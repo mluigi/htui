@@ -5,21 +5,25 @@
 
 use chrono::Duration;
 use htui::app::Action;
+use htui::persona_import::{NO_FRONTMATTER, PersonaImports, PersonaOutcome};
 use htui::persona_settings::PersonaWrite;
 use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::SectionBench;
 use htui::ui::Theme;
 use htui::ui::tabs::settings::personas::{
-    COMMAND_RUN_IS_Y_OR_N, HINT_BROWSE, HINT_EDITOR, HINT_FORM_EDIT, UNCHANGED, UNSAVED,
+    COMMAND_RUN_IS_Y_OR_N, ENTER_A_PATH, HINT_BROWSE, HINT_DELETING, HINT_EDITOR, HINT_FORM_EDIT,
+    HINT_REPORT, IMPORTING, UNCHANGED, UNSAVED,
 };
 use htui::ui::tabs::settings::{PersonasSection, SettingsSection};
 use htui_core::fixtures::ids;
-use htui_core::model::persona::{BLANK_PERSONA_BODY, allow_names_an_mcp_tool};
-use htui_core::model::{
-    Persona, PersonaAnswer, PersonaDefault, PersonaMatch, PersonaPatch, PersonaPermission,
-    PersonaRule, PersonaTools,
+use htui_core::model::persona::{
+    BLANK_PERSONA_BODY, RULE_MATCHES_EVERYTHING, allow_names_an_mcp_tool, rule_kind_unknown,
 };
-use htui_core::store::{MemStore, WriteStore as _};
+use htui_core::model::{
+    Persona, PersonaAnswer, PersonaDefault, PersonaFileError, PersonaMatch, PersonaPatch,
+    PersonaPermission, PersonaRule, PersonaTools,
+};
+use htui_core::store::{MemStore, WriteStore as _, persona_is_bound};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
@@ -731,5 +735,378 @@ async fn a_section_debug_prints_no_typed_text() {
     assert!(
         !shown.contains("secret") && !shown.contains("classified"),
         "{shown}"
+    );
+}
+
+// ---- 9.4: the rules editor -----------------------------------------------------------------------
+
+/// §2.3's fixed rows 1 and 2.
+fn two_rules() -> Vec<PersonaRule> {
+    vec![
+        one_rule(),
+        PersonaRule {
+            matcher: PersonaMatch {
+                path_prefix: Some("/etc".to_owned()),
+                ..PersonaMatch::default()
+            },
+            answer: PersonaAnswer::RejectAlways,
+            reason: String::new(),
+        },
+    ]
+}
+
+/// The demo rows with the architect carrying [`two_rules`] and `default: ask`.
+async fn ruled_rows() -> Vec<Persona> {
+    let mut rows = demo_rows().await;
+    for row in &mut rows {
+        if row.id == ids::PERSONA_ARCHITECT {
+            row.permission = PersonaPermission {
+                default: Some(PersonaDefault::Ask),
+                rules: two_rules(),
+            };
+        }
+    }
+    rows
+}
+
+#[tokio::test]
+async fn r_opens_the_rules_editor_one_line_per_rule() {
+    let (bench, mut section) = bench_with(ruled_rows().await).await;
+    bench.key(&mut section, "r");
+
+    let frame = frame(&bench, &section);
+    assert!(frame.contains("rules of `architect`"), "{frame}");
+    assert!(
+        frame.contains("reject_once kind=execute command=\"rm -rf\" # never wipe"),
+        "{frame}"
+    );
+    assert!(frame.contains("reject_always path=/etc"), "{frame}");
+    assert!(section.captures_input());
+    insta::assert_snapshot!("rules", frame);
+}
+
+#[tokio::test]
+async fn rules_save_sends_the_permission_with_the_default_kept() {
+    let (bench, mut section) = bench_with(ruled_rows().await).await;
+    bench.key(&mut section, "r");
+    bench.key(&mut section, "enter");
+    type_text(&bench, &mut section, "reject_once kind=read");
+    bench.key(&mut section, "ctrl-s");
+
+    let (id, _, patch) = one_update(requests(&bench));
+    assert_eq!(id, ids::PERSONA_ARCHITECT);
+    let mut rules = two_rules();
+    rules.push(PersonaRule {
+        matcher: PersonaMatch {
+            tool_kind: Some("read".to_owned()),
+            ..PersonaMatch::default()
+        },
+        answer: PersonaAnswer::RejectOnce,
+        reason: String::new(),
+    });
+    assert_eq!(
+        patch,
+        PersonaPatch {
+            permission: Some(PersonaPermission {
+                default: Some(PersonaDefault::Ask),
+                rules,
+            }),
+            ..PersonaPatch::default()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_rules_line_error_names_the_line_and_sends_nothing() {
+    let (bench, mut section) = bench_with(ruled_rows().await).await;
+    bench.key(&mut section, "r");
+    bench.key(&mut section, "enter");
+    type_text(&bench, &mut section, "reject_once colour=red");
+    bench.key(&mut section, "ctrl-s");
+
+    assert!(requests(&bench).is_empty(), "nothing is sent");
+    let frame = frame(&bench, &section);
+    assert!(
+        shows(
+            &frame,
+            "rules line 3: `colour` is not a rule key; a rule takes kind, name, path and command"
+        ),
+        "{frame}"
+    );
+    assert!(section.captures_input(), "the editor stays open");
+}
+
+#[tokio::test]
+async fn a_misspelt_rule_kind_is_refused_before_sending() {
+    let (bench, mut section) = bench_with_demo().await;
+    bench.key(&mut section, "r");
+    type_text(&bench, &mut section, "reject_once kind=exec");
+    bench.key(&mut section, "ctrl-s");
+
+    assert!(requests(&bench).is_empty(), "nothing is sent");
+    let frame = frame(&bench, &section);
+    assert!(
+        shows(
+            &frame,
+            &format!("rules line 1: {}", rule_kind_unknown("exec"))
+        ),
+        "{frame}"
+    );
+}
+
+#[tokio::test]
+async fn an_empty_match_is_refused_with_the_stores_sentence() {
+    let (bench, mut section) = bench_with_demo().await;
+    bench.key(&mut section, "r");
+    type_text(&bench, &mut section, "reject_once");
+    bench.key(&mut section, "ctrl-s");
+
+    assert!(requests(&bench).is_empty(), "nothing is sent");
+    assert!(shows(&frame(&bench, &section), RULE_MATCHES_EVERYTHING));
+}
+
+// ---- 9.4: the delete question ------------------------------------------------------------------
+
+#[tokio::test]
+async fn d_asks_and_y_sends_delete_persona() {
+    let (bench, mut section) = bench_with_demo().await;
+    keys(&bench, &mut section, &["j", "d"]);
+
+    let asked = frame(&bench, &section);
+    assert!(
+        asked.contains("delete persona `reviewer`? a persona bound to a phase is refused."),
+        "{asked}"
+    );
+    assert!(asked.contains(HINT_DELETING), "{asked}");
+    insta::assert_snapshot!("delete_ask", asked);
+
+    bench.key(&mut section, "y");
+    let sent = requests(&bench);
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [StoreRequest::DeletePersona { id }] if *id == ids::PERSONA_REVIEWER
+        ),
+        "{sent:?}"
+    );
+}
+
+#[tokio::test]
+async fn n_or_esc_at_the_question_sends_nothing() {
+    let (bench, mut section) = bench_with_demo().await;
+    for stop in ["n", "esc"] {
+        keys(&bench, &mut section, &["d", stop]);
+        assert!(!section.captures_input(), "{stop}: back to Browse");
+        assert!(frame(&bench, &section).contains(HINT_BROWSE), "{stop}");
+    }
+    assert!(bench.drained().is_empty(), "nothing at all was emitted");
+}
+
+#[tokio::test]
+async fn a_bound_refusal_closes_the_question_and_shows_the_sentence() {
+    let (bench, mut section) = bench_with_demo().await;
+    keys(&bench, &mut section, &["j", "d", "y"]);
+    let _ = requests(&bench);
+    let sentence = persona_is_bound(
+        "reviewer",
+        &[("htui".to_owned(), "feature".to_owned(), "review".to_owned())],
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "delete_persona",
+            message: sentence.clone(),
+        },
+    );
+
+    assert!(!section.captures_input(), "the question closed");
+    assert!(
+        shows(&error_text(&bench, &section), &sentence),
+        "{}",
+        frame(&bench, &section)
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_reply_says_which() {
+    let (bench, mut section) = bench_with_demo().await;
+    keys(&bench, &mut section, &["j", "d", "y"]);
+    let _ = requests(&bench);
+    let rows: Vec<Persona> = demo_rows()
+        .await
+        .into_iter()
+        .filter(|row| row.id != ids::PERSONA_REVIEWER)
+        .collect();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaWritten {
+            personas: rows,
+            outcome: PersonaWrite::Deleted {
+                id: ids::PERSONA_REVIEWER,
+            },
+        },
+    );
+
+    assert!(!section.captures_input());
+    let frame = frame(&bench, &section);
+    assert!(frame.contains("deleted persona `reviewer`"), "{frame}");
+    assert!(
+        !frame.contains("reviewer \u{b7}"),
+        "the row is gone: {frame}"
+    );
+}
+
+// ---- 9.4: the import ---------------------------------------------------------------------------
+
+/// `I`, the path, `Enter`: the import in flight.
+fn start_import(bench: &SectionBench, section: &mut PersonasSection) {
+    bench.key(section, "I");
+    type_text(bench, section, "/srv/agents");
+    bench.key(section, "enter");
+}
+
+#[tokio::test]
+async fn upper_i_opens_the_path_and_enter_sends_import_personas() {
+    let (bench, mut section) = bench_with_demo().await;
+    bench.key(&mut section, "I");
+    assert!(section.captures_input(), "the path field takes letters");
+    type_text(&bench, &mut section, "/srv/agents");
+    bench.key(&mut section, "enter");
+
+    let sent = requests(&bench);
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [StoreRequest::ImportPersonas { path }] if path == "/srv/agents"
+        ),
+        "{sent:?}"
+    );
+    assert!(!section.captures_input(), "back to Browse");
+    assert!(frame(&bench, &section).contains(IMPORTING));
+}
+
+#[tokio::test]
+async fn an_empty_path_is_refused() {
+    let (bench, mut section) = bench_with_demo().await;
+    keys(&bench, &mut section, &["I", "enter"]);
+
+    assert!(requests(&bench).is_empty(), "nothing is sent");
+    assert!(shows(&frame(&bench, &section), ENTER_A_PATH));
+}
+
+fn imported(name: &str, dropped: &[&str]) -> PersonaOutcome {
+    PersonaOutcome::Imported {
+        name: name.to_owned(),
+        path: format!("/srv/agents/{name}.md"),
+        dropped: dropped.iter().map(|tool| (*tool).to_owned()).collect(),
+    }
+}
+
+/// One of each outcome, with fixed fake paths (no tempdir in a snapshot).
+fn mixed_report() -> Vec<PersonaOutcome> {
+    vec![
+        imported(
+            "code-architect",
+            &["mcp__gortex__search", "mcp__gortex__read"],
+        ),
+        PersonaOutcome::Refused {
+            path: "/srv/agents/gortex-search.md".to_owned(),
+            message: PersonaFileError::OnlyMcpTools.to_string(),
+        },
+        PersonaOutcome::Refused {
+            path: "/srv/agents/reviewer.md".to_owned(),
+            message: "persona `reviewer` exists; edit it in Settings \u{203a} Personas, or \
+                      delete it and import again"
+                .to_owned(),
+        },
+        PersonaOutcome::Skipped {
+            path: "/srv/agents/README.md".to_owned(),
+            reason: NO_FRONTMATTER.to_owned(),
+        },
+    ]
+}
+
+#[tokio::test]
+async fn a_clean_import_says_so_in_the_notice() {
+    let (bench, mut section) = bench_with_demo().await;
+    start_import(&bench, &mut section);
+    let _ = requests(&bench);
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaImports(Box::new(PersonaImports {
+            personas: demo_rows().await,
+            report: vec![imported("code-architect", &[]), imported("scout", &[])],
+        })),
+    );
+
+    assert!(!section.captures_input(), "no report opens");
+    let frame = frame(&bench, &section);
+    assert!(frame.contains("imported code-architect, scout"), "{frame}");
+}
+
+#[tokio::test]
+async fn an_import_with_a_refusal_or_a_drop_opens_the_report() {
+    let (bench, mut section) = bench_with_demo().await;
+    start_import(&bench, &mut section);
+    let _ = requests(&bench);
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaImports(Box::new(PersonaImports {
+            personas: demo_rows().await,
+            report: mixed_report(),
+        })),
+    );
+
+    assert!(section.captures_input(), "the report is open");
+    let report = frame(&bench, &section);
+    assert!(
+        report.starts_with("imported 1 \u{b7} refused 2 \u{b7} skipped 1"),
+        "{report}"
+    );
+    assert!(report.contains(HINT_REPORT), "{report}");
+    insta::assert_snapshot!("import_report", report);
+
+    bench.key(&mut section, "j");
+    let scrolled = frame(&bench, &section);
+    assert_ne!(
+        scrolled.lines().nth(1),
+        report.lines().nth(1),
+        "j scrolls one line"
+    );
+
+    bench.key(&mut section, "esc");
+    assert!(!section.captures_input(), "back to Browse");
+    assert!(frame(&bench, &section).contains(HINT_BROWSE));
+}
+
+#[tokio::test]
+async fn an_import_landing_over_an_editor_says_the_counts() {
+    let (bench, mut section) = bench_with_demo().await;
+    start_import(&bench, &mut section);
+    let _ = requests(&bench);
+    bench.key(&mut section, "e");
+    assert!(
+        section.captures_input(),
+        "the form opened while the walk ran"
+    );
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaImports(Box::new(PersonaImports {
+            personas: demo_rows().await,
+            report: mixed_report(),
+        })),
+    );
+
+    assert!(section.captures_input(), "the editor is kept");
+    assert!(frame(&bench, &section).contains("edit persona `architect`"));
+    assert!(
+        error_text(&bench, &section).contains("imported 1 \u{b7} refused 2 \u{b7} skipped 1"),
+        "{}",
+        frame(&bench, &section)
     );
 }

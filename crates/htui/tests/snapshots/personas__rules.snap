@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/personas.rs
+expression: frame
+---
+rules of `architect`
+one rule per line: reject_once|reject_always kind=… name=… path=… command=… # reason · quote a value
+holding a space, ", #, = or \ · kind: read edit delete move search execute think fetch switch_mode
+other
+reject_once kind=execute command="rm -rf" # never wipe
+reject_always path=/etc
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Ctrl+S save · Esc cancel · Enter breaks the line

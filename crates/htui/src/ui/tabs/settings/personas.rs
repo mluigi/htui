@@ -11,11 +11,17 @@
 //! section mints (B-13). `e` edits the fields of the selected row and sends only what changed;
 //! `b` edits its body. Every refusal shown before anything is sent is the store's own sentence
 //! (I-8): the form runs the store's rule over a one-field patch, so no second grammar can drift.
-//! Personas are not mirrored, so offline the read is refused and the section offers no key but
+//! `r` edits the permission rules one per line (D17), `d` asks before deleting (a bound persona is
+//! refused by the store, D14), and `I` hands a path to the worker, which reads the files (D20);
+//! anything refused, skipped or dropped opens a report. Personas are not mirrored, so offline the read is refused and the section offers no key but
 //! navigation.
 
+use core::cell::Cell;
+
 use chrono::{DateTime, Utc};
-use htui_core::model::persona::{list_of, new_persona_refusal, persona_patch_refusal};
+use htui_core::model::persona::{
+    format_rules, list_of, new_persona_refusal, parse_rules, persona_patch_refusal,
+};
 use htui_core::model::{
     NewPersona, Persona, PersonaDefault, PersonaId, PersonaPatch, PersonaPermission, PersonaTools,
     Scope,
@@ -27,7 +33,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
-use crate::persona_settings::{PersonaWrite, READ_NAME, REQUEST_NAMES};
+use crate::persona_import::PersonaOutcome;
+use crate::persona_settings::{IMPORT_NAME, PersonaWrite, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
@@ -56,6 +63,27 @@ pub const HINT_BODY_NEW: &str = "Ctrl+S create \u{b7} Esc back to the fields";
 
 /// The body (edit) and rules editors' keys.
 pub const HINT_EDITOR: &str = "Ctrl+S save \u{b7} Esc cancel \u{b7} Enter breaks the line";
+
+/// The delete question's keys.
+pub const HINT_DELETING: &str = "y delete \u{b7} n/Esc stop";
+
+/// The import path's keys.
+pub const HINT_IMPORT: &str = "Enter import \u{b7} Esc cancel";
+
+/// The import report's keys.
+pub const HINT_REPORT: &str = "j/k scroll \u{b7} Esc close";
+
+/// `Enter` on an empty import path.
+pub const ENTER_A_PATH: &str = "type a path to a persona `.md` file or a directory of them";
+
+/// While the worker walks an import.
+pub const IMPORTING: &str = "importing\u{2026}";
+
+/// An import whose path held no candidate file.
+pub const NOTHING_IMPORTED: &str = "nothing to import at that path";
+
+/// The rules editor's help, wrapped to the pane (D17).
+pub const RULES_HELP: &str = "one rule per line: reject_once|reject_always kind=\u{2026} name=\u{2026} path=\u{2026} command=\u{2026} # reason \u{b7} quote a value holding a space, \", #, = or \\ \u{b7} kind: read edit delete move search execute think fetch switch_mode other";
 
 /// Before the first read answered.
 pub const NOT_READ: &str = "personas not read yet";
@@ -150,6 +178,74 @@ enum Mode {
     Editing(Editor),
     /// `b`, or `n`'s second step: the body `TextArea`.
     Body(BodyEditor),
+    /// `r`: the rules `TextArea`, one rule per line (D17).
+    Rules(RulesEditor),
+    /// `d`: the y/n question, then the delete in flight.
+    Deleting {
+        /// The row the question names.
+        id: PersonaId,
+        /// Its name, for the question and the notice.
+        name: String,
+        /// Asking, or sent.
+        stage: DeleteStage,
+    },
+    /// `I`: the path field.
+    ImportPath {
+        /// The path, one line.
+        field: TextField,
+    },
+    /// An import's per-file report, scrolled by line.
+    Report {
+        /// One row per file.
+        report: Vec<PersonaOutcome>,
+        /// The first entry line drawn.
+        top: usize,
+        /// The largest `top` the last frame could draw: `j` stops there.
+        max_top: Cell<usize>,
+    },
+}
+
+/// Where the delete question is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeleteStage {
+    /// The question is on screen.
+    Asking,
+    /// `y` was pressed; the delete is in flight.
+    InFlight,
+}
+
+/// The rules editor. `Debug` hand-written: the texts are printed as lengths only (H-7).
+struct RulesEditor {
+    /// The row.
+    id: PersonaId,
+    /// Its name, for the header.
+    name: String,
+    /// The token.
+    expected: DateTime<Utc>,
+    /// The row's `permission.default`, carried into the permission patch; retaken on `Stale`.
+    default: Option<PersonaDefault>,
+    /// The widget.
+    area: TextArea,
+    /// The text it opened on: the "unchanged" and warn-once baseline.
+    original: String,
+    /// The first `Esc` over an edited text armed the second.
+    esc_armed: bool,
+    /// The text in flight.
+    sent: Option<String>,
+}
+
+impl core::fmt::Debug for RulesEditor {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("RulesEditor")
+            .field("id", &self.id)
+            .field("expected", &self.expected)
+            .field("default", &self.default)
+            .field("area", &self.area)
+            .field("original_len", &self.original.len())
+            .field("esc_armed", &self.esc_armed)
+            .field("sent_len", &self.sent.as_ref().map(String::len))
+            .finish()
+    }
 }
 
 /// The fields form. `Debug` hand-written: labels and focus only, never typed text (H-7).
@@ -310,6 +406,12 @@ impl PersonasSection {
         self.cursor = self.cursor.min(self.personas.len().saturating_sub(1));
     }
 
+    /// The write in flight, unless it is the import: an import walk can be long, and the keys
+    /// typed while it runs may open an editor (whose save is still refused until it lands).
+    fn own_write(&self) -> Option<&'static str> {
+        self.busy.filter(|busy| *busy != IMPORT_NAME)
+    }
+
     /// Sends one write and holds the guard until its answer.
     fn send(&mut self, request: StoreRequest, ctx: &Ctx<'_>) {
         self.busy = Some(request.name());
@@ -335,11 +437,18 @@ impl PersonasSection {
                 self.cursor = self.cursor.saturating_sub(1);
                 Handled::Consumed
             }
-            KeyCode::Char(c @ ('n' | 'e' | 'b')) => {
+            KeyCode::Char(c @ ('n' | 'e' | 'b' | 'r' | 'd' | 'I')) => {
                 if self.unavailable.is_some() {
                     return Handled::Consumed;
                 }
-                if let Some(busy) = self.busy {
+                // `d` and `I` send at once; the editors send only on their own save, which the
+                // import in flight still refuses.
+                let busy = if matches!(c, 'd' | 'I') {
+                    self.busy
+                } else {
+                    self.own_write()
+                };
+                if let Some(busy) = busy {
                     self.notice = Some(Notice::Error(in_flight(busy)));
                     return Handled::Consumed;
                 }
@@ -348,16 +457,32 @@ impl PersonasSection {
                     self.notice = None;
                     return Handled::Consumed;
                 }
+                if c == 'I' {
+                    self.mode = Mode::ImportPath {
+                        field: TextField::new(),
+                    };
+                    self.notice = None;
+                    return Handled::Consumed;
+                }
                 let Some(row) = self.selected() else {
                     self.notice = Some(Notice::Error(NO_ROW.to_owned()));
                     return Handled::Consumed;
                 };
-                self.mode = if c == 'e' {
-                    Mode::Editing(Editor::edit(row))
-                } else {
-                    Mode::Body(BodyEditor::edit(row))
+                let (mode, notice) = match c {
+                    'e' => (Mode::Editing(Editor::edit(row)), None),
+                    'b' => (Mode::Body(BodyEditor::edit(row)), None),
+                    'r' => (Mode::Rules(RulesEditor::edit(row)), None),
+                    _ => (
+                        Mode::Deleting {
+                            id: row.id,
+                            name: row.name.clone(),
+                            stage: DeleteStage::Asking,
+                        },
+                        Some(Notice::Info(delete_question(&row.name))),
+                    ),
                 };
-                self.notice = None;
+                self.mode = mode;
+                self.notice = notice;
                 Handled::Consumed
             }
             _ => Handled::Pass,
@@ -464,7 +589,7 @@ impl PersonasSection {
 
     /// `Esc` in the body editor.
     fn cancel_body(&mut self) {
-        if let Some(busy) = self.busy {
+        if let Some(busy) = self.own_write() {
             self.notice = Some(Notice::Error(in_flight(busy)));
             return;
         }
@@ -560,6 +685,194 @@ impl PersonasSection {
         self.send(request, ctx);
     }
 
+    /// One key while the rules editor is open.
+    fn on_rules_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let own = self.own_write();
+        let Mode::Rules(editor) = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match editor.area.on_key(key, EDITOR_PAGE) {
+            FieldOutcome::Consumed => {
+                editor.esc_armed = false;
+                if matches!(self.notice, Some(Notice::Info(_))) {
+                    self.notice = None;
+                }
+                Handled::Consumed
+            }
+            FieldOutcome::Submit => {
+                self.save_rules(ctx);
+                Handled::Consumed
+            }
+            FieldOutcome::Cancel => {
+                if let Some(busy) = own {
+                    self.notice = Some(Notice::Error(in_flight(busy)));
+                } else if editor.area.text() == editor.original || editor.esc_armed {
+                    self.mode = Mode::Browse;
+                    self.notice = None;
+                } else {
+                    editor.esc_armed = true;
+                    self.notice = Some(Notice::Info(UNSAVED.to_owned()));
+                }
+                Handled::Consumed
+            }
+            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
+            FieldOutcome::Pass => Handled::Consumed,
+        }
+    }
+
+    /// `Ctrl+S` in the rules editor: the rule lines (D17), then the store's rule over the
+    /// permission patch (I-8), then one `UpdatePersona` carrying the permission alone, its
+    /// `default` the row's.
+    fn save_rules(&mut self, ctx: &Ctx<'_>) {
+        if let Some(busy) = self.busy {
+            self.notice = Some(Notice::Error(in_flight(busy)));
+            return;
+        }
+        let Mode::Rules(editor) = &mut self.mode else {
+            return;
+        };
+        let text = editor.area.text().to_owned();
+        let rules = match parse_rules(&text) {
+            Ok(rules) => rules,
+            Err(error) => {
+                self.notice = Some(Notice::Error(error.to_string()));
+                return;
+            }
+        };
+        if parse_rules(&editor.original).is_ok_and(|original| original == rules) {
+            self.mode = Mode::Browse;
+            self.notice = Some(Notice::Info(UNCHANGED.to_owned()));
+            return;
+        }
+        let patch = PersonaPatch {
+            permission: Some(PersonaPermission {
+                default: editor.default,
+                rules,
+            }),
+            ..PersonaPatch::default()
+        };
+        if let Some(sentence) = persona_patch_refusal(&patch) {
+            self.notice = Some(Notice::Error(sentence));
+            return;
+        }
+        let request = StoreRequest::UpdatePersona {
+            id: editor.id,
+            expected: editor.expected,
+            patch,
+        };
+        editor.sent = Some(text);
+        self.notice = None;
+        self.send(request, ctx);
+    }
+
+    /// One key over the delete question: `y` sends, `n`/`Esc` close; once sent, every key but a
+    /// `CONTROL` chord is swallowed until the answer.
+    fn on_delete_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        let Mode::Deleting { id, stage, .. } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        if *stage == DeleteStage::InFlight {
+            return Handled::Consumed;
+        }
+        match key.code {
+            KeyCode::Char('y') => {
+                *stage = DeleteStage::InFlight;
+                let request = StoreRequest::DeletePersona { id: *id };
+                self.notice = None;
+                self.send(request, ctx);
+            }
+            KeyCode::Char('n') | KeyCode::Esc => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+            }
+            _ => {}
+        }
+        Handled::Consumed
+    }
+
+    /// One key in the import path field.
+    fn on_import_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let Mode::ImportPath { field } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match field.on_key(key) {
+            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Submit => {
+                let path = field.text().unwrap_or_default().to_owned();
+                if path.trim().is_empty() {
+                    self.notice = Some(Notice::Error(ENTER_A_PATH.to_owned()));
+                } else if let Some(busy) = self.busy {
+                    self.notice = Some(Notice::Error(in_flight(busy)));
+                } else {
+                    self.mode = Mode::Browse;
+                    self.notice = Some(Notice::Info(IMPORTING.to_owned()));
+                    self.send(StoreRequest::ImportPersonas { path }, ctx);
+                }
+                Handled::Consumed
+            }
+            FieldOutcome::Cancel => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+                Handled::Consumed
+            }
+            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
+            FieldOutcome::Pass => Handled::Consumed,
+        }
+    }
+
+    /// One key over the import report: `j`/`k` scroll a line, `Esc`/`Enter` close.
+    fn on_report_key(&mut self, key: KeyEvent) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        let Mode::Report { top, max_top, .. } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => *top = (*top + 1).min(max_top.get()),
+            KeyCode::Char('k') | KeyCode::Up => *top = top.saturating_sub(1),
+            KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Browse,
+            _ => {}
+        }
+        Handled::Consumed
+    }
+
+    /// An import's answer (D20): a clean one is one notice, anything refused, skipped or dropped
+    /// opens the report over Browse, or is counted over an editor opened while the walk ran.
+    fn land_import(&mut self, report: &[PersonaOutcome]) {
+        let (imported, refused, skipped, dropped) = counts(report);
+        if report.is_empty() {
+            self.notice = Some(Notice::Info(NOTHING_IMPORTED.to_owned()));
+            return;
+        }
+        if refused + skipped + dropped == 0 {
+            let names: Vec<&str> = report
+                .iter()
+                .filter_map(|outcome| match outcome {
+                    PersonaOutcome::Imported { name, .. } => Some(name.as_str()),
+                    _ => None,
+                })
+                .collect();
+            self.notice = Some(Notice::Info(format!("imported {}", names.join(", "))));
+            return;
+        }
+        if matches!(self.mode, Mode::Browse) {
+            self.mode = Mode::Report {
+                report: report.to_vec(),
+                top: 0,
+                max_top: Cell::new(usize::MAX),
+            };
+            self.notice = None;
+        } else {
+            self.notice = Some(Notice::Error(format!(
+                "imported {imported}{DOT}refused {refused}{DOT}skipped {skipped}"
+            )));
+        }
+    }
+
     /// Whether an editor of `id` is open (the form, the body editor).
     fn editing(&self, id: PersonaId) -> bool {
         match &self.mode {
@@ -570,7 +883,8 @@ impl PersonasSection {
             | Mode::Body(BodyEditor {
                 target: BodyTarget::Edit { id: open, .. },
                 ..
-            }) => *open == id,
+            })
+            | Mode::Rules(RulesEditor { id: open, .. }) => *open == id,
             _ => false,
         }
     }
@@ -605,42 +919,61 @@ impl PersonasSection {
                     .iter()
                     .find(|row| row.id == *id)
                     .map(|row| row.updated_at);
-                match &mut self.mode {
-                    Mode::Editing(Editor {
-                        target: Target::Edit { id: open, .. },
-                        ..
-                    }) if open == id => self.mode = Mode::Browse,
-                    Mode::Body(editor) if matches!(editor.target, BodyTarget::Edit { id: open, .. } if open == *id) =>
-                    {
-                        if editor.sent.as_deref() == Some(editor.area.text()) {
-                            self.mode = Mode::Browse;
-                        } else {
-                            // Keys typed while the save was in flight: the editor stays over them,
-                            // the token and the baseline at what was saved (the skills rule).
-                            if let (BodyTarget::Edit { expected, .. }, Some(at)) =
-                                (&mut editor.target, updated_at)
+                if self.editing(*id) {
+                    // Keys typed while a body or rules save was in flight: the editor stays over
+                    // them, its token and baseline at what was saved (the skills rule,
+                    // `library.rs`); anything else closes.
+                    let stays = match &mut self.mode {
+                        Mode::Body(editor) => {
+                            if let BodyTarget::Edit { expected, .. } = &mut editor.target
+                                && let Some(at) = updated_at
                             {
                                 *expected = at;
                             }
-                            if let Some(sent) = editor.sent.take() {
-                                editor.original = sent;
-                            }
-                            editor.esc_armed = false;
+                            let stays =
+                                keep_unsent(&mut editor.original, &mut editor.sent, &editor.area);
+                            editor.esc_armed &= !stays;
+                            stays
                         }
+                        Mode::Rules(editor) => {
+                            if let Some(at) = updated_at {
+                                editor.expected = at;
+                            }
+                            let stays =
+                                keep_unsent(&mut editor.original, &mut editor.sent, &editor.area);
+                            editor.esc_armed &= !stays;
+                            stays
+                        }
+                        _ => false,
+                    };
+                    if !stays {
+                        self.mode = Mode::Browse;
                     }
-                    _ => {}
                 }
                 self.notice = Some(Notice::Info(format!(
                     "saved persona `{}`",
                     name.escape_debug()
                 )));
             }
-            PersonaWrite::Deleted { .. } => {
-                self.notice = Some(Notice::Info("deleted persona".to_owned()));
+            PersonaWrite::Deleted { id } => {
+                let notice = match &self.mode {
+                    Mode::Deleting {
+                        id: asked, name, ..
+                    } if asked == id => {
+                        format!("deleted persona `{}`", name.escape_debug())
+                    }
+                    _ => "deleted persona".to_owned(),
+                };
+                if matches!(&self.mode, Mode::Deleting { id: asked, .. } if asked == id) {
+                    self.mode = Mode::Browse;
+                }
+                self.notice = Some(Notice::Info(notice));
             }
             PersonaWrite::Stale { id } => self.on_stale(*id),
             PersonaWrite::Gone { id } => {
-                if self.editing(*id) {
+                if self.editing(*id)
+                    || matches!(&self.mode, Mode::Deleting { id: asked, .. } if asked == id)
+                {
                     self.mode = Mode::Browse;
                     self.notice = Some(Notice::Error(DELETED_ELSEWHERE.to_owned()));
                 } else {
@@ -682,7 +1015,24 @@ impl PersonasSection {
                 editor.esc_armed = false;
                 CHANGED_ELSEWHERE_SAVE.to_owned()
             }
-            Mode::Browse => return,
+            Mode::Rules(editor) => {
+                let rules = format_rules(&row.permission.rules);
+                if editor.area.text() == editor.original {
+                    editor.area = at_end(&rules);
+                    editor.original = rules;
+                }
+                editor.expected = row.updated_at;
+                editor.default = row.permission.default;
+                editor.sent = None;
+                editor.esc_armed = false;
+                CHANGED_ELSEWHERE_SAVE.to_owned()
+            }
+            Mode::Browse
+            | Mode::Deleting { .. }
+            | Mode::ImportPath { .. }
+            | Mode::Report { .. } => {
+                return;
+            }
         };
         self.notice = Some(Notice::Error(notice));
     }
@@ -711,6 +1061,32 @@ impl PersonasSection {
                 );
                 lines
             }
+            Mode::Rules(editor) => {
+                let mut lines = vec![Line::styled(
+                    format!("rules of `{}`", editor.name),
+                    theme.base,
+                )];
+                lines.extend(
+                    wrapped(RULES_HELP, usize::from(width).max(1))
+                        .into_iter()
+                        .map(|line| Line::styled(line, theme.dim)),
+                );
+                let used = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+                lines.extend(
+                    editor
+                        .area
+                        .lines(width, height.saturating_sub(used), true, theme),
+                );
+                lines
+            }
+            Mode::Deleting { .. } | Mode::ImportPath { .. } => {
+                self.list_lines(width, height, theme)
+            }
+            Mode::Report {
+                report,
+                top,
+                max_top,
+            } => report_lines(report, *top, max_top, width, theme),
         }
     }
 
@@ -750,18 +1126,26 @@ impl PersonasSection {
 
     /// The notice row's lines, wrapped.
     fn notice_lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        if let Mode::ImportPath { field } = &self.mode {
+            let mut spans = vec![Span::styled("path: ", theme.accent)];
+            spans.extend(field.line(width.saturating_sub(6), true, theme).spans);
+            lines.push(Line::from(spans));
+        }
         let Some(notice) = &self.notice else {
-            return Vec::new();
+            return lines;
         };
         let style = match notice {
             Notice::Error(_) => theme.error,
             Notice::Info(text) if is_error(text) => theme.error,
             Notice::Info(_) => theme.dim,
         };
-        wrapped(notice.text(), usize::from(width).max(1))
-            .into_iter()
-            .map(|line| Line::styled(line, style))
-            .collect()
+        lines.extend(
+            wrapped(notice.text(), usize::from(width).max(1))
+                .into_iter()
+                .map(|line| Line::styled(line, style)),
+        );
+        lines
     }
 
     /// The key line for the mode.
@@ -779,7 +1163,10 @@ impl PersonasSection {
                 target: BodyTarget::Create { .. },
                 ..
             }) => HINT_BODY_NEW,
-            Mode::Body(_) => HINT_EDITOR,
+            Mode::Body(_) | Mode::Rules(_) => HINT_EDITOR,
+            Mode::Deleting { .. } => HINT_DELETING,
+            Mode::ImportPath { .. } => HINT_IMPORT,
+            Mode::Report { .. } => HINT_REPORT,
         }
     }
 }
@@ -1019,6 +1406,23 @@ impl BodyEditor {
     }
 }
 
+impl RulesEditor {
+    /// `r` over one row's rules, one per line (D17), the cursor at the end.
+    fn edit(row: &Persona) -> Self {
+        let original = format_rules(&row.permission.rules);
+        Self {
+            id: row.id,
+            name: row.name.clone(),
+            expected: row.updated_at,
+            default: row.permission.default,
+            area: at_end(&original),
+            original,
+            esc_armed: false,
+            sent: None,
+        }
+    }
+}
+
 impl Field {
     /// What was typed. Never masked here.
     fn text(&self) -> &str {
@@ -1176,6 +1580,105 @@ fn clash_notice(clashes: &[&str]) -> String {
     notice
 }
 
+/// A body or rules save landed: `true` when keys typed while it was in flight changed the text,
+/// so the editor stays with the saved text as its baseline; `false` closes it.
+fn keep_unsent(original: &mut String, sent: &mut Option<String>, area: &TextArea) -> bool {
+    match sent.take() {
+        Some(text) if text == area.text() => false,
+        Some(text) => {
+            *original = text;
+            true
+        }
+        None => area.text() != original.as_str(),
+    }
+}
+
+/// An import report's counts: imported, refused, skipped, and imported with entries dropped.
+fn counts(report: &[PersonaOutcome]) -> (usize, usize, usize, usize) {
+    report
+        .iter()
+        .fold((0, 0, 0, 0), |(i, r, s, d), outcome| match outcome {
+            PersonaOutcome::Imported { dropped, .. } => {
+                (i + 1, r, s, d + usize::from(!dropped.is_empty()))
+            }
+            PersonaOutcome::Refused { .. } => (i, r + 1, s, d),
+            PersonaOutcome::Skipped { .. } => (i, r, s + 1, d),
+        })
+}
+
+/// The report: its counts, then one entry per outcome wrapped with a 2-space continuation
+/// indent, scrolled from `top` (clamped so the last line stays, which `max_top` remembers for
+/// `j`).
+fn report_lines(
+    report: &[PersonaOutcome],
+    top: usize,
+    max_top: &Cell<usize>,
+    width: u16,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let width = usize::from(width).max(3);
+    let (imported, refused, skipped, _) = counts(report);
+    let mut entries: Vec<Line<'static>> = Vec::new();
+    for outcome in report {
+        let (text, style) = match outcome {
+            PersonaOutcome::Imported {
+                name,
+                path,
+                dropped,
+            } => {
+                let mut text = format!("+ {name} ({path})");
+                if !dropped.is_empty() {
+                    let tools: Vec<String> =
+                        dropped.iter().map(|tool| format!("`{tool}`")).collect();
+                    text.push_str(&format!(
+                        " \u{2014} dropped from `tools`: {} \u{2014} `allow` keeps built-in tools \
+                         only",
+                        tools.join(", ")
+                    ));
+                }
+                (text, theme.base)
+            }
+            PersonaOutcome::Refused { path, message } => {
+                (format!("! {path} \u{2014} {message}"), theme.error)
+            }
+            PersonaOutcome::Skipped { path, reason } => {
+                (format!("\u{b7} {path} \u{2014} {reason}"), theme.dim)
+            }
+        };
+        let mut first = true;
+        let mut rest = String::new();
+        for line in wrapped(&text, width) {
+            if first {
+                entries.push(Line::styled(line, style));
+                first = false;
+            } else {
+                rest.push_str(&line);
+                rest.push(' ');
+            }
+        }
+        for line in wrapped(&rest, width - 2) {
+            entries.push(Line::styled(format!("  {line}"), style));
+        }
+    }
+    // A pager's rule: the entries scroll until the last line is the first one drawn.
+    max_top.set(entries.len().saturating_sub(1));
+    let top = top.min(max_top.get());
+    let mut lines = vec![Line::styled(
+        format!("imported {imported}{DOT}refused {refused}{DOT}skipped {skipped}"),
+        theme.base,
+    )];
+    lines.extend(entries.into_iter().skip(top));
+    lines
+}
+
+/// The delete question (D14): the store refuses a bound persona, and says which phases hold it.
+fn delete_question(name: &str) -> String {
+    format!(
+        "delete persona `{}`? a persona bound to a phase is refused.",
+        name.escape_debug()
+    )
+}
+
 /// The refusal of a write key while a write is in flight.
 fn in_flight(busy: &str) -> String {
     format!("`{busy}` is still in flight")
@@ -1214,7 +1717,15 @@ impl SettingsSection for PersonasSection {
                 editor.area.on_paste(text);
                 Handled::Consumed
             }
-            Mode::Browse => Handled::Pass,
+            Mode::Rules(editor) => {
+                editor.area.on_paste(text);
+                Handled::Consumed
+            }
+            Mode::ImportPath { field } => {
+                field.on_paste(text);
+                Handled::Consumed
+            }
+            Mode::Browse | Mode::Deleting { .. } | Mode::Report { .. } => Handled::Pass,
         }
     }
 
@@ -1223,6 +1734,10 @@ impl SettingsSection for PersonasSection {
             Mode::Browse => self.on_browse_key(key),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
             Mode::Body(_) => self.on_body_key(key, ctx),
+            Mode::Rules(_) => self.on_rules_key(key, ctx),
+            Mode::Deleting { .. } => self.on_delete_key(key, ctx),
+            Mode::ImportPath { .. } => self.on_import_key(key, ctx),
+            Mode::Report { .. } => self.on_report_key(key),
         }
     }
 
@@ -1242,6 +1757,16 @@ impl SettingsSection for PersonasSection {
                 self.clamp();
                 self.on_written(outcome);
             }
+            StoreReply::PersonaImports(imports) => {
+                self.personas.clone_from(&imports.personas);
+                self.read = true;
+                self.unavailable = None;
+                self.clamp();
+                if self.busy == Some(IMPORT_NAME) {
+                    self.busy = None;
+                    self.land_import(&imports.report);
+                }
+            }
             StoreReply::Failed { request, message } if *request == READ_NAME => {
                 self.personas.clear();
                 self.read = true;
@@ -1251,8 +1776,12 @@ impl SettingsSection for PersonasSection {
             StoreReply::Failed { request, message }
                 if REQUEST_NAMES[1..].contains(request) && self.busy == Some(*request) =>
             {
-                // The store's sentence, bare (B-11); every editor stays open over its text.
+                // The store's sentence, bare (B-11); every editor stays open over its text, and the
+                // delete question closes.
                 self.busy = None;
+                if matches!(self.mode, Mode::Deleting { .. }) {
+                    self.mode = Mode::Browse;
+                }
                 self.notice = Some(Notice::Error(message.clone()));
             }
             _ => {}

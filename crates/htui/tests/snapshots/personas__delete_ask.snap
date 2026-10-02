@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/personas.rs
+expression: asked
+---
+architect · Designs the change before it is built, stud… · deny edit,delete,move · allow 0 · rules 0
+reviewer · Reviews the step's inputs and code for corre… · deny edit,delete,move · allow 0 · rules 0
+    allow all · disallowed none · command-run y · default inherit
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+delete persona `reviewer`? a persona bound to a phase is refused.
+y delete · n/Esc stop
