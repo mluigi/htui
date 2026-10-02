@@ -1,8 +1,8 @@
 # Plan: MOD-26 — Declarative agent personas, milestone 1 (registry rows applied by the engine)
 
-**Status: DRAFT — fact-checked 2026-10-02 (handoff-run step 3.5: three independent verifiers —
+**Status: CONFIRMED by the maintainer 2026-10-02, OQ-1 to OQ-6 as recommended. Fact-checked 2026-10-02 (handoff-run step 3.5: three independent verifiers —
 store, orchestrator/prompt, agent/transports with an offline `claude` 2.1.286 probe; falsified and
-partly-true claims amended in place, see "Verified claims"). Awaiting the maintainer's CONFIRM.**
+partly-true claims amended in place, see "Verified claims").**
 
 **Source PRD**: `.claude/prds/mod-26-agent-personas.prd.md`, milestone 1, with its gate decisions
 (maintainer, 2026-10-02; cited as **PRD Q-storage**, **Q-model**, **Q-binding** (revised to the
