@@ -709,7 +709,7 @@ mod tests {
             async fn upsert(&self, points: Vec<ConceptPoint>) -> Result<(), StoreError> {
                 let failing = self
                     .fail
-                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
                     .is_ok();
                 if failing {
                     return Err(StoreError::Backend(
