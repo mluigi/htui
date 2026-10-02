@@ -5307,6 +5307,20 @@ async fn pass_step_writes_done_and_skipped_under_the_fence<S: WriteStore>(store:
         row,
         "{CASE}: the refused pass wrote nothing"
     );
+    // Review L3: the fence is checked before the status, so a stale lease is told it lost the
+    // run even over a step that is no longer `running`, rather than "not running".
+    let stale = store
+        .pass_step(StepFence::Lease(b), step, Some("stale"), later)
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: a pass of a `done` step under another lease is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        step_row(CASE, store, run, step).await,
+        row,
+        "{CASE}: the fenced pass of a `done` step wrote nothing"
+    );
 
     let quiet = running(1).await;
     assert!(
@@ -5439,6 +5453,18 @@ async fn park_step_moves_step_run_and_item_or_nothing<S: WriteStore>(store: &S) 
         rows(live).await,
         (StepStatus::Running, RunStatus::Running, Status::InProgress),
         "{CASE}: the fenced parks wrote nothing"
+    );
+    // Review L3: the fence is checked before the step's status, so a stale lease is `Fenced`
+    // over a `pending` step too, not `StepMoved`.
+    let stale = store.park_step(StepFence::Lease(b), pending).await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == pending),
+        "{CASE}: a park of a `pending` step under another lease is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        rows(pending).await,
+        (StepStatus::Pending, RunStatus::Running, Status::InProgress),
+        "{CASE}: the fenced park of a `pending` step wrote nothing"
     );
 
     assert_eq!(
