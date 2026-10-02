@@ -37,11 +37,12 @@ use super::library::{Notice, Sent};
 use crate::app::Ctx;
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
+use crate::ui::cells;
 use crate::ui::{TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
-/// A row's label field, in chars: a longer label is cut to `LABEL_WIDTH - 1` and `…`, so the
-/// summary stays on the row.
+/// A row's label field, in cells: a label is fitted to it with `cells::fit`, so the summary stays
+/// on the row and in one column.
 const LABEL_WIDTH: usize = 28;
 
 /// The form's label column, in chars (`description` is the longest label, `effective:` is 10).
@@ -720,7 +721,7 @@ impl AttachPane {
             .enumerate()
             .map(|(index, row)| {
                 let star = if winners.contains(&row) { '*' } else { ' ' };
-                let label = cut(&label(row, snapshot, ctx), LABEL_WIDTH);
+                let label = label(row, snapshot, ctx);
                 let summary = self.summary(row, snapshot);
                 let style = if index == self.cursor {
                     theme.selected
@@ -729,7 +730,7 @@ impl AttachPane {
                 } else {
                     theme.title
                 };
-                Line::styled(format!("{star} {label:<LABEL_WIDTH$} {summary}"), style)
+                Line::styled(row_text(star, &label, &summary), style)
             })
             .collect();
         let offset = self
@@ -930,14 +931,9 @@ pub(super) fn slug(ctx: &Ctx<'_>, project: ProjectId) -> String {
         )
 }
 
-/// `text` cut to `width` chars, the last one `…` when it was longer.
-fn cut(text: &str, width: usize) -> String {
-    if text.chars().count() > width {
-        let kept: String = text.chars().take(width.saturating_sub(1)).collect();
-        format!("{kept}\u{2026}")
-    } else {
-        text.to_owned()
-    }
+/// One attachments row: the winner star, the label fitted to [`LABEL_WIDTH`] cells, the summary.
+fn row_text(star: char, label: &str, summary: &str) -> String {
+    format!("{star} {} {summary}", cells::fit(label, LABEL_WIDTH))
 }
 
 /// The first stored or typed glob whose qualifier names no repo in `repos`, as
@@ -1109,4 +1105,32 @@ fn render_picker(
         Paragraph::new(lines).scroll((u16::try_from(offset).unwrap_or(u16::MAX), 0)),
         inner,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::cells::cell_width;
+
+    /// A ZWJ family: one cluster of five code points, 2 cells.
+    const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+
+    /// MOD-60 D1: the label is fitted in cells, so a wide label never pushes the summary right.
+    #[test]
+    fn a_wide_label_keeps_the_summary_in_its_column() {
+        for label in [
+            "a".repeat(40),
+            "\u{6f22}".repeat(20),
+            "\u{6f22}".repeat(5),
+            FAMILY.repeat(3),
+        ] {
+            let row = row_text('*', &label, "S");
+            let before = row.strip_suffix('S').expect("the summary ends the row");
+            assert_eq!(
+                cell_width(before),
+                2 + LABEL_WIDTH + 1,
+                "{row:?} for {label:?}"
+            );
+        }
+    }
 }
