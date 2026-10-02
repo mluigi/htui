@@ -7,11 +7,12 @@
 //! on screen is always the last snapshot the worker assembled — no row is ever patched in locally,
 //! so there is exactly one source of truth.
 //!
-//! Three modes, and the mode is what [`captures_input`](SettingsSection::captures_input) is derived
-//! from rather than a flag of its own (D2): in `Browse` the tab still cycles on `h`/`l` and the
-//! global table still owns `q`, `?`, `Tab` and the digits; while an editor or a delete
-//! confirmation is open those letters are text and are swallowed, with one carve-out — a chord
-//! carrying `CONTROL` always passes, so `ctrl-c` quits from inside a half-typed slug.
+//! Four modes — browsing, an editor, a delete confirmation, or a directory picker (MOD-49) — and
+//! the mode is what [`captures_input`](SettingsSection::captures_input) is derived from rather than
+//! a flag of its own (D2): in `Browse` the tab still cycles on `h`/`l` and the global table still
+//! owns `q`, `?`, `Tab` and the digits; while an editor, a delete confirmation or the picker is
+//! open those letters are text (or the picker's own keys) and are swallowed, with one carve-out —
+//! a chord carrying `CONTROL` always passes, so `ctrl-c` quits from inside a half-typed slug.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -29,7 +30,8 @@ use crate::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES,
     RepoEntry, reach_parts, reach_totals,
 };
-use crate::store_worker::{StoreReply, StoreRequest};
+use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
+use crate::ui::path_picker::{PathPicker, PickerOutcome, start_dir};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -54,6 +56,9 @@ const HINT_UNAVAILABLE: &str = "r reload";
 
 /// An open editor's keys.
 const HINT_EDITING: &str = "Tab/Shift+Tab field · Enter save · Esc cancel";
+
+/// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list.
+const HINT_PICKING: &str = "choosing a directory \u{b7} Esc cancel";
 
 /// What a CAS miss says while an editor is open (D7, PRD D8): the text is kept, the token is not,
 /// and the retry is the user's.
@@ -112,8 +117,8 @@ enum Row {
 
 /// Which row an open editor writes back to, and what it needs to address it.
 ///
-/// `UpdateRepo` and `SetRepoPath` carry the repo's **project** because the seam has no `repo(id)`
-/// reader: the worker re-reads the tree the reply renders, and it needs the project to find the
+/// `UpdateRepo` (and `SetRepoPath`, now [`PathTarget::RepoPath`]'s, MOD-49) carry the repo's
+/// **project** because the seam has no `repo(id)` reader: the worker re-reads the tree the reply renders, and it needs the project to find the
 /// workspace (plan open item O-2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EditorKind {
@@ -134,15 +139,36 @@ enum EditorKind {
         /// The repo.
         id: RepoId,
     },
-    /// `b` on the workspace row.
+}
+
+/// Which row `b` writes a path for (MOD-49, blueprint D7): the two path writes, out of
+/// [`EditorKind`] now that no editor types them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathTarget {
+    /// `b` on the workspace row: this box's root.
     WorkspaceRoot(WorkspaceId),
-    /// `b` on a repo row.
+    /// `b` on a repo row: this box's checkout.
     RepoPath {
         /// The repo's project.
         project: ProjectId,
         /// The repo.
         id: RepoId,
     },
+}
+
+impl PathTarget {
+    /// The unchanged write (MOD-49 plan summary): the worker's `canonical` guard decides what is
+    /// stored, so the chosen path goes out as navigated.
+    fn request(self, path: String) -> StoreRequest {
+        match self {
+            Self::WorkspaceRoot(id) => StoreRequest::SetWorkspaceRoot { id, path },
+            Self::RepoPath { project, id } => StoreRequest::SetRepoPath {
+                project,
+                repo: id,
+                path,
+            },
+        }
+    }
 }
 
 /// One labelled input of an editor.
@@ -185,6 +211,15 @@ enum Mode {
         slug: String,
         /// How far the confirmation has got.
         stage: DeleteStage,
+    },
+    /// `b`: choosing a directory (MOD-49). Stays open while the write is in flight (blueprint D8).
+    Picking {
+        /// The row the choice is written to.
+        target: PathTarget,
+        /// The popup.
+        picker: PathPicker,
+        /// The path sent, until the reply: what `written` compares the stored path with.
+        chosen: Option<String>,
     },
 }
 
@@ -365,6 +400,8 @@ impl HierarchySection {
         match &self.mode {
             Mode::Browse => Vec::new(),
             Mode::Editing(editor) => editor.lines(width, theme),
+            // MOD-49 P2: the popup draws over the section in `render`, so the pane stays empty.
+            Mode::Picking { .. } => Vec::new(),
             Mode::Deleting {
                 target,
                 slug,
@@ -415,6 +452,7 @@ impl HierarchySection {
                 }
             }
             Mode::Editing(_) => HINT_EDITING,
+            Mode::Picking { .. } => HINT_PICKING,
             Mode::Deleting { stage, .. } => match stage {
                 DeleteStage::Counting => HINT_COUNTING,
                 DeleteStage::Warn(_) => HINT_WARN,
@@ -573,26 +611,27 @@ impl HierarchySection {
         }
     }
 
-    /// `b`: this box's path for the workspace or for a repo, prefilled with what is stored.
-    fn open_path(&mut self, row: Row) {
+    /// `b`: the directory picker on this box's path for the workspace or for a repo (MOD-49 P1,
+    /// P7). The listing goes out through `ctx.request`, not `send`: it is a read and marks nothing
+    /// busy (P11).
+    fn open_path(&mut self, row: Row, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
-        match row {
-            Row::Workspace => {
-                let stored = snapshot
-                    .root_path
-                    .as_ref()
-                    .map_or("", |path| path.root_path.as_str());
-                let fields = vec![Field::required("path", stored)];
-                self.open(
-                    EditorKind::WorkspaceRoot(snapshot.workspace.id),
-                    fields,
-                    None,
-                );
-            }
+        let workspace_root = snapshot
+            .root_path
+            .as_ref()
+            .map(|path| path.root_path.as_str());
+        let (target, title, stored, fallback) = match row {
+            Row::Workspace => (
+                PathTarget::WorkspaceRoot(snapshot.workspace.id),
+                format!("Root of `{}` on this box", snapshot.workspace.slug),
+                workspace_root,
+                None,
+            ),
             Row::Project { .. } => {
                 self.notice = Some("`b` wants the workspace or a repo row".to_owned());
+                return;
             }
             Row::Repo { project, index } => {
                 let Some((owner, repo)) = snapshot
@@ -602,21 +641,28 @@ impl HierarchySection {
                 else {
                     return;
                 };
-                let stored = repo
-                    .local_path
-                    .as_ref()
-                    .map_or("", |path| path.local_path.as_str());
-                let fields = vec![Field::required("path", stored)];
-                self.open(
-                    EditorKind::RepoPath {
+                (
+                    PathTarget::RepoPath {
                         project: owner,
                         id: repo.repo.id,
                     },
-                    fields,
-                    None,
-                );
+                    format!("Checkout of `{}` on this box", repo.repo.name),
+                    repo.local_path
+                        .as_ref()
+                        .map(|path| path.local_path.as_str()),
+                    workspace_root,
+                )
             }
-        }
+        };
+        let start = start_dir(stored, fallback, self.home.as_deref());
+        let (picker, request) = PathPicker::open(title, start);
+        self.notice = None;
+        self.mode = Mode::Picking {
+            target,
+            picker,
+            chosen: None,
+        };
+        ctx.request(request);
     }
 
     /// `p`: move the primary flag to the repo under the cursor (D12).
@@ -776,7 +822,7 @@ impl HierarchySection {
     fn deleting_slug(&self) -> Option<String> {
         match &self.mode {
             Mode::Deleting { slug, .. } => Some(slug.clone()),
-            Mode::Browse | Mode::Editing(_) => None,
+            Mode::Browse | Mode::Editing(_) | Mode::Picking { .. } => None,
         }
     }
 
@@ -797,7 +843,7 @@ impl HierarchySection {
                 Some(field) => field.input.on_key(key),
                 None => FieldOutcome::Pass,
             },
-            Mode::Browse | Mode::Deleting { .. } => return Handled::Pass,
+            Mode::Browse | Mode::Deleting { .. } | Mode::Picking { .. } => return Handled::Pass,
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
@@ -831,10 +877,45 @@ impl HierarchySection {
         }
     }
 
+    /// One key while the picker is open (MOD-49 P8, blueprint H-4, D15).
+    ///
+    /// A `CONTROL` chord passes first, so `ctrl-c` still quits; every other key is the picker's,
+    /// and one it does not bind is swallowed, so `q` can't quit mid-pick. A choice is a write:
+    /// refused while another is in flight, and the picker stays open until its reply (D8).
+    fn on_picker_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return Handled::Pass;
+        }
+        let Mode::Picking { picker, .. } = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match picker.on_key(key) {
+            PickerOutcome::None => {}
+            PickerOutcome::Request(request) => ctx.request(request),
+            PickerOutcome::Chosen(path) => {
+                if self.in_flight() {
+                    return Handled::Consumed;
+                }
+                let Mode::Picking { target, chosen, .. } = &mut self.mode else {
+                    return Handled::Consumed;
+                };
+                let request = target.request(path.clone());
+                *chosen = Some(path);
+                self.notice = None;
+                self.send(request, ctx);
+            }
+            PickerOutcome::Cancelled => {
+                self.mode = Mode::Browse;
+                self.notice = None;
+            }
+        }
+        Handled::Consumed
+    }
+
     /// `Enter` in an editor: the required fields, then one request per [`EditorKind`].
     ///
-    /// The editor **stays open** until the reply lands, so a refusal (a duplicate slug, a refused
-    /// path) leaves the text where it was and a second `Enter` retries it. Which is why the first
+    /// The editor **stays open** until the reply lands, so a refusal (a duplicate slug, say)
+    /// leaves the text where it was and a second `Enter` retries it. Which is why the first
     /// statement is the same refusal the Browse keys get: the editor being open is not a reply, and
     /// a second `Enter` before one arrives would re-send a write that already landed (D6).
     fn submit(&mut self, ctx: &mut Ctx<'_>) {
@@ -931,15 +1012,6 @@ impl HierarchySection {
                     },
                 }
             }
-            EditorKind::WorkspaceRoot(id) => StoreRequest::SetWorkspaceRoot {
-                id,
-                path: editor.text(0),
-            },
-            EditorKind::RepoPath { project, id } => StoreRequest::SetRepoPath {
-                project,
-                repo: id,
-                path: editor.text(0),
-            },
         };
         self.notice = None;
         self.send(request, ctx);
@@ -950,25 +1022,30 @@ impl HierarchySection {
     fn on_tree(&mut self, snapshot: &HierarchySnapshot, ctx: &Ctx<'_>) {
         let write = self.busy.take();
         self.unavailable = None;
-        // MOD-7 milestone 4 (D114, D136): an editor write that can change what inference reads —
-        // the root, or a repo's name or remote — is followed by one inference. Captured here,
-        // before the editor is closed below; `p` has no editor, so it is never followed.
+        // MOD-7 milestone 4 (D114, D136): a write that can change what inference reads — the root
+        // (now chosen in the picker, MOD-49 blueprint D20), or a repo's name or remote — is
+        // followed by one inference. Captured here, before the editor or picker is closed below;
+        // `p` has neither, so it is never followed, and a repo path (`set_repo_path`) isn't either.
         let follow = write.is_some_and(|name| {
             matches!(name, "set_workspace_root" | "create_repo" | "update_repo")
-        }) && matches!(
-            &self.mode,
-            Mode::Editing(editor) if matches!(
-                editor.kind,
-                EditorKind::WorkspaceRoot(_) | EditorKind::NewRepo(_) | EditorKind::EditRepo { .. }
-            )
-        );
+        }) && match &self.mode {
+            Mode::Editing(editor) => {
+                matches!(
+                    editor.kind,
+                    EditorKind::NewRepo(_) | EditorKind::EditRepo { .. }
+                )
+            }
+            Mode::Picking { target, .. } => matches!(target, PathTarget::WorkspaceRoot(_)),
+            Mode::Browse | Mode::Deleting { .. } => false,
+        };
         if let Some(name) = write {
             self.notice = self.written(name, snapshot);
-            // An **editor** only. A reply carries no correlation, so a read that lands while a
-            // delete is being counted would otherwise close a confirmation nobody answered, and the
-            // `Deleted` that followed would report a slug the section had already forgotten. The
-            // delete flow ends through `Deleted`, `DeleteReach(None)`, a refusal or `Esc`.
-            if matches!(self.mode, Mode::Editing(_)) {
+            // An **editor** or the picker only (MOD-49 D8). A reply carries no correlation, so a
+            // read that lands while a delete is being counted would otherwise close a
+            // confirmation nobody answered, and the `Deleted` that followed would report a slug the
+            // section had already forgotten. The delete flow ends through `Deleted`,
+            // `DeleteReach(None)`, a refusal or `Esc`.
+            if matches!(self.mode, Mode::Editing(_) | Mode::Picking { .. }) {
                 self.mode = Mode::Browse;
             }
         }
@@ -1000,18 +1077,24 @@ impl HierarchySection {
 
     /// What a write that applied has to say, if anything.
     ///
-    /// Only the two path writes do: the guard canonicalises what was typed (D8), and a path stored
-    /// under a name the user did not type is a surprise worth one line.
+    /// Only the two path writes do: the guard canonicalises what was chosen (D8), and a path stored
+    /// under a name the user did not navigate to is a surprise worth one line. Both come from the
+    /// picker now (MOD-49 blueprint D7), which holds the path it sent in `chosen`.
     fn written(&self, request: &'static str, snapshot: &HierarchySnapshot) -> Option<String> {
-        let Mode::Editing(editor) = &self.mode else {
+        let Mode::Picking {
+            target,
+            chosen: Some(chosen),
+            ..
+        } = &self.mode
+        else {
             return None;
         };
-        let stored = match editor.kind {
-            EditorKind::WorkspaceRoot(_) if request == "set_workspace_root" => snapshot
+        let stored = match *target {
+            PathTarget::WorkspaceRoot(_) if request == "set_workspace_root" => snapshot
                 .root_path
                 .as_ref()
                 .map(|path| path.root_path.clone())?,
-            EditorKind::RepoPath { id, .. } if request == "set_repo_path" => snapshot
+            PathTarget::RepoPath { id, .. } if request == "set_repo_path" => snapshot
                 .projects
                 .iter()
                 .flat_map(|entry| entry.repos.iter())
@@ -1020,7 +1103,7 @@ impl HierarchySection {
                 .map(|path| path.local_path.clone())?,
             _ => return None,
         };
-        (stored != editor.text(0)).then(|| format!("stored as `{stored}`"))
+        (stored != *chosen).then(|| format!("stored as `{stored}`"))
     }
 
     /// A CAS miss (D7): the tree is replaced, the editor keeps its text and takes the current row's
@@ -1029,6 +1112,9 @@ impl HierarchySection {
         self.busy = None;
         let reloaded = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
+            // MOD-49 blueprint D19: unreachable — path writes are upserts and never answer
+            // `HierarchyStale` — and harmless if it ever were: the picker keeps its place.
+            Mode::Picking { .. } => Some(Reload::Keep),
             // `p` is the one write with no editor behind it, and a delete has no CAS token at all.
             Mode::Browse | Mode::Deleting { .. } => None,
         };
@@ -1098,6 +1184,11 @@ impl SettingsSection for HierarchySection {
                 field.on_paste(text);
                 Handled::Consumed
             }
+            // MOD-49 P6: a paste into the picker's go-to field, opening it when it is closed.
+            Mode::Picking { picker, .. } => {
+                picker.on_paste(text);
+                Handled::Consumed
+            }
             Mode::Browse | Mode::Deleting { .. } => Handled::Pass,
         }
     }
@@ -1105,6 +1196,9 @@ impl SettingsSection for HierarchySection {
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
+        }
+        if matches!(self.mode, Mode::Picking { .. }) {
+            return self.on_picker_key(key, ctx);
         }
         if matches!(self.mode, Mode::Deleting { .. }) {
             return self.on_deleting_key(key, ctx);
@@ -1163,7 +1257,7 @@ impl SettingsSection for HierarchySection {
                 if !self.refuse('b')
                     && let Some(row) = self.selected()
                 {
-                    self.open_path(row);
+                    self.open_path(row, ctx);
                 }
                 Handled::Consumed
             }
@@ -1280,6 +1374,16 @@ impl SettingsSection for HierarchySection {
                     });
                 }
             }
+            // MOD-49: a listing, or its refusal, for the open picker (blueprint D2, B-3). The
+            // shell has already put a refusal on the status line too (D16).
+            StoreReply::DirListing(_)
+            | StoreReply::Failed {
+                request: LIST_DIR, ..
+            } => {
+                if let Mode::Picking { picker, .. } = &mut self.mode {
+                    picker.on_reply(reply);
+                }
+            }
             // The read itself was refused: saying so beats an empty tree that reads as "nothing
             // here yet" (the agent section's rule, one section across).
             StoreReply::Failed { request, message } if *request == "hierarchy" => {
@@ -1293,6 +1397,11 @@ impl SettingsSection for HierarchySection {
                 self.busy = None;
                 if *request == "infer_repo_paths" {
                     self.carried = None;
+                }
+                // MOD-49 D8, D21: a refused path write leaves the picker open for another choice,
+                // and forgets what it sent so a later tree isn't labelled with it.
+                if let Mode::Picking { chosen, .. } = &mut self.mode {
+                    *chosen = None;
                 }
                 // A delete that was refused must not leave `deleting…` or `counting rows…` on
                 // screen: neither stage has anything left to wait for. `InFlight` goes back to the
@@ -1330,6 +1439,10 @@ impl SettingsSection for HierarchySection {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
         frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
+        // MOD-49 P2: the popup draws over the whole section, not in the pane.
+        if let Mode::Picking { picker, .. } = &self.mode {
+            picker.render(frame, area, ctx.theme);
+        }
     }
 }
 
@@ -1403,7 +1516,7 @@ enum Reload {
     Gone,
     /// The row's `updated_at` as it is now.
     Token(DateTime<Utc>),
-    /// The editor has no CAS token to refresh (a create, or a path write).
+    /// Nothing to refresh: a create has no CAS token, and neither has the picker (MOD-49 D19).
     Keep,
 }
 
@@ -1411,7 +1524,7 @@ enum Reload {
 fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
     match kind {
         EditorKind::NewWorkspace | EditorKind::NewProject => Reload::Keep,
-        EditorKind::EditWorkspace(id) | EditorKind::WorkspaceRoot(id) => {
+        EditorKind::EditWorkspace(id) => {
             if snapshot.workspace.id == id {
                 Reload::Token(snapshot.workspace.updated_at)
             } else {
@@ -1430,7 +1543,7 @@ fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
             .iter()
             .find(|entry| entry.project.id == project)
             .map_or(Reload::Gone, |_| Reload::Keep),
-        EditorKind::EditRepo { id, .. } | EditorKind::RepoPath { id, .. } => snapshot
+        EditorKind::EditRepo { id, .. } => snapshot
             .projects
             .iter()
             .flat_map(|entry| entry.repos.iter())
