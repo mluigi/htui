@@ -6,7 +6,7 @@
 //! Navigation is lexical and never canonicalises, so nothing on screen names a link's target (P5,
 //! `R-BOX-4`): the one canonicalisation is the write the section sends on [`PickerOutcome::Chosen`].
 
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent};
 use htui_core::root_path::DirListing;
@@ -247,8 +247,11 @@ impl PathPicker {
         );
     }
 
-    /// `ask(p)`: remember `p` as the newest path asked for (P9) and build its request.
+    /// `ask(p)`: remember `p` as the newest path asked for (P9) and build its request. `.` and
+    /// `..` are resolved lexically first (review L-1), so the kernel never resolves a `..` after a
+    /// link and lists the link target's parent (P5, `R-BOX-4`).
     fn ask(&mut self, path: String) -> StoreRequest {
+        let path = lexical(path);
         self.asked.clone_from(&path);
         StoreRequest::ListDir {
             path,
@@ -348,7 +351,7 @@ fn child(path: &str, name: &str) -> String {
 }
 
 /// The lexical parent (blueprint D23): `None` at `/`, and an empty parent (a relative path) is
-/// `/`. `.` and `..` aren't normalised.
+/// `/`. A path reaches here already [`lexical`], so it holds no `..`.
 fn parent(path: &str) -> Option<String> {
     let up = Path::new(path).parent()?;
     if up.as_os_str().is_empty() {
@@ -356,6 +359,31 @@ fn parent(path: &str) -> Option<String> {
     } else {
         Some(up.to_string_lossy().into_owned())
     }
+}
+
+/// `path` with its `.` and `..` components resolved lexically (MOD-49 review L-1, amending
+/// blueprint D23): `..` pops one component and never climbs above `/`. A path with neither, or a
+/// relative one (the worker refuses it by name), comes back exactly as given, trailing slash and
+/// all, so the header shows what was typed.
+fn lexical(path: String) -> String {
+    let given = Path::new(&path);
+    let dotted = given
+        .components()
+        .any(|part| matches!(part, Component::CurDir | Component::ParentDir));
+    if !given.is_absolute() || !dotted {
+        return path;
+    }
+    let mut resolved = PathBuf::from("/");
+    for part in given.components() {
+        match part {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => resolved.push(name),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => {}
+        }
+    }
+    resolved.to_string_lossy().into_owned()
 }
 
 /// `text` in at most `width` cells, cut from the **left** behind a `…`: the end of a path is the
