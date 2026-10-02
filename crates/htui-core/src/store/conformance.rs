@@ -854,7 +854,7 @@ async fn update_spec_columns_roundtrip<S: WriteStore>(store: &S) {
         priority: Some(7),
         touched_paths: Some(paths.clone()),
         required_tags: Some(tags.clone()),
-        // A `htui` graph that is not the kind's own override, so Postgres's foreign key holds.
+        // A non-override `htui` graph, so Postgres's foreign key holds.
         step_graph_id: Some(Some(ids::GRAPH_HTUI_FEAT)),
         author_id: ids::USER,
         box_id: Some(ids::BOX),
