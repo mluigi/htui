@@ -559,12 +559,11 @@ pub fn assemble(
     // 4. Estimate, 5. refuse, 6. trim — all three inside the trimmer, which owns the arithmetic.
     let est = spec.estimator;
     // MOD-26 B-17: with a persona, the separator between its frame and the body is the frame's.
-    let frame = masked.literals.concat();
-    let template_tokens = if spec.persona.is_some() {
-        est.estimate(&format!("{frame}{PERSONA_SEPARATOR}"))
-    } else {
-        est.estimate(&frame)
-    };
+    let mut frame = masked.literals.concat();
+    if spec.persona.is_some() {
+        frame.push_str(PERSONA_SEPARATOR);
+    }
+    let template_tokens = est.estimate(&frame);
     let inputs = Inputs {
         spec,
         upstream,
