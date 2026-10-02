@@ -166,7 +166,7 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         item: ItemId,
     ) -> impl Future<Output = Result<crate::model::RelayView>> + Send;
 
-    // -- 23 writes
+    // -- 25 writes
     /// [`WriteStore::transition`].
     fn transition(
         &self,

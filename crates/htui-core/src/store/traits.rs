@@ -2365,11 +2365,11 @@ impl<T> CasOutcome<T> {
 /// [`WriteStore::append_events`], [`WriteStore::set_step_usage`], [`WriteStore::finish_step`]
 /// (MOD-40), [`WriteStore::set_step_prompt`], [`WriteStore::upsert_step_tree`] and
 /// [`WriteStore::record_commits`] (MOD-41 plan D1), [`WriteStore::pass_step`] and
-/// [`WriteStore::park_step`] (MOD-37 R-5) take one and write only while the step's run carries exactly that lease:
-/// `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process whose run another process
-/// adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`]) still holds its old `Lease`,
-/// and the store answers it with [`StoreError::Fenced`](crate::store::StoreError::Fenced) and
-/// writes nothing.
+/// [`WriteStore::park_step`] (MOD-37 R-5) take one and write only while the step's run carries
+/// exactly that lease: `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process
+/// whose run another process adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`])
+/// still holds its old `Lease`, and the store answers it with
+/// [`StoreError::Fenced`](crate::store::StoreError::Fenced) and writes nothing.
 ///
 /// No `Default`: every caller says which one it means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
