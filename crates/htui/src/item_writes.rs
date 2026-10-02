@@ -37,7 +37,7 @@
 
 use htui_core::model::item_spec::{self, NOTHING_TO_SAVE, SpecContext};
 use htui_core::model::{
-    Item, ItemId, ItemKind, ItemRevision, ProjectId, Repo, SpecError, StepGraph,
+    EditReason, Item, ItemId, ItemKind, ItemRevision, ProjectId, Repo, SpecError, StepGraph,
 };
 use htui_core::store::{ReadStore as _, Result, StoreError, UpdateOutcome, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
@@ -252,7 +252,11 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let box_id = backend.box_info().await?.map(|row| row.box_id);
             // D6: the request's own token, never moved here.
             match writer
-                .update_item(*id, *expected_version, changes.into_patch(me, box_id))
+                .update_item(
+                    *id,
+                    *expected_version,
+                    changes.into_patch(me, box_id, EditReason::Edited),
+                )
                 .await?
             {
                 UpdateOutcome::Updated(head) => Ok(StoreReply::ItemWritten {

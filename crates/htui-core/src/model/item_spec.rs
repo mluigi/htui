@@ -22,6 +22,30 @@ use crate::prompt::excerpt::split_qualifier;
 
 /// `item_revision.reason` of a form edit (D5).
 pub const EDITED: &str = "edited";
+/// `item_revision.reason` of an edit that resolves a divergence (MOD-13 milestone 3 D6, ANA-9 §4.2 step 3).
+pub const DIVERGENCE_RESOLUTION: &str = "divergence_resolution";
+
+/// Why an edit is written: the `item_revision.reason` it lands with (milestone 3 D6). Closed, so
+/// the worker has nothing to validate. Not a `str_enum!`: `item_revision.reason` has no `CHECK`
+/// (`0001_init.sql:348`), and the store keeps other reasons (`created`, `imported`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditReason {
+    /// A form edit from the item it opened on: [`EDITED`].
+    Edited,
+    /// A form rebased on the head after a divergence: [`DIVERGENCE_RESOLUTION`].
+    DivergenceResolution,
+}
+
+impl EditReason {
+    /// The revision's `reason` text.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Edited => EDITED,
+            Self::DivergenceResolution => DIVERGENCE_RESOLUTION,
+        }
+    }
+}
 /// D5: an edit whose every field equals the item's. Said by the form, refused by the worker.
 pub const NOTHING_TO_SAVE: &str = "nothing to save: no field differs from the item";
 
@@ -442,9 +466,14 @@ impl SpecChanges {
         *self == Self::default()
     }
 
-    /// The `update_item` patch for these changes, `reason = EDITED`.
+    /// The `update_item` patch for these changes, with `reason`'s revision text.
     #[must_use]
-    pub fn into_patch(self, author_id: UserId, box_id: Option<BoxId>) -> ItemPatch {
+    pub fn into_patch(
+        self,
+        author_id: UserId,
+        box_id: Option<BoxId>,
+        reason: EditReason,
+    ) -> ItemPatch {
         ItemPatch {
             title: self.title,
             body: self.body,
@@ -455,7 +484,7 @@ impl SpecChanges {
             step_graph_id: self.step_graph_id,
             author_id,
             box_id,
-            reason: EDITED.to_owned(),
+            reason: reason.as_str().to_owned(),
         }
     }
 }
@@ -991,7 +1020,7 @@ mod tests {
         );
 
         assert_eq!(
-            SpecChanges::from(full.clone()).into_patch(user, box_id),
+            SpecChanges::from(full.clone()).into_patch(user, box_id, EditReason::Edited),
             ItemPatch {
                 title: Some(full.title.clone()),
                 body: Some(full.body.clone()),
@@ -1005,10 +1034,32 @@ mod tests {
                 reason: "edited".to_owned(),
             }
         );
-        let clear = SpecChanges::between(&full, &base).into_patch(user, None);
+        let clear = SpecChanges::between(&full, &base).into_patch(user, None, EditReason::Edited);
         assert_eq!(clear.step_graph_id, Some(None), "`Some(None)` survives");
         assert_eq!(clear.reason, EDITED);
         assert_eq!(clear.title, None);
+        assert_eq!(
+            SpecChanges::from(full)
+                .into_patch(user, box_id, EditReason::DivergenceResolution)
+                .reason,
+            "divergence_resolution",
+            "milestone 3 D6: a resolution lands with its own reason"
+        );
+    }
+
+    /// Milestone 3 D6: each reason names its `item_revision.reason` text.
+    #[test]
+    fn edit_reason_names_its_revision_reason() {
+        assert_eq!(EditReason::Edited.as_str(), "edited");
+        assert_eq!(EditReason::Edited.as_str(), EDITED);
+        assert_eq!(
+            EditReason::DivergenceResolution.as_str(),
+            "divergence_resolution"
+        );
+        assert_eq!(
+            EditReason::DivergenceResolution.as_str(),
+            DIVERGENCE_RESOLUTION
+        );
     }
 
     /// The edit form's base is the item as stored.

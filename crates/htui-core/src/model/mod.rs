@@ -122,7 +122,7 @@ pub use ids::{
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
 };
-pub use item_spec::{ItemSpec, SpecChanges, SpecContext, SpecError};
+pub use item_spec::{EditReason, ItemSpec, SpecChanges, SpecContext, SpecError};
 pub use kind::{
     CommandQueue, Gate, Isolation, ItemKind, ItemKindPatch, NewItemKind, NewPromptTemplate,
     NewStepGraph, PhaseAgent, PhasePatch, ProjectSettings, PromptTemplate, ResolvedGraph,
