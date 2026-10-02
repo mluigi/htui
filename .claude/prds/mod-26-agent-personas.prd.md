@@ -125,7 +125,7 @@ the recorded step shows the persona's block in its prompt and its narrowed expos
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Personas in the registry, applied by the engine | A persona row (seeded `reviewer`/`architect`) bound to a phase candidate changes that step's prompt block, exposure and policy; narrow-only refused at save; snapshot-stable; out-of-list calls refused by the relay and by `claude` CLI flags | complete | `.claude/plans/mod-26-agent-personas.plan.md` (T0-T5) |
-| 2 | Authoring in the TUI | Settings > Personas lists, edits, validates and saves personas; frontmatter `.md` import; a phase's persona is picked in the step-graph editor | pending | — |
+| 2 | Authoring in the TUI | Settings > Personas lists, edits, validates and saves personas; frontmatter `.md` import; a phase's persona is picked in the step-graph editor | in-progress | `.claude/plans/mod-26-m2-persona-authoring.plan.md` (T6-T10) |
 
 Milestone 1 shipped 2026-10-02 (T0-T5; the binding landed on the step-graph phase, per Q-binding's
 revision). Moved counts: store conformance `CASES` 119 → 124 (`READ_CASES` 14), `htui-orch`
