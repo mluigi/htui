@@ -561,7 +561,7 @@ mod tests {
             selected: None,
         };
         let (lines, _) = lines(&view, 45, &theme);
-        let text = |line: &ratatui::text::Line<'_>| {
+        let text = |line: &Line<'_>| {
             line.spans
                 .iter()
                 .map(|span| span.content.as_ref())
