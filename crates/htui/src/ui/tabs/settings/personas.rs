@@ -1727,10 +1727,18 @@ impl SettingsSection for PersonasSection {
             }
             Mode::Body(editor) => {
                 editor.area.on_paste(text);
+                editor.esc_armed = false;
+                if matches!(self.notice, Some(Notice::Info(_))) {
+                    self.notice = None;
+                }
                 Handled::Consumed
             }
             Mode::Rules(editor) => {
                 editor.area.on_paste(text);
+                editor.esc_armed = false;
+                if matches!(self.notice, Some(Notice::Info(_))) {
+                    self.notice = None;
+                }
                 Handled::Consumed
             }
             Mode::ImportPath { field } => {

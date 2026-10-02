@@ -4,7 +4,7 @@
 #![cfg(feature = "testkit")]
 
 use chrono::Duration;
-use htui::app::Action;
+use htui::app::{Action, Handled};
 use htui::persona_import::{NO_FRONTMATTER, PersonaImports, PersonaOutcome};
 use htui::persona_settings::PersonaWrite;
 use htui::store_worker::{StoreReply, StoreRequest};
@@ -598,6 +598,26 @@ async fn esc_on_an_edited_body_warns_once() {
     assert!(requests(&bench).is_empty());
 }
 
+/// A paste is an edit: it disarms the warned Esc and clears the notice, as a typed key does.
+#[tokio::test]
+async fn a_paste_after_the_warning_disarms_the_body_esc() {
+    let (bench, mut section) = bench_with_demo().await;
+    bench.key(&mut section, "b");
+    type_text(&bench, &mut section, "x");
+    bench.key(&mut section, "esc");
+    assert!(frame(&bench, &section).contains(UNSAVED));
+
+    assert_eq!(bench.paste(&mut section, "pasted"), Handled::Consumed);
+    let pasted = frame(&bench, &section);
+    assert!(!pasted.contains(UNSAVED), "{pasted}");
+
+    bench.key(&mut section, "esc");
+    let warned = frame(&bench, &section);
+    assert!(section.captures_input(), "the paste re-arms the warning");
+    assert!(warned.contains(UNSAVED), "{warned}");
+    assert!(requests(&bench).is_empty());
+}
+
 // ---- 9.3: replies --------------------------------------------------------------------------------
 
 /// The demo rows with the architect's description and token moved by another writer.
@@ -816,6 +836,24 @@ async fn r_opens_the_rules_editor_one_line_per_rule() {
     assert!(frame.contains("reject_always path=/etc"), "{frame}");
     assert!(section.captures_input());
     insta::assert_snapshot!("rules", frame);
+}
+
+#[tokio::test]
+async fn a_paste_after_the_warning_disarms_the_rules_esc() {
+    let (bench, mut section) = bench_with(ruled_rows().await).await;
+    bench.key(&mut section, "r");
+    type_text(&bench, &mut section, "x");
+    bench.key(&mut section, "esc");
+    assert!(frame(&bench, &section).contains(UNSAVED));
+
+    assert_eq!(bench.paste(&mut section, "pasted"), Handled::Consumed);
+    assert!(!frame(&bench, &section).contains(UNSAVED));
+
+    bench.key(&mut section, "esc");
+    let warned = frame(&bench, &section);
+    assert!(section.captures_input(), "the paste re-arms the warning");
+    assert!(warned.contains(UNSAVED), "{warned}");
+    assert!(requests(&bench).is_empty());
 }
 
 #[tokio::test]
