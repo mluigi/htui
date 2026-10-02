@@ -2345,6 +2345,96 @@ mod tests {
         );
     }
 
+    /// `N` with `Fresh item` typed, the focus moved back to the project picker and `l` pressed:
+    /// the one `ItemForm` read the move sent (E7).
+    async fn a_project_moved(tab: &mut BacklogTab, bench: &Bench, store: &MemStore) {
+        use htui_core::fixtures::ids::PROJECT_AGY;
+        open_with(tab, bench, store, KeyCode::Char('N')).await;
+        type_into(tab, bench, "Fresh item");
+        for _ in 0..2 {
+            press(tab, bench, KeyCode::BackTab);
+        }
+        assert_eq!(
+            tab.item_form.as_ref().map(ItemForm::focus),
+            Some(item_form::Field::Project)
+        );
+        assert_eq!(press(tab, bench, KeyCode::Char('l')), Handled::Consumed);
+        let requests = sent(bench);
+        assert!(
+            matches!(
+                requests.as_slice(),
+                [StoreRequest::ItemForm { project, item: None }] if *project == PROJECT_AGY
+            ),
+            "one reload for the picked project: {requests:?}"
+        );
+        assert_eq!(
+            tab.item_form.as_ref().and_then(ItemForm::busy),
+            Some(Busy::Reloading(PROJECT_AGY))
+        );
+    }
+
+    /// Review M2, E7: the project picker's reload re-targets the open form; the typed text stays.
+    #[tokio::test]
+    async fn the_project_picker_reloads_and_the_reply_retargets_keeping_the_text() {
+        use htui_core::fixtures::ids::PROJECT_AGY;
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        a_project_moved(&mut tab, &bench, &store).await;
+
+        let reply = served(
+            &store,
+            &StoreRequest::ItemForm {
+                project: PROJECT_AGY,
+                item: None,
+            },
+        )
+        .await;
+        tab.on_reply(&reply, &mut bench.ctx());
+        let form = tab.item_form.as_ref().expect("the form stays");
+        assert_eq!(form.busy(), None);
+        assert_eq!(form.project(), PROJECT_AGY);
+        assert!(bench.actions().is_empty(), "nothing else is read");
+
+        let request = saved(&mut tab, &bench);
+        assert!(
+            matches!(
+                &request,
+                StoreRequest::MintItem { project, spec }
+                    if *project == PROJECT_AGY && spec.title == "Fresh item"
+            ),
+            "the text is kept: {request:?}"
+        );
+    }
+
+    /// Review M2, E7: a refused reload settles the form with the reason; `Esc` then closes it.
+    #[tokio::test]
+    async fn a_refused_reload_settles_the_form_with_a_notice_and_esc_closes_it() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        a_project_moved(&mut tab, &bench, &store).await;
+
+        let why = format!("store unreachable: {}", htui_store::DATABASE_UNREACHABLE);
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: item_writes::FORM_NAME,
+                message: why.clone(),
+            },
+            &mut bench.ctx(),
+        );
+        let form = tab.item_form.as_ref().expect("the form stays");
+        assert_eq!(form.busy(), None);
+        assert_eq!(notice(&tab), Some(why));
+        assert!(
+            bench.actions().is_empty(),
+            "no Action::Error of the tab's own"
+        );
+
+        assert_eq!(press(&mut tab, &bench, KeyCode::Esc), Handled::Consumed);
+        assert!(tab.item_form.is_none(), "Esc closes it");
+    }
+
     /// A reveal would drop the half-typed item, as it would a half-edited filter.
     #[tokio::test]
     async fn a_reveal_while_the_item_form_is_open_asks_to_close_it_first() {
