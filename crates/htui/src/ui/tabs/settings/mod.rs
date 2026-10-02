@@ -27,6 +27,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use crate::app::{Ctx, Handled};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::cells;
 use crate::ui::tabs::registry::{Tab, TabId};
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -68,36 +69,25 @@ pub(crate) fn is_error(notice: &str) -> bool {
     notice.starts_with("changed elsewhere") || notice.starts_with("deleted elsewhere")
 }
 
-/// One sentence broken into lines of at most `width` chars, on spaces.
+/// `text` in rows of at most `width` cells, its whitespace collapsed: words joined by one space,
+/// a word wider than `width` broken by grapheme (MOD-60 D5, OQ-1) and the next word joining its
+/// last piece when it fits (B7); a control character draws as one blank cell (D3). Text with no
+/// words is no rows. Width 0 reads as 1.
 ///
 /// Wrapped here rather than by `Paragraph`'s own `Wrap`, because the layout needs the height
 /// *before* the pane is drawn and a count that disagreed with the widget's wrapping would clip the
 /// last line of a warning — the one line that says nothing can be undone.
 ///
-/// Shared by the hierarchy, kinds and prompt sections. It was copied twice on the argument that a
-/// three-line helper is cheaper than a promotion (M5 O-5); the third copy is what the argument
-/// named as the price, so this is it. Byte-identical to all three, so no frame moves.
+/// Shared by the hierarchy, kinds and prompt sections, and imported by the backlog and
+/// requirements tabs (M5 O-5 promoted it). The rows are `cells::wrap`'s, so there is one break
+/// rule in `ui/`; the whitespace `split_whitespace` drops covers the whitespace controls, and any
+/// other control stays inside its word for `cells::wrap` to flatten.
 pub(crate) fn wrapped(text: &str, width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
-    for word in text.split_whitespace() {
-        let extra = if line.is_empty() {
-            word.chars().count()
-        } else {
-            word.chars().count() + 1
-        };
-        if !line.is_empty() && line.chars().count() + extra > width {
-            lines.push(core::mem::take(&mut line));
-        }
-        if !line.is_empty() {
-            line.push(' ');
-        }
-        line.push_str(word);
+    let words: Vec<&str> = text.split_whitespace().collect();
+    if words.is_empty() {
+        return Vec::new();
     }
-    if !line.is_empty() {
-        lines.push(line);
-    }
-    lines
+    cells::wrap(&words.join(" "), width)
 }
 
 /// What a compare-and-set miss says while an editor is open (M4 D8, PRD D8): the text is kept, the
@@ -425,4 +415,61 @@ pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
         Paragraph::new(Line::styled(text.to_owned(), theme.dim)).wrap(Wrap { trim: true }),
         area,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ui::cells::cell_width;
+
+    /// A ZWJ family: one cluster of five code points, 2 cells.
+    const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+
+    #[test]
+    fn ascii_text_wraps_as_it_did() {
+        assert_eq!(wrapped("ab cd ef", 5), ["ab cd", "ef"]);
+        assert_eq!(
+            wrapped("  a \t b\n c ", 80),
+            ["a b c"],
+            "whitespace collapsed"
+        );
+        assert!(wrapped("", 9).is_empty());
+        assert!(wrapped("   ", 9).is_empty(), "no words is no rows");
+    }
+
+    #[test]
+    fn a_wide_sentence_wraps_by_cells() {
+        let han = "\u{6f22}";
+        let rows = wrapped(&han.repeat(10), 7);
+        assert_eq!(
+            rows,
+            [han.repeat(3), han.repeat(3), han.repeat(3), han.to_owned()]
+        );
+        for row in &rows {
+            assert!(cell_width(row) <= 7, "{row:?} against 7");
+        }
+    }
+
+    #[test]
+    fn a_word_wider_than_the_width_breaks_inside() {
+        assert_eq!(
+            wrapped("see abcdefghijkl now", 5),
+            ["see", "abcde", "fghij", "kl", "now"]
+        );
+        assert_eq!(
+            wrapped("abcdefg hi", 5),
+            ["abcde", "fg hi"],
+            "the next word joins the broken word's last piece (B7)"
+        );
+    }
+
+    #[test]
+    fn a_cluster_is_never_split_across_rows() {
+        assert_eq!(wrapped(&FAMILY.repeat(4), 3), [FAMILY; 4]);
+        assert_eq!(
+            wrapped("x\u{1}y", 80),
+            ["x y"],
+            "a control draws as one blank cell"
+        );
+    }
 }
