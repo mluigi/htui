@@ -395,12 +395,13 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
 /// such a row refuses the clone whole and leaves no orphan graph; the user fixes the attachment
 /// and clones again.
 ///
-/// **One half of ANA-2's clone is owed to a writer that does not exist yet** (blueprint R-6):
-/// `WriteStore` has no `phase_agent` writer at all, so no `phase_agent` row is copied. The clone
-/// this function performs is complete with respect to the seam it has.
-/// Likewise **re-override** (ANA-2 `:297-300`: delete the existing override's phases and re-clone,
-/// leaving `item.step_graph_id` alone) needs a phase deleter `WriteStore` does not carry; until it
-/// does, a second call earns `create_step_graph`'s own `(project_id, name)` `Constraint`, which is
+/// Each source phase's `phase_agent` rows, as `source.resolve_graph` answers them, are written
+/// onto its clone through `create_phase_agents`, re-keyed to the cloned phase (MOD-37 R-6), so the
+/// clone is deep over `step_graph_phase`, `phase_agent` and the phase attachments alike.
+///
+/// **Re-override is still owed** (ANA-2 `:297-300`: delete the existing override's phases and
+/// re-clone, leaving `item.step_graph_id` alone). It needs a phase deleter `WriteStore` does not
+/// carry; until it does, a second call earns `create_step_graph`'s own `(project_id, name)` `Constraint`, which is
 /// a refusal rather than a wrong answer.
 ///
 /// # Errors
@@ -509,6 +510,19 @@ pub async fn override_graph<S: WriteStore, G: GraphSource>(
                 graph_id: clone.id,
                 ..row.phase.clone()
             })
+            .await?;
+        // The source phase's candidates, re-keyed onto the clone (MOD-37 R-6).
+        store
+            .create_phase_agents(
+                id,
+                &row.agents
+                    .iter()
+                    .map(|agent| PhaseAgent {
+                        phase_id: id,
+                        ..agent.clone()
+                    })
+                    .collect::<Vec<_>>(),
+            )
             .await?;
         cloned.push((row.phase.id, id));
     }
@@ -892,11 +906,12 @@ question and not a test fix. Decide the version bump first, then paste the new d
     /// A `GraphSource` over `&MemStore` with one scripted candidate per phase.
     ///
     /// T3's `FakeGraphSource` is the real one; this is the smallest thing that makes `graph.rs`
-    /// testable on its own, and it exists for the reason plan D20 gives: `MemStore::phase_agents`
-    /// answers empty unconditionally (`crates/htui-core/src/store/mem.rs:470-473`) and the demo
-    /// seeds no `agent_box` row, so rungs 1 and 3 of §4.1's chain are both empty here and a resolution
-    /// with no stand-in would refuse every phase for a reason that is about the fixture rather
-    /// than about the walk.
+    /// testable on its own, and it exists for the reason plan D20 gives: the demo seeds no
+    /// `phase_agent` row and no `agent_box` row, so rungs 1 and 3 of §4.1's chain are both empty
+    /// here and a resolution with no stand-in would refuse every phase for a reason that is about
+    /// the fixture rather than about the walk. Its `phase_agents` answers from `candidates`, not
+    /// from the store; `resolve_graph` reads the store, so the rows `create_phase_agents` writes
+    /// reach `override_graph` through it (MOD-37 R-6).
     struct TestSource<'a> {
         store: &'a MemStore,
         candidates: Vec<(AgentId, &'static str)>,
@@ -1717,6 +1732,80 @@ question and not a test fix. Decide the version bump first, then paste the new d
         .expect("the override resolves");
         assert_eq!(resolved.snapshot.graph.id, clone.id);
         assert_eq!(resolved.snapshot.topology, FEATURE_TOPOLOGY);
+    }
+
+    /// MOD-37 R-6: the clone carries `phase_agent` too. Each source phase's candidate rows are
+    /// written onto its clone, re-keyed to the cloned phase, and a phase with none gets none.
+    #[tokio::test]
+    async fn override_clone_carries_phase_agents() {
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        let written: Vec<PhaseAgent> = [
+            (1, ids::AGENT_AGY, "opus"),
+            (0, ids::AGENT_CLAUDE, "sonnet"),
+        ]
+        .into_iter()
+        .map(|(position, agent_id, model)| PhaseAgent {
+            phase_id: ids::PHASE_HTUI_IMPLEMENT,
+            position,
+            agent_id,
+            model: model.to_owned(),
+        })
+        .collect();
+        store
+            .create_phase_agents(ids::PHASE_HTUI_IMPLEMENT, &written)
+            .await
+            .expect("the source rows are written");
+        let source_rows = store
+            .phase_agents(ids::PHASE_HTUI_IMPLEMENT)
+            .await
+            .expect("MemStore never fails a read");
+
+        let clone = override_graph(&store, &TestSource::claude(&store), &item)
+            .await
+            .expect("the item takes an override");
+
+        let cloned = store
+            .phases(clone.id)
+            .await
+            .expect("MemStore never fails a read");
+        let implement = cloned
+            .iter()
+            .find(|phase| phase.name == "implement")
+            .expect("the feature graph has an implement phase");
+        assert_eq!(
+            store
+                .phase_agents(implement.id)
+                .await
+                .expect("MemStore never fails a read"),
+            source_rows
+                .iter()
+                .map(|row| PhaseAgent {
+                    phase_id: implement.id,
+                    ..row.clone()
+                })
+                .collect::<Vec<_>>(),
+            "the cloned implement phase carries the source rows, re-keyed"
+        );
+        for phase in cloned.iter().filter(|phase| phase.id != implement.id) {
+            assert!(
+                store
+                    .phase_agents(phase.id)
+                    .await
+                    .expect("MemStore never fails a read")
+                    .is_empty(),
+                "`{}` had no candidate, so its clone has none",
+                phase.name
+            );
+        }
+        assert_eq!(
+            store
+                .phase_agents(ids::PHASE_HTUI_IMPLEMENT)
+                .await
+                .expect("MemStore never fails a read"),
+            source_rows,
+            "and the source rows are untouched"
+        );
     }
 
     /// MOD-9 D96 (the maintainer's "check first, then refuse"): a source phase attachment whose
