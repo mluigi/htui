@@ -23,19 +23,19 @@ use crate::ui::cells::{cell_width, graphemes};
 
 /// Plan D10: a node's width in cells at zoom 1. Two candidates and the gap are 41 columns, which a
 /// reveal's 1-cell margins keep inside the 43-column pane (fact-check R8; 21 cuts a border).
-pub(super) const NODE_W: f64 = 20.0;
+const NODE_W: f64 = 20.0;
 /// Plan D10: a node's height, a border, two lines and a border.
-pub(super) const NODE_H: f64 = 4.0;
+const NODE_H: f64 = 4.0;
 /// Plan D10: the columns between two nodes of one layer.
-pub(super) const H_GAP: f64 = 1.0;
+const H_GAP: f64 = 1.0;
 /// Plan D10: the rows between two layers. Three keep a `retry` label off the arrowhead (R7).
-pub(super) const V_GAP: f64 = 3.0;
+const V_GAP: f64 = 3.0;
 /// The x distance from one node of a layer to the next.
 const X_STEP: f64 = NODE_W + H_GAP;
 /// The y distance from one layer to the next.
 const Y_STEP: f64 = NODE_H + V_GAP;
 /// Plan D6: the label of an edge into the next attempt of the same position.
-pub(super) const RETRY: &str = "retry";
+const RETRY: &str = "retry";
 /// The margin `ensure_node_visible` keeps (`rataflow` `state/viewport.rs:299`), reused as the
 /// reset viewport's left floor and top offset (blueprint E5).
 const MARGIN: f64 = 1.0;
@@ -143,9 +143,13 @@ pub(super) fn project(run: &RunSummary) -> Projection {
             Some(winner) if !(to.judge && same_slot) => vec![winner],
             _ => from.steps.clone(),
         };
-        let label = (to.position == from.position && to.attempt > from.attempt).then_some(RETRY);
+        let retry = to.position == from.position && to.attempt > from.attempt;
+        // Review L5: one `retry` per target, on its first edge; a label on every edge into it
+        // would draw the word once per source over the same rows.
+        let mut labelled = BTreeSet::new();
         for source in &sources {
             for target in &to.steps {
+                let label = (retry && labelled.insert(*target)).then_some(RETRY);
                 edges.push((*source, *target, label));
             }
         }
@@ -354,14 +358,21 @@ impl ExecutionGraph {
     /// Plan D7/D12: rebuilds the flow from `run`, `cursor` selected. `None` clears it.
     ///
     /// The selection and the hidden handles are baked into every node builder, because
-    /// `set_nodes` clears both (fact-check R2); the viewport survives it, so a re-read of the same
-    /// run keeps the canvas still, and only a new run resets it (blueprint E4).
+    /// `set_nodes` clears both (fact-check R2). The viewport survives it, and a re-read of the same
+    /// run keeps the canvas still: when a wider layer moves the centring, the viewport moves by
+    /// the same amount, so the nodes already drawn stay where they were (review L2). Only a new
+    /// run resets it (blueprint E4).
     pub(super) fn sync(&mut self, run: Option<&RunSummary>, cursor: Option<StepId>, theme: &Theme) {
         let Some(run) = run else {
             self.clear();
             return;
         };
         let projection = project(run);
+        let anchor = if self.run == Some(run.id) {
+            self.anchor(&projection, cursor)
+        } else {
+            None
+        };
         let nodes = projection
             .positions
             .iter()
@@ -398,6 +409,11 @@ impl ExecutionGraph {
             self.clear();
             return;
         }
+        if let Some(((old_x, old_y), (new_x, new_y))) = anchor {
+            let zoom = self.flow.viewport.zoom;
+            self.flow.viewport.x -= (new_x - old_x) * zoom;
+            self.flow.viewport.y -= (new_y - old_y) * zoom;
+        }
         let next = if self.run == Some(run.id) {
             Reveal::Cursor
         } else {
@@ -407,6 +423,24 @@ impl ExecutionGraph {
         self.cursor = cursor;
         self.width = projection.width;
         self.reveal = self.reveal.max(next);
+    }
+
+    /// Review L2: a node drawn before and after a re-read, its old and new world corner: the
+    /// cursor's when it was on the canvas, else the first such node.
+    fn anchor(
+        &self,
+        projection: &Projection,
+        cursor: Option<StepId>,
+    ) -> Option<((f64, f64), (f64, f64))> {
+        cursor
+            .into_iter()
+            .chain(projection.positions.iter().map(|(id, _)| *id))
+            .find_map(|id| {
+                let key = id.to_string();
+                let old = self.flow.nodes().find(|node| node.id == key)?.position;
+                let (_, new) = projection.positions.iter().find(|(at, _)| *at == id)?;
+                Some(((old.x, old.y), *new))
+            })
     }
 
     /// An empty canvas that remembers no run.
@@ -432,14 +466,21 @@ impl ExecutionGraph {
         self.reveal = self.reveal.max(Reveal::Cursor);
     }
 
-    /// Plan D8: `=`, the whole run fitted on the next render. A fit shows every node, so it raises
-    /// no reveal (E9).
+    /// Plan D8: `=`, the whole run fitted on the next render. A run taller than the canvas at the
+    /// 0.5 zoom floor does not fit whole, so the cursor is kept on screen after it (review M1).
     pub(super) fn fit(&mut self) {
         let _ = self.flow.apply_controls_action(ControlsAction::FitView);
+        self.reveal = self.reveal.max(Reveal::Cursor);
     }
 
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
+    ///
+    /// A canvas under 2x2 draws nothing (`rataflow` `ui/canvas.rs:42`), so a reveal measured
+    /// against it would be wrong; it stays pending for the next frame (review L1).
     pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
         let reveal = core::mem::take(&mut self.reveal);
         if reveal != Reveal::None {
             // The canvas size is known only after a draw (`rataflow` `state/viewport.rs:288-291`),
