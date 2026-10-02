@@ -451,7 +451,30 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     and the by-value `merge` that would avoid three spec clones (NIT-2).
 
   Plan `.claude/plans/mod-13-divergence.plan.md`, blueprint
-  `.claude/plans/mod-13-divergence.blueprint.md`. Next: milestone 4, the `$EDITOR` round-trip.
+  `.claude/plans/mod-13-divergence.blueprint.md`.
+  **Phase 4 landed (`1b96f9a`..`726633f`, 2026-10-02):** `$EDITOR` round-trip. In the item
+  form, Ctrl+E on the body or the paths hands that field to `$VISUAL`/`$EDITOR` through MOD-9's
+  handoff (`crate::editor`, `event_loop.rs`). The text comes back into the same field, and Ctrl+S
+  saves it with the same §7.2 compare-and-set, so a stale save still opens the three-way view.
+  - **No new machinery.** There is no new event-loop code, `StoreRequest`/`StoreReply` variant,
+    conformance case or migration. The PRD's mid-suspend risk was already handled by the loop
+    (replies queue, the ticker resets). An integration test pins it from the Backlog side.
+  - **Scope.** On a one-line field, a picker or inside the divergence view, Ctrl+E is swallowed,
+    never passed. While busy it does nothing.
+  - **Returned text.** A final newline the editor added is dropped when the handed-out text had
+    none (D5). Control characters other than `\n` and `\t` are dropped. The cursor lands at the
+    end.
+  - **Offline.** No form opens offline, so Ctrl+E cannot be reached. A form opened before a
+    runtime drop to `Offline` keeps Ctrl+E, which is local only, and its Ctrl+S is refused.
+  - **Shared notices.** `EDITED`/`NO_CHANGES`/`WAIT_FLAG` moved into `crate::editor`.
+  - **Deferred** (maintainer, review):
+    - The item form draws every notice in the error colour, so "edited in $EDITOR" shows red
+      (L5).
+    - The control-character filter covers only the item form's editor return. Templates, Library
+      and bodies loaded from the store are unchanged.
+
+  Plan `.claude/plans/mod-13-editor.plan.md`, blueprint
+  `.claude/plans/mod-13-editor.blueprint.md`. Next: milestone 5, notes and documents.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that

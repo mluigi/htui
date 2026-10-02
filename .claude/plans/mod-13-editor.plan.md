@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-13-backlog-editing.prd.md`
 **Selected Milestone**: 4 — `$EDITOR` round-trip
 **Complexity**: Small
-**Status**: in-progress — CONFIRMed 2026-10-02 (routed as plan path, sandbox `hr/MOD-13`)
+**Status**: complete (2026-10-02) — CONFIRMed, implemented `1b96f9a`..`247ee90`, rust-reviewer approve, review fixes `13047f1`..`726633f` (L1–L4, NIT1–4; L5 deferred)
 
 ## Summary
 In the Backlog item form (milestone 2), Ctrl+E on the body or the touched-paths field hands that
