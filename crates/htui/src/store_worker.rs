@@ -30,7 +30,7 @@ use htui_core::model::{
     WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
-use htui_core::root_path::{DirListing, list_dirs};
+use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
 use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
     WriteStore,
@@ -79,6 +79,11 @@ pub const LIST_DIR: &str = "list_dir";
 
 /// The most entries one [`StoreReply::DirListing`] carries; the rest is its `more` (MOD-49 P4).
 pub const LIST_CAP: usize = 1000;
+
+/// How long one listing may take before it is answered as refused (MOD-49 review M-1): a hung
+/// NFS, sshfs or autofs mount never returns from `stat` or `read_dir`, and the picker must hear
+/// back rather than read `reading…` forever.
+pub const LIST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// What [`serve`] answers an orchestrator command with when no `RunRuntime` serves it (blueprint
 /// D183): the test harness without one.
@@ -1792,6 +1797,24 @@ async fn list_dir(path: &str, show_hidden: bool) -> StoreResult<StoreReply> {
     Ok(StoreReply::DirListing(listing))
 }
 
+/// [`list_dir`] over a chosen lister and bound, so a test can hang one (MOD-49 review M-1).
+///
+/// A listing that hasn't answered within `within` becomes [`StoreError::Constraint`] naming the
+/// path as typed. Its blocking thread is left to finish on its own: a thread stuck in the kernel
+/// can't be cancelled, only stopped being waited for.
+async fn list_dir_within<F>(
+    path: &str,
+    show_hidden: bool,
+    within: std::time::Duration,
+    lister: F,
+) -> StoreResult<StoreReply>
+where
+    F: FnOnce(&std::path::Path, bool, usize) -> Result<DirListing, RootRefusal> + Send + 'static,
+{
+    let _ = (path, show_hidden, within, lister);
+    todo!("MOD-49 review M-1")
+}
+
 /// Renders a store error into the reply the asking view receives.
 fn failed(request: &'static str, err: &StoreError) -> StoreReply {
     StoreReply::Failed {
@@ -2749,6 +2772,100 @@ mod tests {
         };
         assert_eq!(echoed, &query);
         assert_eq!(error, message);
+    }
+
+    /// MOD-49 review M-1: a listing that hangs (a dead mount) is answered as refused once its
+    /// bound passes, naming the path as typed. The fake lister blocks until the test releases it,
+    /// so the runtime's shutdown doesn't wait on it.
+    #[tokio::test]
+    async fn a_listing_that_does_not_answer_in_time_is_refused_by_its_path() {
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let err = list_dir_within(
+            "/mnt/hung",
+            false,
+            std::time::Duration::from_millis(20),
+            move |path, _, _| {
+                let _ = held.recv();
+                Err(RootRefusal::Missing(path.to_path_buf()))
+            },
+        )
+        .await
+        .expect_err("a hung listing is refused");
+        let _ = release.send(());
+
+        let StoreReply::Failed { request, message } = failed(LIST_DIR, &err) else {
+            panic!("a refusal renders as `Failed`")
+        };
+        assert_eq!(request, LIST_DIR);
+        assert!(
+            message.contains("`/mnt/hung`") && message.contains("did not answer"),
+            "the refusal names the path as typed and says why: {message}"
+        );
+    }
+
+    /// The bounded helper answers a listing that is in time exactly as before.
+    #[tokio::test]
+    async fn a_listing_within_its_bound_is_answered() {
+        let dir = tempfile::tempdir().expect("a throwaway directory");
+        std::fs::create_dir(dir.path().join("alpha")).expect("the directory is created");
+        let typed = dir.path().display().to_string();
+
+        let reply = list_dir_within(&typed, false, LIST_TIMEOUT, list_dirs)
+            .await
+            .expect("a real directory is listed");
+        let StoreReply::DirListing(listing) = reply else {
+            panic!("a listing answers `DirListing`: {reply:?}")
+        };
+        assert_eq!(listing.path, typed);
+        assert_eq!(listing.entries.len(), 1);
+    }
+
+    /// MOD-49 review M-1: the loop answers a listing from its own task, addressed to the request
+    /// that asked (its `seq` and `origin`), beside the requests that follow it.
+    #[tokio::test]
+    async fn the_loop_answers_a_listing_at_its_own_address() {
+        let dir = tempfile::tempdir().expect("a throwaway directory");
+        let (tx, mut rx, _worker) = detached(demo());
+        for (seq, request) in [
+            (
+                7,
+                StoreRequest::ListDir {
+                    path: dir.path().display().to_string(),
+                    show_hidden: false,
+                },
+            ),
+            (8, StoreRequest::BoxInfo),
+        ] {
+            tx.send(RequestEnvelope {
+                seq,
+                origin: Origin::App,
+                request,
+            })
+            .expect("the worker is alive");
+        }
+
+        let mut replies = Vec::new();
+        for _ in 0..2 {
+            replies.push(rx.recv().await.expect("the worker answers"));
+        }
+        replies.sort_by_key(|reply| reply.seq);
+        assert!(
+            matches!(
+                &replies[0],
+                ReplyEnvelope {
+                    seq: 7,
+                    origin: Origin::App,
+                    reply: StoreReply::DirListing(_)
+                }
+            ),
+            "{:?}",
+            replies[0]
+        );
+        assert!(
+            matches!(&replies[1].reply, StoreReply::BoxInfo(_)),
+            "{:?}",
+            replies[1]
+        );
     }
 
     #[tokio::test]
