@@ -10,7 +10,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
-use htui::app::Action;
+use htui::app::{Action, Handled};
 use htui::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, REQUEST_NAMES, RepoInference,
 };
@@ -23,7 +23,7 @@ use htui_core::model::{
     NewProject, ProjectId, ProjectPatch, RepoBoxPath, RepoId, RepoPatch, WorkspaceBoxPath,
     WorkspaceId, WorkspacePatch,
 };
-use htui_core::root_path::DirListing;
+use htui_core::root_path::{DirEntry, DirListing};
 use htui_core::store::{DeleteReach, DeleteTarget, MemStore, ReadStore, WriteStore};
 use htui_orch::infer::{MAX_DIRS, MatchedBy};
 use htui_orch::isolate::git::testkit::repo_with_one_commit;
@@ -1879,27 +1879,40 @@ async fn p_moves_the_primary() {
     );
 }
 
-/// `b` on the workspace row sends what was typed, untouched: the guard runs on the worker, so the
-/// section never stats a path and no test path ever reaches a frame (D8, D14).
+/// `b` on the workspace row opens the picker on `$HOME` (nothing is stored), and `s` sends the
+/// highlighted directory as navigated, untouched: the guard runs on the worker, so the section
+/// never stats a path and no test path ever reaches a frame (D8, D14; MOD-49 P5, blueprint B-2).
 #[tokio::test]
-async fn b_on_the_workspace_row_sets_the_root() {
+async fn b_on_the_workspace_row_picks_the_root() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = HierarchySection::new().with_home(Some("/home/u"));
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
     let _ = bench.drained();
 
     bench.key(&mut section, "b");
-    type_at(&bench, &mut section, "/srv/htui");
-    bench.key(&mut section, "enter");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [Action::Store(StoreRequest::ListDir { path, show_hidden: false })] if path == "/home/u"
+        ),
+        "`b` is one listing of the start directory: {emitted:?}"
+    );
+
+    bench.reply(&mut section, &dirs("/home/u", &[("srv", false)], 0));
+    bench.key(&mut section, "s");
 
     let emitted = bench.drained();
     let [Action::Store(StoreRequest::SetWorkspaceRoot { id, path })] = emitted.as_slice() else {
-        panic!("`b` then `Enter` is one request: {emitted:?}");
+        panic!("`s` is one request: {emitted:?}");
     };
     assert_eq!(*id, ids::WORKSPACE_GRAPHICS);
-    assert_eq!(path, "/srv/htui", "the path is the user's, verbatim");
+    assert_eq!(
+        path, "/home/u/srv",
+        "the path is the one navigated, verbatim"
+    );
 }
 
 /// A tree from a workspace the shell is not inside moves the scope (D11): `N` creates a workspace
@@ -2108,12 +2121,12 @@ async fn i_is_refused_while_a_write_is_in_flight() {
     );
 }
 
-/// A root written through the editor, with a root in the fresh tree, is followed by exactly one
-/// inference (D136).
+/// A root written through the picker, with a root in the fresh tree, is followed by exactly one
+/// inference (D136; MOD-49 blueprint B-2, D20).
 #[tokio::test]
 async fn a_root_write_that_applied_is_followed_by_one_inference() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = HierarchySection::new().with_home(Some("/home/u"));
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     bench.reply(
@@ -2123,13 +2136,20 @@ async fn a_root_write_that_applied_is_followed_by_one_inference() {
     let _ = bench.drained();
 
     bench.key(&mut section, "b");
-    type_at(&bench, &mut section, "/srv/htui");
-    bench.key(&mut section, "enter");
-    let _ = bench.drained();
+    bench.reply(&mut section, &dirs("/home/u", &[], 0));
+    bench.key(&mut section, "S");
+    let emitted = bench.drained();
+    assert!(
+        matches!(
+            emitted.as_slice(),
+            [.., Action::Store(StoreRequest::SetWorkspaceRoot { path, .. })] if path == "/home/u"
+        ),
+        "`S` writes the listed directory: {emitted:?}"
+    );
 
     bench.reply(
         &mut section,
-        &StoreReply::Hierarchy(Some(Box::new(with_root(opened, "/srv/htui")))),
+        &StoreReply::Hierarchy(Some(Box::new(with_root(opened, "/home/u")))),
     );
 
     let emitted = bench.drained();
@@ -2352,7 +2372,7 @@ async fn an_inference_reply_renders_the_tree_and_the_report() {
 #[tokio::test]
 async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_the_walk() {
     let bench = SectionBench::new().await;
-    let mut section = HierarchySection::new();
+    let mut section = HierarchySection::new().with_home(None);
     let backend = demo();
     let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
     let rooted = with_root(opened.clone(), "/srv/htui");
@@ -2364,10 +2384,14 @@ async fn an_inference_report_keeps_its_cause_and_drops_a_refusal_shown_during_th
     bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
     let _ = bench.drained();
 
-    // The follow-up: typed with a trailing slash, so the stored root reads differently.
+    // The follow-up: typed into the picker's go-to with a trailing slash, so the stored root
+    // reads differently (MOD-49: the picker replaced the typed editor; implementer I-1).
     bench.key(&mut section, "b");
-    type_at(&bench, &mut section, "/srv/htui/");
+    bench.key(&mut section, "/");
+    type_at(&bench, &mut section, "srv/htui/");
     bench.key(&mut section, "enter");
+    bench.reply(&mut section, &dirs("/srv/htui/", &[], 0));
+    bench.key(&mut section, "S");
     bench.reply(
         &mut section,
         &StoreReply::Hierarchy(Some(Box::new(rooted.clone()))),
@@ -2524,4 +2548,490 @@ async fn the_report_notice_names_what_was_not_inferred() {
             "{report:?} reads `{expected}`: {hint}"
         );
     }
+}
+
+// ---- section: path picker (MOD-49 T4; plan P1, P7, P8, P11; blueprint D7-D22) ----
+
+/// A synthetic `DirListing` reply for `path`: `(name, is_link)` per entry, then `more`. The section
+/// never stats a path, so a bench needs no filesystem (blueprint D18).
+fn dirs(path: &str, names: &[(&str, bool)], more: usize) -> StoreReply {
+    StoreReply::DirListing(DirListing {
+        path: path.to_owned(),
+        entries: names
+            .iter()
+            .map(|(name, is_link)| DirEntry {
+                name: (*name).to_owned(),
+                is_link: *is_link,
+            })
+            .collect(),
+        more,
+    })
+}
+
+/// `tree` with this box's checkout of repo `repo` at `path`: a synthetic row, as `with_root` is.
+fn with_repo_path(mut tree: HierarchySnapshot, repo: &str, path: &str) -> HierarchySnapshot {
+    let entry = tree
+        .projects
+        .iter_mut()
+        .flat_map(|project| project.repos.iter_mut())
+        .find(|entry| entry.repo.name == repo)
+        .unwrap_or_else(|| panic!("`{repo}` is in the tree"));
+    entry.local_path = Some(RepoBoxPath {
+        repo_id: entry.repo.id,
+        box_id: ids::BOX,
+        local_path: path.to_owned(),
+        updated_at: entry.repo.updated_at,
+    });
+    tree
+}
+
+/// The `ListDir` requests among `actions`, as `(path, show_hidden)`.
+fn listings(actions: &[Action]) -> Vec<(String, bool)> {
+    actions
+        .iter()
+        .filter_map(|action| match action {
+            Action::Store(StoreRequest::ListDir { path, show_hidden }) => {
+                Some((path.clone(), *show_hidden))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether `actions` hold a path write.
+fn writes_a_path(actions: &[Action]) -> bool {
+    actions.iter().any(|action| {
+        matches!(
+            action,
+            Action::Store(StoreRequest::SetWorkspaceRoot { .. } | StoreRequest::SetRepoPath { .. })
+        )
+    })
+}
+
+/// A bench section over `tree`, `$HOME` fixed at `home`, with what the reply emitted drained.
+fn picker_section(
+    bench: &SectionBench,
+    tree: HierarchySnapshot,
+    home: Option<&str>,
+) -> HierarchySection {
+    let mut section = HierarchySection::new().with_home(home);
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(tree))));
+    let _ = bench.drained();
+    section
+}
+
+/// The popup over the section (P2, blueprint D14, D18): border, title, header, `> notes/`, the
+/// link marked `@`, `+3 more` and the hint, from synthetic replies at `/srv`.
+#[tokio::test]
+async fn the_picker_renders_over_the_section() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let rooted = with_root(demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await, "/srv");
+    let mut section = picker_section(&bench, rooted, None);
+
+    bench.key(&mut section, "b");
+    assert_eq!(listings(&bench.drained()), [("/srv".to_owned(), false)]);
+    bench.reply(
+        &mut section,
+        &dirs(
+            "/srv",
+            &[("htui", false), ("notes", false), ("shared", true)],
+            3,
+        ),
+    );
+    bench.key(&mut section, "j");
+
+    assert!(section.captures_input(), "picking captures input (P8)");
+    insta::assert_snapshot!("picker", bench.render_section(&section, 100));
+}
+
+/// P7: a repo's picker opens on its stored checkout.
+#[tokio::test]
+async fn b_on_a_repo_row_starts_at_its_stored_path() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = with_root(tree_with_two_repos(&backend).await, "/work");
+    let tree = with_repo_path(tree, "alpha", "/work/alpha");
+    let mut section = picker_section(&bench, tree, Some("/home/u"));
+
+    // Workspace, project, `alpha`.
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "b");
+    assert_eq!(
+        listings(&bench.drained()),
+        [("/work/alpha".to_owned(), false)]
+    );
+}
+
+/// P7: a repo with no checkout here opens on the workspace root on this box.
+#[tokio::test]
+async fn b_on_a_repo_row_starts_at_the_workspace_root() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = with_root(tree_with_two_repos(&backend).await, "/work");
+    let mut section = picker_section(&bench, tree, Some("/home/u"));
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "b");
+    assert_eq!(listings(&bench.drained()), [("/work".to_owned(), false)]);
+}
+
+/// P7: nothing stored and no root falls back to `$HOME`.
+#[tokio::test]
+async fn b_with_nothing_stored_starts_at_home() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = tree_with_two_repos(&backend).await;
+    let mut section = picker_section(&bench, tree, Some("/home/u"));
+
+    // The workspace row, then a repo row: neither has anything stored.
+    bench.key(&mut section, "b");
+    assert_eq!(listings(&bench.drained()), [("/home/u".to_owned(), false)]);
+    bench.key(&mut section, "esc");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "b");
+    assert_eq!(listings(&bench.drained()), [("/home/u".to_owned(), false)]);
+}
+
+/// P7: and without `$HOME`, `/`.
+#[tokio::test]
+async fn b_with_no_home_starts_at_the_root() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let mut section = picker_section(&bench, tree, None);
+
+    bench.key(&mut section, "b");
+    assert_eq!(listings(&bench.drained()), [("/".to_owned(), false)]);
+}
+
+/// A project row has no path on this box: today's notice, no listing, no picker.
+#[tokio::test]
+async fn b_on_a_project_row_keeps_its_notice() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let mut section = picker_section(&bench, tree, Some("/home/u"));
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "b");
+    assert!(bench.drained().is_empty(), "nothing is asked for");
+    assert!(!section.captures_input(), "no picker opened");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("`b` wants the workspace or a repo row"),
+        "{frame}"
+    );
+}
+
+/// The whole flow on a repo row: `l` lists the child, `s` writes the highlighted directory with
+/// `SetRepoPath`, and the reply's path lands in the tree with no notice and no inference (D136).
+#[tokio::test]
+async fn navigating_then_s_writes_the_repo_path() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let rooted = with_root(tree_with_two_repos(&backend).await, "/work");
+    let alpha = rooted.projects[0].repos[0].repo.id;
+    let mut section = picker_section(&bench, rooted.clone(), Some("/home/u"));
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "b");
+    let _ = bench.drained();
+    bench.reply(&mut section, &dirs("/work", &[("core", false)], 0));
+    bench.key(&mut section, "l");
+    assert_eq!(
+        listings(&bench.drained()),
+        [("/work/core".to_owned(), false)]
+    );
+    bench.reply(&mut section, &dirs("/work/core", &[("src", false)], 0));
+    bench.key(&mut section, "s");
+
+    let emitted = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetRepoPath {
+            project,
+            repo,
+            path,
+        }),
+    ] = emitted.as_slice()
+    else {
+        panic!("`s` is one write: {emitted:?}");
+    };
+    assert_eq!(*project, ids::PROJECT_VULKAN);
+    assert_eq!(*repo, alpha);
+    assert_eq!(path, "/work/core/src");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repo_path(
+            rooted,
+            "alpha",
+            "/work/core/src",
+        )))),
+    );
+    assert!(
+        inferences(&bench.drained()).is_empty(),
+        "a repo path write is not followed by an inference (D136)"
+    );
+    assert!(!section.captures_input(), "the tree closes the picker");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("/work/core/src"), "{frame}");
+    assert!(!frame.contains("stored as"), "{frame}");
+}
+
+/// The worker canonicalises on write; a path stored under another name says so, as the editor did.
+#[tokio::test]
+async fn a_chosen_path_stored_under_another_name_says_so() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let rooted = with_root(tree_with_two_repos(&backend).await, "/work");
+    let mut section = picker_section(&bench, rooted.clone(), Some("/home/u"));
+
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "b");
+    bench.reply(&mut section, &dirs("/work", &[("core", false)], 0));
+    bench.key(&mut section, "s");
+    assert!(writes_a_path(&bench.drained()));
+    bench.reply(
+        &mut section,
+        &StoreReply::Hierarchy(Some(Box::new(with_repo_path(
+            rooted,
+            "alpha",
+            "/real/core",
+        )))),
+    );
+
+    assert!(!section.captures_input(), "back to Browse");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("stored as `/real/core`"), "{frame}");
+}
+
+/// `Esc` closes the picker and writes nothing.
+#[tokio::test]
+async fn esc_closes_the_picker_and_writes_nothing() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let mut section = picker_section(&bench, tree, Some("/home/u"));
+
+    bench.key(&mut section, "b");
+    bench.reply(&mut section, &dirs("/home/u", &[("srv", false)], 0));
+    assert!(section.captures_input());
+    bench.key(&mut section, "esc");
+
+    assert!(!writes_a_path(&bench.drained()), "nothing is written");
+    assert!(!section.captures_input(), "Browse again");
+    let frame = bench.render_section(&section, 100);
+    assert!(!frame.contains("srv/"), "the popup is gone: {frame}");
+}
+
+/// P9: a listing of a path the picker no longer wants is not drawn.
+#[tokio::test]
+async fn a_listing_for_another_path_is_ignored() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let rooted = with_root(demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await, "/srv");
+    let mut section = picker_section(&bench, rooted, None);
+
+    bench.key(&mut section, "b");
+    bench.reply(&mut section, &dirs("/elsewhere", &[("stray", false)], 0));
+    let frame = bench.render_section(&section, 100);
+    assert!(!frame.contains("stray"), "{frame}");
+    assert!(frame.contains("reading"), "still reading `/srv`: {frame}");
+}
+
+/// P7: a refused listing shows in the popup, and `h` still climbs out of it.
+#[tokio::test]
+async fn a_refused_listing_shows_in_the_picker_and_h_still_goes_up() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let rooted = with_root(
+        demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await,
+        "/srv/gone",
+    );
+    let mut section = picker_section(&bench, rooted, None);
+
+    bench.key(&mut section, "b");
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: LIST_DIR,
+            message: "constraint violated: `/srv/gone` does not exist on this box".to_owned(),
+        },
+    );
+    assert!(section.captures_input(), "the picker stays open");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("`/srv/gone` does not exist on this box"),
+        "{frame}"
+    );
+
+    bench.key(&mut section, "h");
+    assert_eq!(listings(&bench.drained()), [("/srv".to_owned(), false)]);
+}
+
+/// P6: a bracketed paste opens go-to holding the pasted path, and `Enter` lists it.
+#[tokio::test]
+async fn a_paste_opens_go_to_with_the_pasted_path() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let mut section = picker_section(&bench, tree, None);
+
+    bench.key(&mut section, "b");
+    let _ = bench.drained();
+    assert_eq!(bench.paste(&mut section, "/srv/htui\n"), Handled::Consumed);
+    bench.key(&mut section, "enter");
+    assert_eq!(
+        listings(&bench.drained()),
+        [("/srv/htui".to_owned(), false)]
+    );
+}
+
+/// P11: a listing is a read, so nothing is in flight while picking, and `i` after `Esc` is sent.
+#[tokio::test]
+async fn a_listing_is_not_a_write_in_flight() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let mut section = picker_section(&bench, tree, None);
+
+    bench.key(&mut section, "b");
+    assert!(!bench.render_section(&section, 100).contains("in flight"));
+    bench.key(&mut section, "esc");
+    let _ = bench.drained();
+    bench.key(&mut section, "i");
+    assert_eq!(
+        inferences(&bench.drained()),
+        vec![ids::WORKSPACE_GRAPHICS],
+        "`i` is not refused"
+    );
+}
+
+/// Blueprint H-4, D15: a `CONTROL` chord passes the picker, so `ctrl-c` still quits.
+#[tokio::test]
+async fn ctrl_c_passes_through_the_picker() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let mut section = picker_section(&bench, tree, None);
+
+    bench.key(&mut section, "b");
+    assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
+}
+
+/// Blueprint H-4, D15: every unbound key is swallowed, so `q` can't quit mid-pick.
+#[tokio::test]
+async fn the_picker_swallows_q() {
+    let bench = SectionBench::new().await;
+    let backend = demo();
+    let tree = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    let mut section = picker_section(&bench, tree, None);
+
+    bench.key(&mut section, "b");
+    assert_eq!(bench.key(&mut section, "q"), Handled::Consumed);
+    assert!(section.captures_input(), "still picking");
+}
+
+/// A demo store with this box's root of `graphics` at `root`, as a user's earlier `b` left it.
+async fn rooted_store(root: &str) -> MemStore {
+    let store = MemStore::demo();
+    store
+        .upsert_workspace_box_path(&WorkspaceBoxPath {
+            workspace_id: ids::WORKSPACE_GRAPHICS,
+            box_id: ids::BOX,
+            root_path: root.to_owned(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("the root is seeded");
+    store
+}
+
+/// The real worker end to end (P1, P8): `b` lists the stored root, `l` opens a directory instead
+/// of cycling to Agents, `h` comes back to it, and `S` stores the canonical path in the tree.
+#[tokio::test]
+async fn picking_in_the_shell_lists_the_root_and_keeps_h_and_l() {
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    for name in ["alpha", "beta"] {
+        fs::create_dir(dir.path().join(name)).expect("the directory is created");
+    }
+    let root = canonical(dir.path());
+    let mut harness = hierarchy_over(rooted_store(&root).await)
+        .await
+        .size(200, 30);
+
+    harness.key("b");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("alpha/") && frame.contains("beta/"),
+        "{frame}"
+    );
+
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("transport"),
+        "`l` opened `alpha` instead of cycling to Agents: {frame}"
+    );
+    assert!(frame.contains("no directories here"), "{frame}");
+
+    harness.key("h");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(frame.contains("> alpha/"), "back on `alpha`: {frame}");
+
+    harness.key("l");
+    harness.settle().await;
+    harness.key("S");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("Esc cancel"),
+        "the tree closed the picker: {frame}"
+    );
+    assert!(
+        frame.contains(&format!("{root}/alpha")),
+        "the canonical path is in the tree: {frame}"
+    );
+}
+
+/// Blueprint B-6, D8: a directory removed between the listing and the choice is refused by the
+/// worker's guard, on the status line, and the picker stays open for another choice.
+#[tokio::test]
+async fn a_directory_gone_before_the_choice_is_refused_on_the_status_line() {
+    let dir = tempfile::tempdir().expect("a throwaway directory");
+    for name in ["alpha", "beta"] {
+        fs::create_dir(dir.path().join(name)).expect("the directory is created");
+    }
+    let root = canonical(dir.path());
+    let mut harness = hierarchy_over(rooted_store(&root).await)
+        .await
+        .size(200, 30);
+
+    harness.key("b");
+    harness.settle().await;
+    fs::remove_dir(dir.path().join("beta")).expect("the directory is removed");
+    harness.key("j");
+    harness.key("s");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("set_workspace_root: constraint violated"),
+        "{frame}"
+    );
+    assert!(frame.contains("does not exist on this box"), "{frame}");
+    assert!(
+        frame.contains("> beta/"),
+        "the picker is still open: {frame}"
+    );
 }

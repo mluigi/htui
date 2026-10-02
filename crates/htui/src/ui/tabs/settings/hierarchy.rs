@@ -230,16 +230,31 @@ pub struct HierarchySection {
     /// write it follows, or `None` for `i`. Held apart from `notice`, which a key refused during
     /// the walk overwrites with "still in flight" (R-57).
     carried: Option<String>,
+    /// `$HOME`, read once by [`new`](HierarchySection::new) (MOD-49 blueprint D9): the picker's
+    /// last start directory before `/` (P7).
+    home: Option<String>,
 }
 
 impl HierarchySection {
     /// Identity of the hierarchy section.
     pub const ID: SectionId = SectionId("hierarchy");
 
-    /// A section with nothing read yet.
+    /// A section with nothing read yet. Reads `$HOME` once, here, so opening the picker touches no
+    /// environment (MOD-49 blueprint D9).
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            home: std::env::var("HOME").ok(),
+            ..Self::default()
+        }
+    }
+
+    /// The same section with `$HOME` fixed, so a test's start directory doesn't depend on the box
+    /// running it (MOD-49 blueprint D9).
+    #[must_use]
+    pub fn with_home(mut self, home: Option<&str>) -> Self {
+        self.home = home.map(str::to_owned);
+        self
     }
 
     /// The flat list the cursor indexes: the workspace, then each project with its repos under it.
