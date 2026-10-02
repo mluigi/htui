@@ -1661,7 +1661,8 @@ async fn e_edits_the_title_and_the_body_shows_version_2() {
 
 /// D6 (A13): a write through a held clone between `e` and `Ctrl+S` makes the save stale. The form
 /// stays open on its token with its text, says so, and never overwrites the head, not even on a
-/// second `Ctrl+S`.
+/// second `Ctrl+S`. Review L3: a third write before that second save moves the head to v3, so
+/// the notice naming v3 proves the second save went out and diverged again.
 #[tokio::test]
 async fn a_stale_edit_keeps_the_form_and_never_overwrites_the_head() {
     let store = MemStore::demo();
@@ -1694,9 +1695,17 @@ async fn a_stale_edit_keeps_the_form_and_never_overwrites_the_head() {
         .expect("the demo item exists");
     assert_eq!((head.title.as_str(), head.version), ("Theirs", 2));
 
+    let outcome = store
+        .update_item(ids::HTUI_ANA_1, 2, retitled("Theirs again"))
+        .await
+        .expect("the memory store never fails");
+    assert!(
+        matches!(outcome, UpdateOutcome::Updated(_)),
+        "the third write is at the head: {outcome:?}"
+    );
     keys(&mut harness, &["ctrl-s"]).await;
     let frame = harness.render();
-    assert!(frame.contains("now v2"), "it diverges again:\n{frame}");
+    assert!(frame.contains("now v3"), "it diverges again:\n{frame}");
     assert!(frame.contains(" Edit ANA-1 (v1) "), "{frame}");
     let head = store
         .item(ids::HTUI_ANA_1)
@@ -1705,7 +1714,7 @@ async fn a_stale_edit_keeps_the_form_and_never_overwrites_the_head() {
         .expect("the demo item exists");
     assert_eq!(
         (head.title.as_str(), head.version),
-        ("Theirs", 2),
+        ("Theirs again", 3),
         "the second save wrote nothing either"
     );
 }
