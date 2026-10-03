@@ -24,7 +24,9 @@
 //!   at or past the expected version means it was written (the form closes with D5's sentence for
 //!   that version, the lowest such); none means it was not (the text stays, Ctrl+S tries again).
 //!   A head carries no body and the pane no `UserId` (`R-NF-3`), so kind, title, provenance and
-//!   the version the store would have allocated are the match.
+//!   the version the store would have allocated are the match. An `Unreachable` failure sent the
+//!   worker to the mirror before it answered, and the mirror cannot hold the version, so there
+//!   "none" proves nothing: the pane says it could not check (round 1).
 
 use std::collections::BTreeSet;
 
@@ -38,7 +40,9 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::hand_written::{DOCUMENT_FORM_NAME, WRITE_DOCUMENT_NAME, write_refused};
+use crate::hand_written::{
+    DOCUMENT_FORM_NAME, WRITE_DOCUMENT_NAME, answered_from_the_mirror, write_refused,
+};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells;
 use crate::ui::tabs::backlog::detail::compose::{
@@ -73,6 +77,9 @@ struct Hedged {
     title: String,
     /// What the write expected, for the row to look for and D5's sentence.
     expected: Expected,
+    /// The failure was an `Unreachable`, so the re-read is the mirror's: not finding the version
+    /// there proves nothing (review M1, round 1).
+    mirror: bool,
 }
 
 /// What a `WriteDocument` in flight expects (D5).
@@ -224,6 +231,7 @@ impl DocumentsTab {
                     kind,
                     title,
                     expected,
+                    mirror: answered_from_the_mirror(message),
                 });
                 ctx.request(StoreRequest::Documents(item));
             }
@@ -233,7 +241,8 @@ impl DocumentsTab {
     }
 
     /// Review M1: the re-read after a hedge. A list of another item settles nothing. The version
-    /// found closes the form with D5's sentence; none keeps the text and says it was not written.
+    /// found closes the form with D5's sentence; none keeps the text and says it was not written,
+    /// or, read from the mirror, that it could not be checked (round 1).
     fn settle_hedge(&mut self, documents: &[DocumentHead]) {
         let Some(item) = self.item else {
             return;
@@ -268,7 +277,11 @@ impl DocumentsTab {
             }
             None => {
                 if let Some(compose) = self.compose.as_mut() {
-                    compose.settle(Some(not_written(&hedged.why)));
+                    compose.settle(Some(if hedged.mirror {
+                        could_not_check(&hedged.why, "list")
+                    } else {
+                        not_written(&hedged.why)
+                    }));
                 }
             }
         }
@@ -1151,6 +1164,42 @@ mod tests {
             compose(&pane).notice(),
             Some(may_have_landed(&message, "list").as_str())
         );
+        pane.on_reply(&StoreReply::Documents(rows), &mut shell.ctx());
+        assert_eq!(pane.notice.as_deref(), Some("saved as plan v3"));
+    }
+
+    /// Review round 1, finding 1: an `Unreachable` failure sent the worker to the mirror before it
+    /// answered, so a re-read without the version is the mirror's and says nothing; one with it
+    /// (the refresher mirrored it first) still settles it as written.
+    #[tokio::test]
+    async fn after_an_unreachable_failure_the_mirror_cannot_say_it_was_not_written() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let _ = saving_v(&shell, &backend, &mut pane).await;
+        let message = StoreError::Unreachable("connection reset by peer".to_owned()).to_string();
+        let failed = StoreReply::Failed {
+            request: WRITE_DOCUMENT_NAME,
+            message: message.clone(),
+        };
+        pane.on_reply(&failed, &mut shell.ctx());
+        assert_eq!(shell.requests(), [sent(&StoreRequest::Documents(ITEM))]);
+        let rows = store.documents(ITEM).await.expect("the documents");
+        pane.on_reply(&StoreReply::Documents(rows), &mut shell.ctx());
+        assert_eq!(compose(&pane).busy(), None);
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(could_not_check(&message, "list").as_str())
+        );
+        assert!(compose(&pane).body().starts_with("Edited by hand.\n"));
+
+        let (store, backend) = demo();
+        let mut pane = self::pane(&shell, &store).await;
+        let request = saving_v(&shell, &backend, &mut pane).await;
+        pane.on_reply(&failed, &mut shell.ctx());
+        let _ = shell.requests();
+        let _ = served(&backend, &request).await;
+        let rows = store.documents(ITEM).await.expect("the documents");
         pane.on_reply(&StoreReply::Documents(rows), &mut shell.ctx());
         assert_eq!(pane.notice.as_deref(), Some("saved as plan v3"));
     }

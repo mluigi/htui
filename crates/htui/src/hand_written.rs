@@ -149,6 +149,16 @@ pub fn write_refused(message: &str) -> bool {
     message == offline().to_string() || message.starts_with(&constraint) || item_missing
 }
 
+/// Review M1, round 1: whether `message`, a hedged write's `Failed`, is an `Unreachable`. The
+/// worker drops an online backend to the mirror (`go_offline`) before it answers one, so the
+/// re-read that checks the hedge is the mirror's, which cannot hold a write whose answer was
+/// lost: not finding it there is no proof it was not written. Asked after [`write_refused`],
+/// which takes the offline refusal itself.
+#[must_use]
+pub fn answered_from_the_mirror(message: &str) -> bool {
+    message.starts_with(&StoreError::Unreachable(String::new()).to_string())
+}
+
 /// Serves one hand-written request, off the UI task (D1-D3).
 ///
 /// `NoteForm` answers [`StoreReply::NoteForm`], `AddNote` [`StoreReply::NoteAdded`],
@@ -264,7 +274,8 @@ async fn existing(writer: &Writer, id: ItemId) -> Result<Item> {
 mod tests {
     use super::{
         ADD_NOTE_NAME, DOCUMENT_FORM_NAME, DocumentFormContext, HandText, NOTE_FORM_NAME,
-        REQUEST_NAMES, WRITE_DOCUMENT_NAME, is_hand_written_request, serve, write_refused,
+        REQUEST_NAMES, WRITE_DOCUMENT_NAME, answered_from_the_mirror, is_hand_written_request,
+        serve, write_refused,
     };
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use htui_core::fixtures::ids;
@@ -594,6 +605,25 @@ mod tests {
             },
         ] {
             assert!(!write_refused(&failure.to_string()), "{failure}");
+        }
+    }
+
+    /// Review M1, round 1: a dropped connection on the write is rendered `Unreachable`, after
+    /// which the worker serves the re-read from the mirror; a server's own error is not.
+    #[test]
+    fn answered_from_the_mirror_is_an_unreachable_failure() {
+        let reset = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        let dropped = htui_store::map_sqlx(sqlx::Error::Io(reset)).to_string();
+        assert!(!write_refused(&dropped), "{dropped}");
+        assert!(answered_from_the_mirror(&dropped), "{dropped}");
+        for failure in [
+            StoreError::Backend("connection reset by peer".to_owned()),
+            StoreError::NotFound {
+                entity: "app_user",
+                id: "x".to_owned(),
+            },
+        ] {
+            assert!(!answered_from_the_mirror(&failure.to_string()), "{failure}");
         }
     }
 

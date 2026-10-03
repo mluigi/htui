@@ -17,7 +17,9 @@
 //!   so); none means it was not (the text stays, Ctrl+S tries again). The pane holds no `UserId`
 //!   (`R-NF-3`), so the author cannot be matched; `created_at` stands in for "after the area
 //!   opened": a note committed after the thread was read has a later `now()` than every note in
-//!   it, so a note of the same text already there never counts.
+//!   it, so a note of the same text already there never counts. An `Unreachable` failure sent the
+//!   worker to the mirror before it answered, and the mirror cannot hold the note, so there "none"
+//!   proves nothing: the pane says it could not check (round 1).
 //! - A note's body is drawn one row per line (D8), so a multi-line note reads as written; a `\t`
 //!   as spaces to the next stop, as the compose area drew it (review L2). The thread is wrapped
 //!   here, by `cells::wrap` at the width of the last render, so the scroll clamps against the rows
@@ -36,7 +38,9 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::hand_written::{ADD_NOTE_NAME, HandText, NOTE_FORM_NAME, write_refused};
+use crate::hand_written::{
+    ADD_NOTE_NAME, HandText, NOTE_FORM_NAME, answered_from_the_mirror, write_refused,
+};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
@@ -66,6 +70,9 @@ struct Hedged {
     body: HandText,
     /// The newest `created_at` in the thread when the area opened; `None` for an empty thread.
     since: Option<DateTime<Utc>>,
+    /// The failure was an `Unreachable`, so the re-read is the mirror's: not finding the note
+    /// there proves nothing (review M1, round 1).
+    mirror: bool,
 }
 
 /// Columns between tab stops: `TextArea`'s, so a `\t` from `$EDITOR` reads in the thread as it
@@ -230,6 +237,7 @@ impl NotesTab {
                     why: message.to_owned(),
                     body,
                     since: self.since,
+                    mirror: answered_from_the_mirror(message),
                 });
                 ctx.request(StoreRequest::Notes(item));
             }
@@ -240,7 +248,8 @@ impl NotesTab {
 
     /// Review M1: the re-read after a hedge. A thread of another item settles nothing. The note
     /// found closes the area and says so (and the thread opens at its bottom, where it is); none
-    /// keeps the text and says it was not written.
+    /// keeps the text and says it was not written, or, read from the mirror, that it could not be
+    /// checked (round 1).
     fn settle_hedge(&mut self, notes: &[Note]) {
         let Some(item) = self.item else {
             return;
@@ -261,7 +270,11 @@ impl NotesTab {
             self.notice = Some(NOTE_WRITTEN.to_owned());
             self.follow = true;
         } else if let Some(compose) = self.compose.as_mut() {
-            compose.settle(Some(not_written(&hedged.why)));
+            compose.settle(Some(if hedged.mirror {
+                could_not_check(&hedged.why, "thread")
+            } else {
+                not_written(&hedged.why)
+            }));
         }
     }
 }
@@ -444,7 +457,7 @@ impl DetailTab for NotesTab {
 mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
-    use htui_core::store::{MemStore, ReadStore as _};
+    use htui_core::store::{MemStore, ReadStore as _, StoreError};
 
     use super::*;
     use crate::app::Action;
@@ -737,6 +750,52 @@ mod tests {
             Some(could_not_check(&message, "thread").as_str())
         );
         assert_eq!(compose(&pane).body(), "Hi.");
+    }
+
+    /// `a`, the `NoteForm` answered, `text` pasted and saved, and the `AddNote` answered with
+    /// `message`, a store failure: hedged, and the thread re-read is in flight.
+    fn hedge(shell: &Shell, pane: &mut NotesTab, text: &str, message: &str) {
+        let _ = pane.on_key(key(KeyCode::Char('a')), &mut shell.ctx());
+        pane.on_reply(&StoreReply::NoteForm { item: ITEM }, &mut shell.ctx());
+        let _ = pane.on_paste(text, &mut shell.ctx());
+        let _ = pane.on_key(ctrl('s'), &mut shell.ctx());
+        let _ = shell.requests();
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: ADD_NOTE_NAME,
+                message: message.to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert_eq!(shell.requests(), [sent(&StoreRequest::Notes(ITEM))]);
+        assert_eq!(compose(pane).busy(), Some(ADD_NOTE_NAME));
+    }
+
+    /// Review round 1, finding 1: an `Unreachable` failure sent the worker to the mirror before it
+    /// answered, so the re-read is the mirror's, which cannot hold a note whose answer was lost.
+    /// Not finding it there says nothing; finding it (the refresher mirrored it first) still does.
+    #[tokio::test]
+    async fn after_an_unreachable_failure_the_mirror_cannot_say_it_was_not_written() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        let message = StoreError::Unreachable("connection reset by peer".to_owned()).to_string();
+        hedge(&shell, &mut pane, "Hi.", &message);
+        let thread = pane.notes.clone();
+        pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
+        assert_eq!(compose(&pane).busy(), None);
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(could_not_check(&message, "thread").as_str())
+        );
+        assert_eq!(compose(&pane).body(), "Hi.");
+
+        let mut pane = self::pane(&shell).await;
+        hedge(&shell, &mut pane, "Hi.", &message);
+        let mut thread = pane.notes.clone();
+        thread.push(written(ITEM, "Hi.").await);
+        pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
+        assert!(pane.compose.is_none());
+        assert_eq!(pane.notice.as_deref(), Some(NOTE_WRITTEN));
     }
 
     #[tokio::test]
