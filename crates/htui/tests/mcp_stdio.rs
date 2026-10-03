@@ -290,6 +290,8 @@ async fn a_refused_relay_exits_with_stdin_still_open() {
         (ENV_ADDR, lease.spec.env[ENV_ADDR].as_str()),
         (ENV_TOKEN, stranger.as_str()),
     ]);
+    // `Child::wait` closes a stdin it still holds: the agent's end is held here instead.
+    let stdin = child.stdin.take().expect("stdin is piped");
     let status = tokio::time::timeout(BUDGET, child.wait())
         .await
         .expect("exits without stdin closing")
@@ -304,6 +306,7 @@ async fn a_refused_relay_exits_with_stdin_still_open() {
         .await
         .expect("read");
     assert_eq!(stdout, "");
+    drop(stdin);
     drop(lease);
 }
 
