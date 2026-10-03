@@ -17166,6 +17166,46 @@ mod tests {
             );
         }
 
+        /// D19: the judge's replayed `{{task}}` is the candidate's prompt less the candidate's own
+        /// `output` trailer, so the hosted judge prompt carries exactly one, naming `judge`.
+        #[tokio::test(start_paused = true)]
+        async fn a_hosted_judge_prompt_has_one_output_trailer_naming_judge() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            ana_2_fanned_and_judged(&harness).await;
+            for call in 0..2 {
+                harness
+                    .orch
+                    .writes_through_tools(&key("research:judge", -1, call), &verdict(1, "deeper"));
+            }
+
+            let (run, _rest) = started(&harness, ids::HTUI_ANA_2).await;
+            let candidate =
+                prompt_of(&harness.orch, &step_at(&harness.orch, run, 0, 0).await).await;
+            assert!(
+                candidate.contains("Write your `research` document"),
+                "the candidate's own trailer: {candidate}"
+            );
+            let judge = prompt_of(&harness.orch, &step_at(&harness.orch, run, 0, -1).await).await;
+            assert_eq!(
+                judge.matches("<section name=\"output\">").count(),
+                1,
+                "{judge}"
+            );
+            assert!(
+                !judge.contains("Write your `research` document"),
+                "the replayed task drops the candidate's trailer: {judge}"
+            );
+            assert!(
+                judge.trim_end().ends_with(
+                    "<section name=\"output\">\nWrite your `judge` document by calling the \
+                     `document_write` tool of the `htui` MCP server; text left only in your \
+                     reply is not recorded.\n</section>"
+                ),
+                "{judge}"
+            );
+        }
+
         #[tokio::test(start_paused = true)]
         async fn a_tool_write_after_the_lease_moved_is_fenced_and_the_walk_loses_its_lease() {
             let host = Arc::new(FakeToolHost::default());

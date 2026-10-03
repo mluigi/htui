@@ -195,3 +195,52 @@ fn a_document_tool_without_a_kind_renders_nothing() {
     assert_eq!(prompt.text, golden("prompt_all_empty"));
     assert!(output_row(&prompt).is_none());
 }
+
+/// D19: a judge replays the candidate's recorded prompt as its `{{task}}`, and a hosted candidate's
+/// prompt ends with its own trailer. The replay drops it, so the judge prompt is the one a
+/// trailer-free task gives and names one document to write: its own `judge` one.
+#[test]
+fn a_replayed_task_drops_the_candidates_trailer() {
+    let bare = ok(&fixtures::phase_implement_attempt2());
+    let mut hosted = fixtures::phase_implement_attempt2();
+    hosted.document_tool = true;
+    let hosted = ok(&hosted);
+    assert_eq!(
+        htui_core::prompt::render::without_output_trailer(&hosted.text),
+        bare.text.trim_end_matches('\n')
+    );
+    assert_eq!(
+        htui_core::prompt::render::without_output_trailer(&bare.text),
+        bare.text,
+        "a prompt without the trailer is kept whole"
+    );
+
+    let judge_over = |task: &str| {
+        let mut spec = fixtures::judge_three_candidates();
+        spec.output_kind = Some("judge".to_owned());
+        spec.document_tool = true;
+        spec.judge
+            .as_mut()
+            .expect("a judge fixture has judge inputs")
+            .task = task.to_owned();
+        ok(&spec)
+    };
+    let replayed = judge_over(&hosted.text);
+    assert_eq!(replayed.text, judge_over(&bare.text).text);
+    assert_eq!(replayed.text.matches("name=\"output\"").count(), 1);
+    assert!(
+        replayed.text.ends_with(&trailer("judge")),
+        "{}",
+        replayed.text
+    );
+
+    let quoted = format!(
+        "{}\n<section name=\"output\">\nnot the sentence\n</section>\n",
+        bare.text
+    );
+    assert_eq!(
+        htui_core::prompt::render::without_output_trailer(&quoted),
+        quoted,
+        "only the pinned sentence is stripped"
+    );
+}

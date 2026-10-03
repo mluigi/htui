@@ -658,13 +658,36 @@ pub fn persona(block: &PersonaBlock) -> Rendered {
     }
 }
 
-/// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim.
+/// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim — less the
+/// candidate's own MOD-11 D19 `output` trailer ([`without_output_trailer`]), so a judge is told to
+/// write exactly one document, its own `judge` one.
 #[must_use]
 pub fn judge_task(text: &str) -> Rendered {
     Rendered {
         name: SectionName::JudgeTask,
         attrs: Vec::new(),
-        content: content_of(text),
+        content: content_of(without_output_trailer(text)),
+    }
+}
+
+/// MOD-11 D19: `text` less a trailing `output` trailer, the bytes [`output`] renders for some kind
+/// after the body's trailing newlines; any other `text` is returned whole. The sentence is pinned,
+/// so the match is exact: a body that merely quotes `<section name="output">` keeps it.
+#[must_use]
+pub fn without_output_trailer(text: &str) -> &str {
+    const OPEN: &str = "<section name=\"output\">\n";
+    let trimmed = text.trim_end_matches('\n');
+    let Some(at) = trimmed.rfind(OPEN) else {
+        return text;
+    };
+    let section = &trimmed[at..];
+    let kind = section[OPEN.len()..]
+        .strip_prefix("Write your `")
+        .and_then(|rest| rest.split_once("` document by calling the `document_write` tool"))
+        .map(|(kind, _)| kind);
+    match kind {
+        Some(kind) if section == wrap(&output(kind)) => trimmed[..at].trim_end_matches('\n'),
+        _ => text,
     }
 }
 
