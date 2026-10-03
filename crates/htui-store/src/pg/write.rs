@@ -35,8 +35,8 @@ use htui_core::model::{
     RequirementUpdate, Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind,
     RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
     SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -5420,6 +5420,10 @@ impl WriteStore for PgStore {
         }
 
         tx.commit().await.map_err(map_sqlx)
+    }
+
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        todo!("MOD-37 M5: record_opening({step}, {opening})")
     }
 
     /// MOD-37 R-5: one fenced compare-and-set, `running -> done` with `gate_outcome = 'skipped'`.

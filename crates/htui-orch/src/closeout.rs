@@ -290,6 +290,7 @@ mod tests {
             promoted_at: None,
             agent_name: None,
             gate_note: None,
+            opening: None,
         }
     }
 

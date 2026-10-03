@@ -2200,6 +2200,46 @@ async fn the_core_sqlx_derives_decode_against_text_and_uuid_columns() {
     db.drop_db().await;
 }
 
+/// MOD-37 milestone 5 (R-48): `0014_run_step_opening.sql`'s `run_step.opening` admits exactly
+/// `resumed`, `handoff` and `resume_failed`, and `NULL`; anything else trips its CHECK.
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn the_opening_column_admits_three_values_and_null() {
+    use htui_core::fixtures::ids;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let set = |opening: Option<&'static str>| {
+        sqlx::query("UPDATE run_step SET opening = $2 WHERE id = $1")
+            .bind(ids::STEP_IMPL.as_uuid())
+            .bind(opening)
+            .execute(&db.pool)
+    };
+
+    for opening in ["resumed", "handoff", "resume_failed"] {
+        let done = set(Some(opening))
+            .await
+            .unwrap_or_else(|err| panic!("`{opening}` is admitted: {err}"));
+        assert_eq!(done.rows_affected(), 1, "`{opening}` lands on the step");
+    }
+    let err = set(Some("bogus"))
+        .await
+        .expect_err("a value outside the three is refused");
+    let code = err
+        .as_database_error()
+        .and_then(|e| e.code())
+        .map(|c| c.into_owned());
+    assert_eq!(
+        code.as_deref(),
+        Some("23514"),
+        "the opening CHECK refuses it: {err}"
+    );
+    set(None).await.expect("NULL is admitted");
+
+    db.drop_db().await;
+}
+
 /// `PgStore::connect` takes its identity from the caller and does no file I/O of its own, so a test
 /// never writes to the user's real config directory.
 #[tokio::test]

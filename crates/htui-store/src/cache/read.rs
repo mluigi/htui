@@ -611,6 +611,7 @@ impl ReadStore for CacheStore {
                     promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
                     agent_name: opt_text(row, "agent_name")?,
                     gate_note: opt_text(row, "gate_note")?,
+                    opening: None,
                 },
             ));
         }

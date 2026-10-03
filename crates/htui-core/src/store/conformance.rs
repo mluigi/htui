@@ -32,9 +32,10 @@ use crate::model::{
     RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
     RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
     SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure,
+    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
+    missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -186,6 +187,7 @@ pub const CASES: &[&str] = &[
     "a_bound_persona_is_not_deleted_and_names_its_phases",
     "a_persona_bound_to_many_phases_names_five_and_counts_the_rest",
     "hand_written_rows_round_trip",
+    "record_opening_lands_on_the_run_summary_and_bumps_updated_at",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -476,6 +478,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store).await;
         }
         "hand_written_rows_round_trip" => hand_written_rows_round_trip(store).await,
+        "record_opening_lands_on_the_run_summary_and_bumps_updated_at" => {
+            record_opening_lands_on_the_run_summary_and_bumps_updated_at(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -16325,6 +16330,89 @@ async fn hand_written_rows_round_trip<S: WriteStore>(store: &S) {
     assert!(
         heads.contains(&expected.head()),
         "{CASE}: `documents` lists the hand-written head, got {heads:?}"
+    );
+}
+
+/// MOD-37 milestone 5 (R-48): `record_opening` writes `run_step.opening`, which only the run
+/// summary carries (it is not a [`RunStep`] field). A fresh step reads `None`; the write lands,
+/// moves the step's `updated_at` (so the mirror picks it up), and a second write replaces the
+/// first. A sibling step keeps `None`, and an unknown step is `NotFound`.
+async fn record_opening_lands_on_the_run_summary_and_bumps_updated_at<S: WriteStore>(store: &S) {
+    const CASE: &str = "record_opening_lands_on_the_run_summary_and_bumps_updated_at";
+    async fn opening<S: ReadStore>(store: &S, run: RunId, step: StepId) -> Option<StepOpening> {
+        store
+            .runs(ids::HTUI_ANA_2)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|row| row.id == run)
+            .unwrap_or_else(|| panic!("{CASE}: ANA-2 lists run {run}"))
+            .steps
+            .into_iter()
+            .find(|row| row.id == step)
+            .unwrap_or_else(|| panic!("{CASE}: run {run} lists step {step}"))
+            .opening
+    }
+
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let spec = new_run_step(run, 0, 1, 0);
+    let step = spec.id;
+    store.create_step(spec).await.expect(CASE);
+    let sibling_spec = new_run_step(run, 1, 1, 0);
+    let sibling = sibling_spec.id;
+    store.create_step(sibling_spec).await.expect(CASE);
+    assert_eq!(
+        opening(store, run, step).await,
+        None,
+        "{CASE}: a step never bound to a promoted chat has no opening"
+    );
+
+    let before = step_row(CASE, store, run, step).await.updated_at;
+    store
+        .record_opening(step, StepOpening::ResumeFailed)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        opening(store, run, step).await,
+        Some(StepOpening::ResumeFailed),
+        "{CASE}: the summary carries the opening just written"
+    );
+    assert!(
+        step_row(CASE, store, run, step).await.updated_at > before,
+        "{CASE}: the write moves the step's `updated_at`, so the mirror picks the column up"
+    );
+
+    store
+        .record_opening(step, StepOpening::Handoff)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        opening(store, run, step).await,
+        Some(StepOpening::Handoff),
+        "{CASE}: a second write replaces the first"
+    );
+    assert_eq!(
+        opening(store, run, sibling).await,
+        None,
+        "{CASE}: the sibling step keeps no opening"
+    );
+
+    let missing = store
+        .record_opening(StepId::new(), StepOpening::Resumed)
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is `NotFound`, got {missing:?}"
     );
 }
 

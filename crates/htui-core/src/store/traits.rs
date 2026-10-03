@@ -59,9 +59,9 @@ use crate::model::{
     RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
     RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -1482,6 +1482,15 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the step's status is
     /// any other, or its run is terminal.
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()>;
+
+    /// MOD-37 M5 (R-48): `run_step.opening = opening`, replacing any earlier value: how the step's
+    /// promoted chat opened. Unfenced, as [`promote_step`](Self::promote_step) is, because a promoted
+    /// step's run is parked and holds no lease. `updated_at` moves (the store's), so the mirror
+    /// picks the column up.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run_step" }`.
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()>;
 
     /// MOD-37 R-5, ANA-2 §4.2's "done + skipped" cell: the step `running -> done` with
     /// `gate_outcome = 'skipped'`, `gate_note = note` when `note` is `Some` (kept otherwise) and

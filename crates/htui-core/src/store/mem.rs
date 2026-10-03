@@ -40,9 +40,9 @@ use crate::model::{
     RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
     canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
@@ -1308,6 +1308,7 @@ impl State {
                         .and_then(|id| self.agents.get(&id))
                         .map(|agent| agent.name.clone()),
                     gate_note: step.gate_note.clone(),
+                    opening: None,
                 }
             })
             .collect()
@@ -7145,6 +7146,10 @@ impl WriteStore for MemStore {
     async fn promote_step(&self, step: StepId, at: DateTime<Utc>) -> Result<()> {
         let now = self.now();
         self.write(|state| state.promote_step(step, at, now))
+    }
+
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        todo!("MOD-37 M5: record_opening({step}, {opening})")
     }
 
     async fn pass_step(

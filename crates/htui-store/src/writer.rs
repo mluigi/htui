@@ -36,9 +36,9 @@ use htui_core::model::{
     RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
     RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -1086,6 +1086,13 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.promote_step(step, at).await,
             Self::Online(pg) => pg.promote_step(step, at).await,
+        }
+    }
+
+    async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        match self {
+            Self::Memory(store) => store.record_opening(step, opening).await,
+            Self::Online(pg) => pg.record_opening(step, opening).await,
         }
     }
 

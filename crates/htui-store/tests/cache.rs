@@ -19,7 +19,8 @@ use chrono::{SubsecRound as _, TimeDelta, Utc};
 use htui_core::fixtures::{self, ids};
 use htui_core::model::{
     CitationKind, DocumentId, EventKind, EventRole, ItemFilter, LinkGraph, NewDocument, ProjectId,
-    PromptScope, Resolution, RunId, Scope, SessionEvent, Status, StepId, UserId, WorkspaceSummary,
+    PromptScope, Resolution, RunId, Scope, SessionEvent, Status, StepId, StepOpening, UserId,
+    WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_store::cache::refresh::{RefreshSettings, Refresher, run_pass};
@@ -786,6 +787,45 @@ async fn the_0003_columns_reach_the_mirror() {
             .await
             .is_err(),
         "`lease_owner` is not a mirror column: a liveness token for a process that is not running"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
+/// MOD-37 milestone 5 (R-48): `run_step.opening` (`cache_migrations/0005_run_step_opening.sql`)
+/// reaches the mirror. The fixture leaves it NULL on every step, so an equality against Postgres
+/// proves nothing about it: this writes it through `record_opening`, refreshes, and reads the
+/// summary back off the mirror.
+#[tokio::test]
+async fn the_0005_opening_reaches_the_mirror() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+
+    db.store
+        .record_opening(ids::STEP_IMPL, StepOpening::ResumeFailed)
+        .await
+        .expect("record the opening");
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let mirrored_runs = cache.runs(ids::HTUI_FEAT_1).await.expect("cache runs");
+    let step = mirrored_runs
+        .iter()
+        .flat_map(|run| run.steps.iter())
+        .find(|step| step.id == ids::STEP_IMPL)
+        .expect("the implement step is mirrored");
+    assert_eq!(
+        step.opening,
+        Some(StepOpening::ResumeFailed),
+        "`run_step.opening` comes off the mirror"
+    );
+    assert_eq!(
+        mirrored_runs,
+        db.store.runs(ids::HTUI_FEAT_1).await.expect("pg runs"),
+        "and the two backends project the whole list alike"
     );
 
     teardown(db, &[&cache]).await;

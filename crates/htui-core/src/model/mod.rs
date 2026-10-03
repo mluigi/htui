@@ -162,8 +162,8 @@ pub use run::{
     ChatRunSpec, CommandRun, CommandRunStatus, GateOutcome, GraphSnapshot, NewCommandRun, NewRun,
     NewRunStep, Run, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
     RunStepTree, RunSummary, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPhase,
-    SnapshotSettings, SnapshotTemplate, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount,
-    VerifyOutcome, prompt_summary,
+    SnapshotSettings, SnapshotTemplate, StepOpening, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, VerifyOutcome, prompt_summary,
 };
 pub use scope::{PromptScope, Scope};
 pub use skill::{
@@ -304,6 +304,7 @@ mod tests {
             &["approved", "rejected", "retried", "skipped"],
         );
         check_enum(VerifyOutcome::ALL, &["pass", "fail", "unavailable"]);
+        check_enum(StepOpening::ALL, &["resumed", "handoff", "resume_failed"]);
         check_enum(
             CommandRunStatus::ALL,
             &["queued", "running", "done", "failed", "cancelled"],

@@ -163,6 +163,19 @@ str_enum!(
     }
 );
 
+str_enum!(
+    /// `run_step.opening` (MOD-37 M5, R-48): how a promoted step's chat opened. `NULL` on a step
+    /// never bound to a promoted chat.
+    StepOpening {
+        /// The step's own agent session was restored.
+        Resumed => "resumed",
+        /// A fresh session opened with the handoff prompt.
+        Handoff => "handoff",
+        /// A requested resume failed; the chat opened with the handoff prompt instead.
+        ResumeFailed => "resume_failed",
+    }
+);
+
 /// A row of `run` (§5.8).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Run {
@@ -783,6 +796,9 @@ pub struct RunStepSummary {
     pub agent_name: Option<String>,
     /// `run_step.gate_note`.
     pub gate_note: Option<String>,
+    /// `run_step.opening` (MOD-37 M5): how the step's promoted chat last opened; `None` when no
+    /// chat was ever bound to it.
+    pub opening: Option<StepOpening>,
 }
 
 /// Plan D106's derivation of [`RunStepSummary::prompt_tokens`] and [`RunStepSummary::trimmed`]

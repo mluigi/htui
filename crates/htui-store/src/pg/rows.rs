@@ -169,6 +169,7 @@ impl StepRow {
             promoted_at: self.promoted_at,
             agent_name: self.agent_name,
             gate_note: self.gate_note,
+            opening: None,
         }
     }
 }
