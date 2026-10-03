@@ -37,10 +37,16 @@ use htui_agent::driver::{
 use htui_agent::error::DriverError;
 use htui_agent::event::ToolKind;
 #[cfg(unix)]
-use htui_agent::event::{DriverEvent, Stamp, StopReason, TerminalReason, ToolResultStatus};
+use htui_agent::event::{
+    DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent, Stamp, StopReason,
+    TerminalReason, ToolResultStatus,
+};
 use htui_agent::launch::CliSettings;
 #[cfg(unix)]
 use htui_agent::launch::{AgentSettings, ChildIo};
+use htui_agent::prompt_bridge::{PROMPT_TOOL, bridge};
+#[cfg(unix)]
+use htui_agent::prompt_bridge::{PromptAsk, PromptCall, PromptClosed, PromptVerdict};
 #[cfg(unix)]
 use htui_agent::registry::DriverFactory;
 #[cfg(unix)]
@@ -567,6 +573,47 @@ fn extra_args_stay_last_with_mcp() {
     );
 }
 
+/// MOD-11 D18: a spec with a prompt port names `htui`'s prompt tool as one flag pair right after
+/// the `--mcp-config=` argument; a spec without one passes no such flag at all.
+#[test]
+fn argv_names_the_prompt_tool_only_with_a_port() {
+    let mut with = full_spec();
+    with.mcp = vec![htui_server()];
+    let without = argv(&[], &cli_settings("", &["--y"]), &with, "minted-id");
+    assert!(
+        !without.contains(&"--permission-prompt-tool".to_owned()),
+        "no port, no prompt tool: {without:?}"
+    );
+
+    let (port, _ask) = bridge();
+    with.prompt = Some(port);
+    let args = argv(&[], &cli_settings("", &["--y"]), &with, "minted-id");
+    let config_at = args
+        .iter()
+        .position(|arg| arg.starts_with("--mcp-config="))
+        .expect("the config is there");
+    assert_eq!(
+        args[config_at + 1..config_at + 3],
+        ["--permission-prompt-tool", "mcp__htui__permission_prompt"],
+        "the pair follows the config: {args:?}"
+    );
+    assert_eq!(PROMPT_TOOL, "mcp__htui__permission_prompt");
+    let rest: Vec<&String> = args
+        .iter()
+        .filter(|arg| *arg != "--permission-prompt-tool" && *arg != PROMPT_TOOL)
+        .collect();
+    assert_eq!(
+        rest,
+        without.iter().collect::<Vec<_>>(),
+        "the pair is the only addition"
+    );
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some("--y"),
+        "extra_args last"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // A session over a scripted agent
 // ---------------------------------------------------------------------------------------------
@@ -696,6 +743,12 @@ fn scripted_row(command: &Path, env: serde_json::Map<String, serde_json::Value>)
 /// the capability profile it computes are part of every case rather than bypassed by them.
 #[cfg(unix)]
 async fn start(row: &AgentRow, cwd: &Path) -> Box<dyn AgentSession> {
+    start_with(row, spec(cwd.to_path_buf())).await
+}
+
+/// [`start`] with a spec the case built (MOD-11 D18: one carrying a prompt port).
+#[cfg(unix)]
+async fn start_with(row: &AgentRow, spec: SessionSpec) -> Box<dyn AgentSession> {
     let mut factory = DriverFactory::new();
     factory.register(
         htui_agent::cli::ADAPTER_ID,
@@ -710,7 +763,7 @@ async fn start(row: &AgentRow, cwd: &Path) -> Box<dyn AgentSession> {
         driver.caps()
     );
     driver
-        .start(spec(cwd.to_path_buf()), "hello".to_owned())
+        .start(spec, "hello".to_owned())
         .await
         .expect("the scripted agent sends its `system/init`")
 }
@@ -763,6 +816,19 @@ const RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"t
 const REPLY: &str =
     r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}]}}"#;
 
+/// The tool-use id of the recorded probe's gated call (blueprint §2.7).
+#[cfg(unix)]
+const TOOL_USE_ID: &str = "toolu_01HuMymhasmoPmGaLNFxJ4GV";
+
+/// The assistant line announcing that call, as the CLI streams it before it asks.
+#[cfg(unix)]
+const TOOL_USE: &str = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_01HuMymhasmoPmGaLNFxJ4GV","name":"mcp__htui__hello","input":{}}]}}"#;
+
+/// [`RESULT`] carrying the probe's `permission_denials[]` entry for that call (blueprint §2.7):
+/// what the CLI repeats at the end of a turn whose prompt was answered `deny`.
+#[cfg(unix)]
+const DENIED_RESULT: &str = r#"{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","total_cost_usd":0.000002,"modelUsage":{"m":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}},"permission_denials":[{"tool_name":"mcp__htui__hello","tool_use_id":"toolu_01HuMymhasmoPmGaLNFxJ4GV","tool_input":{}}]}"#;
+
 /// What every script records about itself before it says a word: its argv, and its own pid.
 ///
 /// The pid is the group leader's, and it is the one identifier a kill can be checked against that
@@ -786,6 +852,8 @@ fn script(template: &str) -> String {
         .replace("<INIT>", INIT)
         .replace("<RESULT>", RESULT)
         .replace("<REPLY>", REPLY)
+        .replace("<TOOL_USE>", TOOL_USE)
+        .replace("<DENIED_RESULT>", DENIED_RESULT)
 }
 
 /// Answers every stdin line with a whole turn, and exits when stdin closes.
@@ -858,6 +926,20 @@ printf '%s\n' '<RESULT>'
 exit 0
 "#;
 
+/// MOD-11 D18: announces [`TOOL_USE`] and then waits — as the CLI waits on its
+/// `--permission-prompt-tool` — until the case creates `$HTUI_GO_FILE`; then ends the turn with
+/// [`DENIED_RESULT`] and exits.
+#[cfg(unix)]
+const PROMPT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<TOOL_USE>'
+while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
+printf '%s\n' '<DENIED_RESULT>'
+exit 0
+"#;
+
 /// A row over a script written into `dir`, plus the two files it records about itself.
 #[cfg(unix)]
 struct Scripted {
@@ -877,6 +959,10 @@ fn scripted(dir: &Path, body: &str) -> Scripted {
     let env = serde_json::Map::from_iter([
         ("HTUI_ARGV_FILE".to_owned(), json!(argv.to_string_lossy())),
         ("HTUI_PID_FILE".to_owned(), json!(pid.to_string_lossy())),
+        (
+            "HTUI_GO_FILE".to_owned(),
+            json!(dir.join("go").to_string_lossy()),
+        ),
     ]);
     Scripted {
         row: scripted_row(&command, env),
@@ -1319,4 +1405,284 @@ async fn a_stream_with_no_init_times_out_and_kills_its_child() {
         Ok(_) => panic!("a silent agent does not open a session"),
     }
     assert_not_running(pid, "the session's child").await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-11 D18: the permission bridge
+// ---------------------------------------------------------------------------------------------
+
+/// The probe's prompt call for [`TOOL_USE_ID`], or one with no id when `id` is `None`.
+#[cfg(unix)]
+fn prompt_call(id: Option<&str>) -> PromptCall {
+    PromptCall {
+        tool_name: "mcp__htui__hello".to_owned(),
+        input: json!({}),
+        tool_use_id: id.map(str::to_owned),
+    }
+}
+
+/// The request the session announces for a prompt whose id is `request_id`.
+#[cfg(unix)]
+fn prompt_request(request_id: &str, tool_call_id: Option<&str>) -> DriverEvent {
+    DriverEvent::PermissionRequest(PermissionRequestEvent {
+        request_id: PermissionRequestId::new(request_id),
+        tool_call_id: tool_call_id.map(str::to_owned),
+        options: vec![
+            PermissionOption {
+                id: "allow".to_owned(),
+                label: "Allow".to_owned(),
+                kind: PermissionOptionKind::AllowOnce,
+            },
+            PermissionOption {
+                id: "reject".to_owned(),
+                label: "Reject".to_owned(),
+                kind: PermissionOptionKind::RejectOnce,
+            },
+        ],
+    })
+}
+
+/// A session over [`PROMPT_SCRIPT`] with a prompt port, pulled up to its announced tool call; the
+/// tool end of the bridge and the script's go-file come back with it.
+#[cfg(unix)]
+async fn prompting(dir: &Path) -> (Box<dyn AgentSession>, PromptAsk, PathBuf) {
+    let scripted = scripted(dir, PROMPT_SCRIPT);
+    let (port, ask) = bridge();
+    let mut spec = spec(dir.to_path_buf());
+    spec.prompt = Some(port.clone());
+    let mut session = start_with(&scripted.row, spec).await;
+    assert!(
+        port.take().is_none(),
+        "H-17: the transport took the receiver; a clone gets no second stream"
+    );
+    let _banner = next(&mut session, "the banner").await;
+    let call = next(&mut session, "the gated call").await;
+    assert!(
+        matches!(&call, DriverEvent::ToolCall(call) if call.tool_call_id == TOOL_USE_ID),
+        "{call:?}"
+    );
+    (session, ask, dir.join("go"))
+}
+
+/// Asks `call` on its own task, as the MCP tool does while the session runs.
+#[cfg(unix)]
+fn asking(
+    ask: &PromptAsk,
+    call: PromptCall,
+) -> tokio::task::JoinHandle<Result<PromptVerdict, PromptClosed>> {
+    let ask = ask.clone();
+    htui_agent::contained::spawn(async move { ask.ask(call).await })
+}
+
+/// The verdict an asking task got, within the window.
+#[cfg(unix)]
+async fn verdict(
+    task: tokio::task::JoinHandle<Result<PromptVerdict, PromptClosed>>,
+) -> Result<PromptVerdict, PromptClosed> {
+    tokio::time::timeout(EVENT_WINDOW, task)
+        .await
+        .expect("the ask resolved within the window")
+        .expect("the asking task did not panic")
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_prompt_request_becomes_a_permission_request_event() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting(tmp.path()).await;
+
+    let first = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    assert_eq!(
+        next(&mut session, "the first prompt").await,
+        prompt_request(TOOL_USE_ID, Some(TOOL_USE_ID)),
+        "the CLI's tool-use id is the request id, and the call it gates"
+    );
+
+    let second = asking(&ask, prompt_call(None));
+    let minted = next(&mut session, "the second prompt").await;
+    let DriverEvent::PermissionRequest(request) = &minted else {
+        panic!("a prompt is a permission request: {minted:?}")
+    };
+    assert!(
+        request.request_id.as_str().starts_with("prompt-"),
+        "no tool-use id, a minted request id: {minted:?}"
+    );
+    assert_eq!(
+        minted,
+        prompt_request(request.request_id.as_str(), None),
+        "the same two options, no call named"
+    );
+    assert!(
+        !first.is_finished() && !second.is_finished(),
+        "both asks wait for an answer"
+    );
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    for task in [first, second] {
+        assert!(matches!(
+            verdict(task).await,
+            Ok(PromptVerdict::Deny { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn answering_allow_completes_the_prompt_with_allow() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, go) = prompting(tmp.path()).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(verdict(task).await, Ok(PromptVerdict::Allow));
+
+    let again = session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(&again, Err(DriverError::Transport(why)) if why.contains("no parked")),
+        "an answered prompt is no longer parked: {again:?}"
+    );
+
+    std::fs::write(&go, b"").expect("go");
+    let rest = drain(&mut session).await;
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
+        "{rest:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn answering_reject_completes_it_with_deny() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting(tmp.path()).await;
+
+    let rejected = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the first prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("reject".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(
+        verdict(rejected).await,
+        Ok(PromptVerdict::Deny {
+            message: "denied in htui".to_owned()
+        })
+    );
+
+    let cancelled = asking(&ask, prompt_call(Some("toolu_second")));
+    let _request = next(&mut session, "the second prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new("toolu_second"),
+            PermissionAnswer::Cancelled,
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(
+        verdict(cancelled).await,
+        Ok(PromptVerdict::Deny {
+            message: "the session was cancelled".to_owned()
+        })
+    );
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cancel_denies_every_pending_prompt() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting(tmp.path()).await;
+
+    let first = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the first prompt").await;
+    let second = asking(&ask, prompt_call(None));
+    let _request = next(&mut session, "the second prompt").await;
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    for task in [first, second] {
+        assert_eq!(
+            verdict(task).await,
+            Ok(PromptVerdict::Deny {
+                message: "the session was cancelled".to_owned()
+            })
+        );
+    }
+    assert_eq!(
+        ask.ask(prompt_call(None)).await,
+        Err(PromptClosed),
+        "nobody is left to ask"
+    );
+}
+
+/// D18 dedup: the terminal `result` repeats a prompt-denied call in `permission_denials[]`; the
+/// prompt's own answer already settled it, so the replay adds no `permission_answer`.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_prompt_denial_is_reported_once() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, go) = prompting(tmp.path()).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the prompt").await;
+    session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("reject".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert!(matches!(
+        verdict(task).await,
+        Ok(PromptVerdict::Deny { .. })
+    ));
+
+    std::fs::write(&go, b"").expect("go");
+    let rest = drain(&mut session).await;
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::PermissionAnswer(_))),
+        "the answered prompt is not reported again: {rest:?}"
+    );
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(_))),
+        "{rest:?}"
+    );
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn without_a_port_answer_permission_stays_unsupported() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), TURN_SCRIPT);
+    let mut session = start(&scripted.row, tmp.path()).await;
+    let refused = session
+        .answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await;
+    assert!(
+        matches!(refused, Err(DriverError::Unsupported("answer_permission"))),
+        "{refused:?}"
+    );
+    let argv = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
+    assert!(!argv.contains("--permission-prompt-tool"), "{argv}");
+    session.cancel(Duration::ZERO).await.expect("cancel");
 }

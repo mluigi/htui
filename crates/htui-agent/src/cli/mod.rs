@@ -8,17 +8,24 @@
 //!
 //! **What differs from `acp/`, stated once.** There is no protocol layer at all: a line out is a
 //! user message, a line in is a JSON value, and nothing negotiates. So there is no handshake beyond
-//! the first `system/init`, no permission channel (§4.3 fixes
+//! the first `system/init`, no permission channel on the wire (§4.3 fixes
 //! `DriverCaps { permission_requests: false, edit_proposals: false, plans: false }` for this
-//! transport and [`AgentSession::answer_permission`] answers [`DriverError::Unsupported`]), and a
-//! cancel is a **signal** rather than a notification — which is why it is the one sequence in this
+//! transport and, without a prompt port, [`AgentSession::answer_permission`] answers
+//! [`DriverError::Unsupported`]), and a cancel is a **signal** rather than a notification — which is why it is the one sequence in this
 //! file written from measurements instead of from a specification (plan D81, findings F-1..F-3).
+//!
+//! **MOD-11 D18, the one permission channel this transport has.** When `htui`'s MCP server hosts
+//! `permission_prompt` for the session, `SessionSpec.prompt` carries a port: the CLI is started with
+//! `--permission-prompt-tool` naming that tool, every call it gates arrives on the port as a
+//! [`PromptRequest`], is announced as an ordinary `permission_request`, and is completed by
+//! [`AgentSession::answer_permission`]. The capability triple stays all-false (the interlock reads the
+//! row, not the session); the engine admits a CLI agent to a gated phase only when it hosts the tool.
 //!
 //! [`DriverEvent`]: crate::event::DriverEvent
 
 pub mod claude;
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -35,12 +42,14 @@ use crate::driver::{
 };
 use crate::error::{DriverError, Result};
 use crate::event::{
-    DoneEvent, DriverEnvelope, DriverEvent, ErrorEvent, OtherEvent, SESSION_STARTED, Stamp,
-    StopReason, TRANSPORT_CLOSED, TerminalReason, ToolResultEvent, ToolResultStatus,
+    DoneEvent, DriverEnvelope, DriverEvent, ErrorEvent, OtherEvent, PermissionOption,
+    PermissionOptionKind, PermissionRequestEvent, SESSION_STARTED, Stamp, StopReason,
+    TRANSPORT_CLOSED, TerminalReason, ToolResultEvent, ToolResultStatus,
 };
 use crate::launch::{
     AgentLaunch, AgentSettings, ChildGuard, ChildIo, CliSettings, ResolvedLaunch, StopSignal,
 };
+use crate::prompt_bridge::{PROMPT_TOOL, PromptPort, PromptRequest, PromptVerdict};
 use crate::registry::TransportBuilder;
 
 /// The adapter id this transport registers under (plan D12): `cli/<settings.cli.stream>`.
@@ -109,6 +118,9 @@ pub const UNPARSED: &str = "<unparsed>";
 ///    swallow the token after it. No `--strict-mcp-config` — the operator's own servers stay — and
 ///    `--tools` is left as it is, because it never filters MCP tools;
 ///
+///    6⅓. the pair `--permission-prompt-tool` [`PROMPT_TOOL`] when the spec carries a prompt port
+///    (MOD-11 D18). A pair is safe here: the flag takes exactly one value;
+///
 ///    6½. the step's narrowing (MOD-26 D11): `--tools=<allow>` when the allow-list is not empty,
 ///    then `--disallowedTools=<deny and the names deny_kinds inverts to>` when that is not empty,
 ///    each one `=`-joined argument; `--allowedTools` is never emitted (I-1);
@@ -169,6 +181,11 @@ pub fn argv(
     // MOD-11 D8: after the last pair, before the narrowing, so `extra_args` still wins.
     if let Some(config) = mcp_config(&spec.mcp) {
         args.push(format!("--mcp-config={config}"));
+    }
+    // MOD-11 D18: every gated call asks `htui`'s prompt tool instead of the permission mode.
+    if spec.prompt.is_some() {
+        args.push("--permission-prompt-tool".to_owned());
+        args.push(PROMPT_TOOL.to_owned());
     }
 
     // MOD-26 D11: the step's narrowing, each as one `=`-joined argument (the closure above pushes
@@ -518,13 +535,19 @@ impl TransportBuilder for ClaudeStreamAdapter {
 // ---------------------------------------------------------------------------------------------
 
 /// What the handle asks the session task to do.
-///
-/// No `AnswerPermission`: this transport announces no request, so there is nothing to answer
-/// (§4.3, and [`AgentSession::answer_permission`] below).
 #[derive(Debug)]
 pub enum Command {
     /// Start a new turn with this text.
     FollowUp(String),
+    /// MOD-11 D18: complete the parked prompt `request_id` (a session with a prompt port only).
+    Answer {
+        /// The request the session announced.
+        request_id: PermissionRequestId,
+        /// What the user or the policy chose.
+        answer: PermissionAnswer,
+        /// `Ok` once the prompt tool has its verdict; `Transport` for an id that is not parked.
+        done: oneshot::Sender<Result<()>>,
+    },
     /// End the session. Acknowledged **after** the process tree is gone, so a caller that awaited
     /// `cancel` knows there is nothing left running (§11 criterion 11).
     Cancel {
@@ -548,6 +571,8 @@ pub struct CliSession {
     /// The task has ended: `next_event` answers `Ok(None)`, everything else
     /// [`DriverError::Closed`].
     ended: bool,
+    /// MOD-11 D18: the spec carried a prompt port, so `answer_permission` has requests to answer.
+    prompts: bool,
     task: Option<JoinHandle<()>>,
 }
 
@@ -558,6 +583,7 @@ impl core::fmt::Debug for CliSession {
             .field("pending", &self.pending.len())
             .field("turn_open", &self.turn_open)
             .field("ended", &self.ended)
+            .field("prompts", &self.prompts)
             .finish()
     }
 }
@@ -569,8 +595,8 @@ impl AgentSession for CliSession {
 
     fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
         Box::pin(async move {
-            // No parked check, and nothing to write one about: this transport has no permission
-            // channel, so a pull can never be refused for owing the agent an answer.
+            // No parked check: a prompt (MOD-11 D18) is answered through the bridge whatever the
+            // reader pulls meanwhile — the CLI itself waits on the tool, not on this handle.
             if let Some(envelope) = self.pending.pop_front() {
                 self.note(&envelope);
                 return Ok(Some(envelope));
@@ -612,13 +638,15 @@ impl AgentSession for CliSession {
         })
     }
 
-    /// There is no permission request to answer, and the honest error says so about the
-    /// **operation** rather than about the id.
+    /// MOD-11 D18: with a prompt port, completes the parked prompt `request_id` and returns once the
+    /// prompt tool has its verdict (`Transport("no parked request …")` for an id that is not
+    /// parked).
     ///
-    /// [`DriverError::Unsupported`] and not `Transport("no parked request …")`: the latter claims
-    /// the id is unknown, when the truth is that this transport has no such channel at all — which
-    /// is what `Unsupported` was added for, and `caps.permission_requests == false` is the
-    /// predicate that pairs with it, exactly as `caps.authenticate` pairs with `authenticate`.
+    /// Without one there is no permission request to answer, and the honest error says so about
+    /// the **operation** rather than about the id: [`DriverError::Unsupported`] and not
+    /// `Transport("no parked request …")`, because the latter claims the id is unknown, when the
+    /// truth is that this session has no such channel at all — which is what `Unsupported` was
+    /// added for.
     ///
     /// [`DriverError::Closed`] is checked first because the trait's contract for every operation is
     /// "`Closed` once the session has ended": a session that is over should not be arguing about an
@@ -628,12 +656,21 @@ impl AgentSession for CliSession {
         request_id: PermissionRequestId,
         answer: PermissionAnswer,
     ) -> DriverFuture<'a, ()> {
-        let _ = (request_id, answer);
         Box::pin(async move {
             if self.ended {
                 return Err(DriverError::Closed);
             }
-            Err(DriverError::Unsupported("answer_permission"))
+            if !self.prompts {
+                return Err(DriverError::Unsupported("answer_permission"));
+            }
+            let (done, answered) = oneshot::channel();
+            self.send(Command::Answer {
+                request_id,
+                answer,
+                done,
+            })?;
+            // A task that ended before it read the command dropped `done`.
+            answered.await.map_err(|_| DriverError::Closed)?
         })
     }
 
@@ -776,6 +813,7 @@ pub async fn open_session(
     // answers only *whether* the stream opened, and a disagreement with what `system/init` echoes
     // is a `warn!` there rather than a value here (blueprint H-17).
     let session_ref = AgentSessionRef::new(options.session_id.clone());
+    let prompts = spec.prompt.is_some();
     let task = crate::contained::spawn(run_session(
         io,
         spec,
@@ -809,6 +847,7 @@ pub async fn open_session(
             // handle: a follow-up now would interleave two turns.
             turn_open: true,
             ended: false,
+            prompts,
             task: Some(task),
         }),
         Ok(Ok(Err(err))) => {
@@ -854,10 +893,23 @@ async fn run_session(
     let (lines_tx, lines_rx) = mpsc::channel(EVENTS_CAPACITY);
     let reading = crate::contained::spawn(read_lines(reader, lines_tx));
 
+    // MOD-11 D18 (H-17): the port's receiver is taken once, here; a clone of the spec gets none.
+    let mut prompts = Prompts::new(spec.prompt.as_ref().and_then(PromptPort::take));
     session_main(
-        spec, prompt, options, ready, events, commands, lines_rx, writer, &child,
+        spec,
+        prompt,
+        options,
+        ready,
+        events,
+        commands,
+        lines_rx,
+        writer,
+        &child,
+        &mut prompts,
     )
     .await;
+    // Whatever is still asking gets an answer rather than the prompt tool's timeout.
+    prompts.deny_all(ENDED);
 
     // A spawned child's stdout ends when the kill below closes it, but a prepared pair's writer is
     // held by whoever built it and may never close: the reader is aborted rather than left waiting
@@ -944,7 +996,7 @@ fn is_init(line: &Value) -> bool {
 /// The task's own state machine: the prompt, the banner, then the turn loop.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the task owns nine distinct things; bundling them into a struct renames the arity \
+    reason = "the task owns ten distinct things; bundling them into a struct renames the arity \
               without reducing it"
 )]
 async fn session_main(
@@ -957,6 +1009,7 @@ async fn session_main(
     mut lines: mpsc::Receiver<String>,
     writer: Box<dyn AsyncWrite + Send + Unpin>,
     child: &Mutex<ChildGuard>,
+    prompts: &mut Prompts,
 ) {
     let mut state = TaskState::new(options.stamp, spec.retain_raw, options.settings.usage.scope);
     let session_ref = AgentSessionRef::new(options.session_id.clone());
@@ -1050,11 +1103,12 @@ async fn session_main(
         return;
     }
 
-    // 5. The turn loop. Both arms are cancellation-safe channel receives.
+    // 5. The turn loop. Every arm is a cancellation-safe channel receive.
     loop {
         let step = tokio::select! {
             line = lines.recv() => Step::Line(line),
             command = commands.recv() => Step::Command(command),
+            request = prompts.next() => Step::Prompt(request),
         };
         match step {
             Step::Line(Some(text)) => {
@@ -1100,7 +1154,31 @@ async fn session_main(
                     break;
                 }
             }
+            // MOD-11 D18: a gated call, announced as an ordinary request.
+            Step::Prompt(Some(request)) => {
+                let event = DriverEvent::PermissionRequest(prompts.park(request));
+                if !emit(&mut state, &events, event, None).await {
+                    break;
+                }
+            }
+            // Every asking end is gone; nothing more can arrive.
+            Step::Prompt(None) => prompts.closed(),
+            Step::Command(Some(Command::Answer {
+                request_id,
+                answer,
+                done,
+            })) => {
+                let answered = prompts.answer(&request_id, answer);
+                if answered.is_ok() {
+                    // D18 dedup: the result's `permission_denials[]` repeats a denied call; the
+                    // answer already settled it.
+                    state.mapper.mark_answered(request_id.as_str());
+                }
+                let _ = done.send(answered);
+            }
             Step::Command(Some(Command::Cancel { grace, done })) => {
+                // The CLI is blocked on the prompt tool: answer it before the interrupt.
+                prompts.deny_all(CANCELLED);
                 cancel_session(&mut state, &events, &mut writer, &mut lines, child, grace).await;
                 kill(child).await;
                 // Last, so a caller that awaited `cancel` knows the tree is gone (criterion 11).
@@ -1110,6 +1188,7 @@ async fn session_main(
             // The handle is gone: nobody is reading, so end the session rather than leave a child
             // running for an audience that left.
             Step::Command(None) => {
+                prompts.deny_all(ENDED);
                 cancel_session(
                     &mut state,
                     &events,
@@ -1133,6 +1212,130 @@ enum Step {
     Line(Option<String>),
     /// A command from the handle, or the handle's disappearance.
     Command(Option<Command>),
+    /// A prompt from `htui`'s `permission_prompt` tool, or the end of them (MOD-11 D18).
+    Prompt(Option<PromptRequest>),
+}
+
+/// The option id a prompt's allow carries.
+const ALLOW_OPTION: &str = "allow";
+
+/// The option id a prompt's reject carries.
+const REJECT_OPTION: &str = "reject";
+
+/// What the agent reads when the person driving the session rejected the call.
+const DENIED: &str = "denied in htui";
+
+/// What the agent reads when the session was cancelled with the call still asking.
+const CANCELLED: &str = "the session was cancelled";
+
+/// What the agent reads when the session ended with the call still asking.
+const ENDED: &str = "the session ended";
+
+/// MOD-11 D18: the session end of the permission bridge — the port's receiver, and every prompt
+/// announced and not yet answered.
+struct Prompts {
+    /// `None` without a port, or once every asking end is gone.
+    rx: Option<mpsc::Receiver<PromptRequest>>,
+    /// Announced prompts, by request id, each waiting for its verdict.
+    pending: HashMap<PermissionRequestId, oneshot::Sender<PromptVerdict>>,
+    /// Prompts received so far: the `prompt-<n>` of one that names no tool-use id.
+    received: u64,
+}
+
+impl Prompts {
+    fn new(rx: Option<mpsc::Receiver<PromptRequest>>) -> Self {
+        Self {
+            rx,
+            pending: HashMap::new(),
+            received: 0,
+        }
+    }
+
+    /// The next prompt; never resolves without a port, so the turn loop's arm simply idles.
+    async fn next(&mut self) -> Option<PromptRequest> {
+        match self.rx.as_mut() {
+            Some(rx) => rx.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+
+    /// The asking ends are all gone: stop polling the receiver.
+    fn closed(&mut self) {
+        self.rx = None;
+    }
+
+    /// Parks `request` and answers the event that announces it.
+    fn park(&mut self, request: PromptRequest) -> PermissionRequestEvent {
+        let n = self.received;
+        self.received += 1;
+        let PromptRequest { call, answer } = request;
+        let request_id = PermissionRequestId::new(
+            call.tool_use_id
+                .clone()
+                .unwrap_or_else(|| format!("prompt-{n}")),
+        );
+        self.pending.insert(request_id.clone(), answer);
+        PermissionRequestEvent {
+            request_id,
+            tool_call_id: call.tool_use_id,
+            options: vec![
+                PermissionOption {
+                    id: ALLOW_OPTION.to_owned(),
+                    label: "Allow".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    id: REJECT_OPTION.to_owned(),
+                    label: "Reject".to_owned(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        }
+    }
+
+    /// Completes the parked prompt `request_id` with `answer`.
+    ///
+    /// # Errors
+    /// [`DriverError::Transport`] for an id that is not parked, or an option this transport never
+    /// offered (the prompt stays parked).
+    fn answer(&mut self, request_id: &PermissionRequestId, answer: PermissionAnswer) -> Result<()> {
+        let verdict = match &answer {
+            PermissionAnswer::Selected(option) if option == ALLOW_OPTION => PromptVerdict::Allow,
+            PermissionAnswer::Selected(option) if option == REJECT_OPTION => PromptVerdict::Deny {
+                message: DENIED.to_owned(),
+            },
+            PermissionAnswer::Selected(option) => {
+                return Err(DriverError::Transport(format!(
+                    "permission request `{request_id}` offers no option `{option}`"
+                )));
+            }
+            PermissionAnswer::Cancelled => PromptVerdict::Deny {
+                message: CANCELLED.to_owned(),
+            },
+        };
+        let sender = self.pending.remove(request_id).ok_or_else(|| {
+            DriverError::Transport(format!("no parked permission request `{request_id}`"))
+        })?;
+        // The asker may have gone (the CLI's tool timeout); the answer is still the session's.
+        let _ = sender.send(verdict);
+        Ok(())
+    }
+
+    /// Denies every parked prompt and every one still queued, with `message`, and closes the port.
+    fn deny_all(&mut self, message: &str) {
+        let deny = || PromptVerdict::Deny {
+            message: message.to_owned(),
+        };
+        for (_, sender) in self.pending.drain() {
+            let _ = sender.send(deny());
+        }
+        if let Some(mut rx) = self.rx.take() {
+            rx.close();
+            while let Ok(request) = rx.try_recv() {
+                let _ = request.answer.send(deny());
+            }
+        }
+    }
 }
 
 /// The cancel sequence of plan D81, in the order **F-1, F-2 and F-3 measured** rather than the one

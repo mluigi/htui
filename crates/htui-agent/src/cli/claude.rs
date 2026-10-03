@@ -77,7 +77,8 @@ pub struct Mapper {
     /// It cannot travel as a `usage` row of its own: that would be a usage report arriving
     /// mid-turn on the one transport whose `DriverCaps.usage_mid_turn` is `false` (D91).
     pending_quota: Option<Value>,
-    /// `tool_use_id`s already answered by a `permission_answer` row.
+    /// `tool_use_id`s already answered by a `permission_answer` row, or through `htui`'s prompt
+    /// tool ([`Mapper::mark_answered`]).
     ///
     /// The CLI reports a refusal **twice** — once as `system/permission_denied` when it happens,
     /// and again in the terminal `result`'s `permission_denials[]` (measured, plan F-12b). Both are
@@ -109,6 +110,12 @@ impl Mapper {
             pending_quota: None,
             answered: BTreeSet::new(),
         }
+    }
+
+    /// MOD-11 D18: `id` was answered through `htui`'s prompt tool, so a later `permission_denied`
+    /// or `permission_denials[]` entry for it is the same refusal and produces no row.
+    pub(crate) fn mark_answered(&mut self, id: &str) {
+        self.answered.insert(id.to_owned());
     }
 
     /// Maps one stdout line.

@@ -3,8 +3,8 @@
 //!
 //! [`bridge`] mints the two ends with one id. The session end, [`PromptPort`], rides in
 //! `SessionSpec.prompt`; the tool end, [`PromptAsk`], stays with `htui`'s MCP session. This module
-//! holds the types only: which session takes the port, and how a request becomes a
-//! `PermissionRequest`, belong to the CLI transport.
+//! holds the types only: the CLI transport (`crate::cli`) takes the port, turns each request into a
+//! `PermissionRequest` and completes it from `answer_permission`.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -13,6 +13,10 @@ use uuid::Uuid;
 
 /// Depth of the request channel: one session asks at most one question per tool call.
 pub const PROMPT_CAPACITY: usize = 16;
+
+/// The name the CLI's `--permission-prompt-tool` flag takes: `htui`'s server, its prompt tool
+/// (MOD-11 D18, blueprint §16).
+pub const PROMPT_TOOL: &str = "mcp__htui__permission_prompt";
 
 /// Mints a connected pair: the session's receiving end and the tool's asking end, one id.
 #[must_use]
