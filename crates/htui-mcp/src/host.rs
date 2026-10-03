@@ -669,6 +669,44 @@ pub(crate) mod tests {
         assert_eq!(ended.text, "session ended");
     }
 
+    /// I-7: a fresh chat (no item, no command queue, ACP, no concept index) is offered
+    /// `box_profile` only; `McpHost` itself refuses every other name with -32602, before any tool
+    /// code runs.
+    #[tokio::test]
+    async fn an_unadvertised_tool_is_refused_by_the_host_with_minus_32602() {
+        let host = demo_host();
+        let lease = host.open(scope(Transport::Acp)).expect("a lease");
+        let mut client = host
+            .client(&lease.spec.env[ENV_TOKEN])
+            .expect("a live session");
+        client.initialize().await.expect("initialize");
+        assert_eq!(
+            client.tool_names().await.expect("tools/list"),
+            ["box_profile"]
+        );
+        for name in crate::tools::ALL
+            .iter()
+            .map(|def| def.name)
+            .filter(|name| *name != "box_profile")
+            .chain(["no_such_tool"])
+        {
+            let answer = client
+                .request(
+                    "tools/call",
+                    serde_json::json!({"name": name, "arguments": {}}),
+                )
+                .await
+                .expect("an answer");
+            assert_eq!(answer["error"]["code"], -32602, "{name}: {answer}");
+            assert_eq!(
+                answer["error"]["message"],
+                format!("unknown tool: {name}"),
+                "{name}"
+            );
+            assert!(answer.get("result").is_none(), "{name}: {answer}");
+        }
+    }
+
     #[test]
     fn open_outside_a_runtime_is_a_listener_error() {
         let host = demo_host();
