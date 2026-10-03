@@ -1,6 +1,6 @@
 # Blueprint: MOD-11 — htui MCP server, T0–T10
 
-**Status**: proposed (2026-10-03, code-architect). Implements `.claude/plans/mod-11-mcp-server.plan.md`
+**Status**: proposed (2026-10-03, code-architect; commits `24155c7b`, `1d3013ea`, `fe6d49d5` and the refinement after them). Implements `.claude/plans/mod-11-mcp-server.plan.md`
 (CONFIRMED 2026-10-03, OQ-1…OQ-10 as recommended, fact-checked `wf_33a62d14-658`) under
 `.claude/prds/mod-11-mcp-server.prd.md`. The plan's D1–D19, I-1…I-8, task order
 `T0 → {T1 ∥ T2 ∥ T3} → {T4 ∥ T5} → T6 → {T7 ∥ T8} → T9 → T10`, file sets and "Verified claims" are
@@ -644,8 +644,6 @@ chrono     = { workspace = true }
 uuid       = { workspace = true, features = ["v4"] }   # D3 token; v7's `rng` already compiled
 tokio      = { workspace = true, features = ["net", "io-util", "sync", "time", "process", "rt",
                                             "macros", "io-std"] }
-process-wrap = { workspace = true }        # T8's executor via htui_orch::verify::run_shell (B-15);
-                                           # drop if run_shell hides it completely
 
 [target.'cfg(windows)'.dependencies]
 # nothing yet: tokio::net::windows::named_pipe is enough
@@ -998,8 +996,8 @@ pub struct ConceptHit {
   `pub document_tool: bool,`. `phase_spec` (`engine.rs:5560`) and the judge spec (`:4815`) set
   `document_tool: self.parts.tools.is_some() && !phase.output_kind.is_empty()` (phase_spec always has
   an item; the judge's kind is `JUDGE_KIND`).
-- D19 text (render.rs, pinned): `pub const OUTPUT_TEXT_PREFIX`… or one fn
-  `pub fn output(kind: &str) -> Rendered` whose content is
+- D19 text (`render.rs`, pinned): `pub fn output(kind: &str) -> Rendered` (name
+  `SectionName::Output`, no attrs) whose content is
   ``Write your `<kind>` document by calling the `document_write` tool of the `htui` MCP server; text left only in your reply is not recorded.``
   (`<kind>` substituted; scrubbed like any section).
 - `SelectInput` (`htui-orch/src/select.rs:20-35`, T9) gains `pub inline_prompt: bool` ("MOD-11 D18:
@@ -1392,25 +1390,25 @@ needs nothing (the text is fixed and the kind is already an input). `render.rs`:
 `with_tool_host` and `tool_host()`, and **per-key spec handles** (D9): `specs:
 Mutex<HashMap<OwnedKey, SpecSlot>>`, filled in `driver_for_key` (`:1733`) through
 `FakeDriver::spec_handle()` before boxing, read by `pub fn spec_for(&self, key: &SessionKey<'_>) ->
-Option<SessionSpec>`. `FakeToolHost` (`test-support`):
+Option<SessionSpec>`. `FakeToolHost` (`test-support`) records and lends; the scripted document write happens in the orch
+fake's driver wrapper, in `start` (async, deterministic — `ToolHost::open` is synchronous and must not
+`block_on` inside a runtime):
 ```rust
 #[derive(Debug, Default)]
 pub struct FakeToolHost { opened: Mutex<Vec<ToolScope>>, live: Arc<AtomicUsize>,
-                          write_output: Mutex<Option<(Arc<dyn Fn(&ToolScope) -> Option<NewDocument>
-                                                     + Send + Sync>, MemStore)>>, fail: Mutex<Option<ToolHostError>> }
+                          fail: Mutex<Option<ToolHostError>> }
 impl FakeToolHost {
-    pub fn opened(&self) -> Vec<ToolScope>;  pub fn live(&self) -> usize;
-    /// On every open, write the returned document through `store.write_step_document(scope.fence, …)`
-    /// — what `document_write` would do — and record the outcome.
-    pub fn writing_output(self, store: MemStore, doc: impl Fn(&ToolScope) -> Option<NewDocument> + …) -> Self;
-    pub fn failing(self, err: ToolHostError) -> Self;
+    #[must_use] pub fn opened(&self) -> Vec<ToolScope>;
+    #[must_use] pub fn live(&self) -> usize;               // leases not yet dropped
+    #[must_use] pub fn failing(self, err: ToolHostError) -> Self;
 }
+impl ToolHost for FakeToolHost { /* open: push scope, live += 1, spec with a fake token,
+                                    prompt port for a Cli scope; lease drop: live -= 1 */ }
 ```
-(`open` is synchronous; the write runs on `tokio::runtime::Handle::current().block_on`? **No** —
-`block_on` inside a runtime panics. Record the scope and spawn the write with `tokio::spawn` +
-a `Notify` the test awaits, **or** make the scripted write happen in the fake driver's `start`:
-the orch fake's `driver_for_key` wraps `FakeDriver` so `start` first awaits
-`FakeToolHost::write_for(step)` — preferred, deterministic. Pick the wrapper; it lives in `fake.rs`.)
+`FakeOrchestrator::writes_through_tools(&self, key: SessionKey, doc: NewDocument)`: `driver_for_key`
+wraps that session's `FakeDriver` in `ToolWriting { inner, store, doc, scope_of }` whose `start` first
+calls `store.write_step_document(fence_of_the_last_opened_scope, doc)` (what `document_write` does) and
+records the outcome (`Ok` / `Fenced`), then delegates to `inner.start`.
 **(c) `htui-worker`** — §2.12: `Shared.tools`, `with_tool_host`, `Kit.tools`, `Kit::engine`,
 `shutdown` → `close()`; `ProgressSink.owner` and the fenced write (closes MOD-41 D5).
 **(d) `htui` wiring** —
@@ -1523,11 +1521,12 @@ the orch fake's `driver_for_key` wraps `FakeDriver` so `start` first awaits
 `a_limit_above_twenty_is_refused`, `search_concepts_is_not_advertised_without_a_search_handle`.
 `htui/src/mcp_search.rs` `mod tests` (feature `testkit`: `concepts_worker::MemIndex` over
 `MemVectorStore`): `a_hit_in_another_project_is_never_returned`,
-`hits_map_every_field_by_hand`. `agent_worker.rs`'s `a_fresh_chat_sees_box_profile_only` becomes
-`a_fresh_chat_sees_box_profile_and_search_concepts` **only if** the chat host is built with a search
-handle in that test — keep T6's name and add `…_with_search` beside it (T7 owns neither
-`agent_worker.rs` nor its test: put the widened assertion in `tools_search.rs` instead, over a
-fresh-chat-shaped scope).
+`hits_map_every_field_by_hand`. OQ-8's fresh chat "two tools" is pinned here, in `tools_search.rs`,
+over a fresh-chat-shaped scope (`item_id: None`, `Unleased`) with a search handle:
+`a_fresh_chat_scope_sees_box_profile_and_search_concepts` (T7 owns neither `agent_worker.rs` nor its
+tests; T6's `a_fresh_chat_sees_box_profile_only` keeps holding, because production chat hosts get the
+search handle only through `mcp_search::production()`, which T7 fills — update that T6 test's name
+in T10's close-out if the maintainer wants it renamed).
 
 ### 10.4 Commits
 1. `feat(mod-11): T7 search_concepts tool`
