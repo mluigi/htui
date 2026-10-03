@@ -1483,7 +1483,8 @@ pub(crate) mod tests {
 
     /// D216 (review L7): a failed `box_row` read is an error — `singletons` then caches no
     /// verifier and the next command reads again — while a box with no row, or no
-    /// `command_limits`, or one that does not parse, gets `{"verify": 1}`.
+    /// `command_limits`, or one that does not parse, gets the app setting (MOD-11 D15): none on
+    /// the demo `MemStore`, so every class reads 1, which was `{"verify": 1}`'s meaning.
     #[tokio::test]
     async fn command_limits_fail_with_the_store_and_default_a_missing_value() {
         let root = tempfile::tempdir().expect("a throwaway mirror root");
@@ -1500,7 +1501,7 @@ pub(crate) mod tests {
         );
         cache.close().await;
 
-        let default = BTreeMap::from([("verify".to_owned(), 1)]);
+        let default = BTreeMap::new();
         let limits_of = async |stored: Option<serde_json::Value>| {
             let mut data = htui_core::fixtures::demo_data();
             let row = data

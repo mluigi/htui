@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: CommandRunId\" FROM command_run\n                WHERE box_id = $1 AND class = $2 AND status = 'queued'\n                ORDER BY queued_at, id LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: CommandRunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "command_run",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9f22daa81937f67bbbfcd69bb00a3346890138e7217e2347aaf1e1d7d44d8398"
+}

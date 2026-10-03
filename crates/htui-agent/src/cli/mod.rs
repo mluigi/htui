@@ -212,17 +212,24 @@ pub fn mcp_config(servers: &[McpServerSpec]) -> Option<String> {
     Some(json!({ "mcpServers": servers }).to_string())
 }
 
-/// `deny`, then every name `deny_kinds` inverts to ([`claude::tool_names`]), first occurrence
+/// `deny`, then every name `deny_kinds` inverts to ([`claude::tool_names`]), then — when
+/// `command_run` is exposed (MOD-11 D17, R-MCP-4) — `Bash(<prefix>:*)` per OQ-5 prefix
+/// ([`HEAVY_COMMAND_PREFIXES`](htui_core::model::kind::HEAVY_COMMAND_PREFIXES)), first occurrence
 /// kept.
 fn disallowed(tools: &ToolExposure) -> Vec<String> {
     let inverted = tools
         .deny_kinds
         .iter()
-        .flat_map(|kind| claude::tool_names(*kind).iter().copied());
+        .flat_map(|kind| claude::tool_names(*kind).iter().copied())
+        .map(str::to_owned);
+    let heavy = htui_core::model::kind::HEAVY_COMMAND_PREFIXES
+        .iter()
+        .filter(|_| tools.command_run)
+        .map(|prefix| format!("Bash({prefix}:*)"));
     let mut names: Vec<String> = Vec::new();
-    for name in tools.deny.iter().map(String::as_str).chain(inverted) {
-        if !names.iter().any(|kept| kept == name) {
-            names.push(name.to_owned());
+    for name in tools.deny.iter().cloned().chain(inverted).chain(heavy) {
+        if !names.contains(&name) {
+            names.push(name);
         }
     }
     names

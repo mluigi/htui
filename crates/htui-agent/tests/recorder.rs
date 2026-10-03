@@ -1013,6 +1013,39 @@ impl WriteStore for SpyStore {
     async fn item_by_key(&self, project: ProjectId, key: &str) -> StoreResult<Option<ItemId>> {
         self.inner.item_by_key(project, key).await
     }
+    async fn enqueue_command(&self, new: NewCommandRun) -> StoreResult<CommandRun> {
+        self.inner.enqueue_command(new).await
+    }
+    async fn claim_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> StoreResult<Option<CommandRun>> {
+        self.inner.claim_command(id, claimant, limit).await
+    }
+    async fn beat_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+    ) -> StoreResult<bool> {
+        self.inner.beat_command(id, claimant).await
+    }
+    async fn finish_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        status: htui_core::model::CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> StoreResult<bool> {
+        self.inner
+            .finish_command(id, claimant, status, exit_code, output)
+            .await
+    }
+    async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> StoreResult<bool> {
+        self.inner.cancel_command(id).await
+    }
     // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
     async fn set_requirement_spec(
         &self,

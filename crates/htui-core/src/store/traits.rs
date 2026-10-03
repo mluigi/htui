@@ -48,21 +48,21 @@ use crate::model::skill_language;
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, BindingChange, BoxEdit, BoxId,
     BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
-    CoverageRow, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter,
-    ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision,
-    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewPersona,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, RelaySessionId,
-    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
+    ItemRequirement, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
+    NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
+    PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOutcome, StepPermission, StepStatus, ToolCallCount, UpstreamEntry, UserId,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -1865,6 +1865,68 @@ pub trait WriteStore: ReadStore {
     /// # Errors
     /// The backend's own failures only.
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>>;
+
+    // -- MOD-11 M4: the command queue (plan D14, OQ-3, B-16) ------------------------------------
+
+    /// D14: inserts a `queued` row. The row's own fields are the caller's (F-S), `queued_at`
+    /// included: admission order is `(queued_at, id)`. Its heartbeat is stamped now (R-3), so a
+    /// waiter that dies before its first claim is reaped like one that dies later.
+    ///
+    /// # Errors
+    /// `Constraint(command_not_queued())` when `new.status != Queued` or any of `started_at`,
+    /// `finished_at`, `exit_code`, `output` is set (before any read); then
+    /// [`record_command_run`](Self::record_command_run)'s errors.
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun>;
+
+    /// D14: admits `id` when it is the oldest `queued` row of its `(box, class)` and fewer than
+    /// `limit` rows of that pair are `running`, after reaping that pair's stale rows (heartbeat
+    /// older than [`COMMAND_STALE_AFTER`]): `running` ones `failed` (OQ-3), `queued` ones whose
+    /// waiter stopped asking `cancelled` (R-3: a dead waiter would otherwise stand first in line
+    /// for ever); either way `finished_at` now, `output` += [`reaped_note`]. Asking beats the
+    /// `queued` row first, so a waiter that asks at least once per [`COMMAND_STALE_AFTER`] is
+    /// never reaped; a `queued` row with no heartbeat (none `enqueue_command` wrote) never is.
+    /// `Ok(None)`: not admitted now (wait and ask again). `limit` 0 reads as 1.
+    /// An admitted row is `running` under `claimant`, `started_at` now, heartbeat now.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "command_run" }`;
+    /// `Constraint(command_not_claimable(status))` when the row is no longer `queued`
+    /// (cancelled, reaped, or another claimant's).
+    async fn claim_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> Result<Option<CommandRun>>;
+
+    /// D14: `heartbeat_at = now` while `id` is `running` under `claimant`. `Ok(false)`: it is not
+    /// (reaped, cancelled, finished, or never was) — the executor kills its child.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn beat_command(&self, id: CommandRunId, claimant: Uuid) -> Result<bool>;
+
+    /// D14: `running → status` (`done | failed | cancelled`) with `exit_code`, `output` (already
+    /// scrubbed and capped) and `finished_at` now, while `claimant` holds it. `Ok(false)`: it
+    /// does not, and nothing moved.
+    ///
+    /// # Errors
+    /// `Constraint(command_finish_status(status))` for `queued | running` (before any read).
+    async fn finish_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        status: CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> Result<bool>;
+
+    /// D14: `queued | running → cancelled`, `finished_at` now; a running row's claimant then
+    /// beats `false` and kills its child. `Ok(false)`: already terminal.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "command_run" }`.
+    async fn cancel_command(&self, id: CommandRunId) -> Result<bool>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -2456,6 +2518,39 @@ pub fn link_key(from: ItemId, to: ItemId, kind: LinkKind) -> String {
 pub fn link_not_proposed_by_run(key: &str) -> String {
     format!("link {key} was not proposed by this run")
 }
+
+// ---- MOD-11 M4: the command queue's refusals and clocks (plan D14, OQ-3, B-16) ----
+
+/// B-16: [`WriteStore::enqueue_command`] writes a row that has not started yet.
+#[must_use]
+pub fn command_not_queued() -> String {
+    "an enqueued command run is `queued`, with no start, finish, exit code or output".to_owned()
+}
+
+/// D14: [`WriteStore::claim_command`] admits only a `queued` row.
+#[must_use]
+pub fn command_not_claimable(status: CommandRunStatus) -> String {
+    format!("command is {status}, not queued")
+}
+
+/// D14: [`WriteStore::finish_command`] ends a row; `queued` and `running` are not ends.
+#[must_use]
+pub fn command_finish_status(status: CommandRunStatus) -> String {
+    format!("a command run finishes as done, failed or cancelled, not {status}")
+}
+
+/// OQ-3: the line a reaped row's `output` gains.
+#[must_use]
+pub fn reaped_note() -> String {
+    "reaped: its host stopped heartbeating (MOD-11 OQ-3)".to_owned()
+}
+
+/// OQ-3: how often a claimant beats a `running` row it executes.
+pub const COMMAND_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// OQ-3: a `running` row whose heartbeat is older than this (three beats) is reaped by the next
+/// claim of its `(box, class)`.
+pub const COMMAND_STALE_AFTER: TimeDelta = TimeDelta::seconds(30);
 
 /// §4.5: `select_fanout` takes a winner from the candidates of one `(run, position, attempt)`.
 #[must_use]

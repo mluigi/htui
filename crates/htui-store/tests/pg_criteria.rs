@@ -6454,3 +6454,324 @@ async fn a_step_document_racing_a_park_never_deadlocks() {
 
     db.drop_db().await;
 }
+
+/// MOD-11 D14: a `queued` `build` row on the fixture's `R2/prd` step and box, queued at `at`.
+fn queued_build(at: DateTime<Utc>) -> NewCommandRun {
+    NewCommandRun {
+        id: CommandRunId::new(),
+        run_step_id: ids::STEP_R2_PRD,
+        box_id: ids::BOX,
+        class: "build".to_owned(),
+        command: "make".to_owned(),
+        cwd: "/srv/trees/prd/core".to_owned(),
+        status: CommandRunStatus::Queued,
+        exit_code: None,
+        output: None,
+        queued_at: at,
+        started_at: None,
+        finished_at: None,
+    }
+}
+
+/// MOD-11 D14, R-3: claims racing on two pools never run more than the class limit. Eight
+/// tasks own three `build` commands each (task `i` owns rows `i`, `i + 8`, `i + 16` of the
+/// queue) and loop claim → sleep 20 ms → finish; a sampler on a third connection counts the
+/// `running` rows throughout. The `pg_advisory_xact_lock` per `(box, class)` serialises the
+/// count-then-admit, so the count never passes 2, and every command ends `done`.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_claims_never_exceed_the_class_limit() {
+    const LIMIT: u32 = 2;
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let second = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let t0 = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let mut rows = Vec::new();
+    for n in 0..24 {
+        let new = queued_build(t0 + TimeDelta::milliseconds(n));
+        db.store.enqueue_command(new.clone()).await.expect("queue");
+        rows.push(new.id);
+    }
+
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let sampler = {
+        let pool = db.pool.clone();
+        let done = done.clone();
+        tokio::spawn(async move {
+            let mut most = 0_i64;
+            let mut samples = 0_u32;
+            while !done.load(std::sync::atomic::Ordering::SeqCst) {
+                let running: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM command_run WHERE box_id = $1 AND class = 'build' \
+                     AND status = 'running'",
+                )
+                .bind(ids::BOX.as_uuid())
+                .fetch_one(&pool)
+                .await
+                .expect("sample the running rows");
+                most = most.max(running);
+                samples += 1;
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+            (most, samples)
+        })
+    };
+
+    let tasks = (0..8_usize).map(|task| {
+        let store = if task % 2 == 0 {
+            db.store.clone()
+        } else {
+            second.clone()
+        };
+        let mine: Vec<CommandRunId> = rows.iter().copied().skip(task).step_by(8).collect();
+        tokio::spawn(async move {
+            for id in mine {
+                let claimant = uuid::Uuid::now_v7();
+                loop {
+                    match store.claim_command(id, claimant, LIMIT).await {
+                        Ok(Some(_)) => break,
+                        Ok(None) => tokio::time::sleep(std::time::Duration::from_millis(5)).await,
+                        Err(err) => panic!("task {task}: claim {id}: {err}"),
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                assert!(
+                    store
+                        .finish_command(
+                            id,
+                            claimant,
+                            CommandRunStatus::Done,
+                            Some(0),
+                            Some("ok".to_owned())
+                        )
+                        .await
+                        .expect("finish"),
+                    "task {task}: the claimant finishes {id}"
+                );
+            }
+        })
+    });
+    for task in join_all(tasks).await {
+        task.expect("a claiming task");
+    }
+    done.store(true, std::sync::atomic::Ordering::SeqCst);
+    let (most, samples) = sampler.await.expect("the sampler");
+
+    assert!(samples > 0, "the sampler ran");
+    assert!(
+        most <= i64::from(LIMIT),
+        "at most {LIMIT} build rows ran at once, saw {most}"
+    );
+    let statuses = db
+        .store
+        .command_runs(ids::STEP_R2_PRD)
+        .await
+        .expect("read back");
+    assert_eq!(statuses.len(), 24, "all 24 rows read back");
+    assert!(
+        statuses
+            .iter()
+            .all(|row| row.status == CommandRunStatus::Done && row.finished_at.is_some()),
+        "all 24 end done: {statuses:?}"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-11 OQ-3: a `running` row whose heartbeat is older than three beats is reaped by the next
+/// claim of its `(box, class)`: `failed`, finished, the reaping note appended to what it had
+/// printed, and the next row admitted. The heartbeat is backdated by raw SQL, the one way to
+/// stage a stale row on a server that stamps with `clock_timestamp()` (F-22).
+#[tokio::test]
+async fn a_stale_heartbeat_is_reaped_by_the_next_claim() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let t0 = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let stuck = queued_build(t0);
+    let next = queued_build(t0 + TimeDelta::seconds(1));
+    for new in [&stuck, &next] {
+        db.store.enqueue_command(new.clone()).await.expect("queue");
+    }
+    let gone = uuid::Uuid::now_v7();
+    assert!(
+        db.store
+            .claim_command(stuck.id, gone, 1)
+            .await
+            .expect("claim")
+            .is_some(),
+        "the first row is admitted"
+    );
+    let claimed: (Option<uuid::Uuid>, bool) = sqlx::query_as(
+        "SELECT claimed_by, heartbeat_at IS NOT NULL FROM command_run WHERE id = $1",
+    )
+    .bind(stuck.id.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the claim");
+    assert_eq!(
+        claimed,
+        (Some(gone), true),
+        "the claim stamps claimed_by and heartbeat_at"
+    );
+    assert!(
+        db.store.beat_command(stuck.id, gone).await.expect("beat"),
+        "the claimant beats"
+    );
+    assert_eq!(
+        db.store
+            .claim_command(next.id, gone, 1)
+            .await
+            .expect("claim"),
+        None,
+        "a live row holds the one slot"
+    );
+
+    sqlx::query(
+        "UPDATE command_run SET heartbeat_at = now() - interval '1 minute', output = 'partial' \
+         WHERE id = $1",
+    )
+    .bind(stuck.id.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("backdate the heartbeat");
+
+    let admitted = db
+        .store
+        .claim_command(next.id, uuid::Uuid::now_v7(), 1)
+        .await
+        .expect("claim");
+    assert_eq!(
+        admitted.map(|row| (row.id, row.status)),
+        Some((next.id, CommandRunStatus::Running)),
+        "the stale row is reaped and the next admitted"
+    );
+    let rows = db
+        .store
+        .command_runs(ids::STEP_R2_PRD)
+        .await
+        .expect("read back");
+    let reaped = rows
+        .iter()
+        .find(|row| row.id == stuck.id)
+        .expect("the stuck row");
+    assert_eq!(
+        (
+            reaped.status,
+            reaped.finished_at.is_some(),
+            reaped.output.clone()
+        ),
+        (
+            CommandRunStatus::Failed,
+            true,
+            Some(format!(
+                "partial\n{}",
+                htui_core::store::traits::reaped_note()
+            ))
+        ),
+        "failed, finished, the note appended to its output"
+    );
+    assert!(
+        !db.store.beat_command(stuck.id, gone).await.expect("beat"),
+        "the reaped claimant's beat answers false"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-11 OQ-3 for a `queued` row (R-3): `enqueue_command` stamps the heartbeat and each claim of
+/// the row beats it, so a row whose waiter died — a host killed outright, a call dropped before
+/// its guard existed — is cancelled by the next claim of its `(box, class)` once its heartbeat is
+/// older than three beats, instead of standing first in line for ever. The heartbeat is
+/// backdated by raw SQL (F-22). Memory's half: `mem.rs::an_orphaned_queued_row_is_reaped_by_the_next_claim`.
+#[tokio::test]
+async fn an_orphaned_queued_row_is_reaped_by_the_next_claim() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let t0 = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let orphan = queued_build(t0);
+    let next = queued_build(t0 + TimeDelta::seconds(1));
+    for new in [&orphan, &next] {
+        db.store.enqueue_command(new.clone()).await.expect("queue");
+    }
+    let stamped: (Option<uuid::Uuid>, bool) = sqlx::query_as(
+        "SELECT claimed_by, heartbeat_at IS NOT NULL FROM command_run WHERE id = $1",
+    )
+    .bind(orphan.id.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the stamp");
+    assert_eq!(
+        stamped,
+        (None, true),
+        "the enqueue stamps the heartbeat, and no claimant"
+    );
+    let claimant = uuid::Uuid::now_v7();
+    assert_eq!(
+        db.store
+            .claim_command(next.id, claimant, 1)
+            .await
+            .expect("claim"),
+        None,
+        "a live queued row ahead holds the line"
+    );
+
+    sqlx::query("UPDATE command_run SET heartbeat_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(orphan.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("backdate the heartbeat");
+    sqlx::query("UPDATE command_run SET heartbeat_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(next.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("backdate the asking row too: its own claim beats it first");
+
+    let admitted = db
+        .store
+        .claim_command(next.id, claimant, 1)
+        .await
+        .expect("claim");
+    assert_eq!(
+        admitted.map(|row| (row.id, row.status)),
+        Some((next.id, CommandRunStatus::Running)),
+        "the orphan is reaped and the asking row admitted"
+    );
+    let rows = db
+        .store
+        .command_runs(ids::STEP_R2_PRD)
+        .await
+        .expect("read back");
+    let reaped = rows
+        .iter()
+        .find(|row| row.id == orphan.id)
+        .expect("the orphan");
+    assert_eq!(
+        (
+            reaped.status,
+            reaped.finished_at.is_some(),
+            reaped.output.clone()
+        ),
+        (
+            CommandRunStatus::Cancelled,
+            true,
+            Some(htui_core::store::traits::reaped_note())
+        ),
+        "cancelled, finished, with the note"
+    );
+    assert!(
+        matches!(
+            db.store
+                .claim_command(orphan.id, uuid::Uuid::now_v7(), 1)
+                .await,
+            Err(htui_core::store::StoreError::Constraint(_))
+        ),
+        "the reaped row is no longer claimable"
+    );
+
+    db.drop_db().await;
+}

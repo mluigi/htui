@@ -17,7 +17,10 @@ use std::sync::Arc;
 
 use chrono::TimeDelta;
 use futures::future::Either;
+use htui_agent::driver::{PermissionMatch, PermissionPolicy, PermissionRule, SessionSpec};
+use htui_agent::event::PermissionOptionKind;
 use htui_core::fixtures::ids;
+use htui_core::model::kind::HEAVY_COMMAND_PREFIXES;
 use htui_core::model::{
     AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome,
     Isolation, Item, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId,
@@ -39,7 +42,7 @@ use uuid::Uuid;
 use crate::command::{
     Command, CommandOutcome, EngineError, GateAnswer, OpeningPath, Rest, UnblockCase,
 };
-use crate::engine::{Adopted, Next, Resume, Tails};
+use crate::engine::{Adopted, Next, Resume, SessionKey, Tails};
 use crate::fake::{
     FakeIsolator, FakeOrchestrator, FakeVerifier, RESTART_GAP, ScriptedStep, TestClock,
 };
@@ -198,6 +201,16 @@ pub trait Orchestrate {
         kind: &str,
         body: &str,
     ) -> Result<(), htui_core::store::StoreError>;
+
+    /// MOD-11 D16, D17: the spec the session at `key` was started with — its exposure and its
+    /// policy — or `None` before it started. Out of the blueprint's §4.5 list for the reason
+    /// [`verifier`](Orchestrate::verifier) is: the exposure and the denials are not rows, and
+    /// nothing else on this trait can say what the agent was handed.
+    fn spec_for(&self, key: &SessionKey<'_>) -> Option<SessionSpec>;
+
+    /// MOD-42 plan D9: `agent`'s own permission policy in every engine this orchestrator builds,
+    /// so a case can tell the agent's rules from the ones the walk splices in (MOD-11 D17).
+    fn set_policy(&self, agent: AgentId, policy: PermissionPolicy);
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -300,6 +313,14 @@ impl Orchestrate for FakeOrchestrator {
     ) -> Result<(), htui_core::store::StoreError> {
         Self::author(self, item, step, kind, body).await.map(drop)
     }
+
+    fn spec_for(&self, key: &SessionKey<'_>) -> Option<SessionSpec> {
+        Self::spec_for(self, key)
+    }
+
+    fn set_policy(&self, agent: AgentId, policy: PermissionPolicy) {
+        Self::set_policy(self, agent, policy);
+    }
 }
 
 /// Blueprint A-2: poll `fut` until `stalled` fires, then **drop it** where it stands — a process
@@ -319,11 +340,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Ninety-one, and the count is pinned in two places on purpose — here by
+/// Ninety-eight, and the count is pinned in two places on purpose — here by
 /// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
 /// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 5.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 6.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -391,6 +412,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// phase, a persona edit that does not reach a started run, the judge without a persona, a
 /// persona without `command_run` dropping the `command_queue` section, and the agent row a
 /// persona-bound run leaves untouched.
+///
+/// **Six for MOD-11 T8** (plan D16, D17, OQ-6): `fan_out_only` without a fan-out or a
+/// `heavy_build` item exposes nothing, a fan-out of two and a `heavy_build` item do; an exposed
+/// step's policy opens with the R-MCP-4 denials with and without a persona; a judge never gets
+/// `command_run`.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -594,6 +620,16 @@ pub const CASES: &[&str] = &[
     "a_persona_without_command_run_drops_the_command_queue_section",
     // MOD-26 PRD metric: a persona-bound run leaves the agent row untouched.
     "a_persona_run_leaves_the_agent_row_untouched",
+    // MOD-11 D16, OQ-6: `fan_out_only` exposes `command_run` (and renders its section) only to a
+    // fanned-out step or a `heavy_build` item.
+    "a_single_fan_out_fan_out_only_step_has_no_command_queue_section",
+    "a_fan_out_two_step_has_it",
+    "a_heavy_build_item_has_it",
+    // MOD-11 D17: an exposed step's policy opens with the R-MCP-4 denials, persona or not.
+    "a_persona_less_exposed_step_gets_the_denials_first",
+    "a_persona_step_gets_the_denials_first_too",
+    // MOD-11 D16: the judge's phase is `off`; a judge never gets `command_run`.
+    "judges_never_get_command_run",
 ];
 
 /// Run one case by name.
@@ -618,6 +654,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     hand_back_case(name, harness)
         .or_else(|| persona_case(name, harness))
+        .or_else(|| command_queue_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -909,6 +946,28 @@ fn persona_case<'a, H: CaseHarness>(
         "a_persona_run_leaves_the_agent_row_untouched" => {
             Box::pin(a_persona_run_leaves_the_agent_row_untouched(harness))
         }
+        _ => return None,
+    })
+}
+
+/// [`case`] for MOD-11 T8's six (plan D16, D17), boxed for [`case`]'s reason.
+fn command_queue_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_single_fan_out_fan_out_only_step_has_no_command_queue_section" => {
+            Box::pin(a_single_fan_out_fan_out_only_step_has_no_command_queue_section(harness))
+        }
+        "a_fan_out_two_step_has_it" => Box::pin(a_fan_out_two_step_has_it(harness)),
+        "a_heavy_build_item_has_it" => Box::pin(a_heavy_build_item_has_it(harness)),
+        "a_persona_less_exposed_step_gets_the_denials_first" => {
+            Box::pin(a_persona_less_exposed_step_gets_the_denials_first(harness))
+        }
+        "a_persona_step_gets_the_denials_first_too" => {
+            Box::pin(a_persona_step_gets_the_denials_first_too(harness))
+        }
+        "judges_never_get_command_run" => Box::pin(judges_never_get_command_run(harness)),
         _ => return None,
     })
 }
@@ -7181,6 +7240,253 @@ async fn a_persona_run_leaves_the_agent_row_untouched<H: CaseHarness>(harness: &
     assert_eq!(claude(&orch).await, before, "the agent row is untouched");
 }
 
+// -- MOD-11 T8: the command queue's exposure and the R-MCP-4 denials (plan D16, D17) --------
+
+/// The session key of `phase`'s first attempt, candidate `fanout_index`, first call.
+fn session(phase: &str, fanout_index: i32) -> SessionKey<'_> {
+    SessionKey {
+        phase,
+        attempt: 1,
+        fanout_index,
+        call: 0,
+    }
+}
+
+/// The spec the session at `key` started with.
+///
+/// # Panics
+/// When that session never started.
+fn spec_of<O: Orchestrate>(orch: &O, key: &SessionKey<'_>) -> SessionSpec {
+    orch.spec_for(key)
+        .unwrap_or_else(|| panic!("the session {key:?} started"))
+}
+
+/// MOD-11 D17: the fifteen rules an exposed step's policy opens with, one per OQ-5 prefix, in its
+/// order.
+fn heavy_denials() -> Vec<PermissionRule> {
+    HEAVY_COMMAND_PREFIXES
+        .iter()
+        .map(|prefix| PermissionRule {
+            matcher: PermissionMatch {
+                tool_kind: Some("execute".to_owned()),
+                command_prefix: Some((*prefix).to_owned()),
+                ..PermissionMatch::default()
+            },
+            answer: PermissionOptionKind::RejectOnce,
+            reason: format!("run `{prefix}` through htui's `command_run` tool (R-MCP-4)"),
+        })
+        .collect()
+}
+
+/// An agent rule a case gives `claude`, so the denials can be told from the agent's own.
+fn agent_rule() -> PermissionRule {
+    PermissionRule {
+        matcher: PermissionMatch {
+            tool_name: Some("Write".to_owned()),
+            ..PermissionMatch::default()
+        },
+        answer: PermissionOptionKind::AllowOnce,
+        reason: "the agent's own rule".to_owned(),
+    }
+}
+
+/// Whether a session's spec carries any of the R-MCP-4 denials.
+fn has_denials(spec: &SessionSpec) -> bool {
+    let denials = heavy_denials();
+    spec.permission
+        .rules
+        .iter()
+        .any(|rule| denials.contains(rule))
+}
+
+/// MOD-11 D16, OQ-6: the seeded `prd` phase is `fan_out_only` with one agent and `FEAT-3` carries
+/// no `heavy_build`: no `command_queue` section (which the engine rendered for every phase not
+/// `off` before MOD-11), no `command_run`, no denial.
+async fn a_single_fan_out_fan_out_only_step_has_no_command_queue_section<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let sections = prompt_sections(&orch, at(&steps_of(&orch, run).await, 0, 1).id).await;
+    assert!(
+        !sections.iter().any(|section| section == "command_queue"),
+        "fan_out_only at one agent renders no section: {sections:?}"
+    );
+    let spec = spec_of(&orch, &session("prd", 0));
+    assert!(!spec.tools.command_run, "nor exposes `command_run`");
+    assert!(!has_denials(&spec), "nor denies a heavy command");
+}
+
+/// MOD-11 D16: `research` fanned out to two agents under `fan_out_only` exposes `command_run` to
+/// both candidates, with the section and the denials.
+async fn a_fan_out_two_step_has_it<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    repoint(&orch, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "research" {
+            phase.fan_out = 2;
+        }
+        phase.gate = Gate::Never;
+    })
+    .await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    for index in 0..2 {
+        orch.script_candidate(
+            "research",
+            1,
+            index,
+            0,
+            ScriptedStep::done_with_output(&format!("research by candidate {index}")),
+        );
+    }
+    judge_both(&orch, "research", 1, 1, "the more thorough");
+
+    let (run, _) = start(&orch, ids::HTUI_ANA_2).await;
+    let steps = steps_of(&orch, run).await;
+    for index in 0..2 {
+        let sections = prompt_sections(&orch, candidate(&steps, 0, 1, index).id).await;
+        assert!(
+            sections.iter().any(|section| section == "command_queue"),
+            "candidate {index} of two renders the section: {sections:?}"
+        );
+        let spec = spec_of(&orch, &session("research", index));
+        assert!(
+            spec.tools.command_run,
+            "candidate {index} gets `command_run`"
+        );
+        assert!(has_denials(&spec), "and the denials");
+    }
+}
+
+/// MOD-11 D16, R-MCP-3: a `heavy_build` item queues its commands under `fan_out_only` without a
+/// fan-out.
+async fn a_heavy_build_item_has_it<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    declare_tags(&orch, &["heavy_build"]).await;
+    require_tags(&orch, ids::HTUI_FEAT_3, &["heavy_build"]).await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let sections = prompt_sections(&orch, at(&steps_of(&orch, run).await, 0, 1).id).await;
+    assert!(
+        sections.iter().any(|section| section == "command_queue"),
+        "a heavy_build item renders the section at one agent: {sections:?}"
+    );
+    let spec = spec_of(&orch, &session("prd", 0));
+    assert!(spec.tools.command_run, "and exposes `command_run`");
+    assert!(has_denials(&spec), "with the denials");
+}
+
+/// MOD-11 D17: a persona-less exposed step's rules are the fifteen denials, in OQ-5's order, then
+/// the agent's own, untouched.
+async fn a_persona_less_exposed_step_gets_the_denials_first<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.command_queue = CommandQueue::Always;
+        }
+    })
+    .await;
+    orch.set_policy(
+        ids::AGENT_CLAUDE,
+        PermissionPolicy {
+            rules: vec![agent_rule()],
+            ..PermissionPolicy::default()
+        },
+    );
+    start(&orch, ids::HTUI_FEAT_3).await;
+    let spec = spec_of(&orch, &session("prd", 0));
+    assert!(spec.tools.command_run, "`always` exposes `command_run`");
+    let mut expected = heavy_denials();
+    expected.push(agent_rule());
+    assert_eq!(
+        spec.permission.rules, expected,
+        "the denials first, then the agent's rule"
+    );
+}
+
+/// MOD-11 D17: with a persona bound the denials still come first — ahead of the persona's
+/// narrowing rules and the agent's own — because they are spliced after `narrow`, not in it.
+async fn a_persona_step_gets_the_denials_first_too<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.command_queue = CommandQueue::Always;
+        }
+    })
+    .await;
+    orch.set_policy(
+        ids::AGENT_CLAUDE,
+        PermissionPolicy {
+            rules: vec![agent_rule()],
+            ..PermissionPolicy::default()
+        },
+    );
+    bind_persona(&orch, ids::HTUI_FEAT_3, "prd", "reviewer").await;
+    let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
+    let sections = prompt_sections(&orch, at(&steps_of(&orch, run).await, 0, 1).id).await;
+    assert!(
+        sections.iter().any(|section| section == "persona"),
+        "the persona ran: {sections:?}"
+    );
+    let spec = spec_of(&orch, &session("prd", 0));
+    assert!(
+        spec.tools.command_run,
+        "the seed persona keeps `command_run`"
+    );
+    let denials = heavy_denials();
+    assert_eq!(
+        spec.permission.rules.get(..denials.len()),
+        Some(denials.as_slice()),
+        "the denials open the policy"
+    );
+    assert_eq!(
+        spec.permission.rules.last(),
+        Some(&agent_rule()),
+        "and the agent's own rule closes it, after the persona's"
+    );
+}
+
+/// MOD-11 D16: a judged fan-out exposes `command_run` to its candidates, never to the judge,
+/// whose phase is `off`: no section, no tool, no denial.
+async fn judges_never_get_command_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    fan_research(&orch, Gate::Never, false).await;
+    set_judge(&orch, ids::HTUI_ANA_2).await;
+    research_candidates(&orch, 1);
+    judge_both(&orch, "research", 1, 1, "the most thorough");
+    let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(rest.run, RunStatus::Done, "the judged run walks to done");
+    let steps = steps_of(&orch, run).await;
+    assert!(
+        spec_of(&orch, &session("research", 0)).tools.command_run,
+        "a candidate of three is exposed"
+    );
+    let judge = judge_of(&steps, 0, 1).expect("the judge is a step");
+    let sections = prompt_sections(&orch, judge.id).await;
+    assert!(
+        !sections.iter().any(|section| section == "command_queue"),
+        "the judge renders no section: {sections:?}"
+    );
+    for call in 0..2 {
+        let spec = spec_of(
+            &orch,
+            &SessionKey {
+                phase: "research:judge",
+                attempt: 1,
+                fanout_index: -1,
+                call,
+            },
+        );
+        assert!(
+            !spec.tools.command_run,
+            "judge call {call}: no `command_run`"
+        );
+        assert!(!has_denials(&spec), "judge call {call}: no denial");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -7205,8 +7511,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            92,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            98,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -7235,7 +7541,9 @@ mod tests {
              one (a crashed rejection's `u` handed back and failed by the adopter), and MOD-26's five \
              persona cases (plan D9, D12, D13, OQ-2: the persona frame, an edit that does not \
              reach a started run, the judge without a persona, `command_run` dropping the \
-             `command_queue` section, and the agent row left untouched)"
+             `command_queue` section, and the agent row left untouched), and MOD-11 T8's six \
+             (plan D16, D17: `fan_out_only` at one agent, at two and on a `heavy_build` item, \
+             the denials with and without a persona, and the judge never exposed)"
         );
     }
 

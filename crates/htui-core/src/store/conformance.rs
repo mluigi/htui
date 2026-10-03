@@ -44,8 +44,9 @@ use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome,
     RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
-    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, document_needs_a_step,
-    has_nul, illegal_move, invalid_area_code, invalid_persona_name, kind_not_narrowable, link_key,
+    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, command_finish_status,
+    command_not_claimable, command_not_queued, document_needs_a_step, has_nul, illegal_move,
+    invalid_area_code, invalid_persona_name, kind_not_narrowable, link_key,
     link_not_proposed_by_run, link_outside_project, not_a_tool_name, note_needs_a_step,
     references_no_row, requirement_withdrawn, resolution_not_closable, rule_kind_unknown,
     self_link, step_writes_own_item, withdrawn_requirement_cited,
@@ -193,6 +194,10 @@ pub const CASES: &[&str] = &[
     "propose_link_upserts_revives_and_keeps_a_live_proposer",
     "withdraw_link_only_what_this_run_proposed",
     "item_by_key_answers_within_its_project",
+    "enqueue_command_queues_on_an_existing_step",
+    "claim_command_admits_up_to_the_limit_in_queue_order",
+    "beat_and_finish_need_the_claimant",
+    "cancel_command_ends_a_queued_or_running_row",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -497,6 +502,16 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "item_by_key_answers_within_its_project" => {
             item_by_key_answers_within_its_project(store).await;
+        }
+        "enqueue_command_queues_on_an_existing_step" => {
+            enqueue_command_queues_on_an_existing_step(store).await;
+        }
+        "claim_command_admits_up_to_the_limit_in_queue_order" => {
+            claim_command_admits_up_to_the_limit_in_queue_order(store).await;
+        }
+        "beat_and_finish_need_the_claimant" => beat_and_finish_need_the_claimant(store).await,
+        "cancel_command_ends_a_queued_or_running_row" => {
+            cancel_command_ends_a_queued_or_running_row(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -16983,6 +16998,469 @@ async fn item_by_key_answers_within_its_project<S: WriteStore>(store: &S) {
             "{CASE}: `{key}` in project {project}"
         );
     }
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-11 T8 (plan D14, OQ-3, blueprint B-16): the command queue. A row is enqueued `queued`, a
+// claim admits the oldest `queued` row of its `(box, class)` while fewer than the class limit
+// run, only the claimant beats or finishes it, and a cancel ends it from either live state. The
+// reaping of a stale heartbeat needs a clock the suite cannot move on Postgres (F-22).
+// ------------------------------------------------------------------------------------------
+
+/// MOD-11 D14: a `queued` row of `class` on the fixture's `R2/prd` step and box, queued at `at`.
+fn queued_command(class: &str, at: DateTime<Utc>) -> NewCommandRun {
+    NewCommandRun {
+        id: CommandRunId::new(),
+        run_step_id: ids::STEP_R2_PRD,
+        box_id: ids::BOX,
+        class: class.to_owned(),
+        command: format!("make {class}"),
+        cwd: "/srv/trees/prd/core".to_owned(),
+        status: CommandRunStatus::Queued,
+        exit_code: None,
+        output: None,
+        queued_at: at,
+        started_at: None,
+        finished_at: None,
+    }
+}
+
+/// The one `command_run` row `id` names, read back through the step's list.
+async fn command_row<S: WriteStore>(case: &str, store: &S, id: CommandRunId) -> CommandRun {
+    store
+        .command_runs(ids::STEP_R2_PRD)
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("{case}: command run {id} reads back"))
+}
+
+/// MOD-11 D14, B-16: [`WriteStore::enqueue_command`] writes a `queued` row that
+/// [`WriteStore::command_runs`] reads back as written; a row that is not `queued`, or carries a
+/// start, a finish, an exit code or an output, is refused before anything is read, and an unknown
+/// step is `NotFound` as `record_command_run` answers it.
+async fn enqueue_command_queues_on_an_existing_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "enqueue_command_queues_on_an_existing_step";
+    let t0 = seam_clock();
+    let new = queued_command("build", t0);
+    let written = store.enqueue_command(new.clone()).await.expect(CASE);
+    assert_eq!(
+        written,
+        CommandRun::from(new.clone()),
+        "{CASE}: every column is the caller's"
+    );
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        written,
+        "{CASE}: the queued row reads back"
+    );
+
+    let refusals = [
+        NewCommandRun {
+            status: CommandRunStatus::Running,
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            status: CommandRunStatus::Done,
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            started_at: Some(t0),
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            finished_at: Some(t0),
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            exit_code: Some(0),
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            output: Some("early".to_owned()),
+            ..queued_command("build", t0)
+        },
+        // Refused before the step is read: the B-16 shape first.
+        NewCommandRun {
+            run_step_id: StepId::new(),
+            status: CommandRunStatus::Running,
+            ..queued_command("build", t0)
+        },
+    ];
+    for refused in refusals {
+        let answer = store.enqueue_command(refused.clone()).await;
+        assert_eq!(
+            answer,
+            Err(StoreError::Constraint(command_not_queued())),
+            "{CASE}: {refused:?} is not a queued row"
+        );
+    }
+
+    let unknown = store
+        .enqueue_command(NewCommandRun {
+            run_step_id: StepId::new(),
+            ..queued_command("build", t0)
+        })
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {unknown:?}"
+    );
+    assert_eq!(
+        store
+            .command_runs(ids::STEP_R2_PRD)
+            .await
+            .expect(CASE)
+            .len(),
+        1,
+        "{CASE}: no refusal wrote a row"
+    );
+}
+
+/// MOD-11 D14: [`WriteStore::claim_command`] admits in `(queued_at, id)` order up to the limit.
+/// Three `build` rows on one box under a limit of 2: the youngest asked first is not admitted
+/// ahead of the older two, the two oldest run, the third waits until one of them finishes; a
+/// `test` row on the same box is another class with its own slots; a limit of 0 reads as 1; an
+/// unknown row is `NotFound` and a row already running is not claimable again. Two halves are
+/// not here: the limit under racing claimants on two pools,
+/// `pg_criteria.rs::concurrent_claims_never_exceed_the_class_limit`, and the reaping of a stale
+/// heartbeat, which needs a clock the suite cannot move on Postgres —
+/// `a_stale_running_row_is_reaped_by_the_next_claim` on `MemStore` and
+/// `pg_criteria.rs::a_stale_heartbeat_is_reaped_by_the_next_claim` by a raw-SQL backdate.
+async fn claim_command_admits_up_to_the_limit_in_queue_order<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_command_admits_up_to_the_limit_in_queue_order";
+    let t0 = seam_clock();
+    let first = queued_command("build", t0);
+    let second = queued_command("build", t0 + TimeDelta::seconds(1));
+    let third = queued_command("build", t0 + TimeDelta::seconds(2));
+    // Written youngest first: the order is the rows' `queued_at`, not insertion.
+    for new in [&third, &second, &first] {
+        store.enqueue_command(new.clone()).await.expect(CASE);
+    }
+    let claimant = Uuid::now_v7();
+
+    assert_eq!(
+        store
+            .claim_command(third.id, claimant, 2)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: the youngest is not admitted ahead of two older rows"
+    );
+    assert_eq!(
+        store
+            .claim_command(second.id, claimant, 2)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: nor the second ahead of the first"
+    );
+    let admitted = store
+        .claim_command(first.id, claimant, 2)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the oldest is admitted"));
+    assert_eq!(
+        (admitted.id, admitted.status, admitted.started_at.is_some()),
+        (first.id, CommandRunStatus::Running, true),
+        "{CASE}: the admitted row is running, started now"
+    );
+    assert_eq!(
+        (
+            admitted.finished_at,
+            admitted.exit_code,
+            admitted.output.clone()
+        ),
+        (None, None, None),
+        "{CASE}: and nothing else moved"
+    );
+    assert_eq!(
+        command_row(CASE, store, first.id).await,
+        admitted,
+        "{CASE}: the answer is the stored row"
+    );
+    assert!(
+        store
+            .claim_command(second.id, Uuid::now_v7(), 2)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: the second is admitted under the limit, by any claimant"
+    );
+    assert_eq!(
+        store
+            .claim_command(third.id, claimant, 2)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: two running: the third waits"
+    );
+
+    // Another class on the same box has its own slots.
+    let other_class = queued_command("test", t0 + TimeDelta::seconds(3));
+    store
+        .enqueue_command(other_class.clone())
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .claim_command(other_class.id, claimant, 0)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: `test` is admitted beside two `build` rows; a limit of 0 reads as 1"
+    );
+    let crowded = queued_command("test", t0 + TimeDelta::seconds(4));
+    store.enqueue_command(crowded.clone()).await.expect(CASE);
+    assert_eq!(
+        store
+            .claim_command(crowded.id, claimant, 0)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: and a limit of 0 admits exactly one"
+    );
+
+    assert!(
+        store
+            .finish_command(
+                first.id,
+                claimant,
+                CommandRunStatus::Done,
+                Some(0),
+                Some("built".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the first finishes"
+    );
+    let third_admitted = store
+        .claim_command(third.id, claimant, 2)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        third_admitted.map(|row| (row.id, row.status)),
+        Some((third.id, CommandRunStatus::Running)),
+        "{CASE}: a finished row frees its slot for the next in line"
+    );
+
+    let again = store.claim_command(third.id, claimant, 2).await;
+    assert_eq!(
+        again,
+        Err(StoreError::Constraint(command_not_claimable(
+            CommandRunStatus::Running
+        ))),
+        "{CASE}: a running row is not claimable again"
+    );
+    let unknown_id = CommandRunId::new();
+    let unknown = store.claim_command(unknown_id, claimant, 2).await;
+    assert_eq!(
+        unknown,
+        Err(StoreError::NotFound {
+            entity: "command_run",
+            id: unknown_id.to_string(),
+        }),
+        "{CASE}: an unknown row is NotFound"
+    );
+}
+
+/// MOD-11 D14: only the claimant beats or finishes a running row. A stranger's beat and finish
+/// answer `false` and move nothing; the claimant's finish lands its status, exit code and output
+/// with a finish instant, after which its own beat is `false`; finishing to `queued` or `running`
+/// is refused before anything is read.
+async fn beat_and_finish_need_the_claimant<S: WriteStore>(store: &S) {
+    const CASE: &str = "beat_and_finish_need_the_claimant";
+    let new = queued_command("build", seam_clock());
+    store.enqueue_command(new.clone()).await.expect(CASE);
+    let claimant = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+
+    assert!(
+        !store.beat_command(new.id, claimant).await.expect(CASE),
+        "{CASE}: a queued row has no claimant to beat"
+    );
+    let running = store
+        .claim_command(new.id, claimant, 1)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the row is admitted"));
+
+    assert!(
+        store.beat_command(new.id, claimant).await.expect(CASE),
+        "{CASE}: the claimant beats"
+    );
+    assert!(
+        !store.beat_command(new.id, stranger).await.expect(CASE),
+        "{CASE}: a stranger does not"
+    );
+    assert!(
+        !store
+            .finish_command(
+                new.id,
+                stranger,
+                CommandRunStatus::Done,
+                Some(0),
+                Some("not mine".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: nor finishes it"
+    );
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        running,
+        "{CASE}: the stranger moved nothing"
+    );
+
+    for status in [CommandRunStatus::Queued, CommandRunStatus::Running] {
+        let refused = store
+            .finish_command(new.id, claimant, status, None, None)
+            .await;
+        assert_eq!(
+            refused,
+            Err(StoreError::Constraint(command_finish_status(status))),
+            "{CASE}: `{status}` is not an end"
+        );
+    }
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        running,
+        "{CASE}: the refusals moved nothing"
+    );
+
+    assert!(
+        store
+            .finish_command(
+                new.id,
+                claimant,
+                CommandRunStatus::Done,
+                Some(3),
+                Some("3 tests failed".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the claimant finishes"
+    );
+    let done = command_row(CASE, store, new.id).await;
+    assert_eq!(
+        (done.status, done.exit_code, done.output.as_deref()),
+        (CommandRunStatus::Done, Some(3), Some("3 tests failed")),
+        "{CASE}: status, exit code and output land"
+    );
+    assert!(done.finished_at.is_some(), "{CASE}: with a finish instant");
+    assert_eq!(
+        done.started_at, running.started_at,
+        "{CASE}: the start is the claim's"
+    );
+    assert!(
+        !store.beat_command(new.id, claimant).await.expect(CASE),
+        "{CASE}: a finished row has no claimant to beat"
+    );
+    assert!(
+        !store
+            .finish_command(new.id, claimant, CommandRunStatus::Failed, None, None)
+            .await
+            .expect(CASE),
+        "{CASE}: nor to finish it twice"
+    );
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        done,
+        "{CASE}: the second finish moved nothing"
+    );
+}
+
+/// MOD-11 D14: [`WriteStore::cancel_command`] ends a `queued` or `running` row as `cancelled`
+/// with a finish instant; a running row's claimant then beats `false`, which is the executor's
+/// signal to kill its child. A terminal row answers `false` and stays as it is, a cancelled row
+/// is not claimable, and an unknown row is `NotFound`.
+async fn cancel_command_ends_a_queued_or_running_row<S: WriteStore>(store: &S) {
+    const CASE: &str = "cancel_command_ends_a_queued_or_running_row";
+    let t0 = seam_clock();
+    let queued = queued_command("build", t0);
+    let running = queued_command("build", t0 + TimeDelta::seconds(1));
+    store.enqueue_command(queued.clone()).await.expect(CASE);
+    store.enqueue_command(running.clone()).await.expect(CASE);
+
+    assert!(
+        store.cancel_command(queued.id).await.expect(CASE),
+        "{CASE}: a queued row is cancelled"
+    );
+    let cancelled = command_row(CASE, store, queued.id).await;
+    assert_eq!(
+        (cancelled.status, cancelled.finished_at.is_some()),
+        (CommandRunStatus::Cancelled, true),
+        "{CASE}: cancelled, with a finish instant"
+    );
+    assert_eq!(
+        store.claim_command(queued.id, Uuid::now_v7(), 1).await,
+        Err(StoreError::Constraint(command_not_claimable(
+            CommandRunStatus::Cancelled
+        ))),
+        "{CASE}: a cancelled row is not claimable"
+    );
+
+    let claimant = Uuid::now_v7();
+    assert!(
+        store
+            .claim_command(running.id, claimant, 1)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: the next row is admitted: a cancelled row is no longer in line"
+    );
+    assert!(
+        store.cancel_command(running.id).await.expect(CASE),
+        "{CASE}: a running row is cancelled"
+    );
+    let stopped = command_row(CASE, store, running.id).await;
+    assert_eq!(
+        (stopped.status, stopped.finished_at.is_some()),
+        (CommandRunStatus::Cancelled, true),
+        "{CASE}: cancelled, with a finish instant"
+    );
+    assert!(
+        !store.beat_command(running.id, claimant).await.expect(CASE),
+        "{CASE}: the claimant's next beat answers false"
+    );
+    assert!(
+        !store
+            .finish_command(running.id, claimant, CommandRunStatus::Done, Some(0), None)
+            .await
+            .expect(CASE),
+        "{CASE}: and its finish lands nothing"
+    );
+    assert_eq!(
+        command_row(CASE, store, running.id).await,
+        stopped,
+        "{CASE}: the row stays cancelled"
+    );
+
+    assert!(
+        !store.cancel_command(running.id).await.expect(CASE),
+        "{CASE}: a terminal row answers false"
+    );
+    assert_eq!(
+        command_row(CASE, store, running.id).await,
+        stopped,
+        "{CASE}: and stays as it is"
+    );
+    let unknown_id = CommandRunId::new();
+    assert_eq!(
+        store.cancel_command(unknown_id).await,
+        Err(StoreError::NotFound {
+            entity: "command_run",
+            id: unknown_id.to_string(),
+        }),
+        "{CASE}: an unknown row is NotFound"
+    );
 }
 
 #[cfg(test)]

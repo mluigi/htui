@@ -798,32 +798,39 @@ async fn repo_map<H: htui_core::store::WorkerHost>(
     Ok(repos)
 }
 
-/// The box row's `settings.command_limits`, else `{"verify": 1}` (D156): no row, no key, or a
-/// stored value that does not parse (warned) all get the default.
+/// MOD-11 D15: `app_setting.command_limits` overlaid key by key with the box row's
+/// `settings.command_limits` ([`resolve_command_limits`]). No row or no key is the app setting
+/// alone; a stored value that does not parse as a map of `u32` is warned, and its entries that do
+/// parse still overlay. A class neither names reads 1 (`ShellVerifier::new` for `verify`,
+/// `command_limit` for the queue), which was D156's `{"verify": 1}` default.
 ///
 /// D216 (review L7): a read that fails is not the default. `singletons` passes it up like the
 /// reads beside it, so no verifier is cached from it and the next command reads again. The limits
 /// are read once per build of the parts (per server): an edit to them reaches the next process
 /// (R-55), or this one when its repo map next moves (MOD-41 review R-1).
 ///
+/// [`resolve_command_limits`]: htui_core::model::kind::resolve_command_limits
+///
 /// # Errors
-/// The store's own read failure.
+/// The store's own read failures (the box row, then the app settings).
 async fn command_limits<H: htui_core::store::WorkerHost>(
     host: &H,
     box_id: BoxId,
 ) -> StoreResult<BTreeMap<String, u32>> {
-    let default = || BTreeMap::from([("verify".to_owned(), 1)]);
-    let Some(stored) = host
+    let stored = host
         .box_row(box_id)
         .await?
-        .and_then(|row| row.settings.get("command_limits").cloned())
-    else {
-        return Ok(default());
-    };
-    Ok(serde_json::from_value(stored).unwrap_or_else(|err| {
-        tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; verify runs one at a time");
-        default()
-    }))
+        .and_then(|row| row.settings.get("command_limits").cloned());
+    let app = host.app_settings().await?;
+    if let Some(stored) = &stored
+        && let Err(err) = serde_json::from_value::<BTreeMap<String, u32>>(stored.clone())
+    {
+        tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; the app setting stands where it does not");
+    }
+    Ok(htui_core::model::kind::resolve_command_limits(
+        stored.as_ref(),
+        &app,
+    ))
 }
 
 /// The engine every task builds, per step of work, over [`Kit`]'s parts: over the host's store
@@ -3008,7 +3015,8 @@ pub mod testing {
         super::retry_claims(ctx).await;
     }
 
-    /// `command_limits`: the box row's `settings.command_limits`, else the default.
+    /// `command_limits`: the box row's `settings.command_limits` over the app setting (MOD-11
+    /// D15).
     ///
     /// # Errors
     /// The store's own read failure.
@@ -3161,6 +3169,88 @@ mod tests {
 
         runtime.shared.publisher.publish(&changed(ids::HTUI_FEAT_1));
         assert_eq!(sink.frames_of(ids::HTUI_FEAT_1), [30]);
+    }
+
+    /// MOD-11 D15: with no box value the limits are `app_setting.command_limits`; a box's own
+    /// `settings.command_limits` overlays them key by key; a box value that does not parse
+    /// leaves the app's; with neither, nothing (every class then reads 1).
+    #[tokio::test]
+    async fn command_limits_falls_back_to_the_app_setting() {
+        use std::collections::BTreeMap;
+
+        use htui_core::model::BoxId;
+        use serde_json::json;
+
+        let with_box = |stored: Option<serde_json::Value>| {
+            let mut data = htui_core::fixtures::demo_data();
+            let row = data
+                .boxes
+                .iter_mut()
+                .find(|row| row.id == ids::BOX)
+                .expect("the demo box");
+            match stored {
+                Some(limits) => row.settings["command_limits"] = limits,
+                None => row.settings = json!({}),
+            }
+            MemStore::from_demo(data)
+        };
+        let seeded = json!({"build": 1, "test": 4, "verify": 1});
+        let app = BTreeMap::from([
+            ("build".to_owned(), 1),
+            ("test".to_owned(), 4),
+            ("verify".to_owned(), 1),
+        ]);
+
+        let store = with_box(None);
+        store.set_app_setting("command_limits", seeded.clone());
+        let backend = Backend::memory(store);
+        assert_eq!(
+            super::command_limits(&backend, BoxId::new())
+                .await
+                .expect("the read answers"),
+            app,
+            "no box row: the app setting"
+        );
+        assert_eq!(
+            super::command_limits(&backend, ids::BOX)
+                .await
+                .expect("the read answers"),
+            app,
+            "no box value: the app setting"
+        );
+
+        let store = with_box(Some(json!({"test": 2, "run": 3})));
+        store.set_app_setting("command_limits", seeded.clone());
+        assert_eq!(
+            super::command_limits(&Backend::memory(store), ids::BOX)
+                .await
+                .expect("the read answers"),
+            BTreeMap::from([
+                ("build".to_owned(), 1),
+                ("run".to_owned(), 3),
+                ("test".to_owned(), 2),
+                ("verify".to_owned(), 1),
+            ]),
+            "the box overlays the app key by key"
+        );
+
+        let store = with_box(Some(json!("many")));
+        store.set_app_setting("command_limits", seeded);
+        assert_eq!(
+            super::command_limits(&Backend::memory(store), ids::BOX)
+                .await
+                .expect("the read answers"),
+            app,
+            "a box value that does not parse leaves the app's"
+        );
+
+        assert_eq!(
+            super::command_limits(&Backend::memory(with_box(None)), ids::BOX)
+                .await
+                .expect("the read answers"),
+            BTreeMap::new(),
+            "neither: nothing, and every class reads 1"
+        );
     }
 
     /// Blueprint §0a point 3: a later subscription of the same subscriber replaces the earlier

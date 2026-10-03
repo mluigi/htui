@@ -1187,6 +1187,62 @@ impl WriteStore for Writer {
         }
     }
 
+    // ---- MOD-11 M4 (plan D14): the command queue ----
+
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
+        match self {
+            Self::Memory(store) => store.enqueue_command(new).await,
+            Self::Online(pg) => pg.enqueue_command(new).await,
+        }
+    }
+    async fn claim_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> Result<Option<CommandRun>> {
+        match self {
+            Self::Memory(store) => store.claim_command(id, claimant, limit).await,
+            Self::Online(pg) => pg.claim_command(id, claimant, limit).await,
+        }
+    }
+    async fn beat_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.beat_command(id, claimant).await,
+            Self::Online(pg) => pg.beat_command(id, claimant).await,
+        }
+    }
+    async fn finish_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        status: htui_core::model::CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .finish_command(id, claimant, status, exit_code, output)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.finish_command(id, claimant, status, exit_code, output)
+                    .await
+            }
+        }
+    }
+    async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.cancel_command(id).await,
+            Self::Online(pg) => pg.cancel_command(id).await,
+        }
+    }
+
     // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
 
     async fn set_requirement_spec(

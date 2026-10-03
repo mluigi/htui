@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE command_run SET status = 'cancelled', finished_at = clock_timestamp(), output = COALESCE(output || E'\\n', '') || $3 WHERE id IN (SELECT id FROM command_run WHERE box_id = $1 AND class = $2 AND status = 'queued' AND heartbeat_at < clock_timestamp() - $4::bigint * interval '1 microsecond' FOR UPDATE SKIP LOCKED)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d0a69830b60f66e7f50df3c26c1b461c77a20b0468dee8e4492e03bf17506e15"
+}

@@ -26,6 +26,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -455,6 +456,176 @@ async fn drain(reader: Option<impl tokio::io::AsyncRead + Unpin>, captured: &Mut
     }
 }
 
+// -- MOD-11 OQ-7 (blueprint B-15): `command_run`'s executor -------------------------------------
+
+/// How a [`run_shell`] child ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShellEnd {
+    /// It exited with a code ([`ShellRun::exit_code`]).
+    Exited,
+    /// The budget elapsed first: its process group (job object) was killed.
+    TimedOut,
+    /// It ended without an exit code: a signal, a wait that failed, or a kill because `stop`
+    /// resolved (the queue's claim was lost, MOD-11 D14).
+    Signalled,
+    /// The shell could not be started at all; [`ShellRun::output`] says why.
+    SpawnFailed,
+}
+
+/// OQ-7's executor's answer: `sh -c` / `cmd /C` in `cwd`, stdin null, stdout and stderr merged
+/// into a 64 KiB tail ([`CAPTURE_TAIL`]), supervised like a verify (process group / job object),
+/// killed at `budget`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRun {
+    /// The exit code, when it [`Exited`](ShellEnd::Exited).
+    pub exit_code: Option<i32>,
+    /// The merged output's last [`CAPTURE_TAIL`] bytes, lossily decoded and **not** scrubbed (the
+    /// caller scrubs before storing or returning it, `R-SEC-3`); a spawn failure's reason.
+    pub output: String,
+    /// Whether more was printed than [`output`](Self::output) kept.
+    pub truncated: bool,
+    /// How it ended.
+    pub ended: ShellEnd,
+}
+
+/// MOD-11 OQ-7 (blueprint B-15): runs `command` through the platform shell in `cwd` with the
+/// process environment unchanged, both pipes drained into one tail, until it exits, `budget`
+/// elapses, or `stop` resolves — the last two kill the whole process group (job object on
+/// Windows), so a `cargo test`'s test binaries die with it. Infallible: a shell that cannot start
+/// is [`ShellEnd::SpawnFailed`].
+pub async fn run_shell(
+    command: &str,
+    cwd: &Path,
+    budget: Duration,
+    stop: impl Future<Output = ()> + Send,
+) -> ShellRun {
+    let shell = Path::new(SHELL.0);
+    let build = || {
+        let mut child = tokio::process::Command::new(shell);
+        child
+            .arg(SHELL.1)
+            .arg(command)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true);
+        child
+    };
+    let mut child = match spawn_supervised(build) {
+        Ok(child) => GroupGuard {
+            child,
+            ended: false,
+        },
+        Err(err) => {
+            return ShellRun {
+                exit_code: None,
+                output: cannot_spawn(shell, &err),
+                truncated: false,
+                ended: ShellEnd::SpawnFailed,
+            };
+        }
+    };
+
+    /// How the race below ended; the child is killed after it, once `wait` is no longer polled.
+    enum Race {
+        Waited(std::io::Result<std::process::ExitStatus>),
+        TimedOut,
+        Stopped,
+    }
+
+    let captured = Mutex::new(TailBuffer::new(CAPTURE_TAIL));
+    let printed = AtomicUsize::new(0);
+    let stdout = child.child.stdout().take();
+    let stderr = child.child.stderr().take();
+    let race = {
+        let run = async {
+            tokio::join!(
+                drain_counting(stdout, &captured, &printed),
+                drain_counting(stderr, &captured, &printed),
+                async { child.child.wait().await }
+            )
+            .2
+        };
+        let stop = std::pin::pin!(stop);
+        tokio::select! {
+            waited = run => Race::Waited(waited),
+            () = tokio::time::sleep(budget) => Race::TimedOut,
+            () = stop => Race::Stopped,
+        }
+    };
+    let (exit_code, ended, reason) = match race {
+        Race::Waited(Ok(status)) => match status.code() {
+            Some(code) => (Some(code), ShellEnd::Exited, None),
+            None => (None, ShellEnd::Signalled, None),
+        },
+        Race::Waited(Err(err)) => (None, ShellEnd::Signalled, Some(cannot_wait(&err))),
+        Race::TimedOut | Race::Stopped => {
+            crate::isolate::git::kill_within_grace(child.child.as_mut(), "command_run").await;
+            let ended = if matches!(race, Race::TimedOut) {
+                ShellEnd::TimedOut
+            } else {
+                ShellEnd::Signalled
+            };
+            (None, ended, None)
+        }
+    };
+    child.ended = true;
+    let output = take_output(&captured);
+    ShellRun {
+        exit_code,
+        output: match reason {
+            Some(reason) => with_output(reason, output),
+            None => output,
+        },
+        truncated: printed.load(Ordering::SeqCst) > CAPTURE_TAIL,
+        ended,
+    }
+}
+
+/// H-18: [`run_shell`]'s child, whose whole process group (job object) is killed when the future
+/// is dropped before the child ended — a `command_run` call aborted by `notifications/cancelled`
+/// or by its connection closing must not leave a build running.
+struct GroupGuard {
+    /// The supervised child.
+    child: Box<dyn process_wrap::tokio::ChildWrapper>,
+    /// Set once the child exited or was killed and reaped: nothing left to kill.
+    ended: bool,
+}
+
+impl Drop for GroupGuard {
+    fn drop(&mut self) {
+        if !self.ended {
+            let _ = self.child.start_kill();
+        }
+    }
+}
+
+/// [`drain`]'s counting twin for [`run_shell`]: the same tail, plus every byte read added to
+/// `printed`, so the caller can tell a kept whole from a kept tail.
+async fn drain_counting(
+    reader: Option<impl tokio::io::AsyncRead + Unpin>,
+    captured: &Mutex<TailBuffer>,
+    printed: &AtomicUsize,
+) {
+    let Some(mut reader) = reader else {
+        return;
+    };
+    let mut chunk = vec![0_u8; 8 * 1024];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) | Err(_) => break,
+            Ok(read) => {
+                printed.fetch_add(read, Ordering::SeqCst);
+                captured
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(&chunk[..read]);
+            }
+        }
+    }
+}
+
 /// Builds the wrapped command and spawns it, mirroring `isolate/git.rs`'s `spawn_supervised` and
 /// `crates/htui-agent/src/launch.rs:1106-1164` verb for verb.
 ///
@@ -494,6 +665,139 @@ fn spawn_supervised(
                 wrapped.spawn()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod shell_tests {
+    use std::time::Duration;
+
+    use super::{ShellEnd, run_shell};
+    use crate::isolate::git::CAPTURE_TAIL;
+
+    /// A `stop` that never fires.
+    async fn never() {
+        std::future::pending::<()>().await;
+    }
+
+    /// MOD-11 OQ-7: an exit code and both pipes, merged, in `cwd`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_reports_the_exit_code_and_merged_output() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let ran = run_shell(
+            "echo out; echo err >&2; pwd -P; exit 3",
+            dir.path(),
+            Duration::from_secs(30),
+            never(),
+        )
+        .await;
+        assert_eq!((ran.exit_code, ran.ended), (Some(3), ShellEnd::Exited));
+        assert!(ran.output.contains("out\n"), "{:?}", ran.output);
+        assert!(ran.output.contains("err\n"), "{:?}", ran.output);
+        let here = dir.path().canonicalize().expect("canonical");
+        assert!(
+            ran.output.contains(here.to_str().expect("utf-8")),
+            "runs in `cwd`: {:?}",
+            ran.output
+        );
+        assert!(!ran.truncated);
+    }
+
+    /// MOD-11 OQ-7: the last 64 KiB are kept, and `truncated` says something was dropped.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_keeps_the_tail_and_says_it_truncated() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let ran = run_shell(
+            "head -c 100000 /dev/zero | tr '\\0' a; echo; echo the-end",
+            dir.path(),
+            Duration::from_secs(30),
+            never(),
+        )
+        .await;
+        assert_eq!(ran.exit_code, Some(0));
+        assert!(ran.truncated, "100 kB is past the cap");
+        assert_eq!(ran.output.len(), CAPTURE_TAIL);
+        assert!(ran.output.ends_with("the-end\n"), "the tail is kept");
+    }
+
+    /// MOD-11 OQ-7: the budget kills the shell's whole process group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_kills_the_group_at_the_budget() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let started = std::time::Instant::now();
+        let ran = run_shell(
+            "echo begun; sleep 30 & sleep 30",
+            dir.path(),
+            Duration::from_millis(500),
+            never(),
+        )
+        .await;
+        assert_eq!((ran.exit_code, ran.ended), (None, ShellEnd::TimedOut));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "killed, not waited"
+        );
+        assert!(ran.output.contains("begun"), "{:?}", ran.output);
+    }
+
+    /// MOD-11 D14: `stop` (a lost claim) kills the child too.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_shell_stops_when_told() {
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let ran = run_shell(
+            "sleep 30",
+            dir.path(),
+            Duration::from_secs(60),
+            tokio::time::sleep(Duration::from_millis(200)),
+        )
+        .await;
+        assert_eq!((ran.exit_code, ran.ended), (None, ShellEnd::Signalled));
+    }
+
+    /// H-18: a dropped `run_shell` (an aborted call) kills the child's whole process group.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_dropped_run_shell_kills_its_group() {
+        const PATTERN: &str = "sleep 30.4216";
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let command = format!("{PATTERN} & {PATTERN}");
+        let run = run_shell(&command, dir.path(), Duration::from_secs(60), never());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), run)
+                .await
+                .is_err(),
+            "still running when dropped"
+        );
+        let started = std::time::Instant::now();
+        while std::process::Command::new("pgrep")
+            .args(["-f", PATTERN])
+            .output()
+            .is_ok_and(|out| out.status.success())
+        {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "the group outlived the dropped future"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// MOD-11 OQ-7: a `cwd` that is gone is a spawn failure, reported, not a panic.
+    #[tokio::test]
+    async fn run_shell_reports_a_spawn_failure() {
+        let ran = run_shell(
+            "true",
+            std::path::Path::new("/nonexistent/htui-run-shell"),
+            Duration::from_secs(5),
+            never(),
+        )
+        .await;
+        assert_eq!((ran.exit_code, ran.ended), (None, ShellEnd::SpawnFailed));
+        assert!(ran.output.starts_with("cannot spawn "), "{:?}", ran.output);
     }
 }
 
