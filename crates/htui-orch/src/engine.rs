@@ -1335,9 +1335,9 @@ where
     /// and why it stopped. The handoff is built in both cases ([`Self::handoff_opening`]): a
     /// `Resume` carries it as the fallback a failed resume opens with, on a best-effort basis
     /// (MOD-37 review M-1): a handoff that cannot be built is logged and the resume goes ahead
-    /// with no fallback, as it did before M5. A `Handoff` opening refuses. `cwd` is the step's primary
-    /// tree, else its first; every other tree is an extra directory (ANA-2 `:1208-1213`). Nothing
-    /// here writes.
+    /// with no fallback, as it did before M5. A `Handoff` opening refuses. `cwd` is the step's
+    /// primary tree, else its first; every other tree is an extra directory (ANA-2
+    /// `:1208-1213`). Nothing here writes.
     async fn opening(
         &self,
         run: &Run,
@@ -14784,7 +14784,10 @@ mod tests {
             panic!("`PromoteStep` answers `Promoted`: {outcome:?}");
         };
         assert!(
-            matches!(&opening.path, OpeningPath::Resume { text, .. } if text == crate::promote::RESUME_OPENING),
+            matches!(
+                &opening.path,
+                OpeningPath::Resume { text, .. } if text == crate::promote::RESUME_OPENING
+            ),
             "{:?}",
             opening.path
         );
