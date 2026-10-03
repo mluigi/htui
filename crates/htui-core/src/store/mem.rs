@@ -139,12 +139,14 @@ struct PermissionRow {
 }
 
 /// `command_run.claimed_by` and `heartbeat_at` (MOD-11 `0014`, B-16): the queue's liveness,
-/// which [`CommandRun`] deliberately omits, as `run.lease_owner` is not a [`Run`] field.
+/// which [`CommandRun`] deliberately omits, as `run.lease_owner` is not a [`Run`] field. A
+/// `queued` row has one too (R-3): its waiter's beat, with no claimant yet.
 #[derive(Debug, Clone, Copy)]
 struct CommandClaim {
-    /// `command_run.claimed_by`: the claimant's per-call id.
-    claimant: Uuid,
-    /// `command_run.heartbeat_at`: the claim's instant, then the claimant's last beat.
+    /// `command_run.claimed_by`: the claimant's per-call id; `None` while the row is `queued`.
+    claimant: Option<Uuid>,
+    /// `command_run.heartbeat_at`: the enqueue's instant, then each claim's of the `queued` row,
+    /// then the admission's, then the claimant's last beat.
     heartbeat_at: DateTime<Utc>,
 }
 
@@ -5159,8 +5161,9 @@ impl State {
         Ok(row)
     }
 
-    /// MOD-11 D14, B-16: [`State::record_command_run`] for a row that has not started.
-    fn enqueue_command(&mut self, new: NewCommandRun) -> Result<CommandRun> {
+    /// MOD-11 D14, B-16: [`State::record_command_run`] for a row that has not started, its
+    /// heartbeat stamped `now` (R-3: a waiter that dies before its first claim is reaped too).
+    fn enqueue_command(&mut self, new: NewCommandRun, now: DateTime<Utc>) -> Result<CommandRun> {
         if new.status != CommandRunStatus::Queued
             || new.started_at.is_some()
             || new.finished_at.is_some()
@@ -5169,7 +5172,15 @@ impl State {
         {
             return Err(StoreError::Constraint(command_not_queued()));
         }
-        self.record_command_run(new)
+        let row = self.record_command_run(new)?;
+        self.command_claims.insert(
+            row.id,
+            CommandClaim {
+                claimant: None,
+                heartbeat_at: now,
+            },
+        );
+        Ok(row)
     }
 
     /// One `command_run` row, or the `NotFound` the queue's writers open with.
@@ -5184,7 +5195,9 @@ impl State {
 
     /// MOD-11 D14: the claim. The `write` closure this runs in is Postgres's advisory lock: the
     /// reap, the count and the admission see one state. Refusals (`NotFound`, not `queued`) come
-    /// before the reap, as Postgres decides them on the row it locked first.
+    /// before the reap, as Postgres decides them on the row it locked first; then the asking row
+    /// is beaten (its waiter is alive), then the pair's stale rows are reaped: `running` ones
+    /// fail (OQ-3), `queued` ones whose waiter stopped asking are cancelled (R-3).
     fn claim_command(
         &mut self,
         id: CommandRunId,
@@ -5198,6 +5211,14 @@ impl State {
         }
         let (box_id, class) = (row.box_id, row.class.clone());
         let of_pair = |row: &CommandRun| row.box_id == box_id && row.class == class;
+        // R-3: asking is the queued row's beat.
+        self.command_claims.insert(
+            id,
+            CommandClaim {
+                claimant: None,
+                heartbeat_at: now,
+            },
+        );
 
         // OQ-3: the pair's stale `running` rows. A row no claim admitted (a `running` row
         // `record_command_run` wrote) goes by its start, then its queueing, as Postgres's
@@ -5218,10 +5239,31 @@ impl State {
             })
             .map(|row| row.id)
             .collect();
-        for reaped in stale {
+        // R-3: the pair's `queued` rows whose waiter stopped asking. A row with no beat (one
+        // `record_command_run` wrote `queued`) is never reaped, as Postgres's `NULL` is not.
+        let orphans: Vec<CommandRunId> = self
+            .command_runs
+            .values()
+            .filter(|row| of_pair(row) && row.status == CommandRunStatus::Queued)
+            .filter(|row| {
+                claims
+                    .get(&row.id)
+                    .is_some_and(|claim| claim.heartbeat_at < stale_before)
+            })
+            .map(|row| row.id)
+            .collect();
+        let reaps = stale
+            .into_iter()
+            .map(|id| (id, CommandRunStatus::Failed))
+            .chain(
+                orphans
+                    .into_iter()
+                    .map(|id| (id, CommandRunStatus::Cancelled)),
+            );
+        for (reaped, status) in reaps {
             self.command_claims.remove(&reaped);
             if let Some(row) = self.command_runs.get_mut(&reaped) {
-                row.status = CommandRunStatus::Failed;
+                row.status = status;
                 row.finished_at = Some(now);
                 row.output = Some(match row.output.take() {
                     Some(output) => format!("{output}\n{}", reaped_note()),
@@ -5256,7 +5298,7 @@ impl State {
         self.command_claims.insert(
             id,
             CommandClaim {
-                claimant,
+                claimant: Some(claimant),
                 heartbeat_at: now,
             },
         );
@@ -5271,7 +5313,7 @@ impl State {
             && self
                 .command_claims
                 .get(&id)
-                .is_some_and(|claim| claim.claimant == claimant)
+                .is_some_and(|claim| claim.claimant == Some(claimant))
     }
 
     /// MOD-11 D14: the claimant's beat.
@@ -7556,7 +7598,8 @@ impl WriteStore for MemStore {
     // ---- MOD-11 M4 (plan D14, B-16): the command queue, one `write` closure each ----
 
     async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
-        self.write(|state| state.enqueue_command(new))
+        let now = self.now();
+        self.write(|state| state.enqueue_command(new, now))
     }
 
     async fn claim_command(
@@ -9628,6 +9671,112 @@ mod tests {
             untouched.status,
             CommandRunStatus::Running,
             "another class's row is not reaped by a build claim, stale as it is"
+        );
+    }
+
+    /// MOD-11 OQ-3 for a `queued` row (R-3): a row whose waiter died — a host killed outright, a
+    /// call dropped before its guard existed, a cancel the store refused — would stand first in
+    /// its `(box, class)` line for ever, so `enqueue_command` stamps its heartbeat and every
+    /// claim of it beats it. The next claim of the pair that sees a `queued` row's heartbeat
+    /// older than [`COMMAND_STALE_AFTER`] cancels it with [`reaped_note`]; a waiter that keeps
+    /// asking is never reaped, and the asking row's own beat comes before the reap.
+    /// Postgres's half: `pg_criteria.rs::an_orphaned_queued_row_is_reaped_by_the_next_claim`.
+    ///
+    /// [`COMMAND_STALE_AFTER`]: crate::store::traits::COMMAND_STALE_AFTER
+    /// [`reaped_note`]: crate::store::traits::reaped_note
+    #[tokio::test]
+    async fn an_orphaned_queued_row_is_reaped_by_the_next_claim() {
+        let t0 = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let clock = Arc::new(TestClock::at(t0));
+        let store = MemStore::demo().with_clock(clock.clone());
+        let row = |at| NewCommandRun {
+            id: CommandRunId::new(),
+            run_step_id: ids::STEP_R2_PRD,
+            box_id: ids::BOX,
+            class: "build".to_owned(),
+            command: "make".to_owned(),
+            cwd: "/srv".to_owned(),
+            status: CommandRunStatus::Queued,
+            exit_code: None,
+            output: None,
+            queued_at: at,
+            started_at: None,
+            finished_at: None,
+        };
+        let orphan = row(t0);
+        let waiting = row(t0 + TimeDelta::seconds(1));
+        let next = row(t0 + TimeDelta::seconds(2));
+        for new in [&orphan, &waiting, &next] {
+            store.enqueue_command(new.clone()).await.expect("queued");
+        }
+        let claimant = Uuid::now_v7();
+        assert_eq!(
+            store
+                .claim_command(next.id, claimant, 1)
+                .await
+                .expect("claim"),
+            None,
+            "the orphan stands first in line"
+        );
+
+        clock.advance(crate::store::traits::COMMAND_STALE_AFTER);
+        assert_eq!(
+            store
+                .claim_command(next.id, claimant, 1)
+                .await
+                .expect("claim"),
+            None,
+            "exactly three beats after its enqueue the orphan is not yet stale"
+        );
+        assert_eq!(
+            store
+                .claim_command(waiting.id, Uuid::now_v7(), 1)
+                .await
+                .expect("claim"),
+            None,
+            "the waiting row asks, which beats it"
+        );
+
+        clock.advance(TimeDelta::seconds(1));
+        assert_eq!(
+            store
+                .claim_command(next.id, claimant, 1)
+                .await
+                .expect("claim"),
+            None,
+            "past the bound the orphan is reaped, and the waiter that kept asking is next"
+        );
+        let rows = store.command_runs(ids::STEP_R2_PRD).await.expect("rows");
+        let status = |id| rows.iter().find(|row| row.id == id).expect("row").clone();
+        let reaped = status(orphan.id);
+        assert_eq!(
+            (reaped.status, reaped.finished_at, reaped.output),
+            (
+                CommandRunStatus::Cancelled,
+                Some(clock.now()),
+                Some(crate::store::traits::reaped_note())
+            ),
+            "the orphan is cancelled, finished at the reaping claim, with the note"
+        );
+        assert_eq!(
+            status(waiting.id).status,
+            CommandRunStatus::Queued,
+            "the asking waiter is untouched"
+        );
+        assert!(
+            store
+                .claim_command(waiting.id, Uuid::now_v7(), 1)
+                .await
+                .expect("claim")
+                .is_some(),
+            "and is admitted next"
+        );
+        assert!(
+            matches!(
+                store.claim_command(orphan.id, Uuid::now_v7(), 1).await,
+                Err(StoreError::Constraint(_))
+            ),
+            "the reaped row is no longer claimable"
         );
     }
 

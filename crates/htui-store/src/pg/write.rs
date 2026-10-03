@@ -6736,9 +6736,11 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    /// D14, B-16: the shape refusal, then [`WriteStore::record_command_run`] itself (the same
-    /// `INSERT`, so the same `.sqlx` entry). `record_command_run` takes no lock on `run` or
-    /// `run_step` beyond the foreign key's `FOR KEY SHARE`, so no `park_step` cycle (T1's 40P01).
+    /// D14, B-16: the shape refusal, then [`WriteStore::record_command_run`]'s check and insert
+    /// with the heartbeat stamped `clock_timestamp()` in the same statement (R-3: a waiter that
+    /// dies before its first claim is reaped like one that dies later). Like
+    /// `record_command_run`, it takes no lock on `run` or `run_step` beyond the foreign key's
+    /// `FOR KEY SHARE`, so no `park_step` cycle (T1's 40P01).
     ///
     /// # Errors
     ///
@@ -6752,16 +6754,38 @@ impl WriteStore for PgStore {
         {
             return Err(StoreError::Constraint(command_not_queued()));
         }
-        WriteStore::record_command_run(self, new).await
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        step_exists(&mut tx, new.run_step_id).await?;
+        sqlx::query!(
+            "INSERT INTO command_run (id, run_step_id, box_id, class, command, cwd, status, \
+             queued_at, heartbeat_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())",
+            new.id.as_uuid(),
+            new.run_step_id.as_uuid(),
+            new.box_id.as_uuid(),
+            new.class,
+            new.command,
+            new.cwd,
+            new.status.as_str(),
+            new.queued_at,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(CommandRun::from(new))
     }
 
     /// D14 (blueprint §2.4): one transaction. The row `FOR UPDATE` decides `NotFound` and the
-    /// not-`queued` refusal; then `pg_advisory_xact_lock` on the `(box, class)` pair, so two
-    /// claimants of one pair count and admit one at a time across processes; then the pair's
-    /// stale `running` rows are reaped (OQ-3) and the row is admitted when fewer than `limit`
-    /// run and it is the oldest `queued`. A claim locks no `run` or `item` row; two claimants of
-    /// different rows of one pair each hold only their own row when they meet on the advisory
-    /// lock, so there is no cycle. The reap commits whether or not the row is admitted.
+    /// not-`queued` refusal, and is beaten (R-3: its waiter is alive); then
+    /// `pg_advisory_xact_lock` on the `(box, class)` pair, so two claimants of one pair count and
+    /// admit one at a time across processes; then the pair's stale `running` rows are failed
+    /// (OQ-3) and its stale `queued` rows cancelled (R-3), and the row is admitted when fewer
+    /// than `limit` run and it is the oldest `queued`. A claim locks no `run` or `item` row; two
+    /// claimants of different rows of one pair each hold only their own row when they meet on
+    /// the advisory lock, so there is no cycle — and the `queued` reap skips a row another
+    /// claimant holds (`SKIP LOCKED`: that waiter is alive), so it never waits on one. The reap
+    /// commits whether or not the row is admitted.
     ///
     /// # Errors
     ///
@@ -6788,6 +6812,14 @@ impl WriteStore for PgStore {
         if row.status != CommandRunStatus::Queued {
             return Err(StoreError::Constraint(command_not_claimable(row.status)));
         }
+        // R-3: asking is the queued row's beat.
+        sqlx::query!(
+            "UPDATE command_run SET heartbeat_at = clock_timestamp() WHERE id = $1",
+            id.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
 
         sqlx::query!(
             "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
@@ -6805,6 +6837,25 @@ impl WriteStore for PgStore {
               WHERE box_id = $1 AND class = $2 AND status = 'running' \
                 AND COALESCE(heartbeat_at, started_at, queued_at) \
                     < clock_timestamp() - $4::bigint * interval '1 microsecond'",
+            row.box_id.as_uuid(),
+            row.class,
+            reaped_note(),
+            stale_after,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        // R-3: the pair's `queued` rows whose waiter stopped asking. A `NULL` heartbeat (a row
+        // `record_command_run` wrote `queued`) is never stale.
+        sqlx::query!(
+            "UPDATE command_run \
+                SET status = 'cancelled', finished_at = clock_timestamp(), \
+                    output = COALESCE(output || E'\\n', '') || $3 \
+              WHERE id IN (SELECT id FROM command_run \
+                            WHERE box_id = $1 AND class = $2 AND status = 'queued' \
+                              AND heartbeat_at \
+                                  < clock_timestamp() - $4::bigint * interval '1 microsecond' \
+                              FOR UPDATE SKIP LOCKED)",
             row.box_id.as_uuid(),
             row.class,
             reaped_note(),

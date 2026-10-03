@@ -1869,7 +1869,8 @@ pub trait WriteStore: ReadStore {
     // -- MOD-11 M4: the command queue (plan D14, OQ-3, B-16) ------------------------------------
 
     /// D14: inserts a `queued` row. The row's own fields are the caller's (F-S), `queued_at`
-    /// included: admission order is `(queued_at, id)`.
+    /// included: admission order is `(queued_at, id)`. Its heartbeat is stamped now (R-3), so a
+    /// waiter that dies before its first claim is reaped like one that dies later.
     ///
     /// # Errors
     /// `Constraint(command_not_queued())` when `new.status != Queued` or any of `started_at`,
@@ -1878,9 +1879,13 @@ pub trait WriteStore: ReadStore {
     async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun>;
 
     /// D14: admits `id` when it is the oldest `queued` row of its `(box, class)` and fewer than
-    /// `limit` rows of that pair are `running`, after reaping that pair's stale `running` rows
-    /// (heartbeat older than [`COMMAND_STALE_AFTER`]: `failed`, `finished_at` now, `output` +=
-    /// [`reaped_note`]). `Ok(None)`: not admitted now (wait and ask again). `limit` 0 reads as 1.
+    /// `limit` rows of that pair are `running`, after reaping that pair's stale rows (heartbeat
+    /// older than [`COMMAND_STALE_AFTER`]): `running` ones `failed` (OQ-3), `queued` ones whose
+    /// waiter stopped asking `cancelled` (R-3: a dead waiter would otherwise stand first in line
+    /// for ever); either way `finished_at` now, `output` += [`reaped_note`]. Asking beats the
+    /// `queued` row first, so a waiter that asks at least once per [`COMMAND_STALE_AFTER`] is
+    /// never reaped; a `queued` row with no heartbeat (none `enqueue_command` wrote) never is.
+    /// `Ok(None)`: not admitted now (wait and ask again). `limit` 0 reads as 1.
     /// An admitted row is `running` under `claimant`, `started_at` now, heartbeat now.
     ///
     /// # Errors

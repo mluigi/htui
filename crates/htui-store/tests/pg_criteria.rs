@@ -6681,3 +6681,97 @@ async fn a_stale_heartbeat_is_reaped_by_the_next_claim() {
 
     db.drop_db().await;
 }
+
+/// MOD-11 OQ-3 for a `queued` row (R-3): `enqueue_command` stamps the heartbeat and each claim of
+/// the row beats it, so a row whose waiter died — a host killed outright, a call dropped before
+/// its guard existed — is cancelled by the next claim of its `(box, class)` once its heartbeat is
+/// older than three beats, instead of standing first in line for ever. The heartbeat is
+/// backdated by raw SQL (F-22). Memory's half: `mem.rs::an_orphaned_queued_row_is_reaped_by_the_next_claim`.
+#[tokio::test]
+async fn an_orphaned_queued_row_is_reaped_by_the_next_claim() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let t0 = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let orphan = queued_build(t0);
+    let next = queued_build(t0 + TimeDelta::seconds(1));
+    for new in [&orphan, &next] {
+        db.store.enqueue_command(new.clone()).await.expect("queue");
+    }
+    let stamped: (Option<uuid::Uuid>, bool) = sqlx::query_as(
+        "SELECT claimed_by, heartbeat_at IS NOT NULL FROM command_run WHERE id = $1",
+    )
+    .bind(orphan.id.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("read the stamp");
+    assert_eq!(
+        stamped,
+        (None, true),
+        "the enqueue stamps the heartbeat, and no claimant"
+    );
+    let claimant = uuid::Uuid::now_v7();
+    assert_eq!(
+        db.store
+            .claim_command(next.id, claimant, 1)
+            .await
+            .expect("claim"),
+        None,
+        "a live queued row ahead holds the line"
+    );
+
+    sqlx::query("UPDATE command_run SET heartbeat_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(orphan.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("backdate the heartbeat");
+    sqlx::query("UPDATE command_run SET heartbeat_at = now() - interval '1 minute' WHERE id = $1")
+        .bind(next.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("backdate the asking row too: its own claim beats it first");
+
+    let admitted = db
+        .store
+        .claim_command(next.id, claimant, 1)
+        .await
+        .expect("claim");
+    assert_eq!(
+        admitted.map(|row| (row.id, row.status)),
+        Some((next.id, CommandRunStatus::Running)),
+        "the orphan is reaped and the asking row admitted"
+    );
+    let rows = db
+        .store
+        .command_runs(ids::STEP_R2_PRD)
+        .await
+        .expect("read back");
+    let reaped = rows
+        .iter()
+        .find(|row| row.id == orphan.id)
+        .expect("the orphan");
+    assert_eq!(
+        (
+            reaped.status,
+            reaped.finished_at.is_some(),
+            reaped.output.clone()
+        ),
+        (
+            CommandRunStatus::Cancelled,
+            true,
+            Some(htui_core::store::traits::reaped_note())
+        ),
+        "cancelled, finished, with the note"
+    );
+    assert!(
+        matches!(
+            db.store
+                .claim_command(orphan.id, uuid::Uuid::now_v7(), 1)
+                .await,
+            Err(htui_core::store::StoreError::Constraint(_))
+        ),
+        "the reaped row is no longer claimable"
+    );
+
+    db.drop_db().await;
+}
