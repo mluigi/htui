@@ -7958,6 +7958,7 @@ mod fanout_paths {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: crate::engine::Tails::Walk,
+            tools: None,
         });
 
         let err = engine

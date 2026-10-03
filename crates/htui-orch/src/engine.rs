@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures::future::Either;
 
@@ -35,11 +36,12 @@ use htui_core::model::{
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
     RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPersona, SnapshotPhase,
     SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
-    UserId, VerifyOutcome, missing_tags_failure,
+    Transport, UserId, VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
 };
+use htui_core::prompt::render::HostnameLine;
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PersonaBlock, PromptSpec,
     SectionName, TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble,
@@ -469,6 +471,8 @@ where
     pub user: UserId,
     /// Plan D12 (MOD-41): walk command tails, or hand them back to the box's worker.
     pub tails: Tails,
+    /// MOD-11 D4: htui's MCP host; `None` keeps `mcp: Vec::new()` exactly.
+    pub tools: Option<Arc<dyn crate::tools::ToolHost>>,
 }
 
 /// `Debug` is hand written for one field: a driver factory is a `dyn Fn` and `dyn Fn` is not
@@ -495,6 +499,7 @@ where
             .field("owner", &self.owner)
             .field("user", &self.user)
             .field("tails", &self.tails)
+            .field("tools", &self.tools)
             .finish_non_exhaustive()
     }
 }
@@ -4847,8 +4852,9 @@ where
             // judge body places no `{{skills}}` and records `not_placed`.
             step_files: StepFiles::default(),
             command_queue: false,
-            // MOD-11 D19: the engine's tool seam sets this (T6 commit 2).
-            document_tool: false,
+            // MOD-11 D19: the judge's own kind is `JUDGE_KIND`, never empty, so the trailer
+            // follows the tool host alone.
+            document_tool: self.parts.tools.is_some(),
             verify_failure: None,
             previous_diff: None,
             judge: Some(judge_inputs(task.clone(), candidates.clone(), reverse)),
@@ -5595,8 +5601,9 @@ where
             // MOD-26 D13: the one place `command_run` acts before MOD-11.
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off
                 && persona.is_none_or(|persona| persona.tools.command_run),
-            // MOD-11 D19: the engine's tool seam sets this (T6 commit 2).
-            document_tool: false,
+            // MOD-11 D19: a phase step always has an item; the trailer names `document_write`
+            // whenever a tool host serves the session and the phase writes a document.
+            document_tool: self.parts.tools.is_some() && !phase.output_kind.is_empty(),
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
             // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
             verify_failure,
@@ -5907,6 +5914,23 @@ where
             }
             None => (ToolExposure::default(), policy),
         };
+        // MOD-11 D10, B-17 (H-25): declared before `session`, so the session — and its agent
+        // process — drops first and the token dies after it. Boxed (I-8).
+        let lease = match &self.parts.tools {
+            Some(host) => Some(
+                Box::pin(self.open_tools(
+                    host.as_ref(),
+                    run,
+                    step,
+                    phase,
+                    &candidate,
+                    &project,
+                    &cwd,
+                ))
+                .await?,
+            ),
+            None => None,
+        };
         let driver = (self.parts.driver)(&candidate, key);
 
         let spec = SessionSpec {
@@ -5922,12 +5946,12 @@ where
             env: BTreeMap::new(),
             model: Some(candidate.model.clone()),
             tools,
-            mcp: Vec::new(),
+            mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
             permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
             resume: None,
             budget_micros: settings.per_token_cap_run,
-            prompt: None,
+            prompt: lease.as_ref().and_then(|lease| lease.prompt.clone()),
         };
         let mut session = driver.start(spec, text.to_owned()).await?;
         let now = || self.now();
@@ -5956,6 +5980,57 @@ where
             }
             result => Ok(result),
         }
+    }
+
+    /// MOD-11 D10: the session's [`ToolScope`](crate::tools::ToolScope), built from what the walk
+    /// holds (never from tool arguments, I-1), opened on `host`. A refusal fails the step as a
+    /// spawn failure (never silently drops the server).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the session's coordinates as `drive_once` holds them, read here only"
+    )]
+    async fn open_tools(
+        &self,
+        host: &dyn crate::tools::ToolHost,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        candidate: &SnapshotCandidate,
+        project: &Project,
+        cwd: &std::path::Path,
+    ) -> Result<crate::tools::ToolLease, EngineError> {
+        // B-18: the candidate's transport from its agent row; no row advertises no prompt tool.
+        let transport = self
+            .parts
+            .graphs
+            .agent(candidate.agent_id)
+            .await?
+            .map_or(Transport::Acp, |agent| agent.transport);
+        let scope = crate::tools::ToolScope {
+            run_id: run.id,
+            step_id: step.id,
+            project_id: run.project_id,
+            item_id: run.item_id,
+            box_id: self.parts.box_id,
+            user: self.parts.user,
+            fence: StepFence::Lease(self.parts.owner),
+            // PRD OQ-5: no item, or no kind, withholds `document_write`.
+            output_kind: run
+                .item_id
+                .and(Some(phase.output_kind.clone()))
+                .filter(|kind| !kind.is_empty()),
+            hostname: if settings::resolve_box_hostname(Some(&project.settings)) {
+                HostnameLine::Shown
+            } else {
+                HostnameLine::Omitted
+            },
+            // D16's resolver is T8's.
+            command_queue: false,
+            cwd: cwd.to_path_buf(),
+            transport,
+        };
+        host.open(scope)
+            .map_err(|err| EngineError::Driver(DriverError::Spawn(err.to_string())))
     }
 
     // -- helpers -------------------------------------------------------------------------------
@@ -6752,6 +6827,7 @@ pub(crate) async fn fake_parts<'a>(
         dead_walks: &orch.dead_walks,
         user: orch.user(),
         tails: orch.tails(),
+        tools: orch.tool_host(),
     })
 }
 
@@ -7103,6 +7179,7 @@ mod tests {
             dead_walks: &orch.dead_walks,
             user: orch.user(),
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let CommandOutcome::Started { run, .. } = engine
@@ -7193,6 +7270,7 @@ mod tests {
             dead_walks: &orch.dead_walks,
             user: orch.user(),
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let CommandOutcome::Started { run, rest } = engine
@@ -9885,6 +9963,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let refused = engine
@@ -9986,6 +10065,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         engine
@@ -12882,6 +12962,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let refused = engine
@@ -13999,6 +14080,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         assert_send(&engine.dispatch(Command::CancelRun { run: ids::RUN_2 }));
@@ -16743,6 +16825,462 @@ mod tests {
                 "no driver was built or started"
             );
             assert!(orch.store.relay_rows().is_empty());
+        }
+    }
+
+    /// MOD-11 T6 (D4, D10, D19, B-9, B-17, B-18): the engine's tool seam over a
+    /// [`FakeToolHost`](crate::fake::FakeToolHost). The host records every scope it opened and
+    /// lends a spec with a fake token; a session scripted with
+    /// [`writes_through_tools`](FakeOrchestrator::writes_through_tools) writes its document through
+    /// the scope's fence in `start`, as `document_write` would, while the harness sink writes
+    /// nothing (`done_without_output`), which is production's `author: None`.
+    mod tool_host {
+        use std::sync::Arc;
+
+        use htui_agent::error::DriverError;
+        use htui_core::fixtures::ids;
+        use htui_core::model::{
+            Gate, ItemId, RunId, RunMode, RunStatus, RunStep, StepStatus, Transport,
+        };
+        use htui_core::prompt::render::HostnameLine;
+        use htui_core::store::{ReadStore as _, StepFence, StoreError};
+
+        use super::Harness;
+        use crate::command::{Command, CommandOutcome, EngineError};
+        use crate::engine::SessionKey;
+        use crate::fake::{FakeOrchestrator, FakeToolHost, ScriptedStep};
+        use crate::status::RunFailure;
+        use crate::tools::ToolHostError;
+
+        /// A harness whose engines carry `host`.
+        fn hosted(host: &Arc<FakeToolHost>) -> Harness {
+            Harness {
+                orch: FakeOrchestrator::demo().with_tool_host(Arc::clone(host)),
+            }
+        }
+
+        fn key<'k>(phase: &'k str, fanout_index: i32, call: u32) -> SessionKey<'k> {
+            SessionKey {
+                phase,
+                attempt: 1,
+                fanout_index,
+                call,
+            }
+        }
+
+        /// `FEAT-3` freed, `prd` ungated so the walk settles it and parks at `plan`'s gate.
+        async fn feat_3_prd_ungated(harness: &Harness) {
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+        }
+
+        async fn start(harness: &Harness, item: ItemId) -> Result<CommandOutcome, EngineError> {
+            harness
+                .dispatch(Command::StartRun {
+                    item,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                })
+                .await
+        }
+
+        async fn started(harness: &Harness, item: ItemId) -> (RunId, crate::command::Rest) {
+            match start(harness, item).await {
+                Ok(CommandOutcome::Started { run, rest }) => (run, rest),
+                other => panic!("`StartRun` answers `Started`: {other:?}"),
+            }
+        }
+
+        async fn step_at(
+            orch: &FakeOrchestrator,
+            run: RunId,
+            position: i32,
+            fanout_index: i32,
+        ) -> RunStep {
+            orch.steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.position == position && step.fanout_index == fanout_index)
+                .expect("the walk created the step")
+        }
+
+        /// The seq-0 prompt text the recorder stored for `step`.
+        async fn prompt_of(orch: &FakeOrchestrator, step: &RunStep) -> String {
+            orch.store
+                .step_events(step.id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the step recorded its session")
+                .iter()
+                .find(|event| event.seq == 0)
+                .expect("seq 0 is the prompt")
+                .payload["text"]
+                .as_str()
+                .expect("the prompt payload carries its text")
+                .to_owned()
+        }
+
+        /// `ANA-2` with `research` fanned out two ways, every phase ungated and `agy` judging.
+        async fn ana_2_fanned_and_judged(harness: &Harness) {
+            harness
+                .repoint(ids::HTUI_ANA_2, |phase| {
+                    if phase.name == "research" {
+                        phase.fan_out = 2;
+                    }
+                    phase.gate = Gate::Never;
+                })
+                .await;
+            let project = harness.orch.item(ids::HTUI_ANA_2).await.project_id;
+            let mut settings = harness
+                .orch
+                .store
+                .project_settings(project)
+                .await
+                .expect("MemStore never fails a read")
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            settings["judge_agent_id"] = serde_json::json!(ids::AGENT_AGY);
+            harness.orch.store.set_project_settings(project, settings);
+            for index in 0..2 {
+                harness.orch.script_candidate(
+                    "research",
+                    1,
+                    index,
+                    0,
+                    ScriptedStep::done_without_output(),
+                );
+                harness.orch.writes_through_tools(
+                    &key("research", index, 0),
+                    &format!("research by candidate {index}"),
+                );
+            }
+            for call in 0..2 {
+                harness.orch.script_candidate(
+                    "research:judge",
+                    1,
+                    -1,
+                    call,
+                    ScriptedStep::done_without_output(),
+                );
+            }
+        }
+
+        /// The verdict body a judge call writes through the tool.
+        fn verdict(winner: i32, reason: &str) -> String {
+            let json =
+                serde_json::json!({ "winner": winner, "reasons": { winner.to_string(): reason } });
+            format!("Compared.\n\n```json\n{json}\n```")
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn without_a_tool_host_the_spec_has_no_server_and_no_port() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert!(spec.mcp.is_empty(), "{:?}", spec.mcp);
+            assert_eq!(spec.prompt, None);
+            assert!(harness.orch.tool_host().is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_phase_session_registers_its_scope() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let (run, _) = started(&harness, ids::HTUI_FEAT_3).await;
+            let step = step_at(&harness.orch, run, 0, 0).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            let project = harness
+                .orch
+                .store
+                .project(harness.orch.run(run).await.project_id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the run's project");
+            let hostname =
+                if htui_core::prompt::settings::resolve_box_hostname(Some(&project.settings)) {
+                    HostnameLine::Shown
+                } else {
+                    HostnameLine::Omitted
+                };
+
+            assert_eq!(
+                host.opened(),
+                [crate::tools::ToolScope {
+                    run_id: run,
+                    step_id: step.id,
+                    project_id: project.id,
+                    item_id: Some(ids::HTUI_FEAT_3),
+                    box_id: harness.orch.box_id(),
+                    user: harness.orch.user(),
+                    fence: StepFence::Lease(harness.orch.owner()),
+                    output_kind: Some("prd".to_owned()),
+                    hostname,
+                    command_queue: false,
+                    cwd: spec.cwd.clone(),
+                    transport: Transport::Acp,
+                }]
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_spec_carries_the_leases_server() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert_eq!(spec.mcp.len(), 1, "one server: htui");
+            assert_eq!(spec.mcp[0].name, "htui");
+            assert_eq!(spec.mcp[0].args, ["mcp"]);
+            let token = spec.mcp[0]
+                .env
+                .get("HTUI_MCP_TOKEN")
+                .expect("the lease's token");
+            assert_eq!(
+                host.scope_for_token(token).map(|scope| scope.step_id),
+                Some(spec.step_id),
+                "the token names this session's scope"
+            );
+            assert_eq!(spec.prompt, None, "an ACP scope gets no prompt port");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_cli_candidate_s_spec_carries_the_leases_prompt_port() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let opened = host.opened();
+            assert_eq!(opened[0].transport, Transport::Cli, "B-18: the agent row's");
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert!(
+                spec.prompt.is_some(),
+                "B-21: a CLI scope's lease lends a port"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_lease_ends_with_the_session() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_eq!(host.opened().len(), 1);
+            assert_eq!(host.live(), 0, "B-17: dropped when `drive_once` returns");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_written_document_is_the_candidates_output() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            harness
+                .orch
+                .script("prd", 1, ScriptedStep::done_without_output());
+            harness
+                .orch
+                .writes_through_tools(&key("prd", 0, 0), "the prd, through the tool");
+
+            let (run, rest) = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_eq!(
+                rest.run,
+                RunStatus::AwaitingApproval,
+                "parked at `plan`'s gate"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.status, StepStatus::Done);
+            let writes = harness.orch.tool_writes();
+            assert_eq!(writes.len(), 1);
+            let written = writes[0].clone().expect("the fenced write landed");
+            assert_eq!(
+                (
+                    written.kind.as_str(),
+                    written.body.as_str(),
+                    written.produced_by_step_id
+                ),
+                ("prd", "the prd, through the tool", Some(prd.id))
+            );
+            let plan = step_at(&harness.orch, run, 1, 0).await;
+            assert_eq!(plan.phase_name, "plan", "the walk went on to `plan`");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_judge_opens_two_leases_and_resolves_on_two_tool_documents() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            ana_2_fanned_and_judged(&harness).await;
+            for call in 0..2 {
+                harness
+                    .orch
+                    .writes_through_tools(&key("research:judge", -1, call), &verdict(1, "deeper"));
+            }
+
+            let (run, _rest) = started(&harness, ids::HTUI_ANA_2).await;
+            let judge = step_at(&harness.orch, run, 0, -1).await;
+            assert_eq!(
+                (judge.status, judge.gate_note.as_deref()),
+                (StepStatus::Done, Some("deeper")),
+                "both tool-written verdicts agree"
+            );
+            let winner = step_at(&harness.orch, run, 0, 1).await;
+            assert_eq!(winner.selected, Some(true));
+            let judge_scopes: Vec<_> = host
+                .opened()
+                .into_iter()
+                .filter(|scope| scope.step_id == judge.id)
+                .collect();
+            assert_eq!(judge_scopes.len(), 2, "one lease per judge call");
+            assert!(
+                judge_scopes
+                    .iter()
+                    .all(|scope| scope.output_kind.as_deref() == Some("judge")),
+                "{judge_scopes:?}"
+            );
+            assert_eq!(host.live(), 0);
+            assert!(
+                harness.orch.tool_writes().iter().all(Result::is_ok),
+                "every write landed"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_write_after_the_lease_moved_is_fenced_and_the_walk_loses_its_lease() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            harness
+                .orch
+                .script("prd", 1, ScriptedStep::done_without_output());
+            harness
+                .orch
+                .writes_through_tools(&key("prd", 0, 0), "too late");
+            harness.orch.take_lease_before_tool_writes();
+            let prd_documents = || async {
+                harness
+                    .orch
+                    .store
+                    .documents(ids::HTUI_FEAT_3)
+                    .await
+                    .expect("MemStore never fails a read")
+                    .into_iter()
+                    .filter(|head| head.kind == "prd")
+                    .count()
+            };
+            let before = prd_documents().await;
+
+            let walked = start(&harness, ids::HTUI_FEAT_3).await;
+            assert!(
+                matches!(walked, Err(EngineError::LeaseLost { .. })),
+                "{walked:?}"
+            );
+            let writes = harness.orch.tool_writes();
+            assert!(
+                matches!(writes.as_slice(), [Err(StoreError::Fenced { .. })]),
+                "{writes:?}"
+            );
+            assert_eq!(prd_documents().await, before, "I-3: nothing written");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn no_tool_document_still_fails_missing_output() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            for attempt in 1..=2 {
+                harness
+                    .orch
+                    .script("prd", attempt, ScriptedStep::done_without_output());
+            }
+            let (_, rest) = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_eq!(rest.run, RunStatus::Failed);
+            assert_eq!(
+                rest.failure,
+                Some(RunFailure::MissingOutput),
+                "OQ-9: no fallback"
+            );
+            assert_eq!(host.opened().len(), 2, "one lease per attempt");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_judge_without_tool_documents_is_missing_document() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            ana_2_fanned_and_judged(&harness).await;
+
+            let (run, rest) = started(&harness, ids::HTUI_ANA_2).await;
+            assert_eq!(rest.run, RunStatus::AwaitingApproval);
+            let judge = step_at(&harness.orch, run, 0, -1).await;
+            assert_eq!(
+                (judge.status, judge.gate_note.as_deref()),
+                (StepStatus::Failed, Some("judge_missing_document: call 0"))
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_host_error_fails_the_step_as_a_spawn_failure() {
+            let host = Arc::new(
+                FakeToolHost::default().failing(ToolHostError::Listener("no socket".to_owned())),
+            );
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let refused = start(&harness, ids::HTUI_FEAT_3)
+                .await
+                .expect_err("the lease could not open");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::Driver(DriverError::Spawn(why)) if why.contains("no socket")
+                ),
+                "{refused}"
+            );
+            assert!(
+                harness.orch.spec_for(&key("prd", 0, 0)).is_none(),
+                "no session started"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_output_trailer_appears_only_with_a_tool_host() {
+            let trailer = "<section name=\"output\">\nWrite your `prd` document by calling the \
+                           `document_write` tool of the `htui` MCP server; text left only in \
+                           your reply is not recorded.\n</section>";
+
+            let host = Arc::new(FakeToolHost::default());
+            let with = hosted(&host);
+            with.free_feat_3().await;
+            let (run, _) = started(&with, ids::HTUI_FEAT_3).await;
+            let text = prompt_of(&with.orch, &step_at(&with.orch, run, 0, 0).await).await;
+            assert!(text.ends_with(&format!("{trailer}\n")), "{text}");
+
+            let without = Harness::new().await;
+            without.free_feat_3().await;
+            let (run, _) = started(&without, ids::HTUI_FEAT_3).await;
+            let text = prompt_of(&without.orch, &step_at(&without.orch, run, 0, 0).await).await;
+            assert!(!text.contains("name=\"output\""), "{text}");
+            assert!(!text.contains("document_write"), "{text}");
         }
     }
 }

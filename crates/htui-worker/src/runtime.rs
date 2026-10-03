@@ -1012,6 +1012,8 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             dead_walks: &self.dead_walks,
             user: self.user,
             tails: self.tails,
+            // MOD-11 D11: the worker's host is wired in T6 commit 3.
+            tools: None,
         })
     }
 }
