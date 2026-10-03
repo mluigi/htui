@@ -1286,7 +1286,12 @@ mod tests {
         wants: Rc<Cell<bool>>,
         answer: Handled,
         seen: Pointed,
+        /// How many times it was told capture went off (MOD-74 D1).
+        lost: Lost,
     }
+
+    /// How many capture losses a [`Pointer`] was told of (MOD-74 D1).
+    type Lost = Rc<Cell<usize>>;
 
     impl Tab for Pointer {
         fn id(&self) -> TabId {
@@ -1311,6 +1316,9 @@ mod tests {
             self.seen.borrow_mut().push(mouse.kind);
             self.answer
         }
+        fn on_mouse_lost(&mut self) {
+            self.lost.set(self.lost.get() + 1);
+        }
     }
 
     /// A shell whose only tab is a [`Pointer`], `dirty` cleared.
@@ -1322,18 +1330,21 @@ mod tests {
         UnboundedReceiver<RequestEnvelope>,
         Rc<Cell<bool>>,
         Pointed,
+        Lost,
     ) {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx, Keymap::default_global());
         let wants = Rc::new(Cell::new(wants));
         let seen = Pointed::default();
+        let lost = Lost::default();
         app.register_tab(Box::new(Pointer {
             wants: Rc::clone(&wants),
             answer,
             seen: Rc::clone(&seen),
+            lost: Rc::clone(&lost),
         }));
         app.dirty = false;
-        (app, rx, wants, seen)
+        (app, rx, wants, seen, lost)
     }
 
     /// `kind` at a fixed cell, no modifier.
@@ -1362,7 +1373,7 @@ mod tests {
     /// MOD-71 D4: an event queued before capture went off reaches nobody and costs nothing.
     #[test]
     fn a_mouse_event_nobody_wants_changes_nothing() {
-        let (mut app, _rx, _wants, seen) = pointing(false, Handled::Consumed);
+        let (mut app, _rx, _wants, seen, _lost) = pointing(false, Handled::Consumed);
         app.status = Some("boom".into());
         app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
         assert!(seen.borrow().is_empty());
@@ -1374,7 +1385,7 @@ mod tests {
     /// redraw once per cell; the horizontal wheel has no meaning here either.
     #[test]
     fn motion_and_the_horizontal_wheel_never_reach_a_tab_or_redraw() {
-        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        let (mut app, _rx, _wants, seen, _lost) = pointing(true, Handled::Consumed);
         for kind in [
             MouseEventKind::Moved,
             MouseEventKind::ScrollLeft,
@@ -1389,7 +1400,7 @@ mod tests {
     /// MOD-71 D4, blueprint E8: a consumed event redraws and, like a key, clears the status line.
     #[test]
     fn a_consumed_mouse_event_redraws_and_clears_the_status_line() {
-        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        let (mut app, _rx, _wants, seen, _lost) = pointing(true, Handled::Consumed);
         app.status = Some("boom".into());
         app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(
@@ -1404,7 +1415,7 @@ mod tests {
     /// wipes an error nobody acted on.
     #[test]
     fn a_passed_mouse_event_keeps_the_status_line_and_does_not_redraw() {
-        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Pass);
+        let (mut app, _rx, _wants, seen, _lost) = pointing(true, Handled::Pass);
         app.status = Some("boom".into());
         app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
         assert_eq!(
@@ -1419,7 +1430,7 @@ mod tests {
     /// takes the mouse away from it.
     #[test]
     fn an_overlay_or_the_help_box_takes_the_mouse_away() {
-        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        let (mut app, _rx, _wants, seen, _lost) = pointing(true, Handled::Consumed);
         assert!(app.wants_mouse(), "the tab wants it with nothing over it");
         app.push_overlay(Box::new(Popup));
         app.dirty = false;
@@ -1428,11 +1439,84 @@ mod tests {
         assert!(seen.borrow().is_empty());
         assert!(!app.dirty);
 
-        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        let (mut app, _rx, _wants, seen, _lost) = pointing(true, Handled::Consumed);
         app.help_visible = true;
         assert!(!app.wants_mouse());
         app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
         assert!(seen.borrow().is_empty());
         assert!(!app.dirty);
+    }
+
+    // ---- MOD-74: a lost capture (plan D1, D2) -----------------------------------------------
+
+    /// MOD-74 D1: only an on-to-off edge tells the tabs; off staying off and on staying on never
+    /// do.
+    #[test]
+    fn only_an_on_to_off_edge_is_a_lost_capture() {
+        let (mut app, _rx, wants, _seen, lost) = pointing(false, Handled::Consumed);
+        assert!(!app.mouse_capture());
+        assert_eq!(lost.get(), 0, "off to off");
+        wants.set(true);
+        assert!(app.mouse_capture());
+        assert!(app.mouse_capture());
+        assert_eq!(lost.get(), 0, "off to on, on to on");
+        wants.set(false);
+        assert!(!app.mouse_capture());
+        assert_eq!(lost.get(), 1, "on to off");
+        assert!(!app.mouse_capture());
+        assert_eq!(lost.get(), 1, "off stays off");
+    }
+
+    /// MOD-74 D1: an overlay or the `?` box opening over a tab that held capture is a loss.
+    #[test]
+    fn an_overlay_or_the_help_box_opening_is_a_lost_capture() {
+        let (mut app, _rx, _wants, _seen, lost) = pointing(true, Handled::Consumed);
+        assert!(app.mouse_capture());
+        app.push_overlay(Box::new(Popup));
+        assert!(!app.mouse_capture());
+        assert_eq!(lost.get(), 1, "the overlay");
+
+        let (mut app, _rx, _wants, _seen, lost) = pointing(true, Handled::Consumed);
+        assert!(app.mouse_capture());
+        app.help_visible = true;
+        assert!(!app.mouse_capture());
+        assert_eq!(lost.get(), 1, "the help box");
+    }
+
+    /// MOD-74 D1: after a tab switch the tab holding the gesture is no longer the active one, and
+    /// it is still told.
+    #[test]
+    fn a_tab_switch_tells_the_tab_it_left() {
+        let (mut app, _rx, _wants, _seen, lost) = pointing(true, Handled::Consumed);
+        let (asker, _heard) = Asker::new("asker");
+        app.register_tab(Box::new(asker));
+        assert_eq!(app.tabs.active_id(), Some(TabId("pointer")));
+        assert!(app.mouse_capture());
+        app.update(Action::Tab(TabAction::Focus(TabId("asker"))));
+        assert_eq!(app.tabs.active_id(), Some(TabId("asker")));
+        assert!(!app.mouse_capture());
+        assert_eq!(lost.get(), 1, "the inactive pointer is told");
+    }
+
+    /// MOD-74 D2: `Suspend::leave` turns capture off without the app knowing, so an editor
+    /// handoff under capture is a loss, and the next `mouse_capture` turns it back on with no
+    /// second broadcast.
+    #[test]
+    fn an_editor_handoff_under_capture_is_a_lost_capture() {
+        let (mut app, _rx, _wants, _seen, lost) = pointing(true, Handled::Consumed);
+        assert!(app.mouse_capture());
+        app.pending_edit = Some((TabId("pointer"), asked()));
+        assert!(app.take_external_edit().is_some());
+        assert_eq!(lost.get(), 1, "the handoff is a loss");
+        assert!(!app.mouse, "the editor's `leave` turns capture off");
+        assert!(app.mouse_capture(), "back from the editor, on again");
+        assert_eq!(lost.get(), 1, "with no second broadcast");
+        assert!(app.take_external_edit().is_none());
+        assert_eq!(lost.get(), 1, "nothing pending is no handoff");
+
+        let (mut app, _rx, _wants, _seen, lost) = pointing(true, Handled::Consumed);
+        app.pending_edit = Some((TabId("pointer"), asked()));
+        assert!(app.take_external_edit().is_some());
+        assert_eq!(lost.get(), 0, "capture never applied: nothing to lose");
     }
 }

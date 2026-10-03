@@ -593,6 +593,11 @@ impl Tab for BacklogTab {
         self.detail.on_mouse(mouse, ctx)
     }
 
+    /// MOD-74 D3: to the detail pane, unconditionally (H-12): a form opening is one of the losses.
+    fn on_mouse_lost(&mut self) {
+        self.detail.on_mouse_lost();
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // MOD-13 D1: first, so the form owns every letter while it is open. It only opens while
         // no sub-tab captures (`f` is below that guard).
@@ -1291,6 +1296,8 @@ mod tests {
         id: DetailId,
         wants: Rc<Cell<bool>>,
         seen: Pointed,
+        /// How many times it was told capture went off (MOD-74 D3).
+        lost: Lost,
     }
 
     impl DetailTab for MouseProbe {
@@ -1313,21 +1320,32 @@ mod tests {
             self.seen.borrow_mut().push(mouse.kind);
             Handled::Consumed
         }
+        fn on_mouse_lost(&mut self) {
+            self.lost.set(self.lost.get() + 1);
+        }
     }
 
     /// What a [`MouseProbe`] was offered.
     type Pointed = Rc<RefCell<Vec<MouseEventKind>>>;
 
-    /// A [`MouseProbe`] under `id`, wanting the mouse as `wants` says, and its two handles.
-    fn mouse_probe(id: &'static str, wants: bool) -> (Box<dyn DetailTab>, Rc<Cell<bool>>, Pointed) {
+    /// How many capture losses a [`MouseProbe`] was told of (MOD-74 D3).
+    type Lost = Rc<Cell<usize>>;
+
+    /// A [`MouseProbe`] under `id`, wanting the mouse as `wants` says, and its three handles.
+    fn mouse_probe(
+        id: &'static str,
+        wants: bool,
+    ) -> (Box<dyn DetailTab>, Rc<Cell<bool>>, Pointed, Lost) {
         let wants = Rc::new(Cell::new(wants));
         let seen = Rc::default();
+        let lost = Lost::default();
         let probe = MouseProbe {
             id: DetailId(id),
             wants: Rc::clone(&wants),
             seen: Rc::clone(&seen),
+            lost: Rc::clone(&lost),
         };
-        (Box::new(probe), wants, seen)
+        (Box::new(probe), wants, seen, lost)
     }
 
     /// A left press at a fixed cell, no modifier.
@@ -1345,7 +1363,7 @@ mod tests {
     #[tokio::test]
     async fn the_detail_gets_the_mouse_only_with_no_form_open() {
         let bench = Bench::new().await;
-        let (probe, wants, seen) = mouse_probe("mouse", true);
+        let (probe, wants, seen, _lost) = mouse_probe("mouse", true);
         let mut detail = DetailRegistry::new();
         detail.register(probe);
         let mut tab = BacklogTab {
@@ -1386,8 +1404,8 @@ mod tests {
     #[tokio::test]
     async fn only_the_active_sub_tab_is_asked_for_the_mouse() {
         let bench = Bench::new().await;
-        let (a, _a_wants, a_seen) = mouse_probe("a", false);
-        let (b, _b_wants, b_seen) = mouse_probe("b", true);
+        let (a, _a_wants, a_seen, _a_lost) = mouse_probe("a", false);
+        let (b, _b_wants, b_seen, _b_lost) = mouse_probe("b", true);
         let mut registry = DetailRegistry::new();
         registry.register(a);
         registry.register(b);
@@ -1406,6 +1424,28 @@ mod tests {
             vec![MouseEventKind::Down(MouseButton::Left)]
         );
         assert!(a_seen.borrow().is_empty());
+    }
+
+    /// MOD-74 D3, H-12: a lost capture reaches every sub-tab, the inactive one holding a gesture
+    /// included, and no form gates it: a form opening is itself one of the losses.
+    #[tokio::test]
+    async fn a_lost_capture_reaches_every_sub_tab() {
+        let bench = Bench::new().await;
+        let (a, _a_wants, _a_seen, a_lost) = mouse_probe("a", false);
+        let (b, _b_wants, _b_seen, b_lost) = mouse_probe("b", true);
+        let mut detail = DetailRegistry::new();
+        detail.register(a);
+        detail.register(b);
+        let mut tab = BacklogTab {
+            detail,
+            ..bench.tab()
+        };
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        assert!(tab.form.is_some(), "the filter form is open");
+        assert_eq!(tab.detail.active_id(), Some(DetailId("a")), "b is inactive");
+        tab.on_mouse_lost();
+        assert_eq!(a_lost.get(), 1, "the active sub-tab is told");
+        assert_eq!(b_lost.get(), 1, "and so is the inactive one");
     }
 
     /// MOD-13 D2: applying sends exactly one `Items`, the same request kind the unfiltered list

@@ -610,6 +610,11 @@ impl ExecutionGraph {
         })
     }
 
+    /// MOD-74 D4: ends a live gesture without a click. A pan's drag state, or a node press's
+    /// `AwaitingNodeClick`, gets a **locked** left release (`event_handlers.rs:496-509`): it
+    /// resets the drag state and emits nothing, where an unlocked one would click the node.
+    pub(super) fn end_gesture(&mut self) {}
+
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
     ///
     /// A canvas under 2x2 draws nothing (`rataflow` `ui/canvas.rs:42`), so a reveal measured
@@ -671,6 +676,12 @@ impl ExecutionGraph {
     #[cfg(test)]
     pub(super) fn zoom(&self) -> f64 {
         self.flow.viewport.zoom
+    }
+
+    /// Whether rataflow holds a drag, for the tests.
+    #[cfg(test)]
+    pub(super) fn is_dragging(&self) -> bool {
+        self.flow.is_dragging()
     }
 }
 
@@ -1941,5 +1952,55 @@ mod tests {
         let mut graph = panned();
         let rows = rows(&draw_at(&mut graph, 43, 20));
         assert!(rows.iter().any(|row| row.contains("0.1 done")), "{rows:#?}");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-74 T2: ending a gesture (plan D4).
+    // ---------------------------------------------------------------------------------------------
+
+    /// D4: an ended pan forgets its anchor: a drag with no new press moves nothing, and the lock
+    /// is put back.
+    #[test]
+    fn ending_a_pan_forgets_its_anchor() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (5, 14))), None);
+        assert!(graph.is_dragging());
+        graph.end_gesture();
+        assert!(!graph.is_dragging());
+        assert!(!graph.flow.locked);
+        let before = graph.flow.viewport;
+        assert_eq!(graph.on_mouse(mouse(DRAG, (9, 16))), None);
+        assert_eq!(graph.flow.viewport, before);
+    }
+
+    /// D4, H-10: an ended node press clicks nothing, then or on a later release.
+    #[test]
+    fn ending_a_node_press_clicks_nothing() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "1.1 done");
+        let at = (x + 2, y + 2);
+        assert_eq!(graph.on_mouse(mouse(DOWN, at)), None);
+        graph.end_gesture();
+        assert!(!graph.is_dragging());
+        assert_eq!(graph.on_mouse(mouse(UP, at)), None, "no click");
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+        assert!(!graph.flow.locked);
+    }
+
+    /// D4: with no gesture live, ending one changes nothing.
+    #[test]
+    fn ending_no_gesture_changes_nothing() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        draw(&mut graph);
+        let before = graph.flow.viewport;
+        graph.end_gesture();
+        assert_eq!(graph.flow.viewport, before);
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+        assert!(!graph.flow.locked);
+        assert!(!graph.is_dragging());
     }
 }

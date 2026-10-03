@@ -101,6 +101,10 @@ pub trait Tab {
     fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
         Handled::Pass
     }
+    /// MOD-74 D1, D3: mouse capture went off while this tab may hold a gesture: an overlay, `?`, a
+    /// form, a sub-tab or tab switch, or an `$EDITOR` handoff. Told to every registered tab, active
+    /// or not, once per on-to-off edge. Defaulted to nothing, so no other tab changes.
+    fn on_mouse_lost(&mut self) {}
 }
 
 /// Every registered tab, in registration order, plus which one is active.

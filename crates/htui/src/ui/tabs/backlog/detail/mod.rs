@@ -115,6 +115,9 @@ pub trait DetailTab {
     fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
         Handled::Pass
     }
+    /// Mouse capture went off above the pane (MOD-74 D3): the Backlog tab hands every sub-tab the
+    /// loss, active or not. Only [`RunsTab`] holds a gesture; the default does nothing.
+    fn on_mouse_lost(&mut self) {}
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -281,6 +284,11 @@ impl DetailRegistry {
             _ => Handled::Pass,
         }
     }
+
+    /// MOD-74 D3: a lost capture, to **every** sub-tab, as [`on_item_change`](Self::on_item_change)
+    /// goes (B-4): a sub-tab switch is itself a loss, so the pane holding the gesture is no longer
+    /// the active one. No `wants_mouse` gate: the pane told no longer wants it.
+    pub fn on_mouse_lost(&mut self) {}
 
     /// Offers a key to the active sub-tab.
     pub fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {

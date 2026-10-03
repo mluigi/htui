@@ -210,6 +210,9 @@ pub struct App {
     /// [`App::finish_external_edit`]. One slot: a second ask before the loop comes round replaces
     /// the first.
     pub(super) pending_edit: Option<(TabId, ExternalEdit)>,
+    /// MOD-74 D1: mouse capture as the loop last applied it, the edge `mouse_capture` detects.
+    /// `take_external_edit` clears it for the editor's `leave` (D2).
+    pub(super) mouse: bool,
 }
 
 impl App {
@@ -248,6 +251,7 @@ impl App {
             below_target_shown: false,
             connection_redirect_done: false,
             pending_edit: None,
+            mouse: false,
         }
     }
 
@@ -510,6 +514,13 @@ impl App {
         self.overlays.is_empty()
             && !self.help_visible
             && self.tabs.active().is_some_and(Tab::wants_mouse)
+    }
+
+    /// MOD-74 D1: what the event loop hands `TerminalGuard::set_mouse_capture` after every step:
+    /// [`wants_mouse`](Self::wants_mouse), recorded.
+    pub fn mouse_capture(&mut self) -> bool {
+        self.mouse = self.wants_mouse();
+        self.mouse
     }
 
     /// A mouse event (MOD-71 D4): to the active tab only, with no keymap and no overlay in the

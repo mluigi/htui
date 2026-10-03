@@ -97,8 +97,12 @@ mod tests {
             .find("app.finish_external_edit(")
             .expect("the editor post-step");
         let capture = code
-            .find("term.set_mouse_capture(app.wants_mouse())?;")
-            .expect("the loop sets capture to what the app wants");
+            .find("term.set_mouse_capture(app.mouse_capture())?;")
+            .expect("the loop sets capture through the app's edge (MOD-74 D1)");
+        assert!(
+            !code.contains("app.wants_mouse()"),
+            "the loop never bypasses the edge (MOD-74 D1)"
+        );
         let draw = code
             .find("std::mem::take(&mut app.dirty)")
             .expect("the dirty draw");

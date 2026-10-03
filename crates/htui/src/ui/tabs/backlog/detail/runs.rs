@@ -406,6 +406,13 @@ impl RunsTab {
             .sync(run, step, &self.tool_calls, theme);
     }
 
+    /// MOD-74 D4: the one way a gesture ends: the pane's flag and rataflow's drag state together,
+    /// so neither outlives the other (`RunsTab::gesture`, `ExecutionGraph::end_gesture`).
+    fn end_gesture(&mut self) {
+        self.gesture = false;
+        self.graph.get_mut().end_gesture();
+    }
+
     /// MOD-71 D6: a clicked node moves the cursor to that step's entry in the cursor's run (only
     /// that run is on the canvas), then the flow syncs, as `J`/`K` do. A step the entries don't
     /// hold leaves the cursor where it is.
@@ -1277,7 +1284,7 @@ impl DetailTab for RunsTab {
         self.tool_calls.clear();
         self.answering = None;
         self.mode = Mode::Browse;
-        self.gesture = false; // MOD-71 D11
+        self.end_gesture(); // MOD-71 D11, MOD-74 D4
     }
 
     /// `J` / `K` move the cursor, `Enter` replays the step under it, the action keys act, and
@@ -1333,8 +1340,8 @@ impl DetailTab for RunsTab {
                 ctx.emit(Action::Replay { step_id });
             }
             KeyCode::Char('v') => {
-                // MOD-71 D11: the gesture ends with the view.
-                self.gesture = false;
+                // MOD-71 D11, MOD-74 D4: the gesture ends with the view.
+                self.end_gesture();
                 self.view = match self.view {
                     View::List => View::Flow,
                     View::Flow => View::List,
@@ -1356,9 +1363,10 @@ impl DetailTab for RunsTab {
                 key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
             ) => {
                 let handled = self.action(key, ctx);
-                // MOD-71 D11: a mode that captures input ends a live gesture (blueprint B-8).
+                // MOD-71 D11, MOD-74 D4: a mode that captures input ends a live gesture
+                // (blueprint B-8).
                 if self.captures_input() {
-                    self.gesture = false;
+                    self.end_gesture();
                 }
                 return handled;
             }
@@ -1402,7 +1410,7 @@ impl DetailTab for RunsTab {
     /// the status line (review L4).
     fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
         if !self.wants_mouse() {
-            self.gesture = false;
+            self.end_gesture(); // MOD-71 D11, MOD-74 D4
             return Handled::Pass;
         }
         let inside = self
@@ -4309,6 +4317,10 @@ mod tests {
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         assert!(!pane.gesture);
+        assert!(
+            !pane.graph.borrow().is_dragging(),
+            "`v` ended rataflow's too"
+        );
         assert_eq!(
             pane.on_mouse(drag, &mut shell.ctx()),
             Handled::Pass,
@@ -4320,6 +4332,10 @@ mod tests {
         pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
         pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
         assert!(!pane.gesture);
+        assert!(
+            !pane.graph.borrow().is_dragging(),
+            "the note ended rataflow's too"
+        );
         assert_eq!(
             pane.on_mouse(drag, &mut shell.ctx()),
             Handled::Pass,
@@ -4333,11 +4349,73 @@ mod tests {
         let _ = shell.emit.take();
         let _ = lines(&pane, &shell);
         assert!(!pane.gesture);
+        assert!(
+            !pane.graph.borrow().is_dragging(),
+            "the item change ended rataflow's too"
+        );
         assert_eq!(
             pane.on_mouse(drag, &mut shell.ctx()),
             Handled::Pass,
             "the item change ended it"
         );
+    }
+
+    /// MOD-74 D3, D4: capture lost above the pane ends a live pan, the pane's flag and rataflow's
+    /// drag state both, so a button held across the off-and-on cannot resume the old anchor.
+    #[tokio::test]
+    async fn a_lost_capture_ends_a_live_pan() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = blank_cell(&lines);
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 3, row + 2),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "the drag pans"
+        );
+        let before = pane.graph.borrow().viewport();
+        pane.on_mouse_lost();
+        assert!(!pane.gesture);
+        assert!(!pane.graph.borrow().is_dragging());
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 6, row + 4),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "no gesture is live"
+        );
+        assert_eq!(pane.graph.borrow().viewport(), before);
+    }
+
+    /// MOD-74 B-1: a press off the canvas while a gesture is live (its release was never
+    /// reported) ends it through `end_gesture`, rataflow's drag state included.
+    #[tokio::test]
+    async fn a_press_off_the_canvas_ends_a_live_gesture() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = blank_cell(&lines);
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert!(pane.gesture);
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), 0, 0),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "the run line is not the canvas"
+        );
+        assert!(!pane.gesture);
+        assert!(!pane.graph.borrow().is_dragging());
     }
 
     /// D5: the right and middle buttons have no meaning in the flow.
