@@ -938,7 +938,8 @@ async fn run_step_tree_refreshes_off_its_parent_step() {
     teardown(db, &[&cache]).await;
 }
 
-/// `resolve_inputs`' three-armed `CASE` rank is the mirror's, not just Postgres's (T2 audit).
+/// `resolve_inputs`' three-armed `CASE` rank and its two arms (MOD-73) are the mirror's, not just
+/// Postgres's (T2 audit).
 ///
 /// Blueprint §0.1's A-6 hole, in its second form. `the_mirror_passes_the_read_cases` is the only
 /// harness a read-only `CacheStore` can run, and in every `resolve_inputs` leg of
@@ -951,15 +952,17 @@ async fn run_step_tree_refreshes_off_its_parent_step() {
 /// So the fixture's `research` ladder is extended here, in Postgres, with two rows that make each
 /// arm decide something:
 ///
-/// - **v4, hand-written** (`produced_by_step_id IS NULL`, rank 2). It is a higher version than the
-///   winner, so rank 2 must lose to rank 0 and to rank 1.
+/// - **v4, hand-written** (`produced_by_step_id IS NULL`, the hand-written arm). It is newer than
+///   `RUN_3`'s own v2 and older than v5, so it wins from one seat and loses from the other.
 /// - **v5, produced by `STEP_PLAN`** (rank 1 from `RUN_3`'s seat, rank 0 from `RUN_1`'s). `RUN_1` is
 ///   the run `STEP_PLAN` belongs to and its `selected` is `NULL`, so the row is eligible from both
 ///   seats and only the rank tells them apart.
 ///
-/// From `RUN_3` the answer is still the fixture's v2 - rank 0 beats a higher-versioned rank 1 and
-/// two rank 2s - and from `RUN_1` it is v5, rank 0 there. Both are asserted equal to Postgres's own
-/// answer as well as by id, so a mirror that ranks differently *or* a Postgres that does fails.
+/// From `RUN_3` the answer is v4: the step-produced arm picks v2 (rank 0 beats a higher-versioned
+/// rank 1), and v4 is newer. From `RUN_1` it is v5, rank 0 there and newer than v4. A mirror that
+/// dropped the `CASE` would answer v5 from `RUN_3`; one that dropped the arm partition would answer
+/// v2. Both are asserted equal to Postgres's own answer as well as by id, so a mirror that ranks
+/// differently *or* a Postgres that does fails.
 #[tokio::test]
 async fn the_mirror_ranks_resolve_inputs_the_way_postgres_does() {
     let Some(db) = common::demo_db().await else {
@@ -1018,19 +1021,15 @@ async fn the_mirror_ranks_resolve_inputs_the_way_postgres_does() {
 
     assert_eq!(
         winner(ids::RUN_3).await,
-        Some(ids::DOC_ANA_1_RESEARCH_V2.as_uuid()),
-        "from RUN_3's seat its own selected output outranks v5's other run and v4's hand, \
-         both of which are the higher version"
-    );
-    assert_ne!(
-        winner(ids::RUN_3).await,
         Some(hand_written_v4),
-        "and rank 2 never wins on version alone"
+        "from RUN_3's seat the step-produced pick is its own v2 (rank 0 beats v5's rank 1), and \
+         the hand-written v4 is newer, so v4 is read (MOD-73)"
     );
     assert_eq!(
         winner(ids::RUN_1).await,
         Some(other_runs_v5),
-        "from RUN_1's seat v5 is the rank-0 row, so the arms are told apart and not merely ordered"
+        "from RUN_1's seat v5 is the rank-0 row and newer than the hand-written v4, so the arms \
+         are told apart and not merely ordered"
     );
 
     teardown(db, &[&cache]).await;
