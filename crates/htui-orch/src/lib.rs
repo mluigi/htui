@@ -21,7 +21,8 @@
 //! remote-first, name-second choice (plan D111–D113). `queue.rs`, also named
 //! by ANA-2 §8, remains MOD-12's and is deliberately not created, not even empty (plan D1).
 //! MOD-24 adds [`kill_point`], the crash tests' hook at three seams of a walk and the command
-//! poll; without `test-support` it compiles to nothing.
+//! poll; without `test-support` it compiles to nothing. MOD-11 adds [`tools`], the seam a session's
+//! MCP tool host is opened through (plan D4).
 #![warn(missing_docs)]
 
 pub mod closeout;
@@ -42,6 +43,7 @@ pub mod promote;
 pub mod recover;
 pub mod select;
 pub mod status;
+pub mod tools;
 pub mod verify;
 
 pub use command::{
