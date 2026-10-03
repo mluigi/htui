@@ -87,6 +87,33 @@ pub struct PersonaImports {
 /// [`StoreError::Unreachable`] with [`DATABASE_UNREACHABLE`] offline (before any file is read),
 /// or the one `personas()` read's error. A path that does not exist is a reported `Refused`.
 pub async fn import(backend: &Backend, path: &str) -> Result<Vec<PersonaOutcome>> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    import_in(backend, path, home.as_deref()).await
+}
+
+/// A typed path with a leading `~/`, or a bare `~`, under `home` (R1 N-2): the persona import's
+/// path is the maintainer's `~/.claude/agents` as often as the repo's. Nothing else is expanded
+/// (`~user`, a `~` mid-path), and with no home the path is taken as typed. The skill import keeps
+/// its own behaviour.
+fn expand_home(path: &str, home: Option<&Path>) -> PathBuf {
+    let Some(home) = home else {
+        return PathBuf::from(path);
+    };
+    if path == "~" {
+        return home.to_path_buf();
+    }
+    match path.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None => PathBuf::from(path),
+    }
+}
+
+/// [`import`] with the home directory a leading `~` names.
+async fn import_in(
+    backend: &Backend,
+    path: &str,
+    home: Option<&Path>,
+) -> Result<Vec<PersonaOutcome>> {
     let writer = backend
         .writer()
         .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
@@ -103,7 +130,8 @@ pub async fn import(backend: &Backend, path: &str) -> Result<Vec<PersonaOutcome>
         known,
         written: Vec::new(),
     };
-    Ok(batch.one_path(path).await)
+    let root = expand_home(path, home);
+    Ok(batch.one_path(&root, &root.display().to_string()).await)
 }
 
 /// One import's shared state: the writer, the names one read found, and the names this batch
@@ -118,10 +146,9 @@ struct Batch<'a, W> {
 }
 
 impl<W: WriteStore> Batch<'_, W> {
-    /// The files one typed path contributes (OQ-9, B-14).
-    async fn one_path(&mut self, path: &str) -> Vec<PersonaOutcome> {
-        let root = PathBuf::from(path);
-        let metadata = match std::fs::metadata(&root) {
+    /// The files one typed path contributes (OQ-9, B-14); `path` is how the report names `root`.
+    async fn one_path(&mut self, root: &Path, path: &str) -> Vec<PersonaOutcome> {
+        let metadata = match std::fs::metadata(root) {
             Ok(metadata) => metadata,
             Err(error) => {
                 return vec![PersonaOutcome::Refused {
@@ -132,7 +159,7 @@ impl<W: WriteStore> Batch<'_, W> {
         };
         // A directly named file is read whatever its extension (the skill import's rule).
         if metadata.is_file() {
-            return vec![self.write_one(&root, path).await];
+            return vec![self.write_one(root, path).await];
         }
         if !metadata.is_dir() {
             return vec![PersonaOutcome::Refused {
@@ -141,7 +168,7 @@ impl<W: WriteStore> Batch<'_, W> {
             }];
         }
 
-        let (mut candidates, unexamined) = match markdown_files(&root) {
+        let (mut candidates, unexamined) = match markdown_files(root) {
             Ok(found) => found,
             Err(error) => {
                 return vec![PersonaOutcome::Refused {
@@ -291,7 +318,9 @@ fn read_text(path: &Path) -> std::result::Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BYTES, MAX_ENTRIES, NO_FRONTMATTER, PersonaOutcome, import};
+    use super::{
+        MAX_BYTES, MAX_ENTRIES, NO_FRONTMATTER, PersonaOutcome, expand_home, import, import_in,
+    };
     use htui_core::model::PersonaFileError;
     use htui_core::model::persona::MODEL_REFUSED;
     use htui_core::store::{MemStore, StoreError, WriteStore as _};
@@ -658,6 +687,49 @@ mod tests {
             }]
         );
         assert_eq!(names(&store).await, before, "no row");
+    }
+
+    /// R1 N-2: `~/…` and a bare `~` name the home directory; nothing else is expanded.
+    #[test]
+    fn a_leading_tilde_is_the_home_directory() {
+        let home = Path::new("/home/someone");
+        for (typed, expanded) in [
+            ("~", "/home/someone"),
+            ("~/", "/home/someone/"),
+            ("~/.claude/agents", "/home/someone/.claude/agents"),
+            ("~other/agents", "~other/agents"),
+            ("/srv/~/agents", "/srv/~/agents"),
+            ("agents/~", "agents/~"),
+        ] {
+            assert_eq!(
+                expand_home(typed, Some(home)),
+                Path::new(expanded),
+                "{typed}"
+            );
+        }
+        assert_eq!(expand_home("~/agents", None), Path::new("~/agents"));
+    }
+
+    /// R1 N-2: an import of `~/…` reads under the home directory it is given.
+    #[tokio::test]
+    async fn an_import_of_a_tilde_path_reads_under_home() {
+        let (store, backend) = demo();
+        let home = tempfile::tempdir().expect("a temp home");
+        let path = write(&home.path().join(".claude/agents"), "scout.md", SCOUT);
+
+        let report = import_in(&backend, "~/.claude/agents", Some(home.path()))
+            .await
+            .expect("the import runs");
+
+        assert_eq!(
+            report,
+            [PersonaOutcome::Imported {
+                name: "scout".to_owned(),
+                path,
+                dropped: Vec::new(),
+            }]
+        );
+        assert!(names(&store).await.contains(&"scout".to_owned()));
     }
 
     #[tokio::test]
