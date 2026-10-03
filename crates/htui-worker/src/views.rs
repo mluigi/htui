@@ -10,7 +10,7 @@ use htui_agent::event::DoneEvent;
 use htui_core::model::{
     DocumentHead, DocumentId, Item, ItemId, NewDocument, Run, RunId, RunStep, SnapshotPhase, StepId,
 };
-use htui_core::store::{Result as StoreResult, StoreError};
+use htui_core::store::{Result as StoreResult, StepFence, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
 use htui_orch::status::{group_at, resumable};
 use htui_orch::{
@@ -19,6 +19,7 @@ use htui_orch::{
     retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
 use htui_store::DATABASE_UNREACHABLE;
+use uuid::Uuid;
 
 use crate::address::Publish;
 
@@ -516,11 +517,15 @@ pub trait StepAuthor: Send + Sync + core::fmt::Debug {
 /// output document. Production `author` is `None` (MOD-11 writes documents; R-50).
 ///
 /// MOD-41 plan D7: `S` is the host's store ([`WorkerHost::Store`](htui_core::store::WorkerHost)).
+/// MOD-11 T6 (closes MOD-41 D5): the author's write is fenced by the walk's lease, `owner`, like
+/// every other write of the walk; a lost lease answers `Fenced` and writes nothing (H-22).
 #[derive(Debug, Clone)]
 pub struct ProgressSink<S> {
     pub(crate) publisher: Arc<dyn Publish>,
     pub(crate) writer: S,
     pub(crate) author: Option<Arc<dyn StepAuthor>>,
+    /// The runtime's `claim_run` owner: the fence the author's write is made under.
+    pub(crate) owner: Uuid,
 }
 
 impl<S: htui_core::store::WorkerStore> SessionSink for ProgressSink<S> {
@@ -543,7 +548,12 @@ impl<S: htui_core::store::WorkerStore> SessionSink for ProgressSink<S> {
         if let Some(author) = &self.author
             && let Some(document) = author.document(item, step, phase)
         {
-            self.writer.write_document(document).await?;
+            htui_core::store::WorkerStore::write_step_document(
+                &self.writer,
+                StepFence::Lease(self.owner),
+                document,
+            )
+            .await?;
         }
         self.publisher.publish(&RunFrame {
             item,
@@ -625,6 +635,101 @@ mod tests {
             panic!("`StartRun` answers `Started`, not {outcome:?}");
         };
         run
+    }
+
+    /// A publisher that drops every frame.
+    #[derive(Debug)]
+    struct Silent;
+
+    impl crate::address::Publish for Silent {
+        fn publish(&self, _frame: &crate::RunFrame) {}
+    }
+
+    /// The test author: one document of the phase's kind for the step.
+    #[derive(Debug)]
+    struct Author;
+
+    impl super::StepAuthor for Author {
+        fn document(
+            &self,
+            item: ItemId,
+            step: &htui_core::model::RunStep,
+            phase: &htui_core::model::SnapshotPhase,
+        ) -> Option<htui_core::model::NewDocument> {
+            Some(htui_core::model::NewDocument {
+                id: htui_core::model::DocumentId::new(),
+                item_id: item,
+                kind: phase.output_kind.clone(),
+                title: phase.output_kind.clone(),
+                body: "authored".to_owned(),
+                produced_by_step_id: Some(step.id),
+                created_by: ids::USER,
+                created_at: chrono::Utc::now(),
+            })
+        }
+    }
+
+    /// MOD-11 T6 (closes MOD-41 D5, H-22): the sink's write is fenced by the walk's lease — a
+    /// sink whose owner does not hold the run's lease writes nothing and answers `Fenced`; the
+    /// holder's lands.
+    #[tokio::test]
+    async fn the_sink_writes_under_the_walks_fence() {
+        use htui_orch::SessionSink as _;
+
+        let orch = FakeOrchestrator::demo();
+        let run = started(&orch).await;
+        let row = orch.store().run(run).await.expect("read").expect("the run");
+        let steps = orch.store().run_steps(run).await.expect("MemStore reads");
+        let prd = steps[0].clone();
+        let phase = htui_orch::phase_at(
+            run,
+            &htui_orch::snapshot_of(&row).expect("the snapshot decodes"),
+            prd.position,
+        )
+        .expect("the snapshot names prd");
+        let owner = uuid::Uuid::now_v7();
+        assert!(
+            orch.store()
+                .take_lease(run, orch.box_id(), owner, chrono::TimeDelta::minutes(5))
+                .await
+                .expect("the take answers"),
+            "the parked run's lease is free"
+        );
+        let key = htui_orch::SessionKey::of(&prd);
+        let done = htui_agent::event::DoneEvent {
+            stop_reason: htui_agent::event::StopReason::EndTurn,
+        };
+        let sink = |owner| super::ProgressSink {
+            publisher: std::sync::Arc::new(Silent),
+            writer: orch.store().clone(),
+            author: Some(std::sync::Arc::new(Author) as std::sync::Arc<dyn super::StepAuthor>),
+            owner,
+        };
+        let count = || async {
+            orch.store()
+                .documents(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore reads")
+                .iter()
+                .filter(|head| head.produced_by_step_id == Some(prd.id))
+                .count()
+        };
+        let before = count().await;
+
+        let stranger = sink(uuid::Uuid::now_v7())
+            .after_done(ids::HTUI_FEAT_3, &prd, &phase, &key, &done)
+            .await;
+        assert!(
+            matches!(stranger, Err(htui_core::store::StoreError::Fenced { .. })),
+            "{stranger:?}"
+        );
+        assert_eq!(count().await, before, "nothing written");
+
+        sink(owner)
+            .after_done(ids::HTUI_FEAT_3, &prd, &phase, &key, &done)
+            .await
+            .expect("the holder's write lands");
+        assert_eq!(count().await, before + 1);
     }
 
     /// MOD-37 R-31 (review L2): `u` is enabled over a rejection a crash left parked (the run

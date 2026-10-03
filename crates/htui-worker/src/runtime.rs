@@ -22,6 +22,7 @@ use htui_core::model::{
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::kill_point::{KillPoint, Site};
+use htui_orch::tools::ToolHost;
 use htui_orch::{
     Adopted, Clock, Command, CommandOutcome, DeadWalks, DriverFor, Engine, EngineError,
     EngineParts, FirstCandidate, GixIsolator, Isolator, IsolatorConfig, LeaseTimes, Next,
@@ -185,6 +186,9 @@ struct Shared<P: ReplySink> {
     drivers: Arc<DriverFactory>,
     clock: Arc<dyn Clock>,
     author: Option<Arc<dyn StepAuthor>>,
+    /// MOD-11 D11: htui's MCP host every engine of this runtime opens its leases on; closed by
+    /// [`RunRuntime::shutdown`] (B-19).
+    tools: Option<Arc<dyn ToolHost>>,
     owner: Uuid,
     dead_walks: Arc<DeadWalks>,
     publisher: Publisher<P>,
@@ -872,6 +876,8 @@ struct Kit<H: htui_core::store::WorkerHost> {
     policy: Box<dyn Fn(AgentId) -> PermissionPolicy + Send + Sync>,
     /// MOD-42 plan D10: each run's control: its live `Walks` parent's, else never signalled.
     control: Box<dyn Fn(RunId) -> Control + Send + Sync>,
+    /// MOD-11 D11: the runtime's tool host, handed to every engine.
+    tools: Option<Arc<dyn ToolHost>>,
 }
 
 impl<H: htui_core::store::WorkerHost> Kit<H> {
@@ -920,6 +926,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
                 publisher: Arc::new(shared.publisher.clone()),
                 writer: writer.clone(),
                 author: shared.author.clone(),
+                owner: shared.owner,
             },
             writer,
             graphs: HostGraphs(host.clone()),
@@ -940,6 +947,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             tails,
             policy,
             control: Box::new(move |run| walks.control(run)),
+            tools: shared.tools.clone(),
         })
     }
 
@@ -1012,8 +1020,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             dead_walks: &self.dead_walks,
             user: self.user,
             tails: self.tails,
-            // MOD-11 D11: the worker's host is wired in T6 commit 3.
-            tools: None,
+            tools: self.tools.clone(),
         })
     }
 }
@@ -1114,6 +1121,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 drivers: Arc::new(drivers),
                 clock: Arc::new(SystemClock),
                 author: None,
+                tools: None,
                 owner: Uuid::now_v7(),
                 dead_walks: Arc::new(DeadWalks::new()),
                 publisher: Publisher::default(),
@@ -1320,6 +1328,18 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
         self
     }
 
+    /// MOD-11 D11: a runtime whose engines open one tool lease per session on `tools` (the
+    /// worker's `McpHost<PgStore>`, the TUI's `McpHost<Backend>`). [`shutdown`](Self::shutdown)
+    /// closes it.
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_tool_host(mut self, tools: Arc<dyn ToolHost>) -> Self {
+        self.configure().tools = Some(tools);
+        self
+    }
+
     /// D202: the production isolator's scratch root, instead of `identity::config_root()/trees`.
     ///
     /// # Panics
@@ -1477,7 +1497,8 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// The UI is gone: the runtime closes, so no walk, task or sweep starts after this; every
     /// walk is cancelled — its lease given back through `abandoned` — and every task, including
     /// one spawned while this waits, is awaited within **one** shared window of `2 × grace`, then
-    /// aborted. The loop cancels the chats beside this, inside the same bounded quit.
+    /// aborted. The loop cancels the chats beside this, inside the same bounded quit. Then the
+    /// tool host is closed (MOD-11 B-19): its listener and socket go, and every session ends.
     pub async fn shutdown(&mut self, grace: Duration) {
         self.shared.walks.close();
         let deadline = tokio::time::Instant::now() + grace * 2;
@@ -1490,7 +1511,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                     .unwrap_or_else(PoisonError::into_inner),
             );
             if tasks.is_empty() {
-                return;
+                break;
             }
             for Tracked { tag, handle } in tasks {
                 let abort = handle.abort_handle();
@@ -1499,6 +1520,9 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                     tracing::warn!(run = ?tag.run.get(), "a run task did not end within the grace window");
                 }
             }
+        }
+        if let Some(tools) = &self.shared.tools {
+            tools.close();
         }
     }
 }
@@ -3566,6 +3590,47 @@ mod role_gate {
         runtime.sweep_with(&backend, &sink);
         rests_at(&store, later, RunStatus::AwaitingApproval).await;
         assert!(runtime.settle(PATIENCE).await.is_empty());
+    }
+
+    /// MOD-11 D11: a runtime built `with_tool_host` hands the host to every engine it builds:
+    /// the claimed run's first session opened a lease scoped to its step, under the runtime's
+    /// own fence, and gave it back when the session ended.
+    #[tokio::test]
+    async fn with_tool_host_reaches_the_engine() {
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let run = queued(&store, ids::HTUI_ANA_2, Utc::now()).await;
+        let host = Arc::new(htui_orch::fake::FakeToolHost::default());
+        let mut runtime = worker_runtime()
+            .with_tool_host(Arc::clone(&host) as Arc<dyn htui_orch::tools::ToolHost>);
+        let backend = Backend::memory(store.clone());
+
+        runtime.sweep_with(&backend, &Timed::new());
+        rests_at(&store, run, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+
+        let steps = store.run_steps(run).await.expect("the read");
+        let opened = host.opened();
+        assert!(!opened.is_empty(), "the walk's session opened a lease");
+        assert_eq!(opened[0].run_id, run);
+        assert_eq!(opened[0].step_id, steps[0].id);
+        assert!(
+            matches!(opened[0].fence, htui_core::store::StepFence::Lease(_)),
+            "{:?}",
+            opened[0].fence
+        );
+        assert_eq!(host.live(), 0, "the lease ended with the session");
+    }
+
+    /// MOD-11 B-19: `shutdown` closes the tool host once the tasks have ended.
+    #[tokio::test]
+    async fn shutdown_closes_the_tool_host() {
+        let host = Arc::new(htui_orch::fake::FakeToolHost::default());
+        let mut runtime = worker_runtime()
+            .with_tool_host(Arc::clone(&host) as Arc<dyn htui_orch::tools::ToolHost>);
+        assert!(!host.closed());
+        runtime.shutdown(Duration::from_millis(10)).await;
+        assert!(host.closed(), "the listener is the runtime's to close");
     }
 
     /// OQ-6, blueprint B-10: a stranded run whose live graph no longer resolves (`NoGraph`) fails
