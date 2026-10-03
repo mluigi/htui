@@ -46,19 +46,23 @@ use chrono::Utc;
 use htui_agent::acp::AcpDriver;
 use htui_agent::acp::Handshake;
 #[cfg(unix)]
-use htui_agent::acp::{AcpIo, SessionOptions, Stamp, TOOL_KIND_DENIED, open_session};
+use htui_agent::acp::{
+    AcpIo, SESSION_STARTED, SessionOptions, Stamp, TOOL_KIND_DENIED, open_session,
+};
 use htui_agent::driver::DriverFuture;
 #[cfg(unix)]
-use htui_agent::driver::{AgentDriver, AgentSession};
+use htui_agent::driver::{AgentDriver, AgentSession, AgentSessionRef};
 use htui_agent::driver::{PermissionPolicy, SessionSpec, ToolExposure};
 #[cfg(unix)]
 use htui_agent::error::DriverError;
 #[cfg(unix)]
-use htui_agent::event::{DriverEvent, EditProposalEvent, ErrorEvent, ToolKind};
+use htui_agent::event::{
+    DoneEvent, DriverEvent, EditProposalEvent, ErrorEvent, StopReason, ToolKind,
+};
 use htui_agent::launch::AcpSettings;
 use htui_agent::launch::ResolvedLaunch;
 #[cfg(unix)]
-use htui_agent::launch::{AgentSettings, spawn};
+use htui_agent::launch::{AgentSettings, SessionSettings, spawn};
 use htui_agent::probe::{
     ProbeContext, ProbeEnv, ProbeSnapshot, ProbeSource, ProbeStatus, Tier2, agent_box_row,
     probe_snapshot,
@@ -1233,4 +1237,549 @@ async fn a_probe_column_that_does_not_parse_resolves_as_before() {
         "nothing was read out of a document that does not parse: {:?}",
         launch.args
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-37 M5 (R-48): the driver restores `spec.resume` - `session/resume`, else `session/load`
+// with its replay discarded, else a refusal
+// ---------------------------------------------------------------------------------------------
+
+/// The session id [`restoring_agent`] mints on `session/new`. A banner carrying it means the
+/// driver opened a fresh session instead of restoring the requested one.
+#[cfg(unix)]
+const FRESH_SESSION: &str = "fresh-session";
+
+/// The agent-side id every restore case asks for.
+#[cfg(unix)]
+const PRIOR_SESSION: &str = "prior";
+
+/// How [`restoring_agent`] answers one restore request.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+enum Answer {
+    /// `result: {}`.
+    Ok,
+    /// `error: { code: -32000, message: VENDOR_REFUSAL }`.
+    Refuse,
+}
+
+/// Writes one JSON-RPC line and flushes it; `false` once the client has gone away.
+#[cfg(unix)]
+async fn write_line(
+    writer: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    value: &Value,
+) -> bool {
+    let mut text = serde_json::to_string(value).expect("the line serialises");
+    text.push('\n');
+    writer.write_all(text.as_bytes()).await.is_ok() && writer.flush().await.is_ok()
+}
+
+/// The replay [`restoring_agent`] streams ahead of its `session/load` answer: one assistant chunk
+/// and one completed tool call, the two kinds a duplicated history would show first.
+#[cfg(unix)]
+fn old_history() -> Vec<Value> {
+    vec![
+        json!({
+            "sessionUpdate": "agent_message_chunk",
+            "content": { "type": "text", "text": "old reply" },
+        }),
+        json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": "old-call",
+            "title": "read old",
+            "kind": "read",
+            "status": "completed",
+        }),
+    ]
+}
+
+/// MOD-37 M5: an agent that advertises `caps` in its `initialize` answer, answers `session/new`
+/// with [`FRESH_SESSION`], answers `session/resume` per `resume` and `session/load` per `load`
+/// (writing `replay` as `session/update` notifications for the requested id first), and on
+/// `session/prompt` sends one `agent_message_chunk` "fresh turn" and ends the turn `end_turn`.
+/// Every request's method and params go to `seen`.
+///
+/// Raw newline-delimited JSON-RPC in [`refuse_session_new`]'s style. Notifications from the client
+/// (`session/cancel`) are recorded and get no answer.
+#[cfg(unix)]
+async fn restoring_agent(
+    stream: tokio::io::DuplexStream,
+    caps: Value,
+    resume: Answer,
+    load: Answer,
+    replay: Vec<Value>,
+    seen: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
+) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            continue;
+        };
+        let params = message.get("params").cloned().unwrap_or(Value::Null);
+        let _ = seen.send((method.to_owned(), params.clone()));
+        let Some(id) = message.get("id").cloned() else {
+            continue;
+        };
+        let answered = |answer: Answer| match answer {
+            Answer::Ok => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            Answer::Refuse => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32000, "message": VENDOR_REFUSAL },
+            }),
+        };
+        let reply = match method {
+            "initialize" => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": { "protocolVersion": 1, "agentCapabilities": caps },
+            }),
+            "session/new" => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": FRESH_SESSION } })
+            }
+            "session/resume" => answered(resume),
+            "session/load" => {
+                let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
+                for update in &replay {
+                    let notification = json!({
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": { "sessionId": session_id, "update": update },
+                    });
+                    if !write_line(&mut writer, &notification).await {
+                        return;
+                    }
+                }
+                answered(load)
+            }
+            "session/prompt" => {
+                let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
+                let chunk = json!({
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": session_id,
+                        "update": {
+                            "sessionUpdate": "agent_message_chunk",
+                            "content": { "type": "text", "text": "fresh turn" },
+                        },
+                    },
+                });
+                if !write_line(&mut writer, &chunk).await {
+                    return;
+                }
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "stopReason": "end_turn" } })
+            }
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": { "code": -32601, "message": "method not found" },
+            }),
+        };
+        if !write_line(&mut writer, &reply).await {
+            return;
+        }
+    }
+}
+
+/// `spec(cwd)` asking to restore `id`, with one extra directory so the request's
+/// `additionalDirectories` is something to assert.
+#[cfg(unix)]
+fn spec_resuming(cwd: PathBuf, id: &str) -> SessionSpec {
+    let extra = cwd.join("extra");
+    SessionSpec {
+        resume: Some(AgentSessionRef::new(id)),
+        extra_dirs: vec![extra],
+        ..spec(cwd)
+    }
+}
+
+/// One restore attempt's outcome: what `open_session` answered, the pid of its `sleep` child
+/// when it had one, the requests the agent saw, and the agent's task.
+#[cfg(unix)]
+struct Restore {
+    opened: Result<htui_agent::acp::AcpSession, DriverError>,
+    pid: Option<u32>,
+    seen: tokio::sync::mpsc::UnboundedReceiver<(String, Value)>,
+    agent: tokio::task::JoinHandle<()>,
+}
+
+#[cfg(unix)]
+impl Restore {
+    /// Every `(method, params)` the agent has seen so far. The agent records a request before it
+    /// answers, and `open_session` returns only after its last answer, so nothing is still in
+    /// flight when this is called after `open_session`.
+    fn seen(&mut self) -> Vec<(String, Value)> {
+        let mut seen = Vec::new();
+        while let Ok(entry) = self.seen.try_recv() {
+            seen.push(entry);
+        }
+        seen
+    }
+}
+
+/// The methods in `seen`, in order.
+#[cfg(unix)]
+fn methods(seen: &[(String, Value)]) -> Vec<&str> {
+    seen.iter().map(|(method, _)| method.as_str()).collect()
+}
+
+/// Opens a session resuming [`PRIOR_SESSION`] in `cwd` against [`restoring_agent`], with
+/// `session` as `settings.acp.session` and, when `with_child`, a `sleep 1000` child whose pid the
+/// case can assert on.
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+async fn open_restoring(
+    cwd: &Path,
+    caps: Value,
+    resume: Answer,
+    load: Answer,
+    session: SessionSettings,
+    with_child: bool,
+) -> Restore {
+    let child = if with_child {
+        Some(
+            spawn(
+                &ResolvedLaunch {
+                    command: "sleep".to_owned(),
+                    args: vec!["1000".to_owned()],
+                    env: BTreeMap::new(),
+                },
+                cwd,
+            )
+            .await
+            .expect("`sleep` is on this box"),
+        )
+    } else {
+        None
+    };
+    let pid = child
+        .as_ref()
+        .map(|child| child.pid().expect("a freshly spawned child has a pid"));
+
+    let (client_end, agent_end) = tokio::io::duplex(DUPLEX_BYTES);
+    let (reader, writer) = tokio::io::split(client_end);
+    let (seen_tx, seen) = tokio::sync::mpsc::unbounded_channel();
+    let agent = tokio::spawn(restoring_agent(
+        agent_end,
+        caps,
+        resume,
+        load,
+        old_history(),
+        seen_tx,
+    ));
+    let io = AcpIo {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        child,
+    };
+    let mut options = options(PATIENT_HANDSHAKE);
+    options.settings.acp.session = session;
+
+    let opened = open_session(
+        io,
+        spec_resuming(cwd.to_path_buf(), PRIOR_SESSION),
+        "hi".to_owned(),
+        options,
+    )
+    .await;
+    Restore {
+        opened,
+        pid,
+        seen,
+        agent,
+    }
+}
+
+/// Pulls events until the turn's `done`, inclusive.
+#[cfg(unix)]
+async fn events_to_done(session: &mut htui_agent::acp::AcpSession) -> Vec<DriverEvent> {
+    let mut events = Vec::new();
+    loop {
+        let next = tokio::time::timeout(EVENT_WINDOW, session.next_event())
+            .await
+            .expect("the turn ends within the window")
+            .expect("the transport stays healthy");
+        let Some(envelope) = next else {
+            break;
+        };
+        let done = matches!(envelope.event, DriverEvent::Done(_));
+        events.push(envelope.event);
+        if done {
+            break;
+        }
+    }
+    events
+}
+
+/// The banner's `session_id`, failing unless `event` is the banner.
+#[cfg(unix)]
+fn banner_session(event: &DriverEvent) -> &str {
+    match event {
+        DriverEvent::Other(other) if other.update == SESSION_STARTED => other
+            .body
+            .get("session_id")
+            .and_then(Value::as_str)
+            .expect("the banner names its session"),
+        other => panic!("the first event is the banner, got {other:?}"),
+    }
+}
+
+/// The transport error's text, failing on anything else.
+#[cfg(unix)]
+fn transport_message(opened: &Result<htui_agent::acp::AcpSession, DriverError>) -> &str {
+    match opened {
+        Err(DriverError::Transport(message)) => message,
+        Err(other) => panic!("expected a transport error, got {other:?}"),
+        Ok(_) => panic!("this restore must not open a session"),
+    }
+}
+
+/// Fails unless `params` names the requested session, `cwd` and `cwd/extra`.
+#[cfg(unix)]
+fn assert_restore_params(params: &Value, cwd: &Path) {
+    assert_eq!(params["sessionId"], json!(PRIOR_SESSION), "{params}");
+    assert_eq!(params["cwd"], json!(cwd), "{params}");
+    assert_eq!(
+        params["additionalDirectories"],
+        json!([cwd.join("extra")]),
+        "{params}"
+    );
+}
+
+/// The one event after the banner that opens the turn must be the new prompt's own chunk.
+#[cfg(unix)]
+fn assert_fresh_turn(after_banner: &[DriverEvent]) {
+    match after_banner {
+        [
+            DriverEvent::AssistantChunk(chunk),
+            DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            }),
+        ] => assert_eq!(chunk.text, "fresh turn"),
+        other => panic!("the fresh turn's chunk, then `done(end_turn)`, got {other:?}"),
+    }
+}
+
+/// (a) `session/resume` advertised and allowed: it is sent with the id, the cwd and the extra
+/// dirs, `session/new` never is, and the banner carries the restored id.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resume_sends_session_resume_and_never_session_new() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let mut restore = open_restoring(
+        tmp.path(),
+        json!({ "sessionCapabilities": { "resume": {} }, "loadSession": true }),
+        Answer::Ok,
+        Answer::Ok,
+        SessionSettings::default(),
+        false,
+    )
+    .await;
+    let opened = std::mem::replace(&mut restore.opened, Err(DriverError::Closed));
+    let mut session = opened.expect("a resumable session opens");
+    let events = events_to_done(&mut session).await;
+    let seen = restore.seen();
+
+    let resumed: Vec<_> = seen
+        .iter()
+        .filter(|(method, _)| method == "session/resume")
+        .collect();
+    assert_eq!(
+        resumed.len(),
+        1,
+        "one `session/resume`: {:?}",
+        methods(&seen)
+    );
+    assert_restore_params(&resumed[0].1, tmp.path());
+    assert!(
+        !methods(&seen).contains(&"session/new") && !methods(&seen).contains(&"session/load"),
+        "neither `session/new` nor `session/load` was sent: {:?}",
+        methods(&seen)
+    );
+    assert_eq!(banner_session(&events[0]), PRIOR_SESSION);
+    assert_fresh_turn(&events[1..]);
+
+    drop(session);
+    restore.agent.abort();
+    let _ = restore.agent.await;
+}
+
+/// (b) `loadSession` only: `session/load` is sent, and the history it replays ahead of its answer
+/// never reaches `next_event`, so the first event after the banner is the new prompt's turn. A
+/// replay streamed after the answer would show up here as an extra event (H-5).
+#[cfg(unix)]
+#[tokio::test]
+async fn a_load_discards_the_replay_before_the_first_turn() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let mut restore = open_restoring(
+        tmp.path(),
+        json!({ "loadSession": true }),
+        Answer::Ok,
+        Answer::Ok,
+        SessionSettings::default(),
+        false,
+    )
+    .await;
+    let seen = restore.seen();
+    let loaded: Vec<_> = seen
+        .iter()
+        .filter(|(method, _)| method == "session/load")
+        .collect();
+    assert_eq!(loaded.len(), 1, "one `session/load`: {:?}", methods(&seen));
+    assert_restore_params(&loaded[0].1, tmp.path());
+    assert!(
+        !methods(&seen).contains(&"session/new"),
+        "`session/new` was not sent: {:?}",
+        methods(&seen)
+    );
+
+    let opened = std::mem::replace(&mut restore.opened, Err(DriverError::Closed));
+    let mut session = opened.expect("a loadable session opens");
+    let events = events_to_done(&mut session).await;
+    assert_eq!(banner_session(&events[0]), PRIOR_SESSION);
+    assert!(
+        !events.iter().any(|event| match event {
+            DriverEvent::AssistantChunk(chunk) => chunk.text == "old reply",
+            DriverEvent::ToolCall(call) => call.tool_call_id == "old-call",
+            _ => false,
+        }),
+        "nothing from the replay reached the session: {events:?}"
+    );
+    assert_fresh_turn(&events[1..]);
+
+    drop(session);
+    restore.agent.abort();
+    let _ = restore.agent.await;
+}
+
+/// (c1) Neither request is advertised: `start` refuses, naming both missing capabilities, sends
+/// no `session/new`, and reaps the child.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resume_the_agent_cannot_restore_is_refused_and_reaped() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let mut restore = open_restoring(
+        tmp.path(),
+        json!({}),
+        Answer::Ok,
+        Answer::Ok,
+        SessionSettings::default(),
+        true,
+    )
+    .await;
+    let message = transport_message(&restore.opened).to_owned();
+    assert!(
+        message.contains("cannot resume session `prior`"),
+        "the refusal names the session: {message}"
+    );
+    assert!(
+        message.contains("sessionCapabilities.resume") && message.contains("loadSession"),
+        "and both capabilities the agent lacks: {message}"
+    );
+    let seen = restore.seen();
+    assert!(
+        !methods(&seen).contains(&"session/new"),
+        "no fresh session stands in for the requested one: {:?}",
+        methods(&seen)
+    );
+    assert_reaped(
+        restore.pid.expect("the case spawned a child"),
+        "the session's child",
+    )
+    .await;
+    restore.agent.abort();
+    let _ = restore.agent.await;
+}
+
+/// (c2) Both requests advertised, both switched off in `settings.acp.session`: refused, naming
+/// both settings, and no request of any kind is sent after `initialize`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resume_the_settings_forbid_is_refused() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let mut restore = open_restoring(
+        tmp.path(),
+        json!({ "sessionCapabilities": { "resume": {} }, "loadSession": true }),
+        Answer::Ok,
+        Answer::Ok,
+        SessionSettings {
+            load: false,
+            resume: false,
+        },
+        false,
+    )
+    .await;
+    let message = transport_message(&restore.opened).to_owned();
+    assert!(
+        message.contains("settings.acp.session.resume")
+            && message.contains("settings.acp.session.load"),
+        "the refusal names both settings: {message}"
+    );
+    let seen = restore.seen();
+    assert_eq!(
+        methods(&seen),
+        vec!["initialize"],
+        "no restore request and no `session/new` were sent"
+    );
+    restore.agent.abort();
+    let _ = restore.agent.await;
+}
+
+/// (d) A refused `session/load` answers with the agent's own message in the D61 shape, and the
+/// child is reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_session_load_answers_with_the_agents_own_message() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let restore = open_restoring(
+        tmp.path(),
+        json!({ "loadSession": true }),
+        Answer::Ok,
+        Answer::Refuse,
+        SessionSettings::default(),
+        true,
+    )
+    .await;
+    let message = transport_message(&restore.opened).to_owned();
+    assert!(
+        message.contains("session/load failed"),
+        "the error names the request that was refused: {message}"
+    );
+    assert!(
+        message.contains(VENDOR_REFUSAL),
+        "and carries the agent's own text: {message}"
+    );
+    assert_reaped(
+        restore.pid.expect("the case spawned a child"),
+        "the session's child",
+    )
+    .await;
+    restore.agent.abort();
+    let _ = restore.agent.await;
+}
+
+/// (e) H-11: an ACP row resumes when either restore route is on, and hands off only with both off.
+#[test]
+fn caps_for_an_acp_row_resumes_when_load_or_resume_is_on() {
+    for (resume, load, expected) in [
+        (false, true, true),
+        (true, false, true),
+        (false, false, false),
+    ] {
+        let mut agent = row(json!({}));
+        agent.settings = json!({ "acp": { "session": { "resume": resume, "load": load } } });
+        assert_eq!(
+            caps_for(&agent).resume,
+            expected,
+            "settings.acp.session {{ resume: {resume}, load: {load} }}"
+        );
+    }
 }
