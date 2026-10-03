@@ -1384,10 +1384,10 @@ where
                             reason: format!("the handoff prompt was refused: {err}"),
                         });
                     }
-                    Err(StageThree::NoPersona(reason)) => {
+                    Err(StageThree::NoPersona(refusal)) => {
                         return Err(EngineError::Snapshot {
                             run: run.id,
-                            reason: format!("the handoff prompt was refused: {reason}"),
+                            reason: format!("the handoff prompt was refused: {refusal}"),
                         });
                     }
                 };
@@ -3472,17 +3472,20 @@ where
                     .map(Some);
             }
             // MOD-26 I-4: the step fails before a token, the item is blocked, the run settles.
-            Err(StageThree::NoPersona(reason)) => {
-                return self.refuse_prompt(run, step, phase, reason).await.map(Some);
+            Err(StageThree::NoPersona(refusal)) => {
+                return self
+                    .refuse_prompt(run, step, phase, refusal.to_string())
+                    .await
+                    .map(Some);
             }
         };
         // MOD-26 D12: stage 3 passed, so the snapshot carries the persona; `Err` is unreachable
         // and refuses rather than run un-narrowed.
         let persona = snapshot
             .persona_for(phase)
-            .map_err(|reason| EngineError::Snapshot {
+            .map_err(|refusal| EngineError::Snapshot {
                 run: run.id,
-                reason,
+                reason: refusal.to_string(),
             })?;
         // `unwrap_or(Value::Null)` here once wrote a **null** `trim_record` and said nothing: the
         // row that records which sections were dropped and why would silently become "there was
@@ -3854,10 +3857,10 @@ where
                     .map(Some);
             }
             // MOD-26 I-4 at `drive_group`: the whole group fails before a token, the item blocked.
-            Err(StageThree::NoPersona(reason)) => {
+            Err(StageThree::NoPersona(refusal)) => {
                 let failure = RunFailure::PromptRefused {
                     phase: phase.name.clone(),
-                    reason,
+                    reason: refusal.to_string(),
                 };
                 return self
                     .fail_group_before_a_token(run, phase, &pending, failure, true)
@@ -3869,9 +3872,9 @@ where
         // and refuses rather than run un-narrowed.
         let persona = snapshot
             .persona_for(phase)
-            .map_err(|reason| EngineError::Snapshot {
+            .map_err(|refusal| EngineError::Snapshot {
                 run: run.id,
-                reason,
+                reason: refusal.to_string(),
             })?;
 
         let settled = futures::future::join_all(pending.iter().map(|step| {
@@ -5296,7 +5299,8 @@ where
     /// D125's `StaleWrite`, and nothing else is written.
     ///
     /// `reason` is the refusal's sentence: `assemble`'s own, or MOD-26 I-4's
-    /// `persona_not_in_snapshot` for a phase whose persona the snapshot does not carry (B-5).
+    /// [`PersonaNotInSnapshot`](htui_core::model::persona::PersonaNotInSnapshot) rendered, for a
+    /// phase whose persona the snapshot does not carry (B-5).
     async fn refuse_prompt(
         &self,
         run: &Run,
@@ -5358,9 +5362,10 @@ where
     /// caller turns into the hard failure, [`StageThree::Refused`] is `assemble`'s own refusal
     /// of the phase's prompt, which blocks the item (MOD-4 plan D162), and
     /// [`StageThree::NoPersona`] is a phase whose persona the snapshot does not carry, refused the
-    /// same way (MOD-26 I-4). A store error and a phase
-    /// whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are not about
-    /// this prompt.
+    /// same way (MOD-26 I-4) with the typed
+    /// [`PersonaNotInSnapshot`](htui_core::model::persona::PersonaNotInSnapshot). A store error
+    /// and a phase whose pinned template is gone (`ResolveError::NoTemplate`) stay outer: they are
+    /// not about this prompt.
     async fn assemble_prompt(
         &self,
         run: &Run,
@@ -5455,7 +5460,7 @@ where
     /// upstream summaries and, from attempt 2, the loop's forwarded sections (plan D67).
     ///
     /// `Err(MissingInput(kind))` is a required input that resolved to no document, when `strict`.
-    /// `Err(NoPersona(reason))` is a phase naming a persona its snapshot does not carry, when
+    /// `Err(NoPersona(refusal))` is a phase naming a persona its snapshot does not carry, when
     /// `strict` (MOD-26 I-4). A promoted step's handoff (plan D163) is not strict: its chat opens
     /// with the gap noted instead, and without the persona (MOD-26 OQ-5).
     ///
@@ -5478,7 +5483,7 @@ where
         let persona = match snapshot.persona_for(phase) {
             Ok(persona) => persona,
             Err(_) if !strict => None,
-            Err(reason) => return Ok(Err(StageThree::NoPersona(reason))),
+            Err(refusal) => return Ok(Err(StageThree::NoPersona(refusal))),
         };
         let row = self.item(item).await?;
         let project = self.project(row.project_id).await?;
@@ -6280,9 +6285,9 @@ enum StageThree {
     MissingInput(String),
     /// `assemble` refused the phase's own prompt (MOD-4 plan D162, ANA-5 criterion 3).
     Refused(htui_core::prompt::AssembleError),
-    /// MOD-26 I-4: the phase names a persona the run's snapshot does not carry; carries
-    /// `persona_not_in_snapshot`'s sentence.
-    NoPersona(String),
+    /// MOD-26 I-4: the phase names a persona the run's snapshot does not carry; carries the typed
+    /// refusal (M2 D16); its `Display` is the stored sentence.
+    NoPersona(htui_core::model::persona::PersonaNotInSnapshot),
 }
 
 /// One fan-out candidate's inputs to [`Engine::run_candidate`]: everything its stages 2 to 5 read
@@ -6789,6 +6794,12 @@ mod tests {
     use crate::fake::{FakeOrchestrator, ScriptedStep};
     use crate::isolate::{Clock as _, IsolateError};
     use crate::status::RunFailure;
+
+    /// MOD-26 I-4's refusal as milestone 1 persisted it in `RunFailure::PromptRefused.reason`,
+    /// written out literally so the stored reason's bytes are pinned independently of
+    /// `PersonaNotInSnapshot`'s `Display` (M2 D16, B-15).
+    const M1_SENTENCE: &str = "persona `reviewer` is not in the run's snapshot, so the step does \
+                               not run un-narrowed (MOD-26 I-4)";
 
     /// Everything an `Engine` borrows from a `FakeOrchestrator`, held alive for one test.
     ///
@@ -11726,7 +11737,8 @@ mod tests {
     }
 
     /// MOD-26 I-4 at stage 3 (B-4): a snapshot whose phase names a persona it does not carry is
-    /// `StageThree::NoPersona` with `persona_not_in_snapshot`'s sentence, never a prompt.
+    /// `StageThree::NoPersona` carrying the typed refusal, whose `Display` is milestone 1's
+    /// sentence byte for byte (MOD-26 M2 D16, B-15), never a prompt.
     #[tokio::test]
     async fn a_snapshot_without_its_persona_refuses_at_stage_three() {
         let harness = Harness::new().await;
@@ -11739,11 +11751,17 @@ mod tests {
             .assemble_prompt(&row, &snapshot, &prd, &snapshot.phases[0], ids::HTUI_FEAT_3)
             .await
             .expect("no store fault");
-        let expected = htui_core::model::persona::persona_not_in_snapshot("reviewer");
         assert!(
-            matches!(&refused, Err(super::StageThree::NoPersona(reason)) if *reason == expected),
+            matches!(
+                &refused,
+                Err(super::StageThree::NoPersona(refusal)) if refusal.persona == "reviewer"
+            ),
             "{refused:?}"
         );
+        let Err(super::StageThree::NoPersona(refusal)) = refused else {
+            unreachable!("matched above");
+        };
+        assert_eq!(refusal.to_string(), M1_SENTENCE);
     }
 
     /// MOD-26 I-4 end to end (B-5): a claimed run whose snapshot names a persona it lost fails
@@ -11823,7 +11841,7 @@ mod tests {
             rest.failure,
             Some(RunFailure::PromptRefused {
                 phase: "prd".to_owned(),
-                reason: htui_core::model::persona::persona_not_in_snapshot("reviewer"),
+                reason: M1_SENTENCE.to_owned(),
             })
         );
         let steps = harness.orch.steps(run).await;
@@ -11930,7 +11948,7 @@ mod tests {
             rest.failure,
             Some(RunFailure::PromptRefused {
                 phase: "prd".to_owned(),
-                reason: htui_core::model::persona::persona_not_in_snapshot("reviewer"),
+                reason: M1_SENTENCE.to_owned(),
             })
         );
         let steps = harness.orch.steps(run).await;

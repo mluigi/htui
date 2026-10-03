@@ -1052,6 +1052,9 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
     ) -> StoreResult<CasOutcome<htui_core::model::Persona>> {
         self.inner.update_persona(id, expected, patch).await
     }
+    async fn delete_persona(&self, id: htui_core::model::PersonaId) -> StoreResult<()> {
+        self.inner.delete_persona(id).await
+    }
     async fn set_setting(
         &self,
         rung: SettingRung,

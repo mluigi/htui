@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/personas.rs
+expression: frame
+---
+no workspace · no box · offline · 0s · 0 runs
+ 1 Settings
+┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
+│ Personas                                                                                         │
+│personas unavailable: store unreachable: this box browses its read-only cache and starts no run   │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+personas: store unreachable: this box browses its read-only cache and starts no run

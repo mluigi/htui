@@ -1017,12 +1017,13 @@ pub trait WriteStore: ReadStore {
         change: BindingChange,
     ) -> Result<CasOutcome<Option<SkillBinding>>>;
 
-    // persona (MOD-26 milestone 1, plan D4)
+    // persona (MOD-26 milestone 1, plan D4; milestone 2, D14)
     //
     // A global registry like `skill`, read and written here for the skill block's reason
-    // (above). No delete in milestone 1: `step_graph_phase.persona_id` is `ON DELETE RESTRICT`,
-    // and M2 adds the delete with its "bound to phases" refusal. The refusal sentences are
-    // `model::persona`'s pure helpers, re-exported below (plan D3), so both stores word them once.
+    // (above). `step_graph_phase.persona_id` is `ON DELETE RESTRICT`, and `delete_persona` refuses a
+    // bound persona first with [`persona_is_bound`]'s sentence, so the constraint is never what the
+    // caller reads. The refusal sentences are `model::persona`'s pure helpers, re-exported below
+    // (plan D3), so both stores word them once.
 
     /// Every persona, ordered by `name` bytes (`COLLATE "C"`).
     ///
@@ -1053,6 +1054,16 @@ pub trait WriteStore: ReadStore {
         expected: DateTime<Utc>,
         patch: PersonaPatch,
     ) -> Result<CasOutcome<Persona>>;
+
+    /// Deletes a persona no phase binds (MOD-26 milestone 2 D14, I-9). No compare-and-set token,
+    /// as [`delete_item_kind`](WriteStore::delete_item_kind). Order: `NotFound { entity:
+    /// "persona" }` for an unknown id; then [`persona_is_bound`]'s sentence while any
+    /// `step_graph_phase` names it, override graphs included; then the delete. A started run never
+    /// needs the row: it reads its snapshot (M1 I-3).
+    ///
+    /// # Errors
+    /// As above. A refusal writes nothing.
+    async fn delete_persona(&self, id: PersonaId) -> Result<()>;
 
     // settings (D7, D8)
 
@@ -1962,9 +1973,9 @@ pub fn prompt_template_refusal(name: &str, body: &str) -> Option<String> {
 // ---- MOD-26: the persona writers' refusals (plan D3) live in `model::persona`, where the
 // persona-file reader needs them too; re-exported so the store's refusal vocabulary is one list.
 pub use crate::model::persona::{
-    BLANK_PERSONA_BODY, MODEL_REFUSED, RULE_MATCHES_EVERYTHING, allow_names_an_mcp_tool,
-    invalid_persona_name, kind_not_narrowable, new_persona_refusal, not_a_tool_name,
-    persona_not_in_snapshot, persona_patch_refusal, persona_refusal,
+    BLANK_PERSONA_BODY, MODEL_REFUSED, PersonaNotInSnapshot, RULE_MATCHES_EVERYTHING,
+    allow_names_an_mcp_tool, invalid_persona_name, kind_not_narrowable, new_persona_refusal,
+    not_a_tool_name, persona_patch_refusal, persona_refusal, rule_kind_unknown,
 };
 
 // ---- MOD-9 milestone 3: the skill writers' refusals (plan D71-D79, blueprint D88) -------------
@@ -2182,6 +2193,46 @@ pub fn check_attachment(
 #[must_use]
 pub fn item_kind_is_held(prefix: &str, items: u64) -> String {
     format!("item_kind {prefix} is held by {items} items")
+}
+
+/// How many phases [`persona_is_bound`] names before it counts the rest.
+const BOUND_PHASES_NAMED: usize = 5;
+
+/// MOD-26 milestone 2 D14 (I-9): `delete_persona`'s refusal while phases bind the persona. Each
+/// holder is `(project slug, graph name, phase name)`, named `` `<slug>/<graph>/<phase>` ``: a
+/// persona is global and a graph name is unique only per project (`0001_init.sql:221`). Sorted by
+/// the triple's bytes and deduplicated **here**, so both stores word it the same whatever order
+/// they read in; at most five, then "and n more".
+#[must_use]
+pub fn persona_is_bound(name: &str, holders: &[(String, String, String)]) -> String {
+    let mut holders: Vec<&(String, String, String)> = holders.iter().collect();
+    holders.sort_unstable();
+    holders.dedup();
+    let named: Vec<String> = holders
+        .iter()
+        .take(BOUND_PHASES_NAMED)
+        .map(|(project, graph, phase)| {
+            format!("`{}`", format!("{project}/{graph}/{phase}").escape_debug())
+        })
+        .collect();
+    let more = holders.len().saturating_sub(BOUND_PHASES_NAMED);
+    let more = if more == 0 {
+        String::new()
+    } else {
+        format!(" and {more} more")
+    };
+    let (noun, them) = if holders.len() == 1 {
+        ("phase", "it")
+    } else {
+        ("phases", "them")
+    };
+    format!(
+        "persona `{}` is bound to {} {noun} ({}{more}); clear {them} in Settings \u{203a} Kinds \
+         first",
+        name.escape_debug(),
+        holders.len(),
+        named.join(", ")
+    )
 }
 
 // ---- MOD-4: the refusals of ANA-2 §8's writers ------------------------------------------------

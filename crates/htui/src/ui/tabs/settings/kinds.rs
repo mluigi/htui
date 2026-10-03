@@ -12,6 +12,10 @@
 //! under it, then every graph no kind points at with its own phases. The seed is one graph per
 //! kind, so the common shape is kind-then-phases; listing the unreferenced graphs separately is
 //! what keeps a graph created here from becoming invisible the moment nothing names it.
+//!
+//! A phase's persona (MOD-26 milestone 2, D23) is picked the way a kind's graph is: by typing its
+//! name into the phase editor's seventh field, resolved against the persona list the catalogue
+//! carries and refused before anything is sent when the list does not hold it.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -20,12 +24,14 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    ItemKind, ItemKindId, ItemKindPatch, PhaseId, PhasePatch, ProjectId, Scope, StepGraphId,
-    StepGraphPatch, StepGraphPhase,
+    ItemKind, ItemKindId, ItemKindPatch, PersonaId, PhaseId, PhasePatch, ProjectId, Scope,
+    StepGraphId, StepGraphPatch, StepGraphPhase,
 };
 
 use crate::app::{Ctx, Handled};
-use crate::catalogue::{CatalogueSnapshot, GraphEntry, ProjectCatalogue, REQUEST_NAMES};
+use crate::catalogue::{
+    CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES,
+};
 use crate::hierarchy::MirrorAfterDelete;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
@@ -89,6 +95,9 @@ const HINT_DELETING: &str = "y delete \u{b7} n/Esc stop";
 /// What `d` says on a graph or a phase row: the seam has `delete_item_kind` and nothing else in
 /// this area, and this milestone adds no method to it (D5).
 const NOT_DELETED_HERE: &str = "graphs and phases are not deleted here";
+
+/// What the `persona` field says when the registry is empty (MOD-26 M2 D23).
+const NO_PERSONAS: &str = "no personas exist; add one in Settings \u{203a} Personas";
 
 /// The tail of the read-only detail line (D15): the columns are MOD-4's to give semantics to, so
 /// they are shown and not edited.
@@ -164,14 +173,17 @@ enum FollowUp {
 
 /// What an editor remembers of the row it opened on, beyond the text in its fields.
 ///
-/// Two values, because two comparisons are made at submit: the prefix D10 warns about and the
-/// budget B-4 decides the second write from. Everything else goes out whole (B-5).
+/// Three values, because three comparisons are made at submit: the prefix D10 warns about, the
+/// budget B-4 decides the second write from, and the persona MOD-26 M2 D23 writes only when it was
+/// edited (B-8). Everything else goes out whole (B-5).
 #[derive(Debug, Default)]
 struct Stored {
     /// The kind's prefix as it is stored.
     prefix: Option<String>,
     /// The phase's budget as the field renders it (`""` for inherit).
     budget: Option<String>,
+    /// The phase editor's `persona` text at open (`""` for none).
+    persona: Option<String>,
 }
 
 /// One `Enter`'s outcome: the request that goes out now, and the one it owes afterwards (B-4).
@@ -202,6 +214,11 @@ struct Editor {
     stored_prefix: Option<String>,
     /// A phase edit's stored budget as text, for B-4's comparison; `None` for every other editor.
     stored_budget: Option<String>,
+    /// A phase edit's `persona` text at open, for D23's comparison; `None` for every other editor.
+    ///
+    /// Never refreshed, `stored_budget`'s rule (B-8): a `CatalogueStale` leaves it holding what this
+    /// user found in the field, so only a user who typed in it rewrites another writer's binding.
+    stored_persona: Option<String>,
     /// The write this editor still owes after the one in flight (B-4).
     follow_up: Option<FollowUp>,
 }
@@ -509,6 +526,7 @@ impl KindsSection {
         let Stored {
             prefix: stored_prefix,
             budget: stored_budget,
+            persona: stored_persona,
         } = stored;
         self.notice = None;
         self.mode = Mode::Editing(Editor {
@@ -518,6 +536,7 @@ impl KindsSection {
             expected,
             stored_prefix,
             stored_budget,
+            stored_persona,
             follow_up: None,
         });
     }
@@ -581,6 +600,7 @@ impl KindsSection {
                     Stored {
                         prefix: Some(prefix),
                         budget: None,
+                        persona: None,
                     },
                 );
             }
@@ -598,7 +618,8 @@ impl KindsSection {
                 };
                 let (id, expected) = (phase.id, phase.updated_at);
                 let budget = budget_text(phase.token_budget);
-                let fields = edit_phase_fields(phase);
+                let persona = persona_text(phase.persona_id, self.personas());
+                let fields = edit_phase_fields(phase, self.personas());
                 self.open_with(
                     EditorKind::EditPhase(id),
                     fields,
@@ -606,6 +627,7 @@ impl KindsSection {
                     Stored {
                         prefix: None,
                         budget: Some(budget),
+                        persona: Some(persona),
                     },
                 );
             }
@@ -966,12 +988,20 @@ impl KindsSection {
             super::yes_or_no(&editor.text(3)).ok_or_else(|| GATE_IS_Y_OR_N.to_owned())?;
         let input_kinds = input_kinds(&editor.text(4));
         let budget = budget(&editor.text(5))?;
+        let persona = persona_patch(
+            &editor.text(6),
+            editor.stored_persona.as_deref().unwrap_or_default(),
+            self.personas(),
+        )?;
 
+        // The persona is part of the patch (D-4): left out, a persona + budget edit with no other
+        // column moved would take the budget-only branch below and drop the persona.
         let patch_changed = name != stored.name
             || position != stored.position
             || template_name != stored.template_name
             || gate_hard != stored.gate_hard
-            || input_kinds != stored.input_kinds;
+            || input_kinds != stored.input_kinds
+            || persona.is_some();
         let budget_changed = editor.stored_budget.as_deref() != Some(editor.text(5).trim());
 
         let patch = PhasePatch {
@@ -980,7 +1010,7 @@ impl KindsSection {
             template_name: Some(template_name),
             gate_hard: Some(gate_hard),
             input_kinds: Some(input_kinds),
-            persona: None,
+            persona,
         };
         // A budget-only change is one write on the rung; anything else starts with the patch.
         if budget_changed && !patch_changed {
@@ -1003,6 +1033,13 @@ impl KindsSection {
             },
             budget_changed.then_some(FollowUp::Budget(budget)),
         ))
+    }
+
+    /// The persona registry the last catalogue carried, or none before the first one (D23).
+    fn personas(&self) -> &[PersonaSummary] {
+        self.snapshot
+            .as_ref()
+            .map_or(&[], |snapshot| snapshot.personas.as_slice())
     }
 
     /// One phase of the snapshot, by id.
@@ -1200,7 +1237,7 @@ impl KindsSection {
                     let Some(phase) = self.phase_at(p, g, i) else {
                         continue;
                     };
-                    lines.push(Line::styled(phase_line(phase), style));
+                    lines.push(Line::styled(phase_line(phase, self.personas()), style));
                     if selected {
                         lines.extend(detail_lines(phase, width, theme));
                     }
@@ -1679,8 +1716,8 @@ fn new_phase_fields(entry: &GraphEntry) -> Vec<Field> {
     ]
 }
 
-/// PRD D2's six editable columns of an existing phase, in editor order.
-fn edit_phase_fields(phase: &StepGraphPhase) -> Vec<Field> {
+/// PRD D2's six editable columns plus MOD-26 D23's persona, in editor order.
+fn edit_phase_fields(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> Vec<Field> {
     vec![
         Field::required("name", &phase.name),
         Field::required("position", &phase.position.to_string()),
@@ -1688,6 +1725,7 @@ fn edit_phase_fields(phase: &StepGraphPhase) -> Vec<Field> {
         Field::required("gate_hard (y/n)", if phase.gate_hard { "y" } else { "n" }),
         Field::optional("input_kinds", &phase.input_kinds.join(",")),
         Field::optional("token_budget", &budget_text(phase.token_budget)),
+        Field::optional("persona", &persona_text(phase.persona_id, personas)),
     ]
 }
 
@@ -1738,6 +1776,59 @@ fn graph_named(project: &ProjectCatalogue, name: &str) -> Result<StepGraphId, St
         .find(|entry| entry.graph.name == name)
         .map(|entry| entry.graph.id)
         .ok_or_else(|| NO_GRAPH_NAMED.to_owned())
+}
+
+/// A bound persona's name, or its id when the loaded list does not know it (a persona created
+/// after the catalogue was read; D23).
+fn persona_label(id: PersonaId, personas: &[PersonaSummary]) -> String {
+    personas
+        .iter()
+        .find(|row| row.id == id)
+        .map_or_else(|| id.to_string(), |row| row.name.clone())
+}
+
+/// The `persona` field's text at open: blank for none (D23).
+fn persona_text(bound: Option<PersonaId>, personas: &[PersonaSummary]) -> String {
+    bound.map_or_else(String::new, |id| persona_label(id, personas))
+}
+
+/// The `persona` field as `PhasePatch.persona` (MOD-26 M2 D23, OQ-11; B-8): `None` while the
+/// trimmed text is still the trimmed text the editor opened with — an id the list does not know
+/// included, so it is left alone unless edited; `Some(None)` for a blank field; `Some(Some(id))`
+/// for a name the list holds.
+///
+/// # Errors
+/// [`no_persona_named`] for any other text.
+fn persona_patch(
+    text: &str,
+    opened: &str,
+    personas: &[PersonaSummary],
+) -> Result<Option<Option<PersonaId>>, String> {
+    let text = text.trim();
+    if text == opened.trim() {
+        return Ok(None);
+    }
+    if text.is_empty() {
+        return Ok(Some(None));
+    }
+    personas
+        .iter()
+        .find(|row| row.name == text)
+        .map(|row| Some(Some(row.id)))
+        .ok_or_else(|| no_persona_named(text, personas))
+}
+
+/// The refusal of a name the loaded list does not hold, before anything is sent (D23).
+fn no_persona_named(name: &str, personas: &[PersonaSummary]) -> String {
+    if personas.is_empty() {
+        return NO_PERSONAS.to_owned();
+    }
+    let known: Vec<&str> = personas.iter().map(|row| row.name.as_str()).collect();
+    format!(
+        "no persona named `{}`; known: {}",
+        name.escape_debug(),
+        known.join(", ")
+    )
 }
 
 /// A `position` field as a number (B-8).
@@ -1839,9 +1930,10 @@ fn required(label: &str) -> String {
 }
 
 /// One phase row: the six columns this section edits, in editor order (D2's six, minus the ones
-/// the row cannot show).
-fn phase_line(phase: &StepGraphPhase) -> String {
-    format!(
+/// the row cannot show), then the bound persona's name — only when one is bound, so an unbound
+/// phase's line is exactly what it was before MOD-26 M2 (D23, I-12).
+fn phase_line(phase: &StepGraphPhase, personas: &[PersonaSummary]) -> String {
+    let mut line = format!(
         "    {}. {} \u{b7} template {} \u{b7} gate {} \u{b7} in {} \u{b7} budget {}",
         phase.position,
         phase.name,
@@ -1853,7 +1945,12 @@ fn phase_line(phase: &StepGraphPhase) -> String {
             phase.input_kinds.join(",")
         },
         budget_label(phase.token_budget),
-    )
+    );
+    if let Some(id) = phase.persona_id {
+        line.push_str(" \u{b7} persona ");
+        line.push_str(&persona_label(id, personas));
+    }
+    line
 }
 
 /// `token_budget` as the tree prints it: an empty column inherits from the project or the app rung
@@ -1907,6 +2004,7 @@ mod tests {
             expected: None,
             stored_prefix: Some("ANA".to_owned()),
             stored_budget: None,
+            stored_persona: None,
             follow_up: None,
         };
         let section = KindsSection {

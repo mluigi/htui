@@ -3379,6 +3379,263 @@ async fn a_mint_racing_a_kind_delete_still_names_what_holds_it() {
     db.drop_db().await;
 }
 
+/// The fixture phase `name` of the `htui` `feature` graph.
+async fn htui_feature_phase(store: &PgStore, name: &str) -> htui_core::model::StepGraphPhase {
+    store
+        .phases(ids::GRAPH_HTUI_FEAT)
+        .await
+        .expect("read the feature graph's phases")
+        .into_iter()
+        .find(|row| row.name == name)
+        .unwrap_or_else(|| panic!("the feature graph has a `{name}` phase"))
+}
+
+/// MOD-26 milestone 2 D14 (I-9): a bind that commits while `delete_persona` waits on it is seen
+/// by the guarded `DELETE`, so the deleter reads the "bound to" sentence, never a raw `23503`.
+///
+/// The racing `UPDATE` takes `FOR KEY SHARE` on the persona row through
+/// `fk_step_graph_phase_persona`; the delete's `SELECT ... FOR UPDATE` parks on it until the
+/// commit, the `a_mint_racing_a_kind_delete_still_names_what_holds_it` device.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bind_racing_a_persona_delete_still_names_the_phase() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let reviewer = ids::PERSONA_REVIEWER;
+    let review = htui_feature_phase(&db.store, "review").await;
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query("UPDATE step_graph_phase SET persona_id = $1 WHERE id = $2")
+        .bind(reviewer.as_uuid())
+        .bind(review.id.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing bind");
+
+    let store = db.store.clone();
+    let deleting = tokio::spawn(async move { store.delete_persona(reviewer).await });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    match deleting.await.expect("the delete task") {
+        Err(htui_core::store::StoreError::Constraint(text)) => assert_eq!(
+            text,
+            "persona `reviewer` is bound to 1 phase (`htui/feature/review`); clear it in \
+             Settings \u{203a} Kinds first",
+            "the refusal names the phase the racing bind wrote (I-9)"
+        ),
+        other => panic!("a persona a phase binds is Constraint, got {other:?}"),
+    }
+    let still_there: i64 = sqlx::query_scalar("SELECT count(*) FROM persona WHERE id = $1")
+        .bind(reviewer.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the persona");
+    assert_eq!(still_there, 1, "the refused delete removed nothing");
+
+    db.drop_db().await;
+}
+
+/// MOD-26 milestone 2 D14: a bind that arrives while a persona delete holds the row waits behind
+/// it and, once the delete commits, is refused with `references_no_row`'s sentence (the bind's
+/// own `23503` mapping), never a raw foreign-key error.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bind_behind_a_persona_delete_gets_references_no_row() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let architect = ids::PERSONA_ARCHITECT;
+    let plan = htui_feature_phase(&db.store, "plan").await;
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN on the racing connection");
+    sqlx::query("DELETE FROM persona WHERE id = $1")
+        .bind(architect.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing delete of an unbound persona");
+
+    let store = db.store.clone();
+    let binding = tokio::spawn(async move {
+        store
+            .update_phase(
+                plan.id,
+                plan.updated_at,
+                htui_core::model::PhasePatch {
+                    persona: Some(Some(architect)),
+                    ..htui_core::model::PhasePatch::default()
+                },
+            )
+            .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    match binding.await.expect("the bind task") {
+        Err(htui_core::store::StoreError::Constraint(text)) => assert_eq!(
+            text,
+            htui_core::store::references_no_row(
+                "step_graph_phase.persona_id",
+                architect,
+                "persona"
+            ),
+            "the losing bind reads the store's sentence, never a raw 23503"
+        ),
+        other => panic!("a bind to a deleted persona is Constraint, got {other:?}"),
+    }
+
+    db.drop_db().await;
+}
+
+/// MOD-26 milestone 2 D14 (I-9): an unbind that commits after the guarded `DELETE` fired but
+/// before the holders are read leaves nothing to name, so `delete_persona` deletes rather than
+/// refusing with "bound to 0 phases ()".
+///
+/// The racer holds `ACCESS EXCLUSIVE` on `project` with its unbind uncommitted: the guard still
+/// sees the bind, and the holders query (which joins `project`) parks on the lock until the unbind
+/// commits, so its fresh `READ COMMITTED` snapshot sees no holder.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unbind_racing_a_persona_delete_lets_it_delete() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let reviewer = ids::PERSONA_REVIEWER;
+    let review = htui_feature_phase(&db.store, "review").await;
+    sqlx::query("UPDATE step_graph_phase SET persona_id = $1 WHERE id = $2")
+        .bind(reviewer.as_uuid())
+        .bind(review.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("bind reviewer to the review phase");
+
+    let mut racer = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql("BEGIN; LOCK TABLE project IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut racer)
+        .await
+        .expect("BEGIN and lock project on the racing connection");
+    sqlx::query("UPDATE step_graph_phase SET persona_id = NULL WHERE id = $1")
+        .bind(review.id.as_uuid())
+        .execute(&mut racer)
+        .await
+        .expect("the racing unbind");
+
+    let store = db.store.clone();
+    let deleting = tokio::spawn(async move { store.delete_persona(reviewer).await });
+
+    // Commit only once the delete is parked on the `project` lock, i.e. past its guard.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let parked: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                AND query LIKE '%JOIN project pr%'",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if parked == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the delete never reached the holders query"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    sqlx::raw_sql("COMMIT")
+        .execute(&mut racer)
+        .await
+        .expect("COMMIT on the racing connection");
+    racer.close().await.expect("close the racing connection");
+
+    match deleting.await.expect("the delete task") {
+        Ok(()) => {}
+        other => panic!("a persona no phase binds any more is deleted, got {other:?}"),
+    }
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM persona WHERE id = $1")
+        .bind(reviewer.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the persona");
+    assert_eq!(left, 0, "the delete removed the persona");
+
+    db.drop_db().await;
+}
+
+/// MOD-26 M2 R1 L-3: the guard-then-holders loop is bounded. A holder the guard sees but the
+/// holders read cannot name - here a phase whose graph points at no project, which only a session
+/// that skips the FK triggers can write - would spin it forever; after three passes it gives up
+/// with a `Backend` error and deletes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persona_delete_gives_up_after_three_passes() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let reviewer = ids::PERSONA_REVIEWER;
+    let review = htui_feature_phase(&db.store, "review").await;
+    sqlx::query("UPDATE step_graph_phase SET persona_id = $1 WHERE id = $2")
+        .bind(reviewer.as_uuid())
+        .bind(review.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("bind reviewer to the review phase");
+    let mut skipper = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql(
+        "SET session_replication_role = replica; \
+         UPDATE step_graph SET project_id = gen_random_uuid() \
+          WHERE id = (SELECT graph_id FROM step_graph_phase WHERE persona_id IS NOT NULL LIMIT 1)",
+    )
+    .execute(&mut skipper)
+    .await
+    .expect("orphan the holder's graph past its FK");
+    skipper.close().await.expect("close the second connection");
+
+    let deleted = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.store.delete_persona(reviewer),
+    )
+    .await
+    .expect("delete_persona ends rather than spinning");
+
+    assert_eq!(
+        deleted,
+        Err(htui_core::store::StoreError::Backend(
+            "delete_persona: holders kept changing".to_owned()
+        ))
+    );
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM persona WHERE id = $1")
+        .bind(reviewer.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the persona");
+    assert_eq!(left, 1, "nothing was deleted");
+
+    db.drop_db().await;
+}
+
 /// MOD-15 D4's template rows, which no `WriteStore` reader returns: ten per project, named by
 /// `DEFAULT_TEMPLATES`, body `body_of(name)`, version 1, `created_by` the creator's.
 ///

@@ -6,13 +6,17 @@ reads and runs tests but never edits, or an architect that designs without touch
 persona belongs to a step-graph phase, not to an agent, so the same agent can serve a plain
 `implement` phase and a read-only `review` phase without its row changing.
 
-This page describes milestone 1 of MOD-26: personas are registry rows, a phase can name one, and
-the engine applies it to every step of that phase. Milestone 2 adds the TUI to manage them (see
-[What milestone 1 does not do yet](#what-milestone-1-does-not-do-yet)).
+This page describes MOD-26. Personas are registry rows, which Settings › Personas lists, edits,
+deletes and imports. A phase names one in Settings › Kinds, and the engine applies it to every step
+of that phase. The limits are listed under [What MOD-26 does not do](#what-mod-26-does-not-do).
 
 - [What a persona is](#what-a-persona-is)
 - [The two seeds](#the-two-seeds)
-- [Binding a persona to a phase in milestone 1](#binding-a-persona-to-a-phase-in-milestone-1)
+- [Binding a persona to a phase](#binding-a-persona-to-a-phase)
+- [Settings › Personas](#settings--personas)
+- [Rule lines](#rule-lines)
+- [Deleting a persona](#deleting-a-persona)
+- [Importing persona files](#importing-persona-files)
 - [The persona file format](#the-persona-file-format)
 - [Narrow-only: what a persona can and cannot change](#narrow-only-what-a-persona-can-and-cannot-change)
 - [Precedence](#precedence)
@@ -20,7 +24,7 @@ the engine applies it to every step of that phase. Milestone 2 adds the TUI to m
 - [Freezing: a started run keeps its personas](#freezing-a-started-run-keeps-its-personas)
 - [Enforcement, per transport](#enforcement-per-transport)
 - [What a step records](#what-a-step-records)
-- [What milestone 1 does not do yet](#what-milestone-1-does-not-do-yet)
+- [What MOD-26 does not do](#what-mod-26-does-not-do)
 
 ## What a persona is
 
@@ -65,24 +69,39 @@ operator's edit to a seeded row survives every later connect.
 
 Because the top-up is keyed by name, **renaming a seed brings it back**: rename `reviewer` (or
 `architect`) and the next connect finds no row called `reviewer`, so it creates a fresh one, with
-a new id, beside your renamed row. To retire a seed's behaviour, edit the `reviewer` row rather
-than renaming it.
+a new id, beside your renamed row. **Deleting a seed brings it back too**, for the same reason. To
+retire a seed's behaviour, edit the `reviewer` row rather than renaming or deleting it.
 
-## Binding a persona to a phase in milestone 1
+## Binding a persona to a phase
 
 A `step_graph_phase` names at most one persona through its nullable `persona_id` column. The
 binding applies to whichever candidate wins the phase, on any rung; per-candidate binding is not
 part of MOD-26.
 
-Milestone 1 has no screen for this. Until milestone 2's editor ships, bind a persona with the store
-API or with SQL.
+**Settings › Kinds.** `e` on a phase opens its edit form. The seventh and last field is `persona`,
+prefilled with the bound persona's name, or blank when there is none.
+
+- Type a persona's name to bind it, or clear the field to unbind.
+- A field left as it opened writes nothing, so a binding another writer made since stays.
+- A name the registry does not hold is refused before anything is sent, with the known names:
+  "no persona named \`<name>\`; known: architect, reviewer". With no personas at all the refusal
+  is "no personas exist; add one in Settings › Personas".
+- A bound phase's line in the list ends with `· persona <name>`. A phase without a persona draws
+  as before.
+
+A new phase (`n`) has no `persona` field, so bind it with `e` once it exists. Kinds reads the
+persona list with its catalogue. A persona created in Settings › Personas shows up in Kinds after
+Kinds reloads (`r`).
+
+The store API and SQL remain for scripts.
 
 **Store API.** `WriteStore::update_phase(id, expected, PhasePatch { persona: Some(Some(persona_id)),
 ..PhasePatch::default() })` binds, `Some(None)` clears and `None` leaves the binding alone.
-`create_phase` accepts a `StepGraphPhase` whose `persona_id` is set. A `persona_id` that names no row is refused with
-"step_graph_phase.persona_id \`<id>\` references no persona". `WriteStore::personas()` lists the
-rows by name, `create_persona` adds one and `update_persona` edits one under compare-and-set on
-`updated_at`. There is no delete in milestone 1.
+`create_phase` accepts a `StepGraphPhase` whose `persona_id` is set. A `persona_id` that names no
+row is refused with "step_graph_phase.persona_id \`<id>\` references no persona".
+`WriteStore::personas()` lists the rows by name. `create_persona` adds one, `update_persona` edits
+one under compare-and-set on `updated_at`, and `delete_persona` deletes one (see
+[Deleting a persona](#deleting-a-persona)).
 
 **SQL.** Against your Postgres, for the `review` phase of one project's step graph:
 
@@ -104,10 +123,175 @@ bypasses the save rules the store applies, which are the only thing keeping a ro
 Bind before you start the run. A run started earlier keeps the bindings it froze (see
 [Freezing](#freezing-a-started-run-keeps-its-personas)).
 
+## Settings › Personas
+
+**Personas** is the eighth Settings section, after Boxes. It lists every persona row by name, one
+line each:
+
+```
+reviewer · Reviews the step's inputs and code for correctness, ri… · deny edit,delete,move · allow 0 · rules 0
+```
+
+The description is cut with `…` to fit the line; the name and the counts never are. The row under the cursor has a second line with
+its lists: `allow <names, or all> · disallowed <names, or none> · command-run y|n · default
+inherit|ask|deny`.
+
+| Key | What it does |
+|---|---|
+| `j` / `k` (`↓` / `↑`) | Move the cursor. |
+| `n` | New persona: the fields, then the body. |
+| `e` | Edit the selected persona's fields. |
+| `b` | Edit its body. |
+| `r` | Edit its permission rules (see [Rule lines](#rule-lines)). |
+| `d` | Delete it, after a `y`/`n` question (see [Deleting a persona](#deleting-a-persona)). |
+| `I` | Import a persona file or a directory of them (see [Importing persona files](#importing-persona-files)). |
+
+The section reads its list when the Settings tab asks for it, and it has no reload key. Personas are
+not mirrored to the local copy, so offline the section shows "personas unavailable:" with the
+reason, and offers no key but navigation.
+
+**The fields.** `n` and `e` open seven one-line fields, labelled with the
+[frontmatter](#the-persona-file-format) spellings: `name`, `description`, `tools`,
+`disallowed-tools`, `deny-kinds`, `command-run (y/n)` and `permission-default`. `Tab`/`Shift+Tab`
+(or `↓`/`↑`) move between them, and `Esc` closes the form.
+
+- The three lists are comma-separated, as in a file (`Read, Grep, Glob`).
+- `command-run (y/n)` takes `y`, `yes`, `n` or `no` ("\`command-run (y/n)\` is y or n").
+- `permission-default` is blank (the agent's default stands), `ask` or `deny` ("\`permission-default\`
+  is blank, ask or deny").
+- Every field is checked with the store's own rule, so a refusal is the store's sentence (see
+  [The save rules](#the-save-rules)). The cursor moves to the field it names.
+
+**New (`n`).** The fields start blank, with `command-run` at `y`. `Enter` moves on to the body
+editor, because a persona needs a body. `Ctrl+S` there creates the row, and `Esc` goes back to the
+fields with the body kept. A new persona has no rules: add them with `r` once it exists.
+
+**Edit (`e`).** The fields open prefilled, and `Enter` saves only the fields you changed. A form that
+changed nothing writes nothing ("nothing changed; nothing was written").
+
+**Body (`b`) and rules (`r`).** Each opens a multi-line editor. `Enter` breaks the line, `Ctrl+S`
+saves, and `Esc` closes. `Esc` over unsaved text warns first ("unsaved changes — Esc again
+discards"), and a second `Esc` discards. A rules save keeps the row's `permission-default`.
+
+**Saves are compare-and-set.** A save meets a row changed elsewhere since the editor opened like
+this:
+
+- In the fields form, the untouched fields take the new values and yours stay. The notice says
+  "changed elsewhere — reloaded; Enter retries" and names any field changed on both sides.
+- In the body and rules editors, an untouched text is reloaded ("changed elsewhere since you opened
+  it — reloaded; Ctrl+S retries against the current row").
+- A row deleted elsewhere closes its editor.
+- Only one write runs at a time. A second write key is refused with "\`<request>\` is still in
+  flight".
+
+## Rule lines
+
+The rules editor (`r`) holds one rule per line:
+
+```
+<answer> <key>=<value> ... [# <reason>]
+```
+
+- `answer` is `reject_once` or `reject_always`.
+- The keys are `kind`, `name`, `path` and `command`. They match the tool kind, the tool name, a
+  path prefix and a command prefix. Each key may appear once. An absent key does not constrain the
+  match, and `key=""` matches the empty string.
+- `kind` is one of the ten ACP kinds: `read`, `edit`, `delete`, `move`, `search`, `execute`,
+  `think`, `fetch`, `switch_mode`, `other`. Unlike `deny-kinds`, the last three are allowed here.
+- A value is a bare word or a `"`-quoted string. A value holding a space, `#`, `"`, `=`, `\` or a
+  control character must be quoted. Inside quotes, `\"`, `\\`, `\n`, `\t` and `\r` are the only
+  escapes, and every other character is literal.
+- The reason runs from the first unquoted `#` to the end of the line, trimmed. A reason that needs
+  leading or trailing spaces, or a control character, is written quoted (`# "  …  "`), and nothing
+  may follow it.
+- Blank lines and lines starting with `#` are ignored. They are not stored: the editor reopens on
+  the stored rules, one line each in their shortest form.
+
+```
+reject_once kind=execute command="rm -rf" # never wipe
+reject_always kind=edit path=src/generated/
+reject_once name=WebFetch
+```
+
+A line that cannot be read is refused with its number, for example "rules line 2: \`exec\` is not
+\`key=value\`", "rules line 1: a rule starts with reject_once or reject_always, not \`deny\`" or
+"rules line 3: persona.permission.rules entry kind \`exec\` is not one of read, edit, delete, move,
+search, execute, think, fetch, switch_mode, other". The parsed rules then go through the store's
+save rules, so a rule with no key at all is refused as an empty match.
+
+## Deleting a persona
+
+`d` asks "delete persona \`<name>\`? a persona bound to a phase is refused.". `y` deletes it, and
+`n` or `Esc` leaves it alone.
+
+The store refuses to delete a persona that any phase still names, and the refusal names the
+phases as `<project>/<graph>/<phase>`, sorted:
+
+"persona \`reviewer\` is bound to 2 phases (\`web/default/review\`, \`web/FEAT-12-override/review\`);
+clear them in Settings › Kinds first"
+
+At most five phases are named, then "and *n* more". An item's override graph copies its source
+graph's bindings, so its phases count too. Clear each binding in Settings › Kinds, then delete.
+Both stores refuse the same way, and on Postgres a bind racing the delete either lands first (and
+the delete is refused) or is refused itself ("references no persona"). Migration
+`0013_persona_phase_index.sql` indexes `step_graph_phase.persona_id`, so the check reads only the
+phases that name the persona.
+
+Deleting a persona never breaks a started run, because the run reads its personas from its
+snapshot (see [Freezing](#freezing-a-started-run-keeps-its-personas)). Deleting a seed brings it
+back on the next connect (see [The two seeds](#the-two-seeds)).
+
+## Importing persona files
+
+`I` opens a path field ("type a path to a persona \`.md\` file or a directory of them"). `Enter`
+imports and `Esc` cancels. The store worker reads the files, not the screen. Each file becomes one
+new row, and htui stores no path. The row is the truth from then on: editing or deleting the file
+changes nothing.
+
+- **The path** is a file or a directory. A leading `~/`, or a bare `~`, is your home directory;
+  `~user` and a `~` later in the path are taken as typed. A file named directly is read whatever
+  its extension.
+- **A directory** contributes its own `*.md` files (no subdirectories), sorted by file name, links
+  to files followed. Other files and subdirectories are left alone and not reported. So
+  `~/.claude/agents` or a repository's `.claude/agents` imports in one go.
+- **No frontmatter.** A file that does not open with a `---` fence (a `README.md`) is skipped: "no
+  frontmatter: the file does not open with a \`---\` fence".
+- **The format** is [the persona file format](#the-persona-file-format), with one difference:
+  `tools` entries starting with `mcp__` are dropped from `allow` and named in the report ("dropped
+  from \`tools\`: \`mcp__gortex__search\`, … — \`allow\` keeps built-in tools only"). `--tools`
+  never filtered MCP tools, so htui cannot enforce those entries. To keep an MCP tool from a
+  persona, name it in `disallowed-tools`.
+- **Only MCP tools.** A file whose `tools` lists only `mcp__` entries is refused, because an empty
+  `allow` keeps every built-in tool: "every \`tools\` entry is an MCP tool; htui's \`allow\` keeps
+  built-in tools only, so this file would keep all of them — write \`disallowed-tools\` or
+  \`deny-kinds\` instead".
+- **Other refusals.** A file the format refuses (a `model:` line, an unknown key, a widening
+  shape) is refused with that sentence, and nothing is written for it.
+- **Known names.** A name that already exists is refused rather than overwritten: "persona
+  \`reviewer\` exists; edit it in Settings › Personas, or delete it and import again". A name met
+  twice in one import is refused the second time, naming the first file.
+- **Caps.** A file over 262144 bytes (256 KiB), one that is not UTF-8, or one that cannot be read is
+  skipped. A directory contributes at most 64 files, and only its first 256 entries are examined.
+  Each overflow is one skipped row, never a silent cut.
+- **A lost store** stops the import: the files after it are one row, "\<n\> more file(s) not
+  attempted: the store is unreachable", and what was already imported stays.
+- **Offline**, the import is refused before any file is read.
+
+A clean import says "imported \<names\>" in the notice, and a path with nothing to import says
+"nothing to import at that path". Anything refused, skipped or dropped opens a **report**. It starts
+with a count line (`imported n · refused n · skipped n`). Then it has one row per file: `+ name
+(path)` for an import, with any dropped tools; `! path — sentence` for a refusal; and `· path —
+reason` for a skip. `j`/`k` scroll it and `Esc` or `Enter` closes it. If you opened an editor while
+the import ran, the notice gives the counts and the report opens when the editor closes.
+
+Every real `.claude/agents` file lists Gortex MCP tools, so importing one always opens the report.
+Permission rules cannot be written in a file. Add them with `r` after the import.
+
 ## The persona file format
 
 A persona file is the `.claude/agents/*.md` shape: a frontmatter block between two `---` lines,
-then the body. The seeds are written this way, and milestone 2's import reads the same format.
+then the body. The seeds are written this way, and the import reads the same format, except for its
+`mcp__` rule (see [Importing persona files](#importing-persona-files)).
 
 ```markdown
 ---
@@ -153,8 +337,8 @@ persona key; a persona file takes name, description, tools, disallowed-tools, de
 command-run and permission-default". A file without `name` is refused: "a persona file needs a
 \`name\`".
 
-Permission rules cannot be written in a file. Only the row's `permission.rules` holds them, and in
-milestone 1 only the store API writes that field.
+Permission rules cannot be written in a file. Only the row's `permission.rules` holds them, written
+by the rules editor in Settings › Personas (see [Rule lines](#rule-lines)) or by the store API.
 
 A parsed file then goes through the same save rules as a row, so a file the store would refuse is
 refused when it is read.
@@ -181,10 +365,13 @@ fails:
   would deny every request; use \`default: deny\` instead".
 - A NUL in any rule matcher string or reason: "persona.permission.rules must not contain a NUL
   character".
+- Once every rule has passed the two checks above, a rule whose `tool_kind` is not one of the ten
+  ACP kinds: "persona.permission.rules entry kind \`<kind>\` is not one of read, edit, delete, move,
+  search, execute, think, fetch, switch_mode, other".
 
 `permission.default` can only be `ask` or `deny`, and a rule's answer can only be `reject_once` or
 `reject_always`: the types have no `allow`. A rule's `tool_kind` is compared as text, so a misspelt
-kind matches nothing; milestone 2's rule form is meant to offer the closed list.
+kind would match nothing. That is why both stores and the rules editor accept only the ten kinds.
 
 ## Narrow-only: what a persona can and cannot change
 
@@ -219,8 +406,7 @@ For every key a persona carries:
 **agent row → persona narrows → the step; the model comes from the phase candidate.**
 
 The agent row supplies the base: its permission policy (`agent.settings.permission`: rules,
-remembered choices, default) and its tool exposure. In milestone 1 no agent row carries a tool
-exposure yet, so the base exposure is the empty one: no allow-list, no deny-list, no denied kind.
+remembered choices, default) and its tool exposure. No agent row carries a tool exposure yet, so the base exposure is the empty one: no allow-list, no deny-list, no denied kind.
 The persona then narrows that base with `narrow`. The model is never part of it: it is the winning
 phase candidate's `model`, whatever the persona says.
 
@@ -248,7 +434,7 @@ not one of the twenty placeholders, and a template that writes it is refused as 
 placeholder.
 
 A persona with `command-run: false` also removes the prompt's `command_queue` section. That is the
-only effect `command_run` has in milestone 1: no transport reads `ToolExposure.command_run` until
+only effect `command_run` has today: no transport reads `ToolExposure.command_run` until
 MOD-11 exposes the `command_run` tool.
 
 A prompt for a phase without a persona is byte-for-byte what it was before MOD-26.
@@ -343,13 +529,14 @@ recorded:
 - the run snapshot's frozen copy, `{name, digest}` among the rest, where `digest` is `sha256:` over
   the canonical JSON of the persona's name, body, tools and permission (not its id or timestamps).
 
-## What milestone 1 does not do yet
+## What MOD-26 does not do
 
-- **No TUI.** There is no Settings › Personas tab, no file import and no persona picker in the
-  step-graph editor; milestone 2 adds all three. The phase editor that exists leaves a phase's
-  persona binding as it is.
-- **No delete.** Neither store can delete a persona; milestone 2 adds a delete that refuses a
-  persona still bound to a phase.
+- **No `$EDITOR` for the body or the rules.** Both editors are the embedded multi-line editor. An
+  external `$EDITOR` round-trip would come with or after MOD-13's milestone 4 (MOD-26 OQ-12).
+- **No picker in Settings › Kinds.** A phase's persona is typed by name, and a new phase is bound
+  through `e` after it is created.
+- **`~` in the skill import.** The persona import expands a leading `~/`; the Skills tab's import
+  still takes its path as typed.
 - **Engine steps only.** Chat sessions and promoted steps run without a persona: a promoted step's
   handoff prompt opens without the persona block, and the chat tab never applies one. A fan-out
   judge step also runs without the phase's persona; its prompt replays the candidates' recorded

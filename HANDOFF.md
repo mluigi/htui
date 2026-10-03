@@ -26,6 +26,17 @@ of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` an
 went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
 name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
 no new crate, no snapshot moved.
+Before it, **MOD-26 is done** (`docs/decisions/mod/mod-26.md`): agent
+personas are global registry rows (`0012_persona`; seeds `reviewer`, `architect`) bound to a
+step-graph phase. They are frozen into the run snapshot at `StartRun`, inlined as a protected frame
+before the template, and they only ever narrow the step's tools and permissions
+(`htui_agent::persona::narrow`). A persona carries no model. Milestone 2 added **Settings ›
+Personas**, the eighth section: it lists, edits (fields, body `b`, rules `r` in a one-line rule
+syntax), deletes (`d`, refused while any phase is bound, naming them) and imports (`I`, a `.md`
+file or a directory of them, `mcp__` tools dropped and named) personas. Settings › Kinds gained a
+`persona` field on the phase edit form. Migration `0013_persona_phase_index` is index only. Not
+done: `$EDITOR` for the body (OQ-12, with or after MOD-13 milestone 4). Operator guide
+`docs/personas.md`.
 Before it, **MOD-28 is done** (`docs/decisions/mod/mod-28.md`): `v` in the
 Backlog detail's Runs sub-tab switches to a **flow view**. It draws the run under the cursor as a
 `rataflow` node graph: fan-out candidates side by side, the judge below them, the winner feeding the
@@ -33,19 +44,29 @@ next phase, and retries labelled. It shares the list's cursor, so every run acti
 digit works the same in both views. `+`/`-` zoom and `=` fits. The view is a pure projection,
 rebuilt from every `Runs` reply. It is keyboard only: mouse support is MOD-71 and tool-call chips
 are MOD-72 (done). No migration. The only new crate is `rataflow` (`default-features = false`).
+Before it, **MOD-49 is done** (`docs/decisions/mod/mod-49.md`): `b` in
+Settings > Hierarchy opens a popup that lists directories on this box (links to a directory marked
+`@`, their targets never shown) and chooses one for the workspace root or a repo checkout; the
+choice goes through the unchanged `SetWorkspaceRoot`/`SetRepoPath` and `canonical_root` (F-102).
+Listing is `StoreRequest::ListDir`, served off the store-worker loop under `spawn_blocking` with a
+10 s bound, so neither the UI nor the worker waits on a hung mount. No migration.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
 comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested` (MOD-33, comment only)
-`0011_permission_relay` (MOD-42) and `0012_persona` (MOD-26 milestone 1; cache: `0001`..`0004`), so **the next migration is `0013`** (cache: `0005`).
+`0011_permission_relay` (MOD-42), `0012_persona` (MOD-26 milestone 1) and `0013_persona_phase_index`
+(MOD-26 milestone 2, index only; cache: `0001`..`0004`), so **the next migration is `0014`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-26 milestone 1, MOD-28 and MOD-72 (re-counted 2026-10-01; `StoreReply` 2026-09-30; `CASES`, `.sqlx`, `TABLES`, snapshots and commented columns 2026-10-02): store conformance `CASES` 131, `READ_CASES` 15, `htui-orch` `CASES` 92,
-`GraphSource` 7 methods, `StoreRequest` 97, `StoreReply` 56 (both MOD-72, 2026-10-03), `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `TABLES` 42, 319 `.sqlx` files, 135
+MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72 and MOD-26 (done, both milestones)
+(re-counted 2026-10-01; `TABLES` and commented columns 2026-10-02; `CASES`, `READ_CASES`, `htui-orch`
+`CASES`, `StoreRequest`/`StoreReply`, the `REQUEST_NAMES` below, `.sqlx`, snapshots and Settings
+sections 2026-10-03): store conformance `CASES` 134, `READ_CASES` 14, `htui-orch` `CASES` 92,
+`GraphSource` 7 methods, `StoreRequest` 105, `StoreReply` 62, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
+`skills::REQUEST_NAMES` 6, `persona_settings::REQUEST_NAMES` 5, `TABLES` 42, 322 `.sqlx` files, 143
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
-`MIRRORED_TABLES` 21, seven Settings sections (61 of the 100 strip columns), 44 pinned commented
+`MIRRORED_TABLES` 21, eight Settings sections (71 of the 100 strip columns), 44 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
 `matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
@@ -262,28 +283,9 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   give the Runs flow view click to select (`FlowEvent::NodeClicked` moves the shared cursor),
   drag to pan and scroll to zoom (`rataflow`'s `crossterm` feature, `handle_mouse_event`). Nodes stay
   read-only (MOD-28 D9). Raised by the maintainer at MOD-28's plan gate, 2026-10-02.
-- [ ] **MOD-26 - Declarative Agent Personas (from ANA-13).** Build Markdown/Frontmatter parser in `htui-core`, discover from `~/.config/htui/agents.d/`, map to `SessionSpec` overrides (model, tools).
-  **Relates to ANA-16** (`docs/ANA-16.md` §6.2, §8): personas should be registry rows rather than a
-  per-box directory, so they are distributed like the rest of the config (MOD-48).
-  **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T9):** taking its cue from OpenRig's AgentSpec
-  rule that profiles "filter. They never inject", htui goes further and makes a persona narrow-only:
-  its tool allow-list is a subset of the exposure the step would get, and its permission rules are
-  no looser than the default. Unknown frontmatter keys are refused at save. Precedence is fixed and
-  written down: agent row, then persona, then the phase candidate's `model`. The body is a block
-  htui inlines into the step prompt (`R-ID-5`, `R-PRM-1`), not a file handed to the agent. ANA-13
-  §3.1's "`DriverCaps` overrides" reads as `SessionSpec` overrides, since `DriverCaps` are transport
-  facts. Cites `R-AGT-4`, `R-ID-3`, `R-ID-5`, `R-PRM-1`.
-  **Phase 1 landed (`dc5ba263`..`d1871f5e`, 2026-10-02):** personas as Postgres registry rows
-  (`0012_persona`, global like skills; seeds `reviewer`, `architect`), bound by a nullable
-  `step_graph_phase.persona_id`, frozen into the run snapshot at `StartRun`, inlined as a protected
-  frame before the template, and narrowing the step through `htui_agent::persona::narrow`
-  (`claude-cli`: `--tools=`/`--disallowedTools=`, never `--allowedTools`; ACP: relay kind rules and
-  htui's fs handlers). A persona carries **no model**, so ANA-27's precedence reads "agent row, then
-  the persona narrows; the model is the phase candidate's" (PRD Q-model). Binding moved from the
-  phase candidate to the phase (`phase_agent` has no writer, R-6). Docs `docs/personas.md`; PRD
-  `.claude/prds/mod-26-agent-personas.prd.md`; plan and blueprint under `.claude/plans/`. Milestone 2
-  (Settings > Personas, `.md` import, delete, review N4/N5) remains.
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
+  The named personas a `handoff` targets exist since MOD-26 (done, `docs/decisions/mod/mod-26.md`):
+  `persona` registry rows, bound per phase, frozen into the run snapshot by name.
   **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T6-T7):** settle in the PRD, from OpenRig's queue
   and workflow runtime: (1) **The swarm baton is a typed exit.** An agent yields with one exit from
   a closed set the step declares (`handoff` to a named persona, `done`, `blocked` on an item,
@@ -461,6 +463,8 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 
   Plan `.claude/plans/mod-13-editor.plan.md`, blueprint
   `.claude/plans/mod-13-editor.blueprint.md`. Next: milestone 5, notes and documents.
+  Settings › Personas' body and rules editors would take the same hand-off (MOD-26 OQ-12,
+  `docs/decisions/mod/mod-26.md`).
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -677,6 +681,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 23 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-26 personas, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

@@ -54,11 +54,11 @@ use htui_core::store::{
     finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move, invalid_area_code,
     invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros,
     legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
-    not_a_terminal_status, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_phase, row_names_another_step, run_is_terminal, skill_body_refusal,
-    skill_patch_refusal, skill_version_key, step_is_not_promotable, summary_names_another_item,
-    winner_is_not_settled, withdrawn_requirement_cited,
+    not_a_terminal_status, persona_is_bound, persona_patch_refusal, prompt_template_key,
+    prompt_template_refusal, references_no_row, requirement_withdrawn, reserved_phase_name,
+    resolution_not_closable, row_names_another_phase, row_names_another_step, run_is_terminal,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -307,6 +307,12 @@ fn rows(count: i64) -> u64 {
 /// taken — and rather than unbounded because a project under a steady stream of writes would
 /// otherwise never return.
 const DELETE_ATTEMPTS: u32 = 3;
+
+/// How many guard-then-holders passes `delete_persona` makes before it gives up (MOD-26 M2 R1
+/// L-3, Deviation D-11): the holders only shrink under the persona's `FOR UPDATE`, so a real race
+/// ends in a pass or two, and a third that still finds the guard fired over no nameable holder
+/// is answered as a backend error rather than looped on.
+const DELETE_PERSONA_PASSES: u32 = 3;
 
 /// Opens a transaction at `REPEATABLE READ`, which is where the two delete paths count (review M1).
 ///
@@ -3501,6 +3507,97 @@ impl WriteStore for PgStore {
             Some(row) => Ok(CasOutcome::Applied(row.into())),
             None => cas_miss(self.persona_row(id).await?, "persona", id),
         }
+    }
+
+    /// Locks the persona, then deletes it under a guard the lock makes authoritative (MOD-26 M2
+    /// D14), `delete_item_kind`'s shape (review L2's reasoning, above).
+    ///
+    /// A bind (`create_phase`/`update_phase` naming the persona) takes `FOR KEY SHARE` on the
+    /// persona row through `fk_step_graph_phase_persona`, which `FOR UPDATE` conflicts with: a bind
+    /// in flight is waited for and then **seen** by the guarded `DELETE`'s snapshot (zero rows, the
+    /// sentence); a bind that arrives after the lock waits behind it and gets `23503`, which
+    /// [`phase_persona_refused`] words as `references_no_row`. Without the lock the deleter itself
+    /// would see a raw `23503` (probed, plan "Verified claims"). A guard that fired over holders an
+    /// unbind removed before they were read runs again, so the sentence never names zero phases.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] with
+    /// [`persona_is_bound`]'s sentence while a phase binds it; [`StoreError::Backend`] when
+    /// `DELETE_PERSONA_PASSES` passes find the guard fired over no holder they can name.
+    async fn delete_persona(&self, id: PersonaId) -> Result<()> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+
+        let Some(name) = sqlx::query_scalar!(
+            "SELECT name FROM persona WHERE id = $1 FOR UPDATE",
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            return Err(StoreError::NotFound {
+                entity: "persona",
+                id: id.to_string(),
+            });
+        };
+
+        // Each pass is two READ COMMITTED statements, two snapshots: an unbind, phase delete or
+        // graph delete that commits between the guard and the holders read leaves the guard
+        // fired over holders that are gone. Nothing can become a holder while the row is locked
+        // (a bind's `FOR KEY SHARE` waits on it), so the holders only shrink and an empty read
+        // means the guarded `DELETE` is simply run again.
+        //
+        // That rests on `fk_step_graph_phase_persona` being NOT DEFERRABLE: a bind checks it at
+        // its own statement and so waits on the `FOR UPDATE` lock above, rather than at a commit
+        // that could land between two passes. The holders read joins `step_graph` and `project`,
+        // which NOT NULL FKs make total today; should a holder ever be one the guard sees and the
+        // join cannot name, the passes are capped (R1 L-3) so the loop ends in an error rather
+        // than spinning, and the transaction rolls back with nothing deleted.
+        for _ in 0..DELETE_PERSONA_PASSES {
+            let removed = sqlx::query_scalar!(
+                r#"
+            DELETE FROM persona
+             WHERE id = $1
+               AND NOT EXISTS (SELECT 1 FROM step_graph_phase WHERE persona_id = $1)
+            RETURNING id
+            "#,
+                id.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            if removed.is_some() {
+                tx.commit().await.map_err(map_sqlx)?;
+                return Ok(());
+            }
+
+            // The row is there - it was just locked - so zero rows means the guard fired; the
+            // holders are read only to name them in the sentence.
+            let holders = sqlx::query!(
+                r#"
+                SELECT pr.slug AS "project!", g.name AS "graph!", p.name AS "phase!"
+                  FROM step_graph_phase p
+                  JOIN step_graph g ON g.id = p.graph_id
+                  JOIN project pr ON pr.id = g.project_id
+                 WHERE p.persona_id = $1
+                "#,
+                id.as_uuid(),
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .into_iter()
+            .map(|row| (row.project, row.graph, row.phase))
+            .collect::<Vec<_>>();
+            if !holders.is_empty() {
+                return Err(StoreError::Constraint(persona_is_bound(&name, &holders)));
+            }
+        }
+
+        Err(StoreError::Backend(
+            "delete_persona: holders kept changing".to_owned(),
+        ))
     }
 
     // settings (D7, D8)

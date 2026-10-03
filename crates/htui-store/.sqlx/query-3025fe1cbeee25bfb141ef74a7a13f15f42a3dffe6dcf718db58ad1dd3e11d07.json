@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            DELETE FROM persona\n             WHERE id = $1\n               AND NOT EXISTS (SELECT 1 FROM step_graph_phase WHERE persona_id = $1)\n            RETURNING id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "persona",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3025fe1cbeee25bfb141ef74a7a13f15f42a3dffe6dcf718db58ad1dd3e11d07"
+}

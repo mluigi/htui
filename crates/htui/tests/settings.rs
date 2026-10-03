@@ -11,8 +11,9 @@ use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
-    AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection, PromptSection,
-    QdrantSection, SectionId, SettingsSection, SettingsTab, message,
+    AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
+    PersonasSection, PromptSection, QdrantSection, SectionId, SettingsSection, SettingsTab,
+    message,
 };
 use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
@@ -1080,10 +1081,11 @@ async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
 /// fixture: the moment a section makes the strip 101 columns wide this fails, and that is the one
 /// warning a snapshot of a clipped strip could not give.
 ///
-/// The seventh section is MOD-7 milestone 2's `Boxes` (D47), appended last as `register_all`
-/// appends it. The seven (`Agents`, `Hierarchy`, `Kinds`, `Prompt`, `Connection`, `Qdrant`,
-/// `Boxes`) cost 61 of the 100 columns, so the pin is re-run rather than relaxed — if an eighth
-/// ever does not fit, the fix is the strip's, not a shorter title.
+/// The seventh section is MOD-7 milestone 2's `Boxes` (D47) and the eighth MOD-26 milestone 2's
+/// `Personas` (D22), each appended last as `register_all` appends it. The eight (`Agents`,
+/// `Hierarchy`, `Kinds`, `Prompt`, `Connection`, `Qdrant`, `Boxes`, `Personas`) cost 71 of the 100
+/// columns, so the pin is re-run rather than relaxed — if a ninth ever does not fit, the fix is
+/// the strip's, not a shorter title.
 #[test]
 fn the_section_strip_fits_the_frame() {
     let sections: Vec<Box<dyn SettingsSection>> = vec![
@@ -1094,7 +1096,9 @@ fn the_section_strip_fits_the_frame() {
         Box::new(ConnectionSection::new()),
         Box::new(QdrantSection::new()),
         Box::new(BoxesSection::new()),
+        Box::new(PersonasSection::new()),
     ];
+    assert_eq!(sections.len(), 8);
     let width: usize = sections
         .iter()
         .map(|section| section.title().chars().count() + 2)

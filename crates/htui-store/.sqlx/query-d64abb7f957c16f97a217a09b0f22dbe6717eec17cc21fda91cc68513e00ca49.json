@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT pr.slug AS \"project!\", g.name AS \"graph!\", p.name AS \"phase!\"\n                  FROM step_graph_phase p\n                  JOIN step_graph g ON g.id = p.graph_id\n                  JOIN project pr ON pr.id = g.project_id\n                 WHERE p.persona_id = $1\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "project!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "project",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "graph!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "phase!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_graph_phase",
+            "name": "name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d64abb7f957c16f97a217a09b0f22dbe6717eec17cc21fda91cc68513e00ca49"
+}

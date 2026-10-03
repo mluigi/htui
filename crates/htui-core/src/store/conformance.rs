@@ -45,7 +45,8 @@ use crate::store::traits::{
     RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
     WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, has_nul, illegal_move,
     invalid_area_code, invalid_persona_name, kind_not_narrowable, not_a_tool_name,
-    references_no_row, requirement_withdrawn, resolution_not_closable, withdrawn_requirement_cited,
+    references_no_row, requirement_withdrawn, resolution_not_closable, rule_kind_unknown,
+    withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -181,6 +182,9 @@ pub const CASES: &[&str] = &[
     "a_phase_naming_no_persona_is_refused",
     "a_phase_persona_binding_sets_keeps_and_clears",
     "tool_call_counts_group_by_step_and_kind",
+    "delete_persona_removes_an_unbound_row_once",
+    "a_bound_persona_is_not_deleted_and_names_its_phases",
+    "a_persona_bound_to_many_phases_names_five_and_counts_the_rest",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -460,6 +464,15 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "tool_call_counts_group_by_step_and_kind" => {
             tool_call_counts_group_by_step_and_kind(store).await;
+        }
+        "delete_persona_removes_an_unbound_row_once" => {
+            delete_persona_removes_an_unbound_row_once(store).await;
+        }
+        "a_bound_persona_is_not_deleted_and_names_its_phases" => {
+            a_bound_persona_is_not_deleted_and_names_its_phases(store).await;
+        }
+        "a_persona_bound_to_many_phases_names_five_and_counts_the_rest" => {
+            a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -15659,7 +15672,27 @@ async fn persona_writers_refuse_every_widening_shape<S: WriteStore>(store: &S) {
             sentence,
         );
     }
-    assert_eq!(shapes.len(), 17, "{CASE}: every shape of the D3 list");
+    push(
+        &|new| {
+            new.permission = rules(vec![rule(PersonaMatch {
+                tool_kind: Some("exec".into()),
+                ..PersonaMatch::default()
+            })]);
+        },
+        PersonaPatch {
+            permission: Some(rules(vec![rule(PersonaMatch {
+                tool_kind: Some("exec".into()),
+                ..PersonaMatch::default()
+            })])),
+            ..PersonaPatch::default()
+        },
+        rule_kind_unknown("exec"),
+    );
+    assert_eq!(
+        shapes.len(),
+        18,
+        "{CASE}: every shape of the D3 list and milestone 2's misspelt rule kind (D18)"
+    );
 
     for (new, patch, sentence) in shapes {
         let what = format!("{new:?}");
@@ -16027,6 +16060,191 @@ async fn tool_call_counts_group_by_step_and_kind<S: WriteStore>(store: &S) {
         store.tool_call_counts(ids::HTUI_CLEAN_1).await.expect(CASE),
         vec![tool_calls_of(elsewhere, "read", 1)],
         "{CASE}: the other item's run is its own"
+    );
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-26 milestone 2: deleting a persona (plan D14, I-9)
+// ------------------------------------------------------------------------------------------------
+
+/// The fixture phase `name` of `graph`, or a panic naming the case.
+async fn phase_named<S: WriteStore>(
+    case: &str,
+    store: &S,
+    graph: StepGraphId,
+    name: &str,
+) -> StepGraphPhase {
+    store
+        .phases(graph)
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|row| row.name == name)
+        .unwrap_or_else(|| panic!("{case}: graph {graph} has a `{name}` phase"))
+}
+
+/// Sets `phase`'s binding (`Some(id)`) or clears it (`None`) under its current token.
+async fn bind_phase<S: WriteStore>(
+    case: &str,
+    store: &S,
+    phase: &StepGraphPhase,
+    persona: Option<PersonaId>,
+) -> StepGraphPhase {
+    applied(
+        case,
+        store
+            .update_phase(
+                phase.id,
+                phase.updated_at,
+                PhasePatch {
+                    persona: Some(persona),
+                    ..PhasePatch::default()
+                },
+            )
+            .await
+            .expect(case),
+    )
+}
+
+/// MOD-26 milestone 2 D14: an unbound persona is deleted once; the second delete, and a delete of
+/// an id that never existed, is `NotFound { entity: "persona" }`. The fixture's `architect` binds
+/// no phase, so it goes too.
+async fn delete_persona_removes_an_unbound_row_once<S: WriteStore>(store: &S) {
+    const CASE: &str = "delete_persona_removes_an_unbound_row_once";
+    let scout = store
+        .create_persona(new_persona("scout", "You scout."))
+        .await
+        .expect(CASE);
+    store.delete_persona(scout.id).await.expect(CASE);
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["architect", "reviewer"],
+        "{CASE}: the deleted row is gone from the registry"
+    );
+    for (id, what) in [
+        (scout.id, "a deleted id"),
+        (PersonaId::new(), "an unknown id"),
+    ] {
+        match store.delete_persona(id).await {
+            Err(StoreError::NotFound {
+                entity: "persona", ..
+            }) => {}
+            other => panic!("{CASE}: deleting {what} is NotFound(persona), got {other:?}"),
+        }
+    }
+    store
+        .delete_persona(ids::PERSONA_ARCHITECT)
+        .await
+        .expect("the fixture binds `architect` to no phase");
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["reviewer"],
+        "{CASE}: a seeded unbound persona is deleted too"
+    );
+}
+
+/// MOD-26 milestone 2 D14 (I-9): a persona bound to phases is refused with
+/// [`persona_is_bound`](crate::store::persona_is_bound)'s sentence, which names each phase as
+/// `<slug>/<graph>/<phase>` sorted by that triple, an override graph's copy included; the row
+/// survives. Once every phase is cleared (`Some(None)`) the delete goes through and the phases
+/// stay, unbound. Postgres's race with a concurrent bind is
+/// `pg_criteria.rs::a_bind_racing_a_persona_delete_still_names_the_phase`.
+async fn a_bound_persona_is_not_deleted_and_names_its_phases<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_bound_persona_is_not_deleted_and_names_its_phases";
+    let reviewer = ids::PERSONA_REVIEWER;
+    let htui = phase_named(CASE, store, ids::GRAPH_HTUI_FEAT, "review").await;
+    let agy = phase_named(CASE, store, ids::GRAPH_AGY_FEAT, "review").await;
+    let htui = bind_phase(CASE, store, &htui, Some(reviewer)).await;
+    let agy = bind_phase(CASE, store, &agy, Some(reviewer)).await;
+    let graph = store
+        .create_step_graph(NewStepGraph {
+            id: StepGraphId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "HTUI-3-override".to_owned(),
+            description: String::new(),
+            is_override: true,
+        })
+        .await
+        .expect(CASE);
+    let copy = store
+        .create_phase(&StepGraphPhase {
+            persona_id: Some(reviewer),
+            ..new_phase(graph.id, 0, "review")
+        })
+        .await
+        .expect(CASE);
+
+    constraint_exactly(
+        CASE,
+        store.delete_persona(reviewer).await,
+        "persona `reviewer` is bound to 3 phases (`agy/feature/review`, \
+         `htui/HTUI-3-override/review`, `htui/feature/review`); clear them in Settings \u{203a} \
+         Kinds first",
+        "delete a persona three phases bind",
+    );
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["architect", "reviewer"],
+        "{CASE}: the refusal deleted nothing"
+    );
+
+    let mut cleared = Vec::new();
+    for phase in [&htui, &agy, &copy] {
+        cleared.push(bind_phase(CASE, store, phase, None).await);
+    }
+    store
+        .delete_persona(reviewer)
+        .await
+        .expect("no phase binds `reviewer` any more");
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["architect"],
+        "{CASE}: the unbound persona is deleted"
+    );
+    for (row, graph_id) in cleared
+        .iter()
+        .zip([ids::GRAPH_HTUI_FEAT, ids::GRAPH_AGY_FEAT, graph.id])
+    {
+        let after = store
+            .phases(graph_id)
+            .await
+            .expect(CASE)
+            .into_iter()
+            .find(|phase| phase.id == row.id)
+            .unwrap_or_else(|| panic!("{CASE}: phase {} survives the delete", row.id));
+        assert_eq!(after.persona_id, None, "{CASE}: {} stays unbound", row.name);
+    }
+}
+
+/// MOD-26 milestone 2 D14: a persona bound to seven phases names the first five in triple order
+/// and counts the other two.
+async fn a_persona_bound_to_many_phases_names_five_and_counts_the_rest<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_persona_bound_to_many_phases_names_five_and_counts_the_rest";
+    let architect = ids::PERSONA_ARCHITECT;
+    for (graph, name) in [
+        (ids::GRAPH_HTUI_FEAT, "prd"),
+        (ids::GRAPH_HTUI_FEAT, "plan"),
+        (ids::GRAPH_HTUI_FEAT, "implement"),
+        (ids::GRAPH_HTUI_FEAT, "review"),
+        (ids::GRAPH_HTUI_ANA, "research"),
+        (ids::GRAPH_HTUI_ANA, "verdict"),
+        (ids::GRAPH_HTUI_FIX, "reproduce"),
+    ] {
+        let phase = phase_named(CASE, store, graph, name).await;
+        bind_phase(CASE, store, &phase, Some(architect)).await;
+    }
+    constraint_exactly(
+        CASE,
+        store.delete_persona(architect).await,
+        "persona `architect` is bound to 7 phases (`htui/analysis/research`, \
+         `htui/analysis/verdict`, `htui/bug/reproduce`, `htui/feature/implement`, \
+         `htui/feature/plan` and 2 more); clear them in Settings \u{203a} Kinds first",
+        "delete a persona seven phases bind",
+    );
+    assert_eq!(
+        persona_names(CASE, store).await,
+        ["architect", "reviewer"],
+        "{CASE}: the refusal deleted nothing"
     );
 }
 

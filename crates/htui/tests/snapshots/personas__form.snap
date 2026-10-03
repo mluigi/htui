@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/personas.rs
+expression: frame
+---
+edit persona `architect`
+
+name              : architect
+description       : …lt, studying the existing code and writing a blueprint, without editing files.
+tools             :
+disallowed-tools  :
+deny-kinds        : edit, delete, move
+command-run (y/n) : y
+permission-default:
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Tab/Shift+Tab field · Enter save · Esc cancel

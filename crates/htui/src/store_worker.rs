@@ -24,11 +24,11 @@ use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxInfo, CitationKind,
     Document, DocumentHead, DocumentId, EditReason, Item, ItemFilter, ItemId, ItemKindId,
-    ItemKindPatch, ItemSpec, ItemSummary, LinkGraph, Note, PermissionId, PhaseId, PhasePatch,
-    Priority, ProjectId, ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId,
-    RequirementId, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch,
-    SpecChanges, StepGraphId, StepGraphPatch, StepId, ToolCallCount, WorkspaceId, WorkspacePatch,
-    WorkspaceSummary,
+    ItemKindPatch, ItemSpec, ItemSummary, LinkGraph, NewPersona, Note, PermissionId, Persona,
+    PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView,
+    RepoId, RepoPatch, RequirementAreaId, RequirementId, RunSummary, Scope, SessionEvent,
+    SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch, StepId,
+    ToolCallCount, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -51,6 +51,8 @@ use crate::concepts_worker::{self, ConceptsReply, ConceptsRuntime, ConceptsServe
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
+use crate::persona_import::PersonaImports;
+use crate::persona_settings::{self, PersonaWrite};
 use crate::prompt_settings::{self, SettingsSnapshot};
 use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
@@ -322,6 +324,42 @@ pub enum StoreRequest {
         /// `${tool}` name → an absolute path to a file on this box, for names the row's
         /// `discovery.tools` declares. Paths, not secrets (`R-SEC-2`).
         paths: BTreeMap<String, String>,
+    },
+    /// The persona registry by name (MOD-26 M2 D21). Served by [`persona_settings::serve`]
+    /// through the writer: personas are not mirrored, so offline it is refused with
+    /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::Personas`].
+    Personas,
+    /// Create one persona from the Settings form (D21); the section mints the id (B-13).
+    /// Answered with [`StoreReply::PersonaWritten`] (`Created`), or with [`StoreReply::Failed`]
+    /// carrying the store's sentence byte for byte (I-8, B-11).
+    CreatePersona {
+        /// The row to insert; checked again by the store.
+        new: NewPersona,
+    },
+    /// Edit one persona under compare-and-set on `updated_at` (D21): only the fields the editor
+    /// changed are `Some`. Answered with [`StoreReply::PersonaWritten`] (`Updated`, `Stale` or
+    /// `Gone`), or `Failed` with the store's sentence.
+    UpdatePersona {
+        /// The row.
+        id: PersonaId,
+        /// `updated_at` as a registry reply answered it, never a built one (MOD-40 F-17).
+        expected: DateTime<Utc>,
+        /// The changed fields.
+        patch: PersonaPatch,
+    },
+    /// Delete one persona no phase binds (D14, D21). Answered with
+    /// [`StoreReply::PersonaWritten`] (`Deleted` or `Gone`), or `Failed` carrying
+    /// `persona_is_bound`'s sentence.
+    DeletePersona {
+        /// The row.
+        id: PersonaId,
+    },
+    /// Import one frontmatter `.md` file or the depth-0 `*.md` of a directory (D20, OQ-9). The
+    /// **worker** reads the filesystem (`R-NF-3`, I-11). Answered with
+    /// [`StoreReply::PersonaImports`].
+    ImportPersonas {
+        /// The path exactly as typed (one line, never split).
+        path: String,
     },
     /// Pre-flight an adapter install for one registry row (MOD-20 D13, D18).
     ///
@@ -966,6 +1004,12 @@ impl StoreRequest {
             Self::SetAgentOnBox { .. } => "set_agent_on_box",
             // Served by the agent runtime, not `agent_settings::serve` (MOD-66 D7).
             Self::SetToolPaths { .. } => agent_settings::SET_TOOL_PATHS,
+            // The five of `persona_settings::REQUEST_NAMES`, in that order (MOD-26 M2 D21).
+            Self::Personas => "personas",
+            Self::CreatePersona { .. } => "create_persona",
+            Self::UpdatePersona { .. } => "update_persona",
+            Self::DeletePersona { .. } => "delete_persona",
+            Self::ImportPersonas { .. } => "import_personas",
             Self::InstallPlan { .. } => "install_plan",
             Self::InstallConfirm { .. } => "install_confirm",
             Self::InstallCancel => "install_cancel",
@@ -1315,6 +1359,20 @@ pub enum StoreReply {
         /// What the write did.
         outcome: AgentWrite,
     },
+    /// The persona registry by name: the answer to [`StoreRequest::Personas`] (MOD-26 M2 D21). A
+    /// read answer only: it never closes an editor or moves its token.
+    Personas(Vec<Persona>),
+    /// The answer to every persona write (D21; self-naming, MOD-59): the registry re-read after
+    /// the write, and what the write did.
+    PersonaWritten {
+        /// The registry as it is now, by name, whatever the outcome.
+        personas: Vec<Persona>,
+        /// What the write did.
+        outcome: PersonaWrite,
+    },
+    /// The registry after an import, and what happened to every file (D20). Boxed: the report
+    /// can be long.
+    PersonaImports(Box<PersonaImports>),
     /// The scope's requirements, freshly read: the answer to [`StoreRequest::Requirements`] (MOD-39
     /// plan P3). A read answer only: a tab write that applied answers
     /// [`StoreReply::RequirementWritten`] (MOD-59).
@@ -1712,6 +1770,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::CreateAgent { .. }
         | StoreRequest::EditAgent { .. }
         | StoreRequest::SetAgentOnBox { .. } => agent_settings::serve(backend, request).await?,
+        // The five persona requests, or-ed for the reason the arms above are: a guard does not
+        // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-26 M2
+        // D21). Served here, in the loop: the import's file reads included (`R-NF-3`, I-11).
+        StoreRequest::Personas
+        | StoreRequest::CreatePersona { .. }
+        | StoreRequest::UpdatePersona { .. }
+        | StoreRequest::DeletePersona { .. }
+        | StoreRequest::ImportPersonas { .. } => persona_settings::serve(backend, request).await?,
         // The ten requirement requests, or-ed for the reason the arms above are: a guard does not
         // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-39 plan
         // P1).
@@ -2441,17 +2507,18 @@ pub(crate) fn spawn_with_concepts(
                             });
                             continue;
                         }
-                        other => match try_serve(&backend, other).await {
-                            Ok(reply) => reply,
-                            Err(err) => {
-                                // This read is what noticed the server had gone. The asking view
-                                // still hears back exactly once; the next read finds the mirror.
-                                if matches!(err, StoreError::Unreachable(_)) {
-                                    go_offline(&mut backend, &mut refresher, &mut health, &err);
-                                }
-                                failed(other.name(), &err)
+                        other => {
+                            let served = try_serve(&backend, other).await;
+                            // This read is what noticed the server had gone. The asking view
+                            // still hears back exactly once; the next read finds the mirror.
+                            if let Some(err) = lost_the_store(&served) {
+                                go_offline(&mut backend, &mut refresher, &mut health, err);
                             }
-                        },
+                            match served {
+                                Ok(reply) => reply,
+                                Err(err) => failed(other.name(), &err),
+                            }
+                        }
                     };
 
                     let answer = ReplyEnvelope { seq: envelope.seq, origin: envelope.origin, reply };
@@ -2716,6 +2783,18 @@ fn go_offline(
         return;
     }
     tracing::warn!(%why, "store unreachable; falling back to the mirror");
+}
+
+/// The [`StoreError::Unreachable`] a served request met, if it met one: its own `Err`, or the
+/// re-read a persona import carries beside its report (R1 L-2 keeps the report, so that loss
+/// arrives inside an `Ok`; R1 ADV-1). Any other failure is not a loss of the store.
+fn lost_the_store(served: &StoreResult<StoreReply>) -> Option<&StoreError> {
+    let err = match served {
+        Err(err) => err,
+        Ok(StoreReply::PersonaImports(imports)) => imports.personas.as_ref().err()?,
+        Ok(_) => return None,
+    };
+    matches!(err, StoreError::Unreachable(_)).then_some(err)
 }
 
 /// Resolves with the error when the refresher reports an unreachable server, and never otherwise.
@@ -4713,6 +4792,28 @@ mod tests {
         }
 
         cache.close().await;
+    }
+
+    /// R1 ADV-1: an import that lost the store keeps its report (`Ok(PersonaImports)`) and still
+    /// tells the loop the store is gone, so an `Online` backend drops onto the mirror as it does
+    /// for any served request's `Unreachable`; another failure is not a loss.
+    #[test]
+    fn an_import_that_lost_the_store_still_reports_the_loss() {
+        let lost = StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned());
+        let other = StoreError::Backend("not a loss".to_owned());
+        let import = |personas| {
+            Ok(StoreReply::PersonaImports(Box::new(PersonaImports {
+                personas,
+                report: Vec::new(),
+            })))
+        };
+
+        assert_eq!(lost_the_store(&import(Err(lost.clone()))), Some(&lost));
+        assert_eq!(lost_the_store(&import(Err(other.clone()))), None);
+        assert_eq!(lost_the_store(&import(Ok(Vec::new()))), None);
+        assert_eq!(lost_the_store(&Err(lost.clone())), Some(&lost));
+        assert_eq!(lost_the_store(&Err(other)), None);
+        assert_eq!(lost_the_store(&Ok(StoreReply::Personas(Vec::new()))), None);
     }
 
     /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
