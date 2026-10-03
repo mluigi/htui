@@ -42,6 +42,7 @@ use crate::event::{
     ToolCallEvent, ToolKind, ToolLocation, ToolResultEvent, ToolResultStatus, UsageEvent,
 };
 use crate::launch::UsageScope;
+use crate::prompt_bridge::PromptCall;
 use crate::record::AnsweredBy;
 
 /// The `type` reported for a line that carries none.
@@ -86,6 +87,13 @@ pub struct Mapper {
     /// transcript claim a tool was refused twice, and `idx_session_event_tool` joins on the id that
     /// both carry.
     answered: BTreeSet<String>,
+    /// `tool_use_id`s already announced as a `tool_call` row.
+    ///
+    /// MOD-11 D18: a prompt from `htui`'s `permission_prompt` tool can overtake the `tool_use` line
+    /// of the call it gates (the session task may be behind stdout), and the call is then announced
+    /// from the prompt ([`Mapper::prompted_call`]). The stream's own line for it, when it arrives,
+    /// is the same call and produces no second row.
+    announced: BTreeSet<String>,
 }
 
 /// The five cumulative figures a `result` carries.
@@ -109,7 +117,29 @@ impl Mapper {
             last: Totals::default(),
             pending_quota: None,
             answered: BTreeSet::new(),
+            announced: BTreeSet::new(),
         }
+    }
+
+    /// MOD-11 D18: the call a prompt gates, as the `tool_call` row its `tool_use` line would have
+    /// produced — or nothing when that line was already mapped, or the prompt names no call.
+    ///
+    /// The request that follows is matched against a policy and summarised for a relay by the
+    /// call it names, and both consumers know a call only from a `tool_call` row they have
+    /// already pulled; announcing it here keeps "the call before its request" true whichever of
+    /// the two channels the session task happened to read first.
+    pub(crate) fn prompted_call(&mut self, call: &PromptCall) -> Option<DriverEvent> {
+        let id = call.tool_use_id.as_deref().filter(|id| !id.is_empty())?;
+        if !self.announced.insert(id.to_owned()) {
+            return None;
+        }
+        Some(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: id.to_owned(),
+            title: call.tool_name.clone(),
+            tool_kind: tool_kind(&call.tool_name),
+            locations: locations_of(&call.input),
+            input: call.input.clone(),
+        }))
     }
 
     /// MOD-11 D18: `id` was answered through `htui`'s prompt tool, so a later `permission_denied`
@@ -259,17 +289,23 @@ impl Mapper {
                         message_id: key,
                     })),
                     Some("tool_use") => {
+                        let tool_call_id = block
+                            .get("id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_owned();
+                        // Already announced from the prompt that gates it (MOD-11 D18).
+                        if !tool_call_id.is_empty() && !self.announced.insert(tool_call_id.clone())
+                        {
+                            return None;
+                        }
                         let input = block.get("input").cloned().unwrap_or(Value::Null);
                         let name = block
                             .get("name")
                             .and_then(Value::as_str)
                             .unwrap_or_default();
                         Some(DriverEvent::ToolCall(ToolCallEvent {
-                            tool_call_id: block
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .unwrap_or_default()
-                                .to_owned(),
+                            tool_call_id,
                             title: name.to_owned(),
                             tool_kind: tool_kind(name),
                             locations: locations_of(&input),

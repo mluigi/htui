@@ -1171,6 +1171,13 @@ async fn session_main(
             }
             // MOD-11 D18: a gated call, announced as an ordinary request.
             Step::Prompt(Some(request)) => {
+                // The prompt may have overtaken its `tool_use` line: the call goes first, so the
+                // request's consumers can see what it gates (adversarial review T9-ADV-ORDER-1).
+                if let Some(call) = state.mapper.prompted_call(&request.call)
+                    && !emit(&mut state, &events, call, None).await
+                {
+                    break;
+                }
                 let event = DriverEvent::PermissionRequest(prompts.park(request));
                 if !emit(&mut state, &events, event, None).await {
                     break;

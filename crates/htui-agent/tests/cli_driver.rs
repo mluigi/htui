@@ -854,6 +854,7 @@ fn script(template: &str) -> String {
         .replace("<REPLY>", REPLY)
         .replace("<TOOL_USE>", TOOL_USE)
         .replace("<DENIED_RESULT>", DENIED_RESULT)
+        .replace("<LATE_TOOL_USE>", LATE_TOOL_USE)
         .replace("<FLOOD>", &FLOOD.to_string())
 }
 
@@ -975,6 +976,27 @@ while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
 i=0
 while [ "$i" -lt <FLOOD> ]; do printf '%s\n' '<REPLY>'; i=$((i+1)); done
 while [ ! -f "$HTUI_GO_FILE.end" ]; do sleep 0.05; done
+printf '%s\n' '<RESULT>'
+exit 0
+"#;
+
+/// The assistant line announcing a gated `Write`, for [`LATE_CALL_PROMPT_SCRIPT`].
+#[cfg(unix)]
+const LATE_TOOL_USE: &str = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"tool_use","id":"toolu_late","name":"Write","input":{"file_path":"/tmp/late.txt","content":"x"}}]}}"#;
+
+/// Streams [`FLOOD`] replies and *then* the `tool_use` line of [`LATE_TOOL_USE`], touches
+/// `$HTUI_GO_FILE.sent`, and waits for `$HTUI_GO_FILE` before ending its turn: a session task that
+/// has fallen behind stdout when the CLI asks about the call.
+#[cfg(unix)]
+const LATE_CALL_PROMPT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+i=0
+while [ "$i" -lt <FLOOD> ]; do printf '%s\n' '<REPLY>'; i=$((i+1)); done
+printf '%s\n' '<LATE_TOOL_USE>'
+: > "$HTUI_GO_FILE.sent"
+while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
 printf '%s\n' '<RESULT>'
 exit 0
 "#;
@@ -1808,5 +1830,89 @@ async fn a_cancelled_prompt_is_not_reported_again() {
             .iter()
             .any(|event| matches!(event, DriverEvent::PermissionAnswer(_))),
         "the cancelled prompt is not reported again: {rest:?}"
+    );
+}
+
+/// Adversarial review T9-ADV-ORDER-1: a prompt can overtake the `tool_use` line it gates when the
+/// session task is behind stdout. The call is announced from the prompt itself, ahead of the
+/// request, so a policy matcher and the relay's summary see it; the stream's later line adds no
+/// second `tool_call`.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_prompt_ahead_of_its_tool_use_line_still_follows_its_call() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), LATE_CALL_PROMPT_SCRIPT);
+    let (port, ask) = bridge();
+    let mut spec = spec(tmp.path().to_path_buf());
+    spec.prompt = Some(port);
+    let mut session = start_with(&scripted.row, spec).await;
+    let _banner = next(&mut session, "the banner").await;
+
+    let go = tmp.path().join("go");
+    let sent = go.with_extension("sent");
+    let deadline = tokio::time::Instant::now() + EVENT_WINDOW;
+    while !sent.exists() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the script never streamed its call"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let input = json!({"file_path": "/tmp/late.txt", "content": "x"});
+    let task = asking(
+        &ask,
+        PromptCall {
+            tool_name: "Write".to_owned(),
+            input,
+            tool_use_id: Some("toolu_late".to_owned()),
+        },
+    );
+    let expected = htui_agent::cli::claude::Mapper::new(htui_agent::launch::UsageScope::ModelUsage)
+        .map(&serde_json::from_str(LATE_TOOL_USE).expect("the fixture is JSON"));
+
+    let mut before = Vec::new();
+    loop {
+        let event = next(&mut session, "the prompt").await;
+        if matches!(event, DriverEvent::PermissionRequest(_)) {
+            assert_eq!(event, prompt_request("toolu_late", Some("toolu_late")));
+            break;
+        }
+        before.push(event);
+    }
+    let calls: Vec<_> = before
+        .iter()
+        .filter(|event| matches!(event, DriverEvent::ToolCall(_)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        calls, expected,
+        "the gated call is announced, as the stream would, before its request"
+    );
+
+    session
+        .answer_permission(
+            PermissionRequestId::new("toolu_late"),
+            PermissionAnswer::Selected("allow".to_owned()),
+        )
+        .await
+        .expect("a parked prompt is answerable");
+    assert_eq!(verdict(task).await, Ok(PromptVerdict::Allow));
+
+    std::fs::write(&go, b"").expect("go");
+    let rest = drain(&mut session).await;
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::ToolCall(_))),
+        "the stream's own line for the call adds no second `tool_call`: {:?}",
+        rest.iter()
+            .filter(|event| matches!(event, DriverEvent::ToolCall(_)))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
+        "{:?}",
+        rest.last()
     );
 }
