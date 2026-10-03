@@ -1199,6 +1199,7 @@ const RUN_STEP_COLUMNS: &[&str] = &[
     "verify_outcome",
     "verify_exit_code",
     "promoted_at",
+    "opening",
     "updated_at",
 ];
 
@@ -1213,7 +1214,7 @@ async fn refresh_run_step(
         "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, \
                 gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, usage, \
                 isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, \
-                promoted_at, updated_at \
+                promoted_at, opening, updated_at \
            FROM run_step \
           WHERE run_id IN (SELECT id FROM run WHERE project_id = $1) AND updated_at > $2 \
           ORDER BY updated_at",
@@ -1250,6 +1251,7 @@ async fn refresh_run_step(
             .bind(row.verify_outcome.as_deref())
             .bind(row.verify_exit_code.map(i64::from))
             .bind(row.promoted_at.map(ts_bind))
+            .bind(row.opening.as_deref())
             .bind(ts_bind(row.updated_at))
             .execute(&mut *tx)
             .await

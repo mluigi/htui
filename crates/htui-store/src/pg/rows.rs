@@ -30,8 +30,8 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     Activation, AgentId, BoxId, GateOutcome, ItemId, LinkNode, Persona, PersonaId,
     PersonaPermission, PersonaTools, PhaseId, ProjectId, RunId, RunKind, RunMode, RunStatus,
-    RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status, StepId, StepStatus,
-    UpstreamEntry, VerifyOutcome,
+    RunStepSummary, RunSummary, SkillBinding, SkillBindingId, SkillId, Status, StepId, StepOpening,
+    StepStatus, UpstreamEntry, VerifyOutcome,
 };
 use serde_json::Value;
 use sqlx::types::Json;
@@ -143,6 +143,8 @@ pub(crate) struct StepRow {
     pub(crate) agent_name: Option<String>,
     /// `run_step.gate_note`, appended last (positional).
     pub(crate) gate_note: Option<String>,
+    /// `run_step.opening` (MOD-37 M5), appended last (positional).
+    pub(crate) opening: Option<StepOpening>,
 }
 
 impl StepRow {
@@ -169,7 +171,7 @@ impl StepRow {
             promoted_at: self.promoted_at,
             agent_name: self.agent_name,
             gate_note: self.gate_note,
-            opening: None,
+            opening: self.opening,
         }
     }
 }

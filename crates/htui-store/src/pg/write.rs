@@ -5422,8 +5422,28 @@ impl WriteStore for PgStore {
         tx.commit().await.map_err(map_sqlx)
     }
 
+    /// MOD-37 M5: one `UPDATE`; `trg_run_step_updated_at` moves `updated_at`.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] `{ entity: "run_step" }` when no row has that id.
     async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
-        todo!("MOD-37 M5: record_opening({step}, {opening})")
+        let written = sqlx::query!(
+            "UPDATE run_step SET opening = $2 WHERE id = $1",
+            step.as_uuid(),
+            opening.as_str(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected();
+        if written == 1 {
+            Ok(())
+        } else {
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })
+        }
     }
 
     /// MOD-37 R-5: one fenced compare-and-set, `running -> done` with `gate_outcome = 'skipped'`.

@@ -401,7 +401,9 @@ impl ReadStore for PgStore {
                    s.promoted_at,
                    a.name                                           AS "agent_name?",
                    -- Appended, positional: `run_step.gate_note`.
-                   s.gate_note
+                   s.gate_note,
+                   -- Appended, positional: `run_step.opening` (MOD-37 M5).
+                   s.opening AS "opening: htui_core::model::StepOpening"
               FROM run_step s
               LEFT JOIN agent a ON a.id = s.agent_id
              WHERE s.run_id = ANY($1)

@@ -36,7 +36,7 @@ use htui_core::model::{
     RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
     RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraphId, StepId, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId,
+    StepGraphId, StepId, StepOpening, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId,
     VerifyOutcome, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
@@ -565,7 +565,7 @@ impl ReadStore for CacheStore {
                                           FROM json_each(s.trim_record, '$.sections') e), 0) \
                          ELSE 0 END AS trimmed, \
                     s.usage, s.selected, s.exit_code, s.verify_outcome, s.promoted_at, \
-                    a.name AS agent_name, s.gate_note \
+                    a.name AS agent_name, s.gate_note, s.opening \
                FROM run_step s \
                LEFT JOIN agent a ON a.id = s.agent_id \
               WHERE s.run_id IN ({}) \
@@ -611,7 +611,7 @@ impl ReadStore for CacheStore {
                     promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
                     agent_name: opt_text(row, "agent_name")?,
                     gate_note: opt_text(row, "gate_note")?,
-                    opening: None,
+                    opening: get::<Option<StepOpening>>(row, "opening")?,
                 },
             ));
         }
