@@ -530,14 +530,14 @@ KeyModifiers, MouseButton, MouseEvent, MouseEventKind}`, `std::cell::Cell`. Help
 | `a_passed_mouse_event_keeps_the_status_line_and_does_not_redraw` | `pointing(true, Pass)`, status set | `seen == [Down(Left)]`, `!app.dirty`, status unchanged (E8) |
 | `an_overlay_or_the_help_box_takes_the_mouse_away` | `pointing(true, Consumed)`; `app.push_overlay(Box::new(Popup))` (`:952-977`) | `!app.wants_mouse()`, and `Down(Left)` leaves `seen` empty. Second shell: `app.help_visible = true` gives the same (E7) |
 
-**`backlog/mod.rs` `mod tests`**, after `f_opens_the_filter_form_and_it_captures` (`~:1221-1247`),
-using `Bench` (`:1148-1197`) and `press`:
+**`backlog/mod.rs` `mod tests`**, after `f_opens_the_filter_form_and_it_captures` (`:1229-1255`),
+using `Bench` (`:1149-1198`) and `press`:
 
 ```rust
     /// A sub-tab that wants the mouse while `wants` is set and logs what it is offered (MOD-71).
     #[derive(Debug)]
     struct MouseProbe { wants: Rc<Cell<bool>>, seen: Rc<RefCell<Vec<MouseEventKind>>> }
-    // impl DetailTab: id DetailId("mouse"), title "Mouse", the rest as `CapturingProbe` (`:819-845`),
+    // impl DetailTab: id DetailId("mouse"), title "Mouse", the rest as `CapturingProbe` (`:822-847`),
     // wants_mouse -> self.wants.get(), on_mouse -> push the kind, Consumed.
 ```
 
@@ -548,7 +548,7 @@ using `Bench` (`:1148-1197`) and `press`:
 
 The item form is covered in the first test too: after the filter form's `Esc`,
 `open_with(&mut tab, &bench, &MemStore::demo(), KeyCode::Char('N')).await` (the helper
-`the_item_form_reply_opens_the_form_and_it_captures` uses, `~:1913-1931`) opens it, which gives
+`the_item_form_reply_opens_the_form_and_it_captures` uses, `:1913-1931`) opens it, which gives
 `!tab.wants_mouse()` and `on_mouse == Pass`, and its `Esc` makes the mouse wanted again.
 
 ### 3.8 Commits (T2)
@@ -826,14 +826,14 @@ test, and only in these `execution_graph.rs` ones):
 
 | Test | Line | Verdict |
 |---|---|---|
-| `a_re_sync_of_the_same_run_keeps_zoom_selection_and_hidden_handles` | `:1129` | **unchanged**: same cursor; it already expected the viewport kept, and now no reveal runs at all |
-| `a_wider_re_read_of_the_same_run_keeps_the_nodes_still` | `:1299` | **unchanged**: same cursor, the L2 anchor does the work |
+| `a_re_sync_of_the_same_run_keeps_zoom_selection_and_hidden_handles` | `:1132` | **unchanged**: same cursor; it already expected the viewport kept, and now no reveal runs at all |
+| `a_wider_re_read_of_the_same_run_keeps_the_nodes_still` | `:1302` | **unchanged**: same cursor, the L2 anchor does the work |
 | `a_re_sync_with_new_counts_keeps_the_viewport` | `:1584` | **unchanged** |
-| `the_reveal_leaves_no_ghost_corner` | `~:1340` | **unchanged**: its re-sync moves the cursor `id(7)` → `id(0)`, so the reveal still runs; the second same-size draw now skips the scratch pass, which only removes a ghost source |
-| `a_reveal_waits_for_a_canvas_big_enough_to_hold_it` | `~:1290` | **unchanged**: the 1×1 draw returns before `drawn` is recorded (E5) |
-| `two_renders_of_the_same_state_are_identical` | `~:1218` | **unchanged**: second draw, same size, no reveal, same viewport |
-| `a_cursor_below_the_fold_is_visible_on_the_first_render`, `fit_keeps_the_cursor_node_on_screen`, `zoom_is_clamped_and_fit_zooms_out_to_a_tall_run` | `~:1183`, `~:1275`, `~:1255` | **unchanged**: `Reset`, `fit` and the zoom keys keep their reveals |
-| `runs.rs` `a_tool_calls_reply_draws_the_chips_in_flow` | `~:3960` | **unchanged**: the reply's same-cursor sync queues no reveal now, but `v` (`Reset`) and `J` (`Cursor`) are still pending when `lines` draws |
+| `the_reveal_leaves_no_ghost_corner` | `:1350` | **unchanged**: its re-sync moves the cursor `id(7)` → `id(0)`, so the reveal still runs; the second same-size draw now skips the scratch pass, which only removes a ghost source |
+| `a_reveal_waits_for_a_canvas_big_enough_to_hold_it` | `:1292` | **unchanged**: the 1×1 draw returns before `drawn` is recorded (E5) |
+| `two_renders_of_the_same_state_are_identical` | `:1215` | **unchanged**: second draw, same size, no reveal, same viewport |
+| `a_cursor_below_the_fold_is_visible_on_the_first_render`, `fit_keeps_the_cursor_node_on_screen`, `zoom_is_clamped_and_fit_zooms_out_to_a_tall_run` | `:1184`, `:1278`, `:1254` | **unchanged**: `Reset`, `fit` and the zoom keys keep their reveals |
+| `runs.rs` `a_tool_calls_reply_draws_the_chips_in_flow` | `:3944` | **unchanged**: the reply's same-cursor sync queues no reveal now, but `v` (`Reset`) and `J` (`Cursor`) are still pending when `lines` draws |
 | `no_node_is_draggable_connectable_or_deletable` | `:1230` | **unchanged** (B-2) |
 
 No existing test must be updated.
@@ -841,7 +841,7 @@ No existing test must be updated.
 **`execution_graph.rs` `mod tests`**: a new section at the end, "MOD-71 T3: the mouse (plan
 D5–D9)". Coordinates (H-8): `draw` is 43×23 at `(0, 0)`, so a buffer cell **is** the terminal
 cell. A new run is centred at zoom 1: `linear(n)` nodes occupy columns 11–30 and rows
-`1 + 8k ..= 5 + 8k` (`a_new_run_is_centred_at_zoom_one`, `:1163-1166`, pins `(11, 1)`). Helpers:
+`1 + 8k ..= 5 + 8k` (`a_new_run_is_centred_at_zoom_one`, `:1164-1167`, pins `(11, 1)`). Helpers:
 
 ```rust
     use crossterm::event::{KeyModifiers, MouseButton::{Left, Right}, MouseEventKind::*};
@@ -997,3 +997,65 @@ queues `Reveal::Cursor`. `Consumed` sets `dirty`, so the next frame draws it. Ev
 (`restore_terminal`, the panic hook, `Suspend::leave`) turns capture off. After `$EDITOR`, the
 loop's next ask turns it back on if it is still wanted.
 
+---
+
+## 5. T4: close-out docs (sketch)
+
+1. `docs/decisions/mod/mod-71.md` (new, the `mod-72.md` shape): D1–D11 as decided, B-1..B-12,
+   E1–E16, H-1..H-14 in short. The **operator note**: while the flow view is shown, the
+   terminal's bypass modifier still selects text (Shift in xterm, GNOME Terminal, kitty and
+   Windows Terminal; Option in iTerm2/Terminal.app). A terminal without mouse reporting runs the
+   flow keyboard-only. D8's evidence is corrected to `mouse.rs:421-424` (B-3).
+2. `DECISIONS.md`: one index line at the top: `- **[MOD-71](docs/decisions/mod/mod-71.md)** -
+   Mouse support: capture policy and the Runs flow view (done, <date>)`.
+3. `HANDOFF.md`: tick MOD-71 in the checklist per `lifecycle.md` P2. Update the status block, and
+   change the status paragraph's "keyboard only: mouse support is MOD-71" line to say mouse support
+   is in the flow view only. Pins don't move (snapshots 143). Re-count the MOD-N row if MOD-71 is
+   listed there.
+4. `docs/ANA-12.md` status line: "MOD-71 done (<date>): mouse routing by focus (§"Route events
+   conditionally based on focus"), capture on only in the Runs flow view."
+5. `docs/decisions/mod/mod-28.md` "Carried": mark the fan-out-width bullet "resolved by MOD-71's
+   free panning (drag on empty canvas, wheel zoom)".
+6. `.claude/plans/mod-71-mouse-support.plan.md`: Status → done, and tick the Acceptance boxes.
+7. Commit: `docs(mod-71): close-out - write-up, DECISIONS index, HANDOFF status, ANA-12 and MOD-28
+   notes, plan done`. Run §7 on the real tree **before** this commit.
+
+---
+
+## 6. Blueprint decisions
+
+| # | Decision | Why |
+|---|---|---|
+| **E1** | `ExecutionGraph::on_mouse` re-selects the cursor node (or clears with none) after every forwarded event | B-1. rataflow selects a pressed node on press. Non-selectable nodes would be click-transparent (`mouse.rs:436`), and D8 freezes the builders |
+| **E2** | `ExecutionGraph::on_mouse` forwards only left press/drag/release and the vertical wheel | B-9. Defence in depth under D5's `RunsTab` filter, and it makes the right-drag test meaningful at the graph level |
+| **E3** | `on_mouse` returns `Option<StepId>`, parsed from `NodeClicked.node_id` with `StepId::from_str`; an unparseable id is no click | Node ids are `StepId::to_string()` (`sync`). The pane, not the graph, owns the cursor (MOD-28 D7) |
+| **E4** | `RunsTab::on_mouse` answers `Consumed` for every event it forwards, and `Pass` otherwise | A pan or a zoom changes the frame, and `dirty` comes only from `Consumed` (D4). A press that turns out to do nothing costs one redraw |
+| **E5** | Resize = a different **size** of a **drawable** canvas, held in `drawn: Option<(u16, u16)>` | B-11. The viewport is canvas-relative. A sub-2×2 frame keeps review L1's pending reveal |
+| **E6** | `drawable(area)` is shared by `ExecutionGraph::render` and `RunsTab::render_flow` | B-7. One floor, so the pane never hit-tests against an area rataflow didn't record |
+| **E7** | `App::wants_mouse` also requires `!help_visible` | B-5. The `?` box draws over the tab like an overlay but isn't in `OverlayStack` |
+| **E8** | `App::on_mouse` takes the status before dispatch and puts it back unless `Consumed` (and nothing new was written) | B-6. Same contract as `on_key` for a consumed event. An unconsumed one leaves it alone (D4) |
+| **E9** | `set_mouse_capture` records `on` after an `Unsupported` answer, and `enable_mouse_capture` logs at `debug` | H-14. No per-step retries. The notice would repeat on every toggle, unlike paste's once-at-`init` `info` |
+| **E10** | The terminal's mouse shape test is a **new** test beside the paste one, using its helpers | The paste test's name speaks only for paste. Same precedent, same helpers (D3) |
+| **E11** | `gesture` is cleared by `v`, `on_item_change`, the action arm when a capturing mode opened, and `RunsTab::on_mouse` when not wanted | B-8, D11 |
+| **E12** | `select_step` searches the **cursor's run** only, leaves the cursor on a miss, and always syncs | D6: only that run is on the canvas |
+| **E13** | Commits: T1 2, T2 2, T3 3, T4 1 | Memory: implementers commit incrementally. H-3 keeps every red `todo!()` off live paths |
+| **E14** | `Harness::mouse(kind, column, row)` with no modifier | Plan's shape. A modifier is the terminal's bypass, which never reaches the app |
+| **E15** | `App::{wants_mouse, on_mouse}` go between `on_paste` and `on_key` in `state.rs`; trait defaults go at the end of each trait; `RunsTab`'s overrides go after `on_paste` | Mirror the `on_paste` chain at every level. Additive at trait ends (H-12) |
+| **E16** | `App`'s tests go in `app/update.rs` `mod tests` | That's where `App`'s tests live (`:486-…`). `state.rs` has no test module |
+
+## 7. Close-out gate (plan § Validation, on the real tree)
+
+```bash
+df -h .                                                     # target/ growth (memory: disk pressure)
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test -p htui --all-features --no-fail-fast -- --test-threads=1     # all-features, else tests/*.rs run 0 tests
+cargo test --workspace --all-features --no-fail-fast -- --test-threads=1 2>&1 | grep -E "SIGABRT|FAILED|test result"
+git diff --stat c3243310 -- Cargo.lock                       # empty (D10)
+git ls-files crates/htui/tests/snapshots | wc -l             # 143
+cargo insta pending-snapshots                                # none
+bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
+```
+
+No store, migration or `.sqlx` change, so neither `sqlx prepare --check` nor the Postgres
+conformance runs are needed beyond the workspace test line.
