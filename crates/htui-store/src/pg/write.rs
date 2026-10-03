@@ -6491,9 +6491,10 @@ impl WriteStore for PgStore {
     // ---- MOD-11 (D13) ----
 
     /// D13: [`write_document`](WriteStore::write_document) for the step's own item, one
-    /// transaction: [`step_scope`] (the run, `FOR SHARE`), the own-item check, then the item
-    /// `FOR UPDATE` and [`insert_document`] — `park_step`'s run → item order, so the two never
-    /// deadlock (`pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`).
+    /// transaction: [`step_scope`] (the step and its run, `FOR SHARE OF s, r`), the own-item
+    /// check, then the item `FOR UPDATE` and [`insert_document`] — `park_step`'s step → run → item
+    /// order, so the two never deadlock
+    /// (`pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`).
     ///
     /// # Errors
     ///

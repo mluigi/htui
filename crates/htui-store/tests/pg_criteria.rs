@@ -6286,12 +6286,12 @@ async fn a_bound_persona_cannot_be_deleted() {
 }
 
 /// MOD-11 plan D13, R-12: `write_step_document` and `park_step` take their locks in one order,
-/// run → item, so a step's document racing its own park never deadlocks (`40P01`).
+/// step → run → item, so a step's document racing its own park never deadlocks (`40P01`).
 ///
 /// `park_step` locks the step and its run `FOR UPDATE`, then updates the item; the document write
-/// reads the run `FOR SHARE`, locks the item `FOR UPDATE` and inserts a row whose foreign key
-/// takes `FOR KEY SHARE` on the step. Fifty rounds, each on a fresh running step of one leased
-/// run, with the two writes on two independent pools (`admission_is_serialised_by_the_box_row_lock`'s
+/// locks the step and its run `FOR SHARE`, locks the item `FOR UPDATE` and inserts a row whose
+/// foreign key takes `FOR KEY SHARE` on the step. Fifty rounds, each on a fresh running step of
+/// one leased run, with the two writes on two independent pools (`admission_is_serialised_by_the_box_row_lock`'s
 /// reason). Both always land — a park does not release the lease, so the fence still holds after
 /// it — and every round ends in the one state both orders reach: the step, the run and the item
 /// parked, and the document stored under the step.
