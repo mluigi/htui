@@ -127,11 +127,11 @@ session's run is refused by test.**
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Server + wiring + scoping | Every session htui launches (engine, chat, worker) sees an htui MCP server bound to its step; `box_profile` answers; out-of-scope calls refused | pending | — |
-| 2 | Document and backlog writes | `document_write` (fenced, production `StepAuthor`), `note_add`, `item_status` as note, `item_link`; production judge resolves, `approve`/`accept` live | pending | — |
-| 3 | `search_concepts` | Agents search items and requirements in the step's project | pending | — |
-| 4 | `command_run` queue and exposure | Heavy commands queue under per-box class limits and return output; exposure honours `off` / `fan_out_only` / `always` / `heavy_build`; skill text and ACP denial per R-MCP-4 | pending | — |
-| 5 | CLI `permission_request` | CLI-transport sessions route permission prompts through the MCP permission tool into the MOD-42 relay | pending | — |
+| 1 | Server + wiring + scoping | Every session htui launches (engine, chat, worker) sees an htui MCP server bound to its step; `box_profile` answers; out-of-scope calls refused | in-progress | `.claude/plans/mod-11-mcp-server.plan.md` |
+| 2 | Document and backlog writes | `document_write` (fenced, production `StepAuthor`), `note_add`, `item_status` as note, `item_link`; production judge resolves, `approve`/`accept` live | in-progress | `.claude/plans/mod-11-mcp-server.plan.md` |
+| 3 | `search_concepts` | Agents search items and requirements in the step's project | in-progress | `.claude/plans/mod-11-mcp-server.plan.md` |
+| 4 | `command_run` queue and exposure | Heavy commands queue under per-box class limits and return output; exposure honours `off` / `fan_out_only` / `always` / `heavy_build`; skill text and ACP denial per R-MCP-4 | in-progress | `.claude/plans/mod-11-mcp-server.plan.md` |
+| 5 | CLI `permission_request` | CLI-transport sessions route permission prompts through the MCP permission tool into the MOD-42 relay | in-progress | `.claude/plans/mod-11-mcp-server.plan.md` |
 
 ## Open Questions
 
