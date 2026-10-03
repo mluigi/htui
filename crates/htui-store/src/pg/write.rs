@@ -308,6 +308,12 @@ fn rows(count: i64) -> u64 {
 /// otherwise never return.
 const DELETE_ATTEMPTS: u32 = 3;
 
+/// How many guard-then-holders passes `delete_persona` makes before it gives up (MOD-26 M2 R1
+/// L-3, Deviation D-11): the holders only shrink under the persona's `FOR UPDATE`, so a real race
+/// ends in a pass or two, and a third that still finds the guard fired over no nameable holder
+/// is answered as a backend error rather than looped on.
+const DELETE_PERSONA_PASSES: u32 = 3;
+
 /// Opens a transaction at `REPEATABLE READ`, which is where the two delete paths count (review M1).
 ///
 /// `READ COMMITTED` gives every statement its own snapshot, so a `count(*)` and a `DELETE` in one
@@ -3517,7 +3523,8 @@ impl WriteStore for PgStore {
     /// # Errors
     ///
     /// [`StoreError::NotFound`] for an unknown id; [`StoreError::Constraint`] with
-    /// [`persona_is_bound`]'s sentence while a phase binds it.
+    /// [`persona_is_bound`]'s sentence while a phase binds it; [`StoreError::Backend`] when
+    /// `DELETE_PERSONA_PASSES` passes find the guard fired over no holder they can name.
     async fn delete_persona(&self, id: PersonaId) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
@@ -3540,7 +3547,14 @@ impl WriteStore for PgStore {
         // fired over holders that are gone. Nothing can become a holder while the row is locked
         // (a bind's `FOR KEY SHARE` waits on it), so the holders only shrink and an empty read
         // means the guarded `DELETE` is simply run again.
-        loop {
+        //
+        // That rests on `fk_step_graph_phase_persona` being NOT DEFERRABLE: a bind checks it at
+        // its own statement and so waits on the `FOR UPDATE` lock above, rather than at a commit
+        // that could land between two passes. The holders read joins `step_graph` and `project`,
+        // which NOT NULL FKs make total today; should a holder ever be one the guard sees and the
+        // join cannot name, the passes are capped (R1 L-3) so the loop ends in an error rather
+        // than spinning, and the transaction rolls back with nothing deleted.
+        for _ in 0..DELETE_PERSONA_PASSES {
             let removed = sqlx::query_scalar!(
                 r#"
             DELETE FROM persona
@@ -3554,7 +3568,8 @@ impl WriteStore for PgStore {
             .await
             .map_err(map_sqlx)?;
             if removed.is_some() {
-                break;
+                tx.commit().await.map_err(map_sqlx)?;
+                return Ok(());
             }
 
             // The row is there - it was just locked - so zero rows means the guard fired; the
@@ -3580,8 +3595,9 @@ impl WriteStore for PgStore {
             }
         }
 
-        tx.commit().await.map_err(map_sqlx)?;
-        Ok(())
+        Err(StoreError::Backend(
+            "delete_persona: holders kept changing".to_owned(),
+        ))
     }
 
     // settings (D7, D8)

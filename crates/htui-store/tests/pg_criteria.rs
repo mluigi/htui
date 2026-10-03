@@ -3583,6 +3583,59 @@ async fn an_unbind_racing_a_persona_delete_lets_it_delete() {
     db.drop_db().await;
 }
 
+/// MOD-26 M2 R1 L-3: the guard-then-holders loop is bounded. A holder the guard sees but the
+/// holders read cannot name - here a phase whose graph points at no project, which only a session
+/// that skips the FK triggers can write - would spin it forever; after three passes it gives up
+/// with a `Backend` error and deletes nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_persona_delete_gives_up_after_three_passes() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let reviewer = ids::PERSONA_REVIEWER;
+    let review = htui_feature_phase(&db.store, "review").await;
+    sqlx::query("UPDATE step_graph_phase SET persona_id = $1 WHERE id = $2")
+        .bind(reviewer.as_uuid())
+        .bind(review.id.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("bind reviewer to the review phase");
+    let mut skipper = PgConnection::connect(&db.url)
+        .await
+        .expect("a second connection");
+    sqlx::raw_sql(
+        "SET session_replication_role = replica; \
+         UPDATE step_graph SET project_id = gen_random_uuid() \
+          WHERE id = (SELECT graph_id FROM step_graph_phase WHERE persona_id IS NOT NULL LIMIT 1)",
+    )
+    .execute(&mut skipper)
+    .await
+    .expect("orphan the holder's graph past its FK");
+    skipper.close().await.expect("close the second connection");
+
+    let deleted = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        db.store.delete_persona(reviewer),
+    )
+    .await
+    .expect("delete_persona ends rather than spinning");
+
+    assert_eq!(
+        deleted,
+        Err(htui_core::store::StoreError::Backend(
+            "delete_persona: holders kept changing".to_owned()
+        ))
+    );
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM persona WHERE id = $1")
+        .bind(reviewer.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("count the persona");
+    assert_eq!(left, 1, "nothing was deleted");
+
+    db.drop_db().await;
+}
+
 /// MOD-15 D4's template rows, which no `WriteStore` reader returns: ten per project, named by
 /// `DEFAULT_TEMPLATES`, body `body_of(name)`, version 1, `created_by` the creator's.
 ///
