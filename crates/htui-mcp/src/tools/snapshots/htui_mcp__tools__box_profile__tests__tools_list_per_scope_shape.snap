@@ -23,6 +23,50 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
         "additionalProperties": false,
         "title": "BoxProfileArgs"
       }
+    },
+    {
+      "name": "document_write",
+      "description": "Records this step's output document; each call writes a new version.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The document's title; the output kind when omitted.",
+            "default": null
+          },
+          "body": {
+            "type": "string",
+            "description": "The document's body, in Markdown."
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "DocumentArgs"
+      }
+    },
+    {
+      "name": "note_add",
+      "description": "Adds a note to this step's item.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "type": "string",
+            "description": "The note, at most 16384 bytes."
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "NoteArgs"
+      }
     }
   ],
   "phase step": [
@@ -34,6 +78,50 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
         "additionalProperties": false,
         "title": "BoxProfileArgs"
       }
+    },
+    {
+      "name": "document_write",
+      "description": "Records this step's output document; each call writes a new version.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The document's title; the output kind when omitted.",
+            "default": null
+          },
+          "body": {
+            "type": "string",
+            "description": "The document's body, in Markdown."
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "DocumentArgs"
+      }
+    },
+    {
+      "name": "note_add",
+      "description": "Adds a note to this step's item.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "type": "string",
+            "description": "The note, at most 16384 bytes."
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "NoteArgs"
+      }
     }
   ],
   "CLI phase step": [
@@ -44,6 +132,50 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
         "type": "object",
         "additionalProperties": false,
         "title": "BoxProfileArgs"
+      }
+    },
+    {
+      "name": "document_write",
+      "description": "Records this step's output document; each call writes a new version.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The document's title; the output kind when omitted.",
+            "default": null
+          },
+          "body": {
+            "type": "string",
+            "description": "The document's body, in Markdown."
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "DocumentArgs"
+      }
+    },
+    {
+      "name": "note_add",
+      "description": "Adds a note to this step's item.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "type": "string",
+            "description": "The note, at most 16384 bytes."
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "NoteArgs"
       }
     }
   ]
