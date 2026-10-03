@@ -1,5 +1,5 @@
 //! §4.8's promotion, the pure half (plan D163, blueprint D192, D193): which opening a promoted
-//! step gets, and the handoff role's `PromptSpec`.
+//! step gets, on either transport (MOD-37 M5), and the handoff role's `PromptSpec`.
 //!
 //! The engine reads the step's rows, its agent's caps and its trees; this module decides from
 //! them and builds nothing it would have to read for itself.
@@ -7,7 +7,7 @@
 use htui_agent::driver::{AgentSessionRef, DriverCaps};
 use htui_agent::event::{DriverEvent, SESSION_STARTED};
 use htui_agent::replay::envelope_from_row;
-use htui_core::model::{EventKind, PromptTemplate, SessionEvent, Transport};
+use htui_core::model::{EventKind, PromptTemplate, SessionEvent};
 use htui_core::prompt::excerpt::RepoRoot;
 use htui_core::prompt::{
     DiffBlock, HandoffInputs, PromptSpec, StepSummary, TemplateRef, TemplateRole,
@@ -17,20 +17,26 @@ use htui_core::prompt::{
 pub const RESUME_OPENING: &str = "This step was promoted to an interactive chat. Say where you \
     stopped and what is left, then wait for the maintainer's instructions.";
 
+/// MOD-37 M5 (ANA-27 T5): what a chat that opened with the handoff prompt did not carry. The Runs
+/// pane, the `resume_failed` row and the Chat tab all say it in these words.
+pub const CONTEXT_NOT_CARRIED: &str = "context not carried; handoff prompt only";
+
 /// How a promoted step's chat opens (blueprint D192).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpeningKind {
-    /// The step's own agent session, resumed from its banner's id; the first message is
-    /// [`RESUME_OPENING`].
+    /// The step's own agent session, resumed from its banner's id on either transport; the first
+    /// message is [`RESUME_OPENING`].
     Resume(AgentSessionRef),
     /// A fresh session opened with the `handoff` role's prompt ([`handoff_spec`]).
     Handoff,
 }
 
-/// The step's first `other` row whose update is `session_started`, as ANA-4 §6 records it
-/// (`body.session_id`, `agent_worker.rs:2832-2839`), decoded through `replay::envelope_from_row`.
+/// The step's latest `other` row whose update is `session_started`, as ANA-4 §6 records it
+/// (`body.session_id`, `agent_worker.rs:2832-2839`), decoded through `replay::envelope_from_row`
+/// (MOD-37 M5 A-7, amending D192: after a resume that failed and fell back, the latest session is
+/// the handoff's, which holds the chat).
 ///
-/// "First" is by `seq`. A row that does not decode, or a banner without a string `session_id`,
+/// "Latest" is by `seq`. A row that does not decode, or a banner without a string `session_id`,
 /// answers `None`.
 #[must_use]
 pub fn banner(events: &[SessionEvent]) -> Option<AgentSessionRef> {
@@ -46,7 +52,7 @@ pub fn banner(events: &[SessionEvent]) -> Option<AgentSessionRef> {
             },
             Err(_) => None,
         })
-        .min_by_key(|(seq, _)| *seq)
+        .max_by_key(|(seq, _)| *seq)
         .and_then(|(_, body)| {
             body.get("session_id")
                 .and_then(serde_json::Value::as_str)
@@ -54,18 +60,16 @@ pub fn banner(events: &[SessionEvent]) -> Option<AgentSessionRef> {
         })
 }
 
-/// Blueprint D192: resume only where the transport honours `SessionSpec.resume` today. That is
-/// the CLI (`cli/mod.rs:145`, `:405`); the ACP driver never reads it (R-48).
+/// Blueprint D192: resume whenever the agent's caps say `resume` and [`banner`] finds the
+/// session's id: the CLI through `--resume`, ACP through `session/resume` or `session/load`
+/// (MOD-37 M5, R-48). The handoff text is built either way, as the fallback a failed resume
+/// opens with.
 ///
-/// So: [`OpeningKind::Resume`] when `caps.resume`, the transport is `cli` and [`banner`] finds
-/// the session's id, and [`OpeningKind::Handoff`] otherwise.
+/// So: [`OpeningKind::Resume`] when `caps.resume` and [`banner`] finds the session's id, and
+/// [`OpeningKind::Handoff`] otherwise.
 #[must_use]
-pub fn opening_kind(
-    caps: DriverCaps,
-    transport: Transport,
-    events: &[SessionEvent],
-) -> OpeningKind {
-    if !caps.resume || transport != Transport::Cli {
+pub fn opening_kind(caps: DriverCaps, events: &[SessionEvent]) -> OpeningKind {
+    if !caps.resume {
         return OpeningKind::Handoff;
     }
     banner(events).map_or(OpeningKind::Handoff, OpeningKind::Resume)
