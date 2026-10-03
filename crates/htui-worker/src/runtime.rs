@@ -1358,6 +1358,16 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
             .clear();
     }
 
+    /// MOD-37 M4 D3 (R-46): every live walk of this process preempted at once, without
+    /// forgetting the server: the isolator, the verifier and the claim queue stay (unlike
+    /// [`Self::forget_server`]). The TUI's store loop calls it when its backend drops
+    /// `Online → Offline`. Each walk ends through `walked`'s `None` → `abandoned` → a release
+    /// that fails offline → the dead-walk set, and the next `Online` sweep adopts the run (D175,
+    /// D190). A promotion waiting for its guard ends too (R-49's failure sentence).
+    pub fn preempt_walks(&self) {
+        self.shared.walks.preempt_all();
+    }
+
     /// How many isolators this process has built (D156's test hook).
     #[must_use]
     pub fn isolator_builds(&self) -> usize {

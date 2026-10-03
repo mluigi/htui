@@ -2509,6 +2509,117 @@ pub(crate) mod tests {
         assert!(!shared.is_dead_walk(run));
     }
 
+    /// MOD-37 M4 D3 (R-46): the store loop's `Online → Offline` swap preempts the walk at once,
+    /// where the lease fence alone waits out `ttl - refresh`. Its release fails, the server being
+    /// gone, so the run joins the dead walks and the next sweep adopts it for a second attempt.
+    #[tokio::test(start_paused = true)]
+    async fn an_offline_swap_preempts_the_walk_and_the_sweep_adopts_it() {
+        let fixture = Fixture::new().await;
+        let stall = Stall::default();
+        fixture.sessions.push(Play::Stall(stall.clone()));
+        let mut runtime = fixture.runtime();
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, mut answers) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &replies,
+                &RequestEnvelope {
+                    seq: 1,
+                    origin: Origin::App,
+                    request: start_run(ids::HTUI_ANA_2),
+                },
+                &LiveChats::default(),
+            )
+            .await;
+        assert!(matches!(served, RunServed::Deferred));
+        within("the session starting", stall.reached.notified()).await;
+        let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        // The server is gone: the preempted walk cannot give its lease back.
+        fixture.store.set_fault(MemFault::ReleaseLease, true);
+
+        let t0 = tokio::time::Instant::now();
+        runtime.preempt_walks();
+        let answer = within("the walk stopping", answers.recv())
+            .await
+            .expect("the runtime answers");
+        assert!(
+            matches!(&answer.reply, StoreReply::Failed { message, .. } if message == PREEMPTED),
+            "{:?}",
+            answer.reply
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "at once, not at the lease fence: {:?}",
+            t0.elapsed()
+        );
+        assert!(
+            stall.dropped.load(Ordering::SeqCst),
+            "the session was dropped"
+        );
+        assert!(runtime.settle(PATIENCE).await.is_empty(), "no task stuck");
+        assert!(
+            testing::probe(&runtime).is_dead_walk(run),
+            "a release that failed offline leaves a dead walk"
+        );
+
+        fixture.store.set_fault(MemFault::ReleaseLease, false);
+        swept(&mut runtime, &fixture).await;
+        rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
+        assert_eq!(
+            step_at(&fixture, run, 0).await.attempt,
+            2,
+            "the adopted run walked a second attempt"
+        );
+        assert!(!testing::probe(&runtime).is_dead_walk(run));
+    }
+
+    /// MOD-37 M4 D3: unlike [`RunRuntime::forget_server`], the offline swap keeps the server: the
+    /// claim queue stays, and the next command builds no new isolator.
+    #[tokio::test]
+    async fn an_offline_swap_keeps_the_server() {
+        let fixture = Fixture::new().await;
+        let scratch = tempfile::tempdir().expect("a scratch root");
+        let mut runtime = RunRuntime::new(fixture.factory())
+            .with_clock(Arc::new(TokioClock::new()))
+            .with_scratch_root(scratch.path().to_path_buf());
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+
+        for (seq, item) in [(1, ids::HTUI_ANA_2), (2, ids::AGY_FEAT_1)] {
+            runtime
+                .serve(
+                    &backend,
+                    &replies,
+                    &RequestEnvelope {
+                        seq,
+                        origin: Origin::App,
+                        request: start_run(item),
+                    },
+                    &LiveChats::default(),
+                )
+                .await;
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+            runtime.preempt_walks();
+        }
+        assert_eq!(
+            runtime.isolator_builds(),
+            1,
+            "the same server's isolator serves the second command"
+        );
+
+        let queued = RunId::new();
+        let queued_at = Utc::now();
+        testing::probe(&runtime).queue(queued_at, queued);
+        runtime.preempt_walks();
+        assert!(
+            testing::probe(&runtime)
+                .queued()
+                .contains(&(queued_at, queued)),
+            "the claim queue is kept"
+        );
+    }
+
     /// Plan D155: the five trait reads are the inherent reads of the same name.
     #[tokio::test]
     async fn backend_graphs_delegates_each_read() {
