@@ -68,7 +68,10 @@ pub enum PersonaWrite {
 /// any read (`R-STO-4`; the import before any file is read). A store `Constraint` from a write is
 /// `Ok(Failed)` carrying its sentence byte for byte (B-11); every other error propagates, so an
 /// `Unreachable` still drops an `Online` backend onto the mirror. Every write that reached the
-/// store answers `PersonaWritten` with the registry re-read.
+/// store answers `PersonaWritten` with the registry re-read. The import is the one exception to
+/// propagating (R1 L-2): its report is never lost, so a re-read that fails after the batch rides
+/// typed inside `PersonaImports`, and the worker still goes offline on its `Unreachable`
+/// ([`crate::store_worker`]'s `lost_the_store`, R1 ADV-1).
 ///
 /// # Errors
 /// Whatever the store reports, `Unreachable` offline, and `Backend` for a request that is not one
@@ -131,15 +134,16 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
 }
 
 /// An import's answer: the report, and the registry re-read after it (R1 L-2). Rows were written
-/// by then, so a re-read that fails (the store lost mid-batch, most often) is carried as its
-/// sentence beside the report rather than dropping the report; the section keeps its list and
-/// shows the sentence.
+/// by then, so a re-read that fails (the store lost mid-batch, most often) is carried beside the
+/// report rather than dropping the report; the section keeps its list and shows the sentence. The
+/// error stays typed so an `Unreachable` still takes the backend offline (R1 ADV-1). A write that
+/// met `Unreachable` with a re-read that then answered is not a loss: the store is there.
 fn imports(
     report: Vec<persona_import::PersonaOutcome>,
     reread: StoreResult<Vec<htui_core::model::Persona>>,
 ) -> StoreReply {
     StoreReply::PersonaImports(Box::new(PersonaImports {
-        personas: reread.map_err(|error| error.to_string()),
+        personas: reread,
         report,
     }))
 }
@@ -513,7 +517,11 @@ mod tests {
             panic!("the report is kept: {reply:?}")
         };
         assert_eq!(imports.report, report);
-        assert_eq!(imports.personas, Err(lost.to_string()));
+        assert_eq!(
+            imports.personas,
+            Err(lost),
+            "the error stays typed (R1 ADV-1)"
+        );
     }
 
     /// `try_serve` routes the import here; the report rides beside a registry read after it.

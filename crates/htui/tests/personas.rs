@@ -23,7 +23,7 @@ use htui_core::model::{
     Persona, PersonaAnswer, PersonaDefault, PersonaFileError, PersonaMatch, PersonaPatch,
     PersonaPermission, PersonaRule, PersonaTools,
 };
-use htui_core::store::{MemStore, WriteStore as _, persona_is_bound};
+use htui_core::store::{MemStore, StoreError, WriteStore as _, persona_is_bound};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -1308,7 +1308,7 @@ async fn an_import_whose_reread_failed_keeps_the_list_and_says_why() {
     let (bench, mut section) = bench_with_demo().await;
     start_import(&bench, &mut section);
     let _ = requests(&bench);
-    let lost = format!("store unreachable: {DATABASE_UNREACHABLE}");
+    let lost = StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned());
 
     bench.reply(
         &mut section,
@@ -1329,7 +1329,7 @@ async fn an_import_whose_reread_failed_keeps_the_list_and_says_why() {
     assert!(
         shows(
             &error_text(&bench, &section),
-            &format!("the list was not re-read: {lost}")
+            &format!("the list was not re-read: store unreachable: {DATABASE_UNREACHABLE}")
         ),
         "{frame}"
     );

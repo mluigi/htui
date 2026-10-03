@@ -76,8 +76,10 @@ pub enum PersonaOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonaImports {
     /// A fresh `personas()` read, by name, or why it failed after the batch (R1 L-2): the report
-    /// is never lost to the re-read.
-    pub personas: std::result::Result<Vec<Persona>, String>,
+    /// is never lost to the re-read. The error stays typed (R1 ADV-1): an `Unreachable` here is
+    /// how the worker learns the import lost the store, and drops an `Online` backend onto the
+    /// mirror as it does for any other served request.
+    pub personas: std::result::Result<Vec<Persona>, StoreError>,
     /// One row per file, in the order the walk met them.
     pub report: Vec<PersonaOutcome>,
 }

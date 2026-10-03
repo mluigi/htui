@@ -2485,17 +2485,18 @@ pub(crate) fn spawn_with_concepts(
                             });
                             continue;
                         }
-                        other => match try_serve(&backend, other).await {
-                            Ok(reply) => reply,
-                            Err(err) => {
-                                // This read is what noticed the server had gone. The asking view
-                                // still hears back exactly once; the next read finds the mirror.
-                                if matches!(err, StoreError::Unreachable(_)) {
-                                    go_offline(&mut backend, &mut refresher, &mut health, &err);
-                                }
-                                failed(other.name(), &err)
+                        other => {
+                            let served = try_serve(&backend, other).await;
+                            // This read is what noticed the server had gone. The asking view
+                            // still hears back exactly once; the next read finds the mirror.
+                            if let Some(err) = lost_the_store(&served) {
+                                go_offline(&mut backend, &mut refresher, &mut health, err);
                             }
-                        },
+                            match served {
+                                Ok(reply) => reply,
+                                Err(err) => failed(other.name(), &err),
+                            }
+                        }
                     };
 
                     let answer = ReplyEnvelope { seq: envelope.seq, origin: envelope.origin, reply };
@@ -2760,6 +2761,18 @@ fn go_offline(
         return;
     }
     tracing::warn!(%why, "store unreachable; falling back to the mirror");
+}
+
+/// The [`StoreError::Unreachable`] a served request met, if it met one: its own `Err`, or the
+/// re-read a persona import carries beside its report (R1 L-2 keeps the report, so that loss
+/// arrives inside an `Ok`; R1 ADV-1). Any other failure is not a loss of the store.
+fn lost_the_store(served: &StoreResult<StoreReply>) -> Option<&StoreError> {
+    let err = match served {
+        Err(err) => err,
+        Ok(StoreReply::PersonaImports(imports)) => imports.personas.as_ref().err()?,
+        Ok(_) => return None,
+    };
+    matches!(err, StoreError::Unreachable(_)).then_some(err)
 }
 
 /// Resolves with the error when the refresher reports an unreachable server, and never otherwise.
@@ -4718,6 +4731,28 @@ mod tests {
         }
 
         cache.close().await;
+    }
+
+    /// R1 ADV-1: an import that lost the store keeps its report (`Ok(PersonaImports)`) and still
+    /// tells the loop the store is gone, so an `Online` backend drops onto the mirror as it does
+    /// for any served request's `Unreachable`; another failure is not a loss.
+    #[test]
+    fn an_import_that_lost_the_store_still_reports_the_loss() {
+        let lost = StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned());
+        let other = StoreError::Backend("not a loss".to_owned());
+        let import = |personas| {
+            Ok(StoreReply::PersonaImports(Box::new(PersonaImports {
+                personas,
+                report: Vec::new(),
+            })))
+        };
+
+        assert_eq!(lost_the_store(&import(Err(lost.clone()))), Some(&lost));
+        assert_eq!(lost_the_store(&import(Err(other.clone()))), None);
+        assert_eq!(lost_the_store(&import(Ok(Vec::new()))), None);
+        assert_eq!(lost_the_store(&Err(lost.clone())), Some(&lost));
+        assert_eq!(lost_the_store(&Err(other)), None);
+        assert_eq!(lost_the_store(&Ok(StoreReply::Personas(Vec::new()))), None);
     }
 
     /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
