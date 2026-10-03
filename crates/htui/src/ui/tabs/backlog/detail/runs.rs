@@ -42,6 +42,10 @@
 //! (`⚒ read×5 exec×3`). Every `Runs` reply in the flow, and `v` into it, asks for them
 //! (`ToolCalls`); the list never does.
 //!
+//! MOD-71: in the flow, while browsing, the pane takes the mouse (D1): a click on a node moves the
+//! cursor there, a drag on empty canvas pans, and the wheel zooms at the pointer. Every other view
+//! and every modal leaves the terminal's own text selection alone.
+//!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
 //! plan P13).
@@ -60,13 +64,13 @@ use htui_core::model::{
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
-use self::execution_graph::{ExecutionGraph, by_step};
+use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -75,7 +79,7 @@ use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 /// What an action key says while the verdicts it reads have not arrived.
 pub const NOT_LOADED: &str = "the run actions have not loaded yet";
@@ -213,6 +217,13 @@ pub struct RunsTab {
     /// MOD-72 D7: the last `ToolCalls` reply for [`RunsTab::item`], by step. An item change
     /// clears it; only the flow view asks for it (plan D4), and a toggle back keeps it (E14).
     tool_calls: BTreeMap<StepId, Vec<ToolCallCount>>,
+    /// MOD-71 D5: the flow canvas the last frame drew, which a press is hit-tested against;
+    /// `None` on every frame without one. Written in `render` (`&self`), read by `on_mouse`.
+    canvas: Cell<Option<Rect>>,
+    /// MOD-71 D5, D11: a left press that started on the canvas and is not released yet, so its
+    /// drag and release reach the flow even past the pane's edge. `v`, an item change and a
+    /// capturing mode end it.
+    gesture: bool,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -393,6 +404,23 @@ impl RunsTab {
         self.graph
             .get_mut()
             .sync(run, step, &self.tool_calls, theme);
+    }
+
+    /// MOD-71 D6: a clicked node moves the cursor to that step's entry in the cursor's run (only
+    /// that run is on the canvas), then the flow syncs, as `J`/`K` do. A step the entries don't
+    /// hold leaves the cursor where it is.
+    fn select_step(&mut self, step: StepId, theme: &Theme) {
+        let run = match self.entry() {
+            Some(Entry::Step { run, .. } | Entry::Run { run }) => run,
+            None => return,
+        };
+        let at = self.entries().iter().position(
+            |entry| matches!(entry, Entry::Step { run: r, step: s } if *r == run && *s == step),
+        );
+        if at.is_some() {
+            self.selected = at;
+        }
+        self.sync_graph(theme);
     }
 
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
@@ -1249,6 +1277,7 @@ impl DetailTab for RunsTab {
         self.tool_calls.clear();
         self.answering = None;
         self.mode = Mode::Browse;
+        self.gesture = false; // MOD-71 D11
     }
 
     /// `J` / `K` move the cursor, `Enter` replays the step under it, the action keys act, and
@@ -1304,6 +1333,8 @@ impl DetailTab for RunsTab {
                 ctx.emit(Action::Replay { step_id });
             }
             KeyCode::Char('v') => {
+                // MOD-71 D11: the gesture ends with the view.
+                self.gesture = false;
                 self.view = match self.view {
                     View::List => View::Flow,
                     View::Flow => View::List,
@@ -1323,7 +1354,14 @@ impl DetailTab for RunsTab {
             KeyCode::PageUp | KeyCode::PageDown if self.view == View::Flow => {}
             KeyCode::Char(
                 key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
-            ) => return self.action(key, ctx),
+            ) => {
+                let handled = self.action(key, ctx);
+                // MOD-71 D11: a mode that captures input ends a live gesture (blueprint B-8).
+                if self.captures_input() {
+                    self.gesture = false;
+                }
+                return handled;
+            }
             _ => return self.scroll.on_key(key, self.runs.len()),
         }
         Handled::Consumed
@@ -1342,6 +1380,59 @@ impl DetailTab for RunsTab {
                 Handled::Consumed
             }
             _ => Handled::Pass,
+        }
+    }
+
+    /// MOD-71 D1: the flow view while browsing. The list, a modal and the artifact view keep the
+    /// terminal's own text selection, and so does a flow with no canvas to click (review L2): no
+    /// item, no run, or a cursor run with no step yet — what `render_flow` needs to draw one.
+    fn wants_mouse(&self) -> bool {
+        self.view == View::Flow
+            && matches!(self.mode, Mode::Browse)
+            && self.item.is_some()
+            && self.entry_run().is_some_and(|run| !run.steps.is_empty())
+    }
+
+    /// MOD-71 D5, D6: a left press or the wheel inside the canvas the last frame drew, and the
+    /// drag and release of a press that started there, go to the flow; right and middle buttons,
+    /// and anything outside, pass. A click on a node moves the cursor (`select_step`). A forwarded
+    /// event that completed a click or moved the viewport is `Consumed`, so it is redrawn
+    /// (blueprint E4); one that changed nothing on screen (a press, a drag after a press on a
+    /// node, a wheel tick at the zoom clamp) passes, so a motion flood costs no redraw and keeps
+    /// the status line (review L4).
+    fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if !self.wants_mouse() {
+            self.gesture = false;
+            return Handled::Pass;
+        }
+        let inside = self
+            .canvas
+            .get()
+            .is_some_and(|canvas| canvas.contains(Position::new(mouse.column, mouse.row)));
+        let forward = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.gesture = inside;
+                inside
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => inside,
+            MouseEventKind::Drag(MouseButton::Left) => self.gesture,
+            MouseEventKind::Up(MouseButton::Left) => core::mem::take(&mut self.gesture),
+            _ => false,
+        };
+        if !forward {
+            return Handled::Pass;
+        }
+        let graph = self.graph.get_mut();
+        let before = graph.viewport();
+        let clicked = graph.on_mouse(mouse);
+        let moved = graph.viewport() != before;
+        match clicked {
+            Some(step) => {
+                self.select_step(step, ctx.theme);
+                Handled::Consumed
+            }
+            None if moved => Handled::Consumed,
+            None => Handled::Pass,
         }
     }
 
@@ -1435,6 +1526,8 @@ impl DetailTab for RunsTab {
     /// The footer a modal asks in is drawn whatever the list holds, so the close-out of an item
     /// with no run is on screen too: `C` needs no run (`close_out_enabled`).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        // MOD-71 D5: only a frame that draws the canvas records it (render_flow).
+        self.canvas.set(None);
         if self.item.is_none() {
             message(frame, area, "No item selected.", ctx.theme);
             return;
@@ -1463,7 +1556,7 @@ impl DetailTab for RunsTab {
             return;
         }
         if self.view == View::Flow {
-            self.render_flow(frame, list, ctx.theme);
+            self.render_flow(frame, list, area, ctx.theme);
             return;
         }
 
@@ -1484,8 +1577,10 @@ impl DetailTab for RunsTab {
 
 impl RunsTab {
     /// MOD-28 D11: the flow branch of `render`. The head is what the list says about the cursor's
-    /// run and step, and the rest is the canvas, or "No steps yet." under a run with none.
-    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    /// run and step, and the rest is the canvas, or "No steps yet." under a run with none. `pane`
+    /// is the whole pane, footer included, whose size alone decides a resize reveal (MOD-71 D7,
+    /// review M1).
+    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, pane: Rect, theme: &Theme) {
         let Some(run) = self.entry_run() else {
             return;
         };
@@ -1500,7 +1595,12 @@ impl RunsTab {
             message(frame, canvas, NO_STEPS_YET, theme);
             return;
         }
-        self.graph.borrow_mut().render(frame, canvas);
+        // MOD-71 D5, blueprint B-7: the canvas a press is hit-tested against, only when
+        // rataflow records it on this draw.
+        if drawable(canvas) {
+            self.canvas.set(Some(canvas));
+        }
+        self.graph.borrow_mut().render(frame, canvas, pane);
     }
 
     /// MOD-28 review L3, H1: the flow's head, the lines the list draws for `run` and the cursor's
@@ -1611,7 +1711,7 @@ mod tests {
     use crate::run_worker::{RunActions, RunFrame, StepActions};
     use crate::store_worker::Origin;
     use chrono::TimeDelta;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
         GateOutcome, PermissionStatus, ProjectRef, RelaySessionId, Scope, WorkspaceId,
@@ -3996,6 +4096,387 @@ mod tests {
         assert!(!pane.tool_calls.is_empty(), "the reply applied");
         pane.on_item_change(Some(ids::HTUI_ANA_2));
         assert!(pane.tool_calls.is_empty());
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-71: the mouse in the flow view (plan D1, D5, D6, D11).
+    // -----------------------------------------------------------------------------------------
+
+    /// `kind` at `(column, row)`, no modifier.
+    fn mouse(kind: MouseEventKind, column: u16, row: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// The cell `needle` starts at in `lines`, `(column, row)`: [`lines`] draws at `(0, 0)`, so a
+    /// char column is the terminal cell a press reports.
+    fn cell(lines: &[String], needle: &str) -> (u16, u16) {
+        lines
+            .iter()
+            .enumerate()
+            .find_map(|(row, line)| {
+                let at = column(line, needle)?;
+                Some((
+                    u16::try_from(at).expect("the column fits"),
+                    u16::try_from(row).expect("the row fits"),
+                ))
+            })
+            .unwrap_or_else(|| panic!("`{needle}` is drawn: {lines:#?}"))
+    }
+
+    /// A `FEAT-1` pane in the flow, drawn once, so a press has a canvas to land on (blueprint
+    /// H-9); what `v` asked for is drained.
+    async fn flowing(shell: &Shell) -> (RunsTab, Vec<String>) {
+        let mut pane = pane(shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        let lines = lines(&pane, shell);
+        (pane, lines)
+    }
+
+    /// A blank canvas cell left of every node, on the `1.1` node's text row.
+    fn blank_cell(lines: &[String]) -> (u16, u16) {
+        let (_, row) = cell(lines, "1.1 done");
+        assert_eq!(
+            lines[usize::from(row)].chars().nth(2),
+            Some(' '),
+            "{lines:#?}"
+        );
+        (2, row)
+    }
+
+    /// D1: the flow while browsing takes the mouse; the list, every modal and the artifact view
+    /// keep the terminal's own text selection.
+    #[tokio::test]
+    async fn the_mouse_is_wanted_in_the_flow_while_browsing_only() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        assert!(!pane.wants_mouse(), "the list");
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert!(pane.wants_mouse(), "the flow");
+        for (opener, name) in [
+            (key(KeyCode::Char('x')), "a note"),
+            (key(KeyCode::Char('c')), "a y/n"),
+            (shift('C'), "a close-out"),
+            (key(KeyCode::Char('o')), "a document"),
+        ] {
+            pane.on_key(opener, &mut shell.ctx());
+            assert!(pane.captures_input(), "{name} opened");
+            assert!(!pane.wants_mouse(), "{name} keeps the terminal's selection");
+            pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+            assert!(pane.wants_mouse(), "{name} closed: the flow again");
+        }
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert!(!pane.wants_mouse(), "back on the list");
+    }
+
+    /// Review L2: a flow with nothing to click keeps the terminal's selection: no item, an item
+    /// with no run, and a cursor run with no step yet draw no canvas.
+    #[tokio::test]
+    async fn an_empty_flow_does_not_want_the_mouse() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert_eq!(pane.view, View::Flow);
+        assert!(!pane.wants_mouse(), "no item");
+
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        assert!(!pane.wants_mouse(), "an item with no run");
+
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(
+            &StoreReply::Runs(vec![stepless_run().await]),
+            &mut shell.ctx(),
+        );
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        assert_eq!(pane.view, View::Flow);
+        assert!(!pane.wants_mouse(), "a run with no step yet");
+
+        let (pane, _) = flowing(&shell).await;
+        assert!(pane.wants_mouse(), "a run with steps");
+    }
+
+    /// D6: a click on a node moves the shared cursor to its step, and the flow selects it.
+    #[tokio::test]
+    async fn a_click_on_a_node_moves_the_cursor() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "a press changes nothing on screen yet (review L4)"
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "the release is the click"
+        );
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PLAN));
+        assert_eq!(
+            pane.graph.borrow().selected(),
+            Some(ids::STEP_PLAN.to_string())
+        );
+        assert!(shell.emit.is_empty(), "a click sends nothing");
+    }
+
+    /// D5: a press outside the canvas the last frame drew passes, and so does any press before
+    /// the first flow frame (plan Risks).
+    #[tokio::test]
+    async fn a_press_outside_the_canvas_passes() {
+        let shell = Shell::new();
+        let (mut drawn, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        let press = MouseEventKind::Down(MouseButton::Left);
+        assert_eq!(
+            drawn.on_mouse(mouse(press, 0, 0), &mut shell.ctx()),
+            Handled::Pass,
+            "the run line is not the canvas"
+        );
+        assert_eq!(drawn.selected_step(), Some(ids::STEP_PRD));
+
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert!(pane.wants_mouse());
+        assert_eq!(
+            pane.on_mouse(mouse(press, column, row), &mut shell.ctx()),
+            Handled::Pass,
+            "no frame has drawn a canvas yet"
+        );
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
+    }
+
+    /// D5: a pan carried past the pane's edge still reaches the flow and ends there; after it, a
+    /// drag with no press is nobody's.
+    #[tokio::test]
+    async fn a_drag_that_leaves_the_canvas_still_ends() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = blank_cell(&lines);
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert!(pane.gesture, "the press started on the canvas");
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column, 0),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "the drag past the canvas still pans"
+        );
+        pane.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), column, 0),
+            &mut shell.ctx(),
+        );
+        assert!(!pane.gesture, "the release past the canvas ended it");
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column, row),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "no gesture is live"
+        );
+    }
+
+    /// D11: `v`, a modal and an item change each end a live gesture, so its drag is nobody's.
+    #[tokio::test]
+    async fn v_an_item_change_and_a_modal_end_a_live_gesture() {
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        let (column, row) = blank_cell(&lines(&pane, &shell));
+        let press = mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+        let drag = mouse(MouseEventKind::Drag(MouseButton::Left), column, row);
+
+        pane.on_mouse(press, &mut shell.ctx());
+        assert!(pane.gesture);
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert!(!pane.gesture);
+        assert_eq!(
+            pane.on_mouse(drag, &mut shell.ctx()),
+            Handled::Pass,
+            "`v` ended it"
+        );
+
+        pane.on_mouse(press, &mut shell.ctx());
+        assert!(pane.gesture);
+        pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(!pane.gesture);
+        assert_eq!(
+            pane.on_mouse(drag, &mut shell.ctx()),
+            Handled::Pass,
+            "the note ended it"
+        );
+
+        pane.on_mouse(press, &mut shell.ctx());
+        assert!(pane.gesture);
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(feat_1_runs().await), &mut shell.ctx());
+        let _ = shell.emit.take();
+        let _ = lines(&pane, &shell);
+        assert!(!pane.gesture);
+        assert_eq!(
+            pane.on_mouse(drag, &mut shell.ctx()),
+            Handled::Pass,
+            "the item change ended it"
+        );
+    }
+
+    /// D5: the right and middle buttons have no meaning in the flow.
+    #[tokio::test]
+    async fn right_and_middle_presses_pass() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        for button in [MouseButton::Right, MouseButton::Middle] {
+            assert_eq!(
+                pane.on_mouse(
+                    mouse(MouseEventKind::Down(button), column, row),
+                    &mut shell.ctx()
+                ),
+                Handled::Pass,
+                "{button:?}"
+            );
+        }
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
+    }
+
+    /// Review L4: an event that changes nothing on screen — a wheel tick at the 2.0 clamp, a
+    /// drag after a press on a node (rataflow ignores it) — passes, so a motion flood costs no
+    /// redraw and keeps the status line; a pan drag and the click still consume.
+    #[tokio::test]
+    async fn an_event_that_changes_nothing_passes() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        let wheel = mouse(MouseEventKind::ScrollUp, column, row);
+        while pane.graph.borrow().zoom() < 2.0 - 1e-9 {
+            assert_eq!(pane.on_mouse(wheel, &mut shell.ctx()), Handled::Consumed);
+        }
+        assert_eq!(
+            pane.on_mouse(wheel, &mut shell.ctx()),
+            Handled::Pass,
+            "the wheel at the clamp"
+        );
+
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 3, row + 1),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "a drag from a node moves nothing"
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), column + 3, row + 1),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "and its release is still the click"
+        );
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PLAN));
+
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = blank_cell(&lines);
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 3, row + 1),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "a pan drag redraws"
+        );
+    }
+
+    /// Review M1: a head line that comes and goes (here a `Waiting` frame's) moves the canvas
+    /// inside an unchanged pane, which is no resize: a pan that took the cursor node off screen
+    /// stays where the user put it (D7).
+    #[tokio::test]
+    async fn a_head_line_keeps_a_pan() {
+        let shell = Shell::new();
+        let (mut pane, drawn) = flowing(&shell).await;
+        let (column, row) = blank_cell(&drawn);
+        for (kind, row) in [
+            (MouseEventKind::Down(MouseButton::Left), row),
+            (MouseEventKind::Drag(MouseButton::Left), row - 10),
+            (MouseEventKind::Up(MouseButton::Left), row - 10),
+        ] {
+            pane.on_mouse(mouse(kind, column, row), &mut shell.ctx());
+        }
+        let panned = lines(&pane, &shell);
+        assert!(
+            !panned.iter().any(|line| line.contains("0.1 done")),
+            "the pan took the cursor node off screen: {panned:#?}"
+        );
+
+        pane.on_reply(
+            &StoreReply::RunStream(RunFrame {
+                item: ids::HTUI_FEAT_1,
+                run: Some(ids::RUN_1),
+                kind: FrameKind::Waiting,
+            }),
+            &mut shell.ctx(),
+        );
+        let waiting = lines(&pane, &shell);
+        assert!(
+            waiting
+                .iter()
+                .any(|line| line.trim() == "waiting for the walk"),
+            "{waiting:#?}"
+        );
+        assert!(
+            !waiting.iter().any(|line| line.contains("0.1 done")),
+            "the head line revealed the cursor: {waiting:#?}"
+        );
+    }
+
+    /// D5, D9: the wheel zooms the flow at the pointer, only over the canvas.
+    #[tokio::test]
+    async fn the_wheel_zooms_inside_the_canvas_only() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::ScrollUp, column, row),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed
+        );
+        assert!(pane.graph.borrow().zoom() > 1.0);
+        assert_eq!(
+            pane.on_mouse(mouse(MouseEventKind::ScrollUp, 0, 0), &mut shell.ctx()),
+            Handled::Pass
+        );
     }
 
     // -----------------------------------------------------------------------------------------

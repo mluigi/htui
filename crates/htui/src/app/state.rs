@@ -18,7 +18,7 @@ use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, layout, top_bar};
-use crossterm::event::{Event, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use zeroize::Zeroizing;
 
 /// What the status line says when anything but a tab asks for `$EDITOR` (MOD-9 D10): the outcome
@@ -408,8 +408,8 @@ impl App {
         self.drain(&origin);
     }
 
-    /// A terminal event. Key presses and bracketed pastes reach views; a resize just asks for a
-    /// redraw.
+    /// A terminal event. Key presses, bracketed pastes and (while a view wants them, MOD-71 D4)
+    /// mouse events reach views; a resize just asks for a redraw.
     pub fn on_terminal_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
@@ -418,6 +418,7 @@ impl App {
             // Wrapped before anything reads it: a paste may be a credential (MOD-22's redirect),
             // and this buffer is wiped however the paste ends.
             Event::Paste(text) => self.on_paste(&Zeroizing::new(text)),
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Resize(_, _) => self.dirty = true,
             _ => {}
         }
@@ -497,6 +498,76 @@ impl App {
                 }
             }
             self.drain(&origin);
+        }
+    }
+
+    /// MOD-71 D1: whether the view on screen wants the mouse, which the event loop turns into
+    /// mouse capture after every step. No overlay may be open and the `?` box may not be up — both
+    /// draw over the tab, and a click through them would act on what they hide (blueprint E7) —
+    /// and the active tab must want it.
+    #[must_use]
+    pub fn wants_mouse(&self) -> bool {
+        self.overlays.is_empty()
+            && !self.help_visible
+            && self.tabs.active().is_some_and(Tab::wants_mouse)
+    }
+
+    /// A mouse event (MOD-71 D4): to the active tab only, with no keymap and no overlay in the
+    /// chain (an open overlay turns capture off, D1).
+    ///
+    /// Gated first, so an event queued before capture went off does nothing. `Moved` (capture is
+    /// any-motion, `?1003h`) and the horizontal wheel are dropped before dispatch. Only a
+    /// `Consumed` event sets `dirty` and clears the status line (blueprint E8): a pointer crossing
+    /// the canvas must neither redraw once per cell nor wipe an error nobody acted on. The status
+    /// is taken before dispatch, as [`on_key`](Self::on_key) clears it, so a failure the event
+    /// causes still lands.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if !self.wants_mouse() {
+            return;
+        }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Moved | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) {
+            return;
+        }
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let origin = Origin::Tab(id);
+        let status = self.status.take();
+        let handled = {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                emit,
+                tabs,
+                ..
+            } = self;
+            match tabs.active_mut() {
+                Some(tab) => {
+                    let mut ctx = Ctx::new(
+                        scope,
+                        projects,
+                        top_bar,
+                        keymap,
+                        theme,
+                        origin.clone(),
+                        emit,
+                    );
+                    tab.on_mouse(mouse, &mut ctx)
+                }
+                None => Handled::Pass,
+            }
+        };
+        self.drain(&origin);
+        if handled == Handled::Consumed {
+            self.dirty = true;
+        } else if self.status.is_none() {
+            self.status = status;
         }
     }
 

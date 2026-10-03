@@ -48,7 +48,7 @@ use crate::ui::tabs::backlog::item_form::{
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
 
 /// Width of the list pane, as a percentage of the body region.
 ///
@@ -577,6 +577,22 @@ impl Tab for BacklogTab {
         self.detail.on_paste(text, ctx)
     }
 
+    /// MOD-71 D1: the mouse is wanted while the detail pane is on screen with nothing typed over
+    /// it — no filter form, no item form (which replaces the pane, and its divergence view the
+    /// whole tab, `render`) — and its active sub-tab wants it.
+    fn wants_mouse(&self) -> bool {
+        self.form.is_none() && self.item_form.is_none() && self.detail.wants_mouse()
+    }
+
+    /// MOD-71 D4: to the detail pane, under `wants_mouse`'s form guard; the registry checks the
+    /// sub-tab's own answer. The list takes no mouse event.
+    fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if self.form.is_some() || self.item_form.is_some() {
+            return Handled::Pass;
+        }
+        self.detail.on_mouse(mouse, ctx)
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // MOD-13 D1: first, so the form owns every letter while it is open. It only opens while
         // no sub-tab captures (`f` is below that guard).
@@ -825,6 +841,7 @@ mod tests {
     use crate::ui::Theme;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
+    use crossterm::event::{MouseButton, MouseEventKind};
     use htui_core::model::ItemFilter;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
@@ -1264,6 +1281,131 @@ mod tests {
             "the list cursor did not move"
         );
         assert!(bench.actions().is_empty(), "and nothing was read");
+    }
+
+    // ---- MOD-71: the mouse reaches the detail pane (plan D1, D4) ----------------------------
+
+    /// A sub-tab that wants the mouse while `wants` is set and logs what it is offered (MOD-71).
+    #[derive(Debug)]
+    struct MouseProbe {
+        id: DetailId,
+        wants: Rc<Cell<bool>>,
+        seen: Pointed,
+    }
+
+    impl DetailTab for MouseProbe {
+        fn id(&self) -> DetailId {
+            self.id
+        }
+        fn title(&self) -> &str {
+            "Mouse"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn wants_mouse(&self) -> bool {
+            self.wants.get()
+        }
+        fn on_mouse(&mut self, mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            self.seen.borrow_mut().push(mouse.kind);
+            Handled::Consumed
+        }
+    }
+
+    /// What a [`MouseProbe`] was offered.
+    type Pointed = Rc<RefCell<Vec<MouseEventKind>>>;
+
+    /// A [`MouseProbe`] under `id`, wanting the mouse as `wants` says, and its two handles.
+    fn mouse_probe(id: &'static str, wants: bool) -> (Box<dyn DetailTab>, Rc<Cell<bool>>, Pointed) {
+        let wants = Rc::new(Cell::new(wants));
+        let seen = Rc::default();
+        let probe = MouseProbe {
+            id: DetailId(id),
+            wants: Rc::clone(&wants),
+            seen: Rc::clone(&seen),
+        };
+        (Box::new(probe), wants, seen)
+    }
+
+    /// A left press at a fixed cell, no modifier.
+    fn click() -> MouseEvent {
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// MOD-71 D1, D4: the detail pane gets the mouse only while nothing is typed over it — the
+    /// filter form and the item form each take it away — and only while its sub-tab wants it.
+    #[tokio::test]
+    async fn the_detail_gets_the_mouse_only_with_no_form_open() {
+        let bench = Bench::new().await;
+        let (probe, wants, seen) = mouse_probe("mouse", true);
+        let mut detail = DetailRegistry::new();
+        detail.register(probe);
+        let mut tab = BacklogTab {
+            detail,
+            ..bench.tab()
+        };
+        assert!(tab.wants_mouse());
+        assert_eq!(tab.on_mouse(click(), &mut bench.ctx()), Handled::Consumed);
+        assert_eq!(seen.borrow().len(), 1);
+
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        assert!(tab.form.is_some(), "the filter form is open");
+        assert!(!tab.wants_mouse(), "the filter form takes the mouse away");
+        assert_eq!(tab.on_mouse(click(), &mut bench.ctx()), Handled::Pass);
+        assert_eq!(seen.borrow().len(), 1);
+        press(&mut tab, &bench, KeyCode::Esc);
+        assert!(tab.form.is_none(), "Esc closes it");
+        assert!(tab.wants_mouse(), "and the mouse is wanted again");
+
+        let _ = bench.actions();
+        let store = MemStore::demo();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('N')).await;
+        assert!(!tab.wants_mouse(), "the item form takes the mouse away");
+        assert_eq!(tab.on_mouse(click(), &mut bench.ctx()), Handled::Pass);
+        assert_eq!(seen.borrow().len(), 1);
+        press(&mut tab, &bench, KeyCode::Esc);
+        assert!(tab.item_form.is_none(), "Esc closes it");
+        assert!(tab.wants_mouse(), "and the mouse is wanted again");
+
+        wants.set(false);
+        assert!(!tab.wants_mouse(), "the sub-tab's own answer counts");
+        assert_eq!(tab.on_mouse(click(), &mut bench.ctx()), Handled::Pass);
+        assert_eq!(seen.borrow().len(), 1);
+    }
+
+    /// MOD-71 D1, D4: a hidden sub-tab is not on screen to be clicked, so only the active one is
+    /// asked.
+    #[tokio::test]
+    async fn only_the_active_sub_tab_is_asked_for_the_mouse() {
+        let bench = Bench::new().await;
+        let (a, _a_wants, a_seen) = mouse_probe("a", false);
+        let (b, _b_wants, b_seen) = mouse_probe("b", true);
+        let mut registry = DetailRegistry::new();
+        registry.register(a);
+        registry.register(b);
+        assert!(!registry.wants_mouse());
+        assert_eq!(registry.on_mouse(click(), &mut bench.ctx()), Handled::Pass);
+        assert!(a_seen.borrow().is_empty() && b_seen.borrow().is_empty());
+
+        assert!(registry.select(1));
+        assert!(registry.wants_mouse());
+        assert_eq!(
+            registry.on_mouse(click(), &mut bench.ctx()),
+            Handled::Consumed
+        );
+        assert_eq!(
+            *b_seen.borrow(),
+            vec![MouseEventKind::Down(MouseButton::Left)]
+        );
+        assert!(a_seen.borrow().is_empty());
     }
 
     /// MOD-13 D2: applying sends exactly one `Items`, the same request kind the unfiltered list

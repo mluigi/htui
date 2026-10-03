@@ -16,7 +16,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::tabs::settings::SectionId;
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 /// Stable identity of a tab. The string is also the key of its [`KeyScope`](crate::keymap::KeyScope).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -87,6 +87,20 @@ pub trait Tab {
     /// trait's third default after `focus_section` and `on_external_edit`, so no other tab
     /// changes. A view trait, not a store trait: the no-default rule does not apply.
     fn on_refresh(&mut self, _ctx: &mut Ctx<'_>) {}
+
+    /// Whether this tab wants the terminal's mouse right now (MOD-71 D1). Capture takes the
+    /// terminal's own text selection away, so the event loop turns it on only while the active
+    /// tab says yes and nothing is drawn over it. Defaulted to `false`, so no other tab changes:
+    /// only the Backlog answers, for its Runs pane's flow view.
+    fn wants_mouse(&self) -> bool {
+        false
+    }
+    /// A mouse event reached this tab (MOD-71 D4), only while [`wants_mouse`](Tab::wants_mouse)
+    /// says so. `Consumed` asks for a redraw; `Pass` is the drop and costs nothing — no keymap
+    /// reads a mouse event. Defaulted to `Pass`, so no other tab changes.
+    fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
 }
 
 /// Every registered tab, in registration order, plus which one is active.

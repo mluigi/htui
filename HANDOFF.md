@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-03):** **MOD-13 is done** (`docs/decisions/mod/mod-13.md`): the Backlog
+**Current status (2026-10-03):** **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
+flow view takes the mouse. A click on a node moves the shared cursor, a drag on empty canvas pans,
+and the wheel zooms at the pointer; nodes stay read-only. Capture is on only while that view is
+shown in browse mode with a run to draw. Everywhere else htui is keyboard-only and the terminal
+keeps its own text selection (in the flow view, the terminal's bypass modifier, usually Shift,
+still selects). Every terminal give-back (restore, panic hook, `$EDITOR`) turns capture off. A pan
+survives the active-run poll. No migration, no new crate (`rataflow` gained its `crossterm`
+feature). Follow-ups are MOD-74.
+Before it, **MOD-13 is done** (`docs/decisions/mod/mod-13.md`): the Backlog
 filters and edits items. `f`/`F` filter by status, project, tags and "ready here"; `N`/`e` mint and
 edit through ANA-9 §7.1/§7.2, and a stale edit opens a three-way divergence view that resolves to a
 `divergence_resolution` revision; Ctrl+E hands long text to `$EDITOR`. Milestone 5 made the Notes
@@ -35,30 +43,6 @@ of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` an
 went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
 name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
 no new crate, no snapshot moved.
-Before it, **MOD-26 is done** (`docs/decisions/mod/mod-26.md`): agent
-personas are global registry rows (`0012_persona`; seeds `reviewer`, `architect`) bound to a
-step-graph phase. They are frozen into the run snapshot at `StartRun`, inlined as a protected frame
-before the template, and they only ever narrow the step's tools and permissions
-(`htui_agent::persona::narrow`). A persona carries no model. Milestone 2 added **Settings ›
-Personas**, the eighth section: it lists, edits (fields, body `b`, rules `r` in a one-line rule
-syntax), deletes (`d`, refused while any phase is bound, naming them) and imports (`I`, a `.md`
-file or a directory of them, `mcp__` tools dropped and named) personas. Settings › Kinds gained a
-`persona` field on the phase edit form. Migration `0013_persona_phase_index` is index only. Not
-done: `$EDITOR` for the body (OQ-12, with or after MOD-13 milestone 4). Operator guide
-`docs/personas.md`.
-Before it, **MOD-28 is done** (`docs/decisions/mod/mod-28.md`): `v` in the
-Backlog detail's Runs sub-tab switches to a **flow view**. It draws the run under the cursor as a
-`rataflow` node graph: fan-out candidates side by side, the judge below them, the winner feeding the
-next phase, and retries labelled. It shares the list's cursor, so every run action and permission
-digit works the same in both views. `+`/`-` zoom and `=` fits. The view is a pure projection,
-rebuilt from every `Runs` reply. It is keyboard only: mouse support is MOD-71 and tool-call chips
-are MOD-72 (done). No migration. The only new crate is `rataflow` (`default-features = false`).
-Before it, **MOD-49 is done** (`docs/decisions/mod/mod-49.md`): `b` in
-Settings > Hierarchy opens a popup that lists directories on this box (links to a directory marked
-`@`, their targets never shown) and chooses one for the workspace root or a repo checkout; the
-choice goes through the unchanged `SetWorkspaceRoot`/`SetRepoPath` and `canonical_root` (F-102).
-Listing is `StoreRequest::ListDir`, served off the store-worker loop under `spawn_blocking` with a
-10 s bound, so neither the UI nor the worker waits on a hung mount. No migration.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -283,15 +267,16 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   implement axis, `epoch-eci` is narrowed to `eci_scores.csv`, `tbench-4-0` stays blocked. Each
   dynamic source needs a parser under the fetch conditions of §6 (Arena from Hugging Face only, with
   a per-fetch licence check; Epoch keyed on `benchmark_metadata.csv`, never `*_external.csv`).
-- [ ] **MOD-71 - Mouse support: capture policy and the Runs flow view** (from MOD-28,
-  `docs/decisions/mod/mod-28.md` "Carried"). `R-TUI-4`, `R-TUI-1`. htui has never enabled mouse
-  capture, and enabling it disables the terminal's own text selection. Decide the policy: capture
-  only while a view wants it is the proposal (the active view answers `wants_mouse()` after each
-  event, and the event loop toggles `Enable`/`DisableMouseCapture`). Route `Event::Mouse` through
-  `Tab`/`DetailTab`. Make the restore, panic-hook and editor-suspend paths give the mouse back. Then
-  give the Runs flow view click to select (`FlowEvent::NodeClicked` moves the shared cursor),
-  drag to pan and scroll to zoom (`rataflow`'s `crossterm` feature, `handle_mouse_event`). Nodes stay
-  read-only (MOD-28 D9). Raised by the maintainer at MOD-28's plan gate, 2026-10-02.
+- [ ] **MOD-74 - Mouse follow-ups** (from MOD-71's review, `docs/decisions/mod/mod-71.md`
+  "Carried"; deferred by the maintainer, 2026-10-03). `R-TUI-1`, `R-TUI-4`. Three small gaps in the
+  Runs flow view's mouse handling. (1) Review L3: an overlay, `?`, a form or a sub-tab switch turns
+  capture off without reaching `RunsTab`, so a button held across the off-and-on continues the old
+  pan anchor and the view jumps once. Fix: a "capture lost" hook through `App` → `Tab` →
+  `DetailTab`. (2) `EnableMouseCapture` sets any-motion reporting (`?1003h`) though nothing uses
+  hover; a narrower `?1000h ?1002h ?1006h` command on ANSI terminals stops the `Moved` stream at
+  the source (the Windows legacy console keeps crossterm's WinAPI command). (3) A `Runs` re-read
+  during a live pan shifts the viewport, and rataflow's `Panning` recomputes from its old
+  `initial_viewport` on the next drag, so the view jumps once.
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
   The named personas a `handoff` targets exist since MOD-26 (done, `docs/decisions/mod/mod-26.md`):
   `persona` registry rows, bound per phase, frozen into the run snapshot by name.
@@ -608,6 +593,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support, MOD-73 hand-written step inputs; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

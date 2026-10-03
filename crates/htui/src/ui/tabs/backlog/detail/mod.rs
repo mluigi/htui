@@ -30,7 +30,7 @@ use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 
 pub use body::BodyTab;
 pub use documents::DocumentsTab;
@@ -104,6 +104,17 @@ pub trait DetailTab {
     /// MOD-13 milestone 5 D7: an `$EDITOR` outcome the Backlog had no item form for. Only the
     /// sub-tab that emitted `Action::EditExternally` acts on it; the default drops it.
     fn on_external_edit(&mut self, _outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {}
+    /// Whether this sub-tab wants the terminal's mouse right now (MOD-71 D1): what the Backlog
+    /// tab's [`Tab::wants_mouse`](crate::ui::tabs::Tab::wants_mouse) asks of the active sub-tab.
+    /// Only [`RunsTab`] answers yes, in its flow view while browsing.
+    fn wants_mouse(&self) -> bool {
+        false
+    }
+    /// A mouse event, offered only while [`wants_mouse`](DetailTab::wants_mouse) is true (MOD-71
+    /// D4). The default `Pass` drops it.
+    fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -251,6 +262,22 @@ impl DetailRegistry {
     pub fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
         match self.tabs.get_mut(self.active) {
             Some(tab) if tab.captures_input() => tab.on_paste(text, ctx),
+            _ => Handled::Pass,
+        }
+    }
+
+    /// Whether the active sub-tab wants the mouse (MOD-71 D1). The active one only, unlike
+    /// [`has_active_run`](Self::has_active_run): a hidden pane is not on screen to be clicked.
+    #[must_use]
+    pub fn wants_mouse(&self) -> bool {
+        self.active().is_some_and(DetailTab::wants_mouse)
+    }
+
+    /// Offers a mouse event to the active sub-tab while it wants one (MOD-71 D4), as
+    /// [`on_paste`](Self::on_paste) offers a paste.
+    pub fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        match self.tabs.get_mut(self.active) {
+            Some(tab) if tab.wants_mouse() => tab.on_mouse(mouse, ctx),
             _ => Handled::Pass,
         }
     }
