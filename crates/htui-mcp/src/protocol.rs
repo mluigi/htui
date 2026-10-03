@@ -9,8 +9,10 @@
 //! **Concurrency.** Each `tools/call` runs in its own task (`htui_agent::contained::spawn_in`,
 //! blueprint B-20), so a thirty-minute `command_run` never blocks a `ping`. Every answer goes
 //! through one writer, in the order the answers complete. `notifications/cancelled` aborts that
-//! request's task: whatever a tool must undo lives in a drop guard (blueprint H-18). The end of
-//! the input aborts every task still in flight; nothing is answered for them.
+//! request's task: whatever a tool must undo lives in a drop guard (blueprint H-18). A client that
+//! reuses an id still in flight (it must not) gets both calls served, and a cancel of that id
+//! aborts both. A tool that panics is answered `-32603`; the panic stays inside its task. The end
+//! of the input aborts every task still in flight; nothing is answered for them.
 //!
 //! **Robustness.** No input panics the loop. A line that is not JSON is `-32700`, a JSON value
 //! that is not a request object is `-32600`, a line over [`MAX_LINE_BYTES`] is discarded up to its
@@ -24,7 +26,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
-use tokio::task::{AbortHandle, JoinSet};
+use tokio::task::{AbortHandle, Id, JoinSet};
 
 /// The protocol revisions this server speaks, newest first (blueprint B-10). Every method it
 /// answers is unchanged across the four.
@@ -42,6 +44,8 @@ const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 /// JSON-RPC: the method's parameters are wrong; MCP uses it for an unknown tool.
 const INVALID_PARAMS: i64 = -32602;
+/// JSON-RPC: the server failed; here, the tool's task panicked.
+const INTERNAL_ERROR: i64 = -32603;
 
 /// How many outgoing messages may wait for the writer.
 const OUTBOX: usize = 64;
@@ -109,7 +113,8 @@ impl Progress {
 /// Serves one connection until EOF; never panics on input. Requests are dispatched concurrently
 /// (`contained::spawn_in` into a `JoinSet`, B-20); responses go through one writer task in the
 /// order they complete. `notifications/cancelled {requestId}` aborts that request's task (its drop
-/// guards run: `command_run` cancels its row). EOF aborts every in-flight task.
+/// guards run: `command_run` cancels its row). A call whose task panics is answered `-32603`. EOF
+/// aborts every in-flight task.
 ///
 /// # Errors
 ///
@@ -209,14 +214,26 @@ async fn write_messages<W: AsyncWrite>(
     write.shutdown().await.or(Ok(()))
 }
 
+/// One `tools/call` task still running, keyed in the in-flight map by its task id.
+struct InFlight {
+    /// [`request_key`] of its request id: what `notifications/cancelled` names.
+    key: String,
+    /// The request id, for the `-32603` answer should the task panic.
+    id: Value,
+    /// Aborts the task.
+    abort: AbortHandle,
+}
+
 /// Answers lines as they arrive and reaps finished calls; aborts the rest at EOF.
 async fn dispatch(
     mut lines: mpsc::Receiver<Line>,
     out: mpsc::Sender<Value>,
     handler: Arc<dyn Handler>,
 ) {
-    let mut calls: JoinSet<String> = JoinSet::new();
-    let mut in_flight: HashMap<String, AbortHandle> = HashMap::new();
+    let mut calls: JoinSet<()> = JoinSet::new();
+    // By task id, not request id: two calls under one reused id are two entries, and reaping one
+    // never forgets the other.
+    let mut in_flight: HashMap<Id, InFlight> = HashMap::new();
     loop {
         tokio::select! {
             line = lines.recv() => {
@@ -237,9 +254,20 @@ async fn dispatch(
                     break;
                 }
             }
-            Some(done) = calls.join_next(), if !calls.is_empty() => {
-                if let Ok(key) = done {
-                    in_flight.remove(&key);
+            Some(done) = calls.join_next_with_id(), if !calls.is_empty() => {
+                let (task, panicked) = match done {
+                    Ok((task, ())) => (task, false),
+                    Err(err) => (err.id(), err.is_panic()),
+                };
+                // A cancelled call left the map when it was cancelled: it stays unanswered.
+                if let Some(call) = in_flight.remove(&task)
+                    && panicked
+                    && out
+                        .send(error(call.id, INTERNAL_ERROR, "internal error: the tool panicked"))
+                        .await
+                        .is_err()
+                {
+                    break;
                 }
             }
         }
@@ -252,8 +280,8 @@ fn handle_line(
     bytes: &[u8],
     handler: &Arc<dyn Handler>,
     out: &mpsc::Sender<Value>,
-    calls: &mut JoinSet<String>,
-    in_flight: &mut HashMap<String, AbortHandle>,
+    calls: &mut JoinSet<()>,
+    in_flight: &mut HashMap<Id, InFlight>,
 ) -> Option<Value> {
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return None;
@@ -302,13 +330,20 @@ fn handle_line(
     }
 }
 
-/// The two notifications that mean something; every other one is ignored.
-fn notification(method: &str, params: &Value, in_flight: &mut HashMap<String, AbortHandle>) {
+/// The two notifications that mean something; every other one is ignored. A cancel aborts every
+/// call in flight under that request id and forgets it, so nothing is answered for it.
+fn notification(method: &str, params: &Value, in_flight: &mut HashMap<Id, InFlight>) {
     if method == "notifications/cancelled"
         && let Some(request) = params.get("requestId")
-        && let Some(task) = in_flight.remove(&request_key(request))
     {
-        task.abort();
+        let key = request_key(request);
+        in_flight.retain(|_, call| {
+            let cancelled = call.key == key;
+            if cancelled {
+                call.abort.abort();
+            }
+            !cancelled
+        });
     }
 }
 
@@ -332,8 +367,8 @@ fn call(
     params: Value,
     handler: &Arc<dyn Handler>,
     out: &mpsc::Sender<Value>,
-    calls: &mut JoinSet<String>,
-    in_flight: &mut HashMap<String, AbortHandle>,
+    calls: &mut JoinSet<()>,
+    in_flight: &mut HashMap<Id, InFlight>,
 ) -> Option<Value> {
     let Value::Object(mut params) = params else {
         return Some(error(
@@ -364,8 +399,8 @@ fn call(
     let key = request_key(&id);
     let future = handler.call(name, arguments, progress);
     let out = out.clone();
-    let task_key = key.clone();
-    let task = htui_agent::contained::spawn_in(calls, async move {
+    let reply_id = id.clone();
+    let abort = htui_agent::contained::spawn_in(calls, async move {
         let answer = match future.await {
             Ok(done) => result(
                 id,
@@ -377,9 +412,15 @@ fn call(
             Err(CallRefused(message)) => error(id, INVALID_PARAMS, &message),
         };
         let _ = out.send(answer).await;
-        task_key
     });
-    in_flight.insert(key, task);
+    in_flight.insert(
+        abort.id(),
+        InFlight {
+            key,
+            id: reply_id,
+            abort,
+        },
+    );
     None
 }
 

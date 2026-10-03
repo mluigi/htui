@@ -37,8 +37,9 @@ struct EchoArgs {
     text: String,
 }
 
-/// Four tools: `echo` (decodes its arguments), `slow` (never finishes on its own), `ticker`
-/// (two progress ticks, then `done`) and `permission_prompt` (the transcript's call).
+/// Five tools: `echo` (decodes its arguments), `slow` (never finishes on its own), `ticker`
+/// (two progress ticks, then `done`), `permission_prompt` (the transcript's call) and `panic`
+/// (panics; not advertised).
 struct Double {
     seen: mpsc::UnboundedSender<Seen>,
 }
@@ -97,6 +98,7 @@ impl Handler for Double {
                     text: json!({"behavior": "allow", "updatedInput": {}}).to_string(),
                     is_error: false,
                 }),
+                "panic" => panic!("the double's tool panics"),
                 other => Err(CallRefused(format!("unknown tool: {other}"))),
             }
         })
@@ -444,4 +446,57 @@ async fn progress_ticks_carry_the_clients_token() {
         .await;
     assert_eq!(client.recv().await["id"], 4);
     client.finish().await;
+}
+
+#[tokio::test]
+async fn a_panicking_call_is_minus_32603_and_the_next_is_served() {
+    let mut client = Client::start();
+    client
+        .send(request(9, "tools/call", json!({"name": "panic"})))
+        .await;
+    let answer = client.recv().await;
+    assert_eq!(answer["id"], 9, "{answer}");
+    assert_eq!(answer["error"]["code"], -32603);
+    assert_eq!(
+        answer["error"]["message"],
+        "internal error: the tool panicked"
+    );
+    assert!(answer.get("result").is_none());
+    client.send(request(10, "ping", json!({}))).await;
+    assert_eq!(client.recv().await["id"], 10);
+    let rest = client.finish().await;
+    assert!(rest.is_empty(), "{rest:?}");
+}
+
+#[tokio::test]
+async fn a_reused_id_stays_cancellable_after_its_twin_finishes() {
+    let mut client = Client::start();
+    client
+        .send(request(1, "tools/call", json!({"name": "slow"})))
+        .await;
+    assert_eq!(client.seen().await, Seen::SlowStarted);
+    // The client reuses id 1 (it must not, but the loop accepts it): the quick twin finishes first.
+    client
+        .send(request(
+            1,
+            "tools/call",
+            json!({"name": "echo", "arguments": {"text": "twin"}}),
+        ))
+        .await;
+    let answer = client.recv().await;
+    assert_eq!(answer["id"], 1);
+    assert_eq!(answer["result"]["content"][0]["text"], "twin");
+    client
+        .send(
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                     "params": {"requestId": 1}}),
+        )
+        .await;
+    assert_eq!(
+        client.seen().await,
+        Seen::SlowDropped,
+        "the slow call with the same id is still aborted"
+    );
+    let rest = client.finish().await;
+    assert!(rest.is_empty(), "{rest:?}");
 }
