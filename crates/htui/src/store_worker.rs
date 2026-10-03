@@ -2424,11 +2424,15 @@ pub(crate) fn spawn_with_concepts(
                             Err(err) => {
                                 // This read is what noticed the server had gone. The asking view
                                 // still hears back exactly once; the next read finds the mirror.
-                                // MOD-37 M4 D3 (R-46): the swap preempts every live walk.
-                                if matches!(err, StoreError::Unreachable(_))
-                                    && go_offline(&mut backend, &mut refresher, &mut health, &err)
-                                {
-                                    runs.preempt_walks();
+                                // MOD-37 M4 D3 (R-46), review M1: this swap does **not** preempt.
+                                // `Unreachable` here includes sqlx's `PoolTimedOut` - local pool
+                                // load with the server up - and a walk is not cut for that. Only
+                                // the refresher's arm preempts, and `go_offline` aborts the
+                                // refresher, so a loss a read notices first leaves the walks on
+                                // the pre-M4 path: the heartbeat fence, then adoption.
+                                if matches!(err, StoreError::Unreachable(_)) {
+                                    let _ =
+                                        go_offline(&mut backend, &mut refresher, &mut health, &err);
                                 }
                                 failed(other.name(), &err)
                             }
@@ -2687,9 +2691,10 @@ async fn go_online(
 /// `Unreachable`; [`lost_the_server`] would then resolve on every poll and the `select!` would
 /// spin. A health watch may never outlive the `Online` backend it was armed for.
 ///
-/// Whether the backend went `Online → Offline` now ([`Backend::went_offline`]), which the loop
-/// answers by preempting every live walk (MOD-37 M4 D3, R-46).
-#[must_use = "an Online → Offline swap must preempt the live walks (R-46)"]
+/// Whether the backend went `Online → Offline` now ([`Backend::went_offline`]), which the
+/// refresher's arm answers by preempting every live walk (MOD-37 M4 D3, R-46). A read's arm
+/// discards it (review M1): its `Unreachable` may be pool load, not a lost server.
+#[must_use = "an Online → Offline swap the refresher noticed must preempt the live walks (R-46)"]
 fn go_offline(
     backend: &mut Backend,
     refresher: &mut Option<Refresher>,
@@ -4668,12 +4673,12 @@ mod tests {
         cache.close().await;
     }
 
-    /// MOD-37 M4 D3 (R-46): the loop answers an `Online → Offline` swap by preempting every live
-    /// walk of its run runtime. A read that notices the server has gone is the swap here; a walk's
-    /// child token held by the case stands in for the walk, which a lazy `Online` backend could
-    /// not claim.
+    /// MOD-37 M4 D3 (R-46), review M1: a read that fails `Unreachable` swaps to the mirror but
+    /// preempts no walk - the same error covers sqlx's `PoolTimedOut`, local load with the server
+    /// up. A walk's child token held by the case stands in for the walk, which a lazy `Online`
+    /// backend could not claim; it is still live after the swap.
     #[tokio::test]
-    async fn an_unreachable_read_preempts_every_live_walk() {
+    async fn an_unreachable_read_goes_offline_but_leaves_the_walks() {
         let root = tempfile::tempdir().expect("temp root");
         let cache = CacheStore::open(root.path(), "worker-swap-preempts", 1)
             .await
@@ -4729,8 +4734,8 @@ mod tests {
         };
         assert!(label.starts_with("offline · "), "{label}");
         assert!(
-            !probe.has_parent(run),
-            "the swap preempted the walk: its run's parent is cancelled and gone"
+            probe.has_parent(run),
+            "a read's swap leaves the walk alone: its run's parent is still live"
         );
 
         drop(req_tx);

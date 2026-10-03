@@ -2575,7 +2575,9 @@ pub(crate) mod tests {
     }
 
     /// MOD-37 M4 D3: unlike [`RunRuntime::forget_server`], the offline swap keeps the server: the
-    /// claim queue stays, and the next command builds no new isolator.
+    /// claim queue stays, and the next command builds no new isolator. A walk's child token held
+    /// across each `preempt_walks` makes it a real preempt (review L6): the walk goes, the
+    /// isolator stays.
     #[tokio::test]
     async fn an_offline_swap_keeps_the_server() {
         let fixture = Fixture::new().await;
@@ -2600,7 +2602,14 @@ pub(crate) mod tests {
                 )
                 .await;
             assert!(runtime.settle(PATIENCE).await.is_empty());
+            let walked = RunId::new();
+            let _walk = testing::probe(&runtime).walk_child(walked);
+            assert!(testing::probe(&runtime).has_parent(walked));
             runtime.preempt_walks();
+            assert!(
+                !testing::probe(&runtime).has_parent(walked),
+                "the swap preempted the live walk"
+            );
         }
         assert_eq!(
             runtime.isolator_builds(),
