@@ -4847,6 +4847,8 @@ where
             // judge body places no `{{skills}}` and records `not_placed`.
             step_files: StepFiles::default(),
             command_queue: false,
+            // MOD-11 D19: the engine's tool seam sets this (T6 commit 2).
+            document_tool: false,
             verify_failure: None,
             previous_diff: None,
             judge: Some(judge_inputs(task.clone(), candidates.clone(), reverse)),
@@ -5593,6 +5595,8 @@ where
             // MOD-26 D13: the one place `command_run` acts before MOD-11.
             command_queue: phase.command_queue != htui_core::model::CommandQueue::Off
                 && persona.is_none_or(|persona| persona.tools.command_run),
+            // MOD-11 D19: the engine's tool seam sets this (T6 commit 2).
+            document_tool: false,
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
             // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
             verify_failure,

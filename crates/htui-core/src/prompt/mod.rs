@@ -120,6 +120,10 @@ pub struct PromptSpec {
     pub step_files: StepFiles,
     /// Whether `R-MCP-4`'s `command_run` exposure is on for this phase (§4.2 `:484`).
     pub command_queue: bool,
+    /// MOD-11 D19: render the protected `output` trailer naming `document_write`. The engine sets
+    /// it when a tool host serves the session and the phase has an output kind; fixtures and the
+    /// preview leave it `false`, which renders byte-identically to before (B-7).
+    pub document_tool: bool,
     /// The previous attempt's verification output; `None` on attempt 1.
     pub verify_failure: Option<VerifyFailure>,
     /// The previous attempt's diff; `None` on attempt 1.
@@ -169,6 +173,10 @@ impl From<&SnapshotPersona> for PersonaBlock {
 /// MOD-26 D13, B-17: the bytes between the persona frame and the template body, counted in the
 /// frame's estimate.
 pub const PERSONA_SEPARATOR: &str = "\n\n";
+
+/// MOD-11 D19, B-7: the bytes between the template body and the `output` trailer, counted in the
+/// frame's estimate.
+pub const OUTPUT_SEPARATOR: &str = "\n\n";
 
 /// One resolved input document: the winner of its kind (§4.7 rule 3).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -303,6 +311,9 @@ pub enum SectionName {
     DiffSoFar,
     /// Handoff only: why the step was abandoned.
     FailureReason,
+    /// MOD-11 D19: the trailer naming the `document_write` tool. Always the last section when
+    /// present, rendered after the body's spans (B-7).
+    Output,
 }
 
 impl SectionName {
@@ -326,6 +337,7 @@ impl SectionName {
             Self::StepSummary => "step_summary".to_owned(),
             Self::DiffSoFar => "diff_so_far".to_owned(),
             Self::FailureReason => "failure_reason".to_owned(),
+            Self::Output => "output".to_owned(),
         }
     }
 
@@ -336,7 +348,12 @@ impl SectionName {
     #[must_use]
     pub const fn is_protected(&self, role: TemplateRole) -> bool {
         match self {
-            Self::Template | Self::Persona | Self::Box | Self::Skills | Self::CommandQueue => true,
+            Self::Template
+            | Self::Persona
+            | Self::Box
+            | Self::Skills
+            | Self::CommandQueue
+            | Self::Output => true,
             Self::FailureReason => matches!(role, TemplateRole::Handoff),
             _ => false,
         }
@@ -528,6 +545,11 @@ pub fn assemble(
             rendered.push((*placeholder, section, weight));
         }
     }
+    // MOD-11 D19, B-7: the `output` trailer renders after every span section and outside the
+    // body, so it is scanned with them, protected in the trimmer, and recorded last.
+    for section in render_sections(Placeholder::Output, spec, upstream, skills, candidates) {
+        rendered.push((Placeholder::Output, section, 1));
+    }
 
     // The fail-closed half of `R-SEC-3`, over the bytes the model will see. Step 2 already masked
     // every input, so this pass masks nothing new — it is the residue *scan*, and it runs on the
@@ -562,6 +584,9 @@ pub fn assemble(
     let mut frame = masked.literals.concat();
     if spec.persona.is_some() {
         frame.push_str(PERSONA_SEPARATOR);
+    }
+    if has_output(spec) {
+        frame.push_str(OUTPUT_SEPARATOR);
     }
     let template_tokens = est.estimate(&frame);
     let inputs = Inputs {
@@ -697,7 +722,22 @@ fn substitute(
             }
         }
     }
+    // MOD-11 D19, B-7: one blank line, then the `output` trailer, after every span. `live` carries
+    // it only when the spec sets `document_tool`, so every other prompt is byte-identical.
+    if let Some(trailer) = blocks.get(&Placeholder::Output) {
+        text.push_str(OUTPUT_SEPARATOR);
+        text.push_str(&trailer.join("\n\n"));
+    }
     text
+}
+
+/// Whether `spec` renders the `output` trailer: the tool is on and there is a kind to name.
+fn has_output(spec: &PromptSpec) -> bool {
+    spec.document_tool
+        && spec
+            .output_kind
+            .as_deref()
+            .is_some_and(|kind| !kind.is_empty())
 }
 
 /// How many times the body places this placeholder. Duplicates are legal (§4.1) and each
@@ -797,6 +837,17 @@ fn render_sections(
             .map(|handoff| render::failure_reason(&handoff.failure_reason))
             .collect(),
         Placeholder::Persona => spec.persona.iter().map(render::persona).collect(),
+        Placeholder::Output => {
+            if has_output(spec) {
+                spec.output_kind
+                    .as_deref()
+                    .map(render::output)
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        }
         Placeholder::ItemKey
         | Placeholder::ItemTitle
         | Placeholder::ItemKind
@@ -1338,6 +1389,7 @@ mod tests {
                 SectionName::Box,
                 SectionName::Skills,
                 SectionName::CommandQueue,
+                SectionName::Output,
             ] {
                 assert!(name.is_protected(role), "{name} is protected in {role:?}");
             }

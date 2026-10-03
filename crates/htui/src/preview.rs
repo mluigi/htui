@@ -299,6 +299,8 @@ pub async fn build(
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
+        // MOD-11 D19: a preview has no session, so no tool to name.
+        document_tool: false,
         verify_failure: None,
         previous_diff: None,
         judge: None,

@@ -633,6 +633,21 @@ pub fn command_queue() -> Rendered {
     }
 }
 
+/// MOD-11 D19 (OQ-9): the protected `output` trailer, one fixed sentence naming the
+/// `document_write` tool with `kind` substituted. Every byte is a digest input, so the sentence is
+/// pinned (blueprint §16); `kind` is the spec's already-scrubbed `output_kind`.
+#[must_use]
+pub fn output(kind: &str) -> Rendered {
+    Rendered {
+        name: SectionName::Output,
+        attrs: Vec::new(),
+        content: content_of(&format!(
+            "Write your `{kind}` document by calling the `document_write` tool of the `htui` MCP \
+             server; text left only in your reply is not recorded."
+        )),
+    }
+}
+
 /// MOD-26 D13: `<section name="persona" persona="…">` then the persona's body (B-20).
 #[must_use]
 pub fn persona(block: &PersonaBlock) -> Rendered {
