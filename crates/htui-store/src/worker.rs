@@ -334,6 +334,37 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await
     }
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
+        WriteStore::enqueue_command(self, new).await
+    }
+    async fn claim_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> Result<Option<CommandRun>> {
+        WriteStore::claim_command(self, id, claimant, limit).await
+    }
+    async fn beat_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+    ) -> Result<bool> {
+        WriteStore::beat_command(self, id, claimant).await
+    }
+    async fn finish_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        status: htui_core::model::CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> Result<bool> {
+        WriteStore::finish_command(self, id, claimant, status, exit_code, output).await
+    }
+    async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
+        WriteStore::cancel_command(self, id).await
+    }
 }
 
 impl htui_core::store::RecorderStore for Writer {
@@ -639,6 +670,37 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await
+    }
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
+        WriteStore::enqueue_command(self, new).await
+    }
+    async fn claim_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> Result<Option<CommandRun>> {
+        WriteStore::claim_command(self, id, claimant, limit).await
+    }
+    async fn beat_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+    ) -> Result<bool> {
+        WriteStore::beat_command(self, id, claimant).await
+    }
+    async fn finish_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        status: htui_core::model::CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> Result<bool> {
+        WriteStore::finish_command(self, id, claimant, status, exit_code, output).await
+    }
+    async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
+        WriteStore::cancel_command(self, id).await
     }
 }
 

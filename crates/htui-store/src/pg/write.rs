@@ -6734,6 +6734,48 @@ impl WriteStore for PgStore {
         .await
         .map_err(map_sqlx)
     }
+
+    async fn enqueue_command(&self, _new: NewCommandRun) -> Result<CommandRun> {
+        Err(StoreError::Backend(
+            "MOD-11 T8: not yet implemented".to_owned(),
+        ))
+    }
+
+    async fn claim_command(
+        &self,
+        _id: CommandRunId,
+        _claimant: Uuid,
+        _limit: u32,
+    ) -> Result<Option<CommandRun>> {
+        Err(StoreError::Backend(
+            "MOD-11 T8: not yet implemented".to_owned(),
+        ))
+    }
+
+    async fn beat_command(&self, _id: CommandRunId, _claimant: Uuid) -> Result<bool> {
+        Err(StoreError::Backend(
+            "MOD-11 T8: not yet implemented".to_owned(),
+        ))
+    }
+
+    async fn finish_command(
+        &self,
+        _id: CommandRunId,
+        _claimant: Uuid,
+        _status: CommandRunStatus,
+        _exit_code: Option<i32>,
+        _output: Option<String>,
+    ) -> Result<bool> {
+        Err(StoreError::Backend(
+            "MOD-11 T8: not yet implemented".to_owned(),
+        ))
+    }
+
+    async fn cancel_command(&self, _id: CommandRunId) -> Result<bool> {
+        Err(StoreError::Backend(
+            "MOD-11 T8: not yet implemented".to_owned(),
+        ))
+    }
 }
 
 /// The thirty-five rows a project is born with (MOD-15 D9/D10), on the caller's transaction.

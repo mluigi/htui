@@ -26,25 +26,26 @@ use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
     BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile,
     BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead,
-    DocumentId, EventKind, Executor, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
-    ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary,
-    LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
-    PromptScope, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView, Repo, RepoBoxPath,
-    RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
-    RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand,
-    RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
+    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
+    Document, DocumentHead, DocumentId, EventKind, Executor, GateOutcome, Item, ItemCitation,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
+    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
+    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
+    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry,
+    UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary,
+    scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -53,18 +54,19 @@ use crate::seed;
 use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, ParkOutcome,
-    ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
-    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
+    BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
+    EXECUTOR_MUST_BE_KNOWN, ParkOutcome, ReadStore, SettingRung, StepFence, StoredSetting,
+    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
+    close_out_needs_a_summary, command_finish_status, command_not_claimable, command_not_queued,
     document_needs_a_step, expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
     finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
     link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
     new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
     persona_is_bound, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
-    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
-    row_names_another_phase, row_names_another_step, run_is_terminal, self_link,
-    skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
+    reaped_note, references_no_row, requirement_withdrawn, reserved_phase_name,
+    resolution_not_closable, row_names_another_phase, row_names_another_step, run_is_terminal,
+    self_link, skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
     step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
     summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
@@ -134,6 +136,16 @@ struct PermissionRow {
     row: StepPermission,
     /// `step_permission.owner`: the executor's lease owner at park time (I-2).
     owner: Uuid,
+}
+
+/// `command_run.claimed_by` and `heartbeat_at` (MOD-11 `0014`, B-16): the queue's liveness,
+/// which [`CommandRun`] deliberately omits, as `run.lease_owner` is not a [`Run`] field.
+#[derive(Debug, Clone, Copy)]
+struct CommandClaim {
+    /// `command_run.claimed_by`: the claimant's per-call id.
+    claimant: Uuid,
+    /// `command_run.heartbeat_at`: the claim's instant, then the claimant's last beat.
+    heartbeat_at: DateTime<Utc>,
 }
 
 /// Every §5 table the TUI reads, keyed the way the queries of §7 look rows up.
@@ -238,6 +250,9 @@ struct State {
     /// filter-and-sort [`State::command_runs`] does is cheaper than a compound key that would have
     /// to be maintained. No fixture loads it — MOD-4 milestone 3 is its first writer anywhere.
     command_runs: BTreeMap<CommandRunId, CommandRun>,
+    /// The liveness of every `running` `command_run` row a claim admitted (MOD-11 D14, B-16), by
+    /// row id; a row leaves the map when it finishes, is cancelled or is reaped.
+    command_claims: HashMap<CommandRunId, CommandClaim>,
     /// `run.lease_owner`, which is deliberately not a [`Run`] field: the mirror does not carry it
     /// and a reader has no use for another process's liveness token (blueprint F-S). Kept beside
     /// the run so [`WriteStore::refresh_lease`] can compare against it.
@@ -347,6 +362,7 @@ impl MemStore {
             step_trees: BTreeMap::new(),
             step_commits: BTreeMap::new(),
             command_runs: BTreeMap::new(),
+            command_claims: HashMap::new(),
             lease_owners: HashMap::new(),
             permissions: BTreeMap::new(),
             run_commands: BTreeMap::new(),
@@ -4117,6 +4133,9 @@ impl State {
             .retain(|(step, _), _| !gone.steps.contains(step));
         self.command_runs
             .retain(|_, row| !gone.steps.contains(&row.run_step_id));
+        let command_runs = &self.command_runs;
+        self.command_claims
+            .retain(|id, _| command_runs.contains_key(id));
         self.steps.retain(|id, _| !gone.steps.contains(id));
         self.runs.retain(|id, _| !gone.runs.contains(id));
         self.lease_owners.retain(|id, _| !gone.runs.contains(id));
@@ -5138,6 +5157,172 @@ impl State {
         let row = CommandRun::from(new);
         self.command_runs.insert(row.id, row.clone());
         Ok(row)
+    }
+
+    /// MOD-11 D14, B-16: [`State::record_command_run`] for a row that has not started.
+    fn enqueue_command(&mut self, new: NewCommandRun) -> Result<CommandRun> {
+        if new.status != CommandRunStatus::Queued
+            || new.started_at.is_some()
+            || new.finished_at.is_some()
+            || new.exit_code.is_some()
+            || new.output.is_some()
+        {
+            return Err(StoreError::Constraint(command_not_queued()));
+        }
+        self.record_command_run(new)
+    }
+
+    /// One `command_run` row, or the `NotFound` the queue's writers open with.
+    fn require_command_run(&self, id: CommandRunId) -> Result<&CommandRun> {
+        self.command_runs
+            .get(&id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "command_run",
+                id: id.to_string(),
+            })
+    }
+
+    /// MOD-11 D14: the claim. The `write` closure this runs in is Postgres's advisory lock: the
+    /// reap, the count and the admission see one state. Refusals (`NotFound`, not `queued`) come
+    /// before the reap, as Postgres decides them on the row it locked first.
+    fn claim_command(
+        &mut self,
+        id: CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CommandRun>> {
+        let row = self.require_command_run(id)?;
+        if row.status != CommandRunStatus::Queued {
+            return Err(StoreError::Constraint(command_not_claimable(row.status)));
+        }
+        let (box_id, class) = (row.box_id, row.class.clone());
+        let of_pair = |row: &CommandRun| row.box_id == box_id && row.class == class;
+
+        // OQ-3: the pair's stale `running` rows. A row no claim admitted (a `running` row
+        // `record_command_run` wrote) goes by its start, then its queueing, as Postgres's
+        // `COALESCE(heartbeat_at, started_at, queued_at)` does.
+        let stale_before = now - COMMAND_STALE_AFTER;
+        let claims = &self.command_claims;
+        let stale: Vec<CommandRunId> = self
+            .command_runs
+            .values()
+            .filter(|row| of_pair(row) && row.status == CommandRunStatus::Running)
+            .filter(|row| {
+                let beat = claims
+                    .get(&row.id)
+                    .map(|claim| claim.heartbeat_at)
+                    .or(row.started_at)
+                    .unwrap_or(row.queued_at);
+                beat < stale_before
+            })
+            .map(|row| row.id)
+            .collect();
+        for reaped in stale {
+            self.command_claims.remove(&reaped);
+            if let Some(row) = self.command_runs.get_mut(&reaped) {
+                row.status = CommandRunStatus::Failed;
+                row.finished_at = Some(now);
+                row.output = Some(match row.output.take() {
+                    Some(output) => format!("{output}\n{}", reaped_note()),
+                    None => reaped_note(),
+                });
+            }
+        }
+
+        let running = self
+            .command_runs
+            .values()
+            .filter(|row| of_pair(row) && row.status == CommandRunStatus::Running)
+            .count();
+        let oldest = self
+            .command_runs
+            .values()
+            .filter(|row| of_pair(row) && row.status == CommandRunStatus::Queued)
+            .min_by(|left, right| {
+                left.queued_at
+                    .cmp(&right.queued_at)
+                    .then_with(|| left.id.cmp(&right.id))
+            })
+            .map(|row| row.id);
+        if running >= limit.max(1) as usize || oldest != Some(id) {
+            return Ok(None);
+        }
+        let Some(row) = self.command_runs.get_mut(&id) else {
+            return Ok(None);
+        };
+        row.status = CommandRunStatus::Running;
+        row.started_at = Some(now);
+        self.command_claims.insert(
+            id,
+            CommandClaim {
+                claimant,
+                heartbeat_at: now,
+            },
+        );
+        Ok(Some(row.clone()))
+    }
+
+    /// Whether `id` is `running` under `claimant`.
+    fn holds_command(&self, id: CommandRunId, claimant: Uuid) -> bool {
+        self.command_runs
+            .get(&id)
+            .is_some_and(|row| row.status == CommandRunStatus::Running)
+            && self
+                .command_claims
+                .get(&id)
+                .is_some_and(|claim| claim.claimant == claimant)
+    }
+
+    /// MOD-11 D14: the claimant's beat.
+    fn beat_command(&mut self, id: CommandRunId, claimant: Uuid, now: DateTime<Utc>) -> bool {
+        if !self.holds_command(id, claimant) {
+            return false;
+        }
+        if let Some(claim) = self.command_claims.get_mut(&id) {
+            claim.heartbeat_at = now;
+        }
+        true
+    }
+
+    /// MOD-11 D14: the claimant's end of a row; the status is checked before anything is read.
+    fn finish_command(
+        &mut self,
+        id: CommandRunId,
+        claimant: Uuid,
+        status: CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        if matches!(status, CommandRunStatus::Queued | CommandRunStatus::Running) {
+            return Err(StoreError::Constraint(command_finish_status(status)));
+        }
+        if !self.holds_command(id, claimant) {
+            return Ok(false);
+        }
+        self.command_claims.remove(&id);
+        if let Some(row) = self.command_runs.get_mut(&id) {
+            row.status = status;
+            row.exit_code = exit_code;
+            row.output = output;
+            row.finished_at = Some(now);
+        }
+        Ok(true)
+    }
+
+    /// MOD-11 D14: `queued | running → cancelled`; a terminal row is left as it is.
+    fn cancel_command(&mut self, id: CommandRunId, now: DateTime<Utc>) -> Result<bool> {
+        let status = self.require_command_run(id)?.status;
+        if !matches!(status, CommandRunStatus::Queued | CommandRunStatus::Running) {
+            return Ok(false);
+        }
+        self.command_claims.remove(&id);
+        if let Some(row) = self.command_runs.get_mut(&id) {
+            row.status = CommandRunStatus::Cancelled;
+            row.finished_at = Some(now);
+        }
+        Ok(true)
     }
 
     /// A step's `command_run` rows in `(queued_at, id)` order; an unknown step reads empty.
@@ -7368,6 +7553,44 @@ impl WriteStore for MemStore {
         Ok(self.read(|state| state.item_by_key(project, key)))
     }
 
+    // ---- MOD-11 M4 (plan D14, B-16): the command queue, one `write` closure each ----
+
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
+        self.write(|state| state.enqueue_command(new))
+    }
+
+    async fn claim_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> Result<Option<CommandRun>> {
+        let now = self.now();
+        self.write(|state| state.claim_command(id, claimant, limit, now))
+    }
+
+    async fn beat_command(&self, id: CommandRunId, claimant: Uuid) -> Result<bool> {
+        let now = self.now();
+        Ok(self.write(|state| state.beat_command(id, claimant, now)))
+    }
+
+    async fn finish_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        status: CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.finish_command(id, claimant, status, exit_code, output, now))
+    }
+
+    async fn cancel_command(&self, id: CommandRunId) -> Result<bool> {
+        let now = self.now();
+        self.write(|state| state.cancel_command(id, now))
+    }
+
     // ---- ANA-11 §5.1 (MOD-38): requirements and citations, one `write` closure each ----
 
     async fn set_requirement_spec(
@@ -7553,14 +7776,15 @@ mod tests {
     use crate::fixtures::ids;
     use crate::model::{
         AgentBox, AgentId, AnswerOutcome, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
-        CitationKind, Claim, DocumentId, GateOutcome, GraphSnapshot, Isolation, ItemId,
-        ItemKindPatch, NewDocument, NewItem, NewNote, NewProject, NewRepo, NewRequirement,
-        NewRequirementArea, NewRun, NewRunStep, NoteId, OpenPermission, OverlapRule, PermissionId,
-        PhaseAgent, Priority, ProbedTool, ProjectId, ProjectPatch, RelayOption, RelayOptionKind,
-        RelaySessionId, RepoId, RequirementAreaId, RequirementId, RequirementPatch,
-        RequirementUpdate, Resolution, RunCommandStatus, RunId, RunKind, RunMode, RunStatus,
-        RunStepCommit, RunStepTree, Scope, SnapshotGraph, SnapshotSettings, Status, StepId,
-        StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+        CitationKind, Claim, CommandRunId, CommandRunStatus, DocumentId, GateOutcome,
+        GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewCommandRun, NewDocument, NewItem,
+        NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+        NoteId, OpenPermission, OverlapRule, PermissionId, PhaseAgent, Priority, ProbedTool,
+        ProjectId, ProjectPatch, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
+        RequirementAreaId, RequirementId, RequirementPatch, RequirementUpdate, Resolution,
+        RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope,
+        SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, StepStatus,
+        TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -9298,6 +9522,115 @@ mod tests {
         );
     }
 
+    /// MOD-11 OQ-3: a `running` row whose claimant stopped beating holds its slot until the next
+    /// claim of its `(box, class)` sees the heartbeat older than [`COMMAND_STALE_AFTER`]; that
+    /// claim fails it with [`reaped_note`] and admits the next row. Exactly the stale-after bound
+    /// is not yet stale, a beat moves the bound, and another class's row is not touched.
+    /// Postgres's half: `pg_criteria.rs`'s raw-SQL backdate.
+    ///
+    /// [`COMMAND_STALE_AFTER`]: crate::store::traits::COMMAND_STALE_AFTER
+    /// [`reaped_note`]: crate::store::traits::reaped_note
+    #[tokio::test]
+    async fn a_stale_running_row_is_reaped_by_the_next_claim() {
+        let t0 = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let clock = Arc::new(TestClock::at(t0));
+        let store = MemStore::demo().with_clock(clock.clone());
+        let row = |class: &str, at| NewCommandRun {
+            id: CommandRunId::new(),
+            run_step_id: ids::STEP_R2_PRD,
+            box_id: ids::BOX,
+            class: class.to_owned(),
+            command: format!("make {class}"),
+            cwd: "/srv".to_owned(),
+            status: CommandRunStatus::Queued,
+            exit_code: None,
+            output: None,
+            queued_at: at,
+            started_at: None,
+            finished_at: None,
+        };
+        let stuck = row("build", t0);
+        let next = row("build", t0 + TimeDelta::seconds(1));
+        let other = row("test", t0 + TimeDelta::seconds(2));
+        for new in [&stuck, &next, &other] {
+            store.enqueue_command(new.clone()).await.expect("queued");
+        }
+        let gone = Uuid::now_v7();
+        let alive = Uuid::now_v7();
+        assert!(
+            store
+                .claim_command(stuck.id, gone, 1)
+                .await
+                .expect("claim")
+                .is_some()
+        );
+        assert!(
+            store
+                .claim_command(other.id, alive, 1)
+                .await
+                .expect("claim")
+                .is_some()
+        );
+        assert_eq!(
+            store.claim_command(next.id, alive, 1).await.expect("claim"),
+            None,
+            "the stuck row holds the one build slot"
+        );
+
+        clock.advance(crate::store::traits::COMMAND_STALE_AFTER);
+        assert_eq!(
+            store.claim_command(next.id, alive, 1).await.expect("claim"),
+            None,
+            "exactly three beats old is not yet stale"
+        );
+        assert!(
+            store.beat_command(stuck.id, gone).await.expect("beat"),
+            "a beat at the bound keeps the row alive"
+        );
+        clock.advance(crate::store::traits::COMMAND_STALE_AFTER);
+        assert_eq!(
+            store.claim_command(next.id, alive, 1).await.expect("claim"),
+            None,
+            "the beat moved the bound"
+        );
+
+        clock.advance(TimeDelta::seconds(1));
+        let admitted = store.claim_command(next.id, alive, 1).await.expect("claim");
+        assert_eq!(
+            admitted.map(|row| (row.id, row.status)),
+            Some((next.id, CommandRunStatus::Running)),
+            "past the bound the stuck row is reaped and the next admitted"
+        );
+        let rows = store.command_runs(ids::STEP_R2_PRD).await.expect("rows");
+        let reaped = rows.iter().find(|row| row.id == stuck.id).expect("stuck");
+        assert_eq!(
+            (reaped.status, reaped.finished_at, reaped.output.clone()),
+            (
+                CommandRunStatus::Failed,
+                Some(clock.now()),
+                Some(crate::store::traits::reaped_note())
+            ),
+            "failed, finished at the reaping claim, with the note"
+        );
+        assert!(
+            !store.beat_command(stuck.id, gone).await.expect("beat"),
+            "the reaped claimant's next beat answers false: its executor kills the child"
+        );
+        assert!(
+            !store
+                .finish_command(stuck.id, gone, CommandRunStatus::Done, Some(0), None)
+                .await
+                .expect("finish"),
+            "and its finish lands nothing"
+        );
+        let untouched = rows.iter().find(|row| row.id == other.id).expect("other");
+        assert_eq!(
+            untouched.status,
+            CommandRunStatus::Running,
+            "another class's row is not reaped by a build claim, stale as it is"
+        );
+    }
+
     /// PRD D13's cascade with no ghost left behind, read straight out of `State`.
     ///
     /// `project_delete_takes_everything_and_says_so` asserts the counts, which is all §6.1 can
@@ -9343,6 +9676,36 @@ mod tests {
             (1, 1),
             "precondition: one relay row of each table"
         );
+        // MOD-11 H-21: a claimed `command_run` row on an `htui` step, so the claim map has an
+        // entry the cascade must take.
+        let queued = NewCommandRun {
+            id: CommandRunId::new(),
+            run_step_id: ids::STEP_R2_PRD,
+            box_id: ids::BOX,
+            class: "build".to_owned(),
+            command: "make".to_owned(),
+            cwd: "/srv".to_owned(),
+            status: CommandRunStatus::Queued,
+            exit_code: None,
+            output: None,
+            queued_at: Utc::now(),
+            started_at: None,
+            finished_at: None,
+        };
+        store.enqueue_command(queued.clone()).await.expect("queued");
+        assert!(
+            store
+                .claim_command(queued.id, Uuid::now_v7(), 1)
+                .await
+                .expect("claimed")
+                .is_some(),
+            "precondition: one claimed command run"
+        );
+        assert_eq!(
+            store.read(|state| state.command_claims.len()),
+            1,
+            "precondition: its claim"
+        );
         store.delete_project(gone).await.expect("the delete lands");
 
         store.read(|state| {
@@ -9362,6 +9725,14 @@ mod tests {
                     .all(|c| state.runs.contains_key(&c.run_id))
                     && state.run_commands.is_empty(),
                 "run_command goes with its run (MOD-42 plan D1)"
+            );
+            assert!(
+                state
+                    .command_claims
+                    .keys()
+                    .all(|id| state.command_runs.contains_key(id))
+                    && state.command_claims.is_empty(),
+                "a command_run's claim goes with its row (MOD-11 H-21)"
             );
             assert!(
                 state.kinds.values().all(|row| row.project_id != gone),
