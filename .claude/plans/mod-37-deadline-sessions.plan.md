@@ -23,6 +23,19 @@ reconnect sweep adopts it, instead of running blind until the heartbeat fence (~
 | R-46: when to preempt | **At once** on the `Online → Offline` swap; a short blip that the pool would have survived now ends the session, and the sweep adopts the run as a new attempt |
 | Deadline scope | **Step sessions and fan-out candidates**; judge calls stay untimed (they have no `started_at` of their own) |
 
+> **Maintainer amendment (2026-10-03), supersedes T2 below.** The blueprint found that `claim_run`'s
+> overlap admission (rule I, `NotIsolated`) already refuses any other run on a `shared_serialized`
+> repo of the box while the promoted step's run is `awaiting_approval`, and does so across
+> processes, which an in-process hold cannot. The maintainer chose **close R-49 by admission +
+> pin**: no `Isolator::hold`/`try_hold`, no `Hold`, no `ChatEnd` change, no `chat_hold`. T2 is
+> one pin test (green on old code, by design). It walks a `shared_serialized` run to a park and
+> promotes the parked step, then claims a second run on the same repo. The claim answers
+> `Claim::Overlaps { with: first, rule: OverlapRule::NotIsolated }` and the first run is still
+> `awaiting_approval`. It goes in `crates/htui-orch/src/conformance.rs` (both stores) if a
+> promote fits the case shape, else in `engine.rs` tests. What the hold would have covered stays
+> recorded as LOW in HANDOFF: a same-run command in the gap between `Promoted` and the chat bind,
+> a second promotion of the same step (D185), and an isolator rebuild.
+
 ## Design
 
 ### D1 - Deadline: a step-local control, an explicit cut flag
