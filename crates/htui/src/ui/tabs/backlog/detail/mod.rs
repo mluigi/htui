@@ -8,6 +8,7 @@
 //! and shortens "Documents" to "Docs" so the strip keeps its 40 columns.
 
 pub mod body;
+pub mod compose;
 pub mod documents;
 pub mod graph;
 pub mod notes;
