@@ -36,8 +36,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "string",
               "null"
             ],
-            "description": "The document's title; the output kind when omitted.",
-            "default": null
+            "description": "The document's title; the output kind when omitted."
           },
           "body": {
             "type": "string",
@@ -66,6 +65,94 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
           "body"
         ],
         "title": "NoteArgs"
+      }
+    },
+    {
+      "name": "item_status",
+      "description": "Asks a human to move this step's item to a status; writes a note, never the status itself.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "queued",
+              "in_progress",
+              "awaiting_approval",
+              "blocked",
+              "done",
+              "failed",
+              "closed"
+            ],
+            "description": "The status the item should move to."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why: one line a human reads before deciding."
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "done",
+              "concluded",
+              "rejected",
+              "withdrawn",
+              "superseded",
+              "duplicate",
+              null
+            ],
+            "description": "Why the item closed; only with status `closed`.",
+            "default": null
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "StatusArgs"
+      }
+    },
+    {
+      "name": "item_link",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project, named by key.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "description": "`add` proposes the link, `remove` withdraws one this run proposed."
+          },
+          "to": {
+            "type": "string",
+            "description": "The other item's key in this project, e.g. `FEAT-12`."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "blocked_by",
+              "origin",
+              "relates",
+              "supersedes"
+            ],
+            "description": "Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`."
+          }
+        },
+        "required": [
+          "op",
+          "to",
+          "kind"
+        ],
+        "title": "LinkArgs"
       }
     }
   ],
@@ -91,8 +178,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "string",
               "null"
             ],
-            "description": "The document's title; the output kind when omitted.",
-            "default": null
+            "description": "The document's title; the output kind when omitted."
           },
           "body": {
             "type": "string",
@@ -121,6 +207,94 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
           "body"
         ],
         "title": "NoteArgs"
+      }
+    },
+    {
+      "name": "item_status",
+      "description": "Asks a human to move this step's item to a status; writes a note, never the status itself.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "queued",
+              "in_progress",
+              "awaiting_approval",
+              "blocked",
+              "done",
+              "failed",
+              "closed"
+            ],
+            "description": "The status the item should move to."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why: one line a human reads before deciding."
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "done",
+              "concluded",
+              "rejected",
+              "withdrawn",
+              "superseded",
+              "duplicate",
+              null
+            ],
+            "description": "Why the item closed; only with status `closed`.",
+            "default": null
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "StatusArgs"
+      }
+    },
+    {
+      "name": "item_link",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project, named by key.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "description": "`add` proposes the link, `remove` withdraws one this run proposed."
+          },
+          "to": {
+            "type": "string",
+            "description": "The other item's key in this project, e.g. `FEAT-12`."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "blocked_by",
+              "origin",
+              "relates",
+              "supersedes"
+            ],
+            "description": "Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`."
+          }
+        },
+        "required": [
+          "op",
+          "to",
+          "kind"
+        ],
+        "title": "LinkArgs"
       }
     }
   ],
@@ -146,8 +320,7 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
               "string",
               "null"
             ],
-            "description": "The document's title; the output kind when omitted.",
-            "default": null
+            "description": "The document's title; the output kind when omitted."
           },
           "body": {
             "type": "string",
@@ -176,6 +349,94 @@ expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serial
           "body"
         ],
         "title": "NoteArgs"
+      }
+    },
+    {
+      "name": "item_status",
+      "description": "Asks a human to move this step's item to a status; writes a note, never the status itself.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "status": {
+            "type": "string",
+            "enum": [
+              "open",
+              "queued",
+              "in_progress",
+              "awaiting_approval",
+              "blocked",
+              "done",
+              "failed",
+              "closed"
+            ],
+            "description": "The status the item should move to."
+          },
+          "reason": {
+            "type": "string",
+            "description": "Why: one line a human reads before deciding."
+          },
+          "resolution": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "done",
+              "concluded",
+              "rejected",
+              "withdrawn",
+              "superseded",
+              "duplicate",
+              null
+            ],
+            "description": "Why the item closed; only with status `closed`.",
+            "default": null
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "StatusArgs"
+      }
+    },
+    {
+      "name": "item_link",
+      "description": "Proposes or withdraws a link from this step's item to another item of its project, named by key.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "op": {
+            "type": "string",
+            "enum": [
+              "add",
+              "remove"
+            ],
+            "description": "`add` proposes the link, `remove` withdraws one this run proposed."
+          },
+          "to": {
+            "type": "string",
+            "description": "The other item's key in this project, e.g. `FEAT-12`."
+          },
+          "kind": {
+            "type": "string",
+            "enum": [
+              "blocked_by",
+              "origin",
+              "relates",
+              "supersedes"
+            ],
+            "description": "Read `<this item> <kind> <to>`: `blocked_by`, `origin`, `relates` or `supersedes`."
+          }
+        },
+        "required": [
+          "op",
+          "to",
+          "kind"
+        ],
+        "title": "LinkArgs"
       }
     }
   ]

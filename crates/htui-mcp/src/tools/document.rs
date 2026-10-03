@@ -18,7 +18,6 @@ use super::{Ctx, ToolDef, ToolError, ToolResult, args, schema_of, scrubbed, stor
 #[serde(deny_unknown_fields)]
 struct DocumentArgs {
     /// The document's title; the output kind when omitted.
-    #[serde(default)]
     title: Option<String>,
     /// The document's body, in Markdown.
     body: String,
