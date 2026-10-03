@@ -5567,7 +5567,10 @@ pub(crate) mod tests {
             let mut live = live(served, tx, &host, &slot).await;
 
             assert_eq!(live.tools, ["box_profile", "permission_prompt"]);
-            assert!(live.spec.prompt.is_some(), "the CLI chat's lease lends a port");
+            assert!(
+                live.spec.prompt.is_some(),
+                "the CLI chat's lease lends a port"
+            );
             let profile = live
                 .client
                 .call("box_profile", json!({}))
