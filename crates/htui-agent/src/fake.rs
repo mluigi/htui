@@ -54,7 +54,7 @@
 //! would silently cost that criterion.
 
 use std::collections::{BTreeSet, VecDeque};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use chrono::TimeDelta;
@@ -90,6 +90,34 @@ const FAKE_AGENT_VERSION: &str = "0.0.0-fake";
 // The driver
 // ---------------------------------------------------------------------------------------------
 
+/// The [`SessionSpec`] a fake was last started with, shared with whoever took the handle
+/// (MOD-11 D9).
+///
+/// A driver is boxed into `dyn AgentDriver` before anything starts it, so a test that wants to
+/// assert on what the engine handed the transport — `spec.mcp`, the prompt port — takes this handle
+/// first ([`FakeDriver::spec_handle`], [`FakeAdapter::spec_handle`]) and reads it after.
+#[derive(Debug, Clone, Default)]
+pub struct SpecSlot(Arc<Mutex<Option<SessionSpec>>>);
+
+impl SpecSlot {
+    /// The spec of the latest `start`, or `None` before the first one.
+    ///
+    /// A poisoned lock still answers: the slot holds a plain value, and an earlier panic is the
+    /// failing case's own report.
+    #[must_use]
+    pub fn get(&self) -> Option<SessionSpec> {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Records `spec`; the guard drops before this returns.
+    fn set(&self, spec: SessionSpec) {
+        *self.0.lock().unwrap_or_else(PoisonError::into_inner) = Some(spec);
+    }
+}
+
 /// A transport whose wire is a [`Script`].
 ///
 /// The script sits in a slot rather than in a field because milestone 2's `FakeAdapter` loads it
@@ -100,6 +128,8 @@ pub struct FakeDriver {
     name: String,
     caps: DriverCaps,
     script: Mutex<Option<Script>>,
+    /// What [`AgentDriver::start`] was handed (MOD-11 D9).
+    spec: SpecSlot,
 }
 
 impl FakeDriver {
@@ -119,7 +149,22 @@ impl FakeDriver {
             name: name.into(),
             caps,
             script: Mutex::new(Some(script)),
+            spec: SpecSlot::default(),
         }
+    }
+
+    /// The handle on the spec this driver's [`AgentDriver::start`] records. Take it before the
+    /// driver is boxed.
+    #[must_use]
+    pub fn spec_handle(&self) -> SpecSlot {
+        self.spec.clone()
+    }
+
+    /// This driver, recording into `slot` instead of a slot of its own.
+    #[must_use]
+    pub fn with_spec_slot(mut self, slot: SpecSlot) -> Self {
+        self.spec = slot;
+        self
     }
 
     /// Every session predicate true: the fake is the reference transport, so a case is never
@@ -162,7 +207,9 @@ impl AgentDriver for FakeDriver {
     ) -> DriverFuture<'a, Box<dyn AgentSession>> {
         // The guard is taken and dropped before the future is built: a `MutexGuard` is not `Send`
         // and `DriverFuture` is, so holding one across the `async move` would not compile. The
-        // "never hold a lock across an await" rule is enforced here by the type system.
+        // "never hold a lock across an await" rule is enforced here by the type system. The spec
+        // slot follows the same rule: recorded, and its guard dropped, before the future.
+        self.spec.set(spec.clone());
         let taken =
             self.script.lock().map(|mut slot| slot.take()).map_err(|_| {
                 DriverError::Transport("the fake's script slot is poisoned".to_owned())
@@ -642,6 +689,8 @@ fn payload_of(event: &DriverEvent) -> Value {
 #[derive(Debug, Clone, Default)]
 pub struct FakeAdapter {
     script: Arc<Mutex<Option<Script>>>,
+    /// Handed to every driver [`TransportBuilder::build`] produces (MOD-11 D9).
+    spec: SpecSlot,
 }
 
 impl FakeAdapter {
@@ -658,6 +707,12 @@ impl FakeAdapter {
     /// holding it — reporting that here beats reporting an empty script three assertions later.
     pub fn load(&self, script: Script) {
         *self.script.lock().expect("the script slot is not poisoned") = Some(script);
+    }
+
+    /// The handle on the spec the latest driver this adapter built was started with.
+    #[must_use]
+    pub fn spec_handle(&self) -> SpecSlot {
+        self.spec.clone()
     }
 }
 
@@ -681,7 +736,9 @@ impl TransportBuilder for FakeAdapter {
         // constant in this file. (This comment deliberately does not name the agent that test
         // uses: `tests/extensibility.rs` sweeps the tree for it, and a mention here would make the
         // proof circular.)
-        Ok(Box::new(FakeDriver::new(agent.name.clone(), caps, script)))
+        Ok(Box::new(
+            FakeDriver::new(agent.name.clone(), caps, script).with_spec_slot(self.spec.clone()),
+        ))
     }
 }
 
@@ -699,5 +756,108 @@ impl DriverFactory {
         let mut factory = Self::new();
         factory.register("cli/fake", Box::new(FakeAdapter::new()));
         factory
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use chrono::Utc;
+    use htui_core::model::{Agent, AgentId, Billing, StepId, Transport};
+    use serde_json::json;
+
+    use super::{FakeAdapter, FakeDriver};
+    use crate::conformance::Script;
+    use crate::driver::{AgentDriver, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure};
+    use crate::registry::TransportBuilder;
+
+    /// A spec carrying one MCP server, so "the recorded spec" is visibly the one that was started.
+    fn spec() -> SessionSpec {
+        SessionSpec {
+            agent_id: AgentId::new(),
+            step_id: StepId::new(),
+            cwd: PathBuf::from("/scratch"),
+            extra_dirs: Vec::new(),
+            env: BTreeMap::new(),
+            model: None,
+            tools: ToolExposure::default(),
+            mcp: vec![McpServerSpec {
+                name: "htui".to_owned(),
+                command: "/abs/htui".to_owned(),
+                args: vec!["mcp".to_owned()],
+                env: BTreeMap::from([("HTUI_MCP_TOKEN".to_owned(), "token".to_owned())]),
+            }],
+            permission: PermissionPolicy::default(),
+            retain_raw: false,
+            resume: None,
+            budget_micros: None,
+            prompt: None,
+        }
+    }
+
+    /// A `cli/fake` registry row: only the name and caps reach the driver.
+    fn row() -> Agent {
+        let now = Utc::now();
+        Agent {
+            id: AgentId::new(),
+            name: "scripted-fake".to_owned(),
+            transport: Transport::Cli,
+            launch: json!({ "command": "unused", "args": [], "env": {} }),
+            models: Vec::new(),
+            default_model: None,
+            billing: Billing::Subscription,
+            enabled: true,
+            settings: json!({ "cli": { "stream": "fake" } }),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// MOD-11 D9: the handle is taken before the driver is boxed and sees what `start` was given,
+    /// and a slot handed in with `with_spec_slot` is the one the driver writes.
+    #[tokio::test]
+    async fn the_spec_handle_sees_the_started_spec() {
+        let driver = FakeDriver::scripted(Script::one_turn(Vec::new()));
+        let handle = driver.spec_handle();
+        assert_eq!(handle.get(), None, "nothing started yet");
+
+        let started = spec();
+        let _session = driver
+            .start(started.clone(), "hi".to_owned())
+            .await
+            .expect("the fake starts");
+        assert_eq!(handle.get(), Some(started));
+
+        let shared = super::SpecSlot::default();
+        let driver =
+            FakeDriver::scripted(Script::one_turn(Vec::new())).with_spec_slot(shared.clone());
+        let other = spec();
+        let _session = driver
+            .start(other.clone(), "hi".to_owned())
+            .await
+            .expect("the fake starts");
+        assert_eq!(shared.get(), Some(other.clone()));
+        assert_eq!(driver.spec_handle().get(), Some(other));
+    }
+
+    /// MOD-11 D9: the adapter's handle sees the spec of the driver its `build` produced.
+    #[tokio::test]
+    async fn the_adapter_handle_sees_the_built_drivers_spec() {
+        let adapter = FakeAdapter::new();
+        let handle = adapter.spec_handle();
+        adapter.load(Script::one_turn(Vec::new()));
+        let driver = adapter
+            .build(&row(), None, FakeDriver::full_caps())
+            .expect("a loaded script builds");
+        assert_eq!(handle.get(), None, "built, not started");
+
+        let spec = spec();
+        let _session = driver
+            .start(spec.clone(), "hi".to_owned())
+            .await
+            .expect("the fake starts");
+        assert_eq!(handle.get(), Some(spec));
     }
 }
