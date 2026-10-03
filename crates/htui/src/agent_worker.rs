@@ -4083,6 +4083,8 @@ pub async fn run_chat(args: ChatArgs) {
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
     let step_id = binding.step_id();
+    // Read before the spec moves into the driver: the tab's banner needs it (MOD-11 D18).
+    let prompts = spec.prompt.is_some();
 
     let mut session = match driver.start(spec, prompt.clone()).await {
         Ok(session) => session,
@@ -4117,6 +4119,7 @@ pub async fn run_chat(args: ChatArgs) {
         step_id,
         session_ref: session.session_ref().cloned(),
         caps,
+        prompts,
     });
 
     let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
@@ -5462,7 +5465,7 @@ pub(crate) mod tests {
             start,
         };
         use crate::agent_worker::{AgentRuntime, Served};
-        use crate::store_worker::{ReplyEnvelope, StoreRequest};
+        use crate::store_worker::{ReplyEnvelope, StoreReply, StoreRequest};
 
         /// A live chat: its step, its task, a client on its token and the spec it started with.
         struct Live {
@@ -5560,7 +5563,7 @@ pub(crate) mod tests {
             let (_store, backend, runtime, agent_id, slot) =
                 fixture_with_spec_spy(one_turn(), None).await;
             let (mut runtime, host) = hosted(runtime, &backend);
-            let (tx, _rx) = mpsc::unbounded_channel();
+            let (tx, mut rx) = mpsc::unbounded_channel();
             let served = runtime
                 .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
                 .await;
@@ -5571,6 +5574,18 @@ pub(crate) mod tests {
                 live.spec.prompt.is_some(),
                 "the CLI chat's lease lends a port"
             );
+            // T9-ADV-3: the tab hears it, so its banner does not deny what the session does.
+            let accepted = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let reply = rx.recv().await.expect("the chat answers").reply;
+                    if let StoreReply::ChatAccepted { prompts, .. } = reply {
+                        return prompts;
+                    }
+                }
+            })
+            .await
+            .expect("the chat is accepted");
+            assert!(accepted, "ChatAccepted reports the prompt port");
             let profile = live
                 .client
                 .call("box_profile", json!({}))

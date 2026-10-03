@@ -766,8 +766,9 @@ mod tests {
     /// A refusal by a transport that never asked is still the reason the user's tool call failed,
     /// so it is on the screen (MOD-2 D85, review gate MEDIUM).
     ///
-    /// The CLI transport declares `permission_requests: false` and announces nothing; its
-    /// `--permission-mode` refuses a call and *reports* the answer. Before this, `resolve` found no
+    /// The CLI transport declares `permission_requests: false` and, without `htui`'s prompt port
+    /// (MOD-11 D18), announces nothing; its `--permission-mode` refuses a call and *reports* the
+    /// answer. Before this, `resolve` found no
     /// parked row and returned silently, so the chat tab showed a failed `tool_result` and no
     /// reason for it — live **and** on replay. The comment then in the code claimed the user saw
     /// "the verbatim `other` the transport sent beside it", and no such row exists: the mapper

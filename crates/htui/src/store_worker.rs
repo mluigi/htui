@@ -1177,6 +1177,10 @@ pub enum StoreReply {
         session_ref: Option<AgentSessionRef>,
         /// What this transport can do, for the tab's capability banner.
         caps: DriverCaps,
+        /// MOD-11 D18: the session carries `htui`'s permission-prompt port, so it announces and
+        /// answers permission requests although `caps` — the row's, which the interlock reads —
+        /// says it cannot (a CLI session).
+        prompts: bool,
     },
     /// Answer to [`StoreRequest::StoreState`].
     StoreState {

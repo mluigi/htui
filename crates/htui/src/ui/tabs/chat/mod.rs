@@ -75,6 +75,9 @@ pub struct ChatSessionState {
     pub session_ref: Option<AgentSessionRef>,
     /// What this transport can do.
     pub caps: DriverCaps,
+    /// MOD-11 D18: the session answers permission requests through `htui`'s prompt port, whatever
+    /// `caps` says.
+    pub prompts: bool,
     /// How the session ended, once it has.
     pub ended: Option<htui_agent::event::StopReason>,
 }
@@ -376,10 +379,15 @@ impl ChatTab {
     /// `DriverCaps` is authoritative and `agent.transport` is not (§4.3): the banner is computed
     /// from what the driver answered, so a degraded CLI session says so without the tab knowing
     /// what a CLI session is.
+    ///
+    /// MOD-11 D18: a session with `htui`'s prompt port announces and answers permission requests
+    /// although its caps stay the row's (all-false for a CLI row, which the interlock reads), so it
+    /// is not bannered as unable to.
     fn caps_banner(&self) -> Option<String> {
-        let caps = self.session.as_ref()?.caps;
+        let state = self.session.as_ref()?;
+        let caps = state.caps;
         let mut missing: Vec<&str> = Vec::new();
-        if !caps.permission_requests {
+        if !caps.permission_requests && !state.prompts {
             missing.push("permission requests");
         }
         if !caps.edit_proposals {
@@ -541,6 +549,7 @@ impl Tab for ChatTab {
                 step_id,
                 session_ref,
                 caps,
+                prompts,
             } => {
                 self.pending_start = false;
                 self.refusal = None;
@@ -569,6 +578,7 @@ impl Tab for ChatTab {
                     step_id: *step_id,
                     session_ref: session_ref.clone(),
                     caps: *caps,
+                    prompts: *prompts,
                     ended: None,
                 });
             }
@@ -805,6 +815,37 @@ mod tests {
         }
     }
 
+    /// MOD-11 D18 (adversarial review T9-ADV-3): a CLI session keeps the row's all-false caps, but
+    /// with `htui`'s prompt port it does announce and answer permission requests — so the banner
+    /// names only what it still cannot do.
+    #[test]
+    fn a_session_with_a_prompt_port_is_not_bannered_for_permission_requests() {
+        let shell = Shell::new();
+        for (prompts, banner) in [
+            (
+                false,
+                "this agent cannot: permission requests, edit proposals, plans",
+            ),
+            (true, "this agent cannot: edit proposals, plans"),
+        ] {
+            let mut tab = ChatTab::new();
+            tab.on_reply(
+                &StoreReply::ChatAccepted {
+                    step_id: StepId::new(),
+                    session_ref: None,
+                    caps: DriverCaps::default(),
+                    prompts,
+                },
+                &mut shell.ctx(),
+            );
+            assert_eq!(
+                tab.caps_banner().as_deref(),
+                Some(banner),
+                "prompts: {prompts}"
+            );
+        }
+    }
+
     /// A tab with a live, unfinished chat on screen: what a replay must leave exactly as it is.
     fn live(shell: &Shell) -> ChatTab {
         let mut tab = ChatTab::new();
@@ -823,6 +864,7 @@ mod tests {
                     usage_mid_turn: true,
                     authenticate: true,
                 },
+                prompts: false,
             },
             &mut shell.ctx(),
         );
@@ -1099,6 +1141,7 @@ mod tests {
                 step_id: fresh.session().expect("a session").step_id,
                 session_ref: None,
                 caps: fresh.session().expect("a session").caps,
+                prompts: false,
             },
             &mut shell.ctx(),
         );
@@ -1138,6 +1181,7 @@ mod tests {
             step_id: step,
             session_ref: None,
             caps: live(&shell).session().expect("a session").caps,
+            prompts: false,
         };
         drop(shell.emit.take());
         tab.on_reply(&accepted, &mut shell.ctx());
