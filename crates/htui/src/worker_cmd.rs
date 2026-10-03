@@ -2,7 +2,9 @@
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use htui_mcp::search::ConceptSearch;
 use htui_store::pg::{CONNECT_TIMEOUT, PoolSize};
 use htui_store::secret::{self, DsnSources};
 use htui_store::{PgStore, connect, identity};
@@ -97,9 +99,13 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     // refused before it claims anything.
     let tools = htui_mcp::McpHost::new(pg.clone())
         .map_err(|err| WorkerExit::Refused(format!("htui's MCP tools cannot be hosted: {err}")))?;
+    let tools = match worker_search(index_job.is_some()) {
+        Some(search) => tools.with_search(search),
+        None => tools,
+    };
     let runtime = RunRuntime::<PgStore, Unaddressed>::production()
         .with_role(Role::Worker)
-        .with_tool_host(std::sync::Arc::new(tools));
+        .with_tool_host(Arc::new(tools));
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     if let Some(job) = index_job {
@@ -107,6 +113,19 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     }
     tracing::info!("htui worker stopped");
     Ok(())
+}
+
+/// The worker's `search_concepts` index (MOD-11 D12, blueprint B-14): `Some` exactly when the
+/// keyring holds the Qdrant URL `concepts::spawn_index_job` indexes into (`indexing`), so the
+/// sessions search what this worker keeps current; `None` leaves the tool unadvertised. The
+/// adapter reads that same keyring entry per search, as the TUI's does.
+fn worker_search(indexing: bool) -> Option<Arc<dyn ConceptSearch>> {
+    if indexing {
+        crate::mcp_search::production()
+    } else {
+        tracing::info!("search_concepts is not offered: no concepts index is configured");
+        None
+    }
 }
 
 /// A signal won the race against the startup: a clean exit.
@@ -235,12 +254,19 @@ fn shutdown_signal() -> std::io::Result<impl Future<Output = ()> + Send + 'stati
 
 #[cfg(test)]
 mod tests {
-    use super::WorkerExit;
+    use super::{WorkerExit, worker_search};
 
     /// Plan D14: a startup refusal exits 2, a failure after start exits 1.
     #[test]
     fn worker_exit_codes() {
         assert_eq!(WorkerExit::Refused("no DSN".to_owned()).code(), 2);
         assert_eq!(WorkerExit::Failed("lost".to_owned()).code(), 1);
+    }
+
+    /// MOD-11 D12, B-14: the worker offers `search_concepts` only where it has a concepts index.
+    #[test]
+    fn the_worker_searches_only_where_it_indexes() {
+        assert!(worker_search(true).is_some());
+        assert!(worker_search(false).is_none());
     }
 }

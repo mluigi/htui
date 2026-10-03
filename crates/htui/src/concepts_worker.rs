@@ -8,7 +8,7 @@
 
 use std::collections::HashMap;
 use std::mem::Discriminant;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::Duration;
 
 use futures::FutureExt as _;
@@ -251,6 +251,16 @@ impl ConceptIndex for QdrantIndex {
     }
 }
 
+/// The process's one production index (MOD-11 T7, H-26): [`ConceptsRuntime::production`] and
+/// `mcp_search::production` both search it, so the TUI's concepts search and the MCP tool
+/// `search_concepts` share one embedding model (133 MB, MOD-68) and one cached Qdrant connection.
+/// Built on first use; building it loads nothing.
+#[must_use]
+pub fn shared_index() -> Arc<dyn ConceptIndex> {
+    static SHARED: OnceLock<Arc<dyn ConceptIndex>> = OnceLock::new();
+    Arc::clone(SHARED.get_or_init(|| Arc::new(QdrantIndex::new())))
+}
+
 /// A [`ConceptIndex`] over `MemVectorStore` (D230): ranks by shared terms, needs no model. It can be
 /// told to fail every call, and to wait before answering, for the error and supersede cases.
 #[cfg(any(test, feature = "testkit"))]
@@ -372,10 +382,10 @@ impl ConceptsRuntime {
         }
     }
 
-    /// Over [`QdrantIndex`]: what `store_worker::spawn_with_runtimes` builds (D231).
+    /// Over [`shared_index`]: what `store_worker::spawn_with_runtimes` builds (D231).
     #[must_use]
     pub fn production() -> Self {
-        Self::new(Arc::new(QdrantIndex::new()))
+        Self::new(shared_index())
     }
 
     /// Spawns the request's task and answers `Deferred`, or answers now. Awaits nothing.
@@ -841,6 +851,19 @@ mod tests {
             attempts.load(Ordering::SeqCst),
             0,
             "the settings are read before the model: nothing was loaded"
+        );
+    }
+
+    /// MOD-11 T7, H-26: the TUI's concepts runtime and the MCP adapter search one index, so the
+    /// process loads one embedding model.
+    #[test]
+    fn the_production_runtime_searches_the_process_wide_index() {
+        let address = |index: &Arc<dyn ConceptIndex>| Arc::as_ptr(index).cast::<()>();
+        let shared = shared_index();
+        assert_eq!(address(&shared), address(&shared_index()));
+        assert_eq!(
+            address(&ConceptsRuntime::production().index),
+            address(&shared)
         );
     }
 
