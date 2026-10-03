@@ -11207,7 +11207,8 @@ mod tests {
     }
 
     /// Plan D2: `resolve_inputs` prefers this run's output, skips a fan-out loser and reports a
-    /// kind the item has no eligible row for — none of which `documents_of_kinds` does.
+    /// kind the item has no eligible row for — none of which `documents_of_kinds` does — and
+    /// (MOD-73) reads a hand-written version newer than this run's output.
     #[tokio::test]
     async fn resolve_inputs_prefers_this_run_and_skips_a_loser() {
         let store = MemStore::demo();
@@ -11270,12 +11271,12 @@ mod tests {
             .expect("the resolver answers");
         assert_eq!(
             preferred[0].document.as_ref().map(|row| row.id),
-            Some(ids::DOC_FEAT_1_PLAN_V2),
-            "this run's output outranks a later hand-written version"
+            Some(hand.id),
+            "a hand-written version newer than this run's output outranks it (MOD-73)"
         );
         assert_ne!(
             preferred[0].document.as_ref().map(|row| row.id),
-            Some(hand.id)
+            Some(ids::DOC_FEAT_1_PLAN_V2)
         );
 
         let all = store
