@@ -588,6 +588,16 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   list can reuse the query, and the opening key is a MOD-67 action. **Open question for the
   maintainer:** it needs the proposed `R-TUI-11` and the matching `R-TUI-1` top-bar line (ANA-27
   §7), not yet applied. Not blocked; the permission rows are added after MOD-42.
+- [ ] **MOD-75 - Agent question tool: an MCP tool that parks the step for a person** (from MOD-69,
+  `.claude/prds/mod-69-waiting-on-you.prd.md`). `R-MCP-1..4`, `R-TUI-11`. A step's agent that
+  finds something it did not expect, or needs an opinion, has no way to ask: the question lands in
+  the transcript, and an ungated step still ends `done`, so nobody sees it. Add an MCP tool the
+  agent calls with the question (and optional choices); the call is recorded durably, the step
+  parks waiting on a person, and the answer goes back to the agent as the tool result or a
+  follow-up turn. MOD-69's waiting-on-you list shows each open question as its own row. Whether a
+  parked question holds its session and compute slot (like a permission request) or releases them
+  and resumes later is this item's design call. **Blocked on MOD-11** (the MCP server is not built
+  yet).
 
 ### Deferred backlog
 
@@ -609,6 +619,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 23 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups, MOD-75 agent question tool; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
