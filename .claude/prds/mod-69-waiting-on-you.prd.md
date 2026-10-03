@@ -84,7 +84,7 @@ active workspace appears in the list and the waiting count, each reaching its st
 | Metric | Target | How measured |
 |---|---|---|
 | Reason coverage | Every reason (gate, selection, judge failure, unblock, open permission) yields exactly one row per instance; a resumable crash or a finished run yields none | Conformance cases over MemStore and Postgres, one fixture per reason plus negatives |
-| Count split | A run is counted as working or as waiting, never both; working + waiting = today's active count | Store-level test over mixed fixtures |
+| Count split | Waiting = rows in the list; working = active runs owning no row, so a run is never counted twice ("working + waiting = active" does not hold: a Reopen row has no run and a run may own several rows — plan D5) | Classifier test over mixed fixtures |
 | Freshness | Top bar counts and an open overlay reflect a park or an answer within one refresh tick | Update-loop test on the existing tick cadence |
 | Reach | `Enter` on any row lands on the item's Runs pane with that step (or the run, for selection) selected | TUI snapshot / navigation test per reason |
 | No own state | The list has no table, cache or persisted field of its own | Review gate; no migration for the list itself |
@@ -118,8 +118,8 @@ active workspace appears in the list and the waiting count, each reaching its st
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | See what waits | Top bar shows working vs waiting counts; the overlay lists every waiting reason in the active workspace (gate, selection, judge failure, unblock, open permission) from every screen | pending | — |
-| 2 | Jump to it | `Enter` on a row opens the item's Runs pane on that step; close-out | pending | — |
+| 1 | See what waits | Top bar shows working vs waiting counts; the overlay lists every waiting reason in the active workspace (gate, selection, judge failure, unblock, open permission) from every screen | in-progress | `.claude/plans/mod-69-waiting-on-you.plan.md` |
+| 2 | Jump to it | `Enter` on a row opens the item's Runs pane on that step; close-out | in-progress | `.claude/plans/mod-69-waiting-on-you.plan.md` |
 
 ## Open Questions
 
