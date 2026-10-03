@@ -14,7 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-03):** **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
+**Current status (2026-10-03):** **MOD-13 is done** (`docs/decisions/mod/mod-13.md`): the Backlog
+filters and edits items. `f`/`F` filter by status, project, tags and "ready here"; `N`/`e` mint and
+edit through ANA-9 §7.1/§7.2, and a stale edit opens a three-way divergence view that resolves to a
+`divergence_resolution` revision; Ctrl+E hands long text to `$EDITOR`. Milestone 5 made the Notes
+and Docs sub-tabs writable: `a` adds a note, and in Docs `a` writes a hand-written document of any
+kind (an editable `summary` included) and `v` a new version prefilled from the latest. Every write
+is refused offline before any read; a write whose answer may have been lost settles itself on a
+re-read and never invites a duplicate. Conformance case 135; no migration. It spawned **MOD-73**
+(hand-written versions as step inputs).
+Before it, **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
 the Runs flow view has a third line counting its step's tool calls by kind (`⚒ read×5 exec×3 +1`).
 `ReadStore::tool_call_counts` answers on Postgres, the mirror and `MemStore`; the pane asks
 `StoreRequest::ToolCalls` after each `Runs` reply only while the flow is shown. Nodes are 20×5. No
@@ -112,8 +121,8 @@ ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no 
 ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
 every model;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11, MOD-12 and MOD-13
-can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
+`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11 and MOD-12 can start
+now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 `docs/decisions/mod/mod-7.md`; MOD-9 is done, `docs/decisions/mod/mod-9.md`).
 
 ---
@@ -372,99 +381,17 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   enqueue and at claim (`Claim::MissingTags`), so auto mode reuses them rather than adding a check.
   **Relates to ANA-16** (`docs/ANA-16.md` §8): target-box selection in auto mode is MOD-43's, which
   depends on this item for its auto-mode half.
-- [ ] **MOD-13 - Backlog filters and item editing** (from MOD-1). `R-TUI-2`, `R-ENT-5`,
-  `R-ENT-10..12`. Filters by status, project, capability and readiness; `new` and `edit` actions
-  with the compare-and-set on `version` and the three-way divergence view (`docs/ANA-9.md` §4.2,
-  §7.2), external `$EDITOR` round-trip, note thread append, hand-written documents; mint per §7.1.
-  Not blocked (MOD-1 landed, `docs/decisions/mod/mod-1.md`); lands against `MemStore` through
-  the `DetailRegistry` and overlay registry; `PgStore` (MOD-6, `docs/decisions/mod/mod-6.md`)
-  supplies the real mint and revisions. The `touched_paths` edit path accepts and validates the
-  `repo_name:glob` qualification of `docs/ANA-2.md` §4.7 (bare glob = primary repo);
-  `touched_paths` is tier 1 of ANA-5's excerpt ranking (`docs/ANA-5.md` §4.5). **Editing on a box
-  with no server does not exist** (MOD-25 closed 2026-09-16, `docs/decisions/mod/mod-25.md`): `htui`
-  is online-only, so this item must not ship a `new`/`edit` action reachable while the backend is
-  `Offline`, any local `mint_item` or `item_key_counter`, or a compare-and-set view backed by
-  anything but `PgStore`/`MemStore`. An offline box browses read-only and says so.
-  **The scope line "mint per §7.1" above means ANA-9 §7.1's Postgres statement**, which is now the
-  only mint. MOD-4's close-out writes a generated `summary` document with no human prose (MOD-4 risk
-  R-43, `docs/decisions/mod/mod-4.md`); an editable summary is this item's editor's.
-  **Phase 1 landed (`c9c01dc`..`025ef49`, 2026-10-01):** Backlog filters. `f` opens a
-  capturing filter form in the list pane (status, project, required tags, ready here) and `F`
-  clears it. "Ready here" is ANA-9 §7.4 for this box, composed in the store worker so the
-  offline mirror answers it too (`Items { ready_here }`). With no filter set, the screen is
-  byte-identical. PRD `.claude/prds/mod-13-backlog-editing.prd.md` (5 milestones, all in MVP),
-  plan `.claude/plans/mod-13-filters.plan.md`, blueprint
-  `.claude/plans/mod-13-filters.blueprint.md`.
-  **Phase 2 landed (`7b32f86`..`ac7c989`, 2026-10-02):** New and edit. In the Backlog, `N` opens a
-  new-item form and `e` an edit form, in the detail pane. A new item is minted through §7.1.
-  An edit is one §7.2 compare-and-set that carries only the changed fields, and an edit that
-  changes nothing is refused.
-  - **Offline.** The worker refuses all three requests (`ItemForm`, `MintItem`, `EditItem`) with
-    `DATABASE_UNREACHABLE` before any read, so an offline box never opens a form.
-  - **Validation.** One shared validator, `htui_core::model::item_spec`, checks title, body,
-    tags, kind and step graph (including the graph's project). It also checks `touched_paths`
-    using `PathPrefix::parse`'s own `repo:glob` split: an unknown repo, a bare glob with no
-    primary repo, a bad glob, and `/`, `./` or `..` entries are refused, naming the entry.
-  - **Stale edit (D6).** The form keeps the text and **never moves its token**, so a second save
-    diverges again rather than overwriting. Milestone 3 replaces this branch with the three-way
-    view.
-  - **Failed mint (D11/§10).** A failed mint after a possible COMMIT is hedged ("may have been
-    written") and re-read unfiltered. A refusal is plain.
-  - **Counts.** It adds 3 `StoreRequest` and 3 `StoreReply` variants, conformance case 119
-    (`update_spec_columns_roundtrip`) and 2 snapshots.
-  - **Deferred** (maintainer, review): splitting `item_form::render` and `item_writes::serve`,
-    moving `settings::wrapped` to a shared `ui` util, the paths/body indent in the form, and the
-    wording after a lost edit answer.
-
-  Plan `.claude/plans/mod-13-new-edit.plan.md`, blueprint
-  `.claude/plans/mod-13-new-edit.blueprint.md`.
-  **Phase 3 landed (`54667c9`..`ec0f00c`, 2026-10-02):** Divergence. A stale edit opens a
-  three-way view over the whole Backlog area in place of milestone 2's D6 notice. The view shows
-  ancestor, theirs and mine for each field that differs, plus side-by-side body/paths diffs. `m`
-  or `t` rebases the form on the head, and Ctrl+S saves one §7.2 compare-and-set at
-  `head.version` with `reason = 'divergence_resolution'`.
-  - **Ancestor.** The ancestor is the item the form opened on, which covers all seven
-    `version`-covered columns. `item_revision` snapshots only title, body and tags, and no
-    migration was added.
-  - **Field-level merge.** `htui_core::model::item_merge` keeps both sides' changes that do not
-    conflict. `m`/`t` only pick the winner where both sides changed a field, so no path reverts a
-    column only the head changed.
-  - **Esc.** Esc in the view returns to the unchanged form, keeping its text and its old token.
-  - **Reply.** `ItemDiverged` carries the fresh catalogue.
-  - **Counts.** No new `StoreRequest`/`StoreReply` variant; `EditItem` gains `reason`.
-    Conformance case 121 (`item_edit_reason_lands_in_revision`) and 1 snapshot.
-  - **Deferred** (maintainer, review): display-width measurement in the view's notice, clip and
-    column padding (review L3; the diff rows already measure cells), done by MOD-60
-    (`docs/decisions/mod/mod-60.md`);
-    and the by-value `merge` that would avoid three spec clones (NIT-2).
-
-  Plan `.claude/plans/mod-13-divergence.plan.md`, blueprint
-  `.claude/plans/mod-13-divergence.blueprint.md`.
-  **Phase 4 landed (`1b96f9a`..`726633f`, 2026-10-02):** `$EDITOR` round-trip. In the item
-  form, Ctrl+E on the body or the paths hands that field to `$VISUAL`/`$EDITOR` through MOD-9's
-  handoff (`crate::editor`, `event_loop.rs`). The text comes back into the same field, and Ctrl+S
-  saves it with the same §7.2 compare-and-set, so a stale save still opens the three-way view.
-  - **No new machinery.** There is no new event-loop code, `StoreRequest`/`StoreReply` variant,
-    conformance case or migration. The PRD's mid-suspend risk was already handled by the loop
-    (replies queue, the ticker resets). An integration test pins it from the Backlog side.
-  - **Scope.** On a one-line field, a picker or inside the divergence view, Ctrl+E is swallowed,
-    never passed. While busy it does nothing.
-  - **Returned text.** A final newline the editor added is dropped when the handed-out text had
-    none (D5). Control characters other than `\n` and `\t` are dropped. The cursor lands at the
-    end.
-  - **Offline.** No form opens offline, so Ctrl+E cannot be reached. A form opened before a
-    runtime drop to `Offline` keeps Ctrl+E, which is local only, and its Ctrl+S is refused.
-  - **Shared notices.** `EDITED`/`NO_CHANGES`/`WAIT_FLAG` moved into `crate::editor`.
-  - **Deferred** (maintainer, review):
-    - The item form draws every notice in the error colour, so "edited in $EDITOR" shows red
-      (L5).
-    - The control-character filter covers only the item form's editor return. Templates, Library
-      and bodies loaded from the store are unchanged.
-
-  Plan `.claude/plans/mod-13-editor.plan.md`, blueprint
-  `.claude/plans/mod-13-editor.blueprint.md`. Next: milestone 5, notes and documents.
-  Settings › Personas' body and rules editors would take the same hand-off (MOD-26 OQ-12,
-  `docs/decisions/mod/mod-26.md`).
+- [ ] **MOD-73 - Hand-written document versions as step inputs** (from MOD-13). `R-ENT-12`,
+  `R-ORCH-2`. A hand-written new version of a step's output kind is never what the next step reads:
+  `resolve_inputs` ranks this run's output, then another run's, then a hand-written one, whatever the
+  version (`htui-core/src/store/mem.rs` `input_rank`, `htui-store/src/pg/read.rs` `ORDER BY CASE
+  WHEN s.id IS NULL THEN 2`), and conformance `write_document_allocates_its_version` pins it. ANA-2
+  §4.8 says "an edit is a new document version followed by `approved`", and MOD-13's Docs `v`
+  (`docs/decisions/mod/mod-13.md`) is now how that version gets written, so the edit is shown
+  everywhere but not fed to the next phase while a step-produced version of the kind exists.
+  `documents_of_kinds` (prompt assembly) already takes the latest by version. Reconcile §4.2's
+  ranking with §4.8, for example by letting a hand-written version newer than the run's output win,
+  or by having `accept artifact` adopt it, and update the pinned case. Not blocked.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -681,6 +608,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support, MOD-73 hand-written step inputs; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

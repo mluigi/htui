@@ -21,6 +21,9 @@
 //! Milestone 4: Ctrl+E in the item form's body or paths hands that text to `$EDITOR` (MOD-9's
 //! handoff). The outcome comes back through `Tab::on_external_edit` to the form, and Ctrl+S saves
 //! it as before.
+//!
+//! Milestone 5: Notes and Docs write through their own compose areas. An `$EDITOR` outcome goes to
+//! the item form when one is open, else to the active sub-tab.
 
 pub mod detail;
 pub mod divergence;
@@ -679,17 +682,26 @@ impl Tab for BacklogTab {
             // `f` opens on them rather than on a filter that never arrived.
             self.filter.clone_from(&self.shown);
         }
+        // MOD-13 milestone 5 E4, the `N`/`e` rule one level down: a compose area opens only while
+        // neither form captures above it, so the item form and a sub-tab's area are never both
+        // open.
+        if matches!(
+            reply,
+            StoreReply::NoteForm { .. } | StoreReply::DocumentForm(_)
+        ) && (self.form.is_some() || self.item_form.is_some())
+        {
+            return;
+        }
         self.detail.on_reply(reply, ctx);
     }
 
-    /// MOD-13 milestone 4 D4: the `$EDITOR` outcome goes to the open item form, which ignores one
-    /// it did not ask for. With no form (a scope change landed first) it is dropped, as
-    /// `App::finish_external_edit` drops one for a gone tab.
-    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
-        if let Some(form) = self.item_form.as_mut() {
-            form.on_external_edit(outcome);
-        } else {
-            tracing::debug!("the item form that asked for the editor is gone");
+    /// MOD-13 milestone 4 D4, milestone 5 D7: the item form when one is open (it ignores an
+    /// outcome it did not ask for), else the active detail sub-tab. Both cannot be asking: the
+    /// key owner is the asker, and the item form owns keys first.
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
+        match self.item_form.as_mut() {
+            Some(form) => form.on_external_edit(outcome),
+            None => self.detail.on_external_edit(outcome, ctx),
         }
     }
 
@@ -2861,7 +2873,8 @@ mod tests {
         );
     }
 
-    /// D4: with no form open the outcome is dropped; nothing opens and nothing is emitted.
+    /// D4, milestone 5 D7: with no form open the outcome reaches the active sub-tab; Body asked
+    /// for nothing and drops it.
     #[tokio::test]
     async fn an_outcome_with_no_form_open_is_dropped() {
         let bench = Bench::new().await;
@@ -2872,5 +2885,172 @@ mod tests {
         );
         assert!(tab.item_form.is_none());
         assert!(bench.actions().is_empty());
+    }
+
+    // ---- MOD-13 milestone 5: $EDITOR outcomes to the detail sub-tab --------------------------
+
+    /// A sub-tab that records the `$EDITOR` outcomes it is handed.
+    #[derive(Debug, Default)]
+    struct OutcomeProbe {
+        seen: Rc<RefCell<Vec<ExternalEditOutcome>>>,
+    }
+
+    impl DetailTab for OutcomeProbe {
+        fn id(&self) -> DetailId {
+            DetailId("outcomes")
+        }
+        fn title(&self) -> &str {
+            "Outcomes"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+            self.seen.borrow_mut().push(outcome);
+        }
+    }
+
+    /// A sub-tab that starts capturing when a `NoteForm` reply reaches it, as a compose area
+    /// opens (E4), without depending on the Notes pane.
+    #[derive(Debug, Default)]
+    struct ComposeProbe {
+        capturing: Rc<Cell<bool>>,
+    }
+
+    impl DetailTab for ComposeProbe {
+        fn id(&self) -> DetailId {
+            DetailId("compose")
+        }
+        fn title(&self) -> &str {
+            "Compose"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            if self.capturing.get() {
+                Handled::Consumed
+            } else {
+                Handled::Pass
+            }
+        }
+        fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+            if matches!(reply, StoreReply::NoteForm { .. }) {
+                self.capturing.set(true);
+            }
+        }
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn captures_input(&self) -> bool {
+            self.capturing.get()
+        }
+    }
+
+    /// A registry holding `tab` alone.
+    fn only(tab: impl DetailTab + 'static) -> DetailRegistry {
+        let mut detail = DetailRegistry::new();
+        detail.register(Box::new(tab));
+        detail
+    }
+
+    /// Milestone 5 D7: with no item form, the outcome goes to the active sub-tab.
+    #[tokio::test]
+    async fn an_outcome_with_no_item_form_reaches_the_active_sub_tab() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        let probe = OutcomeProbe::default();
+        let seen = Rc::clone(&probe.seen);
+        tab.detail = only(probe);
+        tab.on_external_edit(
+            ExternalEditOutcome::Edited("x".to_owned()),
+            &mut bench.ctx(),
+        );
+        assert_eq!(
+            *seen.borrow(),
+            [ExternalEditOutcome::Edited("x".to_owned())]
+        );
+        assert!(bench.actions().is_empty());
+    }
+
+    /// Milestone 5 D7: an open item form takes the outcome; the sub-tab sees nothing.
+    #[tokio::test]
+    async fn an_open_item_form_takes_the_outcome_not_the_sub_tab() {
+        let bench = Bench::new().await;
+        let store = MemStore::demo();
+        let mut tab = bench.tab();
+        open_with(&mut tab, &bench, &store, KeyCode::Char('e')).await;
+        let probe = OutcomeProbe::default();
+        let seen = Rc::clone(&probe.seen);
+        tab.detail = only(probe);
+        to_body(&mut tab, &bench);
+        assert_eq!(tab.on_key(ctrl('e'), &mut bench.ctx()), Handled::Consumed);
+        tab.on_external_edit(
+            ExternalEditOutcome::Edited("New body.".to_owned()),
+            &mut bench.ctx(),
+        );
+        assert_eq!(notice(&tab).as_deref(), Some(crate::editor::EDITED));
+        assert!(seen.borrow().is_empty());
+    }
+
+    /// Milestone 5 E4: a compose read answered while a form captures above the detail opens
+    /// nothing; with the form closed, the same reply reaches the sub-tab.
+    #[tokio::test]
+    async fn a_compose_read_answered_under_an_open_form_opens_nothing() {
+        let bench = Bench::new().await;
+        let Selection::Item(item) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        tab.detail = only(ComposeProbe::default());
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        assert!(tab.form.is_some(), "the filter form is open");
+        tab.on_reply(&StoreReply::NoteForm { item }, &mut bench.ctx());
+        assert!(
+            !tab.detail.captures_input(),
+            "the guard held the reply back"
+        );
+
+        press(&mut tab, &bench, KeyCode::Esc);
+        assert!(tab.form.is_none(), "Esc closed the filter form");
+        tab.on_reply(&StoreReply::NoteForm { item }, &mut bench.ctx());
+        assert!(tab.detail.captures_input());
+    }
+
+    /// Milestone 5 E4: `a` in Notes, then `l` before its `NoteForm` answers. The reply reaches
+    /// only the active sub-tab, so back on Notes nothing captures (and `e` could not have opened
+    /// the item form over a hidden area).
+    #[tokio::test]
+    async fn a_compose_read_answered_after_the_strip_moved_opens_nothing() {
+        let bench = Bench::new().await;
+        let Selection::Item(item) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        tab.detail.on_item_change(Some(item));
+        assert!(tab.detail.select_id(NotesTab::ID));
+        assert_eq!(
+            press(&mut tab, &bench, KeyCode::Char('a')),
+            Handled::Consumed
+        );
+        assert!(
+            bench.actions().iter().any(|action| matches!(
+                action,
+                Action::Store(StoreRequest::NoteForm { item: asked }) if *asked == item
+            )),
+            "`a` sent the NoteForm read"
+        );
+        press(&mut tab, &bench, KeyCode::Char('l'));
+        assert_ne!(
+            tab.detail.active_id(),
+            Some(NotesTab::ID),
+            "the strip moved"
+        );
+
+        tab.on_reply(&StoreReply::NoteForm { item }, &mut bench.ctx());
+        assert!(tab.detail.select_id(NotesTab::ID));
+        assert!(
+            !tab.detail.captures_input(),
+            "no area opened on the hidden Notes pane"
+        );
     }
 }

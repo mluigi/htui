@@ -17,24 +17,24 @@ use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
     Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
-    DEFAULT_MAX_CONCURRENT_ITEMS, DocumentId, EditReason, EventKind, EventRole, Executor, Gate,
-    GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKindId,
-    ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    NoteId, OpenPermission, OverlapRule, PermissionChoice, PermissionId, PermissionStatus, Persona,
-    PersonaAnswer, PersonaId, PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule,
-    PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch,
-    PromptScope, PromptTemplate, PromptTemplateId, RelayOption, RelayOptionKind, RelaySessionId,
-    RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
-    RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId,
-    RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
-    SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph,
-    SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome,
-    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry,
-    UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
-    canonical_declared_tags, missing_tags_failure,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentId, EditReason, EventKind, EventRole, Executor,
+    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
+    NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPatch,
+    PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
+    ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId,
+    RelayOption, RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch,
+    RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunCommandId,
+    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -185,6 +185,7 @@ pub const CASES: &[&str] = &[
     "delete_persona_removes_an_unbound_row_once",
     "a_bound_persona_is_not_deleted_and_names_its_phases",
     "a_persona_bound_to_many_phases_names_five_and_counts_the_rest",
+    "hand_written_rows_round_trip",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -474,6 +475,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "a_persona_bound_to_many_phases_names_five_and_counts_the_rest" => {
             a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store).await;
         }
+        "hand_written_rows_round_trip" => hand_written_rows_round_trip(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -13263,7 +13265,7 @@ async fn document_body_round_trip<S: ReadStore>(store: &S) {
 /// preview's form (plan D103) and orders by kind **bytes**, so Postgres's collation and the
 /// mirror's byte order cannot disagree.
 async fn documents_of_kinds_latest_per_kind_in_order<S: ReadStore>(store: &S) {
-    let shape = |documents: &[crate::model::Document]| {
+    let shape = |documents: &[Document]| {
         documents
             .iter()
             .map(|document| (document.kind.clone(), document.version))
@@ -16245,6 +16247,84 @@ async fn a_persona_bound_to_many_phases_names_five_and_counts_the_rest<S: WriteS
         persona_names(CASE, store).await,
         ["architect", "reviewer"],
         "{CASE}: the refusal deleted nothing"
+    );
+}
+
+/// MOD-13 milestone 5 D12: a hand-written note (`via_step_id: None`, on the fixture box) and a
+/// hand-written document (`produced_by_step_id: None`) read back field-equal through `notes`,
+/// `documents` and `document`. The fixture's `plan` v2 is step-produced, so the hand-written
+/// version follows a step's. `gate_answers_write_their_outcome`'s note carries a step, and
+/// `write_document_allocates_its_version` asserts versions and ranking only.
+async fn hand_written_rows_round_trip<S: WriteStore>(store: &S) {
+    const CASE: &str = "hand_written_rows_round_trip";
+
+    let new_note = NewNote {
+        id: NoteId::new(),
+        item_id: ids::HTUI_FEAT_1,
+        body: "  - by hand\nsecond line".to_owned(),
+        created_by: ids::USER,
+        box_id: Some(ids::BOX),
+        via_step_id: None,
+        created_at: seam_clock(),
+    };
+    let expected = Note {
+        id: new_note.id,
+        item_id: new_note.item_id,
+        body: new_note.body.clone(),
+        created_by: new_note.created_by,
+        box_id: new_note.box_id,
+        via_step_id: new_note.via_step_id,
+        created_at: new_note.created_at,
+    };
+    let note = store.add_note(new_note).await.expect(CASE);
+    assert_eq!(
+        note, expected,
+        "{CASE}: `add_note` answers the note it was given"
+    );
+    // Found by id: the fixture's notes are not pinned to now, so no order is asserted.
+    let notes = store.notes(ids::HTUI_FEAT_1).await.expect(CASE);
+    assert_eq!(
+        notes.iter().find(|row| row.id == expected.id),
+        Some(&expected),
+        "{CASE}: `notes` reads the hand-written note back field-equal"
+    );
+
+    let new_document = NewDocument {
+        id: DocumentId::new(),
+        item_id: ids::HTUI_FEAT_1,
+        kind: "plan".to_owned(),
+        title: "Plan: by hand".to_owned(),
+        body: "# Plan\n\nWritten by hand.".to_owned(),
+        produced_by_step_id: None,
+        created_by: ids::USER,
+        created_at: seam_clock(),
+    };
+    let expected = Document {
+        id: new_document.id,
+        item_id: new_document.item_id,
+        kind: new_document.kind.clone(),
+        version: 3,
+        title: new_document.title.clone(),
+        body: new_document.body.clone(),
+        produced_by_step_id: new_document.produced_by_step_id,
+        created_by: new_document.created_by,
+        created_at: new_document.created_at,
+    };
+    let document = store.write_document(new_document).await.expect(CASE);
+    assert_eq!(
+        document, expected,
+        "{CASE}: `write_document` answers version 3 (the fixture holds step-produced plan v1 and \
+         v2)"
+    );
+    assert_eq!(
+        store.document(expected.id).await.expect(CASE),
+        Some(expected.clone()),
+        "{CASE}: `document` reads the hand-written document back field-equal"
+    );
+    let heads = store.documents(ids::HTUI_FEAT_1).await.expect(CASE);
+    assert!(
+        heads.contains(&expected.head()),
+        "{CASE}: `documents` lists the hand-written head, got {heads:?}"
     );
 }
 

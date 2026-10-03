@@ -4,11 +4,11 @@ expression: frame
 ---
 Platform · DESKTOP-HTUI · memory · 1 run
  1 Backlog
-┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-2 ────────────────────────────────────┐
+┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-1 ───────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │
-│  ANA-1    done               Data model, box regist…││No documents for this item.                │
-│  ANA-2    open               Orchestrator step grap…││                                           │
-│  CLEAN-1  failed             Drop the legacy markdo…││                                           │
+│  ANA-1    done               Data model, box regist…││ New note ─────────────────────────────────│
+│  ANA-2    open               Orchestrator step grap…││A hand-written note.                       │
+│  CLEAN-1  failed             Drop the legacy markdo…││Its second line.                           │
 │  FEAT-1   in_progress        TUI scaffold           ││                                           │
 │  FEAT-2   blocked            Agent driver and chat …││                                           │
 │  FEAT-3   queued             Postgres store and cac…││                                           │
@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││J/K move · a new · v new version           │
+│                                                     ││Ctrl+E $EDITOR  Ctrl+S save  Esc cancel    │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

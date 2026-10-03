@@ -49,6 +49,7 @@ use crate::box_settings::{self, BoxesSnapshot};
 use crate::catalogue::{self, CatalogueSnapshot};
 use crate::concepts_worker::{self, ConceptsReply, ConceptsRuntime, ConceptsServed};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
+use crate::hand_written::{self, DocumentFormContext, HandText};
 use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::persona_import::PersonaImports;
@@ -967,6 +968,40 @@ pub enum StoreRequest {
         /// `DivergenceResolution` (milestone 3 D6).
         reason: EditReason,
     },
+    /// MOD-13 milestone 5 D1-D3: the read that opens the Notes compose area; answered with
+    /// [`StoreReply::NoteForm`]. Refused offline before anything is read (D2).
+    NoteForm {
+        /// The item the note is for.
+        item: ItemId,
+    },
+    /// A hand-written note (`R-ENT-11`); the worker fills id, author, box and clock. Answered with
+    /// [`StoreReply::NoteAdded`].
+    AddNote {
+        /// The item.
+        item: ItemId,
+        /// The text; prints as its length (D1).
+        body: HandText,
+    },
+    /// The read that opens the Docs form: `kind` is `None` for `a`, the row's kind for `v`, whose
+    /// latest version prefills the form (D9). Answered with [`StoreReply::DocumentForm`].
+    DocumentForm {
+        /// The item the document is for.
+        item: ItemId,
+        /// The kind whose latest version prefills the form (`v`); `None` for a new document (`a`).
+        kind: Option<String>,
+    },
+    /// A hand-written document at the store's next version of `kind` (`R-ENT-12`, D5: never a
+    /// compare-and-set). Answered with [`StoreReply::DocumentWritten`].
+    WriteDocument {
+        /// The item.
+        item: ItemId,
+        /// The kind, as typed; the worker trims it (D4).
+        kind: String,
+        /// The title, as typed; plain in `Debug` (D1).
+        title: String,
+        /// The text; prints as its length (D1).
+        body: HandText,
+    },
 }
 
 impl StoreRequest {
@@ -1098,6 +1133,11 @@ impl StoreRequest {
             Self::ItemForm { .. } => "item_form",
             Self::MintItem { .. } => "mint_item",
             Self::EditItem { .. } => "edit_item",
+            // The four of `hand_written::REQUEST_NAMES`, in that order (MOD-13 milestone 5 D1).
+            Self::NoteForm { .. } => "note_form",
+            Self::AddNote { .. } => "add_note",
+            Self::DocumentForm { .. } => "document_form",
+            Self::WriteDocument { .. } => "write_document",
         }
     }
 }
@@ -1406,6 +1446,27 @@ pub enum StoreReply {
     /// An edit that missed its version: nothing was written; both sides and the fresh catalogue
     /// (milestone 3 D7).
     ItemDiverged(Box<ItemDivergence>),
+    /// Answer to [`StoreRequest::NoteForm`]: the item exists and the store takes a write.
+    NoteForm {
+        /// The item.
+        item: ItemId,
+    },
+    /// A note that landed (self-naming, MOD-59): the Notes pane closes its area on this alone.
+    NoteAdded {
+        /// The item the note landed on.
+        item: ItemId,
+    },
+    /// Answer to [`StoreRequest::DocumentForm`]; boxed, it carries a whole `Document`.
+    DocumentForm(Box<DocumentFormContext>),
+    /// A document that landed (self-naming): `version` is the one the store allocated (D5).
+    DocumentWritten {
+        /// The item the document landed on.
+        item: ItemId,
+        /// The kind as stored (trimmed).
+        kind: String,
+        /// The version the store allocated.
+        version: i32,
+    },
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -1797,6 +1858,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::ItemForm { .. }
         | StoreRequest::MintItem { .. }
         | StoreRequest::EditItem { .. } => item_writes::serve(backend, request).await?,
+        // The four hand-written requests, or-ed for the reason the arms above are (MOD-13
+        // milestone 5 D1).
+        StoreRequest::NoteForm { .. }
+        | StoreRequest::AddNote { .. }
+        | StoreRequest::DocumentForm { .. }
+        | StoreRequest::WriteDocument { .. } => hand_written::serve(backend, request).await?,
         StoreRequest::StoreState => StoreReply::StoreState {
             label: backend.label(),
             migrations_pending: None,
