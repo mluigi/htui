@@ -306,3 +306,42 @@ async fn a_refused_relay_exits_with_stdin_still_open() {
     assert_eq!(stdout, "");
     drop(lease);
 }
+
+/// The host ending the session ends the relay at once, with the agent still holding its stdin
+/// open: the exit is not held by the blocking read on stdin for the runtime's teardown grace
+/// (`htui::SHUTDOWN`), so the agent sees its MCP server's stdout close promptly.
+#[tokio::test]
+async fn the_host_ending_the_session_ends_the_relay_with_stdin_still_open() {
+    let host = host();
+    let lease = host.open(scope()).expect("a lease");
+    let mut child = relay_for(&lease);
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped")).lines();
+    let mut seen = Vec::new();
+    // One exchange: the relay is spliced, and its stdin read is in flight.
+    exchange(
+        &mut child,
+        &mut stdout,
+        &mut seen,
+        json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+               "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                          "clientInfo": {"name": "mcp_stdio"}}}),
+    )
+    .await;
+
+    // `Child::wait` closes a stdin it still holds: the agent's end is held here instead.
+    let stdin = child.stdin.take().expect("stdin is piped");
+    let started = std::time::Instant::now();
+    host.close();
+    let status = tokio::time::timeout(BUDGET, child.wait())
+        .await
+        .expect("exits without stdin closing")
+        .expect("wait");
+    let elapsed = started.elapsed();
+    assert_eq!(status.code(), Some(0), "{status}");
+    assert!(
+        elapsed < htui::SHUTDOWN / 2,
+        "the relay left {elapsed:?} after the host ended the session"
+    );
+    drop(stdin);
+    drop(lease);
+}

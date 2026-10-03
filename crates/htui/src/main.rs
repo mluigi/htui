@@ -16,11 +16,27 @@ use std::time::Duration;
 /// bounded by [`htui::SHUTDOWN`], whether the body returns or panics: a blocking task that never
 /// ends cannot hold the exit.
 fn main() -> ExitCode {
+    let args = htui::cli::Args::parse();
+    let grace = teardown_grace(&args);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("the tokio runtime builds");
-    run_bounded(runtime, htui::SHUTDOWN, body())
+    run_bounded(runtime, grace, body(args))
+}
+
+/// How long the runtime's teardown may wait for blocking tasks once `body` has returned.
+///
+/// [`htui::SHUTDOWN`], except for `htui mcp` (MOD-11 D6), which gets none: its stdin is read by a
+/// blocking read on fd 0 that nothing can cancel, so when the host ends the session first the
+/// teardown would wait out the whole grace with the agent's stdout still open. Nothing of the
+/// relay is left to finish by then: it returns only after flushing stdout.
+fn teardown_grace(args: &htui::cli::Args) -> Duration {
+    if matches!(args.command, Some(htui::cli::Command::Mcp)) {
+        Duration::ZERO
+    } else {
+        htui::SHUTDOWN
+    }
 }
 
 /// Runs `future` to its end on `runtime`, then tears the runtime down within `grace`.
@@ -43,7 +59,7 @@ fn run_bounded<T>(
 
 /// `main` inside the runtime. The Sentry guard lives here, so it flushes before the runtime's
 /// teardown begins.
-async fn body() -> ExitCode {
+async fn body(args: htui::cli::Args) -> ExitCode {
     let mut options = sentry::ClientOptions::default();
     options.dsn = "https://47539c499d6747008e7561dbbe1129cd@glitchtip.sette.mluigi.it/1"
         .parse()
@@ -62,7 +78,6 @@ async fn body() -> ExitCode {
 
     let _sentry = sentry::init(options);
 
-    let args = htui::cli::Args::parse();
     match htui::run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -120,7 +135,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{reports_to_sentry, run_bounded};
+    use super::{reports_to_sentry, run_bounded, teardown_grace};
     use htui::mcp_cmd::McpExit;
     use htui::provision::ProvisionExit;
     use htui::worker_cmd::WorkerExit;
@@ -174,6 +189,19 @@ mod tests {
             assert_eq!(super::exit_code(&error), expected, "{error}");
         }
         assert_eq!(super::exit_code(&anyhow::anyhow!("boom")), 1);
+    }
+
+    /// MOD-11 D6: `htui mcp` tears its runtime down at once (its stdin read cannot be
+    /// cancelled); every other command keeps the bounded grace.
+    #[test]
+    fn only_mcp_skips_the_teardown_grace() {
+        use clap::Parser;
+        let grace = |argv: &[&str]| {
+            teardown_grace(&htui::cli::Args::try_parse_from(argv).expect("the arguments parse"))
+        };
+        assert_eq!(grace(&["htui", "mcp"]), Duration::ZERO);
+        assert_eq!(grace(&["htui"]), htui::SHUTDOWN);
+        assert_eq!(grace(&["htui", "--clear-dsn"]), htui::SHUTDOWN);
     }
 
     /// MOD-41 review RF-4: a body that panics while a blocking task never ends still leaves
