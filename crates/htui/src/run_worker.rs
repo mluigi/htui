@@ -450,6 +450,7 @@ pub(crate) mod tests {
                 .first()
                 .and_then(|server| server.env.get(htui_mcp::ENV_TOKEN))
                 .cloned();
+            let kind = scope_kind(&prompt);
             let inner = self.inner.start(spec, prompt);
             let play = self.play.clone();
             let mcp = self.mcp.clone();
@@ -462,7 +463,10 @@ pub(crate) mod tests {
                         let token = token.expect("the spec carries htui's server");
                         let mut client = host.client(&token).expect("the session's token is live");
                         client.initialize().await.expect("initialize is answered");
-                        for (tool, arguments) in calls {
+                        for (tool, mut arguments) in calls {
+                            if let Some(kind) = &kind {
+                                with_kind(&mut arguments, kind);
+                            }
                             let result = client
                                 .call(tool, arguments)
                                 .await
@@ -483,6 +487,33 @@ pub(crate) mod tests {
                     }) as Box<dyn AgentSession>),
                 }
             })
+        }
+    }
+
+    /// The session scope's output kind, read off the prompt's D19 `output` trailer — the engine
+    /// renders it exactly when a tool host serves the session and the phase has a kind.
+    fn scope_kind(prompt: &str) -> Option<String> {
+        let (_, rest) = prompt.rsplit_once("Write your `")?;
+        let (kind, _) = rest.split_once("` document by calling the `document_write` tool")?;
+        Some(kind.to_owned())
+    }
+
+    /// Blueprint §9.2(d): every `"{kind}"` in a call's string values becomes the scope's kind.
+    fn with_kind(value: &mut serde_json::Value, kind: &str) {
+        match value {
+            serde_json::Value::String(text) => *text = text.replace("{kind}", kind),
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    with_kind(value, kind);
+                }
+            }
+            serde_json::Value::Object(fields) => {
+                for value in fields.values_mut() {
+                    with_kind(value, kind);
+                }
+            }
+            serde_json::Value::Null | serde_json::Value::Bool(_) | serde_json::Value::Number(_) => {
+            }
         }
     }
 
@@ -966,7 +997,7 @@ pub(crate) mod tests {
         let fixture = Fixture::new().await;
         fixture.sessions.push(Play::Tools(vec![(
             "document_write",
-            json!({ "body": "the research, through the tool" }),
+            json!({ "body": "the {kind}, through the tool" }),
         )]));
         let mut worker = Worker::spawn(&fixture.store, fixture.runtime_with_tools());
         let (_run, research) = parked(&fixture, &mut worker).await;
@@ -976,11 +1007,19 @@ pub(crate) mod tests {
             .documents(ids::HTUI_ANA_2)
             .await
             .expect("the read answers");
-        assert!(
-            heads.iter().any(
-                |head| head.kind == "research" && head.produced_by_step_id == Some(research.id)
-            ),
-            "the tool wrote the step's output: {heads:?}"
+        let head = heads
+            .iter()
+            .find(|head| head.kind == "research" && head.produced_by_step_id == Some(research.id))
+            .unwrap_or_else(|| panic!("the tool wrote the step's output: {heads:?}"));
+        let written = fixture
+            .store
+            .document(head.id)
+            .await
+            .expect("the read answers")
+            .expect("the head's document");
+        assert_eq!(
+            written.body, "the research, through the tool",
+            "blueprint §9.2(d): `{{kind}}` is the scope's kind"
         );
         let ask = worker.send(Origin::App, StoreRequest::RunActions(ids::HTUI_ANA_2));
         let StoreReply::RunActions(actions) = worker.reply(ask).await else {
