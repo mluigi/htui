@@ -416,8 +416,9 @@ pub(super) struct ExecutionGraph {
     width: f64,
     /// The pending viewport move (B-3).
     reveal: Reveal,
-    /// MOD-71 D7: the canvas size the last drawable frame had. A different one reveals the
-    /// cursor; a pan or a zoom alone never does.
+    /// MOD-71 D7: the size of the pane the last drawable canvas sat in. A different one reveals
+    /// the cursor; a pan or a zoom alone never does, and neither does a head line that comes or
+    /// goes, which moves the canvas inside the same pane (review M1).
     drawn: Option<(u16, u16)>,
 }
 
@@ -612,15 +613,17 @@ impl ExecutionGraph {
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
     ///
     /// A canvas under 2x2 draws nothing (`rataflow` `ui/canvas.rs:42`), so a reveal measured
-    /// against it would be wrong; it stays pending for the next frame (review L1). A canvas whose
-    /// size differs from the last drawable one reveals the cursor (MOD-71 D7).
-    pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+    /// against it would be wrong; it stays pending for the next frame (review L1). `pane` is the
+    /// area the canvas was cut from: one whose size differs from the last drawable frame's reveals
+    /// the cursor (MOD-71 D7). Not `area`'s size, which a head line coming or going changes on a
+    /// re-read, and that would undo a pan (review M1).
+    pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect, pane: Rect) {
         if !drawable(area) {
             return;
         }
-        // MOD-71 D7: a canvas of a new size reveals the cursor; the first drawable frame counts,
-        // which a pending `Reset` covers anyway.
-        let size = (area.width, area.height);
+        // MOD-71 D7, review M1: a pane of a new size reveals the cursor; the first drawable frame
+        // counts, which a pending `Reset` covers anyway.
+        let size = (pane.width, pane.height);
         if self.drawn != Some(size) {
             self.drawn = Some(size);
             self.reveal = self.reveal.max(Reveal::Cursor);
@@ -1030,7 +1033,7 @@ mod tests {
     fn draw_at(graph: &mut ExecutionGraph, width: u16, height: u16) -> Buffer {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
             .expect("the test backend is constructible");
-        term.draw(|frame| graph.render(frame, frame.area()))
+        term.draw(|frame| graph.render(frame, frame.area(), frame.area()))
             .expect("the graph draws");
         term.backend().buffer().clone()
     }
@@ -1421,7 +1424,7 @@ mod tests {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(43, 23))
             .expect("the test backend is constructible");
         for _ in 0..2 {
-            term.draw(|frame| graph.render(frame, frame.area()))
+            term.draw(|frame| graph.render(frame, frame.area(), frame.area()))
                 .expect("the graph draws");
             assert_no_ghost_corner(term.backend().buffer());
         }
@@ -1431,7 +1434,7 @@ mod tests {
             &BTreeMap::new(),
             &Theme::default(),
         );
-        term.draw(|frame| graph.render(frame, frame.area()))
+        term.draw(|frame| graph.render(frame, frame.area(), frame.area()))
             .expect("the graph draws");
         assert_no_ghost_corner(term.backend().buffer());
     }

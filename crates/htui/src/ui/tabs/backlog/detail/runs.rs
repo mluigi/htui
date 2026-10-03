@@ -1541,7 +1541,7 @@ impl DetailTab for RunsTab {
             return;
         }
         if self.view == View::Flow {
-            self.render_flow(frame, list, ctx.theme);
+            self.render_flow(frame, list, area, ctx.theme);
             return;
         }
 
@@ -1562,8 +1562,10 @@ impl DetailTab for RunsTab {
 
 impl RunsTab {
     /// MOD-28 D11: the flow branch of `render`. The head is what the list says about the cursor's
-    /// run and step, and the rest is the canvas, or "No steps yet." under a run with none.
-    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    /// run and step, and the rest is the canvas, or "No steps yet." under a run with none. `pane`
+    /// is the whole pane, footer included, whose size alone decides a resize reveal (MOD-71 D7,
+    /// review M1).
+    fn render_flow(&self, frame: &mut Frame<'_>, area: Rect, pane: Rect, theme: &Theme) {
         let Some(run) = self.entry_run() else {
             return;
         };
@@ -1583,7 +1585,7 @@ impl RunsTab {
         if drawable(canvas) {
             self.canvas.set(Some(canvas));
         }
-        self.graph.borrow_mut().render(frame, canvas);
+        self.graph.borrow_mut().render(frame, canvas, pane);
     }
 
     /// MOD-28 review L3, H1: the flow's head, the lines the list draws for `run` and the cursor's
@@ -4293,6 +4295,48 @@ mod tests {
             );
         }
         assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
+    }
+
+    /// Review M1: a head line that comes and goes (here a `Waiting` frame's) moves the canvas
+    /// inside an unchanged pane, which is no resize: a pan that took the cursor node off screen
+    /// stays where the user put it (D7).
+    #[tokio::test]
+    async fn a_head_line_keeps_a_pan() {
+        let shell = Shell::new();
+        let (mut pane, drawn) = flowing(&shell).await;
+        let (column, row) = blank_cell(&drawn);
+        for (kind, row) in [
+            (MouseEventKind::Down(MouseButton::Left), row),
+            (MouseEventKind::Drag(MouseButton::Left), row - 10),
+            (MouseEventKind::Up(MouseButton::Left), row - 10),
+        ] {
+            pane.on_mouse(mouse(kind, column, row), &mut shell.ctx());
+        }
+        let panned = lines(&pane, &shell);
+        assert!(
+            !panned.iter().any(|line| line.contains("0.1 done")),
+            "the pan took the cursor node off screen: {panned:#?}"
+        );
+
+        pane.on_reply(
+            &StoreReply::RunStream(RunFrame {
+                item: ids::HTUI_FEAT_1,
+                run: Some(ids::RUN_1),
+                kind: FrameKind::Waiting,
+            }),
+            &mut shell.ctx(),
+        );
+        let waiting = lines(&pane, &shell);
+        assert!(
+            waiting
+                .iter()
+                .any(|line| line.trim() == "waiting for the walk"),
+            "{waiting:#?}"
+        );
+        assert!(
+            !waiting.iter().any(|line| line.contains("0.1 done")),
+            "the head line revealed the cursor: {waiting:#?}"
+        );
     }
 
     /// D5, D9: the wheel zooms the flow at the pointer, only over the canvas.
