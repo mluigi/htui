@@ -214,7 +214,21 @@ impl DetailRegistry {
 
     /// Hands a reply to every sub-tab: the seven reads are issued together, so a sub-tab is
     /// populated before it is ever looked at.
+    ///
+    /// MOD-13 milestone 5 E4: a compose read's answer (`NoteForm`, `DocumentForm`) opens an area,
+    /// so it goes to the active sub-tab alone. If the strip moved while the read was in flight, no
+    /// area opens on a hidden pane that `captures_input` would not see and the item form could
+    /// open over.
     pub fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        if matches!(
+            reply,
+            StoreReply::NoteForm { .. } | StoreReply::DocumentForm(_)
+        ) {
+            if let Some(tab) = self.tabs.get_mut(self.active) {
+                tab.on_reply(reply, ctx);
+            }
+            return;
+        }
         for tab in &mut self.tabs {
             tab.on_reply(reply, ctx);
         }

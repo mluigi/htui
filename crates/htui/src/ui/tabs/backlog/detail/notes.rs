@@ -6,7 +6,8 @@
 //!   every key. Ctrl+S sends `AddNote`, Ctrl+E hands the text to `$EDITOR`, `Esc` drops it. While
 //!   browsing, `J`/`K` and `PgUp`/`PgDn` scroll the thread and every other key passes.
 //! - **Replies** are this pane's own requests for this pane's item: a `NoteForm` opens the area
-//!   only for the `a` that asked, and `NoteAdded` closes it and re-reads the thread.
+//!   only for the `a` that asked, and only while Notes is the active sub-tab (the registry hands
+//!   it to no other, E4), and `NoteAdded` closes it and re-reads the thread.
 //! - **D10**: a refused `AddNote` (offline, the validator, an unknown item) keeps the text and
 //!   says the sentence; any other failure may have followed a COMMIT whose answer was lost, so it
 //!   is hedged and the thread re-read.

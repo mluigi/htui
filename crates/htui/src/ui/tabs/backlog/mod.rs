@@ -3015,4 +3015,42 @@ mod tests {
         tab.on_reply(&StoreReply::NoteForm { item }, &mut bench.ctx());
         assert!(tab.detail.captures_input());
     }
+
+    /// Milestone 5 E4: `a` in Notes, then `l` before its `NoteForm` answers. The reply reaches
+    /// only the active sub-tab, so back on Notes nothing captures (and `e` could not have opened
+    /// the item form over a hidden area).
+    #[tokio::test]
+    async fn a_compose_read_answered_after_the_strip_moved_opens_nothing() {
+        let bench = Bench::new().await;
+        let Selection::Item(item) = bench.first else {
+            panic!("the first row is an item")
+        };
+        let mut tab = bench.tab();
+        tab.detail.on_item_change(Some(item));
+        assert!(tab.detail.select_id(NotesTab::ID));
+        assert_eq!(
+            press(&mut tab, &bench, KeyCode::Char('a')),
+            Handled::Consumed
+        );
+        assert!(
+            bench.actions().iter().any(|action| matches!(
+                action,
+                Action::Store(StoreRequest::NoteForm { item: asked }) if *asked == item
+            )),
+            "`a` sent the NoteForm read"
+        );
+        press(&mut tab, &bench, KeyCode::Char('l'));
+        assert_ne!(
+            tab.detail.active_id(),
+            Some(NotesTab::ID),
+            "the strip moved"
+        );
+
+        tab.on_reply(&StoreReply::NoteForm { item }, &mut bench.ctx());
+        assert!(tab.detail.select_id(NotesTab::ID));
+        assert!(
+            !tab.detail.captures_input(),
+            "no area opened on the hidden Notes pane"
+        );
+    }
 }
