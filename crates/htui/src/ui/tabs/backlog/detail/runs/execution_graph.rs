@@ -10,6 +10,9 @@
 //! zooms at the pointer (D9), and a press on a node is a click on release that moves the cursor
 //! (D6); no node ever moves (MOD-28 D9). A pan or a zoom survives a re-read: only a cursor
 //! change, a resize or a new run moves the viewport (D7).
+//!
+//! MOD-74 D6: a live pan re-anchors at its last pointer on every draw, so a re-read's shift, a
+//! canvas moved by the head and a wheel zoom all pan on from what is on screen.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -423,13 +426,6 @@ pub(super) struct ExecutionGraph {
     /// MOD-74 D6: the terminal cell of a live pan's last pointer, `None` with no pan. Assigned by
     /// every left press (a pan only on rataflow's `PaneClicked`, `mouse.rs:263-273`; B-1),
     /// moved by its drags, cleared by its release and by `end_gesture`.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "MOD-74 T3 red: read by render in the green commit"
-        )
-    )]
     pan: Option<(u16, u16)>,
 }
 
@@ -612,6 +608,25 @@ impl ExecutionGraph {
             return None;
         }
         let response = self.flow.handle_mouse_event(mouse);
+        // MOD-74 D6, B-1: every left press assigns the pan, so a press on a node forgets one
+        // whose release was never reported; only rataflow's empty-canvas start is a pan.
+        let at = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pans = response
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, FlowEvent::PaneClicked { .. }));
+                self.pan = pans.then_some(at);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pan) = self.pan.as_mut() {
+                    *pan = at;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.pan = None,
+            _ => {}
+        }
         match self.cursor {
             Some(cursor) => self.flow.select_node(&cursor.to_string()),
             None => self.flow.clear_selection(),
@@ -626,6 +641,7 @@ impl ExecutionGraph {
     /// `AwaitingNodeClick`, gets a **locked** left release (`event_handlers.rs:496-509`): it
     /// resets the drag state and emits nothing, where an unlocked one would click the node.
     pub(super) fn end_gesture(&mut self) {
+        self.pan = None;
         if self.flow.is_dragging() {
             self.locked_left(MouseEventKind::Up(MouseButton::Left), (0, 0));
         }
@@ -684,6 +700,16 @@ impl ExecutionGraph {
             }
         }
         frame.render_widget(&mut self.flow, area);
+        // MOD-74 D6: rataflow's `Panning` keeps its own `initial_viewport` (`mouse.rs:818-825`),
+        // so a sync's review-L2 shift, a canvas moved by the head or a wheel zoom would be
+        // overwritten by the next drag. A locked press at the last pointer re-anchors it on what
+        // was just drawn, with this frame's canvas origin. Deltas are whole cells: with nothing
+        // changed it is a no-op up to float association.
+        if let Some(at) = self.pan
+            && self.flow.is_dragging()
+        {
+            self.locked_left(MouseEventKind::Down(MouseButton::Left), at);
+        }
     }
 
     /// The canvas's pan and zoom, which the pane compares across a mouse event to tell one that
