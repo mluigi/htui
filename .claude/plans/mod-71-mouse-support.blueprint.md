@@ -546,8 +546,10 @@ using `Bench` (`:1148-1197`) and `press`:
 | `the_detail_gets_the_mouse_only_with_no_form_open` | `Bench::new().await`; a `DetailRegistry` holding one `MouseProbe` (wants `true`); `let mut tab = BacklogTab { detail, ..bench.tab() };` | `tab.wants_mouse()`; `tab.on_mouse(click, &mut bench.ctx()) == Consumed`, `seen.len() == 1`. `press(f)`: `!tab.wants_mouse()`, `on_mouse == Pass`, `seen.len()` still 1. `press(Esc)` closes the form: wanted again. `wants.set(false)`: `!tab.wants_mouse()` and `on_mouse == Pass` (the registry's guard) |
 | `only_the_active_sub_tab_is_asked_for_the_mouse` | registry: probe A (wants `false`) then probe B (wants `true`), A active | `!registry.wants_mouse()`, `on_mouse == Pass`, B saw nothing; `registry.select(1)`: wanted, B sees it |
 
-The item form guard is the same expression; building an `ItemForm` needs a catalogue reply, so it is
-pinned by shape only (`wants_mouse` and `on_mouse` name both forms).
+The item form is covered in the first test too: after the filter form's `Esc`,
+`open_with(&mut tab, &bench, &MemStore::demo(), KeyCode::Char('N')).await` (the helper
+`the_item_form_reply_opens_the_form_and_it_captures` uses, `~:1913-1931`) opens it, which gives
+`!tab.wants_mouse()` and `on_mouse == Pass`, and its `Esc` makes the mouse wanted again.
 
 ### 3.8 Commits (T2)
 
@@ -558,4 +560,440 @@ pinned by shape only (`wants_mouse` and `on_mouse` name both forms).
    unused-parameter warning on a `todo!()` body is acceptable here; the gate runs on commit 2.
 2. `feat(mod-71): Event::Mouse reaches the active tab, and the loop toggles capture`: the bodies,
    the arm (§3.4) and §3.6. Gate: the T2 row of §1.
+
+---
+
+## 4. T3: gestures in the flow view (D5–D11)
+
+**Files**: `Cargo.toml`, `crates/htui/src/ui/tabs/backlog/detail/runs/execution_graph.rs`,
+`crates/htui/src/ui/tabs/backlog/detail/runs.rs`, `crates/htui/tests/backlog.rs`. No snapshot moves
+(B-12).
+
+### 4.1 `Cargo.toml` (`:169-173`, D10)
+
+```toml
+# MOD-28 D4: the Runs pane's flow view (ANA-12). No default features: `sugiyama` would pull in
+# rust-sugiyama, petgraph and second copies of hashbrown/foldhash, and our layered layout sets
+# every position itself. MOD-71 D10: `crossterm` is `From<crossterm::event::MouseEvent>` for the
+# flow's mouse (`input.rs:218-300`); it turns on `ratatui/crossterm`, which the default-featured
+# `ratatui` already has, so `Cargo.lock` does not move. Adds one crate; its two dependencies
+# (`ratatui`, `thiserror`) are already locked.
+rataflow               = { version = "0.1", default-features = false, features = ["crossterm"] }
+```
+
+rataflow converts through `ratatui::crossterm::event` (`input.rs:221`), which is the one
+`crossterm 0.29.0` in the lock (`Cargo.lock:1111-1113`), so htui's `crossterm::event::MouseEvent`
+satisfies `handle_mouse_event(impl Into<MouseEvent>)` (`state/event_handlers.rs:482`).
+
+### 4.2 `execution_graph.rs`: imports, module doc, struct, `Default`
+
+- `:11-14` gains `FlowEvent` in the `rataflow::{…}` list. New `use crossterm::event::{MouseButton,
+  MouseEvent, MouseEventKind};` after the `ratatui` uses.
+- Module doc (`:1-6`): append
+  ```text
+  //!
+  //! MOD-71: the mouse reaches the flow only through `ExecutionGraph::on_mouse`, from the Runs pane
+  //! while it browses the flow (D1, D5). A press on empty canvas or on an edge pans, the wheel
+  //! zooms at the pointer (D9), and a press on a node is a click on release that moves the cursor
+  //! (D6); no node ever moves (MOD-28 D9). A pan or a zoom survives a re-read: only a cursor
+  //! change, a resize or a new run moves the viewport (D7).
+  ```
+- `ExecutionGraph` (`:391-404`): the `flow` doc becomes "The canvas. Never fed a key (blueprint
+  H-1); a mouse event reaches it only through [`ExecutionGraph::on_mouse`] (MOD-71 D5)." New field,
+  last:
+  ```rust
+      /// MOD-71 D7: the canvas size the last drawable frame had. A different one reveals the
+      /// cursor; a pan or a zoom alone never does.
+      drawn: Option<(u16, u16)>,
+  ```
+- `Default` (`:406-416`):
+  ```rust
+              // Plan D9: an edge is never reconnected. MOD-71 D6: a press on empty canvas keeps
+              // the cursor node selected; rataflow's default clears it (`state/mod.rs:509`).
+              flow: Flow::new()
+                  .with_edges_reconnectable(false)
+                  .with_deselect_on_pane_click(false),
+  ```
+  and `drawn: None,`. `clear()` (`:520-528`) leaves `drawn` alone: the canvas did not change.
+- New free function, after `edge()` (`:353-376`):
+  ```rust
+  /// Whether rataflow draws into `area` at all (`ui/canvas.rs:42`): what `render` needs before it
+  /// measures a reveal (review L1), and what the Runs pane needs before it hit-tests a press
+  /// against the area rataflow recorded on that draw (MOD-71 D5, blueprint B-7).
+  pub(super) const fn drawable(area: Rect) -> bool {
+      area.width >= 2 && area.height >= 2
+  }
+  ```
+
+### 4.3 `ExecutionGraph::sync` (`:418-502`): the D7 reveal rule
+
+`:493-497` becomes:
+
+```rust
+        // MOD-71 D7: a same-run re-read reveals the cursor only when the cursor step changed, so
+        // the active-run poll and every `RunStream` re-read leave a pan or a wheel zoom where the
+        // user put it. A new run still resets.
+        let next = if self.run != Some(run.id) {
+            Reveal::Reset
+        } else if self.cursor != cursor {
+            Reveal::Cursor
+        } else {
+            Reveal::None
+        };
+```
+
+`self.cursor` is read before `:499` assigns it. The doc (`:419-429`) gains: "MOD-71 D7: a same-run
+sync reveals the cursor only when the cursor step changed; the review-L2 anchor keeps the nodes still
+either way." `zoom_in`/`zoom_out`/`fit` keep `Reveal::Cursor` (D7).
+
+### 4.4 `ExecutionGraph::render` (`:556-580`): the resize reveal
+
+```rust
+    pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
+        if !drawable(area) {
+            return;
+        }
+        // MOD-71 D7: a canvas of a new size reveals the cursor; the first drawable frame counts,
+        // which a pending `Reset` covers anyway.
+        let size = (area.width, area.height);
+        if self.drawn != Some(size) {
+            self.drawn = Some(size);
+            self.reveal = self.reveal.max(Reveal::Cursor);
+        }
+        let reveal = core::mem::take(&mut self.reveal);
+        // … unchanged from `:561`
+```
+
+The doc gains "A canvas whose size differs from the last drawable one reveals the cursor (MOD-71
+D7)." A sub-2×2 frame records nothing, so review L1's pending reveal still waits (E5).
+
+### 4.5 `ExecutionGraph::on_mouse` (after `fit`, `:547-551`)
+
+```rust
+    /// MOD-71 D5, D6, D8: one mouse event on the canvas, in terminal coordinates — rataflow maps
+    /// them through the area the last `render` drew (`ui/canvas.rs:37`). A left press on empty
+    /// canvas or on an edge (never selectable, so never hit) pans; the wheel zooms at the pointer
+    /// within 0.5–2.0 (D9); a left press on a node is a click when it is released, wherever that
+    /// is. Every other kind is dropped (blueprint E2).
+    ///
+    /// The clicked step, if this event completed a click; the pane moves the cursor (D6). No
+    /// reveal is queued (D7). After every event the flow's selection is put back on the cursor
+    /// (blueprint E1): rataflow selects a pressed node at once (`state/mouse.rs:230-237`), and
+    /// the flow keeps no selection of its own (MOD-28 D7).
+    pub(super) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<StepId> {
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+        ) {
+            return None;
+        }
+        let response = self.flow.handle_mouse_event(mouse);
+        match self.cursor {
+            Some(cursor) => self.flow.select_node(&cursor.to_string()),
+            None => self.flow.clear_selection(),
+        }
+        response.into_events().find_map(|event| match event {
+            FlowEvent::NodeClicked { node_id } => node_id.parse().ok(),
+            _ => None,
+        })
+    }
+```
+
+`node_id` is `StepId::to_string()` (`sync`, `:466`), and `StepId: FromStr` (`htui-core/src/model/ids.rs:54-60`);
+an id that doesn't parse is no click (E3). `select_node` clears first (`state/selection.rs:61-69`).
+In T3's red commit the body is `todo!("MOD-71 T3")` under
+`#[cfg_attr(not(test), expect(dead_code, reason = "MOD-71 T3's runs.rs commit calls it"))]`, and
+`drawable` carries the same attribute until `runs.rs` uses it. Both attributes go in commit 3.
+
+### 4.6 `runs.rs`
+
+- Imports: `:63` becomes `use ratatui::layout::{Constraint, Layout, Position, Rect};`; `:66` becomes
+  `use self::execution_graph::{ExecutionGraph, by_step, drawable};`; `:78` becomes
+  `use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};`.
+- Module doc: append after the MOD-72 paragraph (`:41-43`):
+  ```text
+  //!
+  //! MOD-71: in the flow, while browsing, the pane takes the mouse (D1): a click on a node moves the
+  //! cursor there, a drag on empty canvas pans, and the wheel zooms at the pointer. Every other view
+  //! and every modal leaves the terminal's own text selection alone.
+  ```
+- `RunsTab` fields, after `tool_calls` (`:213-215`); `#[derive(Debug, Default)]` holds
+  (`Cell<Option<Rect>>` is `Debug` and `Default`):
+  ```rust
+      /// MOD-71 D5: the flow canvas the last frame drew, which a press is hit-tested against;
+      /// `None` on every frame without one. Written in `render` (`&self`), read by `on_mouse`.
+      canvas: Cell<Option<Rect>>,
+      /// MOD-71 D5, D11: a left press that started on the canvas and is not released yet, so its
+      /// drag and release reach the flow even past the pane's edge. `v`, an item change and a
+      /// capturing mode end it.
+      gesture: bool,
+  ```
+- New inherent fn after `sync_graph` (`:378-394`):
+  ```rust
+      /// MOD-71 D6: a clicked node moves the cursor to that step's entry in the cursor's run (only
+      /// that run is on the canvas), then the flow syncs, as `J`/`K` do. A step the entries don't
+      /// hold leaves the cursor where it is.
+      fn select_step(&mut self, step: StepId, theme: &Theme) {
+          let run = match self.entry() {
+              Some(Entry::Step { run, .. } | Entry::Run { run }) => run,
+              None => return,
+          };
+          let at = self.entries().iter().position(|entry| {
+              matches!(entry, Entry::Step { run: r, step: s } if *r == run && *s == step)
+          });
+          if at.is_some() {
+              self.selected = at;
+          }
+          self.sync_graph(theme);
+      }
+  ```
+- `on_item_change` (`:1242-1252`): add `self.gesture = false; // MOD-71 D11` after
+  `self.mode = Mode::Browse;`.
+- `on_key`, the `v` arm (`:1306-1318`): `self.gesture = false;` as its first statement, with
+  `// MOD-71 D11: the gesture ends with the view.` The action arm (`:1323-1326`) becomes:
+  ```rust
+              KeyCode::Char(
+                  key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
+              ) => {
+                  let handled = self.action(key, ctx);
+                  // MOD-71 D11: a mode that captures input ends a live gesture (blueprint B-8).
+                  if self.captures_input() {
+                      self.gesture = false;
+                  }
+                  return handled;
+              }
+  ```
+- `impl DetailTab for RunsTab`, after `on_paste` (`:1336-1347`):
+  ```rust
+      /// MOD-71 D1: the flow view while browsing. The list, a modal and the artifact view keep the
+      /// terminal's own text selection.
+      fn wants_mouse(&self) -> bool {
+          self.view == View::Flow && matches!(self.mode, Mode::Browse)
+      }
+
+      /// MOD-71 D5, D6: a left press or the wheel inside the canvas the last frame drew, and the
+      /// drag and release of a press that started there, go to the flow; right and middle buttons,
+      /// and anything outside, pass. A click on a node moves the cursor (`select_step`). Every
+      /// forwarded event is `Consumed`, so a pan or a zoom is redrawn (blueprint E4).
+      fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+          if !self.wants_mouse() {
+              self.gesture = false;
+              return Handled::Pass;
+          }
+          let inside = self
+              .canvas
+              .get()
+              .is_some_and(|canvas| canvas.contains(Position::new(mouse.column, mouse.row)));
+          let forward = match mouse.kind {
+              MouseEventKind::Down(MouseButton::Left) => {
+                  self.gesture = inside;
+                  inside
+              }
+              MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => inside,
+              MouseEventKind::Drag(MouseButton::Left) => self.gesture,
+              MouseEventKind::Up(MouseButton::Left) => core::mem::take(&mut self.gesture),
+              _ => false,
+          };
+          if !forward {
+              return Handled::Pass;
+          }
+          if let Some(step) = self.graph.get_mut().on_mouse(mouse) {
+              self.select_step(step, ctx.theme);
+          }
+          Handled::Consumed
+      }
+  ```
+  `self.graph.get_mut()` (H-1). `ctx` is `&mut Ctx` but only `ctx.theme` is read.
+- `render` (`:1437`): first statement `self.canvas.set(None);` with
+  `// MOD-71 D5: only a frame that draws the canvas records it (render_flow).` (H-10).
+- `render_flow` (`:1488-1504`), just before `self.graph.borrow_mut().render(frame, canvas);`:
+  ```rust
+          // MOD-71 D5, blueprint B-7: the canvas a press is hit-tested against, only when
+          // rataflow records it on this draw.
+          if drawable(canvas) {
+              self.canvas.set(Some(canvas));
+          }
+  ```
+
+### 4.7 Tests (first)
+
+**Existing tests whose expectation D7 could change** (searched: `viewport` appears in no `runs.rs`
+test, and only in these `execution_graph.rs` ones):
+
+| Test | Line | Verdict |
+|---|---|---|
+| `a_re_sync_of_the_same_run_keeps_zoom_selection_and_hidden_handles` | `:1129` | **unchanged**: same cursor; it already expected the viewport kept, and now no reveal runs at all |
+| `a_wider_re_read_of_the_same_run_keeps_the_nodes_still` | `:1299` | **unchanged**: same cursor, the L2 anchor does the work |
+| `a_re_sync_with_new_counts_keeps_the_viewport` | `:1584` | **unchanged** |
+| `the_reveal_leaves_no_ghost_corner` | `~:1340` | **unchanged**: its re-sync moves the cursor `id(7)` → `id(0)`, so the reveal still runs; the second same-size draw now skips the scratch pass, which only removes a ghost source |
+| `a_reveal_waits_for_a_canvas_big_enough_to_hold_it` | `~:1290` | **unchanged**: the 1×1 draw returns before `drawn` is recorded (E5) |
+| `two_renders_of_the_same_state_are_identical` | `~:1218` | **unchanged**: second draw, same size, no reveal, same viewport |
+| `a_cursor_below_the_fold_is_visible_on_the_first_render`, `fit_keeps_the_cursor_node_on_screen`, `zoom_is_clamped_and_fit_zooms_out_to_a_tall_run` | `~:1183`, `~:1275`, `~:1255` | **unchanged**: `Reset`, `fit` and the zoom keys keep their reveals |
+| `runs.rs` `a_tool_calls_reply_draws_the_chips_in_flow` | `~:3960` | **unchanged**: the reply's same-cursor sync queues no reveal now, but `v` (`Reset`) and `J` (`Cursor`) are still pending when `lines` draws |
+| `no_node_is_draggable_connectable_or_deletable` | `:1230` | **unchanged** (B-2) |
+
+No existing test must be updated.
+
+**`execution_graph.rs` `mod tests`**: a new section at the end, "MOD-71 T3: the mouse (plan
+D5–D9)". Coordinates (H-8): `draw` is 43×23 at `(0, 0)`, so a buffer cell **is** the terminal
+cell. A new run is centred at zoom 1: `linear(n)` nodes occupy columns 11–30 and rows
+`1 + 8k ..= 5 + 8k` (`a_new_run_is_centred_at_zoom_one`, `:1163-1166`, pins `(11, 1)`). Helpers:
+
+```rust
+    use crossterm::event::{KeyModifiers, MouseButton::{Left, Right}, MouseEventKind::*};
+
+    /// `kind` at cell `(column, row)`, no modifier.
+    fn mouse(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
+        MouseEvent { kind, column, row, modifiers: KeyModifiers::NONE }
+    }
+
+    /// A left press then its release at `at`: a click. The press answers `None`.
+    fn click(graph: &mut ExecutionGraph, at: (u16, u16)) -> Option<StepId> {
+        assert_eq!(graph.on_mouse(mouse(Down(Left), at)), None, "a press clicks nothing yet");
+        graph.on_mouse(mouse(Up(Left), at))
+    }
+
+    /// A left press at `from`, a drag to `to`, the release there: the release's answer.
+    fn drag(graph: &mut ExecutionGraph, from: (u16, u16), to: (u16, u16)) -> Option<StepId>
+
+    /// Every node's id and world corner, in flow order.
+    fn positions(graph: &ExecutionGraph) -> Vec<(String, (f64, f64))> {
+        graph.flow.nodes().map(|node| (node.id.clone(), (node.position.x, node.position.y))).collect()
+    }
+
+    /// Asserts `at` is blank in `buf`, so a press there lands on empty canvas.
+    fn assert_blank(buf: &Buffer, at: (u16, u16))
+```
+
+(Write the `MouseEventKind`/`MouseButton` imports however `use super::*` lets them resolve; spell
+`MouseEventKind::Down(MouseButton::Left)` in full if a glob import shadows something.)
+
+| Test | Setup | Assertion |
+|---|---|---|
+| `a_click_on_a_node_is_its_step` | `synced(&linear(2), Some(id(0)))`, `buf = draw(..)`, `(x, y) = corner_of(&buf, "1.1 done")` | `click(&mut graph, (x + 2, y + 2)) == Some(id(1))`; `graph.selected() == Some(id(0).to_string())`: the graph does not move the cursor, the pane does |
+| `a_press_on_a_node_keeps_the_cursor_selected` | as above | `graph.on_mouse(mouse(Down(Left), (x + 2, y + 2))) == None` and, **before** any release, `graph.selected() == Some(id(0).to_string())` and exactly one node is `selected` (E1, B-1) |
+| `a_drag_on_empty_canvas_pans_and_moves_no_node` | `linear(2)`, draw, `assert_blank(&buf, (2, 12))`, record `v = graph.flow.viewport`, `p = positions(..)` | `drag(.., (2, 12), (5, 14)) == None`; `viewport.x == v.x + 3.0`, `viewport.y == v.y + 2.0` (within `f64::EPSILON`), zoom unchanged; `positions == p` |
+| `a_node_press_dragged_away_is_still_a_click` | `linear(2)`, cursor `id(0)`, corner of `"1.1 done"` | `drag(.., (x + 2, y + 2), (x + 7, y + 5)) == Some(id(1))`; viewport and `positions` unchanged (D6: `AwaitingNodeClick` ignores the drag, `mouse.rs:819`) |
+| `the_wheel_zooms_at_the_pointer_within_the_flow_s_range` | `linear(2)`, draw | ten `ScrollUp` at `(21, 3)`, each `None`: `zoom() == 2.0` (1e-9); ten `ScrollDown`: `0.5` (D9) |
+| `a_right_drag_selects_nothing` | `linear(2)`, cursor `id(0)`, draw | `Down(Right)` at `(2, 12)`, `Drag(Right)` to `(40, 20)` (a box over both nodes), `Up(Right)`: each `None`; `graph.selected() == Some(id(0).to_string())`, one node selected (E2, B-9) |
+| `an_edge_press_pans` | `linear(2)`, cursor `id(0)`, `(x, y) = corner_of(&buf, "0.1 done")`, `row = y + 6`, `column` = the first non-blank cell of `row` (asserted found: the edge) | `drag(.., (column, row), (column + 3, row + 1)) == None`; viewport moved by `(3, 1)`; still `id(0)` selected. Green on write (B-2) |
+| `a_pane_click_keeps_the_cursor_node_selected` | `linear(2)`, cursor `id(1)`, draw, `assert_blank((2, 12))` | `click(.., (2, 12)) == None`; `graph.selected() == Some(id(1).to_string())` |
+| `a_re_read_after_a_pan_keeps_the_viewport` | `synced(&linear(3), Some(id(0)))`, draw; `assert_blank((2, 20))`; `drag(.., (2, 20), (2, 2))` (viewport y 1 → −17, the cursor node off screen); `v = viewport` | re-sync a copy with `steps[2].status = Running`, cursor `id(0)`; draw: `viewport == v`, and no row contains `"0.1 done"` (D7; red before §4.3) |
+| `a_cursor_change_reveals_the_cursor` | the same pan | `graph.sync(Some(&linear(3)), Some(id(1)), ..)`; draw: some row contains `"1.1 done"`. Green on write: pins what D7 keeps |
+| `a_resize_reveals_the_cursor` | the same pan, then a same-size draw (still off screen) | `draw_at(&mut graph, 43, 20)`: some row contains `"0.1 done"` (D7; red before §4.4) |
+
+**`runs.rs` `mod tests`**: a new section after the MOD-72 one (after
+`an_item_change_forgets_the_tool_calls`, `:3985-…`), "MOD-71: the mouse in the flow view (plan D1,
+D5, D6, D11)". `lines` (`:1764`) draws the pane at 43×16 at `(0, 0)`; after `pane(&shell)` and `v`
+the head is two rows (`graph…`, `manual…`), so the canvas is rows 2–15 and `FEAT-1`'s four linear
+nodes sit at columns 11–30, `0.1` on rows 3–7 and `1.1` on rows 11–15. Helpers: `fn mouse(kind,
+column, row) -> MouseEvent` (no modifier), and `fn cell(lines: &[String], needle: &str) -> (u16, u16)`
+built on `column` (`:1782`): the row index and the char column.
+
+| Test | Setup | Assertion |
+|---|---|---|
+| `the_mouse_is_wanted_in_the_flow_while_browsing_only` | `driven(&shell, true)` (`:2449`) | list: `!pane.wants_mouse()`; `v`: wanted; for `x`, `c`, `shift('C')`, `o` (the `captures_input_follows_the_mode` openers, `:3282-3305`): not wanted while open, wanted again after `Esc`; `v`: not wanted |
+| `a_click_on_a_node_moves_the_cursor` | `pane(&shell)`, `v`, drain, `lines`; `(c, r) = cell(&lines, "1.1 done")` | `Down(Left)` and `Up(Left)` at `(c, r)` each `Consumed`; `selected_step() == Some(STEP_PLAN)`; `graph.borrow().selected() == Some(STEP_PLAN.to_string())`; `shell.emit.is_empty()` |
+| `a_press_outside_the_canvas_passes` | as above | `Down(Left)` at `(0, 0)` (the run line) → `Pass`, cursor still `STEP_PRD`. Also: a fresh `pane`, `v`, **no** `lines`: a press at `(c, r)` passes (canvas `None`, plan Risks row "before the first flow frame") |
+| `a_drag_that_leaves_the_canvas_still_ends` | `lines`, blank `(2, r)` with `r` = the `"1.1 done"` row (`lines[r]` has a space at char 2) | `Down` at `(2, r)`, `Drag` to `(2, 0)`, `Up` at `(2, 0)`: all `Consumed`; then `Drag` at `(2, r)`: `Pass` (no live gesture) |
+| `v_an_item_change_and_a_modal_end_a_live_gesture` | `driven(&shell, true)`, `v`, `lines` | three cases, each starting `Down(Left)` at a blank canvas cell: (1) `v`, `v`; (2) `x`, `Esc`; (3) `on_item_change(Some(HTUI_FEAT_1))` then re-feed `Runs` (`feat_1_runs`) and `lines`. After each, `Drag(Left)` at that cell is `Pass` (D11) |
+| `right_and_middle_presses_pass` | `lines` | `Down(Right)` and `Down(Middle)` at `(c, r)` → `Pass`, cursor unchanged |
+| `the_wheel_zooms_inside_the_canvas_only` | `lines` | `ScrollUp` at `(c, r)` → `Consumed`, `graph.borrow().zoom() > 1.0`; `ScrollUp` at `(0, 0)` → `Pass` |
+
+**`tests/backlog.rs`** (§4.7b), after `the_flow_draws_the_plan_step_s_tool_call_as_a_chip`
+(`:893-912`), before the Graph section header (`:914`). Imports: `crossterm::event::{MouseButton,
+MouseEventKind}`. Helper:
+
+```rust
+/// The cell `needle` starts at in a frame, `(column, row)`. Every glyph in a Backlog frame is one
+/// cell wide (box drawing, `…`, `✓`, `·`), so a char count is a column.
+fn cell_of(frame: &str, needle: &str) -> (u16, u16)
+```
+
+From `backlog__runs_flow_fanout.snap`, `ANA-1`'s candidates' text row is frame row 8, and
+`"0.1/1 superseded"` starts inside the right node.
+
+```rust
+/// MOD-71 D1, D6, ANA-12 invariant 2: in the flow, a click on `ANA-1`'s losing candidate moves the
+/// shared cursor to it, so `a` answers for that step, and the list shows the cursor there.
+#[tokio::test]
+async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, 1);
+    assert!(!harness.app().wants_mouse(), "the list keeps the terminal's selection");
+    harness.key("v");
+    harness.drive_to_end().await;
+    assert!(harness.app().wants_mouse(), "the flow wants the mouse");
+    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
+
+    let verdicts = run_worker::actions(&Backend::memory(MemStore::demo()), ids::HTUI_ANA_1, &LiveChats::default())
+        .await
+        .expect("the verdicts read");
+    let sentence = verdicts.steps[&ids::STEP_R3_RESEARCH_B]
+        .approve
+        .clone()
+        .expect_err("a step of a finished run cannot be approved");
+    harness.key("a");
+    harness.drive().await;
+    assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
+
+    harness.key("v");
+    harness.drive_to_end().await;
+    assert!(!harness.app().wants_mouse());
+    let frame = harness.render();
+    let loser = frame.lines().find(|line| line.contains("0.1/1")).expect("the loser is listed");
+    assert!(loser.contains('\u{25b8}'), "the list's cursor is on the clicked step:\n{frame}");
+}
+
+/// MOD-71 D5, D9: a drag on empty canvas moves the drawn nodes by the drag, and the wheel redraws
+/// them at another zoom; neither moves the cursor.
+#[tokio::test]
+async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
+    // `backlog`, sub-tab 1, `v`, `drive_to_end`; `(c, r) = cell_of(&render, "0.1/0 done")`.
+    // `(c, r + 8)` is blank canvas (the snapshot's rows under the nodes): `Down` there, `Drag` to
+    // `(c + 2, r + 9)`, `Up`; `cell_of(&render, "0.1/0 done") == (c + 2, r + 1)`.
+    // Then `ScrollDown` at the same blank cell: the next frame differs from the one before it.
+}
+```
+
+If `STEP_R3_RESEARCH_B`'s `approve` turns out `Ok`, use the key whose verdict for it is an `Err`
+(`s`, `r`); the `▸` assertion is the decisive one either way (B-10).
+
+### 4.8 Commits (T3)
+
+1. `test(mod-71): flow gestures, the reveal rule and a click end to end (red)`: §4.1, the
+   §4.2 imports, `ExecutionGraph::on_mouse` with a `todo!()` body and `drawable` (both under the
+   §4.5 `expect(dead_code)`), and every §4.7 test. `RunsTab` keeps the trait defaults (H-3). Red:
+   the graph's mouse tests panic in `todo!()`, the D7/resize tests see the reveal, the `runs`
+   tests see `false`/`Pass`, the integration test sees no capture.
+2. `feat(mod-71): the flow takes clicks, drags and the wheel, and a pan survives a re-read`:
+   §4.2–§4.5 in `execution_graph.rs` (the `on_mouse` body, the flow config, `drawn`, the reveal
+   rule). Gate: `cargo test -p htui --all-features --lib detail::runs::execution_graph -- --test-threads=1`.
+3. `feat(mod-71): the Runs pane routes the flow's mouse and moves the cursor on a click`: §4.6, and
+   the two `expect(dead_code)` attributes removed. Gate: the T3 row of §1, then
+   `cargo test -p htui --all-features -- --test-threads=1`.
+
+### 4.9 Data flow (whole feature)
+
+The event loop asks `App::wants_mouse()` after every step and `TerminalGuard::set_mouse_capture`
+writes `EnableMouseCapture`/`DisableMouseCapture` on a change. It is true only with no overlay, no
+`?` box, the Backlog active with no form open, the Runs sub-tab active, and `RunsTab` in `View::Flow`
+and `Mode::Browse`. Each `Event::Mouse` goes through `App::on_terminal_event`, then `App::on_mouse`
+(gate, `Moved`/horizontal-wheel drop, status taken). It then goes to `BacklogTab::on_mouse` (form
+guard), `DetailRegistry::on_mouse` (active sub-tab's `wants_mouse`) and `RunsTab::on_mouse`. That
+checks the canvas `Rect` (`render_flow` recorded it on the last frame) for presses and the wheel,
+and the gesture flag for drags and releases. Accepted events go to `ExecutionGraph::on_mouse` and
+then to `Flow::handle_mouse_event`, where rataflow maps terminal cells to world positions through
+its own render context. A pan or a wheel zoom changes `flow.viewport` and queues no reveal. A
+`NodeClicked` on release comes back as a `StepId`. `select_step` moves `selected` within the
+cursor's run, and `sync_graph` rebuilds the nodes with the new cursor selected. A cursor change
+queues `Reveal::Cursor`. `Consumed` sets `dirty`, so the next frame draws it. Every give-back
+(`restore_terminal`, the panic hook, `Suspend::leave`) turns capture off. After `$EDITOR`, the
+loop's next ask turns it back on if it is still wanted.
 
