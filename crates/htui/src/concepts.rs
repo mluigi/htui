@@ -14,6 +14,7 @@
 //! keyring once at `htui worker` start and, when it holds a Qdrant URL, spawns [`index_loop`],
 //! which re-syncs every project at start and then every [`sync_interval`].
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
@@ -29,6 +30,8 @@ use htui_store::vector::{
 use htui_store::vector_sync::{Indexer, SyncReport};
 use htui_store::{HeadlessError, PgStore, identity, secret};
 use serde_json::Value;
+
+use crate::concepts_worker::{self, QdrantIndex};
 
 /// Options of `--search-items`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,6 +302,15 @@ pub async fn index_loop(source: &impl IndexSource, vectors: &impl VectorStore) -
 /// `htui worker` start (MOD-41 PRD D6, plan D19). `None`, with an `info` line saying why, when it
 /// holds none or cannot be read, which on a keyring-less host is always.
 pub async fn spawn_index_job(pg: PgStore) -> Option<tokio::task::JoinHandle<()>> {
+    spawn_index_job_over(pg, concepts_worker::shared_qdrant()).await
+}
+
+/// [`spawn_index_job`], its model taken from `models` (MOD-11 H-26): in production the process-wide
+/// index `search_concepts` searches, so a worker that indexes and serves the tool loads one model.
+pub(crate) async fn spawn_index_job_over(
+    pg: PgStore,
+    models: Arc<QdrantIndex>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let settings = match apart("htui-index-keyring", keyring_settings).await {
         Some(Ok(settings)) => settings,
         Some(Err(why)) => {
@@ -311,7 +323,7 @@ pub async fn spawn_index_job(pg: PgStore) -> Option<tokio::task::JoinHandle<()>>
         }
     };
     Some(tokio::spawn(async move {
-        let store = open_index(&pg, &settings).await;
+        let store = open_index(&pg, &settings, &models).await;
         index_loop(&pg, &store).await;
     }))
 }
@@ -331,20 +343,23 @@ fn keyring_settings() -> Result<QdrantSettings, String> {
 }
 
 /// The model, then the collection; a failure is logged and another attempt follows after the
-/// interval, forever (plan D19). The model is fetched on this task and loaded on a thread of its
-/// own (`apart`), once: `RtenEmbedder` is `Clone`, so a retry after an unreachable Qdrant reuses
-/// it (MOD-68 A-4).
+/// interval, forever (plan D19). The model is `models`' (MOD-11 H-26): the one `search_concepts`
+/// shares, loaded once, on a thread of its own, and kept, so a retry after an unreachable Qdrant
+/// reuses it (MOD-68 A-4); a failed load is retried by the next attempt.
 ///
 /// An embedder mismatch is an `error` once, then `debug` (review L3), and is still re-checked
 /// every interval rather than ending the job: its remedy (delete the collection, run `htui
 /// --index-items`) happens outside this process, and a job that had ended would leave the worker
 /// never syncing again until restarted. A check is two Qdrant round trips per interval, not a
 /// hot loop.
-async fn open_index(pg: &PgStore, settings: &QdrantSettings) -> QdrantStore<RtenEmbedder> {
-    let mut loaded: Option<RtenEmbedder> = None;
+async fn open_index(
+    pg: &PgStore,
+    settings: &QdrantSettings,
+    models: &QdrantIndex,
+) -> QdrantStore<RtenEmbedder> {
     let mut reported = false;
     loop {
-        let (err, mismatch) = match index_model(&mut loaded).await {
+        let (err, mismatch) = match models.embedder().await {
             Ok(embedder) => match QdrantStore::connect(settings, embedder).await {
                 Ok(store) => return store,
                 Err(err) => {
@@ -381,28 +396,12 @@ fn open_failure_level(mismatch: bool, reported: &mut bool) -> tracing::Level {
     }
 }
 
-/// The loaded model, or a fetch (on this task: `apart` threads have no runtime) and a load (on a
-/// thread of its own), kept in `loaded` for the next attempt.
-async fn index_model(loaded: &mut Option<RtenEmbedder>) -> Result<RtenEmbedder, String> {
-    if let Some(embedder) = loaded {
-        return Ok(embedder.clone());
-    }
-    let files = model::ensure_model().await.map_err(|err| err.to_string())?;
-    let embedder = match apart("htui-index-model", move || RtenEmbedder::load(&files)).await {
-        Some(Ok(embedder)) => embedder,
-        Some(Err(err)) => return Err(err.to_string()),
-        None => return Err("the model loader stopped".to_owned()),
-    };
-    *loaded = Some(embedder.clone());
-    Ok(embedder)
-}
-
 /// `work` on a named thread of its own, awaited. Not `spawn_blocking`: the runtime waits for its
 /// blocking tasks when it is dropped, and a keyring prompt nobody answers or a model load
 /// must not hold `htui worker`'s exit (`worker_cmd::read_dsn_apart`'s reason). The thread is
 /// left behind on an abort and dies with the process. `None` when the thread cannot be spawned
-/// or ends without answering.
-async fn apart<T: Send + 'static>(
+/// or ends without answering. `concepts_worker`'s model load runs here too.
+pub(crate) async fn apart<T: Send + 'static>(
     name: &str,
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Option<T> {
@@ -891,6 +890,46 @@ mod tests {
             assert!(!job.is_finished(), "the job runs until it is aborted");
             job.abort();
             assert!(job.await.expect_err("aborted").is_cancelled());
+        }
+
+        /// MOD-11 H-26: the job takes its model from the index `search_concepts` searches, so a
+        /// worker that indexes and serves the tool loads the 133 MB model once, not twice.
+        #[tokio::test]
+        async fn the_index_job_and_the_search_share_one_model_load() {
+            use crate::concepts_worker::ConceptIndex as _;
+
+            let _keyring = htui_store::testkit::mock_keyring().await;
+            secret::set_qdrant_url("http://127.0.0.1:1").expect("the fake keyring stores");
+            let loads = Arc::new(AtomicUsize::new(0));
+            let index = Arc::new(QdrantIndex::with_loader({
+                let loads = Arc::clone(&loads);
+                move || {
+                    loads.fetch_add(1, Ordering::SeqCst);
+                    // A load still in flight: everyone who wants the model waits on this one.
+                    Box::pin(std::future::pending())
+                }
+            }));
+
+            let job = spawn_index_job_over(unreachable_store(), Arc::clone(&index))
+                .await
+                .expect("a stored URL starts the job");
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while loads.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("the job loads its model through the index");
+
+            let search = index.search(query("anything", vec![ProjectId::new()], false, 10));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), search)
+                    .await
+                    .is_err(),
+                "the search waits on the job's load"
+            );
+            assert_eq!(loads.load(Ordering::SeqCst), 1, "one model for both");
+            job.abort();
         }
     }
 }
