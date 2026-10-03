@@ -128,8 +128,9 @@ pub struct NotesTab {
     opening: Option<ItemId>,
     /// The open compose area (D6).
     compose: Option<Compose>,
-    /// The thread's width and height at the last render, for the scroll clamp and the bottom
-    /// (review L1). `Cell` because `render` is `&self`.
+    /// The thread's width at the last render, and its height with the sentence's rows under it,
+    /// for the scroll clamp and the bottom (review L1; round 1: the sentence the next render
+    /// draws is taken off when the bottom is found). `Cell` because `render` is `&self`.
     drawn: Cell<(u16, u16)>,
     /// The user's own note landed: the re-read opens at the bottom (review L1).
     follow: bool,
@@ -185,6 +186,14 @@ impl NotesTab {
         self.rows()
             .map(|(_, row)| cells::wrap(&row, width).len())
             .sum()
+    }
+
+    /// Review M1's sentence as drawn under the thread at `width`, one entry per row.
+    fn notice_rows(&self, width: u16) -> Vec<String> {
+        self.notice
+            .as_deref()
+            .map(|sentence| wrapped(sentence, usize::from(width)))
+            .unwrap_or_default()
     }
 
     /// A key while the area is open: its outcome, mapped for the Backlog.
@@ -353,9 +362,11 @@ impl DetailTab for NotesTab {
                 self.settle_hedge(notes);
                 // Review L1: the user's own note is the newest, so the thread opens at its
                 // bottom; before a first render there is no height to fit, and it opens at the top.
-                let (width, height) = self.drawn.get();
-                self.scroll = if std::mem::take(&mut self.follow) && height > 0 {
-                    let bottom = self.row_count(width).saturating_sub(usize::from(height));
+                // Round 1: the rows the sentence takes are not the thread's.
+                let (width, room) = self.drawn.get();
+                let height = usize::from(room).saturating_sub(self.notice_rows(width).len());
+                self.scroll = if std::mem::take(&mut self.follow) && room > 0 {
+                    let bottom = self.row_count(width).saturating_sub(height);
                     Scroll::at(u16::try_from(bottom).unwrap_or(u16::MAX))
                 } else {
                     Scroll::default()
@@ -410,11 +421,7 @@ impl DetailTab for NotesTab {
             return;
         }
         // Review M1's sentence under the thread; D11: the browse hint takes the last row.
-        let notice = self
-            .notice
-            .as_deref()
-            .map(|sentence| wrapped(sentence, usize::from(area.width)))
-            .unwrap_or_default();
+        let notice = self.notice_rows(area.width);
         let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
         let [list, below, hint] = Layout::vertical([
             Constraint::Min(0),
@@ -439,7 +446,8 @@ impl DetailTab for NotesTab {
             message(frame, list, "No notes for this item.", ctx.theme);
             return;
         }
-        self.drawn.set((list.width, list.height));
+        self.drawn
+            .set((list.width, list.height.saturating_add(below.height)));
         let lines = self.lines(list.width, ctx.theme);
         // A pane that widened since the last key has fewer rows than the offset assumed.
         let last = u16::try_from(lines.len().saturating_sub(1)).unwrap_or(u16::MAX);
@@ -978,6 +986,31 @@ mod tests {
         pane.on_reply(&StoreReply::Notes(long_thread(3).await), &mut shell.ctx());
         let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
         assert!(text.contains("note 0"), "{text}");
+    }
+
+    /// Review round 1, finding 3: after a hedged note is found as written, the thread opens at
+    /// its bottom above the sentence under it, so the note is on screen with the sentence.
+    #[tokio::test]
+    async fn a_note_found_written_is_on_screen_above_the_sentence() {
+        let shell = Shell::new();
+        let mut pane = NotesTab::new();
+        pane.on_item_change(Some(ITEM));
+        let mut thread = long_thread(3).await;
+        pane.on_reply(&StoreReply::Notes(thread.clone()), &mut shell.ctx());
+        let _ = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        hedge(
+            &shell,
+            &mut pane,
+            "MINE",
+            "store backend error: connection reset",
+        );
+        thread.push(written(ITEM, "MINE").await);
+        pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
+        assert_eq!(pane.notice.as_deref(), Some(NOTE_WRITTEN));
+        let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        assert!(text.contains("MINE"), "{text}");
+        assert!(text.contains("the note was"), "{text}");
+        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
     }
 
     /// Review L2: a `\t` in a saved note draws as spaces to the next tab stop, as the compose
