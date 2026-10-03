@@ -54,11 +54,12 @@ mod tests {
     use htui_core::prompt::render::{self, HostnameLine};
     use htui_core::store::MemStore;
     use htui_orch::tools::{ToolHost, ToolLease, ToolScope};
+    use htui_store::Backend;
     use serde_json::{Value, json};
 
     use crate::ENV_TOKEN;
-    use crate::host::McpClient;
     use crate::host::tests::{demo_host, scope};
+    use crate::host::{McpClient, McpHost};
     use crate::protocol::CallResult;
 
     /// The demo box's profile, as the store projects it.
@@ -70,21 +71,22 @@ mod tests {
             .expect("the demo box has a profile")
     }
 
-    /// A client of a fresh session on `scope`; the lease must outlive the client's calls.
-    async fn session(scope: ToolScope) -> (ToolLease, McpClient) {
+    /// A client of a fresh session on `scope`; the host and the lease must outlive the client's
+    /// calls (dropping either ends the session, §2.9).
+    async fn session(scope: ToolScope) -> ((McpHost<Backend>, ToolLease), McpClient) {
         let host = demo_host();
         let lease = host.open(scope).expect("a lease");
         let mut client = host
             .client(&lease.spec.env[ENV_TOKEN])
             .expect("a live session");
         client.initialize().await.expect("initialize");
-        (lease, client)
+        ((host, lease), client)
     }
 
     async fn profile_call(hostname: HostnameLine) -> CallResult {
         let mut on = scope(Transport::Acp);
         on.hostname = hostname;
-        let (_lease, mut client) = session(on).await;
+        let (_live, mut client) = session(on).await;
         client.call("box_profile", json!({})).await.expect("a call")
     }
 
@@ -130,7 +132,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_argument_naming_a_run_is_refused() {
-        let (_lease, mut client) = session(scope(Transport::Acp)).await;
+        let (_live, mut client) = session(scope(Transport::Acp)).await;
         let refused = client
             .call(
                 "box_profile",
@@ -153,7 +155,7 @@ mod tests {
         let mut on = scope(Transport::Acp);
         let missing = BoxId::new();
         on.box_id = missing;
-        let (_lease, mut client) = session(on).await;
+        let (_live, mut client) = session(on).await;
         let answer = client.call("box_profile", json!({})).await.expect("a call");
         assert!(answer.is_error);
         assert_eq!(answer.text, format!("not found: box {missing}"));
@@ -185,7 +187,7 @@ mod tests {
             ("phase step", phase_step),
             ("CLI phase step", cli_phase_step),
         ] {
-            let (_lease, mut client) = session(on).await;
+            let (_live, mut client) = session(on).await;
             let answer = client
                 .request("tools/list", json!({}))
                 .await

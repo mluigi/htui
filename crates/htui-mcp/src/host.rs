@@ -112,7 +112,7 @@ impl<S> Session<S> {
     }
 }
 
-/// A session and the host it was opened on: what a connection serves.
+/// A session and the host it was opened on; a connection reaches it through a [`Bound`].
 struct Served<H: htui_core::store::WorkerHost> {
     session: Arc<Session<H::Store>>,
     host: H,
@@ -140,10 +140,7 @@ impl<H: htui_core::store::WorkerHost> Handler for Served<H> {
         let host = self.host.clone();
         Box::pin(async move {
             if session.has_ended() {
-                return Ok(CallResult {
-                    text: "session ended".to_owned(),
-                    is_error: true,
-                });
+                return Ok(session_ended());
             }
             if !session.advertised().any(|def| def.name == name) {
                 return Err(CallRefused(format!("unknown tool: {name}")));
@@ -164,6 +161,51 @@ impl<H: htui_core::store::WorkerHost> Handler for Served<H> {
                 },
             })
         })
+    }
+}
+
+/// What every call to an ended session answers (I-6).
+fn session_ended() -> CallResult {
+    CallResult {
+        text: "session ended".to_owned(),
+        is_error: true,
+    }
+}
+
+/// What a connection (socket or in-process) serves: the session `token` names, found again on
+/// every message through a [`Weak`] to the host (§2.9). Dropping the lease or the last
+/// [`McpHost`] ends the session for the connection, and the connection keeps neither the store
+/// nor the host alive.
+struct Bound<H: htui_core::store::WorkerHost> {
+    inner: Weak<Inner<H>>,
+    token: Token,
+}
+
+impl<H: htui_core::store::WorkerHost> Bound<H> {
+    /// The session, while both the host and the lease live.
+    fn served(&self) -> Option<Arc<Served<H>>> {
+        let inner = self.inner.upgrade()?;
+        lock(&inner.sessions).get(&self.token).cloned()
+    }
+}
+
+impl<H: htui_core::store::WorkerHost> Handler for Bound<H> {
+    fn tools(&self) -> Vec<ToolInfo> {
+        self.served()
+            .map(|served| served.tools())
+            .unwrap_or_default()
+    }
+
+    fn call(
+        &self,
+        name: String,
+        arguments: Value,
+        progress: Option<Progress>,
+    ) -> Pin<Box<dyn Future<Output = Result<CallResult, CallRefused>> + Send>> {
+        match self.served() {
+            Some(served) => served.call(name, arguments, progress),
+            None => Box::pin(async { Ok(session_ended()) }),
+        }
     }
 }
 
@@ -279,17 +321,20 @@ impl<H: htui_core::store::WorkerHost> McpHost<H> {
     }
 }
 
-/// The live session `token` names, as a connection's handler.
+/// The live session `token` names, as a connection's handler: a [`Bound`] that holds the host
+/// weakly.
 fn resolve<H: htui_core::store::WorkerHost>(
-    inner: &Inner<H>,
+    inner: &Arc<Inner<H>>,
     token: &str,
 ) -> Result<Arc<dyn Handler>, Refusal> {
     let token = Token::parse(token).ok_or(Refusal::UnknownToken)?;
-    let served = lock(&inner.sessions)
-        .get(&token)
-        .cloned()
-        .ok_or(Refusal::UnknownToken)?;
-    Ok(served)
+    if !lock(&inner.sessions).contains_key(&token) {
+        return Err(Refusal::UnknownToken);
+    }
+    Ok(Arc::new(Bound {
+        inner: Arc::downgrade(inner),
+        token,
+    }))
 }
 
 /// This process's binary, absolute (the ACP schema requires it).
@@ -667,6 +712,41 @@ pub(crate) mod tests {
             .expect("a call");
         assert!(ended.is_error);
         assert_eq!(ended.text, "session ended");
+    }
+
+    /// §2.9: the in-process client's server task holds the host weakly; dropping the last
+    /// `McpHost` ends the session even while its lease and its client live.
+    #[tokio::test]
+    async fn dropping_the_last_host_ends_an_in_process_client() {
+        let host = demo_host();
+        let lease = host.open(scope(Transport::Acp)).expect("a lease");
+        let mut client = host
+            .client(&lease.spec.env[ENV_TOKEN])
+            .expect("a live session");
+        client.initialize().await.expect("initialize");
+        let live = client
+            .call("box_profile", serde_json::json!({}))
+            .await
+            .expect("a call");
+        assert!(!live.is_error, "{}", live.text);
+
+        let inner = std::sync::Arc::downgrade(&host.inner);
+        drop(host);
+        assert!(
+            inner.upgrade().is_none(),
+            "nothing else keeps the host alive"
+        );
+        let ended = client
+            .call("box_profile", serde_json::json!({}))
+            .await
+            .expect("a call");
+        assert!(ended.is_error);
+        assert_eq!(ended.text, "session ended");
+        assert!(
+            client.tool_names().await.expect("tools/list").is_empty(),
+            "an ended session offers nothing"
+        );
+        drop(lease);
     }
 
     /// I-7: a fresh chat (no item, no command queue, ACP, no concept index) is offered
