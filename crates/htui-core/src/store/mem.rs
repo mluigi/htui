@@ -121,6 +121,8 @@ pub enum MemFault {
     ReleaseLease,
     /// [`WriteStore::transition`], the item compare-and-set.
     ItemTransition,
+    /// [`WriteStore::record_opening`] (MOD-37 review N-4).
+    RecordOpening,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -7173,6 +7175,8 @@ impl WriteStore for MemStore {
     }
 
     async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::RecordOpening)?;
         let now = self.now();
         self.write(|state| state.record_opening(step, opening, now))
     }

@@ -5907,6 +5907,102 @@ pub(crate) mod tests {
         }
     }
 
+    /// A `tracing` writer into a shared buffer, for a case that asserts a line was logged.
+    #[derive(Clone, Default)]
+    struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl LogBuffer {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap_or_else(PoisonError::into_inner))
+                .into_owned()
+        }
+    }
+
+    /// MOD-37 review N-4: `run_step.opening` is a label. A write of it that fails is logged and the
+    /// chat goes on, whether the resume started (`resumed`) or fell back (`resume_failed`).
+    #[tokio::test]
+    async fn a_failing_opening_write_is_logged_and_the_chat_goes_on() {
+        for failures in [
+            Vec::new(),
+            vec![DriverError::Transport(
+                "session/load failed: gone".to_owned(),
+            )],
+        ] {
+            let (store, backend, mut runtime, agent_id, _) = fixture_with_failing_starts(
+                Script::one_turn(vec![ends(StopReason::EndTurn)]),
+                failures.clone(),
+            )
+            .await;
+            store.set_fault(htui_core::store::mem::MemFault::RecordOpening, true);
+            let logs = LogBuffer::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer({
+                    let logs = logs.clone();
+                    move || logs.clone()
+                })
+                .with_ansi(false)
+                .finish();
+            let replies = {
+                let _guard = tracing::subscriber::set_default(subscriber);
+                attach_and_end(
+                    &mut runtime,
+                    &backend,
+                    promoted(agent_id, resume_path()),
+                    async |_| {},
+                )
+                .await
+            };
+
+            assert!(
+                replies
+                    .iter()
+                    .any(|reply| matches!(reply.reply, StoreReply::ChatAccepted { .. })),
+                "{failures:?}: the chat opens: {replies:?}"
+            );
+            assert!(
+                !replies.iter().any(|reply| matches!(
+                    reply.reply,
+                    StoreReply::Failed { .. } | StoreReply::Chat(ChatFrame::Failed { .. })
+                )),
+                "{failures:?}: nothing failed: {replies:?}"
+            );
+            let log = store
+                .step_events(ids::STEP_PLAN)
+                .await
+                .expect("the log reads")
+                .expect("a log");
+            assert!(
+                log.iter().any(|row| row.kind == EventKind::FollowUp),
+                "{failures:?}: the opening is recorded"
+            );
+            assert_eq!(
+                opening_of(&store, ids::STEP_PLAN).await,
+                None,
+                "{failures:?}: the label did not land"
+            );
+            assert!(
+                logs.text()
+                    .contains("the chat's opening could not be recorded"),
+                "{failures:?}: the failure is logged: {}",
+                logs.text()
+            );
+        }
+    }
+
     /// MOD-37 review M-1: a resume with no fallback that starts is still recorded as `resumed`:
     /// the label is the opening's, not the fallback's.
     #[tokio::test]
