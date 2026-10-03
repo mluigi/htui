@@ -239,6 +239,9 @@ struct State {
     /// and a reader has no use for another process's liveness token (blueprint F-S). Kept beside
     /// the run so [`WriteStore::refresh_lease`] can compare against it.
     lease_owners: HashMap<RunId, Uuid>,
+    /// `run_step.opening` (MOD-37 M5), beside `steps` as `lease_owners` sits beside `runs`: the
+    /// column is a [`RunStepSummary`] field and not a [`RunStep`] one.
+    openings: HashMap<StepId, StepOpening>,
     /// `step_permission` (MOD-42 plan D1), by id; `owner` beside the row (B-8), as
     /// [`State::lease_owners`] sits beside `runs`.
     permissions: BTreeMap<PermissionId, PermissionRow>,
@@ -345,6 +348,7 @@ impl MemStore {
             step_commits: BTreeMap::new(),
             command_runs: BTreeMap::new(),
             lease_owners: HashMap::new(),
+            openings: HashMap::new(),
             permissions: BTreeMap::new(),
             run_commands: BTreeMap::new(),
             events: data.events,
@@ -1308,7 +1312,7 @@ impl State {
                         .and_then(|id| self.agents.get(&id))
                         .map(|agent| agent.name.clone()),
                     gate_note: step.gate_note.clone(),
-                    opening: None,
+                    opening: self.openings.get(&step.id).copied(),
                 }
             })
             .collect()
@@ -4116,6 +4120,7 @@ impl State {
         self.command_runs
             .retain(|_, row| !gone.steps.contains(&row.run_step_id));
         self.steps.retain(|id, _| !gone.steps.contains(id));
+        self.openings.retain(|id, _| !gone.steps.contains(id));
         self.runs.retain(|id, _| !gone.runs.contains(id));
         self.lease_owners.retain(|id, _| !gone.runs.contains(id));
         // MOD-42 plan D1: both relay tables go with their run (`ON DELETE CASCADE`, F-18).
@@ -5191,6 +5196,25 @@ impl State {
         };
         self.documents.push(row.clone());
         Ok(row)
+    }
+
+    /// MOD-37 M5: the step's opening, replacing any earlier one; the step's `updated_at` moves.
+    fn record_opening(
+        &mut self,
+        step: StepId,
+        opening: StepOpening,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        let row = self
+            .steps
+            .get_mut(&step)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
+            })?;
+        row.updated_at = now;
+        self.openings.insert(step, opening);
+        Ok(())
     }
 
     /// §4.8's promotion: the step, its run and its item, in one closure (plan D6).
@@ -7149,7 +7173,8 @@ impl WriteStore for MemStore {
     }
 
     async fn record_opening(&self, step: StepId, opening: StepOpening) -> Result<()> {
-        todo!("MOD-37 M5: record_opening({step}, {opening})")
+        let now = self.now();
+        self.write(|state| state.record_opening(step, opening, now))
     }
 
     async fn pass_step(

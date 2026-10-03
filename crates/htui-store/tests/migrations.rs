@@ -93,14 +93,15 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
          milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql, \
          MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
-         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-26 milestone 2's \
-         0013_persona_phase_index.sql, in ordinal order"
+         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
+         0013_persona_phase_index.sql and MOD-37 milestone 5's 0014_run_step_opening.sql, in \
+         ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -1014,9 +1015,9 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(13),
-        "thirteen embedded migrations, none applied (through MOD-26 milestone 2's \
-         0013_persona_phase_index.sql)"
+        MigrationState::Pending(14),
+        "fourteen embedded migrations, none applied (through MOD-37 milestone 5's \
+         0014_run_step_opening.sql)"
     );
 
     db.drop_db().await;
@@ -1114,12 +1115,12 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(13));
+    assert_eq!(db.migrations_at_connect, MigrationState::Pending(14));
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(13));
+    assert_eq!(refused, HeadlessError::MigrationsPending(14));
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1138,7 +1139,7 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(13));
+    assert_eq!(refused, HeadlessError::MigrationsPending(14));
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await
@@ -1288,9 +1289,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        13,
-        "the later applies migrate nothing: the thirteen embedded migrations (through MOD-26 \
-         milestone 2's 0013_persona_phase_index.sql) are applied once"
+        14,
+        "the later applies migrate nothing: the fourteen embedded migrations (through MOD-37 \
+         milestone 5's 0014_run_step_opening.sql) are applied once"
     );
 
     db.drop_db().await;
