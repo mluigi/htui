@@ -244,12 +244,18 @@ impl StepNode {
 
 impl NodeContent for StepNode {
     /// The border, then the head and the phase inside it, then the chips, dim. `ctx.area` is the
-    /// node's full size at the current zoom; a node too small for an interior (zoom 0.5) is a
+    /// node's full size at the current zoom; a node with under two interior rows (zoom 0.5) is a
     /// bare box.
     fn render(&self, ctx: &NodeRenderContext, buf: &mut Buffer) {
         let block = Block::bordered().border_style(self.border(ctx.selected));
         let inner = block.inner(ctx.area);
         block.render(ctx.area, buf);
+        // MOD-72 review L3: rataflow floors a node's top and bottom edges apart, so at zoom 0.5 a
+        // 5-row node is 2 or 3 rows by pan offset. A 1-row interior would flicker a clipped head
+        // while panning; it stays a bare box like the 0-row one (MOD-28's zoom 0.5).
+        if inner.height < 2 {
+            return;
+        }
         let width = usize::from(inner.width);
         // Blueprint E10: fitted to the interior drawn, so `+N` is honest at every zoom.
         let chips = chips(&self.calls, width);
@@ -260,7 +266,7 @@ impl NodeContent for StepNode {
         ];
         for (row, (line, style)) in (0u16..).zip(lines) {
             if row >= inner.height {
-                break; // zoom 0.5: no interior, so no line (D5)
+                break; // a 2-row interior (between zooms) drops the chips line (D5)
             }
             buf.set_string(inner.x, inner.y + row, cells::clip(line, width), style);
         }
@@ -1532,6 +1538,45 @@ mod tests {
         }
         assert_eq!(buf[(x, y + 3)].symbol(), "\u{2502}");
         assert_eq!(buf[(x, y + 4)].symbol(), "\u{2514}");
+    }
+
+    /// `step(1, …)` drawn alone into a `height`-row node, the way rataflow hands it a scratch
+    /// buffer at local `(0, 0)`.
+    fn render_node(height: u16) -> Buffer {
+        let step = step(1, 0, 1, 0);
+        let node = StepNode::new(
+            &step,
+            std::slice::from_ref(&step),
+            &[kind("read", 1)],
+            &Theme::default(),
+        );
+        let area = Rect::new(0, 0, 20, height);
+        let mut buf = Buffer::empty(area);
+        let ctx = NodeRenderContext {
+            id: "1",
+            area,
+            selected: false,
+            dragging: false,
+            position_absolute: rataflow::Position::default(),
+            theme: rataflow::Theme::default(),
+            animation_phase: 0,
+        };
+        node.render(&ctx, &mut buf);
+        buf
+    }
+
+    /// MOD-72 review L3: at zoom 0.5 rataflow floors the two edges apart, so a 5-row node is 2 or
+    /// 3 rows by pan offset. The 3-row one, a 1-row interior, stays a bare box like the 2-row one,
+    /// rather than flickering a clipped head while panning.
+    #[test]
+    fn a_one_row_interior_is_a_bare_box() {
+        let buf = render_node(3);
+        for column in 1..19 {
+            assert_eq!(buf[(column, 1)].symbol(), " ", "column {column}");
+        }
+        assert_eq!(buf[(0, 1)].symbol(), "\u{2502}");
+        let buf = render_node(4);
+        assert!(rows(&buf)[1].contains("0.1 done"), "{:#?}", rows(&buf));
     }
 
     /// D7: new counts for the same run move no node, so the viewport stays (review L2).
