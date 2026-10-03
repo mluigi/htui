@@ -587,10 +587,6 @@ impl ExecutionGraph {
     /// reveal is queued (D7). After every event the flow's selection is put back on the cursor
     /// (blueprint E1): rataflow selects a pressed node at once (`state/mouse.rs:230-237`), and
     /// the flow keeps no selection of its own (MOD-28 D7).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "MOD-71 T3's runs.rs commit calls it")
-    )]
     pub(super) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<StepId> {
         if !matches!(
             mouse.kind,

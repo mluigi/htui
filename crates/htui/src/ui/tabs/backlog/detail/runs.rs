@@ -42,6 +42,10 @@
 //! (`⚒ read×5 exec×3`). Every `Runs` reply in the flow, and `v` into it, asks for them
 //! (`ToolCalls`); the list never does.
 //!
+//! MOD-71: in the flow, while browsing, the pane takes the mouse (D1): a click on a node moves the
+//! cursor there, a drag on empty canvas pans, and the wheel zooms at the pointer. Every other view
+//! and every modal leaves the terminal's own text selection alone.
+//!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
 //! plan P13).
@@ -60,13 +64,13 @@ use htui_core::model::{
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
-use self::execution_graph::{ExecutionGraph, by_step};
+use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -75,7 +79,7 @@ use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 /// What an action key says while the verdicts it reads have not arrived.
 pub const NOT_LOADED: &str = "the run actions have not loaded yet";
@@ -213,6 +217,13 @@ pub struct RunsTab {
     /// MOD-72 D7: the last `ToolCalls` reply for [`RunsTab::item`], by step. An item change
     /// clears it; only the flow view asks for it (plan D4), and a toggle back keeps it (E14).
     tool_calls: BTreeMap<StepId, Vec<ToolCallCount>>,
+    /// MOD-71 D5: the flow canvas the last frame drew, which a press is hit-tested against;
+    /// `None` on every frame without one. Written in `render` (`&self`), read by `on_mouse`.
+    canvas: Cell<Option<Rect>>,
+    /// MOD-71 D5, D11: a left press that started on the canvas and is not released yet, so its
+    /// drag and release reach the flow even past the pane's edge. `v`, an item change and a
+    /// capturing mode end it.
+    gesture: bool,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -393,6 +404,23 @@ impl RunsTab {
         self.graph
             .get_mut()
             .sync(run, step, &self.tool_calls, theme);
+    }
+
+    /// MOD-71 D6: a clicked node moves the cursor to that step's entry in the cursor's run (only
+    /// that run is on the canvas), then the flow syncs, as `J`/`K` do. A step the entries don't
+    /// hold leaves the cursor where it is.
+    fn select_step(&mut self, step: StepId, theme: &Theme) {
+        let run = match self.entry() {
+            Some(Entry::Step { run, .. } | Entry::Run { run }) => run,
+            None => return,
+        };
+        let at = self.entries().iter().position(
+            |entry| matches!(entry, Entry::Step { run: r, step: s } if *r == run && *s == step),
+        );
+        if at.is_some() {
+            self.selected = at;
+        }
+        self.sync_graph(theme);
     }
 
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
@@ -1249,6 +1277,7 @@ impl DetailTab for RunsTab {
         self.tool_calls.clear();
         self.answering = None;
         self.mode = Mode::Browse;
+        self.gesture = false; // MOD-71 D11
     }
 
     /// `J` / `K` move the cursor, `Enter` replays the step under it, the action keys act, and
@@ -1304,6 +1333,8 @@ impl DetailTab for RunsTab {
                 ctx.emit(Action::Replay { step_id });
             }
             KeyCode::Char('v') => {
+                // MOD-71 D11: the gesture ends with the view.
+                self.gesture = false;
                 self.view = match self.view {
                     View::List => View::Flow,
                     View::Flow => View::List,
@@ -1323,7 +1354,14 @@ impl DetailTab for RunsTab {
             KeyCode::PageUp | KeyCode::PageDown if self.view == View::Flow => {}
             KeyCode::Char(
                 key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
-            ) => return self.action(key, ctx),
+            ) => {
+                let handled = self.action(key, ctx);
+                // MOD-71 D11: a mode that captures input ends a live gesture (blueprint B-8).
+                if self.captures_input() {
+                    self.gesture = false;
+                }
+                return handled;
+            }
             _ => return self.scroll.on_key(key, self.runs.len()),
         }
         Handled::Consumed
@@ -1343,6 +1381,44 @@ impl DetailTab for RunsTab {
             }
             _ => Handled::Pass,
         }
+    }
+
+    /// MOD-71 D1: the flow view while browsing. The list, a modal and the artifact view keep the
+    /// terminal's own text selection.
+    fn wants_mouse(&self) -> bool {
+        self.view == View::Flow && matches!(self.mode, Mode::Browse)
+    }
+
+    /// MOD-71 D5, D6: a left press or the wheel inside the canvas the last frame drew, and the
+    /// drag and release of a press that started there, go to the flow; right and middle buttons,
+    /// and anything outside, pass. A click on a node moves the cursor (`select_step`). Every
+    /// forwarded event is `Consumed`, so a pan or a zoom is redrawn (blueprint E4).
+    fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if !self.wants_mouse() {
+            self.gesture = false;
+            return Handled::Pass;
+        }
+        let inside = self
+            .canvas
+            .get()
+            .is_some_and(|canvas| canvas.contains(Position::new(mouse.column, mouse.row)));
+        let forward = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.gesture = inside;
+                inside
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => inside,
+            MouseEventKind::Drag(MouseButton::Left) => self.gesture,
+            MouseEventKind::Up(MouseButton::Left) => core::mem::take(&mut self.gesture),
+            _ => false,
+        };
+        if !forward {
+            return Handled::Pass;
+        }
+        if let Some(step) = self.graph.get_mut().on_mouse(mouse) {
+            self.select_step(step, ctx.theme);
+        }
+        Handled::Consumed
     }
 
     /// MOD-41 plan D16: an item is selected and one of its runs is `queued`, `running` or
@@ -1435,6 +1511,8 @@ impl DetailTab for RunsTab {
     /// The footer a modal asks in is drawn whatever the list holds, so the close-out of an item
     /// with no run is on screen too: `C` needs no run (`close_out_enabled`).
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
+        // MOD-71 D5: only a frame that draws the canvas records it (render_flow).
+        self.canvas.set(None);
         if self.item.is_none() {
             message(frame, area, "No item selected.", ctx.theme);
             return;
@@ -1499,6 +1577,11 @@ impl RunsTab {
         if run.steps.is_empty() {
             message(frame, canvas, NO_STEPS_YET, theme);
             return;
+        }
+        // MOD-71 D5, blueprint B-7: the canvas a press is hit-tested against, only when
+        // rataflow records it on this draw.
+        if drawable(canvas) {
+            self.canvas.set(Some(canvas));
         }
         self.graph.borrow_mut().render(frame, canvas);
     }
