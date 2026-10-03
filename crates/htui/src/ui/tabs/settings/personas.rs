@@ -167,6 +167,9 @@ pub struct PersonasSection {
     busy: Option<&'static str>,
     /// The last outcome, drawn in `theme.error` when `Notice::Error`.
     notice: Option<Notice>,
+    /// An import report that landed over an editor (R1 M-1): it opens on the next return to
+    /// Browse, so no refusal, skip or dropped entry goes unnamed (OQ-7, R-13).
+    pending_report: Option<Vec<PersonaOutcome>>,
 }
 
 /// What the section is doing.
@@ -842,7 +845,8 @@ impl PersonasSection {
     }
 
     /// An import's answer (D20): a clean one is one notice, anything refused, skipped or dropped
-    /// opens the report over Browse, or is counted over an editor opened while the walk ran.
+    /// opens the report over Browse, or is counted over an editor opened while the walk ran and
+    /// kept until that editor closes (R1 M-1).
     fn land_import(&mut self, report: &[PersonaOutcome]) {
         let (imported, refused, skipped, dropped) = counts(report);
         if report.is_empty() {
@@ -868,9 +872,24 @@ impl PersonasSection {
             };
             self.notice = None;
         } else {
+            self.pending_report = Some(report.to_vec());
             self.notice = Some(Notice::Error(format!(
-                "imported {imported}{DOT}refused {refused}{DOT}skipped {skipped}"
+                "imported {imported}{DOT}refused {refused}{DOT}skipped {skipped}{DOT}dropped \
+                 {dropped} \u{2014} the report opens when the editor closes"
             )));
+        }
+    }
+
+    /// Opens a report kept by [`Self::land_import`] once the section is back in Browse.
+    fn open_pending_report(&mut self) {
+        if matches!(self.mode, Mode::Browse)
+            && let Some(report) = self.pending_report.take()
+        {
+            self.mode = Mode::Report {
+                report,
+                top: 0,
+                max_top: Cell::new(usize::MAX),
+            };
         }
     }
 
@@ -1754,7 +1773,7 @@ impl SettingsSection for PersonasSection {
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        match self.mode {
+        let handled = match self.mode {
             Mode::Browse => self.on_browse_key(key),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
             Mode::Body(_) => self.on_body_key(key, ctx),
@@ -1762,7 +1781,9 @@ impl SettingsSection for PersonasSection {
             Mode::Deleting { .. } => self.on_delete_key(key, ctx),
             Mode::ImportPath { .. } => self.on_import_key(key, ctx),
             Mode::Report { .. } => self.on_report_key(key),
-        }
+        };
+        self.open_pending_report();
+        handled
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
@@ -1810,6 +1831,7 @@ impl SettingsSection for PersonasSection {
             }
             _ => {}
         }
+        self.open_pending_report();
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

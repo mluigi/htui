@@ -1237,9 +1237,67 @@ async fn an_import_landing_over_an_editor_says_the_counts() {
     assert!(section.captures_input(), "the editor is kept");
     assert!(frame(&bench, &section).contains("edit persona `architect`"));
     assert!(
-        error_text(&bench, &section).contains("imported 1 \u{b7} refused 2 \u{b7} skipped 1"),
+        shows(
+            &error_text(&bench, &section),
+            "imported 1 \u{b7} refused 2 \u{b7} skipped 1 \u{b7} dropped 1 \u{2014} the report \
+             opens when the editor closes"
+        ),
         "{}",
         frame(&bench, &section)
+    );
+
+    // R1 M-1: the report was kept, and the next return to Browse opens it.
+    bench.key(&mut section, "esc");
+    assert!(section.captures_input(), "the report opened");
+    let report = frame(&bench, &section);
+    assert!(
+        report.starts_with("imported 1 \u{b7} refused 2 \u{b7} skipped 1"),
+        "{report}"
+    );
+    assert!(report.contains("gortex-search.md"), "{report}");
+    assert!(report.contains(HINT_REPORT), "{report}");
+
+    bench.key(&mut section, "esc");
+    assert!(!section.captures_input(), "back to Browse");
+    assert!(frame(&bench, &section).contains(HINT_BROWSE));
+}
+
+/// R1 M-1 (OQ-7, R-13: every drop is named): an import whose only issue is dropped `mcp__`
+/// entries, landing over an editor, says so and opens its report once the editor closes.
+#[tokio::test]
+async fn an_import_with_only_drops_landing_over_an_editor_keeps_its_report() {
+    let (bench, mut section) = bench_with_demo().await;
+    start_import(&bench, &mut section);
+    let _ = requests(&bench);
+    bench.key(&mut section, "b");
+    assert!(section.captures_input(), "the body editor opened");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaImports(Box::new(PersonaImports {
+            personas: demo_rows().await,
+            report: vec![imported("code-architect", &["mcp__gortex__search"])],
+        })),
+    );
+
+    assert!(frame(&bench, &section).contains("body of `architect`"));
+    assert!(
+        shows(
+            &error_text(&bench, &section),
+            "imported 1 \u{b7} refused 0 \u{b7} skipped 0 \u{b7} dropped 1 \u{2014} the report \
+             opens when the editor closes"
+        ),
+        "{}",
+        frame(&bench, &section)
+    );
+
+    bench.key(&mut section, "esc");
+    let report = frame(&bench, &section);
+    assert!(section.captures_input(), "the report opened: {report}");
+    assert!(report.contains(HINT_REPORT), "{report}");
+    assert!(
+        shows(&report, "dropped from `tools`: `mcp__gortex__search`"),
+        "the drop is named: {report}"
     );
 }
 
