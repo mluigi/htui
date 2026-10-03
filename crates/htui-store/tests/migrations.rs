@@ -93,14 +93,14 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
          milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql, \
          MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
-         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-26 milestone 2's \
-         0013_persona_phase_index.sql, in ordinal order"
+         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
+         0013_persona_phase_index.sql and MOD-11's 0014_command_queue.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -507,6 +507,73 @@ const MOD26_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The two `COMMENT ON COLUMN` texts of `0014_command_queue.sql` (MOD-11 plan D14, OQ-3),
+/// verbatim, for [`ANA_COLUMN_COMMENTS`]'s reason. `command_run` had no comment before.
+const MOD11_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "command_run",
+        "claimed_by",
+        "the claiming host's owner id (MOD-11 OQ-3)",
+    ),
+    (
+        "command_run",
+        "heartbeat_at",
+        "last beat of the claiming host; stale after 3 beats",
+    ),
+];
+
+/// MOD-11 plan D14 (OQ-3): `0014_command_queue.sql` gives `command_run` its two liveness columns,
+/// both nullable (every row written before the migration, and every verify row, has neither) and
+/// both commented.
+#[tokio::test]
+async fn the_command_run_liveness_columns_exist() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let columns: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT column_name::text, data_type::text, is_nullable::text \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' AND table_name = 'command_run' \
+           AND column_name IN ('claimed_by', 'heartbeat_at') \
+         ORDER BY column_name",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read command_run's columns");
+    assert_eq!(
+        columns,
+        vec![
+            ("claimed_by".to_owned(), "uuid".to_owned(), "YES".to_owned()),
+            (
+                "heartbeat_at".to_owned(),
+                "timestamp with time zone".to_owned(),
+                "YES".to_owned()
+            ),
+        ],
+        "0014 adds claimed_by UUID and heartbeat_at TIMESTAMPTZ, both nullable"
+    );
+    for (table, column, expected) in MOD11_COLUMN_COMMENTS {
+        let actual: Option<String> = sqlx::query_scalar(
+            "SELECT pg_catalog.col_description(c.oid, a.attnum) \
+             FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid \
+             WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' \
+               AND c.relname = $1 AND a.attname = $2",
+        )
+        .bind(table)
+        .bind(column)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or_else(|err| panic!("read col_description for {table}.{column}: {err}"));
+        assert_eq!(
+            actual.as_deref(),
+            Some(*expected),
+            "{table}.{column}'s comment is 0014's text byte for byte"
+        );
+    }
+
+    db.drop_db().await;
+}
+
 /// MOD-26 milestone 2 D15 (M1 review N5): `0013_persona_phase_index.sql` indexes
 /// `step_graph_phase.persona_id`, the lookup `delete_persona`'s guard and the `ON DELETE RESTRICT`
 /// check both make. `pg_indexes` prints the definition Postgres normalised.
@@ -556,6 +623,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD23_COLUMN_COMMENTS)
         .chain(MOD33_COLUMN_COMMENTS)
         .chain(MOD26_COLUMN_COMMENTS)
+        .chain(MOD11_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -572,8 +640,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(*expected),
-            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33 or MOD-26) text \
-             byte for byte"
+            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26 or \
+             MOD-11) text byte for byte"
         );
     }
 
@@ -595,8 +663,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // forty-four contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33 and MOD-26 wrote and no
-    // half-finished forty-fifth.
+    // forty-six contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26 and MOD-11 wrote and
+    // no half-finished forty-seventh.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -613,6 +681,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD23_COLUMN_COMMENTS)
             .chain(MOD33_COLUMN_COMMENTS)
             .chain(MOD26_COLUMN_COMMENTS)
+            .chain(MOD11_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -629,12 +698,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD23_COLUMN_COMMENTS)
         .chain(MOD33_COLUMN_COMMENTS)
         .chain(MOD26_COLUMN_COMMENTS)
+        .chain(MOD11_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the forty-four commented columns, and no others"
+        "exactly the forty-six commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -1014,9 +1084,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(13),
-        "thirteen embedded migrations, none applied (through MOD-26 milestone 2's \
-         0013_persona_phase_index.sql)"
+        MigrationState::Pending(14),
+        "fourteen embedded migrations, none applied (through MOD-11's 0014_command_queue.sql)"
     );
 
     db.drop_db().await;
@@ -1114,12 +1183,20 @@ async fn a_headless_connect_never_migrates() {
     let Some(db) = common::bare_db().await else {
         return;
     };
-    assert_eq!(db.migrations_at_connect, MigrationState::Pending(13));
+    assert_eq!(
+        db.migrations_at_connect,
+        MigrationState::Pending(14),
+        "fourteen embedded migrations, through MOD-11's 0014_command_queue.sql"
+    );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("a pending schema is refused");
-    assert_eq!(refused, HeadlessError::MigrationsPending(13));
+    assert_eq!(
+        refused,
+        HeadlessError::MigrationsPending(14),
+        "every one of the fourteen, through MOD-11's 0014_command_queue.sql, is pending"
+    );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         0,
@@ -1138,7 +1215,11 @@ async fn a_headless_connect_never_migrates() {
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
         .await
         .expect_err("no migrations table is every migration pending");
-    assert_eq!(refused, HeadlessError::MigrationsPending(13));
+    assert_eq!(
+        refused,
+        HeadlessError::MigrationsPending(14),
+        "every one of the fourteen, through MOD-11's 0014_command_queue.sql, is pending"
+    );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
         .await
@@ -1288,9 +1369,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        13,
-        "the later applies migrate nothing: the thirteen embedded migrations (through MOD-26 \
-         milestone 2's 0013_persona_phase_index.sql) are applied once"
+        14,
+        "the later applies migrate nothing: the fourteen embedded migrations (through MOD-11's \
+         0014_command_queue.sql) are applied once"
     );
 
     db.drop_db().await;
