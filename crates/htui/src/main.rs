@@ -8,18 +8,35 @@ use std::time::Duration;
 /// Parses the command line and runs the shell, or `htui worker`.
 ///
 /// Exit codes: 0 on success; 2 for `htui worker`'s startup refusals, `htui provision`'s
-/// refusals (MOD-45 D292) and clap's usage errors; 1 for every other failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the terminal, so a failure is
+/// refusals (MOD-45 D292), `htui mcp` without its environment and clap's usage errors; 3 for an
+/// `htui mcp` the host refused (MOD-11 D6); 1 for every other failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the terminal, so a failure is
 /// readable instead of being drawn over the last frame.
 ///
 /// MOD-41 review R-4: the runtime is built by hand, not by `#[tokio::main]`, so its teardown is
 /// bounded by [`htui::SHUTDOWN`], whether the body returns or panics: a blocking task that never
 /// ends cannot hold the exit.
 fn main() -> ExitCode {
+    let args = htui::cli::Args::parse();
+    let grace = teardown_grace(&args);
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("the tokio runtime builds");
-    run_bounded(runtime, htui::SHUTDOWN, body())
+    run_bounded(runtime, grace, body(args))
+}
+
+/// How long the runtime's teardown may wait for blocking tasks once `body` has returned.
+///
+/// [`htui::SHUTDOWN`], except for `htui mcp` (MOD-11 D6), which gets none: its stdin is read by a
+/// blocking read on fd 0 that nothing can cancel, so when the host ends the session first the
+/// teardown would wait out the whole grace with the agent's stdout still open. Nothing of the
+/// relay is left to finish by then: it returns only after flushing stdout.
+fn teardown_grace(args: &htui::cli::Args) -> Duration {
+    if matches!(args.command, Some(htui::cli::Command::Mcp)) {
+        Duration::ZERO
+    } else {
+        htui::SHUTDOWN
+    }
 }
 
 /// Runs `future` to its end on `runtime`, then tears the runtime down within `grace`.
@@ -42,7 +59,7 @@ fn run_bounded<T>(
 
 /// `main` inside the runtime. The Sentry guard lives here, so it flushes before the runtime's
 /// teardown begins.
-async fn body() -> ExitCode {
+async fn body(args: htui::cli::Args) -> ExitCode {
     let mut options = sentry::ClientOptions::default();
     options.dsn = "https://47539c499d6747008e7561dbbe1129cd@glitchtip.sette.mluigi.it/1"
         .parse()
@@ -56,26 +73,18 @@ async fn body() -> ExitCode {
         "htui_agent",
         "htui_orch",
         "htui_worker",
+        "htui_mcp",
     ];
 
     let _sentry = sentry::init(options);
 
-    let args = htui::cli::Args::parse();
     match htui::run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             // MOD-41 plan D14: `htui worker` exits 2 on a startup refusal, 1 on a failure, and
             // `htui provision` (MOD-45 D292) likewise; every other error is 1 as before. Never
             // `process::exit`: the `_sentry` guard must flush.
-            let code = error
-                .downcast_ref::<htui::worker_cmd::WorkerExit>()
-                .map(htui::worker_cmd::WorkerExit::code)
-                .or_else(|| {
-                    error
-                        .downcast_ref::<htui::provision::ProvisionExit>()
-                        .map(htui::provision::ProvisionExit::code)
-                })
-                .unwrap_or(1);
+            let code = exit_code(&error);
             if reports_to_sentry(&error, code) {
                 sentry_anyhow::capture_anyhow(&error);
             }
@@ -85,17 +94,39 @@ async fn body() -> ExitCode {
     }
 }
 
+/// The exit code `error` ends `body` with: a [`WorkerExit`](htui::worker_cmd::WorkerExit)'s, a
+/// [`ProvisionExit`](htui::provision::ProvisionExit)'s or an [`McpExit`](htui::mcp_cmd::McpExit)'s
+/// own code (MOD-11 B-13: 2, 3 or 1), else 1.
+fn exit_code(error: &anyhow::Error) -> u8 {
+    error
+        .downcast_ref::<htui::worker_cmd::WorkerExit>()
+        .map(htui::worker_cmd::WorkerExit::code)
+        .or_else(|| {
+            error
+                .downcast_ref::<htui::provision::ProvisionExit>()
+                .map(htui::provision::ProvisionExit::code)
+        })
+        .or_else(|| {
+            error
+                .downcast_ref::<htui::mcp_cmd::McpExit>()
+                .map(htui::mcp_cmd::McpExit::code)
+        })
+        .unwrap_or(1)
+}
+
 /// Whether `body` sends `error`, ending in exit `code`, to Sentry.
 ///
 /// MOD-41 E-1: a startup refusal (2) is a configuration state the user reads on stderr and in the
 /// log, not a crash report. MOD-45 review finding 1: no `htui provision` end is either, whatever
 /// its code: its sentences carry `user@host`, remote paths and the host's journal and log lines,
-/// and each describes that host's state.
+/// and each describes that host's state. MOD-11 B-13: no `htui mcp` end is either; an agent's
+/// relay ending is the session's state, not a crash.
 fn reports_to_sentry(error: &anyhow::Error, code: u8) -> bool {
     code != 2
         && error
             .downcast_ref::<htui::provision::ProvisionExit>()
             .is_none()
+        && error.downcast_ref::<htui::mcp_cmd::McpExit>().is_none()
 }
 
 #[cfg(test)]
@@ -104,7 +135,8 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{reports_to_sentry, run_bounded};
+    use super::{reports_to_sentry, run_bounded, teardown_grace};
+    use htui::mcp_cmd::McpExit;
     use htui::provision::ProvisionExit;
     use htui::worker_cmd::WorkerExit;
 
@@ -130,6 +162,46 @@ mod tests {
             reports_to_sentry(&anyhow::anyhow!("boom"), 1),
             "any other error"
         );
+
+        // MOD-11 B-13: an agent's relay ending is never a crash report, whatever its code.
+        let missing = anyhow::Error::from(McpExit::MissingEnv("HTUI_MCP_ADDR is not set".into()));
+        assert!(!reports_to_sentry(&missing, 2), "a relay missing its env");
+        let refused = anyhow::Error::from(McpExit::Refused("unknown session".into()));
+        assert!(!reports_to_sentry(&refused, 3), "a refused relay");
+        let failed = anyhow::Error::from(McpExit::Failed("cannot reach the host".into()));
+        assert!(!reports_to_sentry(&failed, 1), "a failed relay");
+    }
+
+    /// MOD-11 D6, B-13: `htui mcp` exits 2 without its environment, 3 when the host refuses it, 1
+    /// on any other failure; `body` reads the code off the error the same way.
+    #[test]
+    fn mcp_exit_codes_are_2_3_1() {
+        assert_eq!(McpExit::MissingEnv(String::new()).code(), 2);
+        assert_eq!(McpExit::Refused(String::new()).code(), 3);
+        assert_eq!(McpExit::Failed(String::new()).code(), 1);
+        for exit in [
+            McpExit::MissingEnv("m".into()),
+            McpExit::Refused("r".into()),
+            McpExit::Failed("f".into()),
+        ] {
+            let expected = exit.code();
+            let error = anyhow::Error::from(exit);
+            assert_eq!(super::exit_code(&error), expected, "{error}");
+        }
+        assert_eq!(super::exit_code(&anyhow::anyhow!("boom")), 1);
+    }
+
+    /// MOD-11 D6: `htui mcp` tears its runtime down at once (its stdin read cannot be
+    /// cancelled); every other command keeps the bounded grace.
+    #[test]
+    fn only_mcp_skips_the_teardown_grace() {
+        use clap::Parser;
+        let grace = |argv: &[&str]| {
+            teardown_grace(&htui::cli::Args::try_parse_from(argv).expect("the arguments parse"))
+        };
+        assert_eq!(grace(&["htui", "mcp"]), Duration::ZERO);
+        assert_eq!(grace(&["htui"]), htui::SHUTDOWN);
+        assert_eq!(grace(&["htui", "--clear-dsn"]), htui::SHUTDOWN);
     }
 
     /// MOD-41 review RF-4: a body that panics while a blocking task never ends still leaves

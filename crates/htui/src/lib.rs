@@ -23,6 +23,7 @@ pub mod event_loop;
 pub mod hierarchy;
 pub mod item_writes;
 pub mod keymap;
+pub mod mcp_cmd;
 pub mod persona_import;
 pub mod persona_settings;
 pub mod preview;
@@ -82,6 +83,11 @@ use crate::keymap::Keymap;
 /// the terminal fails. The terminal is restored on every path out of here, error included
 /// (MOD-1 plan D8).
 pub async fn run(args: cli::Args) -> anyhow::Result<()> {
+    if matches!(args.command, Some(cli::Command::Mcp)) {
+        // MOD-11 D6, blueprint H-24: first, before any subscriber or print. Stdout is the
+        // protocol, so nothing here logs; `main` prints a failure on stderr.
+        return mcp_cmd::run().await.map_err(anyhow::Error::from);
+    }
     if let Some(cli::Command::Worker(worker)) = args.command.clone() {
         // The worker installs its own subscriber (stderr without `--log`), MOD-41 plan D14.
         return worker_cmd::run(worker, args.log.as_deref())

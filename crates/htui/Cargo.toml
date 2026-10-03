@@ -30,6 +30,8 @@ htui-agent         = { workspace = true }
 htui-orch          = { workspace = true }
 # MOD-41 plan D6: the run runtime, shared with `htui worker`; `run_worker` is its TUI adapter.
 htui-worker        = { workspace = true }
+# MOD-11 D6: `htui mcp`, the stdio relay an agent starts as its htui MCP server.
+htui-mcp           = { workspace = true }
 htui-core          = { workspace = true, features = ["demo"] }
 chrono             = { workspace = true }
 serde_json         = { workspace = true }
@@ -43,7 +45,9 @@ crossterm          = { workspace = true }
 futures            = { workspace = true }
 ratatui            = { workspace = true }
 # MOD-9: `signal` holds Ctrl-C and Ctrl-\ off htui while `$EDITOR` has the cooked tty (editor.rs).
-tokio              = { workspace = true, features = ["signal"] }
+# MOD-11 blueprint H-15: `io-std`, the stdio `htui mcp` splices; named here rather than left to
+# feature unification through `htui-mcp`.
+tokio              = { workspace = true, features = ["signal", "io-std"] }
 # MOD-20 D18: `CancellationToken` is how an install is stopped. Cooperative, because the task has
 # to sweep its staging entry and send its own last frame — neither of which an `abort()` allows.
 tokio-util         = { workspace = true }

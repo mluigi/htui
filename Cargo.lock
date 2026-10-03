@@ -3033,6 +3033,7 @@ dependencies = [
  "futures",
  "htui-agent",
  "htui-core",
+ "htui-mcp",
  "htui-orch",
  "htui-store",
  "htui-worker",
