@@ -198,6 +198,15 @@ save is a new version, with no compare-and-set (D5).
 - Milestone 5 ships the writer either way. **Recommendation:** file a follow-up item to reconcile
   §4.2's ranking with §4.8, rather than change a pinned engine rule inside an editor milestone.
 
+## Maintainer answers (2026-10-03, after the blueprint)
+- **Blueprint §6 Q1: an unchanged `v` save is refused.** Ctrl+S on a `v` form whose title and body
+  equal `base`'s says `NOTHING_TO_SAVE` (`item_spec`'s sentence) in the form and sends nothing.
+  The check is in the pane only; the worker cannot know the base. One test in T4.
+- **Blueprint §6 Q2: `v` opens with the cursor on the body** (the blueprint default).
+- **Open question (ranking): file a follow-up item at close-out** (lifecycle P0, minted through
+  `scripts/hr-mint`), to reconcile ANA-2 §4.2's input ranking with §4.8. Milestone 5 ships
+  unchanged.
+
 ## Patterns to Mirror
 | Category | Source | Pattern |
 |---|---|---|
