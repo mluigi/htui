@@ -983,11 +983,12 @@ pub enum StoreRequest {
         body: HandText,
     },
     /// The read that opens the Docs form: `kind` is `None` for `a`, the row's kind for `v`, whose
-    /// latest version prefills the form (D9). Answered with [`StoreReply::DocumentForm`].
+    /// version the next step reads (`resolve_inputs`, MOD-73 review M1) prefills the form (D9).
+    /// Answered with [`StoreReply::DocumentForm`].
     DocumentForm {
         /// The item the document is for.
         item: ItemId,
-        /// The kind whose latest version prefills the form (`v`); `None` for a new document (`a`).
+        /// The kind whose next-step input prefills the form (`v`); `None` for a new document (`a`).
         kind: Option<String>,
     },
     /// A hand-written document at the store's next version of `kind` (`R-ENT-12`, D5: never a
