@@ -93,7 +93,13 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
         () = &mut shutdown => return stopped_before_ready(),
         job = concepts::spawn_index_job(pg.clone()) => job,
     };
-    let runtime = RunRuntime::<PgStore, Unaddressed>::production().with_role(Role::Worker);
+    // MOD-11 D11: a worker that cannot host tools would fail every document phase, so it is
+    // refused before it claims anything.
+    let tools = htui_mcp::McpHost::new(pg.clone())
+        .map_err(|err| WorkerExit::Refused(format!("htui's MCP tools cannot be hosted: {err}")))?;
+    let runtime = RunRuntime::<PgStore, Unaddressed>::production()
+        .with_role(Role::Worker)
+        .with_tool_host(std::sync::Arc::new(tools));
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     if let Some(job) = index_job {

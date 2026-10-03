@@ -24,6 +24,7 @@ pub mod hierarchy;
 pub mod item_writes;
 pub mod keymap;
 pub mod mcp_cmd;
+pub mod mcp_search;
 pub mod persona_import;
 pub mod persona_settings;
 pub mod preview;
@@ -52,6 +53,7 @@ pub mod testkit;
 pub const SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(5);
 
 use std::path::Path;
+use std::sync::Arc;
 
 use htui_core::store::MemStore;
 use htui_store::{Backend, StartOptions, Started, connect, identity, secret};
@@ -148,13 +150,26 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
 
     let (request_tx, request_rx) = mpsc::unbounded_channel();
     let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+    // MOD-11 D11: one MCP host for the TUI's walks and chats. A host that cannot start leaves
+    // the TUI running without tools: a step then fails `missing_output`, loudly (OQ-9).
+    let tools = match htui_mcp::McpHost::new(started.backend.clone()) {
+        Ok(host) => Some(Arc::new(match mcp_search::production() {
+            Some(search) => host.with_search(search),
+            None => host,
+        })),
+        Err(err) => {
+            tracing::warn!(%err, "htui's MCP tools are not hosted this session");
+            None
+        }
+    };
     // The backend moves into the worker here and is unreachable from the UI afterwards (D4).
     // MOD-7 D11: the binary, and only the binary, opts in to the registration probe.
-    let worker = store_worker::spawn_with(
+    let worker = store_worker::spawn_hosted(
         started,
         request_rx,
         reply_tx,
         AgentRuntime::production().with_registration_probe(),
+        tools,
     );
 
     let mut app = App::new(request_tx, Keymap::default_global());

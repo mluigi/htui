@@ -211,6 +211,7 @@ pub(crate) mod tests {
         self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, spawn_with_runtimes,
     };
     use crate::ui::tabs::TabId;
+    use htui_mcp::McpHost;
     use uuid::Uuid;
 
     /// The scripted registry row every walk test runs on (blueprint F-O): an `acp` row, because
@@ -310,6 +311,10 @@ pub(crate) mod tests {
         /// MOD-42 T4: `ToolCall`, `ParkPermission(request)`, then `Done`; the grace its session's
         /// `cancel` received is kept in the [`Park`]'s cell.
         Park(Park),
+        /// MOD-11 B-9: before its turn the session calls each `(tool, arguments)` of htui's MCP
+        /// server on its own token, through the fixture's real `McpHost` (D5's in-process
+        /// client), and asserts each answered without `isError`; then one turn and `done`.
+        Tools(Vec<(&'static str, serde_json::Value)>),
     }
 
     /// A parking session's request and the grace its `cancel` was given, if it was cancelled.
@@ -375,8 +380,9 @@ pub(crate) mod tests {
     }
 
     /// The sessions the fixture's builds play, in build order; [`Play::Done`] once it is empty.
+    /// The second cell is the fixture's MCP host, once [`Fixture::runtime_with_tools`] made one.
     #[derive(Debug, Default)]
-    struct Sessions(StdMutex<VecDeque<Play>>);
+    struct Sessions(StdMutex<VecDeque<Play>>, StdMutex<Option<McpHost<Backend>>>);
 
     impl Sessions {
         fn push(&self, play: Play) {
@@ -404,7 +410,7 @@ pub(crate) mod tests {
                 .unwrap_or(Play::Done);
             let script = match &play {
                 Play::Park(park) => park.script(),
-                Play::Done | Play::Stall(_) | Play::Panic => {
+                Play::Done | Play::Stall(_) | Play::Panic | Play::Tools(_) => {
                     Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
                         stop_reason: StopReason::EndTurn,
                     }))])
@@ -413,6 +419,7 @@ pub(crate) mod tests {
             Ok(Box::new(ScriptedDriver {
                 inner: FakeDriver::new(agent.name.clone(), caps, script),
                 play,
+                mcp: self.0.1.lock().expect("the host cell").clone(),
             }))
         }
     }
@@ -421,6 +428,7 @@ pub(crate) mod tests {
     struct ScriptedDriver {
         inner: FakeDriver,
         play: Play,
+        mcp: Option<McpHost<Backend>>,
     }
 
     impl AgentDriver for ScriptedDriver {
@@ -437,12 +445,32 @@ pub(crate) mod tests {
             spec: SessionSpec,
             prompt: String,
         ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+            let token = spec
+                .mcp
+                .first()
+                .and_then(|server| server.env.get(htui_mcp::ENV_TOKEN))
+                .cloned();
             let inner = self.inner.start(spec, prompt);
             let play = self.play.clone();
+            let mcp = self.mcp.clone();
             Box::pin(async move {
                 let session = inner.await?;
                 match play {
                     Play::Done => Ok(session),
+                    Play::Tools(calls) => {
+                        let host = mcp.expect("a `Play::Tools` session runs over a hosted runtime");
+                        let token = token.expect("the spec carries htui's server");
+                        let mut client = host.client(&token).expect("the session's token is live");
+                        client.initialize().await.expect("initialize is answered");
+                        for (tool, arguments) in calls {
+                            let result = client
+                                .call(tool, arguments)
+                                .await
+                                .expect("the call is answered");
+                            assert!(!result.is_error, "{tool}: {}", result.text);
+                        }
+                        Ok(session)
+                    }
                     Play::Stall(stall) => Ok(Box::new(Stalled {
                         inner: session,
                         stall,
@@ -630,6 +658,22 @@ pub(crate) mod tests {
             )
             .with_clock(Arc::new(TokioClock::new()))
             .with_author(Arc::new(OutputAuthor))
+        }
+
+        /// MOD-11 B-9: the production path — the fakes and the tokio-time clock, a real
+        /// `McpHost<Backend>` over the fixture's store, and **no author**: every document is one
+        /// a session wrote through `document_write`.
+        fn runtime_with_tools(&self) -> RunRuntime {
+            let host =
+                McpHost::new(Backend::memory(self.store.clone())).expect("an absolute binary path");
+            *self.sessions.1.lock().expect("the host cell") = Some(host.clone());
+            RunRuntime::with_parts(
+                Arc::clone(&self.isolator) as Arc<dyn Isolator>,
+                Arc::new(FakeVerifier::new()),
+                self.factory(),
+            )
+            .with_clock(Arc::new(TokioClock::new()))
+            .with_tool_host(Arc::new(host))
         }
 
         pub(crate) async fn run(&self, id: RunId) -> Run {
@@ -911,6 +955,124 @@ pub(crate) mod tests {
         assert!(
             fixture.isolator.releases() >= 1,
             "the abandoned walk's guards were released"
+        );
+    }
+
+    /// MOD-11 T6 (B-9): a step whose document came through `document_write` — no test author —
+    /// is approvable, and once promoted its artefact is acceptable: the Runs pane's verbs are live
+    /// on what a production session wrote.
+    #[tokio::test]
+    async fn approve_and_accept_are_live_on_a_tool_written_step() {
+        let fixture = Fixture::new().await;
+        fixture.sessions.push(Play::Tools(vec![(
+            "document_write",
+            json!({ "body": "the research, through the tool" }),
+        )]));
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime_with_tools());
+        let (_run, research) = parked(&fixture, &mut worker).await;
+
+        let heads = fixture
+            .store
+            .documents(ids::HTUI_ANA_2)
+            .await
+            .expect("the read answers");
+        assert!(
+            heads.iter().any(
+                |head| head.kind == "research" && head.produced_by_step_id == Some(research.id)
+            ),
+            "the tool wrote the step's output: {heads:?}"
+        );
+        let ask = worker.send(Origin::App, StoreRequest::RunActions(ids::HTUI_ANA_2));
+        let StoreReply::RunActions(actions) = worker.reply(ask).await else {
+            panic!("the verdicts");
+        };
+        assert_eq!(actions.steps[&research.id].approve, Ok(()));
+        assert!(actions.steps[&research.id].open.is_ok());
+
+        fixture
+            .store
+            .promote_step(research.id, Utc::now())
+            .await
+            .expect("the parked step promotes");
+        let ask = worker.send(Origin::App, StoreRequest::RunActions(ids::HTUI_ANA_2));
+        let StoreReply::RunActions(actions) = worker.reply(ask).await else {
+            panic!("the verdicts");
+        };
+        assert_eq!(actions.steps[&research.id].accept, Ok(()));
+    }
+
+    /// MOD-11 T6 (plan D10, B-9): fan-out 2 plus a judge on the production path. Every session —
+    /// both candidates, both judge calls and the next phase — writes its document through
+    /// `document_write` on its own token, the progress sink writes nothing, and the judge
+    /// resolves the group with no human pick.
+    #[tokio::test]
+    async fn a_production_judge_resolves_on_tool_written_documents() {
+        let mut data = htui_core::fixtures::demo_data();
+        for phase in &mut data.phases {
+            if phase.graph_id == ids::GRAPH_HTUI_ANA {
+                phase.gate = Gate::Never;
+                if phase.name == "research" {
+                    phase.fan_out = 2;
+                }
+            }
+        }
+        let fixture = Fixture::over(MemStore::from_demo(data)).await;
+        let judge = scripted_agent(&fixture).await;
+        let mut settings = fixture
+            .store
+            .project_settings(ids::PROJECT_HTUI)
+            .await
+            .expect("the read answers")
+            .filter(serde_json::Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        settings["judge_agent_id"] = json!(judge);
+        fixture
+            .store
+            .set_project_settings(ids::PROJECT_HTUI, settings);
+        let verdict = format!(
+            "Compared.\n\n```json\n{}\n```",
+            json!({ "winner": 1, "reasons": { "1": "the deeper one" } })
+        );
+        for index in 0..2 {
+            fixture.sessions.push(Play::Tools(vec![(
+                "document_write",
+                json!({ "body": format!("research by candidate {index}") }),
+            )]));
+        }
+        for _call in 0..2 {
+            fixture.sessions.push(Play::Tools(vec![(
+                "document_write",
+                json!({ "body": verdict }),
+            )]));
+        }
+        fixture.sessions.push(Play::Tools(vec![(
+            "document_write",
+            json!({ "body": "the verdict" }),
+        )]));
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime_with_tools());
+
+        let start = worker.send(Origin::App, start_run(ids::HTUI_ANA_2));
+        let CommandOutcome::Started { run, rest } = outcome(worker.reply(start).await) else {
+            panic!("a start answers Started");
+        };
+        assert_eq!(rest.run, RunStatus::Done, "{rest:?}");
+        let steps = fixture.steps(run).await;
+        let judge_step = steps
+            .iter()
+            .find(|step| step.position == 0 && step.fanout_index == -1)
+            .expect("the judge is a step");
+        assert_eq!(
+            (judge_step.status, judge_step.gate_note.as_deref()),
+            (StepStatus::Done, Some("the deeper one"))
+        );
+        let selected: Vec<_> = steps
+            .iter()
+            .filter(|step| step.position == 0 && step.fanout_index >= 0)
+            .map(|step| (step.fanout_index, step.selected))
+            .collect();
+        assert!(
+            selected.contains(&(1, Some(true))) && selected.contains(&(0, Some(false))),
+            "the judge's winner, no human pick: {selected:?}"
         );
     }
 

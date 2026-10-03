@@ -2028,6 +2028,34 @@ pub fn spawn_with(
     spawn_with_runtimes(started, rx, tx, runtime, runs)
 }
 
+/// [`spawn_with`] hosting htui's MCP tools (MOD-11 D11): with `tools`, the chat runtime and the
+/// run runtime open their leases on the one host, and the loop hands it the current backend at
+/// the top of every iteration (B-2), so a session opened after a `SetDsn` writes to the new
+/// server. `None` is [`spawn_with`] exactly.
+pub fn spawn_hosted(
+    started: Started,
+    rx: mpsc::UnboundedReceiver<RequestEnvelope>,
+    tx: mpsc::UnboundedSender<ReplyEnvelope>,
+    runtime: AgentRuntime,
+    tools: Option<Arc<htui_mcp::McpHost<Backend>>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut runtime = runtime;
+    let mut runs = crate::run_worker::production_for(&started.backend);
+    if let Some(host) = &tools {
+        runtime = runtime.with_tool_host(Arc::clone(host) as Arc<dyn htui_orch::tools::ToolHost>);
+        runs = runs.with_tool_host(Arc::clone(host) as Arc<dyn htui_orch::tools::ToolHost>);
+    }
+    spawn_with_concepts(
+        started,
+        rx,
+        tx,
+        runtime,
+        runs,
+        ConceptsRuntime::production(),
+        tools,
+    )
+}
+
 /// The steps a chat of this process is live on (blueprint D206): the runtime's chats whose
 /// session task is still running (`AgentRuntime::live_steps`).
 pub(crate) fn live_chats(runtime: &AgentRuntime) -> LiveChats {
@@ -2099,6 +2127,7 @@ pub fn spawn_with_runtimes(
         runtime,
         runs,
         ConceptsRuntime::production(),
+        None,
     )
 }
 
@@ -2111,6 +2140,7 @@ pub(crate) fn spawn_with_concepts(
     mut runtime: AgentRuntime,
     mut runs: RunRuntime,
     mut concepts: ConceptsRuntime,
+    tools: Option<Arc<htui_mcp::McpHost<Backend>>>,
 ) -> tokio::task::JoinHandle<()> {
     let Started {
         mut backend,
@@ -2172,6 +2202,11 @@ pub(crate) fn spawn_with_concepts(
         let mut beat: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
+            // MOD-11 B-2 (H-10): the backend this iteration serves is the one a tool session
+            // opened from now on writes to — robust to every site below that swaps or mutates it.
+            if let Some(host) = &tools {
+                host.set_host(backend.clone());
+            }
             // The first sweep reads `lease_ttl_seconds`; the ticker follows it.
             if runs.sweep_every() != sweep_every {
                 sweep_every = runs.sweep_every();
@@ -2914,6 +2949,7 @@ mod tests {
             AgentRuntime::production(),
             RunRuntime::production(),
             ConceptsRuntime::new(Arc::new(index)),
+            None,
         );
         let query = crate::concepts::query("anything", scope.project_ids, false, 10);
         for (seq, request) in [
