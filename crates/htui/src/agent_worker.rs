@@ -36,11 +36,11 @@ use htui_agent::auth::{
 use htui_agent::box_probe;
 use htui_agent::box_probe::hardware::{HardwareSource, SystemHardware};
 use htui_agent::driver::{
-    AgentDriver, AgentSession, DriverCaps, PermissionAnswer, PermissionPolicy, PermissionRequestId,
-    SessionSpec,
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, PermissionAnswer, PermissionPolicy,
+    PermissionRequestId, SessionSpec,
 };
 use htui_agent::error::DriverError;
-use htui_agent::event::{DriverEnvelope, DriverEvent, StopReason, ToolCallEvent};
+use htui_agent::event::{DriverEnvelope, DriverEvent, OtherEvent, StopReason, ToolCallEvent};
 use htui_agent::install::{
     InstallConfig, InstallError, InstallJob, InstallOutcome, InstallPlan, InstallProgress,
     Installer, PlanError, install, plan as plan_install,
@@ -56,7 +56,7 @@ use htui_agent::record::{
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, ItemId, PER_TOKEN_CAP_BATCH, ProjectCaps,
-    ProjectId, QuotaSource, RunStatus, Scope, SessionEvent, StepId, Transport,
+    ProjectId, QuotaSource, RunStatus, Scope, SessionEvent, StepId, StepOpening, Transport,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
@@ -925,8 +925,8 @@ impl AgentRuntime {
     /// project's caps and the quota latch, then the step's log read **through the writer**
     /// (blueprint H-9), whose absence is "the step's log is not on this box". The spec is the
     /// promoted step's: its id, `cwd` and `extra_dirs` from the opening, and `resume` on
-    /// [`OpeningPath::Resume`]. No re-probe rides on it: the walk that ran the step already
-    /// started this agent here.
+    /// [`OpeningPath::Resume`], whose handoff the session falls back to (MOD-37 M5). No re-probe
+    /// rides on it: the walk that ran the step already started this agent here.
     ///
     /// Answers [`Served::Start`], whose session answers `addr` with `ChatAccepted` and every frame
     /// after it, or a `Failed` for `promote_step`. While a chat is live it answers
@@ -1030,11 +1030,21 @@ impl AgentRuntime {
             }));
         };
 
-        let (resume, opening_text) = match opening.path {
+        let (resume, opening_text, fallback) = match opening.path {
             OpeningPath::Resume {
-                session_ref, text, ..
-            } => (Some(session_ref), text),
-            OpeningPath::Handoff { text, .. } => (None, text),
+                session_ref,
+                text,
+                handoff,
+                ..
+            } => (
+                Some(session_ref.clone()),
+                text,
+                Some(ResumeFallback {
+                    session_ref,
+                    handoff,
+                }),
+            ),
+            OpeningPath::Handoff { text, .. } => (None, text, None),
         };
         let spec = SessionSpec {
             agent_id: opening.agent_id,
@@ -1073,7 +1083,11 @@ impl AgentRuntime {
         let args = ChatArgs {
             driver,
             writer,
-            binding: ChatBinding::Promoted { step_id, tail },
+            binding: ChatBinding::Promoted {
+                step_id,
+                tail,
+                fallback,
+            },
             spec,
             prompt: opening_text,
             policy: settings.permission,
@@ -2199,7 +2213,18 @@ enum ChatBinding {
         /// The step's persisted rows, read through the writer (blueprint H-9): where the
         /// continuing recorder starts (plan D164).
         tail: Vec<SessionEvent>,
+        /// MOD-37 M5: what the chat opens with if resuming the step's session fails. `Some`
+        /// exactly when the opening is [`OpeningPath::Resume`].
+        fallback: Option<ResumeFallback>,
     },
+}
+
+/// MOD-37 M5: what a promoted chat opens with when resuming the step's own session fails: the
+/// session it tried, and the handoff prompt the engine built for this promotion.
+#[derive(Debug, Clone)]
+struct ResumeFallback {
+    session_ref: AgentSessionRef,
+    handoff: String,
 }
 
 impl ChatBinding {
@@ -3647,7 +3672,7 @@ impl Frames {
     /// renders, and shaping it as `other` is what keeps [`ChatFrame`] one type instead of four.
     fn local(&self, update: &str, body: Value, at: DateTime<Utc>) {
         self.event(DriverEnvelope {
-            event: DriverEvent::Other(htui_agent::event::OtherEvent {
+            event: DriverEvent::Other(OtherEvent {
                 update: update.to_owned(),
                 body,
             }),
@@ -3948,9 +3973,86 @@ pub async fn run_chat(args: ChatArgs) {
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
     let step_id = binding.step_id();
 
-    let mut session = match driver.start(spec, prompt.clone()).await {
-        Ok(session) => session,
-        Err(err) => {
+    // MOD-37 M5 (blueprint D5, H-6): one recorder, built before the first start, so a
+    // `resume_failed` row and the handoff's `follow_up` after it come from the same continuing
+    // recorder: a second one over the stale tail would reuse its `seq`. A start that fails drops a
+    // recorder that wrote nothing (`Recorder` has no `Drop` side effect).
+    let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
+    let retain_raw = std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1");
+    let mut recorder = match &binding {
+        ChatBinding::Fresh(..) => {
+            Recorder::new(&writer, &scrubber, step_id, retain_raw, Some(ui_tx))
+        }
+        // Plan D164: the step's log goes on past its last row, at its next turn, with its
+        // pre-promotion spend in the running total and its prompt digest left alone.
+        ChatBinding::Promoted { tail, .. } => {
+            Recorder::continuing(&writer, &scrubber, step_id, retain_raw, Some(ui_tx), tail)
+        }
+    };
+    // Two opt-in builders rather than two more `new` parameters, because most recorders in this
+    // tree have neither (plan D66-D68, D70). The grace the cap's cancel takes is this runtime's
+    // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
+    recorder = recorder.with_quota_latch(quota_latch);
+    if let Some(micros) = project_caps.run_micros {
+        recorder = recorder.with_run_cap(RunCap { micros, grace });
+    }
+
+    let first = driver.start(spec.clone(), prompt.clone()).await;
+    let fallback = match &binding {
+        ChatBinding::Promoted { fallback, .. } => fallback.clone(),
+        ChatBinding::Fresh(..) => None,
+    };
+    // MOD-37 M5: a promoted resume that fails is reported, then the chat opens with the handoff
+    // in the same bind. `Ok` carries the session, the text recorded as its opening, how it opened
+    // and the notice owed the tab; `Err` the refusal and that notice.
+    let started = match (first, fallback) {
+        (Ok(session), fallback) => {
+            let opening = if fallback.is_some() {
+                StepOpening::Resumed
+            } else {
+                StepOpening::Handoff
+            };
+            Ok((session, prompt, opening, None))
+        }
+        (Err(err), Some(fallback)) if falls_back(&err) => {
+            let at = Utc::now();
+            let notice = resume_failed_notice(&fallback.session_ref, &err.to_string());
+            // The column first, so the Runs pane is truthful even if the row write fails.
+            record_opening(&writer, step_id, StepOpening::ResumeFailed).await;
+            // The row, at the step's current turn, before a second session can write.
+            if let Err(record_err) = recorder.record_notice(&notice, at).await {
+                tracing::error!(%record_err, "the resume_failed row could not be written");
+            }
+            let envelope = DriverEnvelope {
+                event: DriverEvent::Other(notice),
+                raw: None,
+                at,
+            };
+            // The second start: no resume, the handoff text.
+            let handoff_spec = SessionSpec {
+                resume: None,
+                ..spec
+            };
+            match driver.start(handoff_spec, fallback.handoff.clone()).await {
+                Ok(session) => Ok((
+                    session,
+                    fallback.handoff,
+                    StepOpening::ResumeFailed,
+                    Some(envelope),
+                )),
+                Err(err) => Err((err, Some(envelope))),
+            }
+        }
+        (Err(err), _) => Err((err, None)),
+    };
+
+    let (mut session, opening_text, opening, notice) = match started {
+        Ok(started) => started,
+        Err((err, notice)) => {
+            // MOD-37 M5 (H-7): the report reaches the tab before the refusal.
+            if let Some(notice) = notice {
+                frames.event(notice);
+            }
             let message = err.to_string();
             frames.to_stream(StoreReply::Failed {
                 request: binding.request(),
@@ -3982,45 +4084,34 @@ pub async fn run_chat(args: ChatArgs) {
         session_ref: session.session_ref().cloned(),
         caps,
     });
-
-    let (ui_tx, mut ui_rx) = mpsc::channel(UI_FRAMES);
-    let retain_raw = std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1");
-    let mut recorder = match &binding {
-        ChatBinding::Fresh(..) => {
-            Recorder::new(&writer, &scrubber, step_id, retain_raw, Some(ui_tx))
-        }
-        // Plan D164: the step's log goes on past its last row, at its next turn, with its
-        // pre-promotion spend in the running total and its prompt digest left alone.
-        ChatBinding::Promoted { tail, .. } => {
-            Recorder::continuing(&writer, &scrubber, step_id, retain_raw, Some(ui_tx), tail)
-        }
-    };
-    // Two opt-in builders rather than two more `new` parameters, because most recorders in this
-    // tree have neither (plan D66-D68, D70). The grace the cap's cancel takes is this runtime's
-    // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
-    recorder = recorder.with_quota_latch(quota_latch);
-    if let Some(micros) = project_caps.run_micros {
-        recorder = recorder.with_run_cap(RunCap { micros, grace });
+    // MOD-37 M5 (H-8): a promoted chat's opening, written only once its start succeeded.
+    // `resume_failed` was written before the fallback start; a fresh chat records none.
+    if matches!(binding, ChatBinding::Promoted { .. }) && opening != StepOpening::ResumeFailed {
+        record_opening(&writer, step_id, opening).await;
+    }
+    // H-7: after the acceptance, before the opening.
+    if let Some(envelope) = notice {
+        frames.event(envelope);
     }
 
     let now = Utc::now();
     match &binding {
         ChatBinding::Fresh(..) => {
             if let Err(err) = recorder
-                .record_prompt(&prompt, prompt_sections(), now)
+                .record_prompt(&opening_text, prompt_sections(), now)
                 .await
             {
                 tracing::error!(%err, "the prompt row could not be written");
             }
-            frames.local("prompt", json!({ "text": prompt }), now);
+            frames.local("prompt", json!({ "text": opening_text }), now);
         }
         // ANA-5 criterion 18: the opening — the handoff prompt, or the resume sentence — is the
         // step's next `follow_up`, never a second `prompt` (which would rewrite the digest).
         ChatBinding::Promoted { .. } => {
-            if let Err(err) = recorder.record_follow_up(&prompt, now).await {
+            if let Err(err) = recorder.record_follow_up(&opening_text, now).await {
                 tracing::error!(%err, "the opening's follow-up row could not be written");
             }
-            frames.event(follow_up_frame(&prompt, now));
+            frames.event(follow_up_frame(&opening_text, now));
         }
     }
 
@@ -4391,7 +4482,7 @@ async fn record_answer(
         tracing::error!(%err, "the permission answer row could not be written");
     }
     let frame = DriverEnvelope {
-        event: DriverEvent::Other(htui_agent::event::OtherEvent {
+        event: DriverEvent::Other(OtherEvent {
             update: "permission_answer".to_owned(),
             // The **same** key set the recorder writes, `denied` included (D94). A live frame and
             // the row it replays as are read by one function
@@ -4421,10 +4512,42 @@ async fn record_answer(
     }
 }
 
+/// MOD-37 M5: whether a failed resume is worth a handoff start. Not when the adapter cannot run at
+/// all: a missing or unspawnable command (`Spawn`), an unresolved launch placeholder
+/// (`Unresolved`) or no transport (`UnknownAdapter`) would fail the handoff start the same way
+/// (blueprint A-2, H-18).
+const fn falls_back(err: &DriverError) -> bool {
+    !matches!(
+        err,
+        DriverError::Spawn(_) | DriverError::Unresolved(_) | DriverError::UnknownAdapter(_)
+    )
+}
+
+/// MOD-37 M5: the `resume_failed` notice: the session tried, why it failed, and what the chat
+/// opens with instead.
+fn resume_failed_notice(session_ref: &AgentSessionRef, reason: &str) -> OtherEvent {
+    OtherEvent {
+        update: htui_agent::event::RESUME_FAILED.to_owned(),
+        body: json!({
+            "session_id": session_ref.as_str(),
+            "reason": reason,
+            "note": htui_orch::promote::CONTEXT_NOT_CARRIED,
+        }),
+    }
+}
+
+/// MOD-37 M5: `run_step.opening`, written through the bind's writer. A failed write is logged and
+/// never fails the chat: the column is a label, and the session is what the user is waiting on.
+async fn record_opening(writer: &Writer, step: StepId, opening: StepOpening) {
+    if let Err(err) = writer.record_opening(step, opening).await {
+        tracing::warn!(%err, %step, %opening, "the chat's opening could not be recorded");
+    }
+}
+
 /// The frame a follow-up produces, shaped as the `other` row the tab renders.
 fn follow_up_frame(text: &str, at: DateTime<Utc>) -> DriverEnvelope {
     DriverEnvelope {
-        event: DriverEvent::Other(htui_agent::event::OtherEvent {
+        event: DriverEvent::Other(OtherEvent {
             update: "follow_up".to_owned(),
             body: json!({ "text": text }),
         }),
@@ -4487,7 +4610,7 @@ pub(crate) mod tests {
     use htui_agent::fake::FakeAdapter;
     use htui_core::fixtures::{edit_agent, ids};
     use htui_core::model::{
-        Agent, AgentId, EventKind, EventRole, RunId, Scope, StepOpening, StepStatus, Transport,
+        Agent, AgentId, EventKind, EventRole, RunId, Scope, StepStatus, Transport,
     };
     use htui_core::store::MemStore;
     use std::sync::Arc;
@@ -5249,7 +5372,7 @@ pub(crate) mod tests {
         let promotion = promoted(
             agent_id,
             OpeningPath::Resume {
-                session_ref: htui_agent::driver::AgentSessionRef::new("banner-1"),
+                session_ref: AgentSessionRef::new("banner-1"),
                 text: htui_orch::promote::RESUME_OPENING.to_owned(),
                 handoff: "the handoff".to_owned(),
                 digest: "d".to_owned(),
@@ -5263,10 +5386,7 @@ pub(crate) mod tests {
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
             .expect("the driver was started");
-        assert_eq!(
-            seen.resume,
-            Some(htui_agent::driver::AgentSessionRef::new("banner-1"))
-        );
+        assert_eq!(seen.resume, Some(AgentSessionRef::new("banner-1")));
         assert_eq!(seen.step_id, ids::STEP_PLAN, "the step keeps its id");
         assert_eq!(seen.cwd, std::env::temp_dir());
         assert_eq!(
@@ -5364,7 +5484,7 @@ pub(crate) mod tests {
     /// MOD-37 M5: the opening a resume would try, with its handoff fallback.
     fn resume_path() -> OpeningPath {
         OpeningPath::Resume {
-            session_ref: htui_agent::driver::AgentSessionRef::new("banner-1"),
+            session_ref: AgentSessionRef::new("banner-1"),
             text: htui_orch::promote::RESUME_OPENING.to_owned(),
             handoff: "HANDOFF TEXT".to_owned(),
             digest: "d".to_owned(),
@@ -5458,10 +5578,7 @@ pub(crate) mod tests {
         assert_eq!(starts.len(), 2, "the resume, then the handoff: {starts:?}");
         let (first, first_prompt) = &starts[0];
         let (second, second_prompt) = &starts[1];
-        assert_eq!(
-            first.resume,
-            Some(htui_agent::driver::AgentSessionRef::new("banner-1"))
-        );
+        assert_eq!(first.resume, Some(AgentSessionRef::new("banner-1")));
         assert_eq!(first_prompt, htui_orch::promote::RESUME_OPENING);
         assert_eq!(second.resume, None, "the fallback resumes nothing");
         assert_eq!(second_prompt, "HANDOFF TEXT");
@@ -11323,7 +11440,7 @@ done
     struct PanicsOnPull;
 
     impl AgentSession for PanicsOnPull {
-        fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
+        fn session_ref(&self) -> Option<&AgentSessionRef> {
             None
         }
 
