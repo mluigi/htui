@@ -162,7 +162,9 @@ fn caps_from(agent: &Agent, settings: &AgentSettings) -> DriverCaps {
             plans: true,
             thoughts: true,
             follow_up_in_session: true,
-            resume: settings.acp.session.resume,
+            // MOD-37 M5 (R-48): either restore route resumes; session_main picks
+            // `session/resume` first.
+            resume: settings.acp.session.resume || settings.acp.session.load,
             usage: true,
             // `session/update` carries a `usage_update` whenever the adapter reports one (§3), so
             // a cost figure can arrive with the turn still open and the per-run cap is a live

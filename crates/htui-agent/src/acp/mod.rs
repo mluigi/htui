@@ -30,11 +30,14 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, InitializeRequest, NewSessionRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigOptionValue, SetSessionConfigOptionRequest, WriteTextFileResponse,
+    AgentCapabilities, CancelNotification, InitializeRequest, LoadSessionRequest,
+    NewSessionRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionResponse,
+    ResumeSessionRequest, SelectedPermissionOutcome, SessionConfigOptionValue,
+    SetSessionConfigOptionRequest, WriteTextFileResponse,
 };
-use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Dispatch, SessionMessage};
+use agent_client_protocol::{
+    Agent, ByteStreams, Client, ConnectionTo, Dispatch, RestoredSession, SessionMessage,
+};
 use htui_core::model::{Agent as AgentRow, AgentBox};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -63,7 +66,9 @@ use crate::event::{
 // dozen files for no reader's benefit.
 pub use crate::event::{SESSION_STARTED, Stamp, TRANSPORT_CLOSED};
 pub use crate::launch::ChildIo as AcpIo;
-use crate::launch::{AcpSettings, AgentLaunch, AgentSettings, ChildGuard, ResolvedLaunch};
+use crate::launch::{
+    AcpSettings, AgentLaunch, AgentSettings, ChildGuard, ResolvedLaunch, SessionSettings,
+};
 use crate::registry::TransportBuilder;
 
 /// `other.update` of the row written when the agent offers no option for the requested model.
@@ -1098,28 +1103,52 @@ async fn session_main(
         }
     };
 
-    // 2. session/new. ANA-4 risk 11: `block_task` only here.
+    // 2. The session: `session/new`, or the step's own restored (MOD-37 M5, R-48): resume, else
+    //    load (its replay discarded), else refuse. ANA-4 risk 11: `block_task` only here.
     //
-    // The step is recorded before the request goes out because this arm is the one that may not
+    // Each step is recorded before its request goes out because this arm is the one that may not
     // run: `start_session` sends from a connection actor, and a refusal drops this future rather
     // than returning to it ([`ReadyCell`]). `run_session` then answers from the connection's own
-    // error, and what it reads here is how it knows to call the failure `session/new`.
-    at_step(ready, "session/new");
-    let new_session =
-        NewSessionRequest::new(spec.cwd.clone()).additional_directories(spec.extra_dirs.clone());
-    let mut session = match cx
-        .build_session_from(new_session)
-        .block_task()
-        .start_session()
-        .await
-    {
-        Ok(session) => session,
-        // Still reachable, and not dead code: a local `ensure_v1_session_protocol` refusal and an
-        // internal error both return here without ever failing an actor.
-        Err(err) => {
-            answer(ready, Err(handshake_error("session/new", &err, child)));
-            kill(child).await;
-            return;
+    // error, and what it reads here is how it knows which request to name in the failure. A
+    // refusal on capabilities or settings sends nothing, so it records no step.
+    let mut session = match spec.resume.as_ref() {
+        None => {
+            at_step(ready, "session/new");
+            let new_session = NewSessionRequest::new(spec.cwd.clone())
+                .additional_directories(spec.extra_dirs.clone());
+            match cx
+                .build_session_from(new_session)
+                .block_task()
+                .start_session()
+                .await
+            {
+                Ok(session) => session,
+                // Still reachable, and not dead code: a local `ensure_v1_session_protocol` refusal
+                // and an internal error both return here without ever failing an actor.
+                Err(err) => {
+                    answer(ready, Err(handshake_error("session/new", &err, child)));
+                    kill(child).await;
+                    return;
+                }
+            }
+        }
+        Some(previous) => {
+            let restored =
+                match restore_route(&init.agent_capabilities, &options.settings.acp.session) {
+                    Ok(route) => restore_session(&cx, &spec, previous, route, ready, child).await,
+                    Err(why) => Err(DriverError::Transport(format!(
+                        "cannot resume session `{}`: {why}",
+                        previous.as_str()
+                    ))),
+                };
+            match restored {
+                Ok(session) => session,
+                Err(err) => {
+                    answer(ready, Err(err));
+                    kill(child).await;
+                    return;
+                }
+            }
         }
     };
     let session_id = session.session_id().clone();
@@ -1711,6 +1740,93 @@ fn handshake_error(
     }
 }
 
+/// MOD-37 M5 (R-48): which request restores `spec.resume`: `session/resume` when the agent
+/// advertises `sessionCapabilities.resume` and `settings.acp.session.resume` allows it, else
+/// `session/load` on `loadSession` and `settings.acp.session.load`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restore {
+    Resume,
+    Load,
+}
+
+/// [`Restore`]'s decision, or why neither request may be sent, naming each missing capability or
+/// setting.
+fn restore_route(
+    caps: &AgentCapabilities,
+    settings: &SessionSettings,
+) -> std::result::Result<Restore, String> {
+    let resume = match (caps.session_capabilities.resume.is_some(), settings.resume) {
+        (true, true) => return Ok(Restore::Resume),
+        (false, _) => "`session/resume` is not advertised (`sessionCapabilities.resume`)",
+        (true, false) => "`session/resume` is off (`settings.acp.session.resume`)",
+    };
+    let load = match (caps.load_session, settings.load) {
+        (true, true) => return Ok(Restore::Load),
+        (false, _) => "`session/load` is not advertised (`loadSession`)",
+        (true, false) => "`session/load` is off (`settings.acp.session.load`)",
+    };
+    Err(format!("{resume}; {load}"))
+}
+
+/// Restores `previous` by `route` (MOD-37 M5). The step is recorded first, as `session/new`'s
+/// is, so a refusal answered from the connection's error (`answer_from_connection`) names the
+/// request that was actually sent. A loaded session's replay is discarded ([`drain_replay`]).
+async fn restore_session(
+    cx: &ConnectionTo<Agent>,
+    spec: &SessionSpec,
+    previous: &AgentSessionRef,
+    route: Restore,
+    ready: &Mutex<ReadyCell>,
+    child: &Mutex<ChildGuard>,
+) -> Result<agent_client_protocol::ActiveSession<'static, Agent>> {
+    match route {
+        Restore::Resume => {
+            at_step(ready, "session/resume");
+            let request = ResumeSessionRequest::new(previous.as_str().to_owned(), spec.cwd.clone())
+                .additional_directories(spec.extra_dirs.clone());
+            cx.resume_session_from(request)
+                .block_task()
+                .start_session()
+                .await
+                .map(RestoredSession::into_session)
+                .map_err(|err| handshake_error("session/resume", &err, child))
+        }
+        Restore::Load => {
+            at_step(ready, "session/load");
+            let request = LoadSessionRequest::new(previous.as_str().to_owned(), spec.cwd.clone())
+                .additional_directories(spec.extra_dirs.clone());
+            let mut session = cx
+                .load_session_from(request)
+                .block_task()
+                .start_session()
+                .await
+                .map(RestoredSession::into_session)
+                .map_err(|err| handshake_error("session/load", &err, child))?;
+            let discarded = drain_replay(&mut session);
+            tracing::debug!(discarded, "session/load: the history replay was discarded");
+            Ok(session)
+        }
+    }
+}
+
+/// Discards every update already queued on `session`, without waiting: the history a
+/// `session/load` replays ahead of its response (SDK `concepts/sessions.rs:86-88`; the handler
+/// queues at `session.rs:1223` before the ordered response is dispatched, `jsonrpc.rs:6011`).
+/// `read_update` is a `futures` mpsc `next()` (`session.rs:1054`), which is cancel-safe, so one
+/// poll with a no-op waker is `Ready` while something is queued and `Pending` once it is empty.
+/// A closed channel ends the drain too; the turn loop reports it.
+fn drain_replay(session: &mut agent_client_protocol::ActiveSession<'static, Agent>) -> usize {
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    let mut discarded = 0;
+    loop {
+        let next = std::pin::pin!(session.read_update());
+        match next.poll(&mut cx) {
+            std::task::Poll::Ready(Ok(_)) => discarded += 1,
+            std::task::Poll::Ready(Err(_)) | std::task::Poll::Pending => return discarded,
+        }
+    }
+}
+
 /// The config option that offers `model`, by **id** — never by category (§3).
 ///
 /// `settings.acp.model_config_id` wins when the row sets one; otherwise the first option that
@@ -1789,4 +1905,39 @@ fn model_values(
         }
     }
     Vec::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use agent_client_protocol::schema::v1::AgentCapabilities;
+    use serde_json::json;
+
+    use super::{Restore, restore_route};
+    use crate::launch::SessionSettings;
+
+    fn caps(document: serde_json::Value) -> AgentCapabilities {
+        serde_json::from_value(document).expect("the capabilities parse")
+    }
+
+    /// MOD-37 M5 (D4): `session/resume` first, `session/load` next, else a refusal naming both.
+    #[test]
+    fn restore_route_prefers_resume_then_load() {
+        let both = caps(json!({ "sessionCapabilities": { "resume": {} }, "loadSession": true }));
+        let load_only = caps(json!({ "loadSession": true }));
+        let neither = caps(json!({}));
+        let on = SessionSettings::default();
+        let resume_off = SessionSettings {
+            load: true,
+            resume: false,
+        };
+
+        assert_eq!(restore_route(&both, &on), Ok(Restore::Resume));
+        assert_eq!(restore_route(&load_only, &on), Ok(Restore::Load));
+        assert_eq!(restore_route(&both, &resume_off), Ok(Restore::Load));
+        let why = restore_route(&neither, &on).expect_err("nothing restores");
+        assert!(
+            why.contains("sessionCapabilities.resume") && why.contains("loadSession"),
+            "{why}"
+        );
+    }
 }
