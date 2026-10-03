@@ -86,7 +86,7 @@ hand-written document end to end from the keyboard.**
 | 2 | New and edit | Items minted and edited in-TUI through §7.1/§7.2, `touched_paths` validated, offline read-only notice | complete | `.claude/plans/mod-13-new-edit.plan.md` |
 | 3 | Divergence | A stale edit opens the three-way view and resolves to a `divergence_resolution` revision | complete | `.claude/plans/mod-13-divergence.plan.md` |
 | 4 | `$EDITOR` round-trip | Long text edited externally, returns through the same compare-and-set | complete | `.claude/plans/mod-13-editor.plan.md` |
-| 5 | Notes and documents | Note appended to the thread; hand-written document of any kind, incl. `summary`, saved as a new version | in-progress | `.claude/plans/mod-13-notes-docs.plan.md` |
+| 5 | Notes and documents | Note appended to the thread; hand-written document of any kind, incl. `summary`, saved as a new version | complete | `.claude/plans/mod-13-notes-docs.plan.md` |
 
 ## Open Questions
 All four were resolved by the maintainer on 2026-10-01, taking the defaults.
@@ -112,4 +112,4 @@ All four were resolved by the maintainer on 2026-10-01, taking the defaults.
 | Snapshot churn from new Backlog chrome (filter bar) breaks unrelated tests | M | L | Keep filter chrome out of existing snapshots when no filter is set, or update them in one commit |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: complete (2026-10-03) — all five milestones shipped; write-up `docs/decisions/mod/mod-13.md`.*

@@ -3,8 +3,7 @@
 **Source PRD**: `.claude/prds/mod-13-backlog-editing.prd.md`
 **Selected Milestone**: 5 — Notes and documents
 **Complexity**: Medium
-**Status**: fact-checked — awaiting CONFIRM (routed as plan by `/handoff-run`, maintainer accepted 2026-10-03
-with ultracode for the implement phase only)
+**Status**: complete (2026-10-03) — CONFIRMed, implemented `6242e7a3`..`c2ae9699`, rust-reviewer approve-with-fixes, review fixes `a0bca934`..`598b69d9` (M1, L1–L3, NIT1–3; NIT4 deferred)
 
 ## Summary
 Two Backlog detail sub-tabs become writable.
