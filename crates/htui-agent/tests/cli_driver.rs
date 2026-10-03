@@ -854,6 +854,7 @@ fn script(template: &str) -> String {
         .replace("<REPLY>", REPLY)
         .replace("<TOOL_USE>", TOOL_USE)
         .replace("<DENIED_RESULT>", DENIED_RESULT)
+        .replace("<FLOOD>", &FLOOD.to_string())
 }
 
 /// Answers every stdin line with a whole turn, and exits when stdin closes.
@@ -937,6 +938,28 @@ IFS= read -r line
 printf '%s\n' '<TOOL_USE>'
 while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
 printf '%s\n' '<DENIED_RESULT>'
+exit 0
+"#;
+
+/// How many assistant lines [`FLOOD_PROMPT_SCRIPT`] streams while its prompt is parked: well past
+/// [`htui_agent::cli::EVENTS_CAPACITY`], so the session task blocks on a full event channel.
+#[cfg(unix)]
+const FLOOD: usize = 1000;
+
+/// [`PROMPT_SCRIPT`], except that once `$HTUI_GO_FILE` exists it streams [`FLOOD`] replies — as a
+/// CLI keeps streaming parallel work while one gated call waits — and only ends its turn once
+/// `$HTUI_GO_FILE.end` exists too.
+#[cfg(unix)]
+const FLOOD_PROMPT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<TOOL_USE>'
+while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
+i=0
+while [ "$i" -lt <FLOOD> ]; do printf '%s\n' '<REPLY>'; i=$((i+1)); done
+while [ ! -f "$HTUI_GO_FILE.end" ]; do sleep 0.05; done
+printf '%s\n' '<RESULT>'
 exit 0
 "#;
 
@@ -1446,7 +1469,13 @@ fn prompt_request(request_id: &str, tool_call_id: Option<&str>) -> DriverEvent {
 /// tool end of the bridge and the script's go-file come back with it.
 #[cfg(unix)]
 async fn prompting(dir: &Path) -> (Box<dyn AgentSession>, PromptAsk, PathBuf) {
-    let scripted = scripted(dir, PROMPT_SCRIPT);
+    prompting_over(dir, PROMPT_SCRIPT).await
+}
+
+/// [`prompting`] over `body` rather than [`PROMPT_SCRIPT`].
+#[cfg(unix)]
+async fn prompting_over(dir: &Path, body: &str) -> (Box<dyn AgentSession>, PromptAsk, PathBuf) {
+    let scripted = scripted(dir, body);
     let (port, ask) = bridge();
     let mut spec = spec(dir.to_path_buf());
     spec.prompt = Some(port.clone());
@@ -1685,4 +1714,50 @@ async fn without_a_port_answer_permission_stays_unsupported() {
     let argv = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
     assert!(!argv.contains("--permission-prompt-tool"), "{argv}");
     session.cancel(Duration::ZERO).await.expect("cancel");
+}
+
+/// Adversarial review T9-ADV-1: an answer must not depend on the caller pulling events. A CLI that
+/// keeps streaming while one call waits fills the event channel; the session task then sits in
+/// `emit`, and a handle that only awaited the task's reply would wait on a task waiting on it.
+#[tokio::test]
+#[cfg(unix)]
+async fn an_answer_lands_while_the_event_channel_is_full() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, go) = prompting_over(tmp.path(), FLOOD_PROMPT_SCRIPT).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    assert_eq!(
+        next(&mut session, "the prompt").await,
+        prompt_request(TOOL_USE_ID, Some(TOOL_USE_ID))
+    );
+    std::fs::write(&go, b"").expect("go");
+    // Long enough for the flood to fill the channel behind the parked prompt.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let answered = tokio::time::timeout(
+        EVENT_WINDOW,
+        session.answer_permission(
+            PermissionRequestId::new(TOOL_USE_ID),
+            PermissionAnswer::Selected("allow".to_owned()),
+        ),
+    )
+    .await;
+    assert!(
+        matches!(answered, Ok(Ok(()))),
+        "the answer lands with nobody pulling: {answered:?}"
+    );
+    assert_eq!(verdict(task).await, Ok(PromptVerdict::Allow));
+
+    std::fs::write(go.with_extension("end"), b"").expect("end");
+    let rest = drain(&mut session).await;
+    assert!(
+        rest.len() >= FLOOD,
+        "nothing the answer drained is lost: {} events",
+        rest.len()
+    );
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
+        "{:?}",
+        rest.last()
+    );
 }

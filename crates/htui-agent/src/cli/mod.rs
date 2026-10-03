@@ -564,7 +564,8 @@ pub struct CliSession {
     session_ref: AgentSessionRef,
     events: mpsc::Receiver<DriverEnvelope>,
     commands: mpsc::UnboundedSender<Command>,
-    /// Envelopes drained while `cancel` waited for its acknowledgement; served before `events`.
+    /// Envelopes drained while `cancel` or `answer_permission` waited for the task's reply; served
+    /// before `events`.
     pending: VecDeque<DriverEnvelope>,
     /// `false` between a handed-out `done` and the next accepted follow-up.
     turn_open: bool,
@@ -663,14 +664,27 @@ impl AgentSession for CliSession {
             if !self.prompts {
                 return Err(DriverError::Unsupported("answer_permission"));
             }
-            let (done, answered) = oneshot::channel();
+            let (done, mut answered) = oneshot::channel();
             self.send(Command::Answer {
                 request_id,
                 answer,
                 done,
             })?;
-            // A task that ended before it read the command dropped `done`.
-            answered.await.map_err(|_| DriverError::Closed)?
+            // Keep draining while the task gets to the command, as `cancel` does: a CLI that keeps
+            // streaming while this call waits fills the event channel, and a task blocked in
+            // `emit` never reads the answer — while the caller, waiting here, pulls nothing.
+            // Drained envelopes are served by `next_event` ahead of the channel, in order.
+            loop {
+                tokio::select! {
+                    // A task that ended before it read the command dropped `done`.
+                    reply = &mut answered => return reply.map_err(|_| DriverError::Closed)?,
+                    event = self.events.recv(), if !self.ended => match event {
+                        Some(envelope) => self.pending.push_back(envelope),
+                        // The task is gone, so `done` is dropped and the arm above resolves.
+                        None => self.ended = true,
+                    },
+                }
+            }
         })
     }
 
