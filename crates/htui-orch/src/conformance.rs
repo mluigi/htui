@@ -19,10 +19,10 @@ use chrono::TimeDelta;
 use futures::future::Either;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome,
-    Isolation, Item, ItemId, ItemPatch, NewRepo, NewStepGraph, PhaseId, PhasePatch, RepoId,
-    Resolution, Run, RunId, RunMode, RunStatus, RunStep, Status, StepGraphId, StepGraphPhase,
-    StepId, StepStatus, VerifyOutcome,
+    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, DocumentId, EventKind, Gate,
+    GateOutcome, Isolation, Item, ItemId, ItemPatch, NewDocument, NewRepo, NewStepGraph, PhaseId,
+    PhasePatch, RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, Status, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, VerifyOutcome,
 };
 use htui_core::model::{
     BoxEdit, Claim, NewItem, OverlapRule, Quota, QuotaSource, RunKind, Scope, Spend, WorkspaceId,
@@ -319,11 +319,11 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 
 /// Case names in run order. A name never changes: every binding reports per case.
 ///
-/// Ninety-one, and the count is pinned in two places on purpose — here by
+/// Ninety-four, and the count is pinned in two places on purpose — here by
 /// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
 /// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -394,6 +394,9 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 ///
 /// **One for MOD-37 milestone 4** (R-49, closed by admission): a promoted `shared_serialized`
 /// step's parked run refuses another run's claim on its repo with rule I.
+///
+/// **One for MOD-73** (plan D1, D2): a version of the parked step's output kind written by hand
+/// at the gate, then approved, is what the next phase's prompt carries.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -600,6 +603,9 @@ pub const CASES: &[&str] = &[
     // MOD-37 M4 (R-49, closed by admission): a promoted `shared_serialized` step's parked run keeps
     // every other run off its repo through `claim_run`'s rule I.
     "a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo",
+    // MOD-73 plan D1, D2 (ANA-2 §4.2 as amended): a version written by hand at a gate, then
+    // approved, is the next phase's stage-3 input.
+    "a_gate_edit_is_what_the_next_phase_reads",
 ];
 
 /// Run one case by name.
@@ -625,14 +631,15 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
     hand_back_case(name, harness)
         .or_else(|| persona_case(name, harness))
         .or_else(|| hardening_case(name, harness))
+        .or_else(|| input_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
 /// [`case`] for every name before MOD-41 T9's.
 ///
 /// # Panics
-/// On a name [`CASES`] holds and neither this `match` nor [`hand_back_case`] nor
-/// [`persona_case`] does.
+/// On a name [`CASES`] holds and neither this `match` nor any of the frames [`case`] tries first
+/// does.
 fn earlier_case<'a, H: CaseHarness>(
     name: &str,
     harness: &'a H,
@@ -928,6 +935,19 @@ fn hardening_case<'a, H: CaseHarness>(
     Some(match name {
         "a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo" => {
             Box::pin(a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// MOD-73's case, in a frame of its own for [`hand_back_case`]'s reason.
+fn input_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_gate_edit_is_what_the_next_phase_reads" => {
+            Box::pin(a_gate_edit_is_what_the_next_phase_reads(harness))
         }
         _ => return None,
     })
@@ -1685,6 +1705,103 @@ async fn approve_needs_the_output_document<H: CaseHarness>(harness: &H) {
             .len(),
         documents_before,
         "and writes no document of its own"
+    );
+}
+
+/// MOD-73 (ANA-2 §4.2 as amended; §4.2's gate-answer row "edits the artifact"): a version of the
+/// parked step's `output_kind` written by hand at the gate (`produced_by_step_id` `NULL`, as the
+/// Backlog's Docs `v` writes it since MOD-13) and then `approved` is what the next phase's stage 3
+/// reads, because it is newer than the step's own output.
+///
+/// The observable is the next step's recorded prompt, the bytes its agent was sent: the
+/// `documents:prd` section carries the edit's version and body, and the step's own body appears
+/// nowhere in it. The resolver is asserted at the run's seat too, so the prompt and §4.2 cannot
+/// disagree unnoticed.
+async fn a_gate_edit_is_what_the_next_phase_reads<H: CaseHarness>(harness: &H) {
+    const WRITTEN: &str = "PRD as the prd step wrote it.";
+    const EDITED: &str = "PRD as the human edited it at the gate.";
+    let orch = harness.fresh();
+    free_feat_3(&orch).await;
+    orch.script("prd", 1, ScriptedStep::done_with_output(WRITTEN));
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "`prd` parks at its `always` gate with its output written"
+    );
+    let steps = steps_of(&orch, run).await;
+    let parked = at(&steps, 0, 1).clone();
+    let written = orch
+        .store()
+        .documents(ids::HTUI_FEAT_3)
+        .await
+        .expect("MemStore never fails a read")
+        .into_iter()
+        .find(|head| head.kind == "prd" && head.produced_by_step_id == Some(parked.id))
+        .expect("the parked step wrote its `prd`");
+
+    // The edit: a new version, by hand, while the run is parked (R-ENT-12: append-only).
+    let edited = orch
+        .store()
+        .write_document(NewDocument {
+            id: DocumentId::new(),
+            item_id: ids::HTUI_FEAT_3,
+            kind: "prd".to_owned(),
+            title: "prd (edited at the gate)".to_owned(),
+            body: EDITED.to_owned(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: orch.clock().now(),
+        })
+        .await
+        .expect("the item and the user exist");
+    assert!(
+        edited.version > written.version,
+        "the edit is the newer version: v{} after the step's v{}",
+        edited.version,
+        written.version
+    );
+
+    let (answered, rest) = answer(&orch, run, GateAnswer::Approved).await;
+    assert_eq!(
+        answered.id, parked.id,
+        "the approve answered the edited step"
+    );
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "approve walked on: `plan` ran and parked"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    let prompt = prompt_text(&orch, at(&steps, 1, 1).id).await;
+    let section = format!(
+        "<section name=\"documents:prd\" kind=\"prd\" version=\"{}\">\n{EDITED}\n</section>",
+        edited.version
+    );
+    assert!(
+        prompt.contains(&section),
+        "`plan`'s stage 3 read the edit, v{}:\n{prompt}",
+        edited.version
+    );
+    assert!(
+        !prompt.contains(WRITTEN),
+        "and not the step's own output, which the edit superseded:\n{prompt}"
+    );
+
+    let inputs = orch
+        .store()
+        .resolve_inputs(ids::HTUI_FEAT_3, run, &["prd".to_owned()])
+        .await
+        .expect("MemStore never fails a read");
+    assert_eq!(
+        inputs
+            .first()
+            .and_then(|input| input.document.as_ref())
+            .map(|document| document.id),
+        Some(edited.id),
+        "§4.2's resolver at the run's seat answers the edit"
     );
 }
 
@@ -7292,8 +7409,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            93,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            94,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -7323,7 +7440,8 @@ mod tests {
              persona cases (plan D9, D12, D13, OQ-2: the persona frame, an edit that does not \
              reach a started run, the judge without a persona, `command_run` dropping the \
              `command_queue` section, and the agent row left untouched), and MOD-37 milestone \
-             4's one (a promoted `shared_serialized` step's run refusing another claim, R-49)"
+             4's one (a promoted `shared_serialized` step's run refusing another claim, R-49), \
+             and MOD-73's one (a gate edit read by the next phase, plan D2)"
         );
     }
 
