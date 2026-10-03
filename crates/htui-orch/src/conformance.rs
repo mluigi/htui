@@ -323,7 +323,7 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// `cases_are_unique_and_counted` and out of crate by `tests/fake_conformance.rs` —
 /// because a binding that silently ran one fewer of them would still be green.
 ///
-/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 5.
+/// Recounted, not appended: 18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1.
 ///
 /// **Eighteen before milestone 4.** Six are `docs/ANA-2.md` §12's validation criteria (1, 2, 3,
 /// 5, 6 and 7); four are contract lines §12 does not number but §4.2 states outright; one is the
@@ -391,6 +391,9 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// phase, a persona edit that does not reach a started run, the judge without a persona, a
 /// persona without `command_run` dropping the `command_queue` section, and the agent row a
 /// persona-bound run leaves untouched.
+///
+/// **One for MOD-37 milestone 4** (R-49, closed by admission): a promoted `shared_serialized`
+/// step's parked run refuses another run's claim on its repo with rule I.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -594,6 +597,9 @@ pub const CASES: &[&str] = &[
     "a_persona_without_command_run_drops_the_command_queue_section",
     // MOD-26 PRD metric: a persona-bound run leaves the agent row untouched.
     "a_persona_run_leaves_the_agent_row_untouched",
+    // MOD-37 M4 (R-49, closed by admission): a promoted `shared_serialized` step's parked run keeps
+    // every other run off its repo through `claim_run`'s rule I.
+    "a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo",
 ];
 
 /// Run one case by name.
@@ -618,6 +624,7 @@ pub async fn run_case<H: CaseHarness>(name: &str, harness: &H) {
 fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Output = ()> + 'a>> {
     hand_back_case(name, harness)
         .or_else(|| persona_case(name, harness))
+        .or_else(|| hardening_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -908,6 +915,19 @@ fn persona_case<'a, H: CaseHarness>(
         }
         "a_persona_run_leaves_the_agent_row_untouched" => {
             Box::pin(a_persona_run_leaves_the_agent_row_untouched(harness))
+        }
+        _ => return None,
+    })
+}
+
+/// MOD-37's cases, in a frame of their own for [`hand_back_case`]'s reason.
+fn hardening_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo" => {
+            Box::pin(a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo(harness))
         }
         _ => return None,
     })
@@ -5483,6 +5503,73 @@ async fn promote_keeps_the_step_and_writes_no_chat_run<H: CaseHarness>(harness: 
     assert!(!text.is_empty() && !digest.is_empty());
 }
 
+/// MOD-37 M4, R-49 closed by admission (maintainer amendment, 2026-10-03): a promoted
+/// `shared_serialized` step's run is `awaiting_approval` for its chat's whole life, and
+/// `claim_run`'s rule I (`NotIsolated`) refuses every other run on that repo of the box, in any
+/// process. The second item declares disjoint paths, so rule P would admit it: the refusal is the
+/// shared checkout's. The promoted run stays parked. What an in-process hold would add (a same-run
+/// command between `Promoted` and the chat bind, a second promotion of the step, an isolator
+/// rebuild) is recorded LOW in HANDOFF.
+async fn a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo<H: CaseHarness>(
+    harness: &H,
+) {
+    let orch = harness.fresh();
+    primary_repo(&orch).await;
+    free_feat_3(&orch).await;
+    repoint(&orch, ids::HTUI_FEAT_3, |phase| {
+        if phase.name == "prd" {
+            phase.isolation = Some(Isolation::SharedSerialized);
+        }
+    })
+    .await;
+    touch(&orch, ids::HTUI_FEAT_3, &["src/**"]).await;
+    touch(&orch, ids::HTUI_ANA_2, &["docs/**"]).await;
+
+    let (first, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "`prd` parks at its gate"
+    );
+    let prd = step_at(&orch, first, 0, 1).await;
+    let trees = orch
+        .store()
+        .step_trees(prd.id)
+        .await
+        .expect("MemStore never fails a read");
+    assert!(
+        !trees.is_empty()
+            && trees
+                .iter()
+                .all(|tree| tree.mode == Isolation::SharedSerialized),
+        "the parked step works in the shared checkout: {trees:?}"
+    );
+    let (step, rest, _) = promote(&orch, first, prd.id).await;
+    assert_eq!(step, prd.id);
+    assert_eq!(rest.run, RunStatus::AwaitingApproval);
+    orch.clock().advance(TimeDelta::seconds(1));
+
+    let (second, claim) = start_refused(&orch, ids::HTUI_ANA_2).await;
+    assert_eq!(
+        claim,
+        Claim::Overlaps {
+            with: first,
+            rule: OverlapRule::NotIsolated,
+        },
+        "the promoted step's shared checkout keeps the second run off the repo"
+    );
+    assert_eq!(run_of(&orch, second).await.status, RunStatus::Queued);
+    assert_eq!(
+        run_of(&orch, first).await.status,
+        RunStatus::AwaitingApproval,
+        "the promoted run is still parked"
+    );
+    assert!(
+        step_at(&orch, first, 0, 1).await.promoted_at.is_some(),
+        "the step is still promoted"
+    );
+}
+
 /// `docs/ANA-2.md:1563`: a `failed` step under a parked run is promotable. Here it is a step the
 /// sweep failed `interrupted` and parked out of budget (plan D92, D94); the promotion moves it
 /// `failed -> awaiting_approval`, and the handoff says why it stopped.
@@ -7205,8 +7292,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            92,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            93,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -7235,7 +7322,8 @@ mod tests {
              one (a crashed rejection's `u` handed back and failed by the adopter), and MOD-26's five \
              persona cases (plan D9, D12, D13, OQ-2: the persona frame, an edit that does not \
              reach a started run, the judge without a persona, `command_run` dropping the \
-             `command_queue` section, and the agent row left untouched)"
+             `command_queue` section, and the agent row left untouched), and MOD-37 milestone \
+             4's one (a promoted `shared_serialized` step's run refusing another claim, R-49)"
         );
     }
 
