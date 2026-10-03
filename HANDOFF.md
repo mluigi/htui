@@ -14,14 +14,21 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-03):** **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
+**Current status (2026-10-03):** **MOD-74 is done** (`docs/decisions/mod/mod-74.md`): the three
+follow-ups from MOD-71's review. A capture that goes off (an overlay, `?`, a form, a sub-tab or tab
+switch, an `$EDITOR` handoff) now tells every tab, so a button held across the off-and-on no longer
+resumes the old pan. Capture is button-only reporting on ANSI terminals (`?1003h` dropped, so no
+hover stream; Windows keeps crossterm's WinAPI path). A live pan re-anchors on every draw, so a
+`Runs` re-read, a moved canvas or a wheel zoom mid-pan no longer jumps on the next drag. No
+migration, no new crate, no rataflow change.
+Before it, **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
 flow view takes the mouse. A click on a node moves the shared cursor, a drag on empty canvas pans,
 and the wheel zooms at the pointer; nodes stay read-only. Capture is on only while that view is
 shown in browse mode with a run to draw. Everywhere else htui is keyboard-only and the terminal
 keeps its own text selection (in the flow view, the terminal's bypass modifier, usually Shift,
 still selects). Every terminal give-back (restore, panic hook, `$EDITOR`) turns capture off. A pan
 survives the active-run poll. No migration, no new crate (`rataflow` gained its `crossterm`
-feature). Follow-ups are MOD-74.
+feature). Its follow-ups shipped as MOD-74.
 Before it, **MOD-13 is done** (`docs/decisions/mod/mod-13.md`): the Backlog
 filters and edits items. `f`/`F` filter by status, project, tags and "ready here"; `N`/`e` mint and
 edit through ANA-9 §7.1/§7.2, and a stale edit opens a three-way divergence view that resolves to a
@@ -31,19 +38,8 @@ kind (an editable `summary` included) and `v` a new version prefilled from the l
 is refused offline before any read; a write whose answer may have been lost settles itself on a
 re-read and never invites a duplicate. Conformance case 135; no migration. It spawned **MOD-73**
 (hand-written versions as step inputs).
-Before it, **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
-the Runs flow view has a third line counting its step's tool calls by kind (`⚒ read×5 exec×3 +1`).
-`ReadStore::tool_call_counts` answers on Postgres, the mirror and `MemStore`; the pane asks
-`StoreRequest::ToolCalls` after each `Runs` reply only while the flow is shown. Nodes are 20×5. No
-migration, no new crate, one new `.sqlx` entry.
-Before it, **MOD-60 is done** (`docs/decisions/mod/mod-60.md`): every
-hand-laid-out row in the TUI measures, pads, clips and wraps in terminal cells, the way ratatui draws
-them, so CJK, emoji, combining marks and halfwidth kana no longer overrun a pane or push a column out
-of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` and ~16 local copies
-went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
-name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
-no new crate, no snapshot moved.
 Earlier completions are in `DECISIONS.md`.
+
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
@@ -283,16 +279,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   implement axis, `epoch-eci` is narrowed to `eci_scores.csv`, `tbench-4-0` stays blocked. Each
   dynamic source needs a parser under the fetch conditions of §6 (Arena from Hugging Face only, with
   a per-fetch licence check; Epoch keyed on `benchmark_metadata.csv`, never `*_external.csv`).
-- [ ] **MOD-74 - Mouse follow-ups** (from MOD-71's review, `docs/decisions/mod/mod-71.md`
-  "Carried"; deferred by the maintainer, 2026-10-03). `R-TUI-1`, `R-TUI-4`. Three small gaps in the
-  Runs flow view's mouse handling. (1) Review L3: an overlay, `?`, a form or a sub-tab switch turns
-  capture off without reaching `RunsTab`, so a button held across the off-and-on continues the old
-  pan anchor and the view jumps once. Fix: a "capture lost" hook through `App` → `Tab` →
-  `DetailTab`. (2) `EnableMouseCapture` sets any-motion reporting (`?1003h`) though nothing uses
-  hover; a narrower `?1000h ?1002h ?1006h` command on ANSI terminals stops the `Moved` stream at
-  the source (the Windows legacy console keeps crossterm's WinAPI command). (3) A `Runs` re-read
-  during a live pan shifts the viewport, and rataflow's `Panning` recomputes from its old
-  `initial_viewport` on the next drag, so the view jumps once.
 - [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
   The named personas a `handoff` targets exist since MOD-26 (done, `docs/decisions/mod/mod-26.md`):
   `persona` registry rows, bound per phase, frozen into the run snapshot by name.
@@ -474,6 +460,11 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   there once with an empty `<cache>/htui/model`, so that the pinned fetch, the locked `.part`, the
   rename onto a file another process may hold open, and the golden tests
   (`cargo test -p htui-store --features local-embed --lib embed -- --ignored`) run on that platform.
+  **MOD-71 and MOD-74 added the mouse** (`docs/decisions/mod/mod-71.md`, `docs/decisions/mod/mod-74.md`).
+  Exercise capture in the Runs flow view (`v`) on Windows Terminal and on the legacy console: a click,
+  a drag pan and a wheel zoom, then an `$EDITOR` handoff before the flow view was ever opened (MOD-71
+  review H1's path). `cargo check` the `#[cfg(windows)]` half of `EnableButtonMouseCapture`
+  (`crates/htui/src/terminal.rs`, MOD-74 D5), which no Linux build compiles.
 
 - [ ] **MOD-70 - Follow-up command rows for engine steps** (from MOD-42, PRD Q9;
   `docs/decisions/mod/mod-42.md`). `R-AGT-1`, `R-HIS-1`. MOD-42's `run_command` table carries only
@@ -609,6 +600,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 21 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

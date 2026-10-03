@@ -4,7 +4,7 @@
 **Routed**: plan path via `/handoff-run` (C1-C4 none fired), no ultracode; accepted by the maintainer 2026-10-03.
 Sandbox run `hr/MOD-74`.
 **Complexity**: Small (three bounded fixes in one TUI area; no store, migration, `.sqlx` or dependency change)
-**Status**: plan, awaiting CONFIRM
+**Status**: done 2026-10-03 (`docs/decisions/mod/mod-74.md`)
 
 ## Summary
 

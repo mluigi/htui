@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-74](docs/decisions/mod/mod-74.md)** - Mouse follow-ups: capture loss, button-only reporting, a pan across a re-read (done, 2026-10-03)
 - **[MOD-71](docs/decisions/mod/mod-71.md)** - Mouse support: capture policy and the Runs flow view (done, 2026-10-03)
 - **[MOD-72](docs/decisions/mod/mod-72.md)** - Tool-call chips in the Runs flow view (done, 2026-10-03)
 - **[MOD-13](docs/decisions/mod/mod-13.md)** - Backlog filters and item editing (done, 2026-10-03)
