@@ -74,3 +74,39 @@ pub async fn run(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    /// This file up to its tests, with its comments removed.
+    fn code() -> String {
+        let file = include_str!("event_loop.rs");
+        file[..file.find("#[cfg(test)]").unwrap_or(file.len())]
+            .lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// MOD-71 D2, review H1: capture is asked for after the `$EDITOR` post-step, so the editor's
+    /// `leave` cannot leave it off, and before the dirty draw, so a toggle lands before the frame
+    /// it changed.
+    #[test]
+    fn the_loop_sets_mouse_capture_after_the_editor_and_before_the_draw() {
+        let code = code();
+        let editor = code
+            .find("app.finish_external_edit(")
+            .expect("the editor post-step");
+        let capture = code
+            .find("term.set_mouse_capture(app.wants_mouse())?;")
+            .expect("the loop sets capture to what the app wants");
+        let draw = code
+            .find("std::mem::take(&mut app.dirty)")
+            .expect("the dirty draw");
+        assert!(editor < capture && capture < draw);
+        assert_eq!(
+            code.matches("set_mouse_capture(").count(),
+            1,
+            "one place decides"
+        );
+    }
+}

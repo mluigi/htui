@@ -23,8 +23,8 @@
 //! **Mouse capture** (MOD-71 D1-D3) is on only while the view on screen wants the mouse, because
 //! it takes the terminal's own text selection away. The event loop asks the app after every step,
 //! and [`TerminalGuard::set_mouse_capture`] writes only a change. [`init`] and `Suspend::enter`
-//! never turn it on; every way the terminal is given back — [`restore_terminal`] and
-//! `Suspend::leave` — turns it off first, whatever the guard last set.
+//! never turn it on; every way the terminal is given back turns it off first: [`restore_terminal`]
+//! unconditionally and best effort, `Suspend::leave` when the guard turned it on (review H1).
 
 use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend};
 
@@ -170,13 +170,21 @@ impl TerminalGuard {
 impl crate::editor::Suspend for TerminalGuard {
     /// Show the cursor (every draw hid it), mouse capture off (MOD-71 D3) and bracketed paste off
     /// so the editor gets its own mouse and paste (MOD-22 review M-1), then `ratatui::try_restore`
-    /// (MOD-9 D22). `restored` is not touched: this is a pause, not the end. `mouse` is cleared
-    /// before the write, so whatever happens next the loop's `set_mouse_capture` re-asserts what
-    /// the app wants once the editor is gone — one place decides.
+    /// (MOD-9 D22). `restored` is not touched: this is a pause, not the end. The loop's next
+    /// `set_mouse_capture` re-asserts what the app wants once the editor is gone — one place
+    /// decides.
+    ///
+    /// Capture is turned off only when this guard turned it on (review H1): on Windows the disable
+    /// goes through the console API, which errors — not `Unsupported` — when no enable ever
+    /// ran, and would fail every editor handoff before the flow view was first opened. `mouse` is
+    /// cleared only once the write succeeded (review L1), so the flag never says off while the
+    /// terminal is still captured.
     fn leave(&mut self) -> std::io::Result<()> {
         self.terminal.show_cursor()?;
-        self.mouse = false;
-        disable_mouse_capture()?;
+        if self.mouse {
+            disable_mouse_capture()?;
+            self.mouse = false;
+        }
         disable_bracketed_paste()?;
         ratatui::try_restore()
     }
@@ -331,8 +339,9 @@ mod tests {
     }
 
     /// MOD-71 D3: capture is the loop's alone to turn on, and every way the terminal is given back
-    /// turns it off, first and whatever the guard last set. A path that forgot leaves the shell, or
-    /// `$EDITOR`, printing an escape sequence for every mouse move.
+    /// turns it off first: `restore_terminal` whatever the guard last set, `leave` when the guard
+    /// set it (review H1). A path that forgot leaves the shell, or `$EDITOR`, printing an escape
+    /// sequence for every mouse move.
     #[test]
     fn every_give_back_disables_mouse_capture_and_only_the_loop_enables_it() {
         let code = code();
@@ -344,10 +353,25 @@ mod tests {
             .find("disable_bracketed_paste()")
             .expect("`restore_terminal` turns paste off");
         assert!(off < paste, "capture goes first (D3)");
+        // Review H1, L1: `leave` writes the disable only for a capture this guard turned on (a
+        // Windows console that never had it errors, not `Unsupported`), and forgets it only once
+        // the write succeeded.
         let leave = body(&code, "fn leave(&mut self)");
+        let guard = leave
+            .find("if self.mouse {")
+            .expect("`leave` asks the guard first");
+        let off = leave
+            .find("disable_mouse_capture()?")
+            .expect("`leave` turns capture off");
+        let forget = leave
+            .find("self.mouse = false")
+            .expect("`leave` forgets it");
+        let paste = leave
+            .find("disable_bracketed_paste()")
+            .expect("`leave` turns paste off");
         assert!(
-            leave.contains("disable_mouse_capture()") && leave.contains("self.mouse = false"),
-            "`leave` turns capture off and forgets it"
+            guard < off && off < forget && forget < paste,
+            "guard, write, forget, then paste: {leave}"
         );
         for taking in ["pub fn init()", "fn enter(&mut self)"] {
             let body = body(&code, taking);
@@ -356,13 +380,23 @@ mod tests {
                 "`{taking}` leaves capture to the loop"
             );
         }
+        // Review nit: the toggle returns on no change, writes, and records only after the write.
         let toggle = body(&code, "pub fn set_mouse_capture(&mut self, on: bool)");
+        let same = toggle
+            .find("if on == self.mouse {")
+            .expect("the toggle writes only a change");
+        let on = toggle
+            .find("enable_mouse_capture()?")
+            .expect("the toggle turns capture on");
+        let off = toggle
+            .find("disable_mouse_capture()?")
+            .expect("the toggle turns capture off");
+        let recorded = toggle
+            .find("self.mouse = on;")
+            .expect("the toggle records what it wrote");
         assert!(
-            toggle.contains("enable_mouse_capture()") && toggle.contains("disable_mouse_capture()")
-        );
-        assert!(
-            toggle.contains("self.mouse"),
-            "the toggle writes only a change"
+            same < on.min(off) && on.max(off) < recorded,
+            "no change returns, then the write, then the record: {toggle}"
         );
         for (helper, command) in [
             ("fn enable_mouse_capture()", "EnableMouseCapture"),
