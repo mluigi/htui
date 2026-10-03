@@ -807,3 +807,219 @@ cargo clippy -p htui-agent -p htui --all-targets --all-features -- -D warnings
 **Commits**: `feat(mod-37): Recorder::record_notice for htui's own other rows` (with its test);
 `test(mod-37): a failed resume reports and falls back (red)`; `feat(mod-37): a failed resume falls back
 to the handoff in the same bind; run_step.opening is recorded (R-48)`.
+---
+
+## T5 - Runs pane and Chat tab (after T1, T4)
+
+**Files**: `crates/htui/src/ui/tabs/backlog/detail/runs.rs`, `crates/htui/src/ui/tabs/chat/mod.rs`,
+`crates/htui/src/ui/tabs/chat/transcript.rs` (amendment A-9).
+
+### runs.rs
+`PANE` is 43 and `INDENT` is 8 (`:131`, `:150`), so a step's extra line has 35 columns. Both plan
+strings are wider: "context not carried; handoff prompt only" is 40 columns, and the `resume_failed`
+one is 55. `cells::fit` would cut both (H-3). They are wrapped at `; ` onto two lines instead, verbatim
+and at the same indent (amendment A-6):
+```rust
+/// MOD-37 M5 (ANA-27 T5): the two lines under a step whose promoted chat opened without its context,
+/// split at `; ` so neither is cut at the pane's 35 free columns. Joined with a space they are
+/// `promote::CONTEXT_NOT_CARRIED`, and `resume failed; ` before it.
+const OPENING_HANDOFF: [&str; 2] = ["context not carried;", "handoff prompt only"];
+const OPENING_RESUME_FAILED: [&str; 2] = ["resume failed; context not carried;", "handoff prompt only"];
+
+/// MOD-37 M5: [`OPENING_HANDOFF`] or [`OPENING_RESUME_FAILED`] under a step whose `opening` says the
+/// context was not carried, at any status; nothing for `resumed` or no opening.
+fn opening_lines(step: &RunStepSummary, theme: &Theme) -> Vec<Line<'static>> {
+    let parts = match step.opening {
+        Some(StepOpening::Handoff) => OPENING_HANDOFF,
+        Some(StepOpening::ResumeFailed) => OPENING_RESUME_FAILED,
+        Some(StepOpening::Resumed) | None => return Vec::new(),
+    };
+    parts
+        .iter()
+        .map(|part| {
+            Line::from(vec![
+                Span::raw(blank(INDENT)),
+                Span::styled(cells::fit(part, PANE - INDENT), theme.dim),
+            ])
+        })
+        .collect()
+}
+```
+Call sites: in `list_lines` (`:1648`) and `flow_head` (`:1616`), `lines.extend(opening_lines(step, theme));`
+goes right after `lines.extend(note_line(step, theme));` and before the permission lines. R-3's reason
+comes first and the opening second. `cursor_end`, the scroll and the height already follow
+`lines.len()` (`:1570`, `:1589`, `:1655`).
+
+### transcript.rs
+`TranscriptRow` gains:
+```rust
+    /// MOD-37 M5: a promoted chat's resume failed and it opened with the handoff prompt instead.
+    ResumeFailed {
+        /// Why, as the driver said it (the adapter's stderr tail included).
+        reason: String,
+        /// `promote::CONTEXT_NOT_CARRIED`.
+        note: String,
+    },
+```
+`apply_other` (`:344-370`), before the catch-all:
+`htui_agent::event::RESUME_FAILED => self.rows.push(TranscriptRow::ResumeFailed { reason: str_of("reason"), note: str_of("note") }),`
+where an absent `note` reads `promote::CONTEXT_NOT_CARRIED`. Its doc becomes "the rows `htui` authors
+itself…". `render_row` (`:501-624`): `resume failed  <first reason line>` in `theme.error`, each
+further reason line indented two columns in `theme.dim`, then `note` in `theme.accent`. The live path
+(`ChatFrame::Event`) and `from_rows` (replay of the `other` row, `replay.rs` `EventKind::Other` arm)
+reach the same arm, so the sentence shows once either way.
+
+### chat/mod.rs - `on_reply`, the `ChatFrame::Event` arm (`:597-606`)
+After `self.transcript.apply(envelope);`:
+```rust
+                // MOD-37 M5 (ANA-27 T5): the resume failed and the chat fell back to the handoff
+                // prompt, so the header stops saying `resumed`. `via` was set by `Promoted` before the
+                // bind; no other reply carries the outcome.
+                if let DriverEvent::Other(other) = &envelope.event
+                    && other.update == htui_agent::event::RESUME_FAILED
+                    && let Some(promoted) = self.promoted.as_mut()
+                {
+                    promoted.via = Via::Handoff;
+                }
+```
+The header (`:318-372`) needs no change. `PromotedHeader.via`'s doc gains "turned to `Handoff` by a
+`resume_failed` event". There is no new reply or frame type.
+
+### T5 red tests
+| # | Name / file | Asserts | Red on today's code |
+|---|---|---|---|
+| 1 | `runs.rs` `an_opening_without_its_context_adds_two_lines_under_the_step` (beside the R-3 test, `:2000-2030`) | `feat_1_runs()`. `steps[2]` gets `AwaitingApproval`, `gate_note = NOTE` and `opening = Some(ResumeFailed)`. Line `at+2` is the note, `at+3` is `"        resume failed; context not carried;"`, `at+4` is `"        handoff prompt only"`. The non-empty count grows by 3 over the fixture. `steps[1].opening = Some(Resumed)` adds nothing. `steps[0].opening = Some(Handoff)` (status `Done`) adds its two lines | Compile red until T1 (it is in); no lines today |
+| 2 | `runs.rs` `opening_lines_fit_the_pane_and_are_never_cut` | Each line's `width() <= PANE`, none ends with `cells::ELLIPSIS`, `OPENING_HANDOFF.join(" ") == CONTEXT_NOT_CARRIED`, and `OPENING_RESUME_FAILED.join(" ") == format!("resume failed; {CONTEXT_NOT_CARRIED}")` | Compile red |
+| 3 | `runs.rs` `the_flow_head_shows_the_cursor_steps_opening` | The flow view (the MOD-28 L3 flow-head tests' setup) with the cursor on a step with `opening = Some(Handoff)`: `flow_head` contains both lines; on a `Resumed` step, neither | No lines today |
+| 4 | `chat/mod.rs` `a_resume_failed_event_turns_the_header_to_handoff` (beside `:1060`) | `Promoted { via: Via::Resumed }`, then `ChatAccepted` for that step, then `Chat(Event(resume_failed envelope))` (body `{session_id: "s1", reason: "session/load failed: gone", note: CONTEXT_NOT_CARRIED}`). `tab.promoted().via == Via::Handoff`. The rendered header contains `· handoff ·` and not `resumed`. `transcript.rows()` holds exactly one `ResumeFailed { reason, note }`. A later `follow_up` event leaves `via` at `Handoff`. The same event on a fresh (unpromoted) chat changes no header | `via` stays `Resumed` |
+| 5 | `transcript.rs` `a_resume_failed_notice_is_one_row_with_its_reason_and_note` | Live `apply` gives one `ResumeFailed` row rendered `resume failed  …` then the note. `from_rows` over the persisted row (`kind: Other`, `role: Htui`, payload `{update, body}`) gives the same rows | Today it is `Other { update: "resume_failed" }`, rendered `· resume_failed` |
+
+No snapshot should move. Fixture steps carry `opening: None`, and `chat__chat_promoted.snap` stays on
+the handoff path through T3's `handoff_only` row. A moved snapshot is a finding to read, not to
+accept blindly (`cargo insta test --review`).
+
+**Gate T5**: `cargo test -p htui --all-features -- --test-threads=1` (check the `tests/*.rs` counts
+are non-zero) and `cargo clippy -p htui --all-targets --all-features -- -D warnings`.
+**Commits**: `test(mod-37): the Runs pane and the Chat tab say when context was not carried (red)`,
+then `feat(mod-37): ANA-27 T5 - opening lines in the Runs pane; resume_failed flips the chat header`.
+
+---
+
+## T6 - close-out (docs only; as the plan)
+`HANDOFF.md` (R-48 struck, "closed by MOD-37 phase 5"; a phase 5 note; the MOD-37 close decision
+against the PRD's success metric, with R-32's D131 half, R-44, R-53 and R-55 re-deferred or documented),
+`docs/ANA-2.md:1239` §4.8 amendment line (ACP now resumes: `session/resume`, else `session/load` with
+the replay discarded; a failed resume falls back to the handoff, labelled), `docs/decisions/mod/mod-37.md`
+write-up (it records the amendments below and H-4's open question), the DECISIONS index, and PRD row 5
+`complete`. Then `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`.
+
+---
+
+## Hazards
+- **H-1 T3 flips existing pins in three crates.** `FakeSession::open` queues a `session_started`
+  banner (`htui-agent/src/fake.rs:231-250`). The seed `claude` row (`AGENT_CLAUDE`) is ACP with
+  `acp.session {load: true, resume: true}`. The `chat.rs`/`runs_pg.rs` scripted rows are ACP with
+  default settings. So once the CLI-only rule goes, every walked-then-promoted step there resumes.
+  Affected: `htui-orch` `conformance.rs:5500`, `:5598`, `engine.rs:14652`; `htui/tests/chat.rs`
+  `promotion_opens_the_chat_on_the_same_step`, `the_handoff_opening_is_one_follow_up_row` and
+  `chat__chat_promoted.snap`; possibly `runs_pg.rs:700-845`. **Resolution**: T3's list grows
+  (amendment A-8). The orch cases pin the resume and read the handoff through `OpeningPath::handoff()`.
+  The htui test rows turn resume off (`handoff_only`, both keys), so they keep the path they name. T4
+  adds the resumable chat.rs case.
+- **H-2 the column-comment pin.** `the_ana_column_comments_are_present_and_verbatim` asserts exactly
+  forty-four commented columns over tables that include `run_step`. **Resolution**: 0014 writes no
+  `COMMENT ON COLUMN` (D3). Anyone who adds one must add a `MOD37_COLUMN_COMMENTS` chain and move the
+  count to forty-five.
+- **H-3 the pane strings do not fit.** There are 35 free columns. The strings are 40 and 55.
+  **Resolution**: wrap at `; ` (amendment A-6).
+- **H-4 a re-promotion after `resume_failed` retries the dead id.** `promote::banner` takes the
+  **first** `session_started` row by `seq` (`promote.rs:30-52`, blueprint D192). The fallback handoff
+  session's banner comes later, so the next promotion resumes the dead session again, fails, and falls
+  back again. It is reported every time and never silent. **Resolution**: accepted for M5 and recorded
+  in the write-up. Taking the latest banner would resume the handoff conversation instead. That
+  changes D192, so it is the maintainer's call (amendment A-7, not implemented).
+- **H-5 late replay.** An agent that streams `session/load` replay after its response would leave
+  duplicate rows. That is visible, never lost. Accepted per the plan. T2 (b) pins the ordered case,
+  and `session/resume` is preferred.
+- **H-6 `seq` collision.** A second recorder built from the bind's stale `tail` would reuse
+  `last+1`. **Resolution**: one recorder, built before the first start (D5).
+- **H-7 frame order.** The notice frame goes after `ChatAccepted` on success and before `Failed` on
+  failure. The tab's `ChatFrame::Event` arm needs no session. T4 (c) and (d) pin the order.
+- **H-8 an opening can be absent or stale.** A failed Handoff start, or a resume that does not fall
+  back, writes nothing. A later promotion whose start fails keeps the earlier value. The pane then
+  shows the last chat that actually opened. Accepted, LOW.
+- **H-9 stack.** Every promotion now builds the handoff, so the extracted helper sits behind
+  `Box::pin` in `opening`. Gate `htui-orch` with `--no-fail-fast` and grep for `SIGABRT`
+  (`every_case_name_dispatches`).
+- **H-10 `Resume` depends on the handoff.** A missing `handoff` template or an unbuildable phase spec
+  now fails a resumable promotion, on the existing "opening cannot be built" path. This is the plan's
+  T3 note.
+- **H-11 `caps.resume = resume || load`.** An ACP row hands off only with both keys off. Test rows
+  that mean "handoff" must set both (H-1).
+- **H-12 a resumed session may not offer the model.** If the `session/resume` or `session/load`
+  response carries no config options, `model_option` is `None` and step 4 emits its existing
+  `model_unavailable` row for the step's model. That is the truth: `htui` could not set it, and the
+  restored session keeps its own. Accepted.
+- **H-13 MemStore side map.** `delete_project` is the only site that drops steps (`mem.rs:4117`), and
+  `openings` is dropped there.
+- **H-14 mirror.** An old mirror gets 0005 from `CACHE_MIGRATOR`, then rebuilds on the version
+  mismatch. That is one rebuild per box, as with 0011.
+- **H-15 `.sqlx`.** Only T1 changes query text, and its expected diff is listed. Prepare against the
+  migrated scratch DB, never the empty compose `htui` DB.
+- **H-16 test harness.** `tests/*.rs` run 0 tests without `--all-features`; check the counts. The
+  `htui` suite is scheduling-dependent: confirm with `--test-threads=1`. Postgres cases skip silently
+  without `HTUI_TEST_DATABASE_URL`, so check that the DB was reached.
+- **H-17 sandbox.** Check `df -h .` before creating T3's worktree (about 10 GB of `target/`). Dev
+  Postgres crash-loops under disk pressure. Remove the worktree before `branch -d`.
+- **H-18 what falls back.** `Unresolved` and `UnknownAdapter` are excluded with `Spawn`, because a
+  handoff start would fail the same way (amendment A-2).
+
+## Plan amendments (for the maintainer)
+- **A-1** `promote::opening_kind` drops its `transport` parameter (`opening_kind(caps, events)`). With
+  the CLI-only rule gone it would be unused, which is a warning under `-D warnings`.
+- **A-2** T4's fallback rule is "anything but `Spawn`, `Unresolved` or `UnknownAdapter`", not
+  "anything but `Spawn`". The same reason covers all three.
+- **A-3** T4 also edits `htui-agent`: `event.rs` (`RESUME_FAILED`), `record.rs`
+  (`Recorder::record_notice`) and `tests/recorder.rs`. The plan's T4 lists only `agent_worker.rs`.
+  `Recorder::record` would author the row as `agent`, and the only `htui`-role writers today are the
+  prompt, the cap breach and the scrub residue.
+- **A-4** The fallback rides on `ChatBinding::Promoted { fallback }`, not on `ChatArgs`. The effect is
+  the same.
+- **A-5** Plan T4 (e) says "the reprobe runs as today". A promoted chat never carries a reprobe
+  (`bind_promoted` sets `reprobe: None`, `agent_worker.rs:1080`), so (e) asserts no fallback and an
+  unchanged failure, and no reprobe.
+- **A-6** The Runs pane line is two lines, split at `; ` with the text verbatim, not "a fitted line"
+  (H-3).
+- **A-7** (question, not implemented) Should `promote::banner` take the latest `session_started` row
+  instead of the first (H-4)?
+- **A-8** T3's file list grows: `htui-orch/src/conformance.rs`, the `engine.rs` test,
+  `htui/tests/chat.rs` and `htui/tests/runs_pg.rs` (H-1). This stays disjoint from T2, which touches
+  only `htui-agent`.
+- **A-9** T5 also edits `chat/transcript.rs`. Today an unknown `other` update renders as
+  `· resume_failed` only, which cannot "show the sentence".
+- **A-10** `htui-core/src/store/mod.rs` and `htui-store/src/worker.rs` (plan T1's list) do not change.
+  There is no new store type, and the op stays off `WorkerStore` (D2).
+- **A-11** T1's conformance work is one case, not several. Its assertions cover round-trip, replace,
+  `NotFound` and `updated_at`. The counts go 135 → 136.
+
+## Build order
+1. **T1** on `hr/MOD-37` (main tree): migrations, the enum, the field, the op, the three builders,
+   `.sqlx`, the pins. Commit.
+2. **T2** on the main tree **∥ T3** in `../htui-m5-t3` (branch `hr/MOD-37-m5-t3` from T1's head). T3
+   touches `htui-orch`, `htui/src/agent_worker.rs` (two lines) and the htui test rows; T2 touches only
+   `htui-agent`. T2 commits, then T3 is merged `--no-ff`. Run T2's and T3's gates again on the merged tree.
+3. **T4** on the merged tree (it needs T1's op, T2's restore, and T3's `handoff` field and
+   `CONTEXT_NOT_CARRIED`).
+4. **T5** (it needs T1's field and T4's `RESUME_FAILED`).
+5. **T6** docs.
+
+## Validation (the plan's, on the final tree)
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features --no-fail-fast 2>&1 | tee /tmp/m5-gate.log; grep -c SIGABRT /tmp/m5-gate.log   # 0
+cargo test -p htui-orch --all-features --no-fail-fast -- --test-threads=1 2>&1 | tee /tmp/m5-orch.log; grep -n SIGABRT /tmp/m5-orch.log   # nothing
+cargo test -p htui --all-features -- --test-threads=1          # scheduling-dependent suite; check the tests/*.rs counts
+(cd crates/htui-store && DATABASE_URL=postgres://postgres@localhost:5439/htui_sqlx cargo sqlx prepare --check -- --all-features)
+bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
+```
