@@ -4,7 +4,7 @@
 **Selected Milestone**: 4 - Deadline and sessions (ANA-27 §5.1 T4 deadline, R-49, R-46)
 **Complexity**: Medium
 **Routing**: PRD path, M4 planned on its own (maintainer-confirmed 2026-10-03); ultracode not needed.
-**Status**: confirmed 2026-10-03 - implementation
+**Status**: complete 2026-10-03 (`68a7c7e9`..`1787fd69`); R-49 per the maintainer amendment, R-46 refresher arm only (review M1)
 
 ## Summary
 Three fixes, one per risk. **Deadline**: a step session (and each fan-out candidate's) runs under a

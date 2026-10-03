@@ -143,6 +143,15 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   were applied, and one NIT (a hash parsed twice, which is negligible) was left. Not in R-37 and not
   changed: `RealIsolator`'s reconcile still opens the checkout once per `blocking` hop
   (`isolate/real.rs`, `head`, `merge_of`, `is_ancestor` twice) under the admin lock.
+  **Phase 4 landed (`68a7c7e9`..`1787fd69`, 2026-10-03):** deadline and sessions. The ANA-27 T4
+  deadline, R-46 and R-49 are closed. Plan and blueprint are
+  `.claude/plans/mod-37-deadline-sessions.plan.md` and
+  `.claude/plans/mod-37-deadline-sessions.blueprint.md`. R-49 was closed by a pin, not a guard
+  (maintainer amendment): `claim_run`'s overlap admission already keeps other runs off the repo.
+  R-46 preempts only on the refresher's verdict, because a TUI read that fails `Unreachable`
+  includes a `PoolTimedOut` under local load. rust-reviewer approved with fixes; its two MEDIUMs,
+  three LOWs and one NIT were applied, and one NIT (a `Debug`-string comparison in a pin test) was
+  left.
   - ~~**R-3**~~: closed by MOD-37 phase 1. `RunStepSummary` carries `gate_note` from all three
     builders (Mem, Pg, cache mirror), and the Runs pane shows a parked step's reason on a third
     line. `run.failure` stays NULL on a park, as before.
@@ -186,9 +195,12 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     long model ids. `…` marks the cut and the width test keeps it from clipping silently (drive
     plan, Risks). Any real fix is a layout decision (drop the indent, abbreviate the model, or add
     a line), so it waits for the Runs pane's next layout change.
-  - **R-46**: a walk task keeps the `Backend` clone it started with. After an `Online → Offline`
-    swap its `PgStore` handle keeps failing until the heartbeat fences, and the sweep after reconnect
-    adopts the run (drive plan, Risks).
+  - ~~**R-46**~~: closed by MOD-37 phase 4. When the refresher reports the server gone, the
+    store loop calls `RunRuntime::preempt_walks`, so every live walk is abandoned at once and the
+    sweep after reconnect adopts it as a new attempt. Previously it ran blind for up to about 80 s,
+    until the heartbeat fence. A short blip now ends the session (maintainer decision). A loss
+    that a TUI read notices first does not preempt, because the read can be a pool timeout with the
+    server up and `go_offline` stops the refresher. Those walks keep the heartbeat-fence path.
   - **R-48**: the ACP driver ignores `SessionSpec.resume` (only `cli/mod.rs` reads it), so a
     promoted ACP step always gets the handoff prompt and a fresh model context. It needs ACP
     `session/load`. The blueprint named "a MOD-2 follow-up" as the owner, and MOD-2 is closed (drive
@@ -200,10 +212,13 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     failed CLI `--resume` is reported, never silently replaced by a fresh session. Do not key the
     note on `DriverCaps.resume`: for ACP rows it comes from `settings.acp.session.resume`, which
     defaults to `true` (`crates/htui-agent/src/registry.rs:165`).
-  - **R-49**: a promoted chat works in the step's tree without the `shared_serialized` `(box, repo)`
-    guard. The guard was released at `capture` or by `abandoned`, so another run may `prepare` the
-    same checkout meanwhile. The fix is to take the guard again in `attach_promoted` (drive
-    blueprint §18).
+  - ~~**R-49**~~: closed by MOD-37 phase 4, by admission rather than a guard. While a promoted
+    step's run is `awaiting_approval`, `claim_run` refuses every other run on a
+    `shared_serialized` repo of the box (rule I, `NotIsolated`), across processes. The conformance
+    pin `a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo` holds it. The
+    in-process guard is still not re-taken, which leaves three windows open (LOW): a same-run
+    command between `Promoted` and the chat bind, a second promotion of the same step (D185), and
+    an isolator rebuilt during the chat.
   - ~~**R-51**~~: closed by MOD-37 phase 1. A command that queues behind a live walk publishes
     `FrameKind::Waiting`, and the pane shows "waiting for the walk" until the walk rests, fails or is
     adopted. The walk keeps its D157 lock.
@@ -222,12 +237,13 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
     as the `Promoted` reply arrives, and the worker keeps a follow served before the bind for that
     bind, so the chat's frames carry the follow's address from the first one. Moving the stream
     inside the worker was ruled out: only `App::dispatch` mints a fresh seq.
-  - **Deadline (from ANA-27, `docs/ANA-27.md` §5.1 T4)**: `deadline_seconds` limits the verify
-    command (which gets what is left of the step deadline) and is checked when a step settles
-    (`crates/htui-orch/src/gate.rs` `deadline_elapsed`), but nothing times the agent session:
-    `drive_once` starts no timer, so a hung session holds its slot until the per-run cap or a human
-    cancel. The fix is a timer in the walk that cancels through R-38's seam and settles the step as
-    `DeadlineElapsed`.
+  - ~~**Deadline (from ANA-27, `docs/ANA-27.md` §5.1 T4)**~~: closed by MOD-37 phase 4.
+    `drive_once` runs a step session, and each fan-out candidate's, under a timer for the rest of
+    `deadline_seconds`. When it fires, the session is cancelled gracefully through MOD-42's
+    control, and the step settles `DeadlineElapsed` through `SettleInput::deadline_cut`, so the
+    result does not depend on the clock at settle. A run cancel, even one during the cut's drain,
+    still ends as `Cancelled`. Judge calls and `driver.start` are not timed; the start is bounded
+    by the driver's handshake timeout.
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
@@ -566,7 +582,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   derived from rows at read time, never reported by the agent, and "unknown" is a value. Per running
   step: *working* (a `session_event` within a window), *quiet* (none within it), *waiting on you*
   (MOD-42's open permission requests, with count and tool), *overdue* (past `deadline_seconds`;
-  display only until MOD-37's deadline entry lands), and *unknown* (the run's lease holder has not
+  display only; MOD-37 phase 4 now cuts the session at the deadline), and *unknown* (the run's lease holder has not
   refreshed within the TTL). Per run: *queued, no worker* when the target box's worker has not
   checked in (`docs/htui-worker.md`, "the pane cannot tell you why"). The windows are settings, and
   each label shows the age of the evidence behind it.

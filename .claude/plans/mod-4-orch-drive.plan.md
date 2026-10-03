@@ -648,7 +648,7 @@ binding cases (criterion 21) and the layout pins.
 | **R-43** — The close-out summary is generated; there is no human prose in it | Certain | `R-TUI-9` asks for commit hashes and status; an editable summary is MOD-13's editor's |
 | **R-44** — Step rows at 43 columns truncate `agent/model` | Certain for long model ids | `…` marks the cut; D169's width test keeps it from clipping silently |
 | **R-45** — `htui` now links `gix`, `process-wrap` and `walkdir` through `htui-orch` (build time, binary size, MOD-16's Windows facts) | Certain | Recorded for MOD-16 |
-| **R-46** — A walk task keeps the `Backend` clone it was started with; after an `Online → Offline` swap its `PgStore` handle keeps failing until the heartbeat fences (M5 D122) | Medium | That is the fence's job; the sweep after reconnect adopts the run (D175) |
+| **R-46** — A walk task keeps the `Backend` clone it was started with; after an `Online → Offline` swap its `PgStore` handle keeps failing until the heartbeat fences (M5 D122) | Medium | That is the fence's job; the sweep after reconnect adopts the run (D175). Closed by MOD-37 phase 4: the refresher's verdict preempts live walks |
 | **R-47** — Deviations the main thread must record: OQ-3/OQ-4 (item law), OQ-5 (grace), OQ-9 (artifact view), OQ-11 (criterion 19), D162 (ANA-5 criterion 3 generalised), D166 (`GateAnswer::Skipped` unexposed), D178 (`CancelStep`) | Medium | Listed here and under disagreements; each has a failing case if the literal reading returns |
 
 ## Validation
