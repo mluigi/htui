@@ -18,7 +18,7 @@ use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, layout, top_bar};
-use crossterm::event::{Event, KeyEvent, KeyEventKind};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent};
 use zeroize::Zeroizing;
 
 /// What the status line says when anything but a tab asks for `$EDITOR` (MOD-9 D10): the outcome
@@ -498,6 +498,28 @@ impl App {
             }
             self.drain(&origin);
         }
+    }
+
+    /// MOD-71 D1: whether the view on screen wants the mouse, which the event loop turns into
+    /// mouse capture after every step. No overlay may be open and the `?` box may not be up — both
+    /// draw over the tab, and a click through them would act on what they hide (blueprint E7) —
+    /// and the active tab must want it.
+    #[must_use]
+    pub fn wants_mouse(&self) -> bool {
+        todo!("MOD-71 T2")
+    }
+
+    /// A mouse event (MOD-71 D4): to the active tab only, with no keymap and no overlay in the
+    /// chain (an open overlay turns capture off, D1).
+    ///
+    /// Gated first, so an event queued before capture went off does nothing. `Moved` (capture is
+    /// any-motion, `?1003h`) and the horizontal wheel are dropped before dispatch. Only a
+    /// `Consumed` event sets `dirty` and clears the status line (blueprint E8): a pointer crossing
+    /// the canvas must neither redraw once per cell nor wipe an error nobody acted on. The status
+    /// is taken before dispatch, as [`on_key`](Self::on_key) clears it, so a failure the event
+    /// causes still lands.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        todo!("MOD-71 T2")
     }
 
     /// The propagation chain of blueprint C.4, stopping at the first `Handled::Consumed`.

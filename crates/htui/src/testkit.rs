@@ -572,6 +572,20 @@ impl Harness {
             .on_terminal_event(crossterm::event::Event::Paste(text.to_owned()));
     }
 
+    /// Feeds one mouse event at frame cell `(column, row)`, no modifier held: one `Event::Mouse`
+    /// through the same entry point the event loop uses (MOD-71 D4). A view hit-tests against the
+    /// frame it last drew, so a case calls [`Harness::render`] first.
+    pub fn mouse(&mut self, kind: crossterm::event::MouseEventKind, column: u16, row: u16) {
+        self.app.on_terminal_event(crossterm::event::Event::Mouse(
+            crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+        ));
+    }
+
     /// Draws a frame and returns the buffer as text, one line per row, trailing blanks trimmed.
     ///
     /// # Panics

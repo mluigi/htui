@@ -492,7 +492,9 @@ mod tests {
     use crate::store_worker::RequestEnvelope;
     use crate::ui::overlay::{MigrationPrompt, Overlay, OverlayId};
     use crate::ui::tabs::{Tab, TabId};
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
     use htui_core::fixtures::ids;
     use htui_core::model::{
         ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef, Status,
@@ -500,7 +502,7 @@ mod tests {
     use htui_orch::Command;
     use ratatui::Frame;
     use ratatui::layout::Rect;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use tokio::sync::mpsc;
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -1270,5 +1272,167 @@ mod tests {
         assert_eq!(app.status, None);
         assert!(revealed.borrow().is_empty());
         assert!(rx.try_recv().is_err(), "nothing is asked for");
+    }
+
+    // ---- MOD-71: the mouse seam (plan D1, D4) ------------------------------------------------
+
+    /// What a [`Pointer`] was offered.
+    type Pointed = Rc<RefCell<Vec<MouseEventKind>>>;
+
+    /// A tab that wants the mouse while `wants` is set, answers `answer`, and logs every mouse
+    /// event it is offered (MOD-71 D4).
+    #[derive(Debug)]
+    struct Pointer {
+        wants: Rc<Cell<bool>>,
+        answer: Handled,
+        seen: Pointed,
+    }
+
+    impl Tab for Pointer {
+        fn id(&self) -> TabId {
+            TabId("pointer")
+        }
+        fn title(&self) -> &str {
+            "Pointer"
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_scope_change(&mut self, _scope: &Scope) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn wants_mouse(&self) -> bool {
+            self.wants.get()
+        }
+        fn on_mouse(&mut self, mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            self.seen.borrow_mut().push(mouse.kind);
+            self.answer
+        }
+    }
+
+    /// A shell whose only tab is a [`Pointer`], `dirty` cleared.
+    fn pointing(
+        wants: bool,
+        answer: Handled,
+    ) -> (
+        App,
+        UnboundedReceiver<RequestEnvelope>,
+        Rc<Cell<bool>>,
+        Pointed,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, Keymap::default_global());
+        let wants = Rc::new(Cell::new(wants));
+        let seen = Pointed::default();
+        app.register_tab(Box::new(Pointer {
+            wants: Rc::clone(&wants),
+            answer,
+            seen: Rc::clone(&seen),
+        }));
+        app.dirty = false;
+        (app, rx, wants, seen)
+    }
+
+    /// `kind` at a fixed cell, no modifier.
+    fn at(kind: MouseEventKind) -> Event {
+        Event::Mouse(MouseEvent {
+            kind,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        })
+    }
+
+    /// MOD-71 D1: every view the shell starts with keeps the terminal's own text selection.
+    #[test]
+    fn no_tab_wants_the_mouse_at_start_up() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut app = App::new(tx, Keymap::default_global());
+        crate::app::register_all(&mut app);
+        assert!(!app.tabs.is_empty());
+        for i in 0..app.tabs.len() {
+            assert!(app.tabs.select(i));
+            assert!(!app.wants_mouse(), "{:?}", app.tabs.active_id());
+        }
+    }
+
+    /// MOD-71 D4: an event queued before capture went off reaches nobody and costs nothing.
+    #[test]
+    fn a_mouse_event_nobody_wants_changes_nothing() {
+        let (mut app, _rx, _wants, seen) = pointing(false, Handled::Consumed);
+        app.status = Some("boom".into());
+        app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
+        assert!(seen.borrow().is_empty());
+        assert!(!app.dirty);
+        assert_eq!(app.status.as_deref(), Some("boom"));
+    }
+
+    /// MOD-71 D4, blueprint H-5: capture is any-motion, so a pointer crossing the canvas must not
+    /// redraw once per cell; the horizontal wheel has no meaning here either.
+    #[test]
+    fn motion_and_the_horizontal_wheel_never_reach_a_tab_or_redraw() {
+        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::ScrollLeft,
+            MouseEventKind::ScrollRight,
+        ] {
+            app.on_terminal_event(at(kind));
+        }
+        assert!(seen.borrow().is_empty());
+        assert!(!app.dirty);
+    }
+
+    /// MOD-71 D4, blueprint E8: a consumed event redraws and, like a key, clears the status line.
+    #[test]
+    fn a_consumed_mouse_event_redraws_and_clears_the_status_line() {
+        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        app.status = Some("boom".into());
+        app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            *seen.borrow(),
+            vec![MouseEventKind::Down(MouseButton::Left)]
+        );
+        assert!(app.dirty);
+        assert_eq!(app.status, None);
+    }
+
+    /// MOD-71 D4, blueprint E8: an event the tab passed did nothing, so it neither redraws nor
+    /// wipes an error nobody acted on.
+    #[test]
+    fn a_passed_mouse_event_keeps_the_status_line_and_does_not_redraw() {
+        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Pass);
+        app.status = Some("boom".into());
+        app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
+        assert_eq!(
+            *seen.borrow(),
+            vec![MouseEventKind::Down(MouseButton::Left)]
+        );
+        assert!(!app.dirty);
+        assert_eq!(app.status.as_deref(), Some("boom"));
+    }
+
+    /// MOD-71 D1, blueprint E7: an overlay and the `?` box both draw over the tab, so either one
+    /// takes the mouse away from it.
+    #[test]
+    fn an_overlay_or_the_help_box_takes_the_mouse_away() {
+        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        assert!(app.wants_mouse(), "the tab wants it with nothing over it");
+        app.push_overlay(Box::new(Popup));
+        app.dirty = false;
+        assert!(!app.wants_mouse());
+        app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
+        assert!(seen.borrow().is_empty());
+        assert!(!app.dirty);
+
+        let (mut app, _rx, _wants, seen) = pointing(true, Handled::Consumed);
+        app.help_visible = true;
+        assert!(!app.wants_mouse());
+        app.on_terminal_event(at(MouseEventKind::Down(MouseButton::Left)));
+        assert!(seen.borrow().is_empty());
+        assert!(!app.dirty);
     }
 }
