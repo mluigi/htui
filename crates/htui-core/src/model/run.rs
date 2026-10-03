@@ -864,8 +864,11 @@ impl ToolCallCount {
     /// Postgres would order text by collation and the mirror by bytes, the reason
     /// [`UpstreamEntry::sort_canonical`](crate::model::UpstreamEntry::sort_canonical) gives.
     pub fn sort_canonical(rows: &mut [Self]) {
-        let _ = rows;
-        todo!("MOD-72 T1")
+        rows.sort_by(|a, b| {
+            a.step
+                .cmp(&b.step)
+                .then_with(|| a.tool_kind.as_bytes().cmp(b.tool_kind.as_bytes()))
+        });
     }
 }
 

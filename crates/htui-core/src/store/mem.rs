@@ -26,7 +26,7 @@ use crate::model::{
     BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile,
     BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim,
     CommandRun, CommandRunId, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead,
-    DocumentId, Executor, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
+    DocumentId, EventKind, Executor, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
     ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary,
     LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind,
     NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
@@ -1354,6 +1354,47 @@ impl State {
         }
         events.sort_by_key(|event| event.seq);
         Some(events)
+    }
+
+    /// MOD-72 plan D3: the item's `tool_call` rows per `(step, tool_kind)`, a kind that is not a
+    /// JSON string counted as `other` (blueprint E3), in canonical order.
+    fn tool_call_counts(&self, item: ItemId) -> Vec<ToolCallCount> {
+        let steps: BTreeSet<StepId> = self
+            .steps
+            .values()
+            .filter(|step| {
+                self.runs
+                    .get(&step.run_id)
+                    .is_some_and(|run| run.item_id == Some(item))
+            })
+            .map(|step| step.id)
+            .collect();
+        let mut counts: BTreeMap<(StepId, String), u32> = BTreeMap::new();
+        for event in &self.events {
+            if event.kind != EventKind::ToolCall || !steps.contains(&event.run_step_id) {
+                continue;
+            }
+            let kind = event
+                .payload
+                .get("tool_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("other");
+            let calls = counts
+                .entry((event.run_step_id, kind.to_owned()))
+                .or_insert(0);
+            // Blueprint H-5: saturate, never wrap.
+            *calls = calls.saturating_add(1);
+        }
+        let mut rows: Vec<ToolCallCount> = counts
+            .into_iter()
+            .map(|((step, tool_kind), calls)| ToolCallCount {
+                step,
+                tool_kind,
+                calls,
+            })
+            .collect();
+        ToolCallCount::sort_canonical(&mut rows);
+        rows
     }
 
     /// Mints an item: counter upsert, key assembly and revision 1, all in one lock (§7.1, §4.1).
@@ -6491,8 +6532,7 @@ impl ReadStore for MemStore {
     }
 
     async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
-        let _ = item;
-        todo!("MOD-72 T1")
+        Ok(self.read(|state| state.tool_call_counts(item)))
     }
 }
 
