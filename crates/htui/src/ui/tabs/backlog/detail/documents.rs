@@ -34,6 +34,7 @@ use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{DOCUMENT_FORM_NAME, WRITE_DOCUMENT_NAME, write_refused};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells;
 use crate::ui::tabs::backlog::detail::compose::{self, Compose, ComposeOutcome, may_have_landed};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
 use crate::ui::tabs::backlog::item_form::ctrl_s;
@@ -45,6 +46,9 @@ const BY_STEP: &str = "step";
 
 /// Written by a human.
 const BY_HAND: &str = "hand";
+
+/// The browse hint on the pane's last row (D11).
+const HINT: &str = "J/K move \u{b7} a new \u{b7} v new version";
 
 /// What a `WriteDocument` in flight expects (D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,15 +436,24 @@ impl DetailTab for DocumentsTab {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
-        // D5's sentence under the table; with none the table keeps the whole rect (E5).
+        // D5's sentence under the table; with none the table keeps the rect above the hint (E5).
         let notice = self
             .notice
             .as_deref()
             .map(|sentence| wrapped(sentence, usize::from(area.width)))
             .unwrap_or_default();
         let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
-        let [table, below] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(height)]).areas(area);
+        // D11: the browse hint takes the last row, under the table and the notice.
+        let [table, below, hint] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(height),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        frame.render_widget(
+            Line::styled(cells::clip(HINT, usize::from(hint.width)), ctx.theme.dim),
+            hint,
+        );
         if self.documents.is_empty() {
             message(frame, table, "No documents for this item.", ctx.theme);
         } else {
@@ -1075,5 +1088,53 @@ mod tests {
         assert!(!reversed(1), "plan v1");
         assert!(reversed(2), "plan v2, under the cursor");
         assert!(!reversed(3), "prd v1");
+    }
+
+    #[test]
+    fn the_hint_fits_the_detail_pane() {
+        assert!(cells::cell_width(HINT) <= 43, "{HINT}");
+    }
+
+    /// D11: with an item and no form, the last row is the hint, under the table and under D5's
+    /// notice, or under an empty list; with no item there is none.
+    #[tokio::test]
+    async fn the_hint_is_drawn_under_the_table() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows[22].trim_end(), HINT, "{text}");
+        assert_eq!(text.matches(HINT).count(), 1, "{text}");
+
+        // With D5's notice the hint is still last, and the notice sits right above it.
+        let request = saving_v(&shell, &backend, &mut pane).await;
+        let reply = served(&backend, &request).await;
+        pane.on_reply(&reply, &mut shell.ctx());
+        assert!(!pane.captures_input(), "the form closed");
+        let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows[22].trim_end(), HINT, "{text}");
+        assert_eq!(rows[21].trim_end(), "saved as plan v3", "{text}");
+
+        let mut empty = DocumentsTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Documents(Vec::new()), &mut shell.ctx());
+        let text = drawn(43, 23, |frame, rect| {
+            empty.render(frame, rect, &shell.ctx())
+        });
+        assert!(text.contains("No documents for this item."), "{text}");
+        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
+
+        let mut none = DocumentsTab::new();
+        none.on_item_change(None);
+        let text = drawn(43, 23, |frame, rect| none.render(frame, rect, &shell.ctx()));
+        assert!(!text.contains(HINT), "{text}");
+
+        // The landed write re-read the list.
+        let _ = taken(&shell);
+        open(&shell, &backend, &mut pane, 'a').await;
+        let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
+        assert!(!text.contains(HINT), "{text}");
     }
 }

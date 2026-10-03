@@ -15,7 +15,7 @@
 
 use htui_core::model::{ItemId, Note};
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
@@ -24,9 +24,13 @@ use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME, write_refused};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::cells;
 use crate::ui::tabs::backlog::detail::compose::{self, Compose, ComposeOutcome, may_have_landed};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+/// The browse hint on the pane's last row (D11).
+const HINT: &str = "a add note";
 
 /// The `Notes` reply as a thread, oldest first.
 ///
@@ -229,15 +233,22 @@ impl DetailTab for NotesTab {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
+        // D11: the browse hint takes the last row.
+        let [list, hint] =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        frame.render_widget(
+            Line::styled(cells::clip(HINT, usize::from(hint.width)), ctx.theme.dim),
+            hint,
+        );
         if self.notes.is_empty() {
-            message(frame, area, "No notes for this item.", ctx.theme);
+            message(frame, list, "No notes for this item.", ctx.theme);
             return;
         }
         frame.render_widget(
             Paragraph::new(Text::from(self.lines(ctx.theme)))
                 .wrap(Wrap { trim: false })
                 .scroll((self.scroll.offset(), 0)),
-            area,
+            list,
         );
     }
 }
@@ -557,5 +568,42 @@ mod tests {
         );
         assert!(!pane.captures_input());
         assert!(shell.actions().is_empty());
+    }
+
+    #[test]
+    fn the_hint_fits_the_detail_pane() {
+        assert!(cells::cell_width(HINT) <= 43, "{HINT}");
+    }
+
+    /// D11: with an item and no area, the last row is the hint, over a thread or an empty one;
+    /// with no item there is none.
+    #[tokio::test]
+    async fn the_hint_is_drawn_under_the_thread() {
+        let shell = Shell::new();
+        let pane = pane(&shell).await;
+        let text = drawn(43, 23, |frame, area| pane.render(frame, area, &shell.ctx()));
+        let rows: Vec<&str> = text.lines().collect();
+        assert_eq!(rows[22].trim_end(), HINT, "{text}");
+        assert_eq!(text.matches(HINT).count(), 1, "{text}");
+
+        let mut empty = NotesTab::new();
+        empty.on_item_change(Some(ITEM));
+        empty.on_reply(&StoreReply::Notes(Vec::new()), &mut shell.ctx());
+        let text = drawn(43, 23, |frame, area| {
+            empty.render(frame, area, &shell.ctx())
+        });
+        assert!(text.contains("No notes for this item."), "{text}");
+        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
+
+        let mut none = NotesTab::new();
+        none.on_item_change(None);
+        let text = drawn(43, 23, |frame, area| none.render(frame, area, &shell.ctx()));
+        assert!(!text.contains(HINT), "{text}");
+
+        let composing = composing(&shell).await;
+        let text = drawn(43, 23, |frame, area| {
+            composing.render(frame, area, &shell.ctx());
+        });
+        assert!(!text.contains(HINT), "{text}");
     }
 }
