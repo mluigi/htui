@@ -1382,11 +1382,20 @@ pub fn unborn_head(name: &str) -> String {
     format!("unborn HEAD: {name} has no commit to record as before_hash")
 }
 
+#[cfg(test)]
+thread_local! {
+    /// R-37's pin: how many times this thread has called [`open`]. Test builds only; the type is
+    /// spelled in full because a top-level `use std::cell::Cell` is unused in the non-test build.
+    static OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `gix::open` (`gix-0.87.1/src/lib.rs:418`).
 ///
 /// # Errors
 /// [`IsolateError::Git`] when there is no repository at `path` or it cannot be read.
 pub fn open(path: &Path) -> Result<gix::Repository, IsolateError> {
+    #[cfg(test)]
+    OPENS.set(OPENS.get() + 1);
     gix::open(path)
         .map_err(|err| IsolateError::Git(format!("cannot open {}: {err}", path.display())))
 }
@@ -1397,7 +1406,11 @@ pub fn open(path: &Path) -> Result<gix::Repository, IsolateError> {
 /// [`IsolateError::Refused`] with [`unborn_head`] for a repository with no commit;
 /// [`IsolateError::Git`] for anything else.
 pub fn head(path: &Path) -> Result<String, IsolateError> {
-    let repo = open(path)?;
+    head_in(&open(path)?, path)
+}
+
+/// [`head`] over an open `repo`; `path` names it in the messages only (R-37).
+fn head_in(repo: &gix::Repository, path: &Path) -> Result<String, IsolateError> {
     let head = repo.head().map_err(|err| {
         IsolateError::Git(format!("cannot read HEAD of {}: {err}", path.display()))
     })?;
@@ -1421,7 +1434,11 @@ pub fn head(path: &Path) -> Result<String, IsolateError> {
 /// [`IsolateError::Git`] when the repository cannot be opened, `hex` is not a hash, or the lookup
 /// fails.
 pub fn has_commit(path: &Path, hex: &str) -> Result<bool, IsolateError> {
-    let repo = open(path)?;
+    has_commit_in(&open(path)?, hex)
+}
+
+/// [`has_commit`] over an open `repo` (R-37).
+fn has_commit_in(repo: &gix::Repository, hex: &str) -> Result<bool, IsolateError> {
     let id = parse_oid(hex)?;
     let object = repo
         .try_find_object(id)
@@ -1460,14 +1477,20 @@ pub fn head_parents(path: &Path) -> Result<Vec<String>, IsolateError> {
 /// `descendant` is read to its root. An `ancestor` this repository does not hold is not one.
 ///
 /// # Errors
-/// [`IsolateError::Git`] when either hash is not a hash, or the walk cannot read a commit.
+/// [`IsolateError::Git`] when either hash is not a hash, the repository cannot be opened, or the
+/// walk cannot read a commit.
 pub fn is_ancestor(path: &Path, ancestor: &str, descendant: &str) -> Result<bool, IsolateError> {
-    ancestor_walk(path, ancestor, descendant).map(|(found, _)| found)
+    // Both hashes parse, and a commit is its own ancestor, before the repository opens: a bad
+    // hash outranks a bad path, and equal hashes need no repository.
+    if parse_oid(ancestor)? == parse_oid(descendant)? {
+        return Ok(true);
+    }
+    ancestor_walk(&open(path)?, ancestor, descendant).map(|(found, _)| found)
 }
 
 /// [`is_ancestor`]'s answer and the number of commits its walk yielded (plan D142's pin).
 fn ancestor_walk(
-    path: &Path,
+    repo: &gix::Repository,
     ancestor: &str,
     descendant: &str,
 ) -> Result<(bool, usize), IsolateError> {
@@ -1475,10 +1498,9 @@ fn ancestor_walk(
     if wanted == tip {
         return Ok((true, 0));
     }
-    if !has_commit(path, ancestor)? {
+    if !has_commit_in(repo, ancestor)? {
         return Ok((false, 0));
     }
-    let repo = open(path)?;
     let fail = |err: &dyn std::fmt::Display| {
         IsolateError::Git(format!("cannot walk from {descendant}: {err}"))
     };
@@ -1511,25 +1533,29 @@ fn ancestor_walk(
 /// `head` is still read to its root.
 ///
 /// # Errors
-/// [`IsolateError::Git`] when a hash is not a hash or a commit on the walk cannot be read.
+/// [`IsolateError::Git`] when a hash is not a hash, the repository cannot be opened, or a commit on
+/// the walk cannot be read.
 pub fn merge_of(
     path: &Path,
     head: &str,
     base: &str,
     after: &str,
 ) -> Result<Option<String>, IsolateError> {
-    merge_walk(path, head, base, after).map(|(merge, _)| merge)
+    // Every hash parses before the repository opens: a bad hash outranks a bad path.
+    for hex in [head, base, after] {
+        parse_oid(hex)?;
+    }
+    merge_walk(&open(path)?, head, base, after).map(|(merge, _)| merge)
 }
 
 /// [`merge_of`]'s answer and the number of commits its walk read (plan D142's pin).
 fn merge_walk(
-    path: &Path,
+    repo: &gix::Repository,
     head: &str,
     base: &str,
     after: &str,
 ) -> Result<(Option<String>, usize), IsolateError> {
     let (tip, base, after) = (parse_oid(head)?, parse_oid(base)?, parse_oid(after)?);
-    let repo = open(path)?;
     let fail =
         |err: &dyn std::fmt::Display| IsolateError::Git(format!("cannot walk from {head}: {err}"));
     let walk = repo
@@ -1583,7 +1609,8 @@ fn reconcile_message(step: StepId) -> String {
 /// `None` too, and the caller then diffs `before..after`, a superset (R-33's residual).
 ///
 /// # Errors
-/// [`IsolateError::Git`] when a hash is not a hash, or a commit or `HEAD` cannot be read.
+/// [`IsolateError::Git`] when a hash is not a hash, the checkout cannot be opened, or a commit or
+/// `HEAD` cannot be read; [`IsolateError::Refused`] with [`unborn_head`] when `HEAD` is unborn.
 pub fn reconcile_parent(
     checkout: &Path,
     before: &str,
@@ -1591,10 +1618,10 @@ pub fn reconcile_parent(
     step: StepId,
 ) -> Result<Option<String>, IsolateError> {
     let id = parse_oid(after)?;
-    if !has_commit(checkout, after)? {
+    let repo = open(checkout)?;
+    if !has_commit_in(&repo, after)? {
         return Ok(None);
     }
-    let repo = open(checkout)?;
     let commit = repo
         .find_commit(id)
         .map_err(|err| IsolateError::Git(format!("cannot find commit {after}: {err}")))?;
@@ -1606,11 +1633,12 @@ pub fn reconcile_parent(
         return Ok(None);
     }
     let (first, second) = (first.to_hex().to_string(), second.to_hex().to_string());
-    if !is_ancestor(checkout, before, &first)? {
+    let (held, _) = ancestor_walk(&repo, before, &first)?;
+    if !held {
         return Ok(None);
     }
-    let head = head(checkout)?;
-    let merge = merge_of(checkout, &head, before, &second)?;
+    let head = head_in(&repo, checkout)?;
+    let (merge, _) = merge_walk(&repo, &head, before, &second)?;
     Ok((merge == Some(id.to_hex().to_string())).then_some(first))
 }
 
@@ -2354,6 +2382,28 @@ mod tests {
             .to_string()
     }
 
+    /// An empty-tree commit on `parents` with `message`, written through `HEAD`: gix's
+    /// `commit_as` expects `HEAD`'s branch to sit on the first parent (`MustExistAndMatch`,
+    /// `gix-0.87.1/src/repository/object.rs:423-431`) and moves it to the new commit.
+    fn commit_on_head(dir: &std::path::Path, parents: &[&str], message: &str) -> String {
+        let repo = gix::open(dir).expect("the repository opens");
+        let who = gix::actor::SignatureRef {
+            name: gix::bstr::BStr::new(b"htui test"),
+            email: gix::bstr::BStr::new(b"test@localhost"),
+            time: "1600009000 +0000",
+        };
+        let parents: Vec<gix::ObjectId> = parents
+            .iter()
+            .map(|hex| gix::ObjectId::from_hex(hex.as_bytes()).expect("a hex object id"))
+            .collect();
+        let tree = gix::ObjectId::empty_tree(gix::hash::Kind::Sha1);
+        repo.commit_as(who, who, "HEAD", message, tree, parents)
+            .expect("the commit is written and HEAD moves")
+            .detach()
+            .to_hex()
+            .to_string()
+    }
+
     /// Forty commits in a line, each a minute after the last; the last one is returned.
     fn long_history(dir: &std::path::Path) -> String {
         empty_repo(dir);
@@ -2377,14 +2427,15 @@ mod tests {
         let side = commit_at(dir.path(), &[&base], 41);
         let above = commit_at(dir.path(), &[&base], 42);
         let head = commit_at(dir.path(), &[&above], 43);
+        let repo = super::open(dir.path()).expect("the repository opens");
 
-        let (found, yielded) = ancestor_walk(dir.path(), &base, &head).expect("the walk");
+        let (found, yielded) = ancestor_walk(&repo, &base, &head).expect("the walk");
         assert!(found, "the base is under HEAD");
         assert!(
             yielded <= 2,
             "the walk stopped at the base: {yielded} commits"
         );
-        let (found, yielded) = ancestor_walk(dir.path(), &side, &head).expect("the walk");
+        let (found, yielded) = ancestor_walk(&repo, &side, &head).expect("the walk");
         assert!(!found, "a commit beside HEAD's line is not under it");
         assert!(
             yielded <= 2,
@@ -2403,13 +2454,79 @@ mod tests {
         let tip = commit_at(dir.path(), &[&base], 42);
         let head = commit_at(dir.path(), &[&fork], 43);
         let merge = commit_at(dir.path(), &[&base, &tip], 44);
+        let repo = super::open(dir.path()).expect("the repository opens");
 
-        let (found, read) = merge_walk(dir.path(), &head, &base, &tip).expect("the walk");
+        let (found, read) = merge_walk(&repo, &head, &base, &tip).expect("the walk");
         assert_eq!(found, None, "HEAD's line holds no merge of the tip");
         assert!(read <= 1, "the walk stopped at the fork: {read} commits");
-        let (found, read) = merge_walk(dir.path(), &merge, &base, &tip).expect("the walk");
+        let (found, read) = merge_walk(&repo, &merge, &base, &tip).expect("the walk");
         assert_eq!(found.as_deref(), Some(merge.as_str()), "the merge is found");
         assert!(read <= 1, "and nothing under it is read: {read} commits");
+    }
+
+    /// R-37 (lease blueprint §23.4): `reconcile_parent` opens the primary once per diff row, not
+    /// six times. The primary moved under the step (another run's commit sits on `before`), so
+    /// every check runs: the lookup, the ancestor walk past `before`, `HEAD`, the merge walk.
+    #[test]
+    fn reconcile_parent_opens_the_checkout_once() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let before = repo_with_one_commit(dir.path());
+        let moved = commit_file(dir.path(), "g", "other run\n", "another run's work");
+        let tip = commit_at(dir.path(), &[&before], 1);
+        let step = htui_core::model::StepId::new();
+        let merge = commit_on_head(dir.path(), &[&moved, &tip], &super::reconcile_message(step));
+        assert_eq!(
+            super::head(dir.path()).expect("HEAD reads"),
+            merge,
+            "HEAD is on the merge"
+        );
+
+        super::OPENS.set(0);
+        let parent = super::reconcile_parent(dir.path(), &before, &merge, step).expect("it reads");
+        assert_eq!(
+            parent.as_deref(),
+            Some(moved.as_str()),
+            "the merge's first parent"
+        );
+        assert_eq!(super::OPENS.get(), 1, "one open of the checkout");
+    }
+
+    /// R-37: a commit the checkout does not hold answers `None` before any commit is read (the
+    /// early `None`: a `find_commit` first would be an error), after the one open.
+    #[test]
+    fn reconcile_parent_opens_once_for_a_commit_it_does_not_hold() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let before = repo_with_one_commit(dir.path());
+        let other = tempfile::tempdir().expect("a temporary directory");
+        empty_repo(other.path());
+        let elsewhere = commit_file(other.path(), "x", "elsewhere\n", "a line of its own");
+        let step = htui_core::model::StepId::new();
+
+        super::OPENS.set(0);
+        let parent =
+            super::reconcile_parent(dir.path(), &before, &elsewhere, step).expect("it reads");
+        assert_eq!(parent, None, "the checkout does not hold it");
+        assert_eq!(super::OPENS.get(), 1, "one open, then the early None");
+    }
+
+    /// R-37: `is_ancestor` and `merge_of` parse their hashes before they open the repository, so a
+    /// commit is its own ancestor without one and a bad hash outranks a bad path.
+    #[test]
+    fn hashes_are_read_before_the_repository_opens() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let missing = dir.path().join("no-repository-here");
+        let hex = "0123456789abcdef0123456789abcdef01234567";
+
+        assert!(super::is_ancestor(&missing, hex, hex).expect("no repository is needed"));
+        for err in [
+            super::is_ancestor(&missing, "zz", hex).expect_err("a bad hash"),
+            super::merge_of(&missing, hex, hex, "zz").expect_err("a bad hash"),
+        ] {
+            assert!(
+                matches!(&err, IsolateError::Git(text) if text.contains("is not an object id")),
+                "the hash is refused before the path: {err:?}"
+            );
+        }
     }
 
     /// `gix::init` alone makes a repository with an unborn `HEAD`, and `before_hash` is `NOT NULL`
