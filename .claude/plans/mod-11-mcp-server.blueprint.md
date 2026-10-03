@@ -669,3 +669,692 @@ Root `Cargo.toml`: `members` gains `"crates/htui-mcp"`; `[workspace.dependencies
 `cargo tree -i schemars@1.2.2` before and after that no new crate appears in `Cargo.lock` beyond
 `htui-mcp` itself.
 
+### 2.7 `protocol.rs` — JSON-RPC 2.0 / MCP over NDJSON (D2, B-10, B-11)
+
+```rust
+pub const SUPPORTED_VERSIONS: [&str; 4] = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;           // mirrors htui-agent/src/cli/mod.rs:76
+
+/// What the protocol loop asks of whoever owns the tools: `McpHost`'s session, or a test double.
+pub trait Handler: Send + Sync + 'static {
+    /// `tools/list`'s `tools` array, already filtered to the advertised set (I-7).
+    fn tools(&self) -> Vec<ToolInfo>;
+    /// One call. `progress` is `Some` when the client sent `_meta.progressToken` (B-11).
+    fn call(&self, name: String, arguments: serde_json::Value, progress: Option<Progress>)
+        -> Pin<Box<dyn Future<Output = Result<CallResult, CallRefused>> + Send>>;
+}
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ToolInfo { pub name: &'static str, pub description: &'static str,
+                      #[serde(rename = "inputSchema")] pub input_schema: serde_json::Value }
+/// `{content:[{type:"text",text}], isError}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallResult { pub text: String, pub is_error: bool }
+/// A call the protocol refuses rather than the tool: unknown or unadvertised name (-32602).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallRefused(pub String);
+/// Sends `notifications/progress {progressToken, progress}` on the connection's writer.
+#[derive(Debug, Clone)] pub struct Progress { /* token: Value, tx: mpsc::Sender<Value> */ }
+impl Progress { pub async fn tick(&self, progress: u64); }
+
+/// Serves one connection until EOF; never panics on input. Requests are dispatched concurrently
+/// (`contained::spawn_in` into a `JoinSet`, B-20); responses go through one writer task in the order
+/// they complete. `notifications/cancelled {requestId}` aborts that request's task (its drop guards
+/// run: `command_run` cancels its row). EOF aborts every in-flight task.
+pub async fn serve<C>(conn: C, handler: Arc<dyn Handler>) -> std::io::Result<()>
+where C: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + Unpin + 'static;
+```
+
+Message shapes (server side; every response carries `"jsonrpc":"2.0"` and the request's `id`):
+
+| In | Out |
+|---|---|
+| `initialize {protocolVersion, capabilities, clientInfo}` | `result {protocolVersion: <client's if in SUPPORTED_VERSIONS else "2025-11-25">, capabilities: {tools: {}}, serverInfo: {name: "htui", version: CARGO_PKG_VERSION}}` |
+| `notifications/initialized` (no id) | nothing |
+| `ping` | `result {}` |
+| `tools/list` (any `cursor` ignored) | `result {tools: [ToolInfo…]}` (no `nextCursor`) |
+| `tools/call {name, arguments?, _meta?}` | `result {content: [{type:"text", text}], isError}`; `arguments` absent → `{}` |
+| `tools/call` unknown/unadvertised name | `error {code: -32602, message: "unknown tool: <name>"}` |
+| `notifications/cancelled {requestId}` | nothing; aborts the call |
+| any other notification | ignored |
+| unknown method with an id | `error {code: -32601, message: "method not found: <m>"}` |
+| a line that is not JSON | `error {id: null, code: -32700, message: "parse error"}` |
+| JSON that is not a request object (array, no `method`, bad `jsonrpc`) | `error {id: <id or null>, code: -32600}` |
+| a line over `MAX_LINE_BYTES` | the rest of the line discarded, `-32700 "line exceeds 1 MiB"`, loop continues |
+| argument decode failure (serde) | `result {isError: true, text: "invalid arguments: <serde message>"}` (MCP convention, D2) |
+
+Calls before `initialize` are served anyway (the CLI always initialises first; refusing buys nothing).
+
+**Recorded transcript** (fact-check probe of claude 2.1.287, `/tmp/mcpprobe/srv.log`, copied here
+verbatim because a sandbox restart wipes `/tmp`; T2 writes these four lines to
+`tests/transcripts/claude-2.1.287.ndjson` and replays them against a `Handler` double):
+
+```
+{"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"roots":{"listChanged":true},"elicitation":{"form":{},"url":{}}},"clientInfo":{"name":"claude-code","title":"Claude Code","version":"2.1.287","description":"Anthropic's agentic coding tool","websiteUrl":"https://claude.com/claude-code"}},"jsonrpc":"2.0","id":0}
+{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"method":"tools/list","jsonrpc":"2.0","id":1}
+{"method":"tools/call","params":{"name":"permission_prompt","arguments":{"tool_name":"mcp__htui__hello","input":{},"tool_use_id":"toolu_01HuMymhasmoPmGaLNFxJ4GV"},"_meta":{"claudecode/toolUseId":"toolu_01HuMymhasmoPmGaLNFxJ4GV","progressToken":2}},"jsonrpc":"2.0","id":2}
+```
+
+The probe's answers were `{"content":[{"type":"text","text":"{\"behavior\": \"allow\", \"updatedInput\": {}}"}]}`
+(allow) and `{"behavior":"deny","message":"probe denies"}` (deny); a deny then appears in the CLI's
+terminal `result.permission_denials[]` as `{"tool_name":"mcp__htui__hello","tool_use_id":"toolu_01Hu…",
+"tool_input":{}}` (`/tmp/mcpprobe/out3.jsonl`) — the dedup D18 asks for (T9). The CLI's `system/init`
+lists servers as `{"name":"htui","status":"connected","source":"dynamic"}` and never echoes `env`.
+
+### 2.8 `channel.rs` — listener, address, handshake, relay (D3, OQ-1, B-12)
+
+```rust
+/// 32 bytes from two `Uuid::new_v4()` (getrandom-backed), lowercase hex, 64 chars. `Debug` prints
+/// `Token(…)` — never the value (I-6).
+#[derive(Clone, PartialEq, Eq, Hash)] pub struct Token(String);
+impl Token { #[must_use] pub fn mint() -> Self; #[must_use] pub fn as_str(&self) -> &str;
+             #[must_use] pub fn parse(s: &str) -> Option<Self>; /* 64 lowercase hex or None */ }
+
+/// Where the child connects: a socket path (Unix) or a pipe name (Windows), rendered into
+/// `HTUI_MCP_ADDR` as is.
+#[derive(Debug, Clone, PartialEq, Eq)] pub struct Address(String);
+
+/// One per process, created lazily by the first `open` (D3). Drop = `close`.
+pub struct Listener { address: Address, dir: Option<PathBuf> /* unix */, stop: watch::Sender<bool> }
+impl Listener {
+    /// Binds and spawns the accept loop (`contained::spawn`). Each accepted stream gets its own task:
+    /// read the handshake line (5 s budget, `HANDSHAKE_TIMEOUT`), resolve the token through `lookup`,
+    /// answer, then `protocol::serve(stream, session)`.
+    pub fn bind(lookup: Arc<dyn Fn(&HandshakeLine) -> Result<Arc<dyn Handler>, Refusal> + Send + Sync>)
+        -> std::io::Result<Self>;
+    #[must_use] pub fn address(&self) -> &Address;
+    pub fn close(&mut self);   // stop the loop; unix: remove `<dir>/s` then `<dir>`, best effort
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HandshakeLine { pub token: String, pub version: String }
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct HandshakeReply { pub ok: bool, #[serde(default, skip_serializing_if = "Option::is_none")]
+                            pub reason: Option<String> }
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum Refusal {
+    #[error("no live htui session has this token (it ended, or it never existed)")] UnknownToken,
+    #[error("version mismatch: the host is htui {host}, this relay is {relay}; restart the agent")]
+    Version { host: String, relay: String },
+    #[error("malformed handshake")] Malformed,
+}
+
+/// The child side (D6): connect, send the line, read the reply, then splice
+/// stdin → stream and stream → stdout until either side ends.
+pub async fn relay<R, W>(addr: &Address, token: &Token, stdin: R, stdout: W) -> Result<(), RelayError>
+where R: AsyncRead + Unpin + Send, W: AsyncWrite + Unpin + Send;
+#[derive(Debug, thiserror::Error)]
+pub enum RelayError { #[error("cannot reach the htui host at {0}: {1}")] Connect(String, std::io::Error),
+                      #[error("{0}")] Refused(Refusal), #[error("relay i/o: {0}")] Io(std::io::Error) }
+```
+
+Wire: child → host `{"token":"<64 hex>","version":"0.1.0+relay.1"}\n`; host → child `{"ok":true}\n`,
+or `{"ok":false,"reason":"<Refusal Display>"}\n` and close. The reason never names the token. After
+`ok`, the stream carries the MCP NDJSON unchanged in both directions; the child never parses it (I-2).
+The version check compares the whole string (B-12).
+
+**Unix**: base = `$XDG_RUNTIME_DIR` when set, absolute and a directory, else `std::env::temp_dir()`;
+directory `htui-mcp-<pid>-<8 hex of a v4>` created with
+`std::fs::DirBuilder::new().mode(0o700).create(..)` (`std::os::unix::fs::DirBuilderExt`; no `unsafe`);
+then verified `metadata().permissions().mode() & 0o077 == 0` (refuse otherwise:
+`ToolHostError::Listener`). Socket `<dir>/s` via `tokio::net::UnixListener::bind`. Keep the name short:
+`sun_path` is 108 bytes on Linux, 104 on macOS (H-12). Cleanup on `close`/`Drop`; a crashed process
+leaves the directory (no sweeper this item; noted in `docs/htui-mcp.md`).
+
+**Windows**: name `\\.\pipe\htui-mcp-<v4 simple>`; first instance
+`ServerOptions::new().first_pipe_instance(true).reject_remote_clients(true).create(&name)`; the accept
+loop follows tokio's documented pattern (create the next instance **before** handing the connected one
+off). Default security descriptor (OQ-1: "current-user ACL by default"). The child opens with
+`ClientOptions::new().open(&name)`, retrying `ERROR_PIPE_BUSY` (`os error 231`) every 50 ms for up to
+5 s. Compiled with `cargo check -p htui-mcp --target x86_64-pc-windows-gnu` only (R-10).
+
+### 2.9 `host.rs` — `McpHost<H>` (D5, B-2, B-19, B-21)
+
+```rust
+pub struct McpHost<H: htui_core::store::WorkerHost> { inner: Arc<Inner<H>> }
+struct Inner<H: htui_core::store::WorkerHost> {
+    host: StdMutex<H>,                                              // B-2
+    sessions: StdMutex<HashMap<Token, Arc<Session<H::Store>>>>,
+    listener: StdMutex<Option<Listener>>,                           // lazy (D3)
+    search: Option<Arc<dyn ConceptSearch>>,                         // D12
+    binary: PathBuf,                                                // absolute (ACP schema)
+    scrubber: Arc<dyn htui_core::scrub::Scrubber>,                  // MinimalScrubber::new([]) default
+    clock: Arc<dyn htui_core::clock::Clock>,                        // SystemClock default
+}
+pub(crate) struct Session<S> {
+    pub(crate) scope: ToolScope,
+    pub(crate) store: S,                                            // captured at open (B-2)
+    pub(crate) ask: Option<PromptAsk>,                              // B-21
+    pub(crate) ended: AtomicBool,                                   // I-6
+    /* + Arc back-pointers the tools need: search, scrubber, clock, a host clone for reads */
+}
+
+impl<H: htui_core::store::WorkerHost> McpHost<H> {
+    /// Resolves the binary once: Linux `/proc/<std::process::id()>/exe` (valid for the process's
+    /// life even after the file is replaced, the `provision/mod.rs:104-110` precedent); elsewhere
+    /// `std::env::current_exe()` (absolute, canonicalised).
+    /// # Errors
+    /// `ToolHostError::Listener` when no absolute binary path can be had.
+    pub fn new(host: H) -> Result<Self, ToolHostError>;
+    #[must_use] pub fn with_search(self, search: Arc<dyn ConceptSearch>) -> Self;   // T2 API, T7 uses
+    #[must_use] pub fn with_binary(self, binary: PathBuf) -> Self;                   // tests (T5)
+    #[must_use] pub fn with_scrubber(self, s: Arc<dyn Scrubber>) -> Self;
+    #[must_use] pub fn with_clock(self, c: Arc<dyn Clock>) -> Self;
+    pub fn set_host(&self, host: H);                                                 // B-2
+    /// The listener's address once bound (tests).
+    #[must_use] pub fn address(&self) -> Option<Address>;
+    /// D5's in-process client: the same protocol over `tokio::io::duplex(64 KiB)`, no socket and no
+    /// handshake.
+    /// # Errors
+    /// `Refusal::UnknownToken` when `token` names no live session.
+    pub fn client(&self, token: &str) -> Result<McpClient, Refusal>;
+}
+impl<H: WorkerHost> Clone for McpHost<H> { /* Arc clone */ }
+impl<H: WorkerHost> core::fmt::Debug for McpHost<H> { /* sessions count, address; no tokens */ }
+
+impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
+    fn open(&self, scope: ToolScope) -> Result<ToolLease, ToolHostError> {
+        // 1. store = self.host.lock().writer().ok_or(Offline)?        (B-2)
+        // 2. listener: bind lazily (needs a tokio runtime: open is only called from async code)
+        // 3. token = Token::mint(); (port, ask) = prompt_bridge() when scope.transport == Cli (B-21)
+        // 4. sessions.insert(token, Arc::new(Session{..}))
+        // 5. spec = McpServerSpec { name: "htui", command: binary, args: ["mcp"],
+        //                           env: {HTUI_MCP_ADDR: address, HTUI_MCP_TOKEN: token} }
+        // 6. ToolLease::new(spec, port, move || { remove token; session.ended = true })  (Weak<Inner>)
+    }
+    fn close(&self) { /* listener.close(); every session ended; map cleared */ }
+}
+
+/// The client half `client(token)` returns.
+#[derive(Debug)] pub struct McpClient { /* write half, BufReader lines, next id */ }
+impl McpClient {
+    /// One raw request; answers the whole response object (`result` or `error`).
+    pub async fn request(&mut self, method: &str, params: serde_json::Value)
+        -> std::io::Result<serde_json::Value>;
+    pub async fn initialize(&mut self) -> std::io::Result<serde_json::Value>;
+    /// The advertised names, in table order.
+    pub async fn tool_names(&mut self) -> std::io::Result<Vec<String>>;
+    /// `tools/call`; `Err` only on transport failure; a refusal is `CallResult { is_error: true }`,
+    /// an unknown tool `Ok(CallResult { is_error: true, text: "<-32602 message>" })`.
+    pub async fn call(&mut self, tool: &str, arguments: serde_json::Value)
+        -> std::io::Result<CallResult>;
+}
+```
+
+Accept/serve tasks and `client`'s server task hold a `Weak<Inner>`; dropping the last `McpHost` ends
+them. Every call checks `session.ended` first (I-6) and answers `isError "session ended"`.
+
+### 2.10 `tools/mod.rs` — table, context, errors (fixed in T2)
+
+```rust
+pub(crate) struct ToolDef {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) schema: fn() -> serde_json::Value,          // schemars, `$schema` key removed
+    pub(crate) advertised: fn(&ToolScope, &HostCaps) -> bool,
+}
+pub(crate) struct HostCaps { pub(crate) search: bool }
+/// Table order is `tools/list` order and a pin.
+pub(crate) const ALL: [&ToolDef; 8] = [&box_profile::DEF, &document::DEF, &note::DEF, &status::DEF,
+                                       &link::DEF, &search::DEF, &command::DEF, &permission::DEF];
+pub(crate) struct Ctx<'a, H: WorkerHost> { pub(crate) session: &'a Session<H::Store>,
+                                           pub(crate) host: H, pub(crate) progress: Option<Progress> }
+/// One-line reason; becomes `isError: true` (D2, "Tools").
+#[derive(Debug, Clone, PartialEq, Eq)] pub(crate) struct ToolError(pub(crate) String);
+pub(crate) type ToolResult = Result<serde_json::Value, ToolError>;   // Ok → text = compact JSON
+pub(crate) async fn dispatch<H: WorkerHost>(name: &str, ctx: Ctx<'_, H>, args: Value) -> ToolResult {
+    match name { "box_profile" => box_profile::call(ctx, args).await, "document_write" => …, /* all 8 */ }
+}
+pub(crate) fn args<T: serde::de::DeserializeOwned>(v: Value) -> Result<T, ToolError>;  // "invalid arguments: …"
+pub(crate) fn scrubbed(s: &dyn Scrubber, text: String) -> Result<String, ToolError>;  // I-5, fail closed
+pub(crate) fn store_error(err: StoreError) -> ToolError;
+```
+
+Every argument struct is `#[derive(Deserialize, JsonSchema)] #[serde(deny_unknown_fields)]`, so a
+`run_id` (or any other) argument is refused as `invalid arguments: unknown field …` (I-1). A stub file
+is `pub(crate) const DEF: ToolDef = ToolDef { advertised: |_, _| false, .. }` plus
+`pub(crate) async fn call<H: WorkerHost>(_: Ctx<'_, H>, _: Value) -> ToolResult { Err(ToolError(
+"not available in this build".into())) }`; its owning task replaces both.
+
+**Error mapping** (`store_error`, `scrubbed`, the session check):
+
+| Cause | `text` |
+|---|---|
+| session ended (lease dropped / `close`) | `session ended` |
+| `StoreError::Fenced { .. }` | `fenced: lease lost` |
+| `StoreError::NotFound { entity, id }` | `not found: <entity> <id>` |
+| `StoreError::Constraint(s)` | `refused: <s>` (the store's sentence, e.g. `link … was not proposed by this run` → tool rewords to `not yours`) |
+| `StoreError::Unreachable`/`Backend` | `store unavailable: <msg>` |
+| `Unmasked { rule, path }` | `refused: the text matched credential rule <rule>; nothing was written` (never the text) |
+| a key not in the scope's project | `out of scope: <key> is not an item of this project` |
+| `ConceptSearch` error | `search unavailable: <msg>` (R-STO-8) |
+
+**Per-tool contracts** (advertised predicate · arguments · success JSON):
+
+| Tool (file, task) | Advertised when | Arguments (schemars struct) | Success `text` (JSON) |
+|---|---|---|---|
+| `box_profile` (`box_profile.rs`, T2) | always | none: `struct BoxProfileArgs {}` | `{"profile": <BoxProfile, hostname key removed when scope.hostname = Omitted>, "text": <render::box_profile(&p, scope.hostname).content>}`; no profile row → `not found: box <id>` |
+| `document_write` (`document.rs`, T4) | `item_id.is_some() && output_kind.is_some()` | `{title: Option<String>, body: String}` | `{"document_id": "<uuid>", "kind": "<kind>", "version": n}`; title default = the kind; title and body scrubbed |
+| `note_add` (`note.rs`, T4) | `item_id.is_some()` | `{body: String}` | `{"note_id": "<uuid>"}`; body scrubbed then capped: > 16 KiB → `refused: note is N bytes, the limit is 16384` |
+| `item_status` (`status.rs`, T4) | `item_id.is_some()` | `{status: Status, reason: String, resolution: Option<Resolution>}` (enums from `str_enum!` `ALL`; `#[schemars(with = "String")]` + `schemars(extend("enum" = …))` or a hand schema) | `{"note_id": "<uuid>"}`; body `status request: <status>[ (<resolution>)] — <reason>`; `resolution` with a status other than `closed` → `refused: a resolution goes with closed only`; `item.status` untouched (I-4) |
+| `item_link` (`link.rs`, T4) | `item_id.is_some()` | `{op: "add"\|"remove", to: String (item key), kind: LinkKind}` | `{"from": "<key>", "to": "<key>", "kind": "...", "live": bool}`; `to` via `item_by_key(scope.project_id, to)` → `None` = out of scope |
+| `search_concepts` (`search.rs`, T7) | `caps.search` | `{query: String, types: Option<Vec<String>>, statuses: Option<Vec<Status>>, limit: Option<u64> (1..=20, default 10)}` | `{"hits": [ConceptHit…]}` |
+| `command_run` (`command.rs`, T8) | `scope.command_queue` | `{class: "build"\|"test"\|"run", command: String, cwd: Option<String>, timeout_secs: Option<u64>}` | `{"exit_code": n\|null, "status": "done"\|"failed"\|"cancelled", "output": "...", "truncated": bool, "command_run_id": "<uuid>"}` |
+| `permission_prompt` (`permission.rs`, T9) | `scope.transport == Cli && session.ask.is_some()` | `PromptCall {tool_name, input, tool_use_id?}` (not `deny_unknown_fields`: the CLI may add keys) | the CLI contract: `{"behavior":"allow","updatedInput":<input>}` or `{"behavior":"deny","message":"…"}`, `isError: false` either way |
+
+Descriptions are one sentence each and pinned by an `insta` snapshot of `tools/list` per scope shape
+(fresh chat, promoted chat, phase step, CLI phase step).
+
+### 2.11 `search.rs` (T2 trait and types; T7 the tool) — B-3
+
+```rust
+pub trait ConceptSearch: Send + Sync + core::fmt::Debug {
+    fn search(&self, query: ConceptQuery)
+        -> Pin<Box<dyn Future<Output = Result<Vec<ConceptHit>, String>> + Send + '_>>;
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConceptQuery { pub text: String, pub project: ProjectId, pub types: Vec<ConceptType>,
+                          pub statuses: Vec<Status>, pub limit: u64 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)] #[serde(rename_all = "snake_case")]
+pub enum ConceptType { Item, Document, Requirement }
+impl ConceptType { #[must_use] pub fn parse(s: &str) -> Option<Self>; }
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)] #[serde(rename_all = "snake_case")]
+pub enum OwnerKind { Item, Requirement }
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ConceptHit {
+    pub point_type: ConceptType, pub owner_kind: OwnerKind, pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub document_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub resolution: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub state: Option<String>,
+    pub score: f32, pub snippet: String,
+}
+```
+
+### 2.12 Engine and host shapes (T6, T8, T9)
+
+- `EngineParts` (`htui-orch/src/engine.rs:422-472`) gains, after `tails` (`:471`):
+  `/// MOD-11 D4: htui's MCP host; `None` keeps `mcp: Vec::new()` exactly.`
+  `pub tools: Option<Arc<dyn crate::tools::ToolHost>>,`. Ten literals gain `tools: None` (plan D4
+  list); `fake_parts` (`:6731`) takes `orch.tool_host()`.
+- `drive_once` (`:5875-5945`), between the persona `match` (`:5900-5905`) and `driver` (`:5906`):
+  ```rust
+  // MOD-11 D10, B-17: declared before `session`, so the session drops first.
+  let lease = match &self.parts.tools {
+      Some(host) => Some(Box::pin(self.open_tools(host.as_ref(), run, step, phase, &candidate,
+                                                  &project, &cwd)).await?),     // I-8: boxed
+      None => None,
+  };
+  ```
+  and in the spec: `mcp: lease.iter().map(|l| l.spec.clone()).collect(),`
+  `prompt: lease.as_ref().and_then(|l| l.prompt.clone()),` (T0 wrote `prompt: None`).
+  `open_tools` (new private `async fn`) builds the `ToolScope` (`hostname`:
+  `if settings::resolve_box_hostname(Some(&project.settings)) { Shown } else { Omitted }`;
+  `output_kind`: `Some(phase.output_kind.clone()).filter(|k| !k.is_empty())` and `None` when
+  `run.item_id` is `None`; `fence: StepFence::Lease(self.parts.owner)`; `transport` B-18;
+  `command_queue: false` in T6, the resolver in T8) and maps `ToolHostError` to
+  `EngineError::Driver(DriverError::Spawn(err.to_string()))`.
+- `PromptSpec` (`htui-core/src/prompt/mod.rs:74`) gains, after `command_queue` (`:122`):
+  `/// MOD-11 D19: render the protected `output` trailer naming `document_write`.`
+  `pub document_tool: bool,`. `phase_spec` (`engine.rs:5560`) and the judge spec (`:4815`) set
+  `document_tool: self.parts.tools.is_some() && !phase.output_kind.is_empty()` (phase_spec always has
+  an item; the judge's kind is `JUDGE_KIND`).
+- D19 text (render.rs, pinned): `pub const OUTPUT_TEXT_PREFIX`… or one fn
+  `pub fn output(kind: &str) -> Rendered` whose content is
+  ``Write your `<kind>` document by calling the `document_write` tool of the `htui` MCP server; text left only in your reply is not recorded.``
+  (`<kind>` substituted; scrubbed like any section).
+- `SelectInput` (`htui-orch/src/select.rs:20-35`, T9) gains `pub inline_prompt: bool` ("MOD-11 D18:
+  the engine hosts `permission_prompt`; a CLI agent may take a gated phase"). Rule 3 (`:166-171`)
+  becomes `if !(caps.permission_requests || caps.edit_proposals
+  || (input.inline_prompt && agent.transport == Transport::Cli))`. Fourteen literals
+  (`select.rs` ×13, `engine.rs:3236`) gain the field; the engine's is `self.parts.tools.is_some()`.
+- `htui-worker`: `Shared` (`runtime.rs:178`) gains `tools: Option<Arc<dyn htui_orch::tools::ToolHost>>`;
+  `RunRuntime::with_tool_host(mut self, tools: Arc<dyn ToolHost>) -> Self` beside `with_author`
+  (`:1316`, `configure()`'s panic-after-serve contract); `Kit` (`:848`) gains the same field, copied in
+  `Kit::read`; `Kit::engine` sets `tools: self.tools.clone()`; `RunRuntime::shutdown` (`:1479`) calls
+  `tools.close()` after the tasks end. `ProgressSink` (`views.rs:519-524`) gains `pub(crate) owner:
+  Uuid` (literal at `runtime.rs:919`: `owner: shared.owner`) and `after_done` writes
+  `self.writer.write_step_document(StepFence::Lease(self.owner), document)` (UFCS through
+  `htui_core::store::WorkerStore`, H-1).
+- `htui` chat (`agent_worker.rs`): `AgentRuntime` (`:417`) gains `tools: Option<Arc<dyn ToolHost>>` and
+  `pub fn with_tool_host(mut self, tools: Arc<dyn ToolHost>) -> Self` beside
+  `with_registration_probe` (`:652`); `ChatArgs` (`:2241`) gains `lease: Option<ToolLease>` (literals
+  `:1071`, `:2163`; destructure `:3930` keeps it alive in the chat task until it returns).
+
+---
+
+Every task below: **tests first** (written and run red before the code), each commit compiles and
+carries its tests, 2–5 commits per task, explicit-path staging, commit trailer
+`Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`. Gate helpers (`nopg`, `pg`, `lint`, `regen`,
+`check`) are defined in §15.
+
+## 3. T0 — `SessionSpec.prompt` and the bridge types (Wave 0, serial)
+
+### 3.1 Files
+`htui-agent/src/prompt_bridge.rs` (new), `htui-agent/src/lib.rs`, `htui-agent/src/driver.rs`, and the
+ten literals: `htui-agent/src/conformance.rs:305`, `htui-agent/tests/relay.rs:196`,
+`tests/cli_driver.rs:52`, `tests/acp_driver.rs:98`, `tests/driver_contract.rs:145`,
+`tests/extensibility.rs:537`, `tests/agy_live.rs:799`, `htui-orch/src/engine.rs:5908`,
+`htui/src/agent_worker.rs:1037`, `:2069`. Each literal gains `prompt: None,` after `budget_micros`.
+
+### 3.2 Tests (written first)
+`prompt_bridge.rs` `mod tests` (`#[tokio::test]`):
+- `a_port_equals_its_clone_and_no_other_port` — `PartialEq` by id; two `bridge()` calls differ.
+- `take_yields_the_receiver_once` — second `take()` (also through a clone) is `None` (B-21).
+- `an_ask_reaches_the_taken_receiver_and_returns_its_verdict` — `Allow` and `Deny { message }`.
+- `an_ask_after_the_port_is_dropped_is_closed` — `Err(PromptClosed)`, and when the request's
+  `answer` sender is dropped unanswered.
+- `debug_prints_the_id_and_nothing_else` — `PromptPort(<uuid>)`, `PromptAsk(<uuid>)`.
+`tests/driver_contract.rs`:
+- `session_spec_debug_names_the_prompt_port_by_id` — `spec.prompt = Some(port)` → the `Debug` string
+  contains `prompt: Some(<id>)`; with `None`, `prompt: None`; env values still `[REDACTED]`.
+
+### 3.3 Commits
+1. `feat(mod-11): T0 prompt bridge types` — `prompt_bridge.rs`, `lib.rs`, its tests.
+2. `feat(mod-11): T0 SessionSpec.prompt` — `driver.rs` field + `Debug`, the ten literals, the
+   `driver_contract` test.
+
+### 3.4 Gate (G-T0)
+`cargo check --workspace --all-targets --all-features`; `nopg htui-agent`; `lint htui-agent`;
+`cargo fmt --all -- --check`.
+
+---
+
+## 4. T1 — fenced agent writes in the store (Wave 1, the only Postgres lane)
+
+### 4.1 Files (plan, unchanged; B-4 fits inside them)
+`htui-core/src/store/{traits,mem,worker,conformance}.rs`, `htui-core/tests/mem_store.rs`,
+`htui-core/src/model/link.rs`, `htui-store/src/pg/write.rs`, `htui-store/src/{writer,worker}.rs`,
+`htui-store/tests/{pg_conformance,pg_criteria}.rs`, `htui-store/.sqlx/*`,
+`htui-agent/src/conformance.rs` (`UsageSpy`), `htui-agent/tests/recorder.rs` (`SpyStore`).
+
+### 4.2 Edits
+- §2.3 methods and sentences in `traits.rs` (after `answer_permission`, `:1821-1829`); fenced-methods
+  doc `:2481-2491` extended; `ProposeLink`/`WithdrawLink` in `model/link.rs` (after `ItemLink`, `:41`).
+- `MemStore` per §2.5: `State` methods next to `add_note` (`:5448`) and `cite` (`:5982`); async
+  wrappers next to `add_note` (`:7193`), each `let now = self.now(); self.write(|s| s.x(.., now))`.
+- `WorkerStore` (`htui-core/src/store/worker.rs:100-354`): five forwarder signatures after
+  `resolve_command` (`:348`), `/// [`WriteStore::x`].` each; `impl WorkerStore for MemStore` (`:485`)
+  UFCS bodies after `:727`.
+- `PgStore`: `step_scope` beside `step_fence` (`pg/write.rs:197`); bodies §2.4 after `cite`/`uncite`
+  (`:6186`, `:6268`) in their own `// ---- MOD-11 (D13) ----` block. `Writer`: five `match self`
+  forwarders after `add_note` (`writer.rs:1145`). `htui-store/src/worker.rs`: forwarders in both
+  `WorkerStore` impls (after `:313` and `:604`).
+- `UsageSpy` (`htui-agent/src/conformance.rs`, after `add_note` `:1259`) and `SpyStore`
+  (`tests/recorder.rs`, after `:985`): `self.inner.x(..).await`.
+
+### 4.3 Tests (written first)
+Conformance cases (`CASES` `:53` and `run_case` `:199`, appended in this order; names never change):
+
+| Case | Pins |
+|---|---|
+| `write_step_document_fenced_and_versioned` | under `Lease(owner)` on the step's own item: v1, then v2 from the same step (judge, "newest wins"); after `take_lease` by a stranger: `Fenced { step }` and no new row; `Unleased` on a leased run: `Fenced` |
+| `write_step_document_refuses_a_foreign_item` | `produced_by_step_id: None` → `Constraint(document_needs_a_step())` before any read; another item → `Constraint(step_writes_own_item(..))`; unknown step → `NotFound { run_step }` |
+| `add_step_note_fenced_on_its_own_item` | note lands with `via_step_id`; foreign item refused; stale fence → `Fenced`; `via_step_id: None` → `note_needs_a_step()` |
+| `propose_link_upserts_revives_and_keeps_a_live_proposer` | new link live with proposer = step; re-propose of a live importer link (`proposed_by_step_id` NULL, seeded by the demo's links) keeps `None` (B-6); after a withdraw, re-propose revives with the new proposer; `from = to` → `self_link`; `to` of another project → `link_outside_project`; `from` ≠ run item → `step_writes_own_item` |
+| `withdraw_link_only_what_this_run_proposed` | own proposal → tombstoned (`deleted_at` set, `links()` no longer shows it); a live link proposed by another run's step → `Constraint(link_not_proposed_by_run)`; no live row → `NotFound { item_link }` |
+| `item_by_key_answers_within_its_project` | the demo key in its project → `Some`; the same key asked of another project → `None`; unknown key → `None` |
+
+Counts: `htui-core/tests/mem_store.rs:36` `134` → `140` (message extended "…, and MOD-11 T1's six
+fenced-write cases (plan D13, B-4)"); `htui-store/tests/pg_conformance.rs:27` `EXPECTED_CASES = 140`
+(doc sentence + assert message likewise).
+
+Postgres only, `htui-store/tests/pg_criteria.rs`:
+- `a_step_document_racing_a_park_never_deadlocks` — two independent pools (`:646` precedent), fifty
+  rounds of `tokio::join!(park_step(Lease(owner), step), write_step_document(Lease(owner), doc))` on a
+  fresh running step each round; every pair completes (no `40P01`, `StoreError::Backend` containing
+  `deadlock` fails the test), and each round ends in one of the two legal states (document written then
+  parked, or parked then document written — the fence still holds after a park because the lease is
+  not released by `park_step`).
+
+(Doc rule, H-7: the case docs in `conformance.rs` may name `pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`
+only in the commit that adds that test or later.)
+
+### 4.4 Commits
+1. `feat(mod-11): T1 fenced agent-write contract and MemStore reference` — traits, sentences, model,
+   `MemStore`, `WorkerStore` + every forwarder, the six cases, both counts; `PgStore` bodies are
+   `Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))` (no SQL macro yet, so
+   `SQLX_OFFLINE` still builds). Pg conformance is red at this commit; Mem is green.
+2. `feat(mod-11): T1 PgStore fenced writes` — §2.4 SQL, `step_scope`, `.sqlx` regenerated (`regen`).
+3. `test(mod-11): T1 Pg race of a step document against park_step` — `pg_criteria.rs`.
+
+### 4.5 Gate (G-T1)
+`nopg htui-core`; `nopg htui-agent`; `regen` then `check`; `pg htui-store`; `lint htui-core`;
+`lint htui-store`; `lint htui-agent`; `cargo fmt --all -- --check`;
+`grep -rn "MOD-11 T1: not yet implemented" crates` empty; `git status --short crates/htui-store/.sqlx`
+lists only added files (a modified entry means a byte-identical reuse was missed — fine, but say so).
+
+---
+
+## 5. T2 — the `htui-mcp` crate, the seam, `box_profile` (Wave 1)
+
+### 5.1 Files
+`Cargo.toml` (members, `htui-mcp`, `schemars`), `Cargo.lock`, `crates/htui-mcp/**` (§2.6, including
+`clippy.toml` B-20 and all eight tool files), `htui-orch/src/tools.rs` (new), `htui-orch/src/lib.rs`
+(one line).
+
+### 5.2 Tests (written first)
+`htui-orch/src/tools.rs` `mod tests`:
+- `dropping_a_lease_runs_its_unregister_once`
+- `lease_debug_prints_no_env_value` (the token never appears).
+
+`crates/htui-mcp/tests/protocol.rs` (a `Handler` double over `tokio::io::duplex`):
+- `the_recorded_claude_transcript_is_answered` — §2.7's four lines → three responses (ids 0, 1, 2),
+  `protocolVersion` `2025-11-25`, nothing for the notification.
+- `initialize_echoes_each_supported_version`; `initialize_answers_the_newest_for_an_unknown_version`.
+- `ping_answers_an_empty_result`; `an_unknown_method_is_minus_32601`.
+- `a_non_json_line_is_minus_32700_and_the_next_is_served`; `a_batch_array_is_minus_32600`.
+- `an_oversized_line_is_refused_and_the_next_is_served` (1 MiB + 1).
+- `an_unadvertised_tool_is_minus_32602`.
+- `bad_arguments_are_is_error_not_a_protocol_error`.
+- `a_slow_call_does_not_block_ping` (concurrent dispatch).
+- `a_cancelled_call_is_aborted_and_answered_nothing` (its drop guard observed).
+- `progress_ticks_carry_the_clients_token` (B-11).
+
+`crates/htui-mcp/tests/channel.rs` (`#![cfg(unix)]`; `McpHost<Backend>` over
+`Backend::memory(MemStore::demo())`, B-1):
+- `a_unix_round_trip_serves_initialize_after_the_handshake`
+- `the_socket_directory_is_private` (mode `0o700`, socket inside, name under 108 bytes)
+- `a_bad_token_is_refused_with_a_reason_and_closed` (reason has no token)
+- `a_version_mismatch_is_refused_naming_both_versions`
+- `a_dropped_lease_refuses_new_connections_and_ends_open_ones` (`session ended`)
+- `close_removes_the_socket_and_its_directory`
+
+`src/channel.rs` `mod tests`: `a_silent_child_is_dropped_after_the_handshake_budget` (crate-private
+constructor with a 100 ms budget), `a_token_is_64_lowercase_hex_and_debug_hides_it`.
+
+`src/host.rs` `mod tests`:
+- `the_spec_names_htui_the_binary_mcp_and_two_env_vars`
+- `two_opens_mint_two_tokens`
+- `a_cli_scope_gets_a_prompt_port_and_an_acp_scope_none` (B-21)
+- `on_linux_the_binary_is_proc_pid_exe` (`#[cfg(target_os = "linux")]`) and
+  `the_binary_is_absolute`
+- `a_session_keeps_the_store_it_was_opened_on` (B-2: `set_host` to a second demo store; the old
+  session still reads the first)
+- `client_refuses_an_unknown_token`
+
+`src/tools/box_profile.rs` `mod tests` and an `insta` snapshot:
+- `box_profile_omits_the_hostname_when_the_switch_is_off` (no `hostname` key, text starts `os:`)
+- `box_profile_shows_the_hostname_when_on`
+- `box_profile_text_is_the_prompts_render` (`== render::box_profile(&p, scope.hostname).content`)
+- `an_argument_naming_a_run_is_refused` (I-1)
+- `tools_list_per_scope_shape` — snapshot of `tools/list` for four scopes; in T2 only `box_profile`
+  is advertised (every stub answers `false`).
+
+### 5.3 Commits
+1. `feat(mod-11): T2 tool-host seam in htui-orch` — `tools.rs`, `lib.rs`, its tests.
+2. `feat(mod-11): T2 htui-mcp crate and the MCP protocol` — workspace `Cargo.toml`, `Cargo.lock`,
+   crate skeleton, `clippy.toml`, `protocol.rs`, `search.rs`, `tools/mod.rs` + eight stubs,
+   `tests/protocol.rs`, the transcript file.
+3. `feat(mod-11): T2 channel, handshake and McpHost` — `channel.rs`, `host.rs`, `tests/channel.rs`.
+4. `feat(mod-11): T2 box_profile` — `tools/box_profile.rs`, snapshot.
+
+### 5.4 Gate (G-T2)
+`nopg htui-mcp`; `cargo test -p htui-orch --all-features --lib tools -- --test-threads=1`;
+`lint htui-mcp`; `lint htui-orch`; `cargo check -p htui-mcp --target x86_64-pc-windows-gnu`;
+`cargo fmt --all -- --check`; `cargo tree -p htui-mcp -i schemars@1.2.2 -e normal` resolves;
+`git diff c4bf516c -- Cargo.lock` adds only the `htui-mcp` package (and its dependency list).
+
+---
+
+## 6. T3 — transports carry `spec.mcp` (Wave 1)
+
+### 6.1 Files (plan)
+`htui-agent/src/acp/mod.rs`, `htui-agent/src/cli/mod.rs`, `htui-agent/src/fake.rs`,
+`htui-agent/tests/acp_driver.rs`, `htui-agent/tests/cli_driver.rs`.
+
+### 6.2 Edits
+- **ACP** (`acp/mod.rs:1108-1109`): `NewSessionRequest::new(spec.cwd.clone())
+  .additional_directories(spec.extra_dirs.clone()).mcp_servers(spec.mcp.iter().map(acp_server).collect())`
+  with `fn acp_server(spec: &McpServerSpec) -> McpServer { McpServer::Stdio(McpServerStdio::new(
+  spec.name.clone(), PathBuf::from(&spec.command)).args(spec.args.clone()).env(spec.env.iter()
+  .map(|(k, v)| EnvVariable::new(k.clone(), v.clone())).collect())) }` (D7; `McpServer` is
+  `#[serde(untagged)]`, so no `type` key on the wire). Import through `agent_client_protocol`'s
+  re-exports (the compile probe's paths).
+- **CLI** (`cli/mod.rs`): `pub fn mcp_config(servers: &[McpServerSpec]) -> Option<String>` —
+  `None` for an empty slice; else `serde_json::json!({"mcpServers": {name: {"type": "stdio",
+  "command", "args", "env"}}})` serialised compactly (`env` a `BTreeMap`, so key order is stable).
+  `argv` (`:116`) pushes `format!("--mcp-config={config}")` **after** the pair block (`:143-163`) and
+  **before** `--tools` (`:169`); the numbered doc list above `argv` gains the step. No
+  `--strict-mcp-config`; `--tools` untouched (D8).
+- **Fake** (`fake.rs`): `#[derive(Debug, Clone, Default)] pub struct SpecSlot(Arc<Mutex<Option<SessionSpec>>>)`
+  with `#[must_use] pub fn get(&self) -> Option<SessionSpec>`; `FakeDriver` (`:99`) gains
+  `spec: SpecSlot` (constructors initialise it), `pub fn spec_handle(&self) -> SpecSlot`,
+  `#[must_use] pub fn with_spec_slot(self, slot: SpecSlot) -> Self`; `start` (`:158`) stores
+  `spec.clone()` in the slot before the `async move` (the lock is dropped before the future, as the
+  script slot's is). `FakeAdapter` (`:643`) gains `spec: SpecSlot` and `spec_handle()`; `build`
+  (`:664-688`) hands it to the driver. Export `SpecSlot` from `lib.rs` beside `FakeDriver` (`:197`) —
+  `lib.rs` is not in T3's set: reach it as `htui_agent::fake::SpecSlot` instead (no edit).
+
+### 6.3 Tests (written first)
+`tests/acp_driver.rs` (a clone of `fs_agent`, `:492-541`, answering `session/new` and sending the
+`params` back through a oneshot):
+- `session_new_carries_the_mcp_server_as_stdio` — `mcpServers == [{"name":"htui","command":"/abs/htui",
+  "args":["mcp"],"env":[{"name":"HTUI_MCP_ADDR","value":…},{"name":"HTUI_MCP_TOKEN","value":…}]}]`, no
+  `type` key.
+- `session_new_without_mcp_sends_an_empty_list`.
+`tests/cli_driver.rs`:
+- `argv_without_mcp_is_unchanged` (byte-equal to today's argv for the existing `spec`)
+- `argv_with_mcp_has_one_joined_config_before_tools` (exactly one arg starting `--mcp-config=`;
+  index < the `--tools=` index; `--tools=` value unchanged)
+- `the_mcp_config_is_the_clis_stdio_shape` (parse the JSON back)
+- `extra_args_stay_last_with_mcp`
+`fake.rs` `mod tests`: `the_spec_handle_sees_the_started_spec`,
+`the_adapter_handle_sees_the_built_drivers_spec`.
+
+### 6.4 Commits
+1. `feat(mod-11): T3 ACP session/new carries htui's MCP server`
+2. `feat(mod-11): T3 claude argv --mcp-config`
+3. `feat(mod-11): T3 FakeDriver records its SessionSpec`
+
+### 6.5 Gate (G-T3)
+`nopg htui-agent`; `lint htui-agent`; `cargo fmt --all -- --check`.
+
+---
+
+## 7. T4 — backlog write tools (Wave 2, after T1 and T2)
+
+### 7.1 Files (plan)
+`crates/htui-mcp/src/tools/{document,note,status,link}.rs`, `crates/htui-mcp/tests/tools_backlog.rs`.
+
+### 7.2 Behavior (§2.10 table; calls are UFCS on `htui_core::store::WorkerStore`, H-1)
+- `document_write`: `NewDocument { id: DocumentId::new(), item_id: scope.item_id?, kind:
+  scope.output_kind?, title: scrubbed(title.unwrap_or(kind)), body: scrubbed(body),
+  produced_by_step_id: Some(scope.step_id), created_by: scope.user, created_at: clock.now() }` →
+  `write_step_document(scope.fence, new)`.
+- `note_add`: scrub, cap 16 384 bytes after scrub, `NewNote { via_step_id: Some(step), created_by:
+  user, box_id: Some(scope.box_id), .. }` → `add_step_note(scope.fence, note)`.
+- `item_status`: parse (`Status`, `Resolution` through serde of their `str_enum!` names), body
+  `format!("status request: {status}{res} — {reason}")` with `res = " ({resolution})"` or empty;
+  scrub; `add_step_note`. Never `transition` (I-4).
+- `item_link`: `to` → `item_by_key(scope.project_id, &to)` (`None` → `out of scope`), `add` →
+  `propose_link(fence, ProposeLink { from: item, to, kind, step })`, `remove` →
+  `withdraw_link(fence, WithdrawLink { .. })`; a `link_not_proposed_by_run` refusal reads
+  `not yours: <from-key> <kind> <to-key> was not proposed by this run`.
+
+### 7.3 Tests (written first, `tests/tools_backlog.rs`, `McpHost<Backend>` over a `MemStore` seeded
+with one running, leased step on a demo item — `create_run` + `create_step` + `claim_run(owner)` as the
+run-seam conformance cases do — and `client(token)`)
+- `document_write_writes_the_phase_kind_on_the_scope_item` (v1 then v2; produced_by, created_by)
+- `document_write_is_not_advertised_without_an_item_or_a_kind`
+- `document_write_after_the_lease_moved_is_fenced` (`take_lease` by a stranger → `fenced: lease lost`,
+  no row) — I-3
+- `document_write_masks_a_known_secret_and_refuses_an_unmaskable_body` (a `Scrubber` double whose
+  `scrub` answers `Unmasked` → `refused: …`, nothing written) — I-5
+- `note_add_writes_a_note_via_the_step`; `note_add_over_16_kib_is_refused`
+- `item_status_writes_a_note_and_never_moves_the_status` (`item.status` and `version` unchanged)
+- `item_status_rejects_an_unknown_status_and_a_stray_resolution`
+- `item_link_add_resolves_the_key_in_the_project`
+- `item_link_to_another_projects_key_is_out_of_scope`
+- `item_link_to_itself_is_refused`
+- `item_link_remove_of_a_link_this_run_did_not_propose_is_not_yours`
+- `item_link_remove_of_its_own_proposal_tombstones_it`
+- `every_backlog_tool_after_the_session_ended_answers_session_ended` — I-6
+- `no_backlog_tool_accepts_a_run_project_or_item_id_argument` — I-1
+- `tools_list_per_scope_shape` snapshot updated (the four tools appear where §2.10 says)
+
+### 7.4 Commits
+1. `feat(mod-11): T4 document_write and note_add`
+2. `feat(mod-11): T4 item_status and item_link`
+
+### 7.5 Gate (G-T4)
+`nopg htui-mcp`; `lint htui-mcp`; `cargo fmt --all -- --check`;
+`cargo insta test -p htui-mcp --all-features` nothing pending.
+
+---
+
+## 8. T5 — `htui mcp`, the stdio relay (Wave 2, after T2)
+
+### 8.1 Files (plan + B-13)
+`htui/src/cli.rs`, `htui/src/lib.rs`, `htui/src/mcp_cmd.rs` (new), `htui/tests/mcp_stdio.rs` (new),
+`htui/Cargo.toml`, **`htui/src/main.rs`**, **`Cargo.lock`**.
+
+### 8.2 Edits
+- `cli.rs` `Command` (`:77-89`) gains, last:
+  `/// Serve htui's MCP tools to one agent session over stdio. Started by the agent htui launched,
+  never by hand: it reads HTUI_MCP_ADDR and HTUI_MCP_TOKEN, writes only MCP to stdout, and exits when
+  the agent closes stdin.` `Mcp,`
+- `lib.rs` `run` (`:84`): **first** statement:
+  `if matches!(args.command, Some(cli::Command::Mcp)) { return mcp_cmd::run().await.map_err(anyhow::Error::from); }`
+  — before the `Worker` arm and `init_tracing`; nothing is logged, nothing printed (stdout is the
+  protocol, H-24). `pub mod mcp_cmd;` in the module list (`:12-41`, alphabetical).
+- `mcp_cmd.rs`:
+  ```rust
+  #[derive(Debug, Clone, PartialEq, Eq)]
+  pub enum McpExit { MissingEnv(String), Refused(String), Failed(String) }
+  impl McpExit { #[must_use] pub const fn code(&self) -> u8 { /* 2, 3, 1 */ } }
+  impl core::fmt::Display for McpExit { /* the sentence */ }
+  impl std::error::Error for McpExit {}
+  /// Reads the two variables, then `htui_mcp::channel::relay(&addr, &token, stdin, stdout)`.
+  /// # Errors
+  /// `MissingEnv` (a variable unset, empty, or a token that is not 64 hex); `Refused` (the host's
+  /// reason); `Failed` (connect or i/o).
+  pub async fn run() -> Result<(), McpExit>;
+  ```
+- `main.rs` (`:69-80`): `.or_else(|| error.downcast_ref::<htui::mcp_cmd::McpExit>().map(McpExit::code))`;
+  `reports_to_sentry` (`:91-96`) adds `&& error.downcast_ref::<htui::mcp_cmd::McpExit>().is_none()`
+  (an agent's relay ending is never a crash report); `only_crashes_are_reported_to_sentry` gains the
+  three `McpExit` asserts.
+- `htui/Cargo.toml`: `htui-mcp = { workspace = true }` (comment "MOD-11 D6: `htui mcp`"); `tokio`
+  features gain `"io-std"` explicitly (H-15).
+
+### 8.3 Tests (written first, `htui/tests/mcp_stdio.rs`, `#![cfg(unix)]`)
+Host: `McpHost::new(Backend::memory(MemStore::demo()))?.with_binary(env!("CARGO_BIN_EXE_htui"))`,
+one `open`ed scope; child: `tokio::process::Command::new(env!("CARGO_BIN_EXE_htui")).arg("mcp")`
+with `env_clear()` + `PATH` + the two variables, `kill_on_drop(true)` (reaped on every path):
+- `the_relay_serves_initialize_list_and_box_profile` — three requests in, three responses out;
+  **every stdout line parses as a JSON-RPC response** (nothing else on stdout); exit 0 after stdin
+  closes.
+- `a_refused_token_exits_3_with_the_reason_on_stderr` (stderr has the sentence, not the token)
+- `missing_env_exits_2`
+- `a_dead_host_exits_1` (address of a removed socket)
+`main.rs` `mod tests`: `only_crashes_are_reported_to_sentry` (extended), `mcp_exit_codes_are_2_3_1`.
+
+### 8.4 Commits
+1. `feat(mod-11): T5 htui mcp subcommand and exit mapping` — `cli.rs`, `lib.rs`, `mcp_cmd.rs`,
+   `main.rs`, `htui/Cargo.toml`, `Cargo.lock`, unit tests.
+2. `test(mod-11): T5 stdio relay end to end` — `tests/mcp_stdio.rs`.
+
+### 8.5 Gate (G-T5)
+`cargo test -p htui --all-features --test mcp_stdio -- --test-threads=1`;
+`cargo test -p htui --all-features --bin htui`; `lint htui`; `cargo fmt --all -- --check`;
+`ps -eo pid,args | grep '[h]tui mcp'` empty afterwards (no orphaned relay).
