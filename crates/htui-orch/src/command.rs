@@ -272,17 +272,16 @@ pub struct Opening {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpeningPath {
     /// The step's own agent session, resumed; `text` is `promote::RESUME_OPENING`, recorded as the
-    /// chat's first `follow_up`. `handoff` and `digest` are the handoff opening the same promotion
-    /// would have built: what the chat opens with instead when the resume fails (MOD-37 M5).
+    /// chat's first `follow_up`. `fallback` is the handoff opening the same promotion would have
+    /// built: what the chat opens with instead when the resume fails (MOD-37 M5).
     Resume {
         /// The session id the step's `session_started` banner recorded.
         session_ref: AgentSessionRef,
         /// The first message the chat sends.
         text: String,
-        /// The assembled, scrubbed handoff prompt, the fallback.
-        handoff: String,
-        /// Its digest.
-        digest: String,
+        /// The handoff the chat falls back to. Best effort (MOD-37 review M-1): `None` when it
+        /// could not be built, and a resume that fails then fails the chat, as before M5.
+        fallback: Option<HandoffText>,
     },
     /// A fresh session opened with the `handoff` role's assembled prompt.
     Handoff {
@@ -293,18 +292,25 @@ pub enum OpeningPath {
     },
 }
 
+/// A built handoff prompt: what a `Resume` opening falls back to (MOD-37 M5, review M-1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandoffText {
+    /// The assembled, scrubbed handoff prompt.
+    pub text: String,
+    /// Its digest, as `AssembledPrompt::digest` computes it.
+    pub digest: String,
+}
+
 impl OpeningPath {
-    /// The handoff prompt and its digest, whichever opening this is (MOD-37 M5).
+    /// The handoff prompt and its digest, whichever opening this is (MOD-37 M5); `None` for a
+    /// `Resume` whose fallback could not be built (review M-1).
     #[must_use]
-    pub fn handoff(&self) -> (&str, &str) {
+    pub fn handoff(&self) -> Option<(&str, &str)> {
         match self {
-            Self::Resume {
-                handoff, digest, ..
-            }
-            | Self::Handoff {
-                text: handoff,
-                digest,
-            } => (handoff, digest),
+            Self::Resume { fallback, .. } => fallback
+                .as_ref()
+                .map(|handoff| (handoff.text.as_str(), handoff.digest.as_str())),
+            Self::Handoff { text, digest } => Some((text, digest)),
         }
     }
 }

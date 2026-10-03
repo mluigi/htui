@@ -942,6 +942,8 @@ pub struct FakeGraphSource<'a> {
     names: Mutex<BTreeMap<PhaseId, String>>,
     /// Template names whose body answers [`REFUSED_TEMPLATE_BODY`] (MOD-4 plan D162).
     refused: BTreeSet<String>,
+    /// Template names this source answers `None` for, as if the project had no such row.
+    missing: BTreeSet<String>,
 }
 
 impl<'a> FakeGraphSource<'a> {
@@ -954,6 +956,7 @@ impl<'a> FakeGraphSource<'a> {
             fallback: vec![(ids::AGENT_CLAUDE, STAND_IN_MODEL.to_owned())],
             names: Mutex::new(BTreeMap::new()),
             refused: BTreeSet::new(),
+            missing: BTreeSet::new(),
         }
     }
 
@@ -1031,6 +1034,9 @@ impl GraphSource for FakeGraphSource<'_> {
         name: &str,
         version: Option<i32>,
     ) -> Result<Option<PromptTemplate>> {
+        if self.missing.contains(name) {
+            return Ok(None);
+        }
         let template = GraphSource::prompt_template(self.store, project, name, version).await?;
         Ok(template.map(|mut template| {
             if self.refused.contains(name) {
@@ -1362,6 +1368,9 @@ pub struct FakeOrchestrator {
     /// MOD-4 plan D162: the phases whose pinned template stage 3 refuses. Carried by
     /// [`restarted`](Self::restarted): it is the graph's, not the process's.
     refused_prompts: Mutex<BTreeSet<String>>,
+    /// MOD-37 review M-1: the template names the graph source answers `None` for. Carried by
+    /// [`restarted`](Self::restarted), like `refused_prompts`.
+    missing_templates: Mutex<BTreeSet<String>>,
     /// MOD-41 plan D12: who walks a command's tail in the engines built over this harness.
     /// [`Tails::Walk`] in [`demo`](Self::demo) and in [`restarted`](Self::restarted).
     tails: Mutex<Tails>,
@@ -1403,6 +1412,7 @@ impl FakeOrchestrator {
             after_done_advance: Mutex::new(None),
             stalls: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(BTreeSet::new()),
+            missing_templates: Mutex::new(BTreeSet::new()),
             tails: Mutex::new(Tails::Walk),
             default_script: ScriptedStep::done_with_output("scripted output"),
             caps: FakeDriver::full_caps(),
@@ -1455,6 +1465,12 @@ impl FakeOrchestrator {
             stalls: Mutex::new(BTreeMap::new()),
             refused_prompts: Mutex::new(
                 self.refused_prompts
+                    .lock()
+                    .expect("no panic holds the fake orchestrator's lock")
+                    .clone(),
+            ),
+            missing_templates: Mutex::new(
+                self.missing_templates
                     .lock()
                     .expect("no panic holds the fake orchestrator's lock")
                     .clone(),
@@ -1573,6 +1589,18 @@ impl FakeOrchestrator {
             .insert(phase.to_owned());
     }
 
+    /// Make the graph source answer `None` for the project's `name` template, as if the row were
+    /// gone (MOD-37 review M-1).
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    pub fn drop_template(&self, name: &str) {
+        self.missing_templates
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(name.to_owned());
+    }
+
     /// Make one session's [`after_done`](Self::after_done) **never return** — a process killed
     /// between the driver's `done` and the settle (plan D100, blueprint A-2).
     ///
@@ -1667,6 +1695,11 @@ impl FakeOrchestrator {
         source.candidates = registered;
         source.refused = self
             .refused_prompts
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .clone();
+        source.missing = self
+            .missing_templates
             .lock()
             .expect("no panic holds the fake orchestrator's lock")
             .clone();

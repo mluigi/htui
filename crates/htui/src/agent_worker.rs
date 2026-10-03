@@ -1031,17 +1031,17 @@ impl AgentRuntime {
         };
 
         let (resume, opening_text, fallback) = match opening.path {
+            // Review M-1: a resume whose handoff could not be built has no fallback.
             OpeningPath::Resume {
                 session_ref,
                 text,
-                handoff,
-                ..
+                fallback,
             } => (
                 Some(session_ref.clone()),
                 text,
-                Some(ResumeFallback {
+                fallback.map(|handoff| ResumeFallback {
                     session_ref,
-                    handoff,
+                    handoff: handoff.text,
                 }),
             ),
             OpeningPath::Handoff { text, .. } => (None, text, None),
@@ -2214,7 +2214,8 @@ enum ChatBinding {
         /// continuing recorder starts (plan D164).
         tail: Vec<SessionEvent>,
         /// MOD-37 M5: what the chat opens with if resuming the step's session fails. `Some`
-        /// exactly when the opening is [`OpeningPath::Resume`].
+        /// exactly when the opening is [`OpeningPath::Resume`] and the engine built its handoff
+        /// (review M-1); `None` on a resume makes a failed start fail the chat, as before M5.
         fallback: Option<ResumeFallback>,
     },
 }
@@ -3997,6 +3998,8 @@ pub async fn run_chat(args: ChatArgs) {
         recorder = recorder.with_run_cap(RunCap { micros, grace });
     }
 
+    // The opening is a resume exactly when the spec resumes; a fallback is optional (review M-1).
+    let resuming = spec.resume.is_some();
     let first = driver.start(spec.clone(), prompt.clone()).await;
     let fallback = match &binding {
         ChatBinding::Promoted { fallback, .. } => fallback.clone(),
@@ -4006,8 +4009,8 @@ pub async fn run_chat(args: ChatArgs) {
     // in the same bind. `Ok` carries the session, the text recorded as its opening, how it opened
     // and the notice owed the tab; `Err` the refusal and that notice.
     let started = match (first, fallback) {
-        (Ok(session), fallback) => {
-            let opening = if fallback.is_some() {
+        (Ok(session), _) => {
+            let opening = if resuming {
                 StepOpening::Resumed
             } else {
                 StepOpening::Handoff
@@ -5374,8 +5377,10 @@ pub(crate) mod tests {
             OpeningPath::Resume {
                 session_ref: AgentSessionRef::new("banner-1"),
                 text: htui_orch::promote::RESUME_OPENING.to_owned(),
-                handoff: "the handoff".to_owned(),
-                digest: "d".to_owned(),
+                fallback: Some(htui_orch::HandoffText {
+                    text: "the handoff".to_owned(),
+                    digest: "d".to_owned(),
+                }),
             },
         );
 
@@ -5486,8 +5491,19 @@ pub(crate) mod tests {
         OpeningPath::Resume {
             session_ref: AgentSessionRef::new("banner-1"),
             text: htui_orch::promote::RESUME_OPENING.to_owned(),
-            handoff: "HANDOFF TEXT".to_owned(),
-            digest: "d".to_owned(),
+            fallback: Some(htui_orch::HandoffText {
+                text: "HANDOFF TEXT".to_owned(),
+                digest: "d".to_owned(),
+            }),
+        }
+    }
+
+    /// MOD-37 review M-1: a resume whose handoff the engine could not build.
+    fn resume_path_without_fallback() -> OpeningPath {
+        OpeningPath::Resume {
+            session_ref: AgentSessionRef::new("banner-1"),
+            text: htui_orch::promote::RESUME_OPENING.to_owned(),
+            fallback: None,
         }
     }
 
@@ -5720,6 +5736,85 @@ pub(crate) mod tests {
             opening_of(&store, ids::STEP_PLAN).await,
             Some(StepOpening::ResumeFailed)
         );
+    }
+
+    /// MOD-37 review M-1: a resume with no fallback that starts is still recorded as `resumed`:
+    /// the label is the opening's, not the fallback's.
+    #[tokio::test]
+    async fn a_resume_with_no_fallback_that_starts_records_resumed() {
+        let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            Vec::new(),
+        )
+        .await;
+
+        let replies = attach_and_end(
+            &mut runtime,
+            &backend,
+            promoted(agent_id, resume_path_without_fallback()),
+            async |_| {},
+        )
+        .await;
+
+        let starts = starts_of(&starts);
+        assert_eq!(starts.len(), 1, "one start: {starts:?}");
+        assert_eq!(starts[0].0.resume, Some(AgentSessionRef::new("banner-1")));
+        assert!(
+            !replies.iter().any(is_resume_failed_frame),
+            "no notice: {replies:?}"
+        );
+        assert_eq!(
+            opening_of(&store, ids::STEP_PLAN).await,
+            Some(StepOpening::Resumed)
+        );
+    }
+
+    /// MOD-37 review M-1: a resume with no fallback whose start fails fails the chat as before M5:
+    /// one start, the refusal, no `resume_failed` row (there is no handoff to label) and no
+    /// opening, since nothing opened (H-8).
+    #[tokio::test]
+    async fn a_failed_resume_with_no_fallback_fails_the_chat() {
+        let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            vec![DriverError::Transport(
+                "session/resume failed: no such session".to_owned(),
+            )],
+        )
+        .await;
+        let tail_len = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("the fixture's step has a log")
+            .len();
+
+        let replies = attach_and_await(
+            &mut runtime,
+            &backend,
+            promoted(agent_id, resume_path_without_fallback()),
+        )
+        .await;
+
+        assert_eq!(starts_of(&starts).len(), 1, "one start");
+        assert!(
+            replies.iter().any(|reply| matches!(
+                &reply.reply,
+                StoreReply::Failed { request, message }
+                    if *request == PROMOTE_STEP && message.contains("no such session")
+            )),
+            "the promotion is refused: {replies:?}"
+        );
+        assert!(
+            !replies.iter().any(is_resume_failed_frame),
+            "no notice: {replies:?}"
+        );
+        let log = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        assert_eq!(log.len(), tail_len, "nothing is written: {log:?}");
+        assert_eq!(opening_of(&store, ids::STEP_PLAN).await, None, "no opening");
     }
 
     /// MOD-37 M5 (e, A-2, A-5): a resume whose adapter cannot run at all does not fall back: the

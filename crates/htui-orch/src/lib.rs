@@ -45,9 +45,9 @@ pub mod status;
 pub mod verify;
 
 pub use command::{
-    Command, CommandOutcome, EngineError, GateAnswer, Opening, OpeningPath, Rest, UnblockCase,
-    accept_enabled, cleanup_enabled, close_out_enabled, phase_at, promote_enabled, retry_admitted,
-    snapshot_of, start_enabled, unblock_enabled,
+    Command, CommandOutcome, EngineError, GateAnswer, HandoffText, Opening, OpeningPath, Rest,
+    UnblockCase, accept_enabled, cleanup_enabled, close_out_enabled, phase_at, promote_enabled,
+    retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
 pub use engine::{
     Adopted, AgentSelector, ControlFor, DeadWalks, DriverFor, Engine, EngineParts, FirstCandidate,

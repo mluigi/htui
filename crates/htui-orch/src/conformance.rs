@@ -5524,7 +5524,7 @@ async fn promote_keeps_the_step_and_writes_no_chat_run<H: CaseHarness>(harness: 
         "{:?}",
         opening.path
     );
-    let (text, digest) = opening.path.handoff();
+    let (text, digest) = opening.path.handoff().expect("the fallback is built");
     assert!(!text.is_empty() && !digest.is_empty());
 }
 
@@ -5620,7 +5620,7 @@ async fn promote_a_failed_step_of_a_parked_run<H: CaseHarness>(harness: &H) {
     let after = step_at(&other, run, 0, 1).await;
     assert_eq!(after.status, StepStatus::AwaitingApproval);
     assert!(after.promoted_at.is_some());
-    let (text, _) = opening.path.handoff();
+    let (text, _) = opening.path.handoff().expect("the handoff is built");
     assert!(
         text.contains("interrupted"),
         "the failure reason is the step's gate note: {text}"

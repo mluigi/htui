@@ -55,8 +55,8 @@ use uuid::Uuid;
 
 use crate::closeout;
 use crate::command::{
-    Command, CommandOutcome, EngineError, GateAnswer, Opening, OpeningPath, Rest, UnblockCase,
-    stale_run, stale_step,
+    Command, CommandOutcome, EngineError, GateAnswer, HandoffText, Opening, OpeningPath, Rest,
+    UnblockCase, stale_run, stale_step,
 };
 use crate::fanout::{
     AUTO_WIN_REASON, CandidateView, HUMAN_PICK_REASON, HumanReason, JUDGE_KIND, JudgeFailure,
@@ -1333,7 +1333,9 @@ where
     /// banner (MOD-37 M5); otherwise a fresh session opens with the `handoff` role's prompt, built
     /// from the phase's own spec ([`Self::phase_spec`]) with the step's summary, its diff so far
     /// and why it stopped. The handoff is built in both cases ([`Self::handoff_opening`]): a
-    /// `Resume` carries it as the fallback a failed resume opens with. `cwd` is the step's primary
+    /// `Resume` carries it as the fallback a failed resume opens with, on a best-effort basis
+    /// (MOD-37 review M-1): a handoff that cannot be built is logged and the resume goes ahead
+    /// with no fallback, as it did before M5. A `Handoff` opening refuses. `cwd` is the step's primary
     /// tree, else its first; every other tree is an extra directory (ANA-2 `:1208-1213`). Nothing
     /// here writes.
     async fn opening(
@@ -1374,21 +1376,31 @@ where
         // MOD-37 M5: the handoff is built for both openings. A `Resume` carries it as the fallback
         // the worker opens with when the resume fails. Boxed: this future sits in every dispatch
         // future (`every_case_name_dispatches`, H-9).
-        let (handoff, digest) = Box::pin(
+        let handoff = Box::pin(
             self.handoff_opening(run, snapshot, step, phase, item, &events, &trees, &repos),
         )
-        .await?;
+        .await;
         let path = match promote::opening_kind(caps, &events) {
+            // Review M-1: best effort. Whatever refused the handoff (a template, the assembler, a
+            // store read) did not block a resume before M5, and does not now.
             OpeningKind::Resume(session_ref) => OpeningPath::Resume {
                 session_ref,
                 text: promote::RESUME_OPENING.to_owned(),
-                handoff,
-                digest,
+                fallback: handoff
+                    .inspect_err(|err| {
+                        tracing::warn!(
+                            step = %step.id,
+                            %err,
+                            "the resume opens with no handoff fallback"
+                        );
+                    })
+                    .ok()
+                    .map(|(text, digest)| HandoffText { text, digest }),
             },
-            OpeningKind::Handoff => OpeningPath::Handoff {
-                text: handoff,
-                digest,
-            },
+            OpeningKind::Handoff => {
+                let (text, digest) = handoff?;
+                OpeningPath::Handoff { text, digest }
+            }
         };
         Ok(Opening {
             agent_id: agent.id,
@@ -14672,7 +14684,7 @@ mod tests {
         else {
             panic!("`PromoteStep` answers `Promoted`");
         };
-        let (text, _) = opening.path.handoff();
+        let (text, _) = opening.path.handoff().expect("the handoff is built");
         assert!(!text.contains("<file path="), "{text}");
     }
 
@@ -14681,7 +14693,7 @@ mod tests {
     /// resume fails, without asking the engine again.
     #[tokio::test]
     async fn a_resume_opening_carries_the_handoff_a_handoff_opening_would() {
-        use crate::command::OpeningPath;
+        use crate::command::{HandoffText, OpeningPath};
         use crate::graph::GraphSource as _;
 
         let harness = Harness::new().await;
@@ -14709,8 +14721,11 @@ mod tests {
 
         // The seed `claude` row says `acp.session.resume`, and the fake walk wrote a banner.
         let OpeningPath::Resume {
-            handoff: resumed_handoff,
-            digest: resumed_digest,
+            fallback:
+                Some(HandoffText {
+                    text: resumed_handoff,
+                    digest: resumed_digest,
+                }),
             ..
         } = promote().await
         else {
@@ -14739,6 +14754,63 @@ mod tests {
             (text, digest),
             "the fallback is the handoff the same promotion would have opened with"
         );
+    }
+
+    /// MOD-37 review M-1: the fallback is best effort. A resumable promotion whose handoff
+    /// cannot be built (here the project has no `handoff` template) still resumes, with no
+    /// fallback, as it did before M5. A `Handoff` opening of the same step stays strict: it has
+    /// nothing else to open with.
+    #[tokio::test]
+    async fn a_resumable_promotion_with_no_handoff_template_still_resumes_with_no_fallback() {
+        use crate::command::OpeningPath;
+        use crate::graph::GraphSource as _;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, _, prd) = excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        harness.orch.drop_template("handoff");
+        let promote = async || {
+            harness
+                .dispatch(Command::PromoteStep {
+                    run: row.id,
+                    step: prd.id,
+                    chat_open: false,
+                })
+                .await
+        };
+
+        let outcome = promote().await.expect("a resume does not need the handoff");
+        let CommandOutcome::Promoted { opening, .. } = outcome else {
+            panic!("`PromoteStep` answers `Promoted`: {outcome:?}");
+        };
+        assert!(
+            matches!(&opening.path, OpeningPath::Resume { text, .. } if text == crate::promote::RESUME_OPENING),
+            "{:?}",
+            opening.path
+        );
+        assert!(
+            matches!(&opening.path, OpeningPath::Resume { fallback: None, .. }),
+            "no fallback: {:?}",
+            opening.path
+        );
+        assert_eq!(opening.path.handoff(), None);
+
+        // The same row with both restore routes off has only the handoff, and refuses.
+        let mut agent = harness
+            .orch
+            .graphs()
+            .agent(ids::AGENT_CLAUDE)
+            .await
+            .expect("the fake graph source never fails")
+            .expect("the demo registry has the `claude` row");
+        agent.settings["acp"]["session"] = serde_json::json!({ "load": false, "resume": false });
+        htui_core::fixtures::edit_agent(&harness.orch.store, &agent)
+            .await
+            .expect("the row is rewritten");
+        let refused = promote()
+            .await
+            .expect_err("a handoff opening needs its template");
+        assert!(refused.to_string().contains("handoff"), "{refused}");
     }
 
     // -- MOD-9 D120-D123: glob attachments fire --------------------------------------------------
