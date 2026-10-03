@@ -25,6 +25,10 @@ pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The most a handshake line (or its reply) may hold. A token and a version need ~120 bytes.
 const HANDSHAKE_MAX_BYTES: u64 = 4096;
 
+/// How long the relay waits for the host's last answers after the agent closes stdin, when the
+/// stream cannot half-close (a Windows named pipe).
+const DRAIN_WITHOUT_HALF_CLOSE: Duration = Duration::from_secs(1);
+
 /// How long a Windows child keeps retrying a busy pipe, and how often.
 #[cfg(windows)]
 const PIPE_BUSY_BUDGET: Duration = Duration::from_secs(5);
@@ -339,8 +343,11 @@ where
 /// The child side (D6): connect, send the line, read the reply, then splice stdin → stream and
 /// stream → stdout until either side ends.
 ///
-/// The agent closing stdin half-closes the stream, and the relay then waits for the host to finish
-/// answering; the host closing the stream ends the relay at once.
+/// The host closing the stream ends the relay at once. On Unix the agent closing stdin half-closes
+/// the socket, and the relay then waits for the host to finish answering. A Windows named pipe
+/// cannot half-close (tokio's `poll_shutdown` only flushes; the host never reads EOF), so there the
+/// relay waits at most [`DRAIN_WITHOUT_HALF_CLOSE`] for answers already on their way, then ends;
+/// dropping the pipe is the host's EOF.
 ///
 /// # Errors
 ///
@@ -386,24 +393,48 @@ where
         )));
     }
 
-    let (mut from_host, mut to_host) = tokio::io::split(stream);
+    let (from_host, to_host) = tokio::io::split(stream);
+    let drain = cfg!(windows).then_some(DRAIN_WITHOUT_HALF_CLOSE);
+    splice(&mut stdin, &mut stdout, from_host, to_host, drain)
+        .await
+        .map_err(RelayError::Io)
+}
+
+/// Copies `stdin` → host and host → `stdout` until either side ends. The host's end ends the
+/// splice at once. Stdin's end shuts the host-bound half down; then, with `drain` `None` (a stream
+/// that half-closes), the splice waits for the host to close, and with `Some(d)` for at most `d`.
+async fn splice<R, W, HR, HW>(
+    mut stdin: R,
+    mut stdout: W,
+    mut from_host: HR,
+    mut to_host: HW,
+    drain: Option<Duration>,
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    HR: AsyncRead + Unpin,
+    HW: AsyncWrite + Unpin,
+{
     let up = async {
         tokio::io::copy(&mut stdin, &mut to_host).await?;
         to_host.shutdown().await
     };
+    // `copy` flushes `stdout` whenever the host has nothing more to read, so a drain that runs out
+    // has already delivered every answer the host wrote.
     let down = async {
         tokio::io::copy(&mut from_host, &mut stdout).await?;
         stdout.flush().await
     };
     tokio::pin!(up, down);
-    let result = tokio::select! {
+    tokio::select! {
         down = &mut down => down,
-        up = &mut up => match up {
-            Ok(()) => down.await,
-            Err(err) => Err(err),
+        up = &mut up => match (up, drain) {
+            (Err(err), _) => Err(err),
+            (Ok(()), None) => down.await,
+            (Ok(()), Some(drain)) => tokio::time::timeout(drain, down).await.unwrap_or(Ok(())),
         },
-    };
-    result.map_err(RelayError::Io)
+    }
 }
 
 #[cfg(unix)]
@@ -559,10 +590,14 @@ mod platform {
 
 #[cfg(test)]
 mod tests {
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::task::{Context, Poll};
     use std::time::Duration;
 
-    use super::{Listener, Lookup, Refusal, Token};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+    use super::{Listener, Lookup, Refusal, Token, splice};
 
     #[test]
     fn a_token_is_64_lowercase_hex_and_debug_hides_it() {
@@ -599,11 +634,103 @@ mod tests {
         assert_eq!(Refusal::from_reason("something new"), Refusal::Malformed);
     }
 
+    /// A writer whose `shutdown` only flushes, as tokio's Windows named-pipe client does: the peer
+    /// never reads EOF.
+    struct NoHalfClose<W>(W);
+
+    impl<W: AsyncWrite + Unpin> AsyncWrite for NoHalfClose<W> {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+    }
+
+    /// ADV-1: over a stream that cannot half-close, the agent closing stdin ends the relay after
+    /// the drain, with the host's answers already written delivered, although the host never
+    /// closes its side.
+    #[tokio::test]
+    async fn without_a_half_close_stdin_eof_ends_the_relay_after_the_drain() {
+        let (relay_side, mut host_side) = tokio::io::duplex(1024);
+        host_side
+            .write_all(b"{\"answer\":1}\n")
+            .await
+            .expect("the host answers");
+        let (from_host, to_host) = tokio::io::split(relay_side);
+        let mut stdout = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            splice(
+                &b"{\"request\":1}\n"[..],
+                &mut stdout,
+                from_host,
+                NoHalfClose(to_host),
+                Some(Duration::from_millis(100)),
+            ),
+        )
+        .await
+        .expect("the relay ends after the drain, not when the host closes")
+        .expect("a clean end");
+        assert_eq!(stdout, b"{\"answer\":1}\n");
+        let mut request = vec![0; 64];
+        let read = host_side.read(&mut request).await.expect("a read");
+        assert_eq!(&request[..read], b"{\"request\":1}\n");
+    }
+
+    /// Over a stream that half-closes (Unix), the relay waits for the host's last answer after
+    /// stdin ends, and ends when the host closes.
+    #[tokio::test]
+    async fn with_a_half_close_the_relay_waits_for_the_host_to_finish() {
+        let (relay_side, mut host_side) = tokio::io::duplex(1024);
+        let host = async move {
+            let mut request = Vec::new();
+            host_side
+                .read_to_end(&mut request)
+                .await
+                .expect("the request, then EOF");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            host_side
+                .write_all(b"{\"answer\":1}\n")
+                .await
+                .expect("the late answer");
+            request
+        };
+        let (from_host, to_host) = tokio::io::split(relay_side);
+        let mut stdout = Vec::new();
+        let relay = tokio::time::timeout(
+            Duration::from_secs(5),
+            splice(
+                &b"{\"request\":1}\n"[..],
+                &mut stdout,
+                from_host,
+                to_host,
+                None,
+            ),
+        );
+        let (request, relayed) = tokio::join!(host, relay);
+        relayed
+            .expect("the relay ends when the host closes")
+            .expect("a clean end");
+        assert_eq!(stdout, b"{\"answer\":1}\n");
+        assert_eq!(request, b"{\"request\":1}\n");
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_silent_child_is_dropped_after_the_handshake_budget() {
-        use tokio::io::AsyncReadExt;
-
         let lookup: Lookup = Arc::new(|_| Err(Refusal::UnknownToken));
         let mut listener =
             Listener::bind_with(lookup, Duration::from_millis(100)).expect("a listener");
