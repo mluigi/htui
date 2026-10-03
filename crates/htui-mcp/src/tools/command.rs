@@ -4,11 +4,12 @@
 //! The call is validated (class, `cwd`, timeout), its command line scrubbed (I-5), and enqueued
 //! as a `queued` `command_run` row of the session's step on the session's box. It then asks for
 //! admission every [`COMMAND_ADMIT_POLL`] under the class limit D15 resolves per call, ticking
-//! progress (B-11); runs through [`run_shell`] in the session's directory, beating the claim every
-//! [`COMMAND_HEARTBEAT`] (a beat that answers `false` kills the child: the row was reaped or
-//! cancelled); scrubs the tail, fail closed; finishes the row; and answers it. Everything a
-//! cancelled call must undo lives in [`Enqueued`]'s drop (H-18): the row is cancelled and the
-//! child's process group dies with the dropped future.
+//! progress (B-11; a tick never waits long on a client that does not read); runs through
+//! [`run_shell`] in the session's directory, beating the claim every [`COMMAND_HEARTBEAT`] (a
+//! beat that answers `false` kills the child: the row was reaped or cancelled); scrubs the tail,
+//! fail closed; finishes the row; and answers it. Everything a cancelled call must undo lives in
+//! [`Enqueued`]'s drop (H-18): the row is cancelled and the child's process group dies with the
+//! dropped future.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -28,6 +29,9 @@ use crate::protocol::Progress;
 
 /// How often a queued call asks for admission (blueprint §16).
 pub(crate) const COMMAND_ADMIT_POLL: Duration = Duration::from_secs(1);
+
+/// How long one progress tick may wait for room on the connection before it is dropped.
+const TICK_PATIENCE: Duration = Duration::from_millis(250);
 
 /// The longest timeout a call may ask for, and the default (OQ-7, H-13), in seconds.
 pub(crate) const MAX_TIMEOUT_SECS: u64 = 1800;
@@ -151,33 +155,13 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     let progress = ctx.progress;
     let mut ticks = 0_u64;
 
-    // D14: ask until admitted, ticking progress while queued (B-11).
-    loop {
-        match htui_core::store::WorkerStore::claim_command(&store, id, claimant, limit).await {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                tick(progress.as_ref(), &mut ticks).await;
-                tokio::time::sleep(COMMAND_ADMIT_POLL).await;
-            }
-            Err(err) => return Err(store_error(err)),
-        }
-    }
+    admit(&store, id, claimant, limit, progress.as_ref(), &mut ticks).await?;
 
-    // OQ-3: the claim beats every `COMMAND_HEARTBEAT`; a beat answering `false` (reaped,
-    // cancelled) is `run_shell`'s `stop`. A beat the store fails is not a stop: a lasting
-    // failure lets the row go stale, and the next beat after it answers `false`.
+    // OQ-3: the claim beats until the queue takes the row; that is `run_shell`'s `stop`.
     let stopped = AtomicBool::new(false);
     let beats = async {
-        loop {
-            tokio::time::sleep(COMMAND_HEARTBEAT).await;
-            tick(progress.as_ref(), &mut ticks).await;
-            if let Ok(false) =
-                htui_core::store::WorkerStore::beat_command(&store, id, claimant).await
-            {
-                stopped.store(true, Ordering::SeqCst);
-                return;
-            }
-        }
+        beat(&store, id, claimant, progress.as_ref(), &mut ticks).await;
+        stopped.store(true, Ordering::SeqCst);
     };
     let ran = run_shell(&command, &dir, Duration::from_secs(timeout), beats).await;
 
@@ -308,11 +292,55 @@ async fn stored_row<S: htui_core::store::WorkerStore>(
         .ok_or_else(|| ToolError(format!("not found: command_run {id}")))
 }
 
-/// One progress tick, numbered from 1, when the client asked for progress.
+/// D14: asks until `id` is admitted, ticking progress while queued (B-11). Each ask is the
+/// queued row's heartbeat.
+async fn admit<S: htui_core::store::WorkerStore>(
+    store: &S,
+    id: CommandRunId,
+    claimant: Uuid,
+    limit: u32,
+    progress: Option<&Progress>,
+    ticks: &mut u64,
+) -> Result<(), ToolError> {
+    loop {
+        match htui_core::store::WorkerStore::claim_command(store, id, claimant, limit).await {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {
+                tick(progress, ticks).await;
+                tokio::time::sleep(COMMAND_ADMIT_POLL).await;
+            }
+            Err(err) => return Err(store_error(err)),
+        }
+    }
+}
+
+/// OQ-3: beats the claim every [`COMMAND_HEARTBEAT`], then ticks progress, and returns once a
+/// beat answers `false` (reaped, cancelled). A beat the store fails is not a stop: a lasting
+/// failure lets the row go stale, and the next beat after it answers `false`.
+async fn beat<S: htui_core::store::WorkerStore>(
+    store: &S,
+    id: CommandRunId,
+    claimant: Uuid,
+    progress: Option<&Progress>,
+    ticks: &mut u64,
+) {
+    loop {
+        tokio::time::sleep(COMMAND_HEARTBEAT).await;
+        if let Ok(false) = htui_core::store::WorkerStore::beat_command(store, id, claimant).await {
+            return;
+        }
+        tick(progress, ticks).await;
+    }
+}
+
+/// One progress tick, numbered from 1, when the client asked for progress. It waits at most
+/// [`TICK_PATIENCE`] for room on the connection, then is dropped: a client that holds the
+/// connection open without reading must not stop the beats and asks the row's liveness rests
+/// on (a frozen heartbeat is reaped, and its class slot handed on while the child still runs).
 async fn tick(progress: Option<&Progress>, ticks: &mut u64) {
     if let Some(progress) = progress {
         *ticks += 1;
-        progress.tick(*ticks).await;
+        let _ = tokio::time::timeout(TICK_PATIENCE, progress.tick(*ticks)).await;
     }
 }
 
@@ -354,10 +382,17 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use htui_core::model::BoxId;
-    use serde_json::json;
+    use std::time::Duration;
 
-    use super::class_limits;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{BoxId, CommandRunId, CommandRunStatus, NewCommandRun};
+    use htui_core::store::MemStore;
+    use htui_core::store::WorkerStore;
+    use htui_core::store::traits::COMMAND_HEARTBEAT;
+    use serde_json::json;
+    use uuid::Uuid;
+
+    use super::{COMMAND_ADMIT_POLL, class_limits};
 
     /// Counts the `WARN` events emitted while it is the default subscriber.
     struct Warnings(Arc<AtomicUsize>);
@@ -409,5 +444,150 @@ mod tests {
 
         let (_, warned) = limits_and_warnings(None, &app);
         assert_eq!(warned, 0, "no box value warns nothing");
+    }
+
+    /// A `Progress` whose connection is open but never read: once the writer blocks on the full
+    /// pipe and the outbox fills, every tick would wait for ever.
+    async fn stalled_progress() -> (super::Progress, tokio::io::DuplexStream) {
+        use crate::protocol::{CallRefused, CallResult, Handler, Progress, ToolInfo, serve};
+        use std::future::Future;
+        use std::pin::Pin;
+        use tokio::io::AsyncWriteExt;
+
+        /// Hands the call's `Progress` out and never answers.
+        struct Capture(std::sync::Mutex<Option<tokio::sync::oneshot::Sender<Progress>>>);
+
+        impl Handler for Capture {
+            fn tools(&self) -> Vec<ToolInfo> {
+                Vec::new()
+            }
+            fn call(
+                &self,
+                _: String,
+                _: serde_json::Value,
+                progress: Option<Progress>,
+            ) -> Pin<Box<dyn Future<Output = Result<CallResult, CallRefused>> + Send>> {
+                if let (Some(tx), Some(progress)) =
+                    (self.0.lock().expect("the capture lock").take(), progress)
+                {
+                    let _ = tx.send(progress);
+                }
+                Box::pin(std::future::pending())
+            }
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (mut client, server) = tokio::io::duplex(64);
+        drop(htui_agent::contained::spawn(serve(
+            server,
+            Arc::new(Capture(std::sync::Mutex::new(Some(tx)))),
+        )));
+        let mut call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "command_run", "arguments": {}, "_meta": {"progressToken": "stalled"}
+        }})
+        .to_string()
+        .into_bytes();
+        call.push(b'\n');
+        client.write_all(&call).await.expect("the call is written");
+        let progress = rx.await.expect("the call's progress");
+        // Fill the outbox behind the writer that the unread pipe already blocks.
+        let mut filled = false;
+        for n in 0..1_000 {
+            if tokio::time::timeout(Duration::from_secs(1), progress.tick(n))
+                .await
+                .is_err()
+            {
+                filled = true;
+                break;
+            }
+        }
+        assert!(filled, "the outbox never filled");
+        (progress, client)
+    }
+
+    /// A queued `build` row on the demo's `R2/prd` step and box.
+    fn queued() -> NewCommandRun {
+        NewCommandRun {
+            id: CommandRunId::new(),
+            run_step_id: ids::STEP_R2_PRD,
+            box_id: ids::BOX,
+            class: "build".to_owned(),
+            command: "make".to_owned(),
+            cwd: "/srv".to_owned(),
+            status: CommandRunStatus::Queued,
+            exit_code: None,
+            output: None,
+            queued_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// ADV-1: a client that holds the connection open without reading does not stop the beats.
+    /// The row was cancelled under the claim, so the first beat that is reached answers `false`
+    /// and `beat` returns; a tick waiting on the stalled client would never let it get there.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_client_does_not_stop_the_heartbeat() {
+        let (progress, _client) = stalled_progress().await;
+        let store = MemStore::demo();
+        let row = store.enqueue_command(queued()).await.expect("enqueue");
+        let claimant = Uuid::now_v7();
+        assert!(
+            store
+                .claim_command(row.id, claimant, 1)
+                .await
+                .expect("claim")
+                .is_some()
+        );
+        assert!(store.cancel_command(row.id).await.expect("cancel"));
+        let mut ticks = 0;
+        tokio::time::timeout(
+            COMMAND_HEARTBEAT * 6,
+            super::beat(&store, row.id, claimant, Some(&progress), &mut ticks),
+        )
+        .await
+        .expect("the beat is reached and answers false");
+    }
+
+    /// ADV-1: a client that holds the connection open without reading does not stop a queued
+    /// call's asks (its only heartbeat): it is admitted once the slot ahead of it frees.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_client_does_not_stop_the_admission_asks() {
+        let (progress, _client) = stalled_progress().await;
+        let store = MemStore::demo();
+        let ahead = store.enqueue_command(queued()).await.expect("enqueue");
+        let holder = Uuid::now_v7();
+        assert!(
+            store
+                .claim_command(ahead.id, holder, 1)
+                .await
+                .expect("claim")
+                .is_some()
+        );
+        let waiter = store.enqueue_command(queued()).await.expect("enqueue");
+        let mut ticks = 0;
+        let admitted = super::admit(
+            &store,
+            waiter.id,
+            Uuid::now_v7(),
+            1,
+            Some(&progress),
+            &mut ticks,
+        );
+        let frees = async {
+            tokio::time::sleep(COMMAND_ADMIT_POLL * 5).await;
+            assert!(
+                store
+                    .finish_command(ahead.id, holder, CommandRunStatus::Done, Some(0), None)
+                    .await
+                    .expect("finish")
+            );
+        };
+        let (admitted, ()) = tokio::time::timeout(COMMAND_ADMIT_POLL * 60, async {
+            tokio::join!(admitted, frees)
+        })
+        .await
+        .expect("the waiter keeps asking and is admitted");
+        admitted.expect("admitted");
     }
 }
