@@ -5979,24 +5979,30 @@ where
             grace: RELAY_GRACE,
             now: &now,
         };
-        // Boxed, as `pump` boxes it (`record.rs`): `drive`'s state machine inline would grow
-        // every walk future past the debug test stack (`every_case_name_dispatches`). The
-        // deadline's composite is boxed for the same reason (MOD-37 M4 D1).
-        let (driven, cut) = match deadline {
-            None => (
-                Box::pin(drive(&mut *session, recorder, Some(&relay), &mut control)).await,
-                false,
-            ),
-            Some(left) => {
-                Box::pin(drive_with_deadline(
-                    &mut *session,
-                    recorder,
-                    &relay,
-                    &mut control,
-                    left,
-                ))
-                .await
+        // MOD-37 M4 D1: under a deadline `drive` runs against a step-local control, which
+        // `forward_or_cut` feeds from the run's; without one, against the run's own.
+        let (local, mut step_control) = control_channel();
+        let (outer, drive_control) = match deadline {
+            Some(_) => {
+                // A cancel that reached the run during `driver.start` is already the step's.
+                if control.signal().is_cancel() {
+                    local.send_replace(control.signal());
+                }
+                (Some(&mut control), &mut step_control)
             }
+            None => (None, &mut control),
+        };
+        // Boxed, as `pump` boxes it (`record.rs`): `drive`'s state machine inline would grow
+        // every walk future past the debug test stack (`every_case_name_dispatches`). It is built
+        // here, once for both paths, so the deadline's composite (boxed too) holds only the box:
+        // a `drive` built inside it put a second `drive`-sized slot in every poll frame of the
+        // session, past the 2 MiB worker stack on the Postgres walk tests.
+        let driving = Box::pin(drive(&mut *session, recorder, Some(&relay), drive_control));
+        let (driven, cut) = match (deadline, outer) {
+            (Some(left), Some(outer)) => {
+                Box::pin(drive_with_deadline(driving, outer, &local, left)).await
+            }
+            _ => (driving.await, false),
         };
         // MOD-42 D4, D10: two answers leave the session result before settle can read them.
         match driven {
@@ -6402,30 +6408,24 @@ const fn is_fenced(err: &EngineError) -> bool {
     )
 }
 
-/// MOD-37 M4 D1: [`drive`] under the step deadline. `drive` runs against a step-local control;
-/// [`forward_or_cut`] copies the run's cancel into it and, after `left`, sends the deadline's own.
-/// Answers `drive`'s result and whether the deadline's cancel is the one `drive` saw.
-async fn drive_with_deadline<S, R>(
-    session: &mut dyn htui_agent::driver::AgentSession,
-    recorder: &mut Recorder<'_, S>,
-    relay: &Relay<'_, R>,
+/// MOD-37 M4 D1: [`drive`] under the step deadline. `driving` runs against a step-local control
+/// fed by `local`; [`forward_or_cut`] copies the run's cancel into it and, after `left`, sends the
+/// deadline's own. Answers `drive`'s result and whether the deadline's cancel is the one `drive`
+/// saw.
+async fn drive_with_deadline<F>(
+    driving: F,
     control: &mut Control,
+    local: &watch::Sender<Signal>,
     left: std::time::Duration,
 ) -> (SessionResult, bool)
 where
-    S: htui_core::store::RecorderStore,
-    R: htui_core::store::RelayStore,
+    F: Future<Output = SessionResult> + Unpin,
 {
-    let (local, mut step_control) = control_channel();
-    // A cancel that reached the run during `driver.start` is already the step's.
-    if control.signal().is_cancel() {
-        local.send_replace(control.signal());
-    }
     let mut cut = false;
     let driven = tokio::select! {
         biased;
-        driven = drive(session, recorder, Some(relay), &mut step_control) => driven,
-        never = forward_or_cut(control, &local, left, &mut cut) => match never {},
+        driven = driving => driven,
+        never = forward_or_cut(control, local, left, &mut cut) => match never {},
     };
     (driven, cut)
 }
