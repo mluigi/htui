@@ -13,7 +13,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use htui_core::model::{RunId, RunStepSummary, RunSummary, StepId, StepStatus, ToolCallCount};
 use rataflow::{
     ControlsAction, Edge, EdgeStyle, Flow, FlowEvent, Handle, HandlePosition, Node, NodeContent,
@@ -613,7 +613,27 @@ impl ExecutionGraph {
     /// MOD-74 D4: ends a live gesture without a click. A pan's drag state, or a node press's
     /// `AwaitingNodeClick`, gets a **locked** left release (`event_handlers.rs:496-509`): it
     /// resets the drag state and emits nothing, where an unlocked one would click the node.
-    pub(super) fn end_gesture(&mut self) {}
+    pub(super) fn end_gesture(&mut self) {
+        if self.flow.is_dragging() {
+            self.locked_left(MouseEventKind::Up(MouseButton::Left), (0, 0));
+        }
+    }
+
+    /// MOD-74 D4, D6: one left-button event fed to rataflow with `locked` set: a press starts
+    /// `Panning` at the pointer with no hit test, a release only ends the drag. The lock is put
+    /// back as it was, with no early return between (plan Risks; the flow never renders
+    /// rataflow's `Controls`, the only other reader, D7).
+    fn locked_left(&mut self, kind: MouseEventKind, (column, row): (u16, u16)) {
+        let locked = self.flow.locked;
+        self.flow.locked = true;
+        let _ = self.flow.handle_mouse_event(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        self.flow.locked = locked;
+    }
 
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
     ///

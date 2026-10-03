@@ -288,7 +288,11 @@ impl DetailRegistry {
     /// MOD-74 D3: a lost capture, to **every** sub-tab, as [`on_item_change`](Self::on_item_change)
     /// goes (B-4): a sub-tab switch is itself a loss, so the pane holding the gesture is no longer
     /// the active one. No `wants_mouse` gate: the pane told no longer wants it.
-    pub fn on_mouse_lost(&mut self) {}
+    pub fn on_mouse_lost(&mut self) {
+        for tab in &mut self.tabs {
+            tab.on_mouse_lost();
+        }
+    }
 
     /// Offers a key to the active sub-tab.
     pub fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {

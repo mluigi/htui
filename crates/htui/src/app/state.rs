@@ -373,9 +373,17 @@ impl App {
         }
     }
 
-    /// The edit a tab asked for, taken by the event loop (MOD-9 D10).
+    /// The edit a tab asked for, taken by the event loop (MOD-9 D10). `Some` exactly when the loop
+    /// is about to suspend, and `Suspend::leave` turns capture off without the app knowing: so a
+    /// capture that was on is lost here (MOD-74 D2), and the loop's next `mouse_capture` re-enables
+    /// it with no stale gesture.
     pub fn take_external_edit(&mut self) -> Option<(TabId, ExternalEdit)> {
-        self.pending_edit.take()
+        let edit = self.pending_edit.take();
+        if edit.is_some() && self.mouse {
+            self.lose_mouse();
+            self.mouse = false;
+        }
+        edit
     }
 
     /// Routes the editor's outcome to the tab that asked, with a [`Ctx`], then drains what it
@@ -505,8 +513,8 @@ impl App {
         }
     }
 
-    /// MOD-71 D1: whether the view on screen wants the mouse, which the event loop turns into
-    /// mouse capture after every step. No overlay may be open and the `?` box may not be up — both
+    /// MOD-71 D1: whether the view on screen wants the mouse, which
+    /// [`mouse_capture`](Self::mouse_capture) records and the event loop applies after every step. No overlay may be open and the `?` box may not be up — both
     /// draw over the tab, and a click through them would act on what they hide (blueprint E7) —
     /// and the active tab must want it.
     #[must_use]
@@ -517,17 +525,30 @@ impl App {
     }
 
     /// MOD-74 D1: what the event loop hands `TerminalGuard::set_mouse_capture` after every step:
-    /// [`wants_mouse`](Self::wants_mouse), recorded.
+    /// [`wants_mouse`](Self::wants_mouse), recorded. On an on-to-off edge every registered tab is
+    /// told ([`Tab::on_mouse_lost`]): after a tab switch the tab holding the gesture is no longer
+    /// the active one.
     pub fn mouse_capture(&mut self) -> bool {
-        self.mouse = self.wants_mouse();
-        self.mouse
+        let wants = self.wants_mouse();
+        if self.mouse && !wants {
+            self.lose_mouse();
+        }
+        self.mouse = wants;
+        wants
+    }
+
+    /// MOD-74 D1, D2: tells every tab capture went off.
+    fn lose_mouse(&mut self) {
+        for tab in self.tabs.iter_mut() {
+            tab.on_mouse_lost();
+        }
     }
 
     /// A mouse event (MOD-71 D4): to the active tab only, with no keymap and no overlay in the
     /// chain (an open overlay turns capture off, D1).
     ///
-    /// Gated first, so an event queued before capture went off does nothing. `Moved` (capture is
-    /// any-motion, `?1003h`) and the horizontal wheel are dropped before dispatch. Only a
+    /// Gated first, so an event queued before capture went off does nothing. `Moved` (Windows still
+    /// reports motion, and a terminal may ignore button-only mode, MOD-74 D5) and the horizontal wheel are dropped before dispatch. Only a
     /// `Consumed` event sets `dirty` and clears the status line (blueprint E8): a pointer crossing
     /// the canvas must neither redraw once per cell nor wipe an error nobody acted on. The status
     /// is taken before dispatch, as [`on_key`](Self::on_key) clears it, so a failure the event

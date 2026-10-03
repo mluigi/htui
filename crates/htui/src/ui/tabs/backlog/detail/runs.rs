@@ -221,8 +221,9 @@ pub struct RunsTab {
     /// `None` on every frame without one. Written in `render` (`&self`), read by `on_mouse`.
     canvas: Cell<Option<Rect>>,
     /// MOD-71 D5, D11: a left press that started on the canvas and is not released yet, so its
-    /// drag and release reach the flow even past the pane's edge. `v`, an item change and a
-    /// capturing mode end it.
+    /// drag and release reach the flow even past the pane's edge. `v`, an item change, a
+    /// capturing mode, a press off the canvas and a lost capture (MOD-74 D3) end it, through
+    /// `end_gesture` (D4).
     gesture: bool,
 }
 
@@ -1419,6 +1420,11 @@ impl DetailTab for RunsTab {
             .is_some_and(|canvas| canvas.contains(Position::new(mouse.column, mouse.row)));
         let forward = match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                // MOD-74 B-1: a press while a gesture is live (its release never reported) ends
+                // it, rataflow's drag state included, before it starts the next one.
+                if self.gesture {
+                    self.end_gesture();
+                }
                 self.gesture = inside;
                 inside
             }
@@ -1442,6 +1448,11 @@ impl DetailTab for RunsTab {
             None if moved => Handled::Consumed,
             None => Handled::Pass,
         }
+    }
+
+    /// MOD-74 D3: capture went off above the pane; a held button must not resume the old anchor.
+    fn on_mouse_lost(&mut self) {
+        self.end_gesture();
     }
 
     /// MOD-41 plan D16: an item is selected and one of its runs is `queued`, `running` or
