@@ -27,7 +27,9 @@ use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposur
 use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
-use htui_agent::record::{Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, drive};
+use htui_agent::record::{
+    Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, Signal, control_channel, drive,
+};
 use htui_core::model::{
     AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
     DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
@@ -48,6 +50,7 @@ use htui_core::prompt::{
 use htui_core::scrub::Scrubber;
 use htui_core::store::{StepFence, StoreError};
 use serde_json::Value;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::closeout;
@@ -265,6 +268,15 @@ impl<'a> SessionKey<'a> {
 
 /// What one pumped session answered: its `done`, or the driver error a closed stream is.
 type SessionResult = Result<DoneEvent, DriverError>;
+
+/// What [`Engine::drive_once`] answers (MOD-37 M4 D1): the session's result, and whether the step
+/// deadline cut it. `cut` is `true` only with `result == Ok(done {cancelled})` after the
+/// deadline's own cancel, which no run cancel overtook.
+#[derive(Debug)]
+struct Driven {
+    result: SessionResult,
+    cut: bool,
+}
 
 /// How the walk gets a driver for one session.
 ///
@@ -1508,6 +1520,8 @@ where
                     result: &Ok(DoneEvent {
                         stop_reason: StopReason::EndTurn,
                     }),
+                    // A human's chat runs under no timer (MOD-37 M4 D1 times walk sessions).
+                    deadline_cut: false,
                 })
                 .await?;
             let after = self.parts.isolator.capture(row.id, &trees).await?;
@@ -3516,7 +3530,13 @@ where
 
         // -- stage 4: session -----------------------------------------------------------------
         let session_cwd = prepared.cwd.clone();
-        let (result, cap_breach) = self
+        let (
+            Driven {
+                result,
+                cut: deadline_cut,
+            },
+            cap_breach,
+        ) = self
             .session(
                 run,
                 step,
@@ -3525,6 +3545,7 @@ where
                 &prompt,
                 prepared.cwd,
                 prepared.extra_dirs,
+                started_at,
             )
             .await?;
         if let Ok(done) = &result {
@@ -3546,6 +3567,7 @@ where
                 started_at,
                 session_cwd: &session_cwd,
                 result: &result,
+                deadline_cut,
             })
             .await?;
 
@@ -3565,6 +3587,7 @@ where
             started_at,
             now,
             deadline_seconds: phase.deadline_seconds,
+            deadline_cut,
             output: output.as_ref(),
             verify_outcome: verify.as_ref().map(|report| report.outcome),
             is_review: phase.name == REVIEW_PHASE,
@@ -3644,6 +3667,7 @@ where
             started_at,
             session_cwd,
             result,
+            deadline_cut,
         } = stage;
         if result.is_err() {
             return Ok(None);
@@ -3664,7 +3688,11 @@ where
             .run(VerifyRequest {
                 command: phase.verify_command.clone(),
                 cwd: primary.map(|tree| PathBuf::from(&tree.path)),
-                remaining: Self::remaining(phase, started_at, self.now()),
+                remaining: if deadline_cut {
+                    Some(std::time::Duration::ZERO)
+                } else {
+                    Self::remaining(phase, started_at, self.now())
+                },
                 step: step.id,
             })
             .await;
@@ -4151,7 +4179,12 @@ where
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
         let key = SessionKey::of(step);
         let mut recorder = self.open_recorder(run, step, prompt).await?;
-        let result = match self
+        // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48).
+        let deadline = Self::remaining(phase, started_at, self.now());
+        let Driven {
+            result,
+            cut: deadline_cut,
+        } = match self
             .drive_once(
                 run,
                 step,
@@ -4161,11 +4194,12 @@ where
                 &prompt.text,
                 prepared.cwd.clone(),
                 prepared.extra_dirs,
+                deadline,
                 &mut recorder,
             )
             .await
         {
-            Ok(result) => result,
+            Ok(driven) => driven,
             Err(refused) => {
                 let finished = recorder.finish().await;
                 return Err(refused_over_finish(refused, finished, run.id, step.id));
@@ -4187,6 +4221,7 @@ where
                 started_at,
                 session_cwd: &prepared.cwd,
                 result: &result,
+                deadline_cut,
             })
             .await?;
 
@@ -4207,6 +4242,7 @@ where
             started_at,
             now,
             deadline_seconds: phase.deadline_seconds,
+            deadline_cut,
             output: output.as_ref(),
             verify_outcome: None,
             is_review: phase.name == REVIEW_PHASE,
@@ -5062,9 +5098,13 @@ where
                     text,
                     prepared.cwd.clone(),
                     prepared.extra_dirs.clone(),
+                    // The maintainer's M4 scope: judge calls stay untimed (no `started_at` of
+                    // their own).
+                    None,
                     recorder,
                 )
                 .await?
+                .result
             {
                 Ok(done) => done,
                 // MOD-42 I-6 (F-4): `Cancelled` and a lost fence leave `drive_once` as its outer
@@ -5764,7 +5804,8 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), the prompt \
-                  and stage 2's two directories, all handed straight to `drive_once`"
+                  and stage 2's two directories, all handed straight to `drive_once`, and the step's \
+                  `started_at` its deadline is measured from (MOD-37 M4 D1)"
     )]
     async fn session(
         &self,
@@ -5775,8 +5816,11 @@ where
         prompt: &AssembledPrompt,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
-    ) -> Result<(SessionResult, Option<htui_agent::record::CapBreach>), EngineError> {
+        started_at: DateTime<Utc>,
+    ) -> Result<(Driven, Option<htui_agent::record::CapBreach>), EngineError> {
         let mut recorder = self.open_recorder(run, step, prompt).await?;
+        // MOD-37 M4 D1: what is left of the step deadline as the session starts.
+        let deadline = Self::remaining(phase, started_at, self.now());
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
         // recorder has already written the prompt row, so it is closed out on this path exactly as
         // it is on a `pump` error. What it is *not* is a settle outcome — ANA-2 `:639` gives
@@ -5794,11 +5838,12 @@ where
                 &prompt.text,
                 cwd,
                 extra_dirs,
+                deadline,
                 &mut recorder,
             )
             .await
         {
-            Ok(result) => result,
+            Ok(driven) => driven,
             Err(refused) => {
                 let finished = recorder.finish().await;
                 return Err(refused_over_finish(refused, finished, run.id, step.id));
@@ -5865,7 +5910,8 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "the session's four coordinates, the persona stage 3 froze and its three per-call \
-                  inputs; a struct would be built at exactly three call sites and read here only"
+                  inputs, and the step deadline's remainder (MOD-37 M4 D1); a struct would be built at \
+                  exactly three call sites and read here only"
     )]
     async fn drive_once(
         &self,
@@ -5877,8 +5923,9 @@ where
         text: &str,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
+        deadline: Option<std::time::Duration>,
         recorder: &mut Recorder<'a, S>,
-    ) -> Result<SessionResult, EngineError> {
+    ) -> Result<Driven, EngineError> {
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
         let candidate = Self::candidate_of(step, phase)?;
@@ -5933,10 +5980,39 @@ where
             now: &now,
         };
         // Boxed, as `pump` boxes it (`record.rs`): `drive`'s state machine inline would grow
-        // every walk future past the debug test stack (`every_case_name_dispatches`).
-        let driven = Box::pin(drive(&mut *session, recorder, Some(&relay), &mut control)).await;
+        // every walk future past the debug test stack (`every_case_name_dispatches`). The
+        // deadline's composite is boxed for the same reason (MOD-37 M4 D1).
+        let (driven, cut) = match deadline {
+            None => (
+                Box::pin(drive(&mut *session, recorder, Some(&relay), &mut control)).await,
+                false,
+            ),
+            Some(left) => {
+                Box::pin(drive_with_deadline(
+                    &mut *session,
+                    recorder,
+                    &relay,
+                    &mut control,
+                    left,
+                ))
+                .await
+            }
+        };
         // MOD-42 D4, D10: two answers leave the session result before settle can read them.
         match driven {
+            // MOD-37 M4 D1: the deadline's own cancel, no run cancel behind it: a cut session,
+            // which settles as `DeadlineElapsed` (the `enforce_breach` shape, `record.rs`). The
+            // run control is read again here, so a run cancel that landed during the cut's drain
+            // still ends the walk as `Cancelled`.
+            Err(DriverError::Cancelled) if cut && !control.signal().is_cancel() => {
+                tracing::warn!(run = %run.id, step = %step.id, "the step deadline cut the session");
+                Ok(Driven {
+                    result: Ok(DoneEvent {
+                        stop_reason: StopReason::Cancelled,
+                    }),
+                    cut: true,
+                })
+            }
             Err(DriverError::Cancelled) => Err(EngineError::Cancelled { run: run.id }),
             // `is_fenced` makes it `LeaseLost` in `heartbeaten`. Pinned by
             // `a_judge_call_applied_after_the_lease_moved_writes_nothing`: left inner, the judge's
@@ -5944,7 +6020,7 @@ where
             Err(fenced @ DriverError::Store(StoreError::Fenced { .. })) => {
                 Err(EngineError::Driver(fenced))
             }
-            result => Ok(result),
+            result => Ok(Driven { result, cut: false }),
         }
     }
 
@@ -6326,6 +6402,74 @@ const fn is_fenced(err: &EngineError) -> bool {
     )
 }
 
+/// MOD-37 M4 D1: [`drive`] under the step deadline. `drive` runs against a step-local control;
+/// [`forward_or_cut`] copies the run's cancel into it and, after `left`, sends the deadline's own.
+/// Answers `drive`'s result and whether the deadline's cancel is the one `drive` saw.
+async fn drive_with_deadline<S, R>(
+    session: &mut dyn htui_agent::driver::AgentSession,
+    recorder: &mut Recorder<'_, S>,
+    relay: &Relay<'_, R>,
+    control: &mut Control,
+    left: std::time::Duration,
+) -> (SessionResult, bool)
+where
+    S: htui_core::store::RecorderStore,
+    R: htui_core::store::RelayStore,
+{
+    let (local, mut step_control) = control_channel();
+    // A cancel that reached the run during `driver.start` is already the step's.
+    if control.signal().is_cancel() {
+        local.send_replace(control.signal());
+    }
+    let mut cut = false;
+    let driven = tokio::select! {
+        biased;
+        driven = drive(session, recorder, Some(relay), &mut step_control) => driven,
+        never = forward_or_cut(control, &local, left, &mut cut) => match never {},
+    };
+    (driven, cut)
+}
+
+/// MOD-37 M4 D1: forwards the run's cancel into `local`, and after `left` sends `Cancel { grace:
+/// RELAY_GRACE }` unless a cancel is there already; `cut` says the deadline's was the one sent.
+/// Never ends: [`drive_with_deadline`] drops it when `drive` answers.
+async fn forward_or_cut(
+    control: &mut Control,
+    local: &watch::Sender<Signal>,
+    left: std::time::Duration,
+    cut: &mut bool,
+) -> core::convert::Infallible {
+    let mut timer = std::pin::pin!(tokio::time::sleep(left));
+    // A finished `Sleep` polls `Ready` again, so the arm is disarmed after it fires (no spin).
+    let mut armed = true;
+    let cancel_once = |to: Signal| {
+        local.send_if_modified(|seen| {
+            if seen.is_cancel() {
+                false
+            } else {
+                *seen = to;
+                true
+            }
+        })
+    };
+    loop {
+        tokio::select! {
+            // The run first: a run cancel and the deadline in one instant end as the run's.
+            biased;
+            () = control.changed() => {
+                let signal = control.signal();
+                if signal.is_cancel() {
+                    cancel_once(signal);
+                }
+            }
+            () = &mut timer, if armed => {
+                armed = false;
+                *cut = cancel_once(Signal::Cancel { grace: RELAY_GRACE });
+            }
+        }
+    }
+}
+
 /// MOD-42 M-2: the error a session raises when its `drive_once` refused with `refused` and its
 /// recorder's `finish` then answered `finished`. A cancel or a lost fence wins over a failed
 /// `finish` (logged at `warn`): an `Unmasked` residue or a store blip from the close-out would
@@ -6449,6 +6593,9 @@ struct VerifyStage<'a> {
     session_cwd: &'a std::path::Path,
     /// Stage 4's answer: a verify runs only on `Ok` (blueprint A-3).
     result: &'a Result<DoneEvent, DriverError>,
+    /// MOD-37 M4 D1: the step deadline cut the session; the verify gets `Some(ZERO)` at once,
+    /// whatever the engine clock says.
+    deadline_cut: bool,
 }
 
 /// Which of a phase's `input_kinds` are **required** (blueprint H-8, plan D21).
@@ -16294,9 +16441,16 @@ mod tests {
 
             let walked = walked(harness.dispatch(start_feat_3())).await;
 
-            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
                 panic!("the cut candidate does not cancel the walk: {walked:?}");
             };
+            // The group resolved: a group with one survivor parks for a human, as any failed
+            // candidate's does (`a_stale_group_retry_stops_and_gives_the_lease_back`).
+            assert_eq!(
+                (rest.run, rest.position),
+                (RunStatus::AwaitingApproval, Some(0)),
+                "the group with one survivor parks for a human"
+            );
             let first = step_at(&harness.orch, run, 0, 0).await;
             assert_eq!(first.status, StepStatus::Failed, "the hung candidate fails");
             let notes = deadline_notes(&harness.orch, ids::HTUI_FEAT_3).await;
@@ -16304,11 +16458,6 @@ mod tests {
             assert_cancel_answered_once(&harness.orch, first.id).await;
             let second = step_at(&harness.orch, run, 0, 1).await;
             assert_eq!(second.status, StepStatus::Done, "the sibling is not cut");
-            let steps = harness.orch.steps(run).await;
-            assert!(
-                steps.iter().any(|step| step.position == 1),
-                "the group resolved and the walk moved on: {steps:?}"
-            );
         }
 
         /// D1 keeps MOD-42: a run cancel that lands before the deadline still ends the walk as

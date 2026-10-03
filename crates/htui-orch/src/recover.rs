@@ -318,7 +318,7 @@ pub fn verify_of(
 }
 
 /// D91: `gate::settle` with `driver: Ok(DoneEvent { stop_reason: EndTurn })`, `cap_breach: None`,
-/// `deadline_seconds: None`.
+/// `deadline_seconds: None`, `deadline_cut: false` (recovery never has a live timer).
 ///
 /// The deadline is dropped because the sweep's clock is not the step's, and the cap because the
 /// recorder's breach is not durable (plan R-13); `now` is therefore inert. `verify` is
@@ -340,6 +340,7 @@ pub fn resettle(
         started_at,
         now,
         deadline_seconds: None,
+        deadline_cut: false,
         output,
         verify_outcome: verify,
         is_review,
