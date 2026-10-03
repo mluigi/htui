@@ -596,3 +596,214 @@ cargo clippy -p htui-orch -p htui --all-targets --all-features -- -D warnings
 ```
 **Commits**: `test(mod-37): ACP steps with a banner resume; the handoff rides along (red)`, then
 `feat(mod-37): the engine resumes either transport and carries the handoff fallback (R-48)`.
+---
+
+## T4 - the worker falls back on a failed resume and records the opening (after T1, T2, T3)
+
+**Files**: `crates/htui/src/agent_worker.rs`; `crates/htui-agent/src/{record,event}.rs` and
+`crates/htui-agent/tests/recorder.rs` (amendment A-3); `crates/htui/tests/chat.rs` (one new case).
+
+### htui-agent
+**`event.rs`**, beside `SESSION_STARTED` (`:163`):
+```rust
+/// MOD-37 M5: the update of the `other` row `htui` records when a promoted chat's resume failed and
+/// the chat fell back to the handoff prompt. Body: `{ session_id, reason, note }`.
+pub const RESUME_FAILED: &str = "resume_failed";
+```
+**`record.rs`**, `Recorder`, after `record_follow_up` (`:758-781`):
+```rust
+    /// MOD-37 M5: one `other` row `htui` authors about the session (`role = htui`), such as
+    /// [`RESUME_FAILED`](crate::event::RESUME_FAILED). It opens no turn, so it lands in the current one,
+    /// after that turn's last row, and the next [`Self::record_follow_up`] opens the next. Like a
+    /// follow-up it is not sent to the tab; the caller sends the frame.
+    ///
+    /// # Errors
+    /// [`RecordError::Store`] when the append fails; [`RecordError::Encode`] never, in practice.
+    pub async fn record_notice(&mut self, notice: &OtherEvent, at: DateTime<Utc>) -> Result<(), RecordError> {
+        let at = stamp(at);
+        let mut payload = encode(notice)?; // `{ update, body }`: what `replay` decodes an `other` row as
+        self.flush().await?;
+        match self.scrubber.scrub(&mut payload) {
+            Ok(()) => {}
+            Err(unmasked) => return self.refuse(unmasked, at).await,
+        }
+        self.push(PendingRow {
+            kind: EventKind::Other,
+            role: EventRole::Htui,
+            tool_call_id: None,
+            payload,
+            raw: Vec::new(),
+            at,
+        });
+        self.flush().await
+    }
+```
+The reason carries the adapter's stderr tail, so it is scrubbed like any payload. A refused scrub
+writes the residue row, as `record_follow_up` does.
+
+### agent_worker.rs - types
+```rust
+/// MOD-37 M5: what a promoted chat opens with when resuming the step's own session fails: the
+/// session it tried, and the handoff prompt the engine built for this promotion.
+#[derive(Debug, Clone)]
+struct ResumeFallback {
+    session_ref: AgentSessionRef,
+    handoff: String,
+}
+```
+`ChatBinding::Promoted` (`:2195-2202`) gains `fallback: Option<ResumeFallback>` ("`Some` exactly
+when the opening is `OpeningPath::Resume`"). The plan says `ChatArgs`; putting the field on the
+`Promoted` binding, beside the `tail`, means a fresh chat cannot carry one at all (amendment A-4,
+cosmetic). `ChatBinding` stays `Debug`.
+
+`bind_promoted` (`:1033-1036`):
+```rust
+        let (resume, opening_text, fallback) = match opening.path {
+            OpeningPath::Resume { session_ref, text, handoff, .. } => (
+                Some(session_ref.clone()),
+                text,
+                Some(ResumeFallback { session_ref, handoff }),
+            ),
+            OpeningPath::Handoff { text, .. } => (None, text, None),
+        };
+```
+and `binding: ChatBinding::Promoted { step_id, tail, fallback },`. Update the `attach_promoted` doc
+(`:921-934`): "`resume` on [`OpeningPath::Resume`], whose handoff the session falls back to (MOD-37 M5)".
+
+New free fns near `follow_up_frame` (`:4423`):
+```rust
+/// MOD-37 M5: whether a failed resume is worth a handoff start. Not when the adapter cannot run at
+/// all: a missing or unspawnable command (`Spawn`), an unresolved launch placeholder (`Unresolved`)
+/// or no transport (`UnknownAdapter`) would fail the handoff start the same way.
+const fn falls_back(err: &DriverError) -> bool {
+    !matches!(err, DriverError::Spawn(_) | DriverError::Unresolved(_) | DriverError::UnknownAdapter(_))
+}
+
+/// MOD-37 M5: the `resume_failed` notice: the session tried, why it failed, and what the chat
+/// opens with instead.
+fn resume_failed_notice(session_ref: &AgentSessionRef, reason: &str) -> OtherEvent {
+    OtherEvent {
+        update: htui_agent::event::RESUME_FAILED.to_owned(),
+        body: json!({
+            "session_id": session_ref.as_str(),
+            "reason": reason,
+            "note": htui_orch::promote::CONTEXT_NOT_CARRIED,
+        }),
+    }
+}
+
+/// MOD-37 M5: `run_step.opening`, written through the bind's writer. A failed write is logged and
+/// never fails the chat: the column is a label, and the session is what the user is waiting on.
+async fn record_opening(writer: &Writer, step: StepId, opening: StepOpening) {
+    if let Err(err) = writer.record_opening(step, opening).await {
+        tracing::warn!(%err, %step, %opening, "the chat's opening could not be recorded");
+    }
+}
+```
+
+### agent_worker.rs - `run_chat` (`:3929-4149`), the control flow
+1. **The recorder moves above the start** (D5). The `(ui_tx, ui_rx)` channel, `retain_raw`, the
+   `recorder` match over `binding` with `with_quota_latch` and `with_run_cap`, all of `:3984-4002`,
+   move to just after `let step_id = binding.step_id();`. A start that fails drops a recorder that
+   wrote nothing (`Recorder` has no `Drop` side effect).
+2. **The first start**: `let first = driver.start(spec.clone(), prompt.clone()).await;`.
+3. Decide:
+   ```rust
+   let fallback = match &binding { ChatBinding::Promoted { fallback, .. } => fallback.clone(), ChatBinding::Fresh(..) => None };
+   // (session, the opening text recorded as the `follow_up`, the opening, the notice owed the tab)
+   let started = match (first, fallback) {
+       (Ok(session), fallback) => Ok((session, prompt, if fallback.is_some() { StepOpening::Resumed } else { StepOpening::Handoff }, None)),
+       (Err(err), Some(fallback)) if falls_back(&err) => {
+           let at = Utc::now();
+           let notice = resume_failed_notice(&fallback.session_ref, &err.to_string());
+           // (a) the column first, so the pane is truthful even if the row write fails;
+           record_opening(&writer, step_id, StepOpening::ResumeFailed).await;
+           // (b) the row, at the step's current turn, before any second session can write;
+           if let Err(record_err) = recorder.record_notice(&notice, at).await {
+               tracing::error!(%record_err, "the resume_failed row could not be written");
+           }
+           let envelope = DriverEnvelope { event: DriverEvent::Other(notice), raw: None, at };
+           // (c) the second start: no resume, the handoff text.
+           let handoff_spec = SessionSpec { resume: None, ..spec };
+           match driver.start(handoff_spec, fallback.handoff.clone()).await {
+               Ok(session) => Ok((session, fallback.handoff, StepOpening::ResumeFailed, Some(envelope))),
+               Err(err) => Err((err, Some(envelope))),
+           }
+       }
+       (Err(err), _) => Err((err, None)),
+   };
+   ```
+   `StepOpening` comes from `htui_core::model`, and `OtherEvent`/`AgentSessionRef` are imported.
+   `spec` is moved only in the fallback arm; the first start took a clone.
+4. **`Err((err, notice))`**: today's failure arm, with the notice first. If `notice` is `Some`, call
+   `frames.event(notice)` first, so the tab shows the report before the refusal. Then
+   `frames.to_stream(Failed { request: binding.request(), message: err.to_string() })`,
+   `binding.close(..)`, `frames.failed(..)`, and the D60 `Spawn` reprobe `if let` unchanged. A
+   promoted chat's `reprobe` is always `None` (`bind_promoted` `:1080`), so for a promotion this is a
+   no-op, as today (amendment A-5). **What the chat answers when both starts fail**: the second
+   start's error text, as `Failed { request: "promote_step" }` plus `ChatFrame::Failed`, after the
+   `resume_failed` event. The step keeps `opening = resume_failed`, its log has the notice row, and
+   it has no `follow_up`.
+5. **`Ok((session, opening_text, opening, notice))`**: `frames.accept(ChatAccepted { session_ref:
+   session.session_ref().cloned(), .. })` as today. Then, for a promoted binding whose opening is not
+   `ResumeFailed`, `record_opening(&writer, step_id, opening).await` (`ResumeFailed` was written at
+   3(a)). Then `if let Some(envelope) = notice { frames.event(envelope); }`, then the existing
+   prompt/`follow_up` match over `binding`, with `opening_text` in place of `prompt`. A fresh chat
+   records no opening.
+
+Order on a fallback, end to end: `opening = resume_failed` → `other/resume_failed` row (seq `last+1`,
+turn = tail's last turn, role `htui`) → second `start` → `ChatAccepted` → `ChatFrame::Event(resume_failed)`
+→ `follow_up` row with the handoff (seq `last+2`, turn `last+1`) and its frame → the turn loop. The
+tab gets the report after the acceptance and before the opening (H-7). A Handoff opening writes
+`handoff` and a successful Resume writes `resumed`, each only after its start succeeded. A failed
+Handoff start and a non-falling-back resume failure write no opening (H-8).
+
+### T4 red tests
+A new test driver beside `SpecSpy` (`:4907`):
+```rust
+/// MOD-37 M5: the fake driver, failing its first starts with `failures` (front first) and writing
+/// down every `(spec, prompt)` it was started with.
+#[derive(Debug)]
+struct FailingStarts { inner: Box<dyn AgentDriver>, starts: StartLog, failures: Arc<Mutex<VecDeque<DriverError>>> }
+type StartLog = Arc<Mutex<Vec<(SessionSpec, String)>>>;
+```
+`start` records `(spec.clone(), prompt.clone())`, then
+`if let Some(err) = failures.pop_front() { return Box::pin(async move { Err(err) }) }`, else
+delegates. `DriverError` is `Clone`. Its builder mirrors `FakeBuilder`. The fixture
+`fixture_with_failing_starts(script, failures: Vec<DriverError>) -> (MemStore, Backend, AgentRuntime, AgentId, StartLog)`
+mirrors `fixture_with_spec_spy` (`:4848-4879`). A helper `opening_of(&store, step) -> Option<StepOpening>`
+reads `store.runs(<RUN_1's item>)` → `RUN_1` → `STEP_PLAN`. A `resume(handoff)` path builder:
+`OpeningPath::Resume { session_ref: AgentSessionRef::new("banner-1"), text: RESUME_OPENING, handoff: "HANDOFF TEXT", digest: "d" }`.
+Cases (c)-(e) attach, then await the task and collect replies, **not** `attach_and_end`: its
+`ChatCancel` assertion presumes a chat that is still live. Case (c) uses `attach_and_end`.
+
+| # | Name (`agent_worker.rs` tests) | Asserts | Red on today's code |
+|---|---|---|---|
+| a | `a_handoff_promotion_records_handoff` | Handoff path. One start, `resume == None`. `opening_of == Some(Handoff)` | Compile (T1 is in); `None` today |
+| b | `attach_promoted_resumes_a_cli_step_with_its_banner` (extended, `:5130`) | Plus `opening_of == Some(Resumed)` and no `resume_failed` row | `None` today |
+| c | `a_failed_resume_reports_then_opens_the_handoff` | failures `[Transport("session/load failed: no such session")]`. Two starts: the first has `resume == Some("banner-1")` and prompt `RESUME_OPENING`, the second has `resume == None` and prompt `"HANDOFF TEXT"`, with the same `step_id`, `cwd` and `extra_dirs`. The log past the tail is exactly `[other (seq last+1, turn last_turn, role Htui, payload {update: "resume_failed", body: {session_id: "banner-1", reason ∋ "no such session", note: CONTEXT_NOT_CARRIED}}), follow_up (seq last+2, turn last_turn+1, text "HANDOFF TEXT"), …]`. `opening_of == Some(ResumeFailed)`. Replies: `ChatAccepted` at seq 7 comes before a `Chat(Event(Other{update: "resume_failed"}))`, which comes before the `follow_up` event. No `Failed` reply | Today the chat fails (`Failed { promote_step }`), with no row and no second start |
+| d | `a_failed_resume_whose_handoff_fails_too_fails_the_chat` | failures `[Transport("a"), Transport("second refusal")]`. Two starts. Replies, in order: `Event(resume_failed)`, then `Failed { request: "promote_step", message ∋ "second refusal" }`, then `Chat(Failed)`. The log has the notice row and no `follow_up`. `opening_of == Some(ResumeFailed)` | One start today; no row; `None` |
+| e | `a_resume_that_cannot_spawn_does_not_fall_back` | Run once with `Spawn("gone")` and once with `Unresolved("node")`. One start each, a `Failed` reply, no notice row, `opening_of == None` | Pin (green apart from compile) |
+
+`crates/htui-agent/tests/recorder.rs` `a_notice_is_htuis_other_row_in_the_current_turn`: a continuing
+recorder over a tail ending at seq 4, turn 0. `record_notice` writes seq 5, turn 0, `Other`/`Htui`,
+payload `{update, body}`. Then `record_follow_up` writes seq 6, turn 1. `replay::envelope_from_row`
+of the notice is `Other(notice)`. Red by compile.
+
+`crates/htui/tests/chat.rs` `an_acp_promotion_with_a_banner_resumes_its_session`: `graph_store` with
+the scripted row **without** `handoff_only` (a `resumable_graph_store()` variant), then
+`parked` + `promote`. The header reads `promoted · <phase> · resumed · scripted · sonnet`, the
+follow-up row is `RESUME_OPENING`, and `store.runs(ANA_2)`'s step has `opening == Some(Resumed)`. The
+`FakeDriver` ignores `spec.resume` and mints the same `fake-<step>` id, so the banner matches. Red:
+`via` is `handoff` today (the CLI-only rule), and `opening` is `None`.
+
+**Gate T4**
+```
+cargo test -p htui-agent --all-features --test recorder
+cargo test -p htui --all-features --lib agent_worker -- --test-threads=1
+cargo test -p htui --all-features --test chat -- --test-threads=1
+cargo clippy -p htui-agent -p htui --all-targets --all-features -- -D warnings
+```
+**Commits**: `feat(mod-37): Recorder::record_notice for htui's own other rows` (with its test);
+`test(mod-37): a failed resume reports and falls back (red)`; `feat(mod-37): a failed resume falls back
+to the handoff in the same bind; run_step.opening is recorded (R-48)`.
