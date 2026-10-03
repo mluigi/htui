@@ -5553,7 +5553,8 @@ pub(crate) mod tests {
         }
 
         /// OQ-8, as far as T6 can pin it: a fresh chat has no item, so it sees `box_profile`
-        /// alone (T7 adds `search_concepts`).
+        /// alone (T7 adds `search_concepts`) — plus, because the fake row is `cli`, MOD-11 D18's
+        /// `permission_prompt`, which the CLI hides from the model and `run_turn` answers.
         #[tokio::test]
         async fn a_fresh_chat_sees_box_profile_only() {
             let (_store, backend, runtime, agent_id, slot) =
@@ -5565,7 +5566,8 @@ pub(crate) mod tests {
                 .await;
             let mut live = live(served, tx, &host, &slot).await;
 
-            assert_eq!(live.tools, ["box_profile"]);
+            assert_eq!(live.tools, ["box_profile", "permission_prompt"]);
+            assert!(live.spec.prompt.is_some(), "the CLI chat's lease lends a port");
             let profile = live
                 .client
                 .call("box_profile", json!({}))
