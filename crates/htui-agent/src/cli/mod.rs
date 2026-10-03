@@ -18,7 +18,7 @@
 
 pub mod claude;
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -30,8 +30,8 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::driver::{
-    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
-    PermissionRequestId, SessionSpec, ToolExposure,
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,
+    PermissionAnswer, PermissionRequestId, SessionSpec, ToolExposure,
 };
 use crate::error::{DriverError, Result};
 use crate::event::{
@@ -104,6 +104,11 @@ pub const UNPARSED: &str = "<unparsed>";
 /// 5. the spec's model and extra directories;
 /// 6. the budget, **only above zero** — see below;
 ///
+///    6¼. `htui`'s own MCP servers (MOD-11 D8): one `--mcp-config=<json>` argument
+///    ([`mcp_config`]) when `spec.mcp` is not empty, `=`-joined so the CLI's variadic parse cannot
+///    swallow the token after it. No `--strict-mcp-config` — the operator's own servers stay — and
+///    `--tools` is left as it is, because it never filters MCP tools;
+///
 ///    6½. the step's narrowing (MOD-26 D11): `--tools=<allow>` when the allow-list is not empty,
 ///    then `--disallowedTools=<deny and the names deny_kinds inverts to>` when that is not empty,
 ///    each one `=`-joined argument; `--allowedTools` is never emitted (I-1);
@@ -161,6 +166,11 @@ pub fn argv(
         }
     }
 
+    // MOD-11 D8: after the last pair, before the narrowing, so `extra_args` still wins.
+    if let Some(config) = mcp_config(&spec.mcp) {
+        args.push(format!("--mcp-config={config}"));
+    }
+
     // MOD-26 D11: the step's narrowing, each as one `=`-joined argument (the closure above pushes
     // pairs). `--tools` restricts the built-in set and is omitted when `allow` is empty —
     // `--tools=""` would disable every tool. `--allowedTools` is never emitted: it auto-approves
@@ -175,6 +185,31 @@ pub fn argv(
 
     args.extend(cli.extra_args.iter().cloned());
     args
+}
+
+/// The `--mcp-config` JSON for `servers` (MOD-11 D8): the CLI's own
+/// `{"mcpServers":{<name>:{"type":"stdio","command","args","env"}}}`, serialised compactly.
+/// `None` for an empty slice, which is what keeps a session with no server on today's argv.
+///
+/// Both maps are `BTreeMap`s, so the bytes are stable: servers by name, `env` by key.
+#[must_use]
+pub fn mcp_config(servers: &[McpServerSpec]) -> Option<String> {
+    if servers.is_empty() {
+        return None;
+    }
+    let servers: BTreeMap<&str, Value> = servers
+        .iter()
+        .map(|server| {
+            let entry = json!({
+                "type": "stdio",
+                "command": server.command,
+                "args": server.args,
+                "env": server.env,
+            });
+            (server.name.as_str(), entry)
+        })
+        .collect();
+    Some(json!({ "mcpServers": servers }).to_string())
 }
 
 /// `deny`, then every name `deny_kinds` inverts to ([`claude::tool_names`]), first occurrence

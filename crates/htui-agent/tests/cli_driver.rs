@@ -30,7 +30,9 @@ use htui_agent::cli::{SessionOptions, open_session};
 use htui_agent::cli::{argv, usd};
 #[cfg(unix)]
 use htui_agent::driver::{AgentSession, PermissionAnswer, PermissionRequestId};
-use htui_agent::driver::{AgentSessionRef, PermissionPolicy, SessionSpec, ToolExposure};
+use htui_agent::driver::{
+    AgentSessionRef, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure,
+};
 #[cfg(unix)]
 use htui_agent::error::DriverError;
 use htui_agent::event::ToolKind;
@@ -331,6 +333,192 @@ fn a_default_exposure_adds_no_flag() {
     assert_eq!(
         args.last().map(String::as_str),
         Some("minted-id"),
+        "{args:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-11 D8: `htui`'s MCP server on the command line
+// ---------------------------------------------------------------------------------------------
+
+/// The server `htui` registers for a session: the binary, `mcp`, the address and the token.
+fn htui_server() -> McpServerSpec {
+    McpServerSpec {
+        name: "htui".to_owned(),
+        command: "/abs/htui".to_owned(),
+        args: vec!["mcp".to_owned()],
+        env: BTreeMap::from([
+            ("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned()),
+            (
+                "HTUI_MCP_ADDR".to_owned(),
+                "/run/htui-mcp-1-abcd/s".to_owned(),
+            ),
+        ]),
+    }
+}
+
+/// A spec that sets every field `argv` reads: model, directories, budget and a narrowing.
+fn full_spec() -> SessionSpec {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.model = Some("sonnet".to_owned());
+    spec.extra_dirs = vec![PathBuf::from("/a")];
+    spec.budget_micros = Some(300);
+    spec.tools = exposure(&["Read", "Grep"], &["mcp__x__y"], &[]);
+    spec
+}
+
+/// The `--mcp-config=` arguments of `args`.
+fn mcp_configs(args: &[String]) -> Vec<&String> {
+    args.iter()
+        .filter(|arg| arg.starts_with("--mcp-config"))
+        .collect()
+}
+
+/// I-7: a spec with no server gets exactly the pre-MOD-11 command line, flag for flag.
+#[test]
+fn argv_without_mcp_is_unchanged() {
+    let args = argv(
+        &["--row-arg".to_owned()],
+        &cli_settings("acceptEdits", &["--x"]),
+        &full_spec(),
+        "minted-id",
+    );
+    assert_eq!(
+        args,
+        vec![
+            "--row-arg",
+            "-p",
+            "--output-format",
+            "stream-json",
+            "--input-format",
+            "stream-json",
+            "--verbose",
+            "--include-partial-messages",
+            "--permission-mode",
+            "acceptEdits",
+            "--session-id",
+            "minted-id",
+            "--model",
+            "sonnet",
+            "--add-dir",
+            "/a",
+            "--max-budget-usd",
+            "0.000300",
+            "--tools=Read,Grep",
+            "--disallowedTools=mcp__x__y",
+            "--x",
+        ],
+    );
+    assert!(mcp_configs(&args).is_empty(), "{args:?}");
+    assert_eq!(htui_agent::cli::mcp_config(&[]), None);
+}
+
+/// D8: one `=`-joined `--mcp-config` argument (the CLI's variadic parse cannot swallow the next
+/// token), after the last pair and before `--tools`, which is left as it was.
+#[test]
+fn argv_with_mcp_has_one_joined_config_before_tools() {
+    let mut with = full_spec();
+    with.mcp = vec![htui_server()];
+    let args = argv(&[], &cli_settings("", &[]), &with, "minted-id");
+    let without = argv(&[], &cli_settings("", &[]), &full_spec(), "minted-id");
+
+    let configs = mcp_configs(&args);
+    assert_eq!(configs.len(), 1, "{args:?}");
+    assert!(configs[0].starts_with("--mcp-config="), "{args:?}");
+    let config_at = args
+        .iter()
+        .position(|arg| arg.starts_with("--mcp-config="))
+        .expect("the config is there");
+    let tools_at = args
+        .iter()
+        .position(|arg| arg.starts_with("--tools="))
+        .expect("the allow-list is there");
+    assert!(config_at < tools_at, "{args:?}");
+    assert_eq!(
+        args[config_at - 2..config_at],
+        ["--max-budget-usd", "0.000300"],
+        "right after the last pair: {args:?}"
+    );
+    assert_eq!(args[tools_at], "--tools=Read,Grep", "--tools is untouched");
+    let rest: Vec<&String> = args
+        .iter()
+        .filter(|arg| !arg.starts_with("--mcp-config"))
+        .collect();
+    assert_eq!(
+        rest,
+        without.iter().collect::<Vec<_>>(),
+        "the config is the only addition"
+    );
+    assert!(
+        !args
+            .iter()
+            .any(|arg| arg.starts_with("--strict-mcp-config")),
+        "the operator's own servers stay: {args:?}"
+    );
+}
+
+/// D8: the JSON is the CLI's own `mcpServers` shape — keyed by name, `type: "stdio"`, `env` an
+/// object — and serialises compactly in key order.
+#[test]
+fn the_mcp_config_is_the_clis_stdio_shape() {
+    let config = htui_agent::cli::mcp_config(&[htui_server()]).expect("one server, one config");
+    let parsed: serde_json::Value = serde_json::from_str(&config).expect("the config is JSON");
+    assert_eq!(
+        parsed,
+        serde_json::json!({
+            "mcpServers": {
+                "htui": {
+                    "type": "stdio",
+                    "command": "/abs/htui",
+                    "args": ["mcp"],
+                    "env": {
+                        "HTUI_MCP_ADDR": "/run/htui-mcp-1-abcd/s",
+                        "HTUI_MCP_TOKEN": "token-value",
+                    },
+                },
+            },
+        }),
+    );
+    assert!(
+        !config.contains('\n') && !config.contains(": "),
+        "compact: {config}"
+    );
+    assert!(
+        config.find("HTUI_MCP_ADDR") < config.find("HTUI_MCP_TOKEN"),
+        "env in key order: {config}"
+    );
+
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.mcp = vec![htui_server()];
+    let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id");
+    assert_eq!(
+        mcp_configs(&args),
+        [&format!("--mcp-config={config}")],
+        "argv carries exactly that JSON"
+    );
+}
+
+/// D8: the operator's `extra_args` still come last, so a repeated flag is theirs.
+#[test]
+fn extra_args_stay_last_with_mcp() {
+    let mut spec = full_spec();
+    spec.mcp = vec![htui_server()];
+    let args = argv(
+        &[],
+        &cli_settings("", &["--mcp-config=operator.json", "--y"]),
+        &spec,
+        "minted-id",
+    );
+    assert_eq!(
+        args[args.len() - 2..],
+        ["--mcp-config=operator.json", "--y"],
+        "{args:?}"
+    );
+    assert!(
+        args.iter()
+            .position(|arg| arg.starts_with("--disallowedTools="))
+            .expect("the deny list travels")
+            < args.len() - 2,
         "{args:?}"
     );
 }
