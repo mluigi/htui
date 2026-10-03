@@ -101,8 +101,10 @@ active workspace appears in the list and the waiting count, each reaching its st
 - `Enter` on a row opens that item's Runs pane on the step.
 - The list is computed from the store at read time by one shared query that the top bar's waiting
   count also uses; it keeps no state of its own. MOD-12 can reuse the query.
-- `docs/REQUIREMENTS.md`: `R-TUI-11` added and the `R-TUI-1` top-bar line amended, once the
-  maintainer approves the wording (Open Questions).
+- Offline, open permission requests are omitted and the overlay says "permissions unavailable
+  offline" (relay tables are not mirrored).
+- `docs/REQUIREMENTS.md`: `R-TUI-11` added and the `R-TUI-1` top-bar line amended (approved and
+  applied 2026-10-03).
 
 **Out of scope**
 - Rebinding the opening key in `keys.toml` — MOD-67 registers it as a named action when it lands.
@@ -117,24 +119,17 @@ active workspace appears in the list and the waiting count, each reaching its st
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | See what waits | Top bar shows working vs waiting counts; the overlay lists every waiting reason in the active workspace (gate, selection, judge failure, unblock, open permission) from every screen | pending | — |
-| 2 | Jump to it | `Enter` on a row opens the item's Runs pane on that step; requirements text applied; close-out | pending | — |
+| 2 | Jump to it | `Enter` on a row opens the item's Runs pane on that step; close-out | pending | — |
 
 ## Open Questions
 
-- [ ] **`R-TUI-11` and `R-TUI-1` wording** — `docs/REQUIREMENTS.md` changes only by explicit
-  maintainer decision. Proposed (ANA-27 §7, adjusted for the count split, judge row and MOD-75):
-  > **R-TUI-11 (must).** One overlay, opened from every screen, lists every run in the active
-  > workspace that waits on a person — a gate, a fan-out selection, a judge failure, a blocked run,
-  > an open permission request, and an agent's open question — with the reason and the step, and
-  > opens the item's Runs tab on that step. The top bar shows the count. The list is computed from
-  > the store at read time.
-
-  `R-TUI-1`: the top-bar list's "active run count" becomes "working run count and waiting-on-you
-  count (`R-TUI-11`)".
-- [ ] **Offline permission rows** — relay tables are not mirrored, so offline the list cannot show
-  open permission requests. Proposed: omit them offline and mark the overlay "permissions
-  unavailable offline". Needs maintainer confirmation.
-- [ ] **Judge failure as its own row** — decided (maintainer, 2026-10-03); *how* it is recorded
+- [x] **`R-TUI-11` and `R-TUI-1` wording** — approved as proposed (maintainer, 2026-10-03) and applied
+  to `docs/REQUIREMENTS.md`: `R-TUI-11` added (gate, fan-out selection, judge failure, blocked run,
+  open permission request, agent's open question; active workspace; read-time derivation);
+  `R-TUI-1`'s "active run count" became "working run count and waiting-on-you count (R-TUI-11)".
+- [x] **Offline permission rows** — approved (maintainer, 2026-10-03): offline, the list omits open
+  permission requests and the overlay shows "permissions unavailable offline".
+- [x] **Judge failure as its own row** — decided (maintainer, 2026-10-03); *how* it is recorded
   (a structured field vs the note text) is `/plan`'s call, constrained by "no state of the list's
   own".
 

@@ -32,6 +32,9 @@ D1-D3, `docs/ANA-16.md` §7) — R-ID-2, R-STO-1 and R-ORCH-12 amended in place 
 worker; its DSN source; remote dispatch promoted to must), R-LATER-4 narrowed to scheduling.
 amended 2026-10-01 by maintainer decision on MOD-45 (`docs/decisions/mod/mod-45.md`, plan OQ-1) —
 R-STO-1 amended in place (a TUI session may read the DSN once from stdin, held only in memory).
+amended 2026-10-03 by maintainer decision on MOD-69 (`.claude/prds/mod-69-waiting-on-you.prd.md`,
+`docs/ANA-27.md` §7) — R-TUI-11 added (waiting-on-you list); R-TUI-1 amended in place (working and
+waiting-on-you counts replace the active run count).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -332,7 +335,7 @@ conflict. Their verdicts survive only where restated here.
 
 - **R-TUI-1 (must).** Keyboard driven, mouse optional; keys are configurable (R-TUI-10). Top bar: workspace or project, box, store
   state — distinguishing online, connecting, and offline since T
-  — active run count. Tabs: Backlog, Chat (one per session), Skills, Requirements, Settings. Workspace switcher
+  — working run count and waiting-on-you count (R-TUI-11). Tabs: Backlog, Chat (one per session), Skills, Requirements, Settings. Workspace switcher
   overlay. Queue overlay for auto mode with reorder and pause.
 - **R-TUI-2 (must).** Backlog left pane: items grouped by project, filters by status, project,
   capability and readiness. Actions: new, edit, run, queue, close, open graph.
@@ -367,6 +370,11 @@ conflict. Their verdicts survive only where restated here.
   be unbound or bound to anything else; a pane that runs another program in a terminal forwards
   it to that program and always keeps a key that leaves the pane. Every hint line and the `?`
   help show the keys in force, and the help opens from every screen.
+- **R-TUI-11 (must).** One overlay, opened from every screen, lists every run in the active
+  workspace that waits on a person — a gate, a fan-out selection, a judge failure, a blocked run,
+  an open permission request, and an agent's open question — with the reason and the step, and
+  opens the item's Runs tab on that step. The top bar shows the count. The list is computed from
+  the store at read time.
 
 ## 12. Later tier (R-LATER)
 
