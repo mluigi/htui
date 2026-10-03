@@ -1035,6 +1035,119 @@ async fn the_mirror_ranks_resolve_inputs_the_way_postgres_does() {
     teardown(db, &[&cache]).await;
 }
 
+/// Plants one `document` row straight into the mirror, in its encodings: ids as hyphenated text,
+/// `created_at` as epoch microseconds. Postgres never sees it.
+async fn plant_mirrored_document(
+    cache: &CacheStore,
+    kind: &str,
+    version: i32,
+    step: Option<StepId>,
+) -> DocumentId {
+    let id = DocumentId::new();
+    sqlx::query(
+        "INSERT INTO document (id, item_id, kind, version, title, body, produced_by_step_id, \
+                               created_by, created_at) \
+         VALUES (?, ?, ?, ?, ?, 'body', ?, ?, 0)",
+    )
+    .bind(id.as_uuid().to_string())
+    .bind(ids::HTUI_ANA_1.as_uuid().to_string())
+    .bind(kind)
+    .bind(version)
+    .bind(format!("{kind} v{version}"))
+    .bind(step.map(|step| step.as_uuid().to_string()))
+    .bind(ids::USER.as_uuid().to_string())
+    .execute(cache.pool())
+    .await
+    .unwrap_or_else(|e| panic!("plant {kind} v{version} in the mirror: {e}"));
+    id
+}
+
+/// A document whose producing step the mirror does not hold yet competes in the step-produced
+/// arm, never the hand-written one (MOD-73 plan D3, review LOW-1).
+///
+/// This is the mid-pass shape `CacheStore::resolve_inputs` documents: `run_pass` commits
+/// `document` before `run_step`, so a reader between the two sees `produced_by_step_id` naming a
+/// step whose `LEFT JOIN` comes back empty. Postgres cannot hold such a row (the column is a
+/// foreign key), so the case is mirror-only and the rows are planted straight into SQLite after a
+/// refresh. The inner partition is keyed on `d.produced_by_step_id IS NULL`; keyed on the join's
+/// `s.id IS NULL` instead, the step-less row would join the hand-written arm and, being the
+/// newest there, be read over a real pick. Each assertion below fails under that key:
+///
+/// - **winner v1 + step-less v2.** Under D3 both sit in the step-produced arm, where v1 ranks 0
+///   (its step is `RUN_1`'s) and v2 ranks 2, so v1 is read. Keyed on the join, v2 would be the
+///   lone hand-written row and newer than v1, so v2 would be read.
+/// - **winner v1 + hand-written v2 + step-less v3.** Under D3 the step-produced arm picks v1, the
+///   hand-written arm v2, and v2 is newer. Keyed on the join, v2 and v3 share the hand-written arm,
+///   v3 out-versions v2 there, and v3 would be read.
+#[tokio::test]
+async fn a_document_whose_step_has_not_arrived_is_never_hand_written() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("the pass that mirrors the fixture's steps");
+
+    let not_yet_mirrored = StepId::new();
+    let mirrored_steps = |step: StepId| {
+        let cache = &cache;
+        async move {
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM run_step WHERE id = ?")
+                .bind(step.as_uuid().to_string())
+                .fetch_one(cache.pool())
+                .await
+                .expect("count a mirrored step")
+        }
+    };
+    assert_eq!(
+        mirrored_steps(ids::STEP_PLAN).await,
+        1,
+        "the winner's step is mirrored"
+    );
+    assert_eq!(
+        mirrored_steps(not_yet_mirrored).await,
+        0,
+        "the step-less row's step is not"
+    );
+
+    let read = |kind: &'static str| {
+        let cache = &cache;
+        async move {
+            cache
+                .resolve_inputs(ids::HTUI_ANA_1, ids::RUN_1, &[kind.to_owned()])
+                .await
+                .expect("the mirror resolves")
+                .first()
+                .and_then(|row| row.document.as_ref())
+                .map(|document| document.id)
+        }
+    };
+
+    let kind = "mid-pass-over-a-winner";
+    let winner = plant_mirrored_document(&cache, kind, 1, Some(ids::STEP_PLAN)).await;
+    plant_mirrored_document(&cache, kind, 2, Some(not_yet_mirrored)).await;
+    assert_eq!(
+        read(kind).await,
+        Some(winner),
+        "the step-less v2 ranks 2 in the step-produced arm, below RUN_1's own v1, and is not a \
+         hand-written row that out-versions it"
+    );
+
+    let kind = "mid-pass-over-a-hand-written-row";
+    plant_mirrored_document(&cache, kind, 1, Some(ids::STEP_PLAN)).await;
+    let hand_written = plant_mirrored_document(&cache, kind, 2, None).await;
+    plant_mirrored_document(&cache, kind, 3, Some(not_yet_mirrored)).await;
+    assert_eq!(
+        read(kind).await,
+        Some(hand_written),
+        "the hand-written v2 is newer than the step-produced pick v1; the step-less v3 is not in \
+         the hand-written arm, so it never out-versions v2"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// The §7.3 walk never renders the root as its own upstream entry, even when the graph loops back
 /// to it (T68, F-52 review, H3).
 ///
