@@ -10,11 +10,20 @@
 //!
 //! - [`protocol`]: JSON-RPC 2.0 / MCP over newline-delimited JSON, against a
 //!   [`protocol::Handler`] (D2).
+//! - [`channel`]: the listener, the handshake and the child's [`relay`] (D3).
+//! - [`host`]: [`McpHost`], htui's `ToolHost` (D5), and its in-process [`McpClient`].
 //! - [`search`]: the `search_concepts` seam, in this crate's own types (D12, blueprint B-3).
+//! - `tools`: the eight tools, one file each, in one fixed table (blueprint §2.10).
 #![warn(missing_docs)]
 
+pub mod channel;
+pub mod host;
 pub mod protocol;
 pub mod search;
+mod tools;
+
+pub use channel::{Address, Refusal, RelayError, Token, relay};
+pub use host::{McpClient, McpHost};
 
 /// The server name the agent sees: tools read `mcp__htui__<tool>`.
 pub const SERVER_NAME: &str = "htui";
