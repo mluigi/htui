@@ -6284,3 +6284,173 @@ async fn a_bound_persona_cannot_be_deleted() {
 
     db.drop_db().await;
 }
+
+/// MOD-11 plan D13, R-12: `write_step_document` and `park_step` take their locks in one order,
+/// run → item, so a step's document racing its own park never deadlocks (`40P01`).
+///
+/// `park_step` locks the step and its run `FOR UPDATE`, then updates the item; the document write
+/// reads the run `FOR SHARE`, locks the item `FOR UPDATE` and inserts a row whose foreign key
+/// takes `FOR KEY SHARE` on the step. Fifty rounds, each on a fresh running step of one leased
+/// run, with the two writes on two independent pools (`admission_is_serialised_by_the_box_row_lock`'s
+/// reason). Both always land — a park does not release the lease, so the fence still holds after
+/// it — and every round ends in the one state both orders reach: the step, the run and the item
+/// parked, and the document stored under the step.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_step_document_racing_a_park_never_deadlocks() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let item = ids::HTUI_ANA_2;
+    let owner = uuid::Uuid::now_v7();
+    let fence = StepFence::Lease(owner);
+    let run = db
+        .store
+        .create_run(race_run(item))
+        .await
+        .expect("queue a graph run")
+        .id;
+    assert_eq!(
+        db.store
+            .claim_run(run, ids::BOX, owner, Utc::now(), TimeDelta::minutes(30))
+            .await
+            .expect("claim the run"),
+        Claim::Admitted,
+        "the owner leases the run"
+    );
+    let parker = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("second pool")
+        .store;
+    let writer = PgStore::connect(&db.url, &db.identity)
+        .await
+        .expect("third pool")
+        .store;
+
+    for round in 0..50 {
+        let step = db
+            .store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position: round,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: None,
+            })
+            .await
+            .expect("create the round's step")
+            .id;
+        assert!(
+            db.store
+                .transition_step(
+                    step,
+                    htui_core::model::StepStatus::Pending,
+                    htui_core::model::StepStatus::Running,
+                    Utc::now(),
+                )
+                .await
+                .expect("start the step"),
+            "round {round}: the step starts"
+        );
+        let document = htui_core::model::NewDocument {
+            id: htui_core::model::DocumentId::new(),
+            item_id: item,
+            kind: "judge".to_owned(),
+            title: format!("round {round}"),
+            body: String::new(),
+            produced_by_step_id: Some(step),
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        };
+        let id = document.id;
+
+        let (parked, written) = tokio::join!(
+            parker.park_step(fence, step),
+            writer.write_step_document(fence, document),
+        );
+        for (what, outcome) in [
+            ("park", parked.as_ref().map(|_| ())),
+            ("document", written.as_ref().map(|_| ())),
+        ] {
+            if let Err(error) = outcome {
+                assert!(
+                    !error.to_string().contains("deadlock"),
+                    "round {round}: the {what} deadlocked: {error}"
+                );
+                panic!("round {round}: the {what} must not fail, got {error}");
+            }
+        }
+        assert_eq!(
+            parked.expect("checked above"),
+            htui_core::store::ParkOutcome::Parked,
+            "round {round}: the park lands whichever write commits first"
+        );
+        assert_eq!(
+            written.expect("checked above").produced_by_step_id,
+            Some(step),
+            "round {round}: the document lands under the step, before or after the park"
+        );
+
+        let stored = db
+            .store
+            .document(id)
+            .await
+            .expect("read the document back")
+            .map(|row| row.produced_by_step_id);
+        let step_status = db
+            .store
+            .run_steps(run)
+            .await
+            .expect("read the steps")
+            .into_iter()
+            .find(|row| row.id == step)
+            .map(|row| row.status);
+        let run_status = db
+            .store
+            .run(run)
+            .await
+            .expect("read the run")
+            .map(|r| r.status);
+        let item_status = db
+            .store
+            .item(item)
+            .await
+            .expect("read the item")
+            .map(|i| i.status);
+        assert_eq!(
+            (stored, step_status, run_status, item_status),
+            (
+                Some(Some(step)),
+                Some(htui_core::model::StepStatus::AwaitingApproval),
+                Some(RunStatus::AwaitingApproval),
+                Some(Status::AwaitingApproval),
+            ),
+            "round {round}: either order ends with the document stored and everything parked"
+        );
+
+        // The next round races a running step of a running run on an in-progress item again.
+        assert!(
+            db.store
+                .transition_run(
+                    run,
+                    RunStatus::AwaitingApproval,
+                    RunStatus::Running,
+                    Utc::now()
+                )
+                .await
+                .expect("resume the run"),
+            "round {round}: the run resumes"
+        );
+        assert!(
+            db.store
+                .transition(item, Status::AwaitingApproval, Status::InProgress)
+                .await
+                .expect("resume the item"),
+            "round {round}: the item resumes"
+        );
+    }
+
+    db.drop_db().await;
+}

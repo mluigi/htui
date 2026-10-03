@@ -16335,7 +16335,9 @@ async fn live_link<S: ReadStore>(
 
 /// MOD-11 D13: [`WriteStore::write_step_document`] writes the step's own item under its run's
 /// lease, a new version per call ("newest wins"); after a stranger takes the lease the old
-/// owner is `Fenced` and writes nothing, and so is an unleased fence on a leased run.
+/// owner is `Fenced` and writes nothing, and so is an unleased fence on a leased run. The
+/// concurrency half, a step's document racing its own park, is Postgres-only:
+/// `pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`.
 async fn write_step_document_fenced_and_versioned<S: WriteStore>(store: &S) {
     const CASE: &str = "write_step_document_fenced_and_versioned";
     let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
