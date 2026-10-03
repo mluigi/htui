@@ -3750,6 +3750,19 @@ where
         )
     }
 
+    /// MOD-37 M4 D1 (review L3): [`Self::remaining`] as an instant on tokio's monotonic clock,
+    /// fixed when the remainder is read, so the session's start counts against it. A remainder
+    /// past the platform's last instant reads as no deadline, as `remaining` reads one too large
+    /// for a `TimeDelta`.
+    fn deadline_at(
+        &self,
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+    ) -> Option<tokio::time::Instant> {
+        let left = Self::remaining(phase, started_at, self.now())?;
+        tokio::time::Instant::now().checked_add(left)
+    }
+
     /// `running -> failed`, then the run, with `reason` as `run.failure` (`docs/ANA-2.md:639`).
     ///
     /// The one shape both of the walk's hard failures use: stage 3's missing input, and any error
@@ -4180,7 +4193,7 @@ where
         let key = SessionKey::of(step);
         let mut recorder = self.open_recorder(run, step, prompt).await?;
         // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48).
-        let deadline = Self::remaining(phase, started_at, self.now());
+        let deadline = self.deadline_at(phase, started_at);
         let Driven {
             result,
             cut: deadline_cut,
@@ -5820,7 +5833,7 @@ where
     ) -> Result<(Driven, Option<htui_agent::record::CapBreach>), EngineError> {
         let mut recorder = self.open_recorder(run, step, prompt).await?;
         // MOD-37 M4 D1: what is left of the step deadline as the session starts.
-        let deadline = Self::remaining(phase, started_at, self.now());
+        let deadline = self.deadline_at(phase, started_at);
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
         // recorder has already written the prompt row, so it is closed out on this path exactly as
         // it is on a `pump` error. What it is *not* is a settle outcome — ANA-2 `:639` gives
@@ -5910,7 +5923,7 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "the session's four coordinates, the persona stage 3 froze and its three per-call \
-                  inputs, and the step deadline's remainder (MOD-37 M4 D1); a struct would be built at \
+                  inputs, and the step deadline's instant (MOD-37 M4 D1); a struct would be built at \
                   exactly three call sites and read here only"
     )]
     async fn drive_once(
@@ -5923,7 +5936,7 @@ where
         text: &str,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
-        deadline: Option<std::time::Duration>,
+        deadline: Option<tokio::time::Instant>,
         recorder: &mut Recorder<'a, S>,
     ) -> Result<Driven, EngineError> {
         let project = self.project(run.project_id).await?;
@@ -5966,6 +5979,9 @@ where
             resume: None,
             budget_micros: settings.per_token_cap_run,
         };
+        // MOD-37 M4 (review L3): `deadline` was fixed before the start, so the start counts
+        // against it; the start itself is not under it - a hung start is bounded by the driver's
+        // own handshake timeout.
         let mut session = driver.start(spec, text.to_owned()).await?;
         let now = || self.now();
         let relay = Relay {
@@ -5980,15 +5996,19 @@ where
             now: &now,
         };
         // MOD-37 M4 D1: under a deadline `drive` runs against a step-local control, which
-        // `forward_or_cut` feeds from the run's; without one, against the run's own.
-        let (local, mut step_control) = control_channel();
-        let (outer, drive_control) = match deadline {
-            Some(_) => {
-                // A cancel that reached the run during `driver.start` is already the step's.
-                if control.signal().is_cancel() {
-                    local.send_replace(control.signal());
-                }
-                (Some(&mut control), &mut step_control)
+        // `forward_or_cut` feeds from the run's; without one, against the run's own, and no
+        // step-local channel is made.
+        let mut timed = deadline.map(|until| {
+            let (local, step_control) = control_channel();
+            // A cancel that reached the run during `driver.start` is already the step's.
+            if control.signal().is_cancel() {
+                local.send_replace(control.signal());
+            }
+            (until, local, step_control)
+        });
+        let (outer, drive_control) = match &mut timed {
+            Some((until, local, step_control)) => {
+                (Some((*until, &*local, &mut control)), step_control)
             }
             None => (None, &mut control),
         };
@@ -5998,11 +6018,11 @@ where
         // a `drive` built inside it put a second `drive`-sized slot in every poll frame of the
         // session, past the 2 MiB worker stack on the Postgres walk tests.
         let driving = Box::pin(drive(&mut *session, recorder, Some(&relay), drive_control));
-        let (driven, cut) = match (deadline, outer) {
-            (Some(left), Some(outer)) => {
-                Box::pin(drive_with_deadline(driving, outer, &local, left)).await
+        let (driven, cut) = match outer {
+            Some((until, local, outer)) => {
+                Box::pin(drive_with_deadline(driving, outer, local, until)).await
             }
-            _ => (driving.await, false),
+            None => (driving.await, false),
         };
         // MOD-42 D4, D10: two answers leave the session result before settle can read them.
         match driven {
@@ -6409,14 +6429,14 @@ const fn is_fenced(err: &EngineError) -> bool {
 }
 
 /// MOD-37 M4 D1: [`drive`] under the step deadline. `driving` runs against a step-local control
-/// fed by `local`; [`forward_or_cut`] copies the run's cancel into it and, after `left`, sends the
+/// fed by `local`; [`forward_or_cut`] copies the run's cancel into it and, at `until`, sends the
 /// deadline's own. Answers `drive`'s result and whether the deadline's cancel is the one `drive`
 /// saw.
 async fn drive_with_deadline<F>(
     driving: F,
     control: &mut Control,
     local: &watch::Sender<Signal>,
-    left: std::time::Duration,
+    until: tokio::time::Instant,
 ) -> (SessionResult, bool)
 where
     F: Future<Output = SessionResult> + Unpin,
@@ -6425,21 +6445,22 @@ where
     let driven = tokio::select! {
         biased;
         driven = driving => driven,
-        never = forward_or_cut(control, local, left, &mut cut) => match never {},
+        never = forward_or_cut(control, local, until, &mut cut) => match never {},
     };
     (driven, cut)
 }
 
-/// MOD-37 M4 D1: forwards the run's cancel into `local`, and after `left` sends `Cancel { grace:
+/// MOD-37 M4 D1: forwards the run's cancel into `local`, and at `until` sends `Cancel { grace:
 /// RELAY_GRACE }` unless a cancel is there already; `cut` says the deadline's was the one sent.
-/// Never ends: [`drive_with_deadline`] drops it when `drive` answers.
+/// Never ends: [`drive_with_deadline`] drops it when `drive` answers. `until` is absolute (review
+/// L3): a timer started at this first poll would be late by the session's start.
 async fn forward_or_cut(
     control: &mut Control,
     local: &watch::Sender<Signal>,
-    left: std::time::Duration,
+    until: tokio::time::Instant,
     cut: &mut bool,
 ) -> core::convert::Infallible {
-    let mut timer = std::pin::pin!(tokio::time::sleep(left));
+    let mut timer = std::pin::pin!(tokio::time::sleep_until(until));
     // A finished `Sleep` polls `Ready` again, so the arm is disarmed after it fires (no spin).
     let mut armed = true;
     let cancel_once = |to: Signal| {
