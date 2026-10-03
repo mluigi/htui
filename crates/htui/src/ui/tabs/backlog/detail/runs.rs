@@ -1384,9 +1384,13 @@ impl DetailTab for RunsTab {
     }
 
     /// MOD-71 D1: the flow view while browsing. The list, a modal and the artifact view keep the
-    /// terminal's own text selection.
+    /// terminal's own text selection, and so does a flow with no canvas to click (review L2): no
+    /// item, no run, or a cursor run with no step yet — what `render_flow` needs to draw one.
     fn wants_mouse(&self) -> bool {
-        self.view == View::Flow && matches!(self.mode, Mode::Browse)
+        self.view == View::Flow
+            && matches!(self.mode, Mode::Browse)
+            && self.item.is_some()
+            && self.entry_run().is_some_and(|run| !run.steps.is_empty())
     }
 
     /// MOD-71 D5, D6: a left press or the wheel inside the canvas the last frame drew, and the
@@ -4157,6 +4161,34 @@ mod tests {
         }
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         assert!(!pane.wants_mouse(), "back on the list");
+    }
+
+    /// Review L2: a flow with nothing to click keeps the terminal's selection: no item, an item
+    /// with no run, and a cursor run with no step yet draw no canvas.
+    #[tokio::test]
+    async fn an_empty_flow_does_not_want_the_mouse() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert_eq!(pane.view, View::Flow);
+        assert!(!pane.wants_mouse(), "no item");
+
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        assert!(!pane.wants_mouse(), "an item with no run");
+
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(
+            &StoreReply::Runs(vec![stepless_run().await]),
+            &mut shell.ctx(),
+        );
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        assert_eq!(pane.view, View::Flow);
+        assert!(!pane.wants_mouse(), "a run with no step yet");
+
+        let (pane, _) = flowing(&shell).await;
+        assert!(pane.wants_mouse(), "a run with steps");
     }
 
     /// D6: a click on a node moves the shared cursor to its step, and the flow selects it.
