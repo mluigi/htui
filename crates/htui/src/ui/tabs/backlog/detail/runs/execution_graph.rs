@@ -7,6 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crossterm::event::MouseEvent;
 use htui_core::model::{RunId, RunStepSummary, RunSummary, StepId, StepStatus, ToolCallCount};
 use rataflow::{
     ControlsAction, Edge, EdgeStyle, Flow, Handle, HandlePosition, Node, NodeContent,
@@ -376,6 +377,14 @@ fn edge(
     }
 }
 
+/// Whether rataflow draws into `area` at all (`ui/canvas.rs:42`): what `render` needs before it
+/// measures a reveal (review L1), and what the Runs pane needs before it hit-tests a press
+/// against the area rataflow recorded on that draw (MOD-71 D5, blueprint B-7).
+#[expect(dead_code, reason = "MOD-71 T3's next commits call it")]
+pub(super) const fn drawable(area: Rect) -> bool {
+    area.width >= 2 && area.height >= 2
+}
+
 /// Blueprint E4: what the next `render` does to the viewport before it draws.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 enum Reveal {
@@ -549,6 +558,24 @@ impl ExecutionGraph {
         self.reveal = self.reveal.max(Reveal::Cursor);
     }
 
+    /// MOD-71 D5, D6, D8: one mouse event on the canvas, in terminal coordinates — rataflow maps
+    /// them through the area the last `render` drew (`ui/canvas.rs:37`). A left press on empty
+    /// canvas or on an edge (never selectable, so never hit) pans; the wheel zooms at the pointer
+    /// within 0.5–2.0 (D9); a left press on a node is a click when it is released, wherever that
+    /// is. Every other kind is dropped (blueprint E2).
+    ///
+    /// The clicked step, if this event completed a click; the pane moves the cursor (D6). No
+    /// reveal is queued (D7). After every event the flow's selection is put back on the cursor
+    /// (blueprint E1): rataflow selects a pressed node at once (`state/mouse.rs:230-237`), and
+    /// the flow keeps no selection of its own (MOD-28 D7).
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "MOD-71 T3's runs.rs commit calls it")
+    )]
+    pub(super) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<StepId> {
+        todo!("MOD-71 T3")
+    }
+
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
     ///
     /// A canvas under 2x2 draws nothing (`rataflow` `ui/canvas.rs:42`), so a reveal measured
@@ -601,6 +628,7 @@ impl ExecutionGraph {
 mod tests {
     use std::collections::BTreeSet;
 
+    use crossterm::event::{KeyModifiers, MouseButton, MouseEventKind};
     use htui_core::fixtures::demo_at;
     use htui_core::model::{BoxId, ProjectId, RunId, RunKind, RunMode, RunStatus, StepStatus};
     use ratatui::style::{Color, Modifier};
@@ -1604,5 +1632,264 @@ mod tests {
             rows.iter().any(|row| row.contains("\u{2692} read\u{d7}1")),
             "{rows:#?}"
         );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-71 T3: the mouse (plan D5-D9).
+    // ---------------------------------------------------------------------------------------------
+
+    /// A left press.
+    const DOWN: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+    /// A left drag.
+    const DRAG: MouseEventKind = MouseEventKind::Drag(MouseButton::Left);
+    /// A left release.
+    const UP: MouseEventKind = MouseEventKind::Up(MouseButton::Left);
+
+    /// `kind` at cell `(column, row)`, no modifier. `draw` is at `(0, 0)`, so a buffer cell is the
+    /// terminal cell rataflow maps (blueprint H-8).
+    fn mouse(kind: MouseEventKind, (column, row): (u16, u16)) -> MouseEvent {
+        MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    /// A left press then its release at `at`: a click. The press answers `None`.
+    fn click(graph: &mut ExecutionGraph, at: (u16, u16)) -> Option<StepId> {
+        assert_eq!(
+            graph.on_mouse(mouse(DOWN, at)),
+            None,
+            "a press clicks nothing yet"
+        );
+        graph.on_mouse(mouse(UP, at))
+    }
+
+    /// A left press at `from`, a drag to `to`, the release there: the release's answer.
+    fn drag(graph: &mut ExecutionGraph, from: (u16, u16), to: (u16, u16)) -> Option<StepId> {
+        assert_eq!(
+            graph.on_mouse(mouse(DOWN, from)),
+            None,
+            "a press clicks nothing yet"
+        );
+        assert_eq!(
+            graph.on_mouse(mouse(DRAG, to)),
+            None,
+            "a drag clicks nothing"
+        );
+        graph.on_mouse(mouse(UP, to))
+    }
+
+    /// Every node's id and world corner, in flow order.
+    fn positions(graph: &ExecutionGraph) -> Vec<(String, (f64, f64))> {
+        graph
+            .flow
+            .nodes()
+            .map(|node| (node.id.clone(), (node.position.x, node.position.y)))
+            .collect()
+    }
+
+    /// How many nodes the flow has selected.
+    fn selected_count(graph: &ExecutionGraph) -> usize {
+        graph.flow.nodes().filter(|node| node.selected).count()
+    }
+
+    /// Asserts `at` is blank in `buf`, so a press there lands on empty canvas.
+    fn assert_blank(buf: &Buffer, at: (u16, u16)) {
+        assert_eq!(
+            buf[at].symbol(),
+            " ",
+            "{at:?} is not blank: {:#?}",
+            rows(buf)
+        );
+    }
+
+    /// The viewport's offset moved by `(dx, dy)` from `before`, its zoom unchanged.
+    fn assert_panned(graph: &ExecutionGraph, before: Viewport, (dx, dy): (f64, f64)) {
+        let now = graph.flow.viewport;
+        assert!(
+            (now.x - (before.x + dx)).abs() < f64::EPSILON,
+            "{now:?} vs {before:?}"
+        );
+        assert!(
+            (now.y - (before.y + dy)).abs() < f64::EPSILON,
+            "{now:?} vs {before:?}"
+        );
+        assert!((now.zoom - before.zoom).abs() < f64::EPSILON);
+    }
+
+    /// D6: a click on a node's interior answers its step; the graph leaves the cursor to the pane.
+    #[test]
+    fn a_click_on_a_node_is_its_step() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "1.1 done");
+        assert_eq!(click(&mut graph, (x + 2, y + 2)), Some(id(1)));
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+    }
+
+    /// Blueprint E1, B-1: rataflow selects a pressed node at once; the graph puts the selection
+    /// back on the cursor before the release.
+    #[test]
+    fn a_press_on_a_node_keeps_the_cursor_selected() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "1.1 done");
+        assert_eq!(graph.on_mouse(mouse(DOWN, (x + 2, y + 2))), None);
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+        assert_eq!(selected_count(&graph), 1);
+    }
+
+    /// D5, MOD-28 D9: a drag on empty canvas moves the viewport by the drag and no node.
+    #[test]
+    fn a_drag_on_empty_canvas_pans_and_moves_no_node() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        let before = graph.flow.viewport;
+        let nodes = positions(&graph);
+        assert_eq!(drag(&mut graph, (2, 12), (5, 14)), None);
+        assert_panned(&graph, before, (3.0, 2.0));
+        assert_eq!(positions(&graph), nodes);
+    }
+
+    /// D6: a press on a node is a click wherever it is released (`AwaitingNodeClick` ignores the
+    /// drag, `state/mouse.rs:819`), and nothing moves.
+    #[test]
+    fn a_node_press_dragged_away_is_still_a_click() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "1.1 done");
+        let before = graph.flow.viewport;
+        let nodes = positions(&graph);
+        assert_eq!(
+            drag(&mut graph, (x + 2, y + 2), (x + 7, y + 5)),
+            Some(id(1))
+        );
+        assert_eq!(graph.flow.viewport, before);
+        assert_eq!(positions(&graph), nodes);
+    }
+
+    /// D9: the wheel zooms by the keys' step, clamped to MOD-28's 0.5-2.0.
+    #[test]
+    fn the_wheel_zooms_at_the_pointer_within_the_flow_s_range() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        draw(&mut graph);
+        for _ in 0..10 {
+            assert_eq!(
+                graph.on_mouse(mouse(MouseEventKind::ScrollUp, (21, 3))),
+                None
+            );
+        }
+        assert!((graph.zoom() - 2.0).abs() < 1e-9, "{}", graph.zoom());
+        for _ in 0..10 {
+            assert_eq!(
+                graph.on_mouse(mouse(MouseEventKind::ScrollDown, (21, 3))),
+                None
+            );
+        }
+        assert!((graph.zoom() - 0.5).abs() < 1e-9, "{}", graph.zoom());
+    }
+
+    /// Blueprint E2, B-9: a right-drag over both nodes would be rataflow's box selection; it never
+    /// reaches the flow.
+    #[test]
+    fn a_right_drag_selects_nothing() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        draw(&mut graph);
+        for (kind, at) in [
+            (MouseEventKind::Down(MouseButton::Right), (2, 12)),
+            (MouseEventKind::Drag(MouseButton::Right), (40, 20)),
+            (MouseEventKind::Up(MouseButton::Right), (40, 20)),
+        ] {
+            assert_eq!(graph.on_mouse(mouse(kind, at)), None);
+        }
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+        assert_eq!(selected_count(&graph), 1);
+    }
+
+    /// D6, blueprint B-2: an edge is never selectable, so a press on one pans like the pane.
+    #[test]
+    fn an_edge_press_pans() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "0.1 done");
+        let row = y + 6;
+        let column = (buf.area.left()..buf.area.right())
+            .find(|column| buf[(*column, row)].symbol() != " ")
+            .expect("the edge is drawn between the two nodes");
+        assert!(column > x, "the edge is right of the node's left border");
+        let before = graph.flow.viewport;
+        assert_eq!(drag(&mut graph, (column, row), (column + 3, row + 1)), None);
+        assert_panned(&graph, before, (3.0, 1.0));
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+    }
+
+    /// D6: a click on empty canvas keeps the cursor node selected (rataflow's default clears it).
+    #[test]
+    fn a_pane_click_keeps_the_cursor_node_selected() {
+        let mut graph = synced(&linear(2), Some(id(1)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        assert_eq!(click(&mut graph, (2, 12)), None);
+        assert_eq!(graph.selected(), Some(id(1).to_string()));
+    }
+
+    /// A three-step run, the cursor on the first, panned up until its node is off screen.
+    fn panned() -> ExecutionGraph {
+        let mut graph = synced(&linear(3), Some(id(0)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 20));
+        assert_eq!(drag(&mut graph, (2, 20), (2, 2)), None);
+        let rows = rows(&draw(&mut graph));
+        assert!(
+            !rows.iter().any(|row| row.contains("0.1 done")),
+            "the pan took the cursor node off screen: {rows:#?}"
+        );
+        graph
+    }
+
+    /// D7: a same-run re-read with the cursor where it was leaves a pan where the user put it.
+    #[test]
+    fn a_re_read_after_a_pan_keeps_the_viewport() {
+        let mut graph = panned();
+        let before = graph.flow.viewport;
+        let mut changed = linear(3);
+        changed.steps[2].status = StepStatus::Running;
+        graph.sync(
+            Some(&changed),
+            Some(id(0)),
+            &BTreeMap::new(),
+            &Theme::default(),
+        );
+        let rows = rows(&draw(&mut graph));
+        assert_eq!(graph.flow.viewport, before);
+        assert!(
+            !rows.iter().any(|row| row.contains("0.1 done")),
+            "{rows:#?}"
+        );
+    }
+
+    /// D7: a cursor change still reveals the cursor.
+    #[test]
+    fn a_cursor_change_reveals_the_cursor() {
+        let mut graph = panned();
+        graph.sync(
+            Some(&linear(3)),
+            Some(id(1)),
+            &BTreeMap::new(),
+            &Theme::default(),
+        );
+        let rows = rows(&draw(&mut graph));
+        assert!(rows.iter().any(|row| row.contains("1.1 done")), "{rows:#?}");
+    }
+
+    /// D7, blueprint E5: a canvas of a new size reveals the cursor.
+    #[test]
+    fn a_resize_reveals_the_cursor() {
+        let mut graph = panned();
+        let rows = rows(&draw_at(&mut graph, 43, 20));
+        assert!(rows.iter().any(|row| row.contains("0.1 done")), "{rows:#?}");
     }
 }

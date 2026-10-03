@@ -168,9 +168,11 @@ shell-words            = "1.1"
 url                    = "2.5"
 # MOD-28 D4: the Runs pane's flow view (ANA-12). No default features: `sugiyama` would pull in
 # rust-sugiyama, petgraph and second copies of hashbrown/foldhash, and our layered layout sets
-# every position itself. `crossterm` is for the mouse follow-up. Adds one crate; its two
-# dependencies (`ratatui`, `thiserror`) are already locked.
-rataflow               = { version = "0.1", default-features = false }
+# every position itself. MOD-71 D10: `crossterm` is `From<crossterm::event::MouseEvent>` for the
+# flow's mouse (`input.rs:218-300`); it turns on `ratatui/crossterm`, which the default-featured
+# `ratatui` already has, so `Cargo.lock` does not move. Adds one crate; its two dependencies
+# (`ratatui`, `thiserror`) are already locked.
+rataflow               = { version = "0.1", default-features = false, features = ["crossterm"] }
 
 [workspace.lints.rust]
 unsafe_code                   = "forbid"

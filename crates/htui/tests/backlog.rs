@@ -8,6 +8,7 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use crossterm::event::{MouseButton, MouseEventKind};
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, RevealKind};
 use htui::editor::{ExternalEdit, ExternalEditOutcome};
@@ -908,6 +909,111 @@ async fn the_flow_draws_the_plan_step_s_tool_call_as_a_chip() {
         "only the plan step made a call:\n{frame}"
     );
     insta::assert_snapshot!("runs_flow_tool_chips", frame);
+}
+
+/// The cell `needle` starts at in a frame, `(column, row)`. Every glyph in a Backlog frame is one
+/// cell wide (box drawing, `…`, `✓`, `·`), so a char count is a column.
+fn cell_of(frame: &str, needle: &str) -> (u16, u16) {
+    frame
+        .lines()
+        .enumerate()
+        .find_map(|(row, line)| {
+            let byte = line.find(needle)?;
+            Some((
+                u16::try_from(line[..byte].chars().count()).expect("the column fits"),
+                u16::try_from(row).expect("the row fits"),
+            ))
+        })
+        .unwrap_or_else(|| panic!("`{needle}` is drawn:\n{frame}"))
+}
+
+/// The list row of the slot `slot` in a frame: the line that names it.
+fn listed<'a>(frame: &'a str, slot: &str) -> &'a str {
+    frame
+        .lines()
+        .find(|line| line.contains(slot))
+        .unwrap_or_else(|| panic!("`{slot}` is listed:\n{frame}"))
+}
+
+/// MOD-71 D1, D6, ANA-12 invariant 2: in the flow, a click on `ANA-1`'s losing candidate moves the
+/// shared cursor to it, so `a` answers for that step, and the list shows the cursor there.
+#[tokio::test]
+async fn a_click_in_the_flow_moves_the_cursor_an_action_key_reads() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, 1);
+    assert!(
+        !harness.app().wants_mouse(),
+        "the list keeps the terminal's selection"
+    );
+    harness.key("v");
+    harness.drive_to_end().await;
+    assert!(harness.app().wants_mouse(), "the flow wants the mouse");
+    let (column, row) = cell_of(&harness.render(), "0.1/1 superseded");
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column, row);
+
+    let verdicts = run_worker::actions(
+        &Backend::memory(MemStore::demo()),
+        ids::HTUI_ANA_1,
+        &LiveChats::default(),
+    )
+    .await
+    .expect("the verdicts read");
+    let sentence = verdicts.steps[&ids::STEP_R3_RESEARCH_B]
+        .approve
+        .clone()
+        .expect_err("a step of a finished run cannot be approved");
+    harness.key("a");
+    harness.drive().await;
+    assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
+
+    harness.key("v");
+    harness.drive_to_end().await;
+    assert!(!harness.app().wants_mouse());
+    let frame = harness.render();
+    assert!(
+        listed(&frame, "0.1/1").contains('\u{25b8}'),
+        "the list's cursor is on the clicked step:\n{frame}"
+    );
+}
+
+/// MOD-71 D5, D9: a drag on empty canvas moves the drawn nodes by the drag, and the wheel redraws
+/// them at another zoom; neither moves the cursor.
+#[tokio::test]
+async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, 1);
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    let (column, row) = cell_of(&frame, "0.1/0 done");
+    let below = frame
+        .lines()
+        .nth(usize::from(row + 8))
+        .and_then(|line| line.chars().nth(usize::from(column)));
+    assert_eq!(below, Some(' '), "a blank canvas cell:\n{frame}");
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row + 8);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), column + 2, row + 9);
+    harness.mouse(MouseEventKind::Up(MouseButton::Left), column + 2, row + 9);
+    let panned = harness.render();
+    assert_eq!(
+        cell_of(&panned, "0.1/0 done"),
+        (column + 2, row + 1),
+        "the nodes moved by the drag:\n{panned}"
+    );
+
+    harness.mouse(MouseEventKind::ScrollDown, column + 2, row + 9);
+    let zoomed = harness.render();
+    assert_ne!(zoomed, panned, "the wheel redrew the flow");
+
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        listed(&frame, "0.1/0").contains('\u{25b8}'),
+        "the cursor stayed on the first candidate:\n{frame}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
