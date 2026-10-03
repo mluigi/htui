@@ -1814,8 +1814,9 @@ pub trait WriteStore: ReadStore {
     // -- MOD-11: agent writes (plan D13, B-4..B-6) ------------------------------------------
 
     /// D13: [`write_document`](Self::write_document) for a step's own item under its fence. One
-    /// transaction; the run's row `FOR SHARE` first, then the item `FOR UPDATE` (run → item, the
-    /// `park_step` order). Several calls write several versions ("newest wins").
+    /// transaction; the step's and its run's rows `FOR SHARE` first, then the item `FOR UPDATE`
+    /// (step → run → item, the `park_step` order). Several calls write several versions ("newest
+    /// wins").
     ///
     /// # Errors
     /// `Constraint(document_needs_a_step())` when `produced_by_step_id` is `None` (before any

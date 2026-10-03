@@ -1,0 +1,103 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO item_link (from_item_id, to_item_id, kind, proposed_by_step_id)\n            VALUES ($1, $2, $3, $4)\n            ON CONFLICT (from_item_id, to_item_id, kind) DO UPDATE\n               SET proposed_by_step_id = CASE WHEN item_link.deleted_at IS NULL\n                                              THEN item_link.proposed_by_step_id\n                                              ELSE EXCLUDED.proposed_by_step_id END,\n                   deleted_at          = NULL\n            RETURNING from_item_id        AS \"from_item_id: ItemId\",\n                      to_item_id          AS \"to_item_id: ItemId\",\n                      kind                AS \"kind: LinkKind\",\n                      proposed_by_step_id AS \"proposed_by_step_id: StepId\",\n                      created_at,\n                      updated_at,\n                      deleted_at\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "from_item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "from_item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "to_item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "to_item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind: LinkKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "proposed_by_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "proposed_by_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "updated_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "updated_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item_link",
+            "name": "deleted_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "3e7994ed29e4942a27813288c585bf97d80734bff9cb6dc724b04f237c9be94d"
+}

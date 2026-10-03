@@ -19,7 +19,7 @@
 //! trigger of the migration owns it, and `RETURNING` sees the trigger-modified row.
 
 use chrono::{DateTime, TimeDelta, Utc};
-use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
+use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BindingChange,
     BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
@@ -45,7 +45,8 @@ use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    EXECUTOR_MUST_BE_KNOWN,
+    EXECUTOR_MUST_BE_KNOWN, document_needs_a_step, link_key, link_not_proposed_by_run,
+    link_outside_project, note_needs_a_step, self_link, step_writes_own_item,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore as _, Result,
@@ -215,6 +216,56 @@ async fn step_fence(conn: &mut PgConnection, step: StepId, fence: StepFence) -> 
     } else {
         Err(StoreError::Fenced { step })
     }
+}
+
+/// MOD-11 F-21: what [`step_scope`] answers — the step's run, its item (`None` for a chat run)
+/// and its project.
+struct StepScope {
+    /// `run.id`.
+    run: RunId,
+    /// `run.item_id`.
+    item: Option<ItemId>,
+    /// `run.project_id`.
+    project: ProjectId,
+}
+
+/// MOD-11 F-21: [`step_fence`] that also answers the run's id, item and project, read in the
+/// caller's transaction. [`StoreError::NotFound`] first, then [`StoreError::Fenced`]:
+/// `step_fence`'s order.
+///
+/// It locks the **step** as well as the run (`FOR SHARE OF s, r`, the order of `park_step`'s
+/// `FOR UPDATE OF s, r`), where `step_fence` locks the run alone. The writes that follow insert a
+/// row whose foreign key takes `FOR KEY SHARE` on the step; with the run alone held, a park that
+/// had locked the step and was waiting for the run made that key lock wait on the park, and the
+/// two deadlocked (`40P01`, round 0 of
+/// `pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`). Holding the step first
+/// makes whichever of the two reaches it first run to its commit.
+async fn step_scope(conn: &mut PgConnection, step: StepId, fence: StepFence) -> Result<StepScope> {
+    let row = sqlx::query!(
+        r#"SELECT r.id          AS "run_id: RunId",
+                  r.item_id     AS "item_id: ItemId",
+                  r.project_id  AS "project_id: ProjectId",
+                  r.lease_owner AS "lease_owner?"
+             FROM run_step s JOIN run r ON r.id = s.run_id
+            WHERE s.id = $1
+              FOR SHARE OF s, r"#,
+        step.as_uuid(),
+    )
+    .fetch_optional(conn)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(|| StoreError::NotFound {
+        entity: "run_step",
+        id: step.to_string(),
+    })?;
+    if row.lease_owner != fence.owner() {
+        return Err(StoreError::Fenced { step });
+    }
+    Ok(StepScope {
+        run: row.run_id,
+        item: row.item_id,
+        project: row.project_id,
+    })
 }
 
 /// MOD-40 plan D1: why a fenced `UPDATE` of `step` matched no row. [`StoreError::NotFound`] when
@@ -6439,24 +6490,237 @@ impl WriteStore for PgStore {
 
     // ---- MOD-11 (D13) ----
 
-    async fn write_step_document(&self, _fence: StepFence, _new: NewDocument) -> Result<Document> {
-        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    /// D13: [`write_document`](WriteStore::write_document) for the step's own item, one
+    /// transaction: [`step_scope`] (the run, `FOR SHARE`), the own-item check, then the item
+    /// `FOR UPDATE` and [`insert_document`] — `park_step`'s run → item order, so the two never
+    /// deadlock (`pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`).
+    ///
+    /// # Errors
+    ///
+    /// As [`WriteStore::write_step_document`].
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        let Some(step) = new.produced_by_step_id else {
+            return Err(StoreError::Constraint(document_needs_a_step()));
+        };
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let scope = step_scope(&mut tx, step, fence).await?;
+        if scope.item != Some(new.item_id) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                step,
+                new.item_id,
+            )));
+        }
+
+        sqlx::query_scalar!(
+            "SELECT 1 FROM item WHERE id = $1 FOR UPDATE",
+            new.item_id.as_uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: new.item_id.to_string(),
+        })?;
+
+        let written = insert_document(&mut tx, new).await?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(written)
     }
 
-    async fn add_step_note(&self, _fence: StepFence, _note: NewNote) -> Result<Note> {
-        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    /// D13: [`add_note`](WriteStore::add_note)'s insert after [`step_scope`] and the own-item
+    /// check, one transaction. No explicit item lock: the foreign key's `FOR KEY SHARE` on `item`
+    /// comes after the run, which keeps the order.
+    ///
+    /// # Errors
+    ///
+    /// As [`WriteStore::add_step_note`].
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
+        let Some(step) = note.via_step_id else {
+            return Err(StoreError::Constraint(note_needs_a_step()));
+        };
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let scope = step_scope(&mut tx, step, fence).await?;
+        if scope.item != Some(note.item_id) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                step,
+                note.item_id,
+            )));
+        }
+
+        let row = sqlx::query_as!(
+            Note,
+            r#"
+            INSERT INTO item_note (id, item_id, body, created_by, box_id, via_step_id, created_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            RETURNING id          AS "id: htui_core::model::NoteId",
+                      item_id     AS "item_id: ItemId",
+                      body,
+                      created_by  AS "created_by: UserId",
+                      box_id      AS "box_id: BoxId",
+                      via_step_id AS "via_step_id: StepId",
+                      created_at
+            "#,
+            note.id.as_uuid(),
+            note.item_id.as_uuid(),
+            note.body,
+            note.created_by.as_uuid(),
+            note.box_id.map(BoxId::as_uuid),
+            note.via_step_id.map(StepId::as_uuid),
+            note.created_at,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 
-    async fn propose_link(&self, _fence: StepFence, _link: ProposeLink) -> Result<ItemLink> {
-        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    /// D13, B-6: the upsert, one transaction after [`step_scope`], the own-item check and `to`'s
+    /// project. A live row keeps its proposer; a tombstone revives with the step as proposer.
+    /// `updated_at` is the `BEFORE UPDATE` trigger's.
+    ///
+    /// # Errors
+    ///
+    /// As [`WriteStore::propose_link`].
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
+        if link.from == link.to {
+            return Err(StoreError::Constraint(self_link(link.from)));
+        }
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let scope = step_scope(&mut tx, link.step, fence).await?;
+        if scope.item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+        let project = sqlx::query_scalar!(
+            r#"SELECT project_id AS "project_id: ProjectId" FROM item WHERE id = $1"#,
+            link.to.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: link.to.to_string(),
+        })?;
+        if project != scope.project {
+            return Err(StoreError::Constraint(link_outside_project(link.to)));
+        }
+
+        let row = sqlx::query_as!(
+            ItemLink,
+            r#"
+            INSERT INTO item_link (from_item_id, to_item_id, kind, proposed_by_step_id)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (from_item_id, to_item_id, kind) DO UPDATE
+               SET proposed_by_step_id = CASE WHEN item_link.deleted_at IS NULL
+                                              THEN item_link.proposed_by_step_id
+                                              ELSE EXCLUDED.proposed_by_step_id END,
+                   deleted_at          = NULL
+            RETURNING from_item_id        AS "from_item_id: ItemId",
+                      to_item_id          AS "to_item_id: ItemId",
+                      kind                AS "kind: LinkKind",
+                      proposed_by_step_id AS "proposed_by_step_id: StepId",
+                      created_at,
+                      updated_at,
+                      deleted_at
+            "#,
+            link.from.as_uuid(),
+            link.to.as_uuid(),
+            link.kind.as_str(),
+            link.step.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 
-    async fn withdraw_link(&self, _fence: StepFence, _link: WithdrawLink) -> Result<ItemLink> {
-        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    /// D13, B-5: tombstones the live link when a step of `link.step`'s run proposed it, one
+    /// transaction after [`step_scope`] and the own-item check; a miss is told apart by one
+    /// re-read of the live row.
+    ///
+    /// # Errors
+    ///
+    /// As [`WriteStore::withdraw_link`].
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let scope = step_scope(&mut tx, link.step, fence).await?;
+        if scope.item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+
+        let row = sqlx::query_as!(
+            ItemLink,
+            r#"
+            UPDATE item_link SET deleted_at = clock_timestamp()
+             WHERE from_item_id = $1 AND to_item_id = $2 AND kind = $3 AND deleted_at IS NULL
+               AND proposed_by_step_id IN (SELECT id FROM run_step WHERE run_id = $4)
+            RETURNING from_item_id        AS "from_item_id: ItemId",
+                      to_item_id          AS "to_item_id: ItemId",
+                      kind                AS "kind: LinkKind",
+                      proposed_by_step_id AS "proposed_by_step_id: StepId",
+                      created_at,
+                      updated_at,
+                      deleted_at
+            "#,
+            link.from.as_uuid(),
+            link.to.as_uuid(),
+            link.kind.as_str(),
+            scope.run.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let Some(row) = row else {
+            let live = sqlx::query_scalar!(
+                "SELECT 1 FROM item_link \
+                  WHERE from_item_id = $1 AND to_item_id = $2 AND kind = $3 AND deleted_at IS NULL",
+                link.from.as_uuid(),
+                link.to.as_uuid(),
+                link.kind.as_str(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            let key = link_key(link.from, link.to, link.kind);
+            return Err(if live.is_some() {
+                StoreError::Constraint(link_not_proposed_by_run(&key))
+            } else {
+                StoreError::NotFound {
+                    entity: "item_link",
+                    id: key,
+                }
+            });
+        };
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(row)
     }
 
-    async fn item_by_key(&self, _project: ProjectId, _key: &str) -> Result<Option<ItemId>> {
-        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    /// B-4: the item of `project` keyed `key`, on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        sqlx::query_scalar!(
+            r#"SELECT id AS "id: ItemId" FROM item WHERE project_id = $1 AND key = $2"#,
+            project.as_uuid(),
+            key,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
     }
 }
 
