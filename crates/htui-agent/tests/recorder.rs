@@ -4313,3 +4313,101 @@ async fn step_digest(store: &SpyStore, chat: &ChatRunSpec) -> Option<String> {
         .expect("the chat step is there")
         .prompt_digest
 }
+
+// ---------------------------------------------------------------------------------------------
+// MOD-37 M5: `htui`'s own `other` rows
+// ---------------------------------------------------------------------------------------------
+
+/// A notice is an `other` row `htui` authors (`role = htui`) in the **current** turn, right after
+/// the tail; the next follow-up opens the next turn. Its payload is `{ update, body }`, so the
+/// replay reads it back as the same `Other` event the tab was sent.
+#[tokio::test]
+async fn a_notice_is_htuis_other_row_in_the_current_turn() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+    recorder
+        .record_prompt("implement the item", json!([]), at())
+        .await
+        .expect("the prompt row must land");
+    recorder
+        .record(chunk("reading first", "m1"))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(tool_call("call-1"))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(tool_result("call-1", json!("contents")))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })))
+        .await
+        .expect("recording must land");
+    recorder.finish().await.expect("close");
+
+    let tail = rows(&store, chat.step_id).await;
+    assert_eq!(
+        tail.iter().map(|row| (row.seq, row.turn)).max(),
+        Some((4, 0)),
+        "the fixture: a tail ending at seq 4, turn 0"
+    );
+
+    let notice = OtherEvent {
+        update: htui_agent::event::RESUME_FAILED.to_owned(),
+        body: json!({
+            "session_id": "banner-1",
+            "reason": "session/load failed: no such session",
+            "note": "context not carried; handoff prompt only",
+        }),
+    };
+    let mut recorder = Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &tail);
+    recorder
+        .record_notice(&notice, at())
+        .await
+        .expect("the notice row must land");
+    recorder
+        .record_follow_up("the handoff", at())
+        .await
+        .expect("the follow-up row must land");
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    let past: Vec<&SessionEvent> = log.iter().filter(|row| row.seq > 4).collect();
+    assert_eq!(past.len(), 2, "the notice and the follow-up, nothing else");
+
+    let row = past[0];
+    assert_eq!(
+        (row.seq, row.turn),
+        (5, 0),
+        "the notice is in the current turn"
+    );
+    assert_eq!(row.kind, EventKind::Other);
+    assert_eq!(row.role, EventRole::Htui, "`htui` authors the notice");
+    assert_eq!(
+        row.payload,
+        json!({ "update": "resume_failed", "body": notice.body }),
+        "the payload is the `OtherEvent` itself"
+    );
+    assert_eq!(
+        htui_agent::replay::envelope_from_row(row)
+            .expect("the notice replays")
+            .event,
+        DriverEvent::Other(notice),
+        "the replay reads back the event the tab was sent"
+    );
+
+    let follow_up = past[1];
+    assert_eq!(follow_up.kind, EventKind::FollowUp);
+    assert_eq!(
+        (follow_up.seq, follow_up.turn),
+        (6, 1),
+        "the next follow-up opens the next turn"
+    );
+}

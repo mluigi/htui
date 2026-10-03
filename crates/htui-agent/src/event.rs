@@ -162,6 +162,10 @@ wire_enum!(
 /// second transport would be a string that can drift from the readers'.
 pub const SESSION_STARTED: &str = "session_started";
 
+/// MOD-37 M5: the update of the `other` row `htui` records when a promoted chat's resume failed and
+/// the chat fell back to the handoff prompt. Body: `{ session_id, reason, note }`.
+pub const RESUME_FAILED: &str = "resume_failed";
+
 /// `error.code` of the row written when the transport ends before the turn does.
 ///
 /// Shared for [`SESSION_STARTED`]'s reason: a child that dies mid-turn is every transport's

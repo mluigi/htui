@@ -116,7 +116,7 @@ use tokio::sync::mpsc;
 
 use crate::driver::{AgentSession, PermissionRequestId};
 use crate::error::DriverError;
-use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, ErrorEvent, StopReason};
+use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, ErrorEvent, OtherEvent, StopReason};
 
 mod relay;
 
@@ -772,6 +772,40 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         self.push(PendingRow {
             kind: EventKind::FollowUp,
             role: EventRole::User,
+            tool_call_id: None,
+            payload,
+            raw: Vec::new(),
+            at,
+        });
+        self.flush().await
+    }
+
+    /// MOD-37 M5: one `other` row `htui` authors about the session (`role = htui`), such as
+    /// [`RESUME_FAILED`](crate::event::RESUME_FAILED). It opens no turn, so it lands in the current
+    /// one, after that turn's last row, and the next [`Self::record_follow_up`] opens the next. Like
+    /// a follow-up it is not sent to the tab; the caller sends the frame.
+    ///
+    /// The body may carry an adapter's stderr tail, so it is scrubbed like any payload. A refused
+    /// scrub writes the residue row, as [`Self::record_follow_up`] does.
+    ///
+    /// # Errors
+    /// [`RecordError::Store`] when the append fails; [`RecordError::Encode`] never, in practice.
+    pub async fn record_notice(
+        &mut self,
+        notice: &OtherEvent,
+        at: DateTime<Utc>,
+    ) -> Result<(), RecordError> {
+        let at = stamp(at);
+        // `{ update, body }`: what `replay` decodes an `other` row as.
+        let mut payload = encode(notice)?;
+        self.flush().await?;
+        match self.scrubber.scrub(&mut payload) {
+            Ok(()) => {}
+            Err(unmasked) => return self.refuse(unmasked, at).await,
+        }
+        self.push(PendingRow {
+            kind: EventKind::Other,
+            role: EventRole::Htui,
             tool_call_id: None,
             payload,
             raw: Vec::new(),
