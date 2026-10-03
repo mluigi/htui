@@ -4,7 +4,8 @@
 //! **Why the worker reads the files.** `R-NF-3` puts store-touching work off the UI task, and a
 //! directory sweep is file I/O of unbounded size by nature, so the section types a path and the
 //! store worker does the rest (I-11), exactly as [`crate::skill_import`] does. `std::fs` in an
-//! `async fn` is that module's precedent, and the sweep is capped ([`MAX_FILES`], [`MAX_BYTES`]).
+//! `async fn` is that module's precedent, and the sweep is capped ([`MAX_ENTRIES`], [`MAX_FILES`],
+//! [`MAX_BYTES`]).
 //!
 //! **The row is the truth.** An import writes one `persona` row per file and stores no path: the
 //! file is never re-read, and editing it afterwards changes nothing (I-10, `R-ID-3`). Nothing here
@@ -37,6 +38,9 @@ pub const MAX_BYTES: u64 = 256 * 1024;
 /// The most `*.md` files one directory contributes; past it the rest are one reported row.
 pub const MAX_FILES: usize = 64;
 
+/// The most directory entries one sweep examines (R1 L-1); past it the rest are one reported row.
+pub const MAX_ENTRIES: usize = MAX_FILES * 4;
+
 /// Why a fence-less file is left alone (OQ-9): a `README.md` beside the agents.
 pub const NO_FRONTMATTER: &str = "no frontmatter: the file does not open with a `---` fence";
 
@@ -59,7 +63,7 @@ pub enum PersonaOutcome {
         /// One sentence.
         message: String,
     },
-    /// Left alone: no frontmatter, over the byte cap, not UTF-8, past the file cap.
+    /// Left alone: no frontmatter, over the byte cap, not UTF-8, past the file or entry cap.
     Skipped {
         /// The file, or the directory.
         path: String,
@@ -137,8 +141,8 @@ impl<W: WriteStore> Batch<'_, W> {
             }];
         }
 
-        let mut candidates = match markdown_files(&root) {
-            Ok(candidates) => candidates,
+        let (mut candidates, unexamined) = match markdown_files(&root) {
+            Ok(found) => found,
             Err(error) => {
                 return vec![PersonaOutcome::Refused {
                     path: path.to_owned(),
@@ -148,7 +152,7 @@ impl<W: WriteStore> Batch<'_, W> {
         };
         let past = candidates.len().saturating_sub(MAX_FILES);
         candidates.truncate(MAX_FILES);
-        let mut report = Vec::with_capacity(candidates.len() + 1);
+        let mut report = Vec::with_capacity(candidates.len() + 2);
         for candidate in &candidates {
             let label = candidate.display().to_string();
             report.push(self.write_one(candidate, &label).await);
@@ -157,6 +161,14 @@ impl<W: WriteStore> Batch<'_, W> {
             report.push(PersonaOutcome::Skipped {
                 path: path.to_owned(),
                 reason: format!("{past} more file(s) past the {MAX_FILES}-file cap"),
+            });
+        }
+        if unexamined {
+            report.push(PersonaOutcome::Skipped {
+                path: path.to_owned(),
+                reason: format!(
+                    "entries past the first {MAX_ENTRIES} in this directory were not examined"
+                ),
             });
         }
         report
@@ -225,14 +237,23 @@ impl<W: WriteStore> Batch<'_, W> {
 /// sorted by file-name bytes (B-14). Subdirectories, other files and broken links are left alone
 /// and not reported: a sweep that reported them would open the report for every directory.
 ///
+/// At most [`MAX_ENTRIES`] directory entries are examined (R1 L-1); the `bool` says whether more
+/// were left unexamined, which the walk reports in one row rather than dropping silently.
+///
 /// # Errors
 /// The `read_dir` error of a directory that stats but cannot be listed, so the walk refuses it in
 /// one sentence rather than reporting an empty directory.
-fn markdown_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let entries = std::fs::read_dir(dir)?;
-    let mut files: Vec<PathBuf> = entries
+fn markdown_files(dir: &Path) -> std::io::Result<(Vec<PathBuf>, bool)> {
+    let mut entries = std::fs::read_dir(dir)?;
+    let examined: Vec<PathBuf> = entries
+        .by_ref()
+        .take(MAX_ENTRIES)
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.path())
+        .collect();
+    let unexamined = entries.next().is_some();
+    let mut files: Vec<PathBuf> = examined
+        .into_iter()
         .filter(|path| path.extension().is_some_and(|extension| extension == "md"))
         .filter(|path| std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file()))
         .collect();
@@ -242,28 +263,35 @@ fn markdown_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
             .as_encoded_bytes()
             .cmp(right.file_name().unwrap_or_default().as_encoded_bytes())
     });
-    Ok(files)
+    Ok((files, unexamined))
 }
 
-/// Reads a file as text, refusing in one sentence each (copied from `skill_import.rs`, which
-/// stays untouched): the cap is asked of the file **before** it is read.
+/// Reads a file as text, refusing in one sentence each (the sentences are `skill_import.rs`',
+/// which stays untouched). The cap holds **during** the read (R1 L-1): at most one byte past it
+/// is ever read, so a file that grows after it was named, or a FIFO that stats at zero bytes,
+/// is refused rather than read whole.
 fn read_text(path: &Path) -> std::result::Result<String, String> {
-    let size = std::fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .map_err(|error| format!("could not read this file ({error}); nothing was imported"))?;
-    if size > MAX_BYTES {
+    use std::io::Read as _;
+
+    let unreadable =
+        |error: std::io::Error| format!("could not read this file ({error}); nothing was imported");
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)
+        .map_err(unreadable)?
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(unreadable)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_BYTES {
         return Err(format!(
             "the file is over the {MAX_BYTES}-byte cap; nothing was imported"
         ));
     }
-    let bytes = std::fs::read(path)
-        .map_err(|error| format!("could not read this file ({error}); nothing was imported"))?;
     String::from_utf8(bytes).map_err(|_| "the file is not UTF-8; nothing was imported".to_owned())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_BYTES, NO_FRONTMATTER, PersonaOutcome, import};
+    use super::{MAX_BYTES, MAX_ENTRIES, NO_FRONTMATTER, PersonaOutcome, import};
     use htui_core::model::PersonaFileError;
     use htui_core::model::persona::MODEL_REFUSED;
     use htui_core::store::{MemStore, StoreError, WriteStore as _};
@@ -564,6 +592,69 @@ mod tests {
             [PersonaOutcome::Skipped {
                 path,
                 reason: "the file is over the 262144-byte cap; nothing was imported".to_owned(),
+            }]
+        );
+        assert_eq!(names(&store).await, before, "no row");
+    }
+
+    /// R1 L-1: the byte cap holds during the read, not only at the `stat`: a FIFO stats at zero
+    /// bytes and then streams past the cap.
+    #[cfg(unix)]
+    #[test]
+    fn the_byte_cap_holds_while_the_file_is_read() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let fifo = dir.path().join("stream.md");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo runs");
+        assert!(made.success(), "mkfifo");
+        let writer = {
+            let fifo = fifo.clone();
+            std::thread::spawn(move || {
+                use std::io::Write as _;
+                let mut pipe = fs::OpenOptions::new()
+                    .write(true)
+                    .open(&fifo)
+                    .expect("open the fifo");
+                let chunk = vec![b'x'; 64 * 1024];
+                // The reader stops at the cap and closes: a broken pipe ends the writes.
+                for _ in 0..8 {
+                    if pipe.write_all(&chunk).is_err() {
+                        break;
+                    }
+                }
+            })
+        };
+
+        let read = super::read_text(&fifo);
+        writer.join().expect("the writer ends");
+
+        assert_eq!(
+            read,
+            Err("the file is over the 262144-byte cap; nothing was imported".to_owned())
+        );
+    }
+
+    /// R1 L-1: a directory sweep examines at most [`MAX_ENTRIES`] entries and reports the rest as
+    /// not examined, never silently.
+    #[tokio::test]
+    async fn a_directory_past_the_entry_cap_reports_what_was_not_examined() {
+        let (store, backend) = demo();
+        let dir = tempfile::tempdir().expect("a temp dir");
+        for index in 0..=MAX_ENTRIES {
+            write(dir.path(), &format!("n{index:03}.txt"), "not a persona");
+        }
+        let root = label(dir.path());
+        let before = names(&store).await;
+
+        let report = import(&backend, &root).await.expect("the import runs");
+
+        assert_eq!(
+            report,
+            [PersonaOutcome::Skipped {
+                path: root,
+                reason: "entries past the first 256 in this directory were not examined".to_owned(),
             }]
         );
         assert_eq!(names(&store).await, before, "no row");
