@@ -184,12 +184,16 @@ pub trait ReadStore: Send + Sync {
     /// The backend's own failures only.
     async fn step_commits(&self, step: StepId) -> Result<Vec<RunStepCommit>>;
 
-    /// ANA-2 §4.2's resolver, which [`documents_of_kinds`](ReadStore::documents_of_kinds) is not
-    /// (plan D2): per requested kind, the latest document of the item whose producing step is not
-    /// a fan-out loser (`selected IS NOT FALSE`), preferring one produced by a step of `run`;
-    /// hand-written documents rank after any run's output (`ORDER BY (s.run_id = $run) DESC
-    /// NULLS LAST, d.version DESC`). One entry per kind in `kinds` order, a missing kind carried
-    /// as `document: None`. An empty `kinds` means every kind the item has, in kind byte order.
+    /// ANA-2 §4.2's resolver as amended by MOD-73, which
+    /// [`documents_of_kinds`](ReadStore::documents_of_kinds) is not (plan D2): per requested kind,
+    /// the newer (higher `version`) of two picks over the item's documents of that kind. The
+    /// **step-produced** pick takes rows whose producing step is not a fan-out loser
+    /// (`selected IS NOT FALSE`), preferring one produced by a step of `run`, then another run's,
+    /// each by version. The **hand-written** pick is the latest version with no producing step.
+    /// So an edit written at a gate, after this run's output, is what the next step reads, and a
+    /// hand-written version older than this run's output is not. One entry per kind in `kinds`
+    /// order, a missing kind carried as `document: None`. An empty `kinds` means every kind the
+    /// item has, in kind byte order.
     ///
     /// Total, like the two list reads above: an unknown item resolves every requested kind to
     /// `None` rather than refusing, because a caller that asks for inputs of an item that is gone

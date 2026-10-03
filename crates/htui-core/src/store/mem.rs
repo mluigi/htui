@@ -4296,9 +4296,10 @@ impl State {
             .collect()
     }
 
-    /// `ORDER BY (s.run_id = $run) DESC NULLS LAST` spelled out: this run's output, then another
-    /// run's, then a document no step produced. Postgres sorts the `NULL` of the outer join last,
-    /// and a `produced_by_step_id` whose step is gone joins to the same `NULL`.
+    /// The step-produced arm's order (ANA-2 §4.2; MOD-73 plan D2), the SQL's three-armed `CASE`
+    /// spelled out: this run's output 0, another run's 1, a document whose producing step is not
+    /// held 2. [`State::resolve_input`] ranks only rows that have a `produced_by_step_id`; a
+    /// hand-written document is the other arm and is never ranked here.
     fn input_rank(&self, document: &Document, run: RunId) -> u8 {
         match document
             .produced_by_step_id
@@ -4310,11 +4311,21 @@ impl State {
         }
     }
 
-    /// One kind of ANA-2 §4.2's resolver: the eligible documents ranked, best first.
+    /// One kind of ANA-2 §4.2's resolver as amended by MOD-73 (plan D2): the newer of two picks.
+    ///
+    /// The **step-produced** pick is the resolver as it was: rows with a `produced_by_step_id`
+    /// whose step is not a fan-out loser, best [`State::input_rank`] first, then the highest
+    /// version. The **hand-written** pick is the highest version with no producing step. The arm
+    /// is keyed on the column, not on whether the step is still held (plan D3); this store never
+    /// holds a document whose step is gone anyway, because only `delete_project` drops steps and
+    /// it drops the project's items' documents with them. `(item, kind, version)` is unique, so
+    /// the two picks never tie.
     fn resolve_input(&self, item: ItemId, run: RunId, kind: &str) -> Option<Document> {
-        self.documents
+        let produced = self
+            .documents
             .iter()
             .filter(|document| document.item_id == item && document.kind == kind)
+            .filter(|document| document.produced_by_step_id.is_some())
             .filter(|document| {
                 // `s.selected IS NOT FALSE`: a fan-out loser is excluded, `NULL` is not.
                 document
@@ -4327,7 +4338,17 @@ impl State {
                     self.input_rank(document, run),
                     std::cmp::Reverse(document.version),
                 )
-            })
+            });
+        let by_hand = self
+            .documents
+            .iter()
+            .filter(|document| document.item_id == item && document.kind == kind)
+            .filter(|document| document.produced_by_step_id.is_none())
+            .max_by_key(|document| document.version);
+        produced
+            .into_iter()
+            .chain(by_hand)
+            .max_by_key(|document| document.version)
             .cloned()
     }
 
