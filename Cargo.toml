@@ -1,6 +1,6 @@
 [workspace]
 members  = ["crates/htui-core", "crates/htui", "crates/htui-store", "crates/htui-agent",
-            "crates/htui-orch", "crates/htui-worker"]
+            "crates/htui-orch", "crates/htui-worker", "crates/htui-mcp"]
 resolver = "3"
 
 [workspace.package]
@@ -51,6 +51,7 @@ htui-store         = { path = "crates/htui-store" }
 htui-agent         = { path = "crates/htui-agent" }
 htui-orch          = { path = "crates/htui-orch" }
 htui-worker        = { path = "crates/htui-worker" }
+htui-mcp           = { path = "crates/htui-mcp" }
 uuid               = { version = "1.26", features = ["v7", "serde"] }
 chrono             = { version = "0.4", features = ["serde"] }
 serde              = { version = "1", features = ["derive"] }
@@ -162,6 +163,9 @@ unicode-segmentation   = "1.13"
 # MOD-23 D236 (OQ-2): the agent form's `args` field as POSIX shell words. 1.1.1 is already compiled
 # as a dependency of agent-client-protocol, so this promotes a transitive crate and adds nothing.
 shell-words            = "1.1"
+# MOD-11 D1: already compiled (agent-client-protocol-schema); promoted, adds no crate. The MCP
+# server's tool input schemas are derived from each tool's argument struct.
+schemars               = "1.2"
 # MOD-22 D264/D267 (OQ-5): the login pane's paste-back reads a `redirect_uri` nested in another
 # URL's query and compares loopback hosts. 2.5.8 is already compiled as a dependency of `reqwest`
 # and `tower-http`, so this promotes a transitive crate and adds nothing.

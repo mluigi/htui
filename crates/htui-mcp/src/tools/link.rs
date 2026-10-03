@@ -1,0 +1,19 @@
+//! `item_link` (blueprint §2.10): a stub until MOD-11 T4 replaces this file — never advertised, and
+//! refused if called anyway.
+
+use serde_json::Value;
+
+use super::{Ctx, ToolDef, ToolError, ToolResult, no_arguments};
+
+/// Never advertised before MOD-11 T4 lands.
+pub(crate) const DEF: ToolDef = ToolDef {
+    name: "item_link",
+    description: "Proposes or withdraws a link from this step's item to another item of the same project.",
+    schema: no_arguments,
+    advertised: |_, _| false,
+};
+
+/// Refused: the tool is not in this build.
+pub(crate) async fn call<H: htui_core::store::WorkerHost>(_: Ctx<'_, H>, _: Value) -> ToolResult {
+    Err(ToolError("not available in this build".into()))
+}
