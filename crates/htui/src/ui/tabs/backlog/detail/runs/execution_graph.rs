@@ -4,13 +4,19 @@
 //! layers (plan D6), and `ExecutionGraph` owns the `Flow` that draws them. The flow keeps no
 //! selection of its own: the cursor step is rebuilt selected on every sync (plan D7), and no key
 //! ever reaches rataflow's own bindings (blueprint H-1).
+//!
+//! MOD-71: the mouse reaches the flow only through `ExecutionGraph::on_mouse`, from the Runs pane
+//! while it browses the flow (D1, D5). A press on empty canvas or on an edge pans, the wheel
+//! zooms at the pointer (D9), and a press on a node is a click on release that moves the cursor
+//! (D6); no node ever moves (MOD-28 D9). A pan or a zoom survives a re-read: only a cursor
+//! change, a resize or a new run moves the viewport (D7).
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crossterm::event::MouseEvent;
+use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
 use htui_core::model::{RunId, RunStepSummary, RunSummary, StepId, StepStatus, ToolCallCount};
 use rataflow::{
-    ControlsAction, Edge, EdgeStyle, Flow, Handle, HandlePosition, Node, NodeContent,
+    ControlsAction, Edge, EdgeStyle, Flow, FlowEvent, Handle, HandlePosition, Node, NodeContent,
     NodeRenderContext, StepEdge, Viewport,
 };
 use ratatui::Frame;
@@ -380,7 +386,6 @@ fn edge(
 /// Whether rataflow draws into `area` at all (`ui/canvas.rs:42`): what `render` needs before it
 /// measures a reveal (review L1), and what the Runs pane needs before it hit-tests a press
 /// against the area rataflow recorded on that draw (MOD-71 D5, blueprint B-7).
-#[expect(dead_code, reason = "MOD-71 T3's next commits call it")]
 pub(super) const fn drawable(area: Rect) -> bool {
     area.width >= 2 && area.height >= 2
 }
@@ -400,7 +405,8 @@ enum Reveal {
 /// Plan D7/D12/D13: the flow view of one run, rebuilt from every sync.
 #[derive(Debug)]
 pub(super) struct ExecutionGraph {
-    /// The canvas. Never fed a key or a mouse event (blueprint H-1).
+    /// The canvas. Never fed a key (blueprint H-1); a mouse event reaches it only through
+    /// [`ExecutionGraph::on_mouse`] (MOD-71 D5).
     flow: Flow<StepNode, StepEdge>,
     /// The run last synced, which tells a new run apart (plan D12).
     run: Option<RunId>,
@@ -410,17 +416,24 @@ pub(super) struct ExecutionGraph {
     width: f64,
     /// The pending viewport move (B-3).
     reveal: Reveal,
+    /// MOD-71 D7: the canvas size the last drawable frame had. A different one reveals the
+    /// cursor; a pan or a zoom alone never does.
+    drawn: Option<(u16, u16)>,
 }
 
 impl Default for ExecutionGraph {
     fn default() -> Self {
         Self {
-            // Plan D9: an edge is never reconnected.
-            flow: Flow::new().with_edges_reconnectable(false),
+            // Plan D9: an edge is never reconnected. MOD-71 D6: a press on empty canvas keeps
+            // the cursor node selected; rataflow's default clears it (`state/mod.rs:509`).
+            flow: Flow::new()
+                .with_edges_reconnectable(false)
+                .with_deselect_on_pane_click(false),
             run: None,
             cursor: None,
             width: 0.0,
             reveal: Reveal::None,
+            drawn: None,
         }
     }
 }
@@ -432,7 +445,8 @@ impl ExecutionGraph {
     /// `set_nodes` clears both (fact-check R2). The viewport survives it, and a re-read of the same
     /// run keeps the canvas still: when a wider layer moves the centring, the viewport moves by
     /// the same amount, so the nodes already drawn stay where they were (review L2). Only a new
-    /// run resets it (blueprint E4).
+    /// run resets it (blueprint E4). MOD-71 D7: a same-run sync reveals the cursor only when the
+    /// cursor step changed; the review-L2 anchor keeps the nodes still either way.
     ///
     /// `calls` is the pane's last `ToolCalls` reply by step (MOD-72 D7). A re-sync that only
     /// changes it keeps the viewport, because no position moves.
@@ -499,10 +513,15 @@ impl ExecutionGraph {
             self.flow.viewport.x -= (new_x - old_x) * zoom;
             self.flow.viewport.y -= (new_y - old_y) * zoom;
         }
-        let next = if self.run == Some(run.id) {
+        // MOD-71 D7: a same-run re-read reveals the cursor only when the cursor step changed, so
+        // the active-run poll and every `RunStream` re-read leave a pan or a wheel zoom where the
+        // user put it. A new run still resets.
+        let next = if self.run != Some(run.id) {
+            Reveal::Reset
+        } else if self.cursor != cursor {
             Reveal::Cursor
         } else {
-            Reveal::Reset
+            Reveal::None
         };
         self.run = Some(run.id);
         self.cursor = cursor;
@@ -573,16 +592,42 @@ impl ExecutionGraph {
         expect(dead_code, reason = "MOD-71 T3's runs.rs commit calls it")
     )]
     pub(super) fn on_mouse(&mut self, mouse: MouseEvent) -> Option<StepId> {
-        todo!("MOD-71 T3")
+        if !matches!(
+            mouse.kind,
+            MouseEventKind::Down(MouseButton::Left)
+                | MouseEventKind::Drag(MouseButton::Left)
+                | MouseEventKind::Up(MouseButton::Left)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+        ) {
+            return None;
+        }
+        let response = self.flow.handle_mouse_event(mouse);
+        match self.cursor {
+            Some(cursor) => self.flow.select_node(&cursor.to_string()),
+            None => self.flow.clear_selection(),
+        }
+        response.into_events().find_map(|event| match event {
+            FlowEvent::NodeClicked { node_id } => node_id.parse().ok(),
+            _ => None,
+        })
     }
 
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
     ///
     /// A canvas under 2x2 draws nothing (`rataflow` `ui/canvas.rs:42`), so a reveal measured
-    /// against it would be wrong; it stays pending for the next frame (review L1).
+    /// against it would be wrong; it stays pending for the next frame (review L1). A canvas whose
+    /// size differs from the last drawable one reveals the cursor (MOD-71 D7).
     pub(super) fn render(&mut self, frame: &mut Frame<'_>, area: Rect) {
-        if area.width < 2 || area.height < 2 {
+        if !drawable(area) {
             return;
+        }
+        // MOD-71 D7: a canvas of a new size reveals the cursor; the first drawable frame counts,
+        // which a pending `Reset` covers anyway.
+        let size = (area.width, area.height);
+        if self.drawn != Some(size) {
+            self.drawn = Some(size);
+            self.reveal = self.reveal.max(Reveal::Cursor);
         }
         let reveal = core::mem::take(&mut self.reveal);
         if reveal != Reveal::None {
