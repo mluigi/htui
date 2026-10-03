@@ -36,8 +36,8 @@ use htui_core::model::{
     RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
     RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId,
-    WorkspaceSummary,
+    StepGraphId, StepId, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId,
+    VerifyOutcome, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -1244,6 +1244,41 @@ impl ReadStore for CacheStore {
                 })
             })
             .collect()
+    }
+
+    async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
+        // MOD-72 blueprint E3: the `json_type` guard keeps this total and equal to the other two.
+        // A bare `json_extract` hands back the integer 7 for `"tool_kind": 7`, which does not
+        // decode as `String` and would fail the whole read (the T68 rule above).
+        let rows = sqlx::query(
+            "SELECT e.run_step_id AS step, \
+                    CASE WHEN json_type(e.payload, '$.tool_kind') = 'text' \
+                         THEN json_extract(e.payload, '$.tool_kind') ELSE 'other' END AS tool_kind, \
+                    COUNT(*) AS calls \
+               FROM session_event e \
+               JOIN run_step s ON s.id = e.run_step_id \
+               JOIN run r      ON r.id = s.run_id \
+              WHERE r.item_id = ? AND e.kind = 'tool_call' \
+              GROUP BY e.run_step_id, tool_kind",
+        )
+        .bind(item.to_string())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut counts = rows
+            .iter()
+            .map(|row| {
+                Ok(ToolCallCount {
+                    step: uuid_col("session_event.run_step_id", &text(row, "step")?)?,
+                    tool_kind: text(row, "tool_kind")?,
+                    // Blueprint H-5, E4: saturate; an `as` would wrap silently.
+                    calls: u32::try_from(get::<i64>(row, "calls")?).unwrap_or(u32::MAX),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        ToolCallCount::sort_canonical(&mut counts);
+        Ok(counts)
     }
 }
 

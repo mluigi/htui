@@ -60,8 +60,8 @@ use crate::model::{
     RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -262,6 +262,23 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>>;
+
+    // ---- MOD-72: per-step tool-call counts (ANA-12 §3.2) ------------------------------------
+
+    /// How many `tool_call` rows each step of the item's runs recorded, per `payload.tool_kind`
+    /// (MOD-72 plan D1-D3): one row per `(step, tool_kind)` with `calls >= 1`, in
+    /// [`ToolCallCount::sort_canonical`](crate::model::ToolCallCount::sort_canonical) order. A
+    /// `tool_kind` that is missing or not a JSON string counts as `"other"`; a `tool_result` is
+    /// half of a call and is not counted. Empty for an unknown item, or one whose steps recorded
+    /// no call.
+    ///
+    /// On `ReadStore` because `session_event` is mirrored (`cache_migrations/0001_mirror.sql:125-128`):
+    /// offline the mirror answers from its last-N-steps window, and a step outside it has no row,
+    /// which reads as "no calls" (plan D2).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>>;
 }
 
 /// Everything a write path needs.

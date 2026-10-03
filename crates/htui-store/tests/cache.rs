@@ -546,6 +546,89 @@ async fn the_mirror_projects_a_malformed_trim_record_like_postgres() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-72 review M2: the mirror's `json_type` guard (blueprint E3) against the `tool_kind` shapes
+/// the fixture lacks. `store::conformance::tool_call_counts_group_by_step_and_kind` runs on Mem and
+/// Postgres only, and the mirror's read case sees the fixture's one `read`; so this writes the
+/// shapes to Postgres, refreshes, and reads them back. A bare `json_extract` would hand back the
+/// integer 7, which fails the whole read rather than counting as `other`.
+#[tokio::test]
+async fn the_mirror_counts_tool_calls_like_postgres() {
+    use htui_core::model::ToolCallCount;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+
+    // Two finished steps of `FEAT-1`'s run; its plan step keeps the fixture's one `read`.
+    let call = EventKind::ToolCall;
+    let rows = [
+        (ids::STEP_IMPL, call, json!({ "tool_kind": "execute" })),
+        // A result names its call's kind too, so a kind-blind count would say 3.
+        (
+            ids::STEP_IMPL,
+            EventKind::ToolResult,
+            json!({ "status": "completed", "tool_kind": "execute" }),
+        ),
+        (ids::STEP_IMPL, call, json!({ "tool_kind": "execute" })),
+        (ids::STEP_IMPL, call, json!({ "tool_kind": "read" })),
+        (ids::STEP_IMPL, call, json!({ "title": "no kind at all" })),
+        (ids::STEP_REVIEW, call, json!({ "tool_kind": "edit" })),
+        (ids::STEP_REVIEW, call, json!({ "tool_kind": null })),
+        (ids::STEP_REVIEW, call, json!({ "tool_kind": 7 })),
+    ];
+    for (seq, (step, kind, payload)) in (0..).zip(rows) {
+        sqlx::query(
+            "INSERT INTO session_event (run_step_id, seq, turn, kind, role, tool_call_id, \
+                                        payload, at) \
+             VALUES ($1, $2, 0, $3, 'agent', $4, $5, $6)",
+        )
+        .bind(step.as_uuid())
+        .bind(seq)
+        .bind(kind.as_str())
+        .bind(format!("call-{seq}"))
+        .bind(&payload)
+        .bind(fixtures::demo_at(3, i64::from(seq)))
+        .execute(&db.pool)
+        .await
+        .expect("insert a tool event");
+    }
+
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let count = |step, tool_kind: &str, calls| ToolCallCount {
+        step,
+        tool_kind: tool_kind.to_owned(),
+        calls,
+    };
+    let mut expected = vec![
+        count(ids::STEP_PLAN, "read", 1),
+        count(ids::STEP_IMPL, "execute", 2),
+        count(ids::STEP_IMPL, "read", 1),
+        count(ids::STEP_IMPL, "other", 1),
+        count(ids::STEP_REVIEW, "edit", 1),
+        count(ids::STEP_REVIEW, "other", 2),
+    ];
+    ToolCallCount::sort_canonical(&mut expected);
+    let mirrored = cache
+        .tool_call_counts(ids::HTUI_FEAT_1)
+        .await
+        .expect("the mirror reads every shape");
+    assert_eq!(
+        mirrored,
+        db.store
+            .tool_call_counts(ids::HTUI_FEAT_1)
+            .await
+            .expect("pg tool_call_counts"),
+        "the mirror and Postgres count alike"
+    );
+    assert_eq!(mirrored, expected);
+
+    teardown(db, &[&cache]).await;
+}
+
 /// Every column `0003_orchestration.sql` adds reaches the mirror, and the ones a projection
 /// carries read back through it (MOD-4 milestone 1, blueprint §3.8).
 ///

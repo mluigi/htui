@@ -45,7 +45,7 @@ use htui_core::model::{
     RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -425,6 +425,9 @@ impl ReadStore for SpyStore {
         requirement: RequirementId,
     ) -> StoreResult<Vec<CoverageRow>> {
         self.inner.requirement_coverage(requirement).await
+    }
+    async fn tool_call_counts(&self, item: ItemId) -> StoreResult<Vec<ToolCallCount>> {
+        self.inner.tool_call_counts(item).await
     }
 }
 

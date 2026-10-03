@@ -7,7 +7,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use htui_core::model::{RunId, RunStepSummary, RunSummary, StepId, StepStatus};
+use htui_core::model::{RunId, RunStepSummary, RunSummary, StepId, StepStatus, ToolCallCount};
 use rataflow::{
     ControlsAction, Edge, EdgeStyle, Flow, Handle, HandlePosition, Node, NodeContent,
     NodeRenderContext, StepEdge, Viewport,
@@ -24,8 +24,8 @@ use crate::ui::cells;
 /// Plan D10: a node's width in cells at zoom 1. Two candidates and the gap are 41 columns, which a
 /// reveal's 1-cell margins keep inside the 43-column pane (fact-check R8; 21 cuts a border).
 const NODE_W: f64 = 20.0;
-/// Plan D10: a node's height, a border, two lines and a border.
-const NODE_H: f64 = 4.0;
+/// Plan D10, MOD-72 D5: a node's height, a border, three lines (head, phase, chips) and a border.
+const NODE_H: f64 = 5.0;
 /// Plan D10: the columns between two nodes of one layer.
 const H_GAP: f64 = 1.0;
 /// Plan D10: the rows between two layers. Three keep a `retry` label off the arrowhead (R7).
@@ -39,6 +39,10 @@ const RETRY: &str = "retry";
 /// The margin `ensure_node_visible` keeps (`rataflow` `state/viewport.rs:299`), reused as the
 /// reset viewport's left floor and top offset (blueprint E5).
 const MARGIN: f64 = 1.0;
+/// MOD-72 D6: the glyph that leads a node's chip line, once.
+const TOOL: char = '\u{2692}';
+/// MOD-72 D6: the sign between a chip's label and its count.
+const TIMES: char = '\u{d7}';
 
 /// One row of the flow (plan D6): the candidates of a `(position, attempt)`, or its judge.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -169,6 +173,9 @@ pub(super) struct StepNode {
     head: String,
     /// Line 2: the phase name.
     phase: String,
+    /// Line 3 (MOD-72 D5): this step's tool-call rows, fitted to the interior at draw time
+    /// (blueprint E10); none for a step that made no call.
+    calls: Vec<ToolCallCount>,
     /// What colours the border.
     status: StepStatus,
     /// The pane's theme, copied: `NodeContent::render` sees only rataflow's context.
@@ -176,8 +183,14 @@ pub(super) struct StepNode {
 }
 
 impl StepNode {
-    /// The node of `step`, one of `siblings` (its run's steps, for the slot's `/i` and `/j`).
-    pub(super) fn new(step: &RunStepSummary, siblings: &[RunStepSummary], theme: &Theme) -> Self {
+    /// The node of `step`, one of `siblings` (its run's steps, for the slot's `/i` and `/j`),
+    /// and `calls`, its rows of the last `ToolCalls` reply.
+    pub(super) fn new(
+        step: &RunStepSummary,
+        siblings: &[RunStepSummary],
+        calls: &[ToolCallCount],
+        theme: &Theme,
+    ) -> Self {
         // Blueprint B-8/E10: the marks in `gate()`'s order, `*` then `✓`.
         let mut marks = String::new();
         if step.promoted_at.is_some() {
@@ -196,6 +209,7 @@ impl StepNode {
         Self {
             head,
             phase: step.phase_name.clone(),
+            calls: calls.to_vec(),
             status: step.status,
             theme: *theme,
         }
@@ -229,24 +243,102 @@ impl StepNode {
 }
 
 impl NodeContent for StepNode {
-    /// The border, then the head and the phase inside it. `ctx.area` is the node's full size
-    /// at the current zoom; a node too small for an interior (zoom 0.5) is a bare box.
+    /// The border, then the head and the phase inside it, then the chips, dim. `ctx.area` is the
+    /// node's full size at the current zoom; a node with under two interior rows (zoom 0.5) is a
+    /// bare box.
     fn render(&self, ctx: &NodeRenderContext, buf: &mut Buffer) {
         let block = Block::bordered().border_style(self.border(ctx.selected));
         let inner = block.inner(ctx.area);
         block.render(ctx.area, buf);
-        for (row, line) in (0u16..).zip([&self.head, &self.phase]) {
+        // MOD-72 review L3: rataflow floors a node's top and bottom edges apart, so at zoom 0.5 a
+        // 5-row node is 2 or 3 rows by pan offset. A 1-row interior would flicker a clipped head
+        // while panning; it stays a bare box like the 0-row one (MOD-28's zoom 0.5).
+        if inner.height < 2 {
+            return;
+        }
+        let width = usize::from(inner.width);
+        // Blueprint E10: fitted to the interior drawn, so `+N` is honest at every zoom.
+        let chips = chips(&self.calls, width);
+        let lines = [
+            (self.head.as_str(), self.text()),
+            (self.phase.as_str(), self.text()),
+            (chips.as_str(), self.theme.dim), // MOD-72 D6: secondary to the head and phase
+        ];
+        for (row, (line, style)) in (0u16..).zip(lines) {
             if row >= inner.height {
-                break;
+                break; // a 2-row interior (between zooms) drops the chips line (D5)
             }
-            buf.set_string(
-                inner.x,
-                inner.y + row,
-                cells::clip(line, usize::from(inner.width)),
-                self.text(),
-            );
+            buf.set_string(inner.x, inner.y + row, cells::clip(line, width), style);
         }
     }
+}
+
+/// MOD-72 D6: the short label of a `tool_kind` wire value (ACP's ten, `htui_agent::event::ToolKind`);
+/// an unknown value is drawn as itself.
+fn short_label(tool_kind: &str) -> &str {
+    match tool_kind {
+        "delete" => "del",
+        "search" => "find",
+        "execute" => "exec",
+        "switch_mode" => "mode",
+        // `read`, `edit`, `move`, `think`, `fetch`, `other`, and any value a later protocol adds.
+        other => other,
+    }
+}
+
+/// MOD-72 D6: a step's tool calls as one line of at most `width` cells: the tool glyph, then
+/// `label×n` chips, larger counts first and ties by label, then `+N` for the `N` kinds that did
+/// not fit. Empty when the step made no call. Never wider than `width` once `width` holds the
+/// glyph and `+N`; `StepNode::render` clips anyway.
+pub(super) fn chips(calls: &[ToolCallCount], width: usize) -> String {
+    use core::fmt::Write as _;
+
+    // D6: never a `×0`.
+    let mut shown: Vec<(&str, u32)> = calls
+        .iter()
+        .filter(|call| call.calls > 0)
+        .map(|call| (short_label(&call.tool_kind), call.calls))
+        .collect();
+    if shown.is_empty() {
+        return String::new();
+    }
+    shown.sort_by(|(a_label, a_calls), (b_label, b_calls)| {
+        b_calls
+            .cmp(a_calls)
+            .then_with(|| a_label.as_bytes().cmp(b_label.as_bytes()))
+    });
+    let mut line = String::from(TOOL);
+    let mut used = cells::cell_width(&line);
+    let total = shown.len();
+    for (i, (label, count)) in shown.into_iter().enumerate() {
+        let chip = format!(" {label}{TIMES}{count}");
+        let left = total - i - 1;
+        // Blueprint E12: room for the `+N` this chip's failure would leave, unless it is the last.
+        // ` +` and `left`'s ASCII digits, counted without a `String` (MOD-72 review N6).
+        let reserve = if left == 0 {
+            0
+        } else {
+            2 + left.ilog10() as usize + 1
+        };
+        if used + cells::cell_width(&chip) + reserve > width {
+            // E11: stop at the first chip that does not fit, so the shown ones are the largest;
+            // the chip before this one reserved exactly this `+N`.
+            let _ = write!(line, " +{}", total - i); // a `String` write cannot fail
+            return line;
+        }
+        used += cells::cell_width(&chip);
+        line.push_str(&chip);
+    }
+    line
+}
+
+/// MOD-72 D7: a `ToolCalls` reply's rows by step, each step's rows in reply order.
+pub(super) fn by_step(counts: &[ToolCallCount]) -> BTreeMap<StepId, Vec<ToolCallCount>> {
+    let mut map: BTreeMap<StepId, Vec<ToolCallCount>> = BTreeMap::new();
+    for count in counts {
+        map.entry(count.step).or_default().push(count.clone());
+    }
+    map
 }
 
 /// Plan D9: one source on the bottom and one target on the top, both hidden. Baked into every
@@ -332,7 +424,16 @@ impl ExecutionGraph {
     /// run keeps the canvas still: when a wider layer moves the centring, the viewport moves by
     /// the same amount, so the nodes already drawn stay where they were (review L2). Only a new
     /// run resets it (blueprint E4).
-    pub(super) fn sync(&mut self, run: Option<&RunSummary>, cursor: Option<StepId>, theme: &Theme) {
+    ///
+    /// `calls` is the pane's last `ToolCalls` reply by step (MOD-72 D7). A re-sync that only
+    /// changes it keeps the viewport, because no position moves.
+    pub(super) fn sync(
+        &mut self,
+        run: Option<&RunSummary>,
+        cursor: Option<StepId>,
+        calls: &BTreeMap<StepId, Vec<ToolCallCount>>,
+        theme: &Theme,
+    ) {
         let Some(run) = run else {
             self.clear();
             return;
@@ -353,7 +454,12 @@ impl ExecutionGraph {
                         id.to_string(),
                         (*x, *y),
                         (NODE_W, NODE_H),
-                        StepNode::new(step, &run.steps, theme),
+                        StepNode::new(
+                            step,
+                            &run.steps,
+                            calls.get(id).map_or(&[][..], Vec::as_slice),
+                            theme,
+                        ),
                     )
                     .with_selected(Some(*id) == cursor)
                     .with_draggable(false)
@@ -613,8 +719,8 @@ mod tests {
             projection.positions,
             [
                 (id(1), (0.0, 0.0)),
-                (id(2), (0.0, 7.0)),
-                (id(3), (0.0, 14.0))
+                (id(2), (0.0, 8.0)),
+                (id(3), (0.0, 16.0))
             ]
         );
         assert!((projection.width - 20.0).abs() < f64::EPSILON);
@@ -633,7 +739,7 @@ mod tests {
         assert_eq!(ids_of(&projection), [vec![id(1), id(2)], vec![id(3)]]);
         assert_eq!(projection.layers[0].winner, Some(id(2)));
         assert_eq!(projection.edges, [(id(2), id(3), None)]);
-        assert_eq!(at(&projection, id(3)), (10.0, 7.0));
+        assert_eq!(at(&projection, id(3)), (10.0, 8.0));
         assert!((projection.width - 41.0).abs() < f64::EPSILON);
     }
 
@@ -822,9 +928,9 @@ mod tests {
         assert!((projection.width - 62.0).abs() < f64::EPSILON);
         assert_eq!(at(&projection, id(1)), (0.0, 0.0));
         assert_eq!(at(&projection, id(3)), (42.0, 0.0));
-        assert_eq!(at(&projection, id(4)), (21.0, 7.0));
-        assert_eq!(at(&projection, id(5)), (10.0, 14.0));
-        assert_eq!(at(&projection, id(6)), (31.0, 14.0));
+        assert_eq!(at(&projection, id(4)), (21.0, 8.0));
+        assert_eq!(at(&projection, id(5)), (10.0, 16.0));
+        assert_eq!(at(&projection, id(6)), (31.0, 16.0));
     }
 
     // ---------------------------------------------------------------------------------------------
@@ -842,7 +948,7 @@ mod tests {
     /// A fresh graph synced to `run`, the cursor on `cursor`.
     fn synced(run: &RunSummary, cursor: Option<StepId>) -> ExecutionGraph {
         let mut graph = ExecutionGraph::default();
-        graph.sync(Some(run), cursor, &Theme::default());
+        graph.sync(Some(run), cursor, &BTreeMap::new(), &Theme::default());
         graph
     }
 
@@ -1008,7 +1114,7 @@ mod tests {
         let right = (x..buf.area.right())
             .find(|column| buf[(*column, y)].symbol() == "\u{2510}")
             .expect("the node has a top-right corner");
-        for row in y + 1..y + 3 {
+        for row in y + 1..y + 4 {
             assert_eq!(buf[(right, row)].symbol(), "\u{2502}", "row {row}");
         }
 
@@ -1035,7 +1141,7 @@ mod tests {
 
         let mut changed = first.clone();
         changed.steps[1].status = StepStatus::Running;
-        graph.sync(Some(&changed), Some(id(2)), &theme);
+        graph.sync(Some(&changed), Some(id(2)), &BTreeMap::new(), &theme);
         assert_eq!(graph.flow.viewport, viewport);
         assert_eq!(graph.selected(), Some(id(2).to_string()));
         assert!(
@@ -1048,7 +1154,7 @@ mod tests {
         assert_eq!(graph.flow.viewport, viewport);
 
         let other = run(2, vec![step(3, 0, 1, 0)]);
-        graph.sync(Some(&other), Some(id(3)), &theme);
+        graph.sync(Some(&other), Some(id(3)), &BTreeMap::new(), &theme);
         draw(&mut graph);
         assert_eq!(graph.shown_run(), Some(other.id));
         assert!((graph.zoom() - 1.0).abs() < f64::EPSILON);
@@ -1205,7 +1311,12 @@ mod tests {
             candidate(3, 1, 1, 1, None),
             candidate(4, 1, 1, 2, None),
         ]);
-        graph.sync(Some(&after), Some(id(1)), &Theme::default());
+        graph.sync(
+            Some(&after),
+            Some(id(1)),
+            &BTreeMap::new(),
+            &Theme::default(),
+        );
         let buf = draw(&mut graph);
         assert_eq!(corner_of(&buf, "0.1 done"), column, "{:#?}", rows(&buf));
     }
@@ -1245,7 +1356,12 @@ mod tests {
                 .expect("the graph draws");
             assert_no_ghost_corner(term.backend().buffer());
         }
-        graph.sync(Some(&linear(8)), Some(id(0)), &Theme::default());
+        graph.sync(
+            Some(&linear(8)),
+            Some(id(0)),
+            &BTreeMap::new(),
+            &Theme::default(),
+        );
         term.draw(|frame| graph.render(frame, frame.area()))
             .expect("the graph draws");
         assert_no_ghost_corner(term.backend().buffer());
@@ -1272,9 +1388,221 @@ mod tests {
     fn a_sync_of_no_run_clears_the_canvas() {
         let mut graph = synced(&run(1, vec![step(1, 0, 1, 0)]), Some(id(1)));
         draw(&mut graph);
-        graph.sync(None, None, &Theme::default());
+        graph.sync(None, None, &BTreeMap::new(), &Theme::default());
         assert_eq!(graph.flow.nodes().count(), 0);
         assert_eq!(graph.shown_run(), None);
         assert!(rows(&draw(&mut graph)).iter().all(String::is_empty));
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-72 T3: the chip line (plan D5, D6, D7).
+    // ---------------------------------------------------------------------------------------------
+
+    /// `calls` calls of `tool_kind` on `step(1, ..)`.
+    fn kind(tool_kind: &str, calls: u32) -> ToolCallCount {
+        ToolCallCount {
+            step: id(1),
+            tool_kind: tool_kind.to_owned(),
+            calls,
+        }
+    }
+
+    /// D6's own example.
+    #[test]
+    fn chips_lead_with_the_tool_and_put_larger_counts_first() {
+        let line = chips(&[kind("execute", 3), kind("read", 5)], 18);
+        assert_eq!(line, "\u{2692} read\u{d7}5 exec\u{d7}3");
+        assert_eq!(cell_width(&line), 15);
+    }
+
+    #[test]
+    fn chips_break_a_tie_by_label() {
+        assert_eq!(
+            chips(&[kind("edit", 2), kind("delete", 2)], 18),
+            "\u{2692} del\u{d7}2 edit\u{d7}2"
+        );
+    }
+
+    #[test]
+    fn every_known_kind_has_its_short_label() {
+        let wire = [
+            "read",
+            "edit",
+            "delete",
+            "move",
+            "search",
+            "execute",
+            "think",
+            "fetch",
+            "switch_mode",
+            "other",
+        ];
+        let short: Vec<&str> = wire.iter().map(|kind| short_label(kind)).collect();
+        assert_eq!(
+            short,
+            [
+                "read", "edit", "del", "move", "find", "exec", "think", "fetch", "mode", "other"
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unknown_kind_is_drawn_as_itself() {
+        assert_eq!(
+            chips(&[kind("mcp_tool", 1)], 18),
+            "\u{2692} mcp_tool\u{d7}1"
+        );
+    }
+
+    #[test]
+    fn chips_that_do_not_fit_become_plus_n() {
+        let line = chips(
+            &[
+                kind("read", 5),
+                kind("execute", 3),
+                kind("edit", 2),
+                kind("search", 1),
+            ],
+            18,
+        );
+        assert_eq!(line, "\u{2692} read\u{d7}5 exec\u{d7}3 +2");
+        assert_eq!(cell_width(&line), 18);
+    }
+
+    /// Blueprint E12 (MOD-72 review M1): `exec×3` fits 16 alone (15 cells), but not with the
+    /// ` +1` its successor would need, so it gives way to ` +2` rather than overflow to 18.
+    #[test]
+    fn a_chip_leaves_room_for_the_plus_n_after_it() {
+        let line = chips(&[kind("read", 5), kind("execute", 3), kind("edit", 2)], 16);
+        assert_eq!(line, "\u{2692} read\u{d7}5 +2");
+        assert!(cell_width(&line) <= 16, "{line}");
+    }
+
+    #[test]
+    fn the_last_chip_needs_no_room_for_plus_n() {
+        let calls = [kind("read", 5), kind("delete", 1)];
+        assert_eq!(chips(&calls, 14), "\u{2692} read\u{d7}5 del\u{d7}1");
+        assert_eq!(chips(&calls, 13), "\u{2692} read\u{d7}5 +1");
+    }
+
+    /// Counting `char`s (6 of them) would wrongly fit the wide label at 7.
+    #[test]
+    fn chips_are_fitted_by_display_width() {
+        let calls = [kind("\u{8abf}\u{67fb}", 2)];
+        assert_eq!(chips(&calls, 7), "\u{2692} +1");
+        assert_eq!(chips(&calls, 8), "\u{2692} \u{8abf}\u{67fb}\u{d7}2");
+    }
+
+    #[test]
+    fn no_calls_is_no_line() {
+        assert_eq!(chips(&[], 18), "");
+        assert_eq!(chips(&[kind("read", 0)], 18), "");
+    }
+
+    #[test]
+    fn by_step_groups_the_rows_of_a_reply() {
+        let other = ToolCallCount {
+            step: id(2),
+            ..kind("read", 1)
+        };
+        let map = by_step(&[kind("read", 1), kind("edit", 2), other]);
+        assert_eq!(map.len(), 2);
+        assert_eq!(map[&id(1)].len(), 2);
+        assert_eq!(map[&id(2)].len(), 1);
+    }
+
+    #[test]
+    fn a_node_draws_its_chips_dim_on_the_third_line() {
+        let run = run(1, vec![step(1, 0, 1, 0)]);
+        let calls = BTreeMap::from([(id(1), vec![kind("read", 1)])]);
+        let mut graph = ExecutionGraph::default();
+        graph.sync(Some(&run), Some(id(1)), &calls, &Theme::default());
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "0.1 done");
+        let rows = rows(&buf);
+        assert!(
+            rows[usize::from(y + 3)].contains("\u{2692} read\u{d7}1"),
+            "{rows:#?}"
+        );
+        assert_eq!(buf[(x + 1, y + 3)].fg, Color::DarkGray);
+        assert_eq!(buf[(x, y + 4)].symbol(), "\u{2514}", "{rows:#?}");
+    }
+
+    #[test]
+    fn a_node_without_calls_draws_a_blank_third_line() {
+        let mut graph = synced(&run(1, vec![step(1, 0, 1, 0)]), Some(id(1)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "0.1 done");
+        for column in x + 1..x + 19 {
+            assert_eq!(buf[(column, y + 3)].symbol(), " ", "column {column}");
+        }
+        assert_eq!(buf[(x, y + 3)].symbol(), "\u{2502}");
+        assert_eq!(buf[(x, y + 4)].symbol(), "\u{2514}");
+    }
+
+    /// `step(1, …)` drawn alone into a `height`-row node, the way rataflow hands it a scratch
+    /// buffer at local `(0, 0)`.
+    fn render_node(height: u16) -> Buffer {
+        let step = step(1, 0, 1, 0);
+        let node = StepNode::new(
+            &step,
+            std::slice::from_ref(&step),
+            &[kind("read", 1)],
+            &Theme::default(),
+        );
+        let area = Rect::new(0, 0, 20, height);
+        let mut buf = Buffer::empty(area);
+        let ctx = NodeRenderContext {
+            id: "1",
+            area,
+            selected: false,
+            dragging: false,
+            position_absolute: rataflow::Position::default(),
+            theme: rataflow::Theme::default(),
+            animation_phase: 0,
+        };
+        node.render(&ctx, &mut buf);
+        buf
+    }
+
+    /// MOD-72 review L3: at zoom 0.5 rataflow floors the two edges apart, so a 5-row node is 2 or
+    /// 3 rows by pan offset. The 3-row one, a 1-row interior, stays a bare box like the 2-row one,
+    /// rather than flickering a clipped head while panning.
+    #[test]
+    fn a_one_row_interior_is_a_bare_box() {
+        let buf = render_node(3);
+        for column in 1..19 {
+            assert_eq!(buf[(column, 1)].symbol(), " ", "column {column}");
+        }
+        assert_eq!(buf[(0, 1)].symbol(), "\u{2502}");
+        let buf = render_node(4);
+        assert!(rows(&buf)[1].contains("0.1 done"), "{:#?}", rows(&buf));
+    }
+
+    /// D7: new counts for the same run move no node, so the viewport stays (review L2).
+    #[test]
+    fn a_re_sync_with_new_counts_keeps_the_viewport() {
+        let run = run(1, vec![step(1, 0, 1, 0), step(2, 1, 1, 0)]);
+        let mut graph = synced(&run, Some(id(2)));
+        draw(&mut graph);
+        graph.zoom_in();
+        draw(&mut graph);
+        let viewport = graph.flow.viewport;
+
+        let calls = BTreeMap::from([(
+            id(2),
+            vec![ToolCallCount {
+                step: id(2),
+                ..kind("read", 1)
+            }],
+        )]);
+        graph.sync(Some(&run), Some(id(2)), &calls, &Theme::default());
+        assert_eq!(graph.flow.viewport, viewport);
+        let rows = rows(&draw(&mut graph));
+        assert_eq!(graph.flow.viewport, viewport);
+        assert!(
+            rows.iter().any(|row| row.contains("\u{2692} read\u{d7}1")),
+            "{rows:#?}"
+        );
     }
 }

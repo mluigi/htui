@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT e.run_step_id AS \"step!: StepId\",\n                   CASE WHEN jsonb_typeof(e.payload->'tool_kind') = 'string'\n                        THEN e.payload->>'tool_kind' ELSE 'other' END AS \"tool_kind!\",\n                   COUNT(*) AS \"calls!\"\n              FROM session_event e\n              JOIN run_step s ON s.id = e.run_step_id\n              JOIN run r      ON r.id = s.run_id\n             WHERE r.item_id = $1 AND e.kind = 'tool_call'\n             GROUP BY 1, 2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "step!: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "session_event",
+            "name": "run_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tool_kind!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 2,
+        "name": "calls!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "2e78170bb8c9a0564388d862773709eb864aee794934183c8b9ef2604f909387"
+}

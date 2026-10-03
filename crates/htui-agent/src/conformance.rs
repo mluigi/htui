@@ -45,8 +45,8 @@ use htui_core::model::{
     RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, normalize,
+    StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -737,6 +737,9 @@ impl<S: WriteStore> ReadStore for UsageSpy<'_, S> {
         requirement: RequirementId,
     ) -> StoreResult<Vec<CoverageRow>> {
         self.inner.requirement_coverage(requirement).await
+    }
+    async fn tool_call_counts(&self, item: ItemId) -> StoreResult<Vec<ToolCallCount>> {
+        self.inner.tool_call_counts(item).await
     }
 }
 

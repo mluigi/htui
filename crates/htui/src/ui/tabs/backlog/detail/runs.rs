@@ -38,6 +38,10 @@
 //! node *is* the cursor, so every key above acts the same in both views (ANA-12 invariant 2).
 //! `PageUp`/`PageDown` do nothing there.
 //!
+//! MOD-72: in the flow, a node's third line counts its step's tool calls by kind
+//! (`⚒ read×5 exec×3`). Every `Runs` reply in the flow, and `v` into it, asks for them
+//! (`ToolCalls`); the list never does.
+//!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
 //! plan P13).
@@ -45,13 +49,13 @@
 mod execution_graph;
 
 use core::cell::{Cell, RefCell};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use htui_agent::event::{PermissionOption, PermissionOptionKind};
 use htui_core::model::{
     Document, DocumentId, ItemId, PermissionId, RelayOption, RelayOptionKind, RelayView,
     Resolution, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId,
-    StepPermission, StepStatus, UsageTotals,
+    StepPermission, StepStatus, ToolCallCount, UsageTotals,
 };
 use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
@@ -62,7 +66,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
-use self::execution_graph::ExecutionGraph;
+use self::execution_graph::{ExecutionGraph, by_step};
 use crate::app::{Action, Ctx, Handled};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -206,6 +210,9 @@ pub struct RunsTab {
     /// MOD-28 D13: the flow, behind a `RefCell` because `DetailTab::render` takes `&self` and
     /// rataflow draws through `impl Widget for &mut Flow` only.
     graph: RefCell<ExecutionGraph>,
+    /// MOD-72 D7: the last `ToolCalls` reply for [`RunsTab::item`], by step. An item change
+    /// clears it; only the flow view asks for it (plan D4), and a toggle back keeps it (E14).
+    tool_calls: BTreeMap<StepId, Vec<ToolCallCount>>,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -383,7 +390,9 @@ impl RunsTab {
             Some(Entry::Step { run, .. } | Entry::Run { run }) => self.runs.get(run),
             None => None,
         };
-        self.graph.get_mut().sync(run, step, theme);
+        self.graph
+            .get_mut()
+            .sync(run, step, &self.tool_calls, theme);
     }
 
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
@@ -427,6 +436,11 @@ impl RunsTab {
         }
         ctx.request(StoreRequest::RunActions(item));
         ctx.request(StoreRequest::RelayView { item });
+        // MOD-72 D4: the chips, only while they are drawn; last, so the list's requests are
+        // byte-identical to before.
+        if self.view == View::Flow {
+            ctx.request(StoreRequest::ToolCalls { item });
+        }
     }
 
     /// MOD-42 plan D14: the pending request on `step`, as the last `RelayView` had it.
@@ -1232,6 +1246,7 @@ impl DetailTab for RunsTab {
         self.selected = None;
         self.actions = None;
         self.relay = None;
+        self.tool_calls.clear();
         self.answering = None;
         self.mode = Mode::Browse;
     }
@@ -1293,6 +1308,12 @@ impl DetailTab for RunsTab {
                     View::List => View::Flow,
                     View::Flow => View::List,
                 };
+                // MOD-72 D4: into the flow, the chips are asked for once.
+                if self.view == View::Flow
+                    && let Some(item) = self.item
+                {
+                    ctx.request(StoreRequest::ToolCalls { item });
+                }
                 self.sync_graph(ctx.theme);
             }
             KeyCode::Char('+') if self.view == View::Flow => self.graph.get_mut().zoom_in(),
@@ -1395,6 +1416,11 @@ impl DetailTab for RunsTab {
             // re-read brings a fresh view.
             StoreReply::RelayView { item, view } if Some(*item) == self.item => {
                 self.relay = Some((**view).clone());
+            }
+            // MOD-72 D4, D7: this item's chips; another item's reply is dropped.
+            StoreReply::ToolCalls { item, counts } if Some(*item) == self.item => {
+                self.tool_calls = by_step(counts);
+                self.sync_graph(ctx.theme);
             }
             StoreReply::PermissionAnswered { .. } => self.re_read(ctx),
             StoreReply::Failed { request, .. } if *request == ANSWER_PERMISSION => {
@@ -3661,7 +3687,11 @@ mod tests {
             let shell = Shell::new();
             let (mut pane, _) = driven(&shell, true).await;
             pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
-            assert!(shell.emit.take().is_empty(), "`v` sends nothing");
+            assert!(
+                matches!(requests(shell.emit.take()).as_slice(),
+                    [StoreRequest::ToolCalls { item }] if *item == ids::HTUI_FEAT_1),
+                "`v` asks only for the chips"
+            );
             for _ in 0..down {
                 pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
             }
@@ -3806,6 +3836,7 @@ mod tests {
         let shell = Shell::new();
         let (mut pane, pending) = asking(&shell).await;
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let _ = shell.emit.take();
         let lines = lines(&pane, &shell);
         assert!(
             lines
@@ -3837,6 +3868,7 @@ mod tests {
         let shell = Shell::new();
         let mut pane = pane(&shell).await;
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let _ = shell.emit.take();
         for code in [KeyCode::Tab, KeyCode::BackTab, KeyCode::Char('3')] {
             assert_eq!(
                 pane.on_key(key(code), &mut shell.ctx()),
@@ -3854,6 +3886,116 @@ mod tests {
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         pane.on_item_change(Some(ids::HTUI_ANA_2));
         assert_eq!(pane.view, View::Flow);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-72: the tool-call chips (plan D4, D7).
+    // -----------------------------------------------------------------------------------------
+
+    /// One `read` call on `step`.
+    fn read_on(step: StepId) -> ToolCallCount {
+        ToolCallCount {
+            step,
+            tool_kind: "read".to_owned(),
+            calls: 1,
+        }
+    }
+
+    /// D4: into the flow asks once; back to the list asks nothing.
+    #[tokio::test]
+    async fn v_into_the_flow_asks_for_the_tool_calls_once() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::ToolCalls { item }]
+                if *item == ids::HTUI_FEAT_1),
+            "{sent:?}"
+        );
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert!(shell.emit.take().is_empty(), "the list never asks");
+    }
+
+    /// D4, blueprint E15: in the flow, every `Runs` reply asks for the chips, last; the list's
+    /// lists stay as `the_first_runs_reply_subscribes_once_and_asks_for_the_actions` pins them.
+    #[tokio::test]
+    async fn a_runs_reply_in_flow_asks_for_the_tool_calls_last() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        pane.on_reply(&StoreReply::Runs(feat_1_runs().await), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [
+                StoreRequest::RunActions(asked),
+                StoreRequest::RelayView { item: relayed },
+                StoreRequest::ToolCalls { item: counted },
+            ] if *asked == ids::HTUI_FEAT_1
+                && *relayed == ids::HTUI_FEAT_1
+                && *counted == ids::HTUI_FEAT_1),
+            "{sent:?}"
+        );
+    }
+
+    /// D7: a reply for this item lands in the map and the flow draws it.
+    #[tokio::test]
+    async fn a_tool_calls_reply_draws_the_chips_in_flow() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let _ = shell.emit.take();
+        pane.on_reply(
+            &StoreReply::ToolCalls {
+                item: ids::HTUI_FEAT_1,
+                counts: vec![read_on(ids::STEP_PLAN)],
+            },
+            &mut shell.ctx(),
+        );
+        assert_eq!(pane.tool_calls[&ids::STEP_PLAN].len(), 1);
+        let lines = lines(&pane, &shell);
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("\u{2692} read\u{d7}1")),
+            "{lines:#?}"
+        );
+    }
+
+    /// D4: another item's chips are not this pane's.
+    #[tokio::test]
+    async fn a_tool_calls_reply_for_another_item_is_dropped() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::ToolCalls {
+                item: ids::HTUI_ANA_2,
+                counts: vec![read_on(ids::STEP_PLAN)],
+            },
+            &mut shell.ctx(),
+        );
+        assert!(pane.tool_calls.is_empty());
+    }
+
+    /// D7: an item change clears the map.
+    #[tokio::test]
+    async fn an_item_change_forgets_the_tool_calls() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_reply(
+            &StoreReply::ToolCalls {
+                item: ids::HTUI_FEAT_1,
+                counts: vec![read_on(ids::STEP_PLAN)],
+            },
+            &mut shell.ctx(),
+        );
+        assert!(!pane.tool_calls.is_empty(), "the reply applied");
+        pane.on_item_change(Some(ids::HTUI_ANA_2));
+        assert!(pane.tool_calls.is_empty());
     }
 
     // -----------------------------------------------------------------------------------------

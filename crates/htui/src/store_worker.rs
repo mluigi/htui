@@ -27,7 +27,7 @@ use htui_core::model::{
     ItemKindPatch, ItemSpec, ItemSummary, LinkGraph, Note, PermissionId, PhaseId, PhasePatch,
     Priority, ProjectId, ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId,
     RequirementId, RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch,
-    SpecChanges, StepGraphId, StepGraphPatch, StepId, WorkspaceId, WorkspacePatch,
+    SpecChanges, StepGraphId, StepGraphPatch, StepId, ToolCallCount, WorkspaceId, WorkspacePatch,
     WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
@@ -790,6 +790,12 @@ pub enum StoreRequest {
         /// The item the Runs pane shows.
         item: ItemId,
     },
+    /// MOD-72 plan D4: per-step tool-call counts of the item's runs, for the Runs flow's chips.
+    /// An ordinary read, so the mirror answers it offline (plan D2).
+    ToolCalls {
+        /// The item the Runs pane shows.
+        item: ItemId,
+    },
     /// MOD-42 plan D14: one answer to a pending request (D3). Refused offline with
     /// `DATABASE_UNREACHABLE`.
     AnswerPermission {
@@ -1031,6 +1037,8 @@ impl StoreRequest {
             // MOD-42 plan D14.
             Self::RelayView { .. } => "relay_view",
             Self::AnswerPermission { .. } => "answer_permission",
+            // MOD-72 plan D4.
+            Self::ToolCalls { .. } => "tool_calls",
             // The ten of `requirements::REQUEST_NAMES`, in that order (MOD-39 plan P2).
             Self::Requirements(..) => "requirements",
             Self::RequirementDetail(..) => "requirement_detail",
@@ -1273,6 +1281,13 @@ pub enum StoreReply {
         item: ItemId,
         /// What it holds.
         view: Box<RelayView>,
+    },
+    /// Answer to [`StoreRequest::ToolCalls`] for `item`, in `ToolCallCount::sort_canonical` order.
+    ToolCalls {
+        /// The item asked about.
+        item: ItemId,
+        /// One row per `(step, tool_kind)` with at least one call.
+        counts: Vec<ToolCallCount>,
     },
     /// [`StoreRequest::AnswerPermission`] won its compare-and-set; a refusal is
     /// [`StoreReply::Failed`] with the refusal's sentence (MOD-42 blueprint B-13).
@@ -1585,6 +1600,13 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Documents(id) => StoreReply::Documents(backend.documents(*id).await?),
         StoreRequest::Notes(id) => StoreReply::Notes(backend.notes(*id).await?),
         StoreRequest::Runs(id) => StoreReply::Runs(backend.runs(*id).await?),
+        // MOD-72 D4: an ordinary read, so an `Unreachable` drops an `Online` backend onto the
+        // mirror, which answers from its window (plan D2) - unlike `RelayView`, which is the
+        // writer's.
+        StoreRequest::ToolCalls { item } => StoreReply::ToolCalls {
+            item: *item,
+            counts: backend.tool_call_counts(*item).await?,
+        },
         StoreRequest::Agents => StoreReply::Agents(backend.agents().await?),
         // Served through the ordinary read path on purpose: an `Unreachable` from it drops an
         // `Online` backend onto the mirror exactly as any other read does, and the replay then
@@ -3328,6 +3350,45 @@ mod tests {
             events.windows(2).all(|pair| pair[0].seq < pair[1].seq),
             "the rows arrive in `seq` order, which is replay order"
         );
+    }
+
+    /// MOD-72 plan D4: the Runs flow's chip read, through the ordinary read path.
+    #[tokio::test]
+    async fn tool_calls_answers_the_item_s_per_step_counts() {
+        let backend = demo();
+        let StoreReply::ToolCalls { item, counts } = serve(
+            &backend,
+            &StoreRequest::ToolCalls {
+                item: ids::HTUI_FEAT_1,
+            },
+        )
+        .await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(item, ids::HTUI_FEAT_1, "the reply names the item it read");
+        assert_eq!(
+            counts,
+            vec![ToolCallCount {
+                step: ids::STEP_PLAN,
+                tool_kind: "read".to_owned(),
+                calls: 1,
+            }],
+            "the fixture's one read on the plan step"
+        );
+        assert_eq!(StoreRequest::ToolCalls { item }.name(), "tool_calls");
+
+        let StoreReply::ToolCalls { counts, .. } = serve(
+            &backend,
+            &StoreRequest::ToolCalls {
+                item: ids::HTUI_ANA_2,
+            },
+        )
+        .await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert!(counts.is_empty(), "an item with no run has no chips");
     }
 
     /// `None` is "not on this box", and every backend answers it for a step it holds no row of -
