@@ -465,8 +465,11 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
       maintainer. Approve with fixes, 0 critical/high. R1 fixed M-1 `9fca4b56`, L-1 `d5348fa2`, L-2 `10df35e0`, L-3
       `0f175aa2`, L-4 `2aedd54c` and N-2 `a3620ce3` (persona import only). The R1 verifier's ADV-1
       was fixed in `3b7b6297`. N-1 (long functions) was not done, by maintainer decision. T10
-      changed docs only and re-ran only the workflow-docs validator. The code gates are the run's
-      R1 verification.
+      changed docs only and re-ran only the workflow-docs validator. Final gate on `3b7b6297` (the
+      last code commit; T10 touched no code): `cargo fmt --check`, workspace clippy `-D warnings`,
+      `SQLX_OFFLINE` workspace check, `sqlx prepare --check`, `cargo test --workspace
+      --all-features --no-fail-fast -- --test-threads=1` with Postgres (3935 passed, 0 failed, 30
+      ignored, 108 binaries, no `SIGABRT`) and `cargo insta test --workspace --check` all green.
 - [x] Close-out restates moved counts from a fresh count: see "Close-out counts" below
 
 ### Close-out counts
