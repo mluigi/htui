@@ -1460,6 +1460,15 @@ mod tests {
         assert_eq!(cell_width(&line), 18);
     }
 
+    /// Blueprint E12 (MOD-72 review M1): `exec×3` fits 16 alone (15 cells), but not with the
+    /// ` +1` its successor would need, so it gives way to ` +2` rather than overflow to 18.
+    #[test]
+    fn a_chip_leaves_room_for_the_plus_n_after_it() {
+        let line = chips(&[kind("read", 5), kind("execute", 3), kind("edit", 2)], 16);
+        assert_eq!(line, "\u{2692} read\u{d7}5 +2");
+        assert!(cell_width(&line) <= 16, "{line}");
+    }
+
     #[test]
     fn the_last_chip_needs_no_room_for_plus_n() {
         let calls = [kind("read", 5), kind("delete", 1)];
