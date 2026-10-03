@@ -41,6 +41,7 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use crate::model::skill::validate_name;
 use crate::model::skill_glob::{SkillGlob, canonical_globs};
 use crate::model::skill_language;
@@ -1809,6 +1810,61 @@ pub trait WriteStore: ReadStore {
         user: UserId,
         box_id: BoxId,
     ) -> Result<AnswerOutcome>;
+
+    // -- MOD-11: agent writes (plan D13, B-4..B-6) ------------------------------------------
+
+    /// D13: [`write_document`](Self::write_document) for a step's own item under its fence. One
+    /// transaction; the step's and its run's rows `FOR SHARE` first, then the item `FOR UPDATE`
+    /// (step → run → item, the `park_step` order). Several calls write several versions ("newest
+    /// wins").
+    ///
+    /// # Errors
+    /// `Constraint(document_needs_a_step())` when `produced_by_step_id` is `None`, then
+    /// `Constraint(step_document_refusal(..))` for a NUL (both before any read);
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `{ entity: "run_step" }`; [`StoreError::Fenced`](crate::store::StoreError::Fenced)
+    /// `{ step }`; `Constraint(step_writes_own_item(..))` when the run's `item_id` is not
+    /// `new.item_id`; then `write_document`'s own errors.
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document>;
+
+    /// D13: [`add_note`](Self::add_note) with `via_step_id` required, on the step's own item,
+    /// under its fence. Same order of refusals as
+    /// [`write_step_document`](Self::write_step_document) (`note_needs_a_step()` first).
+    ///
+    /// # Errors
+    /// `Constraint(note_needs_a_step())`; `Constraint(step_note_refusal(..))` for a NUL in the
+    /// body; `NotFound { entity: "run_step" }`; `Fenced { step }`;
+    /// `Constraint(step_writes_own_item(..))`; then `add_note`'s own errors.
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note>;
+
+    /// D13, B-6: upserts a live `item_link` proposed by `link.step`; revives a tombstone with the
+    /// new proposer, keeps a live row's proposer. `updated_at` is the trigger's (Pg) / the clock's
+    /// (Mem).
+    ///
+    /// # Errors
+    /// `Constraint(self_link(..))` when `from == to` (before any read); `NotFound { run_step }`;
+    /// `Fenced`; `Constraint(step_writes_own_item(..))` when `from` is not the run's item;
+    /// `NotFound { entity: "item" }` for `to`; `Constraint(link_outside_project(..))` when `to` is
+    /// in another project than the run.
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink>;
+
+    /// D13, B-5: tombstones the live link `(from, to, kind)` when its `proposed_by_step_id` is a
+    /// step of `link.step`'s run. Answers the tombstoned row.
+    ///
+    /// # Errors
+    /// `NotFound { run_step }`; `Fenced`; `Constraint(step_writes_own_item(..))`; then
+    /// `NotFound { entity: "item_link", id: link_key(..) }` when no live row matches, else
+    /// `Constraint(link_not_proposed_by_run(..))`.
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink>;
+
+    /// B-4: the item of `project` whose `key` is `key`; `None` when there is none, a key holding
+    /// a NUL included (answered before any read: no key holds one, and Postgres would fail the
+    /// parameter, `22021`). A read on `WriteStore` by the `command_runs` precedent:
+    /// `WorkerStore`'s reads come from here.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the
@@ -2336,6 +2392,71 @@ pub fn citation_key(item: ItemId, requirement: RequirementId, kind: CitationKind
     format!("{item}/{requirement}/{kind}")
 }
 
+// ---- MOD-11: the agent writes' refusals (plan D13, B-4..B-6) ----
+
+/// D13: [`WriteStore::write_step_document`] writes a document a step produced, so it names one.
+#[must_use]
+pub fn document_needs_a_step() -> String {
+    "an agent document names the step that wrote it (produced_by_step_id)".to_owned()
+}
+
+/// D13: [`WriteStore::add_step_note`] writes a note a step wrote, so it names one.
+#[must_use]
+pub fn note_needs_a_step() -> String {
+    "an agent note names the step that wrote it (via_step_id)".to_owned()
+}
+
+/// D13: the first of an agent document's `text` columns (`kind`, `title`, `body`) that holds a
+/// NUL ([`has_nul`]); [`WriteStore::write_step_document`] refuses it on both stores before any
+/// read, where Postgres alone would fail it as a backend error (`22021`).
+#[must_use]
+pub fn step_document_refusal(new: &NewDocument) -> Option<String> {
+    [
+        ("document.kind", &new.kind),
+        ("document.title", &new.title),
+        ("document.body", &new.body),
+    ]
+    .into_iter()
+    .find(|(_, text)| text.contains('\0'))
+    .map(|(column, _)| has_nul(column))
+}
+
+/// D13: [`step_document_refusal`] for [`WriteStore::add_step_note`]'s `item_note.body`.
+#[must_use]
+pub fn step_note_refusal(note: &NewNote) -> Option<String> {
+    note.body.contains('\0').then(|| has_nul("item_note.body"))
+}
+
+/// D13: a step writes only on its own run's item (PRD OQ-4).
+#[must_use]
+pub fn step_writes_own_item(step: StepId, item: ItemId) -> String {
+    format!("step {step} may write only on its run's own item, not {item}")
+}
+
+/// D13: `item_link`'s `CHECK (from_item_id <> to_item_id)`, in words, decided before any read.
+#[must_use]
+pub fn self_link(item: ItemId) -> String {
+    format!("an item cannot link to itself ({item})")
+}
+
+/// D13: an agent links its item only to items of its run's project.
+#[must_use]
+pub fn link_outside_project(to: ItemId) -> String {
+    format!("item {to} is outside the run's project")
+}
+
+/// The `id` of an `item_link` `NotFound`: its primary key, `from-kind->to` (D13).
+#[must_use]
+pub fn link_key(from: ItemId, to: ItemId, kind: LinkKind) -> String {
+    format!("{from}-{kind}->{to}")
+}
+
+/// D13, B-6: an agent tombstones only a link its own run proposed (PRD OQ-4).
+#[must_use]
+pub fn link_not_proposed_by_run(key: &str) -> String {
+    format!("link {key} was not proposed by this run")
+}
+
 /// §4.5: `select_fanout` takes a winner from the candidates of one `(run, position, attempt)`.
 #[must_use]
 pub fn not_a_fanout_candidate(winner: StepId, run: RunId, position: i32, attempt: i32) -> String {
@@ -2483,7 +2604,9 @@ impl<T> CasOutcome<T> {
 /// [`WriteStore::append_events`], [`WriteStore::set_step_usage`], [`WriteStore::finish_step`]
 /// (MOD-40), [`WriteStore::set_step_prompt`], [`WriteStore::upsert_step_tree`] and
 /// [`WriteStore::record_commits`] (MOD-41 plan D1), [`WriteStore::pass_step`] and
-/// [`WriteStore::park_step`] (MOD-37 R-5) take one and write only while the step's run carries
+/// [`WriteStore::park_step`] (MOD-37 R-5), [`WriteStore::write_step_document`],
+/// [`WriteStore::add_step_note`], [`WriteStore::propose_link`] and [`WriteStore::withdraw_link`]
+/// (MOD-11 plan D13) take one and write only while the step's run carries
 /// exactly that lease: `run.lease_owner IS NOT DISTINCT FROM` [`StepFence::owner`]. A process
 /// whose run another process adopted ([`WriteStore::adopt_runs`], [`WriteStore::take_lease`])
 /// still holds its old `Lease`, and the store answers it with

@@ -10,6 +10,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeDelta, Utc};
+use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CancelRequest,
     Claim, CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind,
@@ -318,6 +319,21 @@ impl htui_core::store::WorkerStore for PgStore {
     ) -> Result<bool> {
         WriteStore::resolve_command(self, id, to, resolution).await
     }
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        WriteStore::write_step_document(self, fence, new).await
+    }
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
+        WriteStore::add_step_note(self, fence, note).await
+    }
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
+        WriteStore::propose_link(self, fence, link).await
+    }
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
+        WriteStore::withdraw_link(self, fence, link).await
+    }
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        WriteStore::item_by_key(self, project, key).await
+    }
 }
 
 impl htui_core::store::RecorderStore for Writer {
@@ -608,6 +624,21 @@ impl htui_core::store::WorkerStore for Writer {
         resolution: Option<String>,
     ) -> Result<bool> {
         WriteStore::resolve_command(self, id, to, resolution).await
+    }
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        WriteStore::write_step_document(self, fence, new).await
+    }
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
+        WriteStore::add_step_note(self, fence, note).await
+    }
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
+        WriteStore::propose_link(self, fence, link).await
+    }
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
+        WriteStore::withdraw_link(self, fence, link).await
+    }
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        WriteStore::item_by_key(self, project, key).await
     }
 }
 

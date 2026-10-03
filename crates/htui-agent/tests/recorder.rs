@@ -985,6 +985,34 @@ impl WriteStore for SpyStore {
     async fn add_note(&self, note: NewNote) -> StoreResult<Note> {
         self.inner.add_note(note).await
     }
+    // ---- MOD-11 (plan D13, B-4) ----
+    async fn write_step_document(
+        &self,
+        fence: StepFence,
+        new: NewDocument,
+    ) -> StoreResult<Document> {
+        self.inner.write_step_document(fence, new).await
+    }
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> StoreResult<Note> {
+        self.inner.add_step_note(fence, note).await
+    }
+    async fn propose_link(
+        &self,
+        fence: StepFence,
+        link: htui_core::model::link::ProposeLink,
+    ) -> StoreResult<htui_core::model::ItemLink> {
+        self.inner.propose_link(fence, link).await
+    }
+    async fn withdraw_link(
+        &self,
+        fence: StepFence,
+        link: htui_core::model::link::WithdrawLink,
+    ) -> StoreResult<htui_core::model::ItemLink> {
+        self.inner.withdraw_link(fence, link).await
+    }
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> StoreResult<Option<ItemId>> {
+        self.inner.item_by_key(project, key).await
+    }
     // ---- ANA-11 §5.1: requirements and citations (MOD-38) ----
     async fn set_requirement_spec(
         &self,

@@ -21,6 +21,7 @@
 //! no test covers.
 
 use chrono::{DateTime, TimeDelta, Utc};
+use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
@@ -1146,6 +1147,43 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.add_note(note).await,
             Self::Online(pg) => pg.add_note(note).await,
+        }
+    }
+
+    // ---- MOD-11 (plan D13, B-4): the agent writes ----
+
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        match self {
+            Self::Memory(store) => store.write_step_document(fence, new).await,
+            Self::Online(pg) => pg.write_step_document(fence, new).await,
+        }
+    }
+
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
+        match self {
+            Self::Memory(store) => store.add_step_note(fence, note).await,
+            Self::Online(pg) => pg.add_step_note(fence, note).await,
+        }
+    }
+
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
+        match self {
+            Self::Memory(store) => store.propose_link(fence, link).await,
+            Self::Online(pg) => pg.propose_link(fence, link).await,
+        }
+    }
+
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
+        match self {
+            Self::Memory(store) => store.withdraw_link(fence, link).await,
+            Self::Online(pg) => pg.withdraw_link(fence, link).await,
+        }
+    }
+
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        match self {
+            Self::Memory(store) => store.item_by_key(project, key).await,
+            Self::Online(pg) => pg.item_by_key(project, key).await,
         }
     }
 
