@@ -1498,7 +1498,9 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// walk is cancelled — its lease given back through `abandoned` — and every task, including
     /// one spawned while this waits, is awaited within **one** shared window of `2 × grace`, then
     /// aborted. The loop cancels the chats beside this, inside the same bounded quit. Then the
-    /// tool host is closed (MOD-11 B-19): its listener and socket go, and every session ends.
+    /// tool host is closed (MOD-11 B-19): its listener and socket go, and every session ends. A
+    /// host shared with the chat runtime (the TUI) is handed in behind a view whose `close` is a
+    /// no-op, and its owner closes it after both shutdowns (T6 ADV-2).
     pub async fn shutdown(&mut self, grace: Duration) {
         self.shared.walks.close();
         let deadline = tokio::time::Instant::now() + grace * 2;
