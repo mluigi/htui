@@ -1119,9 +1119,39 @@ impl ReadStore for PgStore {
             .collect())
     }
 
+    /// MOD-72 plan D2, D3: per `(step, tool_kind)`, the item's `tool_call` rows. The kind is
+    /// guarded by `jsonb_typeof` (blueprint E3): `->>` alone turns a number into its text, where
+    /// `MemStore` and the mirror answer `other`.
     async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
-        let _ = item;
-        todo!("MOD-72 T1")
+        let rows = sqlx::query!(
+            r#"
+            SELECT e.run_step_id AS "step!: StepId",
+                   CASE WHEN jsonb_typeof(e.payload->'tool_kind') = 'string'
+                        THEN e.payload->>'tool_kind' ELSE 'other' END AS "tool_kind!",
+                   COUNT(*) AS "calls!"
+              FROM session_event e
+              JOIN run_step s ON s.id = e.run_step_id
+              JOIN run r      ON r.id = s.run_id
+             WHERE r.item_id = $1 AND e.kind = 'tool_call'
+             GROUP BY 1, 2
+            "#,
+            item.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let mut counts: Vec<ToolCallCount> = rows
+            .into_iter()
+            .map(|row| ToolCallCount {
+                step: row.step,
+                tool_kind: row.tool_kind,
+                // Blueprint H-5, E4: saturate; an `as` would wrap silently.
+                calls: u32::try_from(row.calls).unwrap_or(u32::MAX),
+            })
+            .collect();
+        ToolCallCount::sort_canonical(&mut counts);
+        Ok(counts)
     }
 }
 
