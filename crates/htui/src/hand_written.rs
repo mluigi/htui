@@ -410,8 +410,12 @@ mod tests {
     }
 
     async fn form(backend: &Backend, kind: Option<&str>) -> DocumentFormContext {
+        form_of(backend, ids::HTUI_FEAT_1, kind).await
+    }
+
+    async fn form_of(backend: &Backend, item: ItemId, kind: Option<&str>) -> DocumentFormContext {
         let request = StoreRequest::DocumentForm {
-            item: ids::HTUI_FEAT_1,
+            item,
             kind: kind.map(str::to_owned),
         };
         match serve(backend, &request).await {
@@ -436,6 +440,47 @@ mod tests {
         assert!(!base.body.is_empty(), "the base carries its body");
 
         assert_eq!(form(&backend, Some("review")).await.base, None);
+    }
+
+    /// MOD-73 review M1: `v`'s base is the version the next step reads (`resolve_inputs`), not
+    /// the latest of any producer. The seed's `ANA-1` research fan-out has a loser at v3 over the
+    /// selected v2; prefilling v3 and saving it as a hand-written edit would carry the loser
+    /// forward (`R-ORCH-7`). A newer hand-written version is then the base, as it is the input.
+    #[tokio::test]
+    async fn the_document_form_base_is_what_the_next_step_reads_never_a_loser() {
+        let (store, backend) = demo();
+        assert_eq!(
+            latest(&store, ids::HTUI_ANA_1, "research").await.id,
+            ids::DOC_ANA_1_RESEARCH_V3,
+            "the seed's loser is the kind's highest version"
+        );
+
+        let base = form_of(&backend, ids::HTUI_ANA_1, Some("research"))
+            .await
+            .base
+            .expect("research has an eligible version");
+        assert_eq!(
+            base.id,
+            ids::DOC_ANA_1_RESEARCH_V2,
+            "the selected output, not the loser"
+        );
+
+        let reply = serve(
+            &backend,
+            &write(ids::HTUI_ANA_1, "research", "Research, by hand", "Edited."),
+        )
+        .await;
+        assert!(
+            matches!(reply, Ok(StoreReply::DocumentWritten { version: 4, .. })),
+            "{reply:?}"
+        );
+        let base = form_of(&backend, ids::HTUI_ANA_1, Some("research"))
+            .await
+            .base
+            .expect("research has an eligible version");
+        assert_eq!(base.version, 4);
+        assert_eq!(base.produced_by_step_id, None);
+        assert_eq!(base.body, "Edited.");
     }
 
     #[tokio::test]
