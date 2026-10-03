@@ -104,8 +104,8 @@ pub struct Compose {
     notice: Option<String>,
     /// Whether the body is out with `$EDITOR` (E7: only the body is ever handed out).
     external: bool,
-    /// The `(title, body)` of the version `v` opened, for [`Compose::unchanged`]; `None` for a
-    /// note, `a`, or `v` on a kind with no rows.
+    /// The `(title, body)` of the version `v` opened, canonicalised as the store would keep
+    /// them, for [`Compose::unchanged`]; `None` for a note, `a`, or `v` on a kind with no rows.
     base: Option<(String, String)>,
 }
 
@@ -180,7 +180,15 @@ impl Compose {
                     busy: None,
                     notice: None,
                     external: false,
-                    base: base.map(|_| (title, body)),
+                    // Kept in the store's canonical form, as `unchanged` compares the typed
+                    // side in it: a stored body ending in `\n` (the close-out `summary`) or a
+                    // title with spaces still reads as unchanged when saved untouched.
+                    base: base.map(|_| {
+                        (
+                            hand_written::document_title(&title).unwrap_or(title),
+                            hand_written::document_body(&body).unwrap_or(body),
+                        )
+                    }),
                 }
             }
         }
@@ -1117,6 +1125,27 @@ mod tests {
         assert!(!fresh.unchanged());
         assert!(!typed("FEAT-1").unchanged());
         assert!(!note().unchanged());
+    }
+
+    /// A stored version the store did not trim (the close-out `summary` ends in `\n`, a title may
+    /// carry spaces) still reads as unchanged when opened and saved untouched: both sides are
+    /// compared in the store's canonical form.
+    #[test]
+    fn unchanged_canonicalises_the_base_too() {
+        let mut base = base();
+        base.kind = "summary".to_owned();
+        base.title = "  Summary ".to_owned();
+        base.body = "| a | b |\n|---|---|\n".to_owned();
+        let mut opened = Compose::document(
+            ids::HTUI_FEAT_1,
+            None,
+            Some("summary".to_owned()),
+            Some(&base),
+        );
+        assert!(opened.unchanged());
+        opened.body.set_cursor(usize::MAX);
+        opened.on_paste("More.");
+        assert!(!opened.unchanged());
     }
 
     /// The bench itself: `requests` keeps the store requests as their `Debug` and drops the
