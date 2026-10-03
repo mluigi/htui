@@ -712,11 +712,11 @@ impl Tab for ChatTab {
         else if self.session.is_none()
             && let Some(refusal) = &self.refusal
         {
-            frame.render_widget(
-                Paragraph::new(Line::styled(refusal.clone(), ctx.theme.error))
-                    .wrap(Wrap { trim: true }),
-                body,
-            );
+            // MOD-37 review L-6: a resume whose handoff failed too has a `resume_failed` line, and
+            // it goes above the refusal: it is why the header says `handoff`.
+            let mut lines = self.transcript.resume_failed_lines(ctx.theme);
+            lines.push(Line::styled(refusal.clone(), ctx.theme.error));
+            frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
         } else if self.session.is_none() && !self.pending_start {
             let text = if self.agents.is_empty() {
                 "no agent is registered on this box".to_owned()
@@ -1256,6 +1256,83 @@ mod tests {
             "no promotion, no promoted header"
         );
         assert_eq!(header(&fresh), before);
+    }
+
+    /// MOD-37 review L-6: when the resume and its handoff both fail, the body shows the
+    /// `resume_failed` line above the refusal, so the header's `handoff` is explained.
+    #[test]
+    fn a_chat_whose_resume_and_handoff_both_failed_shows_why_above_the_refusal() {
+        use htui_agent::event::OtherEvent;
+        use htui_orch::promote::CONTEXT_NOT_CARRIED;
+
+        let shell = Shell::new();
+        let mut tab = ChatTab::new();
+        tab.on_reply(
+            &StoreReply::Orch(OrchReply::Promoted {
+                step: StepId::new(),
+                run: htui_core::model::RunId::new(),
+                phase: "research".to_owned(),
+                agent: "scripted".to_owned(),
+                model: None,
+                via: Via::Resumed,
+            }),
+            &mut shell.ctx(),
+        );
+        tab.on_reply(
+            &StoreReply::Chat(ChatFrame::Event(Box::new(DriverEnvelope {
+                event: DriverEvent::Other(OtherEvent {
+                    update: htui_agent::event::RESUME_FAILED.to_owned(),
+                    body: json!({
+                        "session_id": "s1",
+                        "reason": "session/load failed: gone",
+                        "note": CONTEXT_NOT_CARRIED,
+                    }),
+                }),
+                raw: None,
+                at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+            }))),
+            &mut shell.ctx(),
+        );
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: PROMOTE_STEP,
+                message: "second refusal".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        tab.on_reply(
+            &StoreReply::Chat(ChatFrame::Failed {
+                message: "second refusal".to_owned(),
+            }),
+            &mut shell.ctx(),
+        );
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 10)).expect("terminal");
+        terminal
+            .draw(|frame| tab.render(frame, frame.area(), &shell.ctx()))
+            .expect("the frame draws");
+        let buffer = terminal.backend().buffer();
+        let rows: Vec<String> = (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect();
+        let row_of = |needle: &str| {
+            rows.iter()
+                .position(|row| row.contains(needle))
+                .unwrap_or_else(|| panic!("`{needle}` is drawn: {rows:#?}"))
+        };
+        assert!(rows[1].contains(" · handoff · "), "{rows:#?}");
+        let reason = row_of("resume failed  session/load failed: gone");
+        let note = row_of(CONTEXT_NOT_CARRIED);
+        let refusal = row_of("second refusal");
+        assert!(
+            reason < note && note < refusal,
+            "the reason, its note, then the refusal: {rows:#?}"
+        );
     }
 
     /// Verifier finding (D165): the session ref is what a later `session/load` reads back, so a

@@ -496,6 +496,18 @@ impl Transcript {
         }
     }
 
+    /// The last `resume_failed` row's lines, or none: what a chat whose handoff start failed too
+    /// shows above its refusal (MOD-37 review L-6).
+    #[must_use]
+    pub fn resume_failed_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+        self.rows
+            .iter()
+            .rev()
+            .find(|row| matches!(row, TranscriptRow::ResumeFailed { .. }))
+            .map(|row| self.render_row(row, theme))
+            .unwrap_or_default()
+    }
+
     /// The transcript as lines, tail-first when nothing has been scrolled.
     #[must_use]
     pub fn lines(&self, height: usize, theme: &Theme) -> Vec<Line<'static>> {
