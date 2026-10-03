@@ -923,7 +923,8 @@ async fn run_session(
     )
     .await;
     // Whatever is still asking gets an answer rather than the prompt tool's timeout.
-    prompts.deny_all(ENDED);
+    // Nothing is mapped after this point, so the denied ids need no marking.
+    let _ = prompts.deny_all(ENDED);
 
     // A spawned child's stdout ends when the kill below closes it, but a prepared pair's writer is
     // held by whoever built it and may never close: the reader is aborted rather than left waiting
@@ -1192,7 +1193,11 @@ async fn session_main(
             }
             Step::Command(Some(Command::Cancel { grace, done })) => {
                 // The CLI is blocked on the prompt tool: answer it before the interrupt.
-                prompts.deny_all(CANCELLED);
+                for request_id in prompts.deny_all(CANCELLED) {
+                    // D18 dedup, as in the `Answer` arm: the interrupt's `result` repeats the
+                    // denied call in `permission_denials[]`.
+                    state.mapper.mark_answered(request_id.as_str());
+                }
                 cancel_session(&mut state, &events, &mut writer, &mut lines, child, grace).await;
                 kill(child).await;
                 // Last, so a caller that awaited `cancel` knows the tree is gone (criterion 11).
@@ -1202,7 +1207,9 @@ async fn session_main(
             // The handle is gone: nobody is reading, so end the session rather than leave a child
             // running for an audience that left.
             Step::Command(None) => {
-                prompts.deny_all(ENDED);
+                for request_id in prompts.deny_all(ENDED) {
+                    state.mapper.mark_answered(request_id.as_str());
+                }
                 cancel_session(
                     &mut state,
                     &events,
@@ -1336,12 +1343,19 @@ impl Prompts {
     }
 
     /// Denies every parked prompt and every one still queued, with `message`, and closes the port.
-    fn deny_all(&mut self, message: &str) {
+    ///
+    /// Answers the ids of the **parked** ones: each was announced, so its consumer records its
+    /// `cancelled` answer itself (the relay's `answer_cancelled`, chat's `Cancel` arm), and the
+    /// session marks it answered exactly as the `Answer` arm does (D18 dedup). A queued one was
+    /// never announced; a `permission_denials[]` entry is the only row it can get.
+    fn deny_all(&mut self, message: &str) -> Vec<PermissionRequestId> {
         let deny = || PromptVerdict::Deny {
             message: message.to_owned(),
         };
-        for (_, sender) in self.pending.drain() {
+        let mut denied = Vec::with_capacity(self.pending.len());
+        for (request_id, sender) in self.pending.drain() {
             let _ = sender.send(deny());
+            denied.push(request_id);
         }
         if let Some(mut rx) = self.rx.take() {
             rx.close();
@@ -1349,6 +1363,7 @@ impl Prompts {
                 let _ = request.answer.send(deny());
             }
         }
+        denied
     }
 }
 

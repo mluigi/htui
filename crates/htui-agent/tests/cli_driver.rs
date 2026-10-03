@@ -941,6 +941,22 @@ printf '%s\n' '<DENIED_RESULT>'
 exit 0
 "#;
 
+/// [`PROMPT_SCRIPT`] answering the interrupt with [`DENIED_RESULT`] — F-2's real `result`, carrying
+/// the `permission_denials[]` entry for the call the cancel denied.
+#[cfg(unix)]
+const PROMPT_CANCEL_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+on_int() {
+  printf '%s\n' '<DENIED_RESULT>'
+  exit 0
+}
+trap on_int INT
+printf '%s\n' '<INIT>'
+IFS= read -r line
+printf '%s\n' '<TOOL_USE>'
+while true; do sleep 0.05; done
+"#;
+
 /// How many assistant lines [`FLOOD_PROMPT_SCRIPT`] streams while its prompt is parked: well past
 /// [`htui_agent::cli::EVENTS_CAPACITY`], so the session task blocks on a full event channel.
 #[cfg(unix)]
@@ -1759,5 +1775,38 @@ async fn an_answer_lands_while_the_event_channel_is_full() {
         matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
         "{:?}",
         rest.last()
+    );
+}
+
+/// Adversarial review T9-ADV-2: a cancel denies the parked prompt, and the caller records that
+/// request's `cancelled` answer itself (the relay's `answer_cancelled`, chat's `Cancel` arm). The
+/// `result` the interrupt buys repeats the denied call in `permission_denials[]`; it is the same
+/// refusal and adds no second `permission_answer`.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cancelled_prompt_is_not_reported_again() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (mut session, ask, _go) = prompting_over(tmp.path(), PROMPT_CANCEL_SCRIPT).await;
+
+    let task = asking(&ask, prompt_call(Some(TOOL_USE_ID)));
+    let _request = next(&mut session, "the prompt").await;
+
+    session.cancel(EVENT_WINDOW).await.expect("cancel");
+    assert_eq!(
+        verdict(task).await,
+        Ok(PromptVerdict::Deny {
+            message: "the session was cancelled".to_owned()
+        })
+    );
+    let rest = drain(&mut session).await;
+    assert!(
+        matches!(rest.last(), Some(DriverEvent::Done(_))),
+        "the interrupt's `result` was drained: {rest:?}"
+    );
+    assert!(
+        !rest
+            .iter()
+            .any(|event| matches!(event, DriverEvent::PermissionAnswer(_))),
+        "the cancelled prompt is not reported again: {rest:?}"
     );
 }
