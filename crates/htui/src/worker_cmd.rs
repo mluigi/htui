@@ -118,7 +118,8 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
 /// The worker's `search_concepts` index (MOD-11 D12, blueprint B-14): `Some` exactly when the
 /// keyring holds the Qdrant URL `concepts::spawn_index_job` indexes into (`indexing`), so the
 /// sessions search what this worker keeps current; `None` leaves the tool unadvertised. The
-/// adapter reads that same keyring entry per search, as the TUI's does.
+/// adapter reads that same keyring entry per search, as the TUI's does, and searches with the
+/// model the index job loaded: both take it from `concepts_worker::shared_qdrant` (H-26).
 fn worker_search(indexing: bool) -> Option<Arc<dyn ConceptSearch>> {
     if indexing {
         crate::mcp_search::production()

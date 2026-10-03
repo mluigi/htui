@@ -60,14 +60,15 @@ pub trait ConceptIndex: Send + Sync {
 /// How the embedding model is loaded: [`load_model`] in production, a counter in a test.
 type Loader = Arc<dyn Fn() -> BoxFuture<'static, Result<RtenEmbedder, String>> + Send + Sync>;
 
-/// The pinned files (fetched or adopted, on this task), then `RtenEmbedder::load` on the blocking
-/// pool (D238, MOD-68 D7).
+/// The pinned files (fetched or adopted, on this task), then `RtenEmbedder::load` off the async
+/// workers (D238, MOD-68 D7), on a thread of its own (`concepts::apart`): `htui worker` loads its
+/// index job's model here too (H-26), and a load must not hold its exit (MOD-41 D19).
 fn load_model() -> BoxFuture<'static, Result<RtenEmbedder, String>> {
     Box::pin(async {
         let files = model::ensure_model().await.map_err(|e| e.to_string())?;
-        tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))
+        crate::concepts::apart("htui-model", move || RtenEmbedder::load(&files))
             .await
-            .map_err(|e| format!("the embedding model's loader stopped: {e}"))?
+            .ok_or_else(|| "the embedding model's loader stopped".to_owned())?
             .map_err(|e| e.to_string())
     })
 }
@@ -157,7 +158,7 @@ impl QdrantIndex {
     }
 
     /// An index whose model comes from `loader` (review 2: the seam a test counts loads through).
-    fn with_loader(
+    pub(crate) fn with_loader(
         loader: impl Fn() -> BoxFuture<'static, Result<RtenEmbedder, String>> + Send + Sync + 'static,
     ) -> Self {
         Self {
@@ -167,8 +168,9 @@ impl QdrantIndex {
         }
     }
 
-    /// The model, loading it on first use (F9, blueprint D245).
-    async fn embedder(&self) -> Result<RtenEmbedder, String> {
+    /// The model, loading it on first use (F9, blueprint D245). `concepts::spawn_index_job` takes
+    /// the worker's from here too, so its index job and `search_concepts` share one (H-26).
+    pub(crate) async fn embedder(&self) -> Result<RtenEmbedder, String> {
         self.load().await
     }
 
@@ -257,7 +259,14 @@ impl ConceptIndex for QdrantIndex {
 /// Built on first use; building it loads nothing.
 #[must_use]
 pub fn shared_index() -> Arc<dyn ConceptIndex> {
-    static SHARED: OnceLock<Arc<dyn ConceptIndex>> = OnceLock::new();
+    shared_qdrant()
+}
+
+/// [`shared_index`] as itself: `concepts::spawn_index_job` takes the worker's model from it, so
+/// `htui worker`'s index job and its `search_concepts` load the model once (H-26).
+#[must_use]
+pub fn shared_qdrant() -> Arc<QdrantIndex> {
+    static SHARED: OnceLock<Arc<QdrantIndex>> = OnceLock::new();
     Arc::clone(SHARED.get_or_init(|| Arc::new(QdrantIndex::new())))
 }
 
@@ -861,6 +870,11 @@ mod tests {
         let address = |index: &Arc<dyn ConceptIndex>| Arc::as_ptr(index).cast::<()>();
         let shared = shared_index();
         assert_eq!(address(&shared), address(&shared_index()));
+        assert_eq!(
+            Arc::as_ptr(&shared_qdrant()).cast::<()>(),
+            address(&shared),
+            "the worker's index job takes its model from the same index"
+        );
         assert_eq!(
             address(&ConceptsRuntime::production().index),
             address(&shared)
