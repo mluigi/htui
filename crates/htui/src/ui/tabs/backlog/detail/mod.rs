@@ -367,6 +367,13 @@ impl Scroll {
         self.offset as usize
     }
 
+    /// A scroll whose first rendered row is `offset`: the Notes pane's bottom after the user's
+    /// own note lands (MOD-13 review L1). The next key clamps it as any other.
+    #[must_use]
+    pub const fn at(offset: u16) -> Self {
+        Self { offset }
+    }
+
     /// Back to the top: what a new item or a new reply does.
     pub const fn reset(&mut self) {
         self.offset = 0;

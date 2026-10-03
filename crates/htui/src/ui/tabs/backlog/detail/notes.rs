@@ -11,13 +11,20 @@
 //! - **D10**: a refused `AddNote` (offline, the validator, an unknown item) keeps the text and
 //!   says the sentence; any other failure may have followed a COMMIT whose answer was lost, so it
 //!   is hedged and the thread re-read.
-//! - A note's body is drawn one row per line (D8), so a multi-line note reads as written.
+//! - A note's body is drawn one row per line (D8), so a multi-line note reads as written; a `\t`
+//!   as spaces to the next stop, as the compose area drew it (review L2). The thread is wrapped
+//!   here, by `cells::wrap` at the width of the last render, so the scroll clamps against the rows
+//!   on screen (review L1); after the user's own note lands, the re-read opens at the bottom.
+
+use std::borrow::Cow;
+use std::cell::Cell;
+use std::iter;
 
 use htui_core::model::{ItemId, Note};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
@@ -31,6 +38,41 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The browse hint on the pane's last row (D11).
 const HINT: &str = "a add note";
+
+/// Columns between tab stops: `TextArea`'s, so a `\t` from `$EDITOR` reads in the thread as it
+/// did in the compose area (review L2).
+const TAB_STOP: usize = 4;
+
+/// `row` with each `\t` as spaces to the next [`TAB_STOP`], counted in cells from the row's
+/// start, as `TextArea` draws it; `ratatui` would drop it (review L2). Borrowed without one.
+fn expand_tabs(row: &str) -> Cow<'_, str> {
+    if !row.contains('\t') {
+        return Cow::Borrowed(row);
+    }
+    let mut out = String::with_capacity(row.len() + TAB_STOP);
+    let mut col = 0;
+    for cluster in cells::graphemes(row) {
+        if cluster == "\t" {
+            let cells = TAB_STOP - col % TAB_STOP;
+            out.extend(iter::repeat_n(' ', cells));
+            col += cells;
+        } else {
+            out.push_str(cluster);
+            col += cells::cell_width(cluster);
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// The cells to wrap the thread at: `width`, or no wrap before the first render (each row one,
+/// the old lower bound on what is drawn).
+fn wrap_width(width: u16) -> usize {
+    if width == 0 {
+        usize::MAX
+    } else {
+        usize::from(width)
+    }
+}
 
 /// The `Notes` reply as a thread, oldest first.
 ///
@@ -50,6 +92,11 @@ pub struct NotesTab {
     opening: Option<ItemId>,
     /// The open compose area (D6).
     compose: Option<Compose>,
+    /// The thread's width and height at the last render, for the scroll clamp and the bottom
+    /// (review L1). `Cell` because `render` is `&self`.
+    drawn: Cell<(u16, u16)>,
+    /// The user's own note landed: the re-read opens at the bottom (review L1).
+    follow: bool,
 }
 
 impl NotesTab {
@@ -62,25 +109,40 @@ impl NotesTab {
         Self::default()
     }
 
-    /// The thread: per note a stamp line, then one line per row of its body (D8), blank-separated.
-    /// `split('\n')`, not `lines()`, so a one-line body (and `""`) gives exactly one line (V17).
-    fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
-        let mut out = Vec::new();
-        for note in &self.notes {
-            if !out.is_empty() {
-                out.push(Line::raw(""));
-            }
-            out.push(Line::styled(
-                note.created_at.format(STAMP).to_string(),
-                theme.dim,
-            ));
-            out.extend(
-                note.body
-                    .split('\n')
-                    .map(|row| Line::styled(row.to_owned(), theme.base)),
-            );
-        }
-        out
+    /// The thread before wrapping: per note a stamp row, then one row per line of its body (D8),
+    /// tabs expanded (review L2), blank-separated; `true` marks a stamp. `split('\n')`, not
+    /// `lines()`, so a one-line body (and `""`) gives exactly one row (V17).
+    fn rows(&self) -> impl Iterator<Item = (bool, Cow<'_, str>)> {
+        self.notes.iter().enumerate().flat_map(|(at, note)| {
+            let gap = (at > 0).then_some((false, Cow::Borrowed("")));
+            gap.into_iter()
+                .chain(iter::once((
+                    true,
+                    Cow::Owned(note.created_at.format(STAMP).to_string()),
+                )))
+                .chain(note.body.split('\n').map(|row| (false, expand_tabs(row))))
+        })
+    }
+
+    /// The thread as drawn at `width` (0: unwrapped), each row wrapped by `cells::wrap`.
+    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+        let width = wrap_width(width);
+        self.rows()
+            .flat_map(|(stamp, row)| {
+                let style = if stamp { theme.dim } else { theme.base };
+                cells::wrap(&row, width)
+                    .into_iter()
+                    .map(move |wrapped| Line::styled(wrapped, style))
+            })
+            .collect()
+    }
+
+    /// How many rows [`lines`](Self::lines) gives at `width`, without styling them (review L1).
+    fn row_count(&self, width: u16) -> usize {
+        let width = wrap_width(width);
+        self.rows()
+            .map(|(_, row)| cells::wrap(&row, width).len())
+            .sum()
     }
 
     /// A key while the area is open: its outcome, mapped for the Backlog.
@@ -141,6 +203,7 @@ impl DetailTab for NotesTab {
         self.key = None;
         self.opening = None;
         self.compose = None;
+        self.follow = false;
         self.scroll.reset();
     }
 
@@ -162,8 +225,9 @@ impl DetailTab for NotesTab {
             ctx.request(StoreRequest::NoteForm { item });
             return Handled::Consumed;
         }
-        // D8: a real row count, now that a body may span rows.
-        self.scroll.on_key(key, self.lines(ctx.theme).len())
+        // D8, review L1: the rows as wrapped at the last render, not the unwrapped lines.
+        let (width, _) = self.drawn.get();
+        self.scroll.on_key(key, self.row_count(width))
     }
 
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
@@ -191,7 +255,15 @@ impl DetailTab for NotesTab {
         match reply {
             StoreReply::Notes(notes) => {
                 self.notes.clone_from(notes);
-                self.scroll.reset();
+                // Review L1: the user's own note is the newest, so the thread opens at its
+                // bottom; before a first render there is no height to fit, and it opens at the top.
+                let (width, height) = self.drawn.get();
+                self.scroll = if std::mem::take(&mut self.follow) && height > 0 {
+                    let bottom = self.row_count(width).saturating_sub(usize::from(height));
+                    Scroll::at(u16::try_from(bottom).unwrap_or(u16::MAX))
+                } else {
+                    Scroll::default()
+                };
             }
             StoreReply::Item(row) => {
                 if let Some(row) = row.as_ref()
@@ -211,6 +283,7 @@ impl DetailTab for NotesTab {
                     && self.compose.as_ref().and_then(Compose::busy) == Some(ADD_NOTE_NAME) =>
             {
                 self.compose = None;
+                self.follow = true;
                 ctx.request(StoreRequest::Notes(*item));
             }
             // D2: the App already put the refusal on the status line.
@@ -244,10 +317,12 @@ impl DetailTab for NotesTab {
             message(frame, list, "No notes for this item.", ctx.theme);
             return;
         }
+        self.drawn.set((list.width, list.height));
+        let lines = self.lines(list.width, ctx.theme);
+        // A pane that widened since the last key has fewer rows than the offset assumed.
+        let last = u16::try_from(lines.len().saturating_sub(1)).unwrap_or(u16::MAX);
         frame.render_widget(
-            Paragraph::new(Text::from(self.lines(ctx.theme)))
-                .wrap(Wrap { trim: false })
-                .scroll((self.scroll.offset(), 0)),
+            Paragraph::new(Text::from(lines)).scroll((self.scroll.offset().min(last), 0)),
             list,
         );
     }
@@ -500,7 +575,7 @@ mod tests {
             .remove(0);
         note.body = "a\nb".to_owned();
         pane.on_reply(&StoreReply::Notes(vec![note]), &mut shell.ctx());
-        let lines = pane.lines(&shell.theme);
+        let lines = pane.lines(0, &shell.theme);
         assert_eq!(lines.len(), 3, "{lines:?}");
         assert_eq!(lines[1], Line::styled("a", shell.theme.base));
         assert_eq!(lines[2], Line::styled("b", shell.theme.base));
@@ -525,7 +600,95 @@ mod tests {
             old.push(Line::styled(note.body.clone(), theme.base));
         }
         assert_eq!(old.len(), 5, "two demo notes");
-        assert_eq!(pane.lines(theme), old);
+        assert_eq!(pane.lines(0, theme), old);
+    }
+
+    /// A thread of `count` notes on FEAT-1, oldest first, each body wider than a narrow pane
+    /// several times over; the newest ends in `THE END`.
+    async fn long_thread(count: usize) -> Vec<Note> {
+        let template = MemStore::demo()
+            .notes(ITEM)
+            .await
+            .expect("the notes")
+            .remove(0);
+        (0..count)
+            .map(|at| {
+                let mut note = template.clone();
+                note.created_at += chrono::Duration::minutes(i64::try_from(at).expect("small"));
+                note.body = format!("note {at}: {}", "lorem ipsum dolor ".repeat(6));
+                if at + 1 == count {
+                    note.body.push_str("THE END");
+                }
+                note
+            })
+            .collect()
+    }
+
+    /// Review L1: the clamp counts the rows the thread wraps to at the last render's width, so
+    /// the newest note of a long thread can be scrolled to in a narrow pane.
+    #[tokio::test]
+    async fn the_newest_note_of_a_long_thread_can_be_scrolled_to() {
+        let shell = Shell::new();
+        let mut pane = NotesTab::new();
+        pane.on_item_change(Some(ITEM));
+        pane.on_reply(&StoreReply::Notes(long_thread(3).await), &mut shell.ctx());
+        let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        assert!(!text.contains("THE END"), "{text}");
+        for _ in 0..20 {
+            let _ = pane.on_key(key(KeyCode::PageDown), &mut shell.ctx());
+        }
+        let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        assert!(text.contains("THE END"), "{text}");
+        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
+    }
+
+    /// Review L1: after the user's own note lands, the re-read thread opens at its bottom, where
+    /// the new note is; any other re-read opens at the top.
+    #[tokio::test]
+    async fn the_thread_opens_at_the_bottom_after_the_user_s_own_note() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        let _ = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        let _ = pane.on_key(key(KeyCode::Char('a')), &mut shell.ctx());
+        pane.on_reply(&StoreReply::NoteForm { item: ITEM }, &mut shell.ctx());
+        let _ = pane.on_paste("THE END", &mut shell.ctx());
+        let _ = pane.on_key(ctrl('s'), &mut shell.ctx());
+        pane.on_reply(&StoreReply::NoteAdded { item: ITEM }, &mut shell.ctx());
+        pane.on_reply(&StoreReply::Notes(long_thread(3).await), &mut shell.ctx());
+        let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        assert!(text.contains("THE END"), "{text}");
+        assert!(!text.contains("note 0"), "{text}");
+
+        // The next re-read is not the user's note: back to the top.
+        pane.on_reply(&StoreReply::Notes(long_thread(3).await), &mut shell.ctx());
+        let text = drawn(20, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        assert!(text.contains("note 0"), "{text}");
+    }
+
+    /// Review L2: a `\t` in a saved note draws as spaces to the next tab stop, as the compose
+    /// area drew it; `ratatui` would drop it.
+    #[tokio::test]
+    async fn a_tab_in_a_note_draws_as_spaces_to_the_next_stop() {
+        let shell = Shell::new();
+        let mut pane = NotesTab::new();
+        pane.on_item_change(Some(ITEM));
+        let mut note = MemStore::demo()
+            .notes(ITEM)
+            .await
+            .expect("the notes")
+            .remove(0);
+        note.body = "a\tb\n\tc\nabcd\te".to_owned();
+        pane.on_reply(&StoreReply::Notes(vec![note]), &mut shell.ctx());
+        let rows: Vec<String> = pane
+            .lines(0, &shell.theme)
+            .iter()
+            .skip(1)
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(rows, ["a   b", "    c", "abcd    e"]);
+        let text = drawn(43, 8, |frame, area| pane.render(frame, area, &shell.ctx()));
+        assert!(text.contains("a   b"), "{text}");
+        assert!(!text.contains('\t'), "{text}");
     }
 
     /// D11: `w` is not the pane's; it passes while browsing.
