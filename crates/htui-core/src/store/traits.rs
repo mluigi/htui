@@ -189,8 +189,9 @@ pub trait ReadStore: Send + Sync {
     /// the newer (higher `version`) of two picks over the item's documents of that kind. The
     /// **step-produced** pick takes rows whose producing step is not a fan-out loser
     /// (`selected IS NOT FALSE`), preferring one produced by a step of `run`, then another run's,
-    /// each by version. The **hand-written** pick is the latest version with no producing step.
-    /// So an edit written at a gate, after this run's output, is what the next step reads, and a
+    /// each by version. The **hand-written** pick is the latest version with no producing step,
+    /// which is any such document and not only a person's edit: the close-out `summary` is
+    /// written with no producing step too. So an edit written at a gate, after this run's output, is what the next step reads, and a
     /// hand-written version older than this run's output is not. One entry per kind in `kinds`
     /// order, a missing kind carried as `document: None`. An empty `kinds` means every kind the
     /// item has, in kind byte order.

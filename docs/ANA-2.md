@@ -425,7 +425,8 @@ artifact" (a new version followed by `approved`, below) was therefore shown ever
 read by the next phase while a step-produced version of the kind existed. The resolver now takes
 two picks per kind and answers the higher version: the **step-produced** pick, ranked as before
 (this run's output, then another run's, then version), and the **hand-written** pick, the latest
-version with `produced_by_step_id IS NULL`. `document.version` is allocated in write order per
+version with `produced_by_step_id IS NULL`. That arm is any document without a producing step,
+not only a person's edit: close-out writes its `summary` document the same way. `document.version` is allocated in write order per
 `(item, kind)`, so newer is higher. An edit written after this run's output wins. A hand-written
 version older than this run's output loses to it. With no output of this run, the item's history
 is read newest first across hand-written versions and other runs' output. Another run's output
@@ -448,7 +449,11 @@ whose `selected IS FALSE`**, keeping the loser row (which is small: status, inde
 still dropping its `session_event` rows. Since MOD-73 the skip is load-bearing in a second way: a
 document whose `produced_by_step_id` was nulled joins the hand-written arm and competes on version,
 so a readmitted loser could be read over the selected output, not merely after it. That is stated in
-§9 rather than left as a latent bug.
+§9 rather than left as a latent bug. No `run_step` sweep is built yet; if one is, it must also
+tombstone the steps it removes from the offline mirror. The mirror's refresher only upserts
+`run_step` (`refresh_run_step` in `crates/htui-store/src/cache/refresh.rs` reports 0 tombstones),
+so after a sweep Postgres would null the document's column (hand-written arm) while the mirror kept
+the step (step-produced arm), and the two engines would resolve the same kind differently.
 
 **Output.** Exactly one document of `output_kind` per step. It is written by MOD-11's
 `document_write` tool, which calls §8's `write_document` rather than the store directly, so version
