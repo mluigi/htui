@@ -11295,10 +11295,6 @@ mod tests {
             Some(hand.id),
             "a hand-written version newer than this run's output outranks it (MOD-73)"
         );
-        assert_ne!(
-            preferred[0].document.as_ref().map(|row| row.id),
-            Some(ids::DOC_FEAT_1_PLAN_V2)
-        );
 
         let all = store
             .resolve_inputs(ids::HTUI_FEAT_1, ids::RUN_1, &[])

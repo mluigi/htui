@@ -11175,8 +11175,8 @@ async fn verify_run_is_recorded<S: WriteStore>(store: &S) {
 }
 
 /// The version is allocated per `(item, kind)` inside the transaction (plan D6), and ANA-2 §4.2's
-/// resolver, as amended by MOD-73, answers the newer of this run's preferred output and the latest
-/// hand-written version.
+/// resolver, as amended by MOD-73, answers the newer of the step-produced pick (this run's output
+/// when it has one, else another run's) and the latest hand-written version.
 ///
 /// The `MemStore` twin is `mem.rs::write_document_allocates_the_next_version_of_its_kind`; the
 /// thing only Postgres can show — that two concurrent writers cannot allocate the same version —
