@@ -133,7 +133,7 @@ are 133 tracked snapshots. The HANDOFF pin said 129, but the tree already had 13
 
 ## Carried
 
-- **MOD-71, mouse support.**
+- **MOD-71, mouse support** (done 2026-10-03, `docs/decisions/mod/mod-71.md`).
   - An htui-wide mouse-capture policy. Capture disables the terminal's own text selection, so the
     proposal is capture only while a view wants it.
   - `Event::Mouse` routed through `Tab`/`DetailTab`.
@@ -144,4 +144,4 @@ are 133 tracked snapshots. The HANDOFF pin said 129, but the tree already had 13
   a `StoreRequest`/`StoreReply` pair. The counts are drawn as chips in `StepNode` (ANA-12 §3.2).
 - **Hierarchy edges.** Swarm `parent_step_id` edges wait for MOD-27.
 - **Fan-out width.** A fan-out of three or more candidates is wider than the 43-column pane at
-  zoom 1. The reveal and `=` cover it until MOD-71 adds free panning.
+  zoom 1. Resolved by MOD-71's free panning (drag on empty canvas, wheel zoom).

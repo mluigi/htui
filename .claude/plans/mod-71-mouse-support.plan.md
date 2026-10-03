@@ -5,7 +5,7 @@
 **Routed**: plan path via `/handoff-run` (C2 fired, C3 borderline; low-confidence threshold note), accepted by the
 maintainer 2026-10-03. Sandbox run `hr/MOD-71`.
 **Complexity**: Medium (one new event seam through two trait levels, a terminal-mode lifetime, one view's gestures)
-**Status**: confirmed 2026-10-03; blueprint next
+**Status**: done 2026-10-03 (`docs/decisions/mod/mod-71.md`)
 
 ## Summary
 
@@ -229,10 +229,10 @@ No store, migration or `.sqlx` change.
 
 ## Acceptance
 
-- [ ] All tasks complete, TDD order kept
-- [ ] Capture is on only in the flow view in browse mode, and off on every give-back path
-- [ ] Click, drag and wheel work in the flow view; no node moves; existing flow snapshots unchanged
-- [ ] Validation passes on the real tree
+- [x] All tasks complete, TDD order kept
+- [x] Capture is on only in the flow view in browse mode, and off on every give-back path
+- [x] Click, drag and wheel work in the flow view; no node moves; existing flow snapshots unchanged
+- [x] Validation passes on the real tree
 
 ## Verified claims (step 3.5)
 
