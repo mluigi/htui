@@ -1,0 +1,50 @@
+---
+source: crates/htui-mcp/src/tools/box_profile.rs
+expression: "serde_json::to_string_pretty(&Value::Object(lists)).expect(\"serialises\")"
+---
+{
+  "fresh chat": [
+    {
+      "name": "box_profile",
+      "description": "Describes the machine this session runs on: its OS, CPU, RAM, GPU and the tools found on it.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "title": "BoxProfileArgs"
+      }
+    }
+  ],
+  "promoted chat": [
+    {
+      "name": "box_profile",
+      "description": "Describes the machine this session runs on: its OS, CPU, RAM, GPU and the tools found on it.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "title": "BoxProfileArgs"
+      }
+    }
+  ],
+  "phase step": [
+    {
+      "name": "box_profile",
+      "description": "Describes the machine this session runs on: its OS, CPU, RAM, GPU and the tools found on it.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "title": "BoxProfileArgs"
+      }
+    }
+  ],
+  "CLI phase step": [
+    {
+      "name": "box_profile",
+      "description": "Describes the machine this session runs on: its OS, CPU, RAM, GPU and the tools found on it.",
+      "inputSchema": {
+        "type": "object",
+        "additionalProperties": false,
+        "title": "BoxProfileArgs"
+      }
+    }
+  ]
+}
