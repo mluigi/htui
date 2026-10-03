@@ -169,7 +169,7 @@ yet, create one in **Settings › Hierarchy** with `N`.
 | **1 Backlog** | The workspace's items, grouped by project, with details on the right. This is also where you drive runs. |
 | **2 Skills** | Your skill library and prompt templates: browse versions, compare them, edit, import, and attach skills to projects and repositories. |
 | **3 Requirements** | Each project's requirements, grouped by area: what each one says, which items cite it and how it changed over time. The project's owner adds, amends and withdraws them here. |
-| **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server and this machine's profile. |
+| **4 Settings** | Agents, workspaces and projects, item kinds, prompt settings, the database connection, the search server, this machine's profile and agent personas. |
 | **5 Chat** | A live conversation with an agent, and replays of recorded ones. |
 
 **Press `?` on any screen for its full list of keys.** The ones below are the essentials.
@@ -304,11 +304,12 @@ conversation exactly as it was.
 |---|---|
 | **Agents** | See which agents work on this machine (`r` checks again), install an agent's adapter (`i`), and log in (`a`). |
 | **Hierarchy** | Create and edit workspaces (`N`), projects and repositories (`n`), and tell `htui` where each repository lives on this machine (`b` picks a directory, or `i` detects them). |
-| **Kinds** | Item kinds, their phases and step graphs. |
+| **Kinds** | Item kinds, their phases and step graphs; a phase's `persona` field binds a persona to it. |
 | **Prompt** | Prompt settings such as the token budget. |
 | **Connection** | The database connection string (`e` edit, `c` clear) and rebuilding the local copy (`R`). |
 | **Qdrant** | The search server's address and API key (`e` edit, `c` clear). |
 | **Boxes** | This machine's profile: tags (`t`), quirks (`e`), who runs its runs, the TUI or [`htui worker`](docs/htui-worker.md) (`w`), and a fresh check of its tools (`p`). |
+| **Personas** | Agent personas: create (`n`), edit the fields (`e`), the body (`b`) and the permission rules (`r`), delete (`d`), and import `.md` persona files (`I`). See [`docs/personas.md`](docs/personas.md). |
 
 Deleting in **Hierarchy** shows what would be removed and asks you to type a confirmation, because
 it cannot be undone.

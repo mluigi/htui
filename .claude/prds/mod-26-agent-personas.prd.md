@@ -125,23 +125,31 @@ the recorded step shows the persona's block in its prompt and its narrowed expos
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Personas in the registry, applied by the engine | A persona row (seeded `reviewer`/`architect`) bound to a phase candidate changes that step's prompt block, exposure and policy; narrow-only refused at save; snapshot-stable; out-of-list calls refused by the relay and by `claude` CLI flags | complete | `.claude/plans/mod-26-agent-personas.plan.md` (T0-T5) |
-| 2 | Authoring in the TUI | Settings > Personas lists, edits, validates and saves personas; frontmatter `.md` import; a phase's persona is picked in the step-graph editor | in-progress | `.claude/plans/mod-26-m2-persona-authoring.plan.md` (T6-T10) |
+| 2 | Authoring in the TUI | Settings > Personas lists, edits, validates and saves personas; frontmatter `.md` import; a phase's persona is picked in the step-graph editor | complete | `.claude/plans/mod-26-m2-persona-authoring.plan.md` (T6-T10) |
 
 Milestone 1 shipped 2026-10-02 (T0-T5; the binding landed on the step-graph phase, per Q-binding's
 revision). Moved counts: store conformance `CASES` 119 → 124 (`READ_CASES` 14), `htui-orch`
 `CASES` 86 → 91, migrations 11 → 12 (`0012_persona.sql`; next `0013`), Postgres tables 41 → 42,
 column comments 35 → 44, `.sqlx` files 307 → 315. Operator guide: `docs/personas.md`.
 
+Milestone 2 shipped 2026-10-03 (T6-T10, `ac8d0c3a`..`3b7b6297`; review `rust-reviewer` approve
+with fixes, 0 critical/high, M-1, L-1-L-4 and N-2 fixed in R1, N-1 not done by maintainer
+decision). It added Settings › Personas (fields, body and rules editors, delete, `.md` import), the
+Kinds `persona` field and `delete_persona`. Moved counts: store conformance `CASES` 130 → 133,
+migrations 12 → 13 (`0013_persona_phase_index.sql`; next `0014`), `.sqlx` files 318 → 321,
+snapshots 134 → 142, `StoreRequest`/`StoreReply` 99/58 → 104/61, Settings sections 7 → 8.
+Write-up: `docs/decisions/mod/mod-26.md`.
+
 Milestone 2 also carries two items the milestone 1 review deferred (`rust-reviewer`, approve with
 fixes, 2026-10-02; in R1 the maintainer fixed L1, L3, N1-N3 and N6-N8, documented L2 and L4 in
 `docs/personas.md`, and deferred these):
 
-- [ ] **N4** — a typed `PersonaNotInSnapshot` error for `GraphSnapshot::persona_for` in place of
+- [x] **N4** — a typed `PersonaNotInSnapshot` error for `GraphSnapshot::persona_for` in place of
   its `String` (`persona_not_in_snapshot`'s sentence), so the engine's I-4 arms match a type
-  rather than carry a sentence.
-- [ ] **N5** — an index on `step_graph_phase.persona_id`, shipped with milestone 2's persona
+  rather than carry a sentence. Done in T6 (`cd3de2ff`, milestone 2 plan D16).
+- [x] **N5** — an index on `step_graph_phase.persona_id`, shipped with milestone 2's persona
   delete: the `ON DELETE RESTRICT` check of `fk_step_graph_phase_persona` scans the phases
-  without one.
+  without one. Done in T7 (`7c7e78c2`, `0013_persona_phase_index.sql`, milestone 2 plan D15).
 
 ## Open Questions
 
@@ -161,19 +169,26 @@ fixes, 2026-10-02; in R1 the maintainer fixed L1, L3, N1-N3 and N6-N8, documente
   `--tools=` / `--disallowedTools=` (never `--allowedTools`, which auto-approves); the step's
   "layers in force" is documented as a per-transport matrix instead of recorded per step. See the
   plan's OQ-1, OQ-6 and D11.
-- [ ] ~~Which transports accept an allow/deny list, and in what syntax?~~ (settled above) `claude` CLI is assumed
+- [x] ~~Which transports accept an allow/deny list, and in what syntax?~~ (settled above) `claude` CLI is assumed
   (`--allowedTools`/`--disallowedTools`); `agy` over ACP is TBD — needs validation via a probe of
-  the installed binaries at plan fact-check.
-- [ ] Does every tool call surface to the relay? ACP agents may run some tools without a
+  the installed binaries at plan fact-check. *Settled at `/plan`: see the tool vocabulary bullet
+  above (milestone 1 plan OQ-1, OQ-6, D11).*
+- [x] Does every tool call surface to the relay? ACP agents may run some tools without a
   permission request, which the relay cannot deny — TBD, needs validation via the ACP fake and one
-  live `agy` session; the residual gap is documented either way.
-- [ ] Tool-name vocabulary: allow-lists name agent-native tools (`Read`, `Bash`, `mcp__…`), which
+  live `agy` session; the residual gap is documented either way. *Settled at `/plan` (milestone 1
+  plan D11): not every call does; the gap is documented in `docs/personas.md` § "What is not
+  enforced (residuals)".*
+- [x] Tool-name vocabulary: allow-lists name agent-native tools (`Read`, `Bash`, `mcp__…`), which
   differ per agent. Is a persona agent-neutral (names validated per bound agent at apply) or
   agent-scoped? TBD — decide in `/plan`; affects the narrow-only check at save versus at bind.
-- [ ] Where does the persona block sit in `R-PRM-3`'s trim order? Proposed: never trimmed, like the
-  phase template — confirm in `/plan`.
-- [ ] Interactive chat: does a persona apply to the chat path, or engine steps only? MVP assumes
-  engine steps only — confirm in `/plan`.
+  *Settled at `/plan` (milestone 1 plan OQ-1): agent-neutral `deny_kinds` plus agent-native names
+  enforced on `claude-cli` only.*
+- [x] Where does the persona block sit in `R-PRM-3`'s trim order? Proposed: never trimmed, like the
+  phase template — confirm in `/plan`. *Settled at `/plan` (milestone 1 plan OQ-3): never trimmed,
+  a protected frame before the template.*
+- [x] Interactive chat: does a persona apply to the chat path, or engine steps only? MVP assumes
+  engine steps only — confirm in `/plan`. *Settled at `/plan` (milestone 1 plan OQ-5): engine steps
+  only.*
 
 ## Risks
 
@@ -186,4 +201,6 @@ fixes, 2026-10-02; in R1 the maintainer fixed L1, L3, N1-N3 and N6-N8, documente
 | Migration, `.sqlx`, seeds and snapshots couple "independent" implementer tasks | High | Medium | File-set intersection at plan fact-check decides parallelism (auto-memory `parallel-fanout-hidden-file-coupling`) |
 
 ---
-*Status: IN PROGRESS — milestone 1 complete (2026-10-02); milestone 2 (authoring in the TUI) pending.*
+*Status: COMPLETE — milestone 1 (2026-10-02) and milestone 2 (2026-10-03) shipped; write-up
+`docs/decisions/mod/mod-26.md`. The success metric "persona applied end to end" is a manual check
+on the host after collect (milestone 2 plan, Test plan).*

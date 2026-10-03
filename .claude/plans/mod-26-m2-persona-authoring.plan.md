@@ -1,6 +1,9 @@
 # Plan: MOD-26 — Declarative agent personas, milestone 2 (authoring in the TUI)
 
-**Status: CONFIRMED by the maintainer 2026-10-02, OQ-7 to OQ-12 as recommended. DRAFTED and FACT-CHECKED 2026-10-02.** Three
+**Status: IMPLEMENTED 2026-10-03 (milestone 2, T6-T10, `cd3de2ff`..`3b7b6297`; MOD-26 closed,
+`docs/decisions/mod/mod-26.md`). Review: `rust-reviewer` approve with fixes, 0 critical/high; R1
+fixed M-1, L-1-L-4 and N-2, plus ADV-1 from the R1 verifier; N-1 not done (maintainer). CONFIRMED
+by the maintainer 2026-10-02, OQ-7 to OQ-12 as recommended. DRAFTED and FACT-CHECKED 2026-10-02.** Three
 verifiers (core/engine with a scratch parser probe over the six real agent files; store/migrations
 with a migrated scratch database and two-session lock probes; TUI/worker) checked every claim;
 falsified and partly-true claims are amended in place — see "Verified claims".
@@ -447,13 +450,45 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Acceptance
 
-- [ ] I-8…I-12 hold, each with a test naming it; M1's I-1…I-7 tests still green
-- [ ] PRD milestone 2 outcome pinned per the test plan; N4 and N5 closed
-- [ ] Validation passes; reviewer gate (`rust-reviewer`) findings applied or deferred with the
-      maintainer
-- [ ] Close-out restates moved counts from a fresh count: store `CASES` (130 → N), `READ_CASES`
-      (14), migrations (12 → 13, next `0014`), `.sqlx` (318 → N), snapshots, Settings sections
-      (7 → 8), `StoreRequest`/`StoreReply` (re-counted), `persona_settings::REQUEST_NAMES`
+- [x] I-8…I-12 hold. Tests that carry the label: I-9 (conformance
+      `a_bound_persona_is_not_deleted_and_names_its_phases` and the two `pg_criteria.rs` races) and
+      I-12 (`tests/kinds.rs`). I-8, I-10 and I-11 are named in the module docs
+      (`persona_settings.rs`, `persona_import.rs`) and pinned by tests that do not carry the label:
+      `a_form_refusal_is_the_stores_sentence_and_focuses_its_field`,
+      `a_misspelt_rule_kind_is_refused_before_sending`,
+      `a_refused_create_answers_the_stores_sentence_bare` (I-8);
+      `the_report_prints_no_file_content` and the import walk cases (I-10);
+      `offline_the_import_is_unreachable` and the worker's `serve` cases (I-11)
+- [x] PRD milestone 2 outcome pinned per the test plan; N4 (`cd3de2ff`) and N5 (`7c7e78c2`) closed;
+      the "persona applied end to end" metric stays a manual check on the host after collect
+- [x] Validation passes; reviewer gate (`rust-reviewer`) findings applied or deferred with the
+      maintainer. Approve with fixes, 0 critical/high. R1 fixed M-1 `9fca4b56`, L-1 `d5348fa2`, L-2 `10df35e0`, L-3
+      `0f175aa2`, L-4 `2aedd54c` and N-2 `a3620ce3` (persona import only). The R1 verifier's ADV-1
+      was fixed in `3b7b6297`. N-1 (long functions) was not done, by maintainer decision. T10
+      changed docs only and re-ran only the workflow-docs validator. The code gates are the run's
+      R1 verification.
+- [x] Close-out restates moved counts from a fresh count: see "Close-out counts" below
+
+### Close-out counts
+
+Fresh count at T10 (2026-10-03, on `3b7b6297`), each read at its pin site:
+
+- Store conformance `CASES`: 130 → **133** (`htui-core/src/store/conformance.rs`; pinned at
+  `htui-core/tests/mem_store.rs` and `htui-store/tests/pg_conformance.rs` `EXPECTED_CASES`).
+  `persona_writers_refuse_every_widening_shape` shapes: 17 → **18** (D18).
+- `READ_CASES`: **14**, unchanged.
+- `htui-orch` `CASES`: **92**, unchanged.
+- Migrations: 12 → **13** (`0013_persona_phase_index.sql`, index only; next `0014`, cache next
+  `0005`).
+- Postgres `TABLES`: **42**, unchanged; commented columns: **44**, unchanged.
+- `.sqlx` files: 318 → **321** (`ls crates/htui-store/.sqlx | wc -l`).
+- Snapshots: 134 → **142** under `crates/htui/tests/snapshots` (+1 `kinds__phase_persona`, +7
+  `personas__*`); `kinds__editor_phase` updated, every other existing snapshot unchanged.
+- `StoreRequest` / `StoreReply`: 99 / 58 → **104 / 61** (`htui/src/store_worker.rs`; HANDOFF said
+  96 / 55, already stale before this milestone).
+- `persona_settings::REQUEST_NAMES`: **5** (new); `skills::REQUEST_NAMES` **6**, unchanged.
+- Settings sections: 7 → **8**, 61 → **71** of the 100 strip columns
+  (`htui/tests/settings.rs` `the_section_strip_fits_the_frame`).
 
 ## Verified claims
 
