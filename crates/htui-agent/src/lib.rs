@@ -117,6 +117,7 @@ pub mod launch;
 pub mod permission;
 pub mod persona;
 pub mod probe;
+pub mod prompt_bridge;
 pub mod record;
 pub mod registry;
 pub mod replay;
@@ -176,6 +177,11 @@ pub use probe::{
     ProbeSource, ProbeStatus, SpawnTier2, Tier2, ToolReport, ToolResolution, default_install_root,
     install_root, platform_key, probe_agent, probe_snapshot, probe_tools, probe_tools_with,
     resolve_credential,
+};
+// `prompt_bridge`, not `bridge`: at the crate root the bare name says nothing about what is being
+// bridged, and `plan_install`/`resolve_tools` set the precedent.
+pub use prompt_bridge::{
+    PromptAsk, PromptCall, PromptPort, PromptVerdict, bridge as prompt_bridge,
 };
 pub use record::{
     AnsweredBy, CHUNK_FLUSH_BYTES, Control, NoRelay, RELAY_GRACE, RELAY_POLL, RecordError,
