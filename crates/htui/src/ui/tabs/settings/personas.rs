@@ -1007,7 +1007,8 @@ impl PersonasSection {
             Mode::Body(editor) => {
                 if editor.area.text() == editor.original {
                     editor.area = at_end(&row.body);
-                    editor.original.clone_from(&row.body);
+                    // The area's text, as `BodyEditor::edit` takes it (R1 L-4).
+                    editor.original = editor.area.text().to_owned();
                 }
                 if let BodyTarget::Edit { expected, .. } = &mut editor.target {
                     *expected = row.updated_at;
@@ -1391,16 +1392,19 @@ impl BodyEditor {
         }
     }
 
-    /// `b` over one row's body, the cursor at the end.
+    /// `b` over one row's body, the cursor at the end. The baseline is the area's text, not the
+    /// row's: the `TextArea` turns a lone `\r` into a line break, and an untouched body must
+    /// still read as unchanged (R1 L-4).
     fn edit(row: &Persona) -> Self {
+        let area = at_end(&row.body);
         Self {
             target: BodyTarget::Edit {
                 id: row.id,
                 name: row.name.clone(),
                 expected: row.updated_at,
             },
-            area: at_end(&row.body),
-            original: row.body.clone(),
+            original: area.text().to_owned(),
+            area,
             esc_armed: false,
             sent: None,
         }

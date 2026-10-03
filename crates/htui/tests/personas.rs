@@ -618,6 +618,67 @@ async fn a_paste_after_the_warning_disarms_the_body_esc() {
     assert!(requests(&bench).is_empty());
 }
 
+/// The demo rows with the architect's body set to `body`.
+async fn rows_with_body(body: &str) -> Vec<Persona> {
+    let mut rows = demo_rows().await;
+    for row in &mut rows {
+        if row.id == ids::PERSONA_ARCHITECT {
+            body.clone_into(&mut row.body);
+        }
+    }
+    rows
+}
+
+/// R1 L-4: the `TextArea` turns a lone `\r` into a line break, so the baseline is the area's
+/// text, not the row's: an untouched body is unchanged however the row spells its breaks.
+#[tokio::test]
+async fn an_untouched_body_holding_a_carriage_return_is_unchanged() {
+    let (bench, mut section) = bench_with(rows_with_body("one\rtwo\r\nthree\n").await).await;
+
+    bench.key(&mut section, "b");
+    bench.key(&mut section, "esc");
+    assert!(
+        !section.captures_input(),
+        "Esc closes an untouched body without the warning: {}",
+        frame(&bench, &section)
+    );
+    assert!(!frame(&bench, &section).contains(UNSAVED));
+
+    keys(&bench, &mut section, &["b", "ctrl-s"]);
+    assert!(requests(&bench).is_empty(), "nothing is sent");
+    assert!(!section.captures_input(), "the editor closed");
+    assert!(frame(&bench, &section).contains(UNCHANGED));
+
+    bench.key(&mut section, "b");
+    let mut rows = rows_with_body("moved\relsewhere\n").await;
+    for row in &mut rows {
+        if row.id == ids::PERSONA_ARCHITECT {
+            row.updated_at += Duration::seconds(5);
+        }
+    }
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaWritten {
+            personas: rows,
+            outcome: PersonaWrite::Stale {
+                id: ids::PERSONA_ARCHITECT,
+            },
+        },
+    );
+    let rebased = frame(&bench, &section);
+    assert!(
+        rebased.contains("moved"),
+        "the untouched body rebased: {rebased}"
+    );
+    assert!(rebased.contains("elsewhere"), "{rebased}");
+    bench.key(&mut section, "esc");
+    assert!(
+        !section.captures_input(),
+        "the rebased body is untouched too: {}",
+        frame(&bench, &section)
+    );
+}
+
 // ---- 9.3: replies --------------------------------------------------------------------------------
 
 /// The demo rows with the architect's description and token moved by another writer.
