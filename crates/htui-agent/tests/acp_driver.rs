@@ -49,6 +49,8 @@ use htui_agent::acp::Handshake;
 use htui_agent::acp::{AcpIo, SessionOptions, Stamp, TOOL_KIND_DENIED, open_session};
 use htui_agent::driver::DriverFuture;
 #[cfg(unix)]
+use htui_agent::driver::McpServerSpec;
+#[cfg(unix)]
 use htui_agent::driver::{AgentDriver, AgentSession};
 use htui_agent::driver::{PermissionPolicy, SessionSpec, ToolExposure};
 #[cfg(unix)]
@@ -1234,4 +1236,125 @@ async fn a_probe_column_that_does_not_parse_resolves_as_before() {
         "nothing was read out of a document that does not parse: {:?}",
         launch.args
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-11 D7: `session/new` carries `htui`'s MCP server
+// ---------------------------------------------------------------------------------------------
+
+/// An agent that answers `initialize` and `session/new`, forwards the `session/new` params to
+/// `seen`, and ignores everything else (the prompt included: the case ends at the open).
+///
+/// [`fs_agent`]'s raw newline-delimited JSON-RPC, trimmed to the handshake.
+#[cfg(unix)]
+async fn mcp_agent(stream: tokio::io::DuplexStream, seen: oneshot::Sender<Value>) {
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut lines = BufReader::new(reader).lines();
+    let mut seen = Some(seen);
+    while let Ok(Some(line)) = lines.next_line().await {
+        let Ok(message) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        let id = message.get("id").cloned();
+        let reply = match message.get("method").and_then(Value::as_str) {
+            Some("initialize") => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "protocolVersion": 1 } })
+            }
+            Some("session/new") => {
+                if let Some(seen) = seen.take() {
+                    let _ = seen.send(message.get("params").cloned().unwrap_or(Value::Null));
+                }
+                json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": "mcp-session" } })
+            }
+            _ => continue,
+        };
+        let mut text = serde_json::to_string(&reply).expect("the reply serialises");
+        text.push('\n');
+        if writer.write_all(text.as_bytes()).await.is_err() || writer.flush().await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Opens a session over [`mcp_agent`] with `mcp` on the spec and answers the `session/new`
+/// params the agent received.
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+async fn session_new_params(mcp: Vec<McpServerSpec>) -> Value {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let (client_end, agent_end) = tokio::io::duplex(DUPLEX_BYTES);
+    let (reader, writer) = tokio::io::split(client_end);
+    let (seen, params) = oneshot::channel();
+    let agent = tokio::spawn(mcp_agent(agent_end, seen));
+    let io = AcpIo {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        child: None,
+    };
+    let mut spec = spec(tmp.path().to_path_buf());
+    spec.mcp = mcp;
+
+    let session = open_session(io, spec, "hi".to_owned(), options(PATIENT_HANDSHAKE))
+        .await
+        .expect("the agent opens a session");
+    let params = tokio::time::timeout(EVENT_WINDOW, params)
+        .await
+        .expect("session/new arrived within the window")
+        .expect("the agent forwarded the params");
+
+    drop(session);
+    agent.abort();
+    let _ = agent.await;
+    params
+}
+
+/// D7: `htui`'s server travels as an ACP stdio entry — `name`, `command`, `args`, `env` as
+/// `{name, value}` pairs in key order — and with **no `type` key**, because stdio is the
+/// untagged variant every agent must support.
+#[cfg(unix)]
+#[tokio::test]
+async fn session_new_carries_the_mcp_server_as_stdio() {
+    let server = McpServerSpec {
+        name: "htui".to_owned(),
+        command: "/abs/htui".to_owned(),
+        args: vec!["mcp".to_owned()],
+        env: BTreeMap::from([
+            ("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned()),
+            (
+                "HTUI_MCP_ADDR".to_owned(),
+                "/run/htui-mcp-1-abcd/s".to_owned(),
+            ),
+        ]),
+    };
+
+    let params = session_new_params(vec![server]).await;
+
+    assert_eq!(
+        params["mcpServers"],
+        json!([{
+            "name": "htui",
+            "command": "/abs/htui",
+            "args": ["mcp"],
+            "env": [
+                { "name": "HTUI_MCP_ADDR", "value": "/run/htui-mcp-1-abcd/s" },
+                { "name": "HTUI_MCP_TOKEN", "value": "token-value" },
+            ],
+        }]),
+        "{params}"
+    );
+    assert!(
+        params["mcpServers"][0].get("type").is_none(),
+        "stdio is untagged on the wire: {params}"
+    );
+}
+
+/// D7: a spec with no server sends `mcpServers: []`, as before MOD-11.
+#[cfg(unix)]
+#[tokio::test]
+async fn session_new_without_mcp_sends_an_empty_list() {
+    let params = session_new_params(Vec::new()).await;
+    assert_eq!(params["mcpServers"], json!([]), "{params}");
 }

@@ -24,15 +24,16 @@ pub mod handshake;
 pub mod map;
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, InitializeRequest, NewSessionRequest, ReadTextFileResponse,
-    RequestPermissionOutcome, RequestPermissionResponse, SelectedPermissionOutcome,
-    SessionConfigOptionValue, SetSessionConfigOptionRequest, WriteTextFileResponse,
+    CancelNotification, EnvVariable, InitializeRequest, McpServer, McpServerStdio,
+    NewSessionRequest, ReadTextFileResponse, RequestPermissionOutcome, RequestPermissionResponse,
+    SelectedPermissionOutcome, SessionConfigOptionValue, SetSessionConfigOptionRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{Agent, ByteStreams, Client, ConnectionTo, Dispatch, SessionMessage};
 use htui_core::model::{Agent as AgentRow, AgentBox};
@@ -48,8 +49,8 @@ use crate::acp::client::{Inbound, InboundTx};
 pub use crate::acp::handshake::{Handshake, handshake};
 use crate::auth::{AuthFlow, AuthOutcome};
 use crate::driver::{
-    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, PermissionAnswer,
-    PermissionRequestId, SessionSpec,
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, DriverFuture, McpServerSpec,
+    PermissionAnswer, PermissionRequestId, SessionSpec,
 };
 use crate::error::{DriverError, Result};
 use crate::event::{
@@ -1055,6 +1056,24 @@ enum Step {
     Closed,
 }
 
+/// One of `htui`'s own MCP servers as ACP's stdio entry (MOD-11 D7).
+///
+/// Stdio is the transport every ACP agent must support (no capability check) and the untagged
+/// variant, so the wire entry carries no `type` key. `env` leaves the spec's `BTreeMap` in key
+/// order, which keeps the request byte-stable.
+fn acp_server(spec: &McpServerSpec) -> McpServer {
+    McpServer::Stdio(
+        McpServerStdio::new(spec.name.clone(), PathBuf::from(&spec.command))
+            .args(spec.args.clone())
+            .env(
+                spec.env
+                    .iter()
+                    .map(|(name, value)| EnvVariable::new(name.clone(), value.clone()))
+                    .collect(),
+            ),
+    )
+}
+
 /// The foreground future: handshake, banner, first prompt, then the turn loop.
 #[expect(
     clippy::too_many_arguments,
@@ -1105,8 +1124,9 @@ async fn session_main(
     // than returning to it ([`ReadyCell`]). `run_session` then answers from the connection's own
     // error, and what it reads here is how it knows to call the failure `session/new`.
     at_step(ready, "session/new");
-    let new_session =
-        NewSessionRequest::new(spec.cwd.clone()).additional_directories(spec.extra_dirs.clone());
+    let new_session = NewSessionRequest::new(spec.cwd.clone())
+        .additional_directories(spec.extra_dirs.clone())
+        .mcp_servers(spec.mcp.iter().map(acp_server).collect());
     let mut session = match cx
         .build_session_from(new_session)
         .block_task()
