@@ -16543,7 +16543,8 @@ async fn add_step_note_fenced_on_its_own_item<S: WriteStore>(store: &S) {
 /// MOD-11 D13, B-6: [`WriteStore::propose_link`] inserts a live link proposed by the step; a
 /// live row keeps the proposer it has (an importer's `None` included), a tombstone revives with
 /// the new proposer. A self link, a foreign `from`, an unknown or out-of-project `to` and a stale
-/// fence are refused.
+/// fence are refused; after a stranger takes the run, the old owner's proposal and withdraw are
+/// `Fenced` and write nothing.
 async fn propose_link_upserts_revives_and_keeps_a_live_proposer<S: WriteStore>(store: &S) {
     const CASE: &str = "propose_link_upserts_revives_and_keeps_a_live_proposer";
     let a = Uuid::now_v7();
@@ -16715,6 +16716,53 @@ async fn propose_link_upserts_revives_and_keeps_a_live_proposer<S: WriteStore>(s
         !live_link(CASE, store, item, ids::HTUI_FEAT_1, LinkKind::Relates).await
             && !live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Origin).await,
         "{CASE}: the refusals wrote no link"
+    );
+
+    // I-3: after a stranger takes the run, its old owner neither withdraws nor proposes.
+    let b = Uuid::now_v7();
+    taken_by(CASE, store, run, a, b).await;
+    let stale_withdraw = store
+        .withdraw_link(
+            StepFence::Lease(a),
+            WithdrawLink {
+                from: item,
+                to: ids::AGY_FEAT_1,
+                kind: LinkKind::Relates,
+                step,
+            },
+        )
+        .await;
+    assert!(
+        matches!(stale_withdraw, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's withdraw after B took the run is fenced, got {stale_withdraw:?}"
+    );
+    let stale_propose = store
+        .propose_link(
+            StepFence::Lease(a),
+            propose(ids::AGY_FEAT_1, LinkKind::Supersedes, step),
+        )
+        .await;
+    assert!(
+        matches!(stale_propose, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's proposal after B took the run is fenced, got {stale_propose:?}"
+    );
+    assert!(
+        !live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Supersedes).await,
+        "{CASE}: the fenced proposal wrote no link"
+    );
+    // A tombstone would revive under `step`; a live row keeps `later`, so the withdraw wrote
+    // nothing.
+    let kept = store
+        .propose_link(
+            StepFence::Lease(b),
+            propose(ids::AGY_FEAT_1, LinkKind::Relates, step),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (kept.proposed_by_step_id, kept.deleted_at),
+        (Some(later), None),
+        "{CASE}: the fenced withdraw left the link live under its proposer"
     );
 }
 
