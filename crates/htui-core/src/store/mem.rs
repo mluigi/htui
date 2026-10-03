@@ -41,9 +41,9 @@ use crate::model::{
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, TIMESTAMPTZ_DIGITS, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -6488,6 +6488,11 @@ impl ReadStore for MemStore {
 
     async fn requirement_coverage(&self, requirement: RequirementId) -> Result<Vec<CoverageRow>> {
         Ok(self.read(|state| state.coverage_rows(requirement)))
+    }
+
+    async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
+        let _ = item;
+        todo!("MOD-72 T1")
     }
 }
 

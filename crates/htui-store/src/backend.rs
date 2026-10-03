@@ -31,7 +31,7 @@ use htui_core::model::{
     PromptTemplate, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter,
     RequirementId, RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId,
     RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
-    StepId, UpstreamEntry, UserId, WorkspaceSummary,
+    StepId, ToolCallCount, UpstreamEntry, UserId, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -830,6 +830,14 @@ impl ReadStore for Backend {
             Self::Memory(store) => store.requirement_coverage(requirement).await,
             Self::Online { pg, .. } => pg.requirement_coverage(requirement).await,
             Self::Offline { cache, .. } => cache.requirement_coverage(requirement).await,
+        }
+    }
+
+    async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
+        match self {
+            Self::Memory(store) => store.tool_call_counts(item).await,
+            Self::Online { pg, .. } => pg.tool_call_counts(item).await,
+            Self::Offline { cache, .. } => cache.tool_call_counts(item).await,
         }
     }
 }

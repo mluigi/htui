@@ -25,8 +25,9 @@ use htui_core::model::{
     Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
     RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillVersion,
-    Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, UpstreamEntry, UserId,
-    VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, ToolCallCount,
+    UpstreamEntry, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1116,6 +1117,11 @@ impl ReadStore for PgStore {
                 suspect: row.suspect,
             })
             .collect())
+    }
+
+    async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
+        let _ = item;
+        todo!("MOD-72 T1")
     }
 }
 

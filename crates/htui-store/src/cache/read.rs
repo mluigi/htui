@@ -36,8 +36,8 @@ use htui_core::model::{
     RequirementArea, RequirementFilter, RequirementId, RequirementRevision, RequirementSpec,
     RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
-    StepGraphId, StepId, StepStatus, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceId,
-    WorkspaceSummary,
+    StepGraphId, StepId, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId,
+    VerifyOutcome, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -1244,6 +1244,11 @@ impl ReadStore for CacheStore {
                 })
             })
             .collect()
+    }
+
+    async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
+        let _ = item;
+        todo!("MOD-72 T1")
     }
 }
 

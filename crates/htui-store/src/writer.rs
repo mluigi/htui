@@ -37,7 +37,7 @@ use htui_core::model::{
     RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
     WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
@@ -306,6 +306,13 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.requirement_coverage(requirement).await,
             Self::Online(pg) => pg.requirement_coverage(requirement).await,
+        }
+    }
+
+    async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
+        match self {
+            Self::Memory(store) => store.tool_call_counts(item).await,
+            Self::Online(pg) => pg.tool_call_counts(item).await,
         }
     }
 }

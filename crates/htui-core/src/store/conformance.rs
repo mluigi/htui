@@ -32,8 +32,8 @@ use crate::model::{
     RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
     SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph,
     SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome,
-    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UpstreamEntry, UserId,
-    VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry,
+    UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
     canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
@@ -180,6 +180,7 @@ pub const CASES: &[&str] = &[
     "persona_writers_refuse_every_widening_shape",
     "a_phase_naming_no_persona_is_refused",
     "a_phase_persona_binding_sets_keeps_and_clears",
+    "tool_call_counts_group_by_step_and_kind",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -457,6 +458,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "a_phase_persona_binding_sets_keeps_and_clears" => {
             a_phase_persona_binding_sets_keeps_and_clears(store).await;
         }
+        "tool_call_counts_group_by_step_and_kind" => {
+            tool_call_counts_group_by_step_and_kind(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -508,6 +512,7 @@ pub const READ_CASES: &[&str] = &[
     "item_citations_derive_suspect",
     "coverage_carries_status_and_resolution",
     "requirement_revisions_or_not_cached",
+    "tool_call_counts_read_back",
 ];
 
 /// Runs one [`READ_CASES`] case by name against an already-loaded store.
@@ -539,6 +544,7 @@ pub async fn run_read_case<S: ReadStore>(name: &str, store: &S) {
             coverage_carries_status_and_resolution(store).await;
         }
         "requirement_revisions_or_not_cached" => requirement_revisions_or_not_cached(store).await,
+        "tool_call_counts_read_back" => tool_call_counts_read_back(store).await,
         other => panic!("unknown read case `{other}`; READ_CASES and run_read_case disagree"),
     }
 }
@@ -14191,6 +14197,28 @@ async fn requirement_revisions_or_not_cached<S: ReadStore>(store: &S) {
     );
 }
 
+/// MOD-72 plan D2, D3: the fixture's one `tool_call` (a `read` on `FEAT-1`'s plan step) is the
+/// whole answer for `FEAT-1`, its `tool_result` not a second call; an item whose steps recorded no
+/// call, one with no run and an unknown one answer nothing.
+async fn tool_call_counts_read_back<S: ReadStore>(store: &S) {
+    const CASE: &str = "tool_call_counts_read_back";
+    assert_eq!(
+        store.tool_call_counts(ids::HTUI_FEAT_1).await.expect(CASE),
+        vec![ToolCallCount {
+            step: ids::STEP_PLAN,
+            tool_kind: "read".to_owned(),
+            calls: 1,
+        }],
+        "{CASE}: the plan step's one read, its result not counted"
+    );
+    for item in [ids::HTUI_ANA_1, ids::HTUI_ANA_2, ItemId::new()] {
+        assert!(
+            store.tool_call_counts(item).await.expect(CASE).is_empty(),
+            "{CASE}: {item} recorded no call"
+        );
+    }
+}
+
 // ------------------------------------------------------------------------------------------
 // MOD-42 T0 (plan D1-D5, D12, D13; blueprint B-4, B-7, B-9): the permission and control relay.
 // Each case starts from `leased_step` (owner A, the fixture box, item `HTUI_ANA_2`); the demo
@@ -15847,6 +15875,158 @@ async fn a_phase_persona_binding_sets_keeps_and_clears<S: WriteStore>(store: &S)
         read_back(phase.id).await,
         cleared,
         "{CASE}: read back cleared"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-72 T1 (plan D1-D3; blueprint B-2, B-4, E3, E7): per-step tool-call counts. The fixture's
+// read side is `tool_call_counts_read_back` above; this case writes the shapes the fixture lacks.
+// ------------------------------------------------------------------------------------------
+
+/// One `session_event` row of `kind` for `step` at `seq`, with `payload`; a tool row carries a
+/// `tool_call_id` (§4.3).
+fn tool_event(step: StepId, seq: i32, kind: EventKind, payload: Value) -> SessionEvent {
+    SessionEvent {
+        run_step_id: step,
+        seq,
+        turn: 0,
+        kind,
+        role: EventRole::Agent,
+        tool_call_id: Some(format!("call-{seq}")),
+        payload,
+        raw: None,
+        at: Utc::now(),
+    }
+}
+
+/// `calls` `tool_kind` calls of `step`, as `tool_call_counts` answers it.
+fn tool_calls_of(step: StepId, tool_kind: &str, calls: u32) -> ToolCallCount {
+    ToolCallCount {
+        step,
+        tool_kind: tool_kind.to_owned(),
+        calls,
+    }
+}
+
+/// MOD-72 plan D1-D3: counts per step and kind across two steps of one run; a `tool_result` and
+/// a chat row are not calls; a missing, `null` or non-string `tool_kind` is `other` on every
+/// backend (blueprint B-2); another item's run stays its own.
+async fn tool_call_counts_group_by_step_and_kind<S: WriteStore>(store: &S) {
+    const CASE: &str = "tool_call_counts_group_by_step_and_kind";
+    // Blueprint B-4: `ANA-2` (open) and `CLEAN-1` (failed) may queue a run; `FEAT-1` may not.
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let first = store
+        .create_step(new_run_step(run, 0, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let second = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let other_run = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_CLEAN_1, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let elsewhere = store
+        .create_step(new_run_step(other_run, 0, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+
+    let call = EventKind::ToolCall;
+    let batches = [
+        vec![
+            tool_event(
+                first,
+                0,
+                call,
+                json!({ "title": "cargo test", "tool_kind": "execute" }),
+            ),
+            // A result names its call's kind too, so a kind-blind count would say 3.
+            tool_event(
+                first,
+                1,
+                EventKind::ToolResult,
+                json!({ "status": "completed", "tool_kind": "execute" }),
+            ),
+            tool_event(
+                first,
+                2,
+                call,
+                json!({ "title": "cargo fmt", "tool_kind": "execute" }),
+            ),
+            tool_event(
+                first,
+                3,
+                call,
+                json!({ "title": "Read src/main.rs", "tool_kind": "read" }),
+            ),
+            tool_event(first, 4, call, json!({ "title": "no kind at all" })),
+            chat_event(first, 5),
+        ],
+        vec![
+            tool_event(
+                second,
+                0,
+                call,
+                json!({ "title": "Edit", "tool_kind": "edit" }),
+            ),
+            tool_event(
+                second,
+                1,
+                call,
+                json!({ "title": "null kind", "tool_kind": null }),
+            ),
+            tool_event(
+                second,
+                2,
+                call,
+                json!({ "title": "number kind", "tool_kind": 7 }),
+            ),
+        ],
+        vec![tool_event(
+            elsewhere,
+            0,
+            call,
+            json!({ "title": "Read", "tool_kind": "read" }),
+        )],
+    ];
+    for rows in &batches {
+        assert_eq!(
+            store
+                .append_events(StepFence::Unleased, rows)
+                .await
+                .expect(CASE),
+            rows.len(),
+            "{CASE}: an unclaimed run's rows land unleased"
+        );
+    }
+
+    let mut expected = vec![
+        tool_calls_of(first, "execute", 2),
+        tool_calls_of(first, "other", 1),
+        tool_calls_of(first, "read", 1),
+        tool_calls_of(second, "edit", 1),
+        tool_calls_of(second, "other", 2),
+    ];
+    ToolCallCount::sort_canonical(&mut expected);
+    assert_eq!(
+        store.tool_call_counts(ids::HTUI_ANA_2).await.expect(CASE),
+        expected,
+        "{CASE}: per step and kind; the result and the chat row are not calls; a missing, null \
+         or numeric kind is `other`"
+    );
+    assert_eq!(
+        store.tool_call_counts(ids::HTUI_CLEAN_1).await.expect(CASE),
+        vec![tool_calls_of(elsewhere, "read", 1)],
+        "{CASE}: the other item's run is its own"
     );
 }
 

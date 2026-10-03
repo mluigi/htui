@@ -843,10 +843,40 @@ pub struct RunSummary {
     pub steps: Vec<RunStepSummary>,
 }
 
+/// One row of [`crate::store::ReadStore::tool_call_counts`] (MOD-72 plan D3): how many `tool_call`
+/// events one step recorded of one `tool_kind`.
+///
+/// `tool_kind` is the wire string, not `htui_agent`'s `ToolKind`: no store crate depends on
+/// `htui-agent`. A row whose payload has no JSON-string `tool_kind` counts as `"other"`, the
+/// transport mappers' own fallback (`StepSummary::from_events` reads it the same way).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolCallCount {
+    /// `session_event.run_step_id`.
+    pub step: StepId,
+    /// `session_event.payload ->> 'tool_kind'` when it is a string, else `"other"`.
+    pub tool_kind: String,
+    /// How many `tool_call` rows; never `0`.
+    pub calls: u32,
+}
+
+impl ToolCallCount {
+    /// Sorts by `(step, tool_kind bytes)`: every backend runs it after its own read, because
+    /// Postgres would order text by collation and the mirror by bytes, the reason
+    /// [`UpstreamEntry::sort_canonical`](crate::model::UpstreamEntry::sort_canonical) gives.
+    pub fn sort_canonical(rows: &mut [Self]) {
+        let _ = rows;
+        todo!("MOD-72 T1")
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RunStatus, SnapshotJudge, SnapshotTemplate, StepStatus, prompt_summary};
+    use super::{
+        RunStatus, SnapshotJudge, SnapshotTemplate, StepId, StepStatus, ToolCallCount,
+        prompt_summary,
+    };
     use serde_json::json;
+    use uuid::Uuid;
 
     /// Every row of ANA-2 §4.3's `run` transition table (`docs/ANA-2.md:600-616`), transcribed
     /// from the document rather than from [`RunStatus::can_move_to`].
@@ -1173,6 +1203,37 @@ mod tests {
         assert_eq!(
             missing.persona_for(&missing.phases[0]),
             Err(persona_not_in_snapshot("reviewer"))
+        );
+    }
+
+    /// MOD-72 plan D3: step first, then the kind by bytes, so `"Zed"` sorts before `"edit"`,
+    /// which a collation would reverse.
+    #[test]
+    fn tool_call_counts_sort_by_step_then_kind_bytes() {
+        let s1 = StepId::from_uuid(Uuid::from_u128(1));
+        let s2 = StepId::from_uuid(Uuid::from_u128(2));
+        let row = |step: StepId, tool_kind: &str| ToolCallCount {
+            step,
+            tool_kind: tool_kind.to_owned(),
+            calls: 1,
+        };
+        let mut rows = vec![
+            row(s2, "read"),
+            row(s1, "read"),
+            row(s1, "edit"),
+            row(s1, "Zed"),
+        ];
+
+        ToolCallCount::sort_canonical(&mut rows);
+
+        assert_eq!(
+            rows,
+            vec![
+                row(s1, "Zed"),
+                row(s1, "edit"),
+                row(s1, "read"),
+                row(s2, "read"),
+            ]
         );
     }
 }
