@@ -23,11 +23,11 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentId, EXECUTOR_GONE,
-    GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemPatch, NewDocument, NewItem, NewRun,
-    NewRunStep, OpenPermission, PermissionId, PermissionStatus, RelayOption, RelayOptionKind,
-    RelaySessionId, Resolution, RunId, RunMode, RunStatus, RunStep, Scope, SnapshotGraph,
-    SnapshotPhase, SnapshotSettings, Status, StepId, Transport, WorkspaceSummary,
+    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentHead, DocumentId,
+    EXECUTOR_GONE, GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemPatch, NewDocument,
+    NewItem, NewRun, NewRunStep, Note, OpenPermission, PermissionId, PermissionStatus, RelayOption,
+    RelayOptionKind, RelaySessionId, Resolution, RunId, RunMode, RunStatus, RunStep, Scope,
+    SnapshotGraph, SnapshotPhase, SnapshotSettings, Status, StepId, Transport, WorkspaceSummary,
 };
 use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_orch::Clock;
@@ -2379,4 +2379,351 @@ async fn offline_ctrl_e_asks_for_no_editor() {
 
     keys(&mut harness, &["ctrl-e"]).await;
     assert!(harness.app().take_external_edit().is_none());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Notes and documents (MOD-13 milestone 5, plan D1-D12).
+// ---------------------------------------------------------------------------------------------
+
+/// Sub-tabs right of Body to Docs (V22).
+const TO_DOCS: usize = 3;
+
+/// Sub-tabs right of Body to Notes (V22).
+const TO_NOTES: usize = 4;
+
+/// [`backlog_over`] on htui `FEAT-1`, `pane` sub-tabs right of Body.
+async fn on_feat_1(store: MemStore, pane: usize) -> Harness {
+    let mut harness = backlog_over(store).await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, pane);
+    harness.drive_to_end().await;
+    harness
+}
+
+/// `item`'s notes, oldest first.
+async fn notes_of(store: &MemStore, item: ItemId) -> Vec<Note> {
+    store
+        .notes(item)
+        .await
+        .expect("the memory store never fails")
+}
+
+/// `item`'s documents, by kind then version.
+async fn documents_of(store: &MemStore, item: ItemId) -> Vec<DocumentHead> {
+    store
+        .documents(item)
+        .await
+        .expect("the memory store never fails")
+}
+
+/// The detail pane's rows, borders and padding trimmed, joined by spaces: a wrapped notice reads
+/// whole.
+fn detail_text(frame: &str) -> String {
+    detail_pane(frame)
+        .lines()
+        .map(|line| line.trim_end_matches(['\u{2502}', ' ']).trim())
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// D1, D4, D8: `a` opens the compose area, the pasted text is the note, and Ctrl+S lands it by
+/// hand (no step) as this user on this box; the thread shows it one row per line.
+#[tokio::test]
+async fn a_types_a_note_and_ctrl_s_adds_it_to_the_thread() {
+    let store = MemStore::demo();
+    let mut harness = on_feat_1(store.clone(), TO_NOTES).await;
+    keys(&mut harness, &["a"]).await;
+    harness.paste("Written by hand.\nSecond line.");
+    keys(&mut harness, &["ctrl-s"]).await;
+
+    let notes = notes_of(&store, ids::HTUI_FEAT_1).await;
+    let note = notes.last().expect("a note landed");
+    assert_eq!(note.body, "Written by hand.\nSecond line.");
+    assert_eq!(note.via_step_id, None);
+    assert_eq!(note.created_by, ids::USER);
+    assert_eq!(note.box_id, Some(ids::BOX));
+
+    let detail = detail_pane(&harness.render());
+    let rows: Vec<&str> = detail.lines().map(str::trim).collect();
+    let first = rows
+        .iter()
+        .position(|row| row.starts_with("Written by hand."))
+        .unwrap_or_else(|| panic!("the first line:\n{detail}"));
+    assert!(
+        rows[first + 1].starts_with("Second line."),
+        "the second line on its own row:\n{detail}"
+    );
+    assert!(!detail.contains(" New note "), "the area closed:\n{detail}");
+    assert_eq!(harness.app().status, None);
+}
+
+/// D9: `v` on the cursor's `plan` opens the form prefilled from v2, and Ctrl+S lands v3 by hand.
+#[tokio::test]
+async fn v_on_plan_writes_plan_v3_by_hand() {
+    let store = MemStore::demo();
+    let mut harness = on_feat_1(store.clone(), TO_DOCS).await;
+    keys(&mut harness, &["v"]).await;
+    let frame = harness.render();
+    for wanted in [
+        " New version of plan (from v2) ",
+        "Plan: TUI scaffold (revised)",
+    ] {
+        assert!(frame.contains(wanted), "{wanted:?} in the form:\n{frame}");
+    }
+
+    harness.paste("Edited by hand.\n");
+    keys(&mut harness, &["ctrl-s"]).await;
+    let documents = documents_of(&store, ids::HTUI_FEAT_1).await;
+    let v3 = documents
+        .iter()
+        .find(|document| document.kind == "plan" && document.version == 3)
+        .expect("plan v3 landed");
+    assert_eq!(v3.produced_by_step_id, None);
+    let body = store
+        .document(v3.id)
+        .await
+        .expect("the memory store never fails")
+        .expect("plan v3")
+        .body;
+    assert!(body.starts_with("Edited by hand.\n# Plan"), "{body:?}");
+
+    let frame = harness.render();
+    let detail = detail_pane(&frame);
+    assert!(detail.contains("v3  hand"), "the new row:\n{detail}");
+    let text = detail_text(&frame);
+    assert!(text.contains("saved as plan v3"), "the notice: {text}");
+    assert_eq!(harness.app().status, None);
+}
+
+/// Maintainer answer (blueprint §6 Q1): `v`, then Ctrl+S with nothing edited, says there is
+/// nothing to save, keeps the form open and writes nothing.
+#[tokio::test]
+async fn v_then_ctrl_s_with_no_edit_saves_nothing() {
+    let store = MemStore::demo();
+    let before = documents_of(&store, ids::HTUI_FEAT_1).await.len();
+    let mut harness = on_feat_1(store.clone(), TO_DOCS).await;
+    keys(&mut harness, &["v"]).await;
+    keys(&mut harness, &["ctrl-s"]).await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains(" New version of plan (from v2) "),
+        "the form stays open:\n{frame}"
+    );
+    let text = detail_text(&frame);
+    assert!(text.contains("nothing to save"), "the notice: {text}");
+    assert_eq!(
+        documents_of(&store, ids::HTUI_FEAT_1).await.len(),
+        before,
+        "nothing was written"
+    );
+    assert_eq!(harness.app().status, None);
+}
+
+/// D4, D9: `a` with a typed kind, a title and a body lands that kind's first version.
+#[tokio::test]
+async fn a_with_kind_summary_lands_summary_v1() {
+    let store = MemStore::demo();
+    let mut harness = on_feat_1(store.clone(), TO_DOCS).await;
+    keys(&mut harness, &["a"]).await;
+    type_text(&mut harness, "summary");
+    keys(&mut harness, &["tab"]).await;
+    type_text(&mut harness, "Summary of FEAT-1");
+    keys(&mut harness, &["tab"]).await;
+    harness.paste("The summary.");
+    keys(&mut harness, &["ctrl-s"]).await;
+
+    let documents = documents_of(&store, ids::HTUI_FEAT_1).await;
+    let summary = documents
+        .iter()
+        .find(|document| document.kind == "summary")
+        .expect("summary landed");
+    assert_eq!(summary.version, 1);
+    assert_eq!(summary.title, "Summary of FEAT-1");
+    assert_eq!(summary.produced_by_step_id, None);
+
+    let frame = harness.render();
+    let text = detail_text(&frame);
+    assert!(text.contains("saved as summary v1"), "the notice: {text}");
+    assert!(
+        detail_pane(&frame)
+            .lines()
+            .any(|row| row.trim_start().starts_with("summary")),
+        "the table lists it:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None);
+}
+
+/// D5: a version another writer lands between `v` and Ctrl+S is kept, and the notice names it.
+#[tokio::test]
+async fn a_version_written_meanwhile_is_named_in_the_notice() {
+    let store = MemStore::demo();
+    let mut harness = on_feat_1(store.clone(), TO_DOCS).await;
+    keys(&mut harness, &["v"]).await;
+    let theirs = store
+        .write_document(NewDocument {
+            id: DocumentId::new(),
+            item_id: ids::HTUI_FEAT_1,
+            kind: "plan".to_owned(),
+            title: "Theirs".to_owned(),
+            body: "Theirs.".to_owned(),
+            produced_by_step_id: None,
+            created_by: ids::USER,
+            created_at: Utc::now(),
+        })
+        .await
+        .expect("their version lands");
+    assert_eq!(theirs.version, 3);
+
+    harness.paste("Mine.\n");
+    keys(&mut harness, &["ctrl-s"]).await;
+    let frame = harness.render();
+    let text = detail_text(&frame);
+    assert!(
+        text.contains(
+            "saved as plan v4 \u{2014} v3 was written after you opened v2; both are kept"
+        ),
+        "the notice: {text}"
+    );
+    let plans: Vec<i32> = documents_of(&store, ids::HTUI_FEAT_1)
+        .await
+        .into_iter()
+        .filter(|document| document.kind == "plan")
+        .map(|document| document.version)
+        .collect();
+    assert_eq!(plans, [1, 2, 3, 4], "both are kept");
+    let detail = detail_pane(&frame);
+    for row in ["v3  hand", "v4  hand"] {
+        assert!(detail.contains(row), "{row:?} listed:\n{detail}");
+    }
+}
+
+/// D2: offline, `a` is refused by the worker before anything is read, in either pane. The status
+/// line carries the sentence under the form read's name, no area opens, and the mirror is
+/// untouched.
+#[tokio::test]
+async fn offline_a_opens_no_compose_in_either_pane() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let (mut harness, cache) = offline_backlog(root.path()).await;
+    assert!(
+        harness.render().contains("\u{250c} ANA-1"),
+        "ANA-1 is selected"
+    );
+    let notes = cache
+        .notes(ids::HTUI_ANA_1)
+        .await
+        .expect("the mirror")
+        .len();
+    let documents = cache
+        .documents(ids::HTUI_ANA_1)
+        .await
+        .expect("the mirror")
+        .len();
+
+    sub_tab(&mut harness, TO_DOCS);
+    harness.drive_to_end().await;
+    harness.app().status = None;
+    keys(&mut harness, &["a"]).await;
+    assert_eq!(
+        harness.app().status,
+        Some(format!(
+            "document_form: store unreachable: {DATABASE_UNREACHABLE}"
+        )),
+        "`a` on Docs offline"
+    );
+    let frame = harness.render();
+    assert!(!frame.contains(" New document "), "no form:\n{frame}");
+
+    sub_tab(&mut harness, 1);
+    harness.drive_to_end().await;
+    harness.app().status = None;
+    keys(&mut harness, &["a"]).await;
+    assert_eq!(
+        harness.app().status,
+        Some(format!(
+            "note_form: store unreachable: {DATABASE_UNREACHABLE}"
+        )),
+        "`a` on Notes offline"
+    );
+    let frame = harness.render();
+    assert!(!frame.contains(" New note "), "no area:\n{frame}");
+
+    assert_eq!(
+        cache
+            .notes(ids::HTUI_ANA_1)
+            .await
+            .expect("the mirror")
+            .len(),
+        notes
+    );
+    assert_eq!(
+        cache
+            .documents(ids::HTUI_ANA_1)
+            .await
+            .expect("the mirror")
+            .len(),
+        documents
+    );
+}
+
+/// D7: Ctrl+E in the Notes area hands the (empty) text out under `FEAT-1-note`; what comes back
+/// lands in the area (minus the editor's final newline, D5) and Ctrl+S adds it. Mirrors
+/// [`ctrl_e_hands_the_body_out_and_ctrl_s_saves_what_came_back`].
+#[tokio::test]
+async fn ctrl_e_hands_the_note_to_the_editor_and_ctrl_s_adds_it() {
+    let store = MemStore::demo();
+    let mut harness = on_feat_1(store.clone(), TO_NOTES).await;
+    keys(&mut harness, &["a"]).await;
+    keys(&mut harness, &["ctrl-e"]).await;
+    assert_eq!(
+        harness.app().take_external_edit(),
+        Some((
+            BacklogTab::ID,
+            ExternalEdit {
+                text: String::new(),
+                stem: "FEAT-1-note".to_owned(),
+            }
+        ))
+    );
+    assert!(harness.app().take_external_edit().is_none(), "asked once");
+
+    harness.app().finish_external_edit(
+        BacklogTab::ID,
+        ExternalEditOutcome::Edited("From the editor.\n".to_owned()),
+    );
+    let frame = harness.render();
+    assert!(frame.contains("edited in $EDITOR"), "the notice:\n{frame}");
+    assert!(frame.contains(" New note "), "the area, unsaved:\n{frame}");
+
+    keys(&mut harness, &["ctrl-s"]).await;
+    let notes = notes_of(&store, ids::HTUI_FEAT_1).await;
+    assert_eq!(
+        notes.last().map(|note| note.body.as_str()),
+        Some("From the editor."),
+        "D5 dropped the editor's newline"
+    );
+    assert_eq!(
+        harness.app().status,
+        None,
+        "an external edit raises nothing"
+    );
+}
+
+#[tokio::test]
+async fn the_note_compose_renders_in_the_notes_pane() {
+    let mut harness = on_feat_1(MemStore::demo(), TO_NOTES).await;
+    keys(&mut harness, &["a"]).await;
+    harness.paste("A hand-written note.\nIts second line.");
+    let frame = harness.render();
+    insta::assert_snapshot!("note_compose", frame);
+}
+
+#[tokio::test]
+async fn the_document_form_renders_in_the_docs_pane() {
+    let mut harness = on_feat_1(MemStore::demo(), TO_DOCS).await;
+    keys(&mut harness, &["v"]).await;
+    let frame = harness.render();
+    insta::assert_snapshot!("document_form", frame);
 }
