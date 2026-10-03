@@ -747,14 +747,18 @@ impl ReadStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    /// ANA-2 §4.2's input resolver: latest eligible document per kind, this run's own output
-    /// preferred, fan-out losers excluded, one entry per requested kind in request order.
+    /// ANA-2 §4.2's input resolver as amended by MOD-73 (plan D2): per kind, the newer of the
+    /// step-produced pick (fan-out losers excluded, this run's own output preferred) and the
+    /// latest hand-written version; one entry per requested kind in request order.
     ///
     /// The rank is written as an explicit `CASE` rather than the `(s.run_id = $2) DESC NULLS LAST`
-    /// of §4.2's sketch, and the mirror's statement carries the same three arms: `DESC NULLS LAST`
-    /// over a boolean is not spelled or sorted alike on SQLite, and the two backends have to agree
-    /// (blueprint H-14). `ROW_NUMBER() OVER (PARTITION BY kind ...)` rather than `DISTINCT ON` for
-    /// the same reason — it is one statement both engines run.
+    /// of §4.2's first sketch, and the mirror's statement carries the same three arms: `DESC NULLS
+    /// LAST` over a boolean is not spelled or sorted alike on SQLite, and the two backends have to
+    /// agree (blueprint H-14). Two `ROW_NUMBER()` windows rather than `DISTINCT ON`, for the same
+    /// reason: the inner one, partitioned by `(kind, produced_by_step_id IS NULL)`, picks each
+    /// arm's best; the outer one keeps the higher version per kind. The hand-written arm is keyed
+    /// on the column, not on `s.id IS NULL` (MOD-73 plan D3). On Postgres the two coincide
+    /// (`fk_document_step ... ON DELETE SET NULL`); the mirror is where they don't.
     ///
     /// The caller's order is applied in Rust, exactly as
     /// [`documents_of_kinds`](ReadStore::documents_of_kinds) applies it and for the same two
@@ -792,26 +796,39 @@ impl ReadStore for PgStore {
                    produced_by_step_id AS "produced_by_step_id: StepId",
                    created_by          AS "created_by!: UserId",
                    created_at          AS "created_at!"
-              FROM (SELECT d.id,
-                           d.item_id,
-                           d.kind,
-                           d.version,
-                           d.title,
-                           d.body,
-                           d.produced_by_step_id,
-                           d.created_by,
-                           d.created_at,
+              FROM (SELECT arm.id,
+                           arm.item_id,
+                           arm.kind,
+                           arm.version,
+                           arm.title,
+                           arm.body,
+                           arm.produced_by_step_id,
+                           arm.created_by,
+                           arm.created_at,
                            ROW_NUMBER() OVER (
-                               PARTITION BY d.kind
-                               ORDER BY CASE WHEN s.id IS NULL      THEN 2
-                                             WHEN s.run_id = $2     THEN 0
-                                             ELSE 1 END,
-                                        d.version DESC) AS rank_in_kind
-                      FROM document d
-                      LEFT JOIN run_step s ON s.id = d.produced_by_step_id
-                     WHERE d.item_id = $1
-                       AND d.kind = ANY($3::text[])
-                       AND (s.id IS NULL OR s.selected IS NOT FALSE)) ranked
+                               PARTITION BY arm.kind
+                               ORDER BY arm.version DESC) AS rank_in_kind
+                      FROM (SELECT d.id,
+                                   d.item_id,
+                                   d.kind,
+                                   d.version,
+                                   d.title,
+                                   d.body,
+                                   d.produced_by_step_id,
+                                   d.created_by,
+                                   d.created_at,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY d.kind, d.produced_by_step_id IS NULL
+                                       ORDER BY CASE WHEN s.id IS NULL      THEN 2
+                                                     WHEN s.run_id = $2     THEN 0
+                                                     ELSE 1 END,
+                                                d.version DESC) AS rank_in_arm
+                              FROM document d
+                              LEFT JOIN run_step s ON s.id = d.produced_by_step_id
+                             WHERE d.item_id = $1
+                               AND d.kind = ANY($3::text[])
+                               AND (s.id IS NULL OR s.selected IS NOT FALSE)) arm
+                     WHERE arm.rank_in_arm = 1) ranked
              WHERE rank_in_kind = 1
             "#,
             item.as_uuid(),

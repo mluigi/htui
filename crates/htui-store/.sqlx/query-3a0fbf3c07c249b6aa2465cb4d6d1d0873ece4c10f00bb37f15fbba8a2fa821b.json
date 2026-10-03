@@ -1,0 +1,126 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT id                  AS \"id!: DocumentId\",\n                   item_id             AS \"item_id!: ItemId\",\n                   kind                AS \"kind!\",\n                   version             AS \"version!\",\n                   title               AS \"title!\",\n                   body                AS \"body!\",\n                   produced_by_step_id AS \"produced_by_step_id: StepId\",\n                   created_by          AS \"created_by!: UserId\",\n                   created_at          AS \"created_at!\"\n              FROM (SELECT arm.id,\n                           arm.item_id,\n                           arm.kind,\n                           arm.version,\n                           arm.title,\n                           arm.body,\n                           arm.produced_by_step_id,\n                           arm.created_by,\n                           arm.created_at,\n                           ROW_NUMBER() OVER (\n                               PARTITION BY arm.kind\n                               ORDER BY arm.version DESC) AS rank_in_kind\n                      FROM (SELECT d.id,\n                                   d.item_id,\n                                   d.kind,\n                                   d.version,\n                                   d.title,\n                                   d.body,\n                                   d.produced_by_step_id,\n                                   d.created_by,\n                                   d.created_at,\n                                   ROW_NUMBER() OVER (\n                                       PARTITION BY d.kind, d.produced_by_step_id IS NULL\n                                       ORDER BY CASE WHEN s.id IS NULL      THEN 2\n                                                     WHEN s.run_id = $2     THEN 0\n                                                     ELSE 1 END,\n                                                d.version DESC) AS rank_in_arm\n                              FROM document d\n                              LEFT JOIN run_step s ON s.id = d.produced_by_step_id\n                             WHERE d.item_id = $1\n                               AND d.kind = ANY($3::text[])\n                               AND (s.id IS NULL OR s.selected IS NOT FALSE)) arm\n                     WHERE arm.rank_in_arm = 1) ranked\n             WHERE rank_in_kind = 1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!: DocumentId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "item_id!: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "kind!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "version!",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "version"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "title!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "body!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "produced_by_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "produced_by_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "created_by!: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_at!",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "document",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "3a0fbf3c07c249b6aa2465cb4d6d1d0873ece4c10f00bb37f15fbba8a2fa821b"
+}
