@@ -285,6 +285,8 @@ fn short_label(tool_kind: &str) -> &str {
 /// not fit. Empty when the step made no call. Never wider than `width` once `width` holds the
 /// glyph and `+N`; `StepNode::render` clips anyway.
 pub(super) fn chips(calls: &[ToolCallCount], width: usize) -> String {
+    use core::fmt::Write as _;
+
     // D6: never a `×0`.
     let mut shown: Vec<(&str, u32)> = calls
         .iter()
@@ -306,15 +308,16 @@ pub(super) fn chips(calls: &[ToolCallCount], width: usize) -> String {
         let chip = format!(" {label}{TIMES}{count}");
         let left = total - i - 1;
         // Blueprint E12: room for the `+N` this chip's failure would leave, unless it is the last.
+        // ` +` and `left`'s ASCII digits, counted without a `String` (MOD-72 review N6).
         let reserve = if left == 0 {
             0
         } else {
-            cells::cell_width(&format!(" +{left}"))
+            2 + left.ilog10() as usize + 1
         };
         if used + cells::cell_width(&chip) + reserve > width {
             // E11: stop at the first chip that does not fit, so the shown ones are the largest;
             // the chip before this one reserved exactly this `+N`.
-            line.push_str(&format!(" +{}", total - i));
+            let _ = write!(line, " +{}", total - i); // a `String` write cannot fail
             return line;
         }
         used += cells::cell_width(&chip);
