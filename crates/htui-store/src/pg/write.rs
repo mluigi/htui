@@ -45,9 +45,10 @@ use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    EXECUTOR_MUST_BE_KNOWN, document_needs_a_step, link_key, link_not_proposed_by_run,
-    link_outside_project, note_needs_a_step, self_link, step_document_refusal, step_note_refusal,
-    step_writes_own_item,
+    COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, command_finish_status, command_not_claimable,
+    command_not_queued, document_needs_a_step, link_key, link_not_proposed_by_run,
+    link_outside_project, note_needs_a_step, reaped_note, self_link, step_document_refusal,
+    step_note_refusal, step_writes_own_item,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore as _, Result,
@@ -6735,46 +6736,215 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
-    async fn enqueue_command(&self, _new: NewCommandRun) -> Result<CommandRun> {
-        Err(StoreError::Backend(
-            "MOD-11 T8: not yet implemented".to_owned(),
-        ))
+    /// D14, B-16: the shape refusal, then [`WriteStore::record_command_run`] itself (the same
+    /// `INSERT`, so the same `.sqlx` entry). `record_command_run` takes no lock on `run` or
+    /// `run_step` beyond the foreign key's `FOR KEY SHARE`, so no `park_step` cycle (T1's 40P01).
+    ///
+    /// # Errors
+    ///
+    /// `Constraint(command_not_queued())`, then `record_command_run`'s.
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
+        if new.status != CommandRunStatus::Queued
+            || new.started_at.is_some()
+            || new.finished_at.is_some()
+            || new.exit_code.is_some()
+            || new.output.is_some()
+        {
+            return Err(StoreError::Constraint(command_not_queued()));
+        }
+        WriteStore::record_command_run(self, new).await
     }
 
+    /// D14 (blueprint §2.4): one transaction. The row `FOR UPDATE` decides `NotFound` and the
+    /// not-`queued` refusal; then `pg_advisory_xact_lock` on the `(box, class)` pair, so two
+    /// claimants of one pair count and admit one at a time across processes; then the pair's
+    /// stale `running` rows are reaped (OQ-3) and the row is admitted when fewer than `limit`
+    /// run and it is the oldest `queued`. A claim locks no `run` or `item` row; two claimants of
+    /// different rows of one pair each hold only their own row when they meet on the advisory
+    /// lock, so there is no cycle. The reap commits whether or not the row is admitted.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound { entity: "command_run" }`; `Constraint(command_not_claimable(status))`.
     async fn claim_command(
         &self,
-        _id: CommandRunId,
-        _claimant: Uuid,
-        _limit: u32,
+        id: CommandRunId,
+        claimant: Uuid,
+        limit: u32,
     ) -> Result<Option<CommandRun>> {
-        Err(StoreError::Backend(
-            "MOD-11 T8: not yet implemented".to_owned(),
-        ))
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let row = sqlx::query!(
+            r#"SELECT box_id AS "box_id: BoxId", class, status AS "status: CommandRunStatus"
+                 FROM command_run WHERE id = $1 FOR UPDATE"#,
+            id.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "command_run",
+            id: id.to_string(),
+        })?;
+        if row.status != CommandRunStatus::Queued {
+            return Err(StoreError::Constraint(command_not_claimable(row.status)));
+        }
+
+        sqlx::query!(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            format!("{}/{}", row.box_id, row.class),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let stale_after = COMMAND_STALE_AFTER.num_microseconds().unwrap_or(i64::MAX);
+        sqlx::query!(
+            "UPDATE command_run \
+                SET status = 'failed', finished_at = clock_timestamp(), \
+                    output = COALESCE(output || E'\\n', '') || $3 \
+              WHERE box_id = $1 AND class = $2 AND status = 'running' \
+                AND COALESCE(heartbeat_at, started_at, queued_at) \
+                    < clock_timestamp() - $4::bigint * interval '1 microsecond'",
+            row.box_id.as_uuid(),
+            row.class,
+            reaped_note(),
+            stale_after,
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+
+        let running = sqlx::query_scalar!(
+            r#"SELECT count(*) AS "running!" FROM command_run
+                WHERE box_id = $1 AND class = $2 AND status = 'running'"#,
+            row.box_id.as_uuid(),
+            row.class,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let oldest = sqlx::query_scalar!(
+            r#"SELECT id AS "id: CommandRunId" FROM command_run
+                WHERE box_id = $1 AND class = $2 AND status = 'queued'
+                ORDER BY queued_at, id LIMIT 1"#,
+            row.box_id.as_uuid(),
+            row.class,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if running >= i64::from(limit.max(1)) || oldest != Some(id) {
+            tx.commit().await.map_err(map_sqlx)?;
+            return Ok(None);
+        }
+
+        let admitted = sqlx::query_as!(
+            CommandRun,
+            r#"
+            UPDATE command_run
+               SET status = 'running', claimed_by = $2, started_at = clock_timestamp(),
+                   heartbeat_at = clock_timestamp()
+             WHERE id = $1
+            RETURNING id          AS "id: CommandRunId",
+                      run_step_id AS "run_step_id: StepId",
+                      box_id      AS "box_id: BoxId",
+                      class,
+                      command,
+                      cwd,
+                      status      AS "status: CommandRunStatus",
+                      exit_code,
+                      output,
+                      queued_at,
+                      started_at,
+                      finished_at
+            "#,
+            id.as_uuid(),
+            claimant,
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(Some(admitted))
     }
 
-    async fn beat_command(&self, _id: CommandRunId, _claimant: Uuid) -> Result<bool> {
-        Err(StoreError::Backend(
-            "MOD-11 T8: not yet implemented".to_owned(),
-        ))
+    /// D14: the claimant's beat, one statement on the pool.
+    ///
+    /// # Errors
+    ///
+    /// The backend's own failures only.
+    async fn beat_command(&self, id: CommandRunId, claimant: Uuid) -> Result<bool> {
+        let done = sqlx::query!(
+            "UPDATE command_run SET heartbeat_at = clock_timestamp() \
+              WHERE id = $1 AND claimed_by = $2 AND status = 'running'",
+            id.as_uuid(),
+            claimant,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(done.rows_affected() == 1)
     }
 
+    /// D14: the claimant's end of a row, one statement on the pool; the status is refused first.
+    ///
+    /// # Errors
+    ///
+    /// `Constraint(command_finish_status(status))` for `queued | running`.
     async fn finish_command(
         &self,
-        _id: CommandRunId,
-        _claimant: Uuid,
-        _status: CommandRunStatus,
-        _exit_code: Option<i32>,
-        _output: Option<String>,
+        id: CommandRunId,
+        claimant: Uuid,
+        status: CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
     ) -> Result<bool> {
-        Err(StoreError::Backend(
-            "MOD-11 T8: not yet implemented".to_owned(),
-        ))
+        if matches!(status, CommandRunStatus::Queued | CommandRunStatus::Running) {
+            return Err(StoreError::Constraint(command_finish_status(status)));
+        }
+        let done = sqlx::query!(
+            "UPDATE command_run \
+                SET status = $3, exit_code = $4, output = $5, finished_at = clock_timestamp() \
+              WHERE id = $1 AND claimed_by = $2 AND status = 'running'",
+            id.as_uuid(),
+            claimant,
+            status.as_str(),
+            exit_code,
+            output,
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(done.rows_affected() == 1)
     }
 
-    async fn cancel_command(&self, _id: CommandRunId) -> Result<bool> {
-        Err(StoreError::Backend(
-            "MOD-11 T8: not yet implemented".to_owned(),
-        ))
+    /// D14: `queued | running → cancelled`; zero rows re-read the id to tell `NotFound` from a
+    /// terminal row.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound { entity: "command_run" }`.
+    async fn cancel_command(&self, id: CommandRunId) -> Result<bool> {
+        let done = sqlx::query!(
+            "UPDATE command_run SET status = 'cancelled', finished_at = clock_timestamp() \
+              WHERE id = $1 AND status IN ('queued', 'running')",
+            id.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if done.rows_affected() == 1 {
+            return Ok(true);
+        }
+        sqlx::query_scalar!("SELECT 1 FROM command_run WHERE id = $1", id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "command_run",
+                id: id.to_string(),
+            })?;
+        Ok(false)
     }
 }
 

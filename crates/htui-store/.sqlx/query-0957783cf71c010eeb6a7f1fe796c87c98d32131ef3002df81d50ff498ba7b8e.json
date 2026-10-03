@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE command_run SET status = 'cancelled', finished_at = clock_timestamp() WHERE id = $1 AND status IN ('queued', 'running')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0957783cf71c010eeb6a7f1fe796c87c98d32131ef3002df81d50ff498ba7b8e"
+}

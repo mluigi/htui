@@ -17004,8 +17004,7 @@ async fn item_by_key_answers_within_its_project<S: WriteStore>(store: &S) {
 // MOD-11 T8 (plan D14, OQ-3, blueprint B-16): the command queue. A row is enqueued `queued`, a
 // claim admits the oldest `queued` row of its `(box, class)` while fewer than the class limit
 // run, only the claimant beats or finishes it, and a cancel ends it from either live state. The
-// reaping of a stale heartbeat needs a clock the suite cannot move on Postgres:
-// `a_stale_running_row_is_reaped_by_the_next_claim` pins it on `MemStore`.
+// reaping of a stale heartbeat needs a clock the suite cannot move on Postgres (F-22).
 // ------------------------------------------------------------------------------------------
 
 /// MOD-11 D14: a `queued` row of `class` on the fixture's `R2/prd` step and box, queued at `at`.
@@ -17129,7 +17128,12 @@ async fn enqueue_command_queues_on_an_existing_step<S: WriteStore>(store: &S) {
 /// Three `build` rows on one box under a limit of 2: the youngest asked first is not admitted
 /// ahead of the older two, the two oldest run, the third waits until one of them finishes; a
 /// `test` row on the same box is another class with its own slots; a limit of 0 reads as 1; an
-/// unknown row is `NotFound` and a row already running is not claimable again.
+/// unknown row is `NotFound` and a row already running is not claimable again. Two halves are
+/// not here: the limit under racing claimants on two pools,
+/// `pg_criteria.rs::concurrent_claims_never_exceed_the_class_limit`, and the reaping of a stale
+/// heartbeat, which needs a clock the suite cannot move on Postgres —
+/// `a_stale_running_row_is_reaped_by_the_next_claim` on `MemStore` and
+/// `pg_criteria.rs::a_stale_heartbeat_is_reaped_by_the_next_claim` by a raw-SQL backdate.
 async fn claim_command_admits_up_to_the_limit_in_queue_order<S: WriteStore>(store: &S) {
     const CASE: &str = "claim_command_admits_up_to_the_limit_in_queue_order";
     let t0 = seam_clock();

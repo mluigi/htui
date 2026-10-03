@@ -9526,7 +9526,7 @@ mod tests {
     /// claim of its `(box, class)` sees the heartbeat older than [`COMMAND_STALE_AFTER`]; that
     /// claim fails it with [`reaped_note`] and admits the next row. Exactly the stale-after bound
     /// is not yet stale, a beat moves the bound, and another class's row is not touched.
-    /// Postgres's half: `pg_criteria.rs`'s raw-SQL backdate.
+    /// Postgres's half: `pg_criteria.rs::a_stale_heartbeat_is_reaped_by_the_next_claim`.
     ///
     /// [`COMMAND_STALE_AFTER`]: crate::store::traits::COMMAND_STALE_AFTER
     /// [`reaped_note`]: crate::store::traits::reaped_note
