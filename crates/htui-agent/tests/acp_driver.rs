@@ -1259,6 +1259,10 @@ const PRIOR_SESSION: &str = "prior";
 enum Answer {
     /// `result: {}`.
     Ok,
+    /// `result: {}`, after the replay is streamed as `session/update` notifications: what an
+    /// agent that sends updates ahead of its `session/resume` answer looks like (review N-1).
+    /// `session/load` always streams its replay first.
+    OkAfterUpdates,
     /// `error: { code: -32000, message: VENDOR_REFUSAL }`.
     Refuse,
 }
@@ -1325,7 +1329,9 @@ async fn restoring_agent(
             continue;
         };
         let answered = |answer: Answer| match answer {
-            Answer::Ok => json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+            Answer::Ok | Answer::OkAfterUpdates => {
+                json!({ "jsonrpc": "2.0", "id": id, "result": {} })
+            }
             Answer::Refuse => json!({
                 "jsonrpc": "2.0",
                 "id": id,
@@ -1341,8 +1347,14 @@ async fn restoring_agent(
             "session/new" => {
                 json!({ "jsonrpc": "2.0", "id": id, "result": { "sessionId": FRESH_SESSION } })
             }
-            "session/resume" => answered(resume),
-            "session/load" => {
+            "session/resume" | "session/load" => {
+                let resuming = method == "session/resume";
+                if resuming && !matches!(resume, Answer::OkAfterUpdates) {
+                    if !write_line(&mut writer, &answered(resume)).await {
+                        return;
+                    }
+                    continue;
+                }
                 let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
                 for update in &replay {
                     let notification = json!({
@@ -1354,7 +1366,7 @@ async fn restoring_agent(
                         return;
                     }
                 }
-                answered(load)
+                answered(if resuming { resume } else { load })
             }
             "session/prompt" => {
                 let session_id = params.get("sessionId").cloned().unwrap_or(Value::Null);
@@ -1762,6 +1774,85 @@ async fn a_refused_session_load_answers_with_the_agents_own_message() {
         "the session's child",
     )
     .await;
+    restore.agent.abort();
+    let _ = restore.agent.await;
+}
+
+/// (d') Review L-5: a refused `session/resume` answers with the agent's own message in the D61
+/// shape, as (d) does for `session/load`, and the child is reaped.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_refused_session_resume_answers_with_the_agents_own_message() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let mut restore = open_restoring(
+        tmp.path(),
+        json!({ "sessionCapabilities": { "resume": {} } }),
+        Answer::Refuse,
+        Answer::Ok,
+        SessionSettings::default(),
+        true,
+    )
+    .await;
+    let message = transport_message(&restore.opened).to_owned();
+    assert!(
+        message.contains("session/resume failed"),
+        "the error names the request that was refused: {message}"
+    );
+    assert!(
+        message.contains(VENDOR_REFUSAL),
+        "and carries the agent's own text: {message}"
+    );
+    let seen = restore.seen();
+    assert!(
+        !methods(&seen).contains(&"session/new") && !methods(&seen).contains(&"session/load"),
+        "no other request stands in for it: {:?}",
+        methods(&seen)
+    );
+    assert_reaped(
+        restore.pid.expect("the case spawned a child"),
+        "the session's child",
+    )
+    .await;
+    restore.agent.abort();
+    let _ = restore.agent.await;
+}
+
+/// Review N-1: an agent that sends updates ahead of its `session/resume` answer has them
+/// discarded, as a load's replay is: the first event after the banner is the new prompt's turn.
+#[cfg(unix)]
+#[tokio::test]
+async fn updates_sent_before_a_resume_answer_never_reach_the_session() {
+    let tmp = tempfile::tempdir().expect("temp cwd");
+    let mut restore = open_restoring(
+        tmp.path(),
+        json!({ "sessionCapabilities": { "resume": {} } }),
+        Answer::OkAfterUpdates,
+        Answer::Ok,
+        SessionSettings::default(),
+        false,
+    )
+    .await;
+    let seen = restore.seen();
+    assert!(
+        methods(&seen).contains(&"session/resume"),
+        "the resume route was taken: {:?}",
+        methods(&seen)
+    );
+    let opened = std::mem::replace(&mut restore.opened, Err(DriverError::Closed));
+    let mut session = opened.expect("a resumable session opens");
+    let events = events_to_done(&mut session).await;
+    assert_eq!(banner_session(&events[0]), PRIOR_SESSION);
+    assert!(
+        !events.iter().any(|event| match event {
+            DriverEvent::AssistantChunk(chunk) => chunk.text == "old reply",
+            DriverEvent::ToolCall(call) => call.tool_call_id == "old-call",
+            _ => false,
+        }),
+        "nothing sent before the answer reached the session: {events:?}"
+    );
+    assert_fresh_turn(&events[1..]);
+
+    drop(session);
     restore.agent.abort();
     let _ = restore.agent.await;
 }

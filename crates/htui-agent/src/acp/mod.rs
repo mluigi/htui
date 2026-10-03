@@ -1770,7 +1770,9 @@ fn restore_route(
 
 /// Restores `previous` by `route` (MOD-37 M5). The step is recorded first, as `session/new`'s
 /// is, so a refusal answered from the connection's error (`answer_from_connection`) names the
-/// request that was actually sent. A loaded session's replay is discarded ([`drain_replay`]).
+/// request that was actually sent. Whatever either request queued ahead of its answer is
+/// discarded ([`drain_replay`]): a load's replay, and any update an agent sends before its
+/// `session/resume` answer (review N-1), so the first event after the banner is the new turn's.
 async fn restore_session(
     cx: &ConnectionTo<Agent>,
     spec: &SessionSpec,
@@ -1784,12 +1786,19 @@ async fn restore_session(
             at_step(ready, "session/resume");
             let request = ResumeSessionRequest::new(previous.as_str().to_owned(), spec.cwd.clone())
                 .additional_directories(spec.extra_dirs.clone());
-            cx.resume_session_from(request)
+            let mut session = cx
+                .resume_session_from(request)
                 .block_task()
                 .start_session()
                 .await
                 .map(RestoredSession::into_session)
-                .map_err(|err| handshake_error("session/resume", &err, child))
+                .map_err(|err| handshake_error("session/resume", &err, child))?;
+            let discarded = drain_replay(&mut session);
+            tracing::debug!(
+                discarded,
+                "session/resume: updates sent before the answer were discarded"
+            );
+            Ok(session)
         }
         Restore::Load => {
             at_step(ready, "session/load");
@@ -1810,7 +1819,8 @@ async fn restore_session(
 }
 
 /// Discards every update already queued on `session`, without waiting: the history a
-/// `session/load` replays ahead of its response (SDK `concepts/sessions.rs:86-88`; the handler
+/// `session/load` replays ahead of its response, or whatever an agent sent ahead of its
+/// `session/resume` answer (SDK `concepts/sessions.rs:86-88`; the handler
 /// queues at `session.rs:1223` before the ordered response is dispatched, `jsonrpc.rs:6011`).
 /// `read_update` is a `futures` mpsc `next()` (`session.rs:1054`), which is cancel-safe, so one
 /// poll with a no-op waker is `Ready` while something is queued and `Pending` once it is empty.
