@@ -106,11 +106,6 @@ pub(crate) fn schema_of<T: schemars::JsonSchema>() -> Value {
     schema
 }
 
-/// The schema of a tool that takes no arguments, or of a stub.
-pub(crate) fn no_arguments() -> Value {
-    serde_json::json!({"type": "object", "properties": {}, "additionalProperties": false})
-}
-
 /// `text` masked by the session's scrubber, or refused when a credential survives (I-5, fail
 /// closed). The refusal names the rule, never the text.
 #[allow(dead_code, reason = "called by the write tools (MOD-11 T4, T8)")]
