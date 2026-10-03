@@ -137,26 +137,31 @@ completes a run whose tests need a secret, and no resolved value appears in any 
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Scrubber hardening | Exact-match masking from a resolved map and a broader pattern rule set guard every persisted byte; a fail-closed scrub fails the run with a typed, visible reason | pending | — |
+| 1 | Scrubber hardening | Exact-match masking from a resolved map and a broader pattern rule set guard every persisted byte; a fail-closed scrub fails the run with a typed, visible reason | in-progress | `.claude/plans/mod-10-m1-scrubber-hardening.plan.md` |
 | 2 | Infisical provider | A box with a machine identity in its keyring can authenticate to the configured Infisical, list and resolve a project scope's secrets, and report health; every failure is a typed, non-leaking error | pending | — |
 | 3 | Run-start injection | Graph runs and chat on a configured project receive its secrets in the agent environment only, with the scrubber built from the same map; failures refuse the run; the verifier never sees them | pending | — |
 | 4 | Settings section | The maintainer enters the machine identity and base URL, sees provider health, and sets each project's scope, without leaving the TUI | pending | — |
 
 ## Open Questions
 
-- [ ] **`.env` in the worktree.** Should `htui` detect a `.env` (or similar) in a run's tree and warn
-      or refuse, now that a provider exists? Proposed: file as a follow-up item at close-out.
-- [ ] **Pattern rule set breadth.** A broader rule set catches more leaks but, fail-closed, can halt
+- [x] **`.env` in the worktree.** Should `htui` detect a `.env` (or similar) in a run's tree and warn
+      or refuse, now that a provider exists? **Decided 2026-10-03:** follow-up item, filed at
+      close-out; not in this MVP.
+- [x] **Pattern rule set breadth.** A broader rule set catches more leaks but, fail-closed, can halt
       runs on false positives. Which source (curated subset of gitleaks' MIT rules vs extended
       prefix list) and how is a false positive handled? TBD — needs validation via a scrub pass
       over existing stored transcripts in the plan.
-- [ ] **Imported and referenced secrets.** Infisical returns imports separately; which copy wins on
+      **Decided 2026-10-03:** as proposed — the M1 plan measures candidate sets before choosing.
+- [x] **Imported and referenced secrets.** Infisical returns imports separately; which copy wins on
       a key clash, and do hidden values (identity lacks read permission) refuse the run? Proposed:
       refuse on hidden values; precedence settled in the plan.
-- [ ] **Short values.** Exact-match masking of very short values (ANA-7 proposed length ≥ 6)
+      **Decided 2026-10-03:** as proposed.
+- [x] **Short values.** Exact-match masking of very short values (ANA-7 proposed length ≥ 6)
       over-masks transcripts; below the floor, mask anyway, skip, or refuse? TBD in the plan.
-- [ ] **Resolve-once vs per-step.** Is one resolution per run enough for long runs, or does a
+      **Decided 2026-10-03:** deferred to the plan.
+- [x] **Resolve-once vs per-step.** Is one resolution per run enough for long runs, or does a
       retried / resumed step (MOD-37 resume) re-resolve? TBD in the plan.
+      **Decided 2026-10-03:** deferred to the plan.
 
 ## Risks
 
