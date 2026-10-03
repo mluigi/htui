@@ -14588,7 +14588,6 @@ mod tests {
     /// fixture does.
     #[tokio::test]
     async fn a_handoff_spec_carries_no_excerpts_and_runs_no_pass() {
-        use crate::command::OpeningPath;
         use crate::graph::GraphSource as _;
 
         let harness = Harness::new().await;
@@ -14649,10 +14648,73 @@ mod tests {
         else {
             panic!("`PromoteStep` answers `Promoted`");
         };
-        let OpeningPath::Handoff { text, .. } = &opening.path else {
-            panic!("the fake agent row does not resume: {:?}", opening.path);
-        };
+        let (text, _) = opening.path.handoff();
         assert!(!text.contains("<file path="), "{text}");
+    }
+
+    /// MOD-37 M5 (R-48): a `Resume` opening carries, as its fallback, the very handoff text and
+    /// digest a `Handoff` opening of the same step builds, so the worker can open with it when the
+    /// resume fails, without asking the engine again.
+    #[tokio::test]
+    async fn a_resume_opening_carries_the_handoff_a_handoff_opening_would() {
+        use crate::command::OpeningPath;
+        use crate::graph::GraphSource as _;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, _, prd) = excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        assert_eq!(
+            prd.agent_id,
+            Some(ids::AGENT_CLAUDE),
+            "the walk ran on the `claude` row"
+        );
+        let promote = async || {
+            let CommandOutcome::Promoted { opening, .. } = harness
+                .dispatch(Command::PromoteStep {
+                    run: row.id,
+                    step: prd.id,
+                    chat_open: false,
+                })
+                .await
+                .expect("a parked step")
+            else {
+                panic!("`PromoteStep` answers `Promoted`");
+            };
+            opening.path
+        };
+
+        // The seed `claude` row says `acp.session.resume`, and the fake walk wrote a banner.
+        let OpeningPath::Resume {
+            handoff: resumed_handoff,
+            digest: resumed_digest,
+            ..
+        } = promote().await
+        else {
+            panic!("an ACP row with resume caps and a banner resumes");
+        };
+
+        // The same row with both restore routes off hands off.
+        let mut agent = harness
+            .orch
+            .graphs()
+            .agent(ids::AGENT_CLAUDE)
+            .await
+            .expect("the fake graph source never fails")
+            .expect("the demo registry has the `claude` row");
+        agent.settings["acp"]["session"] = serde_json::json!({ "load": false, "resume": false });
+        htui_core::fixtures::edit_agent(&harness.orch.store, &agent)
+            .await
+            .expect("the row is rewritten");
+        let OpeningPath::Handoff { text, digest } = promote().await else {
+            panic!("a row whose caps say no resume hands off");
+        };
+
+        assert!(!text.is_empty() && !digest.is_empty());
+        assert_eq!(
+            (resumed_handoff, resumed_digest),
+            (text, digest),
+            "the fallback is the handoff the same promotion would have opened with"
+        );
     }
 
     // -- MOD-9 D120-D123: glob attachments fire --------------------------------------------------
