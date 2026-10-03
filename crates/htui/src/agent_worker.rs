@@ -1031,7 +1031,9 @@ impl AgentRuntime {
         };
 
         let (resume, opening_text) = match opening.path {
-            OpeningPath::Resume { session_ref, text } => (Some(session_ref), text),
+            OpeningPath::Resume {
+                session_ref, text, ..
+            } => (Some(session_ref), text),
             OpeningPath::Handoff { text, .. } => (None, text),
         };
         let spec = SessionSpec {
@@ -5140,6 +5142,8 @@ pub(crate) mod tests {
             OpeningPath::Resume {
                 session_ref: htui_agent::driver::AgentSessionRef::new("banner-1"),
                 text: htui_orch::promote::RESUME_OPENING.to_owned(),
+                handoff: "the handoff".to_owned(),
+                digest: "d".to_owned(),
             },
         );
 

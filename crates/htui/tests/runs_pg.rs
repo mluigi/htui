@@ -246,7 +246,9 @@ async fn seed(store: &PgStore) {
                 models: Vec::new(),
                 default_model: Some("sonnet".to_owned()),
                 launch: json!({ "command": "unused", "args": [] }),
-                settings: json!({}),
+                // MOD-37 M5 (H-1, H-11): both restore routes off, so the promotion case keeps the
+                // handoff opening it names.
+                settings: json!({ "acp": { "session": { "load": false, "resume": false } } }),
                 enabled: true,
                 created_at: at,
                 updated_at: at,

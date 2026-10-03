@@ -272,12 +272,17 @@ pub struct Opening {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpeningPath {
     /// The step's own agent session, resumed; `text` is `promote::RESUME_OPENING`, recorded as the
-    /// chat's first `follow_up`.
+    /// chat's first `follow_up`. `handoff` and `digest` are the handoff opening the same promotion
+    /// would have built: what the chat opens with instead when the resume fails (MOD-37 M5).
     Resume {
         /// The session id the step's `session_started` banner recorded.
         session_ref: AgentSessionRef,
         /// The first message the chat sends.
         text: String,
+        /// The assembled, scrubbed handoff prompt, the fallback.
+        handoff: String,
+        /// Its digest.
+        digest: String,
     },
     /// A fresh session opened with the `handoff` role's assembled prompt.
     Handoff {
@@ -286,6 +291,22 @@ pub enum OpeningPath {
         /// Its digest, as `AssembledPrompt::digest` computes it.
         digest: String,
     },
+}
+
+impl OpeningPath {
+    /// The handoff prompt and its digest, whichever opening this is (MOD-37 M5).
+    #[must_use]
+    pub fn handoff(&self) -> (&str, &str) {
+        match self {
+            Self::Resume {
+                handoff, digest, ..
+            }
+            | Self::Handoff {
+                text: handoff,
+                digest,
+            } => (handoff, digest),
+        }
+    }
 }
 
 /// Which of §4.3 verdict 1's three ways `Unblock` clears an item (MOD-4 plan D161).

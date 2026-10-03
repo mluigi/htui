@@ -1,5 +1,5 @@
 //! §4.8's promotion, the pure half (plan D163, blueprint D192, D193): which opening a promoted
-//! step gets, and the handoff role's `PromptSpec`.
+//! step gets, on either transport (MOD-37 M5), and the handoff role's `PromptSpec`.
 //!
 //! The engine reads the step's rows, its agent's caps and its trees; this module decides from
 //! them and builds nothing it would have to read for itself.
@@ -7,7 +7,7 @@
 use htui_agent::driver::{AgentSessionRef, DriverCaps};
 use htui_agent::event::{DriverEvent, SESSION_STARTED};
 use htui_agent::replay::envelope_from_row;
-use htui_core::model::{EventKind, PromptTemplate, SessionEvent, Transport};
+use htui_core::model::{EventKind, PromptTemplate, SessionEvent};
 use htui_core::prompt::excerpt::RepoRoot;
 use htui_core::prompt::{
     DiffBlock, HandoffInputs, PromptSpec, StepSummary, TemplateRef, TemplateRole,
@@ -17,20 +17,26 @@ use htui_core::prompt::{
 pub const RESUME_OPENING: &str = "This step was promoted to an interactive chat. Say where you \
     stopped and what is left, then wait for the maintainer's instructions.";
 
+/// MOD-37 M5 (ANA-27 T5): what a chat that opened with the handoff prompt did not carry. The Runs
+/// pane, the `resume_failed` row and the Chat tab all say it in these words.
+pub const CONTEXT_NOT_CARRIED: &str = "context not carried; handoff prompt only";
+
 /// How a promoted step's chat opens (blueprint D192).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpeningKind {
-    /// The step's own agent session, resumed from its banner's id; the first message is
-    /// [`RESUME_OPENING`].
+    /// The step's own agent session, resumed from its banner's id on either transport; the first
+    /// message is [`RESUME_OPENING`].
     Resume(AgentSessionRef),
     /// A fresh session opened with the `handoff` role's prompt ([`handoff_spec`]).
     Handoff,
 }
 
-/// The step's first `other` row whose update is `session_started`, as ANA-4 §6 records it
-/// (`body.session_id`, `agent_worker.rs:2832-2839`), decoded through `replay::envelope_from_row`.
+/// The step's latest `other` row whose update is `session_started`, as ANA-4 §6 records it
+/// (`body.session_id`, `agent_worker.rs:2832-2839`), decoded through `replay::envelope_from_row`
+/// (MOD-37 M5 A-7, amending D192: after a resume that failed and fell back, the latest session is
+/// the handoff's, which holds the chat).
 ///
-/// "First" is by `seq`. A row that does not decode, or a banner without a string `session_id`,
+/// "Latest" is by `seq`. A row that does not decode, or a banner without a string `session_id`,
 /// answers `None`.
 #[must_use]
 pub fn banner(events: &[SessionEvent]) -> Option<AgentSessionRef> {
@@ -46,7 +52,7 @@ pub fn banner(events: &[SessionEvent]) -> Option<AgentSessionRef> {
             },
             Err(_) => None,
         })
-        .min_by_key(|(seq, _)| *seq)
+        .max_by_key(|(seq, _)| *seq)
         .and_then(|(_, body)| {
             body.get("session_id")
                 .and_then(serde_json::Value::as_str)
@@ -54,18 +60,16 @@ pub fn banner(events: &[SessionEvent]) -> Option<AgentSessionRef> {
         })
 }
 
-/// Blueprint D192: resume only where the transport honours `SessionSpec.resume` today. That is
-/// the CLI (`cli/mod.rs:145`, `:405`); the ACP driver never reads it (R-48).
+/// Blueprint D192: resume whenever the agent's caps say `resume` and [`banner`] finds the
+/// session's id: the CLI through `--resume`, ACP through `session/resume` or `session/load`
+/// (MOD-37 M5, R-48). The handoff text is built either way, as the fallback a failed resume
+/// opens with.
 ///
-/// So: [`OpeningKind::Resume`] when `caps.resume`, the transport is `cli` and [`banner`] finds
-/// the session's id, and [`OpeningKind::Handoff`] otherwise.
+/// So: [`OpeningKind::Resume`] when `caps.resume` and [`banner`] finds the session's id, and
+/// [`OpeningKind::Handoff`] otherwise.
 #[must_use]
-pub fn opening_kind(
-    caps: DriverCaps,
-    transport: Transport,
-    events: &[SessionEvent],
-) -> OpeningKind {
-    if !caps.resume || transport != Transport::Cli {
+pub fn opening_kind(caps: DriverCaps, events: &[SessionEvent]) -> OpeningKind {
+    if !caps.resume {
         return OpeningKind::Handoff;
     }
     banner(events).map_or(OpeningKind::Handoff, OpeningKind::Resume)
@@ -156,6 +160,21 @@ mod tests {
         DriverCaps {
             resume: true,
             ..DriverCaps::default()
+        }
+    }
+
+    /// `registry::caps_for`'s ACP profile spelled out, with `acp.session.resume` on.
+    fn acp_caps() -> DriverCaps {
+        DriverCaps {
+            permission_requests: true,
+            edit_proposals: true,
+            plans: true,
+            thoughts: true,
+            follow_up_in_session: true,
+            resume: true,
+            usage: true,
+            usage_mid_turn: true,
+            authenticate: true,
         }
     }
 
@@ -262,19 +281,40 @@ mod tests {
     fn a_resumable_cli_agent_with_a_banner_resumes() {
         assert_eq!(
             banner(&banner_events()),
-            Some(AgentSessionRef("sess_1".to_owned())),
-            "the first `session_started` row, not the first `other` row"
+            Some(AgentSessionRef("sess_2".to_owned())),
+            "the latest `session_started` row, never another `other` row's `session_id`"
         );
         assert_eq!(
-            opening_kind(cli_caps(), Transport::Cli, &banner_events()),
-            OpeningKind::Resume(AgentSessionRef("sess_1".to_owned()))
+            opening_kind(cli_caps(), &banner_events()),
+            OpeningKind::Resume(AgentSessionRef("sess_2".to_owned()))
         );
-        // "First" is by `seq`, whatever order the rows were handed over in.
+        // "Latest" is by `seq`, whatever order the rows were handed over in.
         let mut reversed = banner_events();
         reversed.reverse();
         assert_eq!(
-            opening_kind(cli_caps(), Transport::Cli, &reversed),
-            OpeningKind::Resume(AgentSessionRef("sess_1".to_owned()))
+            opening_kind(cli_caps(), &reversed),
+            OpeningKind::Resume(AgentSessionRef("sess_2".to_owned()))
+        );
+    }
+
+    /// MOD-37 M5 A-7 (amending D192): after a resume that failed and fell back to the handoff,
+    /// the step's log holds two banners, and the latest one names the session that holds the
+    /// chat. A re-promotion resumes that one instead of retrying the dead id.
+    #[test]
+    fn the_latest_banner_wins() {
+        let events = vec![
+            other(5, SESSION_STARTED, json!({ "session_id": "sess_new" })),
+            event(2, 0, EventKind::AssistantText, json!({ "text": "on it" })),
+            other(1, SESSION_STARTED, json!({ "session_id": "sess_old" })),
+        ];
+        assert_eq!(
+            banner(&events),
+            Some(AgentSessionRef("sess_new".to_owned())),
+            "the banner with the highest `seq`, not the first one handed over"
+        );
+        assert_eq!(
+            opening_kind(cli_caps(), &events),
+            OpeningKind::Resume(AgentSessionRef("sess_new".to_owned()))
         );
     }
 
@@ -285,40 +325,44 @@ mod tests {
             .filter(|row| row.payload.get("update") != Some(&json!(SESSION_STARTED)))
             .collect();
         assert_eq!(banner(&events), None);
+        assert_eq!(opening_kind(cli_caps(), &events), OpeningKind::Handoff);
         assert_eq!(
-            opening_kind(cli_caps(), Transport::Cli, &events),
-            OpeningKind::Handoff
-        );
-        assert_eq!(
-            opening_kind(cli_caps(), Transport::Cli, &[]),
+            opening_kind(cli_caps(), &[]),
             OpeningKind::Handoff,
             "a step that never started a session"
         );
         // A banner that names no session is no banner.
         let nameless = [other(0, SESSION_STARTED, json!({ "session_id": null }))];
         assert_eq!(banner(&nameless), None);
-        assert_eq!(
-            opening_kind(cli_caps(), Transport::Cli, &nameless),
-            OpeningKind::Handoff
-        );
+        assert_eq!(opening_kind(cli_caps(), &nameless), OpeningKind::Handoff);
     }
 
     #[test]
     fn a_non_resumable_agent_means_handoff() {
         assert_eq!(
-            opening_kind(DriverCaps::default(), Transport::Cli, &banner_events()),
+            opening_kind(DriverCaps::default(), &banner_events()),
             OpeningKind::Handoff
         );
     }
 
+    /// MOD-37 M5 (R-48): the ACP driver restores a session through `session/resume` or
+    /// `session/load`, so an ACP step whose caps say `resume` resumes like a CLI one.
     #[test]
-    fn an_acp_agent_hands_off_even_when_its_caps_say_resume() {
-        // `acp.session.resume` defaults to `true`, but the ACP driver never reads
-        // `SessionSpec.resume` (R-48): resuming would open a fresh session with no context.
+    fn an_acp_agent_with_resume_caps_and_a_banner_resumes() {
         assert_eq!(
-            opening_kind(cli_caps(), Transport::Acp, &banner_events()),
-            OpeningKind::Handoff
+            opening_kind(acp_caps(), &banner_events()),
+            OpeningKind::Resume(AgentSessionRef("sess_2".to_owned()))
         );
+    }
+
+    /// An ACP row with `acp.session` turned off hands off, banner or not.
+    #[test]
+    fn an_acp_agent_without_resume_caps_hands_off() {
+        let caps = DriverCaps {
+            resume: false,
+            ..acp_caps()
+        };
+        assert_eq!(opening_kind(caps, &banner_events()), OpeningKind::Handoff);
     }
 
     #[test]

@@ -35,9 +35,9 @@ use htui_core::model::{
     DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
     NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, SnapshotCandidate, SnapshotPersona, SnapshotPhase,
-    SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS,
-    UserId, VerifyOutcome, missing_tags_failure,
+    RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotPersona,
+    SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus,
+    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -1328,12 +1328,14 @@ where
 
     /// How a promoted step's chat opens (MOD-4 plan D163, blueprint D192, D193).
     ///
-    /// The step's agent row decides with [`promote::opening_kind`]: its own session is resumed
-    /// only on the CLI transport, with `resume` in its caps and a `session_started` banner in its
-    /// log (R-48); otherwise a fresh session opens with the `handoff` role's prompt, built from
-    /// the phase's own spec ([`Self::phase_spec`]) with the step's summary, its diff so far and
-    /// why it stopped. `cwd` is the step's primary tree, else its first; every other tree is an
-    /// extra directory (ANA-2 `:1208-1213`). Nothing here writes.
+    /// The step's agent row decides with [`promote::opening_kind`]: its own session is resumed on
+    /// either transport when the agent's caps say `resume` and the log has a `session_started`
+    /// banner (MOD-37 M5); otherwise a fresh session opens with the `handoff` role's prompt, built
+    /// from the phase's own spec ([`Self::phase_spec`]) with the step's summary, its diff so far
+    /// and why it stopped. The handoff is built in both cases ([`Self::handoff_opening`]): a
+    /// `Resume` carries it as the fallback a failed resume opens with. `cwd` is the step's primary
+    /// tree, else its first; every other tree is an extra directory (ANA-2 `:1208-1213`). Nothing
+    /// here writes.
     async fn opening(
         &self,
         run: &Run,
@@ -1369,89 +1371,24 @@ where
         })?;
 
         let caps = htui_agent::registry::caps_for(&agent);
-        let path = match promote::opening_kind(caps, agent.transport, &events) {
+        // MOD-37 M5: the handoff is built for both openings. A `Resume` carries it as the fallback
+        // the worker opens with when the resume fails. Boxed: this future sits in every dispatch
+        // future (`every_case_name_dispatches`, H-9).
+        let (handoff, digest) = Box::pin(
+            self.handoff_opening(run, snapshot, step, phase, item, &events, &trees, &repos),
+        )
+        .await?;
+        let path = match promote::opening_kind(caps, &events) {
             OpeningKind::Resume(session_ref) => OpeningPath::Resume {
                 session_ref,
                 text: promote::RESUME_OPENING.to_owned(),
+                handoff,
+                digest,
             },
-            OpeningKind::Handoff => {
-                let spec = match self
-                    .phase_spec(run, snapshot, step, phase, item, false)
-                    .await?
-                {
-                    Ok(spec) => spec,
-                    // Not reachable with `strict = false`: a missing input is a note there.
-                    Err(StageThree::MissingInput(kind)) => {
-                        return Err(EngineError::Snapshot {
-                            run: run.id,
-                            reason: format!("the handoff prompt found no `{kind}` document"),
-                        });
-                    }
-                    // Not reachable with `strict = false` either: a handoff opens without a
-                    // persona it cannot find (MOD-26 OQ-5), and `phase_spec` never assembles.
-                    // Each carries its own sentence, never a `Debug` rendering (review N2).
-                    Err(StageThree::Refused(err)) => {
-                        return Err(EngineError::Snapshot {
-                            run: run.id,
-                            reason: format!("the handoff prompt was refused: {err}"),
-                        });
-                    }
-                    Err(StageThree::NoPersona(refusal)) => {
-                        return Err(EngineError::Snapshot {
-                            run: run.id,
-                            reason: format!("the handoff prompt was refused: {refusal}"),
-                        });
-                    }
-                };
-                let template = self
-                    .parts
-                    .graphs
-                    .prompt_template(run.project_id, HANDOFF_TEMPLATE, None)
-                    .await?
-                    .ok_or_else(|| ResolveError::NoTemplate {
-                        phase: phase.name.clone(),
-                        name: HANDOFF_TEMPLATE.to_owned(),
-                        project: run.project_id,
-                    })?;
-                let roots: Vec<RepoRoot> = trees
-                    .iter()
-                    .map(|tree| RepoRoot {
-                        repo: repos
-                            .iter()
-                            .find(|repo| repo.id == tree.repo_id)
-                            .map_or_else(|| tree.repo_id.to_string(), |repo| repo.name.clone()),
-                        root: PathBuf::from(&tree.path),
-                        source: RootSource::RunStepTree,
-                    })
-                    .collect();
-                let commits = self.parts.store.step_commits(step.id).await?;
-                // The diff is advisory (plan D55): a failed one opens the chat without it.
-                let diff_so_far = match self.parts.isolator.diff(&trees, &commits).await {
-                    Ok(diff) => diff,
-                    Err(err) => {
-                        tracing::warn!(step = %step.id, %err, "the handoff opens without a diff");
-                        None
-                    }
-                };
-                let failure_reason = run
-                    .failure
-                    .clone()
-                    .or_else(|| step.gate_note.clone())
-                    .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned());
-                let spec = promote::handoff_spec(
-                    spec,
-                    &template,
-                    &events,
-                    &roots,
-                    diff_so_far,
-                    failure_reason,
-                );
-                let assembled = assemble(&spec, self.parts.scrubber)?;
-                OpeningPath::Handoff {
-                    text: assembled.text,
-                    digest: assembled.digest,
-                }
-            }
+            OpeningKind::Handoff => OpeningPath::Handoff {
+                text: handoff,
+                digest,
+            },
         };
         Ok(Opening {
             agent_id: agent.id,
@@ -1462,6 +1399,93 @@ where
             extra_dirs,
             path,
         })
+    }
+
+    /// §4.6(c)'s handoff text and digest for a promoted `step` (MOD-4 D193): what a `Handoff`
+    /// opening sends, and what a `Resume` opening falls back to (MOD-37 M5). Nothing here writes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's run, snapshot, row and phase, its item, and the three reads `opening` \
+                  already made; re-reading them here would double the promotion's store round trips"
+    )]
+    async fn handoff_opening(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        events: &[SessionEvent],
+        trees: &[RunStepTree],
+        repos: &[Repo],
+    ) -> Result<(String, String), EngineError> {
+        let spec = match self
+            .phase_spec(run, snapshot, step, phase, item, false)
+            .await?
+        {
+            Ok(spec) => spec,
+            // Not reachable with `strict = false`: a missing input is a note there.
+            Err(StageThree::MissingInput(kind)) => {
+                return Err(EngineError::Snapshot {
+                    run: run.id,
+                    reason: format!("the handoff prompt found no `{kind}` document"),
+                });
+            }
+            // Not reachable with `strict = false` either: a handoff opens without a
+            // persona it cannot find (MOD-26 OQ-5), and `phase_spec` never assembles.
+            // Each carries its own sentence, never a `Debug` rendering (review N2).
+            Err(StageThree::Refused(err)) => {
+                return Err(EngineError::Snapshot {
+                    run: run.id,
+                    reason: format!("the handoff prompt was refused: {err}"),
+                });
+            }
+            Err(StageThree::NoPersona(refusal)) => {
+                return Err(EngineError::Snapshot {
+                    run: run.id,
+                    reason: format!("the handoff prompt was refused: {refusal}"),
+                });
+            }
+        };
+        let template = self
+            .parts
+            .graphs
+            .prompt_template(run.project_id, HANDOFF_TEMPLATE, None)
+            .await?
+            .ok_or_else(|| ResolveError::NoTemplate {
+                phase: phase.name.clone(),
+                name: HANDOFF_TEMPLATE.to_owned(),
+                project: run.project_id,
+            })?;
+        let roots: Vec<RepoRoot> = trees
+            .iter()
+            .map(|tree| RepoRoot {
+                repo: repos
+                    .iter()
+                    .find(|repo| repo.id == tree.repo_id)
+                    .map_or_else(|| tree.repo_id.to_string(), |repo| repo.name.clone()),
+                root: PathBuf::from(&tree.path),
+                source: RootSource::RunStepTree,
+            })
+            .collect();
+        let commits = self.parts.store.step_commits(step.id).await?;
+        // The diff is advisory (plan D55): a failed one opens the chat without it.
+        let diff_so_far = match self.parts.isolator.diff(trees, &commits).await {
+            Ok(diff) => diff,
+            Err(err) => {
+                tracing::warn!(step = %step.id, %err, "the handoff opens without a diff");
+                None
+            }
+        };
+        let failure_reason = run
+            .failure
+            .clone()
+            .or_else(|| step.gate_note.clone())
+            .unwrap_or_else(|| PROMOTED_AT_A_GATE.to_owned());
+        let spec =
+            promote::handoff_spec(spec, &template, events, &roots, diff_so_far, failure_reason);
+        let assembled = assemble(&spec, self.parts.scrubber)?;
+        Ok((assembled.text, assembled.digest))
     }
 
     /// §4.8's `accept artifact` (MOD-4 plan D166, blueprint D194, `docs/ANA-2.md:1223-1233`).
@@ -14588,7 +14612,6 @@ mod tests {
     /// fixture does.
     #[tokio::test]
     async fn a_handoff_spec_carries_no_excerpts_and_runs_no_pass() {
-        use crate::command::OpeningPath;
         use crate::graph::GraphSource as _;
 
         let harness = Harness::new().await;
@@ -14649,10 +14672,73 @@ mod tests {
         else {
             panic!("`PromoteStep` answers `Promoted`");
         };
-        let OpeningPath::Handoff { text, .. } = &opening.path else {
-            panic!("the fake agent row does not resume: {:?}", opening.path);
-        };
+        let (text, _) = opening.path.handoff();
         assert!(!text.contains("<file path="), "{text}");
+    }
+
+    /// MOD-37 M5 (R-48): a `Resume` opening carries, as its fallback, the very handoff text and
+    /// digest a `Handoff` opening of the same step builds, so the worker can open with it when the
+    /// resume fails, without asking the engine again.
+    #[tokio::test]
+    async fn a_resume_opening_carries_the_handoff_a_handoff_opening_would() {
+        use crate::command::OpeningPath;
+        use crate::graph::GraphSource as _;
+
+        let harness = Harness::new().await;
+        let dir = tempfile::tempdir().expect("a throwaway root");
+        let (_, row, _, prd) = excerpt_prologue(&harness, dir.path(), "pub fn marker() {}\n").await;
+        assert_eq!(
+            prd.agent_id,
+            Some(ids::AGENT_CLAUDE),
+            "the walk ran on the `claude` row"
+        );
+        let promote = async || {
+            let CommandOutcome::Promoted { opening, .. } = harness
+                .dispatch(Command::PromoteStep {
+                    run: row.id,
+                    step: prd.id,
+                    chat_open: false,
+                })
+                .await
+                .expect("a parked step")
+            else {
+                panic!("`PromoteStep` answers `Promoted`");
+            };
+            opening.path
+        };
+
+        // The seed `claude` row says `acp.session.resume`, and the fake walk wrote a banner.
+        let OpeningPath::Resume {
+            handoff: resumed_handoff,
+            digest: resumed_digest,
+            ..
+        } = promote().await
+        else {
+            panic!("an ACP row with resume caps and a banner resumes");
+        };
+
+        // The same row with both restore routes off hands off.
+        let mut agent = harness
+            .orch
+            .graphs()
+            .agent(ids::AGENT_CLAUDE)
+            .await
+            .expect("the fake graph source never fails")
+            .expect("the demo registry has the `claude` row");
+        agent.settings["acp"]["session"] = serde_json::json!({ "load": false, "resume": false });
+        htui_core::fixtures::edit_agent(&harness.orch.store, &agent)
+            .await
+            .expect("the row is rewritten");
+        let OpeningPath::Handoff { text, digest } = promote().await else {
+            panic!("a row whose caps say no resume hands off");
+        };
+
+        assert!(!text.is_empty() && !digest.is_empty());
+        assert_eq!(
+            (resumed_handoff, resumed_digest),
+            (text, digest),
+            "the fallback is the handoff the same promotion would have opened with"
+        );
     }
 
     // -- MOD-9 D120-D123: glob attachments fire --------------------------------------------------

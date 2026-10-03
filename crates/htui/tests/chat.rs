@@ -1001,9 +1001,16 @@ impl StepAuthor for OutputAuthor {
     }
 }
 
+/// MOD-37 M5 (H-1, H-11): `row` with both of ACP's restore routes off, so its caps say no
+/// `resume` and a promotion of its step opens with the handoff prompt.
+fn handoff_only(mut row: Agent) -> Agent {
+    row.settings["acp"] = json!({ "session": { "load": false, "resume": false } });
+    row
+}
+
 /// Blueprint F-O: the demo with its own agents disabled, the scripted `acp` row probed ready on
 /// the demo box (the candidate chain's rung 3), and a primary repo for the demo project, whose
-/// tree the promoted step chats in.
+/// tree the promoted step chats in. The row hands off on promotion ([`handoff_only`]).
 async fn graph_store() -> MemStore {
     let store = MemStore::demo();
     for summary in store.agents().await.expect("the fixture's agents") {
@@ -1013,7 +1020,7 @@ async fn graph_store() -> MemStore {
     }
     let agent_id = AgentId::new();
     store
-        .upsert_agent(&scripted_row(agent_id, Transport::Acp), None)
+        .upsert_agent(&handoff_only(scripted_row(agent_id, Transport::Acp)), None)
         .await
         .expect("the scripted row lands");
     store
@@ -1127,7 +1134,8 @@ async fn log_of(store: &MemStore, step: StepId) -> Vec<SessionEvent> {
 
 /// Plan D165: promoting a parked step opens the Chat tab on **that** step — the session the
 /// runtime starts records against the step's own id — and the header says it is a promotion,
-/// which phase, and how it opened (an `acp` row always opens with the handoff prompt, R-48).
+/// which phase, and how it opened (this row's settings turn resume off, so it opens with the
+/// handoff prompt).
 #[tokio::test]
 async fn promotion_opens_the_chat_on_the_same_step() {
     let (mut harness, store) = promotion_harness(Script::one_turn(vec![

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use chrono::TimeDelta;
 use futures::future::Either;
+use htui_agent::driver::AgentSessionRef;
 use htui_core::fixtures::ids;
 use htui_core::model::{
     AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, EventKind, Gate, GateOutcome,
@@ -44,6 +45,7 @@ use crate::fake::{
     FakeIsolator, FakeOrchestrator, FakeVerifier, RESTART_GAP, ScriptedStep, TestClock,
 };
 use crate::isolate::Clock as _;
+use crate::promote;
 use crate::status::RunFailure;
 
 /// What a case needs to be handed, and nothing more (plan D18).
@@ -5497,9 +5499,32 @@ async fn promote_keeps_the_step_and_writes_no_chat_run<H: CaseHarness>(harness: 
     );
     assert_eq!(opening.cwd, std::path::PathBuf::from(&tree.path));
     assert!(opening.extra_dirs.is_empty());
-    let OpeningPath::Handoff { text, digest } = &opening.path else {
-        panic!("the fake agent row does not resume: {:?}", opening.path);
-    };
+    // MOD-37 M5 (R-48): the seed `claude` row is ACP with `acp.session.resume`, so a step whose
+    // log holds a banner resumes its own session, and the handoff rides along as the fallback.
+    let banner = promote::banner(
+        &orch
+            .store()
+            .step_events(prd.id)
+            .await
+            .expect("MemStore never fails a read")
+            .unwrap_or_default(),
+    );
+    assert_eq!(
+        banner,
+        Some(AgentSessionRef::new(format!("fake-{}", prd.id))),
+        "the fake walk recorded its banner"
+    );
+    assert!(
+        matches!(
+            &opening.path,
+            OpeningPath::Resume { session_ref, text, .. }
+                if session_ref.as_str() == format!("fake-{}", prd.id)
+                    && text == promote::RESUME_OPENING
+        ),
+        "{:?}",
+        opening.path
+    );
+    let (text, digest) = opening.path.handoff();
     assert!(!text.is_empty() && !digest.is_empty());
 }
 
@@ -5595,9 +5620,7 @@ async fn promote_a_failed_step_of_a_parked_run<H: CaseHarness>(harness: &H) {
     let after = step_at(&other, run, 0, 1).await;
     assert_eq!(after.status, StepStatus::AwaitingApproval);
     assert!(after.promoted_at.is_some());
-    let OpeningPath::Handoff { text, .. } = &opening.path else {
-        panic!("a handoff: {:?}", opening.path);
-    };
+    let (text, _) = opening.path.handoff();
     assert!(
         text.contains("interrupted"),
         "the failure reason is the step's gate note: {text}"
