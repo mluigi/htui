@@ -1600,7 +1600,13 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Documents(id) => StoreReply::Documents(backend.documents(*id).await?),
         StoreRequest::Notes(id) => StoreReply::Notes(backend.notes(*id).await?),
         StoreRequest::Runs(id) => StoreReply::Runs(backend.runs(*id).await?),
-        StoreRequest::ToolCalls { .. } => todo!("MOD-72 T2"),
+        // MOD-72 D4: an ordinary read, so an `Unreachable` drops an `Online` backend onto the
+        // mirror, which answers from its window (plan D2) - unlike `RelayView`, which is the
+        // writer's.
+        StoreRequest::ToolCalls { item } => StoreReply::ToolCalls {
+            item: *item,
+            counts: backend.tool_call_counts(*item).await?,
+        },
         StoreRequest::Agents => StoreReply::Agents(backend.agents().await?),
         // Served through the ordinary read path on purpose: an `Unreachable` from it drops an
         // `Online` backend onto the mirror exactly as any other read does, and the replay then
