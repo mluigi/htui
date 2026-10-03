@@ -1,7 +1,10 @@
 //! Item kinds, step graphs and prompt templates (`docs/ANA-9.md` §5.4, §5.5).
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::model::ids::{
     AgentId, ItemKindId, PersonaId, PhaseId, ProjectId, PromptTemplateId, StepGraphId, UserId,
@@ -46,6 +49,87 @@ str_enum!(
         Always => "always",
     }
 );
+
+impl CommandQueue {
+    /// MOD-11 D16: whether a step of this phase gets `command_run` (and the prompt's command-queue
+    /// section): `off` → never; `always` → always; `fan_out_only` → when the phase fans out to
+    /// more than one agent or the item carries [`HEAVY_BUILD_TAG`] (ANA-5 `:337`, R-MCP-3).
+    #[must_use]
+    pub fn exposed(self, fan_out: i32, item_tags: &[String]) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Always => true,
+            Self::FanOutOnly => fan_out > 1 || item_tags.iter().any(|tag| tag == HEAVY_BUILD_TAG),
+        }
+    }
+}
+
+/// MOD-11 D16's one resolver, as a function for callers holding the three values:
+/// [`CommandQueue::exposed`].
+#[must_use]
+pub fn command_queue_exposed(mode: CommandQueue, fan_out: i32, item_tags: &[String]) -> bool {
+    mode.exposed(fan_out, item_tags)
+}
+
+/// The item tag R-MCP-3 names: a `fan_out_only` phase queues the commands of an item carrying it
+/// even when it does not fan out (MOD-11 D16).
+pub const HEAVY_BUILD_TAG: &str = "heavy_build";
+
+/// MOD-11 OQ-5: the shell prefixes refused once (`reject_once`) while `command_run` is exposed
+/// (R-MCP-4), so an agent routes them through the queue. A prefix match only: `cd x && cargo
+/// build` passes (R-6). The order is a pin.
+pub const HEAVY_COMMAND_PREFIXES: &[&str] = &[
+    "cargo build",
+    "cargo test",
+    "cargo nextest",
+    "cargo clippy",
+    "cmake --build",
+    "ctest",
+    "make",
+    "ninja",
+    "msbuild",
+    "dotnet build",
+    "dotnet test",
+    "npm test",
+    "pnpm test",
+    "go build",
+    "go test",
+];
+
+/// MOD-11 D15: the class limits of a box. `app_setting.command_limits` (`0003_orchestration.sql`
+/// seeds `{"build":1,"test":4,"verify":1}`) overlaid key by key with the box's own
+/// `box.settings.command_limits`, which `box_settings` is (the value under that key, not the
+/// whole settings object). A value that is not an object contributes nothing, and an entry
+/// whose value is not a `u32` is skipped (the caller warns); a class missing from both is 1,
+/// which [`command_limit`] answers.
+#[must_use]
+pub fn resolve_command_limits(
+    box_settings: Option<&Value>,
+    app: &BTreeMap<String, Value>,
+) -> BTreeMap<String, u32> {
+    let mut limits = BTreeMap::new();
+    for layer in [app.get("command_limits"), box_settings]
+        .into_iter()
+        .flatten()
+    {
+        let Some(entries) = layer.as_object() else {
+            continue;
+        };
+        for (class, value) in entries {
+            if let Some(limit) = value.as_u64().and_then(|n| u32::try_from(n).ok()) {
+                limits.insert(class.clone(), limit);
+            }
+        }
+    }
+    limits
+}
+
+/// MOD-11 D15: the limit of `class` in resolved `limits`: a missing class is 1, and so is 0 (a
+/// zero-slot class would admit nothing, ever: the `verify` reading of `ShellVerifier::new`).
+#[must_use]
+pub fn command_limit(limits: &BTreeMap<String, u32>, class: &str) -> u32 {
+    limits.get(class).copied().unwrap_or(1).max(1)
+}
 
 /// A row of `item_kind` (§5.5): a per-project kind with its key prefix and default graph.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -397,8 +481,150 @@ impl PromptTemplate {
 
 #[cfg(test)]
 mod tests {
-    use super::{ItemKind, PhasePatch, PromptTemplate};
+    use std::collections::BTreeMap;
+
+    use serde_json::{Value, json};
+
+    use super::{
+        CommandQueue, HEAVY_BUILD_TAG, HEAVY_COMMAND_PREFIXES, ItemKind, PhasePatch,
+        PromptTemplate, command_limit, command_queue_exposed, resolve_command_limits,
+    };
     use crate::model::ids::PersonaId;
+
+    fn tags(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// MOD-11 D16: `off` never exposes `command_run`, whatever the fan-out or the tags.
+    #[test]
+    fn off_never_exposes() {
+        for (fan_out, item_tags) in [(1, tags(&[])), (4, tags(&[HEAVY_BUILD_TAG]))] {
+            assert!(!CommandQueue::Off.exposed(fan_out, &item_tags));
+            assert!(!command_queue_exposed(
+                CommandQueue::Off,
+                fan_out,
+                &item_tags
+            ));
+        }
+    }
+
+    /// MOD-11 D16: `always` always exposes it, a single-agent step without tags included.
+    #[test]
+    fn always_always_exposes() {
+        for (fan_out, item_tags) in [(1, tags(&[])), (0, tags(&["rust"])), (3, tags(&[]))] {
+            assert!(CommandQueue::Always.exposed(fan_out, &item_tags));
+        }
+    }
+
+    /// MOD-11 D16, OQ-6: `fan_out_only` exposes it only to a fanned-out step (more than one
+    /// agent) or on a `heavy_build` item; a tag that only resembles it does not count.
+    #[test]
+    fn fan_out_only_exposes_only_fanned_or_heavy() {
+        let mode = CommandQueue::FanOutOnly;
+        assert!(!mode.exposed(1, &tags(&[])), "one agent, no tag");
+        assert!(
+            !mode.exposed(0, &tags(&["rust", "heavy"])),
+            "no heavy_build"
+        );
+        assert!(
+            !mode.exposed(1, &tags(&["heavy_build_x", "HEAVY_BUILD"])),
+            "an exact tag"
+        );
+        assert!(mode.exposed(2, &tags(&[])), "fanned out");
+        assert!(mode.exposed(1, &tags(&["rust", "heavy_build"])), "heavy");
+        assert_eq!(HEAVY_BUILD_TAG, "heavy_build");
+    }
+
+    /// MOD-11 D15: the box's `command_limits` overlays the app default key by key; a value of
+    /// the wrong shape is skipped, an absent layer contributes nothing.
+    #[test]
+    fn limits_overlay_the_box_over_the_app_default() {
+        let app = BTreeMap::from([(
+            "command_limits".to_owned(),
+            json!({"build": 1, "test": 4, "verify": 1}),
+        )]);
+        let seeded = BTreeMap::from([
+            ("build".to_owned(), 1),
+            ("test".to_owned(), 4),
+            ("verify".to_owned(), 1),
+        ]);
+        assert_eq!(resolve_command_limits(None, &app), seeded, "no box value");
+        assert_eq!(
+            resolve_command_limits(Some(&json!({"test": 2, "run": 3})), &app),
+            BTreeMap::from([
+                ("build".to_owned(), 1),
+                ("run".to_owned(), 3),
+                ("test".to_owned(), 2),
+                ("verify".to_owned(), 1),
+            ]),
+            "the box wins per key and adds its own classes"
+        );
+        assert_eq!(
+            resolve_command_limits(
+                Some(&json!({"build": "many", "test": -1, "verify": 2})),
+                &app
+            ),
+            BTreeMap::from([
+                ("build".to_owned(), 1),
+                ("test".to_owned(), 4),
+                ("verify".to_owned(), 2),
+            ]),
+            "an entry that is not a u32 is skipped, the app's value stands"
+        );
+        assert_eq!(
+            resolve_command_limits(Some(&json!("many")), &app),
+            seeded,
+            "a box value that is not an object contributes nothing"
+        );
+        assert_eq!(
+            resolve_command_limits(Some(&json!({"test": 3})), &BTreeMap::new()),
+            BTreeMap::from([("test".to_owned(), 3)]),
+            "no app default: the box alone"
+        );
+        assert_eq!(
+            resolve_command_limits(
+                None,
+                &BTreeMap::from([("command_limits".to_owned(), Value::Null)])
+            ),
+            BTreeMap::new(),
+            "neither layer: nothing"
+        );
+    }
+
+    /// MOD-11 D15: a class missing from both layers is 1, and so is a stored 0.
+    #[test]
+    fn a_missing_or_zero_class_limit_is_one() {
+        let limits = BTreeMap::from([("build".to_owned(), 0), ("test".to_owned(), 4)]);
+        assert_eq!(command_limit(&limits, "test"), 4);
+        assert_eq!(command_limit(&limits, "build"), 1, "zero reads as one");
+        assert_eq!(command_limit(&limits, "run"), 1, "missing reads as one");
+        assert_eq!(command_limit(&BTreeMap::new(), "verify"), 1);
+    }
+
+    /// MOD-11 OQ-5: the heavy-command list, in its order (a pin: the denials are spliced in it).
+    #[test]
+    fn the_heavy_prefixes_are_the_oq5_list() {
+        assert_eq!(
+            HEAVY_COMMAND_PREFIXES,
+            [
+                "cargo build",
+                "cargo test",
+                "cargo nextest",
+                "cargo clippy",
+                "cmake --build",
+                "ctest",
+                "make",
+                "ninja",
+                "msbuild",
+                "dotnet build",
+                "dotnet test",
+                "npm test",
+                "pnpm test",
+                "go build",
+                "go test",
+            ]
+        );
+    }
 
     /// The CHECK, byte for byte: `^[A-Z][A-Z0-9]{1,15}$` (`0001_init.sql:282-290`).
     ///

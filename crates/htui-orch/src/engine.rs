@@ -5598,8 +5598,11 @@ where
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.
             step_files: StepFiles::default(),
-            // MOD-26 D13: the one place `command_run` acts before MOD-11.
-            command_queue: phase.command_queue != htui_core::model::CommandQueue::Off
+            // MOD-11 D16 (OQ-6): the one resolver — `fan_out_only` renders the section only for a
+            // fanned-out phase or a `heavy_build` item — and MOD-26 D13's persona term.
+            command_queue: phase
+                .command_queue
+                .exposed(phase.fan_out, &row.required_tags)
                 && persona.is_none_or(|persona| persona.tools.command_run),
             // MOD-11 D19: a phase step always has an item; the trailer names `document_write`
             // whenever a tool host serves the session and the phase writes a document.
@@ -5906,14 +5909,41 @@ where
         // MOD-42 D9: the agent's own policy (a judge call's is the judge agent's: `candidate_of`
         // over the judge phase).
         let policy = (self.parts.policy)(candidate.agent_id);
+        // MOD-11 D16: the base exposure carries `command_run` per the phase's queue mode, the
+        // fan-out and the item's tags (the prompt's section uses the same resolver). A judge's
+        // phase is `off` (`fanout.rs`), so it never reads the item.
+        let exposed = phase.command_queue != htui_core::model::CommandQueue::Off && {
+            let item = self.item(Self::item_of(run)?).await?;
+            phase
+                .command_queue
+                .exposed(phase.fan_out, &item.required_tags)
+        };
+        let base = ToolExposure {
+            command_run: exposed,
+            ..ToolExposure::default()
+        };
         // MOD-26 D10, D12: the persona narrows the agent's exposure and policy, never widens them
         // (I-1); a persona-less step is exactly today's (I-7).
-        let (tools, policy) = match persona {
-            Some(persona) => {
-                htui_agent::persona::narrow(&ToolExposure::default(), &policy, persona)
-            }
-            None => (ToolExposure::default(), policy),
+        let (tools, mut policy) = match persona {
+            Some(persona) => htui_agent::persona::narrow(&base, &policy, persona),
+            None => (base, policy),
         };
+        // MOD-11 D17 (R-MCP-4): an exposed step's policy opens with one `reject_once` per OQ-5
+        // prefix, ahead of the persona's and the agent's rules, on both branches.
+        if tools.command_run {
+            let denials = htui_core::model::kind::HEAVY_COMMAND_PREFIXES
+                .iter()
+                .map(|prefix| htui_agent::driver::PermissionRule {
+                    matcher: htui_agent::driver::PermissionMatch {
+                        tool_kind: Some("execute".to_owned()),
+                        command_prefix: Some((*prefix).to_owned()),
+                        ..htui_agent::driver::PermissionMatch::default()
+                    },
+                    answer: htui_agent::event::PermissionOptionKind::RejectOnce,
+                    reason: format!("run `{prefix}` through htui's `command_run` tool (R-MCP-4)"),
+                });
+            policy.rules.splice(0..0, denials);
+        }
         // MOD-11 D10, B-17 (H-25): declared before `session`, so the session — and its agent
         // process — drops first and the token dies after it. Boxed (I-8).
         let lease = match &self.parts.tools {
@@ -5926,6 +5956,7 @@ where
                     &candidate,
                     &project,
                     &cwd,
+                    tools.command_run,
                 ))
                 .await?,
             ),
@@ -5998,6 +6029,7 @@ where
         candidate: &SnapshotCandidate,
         project: &Project,
         cwd: &std::path::Path,
+        command_queue: bool,
     ) -> Result<crate::tools::ToolLease, EngineError> {
         // B-18: the candidate's transport from its agent row; no row advertises no prompt tool.
         let transport = self
@@ -6024,8 +6056,8 @@ where
             } else {
                 HostnameLine::Omitted
             },
-            // D16's resolver is T8's.
-            command_queue: false,
+            // MOD-11 D16: the exposure `drive_once` resolved, after the persona's narrowing.
+            command_queue,
             cwd: cwd.to_path_buf(),
             transport,
         };
@@ -12644,6 +12676,9 @@ mod tests {
 
         let seen = seen.lock().expect("no panic holds the spy's lock").clone();
         assert_eq!(seen.len(), 2, "both candidates reached stage 4");
+        // MOD-11 D16, D17: a `fan_out_only` phase fanned out to two exposes `command_run`, so the
+        // R-MCP-4 denials open each candidate's policy, ahead of the persona's.
+        let denials = htui_core::model::kind::HEAVY_COMMAND_PREFIXES.len();
         for (index, (spec, prompt)) in seen.iter().enumerate() {
             assert_eq!(
                 spec.tools.deny_kinds,
@@ -12651,10 +12686,18 @@ mod tests {
                 "candidate {index}'s exposure is narrowed"
             );
             assert!(spec.tools.allow.is_empty(), "{:?}", spec.tools.allow);
+            assert!(spec.tools.command_run, "candidate {index} is exposed");
+            assert!(
+                spec.permission.rules[..denials]
+                    .iter()
+                    .all(|rule| rule.reason.ends_with("(R-MCP-4)")),
+                "candidate {index}: the denials come first"
+            );
             assert_eq!(
                 spec.permission
                     .rules
                     .iter()
+                    .skip(denials)
                     .take(3)
                     .map(|rule| rule.reason.as_str())
                     .collect::<Vec<_>>(),
@@ -12663,10 +12706,10 @@ mod tests {
                     "persona reviewer denies delete",
                     "persona reviewer denies move",
                 ],
-                "candidate {index}: the persona's kind rejects come first"
+                "candidate {index}: the persona's kind rejects follow the denials"
             );
             assert_eq!(
-                spec.permission.rules.get(3..),
+                spec.permission.rules.get(denials + 3..),
                 Some(policy.rules.as_slice()),
                 "candidate {index}: the agent's own rules follow"
             );
@@ -16241,6 +16284,9 @@ mod tests {
                 .repoint(ids::HTUI_FEAT_3, |phase| {
                     if phase.name == "prd" {
                         phase.fan_out = 2;
+                        // MOD-11 D17: the scripted call is `cargo test`, which an exposed
+                        // candidate's denials would answer before the relay; this case is the relay's.
+                        phase.command_queue = htui_core::model::CommandQueue::Off;
                         phase.gate = Gate::Never;
                     }
                 })
@@ -16381,6 +16427,9 @@ mod tests {
                 .repoint(ids::HTUI_FEAT_3, |phase| {
                     if phase.name == "prd" {
                         phase.fan_out = 2;
+                        // MOD-11 D17: the scripted call is `cargo test`, which an exposed
+                        // candidate's denials would answer before the relay; this case is the relay's.
+                        phase.command_queue = htui_core::model::CommandQueue::Off;
                         phase.gate = Gate::Never;
                     }
                 })
@@ -16665,6 +16714,9 @@ mod tests {
                 .repoint(ids::HTUI_FEAT_3, |phase| {
                     if phase.name == "prd" {
                         phase.fan_out = 2;
+                        // MOD-11 D17: the scripted call is `cargo test`, which an exposed
+                        // candidate's denials would answer before the relay; this case is the relay's.
+                        phase.command_queue = htui_core::model::CommandQueue::Off;
                         phase.gate = Gate::Never;
                     }
                 })
@@ -17033,6 +17085,36 @@ mod tests {
                     cwd: spec.cwd.clone(),
                     transport: Transport::Acp,
                 }]
+            );
+        }
+
+        /// MOD-11 D16: the scope's `command_queue` is the exposure `drive_once` resolved — on for
+        /// an `always` phase, and the spec agrees.
+        #[tokio::test(start_paused = true)]
+        async fn an_exposed_phase_s_scope_carries_the_command_queue() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert!(spec.tools.command_run, "the exposure");
+            assert_eq!(
+                host.opened()
+                    .iter()
+                    .map(|scope| scope.command_queue)
+                    .collect::<Vec<_>>(),
+                [true],
+                "the scope advertises `command_run`"
             );
         }
 

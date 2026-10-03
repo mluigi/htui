@@ -320,6 +320,50 @@ fn deny_kinds_edit_yields_the_four_claude_names() {
     );
 }
 
+/// MOD-11 D17: an exposed `command_run` denies every OQ-5 prefix as `Bash(<prefix>:*)`, after
+/// the names the exposure already denies, in the list's order.
+#[test]
+fn command_run_exposure_denies_the_heavy_bash_prefixes() {
+    let mut tools = exposure(&[], &["mcp__x__y", "Bash(make:*)"], &[]);
+    tools.command_run = true;
+    let args = narrowed_argv(tools, &[]);
+    let mut expected = vec!["mcp__x__y".to_owned(), "Bash(make:*)".to_owned()];
+    for prefix in htui_core::model::kind::HEAVY_COMMAND_PREFIXES {
+        let name = format!("Bash({prefix}:*)");
+        if !expected.contains(&name) {
+            expected.push(name);
+        }
+    }
+    assert_eq!(
+        expected.len(),
+        2 + 14,
+        "`make` was already denied: kept once"
+    );
+    assert_eq!(
+        args.last().cloned(),
+        Some(format!("--disallowedTools={}", expected.join(","))),
+        "{args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|arg| arg.contains("Bash(cargo build:*)") && arg.contains("Bash(go test:*)")),
+        "{args:?}"
+    );
+}
+
+/// MOD-11 D17: no exposure, no Bash denial — a persona's deny list travels as it was.
+#[test]
+fn no_exposure_no_bash_denials() {
+    let args = narrowed_argv(exposure(&[], &["mcp__x__y"], &[]), &[]);
+    assert_eq!(
+        args.last().map(String::as_str),
+        Some("--disallowedTools=mcp__x__y"),
+        "{args:?}"
+    );
+    let args = narrowed_argv(ToolExposure::default(), &[]);
+    assert!(!args.iter().any(|arg| arg.contains("Bash(")), "{args:?}");
+}
+
 /// I-7: a step with no persona gets exactly today's command line.
 #[test]
 fn a_default_exposure_adds_no_flag() {
