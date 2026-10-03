@@ -4515,15 +4515,25 @@ async fn record_answer(
     }
 }
 
-/// MOD-37 M5: whether a failed resume is worth a handoff start. Not when the adapter cannot run at
-/// all: a missing or unspawnable command (`Spawn`), an unresolved launch placeholder
-/// (`Unresolved`) or no transport (`UnknownAdapter`) would fail the handoff start the same way
-/// (blueprint A-2, H-18).
+/// MOD-37 M5: whether a failed resume is worth a handoff start (review L-2): only when it failed on
+/// the wire (`Transport`, `Closed`), which is what an agent that lost or refused the session
+/// answers. Not when the adapter cannot run at all: a missing or unspawnable command (`Spawn`), an
+/// unresolved launch placeholder (`Unresolved`) or no transport (`UnknownAdapter`) would fail the
+/// handoff start the same way (blueprint A-2, H-18). Not on a transport that cannot restore
+/// (`Unsupported`), a cancel (`Cancelled`), or the driver's own write or scrub (`Store`, `Scrub`),
+/// which are not the resume's to fall back from. Exhaustive, with no wildcard: a new variant is a
+/// decision, not a default.
 const fn falls_back(err: &DriverError) -> bool {
-    !matches!(
-        err,
-        DriverError::Spawn(_) | DriverError::Unresolved(_) | DriverError::UnknownAdapter(_)
-    )
+    match err {
+        DriverError::Transport(_) | DriverError::Closed => true,
+        DriverError::Unresolved(_)
+        | DriverError::UnknownAdapter(_)
+        | DriverError::Spawn(_)
+        | DriverError::Unsupported(_)
+        | DriverError::Cancelled
+        | DriverError::Store(_)
+        | DriverError::Scrub(_) => false,
+    }
 }
 
 /// MOD-37 M5: the `resume_failed` notice: the session tried, why it failed, and what the chat
@@ -5738,6 +5748,47 @@ pub(crate) mod tests {
         );
     }
 
+    /// MOD-37 review L-2: the two wire failures, `Transport` and `Closed`, fall back: two starts,
+    /// the notice row and frame, and `resume_failed`.
+    #[tokio::test]
+    async fn a_resume_that_fails_on_the_wire_falls_back() {
+        for failure in [
+            DriverError::Transport("session/load failed: gone".to_owned()),
+            DriverError::Closed,
+        ] {
+            let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+                Script::one_turn(vec![ends(StopReason::EndTurn)]),
+                vec![failure.clone()],
+            )
+            .await;
+
+            let replies = attach_and_end(
+                &mut runtime,
+                &backend,
+                promoted(agent_id, resume_path()),
+                async |_| {},
+            )
+            .await;
+
+            assert_eq!(starts_of(&starts).len(), 2, "{failure:?}: two starts");
+            assert!(
+                replies.iter().any(is_resume_failed_frame),
+                "{failure:?}: the notice: {replies:?}"
+            );
+            let log = store
+                .step_events(ids::STEP_PLAN)
+                .await
+                .expect("the log reads")
+                .expect("a log");
+            assert!(log.iter().any(is_resume_failed), "{failure:?}: the row");
+            assert_eq!(
+                opening_of(&store, ids::STEP_PLAN).await,
+                Some(StepOpening::ResumeFailed),
+                "{failure:?}"
+            );
+        }
+    }
+
     /// MOD-37 review M-1: a resume with no fallback that starts is still recorded as `resumed`:
     /// the label is the opening's, not the fallback's.
     #[tokio::test]
@@ -5817,13 +5868,23 @@ pub(crate) mod tests {
         assert_eq!(opening_of(&store, ids::STEP_PLAN).await, None, "no opening");
     }
 
-    /// MOD-37 M5 (e, A-2, A-5): a resume whose adapter cannot run at all does not fall back: the
-    /// handoff would fail the same way. One start, the failure as before, no notice, no opening.
+    /// MOD-37 M5 (e, A-2, A-5), review L-2: only a wire failure falls back. A resume whose adapter
+    /// cannot run at all, that the transport cannot do, that was cancelled, or whose own write or
+    /// scrub failed does not: the handoff would fail the same way, or the failure is not the
+    /// resume's. One start, the failure as before, no notice, no opening.
     #[tokio::test]
     async fn a_resume_that_cannot_spawn_does_not_fall_back() {
         for failure in [
             DriverError::Spawn("gone".to_owned()),
             DriverError::Unresolved("node".to_owned()),
+            DriverError::UnknownAdapter("nope".to_owned()),
+            DriverError::Unsupported("resume"),
+            DriverError::Cancelled,
+            DriverError::Store(StoreError::Backend("the write failed".to_owned())),
+            DriverError::Scrub(htui_core::scrub::Unmasked {
+                path: "/payload".to_owned(),
+                rule: "anthropic_api_key",
+            }),
         ] {
             let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
                 Script::one_turn(vec![ends(StopReason::EndTurn)]),
@@ -5831,8 +5892,13 @@ pub(crate) mod tests {
             )
             .await;
 
-            let replies =
-                attach_and_await(&mut runtime, &backend, promoted(agent_id, resume_path())).await;
+            // Bounded: a fallback that wrongly starts opens a chat nobody ends.
+            let replies = tokio::time::timeout(
+                Duration::from_secs(30),
+                attach_and_await(&mut runtime, &backend, promoted(agent_id, resume_path())),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("{failure:?}: a second session opened and never ended"));
 
             assert_eq!(starts_of(&starts).len(), 1, "{failure:?}: one start");
             assert!(
