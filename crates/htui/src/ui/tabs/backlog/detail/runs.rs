@@ -4429,6 +4429,48 @@ mod tests {
         assert!(!pane.graph.borrow().is_dragging());
     }
 
+    /// MOD-74 D6, blueprint E3: a frame drawn mid-pan (through the pane's `RefCell`, as the app
+    /// redraws after every consumed drag) re-anchors the pan where the pointer is, so the next
+    /// drag carries on by whole cells, and the release still ends it.
+    #[tokio::test]
+    async fn a_redraw_mid_pan_keeps_the_pan_under_the_pointer() {
+        let shell = Shell::new();
+        let (mut pane, drawn) = flowing(&shell).await;
+        let (column, row) = blank_cell(&drawn);
+        let start = pane.graph.borrow().viewport();
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 3, row + 2),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed
+        );
+        let _ = lines(&pane, &shell);
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 5, row + 3),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed
+        );
+        let now = pane.graph.borrow().viewport();
+        assert_eq!(
+            (now.x, now.y, now.zoom),
+            (start.x + 5.0, start.y + 3.0, start.zoom),
+            "{start:?} -> {now:?}"
+        );
+        pane.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), column + 5, row + 3),
+            &mut shell.ctx(),
+        );
+        assert!(!pane.gesture);
+        assert!(!pane.graph.borrow().is_dragging());
+    }
+
     /// D5: the right and middle buttons have no meaning in the flow.
     #[tokio::test]
     async fn right_and_middle_presses_pass() {
