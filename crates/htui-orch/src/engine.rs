@@ -3243,6 +3243,8 @@ where
             agents: &agents,
             boxes: &boxes,
             gate_effective: gate,
+            // MOD-11 D18: a host lends a CLI session a prompt port (guarded in `open_tools`).
+            inline_prompt: self.parts.tools.is_some(),
             spent_micros: select::run_spend(&steps),
             cap_micros: snapshot.settings.per_token_cap_run,
             min_budget_micros: min_budget(&self.parts.app),
@@ -6061,8 +6063,22 @@ where
             cwd: cwd.to_path_buf(),
             transport,
         };
-        host.open(scope)
-            .map_err(|err| EngineError::Driver(DriverError::Spawn(err.to_string())))
+        let lease = host
+            .open(scope)
+            .map_err(|err| EngineError::Driver(DriverError::Spawn(err.to_string())))?;
+        // MOD-11 D18, the start-time guard: `walk` admitted a CLI agent to a gated phase because
+        // this engine hosts the prompt tool; a lease without a port would run it unanswerable.
+        if transport == Transport::Cli
+            && phase.gate_effective != Gate::Never
+            && lease.prompt.is_none()
+        {
+            return Err(EngineError::Driver(DriverError::Spawn(
+                "missing_capability: inline_approval — a gated CLI step needs htui's \
+                 permission_prompt tool"
+                    .into(),
+            )));
+        }
+        Ok(lease)
     }
 
     // -- helpers -------------------------------------------------------------------------------
@@ -17162,6 +17178,61 @@ mod tests {
                 spec.prompt.is_some(),
                 "B-21: a CLI scope's lease lends a port"
             );
+        }
+
+        /// MOD-11 D18: a host that lends prompt ports admits a CLI agent to a gated phase
+        /// (`inline_prompt`), and its session starts with the lease's port.
+        #[tokio::test(start_paused = true)]
+        async fn a_gated_cli_step_with_a_port_starts() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            let (run, rest) = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_ne!(
+                rest.failure,
+                Some(RunFailure::MissingCapability),
+                "the interlock admits a CLI agent with a prompt port"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.phase_name, "prd");
+            let opened = host.opened();
+            assert_eq!(opened[0].transport, Transport::Cli);
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the gated prd session started");
+            assert!(spec.prompt.is_some(), "the session carries the port");
+        }
+
+        /// MOD-11 D18: the start-time guard. A gated CLI step whose lease came back without a
+        /// prompt port is refused before its agent starts, so the interlock cannot be bypassed.
+        #[tokio::test(start_paused = true)]
+        async fn a_gated_cli_step_without_a_prompt_port_is_refused_at_start() {
+            let host = Arc::new(FakeToolHost::default().without_prompt_ports());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            let refused = start(&harness, ids::HTUI_FEAT_3)
+                .await
+                .expect_err("the guard refuses the step");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::Driver(DriverError::Spawn(why))
+                        if why.starts_with("missing_capability: inline_approval")
+                ),
+                "{refused}"
+            );
+            assert!(
+                harness.orch.spec_for(&key("prd", 0, 0)).is_none(),
+                "no session started"
+            );
+            assert_eq!(host.live(), 0, "the portless lease was dropped");
         }
 
         #[tokio::test(start_paused = true)]

@@ -1287,6 +1287,7 @@ pub struct FakeToolHost {
     live: Arc<AtomicUsize>,
     fail: Mutex<Option<ToolHostError>>,
     closed: AtomicBool,
+    portless: AtomicBool,
 }
 
 impl FakeToolHost {
@@ -1335,6 +1336,14 @@ impl FakeToolHost {
             .cloned()
     }
 
+    /// MOD-11 T9: every lease from now on comes back without a prompt port, even for a
+    /// `Transport::Cli` scope — the host the engine's start-time guard refuses.
+    #[must_use]
+    pub fn without_prompt_ports(self) -> Self {
+        self.portless.store(true, Ordering::SeqCst);
+        self
+    }
+
     /// Whether [`ToolHost::close`] was called (B-19).
     #[must_use]
     pub fn closed(&self) -> bool {
@@ -1352,7 +1361,8 @@ impl ToolHost for FakeToolHost {
         {
             return Err(err);
         }
-        let prompt = (scope.transport == Transport::Cli).then(|| htui_agent::prompt_bridge().0);
+        let prompt = (scope.transport == Transport::Cli && !self.portless.load(Ordering::SeqCst))
+            .then(|| htui_agent::prompt_bridge().0);
         let token = {
             let mut opened = self
                 .opened
