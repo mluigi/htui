@@ -12,12 +12,13 @@
 //!   says the sentence; any other failure may have followed a COMMIT whose answer was lost, so it
 //!   is hedged and the thread re-read.
 //! - **Review M1**: the area covers the thread, so the pane looks, not the user. The area stays
-//!   busy under the hedge until the re-read lands; a note of this item with the sent body, newer
-//!   than every note the area opened on, means it was written (the area closes and the pane says
-//!   so); none means it was not (the text stays, Ctrl+S tries again). The pane holds no `UserId`
-//!   (`R-NF-3`), so the author cannot be matched; `created_at` stands in for "after the area
-//!   opened": a note committed after the thread was read has a later `now()` than every note in
-//!   it, so a note of the same text already there never counts. An `Unreachable` failure sent the
+//!   busy under the hedge until the re-read lands; a note of this item with the sent body, not in
+//!   the thread when it was sent, means it was written (the area closes and the pane says so);
+//!   none means it was not (the text stays, Ctrl+S tries again). The pane holds no `UserId`
+//!   (`R-NF-3`), so the author cannot be matched, and a note of the same text already there never
+//!   counts. Its id, not `created_at`, says "already there": `created_at` is the writing box's
+//!   clock (`Utc::now()` in `hand_written::serve`), and a box whose clock runs ahead stamps its
+//!   notes after the user's own (round 1). An `Unreachable` failure sent the
 //!   worker to the mirror before it answered, and the mirror cannot hold the note, so there "none"
 //!   proves nothing: the pane says it could not check (round 1).
 //! - A note's body is drawn one row per line (D8), so a multi-line note reads as written; a `\t`
@@ -29,8 +30,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::iter;
 
-use chrono::{DateTime, Utc};
-use htui_core::model::{ItemId, Note};
+use htui_core::model::{ItemId, Note, NoteId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Text};
@@ -68,8 +68,8 @@ struct Hedged {
     why: String,
     /// The body as sent, the store's canonical form (`Debug` prints its length).
     body: HandText,
-    /// The newest `created_at` in the thread when the area opened; `None` for an empty thread.
-    since: Option<DateTime<Utc>>,
+    /// The notes in the thread when it was sent: one of them is never the sent note (round 1).
+    known: Vec<NoteId>,
     /// The failure was an `Unreachable`, so the re-read is the mirror's: not finding the note
     /// there proves nothing (review M1, round 1).
     mirror: bool,
@@ -133,10 +133,8 @@ pub struct NotesTab {
     drawn: Cell<(u16, u16)>,
     /// The user's own note landed: the re-read opens at the bottom (review L1).
     follow: bool,
-    /// The newest `created_at` in the thread when the area opened (review M1).
-    since: Option<DateTime<Utc>>,
-    /// The `AddNote` body in flight (review M1).
-    sent: Option<HandText>,
+    /// The `AddNote` body in flight, and the notes in the thread when it was sent (review M1).
+    sent: Option<(HandText, Vec<NoteId>)>,
     /// The hedged `AddNote` the re-read in flight settles (review M1).
     hedged: Option<Hedged>,
     /// Review M1: the hedge settled as written, under the thread until the next key.
@@ -201,7 +199,8 @@ impl NotesTab {
             }
             ComposeOutcome::Save(request) => {
                 if let StoreRequest::AddNote { body, .. } = &request {
-                    self.sent = Some(body.clone());
+                    let known = self.notes.iter().map(|note| note.id).collect();
+                    self.sent = Some((body.clone(), known));
                 }
                 ctx.request(request);
                 Handled::Consumed
@@ -231,12 +230,12 @@ impl NotesTab {
         }
         let hedge = may_have_landed(message, "thread");
         match (sent, self.item) {
-            (Some(body), Some(item)) => {
+            (Some((body, known)), Some(item)) => {
                 compose.checking(hedge);
                 self.hedged = Some(Hedged {
                     why: message.to_owned(),
                     body,
-                    since: self.since,
+                    known,
                     mirror: answered_from_the_mirror(message),
                 });
                 ctx.request(StoreRequest::Notes(item));
@@ -263,7 +262,7 @@ impl NotesTab {
         let written = notes.iter().any(|note| {
             note.item_id == item
                 && note.body == hedged.body.as_str()
-                && hedged.since.is_none_or(|since| note.created_at > since)
+                && !hedged.known.contains(&note.id)
         });
         if written {
             self.compose = None;
@@ -295,7 +294,6 @@ impl DetailTab for NotesTab {
         self.opening = None;
         self.compose = None;
         self.follow = false;
-        self.since = None;
         self.sent = None;
         self.hedged = None;
         self.notice = None;
@@ -374,7 +372,6 @@ impl DetailTab for NotesTab {
                 if self.opening == Some(*item) && Some(*item) == self.item =>
             {
                 self.opening = None;
-                self.since = self.notes.iter().map(|note| note.created_at).max();
                 self.compose = Some(Compose::note(*item, self.key.as_deref()));
             }
             StoreReply::NoteAdded { item }
@@ -455,6 +452,7 @@ impl DetailTab for NotesTab {
 
 #[cfg(test)]
 mod tests {
+    use chrono::Utc;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::store::{MemStore, ReadStore as _, StoreError};
@@ -659,7 +657,7 @@ mod tests {
             .await
             .expect("the notes")
             .remove(0);
-        note.id = htui_core::model::NoteId::new();
+        note.id = NoteId::new();
         note.item_id = item;
         note.body = body.to_owned();
         note.created_at = Utc::now();
@@ -688,16 +686,17 @@ mod tests {
         assert_eq!(pane.notice, None);
     }
 
-    /// Review M1: the re-read holds no such note (one with the body from before the area opened
-    /// does not count): the text stays, busy settles, and Ctrl+S sends it again.
+    /// Review M1: the re-read holds no such note (one with the body already in the thread when
+    /// the note was sent does not count): the text stays, busy settles, and Ctrl+S sends it again.
     #[tokio::test]
     async fn a_reread_without_the_note_keeps_the_text_and_says_it_was_not_written() {
         let shell = Shell::new();
-        let (mut pane, message) = hedged(&shell, "Hi.").await;
+        let mut pane = pane(&shell).await;
         let mut thread = pane.notes.clone();
-        let mut older = written(ITEM, "Hi.").await;
-        older.created_at = thread[0].created_at;
-        thread.push(older);
+        thread.push(written(ITEM, "Hi.").await);
+        pane.on_reply(&StoreReply::Notes(thread.clone()), &mut shell.ctx());
+        let message = "store backend error: connection reset".to_owned();
+        hedge(&shell, &mut pane, "Hi.", &message);
         pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
         assert_eq!(
             compose(&pane).notice(),
@@ -792,6 +791,30 @@ mod tests {
         let mut pane = self::pane(&shell).await;
         hedge(&shell, &mut pane, "Hi.", &message);
         let mut thread = pane.notes.clone();
+        thread.push(written(ITEM, "Hi.").await);
+        pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
+        assert!(pane.compose.is_none());
+        assert_eq!(pane.notice.as_deref(), Some(NOTE_WRITTEN));
+    }
+
+    /// Review round 1, finding 2: `created_at` is the writing box's clock, not the server's. A
+    /// note from a box whose clock runs ahead is stamped after the user's own, which is still
+    /// found as written.
+    #[tokio::test]
+    async fn a_note_stamped_before_a_fast_clock_s_newest_is_still_found() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        let mut thread = pane.notes.clone();
+        let mut ahead = written(ITEM, "From a box whose clock runs ahead.").await;
+        ahead.created_at = Utc::now() + chrono::Duration::minutes(2);
+        thread.push(ahead);
+        pane.on_reply(&StoreReply::Notes(thread.clone()), &mut shell.ctx());
+        hedge(
+            &shell,
+            &mut pane,
+            "Hi.",
+            "store backend error: connection reset",
+        );
         thread.push(written(ITEM, "Hi.").await);
         pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
         assert!(pane.compose.is_none());
