@@ -888,6 +888,28 @@ async fn an_action_key_in_flow_answers_as_in_the_list() {
     assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
 }
 
+/// MOD-72 D1, D5, D6: `FEAT-1`'s plan step recorded the fixture's one tool call, a `read`, so its
+/// node's third line is `⚒ read×1`; no other node draws a chip.
+#[tokio::test]
+async fn the_flow_draws_the_plan_step_s_tool_call_as_a_chip() {
+    let mut harness = backlog().await;
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, 1);
+    harness.key("v");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{2692} read\u{d7}1"),
+        "the plan step's chip:\n{frame}"
+    );
+    assert_eq!(
+        frame.matches('\u{2692}').count(),
+        1,
+        "only the plan step made a call:\n{frame}"
+    );
+    insta::assert_snapshot!("runs_flow_tool_chips", frame);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The Graph sub-tab (MOD-14 plan D2-D8, blueprint §3 T3).
 // ---------------------------------------------------------------------------------------------
