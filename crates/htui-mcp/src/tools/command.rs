@@ -10,12 +10,13 @@
 //! cancelled call must undo lives in [`Enqueued`]'s drop (H-18): the row is cancelled and the
 //! child's process group dies with the dropped future.
 
+use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use htui_core::model::kind::{command_limit, resolve_command_limits};
-use htui_core::model::{CommandRun, CommandRunId, CommandRunStatus, NewCommandRun};
+use htui_core::model::{BoxId, CommandRun, CommandRunId, CommandRunStatus, NewCommandRun};
 use htui_core::scrub::Scrubber;
 use htui_core::store::traits::COMMAND_HEARTBEAT;
 use htui_orch::verify::{ShellEnd, ShellRun, run_shell};
@@ -116,7 +117,10 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
         .map_err(store_error)?
         .and_then(|row| row.settings.get("command_limits").cloned());
     let app = ctx.host.app_settings().await.map_err(store_error)?;
-    let limit = command_limit(&resolve_command_limits(box_limits.as_ref(), &app), &class);
+    let limit = command_limit(
+        &class_limits(scope.box_id, box_limits.as_ref(), &app),
+        &class,
+    );
 
     let store = session.store.clone();
     let queued = htui_core::store::WorkerStore::enqueue_command(
@@ -225,6 +229,22 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     }))
 }
 
+/// D15: the box's stored `command_limits` over the app's. A stored value that does not parse is
+/// skipped by [`resolve_command_limits`] and warned about here, as the worker's `command_limits`
+/// does: a box whose limits read as nothing must not fall back to the app's in silence.
+fn class_limits(
+    box_id: BoxId,
+    stored: Option<&Value>,
+    app: &BTreeMap<String, Value>,
+) -> BTreeMap<String, u32> {
+    if let Some(stored) = stored
+        && let Err(err) = serde_json::from_value::<BTreeMap<String, u32>>(stored.clone())
+    {
+        tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; the app setting stands where it does not");
+    }
+    resolve_command_limits(stored, app)
+}
+
 /// OQ-7: the session's directory, or a relative path under it that exists, with no `..`.
 fn directory(base: &Path, cwd: Option<&str>) -> Result<PathBuf, ToolError> {
     let Some(cwd) = cwd else {
@@ -325,5 +345,69 @@ impl<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static> Drop for 
                 }
             }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use htui_core::model::BoxId;
+    use serde_json::json;
+
+    use super::class_limits;
+
+    /// Counts the `WARN` events emitted while it is the default subscriber.
+    struct Warnings(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for Warnings {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            if *event.metadata().level() == tracing::Level::WARN {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// `class_limits` under a counting subscriber: the limits and how many warnings it logged.
+    fn limits_and_warnings(
+        stored: Option<&serde_json::Value>,
+        app: &BTreeMap<String, serde_json::Value>,
+    ) -> (BTreeMap<String, u32>, usize) {
+        let warned = Arc::new(AtomicUsize::new(0));
+        let limits = tracing::subscriber::with_default(Warnings(Arc::clone(&warned)), || {
+            class_limits(BoxId::new(), stored, app)
+        });
+        (limits, warned.load(Ordering::SeqCst))
+    }
+
+    /// D15 (blueprint §11.2): a box value that does not parse is skipped — the app's setting
+    /// stands for that class — and the caller warns, as the worker's `command_limits` does; a
+    /// value that parses, or none at all, warns nothing.
+    #[test]
+    fn a_box_limit_that_does_not_parse_is_skipped_and_warned() {
+        let app = BTreeMap::from([("command_limits".to_owned(), json!({"build": 2}))]);
+
+        let (limits, warned) = limits_and_warnings(Some(&json!({"build": "many"})), &app);
+        assert_eq!(limits.get("build"), Some(&2), "the app's limit stands");
+        assert_eq!(warned, 1, "and the unparsable box value is warned about");
+
+        let (limits, warned) = limits_and_warnings(Some(&json!({"build": 3})), &app);
+        assert_eq!(limits.get("build"), Some(&3), "a parsed box value overlays");
+        assert_eq!(warned, 0, "silently");
+
+        let (_, warned) = limits_and_warnings(None, &app);
+        assert_eq!(warned, 0, "no box value warns nothing");
     }
 }
