@@ -41,8 +41,8 @@ use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
 use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::store_worker::StoreRequest;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::filter;
-use crate::ui::tabs::backlog::list::clip;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
@@ -989,8 +989,8 @@ impl ItemForm {
         let head = format!("{}{label:<LABEL$}", marker(focused));
         let head_style = if focused { theme.title } else { theme.dim };
         let all = usize::from(width);
-        let room = all.saturating_sub(head.chars().count());
-        let mut spans = vec![Span::styled(clip(&head, all), head_style)];
+        let room = all.saturating_sub(cell_width(&head));
+        let mut spans = vec![Span::styled(cells::clip(&head, all), head_style)];
         let text = match field {
             Field::Title => Some(&self.title),
             Field::Priority => Some(&self.priority),
@@ -1004,7 +1004,7 @@ impl ItemForm {
             }
             None => {
                 let value = format!("\u{2039}{}\u{203a}", self.picker_label(field));
-                spans.push(Span::styled(clip(&value, room), theme.base));
+                spans.push(Span::styled(cells::clip(&value, room), theme.base));
             }
         }
         Line::from(spans)
@@ -1032,10 +1032,14 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         .copied()
         .filter(|field| !matches!(field, Field::Paths | Field::Body))
         .collect();
+    // The notice in rows of at most the pane's width in cells: broken at spaces, and inside a word
+    // only when the word alone is wider (a long path in a refusal). Wrapped here rather than by
+    // `Paragraph`'s `Wrap`, because the layout sizes the notice from this count before drawing it
+    // (the `settings::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
     let mut notice_lines = form
         .notice
         .as_deref()
-        .map(|sentence| notice_lines(sentence, usize::from(inner.width)))
+        .map(|sentence| wrapped(sentence, usize::from(inner.width)))
         .unwrap_or_default();
     // Every row but the body and the notice: the one-line rows, the paths and their label, the
     // body label and the hint.
@@ -1073,7 +1077,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         let focused = form.focus == field;
         let style = if focused { theme.title } else { theme.dim };
         Line::styled(
-            clip(&format!("{}{text}", marker(focused)), usize::from(width)),
+            cells::clip(&format!("{}{text}", marker(focused)), usize::from(width)),
             style,
         )
     };
@@ -1113,27 +1117,12 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         Field::Paths | Field::Body => HINT_AREA,
     };
     frame.render_widget(
-        Paragraph::new(Line::styled(clip(text, usize::from(width)), theme.dim)),
+        Paragraph::new(Line::styled(
+            cells::clip(text, usize::from(width)),
+            theme.dim,
+        )),
         hint,
     );
-}
-
-/// The notice in rows of at most `width` characters: broken at spaces, and inside a word only
-/// when the word alone is wider (a long path in a refusal). Wrapped here rather than by
-/// `Paragraph`'s `Wrap`, because the layout sizes the notice from this count before drawing it
-/// (the `settings::wrapped` precedent), and a count that disagreed would cut off the D11 hedge.
-pub(super) fn notice_lines(sentence: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for line in wrapped(sentence, width) {
-        let chars: Vec<char> = line.chars().collect();
-        lines.extend(
-            chars
-                .chunks(width)
-                .map(|chunk| chunk.iter().collect::<String>()),
-        );
-    }
-    lines
 }
 
 /// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost.
@@ -1573,9 +1562,9 @@ mod tests {
         let room = panes(chrome(Rect::new(0, 0, width, height)).body)[1].width - 2;
         for hint in [HINT_TEXT, HINT_PICK, HINT_AREA] {
             assert!(
-                hint.chars().count() <= usize::from(room),
+                cell_width(hint) <= usize::from(room),
                 "{hint:?} is {} columns against {room}",
-                hint.chars().count()
+                cell_width(hint)
             );
         }
     }
@@ -1728,6 +1717,56 @@ mod tests {
             .map(|row| row.trim_matches(|c| c == ' ' || c == '\u{2502}'))
             .collect::<String>();
         assert!(flowed.contains(&"a/".repeat(40)), "{}", rows.join("\n"));
+    }
+
+    /// MOD-60 D1: a picker value is clipped in cells, so a CJK graph name stays inside the row.
+    #[tokio::test]
+    async fn a_wide_graph_name_is_clipped_to_the_row() {
+        let store = MemStore::demo();
+        let mut htui = context(&store, ids::PROJECT_HTUI, None).await;
+        htui.graphs[0].name = "\u{6f22}".repeat(30);
+        let id = htui.graphs[0].id;
+        let mut form = ItemForm::open_new(htui, &projects(), None);
+        form.graph = Some(id);
+        let line = form.row_line(Field::Graph, 30, &Theme::default());
+        let used: usize = line
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum();
+        assert!(used <= 30, "{line:?} against 30");
+    }
+
+    /// MOD-60 D5: a CJK notice wraps by cells, so its last character is on screen, not past the
+    /// pane's edge.
+    #[tokio::test]
+    async fn a_wide_notice_wraps_by_cells_and_keeps_its_end() {
+        let mut form = new_form().await;
+        form.settle(Some(format!("{}\u{7d42}", "\u{6f22}".repeat(60))));
+        let rows = drawn(&form);
+        assert!(
+            rows.iter().any(|row| row.contains('\u{7d42}')),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    /// MOD-60 B9: the notice wraps by clusters, so a run of combining-mark clusters exactly as
+    /// wide as the pane fills one row. A per-char cut after the wrap (the deleted `notice_lines`)
+    /// would halve it, and at an odd width strand an accent at the start of the next row.
+    #[tokio::test]
+    async fn a_combining_notice_fills_its_row_by_clusters() {
+        let mut form = new_form().await;
+        let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
+        let inner = usize::from(right.width - 2);
+        let accented = "e\u{301}".repeat(inner);
+        form.settle(Some(accented.clone()));
+        let rows = drawn(&form);
+        assert!(
+            rows.iter().any(|row| row.contains(&accented)),
+            "{inner} accented cells in one row of\n{}",
+            rows.join("\n")
+        );
     }
 
     // ---- MOD-13 milestone 3: the divergence view -------------------------------------------

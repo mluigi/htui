@@ -29,6 +29,7 @@ use crate::app::{Action, Ctx, Handled};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
@@ -40,12 +41,12 @@ const SAVE_NAME: &str = REQUEST_NAMES[1];
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
 
-/// The tree's width, borders included: `  {name:<13} v{head:<3} {role}` is at most 28 chars, a
-/// longer name cut to [`NAME_WIDTH`].
+/// The tree's width, borders included: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v`,
+/// a head of up to three digits, a space and the role make at most 28 cells.
 const LIST_WIDTH: u16 = 32;
 
-/// A template row's name field, in chars: a longer name is cut to `NAME_WIDTH - 1` and `…`, so the
-/// head and the role stay on the row.
+/// A template row's name field, in cells: a name is fitted to it with `cells::fit`, so the head
+/// and the role stay on the row and in their columns.
 const NAME_WIDTH: usize = 13;
 
 /// The help column's width, borders included: `{{failure_reason}} section required`, the widest
@@ -932,16 +933,7 @@ impl TemplatesView {
                             .and_then(|snapshot| snapshot.head(*project, name))
                             .map_or(0, |row| row.version);
                         let role = TemplateRole::of_name(name).as_str();
-                        let name = if name.chars().count() > NAME_WIDTH {
-                            let cut: String = name.chars().take(NAME_WIDTH - 1).collect();
-                            format!("{cut}\u{2026}")
-                        } else {
-                            name.clone()
-                        };
-                        (
-                            format!("  {name:<NAME_WIDTH$} v{head:<3} {role}"),
-                            theme.base,
-                        )
+                        (template_row(name, head, role), theme.base)
                     }
                 };
                 let style = if index == self.cursor {
@@ -991,7 +983,8 @@ impl TemplatesView {
         let theme = ctx.theme;
         if let Mode::Naming { project, field } = &self.mode {
             let prompt = format!("new template in {}: ", slug(ctx, *project));
-            let budget = width.saturating_sub(u16::try_from(prompt.chars().count()).unwrap_or(0));
+            let budget =
+                width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
             let mut spans = vec![Span::styled(prompt, theme.base)];
             spans.extend(field.line(budget, true, theme).spans);
             return (" new template ".to_owned(), vec![Line::from(spans)]);
@@ -1139,6 +1132,12 @@ fn slug(ctx: &Ctx<'_>, project: ProjectId) -> String {
         )
 }
 
+/// One template row: two spaces, the name fitted to [`NAME_WIDTH`] cells, ` v` and the head, a
+/// space and the role.
+fn template_row(name: &str, head: i32, role: &str) -> String {
+    format!("  {} v{head:<3} {role}", cells::fit(name, NAME_WIDTH))
+}
+
 #[cfg(test)]
 mod tests {
     use htui_core::fixtures::ids;
@@ -1152,8 +1151,74 @@ mod tests {
     use crate::store_worker::{Origin, StoreRequest};
     use crate::templates;
     use crate::ui::Theme;
+    use crate::ui::cells::cell_width;
     use crate::ui::tabs::SkillsTab;
     use crossterm::event::{KeyCode, KeyModifiers};
+
+    /// MOD-60 D1: the name is fitted in cells, so a wide name never pushes the head or the role
+    /// right.
+    #[test]
+    fn a_wide_template_name_keeps_the_head_and_role_columns() {
+        for name in [
+            "plan".to_owned(),
+            "a".repeat(40),
+            "\u{6f22}".repeat(3),
+            "\u{6f22}".repeat(20),
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}".repeat(7),
+        ] {
+            let row = template_row(&name, 3, "plan");
+            let at = row.find(" v3").expect("the head is on the row");
+            assert_eq!(
+                cell_width(&row[..at]),
+                2 + NAME_WIDTH,
+                "{row:?} for {name:?}"
+            );
+            assert!(row.ends_with(" v3   plan"), "{row:?} keeps the role");
+        }
+    }
+
+    /// MOD-60: the name prompt carries the runtime project slug, so the field's budget is the
+    /// pane less the prompt in cells. A CJK slug measured in chars leaves the field 5 cells too
+    /// many and the prompt line runs past the pane.
+    #[test]
+    fn a_wide_project_slug_keeps_the_name_prompt_within_the_pane() {
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let scope = vulkan();
+        let projects = [htui_core::model::ProjectRef {
+            project_id: ids::PROJECT_VULKAN,
+            slug: "\u{6f22}".repeat(5),
+            name: "Vulkan".to_owned(),
+            position: 0,
+        }];
+        let ctx = Ctx::new(
+            &scope,
+            &projects,
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        let view = TemplatesView {
+            mode: Mode::Naming {
+                project: ids::PROJECT_VULKAN,
+                field: TextField::with_text(&"x".repeat(80)),
+            },
+            ..TemplatesView::default()
+        };
+        let (_, lines) = view.pane(40, &ctx);
+        let drawn: usize = lines[0]
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .sum();
+        assert_eq!(drawn, 40, "{lines:?}");
+    }
 
     /// The Harness's startup scope: the Graphics workspace and its one project.
     fn vulkan() -> Scope {

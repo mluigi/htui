@@ -67,6 +67,7 @@ use crate::app::{Action, Ctx, Handled};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::text_field::{FieldOutcome, TextField};
@@ -149,9 +150,6 @@ const PENDING: &str = "\u{2014}";
 
 /// The duration of a step that has not finished: no clock is read in `render` (D170).
 const RUNNING: &str = "\u{2026}";
-
-/// Marks a cut in [`fit`].
-const CUT: char = '\u{2026}';
 
 /// Marks the step the cursor is on. Unselected step rows carry a space of the same width, so the
 /// columns do not shift as the cursor moves.
@@ -683,7 +681,7 @@ const fn invalidates(kind: &FrameKind) -> bool {
 }
 
 /// The artifact view's rows at `width` columns (`0` reads as [`PANE`]): `<kind> v<version> ·
-/// <title>`, then the body line by line, each wrapped by [`wrap_line`]. The `bool` marks the
+/// <title>`, then the body line by line, each wrapped by `cells::wrap`. The `bool` marks the
 /// title's rows.
 ///
 /// Wrapped here rather than by `Paragraph::wrap`, so the scroll clamps against the rows the reader
@@ -691,48 +689,12 @@ const fn invalidates(kind: &FrameKind) -> bool {
 fn artifact_rows(doc: &Document, width: u16) -> Vec<(bool, String)> {
     let width = if width == 0 { PANE } else { usize::from(width) };
     let title = format!("{} v{} · {}", doc.kind, doc.version, doc.title);
-    let mut rows: Vec<(bool, String)> = wrap_line(&title, width)
+    let mut rows: Vec<(bool, String)> = cells::wrap(&title, width)
         .into_iter()
         .map(|row| (true, row))
         .collect();
     for line in doc.body.lines() {
-        rows.extend(wrap_line(line, width).into_iter().map(|row| (false, row)));
-    }
-    rows
-}
-
-/// `line` in rows of at most `width` characters: broken at a space where one fits, inside a word
-/// only when the word alone is wider. An empty line is one empty row; the spaces a line starts
-/// with are kept, so an indented block stays indented.
-fn wrap_line(line: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut rows = vec![String::new()];
-    for (at, word) in line.split(' ').enumerate() {
-        let used = rows.last().map_or(0, |row| row.chars().count());
-        if at > 0 {
-            if used + 1 + word.chars().count() <= width {
-                if let Some(row) = rows.last_mut() {
-                    row.push(' ');
-                    row.push_str(word);
-                }
-                continue;
-            }
-            if word.is_empty() {
-                // A space that does not fit is the break itself.
-                continue;
-            }
-            if used > 0 {
-                rows.push(String::new());
-            }
-        }
-        for c in word.chars() {
-            if rows.last().is_some_and(|row| row.chars().count() >= width) {
-                rows.push(String::new());
-            }
-            if let Some(row) = rows.last_mut() {
-                row.push(if c.is_control() { ' ' } else { c });
-            }
-        }
+        rows.extend(cells::wrap(line, width).into_iter().map(|row| (false, row)));
     }
     rows
 }
@@ -954,41 +916,19 @@ fn indicator(step: &RunStepSummary) -> Option<String> {
     }
 }
 
-/// `text` in exactly `width` characters: space-padded, or cut with `…` as its last character.
-///
-/// Counted in `char`s, like the text field (`ui/text_field.rs`). A control character, a newline in
-/// a failure sentence say, becomes a space: one line is one line.
-fn fit(text: &str, width: usize) -> String {
-    let flat: Vec<char> = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    if flat.len() <= width {
-        let mut out: String = flat.iter().collect();
-        out.extend(core::iter::repeat_n(' ', width - flat.len()));
-        out
-    } else if width == 0 {
-        String::new()
-    } else {
-        let mut out: String = flat[..width - 1].iter().collect();
-        out.push(CUT);
-        out
-    }
-}
-
 /// A blank cell of `width` columns.
 fn blank(width: usize) -> String {
     " ".repeat(width)
 }
 
 /// Four cells on [`RUN_GRID`], single-spaced.
-fn run_grid(cells: [(&str, Style); 4]) -> Line<'static> {
+fn run_grid(values: [(&str, Style); 4]) -> Line<'static> {
     let mut spans = Vec::with_capacity(7);
-    for (at, ((text, style), width)) in cells.into_iter().zip(RUN_GRID).enumerate() {
+    for (at, ((text, style), width)) in values.into_iter().zip(RUN_GRID).enumerate() {
         if at > 0 {
             spans.push(Span::raw(" "));
         }
-        spans.push(Span::styled(fit(text, width), style));
+        spans.push(Span::styled(cells::fit(text, width), style));
     }
     Line::from(spans)
 }
@@ -1056,12 +996,15 @@ fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Lin
     ];
     if cancel_requested {
         lines.push(Line::from(Span::styled(
-            fit(CANCEL_REQUESTED_LINE, PANE),
+            cells::fit(CANCEL_REQUESTED_LINE, PANE),
             theme.accent,
         )));
     }
     if let Some(failure) = &run.failure {
-        lines.push(Line::from(Span::styled(fit(failure, PANE), theme.error)));
+        lines.push(Line::from(Span::styled(
+            cells::fit(failure, PANE),
+            theme.error,
+        )));
     }
     lines
 }
@@ -1122,30 +1065,30 @@ fn step_lines(
     let first = Line::from(vec![
         Span::styled(mark, label),
         Span::raw(" "),
-        Span::styled(fit(&slot(step, siblings), SLOT_WIDTH), label),
+        Span::styled(cells::fit(&slot(step, siblings), SLOT_WIDTH), label),
         Span::raw(" "),
         Span::styled(
-            fit(step_status(step.status), STATUS_WIDTH),
+            cells::fit(step_status(step.status), STATUS_WIDTH),
             step_style(theme, step.status),
         ),
         Span::raw(" "),
-        Span::styled(fit(&step.phase_name, PHASE_WIDTH), label),
+        Span::styled(cells::fit(&step.phase_name, PHASE_WIDTH), label),
         Span::raw(" "),
         Span::styled(
-            format!("{:>USAGE_WIDTH$}", usage_cell(step.usage.as_ref())),
+            cells::pad_left(&usage_cell(step.usage.as_ref()), USAGE_WIDTH),
             theme.dim,
         ),
         Span::raw(" "),
         Span::styled(
-            format!("{:>DURATION_WIDTH$}", duration_cell(step)),
+            cells::pad_left(&duration_cell(step), DURATION_WIDTH),
             theme.dim,
         ),
     ]);
     let second = Line::from(vec![
         Span::raw(blank(INDENT)),
-        Span::styled(fit(&gate(step), GATE_WIDTH), theme.dim),
+        Span::styled(cells::fit(&gate(step), GATE_WIDTH), theme.dim),
         Span::raw(" "),
-        Span::styled(fit(&tail(step), TAIL_WIDTH), theme.dim),
+        Span::styled(cells::fit(&tail(step), TAIL_WIDTH), theme.dim),
     ]);
     [first, second]
 }
@@ -1159,7 +1102,7 @@ fn note_line(step: &RunStepSummary, theme: &Theme) -> Option<Line<'static>> {
     let note = step.gate_note.as_deref().filter(|note| !note.is_empty())?;
     Some(Line::from(vec![
         Span::raw(blank(INDENT)),
-        Span::styled(fit(note, PANE - INDENT), theme.accent),
+        Span::styled(cells::fit(note, PANE - INDENT), theme.accent),
     ]))
 }
 
@@ -1181,47 +1124,6 @@ fn strip_options(options: &[RelayOption]) -> Vec<PermissionOption> {
         .collect()
 }
 
-/// `line` in exactly `width` characters, its spans' styles kept: padded with a blank span, or cut
-/// with [`CUT`] as its last character, as [`fit`] does to a string.
-fn fit_line(line: Line<'static>, width: usize) -> Line<'static> {
-    let flat: Vec<(String, Style)> = line
-        .spans
-        .iter()
-        .map(|span| {
-            let text = span
-                .content
-                .chars()
-                .map(|c| if c.is_control() { ' ' } else { c })
-                .collect();
-            (text, span.style)
-        })
-        .collect();
-    let total: usize = flat.iter().map(|(text, _)| text.chars().count()).sum();
-    let mut spans = Vec::with_capacity(flat.len() + 1);
-    if total <= width {
-        spans.extend(
-            flat.into_iter()
-                .map(|(text, style)| Span::styled(text, style)),
-        );
-        spans.push(Span::raw(blank(width - total)));
-    } else if width > 0 {
-        let mut room = width - 1;
-        for (text, style) in flat {
-            let count = text.chars().count();
-            if count <= room {
-                room -= count;
-                spans.push(Span::styled(text, style));
-            } else {
-                let mut head: String = text.chars().take(room).collect();
-                head.push(CUT);
-                spans.push(Span::styled(head, style));
-                break;
-            }
-        }
-    }
-    Line::from(spans)
-}
-
 /// MOD-42 plan D14: the two lines under a step with a pending request, each exactly [`PANE`]
 /// wide: `asks: <summary>` from the status column, then the answer strip.
 fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 2] {
@@ -1229,15 +1131,17 @@ fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 
     let asks = Line::from(vec![
         Span::raw(blank(INDENT)),
         Span::styled(
-            fit(&format!("asks: {summary}"), PANE - INDENT),
+            cells::fit(&format!("asks: {summary}"), PANE - INDENT),
             theme.accent,
         ),
     ]);
-    let strip = fit_line(
-        PermissionStrip::line(&strip_options(&pending.options), theme),
+    let mut spans = cells::clip_spans(
+        &PermissionStrip::line(&strip_options(&pending.options), theme).spans,
         PANE,
     );
-    [asks, strip]
+    let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
+    spans.push(Span::raw(blank(PANE.saturating_sub(used))));
+    [asks, Line::from(spans)]
 }
 
 /// D170's usage cell: dollars when the usage document carries a cost, else tokens, else `—`. At
@@ -1580,7 +1484,7 @@ impl RunsTab {
     fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
         if self.waiting.contains(&run.id) {
-            lines.push(Line::styled(fit(WAITING_LINE, PANE), theme.accent));
+            lines.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.accent));
         }
         if let Some((_, step)) = self.entry_step() {
             lines.extend(note_line(step, theme));
@@ -1601,7 +1505,7 @@ impl RunsTab {
         for (at, run) in self.runs.iter().enumerate().skip(self.first_visible()) {
             let mut header = run_lines(run, self.cancel_requested(run.id), theme);
             if self.waiting.contains(&run.id) {
-                header.push(Line::styled(fit(WAITING_LINE, PANE), theme.accent));
+                header.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.accent));
             }
             if cursor == Some(Entry::Run { run: at }) {
                 // A run with no step is its own entry (D198); the run grid has no cursor column,
@@ -1662,7 +1566,8 @@ impl RunsTab {
             ],
             Mode::CloseOut(CloseOutStage::Typed { preview, field }) => {
                 let prompt = format!("type {} to close it: ", preview.key);
-                let room = width.saturating_sub(u16::try_from(prompt.chars().count()).unwrap_or(0));
+                let room =
+                    width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
                 let mut line = Line::from(Span::styled(prompt, theme.title));
                 line.spans.extend(field.line(room, true, theme).spans);
                 vec![line, hint("Enter close · Esc cancel")]
@@ -1920,7 +1825,7 @@ mod tests {
             };
             let rendered = indicator(&step).expect("a step with a figure has a second line");
             assert!(
-                rendered.chars().count() <= PHASE_WIDTH,
+                cell_width(&rendered) <= PHASE_WIDTH,
                 "`{rendered}` does not fit the phase cell"
             );
         }
@@ -1995,7 +1900,8 @@ mod tests {
         );
     }
 
-    /// R-3: the reason line is the pane's 43 columns whatever the note holds, cut with `CUT`.
+    /// R-3: the reason line is the pane's 43 columns whatever the note holds, cut with
+    /// `cells::ELLIPSIS`.
     #[tokio::test]
     async fn a_reason_line_is_forty_three_columns_whatever_the_note() {
         let theme = Theme::default();
@@ -2005,7 +1911,7 @@ mod tests {
         step.gate_note = Some(note);
         let line = note_line(&step, &theme).expect("a parked step with a note has a line");
         assert_eq!(line.width(), PANE);
-        assert!(text(&line).ends_with(CUT), "{:?}", text(&line));
+        assert!(text(&line).ends_with(cells::ELLIPSIS), "{:?}", text(&line));
         assert!(text(&line).chars().all(|c| !c.is_control()));
         step.gate_note = Some(String::new());
         assert!(note_line(&step, &theme).is_none(), "an empty note is none");
@@ -2102,7 +2008,7 @@ mod tests {
                 assert_eq!(cell(8, 18), status, "the status starts at column 8");
                 assert_eq!(
                     cell(19, 30),
-                    fit(&step.phase_name, PHASE_WIDTH).trim(),
+                    cells::fit(&step.phase_name, PHASE_WIDTH).trim(),
                     "the phase starts at column 19"
                 );
                 assert_eq!(cell(31, 37), usage_cell(step.usage.as_ref()), "usage at 31");
@@ -2324,7 +2230,7 @@ mod tests {
             ] {
                 let cell = usage_cell(Some(&document));
                 assert!(
-                    cell.chars().count() <= USAGE_WIDTH,
+                    cell_width(&cell) <= USAGE_WIDTH,
                     "`{cell}` from {document} is wider than {USAGE_WIDTH}"
                 );
             }
@@ -2381,42 +2287,75 @@ mod tests {
         for seconds in seconds {
             let cell = duration_cell(&span(seconds));
             assert!(
-                cell.chars().count() <= DURATION_WIDTH,
+                cell_width(&cell) <= DURATION_WIDTH,
                 "`{cell}` for {seconds}s is wider than {DURATION_WIDTH}"
             );
         }
     }
 
-    #[test]
-    fn fit_pads_cuts_and_flattens() {
-        assert_eq!(fit("ab", 4), "ab  ");
-        assert_eq!(fit("abcd", 4), "abcd");
-        assert_eq!(fit("abcde", 4), "abc\u{2026}");
-        assert_eq!(fit("a\nb", 3), "a b");
+    /// MOD-60 D1: the phase is fitted in cells, so a CJK phase name leaves the first line
+    /// exactly the pane wide and the usage figure in its column at cell 31.
+    #[tokio::test]
+    async fn a_wide_phase_name_keeps_the_usage_column() {
+        let theme = Theme::default();
+        let step = RunStepSummary {
+            phase_name: "\u{5b9f}\u{88c5}".repeat(6),
+            ..feat_1_runs().await[0].steps[0].clone()
+        };
+        let [first, _] = step_lines(&step, std::slice::from_ref(&step), false, &theme);
+        let widths: Vec<usize> = first
+            .spans
+            .iter()
+            .map(|span| cell_width(&span.content))
+            .collect();
+        assert_eq!(widths.iter().sum::<usize>(), PANE, "{first:?}");
+        assert_eq!(widths[..8].iter().sum::<usize>(), 31, "{first:?}");
         assert_eq!(
-            fit("\u{2014}", 2),
-            "\u{2014} ",
-            "counted in chars, not bytes"
+            first.spans[8].content.trim_start(),
+            usage_cell(step.usage.as_ref())
         );
-        assert_eq!(fit("abc", 0), "");
     }
 
+    /// MOD-60 D1: the summary and the strip are cut in cells, so CJK in either keeps both
+    /// lines exactly the pane wide.
     #[test]
-    fn wrap_line_breaks_at_spaces_and_inside_only_a_wider_word() {
-        assert_eq!(wrap_line("", 5), [""]);
-        assert_eq!(wrap_line("ab cd ef", 5), ["ab cd", "ef"]);
-        assert_eq!(wrap_line("  ab", 5), ["  ab"], "an indent is kept");
-        assert_eq!(wrap_line("abcdefgh ij", 3), ["abc", "def", "gh", "ij"]);
-        assert_eq!(
-            wrap_line("abc ", 3),
-            ["abc"],
-            "a space that does not fit is the break"
-        );
-        assert!(
-            wrap_line(&"word ".repeat(40), 7)
+    fn a_wide_permission_summary_is_forty_three_cells() {
+        let theme = Theme::default();
+        let summary = "\u{6f22}".repeat(40);
+        let options = vec![
+            option(
+                "allow",
+                &"\u{8a31}\u{53ef}".repeat(10),
+                RelayOptionKind::AllowOnce,
+            ),
+            option("reject", "Reject once", RelayOptionKind::RejectOnce),
+        ];
+        let pending = pending_on(ids::RUN_1, ids::STEP_PRD, Some(&summary), options);
+        for line in permission_lines(&pending, &theme) {
+            let used: usize = line
+                .spans
                 .iter()
-                .all(|row| row.chars().count() <= 7)
-        );
+                .map(|span| cell_width(&span.content))
+                .sum();
+            assert_eq!(used, PANE, "{line:?}");
+        }
+    }
+
+    /// MOD-60 D4: an artifact's body wraps by cells, so no row of a CJK document is wider
+    /// than the pane and its last character is still on a row.
+    #[test]
+    fn a_wide_document_wraps_by_cells() {
+        let body = format!("{}\u{7d42}", "\u{6f22}".repeat(49));
+        let rows = artifact_rows(&document(DocumentId::new(), &body), 20);
+        for (_, row) in &rows {
+            assert!(cell_width(row) <= 20, "{row:?} against 20");
+        }
+        let kept: String = rows
+            .iter()
+            .filter(|(title, _)| !title)
+            .map(|(_, row)| row.as_str())
+            .collect();
+        assert_eq!(kept, body);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -4367,7 +4306,7 @@ mod tests {
                 RelayOptionKind::RejectAlways,
             ),
         ];
-        assert!(long.chars().count() >= 200);
+        assert!(cell_width(&long) >= 200);
         for (summary, options) in [
             (Some("execute: cargo test"), two_options()),
             (Some(long.as_str()), two_options()),
@@ -4473,7 +4412,7 @@ mod tests {
                 .any(|line| line.trim() == "waiting for the walk"),
             "{waiting:#?}"
         );
-        assert!(waiting.iter().all(|line| line.chars().count() <= PANE));
+        assert!(waiting.iter().all(|line| cell_width(line) <= PANE));
         pane.on_reply(
             &StoreReply::RunStream(RunFrame {
                 item: ids::HTUI_FEAT_1,

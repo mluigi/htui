@@ -289,7 +289,7 @@ impl PathPicker {
     fn lines(&self, width: u16, height: usize, theme: &Theme) -> Vec<Line<'static>> {
         let mut footer = Vec::new();
         if let Some(field) = &self.goto {
-            let room = width.saturating_sub(u16::try_from(GOTO.len()).unwrap_or(u16::MAX));
+            let room = width.saturating_sub(u16::try_from(cell_width(GOTO)).unwrap_or(u16::MAX));
             let mut spans = vec![Span::styled(GOTO, theme.base)];
             spans.extend(field.line(room, true, theme).spans);
             footer.push(Line::from(spans));

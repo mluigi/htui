@@ -19,6 +19,7 @@ use ratatui::widgets::Paragraph;
 use crate::app::{Ctx, Handled};
 use crate::preview::PromptPreview;
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -272,9 +273,11 @@ fn section_lines(sections: &[Section]) -> Vec<String> {
         "section", "before", "after", "strategy"
     )];
     for section in sections {
+        // The name is padded in cells (MOD-60 D1): a `Documents` name carries a runtime
+        // `document.kind`. Padded, not fitted: the column never clipped.
         let mut row = format!(
-            "{:<24}{:>8}{:>8}  {}",
-            section.name.render(),
+            "{}{:>8}{:>8}  {}",
+            cells::pad(&section.name.render(), 24),
             section.tokens_before,
             section.tokens_after,
             section.strategy.as_str(),
@@ -413,9 +416,34 @@ impl DetailTab for PromptTab {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::cells::cell_width;
     use htui_core::model::{Activation, SkillLevel};
+    use htui_core::prompt::{SectionName, TrimStrategy};
     use ratatui::buffer::Buffer;
     use ratatui::widgets::Widget as _;
+
+    /// MOD-60 D1: the section name is padded in cells, so a document kind in CJK leaves the
+    /// `before` figure ending at cell 32 on its row, as `before` does on the header.
+    #[test]
+    fn a_wide_document_kind_keeps_the_numbers_in_their_columns() {
+        let lines = section_lines(&[Section {
+            name: SectionName::Documents("\u{6587}\u{66f8}".into()),
+            tokens_before: 4321,
+            tokens_after: 1234,
+            strategy: TrimStrategy::None,
+            trimmed: false,
+            elided_lines: None,
+            elided_bytes: None,
+            stubbed: None,
+            dropped: None,
+        }]);
+        let end = |line: &str, needle: &str| {
+            let at = line.find(needle).expect("the figure is on the line") + needle.len();
+            cell_width(&line[..at])
+        };
+        assert_eq!(end(&lines[0], "before"), 32, "{:?}", lines[0]);
+        assert_eq!(end(&lines[1], "4321"), 32, "{:?}", lines[1]);
+    }
 
     #[test]
     fn the_window_renders_the_cells_the_scrolled_whole_used_to() {

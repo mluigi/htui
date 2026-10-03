@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-60](docs/decisions/mod/mod-60.md)** - Display width in every hand-laid-out row (done, 2026-10-03)
 - **[MOD-28](docs/decisions/mod/mod-28.md)** - rataflow execution view (done, 2026-10-02)
 - **[MOD-49](docs/decisions/mod/mod-49.md)** - Interactive path picker for repo and workspace roots (done, 2026-10-02)
 - **[MOD-24](docs/decisions/mod/mod-24.md)** - Crash recovery of runs under the headless worker (done, 2026-10-02)

@@ -31,6 +31,7 @@ use std::collections::BTreeSet;
 use crate::app::{Ctx, Handled};
 use crate::box_settings::{BoxesSnapshot, READ_NAME, REQUEST_NAMES, SpecView};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
     is_error, message, wrapped,
@@ -1083,7 +1084,7 @@ impl BoxesSection {
 }
 
 /// A list row: the hostname, the last eight hex digits of the id only when another listed box has
-/// the same hostname (PRD `:262`), and ` (this box)` on this box, in `room` chars.
+/// the same hostname (PRD `:262`), and ` (this box)` on this box, in `room` cells.
 ///
 /// Only the hostname is clipped: the suffix and the marker are what tell two same-named boxes
 /// apart, so they survive a long hostname.
@@ -1102,22 +1103,10 @@ fn list_label(record: &BoxRecord, snapshot: &BoxesSnapshot, room: usize) -> Stri
     if snapshot.this_box == Some(row.id) {
         tail.push_str(" (this box)");
     }
-    let host_room = room.saturating_sub(tail.chars().count()).max(1);
-    let mut label = clip(&row.hostname, host_room);
+    let host_room = room.saturating_sub(cell_width(&tail)).max(1);
+    let mut label = cells::clip(&row.hostname, host_room);
     label.push_str(&tail);
-    clip(&label, room)
-}
-
-/// `text` cut to `width` chars, the last one a `…` when anything was cut.
-fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_owned();
-    }
-    let mut clipped: String = text.chars().take(width.saturating_sub(1)).collect();
-    if width > 0 {
-        clipped.push('\u{2026}');
-    }
-    clipped
+    cells::clip(&label, room)
 }
 
 /// The label column's span.
@@ -1231,4 +1220,66 @@ fn spec_lines(spec: &SpecView, width: usize, theme: &Theme) -> Vec<Line<'static>
         );
     }
     lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use htui_core::model::{BoxRow, OsFamily, UserId};
+
+    /// A box called `hostname`, every other field a placeholder.
+    fn record(hostname: &str) -> BoxRecord {
+        let at = DateTime::<Utc>::UNIX_EPOCH;
+        BoxRecord {
+            row: BoxRow {
+                id: BoxId::new(),
+                user_id: UserId::from_uuid(uuid::Uuid::nil()),
+                hostname: hostname.to_owned(),
+                os_family: OsFamily::Linux,
+                os_version: "6.8".to_owned(),
+                arch: "x86_64".to_owned(),
+                cpu: String::new(),
+                ram_mb: None,
+                gpu_present: false,
+                gpu_vendor: None,
+                htui_version: "0.1.0".to_owned(),
+                probed_tags: Vec::new(),
+                declared_tags: Vec::new(),
+                quirks: String::new(),
+                settings: serde_json::json!({}),
+                registered_at: at,
+                last_seen_at: at,
+                last_probed_at: None,
+                updated_at: at,
+                edit_version: 0,
+            },
+            tools: Vec::new(),
+            probe_spec_digest: None,
+        }
+    }
+
+    /// MOD-60: a CJK hostname is clipped in cells, so the row stays inside its room and the
+    /// ` (this box)` marker that tells boxes apart still shows.
+    #[test]
+    fn a_wide_hostname_keeps_the_suffix_and_the_marker() {
+        let room = 24;
+        let record = record(&"\u{6f22}".repeat(20));
+        let snapshot = BoxesSnapshot {
+            this_box: Some(record.row.id),
+            boxes: vec![record.clone()],
+            spec: SpecView {
+                digest: String::new(),
+                overlay: false,
+                error: None,
+                stored: None,
+            },
+        };
+
+        let out = list_label(&record, &snapshot, room);
+
+        assert!(cell_width(&out) <= room, "{out:?} against {room}");
+        // ` (this box)` takes 11 cells and leaves the hostname 13: six two-cell clusters and `…`.
+        assert_eq!(out, format!("{}\u{2026} (this box)", "\u{6f22}".repeat(6)));
+    }
 }

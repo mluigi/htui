@@ -481,6 +481,25 @@ mod tests {
             .collect()
     }
 
+    /// MOD-60 B10, the visible window: `before` is measured as one string, so it must be the sum
+    /// of its clusters. A whole-string measure joins the lam-alef in "salam" into one ligature
+    /// cell, `ratatui` draws two, and the tail would be given a cell the row does not have.
+    #[test]
+    fn a_ligature_before_the_cursor_does_not_widen_the_line() {
+        let salam = "\u{633}\u{644}\u{627}\u{645}";
+        let mut field = TextField::with_text(&format!("{salam}abcdef"));
+        for _ in 0..6 {
+            field.on_key(key(KeyCode::Left));
+        }
+        assert_eq!(field.before_cursor(), Some(salam));
+        assert_eq!(line_text(&field, 8, true), format!("{salam}abcd"));
+
+        let line = field.line(8, true, &Theme::default());
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 80, 1));
+        let (x, _) = buffer.set_line(0, 0, &line, 80);
+        assert_eq!(x, 8, "drawn exactly the 8 cells it was given");
+    }
+
     #[test]
     fn inserts_at_the_cursor() {
         let mut field = TextField::with_text("ac");

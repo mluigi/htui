@@ -16,6 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::app::{Action, Ctx, Handled, OverlayAction};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
+use crate::ui::cells::{self, cell_width};
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
 use crossterm::event::{KeyCode, KeyEvent};
@@ -95,7 +96,7 @@ impl WorkspaceSwitcher {
             let column = self
                 .workspaces
                 .iter()
-                .map(|w| w.name.chars().count())
+                .map(|w| cell_width(&w.name))
                 .max()
                 .unwrap_or(0);
             self.workspaces
@@ -128,8 +129,9 @@ impl WorkspaceSwitcher {
     ) -> Line<'static> {
         let selected = index == self.selected;
         let marker = if selected { CURSOR } else { NO_CURSOR };
-        let padding = " ".repeat(column.saturating_sub(workspace.name.chars().count()));
-        let name = format!("{marker}{}{padding}{GAP}", workspace.name);
+        // `fit`, not `pad`: `column` is the widest name, so nothing is cut, but `fit` clips first
+        // and clipping flattens a control to the blank cell `cell_width` counted it as (D3).
+        let name = format!("{marker}{}{GAP}", cells::fit(&workspace.name, column));
         let style = if selected { theme.accent } else { theme.base };
         Line::from(vec![
             Span::styled(name, style),
@@ -189,7 +191,7 @@ impl Overlay for WorkspaceSwitcher {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let lines = self.lines(ctx.theme);
-        let widest = lines.iter().map(Line::width).max().unwrap_or(0);
+        let widest = widest(&lines);
         let width = u16::try_from(widest)
             .unwrap_or(u16::MAX)
             .saturating_add(CHROME);
@@ -216,5 +218,99 @@ fn projects_label(count: usize) -> String {
         0 => "no projects".to_owned(),
         1 => "1 project".to_owned(),
         n => format!("{n} projects"),
+    }
+}
+
+/// The widest of `lines`, in cells. Measured as the rows were padded: `Line::width` skips the
+/// halfwidth sound mark rule, so a name the column pads by cells would overrun a box sized by it
+/// (MOD-60 B3).
+fn widest(lines: &[Line<'_>]) -> usize {
+    lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| cell_width(&span.content))
+                .sum::<usize>()
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use htui_core::model::WorkspaceId;
+
+    use super::*;
+
+    fn workspace(name: &str) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id: WorkspaceId::default(),
+            slug: "w".to_owned(),
+            name: name.to_owned(),
+            projects: Vec::new(),
+        }
+    }
+
+    /// MOD-60: the name column is measured and padded in cells, so a CJK name's project count
+    /// lines up with an ASCII one's.
+    #[test]
+    fn a_wide_workspace_name_keeps_the_counts_in_one_column() {
+        let switcher = WorkspaceSwitcher {
+            workspaces: vec![workspace("Platform"), workspace("\u{5e73}\u{53f0}")],
+            selected: 0,
+            loaded: true,
+        };
+        let lines = switcher.lines(&Theme::default());
+        let first: Vec<usize> = lines[..2]
+            .iter()
+            .map(|line| cell_width(&line.spans[0].content))
+            .collect();
+        assert_eq!(first[0], first[1], "{lines:?}");
+    }
+
+    /// MOD-60 D3: `cell_width` counts a control as one cell but ratatui draws nothing for it, so
+    /// the name is flattened before it is padded. Measured where ratatui stops drawing each row:
+    /// every row ends with the same label, so equal ends mean one count column.
+    #[test]
+    fn a_control_char_in_a_workspace_name_keeps_the_counts_in_one_column() {
+        let switcher = WorkspaceSwitcher {
+            workspaces: vec![
+                workspace("Platform"),
+                workspace("a\tb"),
+                workspace("a\u{1}b"),
+            ],
+            selected: 0,
+            loaded: true,
+        };
+        let lines = switcher.lines(&Theme::default());
+        let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 3));
+        let ends: Vec<u16> = (0u16..3)
+            .map(|y| buffer.set_line(0, y, &lines[usize::from(y)], 80).0)
+            .collect();
+        assert_eq!(ends, vec![ends[0]; 3], "{lines:?}");
+    }
+
+    /// MOD-60 B3: the box is as wide as the widest row in cells. `ｶﾞ` is two cells and one to
+    /// `Line::width`, so a box sized that way is narrower than the row padded in cells.
+    #[test]
+    fn a_halfwidth_workspace_name_fits_inside_the_box() {
+        let name = "\u{ff76}\u{ff9e}".repeat(20);
+        let switcher = WorkspaceSwitcher {
+            workspaces: vec![workspace(&name)],
+            selected: 0,
+            loaded: true,
+        };
+        let lines = switcher.lines(&Theme::default());
+        let row: String = lines[0]
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(
+            cell_width(&row),
+            2 + 40 + 2 + cell_width(&projects_label(0))
+        );
+        assert_eq!(widest(&lines), cell_width(&row), "{row:?}");
     }
 }

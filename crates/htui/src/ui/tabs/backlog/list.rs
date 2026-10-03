@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::ui::Theme;
+use crate::ui::cells::{self, cell_width};
 
 /// Two spaces between the columns of an item row, as in the blueprint's `KEY  status  title`.
 const GAP: usize = 2;
@@ -167,13 +168,13 @@ fn lines(view: &ListView<'_>, theme: &Theme, width: usize) -> Vec<Line<'static>>
     let key_width = view
         .items
         .iter()
-        .map(|item| item.key.chars().count())
+        .map(|item| cell_width(&item.key))
         .max()
         .unwrap_or(0);
     let status_width = view
         .items
         .iter()
-        .map(|item| item.status.as_str().len())
+        .map(|item| cell_width(item.status.as_str()))
         .max()
         .unwrap_or(0);
     let title_width = width
@@ -202,14 +203,14 @@ fn lines(view: &ListView<'_>, theme: &Theme, width: usize) -> Vec<Line<'static>>
             out.push(row(
                 vec![
                     Span::raw(" ".repeat(INDENT)),
-                    Span::styled(pad(&item.key, key_width), theme.accent),
+                    Span::styled(cells::pad(&item.key, key_width), theme.accent),
                     Span::raw(" ".repeat(GAP)),
                     Span::styled(
-                        pad(item.status.as_str(), status_width),
+                        cells::pad(item.status.as_str(), status_width),
                         theme.status_style(item.status),
                     ),
                     Span::raw(" ".repeat(GAP)),
-                    Span::styled(clip(&item.title, title_width), theme.base),
+                    Span::styled(cells::clip(&item.title, title_width), theme.base),
                 ],
                 width,
                 selected,
@@ -227,7 +228,7 @@ fn row(
     selected: bool,
     theme: &Theme,
 ) -> Line<'static> {
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
+    let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
     let line = Line::from(spans);
     if selected {
@@ -235,26 +236,6 @@ fn row(
     } else {
         line
     }
-}
-
-/// `text` padded with spaces to `width`.
-fn pad(text: &str, width: usize) -> String {
-    let mut out = text.to_owned();
-    out.extend(std::iter::repeat_n(
-        ' ',
-        width.saturating_sub(text.chars().count()),
-    ));
-    out
-}
-
-/// `text` cut to `width` characters, the last one replaced by an ellipsis when it did not fit.
-pub fn clip(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_owned();
-    }
-    let mut out: String = text.chars().take(width.saturating_sub(1)).collect();
-    out.push('\u{2026}');
-    out
 }
 
 /// First visible row: enough to keep `cursor` inside a `height`-tall viewport.
@@ -273,6 +254,8 @@ pub fn window(cursor: usize, len: usize, height: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use htui_core::fixtures::ids;
+    use htui_core::model::Status;
 
     /// MOD-13 D5: no filter, the title every existing snapshot pins.
     #[test]
@@ -284,5 +267,70 @@ mod tests {
     #[test]
     fn the_title_with_a_filter_appends_its_summary() {
         assert_eq!(title(2, Some("status:done")), " Backlog (2) · status:done ");
+    }
+
+    fn summary(key: &str, number: i32, title: &str, status: Status) -> ItemSummary {
+        ItemSummary {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            key: key.to_owned(),
+            key_prefix: key.split('-').next().unwrap_or_default().to_owned(),
+            key_number: number,
+            title: title.to_owned(),
+            status,
+            priority: 0,
+            required_tags: Vec::new(),
+            updated_at: htui_core::fixtures::demo_at(0, 0),
+            touched_paths: Vec::new(),
+        }
+    }
+
+    /// MOD-60 D1: the key column is padded and the title clipped in cells, so a CJK key or
+    /// title neither pushes the status column right nor runs the row past the pane.
+    #[test]
+    fn a_wide_key_and_title_keep_every_row_the_pane_width() {
+        let items = vec![
+            summary("FEAT-12", 12, "short", Status::Open),
+            summary(
+                "\u{6f22}\u{5b57}-1",
+                1,
+                &"\u{6587}".repeat(40),
+                Status::InProgress,
+            ),
+        ];
+        let projects = vec![ProjectRef {
+            project_id: ids::PROJECT_HTUI,
+            slug: "htui".to_owned(),
+            name: "htui".to_owned(),
+            position: 0,
+        }];
+        let view = ListView {
+            items: &items,
+            projects: &projects,
+            folded: &[],
+            selected: None,
+            filter: None,
+        };
+        let lines = lines(&view, &Theme::default(), 50);
+        assert_eq!(lines.len(), 3, "one header and two items");
+        for line in &lines {
+            let used: usize = line
+                .spans
+                .iter()
+                .map(|span| cell_width(&span.content))
+                .sum();
+            assert_eq!(used, 50, "{line:?}");
+        }
+        let status_at: Vec<usize> = lines[1..]
+            .iter()
+            .map(|line| {
+                line.spans[..3]
+                    .iter()
+                    .map(|span| cell_width(&span.content))
+                    .sum()
+            })
+            .collect();
+        assert_eq!(status_at[0], status_at[1], "{lines:?}");
     }
 }

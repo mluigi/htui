@@ -88,6 +88,7 @@ use crate::agent_settings::{
 use crate::agent_worker::{AUTH_ALREADY_CHOSEN, LOGIN_ENDED, NO_LOGIN_RUNNING};
 use crate::app::{Action, Ctx, Handled};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
+use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
     is_error, message,
@@ -2031,7 +2032,7 @@ impl Editor {
         let label_width = self
             .fields
             .iter()
-            .map(|field| field.label.chars().count())
+            .map(|field| cell_width(field.label))
             .max()
             .unwrap_or(0);
         self.fields
@@ -2039,9 +2040,9 @@ impl Editor {
             .enumerate()
             .map(|(index, field)| {
                 let focused = index == self.focus;
-                let padding = " ".repeat(label_width - field.label.chars().count());
                 let style = if focused { theme.accent } else { theme.dim };
-                let mut spans = vec![Span::styled(format!("{}{padding}: ", field.label), style)];
+                let label = cells::pad(field.label, label_width);
+                let mut spans = vec![Span::styled(format!("{label}: "), style)];
                 let room = usize::from(width).saturating_sub(label_width + 2);
                 spans.extend(
                     field
@@ -2124,13 +2125,14 @@ impl PathsForm {
     }
 
     /// One line per tool, [`Editor::lines`]' shape (MOD-66 D11, B8). The label column is the
-    /// longest tool name, capped at a third of `width`; a longer name is cut to one less than the
-    /// column and ends in `…`.
+    /// longest tool name in cells, capped at a third of `width`. Each name is `cells::fit` to the
+    /// column (MOD-60): padded when it fits, else cut to at most one cell less than the column and
+    /// ending in `…`, then padded back, so every label ends at the same cell.
     fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         let longest = self
             .fields
             .iter()
-            .map(|field| field.tool.chars().count())
+            .map(|field| cell_width(&field.tool))
             .max()
             .unwrap_or(0);
         let column = longest.min(usize::from(width) / 3);
@@ -2140,7 +2142,7 @@ impl PathsForm {
             .map(|(index, field)| {
                 let focused = index == self.focus;
                 let style = if focused { theme.accent } else { theme.dim };
-                let label = fit_label(&field.tool, column);
+                let label = cells::fit(&field.tool, column);
                 let mut spans = vec![Span::styled(format!("{label}: "), style)];
                 let room = usize::from(width).saturating_sub(column + 2);
                 spans.extend(
@@ -2152,20 +2154,6 @@ impl PathsForm {
                 Line::from(spans)
             })
             .collect()
-    }
-}
-
-/// `tool` in a label column `column` wide (MOD-66 B8): padded when it fits, else cut to
-/// `column - 1` characters and `…`.
-fn fit_label(tool: &str, column: usize) -> String {
-    if tool.chars().count() <= column {
-        format!("{tool:<column$}")
-    } else {
-        let mut cut: String = tool.chars().take(column.saturating_sub(1)).collect();
-        if column > 0 {
-            cut.push('\u{2026}');
-        }
-        cut
     }
 }
 
@@ -2230,7 +2218,7 @@ fn clash_notice(clashes: &[&str]) -> String {
             format!(" +{after} more")
         };
         let width =
-            notice.chars().count() + separator.len() + label.chars().count() + owed.chars().count();
+            cell_width(&notice) + cell_width(separator) + cell_width(label) + cell_width(&owed);
         if width > NOTE_WIDTH {
             break;
         }
@@ -2873,5 +2861,54 @@ fn human_bytes(bytes: u64) -> String {
         format!("{:.1} KB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} bytes")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MOD-60: the tool-name column is measured and cut in cells. A CJK name that fits the
+    /// column by `char` count is twice as wide on screen; it is cut with `…` so every label,
+    /// wide or not, ends at the same cell. At an odd column (63 / 3 = 21) the cut lands on a
+    /// cluster boundary and `…` sits right against the `": "`; at an even one (60 / 3 = 20)
+    /// a wide glyph cannot fill the last cell before `…`, so `cells::fit` pads one space after
+    /// it. Both pin the exact label, so an over-clip padded back to the column cannot pass.
+    #[test]
+    fn a_wide_tool_name_is_fitted_to_the_label_column() {
+        let wide = "\u{6f22}";
+        let cases = [
+            (63, format!("{}\u{2026}: ", wide.repeat(10))),
+            (60, format!("{}\u{2026} : ", wide.repeat(9))),
+        ];
+        for (width, expected) in cases {
+            let column = usize::from(width) / 3;
+            let form = PathsForm {
+                agent_id: AgentId::new(),
+                name: "agent".to_owned(),
+                opened: BTreeMap::new(),
+                fields: [wide.repeat(20), "git".to_owned()]
+                    .into_iter()
+                    .map(|tool| PathField {
+                        tool,
+                        input: TextField::new(),
+                    })
+                    .collect(),
+                focus: 0,
+            };
+
+            let lines = form.lines(width, &Theme::default());
+
+            for line in &lines {
+                let label = &line.spans[0].content;
+                assert_eq!(cell_width(label), column + 2, "{label:?} against {column}");
+            }
+            assert_eq!(lines[0].spans[0].content, expected, "width {width}");
+            assert_eq!(
+                lines[1].spans[0].content,
+                format!("{:<column$}: ", "git"),
+                "width {width}"
+            );
+        }
     }
 }

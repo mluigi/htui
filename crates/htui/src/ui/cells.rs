@@ -11,15 +11,29 @@
 //! **own string**: `UnicodeWidthStr::width`, never a sum of `UnicodeWidthChar::width` over the code
 //! points. A family emoji is one cluster of five code points; summed per `char` it is 6, and
 //! measured as a string it is 2. The crate documents the same asymmetry for `"\r\n"` and for emoji
-//! modifier and presentation sequences. Second, a per-`char` sum is *also* simply wrong for control
-//! characters: `UnicodeWidthChar::width('\u{1}')` is `None` while `UnicodeWidthStr::width("\u{1}")`
-//! is `1`, so the natural `.unwrap_or(0)` undercounts every C0 control and `DEL` by one — and a body
-//! that came back from `$EDITOR` can hold those.
+//! modifier and presentation sequences. A string of several clusters is the sum of its clusters'
+//! widths, never `UnicodeWidthStr::width` over the whole string, which joins ligatures across
+//! cluster boundaries that `ratatui` draws one at a time (see [`cell_width`]). Second, a per-`char`
+//! sum is *also* simply wrong for control characters: `UnicodeWidthChar::width('\u{1}')` is `None`
+//! while `UnicodeWidthStr::width("\u{1}")` is `1`, so the natural `.unwrap_or(0)` undercounts every
+//! C0 control and `DEL` by one — and a body that came back from `$EDITOR` can hold those.
 //!
 //! The non-CJK `width()` is used, never `width_cjk()`. East Asian **Ambiguous** characters — `…`,
 //! `•`, `U+FFFD`, every box-drawing char — are 1 cell under `width()` and 2 under `width_cjk()`,
 //! and `…` and `•` are two of the glyphs `TextField` draws itself. `ratatui` uses `width()`.
+//!
+//! Every clip with a cut mark, pad, fit and word wrap in `ui/` goes through the operations below
+//! (MOD-60 D1), so a row is never measured one way and drawn another: [`clip`], [`pad`],
+//! [`pad_left`], [`fit`], [`wrap`] and [`clip_spans`], all cutting at [`ELLIPSIS`] and all drawing
+//! a control character as one blank cell (D3). A few walks are other operations and keep their
+//! own loop over the two measures above: the text widgets' cursor windows, `path_picker`'s cut
+//! from the left and its word wrap (which keeps controls raw; out of MOD-60's scope, D10), the
+//! graph pane's edge cut (no mark), and `concepts_search`'s unmarked clip and grapheme-only wrap.
 
+use std::borrow::Cow;
+
+use ratatui::style::Style;
+use ratatui::text::Span;
 use unicode_segmentation::UnicodeSegmentation as _;
 use unicode_width::UnicodeWidthStr;
 
@@ -41,10 +55,23 @@ const SEMI_VOICED_SOUND_MARK: char = '\u{FF9F}';
 /// unconditionally, which gives `"あﾞ"` 3; because both marks are `Grapheme_Extend` they always
 /// attach to the preceding cluster, so counting per cluster gives the same answer. The test below
 /// pins `"あﾞ"` at 3 so that equivalence is tested rather than assumed.
+///
+/// A string of several clusters is the **sum of its clusters**, each measured alone, because that
+/// is how `ratatui` draws it: `Buffer::set_stringn` advances one grapheme at a time
+/// (`ratatui-core-0.1.2/src/buffer/buffer.rs:350-353`). `UnicodeWidthStr::width` over the whole
+/// string applies ligature and ZWJ rules *across* cluster boundaries — Arabic lam + alef is two
+/// clusters it measures as one cell, and `ratatui` draws two — so a whole-string measure would
+/// let a clipped or wrapped row draw wider than its budget.
 #[must_use]
 pub(crate) fn cell_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
-        + s.chars()
+    graphemes(s).map(cluster_width).sum()
+}
+
+/// One cluster's cells: its own string's width, plus `ratatui`'s halfwidth sound mark cell.
+fn cluster_width(cluster: &str) -> usize {
+    UnicodeWidthStr::width(cluster)
+        + cluster
+            .chars()
             .filter(|c| matches!(*c, VOICED_SOUND_MARK | SEMI_VOICED_SOUND_MARK))
             .count()
 }
@@ -59,9 +86,188 @@ pub(crate) fn graphemes(s: &str) -> impl Iterator<Item = &str> + '_ {
     s.graphemes(true)
 }
 
+/// The one cut mark (MOD-60 D2): East Asian Ambiguous, so 1 cell under `width()` (see the module
+/// doc).
+pub(crate) const ELLIPSIS: char = '\u{2026}';
+
+/// `text` with every control cluster drawn as one blank cell (MOD-60 D3). Every op below applies
+/// it to its output — [`pad`] and [`pad_left`] too, which otherwise never rewrite.
+///
+/// `cell_width("\u{1}")` is 1, but `ratatui` skips a control grapheme when it draws, so an
+/// unflattened control is measured one way and drawn another. Per **cluster**, not per `char`:
+/// `"\r\n"` is one cluster and becomes one space. UAX #29 always isolates controls (GB4/GB5), so
+/// a cluster holding a control is nothing but control. Borrowed when there is nothing to rewrite.
+fn flatten(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return Cow::Borrowed(text);
+    }
+    Cow::Owned(
+        graphemes(text)
+            .map(|cluster| {
+                if cluster.chars().any(char::is_control) {
+                    " "
+                } else {
+                    cluster
+                }
+            })
+            .collect(),
+    )
+}
+
+/// `text` in at most `width` cells, cut at a grapheme boundary with [`ELLIPSIS`] as its last cell
+/// when anything was cut (MOD-60 D1, D2). A control character draws as one blank cell (D3) —
+/// also when nothing is cut. Width 0 is `""`: a lone `…` would be a cell over. A cluster that
+/// would straddle the cut is dropped, so a cut result may fall short of `width` by up to that
+/// cluster's cells less one (a stacked `ｶﾞﾞﾞ` is 4, so up to 3); never long. [`fit`] pads it back.
+#[must_use]
+pub(crate) fn clip(text: &str, width: usize) -> String {
+    let flat = flatten(text);
+    if cell_width(&flat) <= width {
+        return flat.into_owned();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = head(&flat, width - 1);
+    out.push(ELLIPSIS);
+    out
+}
+
+/// The leading clusters of `text` that fit in `room` cells, stopping at the **first** that does
+/// not — a narrower cluster behind it is not looked for, so nothing is reordered.
+fn head(text: &str, room: usize) -> String {
+    let mut used = 0;
+    let mut out = String::new();
+    for cluster in graphemes(text) {
+        let cells = cell_width(cluster);
+        if used + cells > room {
+            break;
+        }
+        used += cells;
+        out.push_str(cluster);
+    }
+    out
+}
+
+/// `text` followed by spaces up to `width` cells (MOD-60 D1). Never clips: a `text` already
+/// `width` or wider comes back unpadded. A control character draws as one blank cell (D3), as in
+/// [`clip`]: `ratatui` draws nothing for it, so an unflattened one leaves the row a cell short.
+#[must_use]
+pub(crate) fn pad(text: &str, width: usize) -> String {
+    let mut out = flatten(text).into_owned();
+    out.push_str(&" ".repeat(width.saturating_sub(cell_width(&out))));
+    out
+}
+
+/// Spaces then `text`, right-aligned in `width` cells — `{:>N}` measured in cells (MOD-60 D1).
+/// Never clips; a control character draws as one blank cell (D3), as in [`pad`].
+#[must_use]
+pub(crate) fn pad_left(text: &str, width: usize) -> String {
+    let flat = flatten(text);
+    let mut out = " ".repeat(width.saturating_sub(cell_width(&flat)));
+    out.push_str(&flat);
+    out
+}
+
+/// Exactly `width` cells: [`clip`] then [`pad`], so a straddling wide cluster's lost cell is
+/// padded back and the next column stays put (MOD-60 D1, R-3).
+#[must_use]
+pub(crate) fn fit(text: &str, width: usize) -> String {
+    pad(&clip(text, width), width)
+}
+
+/// `line` in rows of at most `width` cells (MOD-60 D4, from `divergence::wrap_row`): broken at a
+/// space where one fits, inside a word by grapheme only when the word alone is wider; a cluster
+/// wider than the whole width sits alone on its row (the one overflow). An empty line is one
+/// empty row; leading spaces are kept; a space that does not fit is the break. Width 0 reads as 1.
+/// Control clusters draw as one blank cell (D3); only U+0020 splits words.
+#[must_use]
+pub(crate) fn wrap(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    // The last row's cells, kept as a running sum: [`cell_width`] is the sum of the clusters'
+    // widths (B10), so adding each push's cells is exactly the re-measured row (review M1).
+    let mut used = 0;
+    for (at, raw) in line.split(' ').enumerate() {
+        // Flattened before either push path, so the fits-after-a-space one draws a control as
+        // a blank cell too (MOD-60 B8). Widths do not move: a control cluster is 1 cell either
+        // way.
+        let word = flatten(raw);
+        if at > 0 {
+            let word_cells = cell_width(&word);
+            if used + 1 + word_cells <= width {
+                if let Some(row) = rows.last_mut() {
+                    row.push(' ');
+                    row.push_str(&word);
+                }
+                used += 1 + word_cells;
+                continue;
+            }
+            if word.is_empty() {
+                // A space that does not fit is the break itself.
+                continue;
+            }
+            if used > 0 {
+                rows.push(String::new());
+                used = 0;
+            }
+        }
+        for cluster in graphemes(&word) {
+            let cells = cell_width(cluster);
+            if rows.last().is_some_and(|row| !row.is_empty()) && used + cells > width {
+                rows.push(String::new());
+                used = 0;
+            }
+            if let Some(row) = rows.last_mut() {
+                row.push_str(cluster);
+            }
+            used += cells;
+        }
+    }
+    rows
+}
+
+/// `spans` cut from the end to at most `width` cells, every kept span keeping its style; when
+/// anything was cut, [`ELLIPSIS`] ends the line in the style of the span the cut fell in (B1).
+/// Controls flattened per span (D3). No padding. Width 0 is no spans.
+#[must_use]
+pub(crate) fn clip_spans(spans: &[Span<'_>], width: usize) -> Vec<Span<'static>> {
+    let flat: Vec<(Cow<'_, str>, Style)> = spans
+        .iter()
+        .map(|span| (flatten(&span.content), span.style))
+        .collect();
+    if flat.iter().map(|(text, _)| cell_width(text)).sum::<usize>() <= width {
+        return flat
+            .into_iter()
+            .map(|(text, style)| Span::styled(text.into_owned(), style))
+            .collect();
+    }
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut room = width - 1;
+    let mut out = Vec::new();
+    for (text, style) in flat {
+        let cells = cell_width(&text);
+        if cells <= room {
+            room -= cells;
+            out.push(Span::styled(text.into_owned(), style));
+            continue;
+        }
+        // The cut span: the first not kept whole. Its head plus the mark, which may be the mark
+        // alone when the cut lands on a span boundary (B1).
+        let mut cut = head(&text, room);
+        cut.push(ELLIPSIS);
+        out.push(Span::styled(cut, style));
+        break;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::{Color, Modifier};
     use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
     #[test]
@@ -196,6 +402,464 @@ mod tests {
     fn clusters_rejoin_into_the_string_they_came_from() {
         for s in ["👨‍👩‍👧", "a\tb", "a\u{1}b", "漢字\t字", "", "\r\n", "e\u{301}x"] {
             assert_eq!(graphemes(s).collect::<String>(), s, "{s:?}");
+        }
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The shared operations (MOD-60 D1-D4, D12): one table per op.
+    // -----------------------------------------------------------------------------------------
+
+    /// Three wide CJK characters: 6 cells.
+    const CJK: &str = "\u{6f22}\u{5b57}\u{6587}";
+    /// A ZWJ family: one cluster of five code points, 2 cells.
+    const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+    /// A base and a combining mark: one cluster, 1 cell.
+    const COMBINING: &str = "e\u{301}";
+    /// A halfwidth katakana and its voiced sound mark: one cluster, 2 cells.
+    const SOUND: &str = "\u{ff76}\u{ff9e}";
+
+    /// Every input the clip and fit tables use, for the properties over all widths.
+    fn table_inputs() -> Vec<String> {
+        vec![
+            "abcdef".to_owned(),
+            CJK.to_owned(),
+            FAMILY.repeat(2),
+            COMBINING.repeat(3),
+            SOUND.repeat(2),
+            "a\u{1}b".to_owned(),
+            "a\r\nb".to_owned(),
+            "ab\ncd".to_owned(),
+            "\t".to_owned(),
+            "ab".to_owned(),
+            "abcd".to_owned(),
+            "abcde".to_owned(),
+            "a\nb".to_owned(),
+            "\u{2014}".to_owned(),
+            "abc".to_owned(),
+            String::new(),
+            "\u{6f22}\u{5b57}a".to_owned(),
+            "a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}".to_owned(),
+        ]
+    }
+
+    #[test]
+    fn the_ellipsis_is_one_cell() {
+        assert_eq!(cell_width(&ELLIPSIS.to_string()), 1);
+    }
+
+    #[test]
+    fn clip_cuts_by_cells_and_marks_the_cut() {
+        let family2 = FAMILY.repeat(2);
+        let combining3 = COMBINING.repeat(3);
+        let sound2 = SOUND.repeat(2);
+        let cases: Vec<(&str, usize, String, usize)> = vec![
+            ("abcdef", 6, "abcdef".to_owned(), 6),
+            ("abcdef", 5, "abcd\u{2026}".to_owned(), 5),
+            ("abcdef", 1, "\u{2026}".to_owned(), 1),
+            ("abcdef", 0, String::new(), 0),
+            (CJK, 6, CJK.to_owned(), 6),
+            (CJK, 5, "\u{6f22}\u{5b57}\u{2026}".to_owned(), 5),
+            (CJK, 4, "\u{6f22}\u{2026}".to_owned(), 3),
+            (CJK, 3, "\u{6f22}\u{2026}".to_owned(), 3),
+            (CJK, 2, "\u{2026}".to_owned(), 1),
+            (CJK, 1, "\u{2026}".to_owned(), 1),
+            (CJK, 0, String::new(), 0),
+            (&family2, 4, family2.clone(), 4),
+            (&family2, 3, format!("{FAMILY}\u{2026}"), 3),
+            (&family2, 2, "\u{2026}".to_owned(), 1),
+            (&combining3, 3, combining3.clone(), 3),
+            (&combining3, 2, "e\u{301}\u{2026}".to_owned(), 2),
+            (&combining3, 1, "\u{2026}".to_owned(), 1),
+            (&sound2, 4, sound2.clone(), 4),
+            (&sound2, 3, format!("{SOUND}\u{2026}"), 3),
+            (&sound2, 2, "\u{2026}".to_owned(), 1),
+            ("a\u{1}b", 3, "a b".to_owned(), 3),
+            ("a\r\nb", 3, "a b".to_owned(), 3),
+            ("ab\ncd", 3, "ab\u{2026}".to_owned(), 3),
+            ("\t", 1, " ".to_owned(), 1),
+            // The cut stops at the first cluster that does not fit: the narrower `a` behind it
+            // is not pulled forward, which would reorder the text (blueprint §1.3 step 4).
+            ("\u{6f22}\u{5b57}a", 4, "\u{6f22}\u{2026}".to_owned(), 3),
+            // A straddling cluster of 4 cells leaves the cut 2 short, not 1.
+            (
+                "a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}",
+                4,
+                "a\u{2026}".to_owned(),
+                2,
+            ),
+        ];
+        for (text, width, want, cells) in cases {
+            let out = clip(text, width);
+            assert_eq!(out, want, "{text:?} at {width}");
+            assert_eq!(cell_width(&out), cells, "{out:?} at {width}");
+        }
+    }
+
+    #[test]
+    fn clip_is_never_wider_than_its_width() {
+        for input in table_inputs() {
+            for w in 0..=8 {
+                let out = clip(&input, w);
+                assert!(cell_width(&out) <= w, "{out:?} against {w}");
+                if cell_width(&input) <= w {
+                    assert_eq!(out, flatten(&input), "{input:?} fits {w}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pad_fills_to_the_width_and_never_clips() {
+        assert_eq!(pad("ab", 4), "ab  ");
+        assert_eq!(pad("\u{6f22}", 4), "\u{6f22}  ");
+        assert_eq!(pad(FAMILY, 3), format!("{FAMILY} "));
+        assert_eq!(pad(SOUND, 3), format!("{SOUND} "));
+        assert_eq!(pad(COMBINING, 2), "e\u{301} ");
+        assert_eq!(pad("abcdef", 4), "abcdef", "never clips");
+        assert_eq!(pad("", 0), "");
+    }
+
+    /// D3 for the pads: `ratatui` draws nothing for a control, so an unflattened one would leave
+    /// the row a cell short of the width it was measured at and shift the next column left.
+    #[test]
+    fn pad_and_pad_left_draw_a_control_char_as_a_blank_cell() {
+        assert_eq!(pad("a\u{1}", 3), "a  ");
+        assert_eq!(pad("a\r\nb", 4), "a b ", "one cluster, one blank cell");
+        assert_eq!(
+            pad("a\tbcd", 2),
+            "a bcd",
+            "flattened, and still never clipped"
+        );
+        assert_eq!(pad_left("a\u{1}", 3), " a ");
+        assert_eq!(pad_left("\u{7f}bc", 2), " bc", "never clips");
+        for (out, width) in [(pad("a\u{1}", 3), 3), (pad_left("\u{1}\u{7f}", 4), 4)] {
+            assert_eq!(drawn(&out), width, "{out:?} against {width}");
+        }
+    }
+
+    #[test]
+    fn pad_left_right_aligns_by_cells() {
+        assert_eq!(pad_left("ab", 4), "  ab");
+        assert_eq!(pad_left("\u{6f22}", 3), " \u{6f22}");
+        assert_eq!(pad_left("abc", 2), "abc", "never clips");
+    }
+
+    #[test]
+    fn fit_is_exactly_its_width() {
+        // Ported from `runs::fit_pads_cuts_and_flattens`.
+        assert_eq!(fit("ab", 4), "ab  ");
+        assert_eq!(fit("abcd", 4), "abcd");
+        assert_eq!(fit("abcde", 4), "abc\u{2026}");
+        assert_eq!(fit("a\nb", 3), "a b");
+        assert_eq!(
+            fit("\u{2014}", 2),
+            "\u{2014} ",
+            "counted in chars, not bytes"
+        );
+        assert_eq!(fit("abc", 0), "");
+        // The straddling wide cluster's lost cell is padded back (R-3).
+        assert_eq!(fit(CJK, 4), "\u{6f22}\u{2026} ");
+        assert_eq!(fit(CJK, 5), "\u{6f22}\u{5b57}\u{2026}");
+        assert_eq!(fit(&FAMILY.repeat(2), 2), "\u{2026} ");
+        assert_eq!(fit(&SOUND.repeat(2), 2), "\u{2026} ");
+        assert_eq!(
+            fit("a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}", 4),
+            "a\u{2026}  ",
+            "a cut two cells short is padded back by two"
+        );
+        for input in table_inputs() {
+            for w in 0..=8 {
+                let out = fit(&input, w);
+                assert_eq!(cell_width(&out), w, "{out:?} against {w}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_inside_only_a_wider_word() {
+        // Ported from `runs::wrap_line_breaks_at_spaces_and_inside_only_a_wider_word`.
+        assert_eq!(wrap("", 5), [""]);
+        assert_eq!(wrap("ab cd ef", 5), ["ab cd", "ef"]);
+        assert_eq!(wrap("  ab", 5), ["  ab"], "an indent is kept");
+        assert_eq!(wrap("abcdefgh ij", 3), ["abc", "def", "gh", "ij"]);
+        assert_eq!(
+            wrap("abc ", 3),
+            ["abc"],
+            "a space that does not fit is the break"
+        );
+        assert!(
+            wrap(&"word ".repeat(40), 7)
+                .iter()
+                .all(|row| cell_width(row) <= 7)
+        );
+    }
+
+    #[test]
+    fn no_wrapped_row_is_wider_than_its_width() {
+        // Ported from `divergence::no_wrapped_row_is_wider_than_its_column`.
+        for line in [
+            format!("+{}\u{7d42}", "\u{6f22}".repeat(45)),
+            format!("+{} end", "\u{1f642}".repeat(30)),
+            " ascii then \u{6f22}\u{5b57} and a\u{301} \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}"
+                .to_owned(),
+            "\u{1}\u{7f}x".to_owned(),
+        ] {
+            for width in [1, 2, 3, 7, 20, 48] {
+                let rows = wrap(&line, width);
+                // A wide cluster alone on a row is the one overflow a 1-cell column allows.
+                let room = width.max(2);
+                for row in &rows {
+                    let cells = cell_width(row);
+                    assert!(cells <= room, "{row:?} is {cells} cells at {width}");
+                }
+                let kept: String = rows.concat().chars().filter(|c| *c != ' ').collect();
+                let wanted: String = line
+                    .chars()
+                    .filter(|c| *c != ' ' && !c.is_control())
+                    .collect();
+                assert_eq!(kept, wanted, "nothing dropped from {line:?} at {width}");
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_keeps_a_cluster_whole() {
+        let han = "\u{6f22}";
+        assert_eq!(
+            wrap(&han.repeat(5), 4),
+            [han.repeat(2), han.repeat(2), han.to_owned()]
+        );
+        assert_eq!(
+            wrap(&han.repeat(3), 1),
+            [han, han, han],
+            "a cluster wider than the width sits alone: the one overflow"
+        );
+        assert_eq!(
+            wrap(&FAMILY.repeat(3), 4),
+            [FAMILY.repeat(2), FAMILY.to_owned()]
+        );
+        assert_eq!(wrap(FAMILY, 1), [FAMILY]);
+        assert_eq!(
+            wrap(&COMBINING.repeat(3), 2),
+            [COMBINING.repeat(2), COMBINING.to_owned()]
+        );
+        assert_eq!(
+            wrap(&SOUND.repeat(3), 4),
+            [SOUND.repeat(2), SOUND.to_owned()]
+        );
+        assert_eq!(wrap("ab", 0), ["a", "b"], "width 0 reads as 1");
+    }
+
+    /// `wrap` as it was before the running sum (MOD-60 review M1): every row re-measured whole
+    /// with [`cell_width`] for every cluster. Since B10 that is a per-cluster sum, so a running
+    /// count must give the same rows; this is the oracle that says so.
+    fn remeasuring_wrap(line: &str, width: usize) -> Vec<String> {
+        let width = width.max(1);
+        let mut rows = vec![String::new()];
+        for (at, raw) in line.split(' ').enumerate() {
+            let word = flatten(raw);
+            let used = rows.last().map_or(0, |row| cell_width(row));
+            if at > 0 {
+                if used + 1 + cell_width(&word) <= width {
+                    if let Some(row) = rows.last_mut() {
+                        row.push(' ');
+                        row.push_str(&word);
+                    }
+                    continue;
+                }
+                if word.is_empty() {
+                    continue;
+                }
+                if used > 0 {
+                    rows.push(String::new());
+                }
+            }
+            for cluster in graphemes(&word) {
+                let cells = cell_width(cluster);
+                if rows
+                    .last()
+                    .is_some_and(|row| !row.is_empty() && cell_width(row) + cells > width)
+                {
+                    rows.push(String::new());
+                }
+                if let Some(row) = rows.last_mut() {
+                    row.push_str(cluster);
+                }
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn wrap_with_a_running_sum_matches_the_remeasuring_wrap() {
+        let words = [
+            "ab".to_owned(),
+            "abcdefghij".to_owned(),
+            CJK.to_owned(),
+            FAMILY.repeat(3),
+            COMBINING.repeat(4),
+            SOUND.repeat(3),
+            "a\u{ff76}\u{ff9e}\u{ff9e}\u{ff9e}".to_owned(),
+            "a\u{1}b".to_owned(),
+            "\r\n".to_owned(),
+            "x\ty\u{7f}".to_owned(),
+            LAM_ALEF.repeat(3),
+            SALAM.to_owned(),
+            String::new(),
+        ];
+        let mut lines = vec![String::new(), " ".to_owned(), "   ".to_owned()];
+        for first in &words {
+            lines.push(first.clone());
+            lines.push(format!("  {first} "));
+            for second in &words {
+                lines.push(format!("{first} {second}"));
+                lines.push(format!("{first}  {second} {first}"));
+            }
+        }
+        lines.push(words.join(" "));
+        lines.push(words.join("  "));
+        for line in &lines {
+            for width in 0..=12 {
+                assert_eq!(
+                    wrap(line, width),
+                    remeasuring_wrap(line, width),
+                    "{line:?} at {width}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wrap_draws_a_control_char_as_a_blank_cell() {
+        assert_eq!(wrap("a\u{1}b c", 80), ["a b c"]);
+        assert_eq!(
+            wrap("x \u{1}y", 80),
+            ["x  y"],
+            "flattened on the fits-after-a-space path too (B8)"
+        );
+        assert_eq!(wrap("a\tb", 80), ["a b"], "a tab is not a break");
+    }
+
+    fn style_a() -> Style {
+        Style::new().fg(Color::Red)
+    }
+
+    fn style_b() -> Style {
+        Style::new().add_modifier(Modifier::BOLD)
+    }
+
+    fn spans(parts: &[(&str, Style)]) -> Vec<Span<'static>> {
+        parts
+            .iter()
+            .map(|(text, style)| Span::styled((*text).to_owned(), *style))
+            .collect()
+    }
+
+    #[test]
+    fn clip_spans_cuts_from_the_end_and_keeps_styles() {
+        let (a, b) = (style_a(), style_b());
+        let input = spans(&[("ab", a), ("cd", b)]);
+        for w in [4, 5, 9] {
+            assert_eq!(clip_spans(&input, w), input, "fits at {w}");
+        }
+        assert_eq!(clip_spans(&input, 2), spans(&[("a\u{2026}", a)]));
+        assert_eq!(clip_spans(&input, 1), spans(&[("\u{2026}", a)]));
+        assert_eq!(clip_spans(&input, 0), Vec::<Span<'static>>::new());
+        assert_eq!(
+            clip_spans(&spans(&[("a\nb", a)]), 3),
+            spans(&[("a b", a)]),
+            "flattened, and it fits"
+        );
+        let with_empty = spans(&[("", a), ("ab", b)]);
+        assert_eq!(clip_spans(&with_empty, 2), with_empty, "empty span kept");
+    }
+
+    #[test]
+    fn clip_spans_puts_the_ellipsis_in_the_style_of_the_span_it_cuts() {
+        let (a, b) = (style_a(), style_b());
+        let input = spans(&[("ab", a), ("cd", b)]);
+        assert_eq!(
+            clip_spans(&input, 3),
+            spans(&[("ab", a), ("\u{2026}", b)]),
+            "a cut on a span boundary marks the first dropped span (B1)"
+        );
+    }
+
+    /// How many cells `ratatui` advances drawing `s` in one line: the renderer, as the oracle.
+    fn drawn(s: &str) -> usize {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 80, 1));
+        let (x, _) = buffer.set_stringn(0, 0, s, usize::MAX, Style::new());
+        usize::from(x)
+    }
+
+    /// Lam + alef, two clusters: `unicode-width` measures the pair as one ligature cell.
+    const LAM_ALEF: &str = "\u{644}\u{627}";
+    /// Arabic "salam": four clusters holding a lam-alef.
+    const SALAM: &str = "\u{633}\u{644}\u{627}\u{645}";
+
+    /// Strings `UnicodeWidthStr::width` measures across cluster boundaries — ligatures, and a ZWJ
+    /// after a cluster that is not an emoji — while `ratatui` draws one cluster at a time.
+    fn cross_cluster_inputs() -> Vec<String> {
+        vec![
+            LAM_ALEF.to_owned(),
+            LAM_ALEF.repeat(3),
+            SALAM.to_owned(),
+            format!("{SALAM} {SALAM}"),
+            "\u{2d5c}\u{2d7f}\u{2d5c}".to_owned(),
+            "\u{a4f8}\u{a4fc}".to_owned(),
+            "\u{17d2}\u{1780}".to_owned(),
+            format!("{ELLIPSIS}\u{1f3fb}\u{200d}{FAMILY}"),
+        ]
+    }
+
+    /// A string is as wide as its clusters, each measured alone: what `ratatui` draws, even where
+    /// `unicode-width` would join two clusters into one ligature or ZWJ sequence.
+    #[test]
+    fn a_string_is_as_wide_as_ratatui_draws_it() {
+        assert_eq!(cell_width(LAM_ALEF), 2, "two clusters, two cells");
+        assert_eq!(cell_width(SALAM), 4);
+        for input in cross_cluster_inputs().into_iter().chain(table_inputs()) {
+            if input.chars().any(char::is_control) {
+                continue; // ratatui skips a control; flatten is what makes those agree (D3)
+            }
+            assert_eq!(cell_width(&input), drawn(&input), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn no_op_draws_wider_than_its_width() {
+        for input in cross_cluster_inputs() {
+            for w in 0..=10 {
+                let clipped = clip(&input, w);
+                assert!(drawn(&clipped) <= w, "clip {clipped:?} against {w}");
+                let fitted = fit(&input, w);
+                assert_eq!(drawn(&fitted), w, "fit {fitted:?} against {w}");
+                let cut = clip_spans(&[Span::raw(input.clone())], w);
+                let cells: usize = cut.iter().map(|span| drawn(&span.content)).sum();
+                assert!(cells <= w, "clip_spans {cut:?} against {w}");
+                for row in wrap(&input, w) {
+                    // A cluster wider than the width alone on its row is wrap's one overflow.
+                    let alone = graphemes(&row).count() == 1;
+                    assert!(drawn(&row) <= w.max(1) || alone, "wrap {row:?} against {w}");
+                }
+            }
+        }
+        assert_eq!(clip(SALAM, 3), "\u{633}\u{644}\u{2026}");
+        assert_eq!(pad(LAM_ALEF, 3), format!("{LAM_ALEF} "));
+        assert_eq!(pad_left(LAM_ALEF, 3), format!(" {LAM_ALEF}"));
+    }
+
+    #[test]
+    fn clip_spans_drops_a_wide_cluster_that_would_straddle_the_cut() {
+        let (a, b) = (style_a(), style_b());
+        let input = spans(&[("\u{6f22}", a), ("\u{5b57}\u{6587}", b)]);
+        let five = clip_spans(&input, 5);
+        assert_eq!(five, spans(&[("\u{6f22}", a), ("\u{5b57}\u{2026}", b)]));
+        let four = clip_spans(&input, 4);
+        assert_eq!(four, spans(&[("\u{6f22}", a), ("\u{2026}", b)]));
+        for (out, w) in [(five, 5), (four, 4)] {
+            let cells: usize = out.iter().map(|span| cell_width(&span.content)).sum();
+            assert!(cells <= w, "{out:?} against {w}");
         }
     }
 }

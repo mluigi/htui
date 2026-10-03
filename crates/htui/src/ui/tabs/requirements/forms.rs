@@ -14,6 +14,7 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::ui::cells;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent};
 
@@ -408,7 +409,7 @@ impl RequirementForm {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled(
-                    padded("priority", LABEL),
+                    cells::pad("priority", LABEL),
                     label_style(self.focus == FormFocus::Priority, theme),
                 ),
                 choice(Priority::Must),
@@ -542,7 +543,7 @@ impl WithdrawForm {
                 ..
             } => {
                 lines.push(Line::from(vec![
-                    Span::styled(padded("deciding item", LABEL), theme.dim),
+                    Span::styled(cells::pad("deciding item", LABEL), theme.dim),
                     Span::styled(deciding.clone(), theme.base),
                 ]));
                 lines.push(Line::default());
@@ -579,21 +580,11 @@ fn field_line(
 ) -> Line<'static> {
     let room = width.saturating_sub(u16::try_from(LABEL).unwrap_or(u16::MAX));
     let mut spans = vec![Span::styled(
-        padded(label, LABEL),
+        cells::pad(label, LABEL),
         label_style(focused, theme),
     )];
     spans.extend(field.line(room, focused, theme).spans);
     Line::from(spans)
-}
-
-/// `text` padded with spaces to `width` chars.
-fn padded(text: &str, width: usize) -> String {
-    let mut out = text.to_owned();
-    out.extend(std::iter::repeat_n(
-        ' ',
-        width.saturating_sub(text.chars().count()),
-    ));
-    out
 }
 
 #[cfg(test)]

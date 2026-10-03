@@ -37,6 +37,7 @@ use zeroize::Zeroizing;
 use crate::app::{Ctx, Handled};
 use crate::connection::{AttemptOutcome, ConnectionSnapshot, DsnState, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
+use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -565,7 +566,7 @@ impl ConnectionSection {
             Mode::Browse => Vec::new(),
             Mode::Editing(editor) => {
                 let label = "DSN: ";
-                let field_room = usize::from(width).saturating_sub(label.chars().count());
+                let field_room = usize::from(width).saturating_sub(cell_width(label));
                 let mut spans = vec![Span::styled(label, theme.accent)];
                 spans.extend(
                     editor
@@ -622,7 +623,7 @@ impl ConnectionSection {
         // The outcome wins the line when both do not fit: the keys are on screen every other
         // frame, and this is the only place the outcome appears.
         let room = usize::from(width);
-        if keys.chars().count() + text.chars().count() + 3 > room {
+        if cell_width(&keys) + cell_width(&text) + 3 > room {
             return Line::styled(text, style);
         }
         Line::from(vec![
@@ -891,7 +892,7 @@ impl SettingsSection for ConnectionSection {
 fn label_width() -> usize {
     Row::ALL
         .iter()
-        .map(|row| row.label().chars().count())
+        .map(|row| cell_width(row.label()))
         .max()
         .unwrap_or(0)
 }
@@ -1017,5 +1018,28 @@ mod tests {
             !confirm_rebuild().contains("pending/"),
             "D1: `CacheStore::rebuild` has no pending/ buffer to spare"
         );
+    }
+
+    /// MOD-60: the hint line measures the notice in cells, so a CJK notice that fits by `char`
+    /// count but not on screen takes the line alone rather than overrunning it. The same rule
+    /// stands in all five sections' hint checks.
+    #[test]
+    fn a_wide_notice_takes_the_hint_line_alone() {
+        let k = 10;
+        let notice = "\u{6f22}".repeat(k);
+        let section = ConnectionSection {
+            notice: Some(Notice::Error(notice.clone())),
+            ..ConnectionSection::new()
+        };
+        let keys = section.hint_text();
+        let width = cell_width(&keys) + k + 3;
+
+        let line = section.hint(
+            u16::try_from(width).expect("a hint this narrow fits u16"),
+            &Theme::default(),
+        );
+
+        assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
+        assert_eq!(line.spans[0].content, notice);
     }
 }
