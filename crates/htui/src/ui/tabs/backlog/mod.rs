@@ -578,13 +578,16 @@ impl Tab for BacklogTab {
     /// it — no filter form, no item form (which replaces the pane, and its divergence view the
     /// whole tab, `render`) — and its active sub-tab wants it.
     fn wants_mouse(&self) -> bool {
-        todo!("MOD-71 T2")
+        self.form.is_none() && self.item_form.is_none() && self.detail.wants_mouse()
     }
 
     /// MOD-71 D4: to the detail pane, under `wants_mouse`'s form guard; the registry checks the
     /// sub-tab's own answer. The list takes no mouse event.
     fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
-        todo!("MOD-71 T2")
+        if self.form.is_some() || self.item_form.is_some() {
+            return Handled::Pass;
+        }
+        self.detail.on_mouse(mouse, ctx)
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {

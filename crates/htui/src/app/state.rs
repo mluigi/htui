@@ -18,7 +18,7 @@ use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, layout, top_bar};
-use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent};
+use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};
 use zeroize::Zeroizing;
 
 /// What the status line says when anything but a tab asks for `$EDITOR` (MOD-9 D10): the outcome
@@ -408,8 +408,8 @@ impl App {
         self.drain(&origin);
     }
 
-    /// A terminal event. Key presses and bracketed pastes reach views; a resize just asks for a
-    /// redraw.
+    /// A terminal event. Key presses, bracketed pastes and (while a view wants them, MOD-71 D4)
+    /// mouse events reach views; a resize just asks for a redraw.
     pub fn on_terminal_event(&mut self, event: Event) {
         match event {
             Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
@@ -418,6 +418,7 @@ impl App {
             // Wrapped before anything reads it: a paste may be a credential (MOD-22's redirect),
             // and this buffer is wiped however the paste ends.
             Event::Paste(text) => self.on_paste(&Zeroizing::new(text)),
+            Event::Mouse(mouse) => self.on_mouse(mouse),
             Event::Resize(_, _) => self.dirty = true,
             _ => {}
         }
@@ -506,7 +507,9 @@ impl App {
     /// and the active tab must want it.
     #[must_use]
     pub fn wants_mouse(&self) -> bool {
-        todo!("MOD-71 T2")
+        self.overlays.is_empty()
+            && !self.help_visible
+            && self.tabs.active().is_some_and(Tab::wants_mouse)
     }
 
     /// A mouse event (MOD-71 D4): to the active tab only, with no keymap and no overlay in the
@@ -519,7 +522,53 @@ impl App {
     /// is taken before dispatch, as [`on_key`](Self::on_key) clears it, so a failure the event
     /// causes still lands.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
-        todo!("MOD-71 T2")
+        if !self.wants_mouse() {
+            return;
+        }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Moved | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) {
+            return;
+        }
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let origin = Origin::Tab(id);
+        let status = self.status.take();
+        let handled = {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                emit,
+                tabs,
+                ..
+            } = self;
+            match tabs.active_mut() {
+                Some(tab) => {
+                    let mut ctx = Ctx::new(
+                        scope,
+                        projects,
+                        top_bar,
+                        keymap,
+                        theme,
+                        origin.clone(),
+                        emit,
+                    );
+                    tab.on_mouse(mouse, &mut ctx)
+                }
+                None => Handled::Pass,
+            }
+        };
+        self.drain(&origin);
+        if handled == Handled::Consumed {
+            self.dirty = true;
+        } else if self.status.is_none() {
+            self.status = status;
+        }
     }
 
     /// The propagation chain of blueprint C.4, stopping at the first `Handled::Consumed`.

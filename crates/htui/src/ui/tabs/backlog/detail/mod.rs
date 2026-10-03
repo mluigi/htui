@@ -248,13 +248,16 @@ impl DetailRegistry {
     /// [`has_active_run`](Self::has_active_run): a hidden pane is not on screen to be clicked.
     #[must_use]
     pub fn wants_mouse(&self) -> bool {
-        todo!("MOD-71 T2")
+        self.active().is_some_and(DetailTab::wants_mouse)
     }
 
     /// Offers a mouse event to the active sub-tab while it wants one (MOD-71 D4), as
     /// [`on_paste`](Self::on_paste) offers a paste.
     pub fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
-        todo!("MOD-71 T2")
+        match self.tabs.get_mut(self.active) {
+            Some(tab) if tab.wants_mouse() => tab.on_mouse(mouse, ctx),
+            _ => Handled::Pass,
+        }
     }
 
     /// Offers a key to the active sub-tab.

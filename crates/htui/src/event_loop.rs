@@ -2,8 +2,9 @@
 //!
 //! A new tab, overlay, action or store request adds no arm here. The arms are the terminal, the
 //! worker's replies and the tick; everything else is an [`Action`] that
-//! [`App::update`](crate::app::App::update) applies. One post-step, not an arm, suspends the
-//! terminal for `$EDITOR` (MOD-9 D9).
+//! [`App::update`](crate::app::App::update) applies. Two post-steps, not arms: one suspends the
+//! terminal for `$EDITOR` (MOD-9 D9), and one sets mouse capture to what the view on screen wants
+//! (MOD-71 D2).
 
 use std::time::Duration;
 
@@ -63,6 +64,10 @@ pub async fn run(
             ticker.reset();
             app.finish_external_edit(tab, outcome);
         }
+        // MOD-71 D2: capture follows the view on screen. Asked after every step, the editor's
+        // included, so a toggle `v` or `Esc` caused lands before the frame it changed; the guard
+        // writes only a change.
+        term.set_mouse_capture(app.wants_mouse())?;
         if std::mem::take(&mut app.dirty) {
             term.terminal_mut().draw(|frame| app.render(frame))?;
         }
