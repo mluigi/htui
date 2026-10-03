@@ -58,7 +58,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use htui_agent::event::{PermissionOption, PermissionOptionKind};
 use htui_core::model::{
     Document, DocumentId, ItemId, PermissionId, RelayOption, RelayOptionKind, RelayView,
-    Resolution, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId,
+    Resolution, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId, StepOpening,
     StepPermission, StepStatus, ToolCallCount, UsageTotals,
 };
 use htui_orch::closeout::Preview;
@@ -1158,9 +1158,21 @@ const OPENING_RESUME_FAILED: [&str; 2] =
 
 /// MOD-37 M5: [`OPENING_HANDOFF`] or [`OPENING_RESUME_FAILED`] under a step whose `opening` says the
 /// context was not carried, at any status; nothing for `resumed` or no opening.
-fn opening_lines(_step: &RunStepSummary, _theme: &Theme) -> Vec<Line<'static>> {
-    // Red (MOD-37 T5): no lines yet.
-    Vec::new()
+fn opening_lines(step: &RunStepSummary, theme: &Theme) -> Vec<Line<'static>> {
+    let parts = match step.opening {
+        Some(StepOpening::Handoff) => OPENING_HANDOFF,
+        Some(StepOpening::ResumeFailed) => OPENING_RESUME_FAILED,
+        Some(StepOpening::Resumed) | None => return Vec::new(),
+    };
+    parts
+        .iter()
+        .map(|part| {
+            Line::from(vec![
+                Span::raw(blank(INDENT)),
+                Span::styled(cells::fit(part, PANE - INDENT), theme.dim),
+            ])
+        })
+        .collect()
 }
 
 /// A relayed request's options as the strip takes them (MOD-42 blueprint F-19: the orphan rule
@@ -1629,6 +1641,7 @@ impl RunsTab {
         }
         if let Some((_, step)) = self.entry_step() {
             lines.extend(note_line(step, theme));
+            lines.extend(opening_lines(step, theme));
             if let Some(pending) = self.pending_on(step.id) {
                 lines.extend(permission_lines(pending, theme));
             }
@@ -1661,6 +1674,8 @@ impl RunsTab {
                 let on_cursor = step_cursor == Some(step.id);
                 lines.extend(step_lines(step, &run.steps, on_cursor, theme));
                 lines.extend(note_line(step, theme));
+                // MOD-37 M5 (ANA-27 T5): how the step's chat opened, after R-3's reason.
+                lines.extend(opening_lines(step, theme));
                 // MOD-42 D14: the request's two lines belong to the step, so the cursor's end
                 // counts them and the scroll keeps them in view.
                 if let Some(pending) = self.pending_on(step.id) {
@@ -1729,7 +1744,7 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
-        GateOutcome, PermissionStatus, ProjectRef, RelaySessionId, Scope, StepOpening, WorkspaceId,
+        GateOutcome, PermissionStatus, ProjectRef, RelaySessionId, Scope, WorkspaceId,
     };
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
