@@ -213,6 +213,10 @@ pub struct SettleInput<'a> {
     pub now: DateTime<Utc>,
     /// `SnapshotPhase::deadline_seconds`; `None` is "no step deadline".
     pub deadline_seconds: Option<u32>,
+    /// MOD-37 M4 D1: the step deadline's timer cut the session (`Engine::drive_once`). Settles
+    /// `DeadlineElapsed` whatever `now` says: the timer runs on tokio's clock and `now` on the
+    /// engine's, and the two need not agree at the boundary (`deadline_elapsed` is a strict `>`).
+    pub deadline_cut: bool,
     /// The document of the phase's `output_kind` produced by **this step**, if there is one.
     pub output: Option<&'a Document>,
     /// `run_step.verify_outcome`, from `crate::verify` (milestone 3, plan D30).
@@ -251,7 +255,7 @@ pub fn settle(input: &SettleInput<'_>) -> Settle {
     if input.cap_breach.is_some() {
         return Settle::Failed(StepFailure::CapBreached);
     }
-    if deadline_elapsed(input) {
+    if input.deadline_cut || deadline_elapsed(input) {
         return Settle::Failed(StepFailure::DeadlineElapsed);
     }
     let Some(output) = input.output else {
@@ -1120,6 +1124,7 @@ mod tests {
             started_at: epoch(),
             now: epoch(),
             deadline_seconds: Some(7200),
+            deadline_cut: false,
             output,
             verify_outcome: None,
             is_review: false,
@@ -1310,6 +1315,52 @@ mod tests {
             ..ok_input(&ended, None)
         };
         assert_eq!(settle(&breached), Settle::Failed(StepFailure::CapBreached));
+    }
+
+    /// MOD-37 M4 D1: a session the step deadline's timer cut settles `DeadlineElapsed` with the
+    /// engine clock still inside the deadline (the two clocks need not agree), and the rule keeps
+    /// its rank: below the driver's own error and the cap breach.
+    #[test]
+    fn a_cut_session_settles_deadline_elapsed_whatever_the_clock_says() {
+        let output = document("body");
+        let cancelled = done(StopReason::Cancelled);
+        let cut = SettleInput {
+            deadline_cut: true,
+            ..ok_input(&cancelled, Some(&output))
+        };
+        assert_eq!(cut.now, cut.started_at, "the engine clock has not moved");
+        assert_eq!(settle(&cut), Settle::Failed(StepFailure::DeadlineElapsed));
+
+        let breached = SettleInput {
+            cap_breach: Some(CapBreach {
+                cap_micros: 1_000,
+                spent_micros: 2_000,
+                at: epoch(),
+            }),
+            deadline_cut: true,
+            ..ok_input(&cancelled, Some(&output))
+        };
+        assert_eq!(
+            settle(&breached),
+            Settle::Failed(StepFailure::CapBreached),
+            "the cap breach outranks the cut"
+        );
+
+        let closed: Result<DoneEvent, DriverError> = Err(DriverError::Closed);
+        let failed = SettleInput {
+            deadline_cut: true,
+            ..ok_input(&closed, Some(&output))
+        };
+        assert!(
+            matches!(settle(&failed), Settle::Failed(StepFailure::Driver(_))),
+            "the driver's own error outranks the cut"
+        );
+
+        let uncut = SettleInput {
+            deadline_cut: false,
+            ..ok_input(&cancelled, Some(&output))
+        };
+        assert_eq!(settle(&uncut), Settle::Ok { note: None });
     }
 
     /// The front matter is read only for a `review` phase, and only `request-changes` rejects.

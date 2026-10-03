@@ -2578,8 +2578,14 @@ pub(crate) fn spawn_with_concepts(
                             let served = try_serve(&backend, other).await;
                             // This read is what noticed the server had gone. The asking view
                             // still hears back exactly once; the next read finds the mirror.
+                            // MOD-37 M4 D3 (R-46), review M1: this swap does **not** preempt.
+                            // `Unreachable` here includes sqlx's `PoolTimedOut` - local pool
+                            // load with the server up - and a walk is not cut for that. Only
+                            // the refresher's arm preempts, and `go_offline` aborts the
+                            // refresher, so a loss a read notices first leaves the walks on
+                            // the pre-M4 path: the heartbeat fence, then adoption.
                             if let Some(err) = lost_the_store(&served) {
-                                go_offline(&mut backend, &mut refresher, &mut health, err);
+                                let _ = go_offline(&mut backend, &mut refresher, &mut health, err);
                             }
                             match served {
                                 Ok(reply) => reply,
@@ -2681,7 +2687,10 @@ pub(crate) fn spawn_with_concepts(
 
                 err = lost_the_server(health.clone()) => {
                     // The refresher passes every `interval`, so it usually notices first.
-                    go_offline(&mut backend, &mut refresher, &mut health, &err);
+                    // MOD-37 M4 D3 (R-46): the swap preempts every live walk.
+                    if go_offline(&mut backend, &mut refresher, &mut health, &err) {
+                        runs.preempt_walks();
+                    }
                 }
 
                 _ = ticker.tick(),
@@ -2836,20 +2845,26 @@ async fn go_online(
 /// that is not `Online` would leave a live watch behind whose sender keeps republishing the same
 /// `Unreachable`; [`lost_the_server`] would then resolve on every poll and the `select!` would
 /// spin. A health watch may never outlive the `Online` backend it was armed for.
+///
+/// Whether the backend went `Online → Offline` now ([`Backend::went_offline`]), which the
+/// refresher's arm answers by preempting every live walk (MOD-37 M4 D3, R-46). A read's arm
+/// discards it (review M1): its `Unreachable` may be pool load, not a lost server.
+#[must_use = "an Online → Offline swap the refresher noticed must preempt the live walks (R-46)"]
 fn go_offline(
     backend: &mut Backend,
     refresher: &mut Option<Refresher>,
     health: &mut Option<watch::Receiver<Option<StoreError>>>,
     why: &StoreError,
-) {
+) -> bool {
     if let Some(previous) = refresher.take() {
         previous.abort();
     }
     *health = None;
     if !backend.went_offline() {
-        return;
+        return false;
     }
     tracing::warn!(%why, "store unreachable; falling back to the mirror");
+    true
 }
 
 /// The [`StoreError::Unreachable`] a served request met, if it met one: its own `Err`, or the
@@ -4085,7 +4100,10 @@ mod tests {
         assert!(matches!(err, StoreError::Unreachable(_)));
 
         // A memory backend has no mirror, so the swap is refused.
-        go_offline(&mut backend, &mut refresher, &mut seen, &err);
+        assert!(
+            !go_offline(&mut backend, &mut refresher, &mut seen, &err),
+            "a memory backend never swaps"
+        );
         assert_eq!(backend.label(), "memory");
     }
 
@@ -4883,6 +4901,183 @@ mod tests {
         assert_eq!(lost_the_store(&Ok(StoreReply::Personas(Vec::new()))), None);
     }
 
+    /// MOD-37 M4 D3 (R-46), review M1: a read that fails `Unreachable` swaps to the mirror but
+    /// preempts no walk - the same error covers sqlx's `PoolTimedOut`, local load with the server
+    /// up. A walk's child token held by the case stands in for the walk, which a lazy `Online`
+    /// backend could not claim; it is still live after the swap.
+    #[tokio::test]
+    async fn an_unreachable_read_goes_offline_but_leaves_the_walks() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-swap-preempts", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let backend = Backend::Online {
+            pg,
+            cache: cache.clone(),
+        };
+        let runs = crate::run_worker::production_for(&backend);
+        let probe = htui_worker::testing::probe(&runs);
+        let run = htui_core::model::RunId::new();
+        let _walk = probe.walk_child(run);
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(backend);
+        started.reconnect = None;
+        let worker = spawn_with_runtimes(started, req_rx, rep_tx, AgentRuntime::production(), runs);
+
+        let StoreReply::StoreState { label, .. } =
+            round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert_eq!(label, "online", "nothing has asked the server yet");
+        assert!(probe.has_parent(run), "the walk is live before the swap");
+
+        let reply = round_trip(&req_tx, &mut rep_rx, StoreRequest::Workspaces).await;
+        assert!(
+            matches!(
+                &reply,
+                StoreReply::Failed {
+                    request: "workspaces",
+                    ..
+                }
+            ),
+            "{reply:?}"
+        );
+        let StoreReply::StoreState { label, .. } =
+            round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert!(label.starts_with("offline · "), "{label}");
+        assert!(
+            probe.has_parent(run),
+            "a read's swap leaves the walk alone: its run's parent is still live"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
+    }
+
+    /// MOD-37 M4 D3 (R-46): the refresher's arm of the swap preempts too. A dial's `Online` over
+    /// a lazy store nothing listens behind arms a refresher whose first pass, at once, reports the
+    /// server unreachable; nothing else in the case reads through the store.
+    #[tokio::test]
+    async fn a_refresher_that_loses_the_server_preempts_every_live_walk() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-refresher-preempts", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        let runs = crate::run_worker::production_for(&backend);
+        let probe = htui_worker::testing::probe(&runs);
+        let run = htui_core::model::RunId::new();
+        let _walk = probe.walk_child(run);
+
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let mut started = Started::detached(backend);
+        started.reconnect = None;
+        let dialled = started.events_tx.clone();
+        let worker = spawn_with_runtimes(started, req_rx, rep_tx, AgentRuntime::production(), runs);
+        dialled
+            .send((0, ConnEvent::Online(pg)))
+            .await
+            .expect("the worker is alive");
+
+        // `connecting` before the dial lands, `online` until the refresher's pass fails.
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                let StoreReply::StoreState { label, .. } =
+                    round_trip(&req_tx, &mut rep_rx, StoreRequest::StoreState).await
+                else {
+                    panic!("wrong reply variant")
+                };
+                if label.starts_with("offline · ") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the refresher reports the lost server");
+        assert!(
+            !probe.has_parent(run),
+            "the swap preempted the walk: its run's parent is cancelled and gone"
+        );
+
+        drop(req_tx);
+        worker.await.expect("the worker stops with its channel");
+        cache.close().await;
+    }
+
+    /// MOD-37 M4 D3: `go_offline` reports the swap, and only the first notice of it is one.
+    #[tokio::test]
+    async fn go_offline_reports_a_swap_only_from_online() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-go-offline-swap", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let mut backend = Backend::Online {
+            pg,
+            cache: cache.clone(),
+        };
+        let err = StoreError::Unreachable("gone".to_owned());
+        let mut refresher = None;
+        let mut seen = None;
+
+        assert!(
+            go_offline(&mut backend, &mut refresher, &mut seen, &err),
+            "an Online backend swaps"
+        );
+        assert!(
+            backend.label().starts_with("offline · "),
+            "{}",
+            backend.label()
+        );
+        assert!(
+            !go_offline(&mut backend, &mut refresher, &mut seen, &err),
+            "a second notice of the same drop is no swap"
+        );
+
+        cache.close().await;
+    }
+
     /// `go_offline` disarms the `lost_the_server` arm whatever the backend was.
     ///
     /// A health watch that outlived its `Online` backend would keep republishing the same
@@ -4910,7 +5105,10 @@ mod tests {
             let mut refresher = None;
             let mut seen = Some(watcher);
 
-            go_offline(&mut backend, &mut refresher, &mut seen, &err);
+            assert!(
+                !go_offline(&mut backend, &mut refresher, &mut seen, &err),
+                "{was} is not Online: no swap"
+            );
 
             assert_eq!(
                 backend.label(),

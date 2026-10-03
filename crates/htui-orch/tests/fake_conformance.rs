@@ -15,10 +15,10 @@ impl CaseHarness for Demo {
 fn cases_len_is_pinned() {
     assert_eq!(
         CASES.len(),
-        92,
+        93,
         "73 before MOD-41; CLEAN-4 makes it 74, T1's fenced capture (plan D1) 75, T9's eleven hand-back \
-         cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, and MOD-26's \
-         five persona cases (plan D9, D12, D13) 92"
+         cases (plan D12, OQ-6) 86, MOD-37 review L1's crashed rejection handed back 87, MOD-26's \
+         five persona cases (plan D9, D12, D13) 92, and MOD-37 M4's R-49 admission pin 93"
     );
 }
 

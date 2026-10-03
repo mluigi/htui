@@ -27,7 +27,9 @@ use htui_agent::driver::{AgentDriver, PermissionPolicy, SessionSpec, ToolExposur
 use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
-use htui_agent::record::{Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, drive};
+use htui_agent::record::{
+    Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, Signal, control_channel, drive,
+};
 use htui_core::model::{
     AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
     DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
@@ -48,6 +50,7 @@ use htui_core::prompt::{
 use htui_core::scrub::Scrubber;
 use htui_core::store::{StepFence, StoreError};
 use serde_json::Value;
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::closeout;
@@ -265,6 +268,15 @@ impl<'a> SessionKey<'a> {
 
 /// What one pumped session answered: its `done`, or the driver error a closed stream is.
 type SessionResult = Result<DoneEvent, DriverError>;
+
+/// What [`Engine::drive_once`] answers (MOD-37 M4 D1): the session's result, and whether the step
+/// deadline cut it. `cut` is `true` only with `result == Ok(done {cancelled})` after the
+/// deadline's own cancel, which no run cancel overtook.
+#[derive(Debug)]
+struct Driven {
+    result: SessionResult,
+    cut: bool,
+}
 
 /// How the walk gets a driver for one session.
 ///
@@ -1508,6 +1520,8 @@ where
                     result: &Ok(DoneEvent {
                         stop_reason: StopReason::EndTurn,
                     }),
+                    // A human's chat runs under no timer (MOD-37 M4 D1 times walk sessions).
+                    deadline_cut: false,
                 })
                 .await?;
             let after = self.parts.isolator.capture(row.id, &trees).await?;
@@ -3519,7 +3533,13 @@ where
 
         // -- stage 4: session -----------------------------------------------------------------
         let session_cwd = prepared.cwd.clone();
-        let (result, cap_breach) = self
+        let (
+            Driven {
+                result,
+                cut: deadline_cut,
+            },
+            cap_breach,
+        ) = self
             .session(
                 run,
                 step,
@@ -3528,6 +3548,7 @@ where
                 &prompt,
                 prepared.cwd,
                 prepared.extra_dirs,
+                started_at,
             )
             .await?;
         if let Ok(done) = &result {
@@ -3549,6 +3570,7 @@ where
                 started_at,
                 session_cwd: &session_cwd,
                 result: &result,
+                deadline_cut,
             })
             .await?;
 
@@ -3568,6 +3590,7 @@ where
             started_at,
             now,
             deadline_seconds: phase.deadline_seconds,
+            deadline_cut,
             output: output.as_ref(),
             verify_outcome: verify.as_ref().map(|report| report.outcome),
             is_review: phase.name == REVIEW_PHASE,
@@ -3647,6 +3670,7 @@ where
             started_at,
             session_cwd,
             result,
+            deadline_cut,
         } = stage;
         if result.is_err() {
             return Ok(None);
@@ -3667,7 +3691,11 @@ where
             .run(VerifyRequest {
                 command: phase.verify_command.clone(),
                 cwd: primary.map(|tree| PathBuf::from(&tree.path)),
-                remaining: Self::remaining(phase, started_at, self.now()),
+                remaining: if deadline_cut {
+                    Some(std::time::Duration::ZERO)
+                } else {
+                    Self::remaining(phase, started_at, self.now())
+                },
                 step: step.id,
             })
             .await;
@@ -3723,6 +3751,19 @@ where
                 .to_std()
                 .unwrap_or(std::time::Duration::ZERO),
         )
+    }
+
+    /// MOD-37 M4 D1 (review L3): [`Self::remaining`] as an instant on tokio's monotonic clock,
+    /// fixed when the remainder is read, so the session's start counts against it. A remainder
+    /// past the platform's last instant reads as no deadline, as `remaining` reads one too large
+    /// for a `TimeDelta`.
+    fn deadline_at(
+        &self,
+        phase: &SnapshotPhase,
+        started_at: DateTime<Utc>,
+    ) -> Option<tokio::time::Instant> {
+        let left = Self::remaining(phase, started_at, self.now())?;
+        tokio::time::Instant::now().checked_add(left)
     }
 
     /// `running -> failed`, then the run, with `reason` as `run.failure` (`docs/ANA-2.md:639`).
@@ -4154,7 +4195,12 @@ where
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
         let key = SessionKey::of(step);
         let mut recorder = self.open_recorder(run, step, prompt).await?;
-        let result = match self
+        // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48).
+        let deadline = self.deadline_at(phase, started_at);
+        let Driven {
+            result,
+            cut: deadline_cut,
+        } = match self
             .drive_once(
                 run,
                 step,
@@ -4164,11 +4210,12 @@ where
                 &prompt.text,
                 prepared.cwd.clone(),
                 prepared.extra_dirs,
+                deadline,
                 &mut recorder,
             )
             .await
         {
-            Ok(result) => result,
+            Ok(driven) => driven,
             Err(refused) => {
                 let finished = recorder.finish().await;
                 return Err(refused_over_finish(refused, finished, run.id, step.id));
@@ -4190,6 +4237,7 @@ where
                 started_at,
                 session_cwd: &prepared.cwd,
                 result: &result,
+                deadline_cut,
             })
             .await?;
 
@@ -4210,6 +4258,7 @@ where
             started_at,
             now,
             deadline_seconds: phase.deadline_seconds,
+            deadline_cut,
             output: output.as_ref(),
             verify_outcome: None,
             is_review: phase.name == REVIEW_PHASE,
@@ -5065,9 +5114,13 @@ where
                     text,
                     prepared.cwd.clone(),
                     prepared.extra_dirs.clone(),
+                    // The maintainer's M4 scope: judge calls stay untimed (no `started_at` of
+                    // their own).
+                    None,
                     recorder,
                 )
                 .await?
+                .result
             {
                 Ok(done) => done,
                 // MOD-42 I-6 (F-4): `Cancelled` and a lost fence leave `drive_once` as its outer
@@ -5769,7 +5822,8 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "the step's three coordinates, the persona stage 3 froze (MOD-26 D12), the prompt \
-                  and stage 2's two directories, all handed straight to `drive_once`"
+                  and stage 2's two directories, all handed straight to `drive_once`, and the step's \
+                  `started_at` its deadline is measured from (MOD-37 M4 D1)"
     )]
     async fn session(
         &self,
@@ -5780,8 +5834,11 @@ where
         prompt: &AssembledPrompt,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
-    ) -> Result<(SessionResult, Option<htui_agent::record::CapBreach>), EngineError> {
+        started_at: DateTime<Utc>,
+    ) -> Result<(Driven, Option<htui_agent::record::CapBreach>), EngineError> {
         let mut recorder = self.open_recorder(run, step, prompt).await?;
+        // MOD-37 M4 D1: what is left of the step deadline as the session starts.
+        let deadline = self.deadline_at(phase, started_at);
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
         // recorder has already written the prompt row, so it is closed out on this path exactly as
         // it is on a `pump` error. What it is *not* is a settle outcome — ANA-2 `:639` gives
@@ -5799,11 +5856,12 @@ where
                 &prompt.text,
                 cwd,
                 extra_dirs,
+                deadline,
                 &mut recorder,
             )
             .await
         {
-            Ok(result) => result,
+            Ok(driven) => driven,
             Err(refused) => {
                 let finished = recorder.finish().await;
                 return Err(refused_over_finish(refused, finished, run.id, step.id));
@@ -5870,7 +5928,8 @@ where
     #[allow(
         clippy::too_many_arguments,
         reason = "the session's four coordinates, the persona stage 3 froze and its three per-call \
-                  inputs; a struct would be built at exactly three call sites and read here only"
+                  inputs, and the step deadline's instant (MOD-37 M4 D1); a struct would be built at \
+                  exactly three call sites and read here only"
     )]
     async fn drive_once(
         &self,
@@ -5882,8 +5941,9 @@ where
         text: &str,
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
+        deadline: Option<tokio::time::Instant>,
         recorder: &mut Recorder<'a, S>,
-    ) -> Result<SessionResult, EngineError> {
+    ) -> Result<Driven, EngineError> {
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
         let candidate = Self::candidate_of(step, phase)?;
@@ -5924,6 +5984,9 @@ where
             resume: None,
             budget_micros: settings.per_token_cap_run,
         };
+        // MOD-37 M4 (review L3): `deadline` was fixed before the start, so the start counts
+        // against it; the start itself is not under it - a hung start is bounded by the driver's
+        // own handshake timeout.
         let mut session = driver.start(spec, text.to_owned()).await?;
         let now = || self.now();
         let relay = Relay {
@@ -5937,11 +6000,50 @@ where
             grace: RELAY_GRACE,
             now: &now,
         };
+        // MOD-37 M4 D1: under a deadline `drive` runs against a step-local control, which
+        // `forward_or_cut` feeds from the run's; without one, against the run's own, and no
+        // step-local channel is made.
+        let mut timed = deadline.map(|until| {
+            let (local, step_control) = control_channel();
+            // A cancel that reached the run during `driver.start` is already the step's.
+            if control.signal().is_cancel() {
+                local.send_replace(control.signal());
+            }
+            (until, local, step_control)
+        });
+        let (outer, drive_control) = match &mut timed {
+            Some((until, local, step_control)) => {
+                (Some((*until, &*local, &mut control)), step_control)
+            }
+            None => (None, &mut control),
+        };
         // Boxed, as `pump` boxes it (`record.rs`): `drive`'s state machine inline would grow
-        // every walk future past the debug test stack (`every_case_name_dispatches`).
-        let driven = Box::pin(drive(&mut *session, recorder, Some(&relay), &mut control)).await;
+        // every walk future past the debug test stack (`every_case_name_dispatches`). It is built
+        // here, once for both paths, so the deadline's composite (boxed too) holds only the box:
+        // a `drive` built inside it put a second `drive`-sized slot in every poll frame of the
+        // session, past the 2 MiB worker stack on the Postgres walk tests.
+        let driving = Box::pin(drive(&mut *session, recorder, Some(&relay), drive_control));
+        let (driven, cut) = match outer {
+            Some((until, local, outer)) => {
+                Box::pin(drive_with_deadline(driving, outer, local, until)).await
+            }
+            None => (driving.await, false),
+        };
         // MOD-42 D4, D10: two answers leave the session result before settle can read them.
         match driven {
+            // MOD-37 M4 D1: the deadline's own cancel, no run cancel behind it: a cut session,
+            // which settles as `DeadlineElapsed` (the `enforce_breach` shape, `record.rs`). The
+            // run control is read again here, so a run cancel that landed during the cut's drain
+            // still ends the walk as `Cancelled`.
+            Err(DriverError::Cancelled) if cut && !control.signal().is_cancel() => {
+                tracing::warn!(run = %run.id, step = %step.id, "the step deadline cut the session");
+                Ok(Driven {
+                    result: Ok(DoneEvent {
+                        stop_reason: StopReason::Cancelled,
+                    }),
+                    cut: true,
+                })
+            }
             Err(DriverError::Cancelled) => Err(EngineError::Cancelled { run: run.id }),
             // `is_fenced` makes it `LeaseLost` in `heartbeaten`. Pinned by
             // `a_judge_call_applied_after_the_lease_moved_writes_nothing`: left inner, the judge's
@@ -5949,7 +6051,7 @@ where
             Err(fenced @ DriverError::Store(StoreError::Fenced { .. })) => {
                 Err(EngineError::Driver(fenced))
             }
-            result => Ok(result),
+            result => Ok(Driven { result, cut: false }),
         }
     }
 
@@ -6331,6 +6433,69 @@ const fn is_fenced(err: &EngineError) -> bool {
     )
 }
 
+/// MOD-37 M4 D1: [`drive`] under the step deadline. `driving` runs against a step-local control
+/// fed by `local`; [`forward_or_cut`] copies the run's cancel into it and, at `until`, sends the
+/// deadline's own. Answers `drive`'s result and whether the deadline's cancel is the one `drive`
+/// saw.
+async fn drive_with_deadline<F>(
+    driving: F,
+    control: &mut Control,
+    local: &watch::Sender<Signal>,
+    until: tokio::time::Instant,
+) -> (SessionResult, bool)
+where
+    F: Future<Output = SessionResult> + Unpin,
+{
+    let mut cut = false;
+    let driven = tokio::select! {
+        biased;
+        driven = driving => driven,
+        never = forward_or_cut(control, local, until, &mut cut) => match never {},
+    };
+    (driven, cut)
+}
+
+/// MOD-37 M4 D1: forwards the run's cancel into `local`, and at `until` sends `Cancel { grace:
+/// RELAY_GRACE }` unless a cancel is there already; `cut` says the deadline's was the one sent.
+/// Never ends: [`drive_with_deadline`] drops it when `drive` answers. `until` is absolute (review
+/// L3): a timer started at this first poll would be late by the session's start.
+async fn forward_or_cut(
+    control: &mut Control,
+    local: &watch::Sender<Signal>,
+    until: tokio::time::Instant,
+    cut: &mut bool,
+) -> core::convert::Infallible {
+    let mut timer = std::pin::pin!(tokio::time::sleep_until(until));
+    // A finished `Sleep` polls `Ready` again, so the arm is disarmed after it fires (no spin).
+    let mut armed = true;
+    let cancel_once = |to: Signal| {
+        local.send_if_modified(|seen| {
+            if seen.is_cancel() {
+                false
+            } else {
+                *seen = to;
+                true
+            }
+        })
+    };
+    loop {
+        tokio::select! {
+            // The run first: a run cancel and the deadline in one instant end as the run's.
+            biased;
+            () = control.changed() => {
+                let signal = control.signal();
+                if signal.is_cancel() {
+                    cancel_once(signal);
+                }
+            }
+            () = &mut timer, if armed => {
+                armed = false;
+                *cut = cancel_once(Signal::Cancel { grace: RELAY_GRACE });
+            }
+        }
+    }
+}
+
 /// MOD-42 M-2: the error a session raises when its `drive_once` refused with `refused` and its
 /// recorder's `finish` then answered `finished`. A cancel or a lost fence wins over a failed
 /// `finish` (logged at `warn`): an `Unmasked` residue or a store blip from the close-out would
@@ -6454,6 +6619,9 @@ struct VerifyStage<'a> {
     session_cwd: &'a std::path::Path,
     /// Stage 4's answer: a verify runs only on `Ok` (blueprint A-3).
     result: &'a Result<DoneEvent, DriverError>,
+    /// MOD-37 M4 D1: the step deadline cut the session; the verify gets `Some(ZERO)` at once,
+    /// whatever the engine clock says.
+    deadline_cut: bool,
 }
 
 /// Which of a phase's `input_kinds` are **required** (blueprint H-8, plan D21).
@@ -16226,6 +16394,338 @@ mod tests {
                     .all(|step| !matches!(step.status, StepStatus::Running | StepStatus::Pending)),
                 "no member is left live"
             );
+        }
+
+        /// The app rung of `deadline_seconds` (plan D8), the one a test can plant: every phase's
+        /// step deadline becomes `seconds`.
+        fn step_deadline(harness: &Harness, seconds: u32) {
+            harness
+                .orch
+                .store
+                .set_app_setting("step_deadline_seconds", serde_json::json!(seconds));
+        }
+
+        /// The item's note bodies that name the deadline.
+        async fn deadline_notes(orch: &FakeOrchestrator, item: ItemId) -> Vec<String> {
+            orch.store
+                .notes(item)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .map(|note| note.body)
+                .filter(|body| body.contains("deadline elapsed"))
+                .collect()
+        }
+
+        /// MOD-37 M4 D1 (ANA-27 T4): a session that never sends `done` (a stage-3 request
+        /// nobody answers) is cut when the step deadline's timer fires: the graceful cancel
+        /// reaches it (I-7), the walk is not `Cancelled`, and the step settles `DeadlineElapsed`,
+        /// which `prd`'s `always` gate parks. The `TestClock` never moves, so the settle reads
+        /// the cut flag, not the engine clock.
+        #[tokio::test(start_paused = true)]
+        async fn a_hung_session_is_cut_at_the_step_deadline_and_settles_deadline_elapsed() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            // Review L5: a `verify_command`, so the cut session's verify is asked for at all.
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.verify_command = Some("cargo test".to_owned());
+                    }
+                })
+                .await;
+            step_deadline(&harness, 1);
+            harness.orch.script("prd", 1, parks("the prd"));
+            let t0 = tokio::time::Instant::now();
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+
+            let elapsed = t0.elapsed();
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the cut walk answers `Started`, not `Cancelled`: {walked:?}");
+            };
+            assert_eq!(
+                rest.run,
+                RunStatus::AwaitingApproval,
+                "`always` parks the failure"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.status, StepStatus::AwaitingApproval);
+            let notes = deadline_notes(&harness.orch, ids::HTUI_FEAT_3).await;
+            assert!(!notes.is_empty(), "the settle's reason is the deadline");
+            assert_cancel_answered_once(&harness.orch, prd.id).await;
+            assert!(
+                elapsed >= Duration::from_secs(1) && elapsed < CLIENT_LIMIT,
+                "cut at the deadline: {elapsed:?}"
+            );
+            assert_eq!(
+                harness.orch.verifier.remaining(),
+                [(prd.id, Some(Duration::ZERO))],
+                "the cut session's verify is left no time (`deadline_cut`)"
+            );
+        }
+
+        /// D1 for one fan-out candidate: the hung candidate is cut at its own deadline and fails
+        /// alone; its sibling's `done` stands and the group resolves.
+        #[tokio::test(start_paused = true)]
+        async fn a_hung_fanout_candidate_is_cut_at_its_deadline_and_fails_alone() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.fan_out = 2;
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+            step_deadline(&harness, 1);
+            harness
+                .orch
+                .script_candidate("prd", 1, 0, 0, parks("candidate 0"));
+            harness.orch.script_candidate(
+                "prd",
+                1,
+                1,
+                0,
+                ScriptedStep::done_with_output("candidate 1"),
+            );
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the cut candidate does not cancel the walk: {walked:?}");
+            };
+            // The group resolved: a group with one survivor parks for a human, as any failed
+            // candidate's does (`a_stale_group_retry_stops_and_gives_the_lease_back`).
+            assert_eq!(
+                (rest.run, rest.position),
+                (RunStatus::AwaitingApproval, Some(0)),
+                "the group with one survivor parks for a human"
+            );
+            let first = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(first.status, StepStatus::Failed, "the hung candidate fails");
+            let notes = deadline_notes(&harness.orch, ids::HTUI_FEAT_3).await;
+            assert!(!notes.is_empty(), "its reason is the deadline");
+            assert_cancel_answered_once(&harness.orch, first.id).await;
+            let second = step_at(&harness.orch, run, 0, 1).await;
+            assert_eq!(second.status, StepStatus::Done, "the sibling is not cut");
+        }
+
+        /// D1 keeps MOD-42: a run cancel that lands before the deadline still ends the walk as
+        /// `Cancelled` and settles nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_run_cancel_before_the_deadline_still_ends_cancelled() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            step_deadline(&harness, 5);
+            harness.orch.script("prd", 1, parks("the prd"));
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+
+            let (walked, parked) = tokio::join!(
+                walked(harness.dispatch(start_feat_3())),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("the request was relayed before the cancel");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(
+                (prd.status, prd.finished_at),
+                (StepStatus::Running, None),
+                "a cancel settles nothing"
+            );
+            assert_eq!(
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+            assert_cancel_answered_once(&harness.orch, prd.id).await;
+        }
+
+        /// An [`AgentDriver`](htui_agent::driver::AgentDriver) whose session is deaf to its
+        /// cancel until the grace runs out: a transport whose agent ignores `session/cancel`.
+        #[derive(Debug)]
+        struct DeafDriver {
+            inner: Box<dyn htui_agent::driver::AgentDriver>,
+        }
+
+        impl htui_agent::driver::AgentDriver for DeafDriver {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+
+            fn caps(&self) -> htui_agent::driver::DriverCaps {
+                self.inner.caps()
+            }
+
+            fn start<'a>(
+                &'a self,
+                spec: htui_agent::driver::SessionSpec,
+                prompt: String,
+            ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
+            {
+                Box::pin(async move {
+                    let inner = self.inner.start(spec, prompt).await?;
+                    Ok(Box::new(DeafSession { inner, deaf: None })
+                        as Box<dyn htui_agent::driver::AgentSession>)
+                })
+            }
+        }
+
+        /// [`DeafDriver`]'s session: `cancel` only notes its grace, and the next pull waits the
+        /// grace out before the inner session's own cancel ends the turn, so `drive`'s
+        /// post-cancel drain stays open for the whole grace.
+        #[derive(Debug)]
+        struct DeafSession {
+            inner: Box<dyn htui_agent::driver::AgentSession>,
+            deaf: Option<Duration>,
+        }
+
+        impl htui_agent::driver::AgentSession for DeafSession {
+            fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
+                self.inner.session_ref()
+            }
+
+            fn next_event<'a>(
+                &'a mut self,
+            ) -> htui_agent::driver::DriverFuture<'a, Option<htui_agent::event::DriverEnvelope>>
+            {
+                Box::pin(async move {
+                    if let Some(grace) = self.deaf {
+                        tokio::time::sleep(grace).await;
+                        self.deaf = None;
+                        self.inner.cancel(grace).await?;
+                    }
+                    self.inner.next_event().await
+                })
+            }
+
+            fn send_follow_up<'a>(
+                &'a mut self,
+                text: String,
+            ) -> htui_agent::driver::DriverFuture<'a, ()> {
+                self.inner.send_follow_up(text)
+            }
+
+            fn answer_permission<'a>(
+                &'a mut self,
+                request_id: PermissionRequestId,
+                answer: htui_agent::driver::PermissionAnswer,
+            ) -> htui_agent::driver::DriverFuture<'a, ()> {
+                self.inner.answer_permission(request_id, answer)
+            }
+
+            fn cancel<'a>(
+                &'a mut self,
+                grace: Duration,
+            ) -> htui_agent::driver::DriverFuture<'a, ()> {
+                self.deaf = Some(grace);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        /// MOD-37 M4 D1 (review M2): a run cancel that lands while the cut's drain is still open
+        /// ends the walk `Cancelled` and settles nothing. The deadline cuts at 1 s, the deaf
+        /// session holds the drain open until `1 s + RELAY_GRACE`, and the run's cancel arrives
+        /// at 1.5 s, after the deadline's own cancel: only `drive_once`'s read of the run control
+        /// after `drive` can tell it from a plain cut.
+        #[tokio::test(start_paused = true)]
+        async fn a_run_cancel_during_the_cuts_drain_still_ends_cancelled() {
+            let harness = Harness::new().await;
+            // `prd`'s `always` gate: a cut settle would park and answer `Started`.
+            harness.free_feat_3().await;
+            step_deadline(&harness, 1);
+            harness.orch.script("prd", 1, parks("the prd"));
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+            let orch = &harness.orch;
+            let graphs = orch.graphs();
+            let driver = |_candidate: &SnapshotCandidate,
+                          key: &SessionKey<'_>|
+             -> Box<dyn htui_agent::driver::AgentDriver> {
+                Box::new(DeafDriver {
+                    inner: orch.driver_for_key(key),
+                })
+            };
+            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let engine = Engine::new(
+                fake_parts(orch, &graphs, &driver, &scrubber)
+                    .await
+                    .expect("the harness has a box"),
+            );
+            let t0 = tokio::time::Instant::now();
+            let late_cancel = async {
+                tokio::time::sleep_until(t0 + Duration::from_millis(1500)).await;
+                orch.cancel_walks(GRACE);
+            };
+
+            let (walked, ()) = tokio::join!(walked(engine.dispatch(start_feat_3())), late_cancel);
+
+            let elapsed = t0.elapsed();
+            let rows = orch.store.relay_rows();
+            let run = rows.first().expect("the prd's request was relayed").run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the run's cancel wins over the cut: {walked:?}"
+            );
+            assert!(
+                elapsed >= Duration::from_secs(1) + htui_agent::record::RELAY_GRACE,
+                "the drain was open when the run's cancel landed: {elapsed:?}"
+            );
+            let prd = step_at(orch, run, 0, 0).await;
+            assert_eq!(
+                (prd.status, prd.finished_at),
+                (StepStatus::Running, None),
+                "a cancel settles nothing"
+            );
+            assert!(
+                deadline_notes(orch, ids::HTUI_FEAT_3).await.is_empty(),
+                "no deadline elapsed note"
+            );
+            assert_eq!(
+                note_count(orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+            assert_cancel_answered_once(orch, prd.id).await;
+        }
+
+        /// D1: a session that ends inside its deadline is not cut, and the dropped timer does
+        /// nothing after the walk.
+        #[tokio::test(start_paused = true)]
+        async fn a_session_that_ends_inside_its_deadline_is_not_cut() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            step_deadline(&harness, 1);
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the walk starts: {walked:?}");
+            };
+            assert_eq!(rest.run, RunStatus::AwaitingApproval);
+            assert!(
+                deadline_notes(&harness.orch, ids::HTUI_FEAT_3)
+                    .await
+                    .is_empty(),
+                "nothing was cut"
+            );
+            let before = (
+                format!("{:?}", harness.orch.run(run).await),
+                format!("{:?}", harness.orch.steps(run).await),
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let after = (
+                format!("{:?}", harness.orch.run(run).await),
+                format!("{:?}", harness.orch.steps(run).await),
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+            );
+            assert_eq!(before, after, "the dropped timer changed nothing");
         }
 
         /// A request whose option label the scrubber refuses (R-SEC-3): its `permission_request`
