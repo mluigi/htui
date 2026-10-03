@@ -317,6 +317,7 @@ fn session_spec(step: StepId, retain_raw: bool) -> SessionSpec {
         // No case scripts a server-side budget: the cap under test in this suite is the
         // recorder's own, and a second one would make a breach ambiguous (plan D70, D90).
         budget_micros: None,
+        prompt: None,
     }
 }
 

@@ -5923,6 +5923,7 @@ where
             retain_raw: settings.keep_raw_events,
             resume: None,
             budget_micros: settings.per_token_cap_run,
+            prompt: None,
         };
         let mut session = driver.start(spec, text.to_owned()).await?;
         let now = || self.now();

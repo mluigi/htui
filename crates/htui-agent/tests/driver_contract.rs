@@ -157,6 +157,7 @@ fn spec() -> SessionSpec {
         // A figure rather than `None`, so the hand-written `Debug` below is asserted against a
         // value it could have dropped silently (plan D90).
         budget_micros: Some(300),
+        prompt: None,
     }
 }
 
@@ -369,6 +370,35 @@ fn session_spec_debug_redacts_every_environment_value() {
     assert!(
         shown.contains("budget_micros: Some(300)"),
         "a hand-written Debug that forgot a field would hide it from every log: {shown}"
+    );
+}
+
+#[test]
+fn session_spec_debug_names_the_prompt_port_by_id() {
+    let mut spec = spec();
+    spec.env.insert("TOKEN".to_owned(), "s3cr3t".to_owned());
+    assert!(
+        format!("{spec:?}").contains("prompt: None"),
+        "a spec without a bridge says so: {spec:?}"
+    );
+
+    // MOD-11 D18: the port prints as its id alone; the receiver behind it is not `Debug`.
+    let (port, _ask) = htui_agent::prompt_bridge();
+    let id = port.id();
+    spec.prompt = Some(port);
+    let shown = format!("{spec:?}");
+
+    assert!(
+        shown.contains(&format!("prompt: Some({id})")),
+        "the port is named by id: {shown}"
+    );
+    assert!(
+        shown.contains("[REDACTED]"),
+        "values are still masked: {shown}"
+    );
+    assert!(
+        !shown.contains("s3cr3t"),
+        "no environment value survives Debug: {shown}"
     );
 }
 

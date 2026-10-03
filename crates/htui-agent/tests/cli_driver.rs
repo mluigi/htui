@@ -62,6 +62,7 @@ fn spec(cwd: PathBuf) -> SessionSpec {
         retain_raw: false,
         resume: None,
         budget_micros: None,
+        prompt: None,
     }
 }
 

@@ -206,6 +206,7 @@ fn spec(step: StepId) -> SessionSpec {
         retain_raw: false,
         resume: None,
         budget_micros: None,
+        prompt: None,
     }
 }
 

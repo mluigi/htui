@@ -1049,6 +1049,7 @@ impl AgentRuntime {
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
             resume,
             budget_micros: project_caps.run_micros,
+            prompt: None,
         };
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -2092,6 +2093,7 @@ impl AgentRuntime {
             // the same number. `project_caps` is read once, above, and both readers take it from
             // there — two reads of the setting would be two chances to convert it differently.
             budget_micros: project_caps.run_micros,
+            prompt: None,
         };
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
