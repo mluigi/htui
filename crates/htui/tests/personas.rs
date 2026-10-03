@@ -1169,7 +1169,7 @@ async fn a_clean_import_says_so_in_the_notice() {
     bench.reply(
         &mut section,
         &StoreReply::PersonaImports(Box::new(PersonaImports {
-            personas: demo_rows().await,
+            personas: Ok(demo_rows().await),
             report: vec![imported("code-architect", &[]), imported("scout", &[])],
         })),
     );
@@ -1188,7 +1188,7 @@ async fn an_import_with_a_refusal_or_a_drop_opens_the_report() {
     bench.reply(
         &mut section,
         &StoreReply::PersonaImports(Box::new(PersonaImports {
-            personas: demo_rows().await,
+            personas: Ok(demo_rows().await),
             report: mixed_report(),
         })),
     );
@@ -1229,7 +1229,7 @@ async fn an_import_landing_over_an_editor_says_the_counts() {
     bench.reply(
         &mut section,
         &StoreReply::PersonaImports(Box::new(PersonaImports {
-            personas: demo_rows().await,
+            personas: Ok(demo_rows().await),
             report: mixed_report(),
         })),
     );
@@ -1275,7 +1275,7 @@ async fn an_import_with_only_drops_landing_over_an_editor_keeps_its_report() {
     bench.reply(
         &mut section,
         &StoreReply::PersonaImports(Box::new(PersonaImports {
-            personas: demo_rows().await,
+            personas: Ok(demo_rows().await),
             report: vec![imported("code-architect", &["mcp__gortex__search"])],
         })),
     );
@@ -1298,6 +1298,40 @@ async fn an_import_with_only_drops_landing_over_an_editor_keeps_its_report() {
     assert!(
         shows(&report, "dropped from `tools`: `mcp__gortex__search`"),
         "the drop is named: {report}"
+    );
+}
+
+/// R1 L-2: an import whose re-read failed keeps the list it had, says what landed and why the
+/// list was not re-read.
+#[tokio::test]
+async fn an_import_whose_reread_failed_keeps_the_list_and_says_why() {
+    let (bench, mut section) = bench_with_demo().await;
+    start_import(&bench, &mut section);
+    let _ = requests(&bench);
+    let lost = format!("store unreachable: {DATABASE_UNREACHABLE}");
+
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaImports(Box::new(PersonaImports {
+            personas: Err(lost.clone()),
+            report: vec![imported("scout", &[])],
+        })),
+    );
+
+    assert!(!section.captures_input(), "a clean report stays a notice");
+    let frame = frame(&bench, &section);
+    assert!(
+        frame.contains("architect \u{b7} "),
+        "the list is kept: {frame}"
+    );
+    assert!(frame.contains("reviewer \u{b7} "), "{frame}");
+    assert!(shows(&frame, "imported scout"), "{frame}");
+    assert!(
+        shows(
+            &error_text(&bench, &section),
+            &format!("the list was not re-read: {lost}")
+        ),
+        "{frame}"
     );
 }
 

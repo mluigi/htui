@@ -1803,13 +1803,23 @@ impl SettingsSection for PersonasSection {
                 self.on_written(outcome);
             }
             StoreReply::PersonaImports(imports) => {
-                self.personas.clone_from(&imports.personas);
-                self.read = true;
-                self.unavailable = None;
-                self.clamp();
+                if let Ok(rows) = &imports.personas {
+                    self.personas.clone_from(rows);
+                    self.read = true;
+                    self.unavailable = None;
+                    self.clamp();
+                }
                 if self.busy == Some(IMPORT_NAME) {
                     self.busy = None;
                     self.land_import(&imports.report);
+                    if let Err(why) = &imports.personas {
+                        // R1 L-2: the report landed; the list is the one before the import.
+                        let why = format!("the list was not re-read: {why}");
+                        self.notice = Some(Notice::Error(match self.notice.take() {
+                            Some(notice) => format!("{}{DOT}{why}", notice.text()),
+                            None => why,
+                        }));
+                    }
                 }
             }
             StoreReply::Failed { request, message } if *request == READ_NAME => {

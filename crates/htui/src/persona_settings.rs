@@ -114,11 +114,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         },
         StoreRequest::ImportPersonas { path } => {
             let report = persona_import::import(backend, path).await?;
-            let personas = writer.personas().await?;
-            return Ok(StoreReply::PersonaImports(Box::new(PersonaImports {
-                personas,
-                report,
-            })));
+            return Ok(imports(report, writer.personas().await));
         }
         other => {
             return Err(StoreError::Backend(format!(
@@ -134,6 +130,20 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
     Ok(StoreReply::PersonaWritten { personas, outcome })
 }
 
+/// An import's answer: the report, and the registry re-read after it (R1 L-2). Rows were written
+/// by then, so a re-read that fails (the store lost mid-batch, most often) is carried as its
+/// sentence beside the report rather than dropping the report; the section keeps its list and
+/// shows the sentence.
+fn imports(
+    report: Vec<persona_import::PersonaOutcome>,
+    reread: StoreResult<Vec<htui_core::model::Persona>>,
+) -> StoreReply {
+    StoreReply::PersonaImports(Box::new(PersonaImports {
+        personas: reread.map_err(|error| error.to_string()),
+        report,
+    }))
+}
+
 /// A store refusal as the section shows it (I-8, B-11): `Failed` carrying the sentence itself,
 /// never `constraint violated: …`.
 fn refused(request: &StoreRequest, sentence: String) -> StoreReply {
@@ -145,7 +155,7 @@ fn refused(request: &StoreRequest, sentence: String) -> StoreReply {
 
 #[cfg(test)]
 mod tests {
-    use super::{IMPORT_NAME, PersonaWrite, READ_NAME, REQUEST_NAMES, serve};
+    use super::{IMPORT_NAME, PersonaWrite, READ_NAME, REQUEST_NAMES, imports, serve};
     use crate::persona_import::PersonaOutcome;
     use crate::store_worker::{self, StoreReply, StoreRequest};
     use chrono::{DateTime, Duration};
@@ -486,6 +496,26 @@ mod tests {
         );
     }
 
+    /// R1 L-2: a re-read that fails after the batch loses nothing: the report rides with the
+    /// read's sentence in place of the registry.
+    #[test]
+    fn a_failed_reread_keeps_the_import_report() {
+        let report = vec![PersonaOutcome::Imported {
+            name: "scout".to_owned(),
+            path: "/srv/agents/scout.md".to_owned(),
+            dropped: Vec::new(),
+        }];
+        let lost = StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned());
+
+        let reply = imports(report.clone(), Err(lost.clone()));
+
+        let StoreReply::PersonaImports(imports) = reply else {
+            panic!("the report is kept: {reply:?}")
+        };
+        assert_eq!(imports.report, report);
+        assert_eq!(imports.personas, Err(lost.to_string()));
+    }
+
     /// `try_serve` routes the import here; the report rides beside a registry read after it.
     #[tokio::test]
     async fn an_import_is_routed_here_and_answers_its_report_beside_the_registry() {
@@ -518,7 +548,10 @@ mod tests {
             imports.report
         );
         assert!(
-            imports.personas.iter().any(|row| row.name == "scout"),
+            imports
+                .personas
+                .as_ref()
+                .is_ok_and(|rows| rows.iter().any(|row| row.name == "scout")),
             "the registry is read after the writes"
         );
     }

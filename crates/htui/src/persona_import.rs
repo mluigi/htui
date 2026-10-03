@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use htui_core::model::frontmatter::FrontmatterError;
 use htui_core::model::persona::parse_import;
-use htui_core::model::{Persona, PersonaFileError, PersonaId};
+use htui_core::model::{NewPersona, Persona, PersonaFileError, PersonaId};
 use htui_core::store::{Result, StoreError, WriteStore};
 use htui_store::{Backend, DATABASE_UNREACHABLE};
 
@@ -75,8 +75,9 @@ pub enum PersonaOutcome {
 /// The import's answer: the registry after the batch, and one row per file.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersonaImports {
-    /// A fresh `personas()` read, by name.
-    pub personas: Vec<Persona>,
+    /// A fresh `personas()` read, by name, or why it failed after the batch (R1 L-2): the report
+    /// is never lost to the re-read.
+    pub personas: std::result::Result<Vec<Persona>, String>,
     /// One row per file, in the order the walk met them.
     pub report: Vec<PersonaOutcome>,
 }
@@ -129,6 +130,7 @@ async fn import_in(
         writer: &writer,
         known,
         written: Vec::new(),
+        unreachable: false,
     };
     let root = expand_home(path, home);
     Ok(batch.one_path(&root, &root.display().to_string()).await)
@@ -143,9 +145,24 @@ struct Batch<'a, W> {
     known: Vec<String>,
     /// `(name, path)` of every row this batch created.
     written: Vec<(String, String)>,
+    /// A write met [`StoreError::Unreachable`]: the batch stops, and the files after it are not
+    /// attempted (R1 L-2).
+    unreachable: bool,
 }
 
-impl<W: WriteStore> Batch<'_, W> {
+/// The one write a batch makes: a seam, so a test can lose the store mid-batch (R1 L-2).
+trait CreatePersona {
+    /// [`WriteStore::create_persona`].
+    async fn create(&self, new: NewPersona) -> Result<Persona>;
+}
+
+impl<W: WriteStore> CreatePersona for W {
+    async fn create(&self, new: NewPersona) -> Result<Persona> {
+        self.create_persona(new).await
+    }
+}
+
+impl<W: CreatePersona> Batch<'_, W> {
     /// The files one typed path contributes (OQ-9, B-14); `path` is how the report names `root`.
     async fn one_path(&mut self, root: &Path, path: &str) -> Vec<PersonaOutcome> {
         let metadata = match std::fs::metadata(root) {
@@ -180,9 +197,22 @@ impl<W: WriteStore> Batch<'_, W> {
         let past = candidates.len().saturating_sub(MAX_FILES);
         candidates.truncate(MAX_FILES);
         let mut report = Vec::with_capacity(candidates.len() + 2);
-        for candidate in &candidates {
+        for (index, candidate) in candidates.iter().enumerate() {
             let label = candidate.display().to_string();
             report.push(self.write_one(candidate, &label).await);
+            if self.unreachable {
+                // R1 L-2: every later write would meet the same loss; the report so far stays.
+                let rest = candidates.len() - index - 1;
+                if rest > 0 {
+                    report.push(PersonaOutcome::Skipped {
+                        path: path.to_owned(),
+                        reason: format!(
+                            "{rest} more file(s) not attempted: the store is unreachable"
+                        ),
+                    });
+                }
+                break;
+            }
         }
         if past > 0 {
             report.push(PersonaOutcome::Skipped {
@@ -243,7 +273,7 @@ impl<W: WriteStore> Batch<'_, W> {
         }
         match self
             .writer
-            .create_persona(imported.file.into_new(PersonaId::new()))
+            .create(imported.file.into_new(PersonaId::new()))
             .await
         {
             Ok(row) => {
@@ -255,7 +285,10 @@ impl<W: WriteStore> Batch<'_, W> {
                 }
             }
             Err(StoreError::Constraint(sentence)) => refused(sentence),
-            Err(other) => refused(other.to_string()),
+            Err(other) => {
+                self.unreachable = matches!(other, StoreError::Unreachable(_));
+                refused(other.to_string())
+            }
         }
     }
 }
@@ -319,10 +352,11 @@ fn read_text(path: &Path) -> std::result::Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_BYTES, MAX_ENTRIES, NO_FRONTMATTER, PersonaOutcome, expand_home, import, import_in,
+        Batch, MAX_BYTES, MAX_ENTRIES, NO_FRONTMATTER, PersonaOutcome, expand_home, import,
+        import_in,
     };
-    use htui_core::model::PersonaFileError;
     use htui_core::model::persona::MODEL_REFUSED;
+    use htui_core::model::{NewPersona, Persona, PersonaFileError};
     use htui_core::store::{MemStore, StoreError, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
     use std::fs;
@@ -687,6 +721,75 @@ mod tests {
             }]
         );
         assert_eq!(names(&store).await, before, "no row");
+    }
+
+    /// A store that answers `creates` writes, then goes unreachable (R1 L-2).
+    struct Vanishing {
+        store: MemStore,
+        creates: std::sync::atomic::AtomicUsize,
+    }
+
+    impl super::CreatePersona for Vanishing {
+        async fn create(&self, new: NewPersona) -> htui_core::store::Result<Persona> {
+            let left = self.creates.load(std::sync::atomic::Ordering::SeqCst);
+            if left == 0 {
+                return Err(StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()));
+            }
+            self.creates
+                .store(left - 1, std::sync::atomic::Ordering::SeqCst);
+            self.store.create_persona(new).await
+        }
+    }
+
+    /// R1 L-2: a store lost mid-batch stops it; the outcomes so far stay, the file that met the
+    /// loss is refused with its sentence, and the rest are one row, not attempted.
+    #[tokio::test]
+    async fn an_unreachable_store_stops_the_batch_and_keeps_the_report() {
+        let store = MemStore::demo();
+        let writer = Vanishing {
+            store: store.clone(),
+            creates: std::sync::atomic::AtomicUsize::new(1),
+        };
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let a = write(dir.path(), "a.md", SCOUT);
+        let b = write(
+            dir.path(),
+            "b.md",
+            "---\nname: second\n---\n\nYou follow.\n",
+        );
+        write(dir.path(), "c.md", "---\nname: third\n---\n\nYou trail.\n");
+        write(dir.path(), "d.md", "---\nname: fourth\n---\n\nYou wait.\n");
+        let root = label(dir.path());
+        let mut batch = Batch {
+            writer: &writer,
+            known: Vec::new(),
+            written: Vec::new(),
+            unreachable: false,
+        };
+
+        let report = batch.one_path(dir.path(), &root).await;
+
+        assert_eq!(
+            report,
+            [
+                PersonaOutcome::Imported {
+                    name: "scout".to_owned(),
+                    path: a,
+                    dropped: Vec::new(),
+                },
+                PersonaOutcome::Refused {
+                    path: b,
+                    message: StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()).to_string(),
+                },
+                PersonaOutcome::Skipped {
+                    path: root,
+                    reason: "2 more file(s) not attempted: the store is unreachable".to_owned(),
+                },
+            ]
+        );
+        let names = names(&store).await;
+        assert!(names.contains(&"scout".to_owned()), "{names:?}");
+        assert!(!names.contains(&"third".to_owned()), "{names:?}");
     }
 
     /// R1 N-2: `~/…` and a bare `~` name the home directory; nothing else is expanded.
