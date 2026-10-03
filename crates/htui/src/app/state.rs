@@ -514,9 +514,10 @@ impl App {
     }
 
     /// MOD-71 D1: whether the view on screen wants the mouse, which
-    /// [`mouse_capture`](Self::mouse_capture) records and the event loop applies after every step. No overlay may be open and the `?` box may not be up — both
-    /// draw over the tab, and a click through them would act on what they hide (blueprint E7) —
-    /// and the active tab must want it.
+    /// [`mouse_capture`](Self::mouse_capture) records and the event loop applies after every
+    /// step. No overlay may be open and the `?` box may not be up — both draw over the tab, and a
+    /// click through them would act on what they hide (blueprint E7) — and the active tab must
+    /// want it.
     #[must_use]
     pub fn wants_mouse(&self) -> bool {
         self.overlays.is_empty()
@@ -528,6 +529,13 @@ impl App {
     /// [`wants_mouse`](Self::wants_mouse), recorded. On an on-to-off edge every registered tab is
     /// told ([`Tab::on_mouse_lost`]): after a tab switch the tab holding the gesture is no longer
     /// the active one.
+    ///
+    /// A "loss" is the on-to-off capture edge. That equals "the gesture holder lost the pointer"
+    /// only because `RunsTab` is the sole view that wants the mouse: a switch between two
+    /// capturing views keeps capture on and fires nothing. A second `wants_mouse` implementor
+    /// must also handle that switch (e.g. by tracking the capture holder), or the review-L3 stale
+    /// anchor returns.
+    #[must_use = "the loop must hand this to TerminalGuard::set_mouse_capture"]
     pub fn mouse_capture(&mut self) -> bool {
         let wants = self.wants_mouse();
         if self.mouse && !wants {
@@ -548,11 +556,11 @@ impl App {
     /// chain (an open overlay turns capture off, D1).
     ///
     /// Gated first, so an event queued before capture went off does nothing. `Moved` (Windows still
-    /// reports motion, and a terminal may ignore button-only mode, MOD-74 D5) and the horizontal wheel are dropped before dispatch. Only a
-    /// `Consumed` event sets `dirty` and clears the status line (blueprint E8): a pointer crossing
-    /// the canvas must neither redraw once per cell nor wipe an error nobody acted on. The status
-    /// is taken before dispatch, as [`on_key`](Self::on_key) clears it, so a failure the event
-    /// causes still lands.
+    /// reports motion, and a terminal may ignore button-only mode, MOD-74 D5) and the horizontal
+    /// wheel are dropped before dispatch. Only a `Consumed` event sets `dirty` and clears the
+    /// status line (blueprint E8): a pointer crossing the canvas must neither redraw once per cell
+    /// nor wipe an error nobody acted on. The status is taken before dispatch, as
+    /// [`on_key`](Self::on_key) clears it, so a failure the event causes still lands.
     pub fn on_mouse(&mut self, mouse: MouseEvent) {
         if !self.wants_mouse() {
             return;

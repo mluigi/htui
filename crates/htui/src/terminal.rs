@@ -149,9 +149,9 @@ impl TerminalGuard {
     /// MOD-71 D2: mouse capture on or off, written only when `on` differs from what this guard
     /// last set, so the event loop can ask after every step for nothing. The loop is the only
     /// caller, with `App::mouse_capture` (MOD-74 D1), which also tells the tabs when capture goes
-    /// off. A terminal without mouse reporting answers
-    /// `Unsupported`, which is recorded as done so it is not asked again every step: the view runs
-    /// keyboard-only (review R2-L6's shape, blueprint H-14).
+    /// off. A terminal without mouse reporting answers `Unsupported`, which is recorded as done so
+    /// it is not asked again every step: the view runs keyboard-only (review R2-L6's shape,
+    /// blueprint H-14).
     ///
     /// # Errors
     ///
@@ -465,7 +465,6 @@ mod tests {
     fn button_capture_reports_presses_drags_and_releases_and_no_motion() {
         let written = ansi(super::EnableButtonMouseCapture);
         assert_eq!(written, "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h");
-        assert_eq!(written.len(), 32);
         assert!(!written.contains("?1003h"), "no any-motion: {written:?}");
     }
 

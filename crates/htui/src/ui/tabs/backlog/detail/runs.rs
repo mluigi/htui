@@ -4458,9 +4458,10 @@ mod tests {
             Handled::Consumed
         );
         let now = pane.graph.borrow().viewport();
-        assert_eq!(
-            (now.x, now.y, now.zoom),
-            (start.x + 5.0, start.y + 3.0, start.zoom),
+        // Up to float association, as execution_graph's `assert_near` (blueprint H-8, E4).
+        let near = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(
+            near(now.x, start.x + 5.0) && near(now.y, start.y + 3.0) && near(now.zoom, start.zoom),
             "{start:?} -> {now:?}"
         );
         pane.on_mouse(

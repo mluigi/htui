@@ -704,7 +704,8 @@ impl ExecutionGraph {
         // so a sync's review-L2 shift, a canvas moved by the head or a wheel zoom would be
         // overwritten by the next drag. A locked press at the last pointer re-anchors it on what
         // was just drawn, with this frame's canvas origin. Deltas are whole cells: with nothing
-        // changed it is a no-op up to float association.
+        // changed it is a no-op up to float association. A sub-2x2 canvas returned above and
+        // skips the re-anchor: accepted, there is no visible canvas to drag on (review N5).
         if let Some(at) = self.pan
             && self.flow.is_dragging()
         {

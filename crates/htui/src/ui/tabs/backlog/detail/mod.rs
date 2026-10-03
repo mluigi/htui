@@ -117,6 +117,11 @@ pub trait DetailTab {
     }
     /// Mouse capture went off above the pane (MOD-74 D3): the Backlog tab hands every sub-tab the
     /// loss, active or not. Only [`RunsTab`] holds a gesture; the default does nothing.
+    ///
+    /// That loss is the on-to-off capture edge, and it means "the gesture holder lost the
+    /// pointer" only while [`RunsTab`] is the sole view that wants the mouse: a second capturing
+    /// view must also handle a switch between two capturing views (e.g. by tracking the capture
+    /// holder), or the review-L3 stale anchor returns.
     fn on_mouse_lost(&mut self) {}
 }
 
@@ -288,6 +293,11 @@ impl DetailRegistry {
     /// MOD-74 D3: a lost capture, to **every** sub-tab, as [`on_item_change`](Self::on_item_change)
     /// goes (B-4): a sub-tab switch is itself a loss, so the pane holding the gesture is no longer
     /// the active one. No `wants_mouse` gate: the pane told no longer wants it.
+    ///
+    /// The loss is the shell's on-to-off capture edge, which equals "the gesture holder lost the
+    /// pointer" only because [`RunsTab`] is the sole view that wants the mouse. A second
+    /// capturing sub-tab must also handle a switch between two capturing views (e.g. by tracking
+    /// the capture holder), or the review-L3 stale anchor returns.
     pub fn on_mouse_lost(&mut self) {
         for tab in &mut self.tabs {
             tab.on_mouse_lost();
