@@ -29,6 +29,7 @@ pub mod permission;
 pub mod transcript;
 
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer};
+use htui_agent::event::DriverEvent;
 use htui_core::model::{AgentSummary, Scope, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -91,7 +92,8 @@ pub struct PromotedHeader {
     pub agent: String,
     /// The step's model.
     pub model: Option<String>,
-    /// Whether the chat resumed the step's session or opened with the handoff prompt.
+    /// Whether the chat resumed the step's session or opened with the handoff prompt: what
+    /// `Promoted` asked for, turned to `Handoff` by a `resume_failed` event (MOD-37 M5).
     pub via: Via,
 }
 
@@ -590,6 +592,15 @@ impl Tab for ChatTab {
             }
             StoreReply::Chat(ChatFrame::Event(envelope)) => {
                 self.transcript.apply(envelope);
+                // MOD-37 M5 (ANA-27 T5): the resume failed and the chat fell back to the handoff
+                // prompt, so the header stops saying `resumed`. `via` was set by `Promoted` before
+                // the bind; no other reply carries the outcome.
+                if let DriverEvent::Other(other) = &envelope.event
+                    && other.update == htui_agent::event::RESUME_FAILED
+                    && let Some(promoted) = self.promoted.as_mut()
+                {
+                    promoted.via = Via::Handoff;
+                }
                 // The banner carries the agent-side session id, and it arrives as a frame rather
                 // than in the acceptance because only the session task ever sees it.
                 if let (Some(session), Some(reference)) =

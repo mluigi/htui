@@ -347,16 +347,17 @@ impl Transcript {
         }
     }
 
-    /// The three rows `htui` authors itself arrive shaped as `other`; so does the banner.
+    /// The rows `htui` authors itself (the prompt, a follow-up, a permission answer and a failed
+    /// resume) arrive shaped as `other`; so does the banner.
     fn apply_other(&mut self, other: &htui_agent::event::OtherEvent) {
-        let text = || {
+        let str_of = |key: &str| {
             other
                 .body
-                .get("text")
+                .get(key)
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or_default()
-                .to_owned()
+                .map(str::to_owned)
         };
+        let text = || str_of("text").unwrap_or_default();
         match other.update.as_str() {
             "prompt" => self.rows.push(TranscriptRow::Prompt { text: text() }),
             "follow_up" => self.rows.push(TranscriptRow::FollowUp { text: text() }),
@@ -370,6 +371,13 @@ impl Transcript {
                     .and_then(serde_json::Value::as_str)
                     .map(AgentSessionRef::new);
             }
+            // MOD-37 M5 (ANA-27 T5): the resume failed and the chat opened with the handoff. Live
+            // and on replay alike, the sentence is this one row.
+            htui_agent::event::RESUME_FAILED => self.rows.push(TranscriptRow::ResumeFailed {
+                reason: str_of("reason").unwrap_or_default(),
+                note: str_of("note")
+                    .unwrap_or_else(|| htui_orch::promote::CONTEXT_NOT_CARRIED.to_owned()),
+            }),
             update => self.rows.push(TranscriptRow::Other {
                 update: update.to_owned(),
             }),
@@ -624,7 +632,14 @@ impl Transcript {
                 format!("— turn ended ({}) —", stop_reason.as_str()),
                 theme.dim,
             )],
-            TranscriptRow::ResumeFailed { .. } => todo!("red (MOD-37 T5): the resume_failed row"),
+            TranscriptRow::ResumeFailed { reason, note } => {
+                let mut reason = reason.lines();
+                let first = reason.next().unwrap_or_default();
+                let mut lines = vec![Line::styled(format!("resume failed  {first}"), theme.error)];
+                lines.extend(reason.map(|line| Line::styled(format!("  {line}"), theme.dim)));
+                lines.push(Line::styled(note.clone(), theme.accent));
+                lines
+            }
             TranscriptRow::Other { update } => {
                 vec![Line::styled(format!("· {update}"), theme.dim)]
             }

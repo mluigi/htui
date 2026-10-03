@@ -1148,16 +1148,16 @@ fn note_line(step: &RunStepSummary, theme: &Theme) -> Option<Line<'static>> {
     ]))
 }
 
-/// MOD-37 M5 (ANA-27 T5): the two lines under a step whose promoted chat opened without its context,
-/// split at `; ` so neither is cut at the pane's 35 free columns. Joined with a space they are
-/// `promote::CONTEXT_NOT_CARRIED`, and `resume failed; ` before it.
+/// MOD-37 M5 (ANA-27 T5): the two lines under a step whose promoted chat opened without its
+/// context, split at `; ` so neither is cut at the pane's 35 free columns. Joined with a space they
+/// are `promote::CONTEXT_NOT_CARRIED`, and `resume failed; ` before it.
 const OPENING_HANDOFF: [&str; 2] = ["context not carried;", "handoff prompt only"];
 /// See [`OPENING_HANDOFF`].
 const OPENING_RESUME_FAILED: [&str; 2] =
     ["resume failed; context not carried;", "handoff prompt only"];
 
-/// MOD-37 M5: [`OPENING_HANDOFF`] or [`OPENING_RESUME_FAILED`] under a step whose `opening` says the
-/// context was not carried, at any status; nothing for `resumed` or no opening.
+/// MOD-37 M5: [`OPENING_HANDOFF`] or [`OPENING_RESUME_FAILED`] under a step whose `opening` says
+/// the context was not carried, at any status; nothing for `resumed` or no opening.
 fn opening_lines(step: &RunStepSummary, theme: &Theme) -> Vec<Line<'static>> {
     let parts = match step.opening {
         Some(StepOpening::Handoff) => OPENING_HANDOFF,
