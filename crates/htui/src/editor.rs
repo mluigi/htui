@@ -162,6 +162,39 @@ impl core::fmt::Debug for ExternalEditOutcome {
     }
 }
 
+/// D5: `returned` without the one final `\n` an editor adds on save (vim's `fixeol`, nano, VS
+/// Code), when `handed`, the text the field handed out, had none. Exactly one is dropped:
+/// `"abc\n\n"` back from `"abc"` is `"abc\n"`. When `handed` ends in `\n`, `returned` is kept
+/// whole. `returned` is already LF-only (`editor::run` normalises it).
+///
+/// Shared by the item form and the detail compose area (MOD-13 milestone 5 D7).
+#[must_use]
+pub(crate) fn strip_added_newline<'a>(handed: &str, returned: &'a str) -> &'a str {
+    if handed.ends_with('\n') {
+        returned
+    } else {
+        returned.strip_suffix('\n').unwrap_or(returned)
+    }
+}
+
+/// Review L2: `returned` without its control characters, as
+/// [`TextArea::on_paste`](crate::ui::TextArea::on_paste) drops them from a paste, so an escape
+/// sequence an editor or a script left in the file is not saved into the item, where typing and
+/// pasting cannot put one. `\n` is kept, and so is `\t`: unlike a
+/// paste, an editor's text is often indented code, and the area draws a `\t` as spaces to its
+/// next tab stop with the cursor counted the same way (`text_area.rs` `drawn`, pinned by
+/// `a_tab_draws_as_spaces_to_the_next_stop`). `returned` is already LF-only (`editor::run`
+/// normalises it), so no `\r` is lost.
+///
+/// Shared by the item form and the detail compose area (MOD-13 milestone 5 D7).
+#[must_use]
+pub(crate) fn without_controls(returned: &str) -> String {
+    returned
+        .chars()
+        .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
+        .collect()
+}
+
 /// Leaving and re-entering the TUI's terminal state (D9). `TerminalGuard` is the real one; tests
 /// use a recording fake.
 pub trait Suspend {
@@ -550,6 +583,29 @@ mod tests {
         assert_eq!(sanitise("implement"), "implement");
         assert_eq!(sanitise("a/b ..é-1_x"), "a_b____-1_x");
         assert_eq!(sanitise(&"x".repeat(40)).chars().count(), STEM_MAX);
+    }
+
+    #[test]
+    fn strip_added_newline_drops_exactly_one_editor_newline() {
+        for (handed, returned, result) in [
+            ("abc", "abc\n", "abc"),
+            ("abc", "abd\n", "abd"),
+            ("abc", "abc\n\n", "abc\n"),
+            ("abc\n", "abc\n\n", "abc\n\n"),
+            ("", "\n", ""),
+            ("abc", "abc", "abc"),
+        ] {
+            assert_eq!(
+                strip_added_newline(handed, returned),
+                result,
+                "{handed:?} -> {returned:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn without_controls_keeps_line_breaks_and_tabs() {
+        assert_eq!(without_controls("a\tb\n\u{1b}[31mc\u{7}"), "a\tb\n[31mc");
     }
 
     /// Fake editors: `#!/bin/sh` scripts in a temp dir. No test launches a real editor.

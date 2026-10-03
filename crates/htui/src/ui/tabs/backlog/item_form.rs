@@ -38,7 +38,10 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
-use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
+use crate::editor::{
+    EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
+    without_controls,
+};
 use crate::item_writes::{ItemDivergence, ItemFormContext};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
@@ -273,7 +276,7 @@ pub(super) fn ctrl_s(key: &KeyEvent) -> bool {
 }
 
 /// Ctrl+E, with or without `SHIFT` (milestone 4 D1; the Templates editor's rule).
-fn ctrl_e(key: &KeyEvent) -> bool {
+pub(super) fn ctrl_e(key: &KeyEvent) -> bool {
     key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
         && matches!(key.code, KeyCode::Char('e' | 'E'))
 }
@@ -301,32 +304,6 @@ fn field<T: Clone>(
         Some(stored) if typed == opened => Ok(stored.clone()),
         _ => parse(typed),
     }
-}
-
-/// D5: `returned` without the one final `\n` an editor adds on save (vim's `fixeol`, nano, VS
-/// Code), when `handed`, the text the field handed out, had none. Exactly one is dropped:
-/// `"abc\n\n"` back from `"abc"` is `"abc\n"`. When `handed` ends in `\n`, `returned` is kept
-/// whole. `returned` is already LF-only (`editor::run` normalises it).
-fn strip_added_newline<'a>(handed: &str, returned: &'a str) -> &'a str {
-    if handed.ends_with('\n') {
-        returned
-    } else {
-        returned.strip_suffix('\n').unwrap_or(returned)
-    }
-}
-
-/// Review L2: `returned` without its control characters, as [`TextArea::on_paste`] drops them
-/// from a paste, so an escape sequence an editor or a script left in the file is not saved into
-/// the item, where typing and pasting cannot put one. `\n` is kept, and so is `\t`: unlike a
-/// paste, an editor's text is often indented code, and the area draws a `\t` as spaces to its
-/// next tab stop with the cursor counted the same way (`text_area.rs` `drawn`, pinned by
-/// `a_tab_draws_as_spaces_to_the_next_stop`). `returned` is already LF-only (`editor::run`
-/// normalises it), so no `\r` is lost.
-fn without_controls(returned: &str) -> String {
-    returned
-        .chars()
-        .filter(|c| matches!(c, '\n' | '\t') || !c.is_control())
-        .collect()
 }
 
 impl ItemForm {
@@ -1012,7 +989,7 @@ impl ItemForm {
 }
 
 /// The two-cell focus marker, so focus shows in a text snapshot.
-const fn marker(focused: bool) -> &'static str {
+pub(super) const fn marker(focused: bool) -> &'static str {
     if focused { "> " } else { "  " }
 }
 
@@ -2330,24 +2307,6 @@ mod tests {
             assert_eq!(form.notice(), Some(notice.as_str()));
             assert_eq!(form.body.text(), body);
             assert_eq!(form.external, None);
-        }
-    }
-
-    #[test]
-    fn strip_added_newline_drops_exactly_one_editor_newline() {
-        for (handed, returned, result) in [
-            ("abc", "abc\n", "abc"),
-            ("abc", "abd\n", "abd"),
-            ("abc", "abc\n\n", "abc\n"),
-            ("abc\n", "abc\n\n", "abc\n\n"),
-            ("", "\n", ""),
-            ("abc", "abc", "abc"),
-        ] {
-            assert_eq!(
-                strip_added_newline(handed, returned),
-                result,
-                "{handed:?} -> {returned:?}"
-            );
         }
     }
 
