@@ -436,3 +436,163 @@ cargo clippy -p htui-agent --all-targets --all-features -- -D warnings
 **Commits**: `test(mod-37): ACP restore cases (red)` (tests a-e compile on today's code; f lands with the
 fix), then `feat(mod-37): the ACP driver resumes, loads or refuses spec.resume (R-48)`.
 
+---
+
+## T3 - the engine resumes ACP steps and always carries the handoff (worktree, parallel with T2)
+
+**Files**: `crates/htui-orch/src/{promote,command,engine,conformance}.rs`; `crates/htui/src/agent_worker.rs`
+(`:1034`, `:5140` only); `crates/htui/tests/chat.rs` and `crates/htui/tests/runs_pg.rs` (test rows
+only, H-1). `htui-worker/src/runtime.rs:2386-2389` matches `{ .. }` and is unaffected.
+**Worktree** (memory rules): `git branch hr/MOD-37-m5-t3 <T1 head>` first, then
+`git worktree add ../htui-m5-t3 hr/MOD-37-m5-t3`. Edit with file tools on the worktree path, because
+Gortex `edit` writes to the primary checkout. Expect about 10 GB of `target/`. Merge back with
+`git merge --no-ff hr/MOD-37-m5-t3` after T2 has committed. Then run `git worktree remove ../htui-m5-t3`
+before `git branch -d`.
+
+### promote.rs
+- New constant beside `RESUME_OPENING` (`:17`):
+  ```rust
+  /// MOD-37 M5 (ANA-27 T5): what a chat that opened with the handoff prompt did not carry. The Runs
+  /// pane, the `resume_failed` row and the Chat tab all say it in these words.
+  pub const CONTEXT_NOT_CARRIED: &str = "context not carried; handoff prompt only";
+  ```
+- `opening_kind` (`:57-72`) **drops its `transport` parameter**: `pub fn opening_kind(caps: DriverCaps, events: &[SessionEvent]) -> OpeningKind`,
+  with the body `if !caps.resume { return OpeningKind::Handoff; } banner(events).map_or(OpeningKind::Handoff, OpeningKind::Resume)`.
+  An unused named parameter would warn (amendment A-1). Its only production caller is `engine.rs:1372`.
+  The `Transport` import goes if nothing else uses it. Doc: "Resume whenever the agent's caps say
+  `resume` and [`banner`] finds the session's id: the CLI through `--resume`, ACP through
+  `session/resume` or `session/load` (MOD-37 M5, R-48). The handoff text is built either way, as the
+  fallback a failed resume opens with."
+- The module doc (`:1-5`) and `OpeningKind::Resume`'s doc gain "either transport".
+- Tests (`:262-322`): every `opening_kind(caps, Transport::Cli, events)` becomes `opening_kind(caps, events)`.
+  `an_acp_agent_hands_off_even_when_its_caps_say_resume` (`:315`) becomes
+  `an_acp_agent_with_resume_caps_and_a_banner_resumes`. It asserts
+  `opening_kind(acp_caps(), &banner_events()) == OpeningKind::Resume(AgentSessionRef("sess_1".into()))`,
+  where `acp_caps()` is `registry::caps_for`'s ACP profile spelled out (all of `permission_requests`,
+  `edit_proposals`, `plans`, `thoughts`, `follow_up_in_session`, `resume`, `usage`, `usage_mid_turn`,
+  `authenticate` true). A new `an_acp_agent_without_resume_caps_hands_off` (`acp_caps()` with
+  `resume: false`) asserts `Handoff`.
+
+### command.rs - `OpeningPath::Resume` (`:273-289`)
+```rust
+    /// The step's own agent session, resumed; `text` is `promote::RESUME_OPENING`, recorded as the
+    /// chat's first `follow_up`. `handoff` and `digest` are the handoff opening the same promotion
+    /// would have built: what the chat opens with instead when the resume fails (MOD-37 M5).
+    Resume {
+        /// The session id the step's `session_started` banner recorded.
+        session_ref: AgentSessionRef,
+        /// The first message the chat sends.
+        text: String,
+        /// The assembled, scrubbed handoff prompt, the fallback.
+        handoff: String,
+        /// Its digest.
+        digest: String,
+    },
+```
+And an accessor, so tests and the worker read the handoff from either variant:
+```rust
+impl OpeningPath {
+    /// The handoff prompt and its digest, whichever opening this is (MOD-37 M5).
+    #[must_use]
+    pub fn handoff(&self) -> (&str, &str) {
+        match self {
+            Self::Resume { handoff, digest, .. } | Self::Handoff { text: handoff, digest } => (handoff, digest),
+        }
+    }
+}
+```
+
+### engine.rs - `opening` (`:1337-1465`) and the extracted helper
+`Engine::opening` keeps its signature. After `trees`, `repos` and `(cwd, extra_dirs)`:
+```rust
+        let caps = htui_agent::registry::caps_for(&agent);
+        // MOD-37 M5: the handoff is built for both openings. A `Resume` carries it as the fallback
+        // the worker opens with when the resume fails. Boxed: this future sits in every dispatch
+        // future (`every_case_name_dispatches`, H-9).
+        let (handoff, digest) = Box::pin(self.handoff_opening(
+            run, snapshot, step, phase, item, &events, &trees, &repos,
+        ))
+        .await?;
+        let path = match promote::opening_kind(caps, &events) {
+            OpeningKind::Resume(session_ref) => OpeningPath::Resume {
+                session_ref,
+                text: promote::RESUME_OPENING.to_owned(),
+                handoff,
+                digest,
+            },
+            OpeningKind::Handoff => OpeningPath::Handoff { text: handoff, digest },
+        };
+```
+The new private method holds today's `OpeningKind::Handoff` arm verbatim (`:1378-1453`): `phase_spec`
+with its three refusal sentences, the `HANDOFF_TEMPLATE` lookup (`ResolveError::NoTemplate`), `roots`,
+`step_commits`, the advisory diff, `failure_reason`, `handoff_spec` and `assemble`:
+```rust
+    /// §4.6(c)'s handoff text and digest for a promoted `step` (MOD-4 D193): what a `Handoff`
+    /// opening sends, and what a `Resume` opening falls back to (MOD-37 M5). Nothing here writes.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the step's run, snapshot, row and phase, its item, and the three reads `opening` \
+                  already made; re-reading them here would double the promotion's store round trips"
+    )]
+    async fn handoff_opening(
+        &self,
+        run: &Run,
+        snapshot: &GraphSnapshot,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        item: ItemId,
+        events: &[SessionEvent],
+        trees: &[RunStepTree],
+        repos: &[Repo],
+    ) -> Result<(String, String), EngineError>
+```
+It returns `Ok((assembled.text, assembled.digest))`. Add `SessionEvent` to the `htui_core::model` import
+(`:33-40`). Rewrite `opening`'s doc (`:1326-1336`): "resumed on either transport when the agent's
+caps say `resume` and the log has a banner (MOD-37 M5); the handoff is built in both cases".
+**Behaviour change (plan T3 note)**: a `Resume` promotion now also needs the `handoff` template and a
+buildable phase spec. When either is missing it fails on the existing "opening cannot be built" path,
+with the step promoted and no chat.
+
+### The existing pins that flip (H-1), and what each becomes
+The orch fakes (`htui_agent::fake::FakeSession::open`, `fake.rs:231-250`) queue a `session_started`
+banner on every session. Fixture `AGENT_CLAUDE` is the ACP seed with `acp.session {load: true,
+resume: true}` (`seeds/agent_claude.json`). So after T3, every walked-then-promoted claude step resumes:
+- `conformance.rs` `promote_keeps_the_step_and_writes_no_chat_run` (`:5500`): replace the `let OpeningPath::Handoff { text, digest } = … else { panic!(…) }`
+  with a precondition, `assert_eq!(promote::banner(&orch.store().step_events(prd.id).await…), Some(AgentSessionRef::new(format!("fake-{}", prd.id))))`
+  ("the fake walk recorded its banner"). Then
+  `assert!(matches!(&opening.path, OpeningPath::Resume { session_ref, text, .. } if session_ref.as_str() == format!("fake-{}", prd.id) && text == promote::RESUME_OPENING))`
+  and `let (text, digest) = opening.path.handoff(); assert!(!text.is_empty() && !digest.is_empty());`.
+  The case now pins the resume.
+- `conformance.rs` `promote_a_failed_step_of_a_parked_run` (`:5598`): `let (text, _) = opening.path.handoff();`.
+  Its later assertions about the failure reason in the text stand, since the handoff is the same text.
+- `engine.rs` `a_handoff_spec_carries_no_excerpts_and_runs_no_pass` (`:14652`): `let (text, _) = opening.path.handoff();`.
+- `crates/htui/tests/chat.rs`: `graph_store` (`:1007-1018`) registers the scripted row through a new
+  `fn handoff_only(mut row: Agent) -> Agent { row.settings["acp"] = json!({ "session": { "load": false, "resume": false } }); row }`.
+  Both keys go false because T2 makes either one resume. With that, `promotion_opens_the_chat_on_the_same_step`
+  (header `· handoff ·`, `:1131`), `the_handoff_opening_is_one_follow_up_row` (`:1380-1424`) and the
+  `chat__chat_promoted.snap` snapshot keep the handoff path they name. Rewrite the doc at `:1130`
+  ("an `acp` row always opens with the handoff prompt, R-48") to "this row's settings turn resume
+  off, so it opens with the handoff prompt".
+- `crates/htui/tests/runs_pg.rs` `seed` (`:231-262`): `settings: json!({ "acp": { "session": { "load": false, "resume": false } } })`,
+  so the promotion case (`:700-845`, "the handoff opening") keeps the path it names.
+- `agent_worker.rs:1034` becomes `OpeningPath::Resume { session_ref, text, .. } => (Some(session_ref), text),`
+  (T4 replaces it). `:5140` gains `handoff: "the handoff".to_owned(), digest: "d".to_owned(),`.
+
+### T3 red tests
+| # | Name / file | Asserts | Red on today's code |
+|---|---|---|---|
+| 1 | `promote.rs` `an_acp_agent_with_resume_caps_and_a_banner_resumes` | Above | `Handoff` today (the CLI-only rule) |
+| 2 | `promote.rs` `an_acp_agent_without_resume_caps_hands_off` | `Handoff` | Pin, green |
+| 3 | `engine.rs` `a_resume_opening_carries_the_handoff_a_handoff_opening_would` (beside `:14610`) | The `a_handoff_spec_carries_no_excerpts_and_runs_no_pass` setup. `PromoteStep { chat_open: false }` gives `OpeningPath::Resume { handoff: h1, digest: d1, .. }`. Then `AGENT_CLAUDE`'s row is rewritten with `acp.session {load:false, resume:false}` through the store's agent writer, which the fake `GraphSource::agent` reads (`fake.rs:894-901`). `PromoteStep` again (a promoted `awaiting_approval` step under a parked run is promotable) gives `OpeningPath::Handoff { text: h2, digest: d2 }`, with `(h1, d1) == (h2, d2)` | Compile red. On today's code the first promotion is `Handoff` |
+| 4 | conformance `promote_keeps_the_step_and_writes_no_chat_run` (rewritten) | Above | Its new `Resume` assertion fails today |
+
+**Gate T3** (in the worktree)
+```
+cargo test -p htui-orch --all-features --no-fail-fast 2>&1 | tee /tmp/m5-t3.log; grep -c SIGABRT /tmp/m5-t3.log   # 0
+cargo test -p htui --all-features --test chat -- --test-threads=1      # check the count is non-zero
+cargo test -p htui --all-features --test runs_pg -- --test-threads=1   # DB reached
+cargo test -p htui --all-features --lib agent_worker -- --test-threads=1
+cargo clippy -p htui-orch -p htui --all-targets --all-features -- -D warnings
+```
+**Commits**: `test(mod-37): ACP steps with a banner resume; the handoff rides along (red)`, then
+`feat(mod-37): the engine resumes either transport and carries the handoff fallback (R-48)`.
