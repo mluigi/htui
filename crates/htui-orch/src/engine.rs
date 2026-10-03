@@ -16210,6 +16210,176 @@ mod tests {
             );
         }
 
+        /// The app rung of `deadline_seconds` (plan D8), the one a test can plant: every phase's
+        /// step deadline becomes `seconds`.
+        fn step_deadline(harness: &Harness, seconds: u32) {
+            harness
+                .orch
+                .store
+                .set_app_setting("step_deadline_seconds", serde_json::json!(seconds));
+        }
+
+        /// The item's note bodies that name the deadline.
+        async fn deadline_notes(orch: &FakeOrchestrator, item: ItemId) -> Vec<String> {
+            orch.store
+                .notes(item)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .map(|note| note.body)
+                .filter(|body| body.contains("deadline elapsed"))
+                .collect()
+        }
+
+        /// MOD-37 M4 D1 (ANA-27 T4): a session that never sends `done` (a stage-3 request
+        /// nobody answers) is cut when the step deadline's timer fires: the graceful cancel
+        /// reaches it (I-7), the walk is not `Cancelled`, and the step settles `DeadlineElapsed`,
+        /// which `prd`'s `always` gate parks. The `TestClock` never moves, so the settle reads
+        /// the cut flag, not the engine clock.
+        #[tokio::test(start_paused = true)]
+        async fn a_hung_session_is_cut_at_the_step_deadline_and_settles_deadline_elapsed() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            step_deadline(&harness, 1);
+            harness.orch.script("prd", 1, parks("the prd"));
+            let t0 = tokio::time::Instant::now();
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+
+            let elapsed = t0.elapsed();
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the cut walk answers `Started`, not `Cancelled`: {walked:?}");
+            };
+            assert_eq!(
+                rest.run,
+                RunStatus::AwaitingApproval,
+                "`always` parks the failure"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.status, StepStatus::AwaitingApproval);
+            let notes = deadline_notes(&harness.orch, ids::HTUI_FEAT_3).await;
+            assert!(!notes.is_empty(), "the settle's reason is the deadline");
+            assert_cancel_answered_once(&harness.orch, prd.id).await;
+            assert!(
+                elapsed >= Duration::from_secs(1) && elapsed < CLIENT_LIMIT,
+                "cut at the deadline: {elapsed:?}"
+            );
+        }
+
+        /// D1 for one fan-out candidate: the hung candidate is cut at its own deadline and fails
+        /// alone; its sibling's `done` stands and the group resolves.
+        #[tokio::test(start_paused = true)]
+        async fn a_hung_fanout_candidate_is_cut_at_its_deadline_and_fails_alone() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.fan_out = 2;
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+            step_deadline(&harness, 1);
+            harness
+                .orch
+                .script_candidate("prd", 1, 0, 0, parks("candidate 0"));
+            harness.orch.script_candidate(
+                "prd",
+                1,
+                1,
+                0,
+                ScriptedStep::done_with_output("candidate 1"),
+            );
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+
+            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+                panic!("the cut candidate does not cancel the walk: {walked:?}");
+            };
+            let first = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(first.status, StepStatus::Failed, "the hung candidate fails");
+            let notes = deadline_notes(&harness.orch, ids::HTUI_FEAT_3).await;
+            assert!(!notes.is_empty(), "its reason is the deadline");
+            assert_cancel_answered_once(&harness.orch, first.id).await;
+            let second = step_at(&harness.orch, run, 0, 1).await;
+            assert_eq!(second.status, StepStatus::Done, "the sibling is not cut");
+            let steps = harness.orch.steps(run).await;
+            assert!(
+                steps.iter().any(|step| step.position == 1),
+                "the group resolved and the walk moved on: {steps:?}"
+            );
+        }
+
+        /// D1 keeps MOD-42: a run cancel that lands before the deadline still ends the walk as
+        /// `Cancelled` and settles nothing.
+        #[tokio::test(start_paused = true)]
+        async fn a_run_cancel_before_the_deadline_still_ends_cancelled() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            step_deadline(&harness, 5);
+            harness.orch.script("prd", 1, parks("the prd"));
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+
+            let (walked, parked) = tokio::join!(
+                walked(harness.dispatch(start_feat_3())),
+                cancelling_client(&harness.orch)
+            );
+
+            let parked = parked.expect("the request was relayed before the cancel");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(
+                (prd.status, prd.finished_at),
+                (StepStatus::Running, None),
+                "a cancel settles nothing"
+            );
+            assert_eq!(
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+            assert_cancel_answered_once(&harness.orch, prd.id).await;
+        }
+
+        /// D1: a session that ends inside its deadline is not cut, and the dropped timer does
+        /// nothing after the walk.
+        #[tokio::test(start_paused = true)]
+        async fn a_session_that_ends_inside_its_deadline_is_not_cut() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            step_deadline(&harness, 1);
+
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the walk starts: {walked:?}");
+            };
+            assert_eq!(rest.run, RunStatus::AwaitingApproval);
+            assert!(
+                deadline_notes(&harness.orch, ids::HTUI_FEAT_3)
+                    .await
+                    .is_empty(),
+                "nothing was cut"
+            );
+            let before = (
+                format!("{:?}", harness.orch.run(run).await),
+                format!("{:?}", harness.orch.steps(run).await),
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+            );
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let after = (
+                format!("{:?}", harness.orch.run(run).await),
+                format!("{:?}", harness.orch.steps(run).await),
+                note_count(&harness.orch, ids::HTUI_FEAT_3).await,
+            );
+            assert_eq!(before, after, "the dropped timer changed nothing");
+        }
+
         /// A request whose option label the scrubber refuses (R-SEC-3): its `permission_request`
         /// row is replaced by a `scrub_residue` row, so the recorder holds a residue while the
         /// request is parked.
