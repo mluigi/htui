@@ -11,7 +11,8 @@
 //! - **The outcome comes back** through [`Compose::on_external_edit`], with the item form's rules:
 //!   control characters dropped, one editor-added newline dropped, the cursor at the end.
 //! - **Busy**: a save leaves the area busy with its request's name until the pane's reply
-//!   [`settle`](Compose::settle)s it; the validator in `htui_core::model::hand_written` refuses
+//!   [`settle`](Compose::settle)s it (a lost answer's [`checking`](Compose::checking) keeps it
+//!   busy until the pane's re-read does, review M1); the validator in `htui_core::model::hand_written` refuses
 //!   first, in the area, and nothing is sent.
 //! - **Redaction**: `Compose`'s `Debug` prints lengths and the fixed kind, never the title or the
 //!   body.
@@ -260,6 +261,13 @@ impl Compose {
             && hand_written::document_body(self.body.text()).is_ok_and(|typed| typed == *body)
     }
 
+    /// D10, review M1: a write's answer was lost. The notice says so while the pane re-reads to
+    /// look for the row, and the area stays busy with the write, so Ctrl+S cannot send it twice
+    /// and `Esc` cannot drop the text before the re-read [`settle`](Compose::settle)s it.
+    pub fn checking(&mut self, notice: String) {
+        self.notice = Some(notice);
+    }
+
     /// A reply ended the flight: busy cleared, the notice set or cleared.
     pub fn settle(&mut self, notice: Option<String>) {
         self.busy = None;
@@ -505,12 +513,27 @@ impl Compose {
 }
 
 /// D10: a write `Failed` that may have followed a COMMIT whose answer was lost (the mint hedge's
-/// wording, `item_form::mint_may_have_landed`); `reread` is `thread` or `list`.
+/// opening, `item_form::mint_may_have_landed`); `reread` is `thread` or `list`. Review M1: the
+/// area covers the pane, so the user cannot look; the pane does, and the sentence stays only
+/// while that re-read is in flight.
 #[must_use]
 pub fn may_have_landed(why: &str, reread: &str) -> String {
+    format!("{why} \u{2014} it may have been written; the {reread} is being re-read to check")
+}
+
+/// Review M1: the re-read after [`may_have_landed`] holds no such row, so nothing was written and
+/// a retry writes it once.
+#[must_use]
+pub fn not_written(why: &str) -> String {
+    format!("{why} \u{2014} the re-read shows it was not written; Ctrl+S tries again")
+}
+
+/// Review M1: the re-read after [`may_have_landed`] failed too, so whether it landed is unknown.
+#[must_use]
+pub fn could_not_check(why: &str, reread: &str) -> String {
     format!(
-        "{why} \u{2014} it may have been written; the {reread} is being re-read, look for it \
-         before Ctrl+S"
+        "{why} \u{2014} it may have been written, and the {reread} could not be re-read to check; \
+         Ctrl+S may write it twice"
     )
 }
 
@@ -1104,7 +1127,7 @@ mod tests {
         let text = drawn(43, 8, |frame, area| {
             render(frame, area, &compose, " New note ", None, &Theme::default());
         });
-        assert!(text.contains("before Ctrl+S"), "{text}");
+        assert!(text.contains("re-read to check"), "{text}");
         assert!(text.contains(HINT_AREA), "{text}");
     }
 
@@ -1178,6 +1201,43 @@ mod tests {
         let hedge = may_have_landed("boom", "thread");
         assert!(hedge.starts_with("boom \u{2014} it may have been written"));
         assert!(hedge.contains("the thread is being re-read"));
-        assert!(hedge.ends_with("before Ctrl+S"));
+        // Review M1: the pane looks, not the user, who cannot see past the area.
+        assert!(!hedge.contains("look for it"), "{hedge}");
+    }
+
+    /// Review M1: the two ways the re-read settles a hedge it could not decide by itself.
+    #[test]
+    fn not_written_and_could_not_check_say_what_ctrl_s_does() {
+        assert_eq!(
+            not_written("boom"),
+            "boom \u{2014} the re-read shows it was not written; Ctrl+S tries again"
+        );
+        let unknown = could_not_check("boom", "list");
+        assert!(unknown.starts_with("boom \u{2014} it may have been written"));
+        assert!(unknown.contains("the list could not be re-read"));
+        assert!(unknown.ends_with("Ctrl+S may write it twice"));
+    }
+
+    /// Review M1: while the re-read checks, the area keeps the write busy: the hedge shows, and
+    /// Ctrl+S, `Esc` and a paste are swallowed until a settle.
+    #[test]
+    fn checking_keeps_the_area_busy_with_the_hedge() {
+        let mut compose = note();
+        compose.on_paste("Hi.");
+        assert!(matches!(compose.on_key(ctrl('s')), ComposeOutcome::Save(_)));
+        compose.checking(may_have_landed("boom", "thread"));
+        assert_eq!(compose.busy(), Some(ADD_NOTE_NAME));
+        assert_eq!(
+            compose.notice(),
+            Some(may_have_landed("boom", "thread").as_str())
+        );
+        for key in [ctrl('s'), key(KeyCode::Esc)] {
+            assert!(matches!(compose.on_key(key), ComposeOutcome::Stay));
+        }
+        compose.on_paste("more");
+        assert_eq!(compose.body(), "Hi.");
+        compose.settle(Some(not_written("boom")));
+        assert_eq!(compose.busy(), None);
+        assert!(matches!(compose.on_key(ctrl('s')), ComposeOutcome::Save(_)));
     }
 }

@@ -11,6 +11,13 @@
 //! - **D10**: a refused `AddNote` (offline, the validator, an unknown item) keeps the text and
 //!   says the sentence; any other failure may have followed a COMMIT whose answer was lost, so it
 //!   is hedged and the thread re-read.
+//! - **Review M1**: the area covers the thread, so the pane looks, not the user. The area stays
+//!   busy under the hedge until the re-read lands; a note of this item with the sent body, newer
+//!   than every note the area opened on, means it was written (the area closes and the pane says
+//!   so); none means it was not (the text stays, Ctrl+S tries again). The pane holds no `UserId`
+//!   (`R-NF-3`), so the author cannot be matched; `created_at` stands in for "after the area
+//!   opened": a note committed after the thread was read has a later `now()` than every note in
+//!   it, so a note of the same text already there never counts.
 //! - A note's body is drawn one row per line (D8), so a multi-line note reads as written; a `\t`
 //!   as spaces to the next stop, as the compose area drew it (review L2). The thread is wrapped
 //!   here, by `cells::wrap` at the width of the last render, so the scroll clamps against the rows
@@ -20,6 +27,7 @@ use std::borrow::Cow;
 use std::cell::Cell;
 use std::iter;
 
+use chrono::{DateTime, Utc};
 use htui_core::model::{ItemId, Note};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -28,16 +36,37 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME, write_refused};
+use crate::hand_written::{ADD_NOTE_NAME, HandText, NOTE_FORM_NAME, write_refused};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
-use crate::ui::tabs::backlog::detail::compose::{self, Compose, ComposeOutcome, may_have_landed};
+use crate::ui::tabs::backlog::detail::compose::{
+    self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
+};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
+use crate::ui::tabs::settings::wrapped;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// The browse hint on the pane's last row (D11).
 const HINT: &str = "a add note";
+
+/// `StoreRequest::Notes`' name: the `Failed` of the re-read that checks a hedge (review M1).
+const NOTES_READ: &str = "notes";
+
+/// Review M1: the re-read found the hedged note, so it was written; only the answer was lost.
+const NOTE_WRITTEN: &str = "the note was written; only the store's answer was lost";
+
+/// Review M1: an `AddNote` whose `Failed` may have followed a lost COMMIT, kept while the thread
+/// re-read that settles it is in flight.
+#[derive(Debug)]
+struct Hedged {
+    /// The failure's sentence, for the settled notice.
+    why: String,
+    /// The body as sent, the store's canonical form (`Debug` prints its length).
+    body: HandText,
+    /// The newest `created_at` in the thread when the area opened; `None` for an empty thread.
+    since: Option<DateTime<Utc>>,
+}
 
 /// Columns between tab stops: `TextArea`'s, so a `\t` from `$EDITOR` reads in the thread as it
 /// did in the compose area (review L2).
@@ -97,6 +126,14 @@ pub struct NotesTab {
     drawn: Cell<(u16, u16)>,
     /// The user's own note landed: the re-read opens at the bottom (review L1).
     follow: bool,
+    /// The newest `created_at` in the thread when the area opened (review M1).
+    since: Option<DateTime<Utc>>,
+    /// The `AddNote` body in flight (review M1).
+    sent: Option<HandText>,
+    /// The hedged `AddNote` the re-read in flight settles (review M1).
+    hedged: Option<Hedged>,
+    /// Review M1: the hedge settled as written, under the thread until the next key.
+    notice: Option<String>,
 }
 
 impl NotesTab {
@@ -156,6 +193,9 @@ impl NotesTab {
                 Handled::Consumed
             }
             ComposeOutcome::Save(request) => {
+                if let StoreRequest::AddNote { body, .. } = &request {
+                    self.sent = Some(body.clone());
+                }
                 ctx.request(request);
                 Handled::Consumed
             }
@@ -167,8 +207,8 @@ impl NotesTab {
     }
 
     /// D10: an `AddNote` failed. A refusal keeps the text and says the sentence; anything else is
-    /// hedged and the thread re-read. A failure with no busy area (an item change dropped it) is
-    /// ignored.
+    /// hedged, the area kept busy, and the thread re-read to settle it (review M1). A failure with
+    /// no busy area (an item change dropped it) is ignored.
     fn on_add_failed(&mut self, message: &str, ctx: &Ctx<'_>) {
         let Some(compose) = self
             .compose
@@ -177,13 +217,51 @@ impl NotesTab {
         else {
             return;
         };
+        let sent = self.sent.take();
         if write_refused(message) {
             compose.settle(Some(message.to_owned()));
-        } else {
-            compose.settle(Some(may_have_landed(message, "thread")));
-            if let Some(item) = self.item {
+            return;
+        }
+        let hedge = may_have_landed(message, "thread");
+        match (sent, self.item) {
+            (Some(body), Some(item)) => {
+                compose.checking(hedge);
+                self.hedged = Some(Hedged {
+                    why: message.to_owned(),
+                    body,
+                    since: self.since,
+                });
                 ctx.request(StoreRequest::Notes(item));
             }
+            // Nothing to look for: the hedge alone, as before review M1.
+            _ => compose.settle(Some(hedge)),
+        }
+    }
+
+    /// Review M1: the re-read after a hedge. A thread of another item settles nothing. The note
+    /// found closes the area and says so (and the thread opens at its bottom, where it is); none
+    /// keeps the text and says it was not written.
+    fn settle_hedge(&mut self, notes: &[Note]) {
+        let Some(item) = self.item else {
+            return;
+        };
+        if notes.first().is_some_and(|note| note.item_id != item) {
+            return;
+        }
+        let Some(hedged) = self.hedged.take() else {
+            return;
+        };
+        let written = notes.iter().any(|note| {
+            note.item_id == item
+                && note.body == hedged.body.as_str()
+                && hedged.since.is_none_or(|since| note.created_at > since)
+        });
+        if written {
+            self.compose = None;
+            self.notice = Some(NOTE_WRITTEN.to_owned());
+            self.follow = true;
+        } else if let Some(compose) = self.compose.as_mut() {
+            compose.settle(Some(not_written(&hedged.why)));
         }
     }
 }
@@ -204,6 +282,10 @@ impl DetailTab for NotesTab {
         self.opening = None;
         self.compose = None;
         self.follow = false;
+        self.since = None;
+        self.sent = None;
+        self.hedged = None;
+        self.notice = None;
         self.scroll.reset();
     }
 
@@ -211,6 +293,8 @@ impl DetailTab for NotesTab {
         if let Some(handled) = self.on_compose_key(key, ctx) {
             return handled;
         }
+        // Review M1: the sentence stays until the next key.
+        self.notice = None;
         if key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -255,6 +339,7 @@ impl DetailTab for NotesTab {
         match reply {
             StoreReply::Notes(notes) => {
                 self.notes.clone_from(notes);
+                self.settle_hedge(notes);
                 // Review L1: the user's own note is the newest, so the thread opens at its
                 // bottom; before a first render there is no height to fit, and it opens at the top.
                 let (width, height) = self.drawn.get();
@@ -276,6 +361,7 @@ impl DetailTab for NotesTab {
                 if self.opening == Some(*item) && Some(*item) == self.item =>
             {
                 self.opening = None;
+                self.since = self.notes.iter().map(|note| note.created_at).max();
                 self.compose = Some(Compose::note(*item, self.key.as_deref()));
             }
             StoreReply::NoteAdded { item }
@@ -283,6 +369,7 @@ impl DetailTab for NotesTab {
                     && self.compose.as_ref().and_then(Compose::busy) == Some(ADD_NOTE_NAME) =>
             {
                 self.compose = None;
+                self.sent = None;
                 self.follow = true;
                 ctx.request(StoreRequest::Notes(*item));
             }
@@ -292,6 +379,12 @@ impl DetailTab for NotesTab {
             }
             StoreReply::Failed { request, message } if *request == ADD_NOTE_NAME => {
                 self.on_add_failed(message, ctx);
+            }
+            // Review M1: the check failed too; say so rather than leave the area busy.
+            StoreReply::Failed { request, .. } if *request == NOTES_READ => {
+                if let (Some(hedged), Some(compose)) = (self.hedged.take(), self.compose.as_mut()) {
+                    compose.settle(Some(could_not_check(&hedged.why, "thread")));
+                }
             }
             _ => {}
         }
@@ -306,9 +399,28 @@ impl DetailTab for NotesTab {
             message(frame, area, "No item selected.", ctx.theme);
             return;
         }
-        // D11: the browse hint takes the last row.
-        let [list, hint] =
-            Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
+        // Review M1's sentence under the thread; D11: the browse hint takes the last row.
+        let notice = self
+            .notice
+            .as_deref()
+            .map(|sentence| wrapped(sentence, usize::from(area.width)))
+            .unwrap_or_default();
+        let height = u16::try_from(notice.len()).unwrap_or(u16::MAX);
+        let [list, below, hint] = Layout::vertical([
+            Constraint::Min(0),
+            Constraint::Length(height),
+            Constraint::Length(1),
+        ])
+        .areas(area);
+        frame.render_widget(
+            Paragraph::new(
+                notice
+                    .into_iter()
+                    .map(|line| Line::styled(line, ctx.theme.base))
+                    .collect::<Vec<_>>(),
+            ),
+            below,
+        );
         frame.render_widget(
             Line::styled(cells::clip(HINT, usize::from(hint.width)), ctx.theme.dim),
             hint,
@@ -340,7 +452,9 @@ mod tests {
     use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME};
     use crate::store_worker::StoreRequest;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key};
-    use crate::ui::tabs::backlog::detail::compose::may_have_landed;
+    use crate::ui::tabs::backlog::detail::compose::{
+        could_not_check, may_have_landed, not_written,
+    };
 
     const ITEM: ItemId = ids::HTUI_FEAT_1;
 
@@ -503,7 +617,126 @@ mod tests {
         );
         assert_eq!(shell.requests(), [sent(&StoreRequest::Notes(ITEM))]);
         assert_eq!(compose(&pane).body(), "Hi.");
+        // Review M1: busy until the re-read settles it, so Ctrl+S cannot write it twice.
+        assert_eq!(compose(&pane).busy(), Some(ADD_NOTE_NAME));
+        assert_eq!(pane.on_key(ctrl('s'), &mut shell.ctx()), Handled::Consumed);
+        assert!(shell.actions().is_empty(), "nothing sent while checking");
+    }
+
+    /// [`saving`] `text` and the `AddNote` answered with a store failure: hedged, and the thread
+    /// re-read is in flight. Returns the failure's sentence.
+    async fn hedged(shell: &Shell, text: &str) -> (NotesTab, String) {
+        let mut pane = saving(shell, text).await;
+        let message = "store backend error: connection reset".to_owned();
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: ADD_NOTE_NAME,
+                message: message.clone(),
+            },
+            &mut shell.ctx(),
+        );
+        assert_eq!(shell.requests(), [sent(&StoreRequest::Notes(ITEM))]);
+        (pane, message)
+    }
+
+    /// `body` as a note on `item`, written now.
+    async fn written(item: ItemId, body: &str) -> Note {
+        let mut note = MemStore::demo()
+            .notes(ITEM)
+            .await
+            .expect("the notes")
+            .remove(0);
+        note.id = htui_core::model::NoteId::new();
+        note.item_id = item;
+        note.body = body.to_owned();
+        note.created_at = Utc::now();
+        note
+    }
+
+    /// Review M1: the re-read holds the note (its body, newer than the thread the area opened
+    /// on): the area closes and the pane says it was written.
+    #[tokio::test]
+    async fn a_reread_with_the_note_closes_the_area_and_says_it_was_written() {
+        let shell = Shell::new();
+        let (mut pane, _) = hedged(&shell, "Hi.\n\n").await;
+        let mut thread = pane.notes.clone();
+        thread.push(written(ITEM, "Hi.").await);
+        pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
+        assert!(pane.compose.is_none());
+        assert!(!pane.captures_input());
+        assert_eq!(pane.notice.as_deref(), Some(NOTE_WRITTEN));
+        let text = drawn(43, 23, |frame, area| pane.render(frame, area, &shell.ctx()));
+        assert!(text.contains("the note was written;"), "{text}");
+        assert!(text.contains("Hi."), "{text}");
+        assert_eq!(text.lines().last().map(str::trim_end), Some(HINT), "{text}");
+        assert!(shell.actions().is_empty(), "the re-read was the check");
+        // The sentence stays until the next key.
+        let _ = pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        assert_eq!(pane.notice, None);
+    }
+
+    /// Review M1: the re-read holds no such note (one with the body from before the area opened
+    /// does not count): the text stays, busy settles, and Ctrl+S sends it again.
+    #[tokio::test]
+    async fn a_reread_without_the_note_keeps_the_text_and_says_it_was_not_written() {
+        let shell = Shell::new();
+        let (mut pane, message) = hedged(&shell, "Hi.").await;
+        let mut thread = pane.notes.clone();
+        let mut older = written(ITEM, "Hi.").await;
+        older.created_at = thread[0].created_at;
+        thread.push(older);
+        pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(not_written(&message).as_str())
+        );
+        assert_eq!(compose(&pane).body(), "Hi.");
         assert_eq!(compose(&pane).busy(), None);
+        assert!(pane.notice.is_none());
+        assert_eq!(pane.on_key(ctrl('s'), &mut shell.ctx()), Handled::Consumed);
+        let requests = shell.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].starts_with("AddNote"), "{requests:?}");
+    }
+
+    /// Review M1: a thread of another item does not settle the hedge; this item's does.
+    #[tokio::test]
+    async fn a_reread_for_another_item_is_ignored() {
+        let shell = Shell::new();
+        let (mut pane, message) = hedged(&shell, "Hi.").await;
+        let other = written(ids::HTUI_ANA_1, "Hi.").await;
+        pane.on_reply(&StoreReply::Notes(vec![other]), &mut shell.ctx());
+        assert_eq!(compose(&pane).busy(), Some(ADD_NOTE_NAME));
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(may_have_landed(&message, "thread").as_str())
+        );
+        pane.on_reply(&StoreReply::Notes(Vec::new()), &mut shell.ctx());
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(not_written(&message).as_str())
+        );
+    }
+
+    /// Review M1: a re-read that fails too settles the area saying it could not check.
+    #[tokio::test]
+    async fn a_failed_reread_settles_saying_it_could_not_check() {
+        let shell = Shell::new();
+        let (mut pane, message) = hedged(&shell, "Hi.").await;
+        assert_eq!(StoreRequest::Notes(ITEM).name(), NOTES_READ);
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: NOTES_READ,
+                message: "store unreachable".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert_eq!(compose(&pane).busy(), None);
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(could_not_check(&message, "thread").as_str())
+        );
+        assert_eq!(compose(&pane).body(), "Hi.");
     }
 
     #[tokio::test]

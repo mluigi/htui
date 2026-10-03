@@ -19,6 +19,12 @@
 //! - **D10**: a refused `WriteDocument` (offline, the validator, an unknown item) keeps the text
 //!   and says the sentence; any other failure may have followed a COMMIT whose answer was lost, so
 //!   it is hedged and the list re-read.
+//! - **Review M1**: the form covers the list, so the pane looks, not the user. The form stays
+//!   busy under the hedge until the re-read lands; a hand-written row of the sent kind and title
+//!   at or past the expected version means it was written (the form closes with D5's sentence for
+//!   that version, the lowest such); none means it was not (the text stays, Ctrl+S tries again).
+//!   A head carries no body and the pane no `UserId` (`R-NF-3`), so kind, title, provenance and
+//!   the version the store would have allocated are the match.
 
 use std::collections::BTreeSet;
 
@@ -35,7 +41,9 @@ use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{DOCUMENT_FORM_NAME, WRITE_DOCUMENT_NAME, write_refused};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells;
-use crate::ui::tabs::backlog::detail::compose::{self, Compose, ComposeOutcome, may_have_landed};
+use crate::ui::tabs::backlog::detail::compose::{
+    self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
+};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
 use crate::ui::tabs::backlog::item_form::ctrl_s;
 use crate::ui::tabs::settings::wrapped;
@@ -49,6 +57,23 @@ const BY_HAND: &str = "hand";
 
 /// The browse hint on the pane's last row (D11).
 const HINT: &str = "J/K move \u{b7} a new \u{b7} v new version";
+
+/// `StoreRequest::Documents`' name: the `Failed` of the re-read that checks a hedge (review M1).
+const DOCUMENTS_READ: &str = "documents";
+
+/// Review M1: a `WriteDocument` whose `Failed` may have followed a lost COMMIT, kept while the
+/// list re-read that settles it is in flight.
+#[derive(Debug)]
+struct Hedged {
+    /// The failure's sentence, for the settled notice.
+    why: String,
+    /// The kind and title as sent, the store's canonical form.
+    kind: String,
+    /// See `kind`.
+    title: String,
+    /// What the write expected, for the row to look for and D5's sentence.
+    expected: Expected,
+}
 
 /// What a `WriteDocument` in flight expects (D5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +105,10 @@ pub struct DocumentsTab {
     opened: Option<i32>,
     /// What the `WriteDocument` in flight expects.
     expected: Option<Expected>,
+    /// The kind and title of the `WriteDocument` in flight (review M1).
+    sent: Option<(String, String)>,
+    /// The hedged `WriteDocument` the re-read in flight settles (review M1).
+    hedged: Option<Hedged>,
     /// The open compose area (D6).
     compose: Option<Compose>,
     /// D5: the last save's sentence, under the table until the next key.
@@ -150,7 +179,8 @@ impl DocumentsTab {
                 Handled::Consumed
             }
             ComposeOutcome::Save(request) => {
-                if let StoreRequest::WriteDocument { kind, .. } = &request {
+                if let StoreRequest::WriteDocument { kind, title, .. } = &request {
+                    self.sent = Some((kind.clone(), title.clone()));
                     self.expected = Some(Expected {
                         version: self
                             .opened
@@ -169,8 +199,8 @@ impl DocumentsTab {
     }
 
     /// D10: a `WriteDocument` failed. A refusal keeps the text and says the sentence; anything
-    /// else is hedged and the list re-read. A failure with no busy area (an item change dropped
-    /// it) is ignored.
+    /// else is hedged, the form kept busy, and the list re-read to settle it (review M1). A
+    /// failure with no busy area (an item change dropped it) is ignored.
     fn on_write_failed(&mut self, message: &str, ctx: &Ctx<'_>) {
         let Some(compose) = self
             .compose
@@ -179,13 +209,67 @@ impl DocumentsTab {
         else {
             return;
         };
-        self.expected = None;
+        let expected = self.expected.take();
+        let sent = self.sent.take();
         if write_refused(message) {
             compose.settle(Some(message.to_owned()));
-        } else {
-            compose.settle(Some(may_have_landed(message, "list")));
-            if let Some(item) = self.item {
+            return;
+        }
+        let hedge = may_have_landed(message, "list");
+        match (sent, expected, self.item) {
+            (Some((kind, title)), Some(expected), Some(item)) => {
+                compose.checking(hedge);
+                self.hedged = Some(Hedged {
+                    why: message.to_owned(),
+                    kind,
+                    title,
+                    expected,
+                });
                 ctx.request(StoreRequest::Documents(item));
+            }
+            // Nothing to look for: the hedge alone, as before review M1.
+            _ => compose.settle(Some(hedge)),
+        }
+    }
+
+    /// Review M1: the re-read after a hedge. A list of another item settles nothing. The version
+    /// found closes the form with D5's sentence; none keeps the text and says it was not written.
+    fn settle_hedge(&mut self, documents: &[DocumentHead]) {
+        let Some(item) = self.item else {
+            return;
+        };
+        if documents.first().is_some_and(|row| row.item_id != item) {
+            return;
+        }
+        let Some(hedged) = self.hedged.take() else {
+            return;
+        };
+        let landed = documents
+            .iter()
+            .filter(|row| {
+                row.item_id == item
+                    && row.produced_by_step_id.is_none()
+                    && row.kind == hedged.kind
+                    && row.title == hedged.title
+                    && row.version >= hedged.expected.version
+            })
+            .map(|row| row.version)
+            .min();
+        match landed {
+            Some(version) => {
+                self.notice = Some(saved_as(
+                    &hedged.kind,
+                    version,
+                    hedged.expected.version,
+                    hedged.expected.opened,
+                ));
+                self.compose = None;
+                self.opened = None;
+            }
+            None => {
+                if let Some(compose) = self.compose.as_mut() {
+                    compose.settle(Some(not_written(&hedged.why)));
+                }
             }
         }
     }
@@ -362,6 +446,7 @@ impl DetailTab for DocumentsTab {
         match reply {
             StoreReply::Documents(documents) => {
                 self.documents.clone_from(documents);
+                self.settle_hedge(documents);
                 self.cursor = self.cursor.min(documents.len().saturating_sub(1));
                 self.scroll.reset();
             }
@@ -410,6 +495,7 @@ impl DetailTab for DocumentsTab {
                     opened: None,
                 });
                 self.notice = Some(saved_as(kind, *version, expected.version, expected.opened));
+                self.sent = None;
                 self.compose = None;
                 self.opened = None;
                 ctx.request(StoreRequest::Documents(*item));
@@ -420,6 +506,12 @@ impl DetailTab for DocumentsTab {
             }
             StoreReply::Failed { request, message } if *request == WRITE_DOCUMENT_NAME => {
                 self.on_write_failed(message, ctx);
+            }
+            // Review M1: the check failed too; say so rather than leave the form busy.
+            StoreReply::Failed { request, .. } if *request == DOCUMENTS_READ => {
+                if let (Some(hedged), Some(compose)) = (self.hedged.take(), self.compose.as_mut()) {
+                    compose.settle(Some(could_not_check(&hedged.why, "list")));
+                }
             }
             _ => {}
         }
@@ -485,7 +577,9 @@ mod tests {
     use crate::hand_written::{self, DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME};
     use crate::store_worker::StoreRequest;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key};
-    use crate::ui::tabs::backlog::detail::compose::{Part, may_have_landed};
+    use crate::ui::tabs::backlog::detail::compose::{
+        Part, could_not_check, may_have_landed, not_written,
+    };
 
     const ITEM: ItemId = ids::HTUI_FEAT_1;
 
@@ -954,9 +1048,133 @@ mod tests {
         );
         assert_eq!(shell.requests(), [sent(&StoreRequest::Documents(ITEM))]);
         assert!(compose(&pane).body().starts_with("Edited by hand.\n"));
-        assert_eq!(compose(&pane).busy(), None);
+        // Review M1: busy until the re-read settles it, so Ctrl+S cannot write it twice.
+        assert_eq!(compose(&pane).busy(), Some(WRITE_DOCUMENT_NAME));
+        assert_eq!(pane.on_key(ctrl('s'), &mut shell.ctx()), Handled::Consumed);
+        assert!(shell.actions().is_empty(), "nothing sent while checking");
         assert!(pane.expected.is_none());
         assert_eq!(pane.opened, Some(2), "the form still comes from v2");
+    }
+
+    /// [`saving_v`], then the `WriteDocument` answered with a store failure: hedged, and the list
+    /// re-read is in flight. Returns the write (to land it by hand) and the failure's sentence.
+    async fn hedged(
+        shell: &Shell,
+        backend: &Backend,
+        pane: &mut DocumentsTab,
+    ) -> (StoreRequest, String) {
+        let request = saving_v(shell, backend, pane).await;
+        let message = "store backend error: connection reset".to_owned();
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: WRITE_DOCUMENT_NAME,
+                message: message.clone(),
+            },
+            &mut shell.ctx(),
+        );
+        assert_eq!(shell.requests(), [sent(&StoreRequest::Documents(ITEM))]);
+        (request, message)
+    }
+
+    /// Review M1: the re-read holds a hand-written plan with the sent title at the expected
+    /// version: the form closes and says D5's sentence for it.
+    #[tokio::test]
+    async fn a_reread_with_the_version_closes_the_form_and_says_saved() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let (request, _) = hedged(&shell, &backend, &mut pane).await;
+        // The COMMIT landed; only its answer was lost.
+        let _ = served(&backend, &request).await;
+        let rows = store.documents(ITEM).await.expect("the documents");
+        pane.on_reply(&StoreReply::Documents(rows), &mut shell.ctx());
+        assert!(pane.compose.is_none());
+        assert!(!pane.captures_input());
+        assert!(pane.opened.is_none());
+        assert_eq!(pane.notice.as_deref(), Some("saved as plan v3"));
+        let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
+        assert!(text.contains("saved as plan v3"), "{text}");
+        assert!(shell.actions().is_empty(), "the re-read was the check");
+    }
+
+    /// Review M1: the re-read holds no such version (another title at v3 is not this write):
+    /// the text stays, busy settles, and Ctrl+S sends it again.
+    #[tokio::test]
+    async fn a_reread_without_the_version_keeps_the_text_and_says_it_was_not_written() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let (_, message) = hedged(&shell, &backend, &mut pane).await;
+        let theirs = StoreRequest::WriteDocument {
+            item: ITEM,
+            kind: "plan".to_owned(),
+            title: "Theirs".to_owned(),
+            body: HandText::new("Theirs."),
+        };
+        let _ = served(&backend, &theirs).await;
+        let rows = store.documents(ITEM).await.expect("the documents");
+        pane.on_reply(&StoreReply::Documents(rows), &mut shell.ctx());
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(not_written(&message).as_str())
+        );
+        assert_eq!(compose(&pane).busy(), None);
+        assert!(compose(&pane).body().starts_with("Edited by hand.\n"));
+        assert!(pane.notice.is_none());
+        assert_eq!(pane.opened, Some(2));
+        assert_eq!(pane.on_key(ctrl('s'), &mut shell.ctx()), Handled::Consumed);
+        let requests = shell.requests();
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].starts_with("WriteDocument"), "{requests:?}");
+    }
+
+    /// Review M1: a list of another item does not settle the hedge; this item's does.
+    #[tokio::test]
+    async fn a_reread_for_another_item_is_ignored() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let (request, message) = hedged(&shell, &backend, &mut pane).await;
+        let _ = served(&backend, &request).await;
+        let rows = store.documents(ITEM).await.expect("the documents");
+        let other: Vec<DocumentHead> = rows
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                row.item_id = ids::HTUI_ANA_1;
+                row
+            })
+            .collect();
+        pane.on_reply(&StoreReply::Documents(other), &mut shell.ctx());
+        assert_eq!(compose(&pane).busy(), Some(WRITE_DOCUMENT_NAME));
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(may_have_landed(&message, "list").as_str())
+        );
+        pane.on_reply(&StoreReply::Documents(rows), &mut shell.ctx());
+        assert_eq!(pane.notice.as_deref(), Some("saved as plan v3"));
+    }
+
+    /// Review M1: a re-read that fails too settles the form saying it could not check.
+    #[tokio::test]
+    async fn a_failed_reread_settles_saying_it_could_not_check() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let (_, message) = hedged(&shell, &backend, &mut pane).await;
+        assert_eq!(StoreRequest::Documents(ITEM).name(), DOCUMENTS_READ);
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: DOCUMENTS_READ,
+                message: "store unreachable".to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert_eq!(compose(&pane).busy(), None);
+        assert_eq!(
+            compose(&pane).notice(),
+            Some(could_not_check(&message, "list").as_str())
+        );
     }
 
     #[tokio::test]
