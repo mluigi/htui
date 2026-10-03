@@ -283,3 +283,279 @@ idempotence is pinned by shape, not by a behaviour test.
    Gate: the T1 row of §1. `set_mouse_capture` is `pub` on a `pub` type in `pub mod terminal`
    (`lib.rs:39`), so it raises no `dead_code` before T2 calls it.
 
+---
+
+## 3. T2: the event seam (D1, D2, D4)
+
+**Files**: `crates/htui/src/ui/tabs/registry.rs`, `crates/htui/src/ui/tabs/backlog/detail/mod.rs`,
+`crates/htui/src/ui/tabs/backlog/mod.rs`, `crates/htui/src/app/state.rs`, `crates/htui/src/app/update.rs`
+(tests only: `App`'s tests live there, `state.rs` has none), `crates/htui/src/testkit.rs`,
+`crates/htui/src/event_loop.rs`.
+
+### 3.1 `Tab` (`registry.rs:38-90`), appended after `on_refresh` (`:89`)
+
+`:18` becomes `use crossterm::event::{KeyEvent, MouseEvent};`.
+
+```rust
+    /// Whether this tab wants the terminal's mouse right now (MOD-71 D1). Capture takes the
+    /// terminal's own text selection away, so the event loop turns it on only while the active
+    /// tab says yes and nothing is drawn over it. Defaulted to `false`, so no other tab changes:
+    /// only the Backlog answers, for its Runs pane's flow view.
+    fn wants_mouse(&self) -> bool {
+        false
+    }
+    /// A mouse event reached this tab (MOD-71 D4), only while [`wants_mouse`](Tab::wants_mouse)
+    /// says so. `Consumed` asks for a redraw; `Pass` is the drop and costs nothing — no keymap
+    /// reads a mouse event. Defaulted to `Pass`, so no other tab changes.
+    fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
+```
+
+No ordinal in either doc (H-12).
+
+### 3.2 `DetailTab` and `DetailRegistry` (`detail/mod.rs`)
+
+`:28` becomes `use crossterm::event::{KeyCode, KeyEvent, MouseEvent};`. Appended to the trait
+after `has_active_run` (`:96-98`):
+
+```rust
+    /// Whether this sub-tab wants the terminal's mouse right now (MOD-71 D1): what the Backlog
+    /// tab's [`Tab::wants_mouse`](crate::ui::tabs::Tab::wants_mouse) asks of the active sub-tab.
+    /// Only [`RunsTab`] answers yes, in its flow view while browsing.
+    fn wants_mouse(&self) -> bool {
+        false
+    }
+    /// A mouse event, offered only while [`wants_mouse`](DetailTab::wants_mouse) is true (MOD-71
+    /// D4). The default `Pass` drops it.
+    fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
+```
+
+`DetailRegistry`, after `on_paste` (`:228-235`):
+
+```rust
+    /// Whether the active sub-tab wants the mouse (MOD-71 D1). The active one only, unlike
+    /// [`has_active_run`](Self::has_active_run): a hidden pane is not on screen to be clicked.
+    #[must_use]
+    pub fn wants_mouse(&self) -> bool {
+        self.active().is_some_and(DetailTab::wants_mouse)
+    }
+
+    /// Offers a mouse event to the active sub-tab while it wants one (MOD-71 D4), as
+    /// [`on_paste`](Self::on_paste) offers a paste.
+    pub fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        match self.tabs.get_mut(self.active) {
+            Some(tab) if tab.wants_mouse() => tab.on_mouse(mouse, ctx),
+            _ => Handled::Pass,
+        }
+    }
+```
+
+### 3.3 `BacklogTab` (`backlog/mod.rs`), after `on_paste` (`:564-575`)
+
+`:48` becomes `use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};`.
+
+```rust
+    /// MOD-71 D1: the mouse is wanted while the detail pane is on screen with nothing typed over
+    /// it — no filter form, no item form (which replaces the pane, and its divergence view the
+    /// whole tab, `render`) — and its active sub-tab wants it.
+    fn wants_mouse(&self) -> bool {
+        self.form.is_none() && self.item_form.is_none() && self.detail.wants_mouse()
+    }
+
+    /// MOD-71 D4: to the detail pane, under `wants_mouse`'s form guard; the registry checks the
+    /// sub-tab's own answer. The list takes no mouse event.
+    fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if self.form.is_some() || self.item_form.is_some() {
+            return Handled::Pass;
+        }
+        self.detail.on_mouse(mouse, ctx)
+    }
+```
+
+### 3.4 `App` (`app/state.rs`)
+
+`:21` becomes `use crossterm::event::{Event, KeyEvent, KeyEventKind, MouseEvent, MouseEventKind};`.
+
+`on_terminal_event` (`:411-424`): doc becomes "A terminal event. Key presses, bracketed pastes and
+(while a view wants them, MOD-71 D4) mouse events reach views; a resize just asks for a redraw."
+New arm, before `Event::Resize`: `Event::Mouse(mouse) => self.on_mouse(mouse),`.
+
+After `on_paste` (`:426-499`), before `on_key`:
+
+```rust
+    /// MOD-71 D1: whether the view on screen wants the mouse, which the event loop turns into
+    /// mouse capture after every step. No overlay may be open and the `?` box may not be up — both
+    /// draw over the tab, and a click through them would act on what they hide (blueprint E7) —
+    /// and the active tab must want it.
+    #[must_use]
+    pub fn wants_mouse(&self) -> bool {
+        self.overlays.is_empty()
+            && !self.help_visible
+            && self.tabs.active().is_some_and(Tab::wants_mouse)
+    }
+
+    /// A mouse event (MOD-71 D4): to the active tab only, with no keymap and no overlay in the
+    /// chain (an open overlay turns capture off, D1).
+    ///
+    /// Gated first, so an event queued before capture went off does nothing. `Moved` (capture is
+    /// any-motion, `?1003h`) and the horizontal wheel are dropped before dispatch. Only a
+    /// `Consumed` event sets `dirty` and clears the status line (blueprint E8): a pointer crossing
+    /// the canvas must neither redraw once per cell nor wipe an error nobody acted on. The status
+    /// is taken before dispatch, as [`on_key`](Self::on_key) clears it, so a failure the event
+    /// causes still lands.
+    pub fn on_mouse(&mut self, mouse: MouseEvent) {
+        if !self.wants_mouse() {
+            return;
+        }
+        if matches!(
+            mouse.kind,
+            MouseEventKind::Moved | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight
+        ) {
+            return;
+        }
+        let Some(id) = self.tabs.active_id() else {
+            return;
+        };
+        let origin = Origin::Tab(id);
+        let status = self.status.take();
+        let handled = {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                emit,
+                tabs,
+                ..
+            } = self;
+            match tabs.active_mut() {
+                Some(tab) => {
+                    let mut ctx = Ctx::new(
+                        scope,
+                        projects,
+                        top_bar,
+                        keymap,
+                        theme,
+                        origin.clone(),
+                        emit,
+                    );
+                    tab.on_mouse(mouse, &mut ctx)
+                }
+                None => Handled::Pass,
+            }
+        };
+        self.drain(&origin);
+        if handled == Handled::Consumed {
+            self.dirty = true;
+        } else if self.status.is_none() {
+            self.status = status;
+        }
+    }
+```
+
+Order is H-2's: gate, filter and `take` before the destructure; drain and the writes after.
+
+### 3.5 `Harness::mouse` (`testkit.rs`, after `paste`, `:566-573`)
+
+```rust
+    /// Feeds one mouse event at frame cell `(column, row)`, no modifier held: one `Event::Mouse`
+    /// through the same entry point the event loop uses (MOD-71 D4). A view hit-tests against the
+    /// frame it last drew, so a case calls [`Harness::render`] first.
+    pub fn mouse(&mut self, kind: crossterm::event::MouseEventKind, column: u16, row: u16) {
+        self.app
+            .on_terminal_event(crossterm::event::Event::Mouse(crossterm::event::MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            }));
+    }
+```
+
+Full paths as `paste` writes them (`testkit.rs` imports nothing from `crossterm`, so
+`unused_qualifications` stays quiet). `tests/backlog.rs` imports `crossterm::event::{MouseButton,
+MouseEventKind}`; `crossterm` is a normal dependency of `htui`, so integration tests can name it.
+
+### 3.6 Event loop (`event_loop.rs`)
+
+Module doc (`:1-6`): "One post-step, not an arm, suspends the terminal for `$EDITOR` (MOD-9 D9)"
+becomes "Two post-steps, not arms: one suspends the terminal for `$EDITOR` (MOD-9 D9), and one sets
+mouse capture to what the view on screen wants (MOD-71 D2)." Between the editor block (`:56-67`)
+and the dirty check (`:68`):
+
+```rust
+        // MOD-71 D2: capture follows the view on screen. Asked after every step, the editor's
+        // included, so a toggle `v` or `Esc` caused lands before the frame it changed; the guard
+        // writes only a change.
+        term.set_mouse_capture(app.wants_mouse())?;
+```
+
+The first frame (`:31`) is drawn before any ask, with capture off; `wants_mouse` is false at
+start-up anyway (§3.7 test 1).
+
+### 3.7 Tests (first)
+
+**`app/update.rs` `mod tests`**, a new section at the end. Imports: `crossterm::event::{Event,
+KeyModifiers, MouseButton, MouseEvent, MouseEventKind}`, `std::cell::Cell`. Helpers:
+
+```rust
+    /// What a [`Pointer`] was offered.
+    type Pointed = Rc<RefCell<Vec<MouseEventKind>>>;
+
+    /// A tab that wants the mouse while `wants` is set, answers `answer`, and logs every mouse
+    /// event it is offered (MOD-71 D4).
+    #[derive(Debug)]
+    struct Pointer { wants: Rc<Cell<bool>>, answer: Handled, seen: Pointed }
+    // impl Tab for Pointer: id TabId("pointer"), title "Pointer", wants_requests vec![],
+    // on_scope_change {}, on_key Pass, on_reply {}, render {}, wants_mouse -> self.wants.get(),
+    // on_mouse -> { self.seen.borrow_mut().push(mouse.kind); self.answer }
+
+    /// A shell whose only tab is a [`Pointer`], `dirty` cleared.
+    fn pointing(wants: bool, answer: Handled) -> (App, UnboundedReceiver<RequestEnvelope>, Rc<Cell<bool>>, Pointed)
+
+    /// `kind` at a fixed cell, no modifier.
+    fn at(kind: MouseEventKind) -> Event { Event::Mouse(MouseEvent { kind, column: 3, row: 4, modifiers: KeyModifiers::NONE }) }
+```
+
+| Test | Setup | Assertion |
+|---|---|---|
+| `no_tab_wants_the_mouse_at_start_up` | `App::new(tx, Keymap::default_global())`, `crate::app::register_all(&mut app)` | For every `i in 0..app.tabs.len()`: `app.tabs.select(i)`, `!app.wants_mouse()` (message: `app.tabs.active_id()`). Plain `#[test]`; `register_all` spawns nothing |
+| `a_mouse_event_nobody_wants_changes_nothing` | `pointing(false, Consumed)`, `app.status = Some("boom".into())` | after `at(Down(Left))`: `seen` empty, `!app.dirty`, `status == Some("boom")` |
+| `motion_and_the_horizontal_wheel_never_reach_a_tab_or_redraw` | `pointing(true, Consumed)` | after `Moved`, `ScrollLeft`, `ScrollRight`: `seen` empty, `!app.dirty` (H-5) |
+| `a_consumed_mouse_event_redraws_and_clears_the_status_line` | `pointing(true, Consumed)`, status set | after `Down(Left)`: `seen == [Down(Left)]`, `app.dirty`, `status.is_none()` |
+| `a_passed_mouse_event_keeps_the_status_line_and_does_not_redraw` | `pointing(true, Pass)`, status set | `seen == [Down(Left)]`, `!app.dirty`, status unchanged (E8) |
+| `an_overlay_or_the_help_box_takes_the_mouse_away` | `pointing(true, Consumed)`; `app.push_overlay(Box::new(Popup))` (`:952-977`) | `!app.wants_mouse()`, and `Down(Left)` leaves `seen` empty. Second shell: `app.help_visible = true` gives the same (E7) |
+
+**`backlog/mod.rs` `mod tests`**, after `f_opens_the_filter_form_and_it_captures` (`~:1221-1247`),
+using `Bench` (`:1148-1197`) and `press`:
+
+```rust
+    /// A sub-tab that wants the mouse while `wants` is set and logs what it is offered (MOD-71).
+    #[derive(Debug)]
+    struct MouseProbe { wants: Rc<Cell<bool>>, seen: Rc<RefCell<Vec<MouseEventKind>>> }
+    // impl DetailTab: id DetailId("mouse"), title "Mouse", the rest as `CapturingProbe` (`:819-845`),
+    // wants_mouse -> self.wants.get(), on_mouse -> push the kind, Consumed.
+```
+
+| Test | Setup | Assertion |
+|---|---|---|
+| `the_detail_gets_the_mouse_only_with_no_form_open` | `Bench::new().await`; a `DetailRegistry` holding one `MouseProbe` (wants `true`); `let mut tab = BacklogTab { detail, ..bench.tab() };` | `tab.wants_mouse()`; `tab.on_mouse(click, &mut bench.ctx()) == Consumed`, `seen.len() == 1`. `press(f)`: `!tab.wants_mouse()`, `on_mouse == Pass`, `seen.len()` still 1. `press(Esc)` closes the form: wanted again. `wants.set(false)`: `!tab.wants_mouse()` and `on_mouse == Pass` (the registry's guard) |
+| `only_the_active_sub_tab_is_asked_for_the_mouse` | registry: probe A (wants `false`) then probe B (wants `true`), A active | `!registry.wants_mouse()`, `on_mouse == Pass`, B saw nothing; `registry.select(1)`: wanted, B sees it |
+
+The item form guard is the same expression; building an `ItemForm` needs a catalogue reply, so it is
+pinned by shape only (`wants_mouse` and `on_mouse` name both forms).
+
+### 3.8 Commits (T2)
+
+1. `test(mod-71): the mouse seam's tests, trait defaults and Harness::mouse (red)`: §3.1 and §3.2's
+   trait defaults (final), §3.5 (final), `DetailRegistry::{wants_mouse, on_mouse}`,
+   `BacklogTab`'s two overrides and `App::{wants_mouse, on_mouse}` with `todo!("MOD-71 T2")`
+   bodies, and §3.7. **Not** the `Event::Mouse` arm, **not** the event-loop line (H-3). An
+   unused-parameter warning on a `todo!()` body is acceptable here; the gate runs on commit 2.
+2. `feat(mod-71): Event::Mouse reaches the active tab, and the loop toggles capture`: the bodies,
+   the arm (§3.4) and §3.6. Gate: the T2 row of §1.
+
