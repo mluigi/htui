@@ -4318,6 +4318,53 @@ async fn step_digest(store: &SpyStore, chat: &ChatRunSpec) -> Option<String> {
 // MOD-37 M5: `htui`'s own `other` rows
 // ---------------------------------------------------------------------------------------------
 
+/// MOD-37 review L-1: `record_notice` answers what it wrote. A reason quoting the env secret is
+/// masked in the row and in the answer alike; a credential-shaped one writes the residue row and
+/// answers its `error`, never the notice.
+#[tokio::test]
+async fn a_notice_answers_the_scrubbed_row_it_wrote() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let notice = |reason: String| OtherEvent {
+        update: htui_agent::event::RESUME_FAILED.to_owned(),
+        body: json!({ "session_id": "banner-1", "reason": reason }),
+    };
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+
+    let masked = recorder
+        .record_notice(&notice(format!("token {SECRET} rejected")), at())
+        .await
+        .expect("the notice row must land");
+    let credential = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
+    let refused = recorder
+        .record_notice(&notice(format!("key {credential}")), at())
+        .await
+        .expect("a refused notice is not a recording failure");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(log.len(), 2, "the masked notice and the residue: {log:?}");
+    for (row, answer) in log.iter().zip([&masked, &refused]) {
+        assert_eq!(
+            *answer,
+            htui_agent::replay::envelope_from_row(row).expect("the row replays"),
+            "the answer is the row"
+        );
+        for leaked in [SECRET, credential] {
+            assert!(!format!("{answer:?}").contains(leaked), "{answer:?}");
+            assert!(!row.payload.to_string().contains(leaked), "{row:?}");
+        }
+    }
+    assert!(
+        matches!(&masked.event, DriverEvent::Other(other) if other.update == "resume_failed"),
+        "{masked:?}"
+    );
+    assert!(
+        matches!(&refused.event, DriverEvent::Error(error) if error.code == "scrub_residue"),
+        "{refused:?}"
+    );
+}
+
 /// A notice is an `other` row `htui` authors (`role = htui`) in the **current** turn, right after
 /// the tail; the next follow-up opens the next turn. Its payload is `{ update, body }`, so the
 /// replay reads it back as the same `Other` event the tab was sent.
@@ -4368,7 +4415,7 @@ async fn a_notice_is_htuis_other_row_in_the_current_turn() {
         }),
     };
     let mut recorder = Recorder::continuing(&store, &scrubber, chat.step_id, false, None, &tail);
-    recorder
+    let written = recorder
         .record_notice(&notice, at())
         .await
         .expect("the notice row must land");
@@ -4401,6 +4448,11 @@ async fn a_notice_is_htuis_other_row_in_the_current_turn() {
             .event,
         DriverEvent::Other(notice),
         "the replay reads back the event the tab was sent"
+    );
+    assert_eq!(
+        written,
+        htui_agent::replay::envelope_from_row(row).expect("the notice replays"),
+        "`record_notice` answers the row it wrote (review L-1)"
     );
 
     let follow_up = past[1];

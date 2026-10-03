@@ -4022,14 +4022,15 @@ pub async fn run_chat(args: ChatArgs) {
             let notice = resume_failed_notice(&fallback.session_ref, &err.to_string());
             // The column first, so the Runs pane is truthful even if the row write fails.
             record_opening(&writer, step_id, StepOpening::ResumeFailed).await;
-            // The row, at the step's current turn, before a second session can write.
-            if let Err(record_err) = recorder.record_notice(&notice, at).await {
-                tracing::error!(%record_err, "the resume_failed row could not be written");
-            }
-            let envelope = DriverEnvelope {
-                event: DriverEvent::Other(notice),
-                raw: None,
-                at,
+            // The row, at the step's current turn, before a second session can write. The tab is
+            // sent what was written, scrubbed (review L-1); a row that could not be written has
+            // no frame either, so the live view and a replay agree.
+            let envelope = match recorder.record_notice(&notice, at).await {
+                Ok(written) => Some(written),
+                Err(record_err) => {
+                    tracing::error!(%record_err, "the resume_failed row could not be written");
+                    None
+                }
             };
             // The second start: no resume, the handoff text.
             let handoff_spec = SessionSpec {
@@ -4041,9 +4042,9 @@ pub async fn run_chat(args: ChatArgs) {
                     session,
                     fallback.handoff,
                     StepOpening::ResumeFailed,
-                    Some(envelope),
+                    envelope,
                 )),
-                Err(err) => Err((err, Some(envelope))),
+                Err(err) => Err((err, envelope)),
             }
         }
         (Err(err), _) => Err((err, None)),
@@ -5745,6 +5746,123 @@ pub(crate) mod tests {
         assert_eq!(
             opening_of(&store, ids::STEP_PLAN).await,
             Some(StepOpening::ResumeFailed)
+        );
+    }
+
+    /// MOD-37 review L-1: the tab's `resume_failed` frame is the row the recorder wrote, scrubbed,
+    /// never the raw notice. The failure reason quotes a secret from the spec's env (the one the
+    /// chat's scrubber masks); neither the stored row nor the frame carries it. Driven through
+    /// [`run_chat`] itself, because a promotion's spec carries no env until MOD-10.
+    #[tokio::test]
+    async fn the_resume_failed_frame_is_the_scrubbed_row() {
+        const SECRET: &str = "hunter2-env-secret-value";
+        let (store, backend, runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            vec![
+                DriverError::Transport(format!("session/load failed: token {SECRET} rejected")),
+                DriverError::Transport("second refusal".to_owned()),
+            ],
+        )
+        .await;
+        let agent = fake_row(agent_id);
+        let driver = runtime
+            .factory
+            .driver_for(&agent, None)
+            .expect("the fake row builds a driver");
+        let writer = backend.writer().expect("a memory backend writes");
+        let tail = writer
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("the fixture's step has a log");
+        let tail_len = tail.len();
+        let box_id = registered_box(&backend).await.expect("the box registers");
+        let settings = AgentSettings::default();
+        let session_ref = AgentSessionRef::new("banner-1");
+        let spec = SessionSpec {
+            agent_id,
+            step_id: ids::STEP_PLAN,
+            cwd: std::env::temp_dir(),
+            extra_dirs: Vec::new(),
+            env: BTreeMap::from([("API_TOKEN".to_owned(), SECRET.to_owned())]),
+            model: None,
+            tools: htui_agent::driver::ToolExposure::default(),
+            mcp: Vec::new(),
+            permission: settings.permission.clone(),
+            retain_raw: false,
+            resume: Some(session_ref.clone()),
+            budget_micros: None,
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (_commands_tx, commands) = mpsc::unbounded_channel();
+        let caps = driver.caps();
+        run_chat(ChatArgs {
+            driver,
+            writer,
+            binding: ChatBinding::Promoted {
+                step_id: ids::STEP_PLAN,
+                tail,
+                fallback: Some(ResumeFallback {
+                    session_ref,
+                    handoff: "HANDOFF TEXT".to_owned(),
+                }),
+            },
+            spec,
+            prompt: htui_orch::promote::RESUME_OPENING.to_owned(),
+            policy: settings.permission,
+            caps,
+            commands,
+            frames: Frames::new(tx, promote_addr()),
+            grace: Duration::from_millis(0),
+            reprobe: None,
+            project_caps: project_caps_for(
+                ids::PROJECT_HTUI,
+                backend
+                    .project_settings(ids::PROJECT_HTUI)
+                    .await
+                    .expect("the settings read"),
+            )
+            .expect("the demo project's caps"),
+            quota_latch: quota_latch_for(&agent, box_id, settings.quota.source),
+        })
+        .await;
+        let mut replies = Vec::new();
+        while let Ok(reply) = rx.try_recv() {
+            replies.push(reply);
+        }
+
+        assert_eq!(starts_of(&starts).len(), 2, "the resume, then the handoff");
+        let log = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        assert_eq!(log.len(), tail_len + 1, "the notice: {log:?}");
+        let row = log
+            .iter()
+            .find(|row| is_resume_failed(row))
+            .expect("the notice row");
+        assert!(
+            !row.payload.to_string().contains(SECRET),
+            "the row is scrubbed: {row:?}"
+        );
+        let frame = replies
+            .iter()
+            .find(|reply| is_resume_failed_frame(reply))
+            .unwrap_or_else(|| panic!("the tab hears the notice: {replies:?}"));
+        assert!(
+            !format!("{frame:?}").contains(SECRET),
+            "the frame is scrubbed: {frame:?}"
+        );
+        let StoreReply::Chat(ChatFrame::Event(envelope)) = &frame.reply else {
+            panic!("an event frame: {frame:?}");
+        };
+        assert_eq!(
+            htui_agent::replay::envelope_from_row(row)
+                .expect("the notice replays")
+                .event,
+            envelope.event,
+            "the frame is the row the tab would replay"
         );
     }
 

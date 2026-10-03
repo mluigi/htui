@@ -788,21 +788,36 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// The body may carry an adapter's stderr tail, so it is scrubbed like any payload. A refused
     /// scrub writes the residue row, as [`Self::record_follow_up`] does.
     ///
+    /// Answers the envelope of the row it wrote (MOD-37 review L-1): the scrubbed notice, or the
+    /// residue `error` when the scrub refused. That is the frame the caller sends, so the tab sees
+    /// what a replay of the log would, and never the raw notice.
+    ///
     /// # Errors
     /// [`RecordError::Store`] when the append fails; [`RecordError::Encode`] never, in practice.
     pub async fn record_notice(
         &mut self,
         notice: &OtherEvent,
         at: DateTime<Utc>,
-    ) -> Result<(), RecordError> {
+    ) -> Result<DriverEnvelope, RecordError> {
         let at = stamp(at);
         // `{ update, body }`: what `replay` decodes an `other` row as.
         let mut payload = encode(notice)?;
         self.flush().await?;
-        match self.scrubber.scrub(&mut payload) {
-            Ok(()) => {}
-            Err(unmasked) => return self.refuse(unmasked, at).await,
+        if let Err(unmasked) = self.scrubber.scrub(&mut payload) {
+            let residue = ErrorEvent {
+                code: SCRUB_RESIDUE.to_owned(),
+                message: residue_message(&unmasked),
+            };
+            self.refuse(unmasked, at).await?;
+            return Ok(DriverEnvelope {
+                event: DriverEvent::Error(residue),
+                raw: None,
+                at,
+            });
         }
+        // Masking rewrites string leaves only, so the scrubbed document is still an `OtherEvent`.
+        let written: OtherEvent = serde_json::from_value(payload.clone())
+            .map_err(|error| RecordError::Encode(error.to_string()))?;
         self.push(PendingRow {
             kind: EventKind::Other,
             role: EventRole::Htui,
@@ -811,7 +826,12 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             raw: Vec::new(),
             at,
         });
-        self.flush().await
+        self.flush().await?;
+        Ok(DriverEnvelope {
+            event: DriverEvent::Other(written),
+            raw: None,
+            at,
+        })
     }
 
     /// Records the answer to a parked permission request (ANA-9 §4.3: `request_id`, `option_id`,
@@ -1744,11 +1764,16 @@ fn residue_row(unmasked: &Unmasked, at: DateTime<Utc>) -> PendingRow {
         tool_call_id: None,
         payload: json!({
             "code": SCRUB_RESIDUE,
-            "message": format!("{} at {}", unmasked.rule, unmasked.path),
+            "message": residue_message(unmasked),
         }),
         raw: Vec::new(),
         at,
     }
+}
+
+/// A residue row's `message`: the rule and the pointer, never the text.
+fn residue_message(unmasked: &Unmasked) -> String {
+    format!("{} at {}", unmasked.rule, unmasked.path)
 }
 
 /// One of the recorder's own events as the payload document it persists.
