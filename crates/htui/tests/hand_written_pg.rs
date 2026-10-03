@@ -308,6 +308,24 @@ async fn refusals_and_an_unknown_item_write_nothing_on_postgres() {
         documents,
         "no document landed"
     );
+    // Review L3: the counts above are FEAT-1's, which a write to `unknown` could never move; a
+    // row that slipped through would be the unknown item's.
+    assert!(
+        store
+            .notes(unknown)
+            .await
+            .expect("the server's notes")
+            .is_empty(),
+        "no note landed on the unknown item"
+    );
+    assert!(
+        store
+            .documents(unknown)
+            .await
+            .expect("the server's documents")
+            .is_empty(),
+        "no document landed on the unknown item"
+    );
 
     stack.finish().await;
 }

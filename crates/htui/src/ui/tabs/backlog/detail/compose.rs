@@ -1012,7 +1012,16 @@ mod tests {
         assert_eq!(compose.title(), Some("Title"));
         assert_eq!(compose.body(), "Body\nline");
 
-        // A fixed kind takes no paste, and a note's body does.
+        // A fixed kind takes no paste (`Tab` never reaches it, so the focus is put there by
+        // hand), and a note's body does.
+        let base = base();
+        let mut fixed =
+            Compose::document(ids::HTUI_FEAT_1, None, Some("plan".to_owned()), Some(&base));
+        fixed.focus = Part::Kind;
+        fixed.on_paste("review");
+        assert_eq!(fixed.kind(), Some("plan".to_owned()));
+        assert_eq!(fixed.title(), Some("Plan"));
+        assert_eq!(fixed.body(), "# Plan\n\nBody.");
         let mut note = note();
         note.on_paste("x");
         assert_eq!(note.body(), "x");

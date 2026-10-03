@@ -52,7 +52,9 @@ pub const DOCUMENT_FORM_NAME: &str = REQUEST_NAMES[2];
 /// The document write; hedged as [`ADD_NOTE_NAME`] is.
 pub const WRITE_DOCUMENT_NAME: &str = REQUEST_NAMES[3];
 
-/// Whether `name` is one of this module's four requests.
+/// Whether `name` is one of this module's four requests. Nothing routes on it: it exists for
+/// `request_names_match_the_name_arms`, so it is test-only.
+#[cfg(test)]
 #[must_use]
 pub fn is_hand_written_request(name: &str) -> bool {
     REQUEST_NAMES.contains(&name)
@@ -498,6 +500,16 @@ mod tests {
             );
         }
         assert_eq!(counts(&store).await, before);
+        // Review L3: FEAT-1's counts cannot move under a write to another item; the unknown
+        // item's own rows are what a write that slipped through would have added.
+        assert!(store.notes(unknown).await.expect("notes").is_empty());
+        assert!(
+            store
+                .documents(unknown)
+                .await
+                .expect("documents")
+                .is_empty()
+        );
     }
 
     #[tokio::test]

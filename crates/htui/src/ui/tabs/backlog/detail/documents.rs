@@ -1010,7 +1010,9 @@ mod tests {
         let (store, backend) = demo();
         let mut pane = pane(&shell, &store).await;
         let request = saving_v(&shell, &backend, &mut pane).await;
-        let _ = press(&mut pane, &shell, KeyCode::Esc);
+        // Review NIT3: `Esc` is swallowed while busy; only the item change drops the form.
+        assert_eq!(press(&mut pane, &shell, KeyCode::Esc), Handled::Consumed);
+        assert!(pane.captures_input(), "Esc does not close a busy form");
         pane.on_item_change(Some(ids::HTUI_ANA_1));
         assert!(pane.compose.is_none());
         assert!(pane.key.is_none());
