@@ -2424,8 +2424,11 @@ pub(crate) fn spawn_with_concepts(
                             Err(err) => {
                                 // This read is what noticed the server had gone. The asking view
                                 // still hears back exactly once; the next read finds the mirror.
-                                if matches!(err, StoreError::Unreachable(_)) {
-                                    let _ = go_offline(&mut backend, &mut refresher, &mut health, &err);
+                                // MOD-37 M4 D3 (R-46): the swap preempts every live walk.
+                                if matches!(err, StoreError::Unreachable(_))
+                                    && go_offline(&mut backend, &mut refresher, &mut health, &err)
+                                {
+                                    runs.preempt_walks();
                                 }
                                 failed(other.name(), &err)
                             }
@@ -2525,7 +2528,10 @@ pub(crate) fn spawn_with_concepts(
 
                 err = lost_the_server(health.clone()) => {
                     // The refresher passes every `interval`, so it usually notices first.
-                    let _ = go_offline(&mut backend, &mut refresher, &mut health, &err);
+                    // MOD-37 M4 D3 (R-46): the swap preempts every live walk.
+                    if go_offline(&mut backend, &mut refresher, &mut health, &err) {
+                        runs.preempt_walks();
+                    }
                 }
 
                 _ = ticker.tick(),
