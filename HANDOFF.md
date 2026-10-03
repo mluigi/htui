@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-03):** **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
+**Current status (2026-10-03):** **MOD-73 is done** (`docs/decisions/mod/mod-73.md`): a hand-written
+document version newer than a step's output is what the next step reads. `resolve_inputs` answers,
+per kind, the higher version of the step-produced pick (this run first, losers excluded) and the
+latest document no step produced, on `MemStore`, Postgres and the mirror (one statement on both
+engines, one `.sqlx` entry replaced), so a gate edit made with Docs `v` reaches the next phase
+(ANA-2 §4.2 amended). Docs `v` now prefills from that same read, never a fan-out loser's body.
+`htui-orch` conformance case 94; no migration.
+Before it, **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
 flow view takes the mouse. A click on a node moves the shared cursor, a drag on empty canvas pans,
 and the wheel zooms at the pointer; nodes stay read-only. Capture is on only while that view is
 shown in browse mode with a run to draw. Everywhere else htui is keyboard-only and the terminal
@@ -31,18 +38,6 @@ kind (an editable `summary` included) and `v` a new version prefilled from the l
 is refused offline before any read; a write whose answer may have been lost settles itself on a
 re-read and never invites a duplicate. Conformance case 135; no migration. It spawned **MOD-73**
 (hand-written versions as step inputs).
-Before it, **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
-the Runs flow view has a third line counting its step's tool calls by kind (`⚒ read×5 exec×3 +1`).
-`ReadStore::tool_call_counts` answers on Postgres, the mirror and `MemStore`; the pane asks
-`StoreRequest::ToolCalls` after each `Runs` reply only while the flow is shown. Nodes are 20×5. No
-migration, no new crate, one new `.sqlx` entry.
-Before it, **MOD-60 is done** (`docs/decisions/mod/mod-60.md`): every
-hand-laid-out row in the TUI measures, pads, clips and wraps in terminal cells, the way ratatui draws
-them, so CJK, emoji, combining marks and halfwidth kana no longer overrun a pane or push a column out
-of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` and ~16 local copies
-went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
-name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
-no new crate, no snapshot moved.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -52,10 +47,10 @@ comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested
 (MOD-26 milestone 2, index only; cache: `0001`..`0004`), so **the next migration is `0014`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72 and MOD-26 (done, both milestones)
+MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72, MOD-26 (done, both milestones) and MOD-73
 (re-counted 2026-10-01; `TABLES` and commented columns 2026-10-02; `CASES`, `READ_CASES`, `htui-orch`
 `CASES`, `StoreRequest`/`StoreReply`, the `REQUEST_NAMES` below, `.sqlx`, snapshots and Settings
-sections 2026-10-03): store conformance `CASES` 134, `READ_CASES` 14, `htui-orch` `CASES` 92,
+sections 2026-10-03): store conformance `CASES` 135, `READ_CASES` 15, `htui-orch` `CASES` 94 (re-counted at MOD-73),
 `GraphSource` 7 methods, `StoreRequest` 105, `StoreReply` 62, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
 `skills::REQUEST_NAMES` 6, `persona_settings::REQUEST_NAMES` 5, `TABLES` 42, 322 `.sqlx` files, 143
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
@@ -382,17 +377,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   enqueue and at claim (`Claim::MissingTags`), so auto mode reuses them rather than adding a check.
   **Relates to ANA-16** (`docs/ANA-16.md` §8): target-box selection in auto mode is MOD-43's, which
   depends on this item for its auto-mode half.
-- [ ] **MOD-73 - Hand-written document versions as step inputs** (from MOD-13). `R-ENT-12`,
-  `R-ORCH-2`. A hand-written new version of a step's output kind is never what the next step reads:
-  `resolve_inputs` ranks this run's output, then another run's, then a hand-written one, whatever the
-  version (`htui-core/src/store/mem.rs` `input_rank`, `htui-store/src/pg/read.rs` `ORDER BY CASE
-  WHEN s.id IS NULL THEN 2`), and conformance `write_document_allocates_its_version` pins it. ANA-2
-  §4.8 says "an edit is a new document version followed by `approved`", and MOD-13's Docs `v`
-  (`docs/decisions/mod/mod-13.md`) is now how that version gets written, so the edit is shown
-  everywhere but not fed to the next phase while a step-produced version of the kind exists.
-  `documents_of_kinds` (prompt assembly) already takes the latest by version. Reconcile §4.2's
-  ranking with §4.8, for example by letting a hand-written version newer than the run's output win,
-  or by having `accept artifact` adopt it, and update the pinned case. Not blocked.
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -609,6 +593,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 21 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-74 mouse follow-ups; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

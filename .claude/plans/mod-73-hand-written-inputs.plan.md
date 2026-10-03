@@ -5,7 +5,7 @@
 maintainer 2026-10-03. Sandbox run `hr/MOD-73`.
 **Complexity**: Small (one ranking rule, written three times — Postgres, the SQLite mirror, `MemStore` — plus the
 tests that pin the old rule and one ANA-2 amendment)
-**Status**: drafted, awaiting CONFIRM
+**Status**: done 2026-10-03 (`docs/decisions/mod/mod-73.md`)
 
 ## Summary
 
