@@ -17260,6 +17260,31 @@ mod tests {
                 harness.orch.spec_for(&key("prd", 0, 0)).is_none(),
                 "no session started"
             );
+            let summary = harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .find(|run| run.id != ids::RUN_2)
+                .expect("the walk created its run before the lease refused");
+            let prd = step_at(&harness.orch, summary.id, 0, 0).await;
+            assert_eq!(
+                prd.status,
+                StepStatus::Failed,
+                "a spawn failure, not a park"
+            );
+            let row = harness.orch.run(summary.id).await;
+            assert_eq!(row.status, RunStatus::Failed);
+            assert!(
+                row.failure
+                    .as_deref()
+                    .is_some_and(|failure| failure.starts_with("agent spawn failed: ")
+                        && failure.contains("no socket")),
+                "{:?}",
+                row.failure
+            );
         }
 
         #[tokio::test(start_paused = true)]
