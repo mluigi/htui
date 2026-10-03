@@ -96,3 +96,190 @@ drives T2's `Harness::mouse`. No file joins a task beyond the plan's list.
 
 clippy is `cargo clippy --workspace --all-targets --all-features -- -D warnings` throughout.
 
+---
+
+## 2. T1: capture lifetime in the terminal (D2, D3)
+
+**File**: `crates/htui/src/terminal.rs` only.
+
+### 2.1 Module doc (after the bracketed-paste paragraph, `:16-21`)
+
+```text
+//!
+//! **Mouse capture** (MOD-71 D1-D3) is on only while the view on screen wants the mouse, because
+//! it takes the terminal's own text selection away. The event loop asks the app after every step,
+//! and [`TerminalGuard::set_mouse_capture`] writes only a change. [`init`] and `Suspend::enter`
+//! never turn it on; every way the terminal is given back — [`restore_terminal`] and
+//! `Suspend::leave` — turns it off first, whatever the guard last set.
+```
+
+### 2.2 `TerminalGuard` (`:25-32`) and `init` (`:60-63`)
+
+New field, last:
+
+```rust
+    /// MOD-71 D2: whether mouse capture is on, as this guard last set it. Only
+    /// [`TerminalGuard::set_mouse_capture`] turns it on; `Suspend::leave` clears it (D3).
+    mouse: bool,
+```
+
+`init`'s literal gains `mouse: false,` after `restored: false,` with
+`// MOD-71 D1: capture starts off; the loop turns it on for a view that wants it.`
+`init` issues no mouse command.
+
+### 2.3 `restore_terminal` (`:72-78`)
+
+```rust
+/// Gives the terminal back: mouse capture off (MOD-71 D3), bracketed paste off (MOD-22 review
+/// M-1), then `ratatui::restore` — raw mode off and the alternate screen left. Best effort, as
+/// `ratatui::restore` is: a stdout that cannot take one escape sequence is not a reason to stop
+/// giving the rest back. A free function, so it cannot know whether capture is on: it turns it
+/// off unconditionally, which a terminal that never had it ignores.
+pub fn restore_terminal() {
+    let _ = disable_mouse_capture();
+    let _ = disable_bracketed_paste();
+    ratatui::restore();
+}
+```
+
+### 2.4 `impl TerminalGuard` (`:118-131`): `set_mouse_capture`, **last** (H-6)
+
+```rust
+    /// MOD-71 D2: mouse capture on or off, written only when `on` differs from what this guard
+    /// last set, so the event loop can ask after every step for nothing. The loop is the only
+    /// caller, with `App::wants_mouse` (D1). A terminal without mouse reporting answers
+    /// `Unsupported`, which is recorded as done so it is not asked again every step: the view runs
+    /// keyboard-only (review R2-L6's shape, H-14).
+    ///
+    /// # Errors
+    ///
+    /// A terminal write that failed for any other reason: the loop ends and `lib.rs` restores
+    /// (MOD-9 D21).
+    pub fn set_mouse_capture(&mut self, on: bool) -> std::io::Result<()> {
+        if on == self.mouse {
+            return Ok(());
+        }
+        if on {
+            enable_mouse_capture()?;
+        } else {
+            disable_mouse_capture()?;
+        }
+        self.mouse = on;
+        Ok(())
+    }
+```
+
+No `#[must_use]` (H-4: `io::Result` already is). `restore` is not changed: after it nothing draws.
+
+### 2.5 `impl Suspend for TerminalGuard` (`:133-155`) and the helpers (after `disable_bracketed_paste`, `:178-185`)
+
+```rust
+    /// Show the cursor (every draw hid it), mouse capture off (MOD-71 D3) and bracketed paste off
+    /// so the editor gets its own mouse and paste (MOD-22 review M-1), then `ratatui::try_restore`
+    /// (MOD-9 D22). `restored` is not touched: this is a pause, not the end. `mouse` is cleared
+    /// before the write, so whatever happens next the loop's `set_mouse_capture` re-asserts what
+    /// the app wants once the editor is gone — one place decides.
+    fn leave(&mut self) -> std::io::Result<()> {
+        self.terminal.show_cursor()?;
+        self.mouse = false;
+        disable_mouse_capture()?;
+        disable_bracketed_paste()?;
+        ratatui::try_restore()
+    }
+```
+
+`enter`'s body is unchanged. Its doc gains one sentence: "Mouse capture is not turned back on
+here (MOD-71 D3): the loop's next `set_mouse_capture` decides, in one place." A failed `leave`
+followed by `run_suspended`'s re-`enter` (`editor.rs:270-277`) leaves `mouse == false`, and the
+loop re-enables if wanted.
+
+```rust
+/// MOD-71 D2: mouse capture on, in its own `execute!` (review R2-L6's shape). crossterm's
+/// `EnableMouseCapture` is any-motion reporting (`?1003h`, `crossterm-0.29.0/src/event.rs:325-333`),
+/// which `App::on_mouse` drops before it can cost a redraw (D4). `Unsupported` is a terminal with
+/// no mouse reporting, which runs keyboard-only.
+fn enable_mouse_capture() -> std::io::Result<()> {
+    let enabled = tolerate_unsupported(crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture
+    ))?;
+    if !enabled {
+        tracing::debug!("this terminal has no mouse reporting; the flow view is keyboard-only");
+    }
+    Ok(())
+}
+
+/// Mouse capture off, in its own `execute!`, `Unsupported` tolerated as on the way in (MOD-71 D3).
+fn disable_mouse_capture() -> std::io::Result<()> {
+    tolerate_unsupported(crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture
+    ))
+    .map(|_| ())
+}
+```
+
+`debug!`, not `info!` (E9): it fires on every toggle on such a terminal, unlike the paste notice,
+which fires once at `init`.
+
+### 2.6 Tests (first) and commits (T1)
+
+A **new** test beside the paste one (E10), using the same `code()` and `body()` helpers:
+
+```rust
+    /// MOD-71 D3: capture is the loop's alone to turn on, and every way the terminal is given back
+    /// turns it off, first and whatever the guard last set. A path that forgot leaves the shell, or
+    /// `$EDITOR`, printing an escape sequence for every mouse move.
+    #[test]
+    fn every_give_back_disables_mouse_capture_and_only_the_loop_enables_it() {
+        let code = code();
+        let restore = body(&code, "pub fn restore_terminal()");
+        let off = restore
+            .find("disable_mouse_capture()")
+            .expect("`restore_terminal` turns capture off");
+        let paste = restore
+            .find("disable_bracketed_paste()")
+            .expect("`restore_terminal` turns paste off");
+        assert!(off < paste, "capture goes first (D3)");
+        let leave = body(&code, "fn leave(&mut self)");
+        assert!(
+            leave.contains("disable_mouse_capture()") && leave.contains("self.mouse = false"),
+            "`leave` turns capture off and forgets it"
+        );
+        for taking in ["pub fn init()", "fn enter(&mut self)"] {
+            let body = body(&code, taking);
+            assert!(
+                !body.contains("MouseCapture") && !body.contains("mouse_capture"),
+                "`{taking}` leaves capture to the loop"
+            );
+        }
+        let toggle = body(&code, "pub fn set_mouse_capture(&mut self, on: bool)");
+        assert!(toggle.contains("enable_mouse_capture()") && toggle.contains("disable_mouse_capture()"));
+        assert!(toggle.contains("self.mouse"), "the toggle writes only a change");
+        for (helper, command) in [
+            ("fn enable_mouse_capture()", "EnableMouseCapture"),
+            ("fn disable_mouse_capture()", "DisableMouseCapture"),
+        ] {
+            let body = body(&code, helper);
+            assert!(body.contains(command), "`{helper}` issues `{command}`");
+            assert!(body.contains("tolerate_unsupported("), "`{helper}` tolerates an unsupported terminal");
+            assert!(
+                !body.contains("AlternateScreen") && !body.contains("BracketedPaste"),
+                "`{helper}` issues nothing else"
+            );
+        }
+    }
+```
+
+`init`'s body contains `mouse: false`, which matches neither `"MouseCapture"` nor `"mouse_capture"`.
+The existing `every_path_that_takes_the_terminal_enables_bracketed_paste_and_every_restore_disables_it`
+(`:226`) and `an_unsupported_paste_mode_is_tolerated_and_nothing_else_is` (`:270`) are **unchanged**
+and stay green (H-6). `TerminalGuard` can't be built without a real tty (`DefaultTerminal`), so the
+idempotence is pinned by shape, not by a behaviour test.
+
+1. `test(mod-71): the mouse half of terminal.rs's source-shape test (red)`: the test only. It
+   compiles and panics at the first `expect`.
+2. `feat(mod-71): TerminalGuard owns mouse capture, and every give-back turns it off`: §2.1–§2.5.
+   Gate: the T1 row of §1. `set_mouse_capture` is `pub` on a `pub` type in `pub mod terminal`
+   (`lib.rs:39`), so it raises no `dead_code` before T2 calls it.
+
