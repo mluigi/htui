@@ -649,6 +649,12 @@ impl ExecutionGraph {
         frame.render_widget(&mut self.flow, area);
     }
 
+    /// The canvas's pan and zoom, which the pane compares across a mouse event to tell one that
+    /// changed the frame from one that did not (MOD-71 review L4).
+    pub(super) const fn viewport(&self) -> Viewport {
+        self.flow.viewport
+    }
+
     /// The run on the canvas, for the tests.
     #[cfg(test)]
     pub(super) fn shown_run(&self) -> Option<RunId> {

@@ -1395,8 +1395,11 @@ impl DetailTab for RunsTab {
 
     /// MOD-71 D5, D6: a left press or the wheel inside the canvas the last frame drew, and the
     /// drag and release of a press that started there, go to the flow; right and middle buttons,
-    /// and anything outside, pass. A click on a node moves the cursor (`select_step`). Every
-    /// forwarded event is `Consumed`, so a pan or a zoom is redrawn (blueprint E4).
+    /// and anything outside, pass. A click on a node moves the cursor (`select_step`). A forwarded
+    /// event that completed a click or moved the viewport is `Consumed`, so it is redrawn
+    /// (blueprint E4); one that changed nothing on screen (a press, a drag after a press on a
+    /// node, a wheel tick at the zoom clamp) passes, so a motion flood costs no redraw and keeps
+    /// the status line (review L4).
     fn on_mouse(&mut self, mouse: MouseEvent, ctx: &mut Ctx<'_>) -> Handled {
         if !self.wants_mouse() {
             self.gesture = false;
@@ -1419,10 +1422,18 @@ impl DetailTab for RunsTab {
         if !forward {
             return Handled::Pass;
         }
-        if let Some(step) = self.graph.get_mut().on_mouse(mouse) {
-            self.select_step(step, ctx.theme);
+        let graph = self.graph.get_mut();
+        let before = graph.viewport();
+        let clicked = graph.on_mouse(mouse);
+        let moved = graph.viewport() != before;
+        match clicked {
+            Some(step) => {
+                self.select_step(step, ctx.theme);
+                Handled::Consumed
+            }
+            None if moved => Handled::Consumed,
+            None => Handled::Pass,
         }
-        Handled::Consumed
     }
 
     /// MOD-41 plan D16: an item is selected and one of its runs is `queued`, `running` or
@@ -4197,16 +4208,22 @@ mod tests {
         let shell = Shell::new();
         let (mut pane, lines) = flowing(&shell).await;
         let (column, row) = cell(&lines, "1.1 done");
-        for kind in [
-            MouseEventKind::Down(MouseButton::Left),
-            MouseEventKind::Up(MouseButton::Left),
-        ] {
-            assert_eq!(
-                pane.on_mouse(mouse(kind, column, row), &mut shell.ctx()),
-                Handled::Consumed,
-                "{kind:?}"
-            );
-        }
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "a press changes nothing on screen yet (review L4)"
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), column, row),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "the release is the click"
+        );
         assert_eq!(pane.selected_step(), Some(ids::STEP_PLAN));
         assert_eq!(
             pane.graph.borrow().selected(),
@@ -4248,17 +4265,24 @@ mod tests {
         let shell = Shell::new();
         let (mut pane, lines) = flowing(&shell).await;
         let (column, row) = blank_cell(&lines);
-        for (kind, row) in [
-            (MouseEventKind::Down(MouseButton::Left), row),
-            (MouseEventKind::Drag(MouseButton::Left), 0),
-            (MouseEventKind::Up(MouseButton::Left), 0),
-        ] {
-            assert_eq!(
-                pane.on_mouse(mouse(kind, column, row), &mut shell.ctx()),
-                Handled::Consumed,
-                "{kind:?} at row {row}"
-            );
-        }
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert!(pane.gesture, "the press started on the canvas");
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column, 0),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "the drag past the canvas still pans"
+        );
+        pane.on_mouse(
+            mouse(MouseEventKind::Up(MouseButton::Left), column, 0),
+            &mut shell.ctx(),
+        );
+        assert!(!pane.gesture, "the release past the canvas ended it");
         assert_eq!(
             pane.on_mouse(
                 mouse(MouseEventKind::Drag(MouseButton::Left), column, row),
@@ -4280,29 +4304,35 @@ mod tests {
         let press = mouse(MouseEventKind::Down(MouseButton::Left), column, row);
         let drag = mouse(MouseEventKind::Drag(MouseButton::Left), column, row);
 
-        assert_eq!(pane.on_mouse(press, &mut shell.ctx()), Handled::Consumed);
+        pane.on_mouse(press, &mut shell.ctx());
+        assert!(pane.gesture);
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
         pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        assert!(!pane.gesture);
         assert_eq!(
             pane.on_mouse(drag, &mut shell.ctx()),
             Handled::Pass,
             "`v` ended it"
         );
 
-        assert_eq!(pane.on_mouse(press, &mut shell.ctx()), Handled::Consumed);
+        pane.on_mouse(press, &mut shell.ctx());
+        assert!(pane.gesture);
         pane.on_key(key(KeyCode::Char('x')), &mut shell.ctx());
         pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(!pane.gesture);
         assert_eq!(
             pane.on_mouse(drag, &mut shell.ctx()),
             Handled::Pass,
             "the note ended it"
         );
 
-        assert_eq!(pane.on_mouse(press, &mut shell.ctx()), Handled::Consumed);
+        pane.on_mouse(press, &mut shell.ctx());
+        assert!(pane.gesture);
         pane.on_item_change(Some(ids::HTUI_FEAT_1));
         pane.on_reply(&StoreReply::Runs(feat_1_runs().await), &mut shell.ctx());
         let _ = shell.emit.take();
         let _ = lines(&pane, &shell);
+        assert!(!pane.gesture);
         assert_eq!(
             pane.on_mouse(drag, &mut shell.ctx()),
             Handled::Pass,
@@ -4327,6 +4357,64 @@ mod tests {
             );
         }
         assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
+    }
+
+    /// Review L4: an event that changes nothing on screen — a wheel tick at the 2.0 clamp, a
+    /// drag after a press on a node (rataflow ignores it) — passes, so a motion flood costs no
+    /// redraw and keeps the status line; a pan drag and the click still consume.
+    #[tokio::test]
+    async fn an_event_that_changes_nothing_passes() {
+        let shell = Shell::new();
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        let wheel = mouse(MouseEventKind::ScrollUp, column, row);
+        while pane.graph.borrow().zoom() < 2.0 - 1e-9 {
+            assert_eq!(pane.on_mouse(wheel, &mut shell.ctx()), Handled::Consumed);
+        }
+        assert_eq!(
+            pane.on_mouse(wheel, &mut shell.ctx()),
+            Handled::Pass,
+            "the wheel at the clamp"
+        );
+
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = cell(&lines, "1.1 done");
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 3, row + 1),
+                &mut shell.ctx()
+            ),
+            Handled::Pass,
+            "a drag from a node moves nothing"
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Up(MouseButton::Left), column + 3, row + 1),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "and its release is still the click"
+        );
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PLAN));
+
+        let (mut pane, lines) = flowing(&shell).await;
+        let (column, row) = blank_cell(&lines);
+        pane.on_mouse(
+            mouse(MouseEventKind::Down(MouseButton::Left), column, row),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            pane.on_mouse(
+                mouse(MouseEventKind::Drag(MouseButton::Left), column + 3, row + 1),
+                &mut shell.ctx()
+            ),
+            Handled::Consumed,
+            "a pan drag redraws"
+        );
     }
 
     /// Review M1: a head line that comes and goes (here a `Waiting` frame's) moves the canvas
