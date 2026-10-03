@@ -1358,3 +1358,531 @@ with `env_clear()` + `PATH` + the two variables, `kill_on_drop(true)` (reaped on
 `cargo test -p htui --all-features --test mcp_stdio -- --test-threads=1`;
 `cargo test -p htui --all-features --bin htui`; `lint htui`; `cargo fmt --all -- --check`;
 `ps -eo pid,args | grep '[h]tui mcp'` empty afterwards (no orphaned relay).
+
+---
+
+## 9. T6 — engine registration, hosts, output section (Wave 3, serial)
+
+### 9.1 Files (plan + B-8)
+`htui-orch/src/{engine,fake,conformance}.rs`, `htui-orch/tests/gix_isolator.rs`,
+`htui-core/src/prompt/{mod,render}.rs`, **`htui-core/src/prompt/template.rs`**,
+**`htui-core/src/prompt/fixtures.rs`**, `htui-core/tests/snapshots/*output*` (new),
+**`htui-core/tests/prompt_output.rs`** (new), `htui-worker/src/{runtime,views}.rs`,
+`htui-worker/Cargo.toml` (only if a dev-dependency is needed; expected untouched),
+`htui/src/{worker_cmd,store_worker,agent_worker,run_worker,lib}.rs`, `htui/src/mcp_search.rs` (new
+stub), **`htui/src/preview.rs`**, `htui/Cargo.toml`, `htui/tests/runs_pg.rs`, `htui/tests/backlog.rs`.
+
+### 9.2 Edits, in commit order
+**(a) The `output` trailer (D19, B-7)** — `template.rs`: `Placeholder::Output` after `Persona`
+(`:121`), documented like it ("**Internal** … `assemble` renders it after the body whenever the spec
+sets `document_tool`"), excluded from `ALL` (`:134`) and from the role tables; `as_str` `"output"`.
+`mod.rs`: `SectionName::Output` (render `"output"`, `is_protected` → `true`, `:333-340`);
+`PromptSpec.document_tool` (`:122`); `render_sections` arm `Placeholder::Output =>
+spec.document_tool.then(|| render::output(spec.output_kind…))` — the kind comes from the spec's
+`output_kind` (`Option<String>`, the `{{output_kind}}` scalar's source); `assemble` pushes it after
+the span sections (the persona push at `:517-520` is the model: weight 1, scanned, protected);
+`substitute` (`:662-700`) appends `"\n\n"` + the wrapped block **after** the span loop when present;
+the trimmer's frame estimate counts that separator (B-17 of MOD-26 is the precedent). `scrubbed_inputs`
+needs nothing (the text is fixed and the kind is already an input). `render.rs`: `pub fn output(kind:
+&str) -> Rendered` beside `command_queue` (`:628`). Seven literals: `fixtures.rs` ×4 and
+`preview.rs:281` → `document_tool: false`; `engine.rs:4815`, `:5560` → §2.12.
+**(b) The seam in the engine (D4, D10, B-9, B-17, B-18)** — `EngineParts.tools`, ten literals,
+`fake_parts` → `orch.tool_host()`; `drive_once` per §2.12; `open_tools` boxed (I-8).
+`htui-orch/src/fake.rs`: `FakeOrchestrator` gains `tools: Option<Arc<dyn ToolHost>>` with
+`with_tool_host` and `tool_host()`, and **per-key spec handles** (D9): `specs:
+Mutex<HashMap<OwnedKey, SpecSlot>>`, filled in `driver_for_key` (`:1733`) through
+`FakeDriver::spec_handle()` before boxing, read by `pub fn spec_for(&self, key: &SessionKey<'_>) ->
+Option<SessionSpec>`. `FakeToolHost` (`test-support`):
+```rust
+#[derive(Debug, Default)]
+pub struct FakeToolHost { opened: Mutex<Vec<ToolScope>>, live: Arc<AtomicUsize>,
+                          write_output: Mutex<Option<(Arc<dyn Fn(&ToolScope) -> Option<NewDocument>
+                                                     + Send + Sync>, MemStore)>>, fail: Mutex<Option<ToolHostError>> }
+impl FakeToolHost {
+    pub fn opened(&self) -> Vec<ToolScope>;  pub fn live(&self) -> usize;
+    /// On every open, write the returned document through `store.write_step_document(scope.fence, …)`
+    /// — what `document_write` would do — and record the outcome.
+    pub fn writing_output(self, store: MemStore, doc: impl Fn(&ToolScope) -> Option<NewDocument> + …) -> Self;
+    pub fn failing(self, err: ToolHostError) -> Self;
+}
+```
+(`open` is synchronous; the write runs on `tokio::runtime::Handle::current().block_on`? **No** —
+`block_on` inside a runtime panics. Record the scope and spawn the write with `tokio::spawn` +
+a `Notify` the test awaits, **or** make the scripted write happen in the fake driver's `start`:
+the orch fake's `driver_for_key` wraps `FakeDriver` so `start` first awaits
+`FakeToolHost::write_for(step)` — preferred, deterministic. Pick the wrapper; it lives in `fake.rs`.)
+**(c) `htui-worker`** — §2.12: `Shared.tools`, `with_tool_host`, `Kit.tools`, `Kit::engine`,
+`shutdown` → `close()`; `ProgressSink.owner` and the fenced write (closes MOD-41 D5).
+**(d) `htui` wiring** —
+- `mcp_search.rs` (new): `pub fn production() -> Option<Arc<dyn htui_mcp::search::ConceptSearch>> { None }`
+  ("T7 fills this").
+- `lib.rs:147`: build `let tools = htui_mcp::McpHost::new(started.backend.clone()).map(|h| match
+  mcp_search::production() { Some(s) => h.with_search(s), None => h })` — on `Err` log `warn!` and
+  run without tools (the TUI must still start); call the new `store_worker::spawn_hosted(started, rx,
+  tx, AgentRuntime::production().with_registration_probe(), tools.ok().map(Arc::new))`.
+- `store_worker.rs`: `pub fn spawn_hosted(.., tools: Option<Arc<McpHost<Backend>>>)` builds
+  `runs = production_for(&started.backend)` and, when `Some`, `runtime.with_tool_host(t.clone())`,
+  `runs.with_tool_host(t.clone())`, then `spawn_with_concepts(.., tools)`;
+  `spawn_with_concepts` (`:2107`) gains the trailing `tools` parameter (callers `:2095` and the test
+  at `:2910` pass `None`); the loop calls `if let Some(t) = &tools { t.set_host(backend.clone()) }` as
+  the first statement of each iteration (B-2). `spawn`/`spawn_with`/`spawn_with_runtimes` keep their
+  signatures (tests unchanged).
+- `worker_cmd.rs:96`: `RunRuntime::<PgStore, Unaddressed>::production().with_role(Role::Worker)
+  .with_tool_host(Arc::new(McpHost::new(pg.clone())?))` (an `Err` is `WorkerExit::Refused`: a worker
+  that cannot host tools would fail every document phase).
+- `agent_worker.rs`: `start` (`:1978`) opens `ToolScope { run_id: chat.run_id, step_id:
+  chat.step_id, project_id, item_id: None, box_id, user, fence: Unleased, output_kind: None, hostname:
+  <project switch>, command_queue: false, cwd: cwd.clone(), transport: summary.agent.transport }`;
+  `bind_promoted` stops discarding `run` (`:986-991`), reads `writer.run(run)` → `snapshot_of` →
+  `writer.run_steps(run)` → the step's `position` → `phase_at` → `output_kind` (non-empty), any error
+  → `None` with a `debug!` (never fails the chat); `item_id = run.item_id`. Specs get `mcp`/`prompt`
+  from the lease; `ChatArgs.lease` keeps it alive in the chat task. `AgentRuntime::with_tool_host`.
+  **Never `use htui_core::store::WorkerStore`** here (H-1: `Writer` implements both families).
+- `run_worker.rs` tests: `Play::Tools(Vec<(&'static str, Value)>)` — `ScriptedDriver::start` reads
+  `spec.mcp[0].env["HTUI_MCP_TOKEN"]`, `mcp.client(token)`, `initialize`, calls each tool (the string
+  `"{kind}"` in a body is replaced by the scope's kind) and asserts `!is_error`, then returns the
+  session. `Fixture::runtime_with_tools()` = `RunRuntime::with_parts(..).with_clock(..)
+  .with_tool_host(Arc::new(McpHost::new(Backend::memory(store.clone()))?))` — **no `with_author`**.
+
+### 9.3 Tests (written first)
+`htui-core/tests/prompt_output.rs`:
+- `a_spec_without_the_document_tool_is_byte_identical` (every fixture's assembled text and digest
+  equal the existing snapshots; `cargo insta test` shows no change outside `*output*`)
+- `the_output_trailer_renders_after_the_body` (snapshot `prompt_output__phase_with_output.snap`)
+- `the_output_trailer_is_kept_by_the_trimmer` (an oversize spec keeps it)
+- `no_template_can_place_output` (`{{output}}` → unknown placeholder)
+- `the_judge_prompt_gets_the_trailer` (snapshot `prompt_output__judge_with_output.snap`)
+`htui-orch` (`engine.rs` `mod tests`, `#[tokio::test(start_paused = true)]`, `FakeToolHost`):
+- `without_a_tool_host_the_spec_has_no_server_and_no_port`
+- `a_phase_session_registers_its_scope` (every `ToolScope` field)
+- `the_spec_carries_the_leases_server`; `the_lease_ends_with_the_session` (`live() == 0` after)
+- `a_tool_written_document_is_the_candidates_output`
+- `the_judge_opens_two_leases_and_resolves_on_two_tool_documents` (`author: None` equivalent: the
+  harness sink writes nothing)
+- `a_tool_write_after_the_lease_moved_is_fenced_and_the_walk_loses_its_lease`
+- `no_tool_document_still_fails_missing_output` and `a_judge_without_tool_documents_is_missing_document` (OQ-9)
+- `a_tool_host_error_fails_the_step_as_a_spawn_failure`
+- `the_output_trailer_appears_only_with_a_tool_host` (prompt sections of the step)
+`htui-worker` (`runtime.rs` `mod tests`): `with_tool_host_reaches_the_engine`,
+`shutdown_closes_the_tool_host`; (`views.rs`) `the_sink_writes_under_the_walks_fence`.
+`htui/src/run_worker.rs` `mod tests` (real `McpHost<Backend>`, B-9):
+- `a_production_judge_resolves_on_tool_written_documents` (fan-out 2 + judge, every session
+  `Play::Tools([("document_write", {"body": "…"})])`; the judge resolves, no human pick)
+- `approve_and_accept_are_live_on_a_tool_written_step` (the `RunActions` reply)
+`htui/src/agent_worker.rs` `mod tests`:
+- `a_fresh_chat_sees_box_profile_only` (T7 widens it to `search_concepts` too)
+- `a_promoted_chat_sees_the_item_tools_with_the_snapshot_kind`
+- `a_promoted_chat_with_an_undecodable_snapshot_withholds_document_write`
+- `the_chat_lease_ends_with_the_chat` (`session ended` after the chat ends)
+`htui/tests/runs_pg.rs`: `a_production_judge_resolves_through_document_write_on_postgres`.
+`htui/tests/backlog.rs`: `runs_pane_approve_is_enabled_by_a_tool_written_document` (testkit harness).
+
+### 9.4 Commits
+1. `feat(mod-11): T6 output trailer in the prompt (D19)` — (a), snapshots, fixtures, preview.
+2. `feat(mod-11): T6 engine opens a tool lease per session` — (b), engine tests, `FakeToolHost`.
+3. `feat(mod-11): T6 worker runtime hosts tools; sink writes fenced` — (c).
+4. `feat(mod-11): T6 TUI, chat and worker wiring` — (d), `run_worker`/`agent_worker` tests.
+5. `test(mod-11): T6 production judge and Runs pane on tool-written documents` — `runs_pg.rs`,
+   `backlog.rs`.
+
+### 9.5 Gate (G-T6)
+`nopg htui-core`; `nopg htui-orch 2>&1 | tee /tmp/mod11-t6-orch.log; grep -c SIGABRT /tmp/mod11-t6-orch.log`
+= 0; `nopg htui-worker`; `$NOPG cargo test -p htui --all-features -- --test-threads=1`; `pg htui`
+(`runs_pg`); `cargo insta test --workspace --all-features` nothing pending (DSN unset);
+`lint htui-core htui-orch htui-worker htui`; `cargo fmt --all -- --check`.
+
+---
+
+## 10. T7 — `search_concepts` (Wave 4, after T6)
+
+### 10.1 Files (plan + B-14)
+`crates/htui-mcp/src/tools/search.rs`, `htui/src/concepts_worker.rs`, `htui/src/mcp_search.rs`,
+**`htui/src/worker_cmd.rs`**, **`crates/htui-mcp/tests/tools_search.rs`**.
+
+### 10.2 Edits
+- Tool: §2.10 row; `types` parsed with `ConceptType::parse` (unknown → `invalid arguments: unknown
+  type <t>`), `limit` 1..=20 (default 10), `ConceptQuery { project: scope.project_id, .. }` — the
+  project never comes from arguments (I-1). Advertised iff `HostCaps.search`.
+- `concepts_worker.rs`: one process-wide index, so the TUI's concepts runtime and the MCP adapter
+  share one embedding model (133 MB, MOD-68): `pub fn shared_index() -> Arc<dyn ConceptIndex>`
+  (a `OnceLock` over `QdrantIndex`'s production constructor) used by `ConceptsRuntime::production()`
+  and by `mcp_search::production()`.
+- `mcp_search.rs`: `pub struct McpSearch(Arc<dyn ConceptIndex>)` implementing `ConceptSearch`
+  (`SearchQuery { text, projects: vec![q.project], types: map ConceptType → PointType, statuses,
+  resolutions: vec![], limit }`; `Hit` → `ConceptHit` by hand: `owner_kind` from `Owner::{Item,
+  Requirement}`, `document_kind = document.map(|(_, k)| k)`, `resolution`/`state` as their
+  `as_str()`); `production()` → `Some(Arc::new(McpSearch(shared_index())))`.
+- `worker_cmd.rs`: `McpHost::new(pg.clone())?.with_search(mcp_search_for_worker)` where the worker's
+  index is the one `concepts::spawn_index_job` already configures (its keyring Qdrant URL); `None`
+  when no Qdrant URL is configured (tool not advertised).
+
+### 10.3 Tests (written first)
+`crates/htui-mcp/tests/tools_search.rs` (a `ConceptSearch` double recording its queries):
+`search_is_scoped_to_the_scopes_project`, `requirement_hits_carry_owner_kind_requirement`,
+`an_unavailable_index_is_is_error_with_its_cause`, `unknown_types_are_refused`,
+`a_limit_above_twenty_is_refused`, `search_concepts_is_not_advertised_without_a_search_handle`.
+`htui/src/mcp_search.rs` `mod tests` (feature `testkit`: `concepts_worker::MemIndex` over
+`MemVectorStore`): `a_hit_in_another_project_is_never_returned`,
+`hits_map_every_field_by_hand`. `agent_worker.rs`'s `a_fresh_chat_sees_box_profile_only` becomes
+`a_fresh_chat_sees_box_profile_and_search_concepts` **only if** the chat host is built with a search
+handle in that test — keep T6's name and add `…_with_search` beside it (T7 owns neither
+`agent_worker.rs` nor its test: put the widened assertion in `tools_search.rs` instead, over a
+fresh-chat-shaped scope).
+
+### 10.4 Commits
+1. `feat(mod-11): T7 search_concepts tool`
+2. `feat(mod-11): T7 concept-index adapter for the TUI and the worker`
+
+### 10.5 Gate (G-T7)
+`nopg htui-mcp`; `$NOPG cargo test -p htui --all-features mcp_search -- --test-threads=1`;
+`lint htui-mcp`; `lint htui`; `cargo fmt --all -- --check`.
+
+---
+
+## 11. T8 — `command_run`: queue, exposure, denial (Wave 4, after T6)
+
+### 11.1 Files (plan + B-15)
+`htui-store/migrations/0014_command_queue.sql` (new), `htui-store/tests/migrations.rs`,
+`htui-core/src/store/{traits,mem,worker,conformance}.rs`, `htui-core/tests/mem_store.rs`,
+**`htui-core/src/model/kind.rs`** (the plan's "wherever the resolver lands"; `model/run.rs` stays
+untouched), `htui-store/src/pg/write.rs`, `htui-store/src/{writer,worker}.rs`,
+`htui-store/tests/{pg_conformance,pg_criteria}.rs`, `htui-store/.sqlx/*`, `htui-agent/src/cli/mod.rs`,
+`htui-agent/src/conformance.rs`, `htui-agent/tests/{recorder,cli_driver}.rs`,
+`htui-orch/src/{engine,conformance}.rs`, **`htui-orch/src/verify.rs`**, `htui-worker/src/runtime.rs`,
+`crates/htui-mcp/src/tools/command.rs`, `crates/htui-mcp/tests/tools_command.rs` (new).
+
+### 11.2 Shapes
+`htui-core/src/model/kind.rs` (beside `CommandQueue`, `:40-48`):
+```rust
+impl CommandQueue {
+    /// D16: `off` → false; `always` → true; `fan_out_only` → fanned out or a `heavy_build` item.
+    #[must_use] pub fn exposed(self, fan_out: i32, item_tags: &[String]) -> bool;
+}
+/// D16's one resolver, as a function for callers holding the three values.
+#[must_use] pub fn command_queue_exposed(mode: CommandQueue, fan_out: i32, item_tags: &[String]) -> bool;
+/// The item tag R-MCP-3 names.
+pub const HEAVY_BUILD_TAG: &str = "heavy_build";
+/// OQ-5: shell prefixes refused once while `command_run` is exposed (R-MCP-4). Order is a pin.
+pub const HEAVY_COMMAND_PREFIXES: &[&str] = &["cargo build", "cargo test", "cargo nextest",
+    "cargo clippy", "cmake --build", "ctest", "make", "ninja", "msbuild", "dotnet build",
+    "dotnet test", "npm test", "pnpm test", "go build", "go test"];
+/// D15: `app_setting.command_limits` overlaid key by key with `box.settings.command_limits`; a value
+/// that does not parse is skipped (warned by the caller); a class missing from both is 1.
+#[must_use] pub fn resolve_command_limits(box_settings: Option<&Value>,
+    app: &BTreeMap<String, Value>) -> BTreeMap<String, u32>;
+#[must_use] pub fn command_limit(limits: &BTreeMap<String, u32>, class: &str) -> u32; // missing → 1, 0 → 1
+```
+`htui-orch/src/verify.rs` (B-15, additive):
+```rust
+/// OQ-7's executor: `sh -c` / `cmd /C` in `cwd`, stdin null, stdout+stderr merged into a 64 KiB tail,
+/// supervised like a verify (process group / job object), killed at `budget`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ShellRun { pub exit_code: Option<i32>, pub output: String, pub truncated: bool,
+                      pub ended: ShellEnd }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum ShellEnd { Exited, TimedOut, Signalled, SpawnFailed }
+pub async fn run_shell(command: &str, cwd: &Path, budget: Duration,
+                       stop: impl Future<Output = ()> + Send) -> ShellRun;   // `stop` = a lost claim
+```
+`truncated` comes from a byte counter beside the `TailBuffer` (`drain` gains a counting twin; the
+existing `drain` is untouched).
+
+Engine (`engine.rs`):
+- `phase_spec` (`:5593-5595`): `command_queue: phase.command_queue.exposed(phase.fan_out,
+  &row.required_tags) && persona.is_none_or(|p| p.tools.command_run)` (`row` is read at `:5488`).
+- `drive_once`: before the persona `match` (`:5900`), `let exposed = phase.command_queue != Off &&
+  { let item = self.item(Self::item_of(run)?).await?; phase.command_queue.exposed(phase.fan_out,
+  &item.required_tags) };` (the judge phase is `Off`, `fanout.rs:299`, so judges stay off without a
+  read); `let base = ToolExposure { command_run: exposed, ..Default::default() };` and both arms use
+  `base` (`narrow(&base, &policy, persona)` / `(base, policy)`). After the `match` (D17):
+  ```rust
+  if tools.command_run {
+      let denials = HEAVY_COMMAND_PREFIXES.iter().map(|p| PermissionRule {
+          matcher: PermissionMatch { tool_kind: Some("execute".to_owned()),
+                                     command_prefix: Some((*p).to_owned()), ..Default::default() },
+          answer: PermissionOptionKind::RejectOnce,
+          reason: format!("run `{p}` through htui's `command_run` tool (R-MCP-4)"),
+      });
+      policy.rules.splice(0..0, denials);
+  }
+  ```
+  (`policy` becomes `mut`). `ToolScope.command_queue = tools.command_run`.
+- `cli/mod.rs` `disallowed` (`:177-190`): when `tools.command_run`, append `Bash(<p>:*)` per prefix
+  after the existing names (first occurrence kept).
+- `htui-worker/src/runtime.rs` `command_limits` (`:807-823`): the default becomes
+  `resolve_command_limits(None, &host.app_settings().await?)`; a stored box value overlays it through
+  `resolve_command_limits(Some(..), &app)`; doc updated (D15).
+- `tools/command.rs` flow: validate class ∈ {build, test, run} (`verify` → `refused: verify is the
+  orchestrator's`, PRD OQ-6); `cwd` relative, no `..` component, joined to `scope.cwd`, must exist;
+  `timeout_secs` ≤ 1800 (default 1800); `enqueue_command(NewCommandRun { status: Queued, cwd:
+  <joined path>, queued_at: clock.now(), .. })`; a **drop guard** that, unless disarmed, spawns
+  `cancel_command(id)` (`contained::spawn`); loop `claim_command(id, claimant = Uuid::now_v7() per
+  call, limit)` every 1 s (`COMMAND_ADMIT_POLL`), ticking progress (B-11); then `run_shell` with
+  `stop` = a beat loop (`beat_command` every `COMMAND_HEARTBEAT`; `Ok(false)` stops); scrub the tail
+  (`Unmasked` → output `"[output withheld: it matched credential rule <r>]"`, I-5), add the marker
+  `"[… earlier output truncated]\n"` when `truncated`; `finish_command(id, claimant, status, code,
+  Some(output))`; disarm; answer §2.10's JSON. Limits: `resolve_command_limits(box_row.settings
+  .get("command_limits"), &host.app_settings())` read per call through the session's host clone.
+
+### 11.3 Tests (written first)
+`migrations.rs`: the six `13` pins (`:96`, `:1017-1019`, `:1117`, `:1122`, `:1141`, `:1291-1294`) →
+`14` with "MOD-11's `0014_command_queue.sql`" in each message; new
+`the_command_run_liveness_columns_exist` (both columns nullable, comments present).
+Conformance (appended; `140` → `144` in both count pins):
+
+| Case | Pins |
+|---|---|
+| `enqueue_command_queues_on_an_existing_step` | `queued` row readable by `command_runs`; a `running` or stamped row → `command_not_queued`; unknown step → `NotFound { run_step }` |
+| `claim_command_admits_up_to_the_limit_in_queue_order` | three queued of one `(box, build)`, limit 2: first two admitted in `(queued_at, id)` order, third `Ok(None)` until one finishes; a younger row is not admitted ahead of an older one |
+| `beat_and_finish_need_the_claimant` | stranger's beat/finish → `Ok(false)`, row unchanged; claimant's finish → `done` with exit code and output; `finish` to `queued`/`running` → `command_finish_status` |
+| `cancel_command_ends_a_queued_or_running_row` | queued → cancelled; running → cancelled and the claimant's beat answers `false`; terminal → `Ok(false)`; unknown → `NotFound` |
+
+`mem.rs` `mod tests`: `a_stale_running_row_is_reaped_by_the_next_claim` (clock advanced past
+`COMMAND_STALE_AFTER`), `delete_project_leaves_no_row_in_any_map` extended (H-21).
+`pg_criteria.rs`: `concurrent_claims_never_exceed_the_class_limit` (two pools, 8 tasks × 3 commands,
+limit 2, every task loops claim → sleep 20 ms → finish; a sampler asserts `count(running) ≤ 2`
+throughout and all 24 end `done`); `a_stale_heartbeat_is_reaped_by_the_next_claim` (raw
+`UPDATE command_run SET heartbeat_at = now() - interval '1 minute'`).
+`kind.rs` `mod tests`: `off_never_exposes`, `always_always_exposes`,
+`fan_out_only_exposes_only_fanned_or_heavy`, `limits_overlay_the_box_over_the_app_default`,
+`a_missing_or_zero_class_limit_is_one`, `the_heavy_prefixes_are_the_oq5_list`.
+`runtime.rs`: `command_limits_falls_back_to_the_app_setting`.
+`htui-orch/src/conformance.rs`: `a_single_fan_out_fan_out_only_step_has_no_command_queue_section`,
+`a_fan_out_two_step_has_it`, `a_heavy_build_item_has_it`, `a_persona_less_exposed_step_gets_the_denials_first`,
+`a_persona_step_gets_the_denials_first_too`, `judges_never_get_command_run`; the existing MOD-26 case
+at `:7095-7137` (`Always`) is unchanged.
+`cli_driver.rs`: `command_run_exposure_denies_the_heavy_bash_prefixes`, `no_exposure_no_bash_denials`.
+`crates/htui-mcp/tests/tools_command.rs` (unix; `MemStore` backend; `sh` commands):
+`a_command_runs_after_admission_and_returns_its_tail`, `the_class_limit_queues_the_second_call`,
+`verify_and_unknown_classes_are_refused`, `cwd_must_stay_inside_the_session_cwd`,
+`a_timeout_kills_the_process_tree_and_fails` (`sh -c 'sleep 30 & sleep 30'`, timeout 1 s, no `sleep`
+left), `output_is_scrubbed_and_truncated_with_a_marker`, `a_cancelled_call_cancels_its_row`,
+`a_reaped_claim_stops_its_child`, `progress_ticks_while_queued`,
+`command_run_is_not_advertised_when_exposure_is_off`.
+
+### 11.4 Commits
+1. `feat(mod-11): T8 migration 0014 command_run liveness` — migration + `migrations.rs` pins; then
+   **migrate the scratch DB** (§15 `regen` runs `migrate run` first).
+2. `feat(mod-11): T8 command queue contract and MemStore reference` — traits, Mem, forwarders, four
+   cases + counts, Pg placeholders (`"MOD-11 T8: not yet implemented"`).
+3. `feat(mod-11): T8 PgStore command queue` — SQL, `.sqlx`, both `pg_criteria` tests.
+4. `feat(mod-11): T8 exposure resolver, limits and R-MCP-4 denials` — `kind.rs`, `runtime.rs`,
+   `engine.rs`, `cli/mod.rs` and their tests (expect prompt-digest churn, OQ-6/R-4: review every
+   moved snapshot and name it in the commit body).
+5. `feat(mod-11): T8 command_run executor and tool` — `verify.rs::run_shell`, `tools/command.rs`,
+   `tests/tools_command.rs`.
+
+### 11.5 Gate (G-T8)
+`regen` then `check`; `pg htui-store`; `nopg htui-core`; `nopg htui-agent`;
+`nopg htui-orch | tee …; grep -c SIGABRT` = 0; `nopg htui-worker`; `nopg htui-mcp`; `lint` on all six;
+`cargo fmt --all -- --check`; `grep -rn "MOD-11 T8: not yet implemented" crates` empty;
+`pgrep -f 'sleep 30'` empty after `tools_command`.
+
+---
+
+## 12. T9 — CLI `permission_prompt` (after T8)
+
+### 12.1 Files (plan)
+`htui-agent/src/prompt_bridge.rs`, `htui-agent/src/cli/{mod,claude}.rs`,
+`htui-agent/tests/{cli_driver,relay}.rs`, `htui-orch/src/{select,engine}.rs`,
+`crates/htui-mcp/src/tools/permission.rs`, `crates/htui-mcp/tests/tools_permission.rs` (new).
+
+### 12.2 Edits
+- `cli/mod.rs`: `Command` (`:483`) gains `Answer { request_id: PermissionRequestId, answer:
+  PermissionAnswer, done: oneshot::Sender<Result<()>> }`. `session_main` (`:912`) takes the port's
+  receiver once (`spec.prompt.as_ref().and_then(PromptPort::take)`) and selects it beside `commands`
+  and `lines`: each `PromptRequest` gets `request_id = tool_use_id.unwrap_or_else(|| format!("prompt-{n}"))`,
+  is parked in `pending: HashMap<PermissionRequestId, oneshot::Sender<PromptVerdict>>`, and is sent as
+  `DriverEvent::PermissionRequest(PermissionRequestEvent { request_id, tool_call_id: tool_use_id,
+  options: vec![PermissionOption { id: "allow", label: "Allow", kind: AllowOnce },
+  PermissionOption { id: "reject", label: "Reject", kind: RejectOnce }] })`. `Command::Answer` →
+  `Selected("allow")` → `Allow`; `Selected("reject")` → `Deny { message: "denied in htui" }`;
+  `Cancelled` → `Deny { message: "the session was cancelled" }`; unknown id → `Transport("no parked
+  request …")`. The answered `tool_use_id` is inserted into the mapper's `answered` set
+  (`claude.rs:87`, new `pub(crate) fn mark_answered(&mut self, id: &str)`), so `permission_denials[]`
+  does not report it again (§2.7, D18 dedup). On cancel/end every pending sender gets `Deny`.
+  `CliSession::answer_permission` (`:584-596`): with a port → `Command::Answer` and await `done`;
+  without → today's `Unsupported`. `argv`: when `spec.prompt.is_some()`, the pair
+  `--permission-prompt-tool`, `mcp__htui__permission_prompt` right after `--mcp-config=` (a pair is
+  safe: the flag is not variadic). `DriverCaps` for CLI stays all-false (D18).
+- `select.rs`/`engine.rs`: §2.12 `inline_prompt` and rule 3; start-time guard in `drive_once` after
+  `open_tools`: `transport == Cli && phase.gate_effective != Gate::Never && lease.prompt.is_none()` →
+  `Err(EngineError::Driver(DriverError::Spawn("missing_capability: inline_approval — a gated CLI
+  step needs htui's permission_prompt tool".into())))`.
+- `tools/permission.rs`: advertised per §2.10; `call` decodes `PromptCall`, `session.ask.ask(call)`,
+  answers `{"behavior":"allow","updatedInput":<input>}` / `{"behavior":"deny","message":…}`;
+  `PromptClosed` → deny with its sentence. Description: one line (the CLI hides the tool from the
+  model).
+
+### 12.3 Tests (written first)
+`cli_driver.rs`: `a_prompt_request_becomes_a_permission_request_event`,
+`answering_allow_completes_the_prompt_with_allow`, `answering_reject_completes_it_with_deny`,
+`a_cancel_denies_every_pending_prompt`, `argv_names_the_prompt_tool_only_with_a_port`,
+`a_prompt_denial_is_reported_once` (the §2.7 `permission_denials[]` line replayed after an answered
+prompt), `without_a_port_answer_permission_stays_unsupported`.
+`relay.rs`: `the_relay_answers_a_cli_prompt_from_the_store` (a CLI session over the
+`cli_driver.rs` child double parks through the port; the MOD-42 relay opens the row; an
+`answer_permission` from the store resolves it to `Allow`).
+`select.rs` `mod tests`: `a_cli_agent_takes_a_gated_phase_only_with_inline_prompt` (both ways),
+`an_acp_agent_is_unaffected_by_inline_prompt`.
+`engine.rs` `mod tests`: `a_gated_cli_step_without_a_prompt_port_is_refused_at_start`,
+`a_gated_cli_step_with_a_port_starts`.
+`tools_permission.rs`: `the_prompt_tool_is_advertised_only_on_cli_scopes`,
+`the_recorded_prompt_call_is_answered_allow_with_its_input` (§2.7 line id 2),
+`deny_carries_its_message`, `a_closed_session_answers_deny`.
+
+### 12.4 Commits
+1. `feat(mod-11): T9 CLI session answers permission prompts through the bridge` — `cli/`,
+   `prompt_bridge.rs` (any helper), `cli_driver.rs`.
+2. `feat(mod-11): T9 select admits CLI agents to gated phases with a prompt port` — `select.rs`,
+   `engine.rs`.
+3. `feat(mod-11): T9 permission_prompt tool` — `permission.rs`, `tools_permission.rs`.
+4. `test(mod-11): T9 relay answers a CLI prompt from the store` — `relay.rs`.
+
+### 12.5 Gate (G-T9)
+`nopg htui-agent`; `nopg htui-orch | tee …; grep -c SIGABRT` = 0; `nopg htui-mcp`;
+`lint htui-agent htui-orch htui-mcp`; `cargo fmt --all -- --check`.
+
+---
+
+## 13. T10 — docs (after T9)
+
+`docs/htui-mcp.md` (new): what the server is (one per session, `htui mcp` relay, host-side tools);
+the eight tools with their argument and answer shapes (§2.10) and when each is advertised; scoping
+(I-1, I-3, I-4, I-7); where the socket lives (`$XDG_RUNTIME_DIR` or the temp dir,
+`htui-mcp-<pid>-*`, `0700`; the Windows pipe name), what a crash leaves behind and that it is safe to
+delete; troubleshooting (`session ended`, `fenced: lease lost`, `version mismatch`, exit codes 1/2/3,
+long `command_run` calls and the client's MCP tool timeout, H-13); OQ-10: a persona `deny` of
+`mcp__*` or `mcp__htui__*` hides htui's tools, deliberately. `docs/htui-worker.md`: the worker hosts
+the listener; nothing listens on the network (OQ-1, ANA-16 §5.4 scoped reading). `docs/personas.md`:
+the deny note. Gate: `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`; one commit
+`docs(mod-11): T10 htui-mcp user doc, worker and persona notes`.
+
+---
+
+## 14. Hazards
+
+- **H-1 E0034 (every store task).** `MemStore`, `PgStore` and `Writer` implement both `WriteStore` and
+  `WorkerStore` (and the relay/recorder families); a module that imports two of them and calls
+  `store.write_step_document(..)` on a concrete type fails with E0034. Bound generics by path
+  (`S: htui_core::store::WorkerStore`), forward with UFCS, never `use htui_core::store::WorkerStore`
+  in `agent_worker.rs`, `store_worker.rs` or a conformance file. `htui-mcp` is generic over
+  `H: WorkerHost` and calls only `htui_core::store::WorkerStore::x(&session.store, ..)`.
+- **H-2 contain window (T2–T9).** `htui-agent` forbids raw spawns (`htui-agent/clippy.toml`); `htui-mcp`
+  copies the list (B-20) because its tasks run in the TUI. Use `htui_agent::contained::spawn` /
+  `spawn_in`; `run_shell`'s children are processes, not tasks. A crate-level `clippy.toml` must repeat
+  `msrv = "1.98"`.
+- **H-3 stack headroom (T6, T8, T9).** `every_case_name_dispatches` sits near the 2 MiB test stack
+  (memory). Box `open_tools` and any new await-heavy helper inside `drive_once`; the T8 item read is
+  inside the existing future — box it with the exposure computation if `SIGABRT` appears. Gate with
+  `--no-fail-fast` and grep `SIGABRT`.
+- **H-4 sqlx offline (T1, T8).** New `query!` macros need `.sqlx` regenerated against a **migrated
+  scratch DB** (`postgres://postgres@localhost:5439/htui_sqlx_mod11`, §15) — not the test DSN
+  (`HTUI_TEST_DATABASE_URL`) and not the compose `htui` DB (empty). T8 must migrate the scratch DB
+  after `0014` exists, before `prepare`. Byte-identical SQL reuses an entry (memory) — §2.4 reuses
+  `write_document`'s item lock, `add_note`'s insert and `record_command_run`'s insert on purpose.
+  Keep `--all-targets --all-features` on `prepare`.
+- **H-5 features (all `htui` tests).** Without `--features testkit` / `--all-features`, `htui/tests/*.rs`
+  run zero tests and report ok (memory). Every gate passes `--all-features`.
+- **H-6 exhaustive literals.** `SessionSpec` ×10 (T0), `EngineParts` ×10 (T6), `PromptSpec` ×7 (T6,
+  B-8), `SelectInput` ×14 (T9), `ChatArgs` ×2 + destructure (T6), `ProgressSink` ×1 (T6),
+  `FakeDriver` constructors (T3), `CliSession` ×1 (T9 if a field is added). None has `..`.
+- **H-7 conformance doc names.** A ≥4-underscore backticked name in `conformance.rs` docs must exist;
+  T1/T8 docs name Pg tests only once they exist (`pg_criteria.rs::name`).
+- **H-8 `zeta`.** Never in an identifier or fixture.
+- **H-9 uuid `v4`.** Declared on `htui-mcp`'s `uuid` only (F-20); `htui-agent` keeps `v7` (the port id
+  is `now_v7`, an identity).
+- **H-10 stale host (T6).** Forgetting the per-iteration `set_host` makes a new session after a
+  `SetDsn` write to the old server (B-2). Pinned by `a_session_keeps_the_store_it_was_opened_on` (T2);
+  the loop call is reviewed by eye.
+- **H-11 `/proc/<pid>/exe` (T2).** Valid only where the agent sees the host's `/proc` (same PID
+  namespace). A sandboxed agent (bubblewrap) may not; then the agent reports the server failed to
+  start and `document_write` is absent → `MissingDocument` (loud, OQ-9). `with_binary` is the
+  escape hatch; MOD-44 owns containers.
+- **H-12 `sun_path`.** 108 bytes (Linux), 104 (macOS); `XDG_RUNTIME_DIR` is short, macOS `$TMPDIR` is
+  ~50 chars — keep `htui-mcp-<pid>-<8hex>/s`.
+- **H-13 client tool timeouts (T8).** A 30-minute `command_run` may outlive an MCP client's tool-call
+  timeout; B-11's progress ticks help clients that reset on progress. Document in T10; do not raise the
+  30-minute default.
+- **H-14 the token in argv (E-1).** Visible to local users; harmless given the 0700 directory.
+- **H-15 tokio features.** The workspace `tokio` has no `net` and no `io-std`; `htui-mcp` declares both,
+  `htui` declares `io-std` for `mcp_cmd.rs` (feature unification would hide the omission until a
+  crate graph changes).
+- **H-16 Windows (T2).** `cargo check -p htui-mcp --target x86_64-pc-windows-gnu` compiles every
+  `cfg(windows)` path of `htui-agent`/`htui-orch` too; a `cfg(unix)`-only import in `channel.rs`
+  breaks it. Runtime is MOD-16's (R-10).
+- **H-17 `PromptPort::take` once.** A spec cloned before the CLI session starts shares the receiver;
+  only the transport takes it. Tests that clone a spec must not take the port.
+- **H-18 cancellation (T2, T8).** `notifications/cancelled` aborts the handler task: everything a tool
+  must undo lives in a drop guard (`command_run`'s `cancel_command`), never after an `.await`.
+- **H-19 no dev-dependency cycle.** Never add `htui-mcp` as a dev-dependency of `htui-orch` or
+  `htui-worker` (F-9); production-path tests live in `htui`.
+- **H-20 paused clocks.** Engine tests run `start_paused`; `FakeToolHost` does no I/O. `client(token)`
+  skips the handshake, so its 5 s budget never fires under a paused clock; socket tests run with a real
+  clock.
+- **H-21 MemStore maps (T8).** `command_claims` must be pruned by `State::delete_project`, and
+  `delete_project_leaves_no_row_in_any_map` must assert it (MOD-42 F-18 precedent).
+- **H-22 fenced sink (T6).** `ProgressSink`'s write can now answer `Fenced`; `after_done(..).await?`
+  makes it `EngineError::Store(Fenced)`, which `is_fenced` (`engine.rs:6325-6331`) maps to `LeaseLost`.
+  Every test `StepAuthor` already sets `produced_by_step_id` (verified: `htui/tests/{backlog,
+  worker_pg,runs_pg,worker_crash_pg,chat}.rs`, `htui/src/run_worker.rs:587`,
+  `htui-worker/src/runtime.rs:3304`).
+- **H-23 handoff inherits `document_tool` (T6).** `promote.rs:89` builds the handoff spec with
+  `..phase`; the promoted chat does advertise `document_write` when its snapshot resolves (OQ-8), so
+  the sentence stays true. A snapshot that fails to decode withholds the tool while the handoff prompt
+  still names it — acceptable (the step then fails `missing_output`, loudly).
+- **H-24 stdout is the protocol (T5).** `htui mcp` must not init tracing, print a banner or let Sentry
+  write to stdout; `main.rs`'s error line goes to stderr.
+- **H-25 drop order (T6).** In `drive_once`, `let lease` is declared before `let mut session`; Rust
+  drops locals in reverse order, so the agent process is cancelled before its token dies (B-17).
+- **H-26 one embedding model (T7).** Two `QdrantIndex` instances would load the 133 MB model twice;
+  share one (`shared_index`).
+
+**Hazards that change task ordering**: none changes the wave order. Two change order *inside* a task:
+T8 must land and apply `0014` to the scratch DB before its `.sqlx` regeneration (commit 1 before 3),
+and T6's commit (a) (the prompt) must precede (b) because the engine sets `document_tool`. One
+assertion moves between tasks: the fresh chat's "two tools" (OQ-8) can only be pinned once T7's
+`search_concepts` is real, so T6 pins `box_profile` alone and T7 pins both (in `tools_search.rs`).
+
+---
+
+## 15. Gate reference
+
+```bash
+LOCK="flock /tmp/mod11-pg.lock"                    # anything touching Postgres
+NOPG="env -u HTUI_TEST_DATABASE_URL"               # Postgres suites skip
+pg()   { $LOCK cargo test -p "$1" --all-features --no-fail-fast -- --test-threads=1; }
+nopg() { $NOPG cargo test -p "$1" --all-features --no-fail-fast -- --test-threads=1; }
+lint() { for c in "$@"; do cargo clippy -p "$c" --all-targets --all-features -- -D warnings || return 1; done; }
+# Scratch DB for `cargo sqlx prepare` (docs/hr-sandbox.md:196-205), once:
+#   psql -h localhost -p 5439 -U postgres -c 'CREATE DATABASE htui_sqlx_mod11;'
+SQLX_DB=postgres://postgres@localhost:5439/htui_sqlx_mod11
+regen() { (cd crates/htui-store && $LOCK env DATABASE_URL=$SQLX_DB sh -c \
+  'cargo sqlx migrate run --source migrations && cargo sqlx prepare -- --all-targets --all-features'); }
+check() { (cd crates/htui-store && $LOCK env DATABASE_URL=$SQLX_DB \
+  cargo sqlx prepare --check -- --all-targets --all-features); }
+```
+
+| Gate | Commands |
+|---|---|
+| G-T0 … G-T9 | per task, §3.4 … §12.5 |
+| G-W1 (after T1 ∥ T2 ∥ T3 merge) | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `SQLX_OFFLINE=true cargo check --workspace --all-targets --all-features`; `check`; `$LOCK cargo test --workspace --all-features --no-fail-fast -- --test-threads=1` |
+| G-Final (plan "Validation") | `cargo fmt --all -- --check`; `cargo clippy --workspace --all-targets --all-features -- -D warnings`; `$LOCK cargo test --workspace --all-features --no-fail-fast -- --test-threads=1 2>&1 \| tee /tmp/mod11-test.log`; `grep -c SIGABRT /tmp/mod11-test.log` = 0; `check`; `cargo check -p htui-mcp --target x86_64-pc-windows-gnu`; `cargo insta test --workspace --all-features` nothing pending (DSN unset); `bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh`; no orphan `htui mcp` / `sleep` processes; `ls ${XDG_RUNTIME_DIR:-/tmp} \| grep -c htui-mcp-` = 0 after the suite |
+
+`df -h .` before a full gate (memory: Postgres crash loop is disk pressure; `target/` fills the disk).
+
+---
+
+## 16. Pins
+
+- `RELAY_VERSION = "0.1.0+relay.1"`; `ENV_ADDR = "HTUI_MCP_ADDR"`; `ENV_TOKEN = "HTUI_MCP_TOKEN"`;
+  server name `htui`; args `["mcp"]`; prompt tool `mcp__htui__permission_prompt`.
+- `SUPPORTED_VERSIONS = ["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]`;
+  `MAX_LINE_BYTES = 1 MiB`; `HANDSHAKE_TIMEOUT = 5 s`.
+- Tool order: `box_profile, document_write, note_add, item_status, item_link, search_concepts,
+  command_run, permission_prompt`.
+- Note cap 16 384 bytes; search limit 1..=20 (default 10); `command_run` timeout ≤ 1800 s (default
+  1800), output tail 64 KiB, `COMMAND_HEARTBEAT = 10 s`, `COMMAND_STALE_AFTER = 30 s`,
+  `COMMAND_ADMIT_POLL = 1 s`.
+- `HEAVY_COMMAND_PREFIXES` in OQ-5's order (§11.2).
+- D19 sentence (§2.12), exact bytes.
+- Conformance count: 134 → 140 (T1) → 144 (T8). Migrations: 13 → 14.
