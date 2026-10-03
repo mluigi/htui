@@ -36,7 +36,8 @@ use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
     Agent, AgentBox, AgentId, Billing, DocumentId, EventKind, ItemId, NewDocument, NewRepo, RepoId,
-    RunId, RunMode, RunStatus, RunStep, SessionEvent, SnapshotPhase, StepId, StepStatus, Transport,
+    RunId, RunMode, RunStatus, RunStep, SessionEvent, SnapshotPhase, StepId, StepOpening,
+    StepStatus, Transport,
 };
 use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -1012,6 +1013,17 @@ fn handoff_only(mut row: Agent) -> Agent {
 /// the demo box (the candidate chain's rung 3), and a primary repo for the demo project, whose
 /// tree the promoted step chats in. The row hands off on promotion ([`handoff_only`]).
 async fn graph_store() -> MemStore {
+    graph_store_with(handoff_only).await
+}
+
+/// MOD-37 M5: [`graph_store`] with the scripted row's default ACP settings, so its caps say
+/// `resume` and a promotion of a step with a banner resumes the step's own session.
+async fn resumable_graph_store() -> MemStore {
+    graph_store_with(|row| row).await
+}
+
+/// [`graph_store`]'s body, with the scripted row passed through `row` before it lands.
+async fn graph_store_with(row: fn(Agent) -> Agent) -> MemStore {
     let store = MemStore::demo();
     for summary in store.agents().await.expect("the fixture's agents") {
         let mut row = summary.agent;
@@ -1020,7 +1032,7 @@ async fn graph_store() -> MemStore {
     }
     let agent_id = AgentId::new();
     store
-        .upsert_agent(&handoff_only(scripted_row(agent_id, Transport::Acp)), None)
+        .upsert_agent(&row(scripted_row(agent_id, Transport::Acp)), None)
         .await
         .expect("the scripted row lands");
     store
@@ -1071,7 +1083,11 @@ fn chat_runtime(chat: Script) -> AgentRuntime {
 
 /// A shell with a Chat tab, both runtimes, and the graph fixture behind them.
 async fn promotion_harness(chat: Script) -> (Harness, MemStore) {
-    let store = graph_store().await;
+    promotion_harness_over(graph_store().await, chat).await
+}
+
+/// [`promotion_harness`] over `store`.
+async fn promotion_harness_over(store: MemStore, chat: Script) -> (Harness, MemStore) {
     let mut harness = Harness::over(store.clone())
         .with_tab(Box::new(ChatTab::new()))
         .with_replay_tab(ChatTab::ID)
@@ -1180,6 +1196,53 @@ async fn promotion_opens_the_chat_on_the_same_step() {
         "the header shows the whole session ref: {rendered}"
     );
     stable().bind(|| insta::assert_snapshot!("chat_promoted", rendered));
+}
+
+/// MOD-37 M5 (R-48): an ACP row whose caps say `resume` resumes a promoted step that has a
+/// banner. The header says `resumed`, the opening is the resume sentence, and the step records
+/// that it resumed. The fake ignores `spec.resume` and mints the same `fake-<step>` id, so the
+/// banner matches.
+#[tokio::test]
+async fn an_acp_promotion_with_a_banner_resumes_its_session() {
+    let (mut harness, store) = promotion_harness_over(
+        resumable_graph_store().await,
+        Script::one_turn(vec![chunk("Picking the step back up."), done()]),
+    )
+    .await;
+    let (run, step) = parked(&mut harness, &store).await;
+
+    promote(&mut harness, run, step.id).await;
+
+    assert_eq!(harness.app().status, None, "nothing was refused");
+    assert_eq!(harness.chat_steps(), vec![step.id]);
+    let rendered = harness.render();
+    assert!(
+        rendered.contains(&format!(
+            "promoted · {} · resumed · scripted · sonnet",
+            step.phase_name
+        )),
+        "the header says the session resumed: {rendered}"
+    );
+    let log = log_of(&store, step.id).await;
+    let follow_up = log
+        .iter()
+        .find(|row| row.kind == EventKind::FollowUp)
+        .expect("the opening is recorded");
+    assert_eq!(
+        follow_up
+            .payload
+            .get("text")
+            .and_then(serde_json::Value::as_str),
+        Some(htui_orch::promote::RESUME_OPENING),
+        "the opening is the resume sentence"
+    );
+    let runs = store.runs(ids::HTUI_ANA_2).await.expect("the read answers");
+    let summary = runs
+        .iter()
+        .flat_map(|run| &run.steps)
+        .find(|summary| summary.id == step.id)
+        .expect("the step is on the item's run");
+    assert_eq!(summary.opening, Some(StepOpening::Resumed));
 }
 
 /// Review L-3: promoting a step whose agent is switched off on this box (`agent_box.user_off`) is

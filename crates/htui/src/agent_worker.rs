@@ -4487,7 +4487,7 @@ pub(crate) mod tests {
     use htui_agent::fake::FakeAdapter;
     use htui_core::fixtures::{edit_agent, ids};
     use htui_core::model::{
-        Agent, AgentId, EventKind, EventRole, RunId, Scope, StepStatus, Transport,
+        Agent, AgentId, EventKind, EventRole, RunId, Scope, StepOpening, StepStatus, Transport,
     };
     use htui_core::store::MemStore;
     use std::sync::Arc;
@@ -4934,6 +4934,115 @@ pub(crate) mod tests {
         }
     }
 
+    /// Where [`FailingStarts`] writes down every `(spec, prompt)` it was started with.
+    type StartLog = Arc<Mutex<Vec<(SessionSpec, String)>>>;
+
+    /// The errors [`FailingStarts`] fails its next starts with, front first.
+    type Failures = Arc<Mutex<std::collections::VecDeque<DriverError>>>;
+
+    /// MOD-37 M5: the fake driver, failing its first starts with `failures` (front first) and
+    /// writing down every `(spec, prompt)` it was started with.
+    #[derive(Debug)]
+    struct FailingStarts {
+        inner: Box<dyn AgentDriver>,
+        starts: StartLog,
+        failures: Failures,
+    }
+
+    impl AgentDriver for FailingStarts {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
+            // Both locks released here, as in `SpecSpy::start`: the future below is `Send`.
+            self.starts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((spec.clone(), prompt.clone()));
+            let failure = self
+                .failures
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front();
+            if let Some(err) = failure {
+                return Box::pin(async move { Err(err) });
+            }
+            self.inner.start(spec, prompt)
+        }
+    }
+
+    /// [`FakeBuilder`]'s twin for [`FailingStarts`]: one queue of failures and one start log
+    /// shared by every driver the factory builds.
+    #[derive(Debug)]
+    struct FailingBuilder {
+        adapter: Arc<FakeAdapter>,
+        starts: StartLog,
+        failures: Failures,
+    }
+
+    impl htui_agent::registry::TransportBuilder for FailingBuilder {
+        fn build(
+            &self,
+            agent: &Agent,
+            on_box: Option<&AgentBox>,
+            caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            Ok(Box::new(FailingStarts {
+                inner: self.adapter.build(agent, on_box, caps)?,
+                starts: Arc::clone(&self.starts),
+                failures: Arc::clone(&self.failures),
+            }))
+        }
+    }
+
+    /// MOD-37 M5: [`fixture_with_spec_spy`]'s shape over [`FailingStarts`], whose first starts
+    /// fail with `failures`.
+    async fn fixture_with_failing_starts(
+        script: Script,
+        failures: Vec<DriverError>,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId, StartLog) {
+        let store = MemStore::from_demo(htui_core::fixtures::demo_data());
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&fake_row(agent_id), None)
+            .await
+            .expect("the fake row lands");
+
+        let adapter = Arc::new(FakeAdapter::new());
+        adapter.load(script);
+        let starts: StartLog = Arc::new(Mutex::new(Vec::new()));
+        let mut factory = DriverFactory::new();
+        factory.register(
+            "cli/fake",
+            Box::new(FailingBuilder {
+                adapter,
+                starts: Arc::clone(&starts),
+                failures: Arc::new(Mutex::new(failures.into())),
+            }),
+        );
+
+        let backend = Backend::memory(store.clone());
+        let runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
+        (store, backend, runtime, agent_id, starts)
+    }
+
+    /// The starts [`FailingStarts`] saw, in order.
+    fn starts_of(starts: &StartLog) -> Vec<(SessionSpec, String)> {
+        starts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
     fn envelope(seq: Seq, request: StoreRequest) -> RequestEnvelope {
         RequestEnvelope {
             seq,
@@ -5191,6 +5300,355 @@ pub(crate) mod tests {
             follow_up.payload.get("text").and_then(Value::as_str),
             Some(htui_orch::promote::RESUME_OPENING)
         );
+        assert_eq!(
+            opening_of(&store, ids::STEP_PLAN).await,
+            Some(StepOpening::Resumed),
+            "a resume that started is recorded as one (MOD-37 M5)"
+        );
+        assert!(
+            !log.iter().any(is_resume_failed),
+            "and no `resume_failed` row is written: {log:?}"
+        );
+    }
+
+    /// MOD-37 M5: `run_step.opening` of the fixture's step, read through the item's run summary,
+    /// the read the Runs pane makes.
+    async fn opening_of(store: &MemStore, step: StepId) -> Option<StepOpening> {
+        let item = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run")
+            .item_id
+            .expect("the fixture's run is an item's");
+        store
+            .runs(item)
+            .await
+            .expect("the read answers")
+            .into_iter()
+            .find(|run| run.id == ids::RUN_1)
+            .expect("the fixture's run is the item's")
+            .steps
+            .into_iter()
+            .find(|summary| summary.id == step)
+            .expect("the fixture's step is the run's")
+            .opening
+    }
+
+    /// Whether `row` is `htui`'s `resume_failed` notice.
+    fn is_resume_failed(row: &SessionEvent) -> bool {
+        row.kind == EventKind::Other
+            && row.payload.get("update").and_then(Value::as_str)
+                == Some(htui_agent::event::RESUME_FAILED)
+    }
+
+    /// Whether `reply` is the tab's copy of the `resume_failed` notice.
+    fn is_resume_failed_frame(reply: &ReplyEnvelope) -> bool {
+        matches!(
+            &reply.reply,
+            StoreReply::Chat(ChatFrame::Event(envelope))
+                if matches!(&envelope.event, DriverEvent::Other(other)
+                    if other.update == htui_agent::event::RESUME_FAILED)
+        )
+    }
+
+    /// Whether `reply` is the tab's copy of a `follow_up` row.
+    fn is_follow_up_frame(reply: &ReplyEnvelope) -> bool {
+        matches!(
+            &reply.reply,
+            StoreReply::Chat(ChatFrame::Event(envelope))
+                if matches!(&envelope.event, DriverEvent::Other(other) if other.update == "follow_up")
+        )
+    }
+
+    /// MOD-37 M5: the opening a resume would try, with its handoff fallback.
+    fn resume_path() -> OpeningPath {
+        OpeningPath::Resume {
+            session_ref: htui_agent::driver::AgentSessionRef::new("banner-1"),
+            text: htui_orch::promote::RESUME_OPENING.to_owned(),
+            handoff: "HANDOFF TEXT".to_owned(),
+            digest: "d".to_owned(),
+        }
+    }
+
+    /// Attaches `promoted` and drives its task to the end without a cancel: for a chat that fails
+    /// to start, which [`attach_and_end`]'s `ChatCancel` would find already gone.
+    async fn attach_and_await(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        promoted: crate::run_worker::Promoted,
+    ) -> Vec<ReplyEnvelope> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Served::Start { task, .. } = runtime
+            .attach_promoted(backend, &tx, promote_addr(), promoted)
+            .await
+        else {
+            panic!("a promotion over a registered row opens a session")
+        };
+        task.await;
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+        replies
+    }
+
+    /// MOD-37 M5 (a): a handoff opening starts once, with no resume, and records `handoff`.
+    #[tokio::test]
+    async fn a_handoff_promotion_records_handoff() {
+        let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            Vec::new(),
+        )
+        .await;
+        let promotion = promoted(
+            agent_id,
+            OpeningPath::Handoff {
+                text: "pick up where the step stopped".to_owned(),
+                digest: "d-handoff".to_owned(),
+            },
+        );
+
+        let replies = attach_and_end(&mut runtime, &backend, promotion, async |_| {}).await;
+
+        let starts = starts_of(&starts);
+        assert_eq!(starts.len(), 1, "one start: {starts:?}");
+        assert_eq!(starts[0].0.resume, None, "a handoff resumes nothing");
+        assert!(
+            !replies.iter().any(is_resume_failed_frame),
+            "no notice: {replies:?}"
+        );
+        assert_eq!(
+            opening_of(&store, ids::STEP_PLAN).await,
+            Some(StepOpening::Handoff)
+        );
+    }
+
+    /// MOD-37 M5 (c): a resume that fails is reported, then the chat opens with the handoff in
+    /// the same bind. The notice is `htui`'s `other` row in the step's current turn, the handoff
+    /// is the next turn's `follow_up`, and the tab hears the notice after the acceptance and
+    /// before the opening.
+    #[tokio::test]
+    async fn a_failed_resume_reports_then_opens_the_handoff() {
+        let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            vec![DriverError::Transport(
+                "session/load failed: no such session".to_owned(),
+            )],
+        )
+        .await;
+        let tail = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("the fixture's step has a log");
+        let last_seq = tail.iter().map(|row| row.seq).max().expect("a tail");
+        let last_turn = tail.iter().map(|row| row.turn).max().expect("a tail");
+
+        let replies = attach_and_end(
+            &mut runtime,
+            &backend,
+            promoted(agent_id, resume_path()),
+            async |_| {},
+        )
+        .await;
+
+        let starts = starts_of(&starts);
+        assert_eq!(starts.len(), 2, "the resume, then the handoff: {starts:?}");
+        let (first, first_prompt) = &starts[0];
+        let (second, second_prompt) = &starts[1];
+        assert_eq!(
+            first.resume,
+            Some(htui_agent::driver::AgentSessionRef::new("banner-1"))
+        );
+        assert_eq!(first_prompt, htui_orch::promote::RESUME_OPENING);
+        assert_eq!(second.resume, None, "the fallback resumes nothing");
+        assert_eq!(second_prompt, "HANDOFF TEXT");
+        assert_eq!(second.step_id, first.step_id, "the same step");
+        assert_eq!(second.cwd, first.cwd, "in the same tree");
+        assert_eq!(second.extra_dirs, first.extra_dirs);
+
+        let log = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        let past: Vec<&SessionEvent> = log.iter().filter(|row| row.seq > last_seq).collect();
+        assert!(past.len() >= 2, "the notice and the opening: {past:?}");
+        let notice = past[0];
+        assert!(
+            is_resume_failed(notice),
+            "the notice comes first: {notice:?}"
+        );
+        assert_eq!(
+            (notice.seq, notice.turn),
+            (last_seq + 1, last_turn),
+            "in the step's current turn"
+        );
+        assert_eq!(notice.role, EventRole::Htui, "`htui` authors the notice");
+        let body = notice.payload.get("body").expect("a body");
+        assert_eq!(body.get("session_id"), Some(&json!("banner-1")));
+        assert!(
+            body.get("reason")
+                .and_then(Value::as_str)
+                .is_some_and(|reason| reason.contains("no such session")),
+            "the reason quotes the failure: {body}"
+        );
+        assert_eq!(
+            body.get("note").and_then(Value::as_str),
+            Some(htui_orch::promote::CONTEXT_NOT_CARRIED)
+        );
+        let follow_up = past[1];
+        assert_eq!(follow_up.kind, EventKind::FollowUp);
+        assert_eq!(
+            (follow_up.seq, follow_up.turn),
+            (last_seq + 2, last_turn + 1),
+            "the handoff opens the next turn"
+        );
+        assert_eq!(
+            follow_up.payload.get("text").and_then(Value::as_str),
+            Some("HANDOFF TEXT")
+        );
+        assert_eq!(
+            opening_of(&store, ids::STEP_PLAN).await,
+            Some(StepOpening::ResumeFailed)
+        );
+
+        let accepted = replies
+            .iter()
+            .position(|reply| {
+                matches!(reply.reply, StoreReply::ChatAccepted { .. }) && reply.seq == 7
+            })
+            .unwrap_or_else(|| panic!("the chat was accepted: {replies:?}"));
+        let reported = replies
+            .iter()
+            .position(is_resume_failed_frame)
+            .unwrap_or_else(|| panic!("the tab hears the notice: {replies:?}"));
+        let opened = replies
+            .iter()
+            .position(is_follow_up_frame)
+            .unwrap_or_else(|| panic!("the tab hears the opening: {replies:?}"));
+        assert!(
+            accepted < reported && reported < opened,
+            "acceptance, notice, opening: {replies:?}"
+        );
+        assert!(
+            !replies
+                .iter()
+                .any(|reply| matches!(reply.reply, StoreReply::Failed { .. })),
+            "nothing failed: {replies:?}"
+        );
+    }
+
+    /// MOD-37 M5 (d): a fallback whose own start fails fails the chat as before, after the notice.
+    /// The step keeps `resume_failed` and its notice row, and has no opening.
+    #[tokio::test]
+    async fn a_failed_resume_whose_handoff_fails_too_fails_the_chat() {
+        let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            vec![
+                DriverError::Transport("a".to_owned()),
+                DriverError::Transport("second refusal".to_owned()),
+            ],
+        )
+        .await;
+        let tail_len = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("the fixture's step has a log")
+            .len();
+
+        let replies =
+            attach_and_await(&mut runtime, &backend, promoted(agent_id, resume_path())).await;
+
+        assert_eq!(starts_of(&starts).len(), 2, "the resume, then the handoff");
+        let reported = replies
+            .iter()
+            .position(is_resume_failed_frame)
+            .unwrap_or_else(|| panic!("the tab hears the notice: {replies:?}"));
+        let refused = replies
+            .iter()
+            .position(|reply| {
+                matches!(&reply.reply, StoreReply::Failed { request, message }
+                    if *request == PROMOTE_STEP && message.contains("second refusal"))
+            })
+            .unwrap_or_else(|| panic!("the promotion is refused: {replies:?}"));
+        let ended = replies
+            .iter()
+            .position(|reply| matches!(reply.reply, StoreReply::Chat(ChatFrame::Failed { .. })))
+            .unwrap_or_else(|| panic!("the chat failed: {replies:?}"));
+        assert!(
+            reported < refused && refused < ended,
+            "notice, refusal, failure: {replies:?}"
+        );
+
+        let log = store
+            .step_events(ids::STEP_PLAN)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        assert_eq!(
+            log.len(),
+            tail_len + 1,
+            "the notice and nothing else: {log:?}"
+        );
+        assert!(log.iter().any(is_resume_failed));
+        assert!(
+            !log.iter().any(|row| row.kind == EventKind::FollowUp),
+            "no opening was recorded"
+        );
+        assert_eq!(
+            opening_of(&store, ids::STEP_PLAN).await,
+            Some(StepOpening::ResumeFailed)
+        );
+    }
+
+    /// MOD-37 M5 (e, A-2, A-5): a resume whose adapter cannot run at all does not fall back: the
+    /// handoff would fail the same way. One start, the failure as before, no notice, no opening.
+    #[tokio::test]
+    async fn a_resume_that_cannot_spawn_does_not_fall_back() {
+        for failure in [
+            DriverError::Spawn("gone".to_owned()),
+            DriverError::Unresolved("node".to_owned()),
+        ] {
+            let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+                Script::one_turn(vec![ends(StopReason::EndTurn)]),
+                vec![failure.clone()],
+            )
+            .await;
+
+            let replies =
+                attach_and_await(&mut runtime, &backend, promoted(agent_id, resume_path())).await;
+
+            assert_eq!(starts_of(&starts).len(), 1, "{failure:?}: one start");
+            assert!(
+                replies.iter().any(|reply| matches!(
+                    &reply.reply,
+                    StoreReply::Failed { request, .. } if *request == PROMOTE_STEP
+                )),
+                "{failure:?}: the promotion is refused: {replies:?}"
+            );
+            assert!(
+                !replies.iter().any(is_resume_failed_frame),
+                "{failure:?}: no notice: {replies:?}"
+            );
+            let log = store
+                .step_events(ids::STEP_PLAN)
+                .await
+                .expect("the log reads")
+                .expect("a log");
+            assert!(
+                !log.iter().any(is_resume_failed),
+                "{failure:?}: no notice row"
+            );
+            assert_eq!(
+                opening_of(&store, ids::STEP_PLAN).await,
+                None,
+                "{failure:?}: no opening"
+            );
+        }
     }
 
     /// Blueprint D205: a promoted session neither mints a `run(kind='chat')` nor closes one — the
