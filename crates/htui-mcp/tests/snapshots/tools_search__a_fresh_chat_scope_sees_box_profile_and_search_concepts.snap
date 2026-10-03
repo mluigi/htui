@@ -1,0 +1,81 @@
+---
+source: crates/htui-mcp/tests/tools_search.rs
+expression: "serde_json::to_string_pretty(&listed[\"result\"][\"tools\"]).expect(\"serialises\")"
+---
+[
+  {
+    "name": "box_profile",
+    "description": "Describes the machine this session runs on: its OS, CPU, RAM, GPU and the tools found on it.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "title": "BoxProfileArgs"
+    }
+  },
+  {
+    "name": "search_concepts",
+    "description": "Searches this project's items, documents and requirements by meaning.",
+    "inputSchema": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "query": {
+          "type": "string",
+          "description": "What to look for, in words; an exact key such as `HTUI-12` matches too."
+        },
+        "types": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "item",
+              "document",
+              "requirement"
+            ]
+          },
+          "description": "Point types to keep; every type when omitted.",
+          "default": null
+        },
+        "statuses": {
+          "type": [
+            "array",
+            "null"
+          ],
+          "items": {
+            "type": "string",
+            "enum": [
+              "open",
+              "queued",
+              "in_progress",
+              "awaiting_approval",
+              "blocked",
+              "done",
+              "failed",
+              "closed"
+            ]
+          },
+          "description": "Item statuses to keep; every status when omitted; any status leaves requirements out.",
+          "default": null
+        },
+        "limit": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 1,
+          "description": "At most this many hits, 1 to 20; 10 when omitted.",
+          "maximum": 20,
+          "default": null
+        }
+      },
+      "required": [
+        "query"
+      ],
+      "title": "SearchArgs"
+    }
+  }
+]
