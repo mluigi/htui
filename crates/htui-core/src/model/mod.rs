@@ -82,6 +82,7 @@ pub mod box_;
 pub mod document;
 pub mod event;
 pub mod frontmatter;
+pub mod hand_written;
 pub mod hierarchy;
 pub mod ids;
 pub mod item;
@@ -112,6 +113,7 @@ pub use box_::{
 };
 pub use document::{Document, DocumentHead, NewDocument, ResolvedInput};
 pub use event::{EventKind, EventRole, SessionEvent};
+pub use hand_written::HandWrittenError;
 pub use hierarchy::{
     NewProject, NewRepo, NewWorkspace, Project, ProjectPatch, ProjectRef, Repo, RepoBoxPath,
     RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
