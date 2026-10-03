@@ -1155,6 +1155,98 @@ mod tests {
         );
     }
 
+    /// MOD-37 M5 (ANA-27 T5): a promotion that asked to resume says `resumed` until the worker's
+    /// `resume_failed` notice arrives; then the chat opened with the handoff, and the header says
+    /// so for the rest of the chat. The transcript shows the sentence once. The notice on a chat
+    /// no promotion opened changes no header.
+    #[test]
+    fn a_resume_failed_event_turns_the_header_to_handoff() {
+        use htui_agent::event::OtherEvent;
+        use htui_orch::promote::CONTEXT_NOT_CARRIED;
+
+        const REASON: &str = "session/load failed: gone";
+        let shell = Shell::new();
+        let other = |update: &str, body: serde_json::Value| {
+            StoreReply::Chat(ChatFrame::Event(Box::new(DriverEnvelope {
+                event: DriverEvent::Other(OtherEvent {
+                    update: update.to_owned(),
+                    body,
+                }),
+                raw: None,
+                at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+            })))
+        };
+        let resume_failed = other(
+            htui_agent::event::RESUME_FAILED,
+            json!({ "session_id": "s1", "reason": REASON, "note": CONTEXT_NOT_CARRIED }),
+        );
+        let header = |tab: &ChatTab| -> String {
+            tab.header(&shell.ctx(), 200)
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        };
+
+        let mut tab = ChatTab::new();
+        let step = StepId::new();
+        tab.on_reply(
+            &StoreReply::Orch(OrchReply::Promoted {
+                step,
+                run: htui_core::model::RunId::new(),
+                phase: "research".to_owned(),
+                agent: "scripted".to_owned(),
+                model: None,
+                via: Via::Resumed,
+            }),
+            &mut shell.ctx(),
+        );
+        tab.on_reply(
+            &StoreReply::ChatAccepted {
+                step_id: step,
+                session_ref: None,
+                caps: live(&shell).session().expect("a session").caps,
+            },
+            &mut shell.ctx(),
+        );
+        assert!(header(&tab).contains(" · resumed · "), "{}", header(&tab));
+
+        tab.on_reply(&resume_failed, &mut shell.ctx());
+        assert_eq!(tab.promoted().map(|header| header.via), Some(Via::Handoff));
+        let text = header(&tab);
+        assert!(
+            text.contains(" · handoff · ") && !text.contains("resumed"),
+            "{text}"
+        );
+        assert_eq!(
+            tab.transcript.rows(),
+            &[TranscriptRow::ResumeFailed {
+                reason: REASON.to_owned(),
+                note: CONTEXT_NOT_CARRIED.to_owned(),
+            }],
+            "the sentence, once"
+        );
+
+        tab.on_reply(
+            &other("follow_up", json!({ "text": "the handoff prompt" })),
+            &mut shell.ctx(),
+        );
+        assert_eq!(
+            tab.promoted().map(|header| header.via),
+            Some(Via::Handoff),
+            "the handoff's opening leaves the header where the notice put it"
+        );
+
+        let mut fresh = live(&shell);
+        let before = header(&fresh);
+        fresh.on_reply(&resume_failed, &mut shell.ctx());
+        assert!(
+            fresh.promoted().is_none(),
+            "no promotion, no promoted header"
+        );
+        assert_eq!(header(&fresh), before);
+    }
+
     /// Verifier finding (D165): the session ref is what a later `session/load` reads back, so a
     /// header too wide for its line drops the `session ` label, then cuts the fields before the
     /// ref — never the ref itself.

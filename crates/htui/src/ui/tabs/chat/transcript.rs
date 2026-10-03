@@ -129,6 +129,13 @@ pub enum TranscriptRow {
         /// Why it ended.
         stop_reason: StopReason,
     },
+    /// MOD-37 M5: a promoted chat's resume failed and it opened with the handoff prompt instead.
+    ResumeFailed {
+        /// Why, as the driver said it (the adapter's stderr tail included).
+        reason: String,
+        /// `promote::CONTEXT_NOT_CARRIED`.
+        note: String,
+    },
     /// Anything else the protocol said, named but not interpreted.
     Other {
         /// The transport's own name for it.
@@ -617,6 +624,7 @@ impl Transcript {
                 format!("— turn ended ({}) —", stop_reason.as_str()),
                 theme.dim,
             )],
+            TranscriptRow::ResumeFailed { .. } => todo!("red (MOD-37 T5): the resume_failed row"),
             TranscriptRow::Other { update } => {
                 vec![Line::styled(format!("· {update}"), theme.dim)]
             }
@@ -819,6 +827,76 @@ mod tests {
         assert_eq!(
             transcript.session_ref().map(AgentSessionRef::as_str),
             Some("abc-123")
+        );
+    }
+
+    /// MOD-37 M5 (ANA-27 T5): `htui`'s `resume_failed` notice is one row, its reason then the
+    /// note, live and on replay alike; a body with no note still says the context was not carried.
+    #[test]
+    fn a_resume_failed_notice_is_one_row_with_its_reason_and_note() {
+        use chrono::TimeZone as _;
+        use htui_core::fixtures::ids;
+        use htui_core::model::{EventKind, EventRole};
+        use htui_orch::promote::CONTEXT_NOT_CARRIED;
+
+        const REASON: &str = "session/load failed: gone\nstderr: no such session";
+        let notice = |body: serde_json::Value| OtherEvent {
+            update: htui_agent::event::RESUME_FAILED.to_owned(),
+            body,
+        };
+        let body = json!({ "session_id": "s1", "reason": REASON, "note": CONTEXT_NOT_CARRIED });
+        let expected = [TranscriptRow::ResumeFailed {
+            reason: REASON.to_owned(),
+            note: CONTEXT_NOT_CARRIED.to_owned(),
+        }];
+
+        let mut live = Transcript::new();
+        live.apply(&envelope(DriverEvent::Other(notice(body.clone()))));
+        assert_eq!(live.rows(), &expected, "one row, live");
+
+        let theme = Theme::default();
+        let lines = live.render_row(&live.rows()[0], &theme);
+        let shown: Vec<String> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            shown,
+            [
+                "resume failed  session/load failed: gone",
+                "  stderr: no such session",
+                CONTEXT_NOT_CARRIED,
+            ],
+        );
+        assert_eq!(lines[0].style, theme.error, "the failure");
+        assert_eq!(lines[1].style, theme.dim, "the rest of the reason");
+        assert_eq!(lines[2].style, theme.accent, "what the chat opened with");
+
+        let persisted = SessionEvent {
+            run_step_id: ids::STEP_PLAN,
+            seq: 3,
+            turn: 0,
+            kind: EventKind::Other,
+            role: EventRole::Htui,
+            tool_call_id: None,
+            payload: serde_json::to_value(notice(body)).expect("an other event encodes"),
+            raw: None,
+            at: Utc.timestamp_opt(0, 0).single().expect("epoch is a time"),
+        };
+        assert_eq!(
+            Transcript::from_rows(&[persisted]).rows(),
+            &expected,
+            "replay reaches the same row"
+        );
+
+        let mut bare = Transcript::new();
+        bare.apply(&envelope(DriverEvent::Other(notice(
+            json!({ "session_id": "s1", "reason": "gone" }),
+        ))));
+        assert_eq!(
+            bare.rows(),
+            &[TranscriptRow::ResumeFailed {
+                reason: "gone".to_owned(),
+                note: CONTEXT_NOT_CARRIED.to_owned(),
+            }],
+            "an absent note reads as the context not carried"
         );
     }
 

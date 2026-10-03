@@ -1148,6 +1148,21 @@ fn note_line(step: &RunStepSummary, theme: &Theme) -> Option<Line<'static>> {
     ]))
 }
 
+/// MOD-37 M5 (ANA-27 T5): the two lines under a step whose promoted chat opened without its context,
+/// split at `; ` so neither is cut at the pane's 35 free columns. Joined with a space they are
+/// `promote::CONTEXT_NOT_CARRIED`, and `resume failed; ` before it.
+const OPENING_HANDOFF: [&str; 2] = ["context not carried;", "handoff prompt only"];
+/// See [`OPENING_HANDOFF`].
+const OPENING_RESUME_FAILED: [&str; 2] =
+    ["resume failed; context not carried;", "handoff prompt only"];
+
+/// MOD-37 M5: [`OPENING_HANDOFF`] or [`OPENING_RESUME_FAILED`] under a step whose `opening` says the
+/// context was not carried, at any status; nothing for `resumed` or no opening.
+fn opening_lines(_step: &RunStepSummary, _theme: &Theme) -> Vec<Line<'static>> {
+    // Red (MOD-37 T5): no lines yet.
+    Vec::new()
+}
+
 /// A relayed request's options as the strip takes them (MOD-42 blueprint F-19: the orphan rule
 /// forbids a `From` between core's and the agent crate's types).
 fn strip_options(options: &[RelayOption]) -> Vec<PermissionOption> {
@@ -1714,7 +1729,7 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
-        GateOutcome, PermissionStatus, ProjectRef, RelaySessionId, Scope, WorkspaceId,
+        GateOutcome, PermissionStatus, ProjectRef, RelaySessionId, Scope, StepOpening, WorkspaceId,
     };
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
@@ -2044,6 +2059,102 @@ mod tests {
         step.gate_note = Some("a note".to_owned());
         step.status = StepStatus::Running;
         assert!(note_line(&step, &theme).is_none(), "only a parked step");
+    }
+
+    /// The text of the list's lines, trailing blanks trimmed: every line, where [`lines`] stops at
+    /// the test terminal's sixteen rows.
+    fn list_text(pane: &RunsTab, theme: &Theme) -> Vec<String> {
+        pane.list_lines(theme)
+            .0
+            .iter()
+            .map(|line| text(line).trim_end().to_owned())
+            .collect()
+    }
+
+    /// MOD-37 M5 (ANA-27 T5): a step whose promoted chat opened without its context carries two
+    /// more lines, verbatim and indented to the status column, after R-3's reason when both exist.
+    /// `resumed` adds nothing, and the lines show at any status.
+    #[tokio::test]
+    async fn an_opening_without_its_context_adds_two_lines_under_the_step() {
+        const NOTE: &str = "judge failed: orderings disagree";
+        let shell = Shell::new();
+        let mut runs = feat_1_runs().await;
+        runs[0].steps[2].status = StepStatus::AwaitingApproval;
+        runs[0].steps[2].gate_note = Some(NOTE.to_owned());
+        runs[0].steps[2].opening = Some(StepOpening::ResumeFailed);
+        runs[0].steps[1].opening = Some(StepOpening::Resumed);
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+        let _ = shell.emit.take();
+        let lines = lines(&pane, &shell);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("implement"))
+            .expect("the `implement` step is listed");
+        assert!(
+            lines[at + 2].contains(NOTE),
+            "R-3's reason comes first: {lines:#?}"
+        );
+        assert_eq!(lines[at + 3], "        resume failed; context not carried;");
+        assert_eq!(lines[at + 4], "        handoff prompt only");
+        assert_eq!(
+            lines.iter().filter(|line| !line.is_empty()).count(),
+            2 + 2 + 4 * 2 + 1 + 2,
+            "only the parked step grew: its reason and its two opening lines; `resumed` adds none"
+        );
+
+        // A step that is done still says how its chat opened. Seventeen lines are more than the
+        // test terminal's rows, so the list itself is read.
+        runs[0].steps[0].opening = Some(StepOpening::Handoff);
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        let _ = shell.emit.take();
+        let lines = list_text(&pane, &shell.theme);
+        let at = lines
+            .iter()
+            .position(|line| line.contains("prd"))
+            .expect("the `prd` step is listed");
+        assert_eq!(lines[at + 2], "        context not carried;");
+        assert_eq!(lines[at + 3], "        handoff prompt only");
+        assert_eq!(lines.len(), 2 + 4 * 2 + 1 + 2 + 2, "{lines:#?}");
+    }
+
+    /// MOD-37 M5 (blueprint H-3, A-6): neither opening sentence fits the 35 free columns whole, so
+    /// each is two lines split at `; `, verbatim, and no line is cut or wider than the pane.
+    #[tokio::test]
+    async fn opening_lines_fit_the_pane_and_are_never_cut() {
+        let theme = Theme::default();
+        let mut step = feat_1_runs().await[0].steps[0].clone();
+        for (opening, parts) in [
+            (StepOpening::Handoff, OPENING_HANDOFF),
+            (StepOpening::ResumeFailed, OPENING_RESUME_FAILED),
+        ] {
+            step.opening = Some(opening);
+            let lines = opening_lines(&step, &theme);
+            assert_eq!(lines.len(), 2, "{opening}: two lines");
+            for (line, part) in lines.iter().zip(parts) {
+                assert!(line.width() <= PANE, "{opening}: {:?}", text(line));
+                let shown = text(line);
+                assert!(!shown.trim_end().ends_with(cells::ELLIPSIS), "{shown:?}");
+                assert_eq!(
+                    shown.trim_end(),
+                    format!("{}{part}", " ".repeat(INDENT)),
+                    "{opening}: verbatim, at the status column"
+                );
+            }
+        }
+        for opening in [Some(StepOpening::Resumed), None] {
+            step.opening = opening;
+            assert!(opening_lines(&step, &theme).is_empty(), "{opening:?}");
+        }
+        assert_eq!(
+            OPENING_HANDOFF.join(" "),
+            htui_orch::promote::CONTEXT_NOT_CARRIED
+        );
+        assert_eq!(
+            OPENING_RESUME_FAILED.join(" "),
+            format!("resume failed; {}", htui_orch::promote::CONTEXT_NOT_CARRIED)
+        );
     }
 
     /// The text of a line, spans joined.
@@ -3928,6 +4039,40 @@ mod tests {
         assert!(
             lines[3].contains("needs a second look"),
             "the cursor step's note: {lines:#?}"
+        );
+    }
+
+    /// MOD-37 M5 (ANA-27 T5): the flow's head carries the cursor step's opening lines too, as the
+    /// list does; a `resumed` step has none.
+    #[tokio::test]
+    async fn the_flow_head_shows_the_cursor_steps_opening() {
+        let shell = Shell::new();
+        let mut run = feat_1_runs().await.remove(0);
+        run.steps[1].opening = Some(StepOpening::Handoff);
+        run.steps[2].opening = Some(StepOpening::Resumed);
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(vec![run]), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('v')), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let lines = lines(&pane, &shell);
+        assert!(lines[0].starts_with("graph"), "{lines:#?}");
+        assert_eq!(lines[2], "        context not carried;", "{lines:#?}");
+        assert_eq!(lines[3], "        handoff prompt only", "{lines:#?}");
+
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let run = pane.runs[0].clone();
+        let head: Vec<String> = pane
+            .flow_head(&run, &shell.theme)
+            .iter()
+            .map(|line| text(line).trim_end().to_owned())
+            .collect();
+        assert!(
+            !head
+                .iter()
+                .any(|line| line.contains("context not carried")
+                    || line.contains("handoff prompt only")),
+            "a resumed step's head has no opening line: {head:#?}"
         );
     }
 
