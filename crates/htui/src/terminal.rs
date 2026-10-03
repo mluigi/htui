@@ -19,6 +19,12 @@
 //! `Suspend::leave` — turns it off first. With it on, a paste is one `Event::Paste` the shell
 //! routes to a capturing field or drops; without it, a paste is replayed as keystrokes and runs as
 //! commands wherever no field is open.
+//!
+//! **Mouse capture** (MOD-71 D1-D3) is on only while the view on screen wants the mouse, because
+//! it takes the terminal's own text selection away. The event loop asks the app after every step,
+//! and [`TerminalGuard::set_mouse_capture`] writes only a change. [`init`] and `Suspend::enter`
+//! never turn it on; every way the terminal is given back — [`restore_terminal`] and
+//! `Suspend::leave` — turns it off first, whatever the guard last set.
 
 use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend};
 
@@ -29,6 +35,9 @@ pub struct TerminalGuard {
     terminal: DefaultTerminal,
     /// Whether the raw mode and the alternate screen have already been given back.
     restored: bool,
+    /// MOD-71 D2: whether mouse capture is on, as this guard last set it. Only
+    /// [`TerminalGuard::set_mouse_capture`] turns it on; `Suspend::leave` clears it (D3).
+    mouse: bool,
 }
 
 /// Installs the panic hook and takes the terminal over.
@@ -60,6 +69,8 @@ pub fn init() -> TerminalGuard {
     TerminalGuard {
         terminal: Terminal::new(backend).expect("htui cannot measure the terminal"),
         restored: false,
+        // MOD-71 D1: capture starts off; the loop turns it on for a view that wants it.
+        mouse: false,
     }
 }
 
@@ -71,10 +82,13 @@ pub fn install_panic_hook() {
     install_panic_hook_restoring(restore_terminal);
 }
 
-/// Gives the terminal back: bracketed paste off (MOD-22 review M-1), then `ratatui::restore` —
-/// raw mode off and the alternate screen left. Best effort, as `ratatui::restore` is: a stdout
-/// that cannot take the one escape sequence is not a reason to stop giving the rest back.
+/// Gives the terminal back: mouse capture off (MOD-71 D3), bracketed paste off (MOD-22 review
+/// M-1), then `ratatui::restore` — raw mode off and the alternate screen left. Best effort, as
+/// `ratatui::restore` is: a stdout that cannot take one escape sequence is not a reason to stop
+/// giving the rest back. A free function, so it cannot know whether capture is on: it turns it
+/// off unconditionally, which a terminal that never had it ignores.
 pub fn restore_terminal() {
+    let _ = disable_mouse_capture();
     let _ = disable_bracketed_paste();
     ratatui::restore();
 }
@@ -128,14 +142,41 @@ impl TerminalGuard {
             self.restored = true;
         }
     }
+
+    /// MOD-71 D2: mouse capture on or off, written only when `on` differs from what this guard
+    /// last set, so the event loop can ask after every step for nothing. The loop is the only
+    /// caller, with `App::wants_mouse` (D1). A terminal without mouse reporting answers
+    /// `Unsupported`, which is recorded as done so it is not asked again every step: the view runs
+    /// keyboard-only (review R2-L6's shape, blueprint H-14).
+    ///
+    /// # Errors
+    ///
+    /// A terminal write that failed for any other reason: the loop ends and `lib.rs` restores
+    /// (MOD-9 D21).
+    pub fn set_mouse_capture(&mut self, on: bool) -> std::io::Result<()> {
+        if on == self.mouse {
+            return Ok(());
+        }
+        if on {
+            enable_mouse_capture()?;
+        } else {
+            disable_mouse_capture()?;
+        }
+        self.mouse = on;
+        Ok(())
+    }
 }
 
 impl crate::editor::Suspend for TerminalGuard {
-    /// Show the cursor (every draw hid it), bracketed paste off so the editor gets its own paste
-    /// (MOD-22 review M-1), then `ratatui::try_restore` (MOD-9 D22). `restored` is not touched:
-    /// this is a pause, not the end.
+    /// Show the cursor (every draw hid it), mouse capture off (MOD-71 D3) and bracketed paste off
+    /// so the editor gets its own mouse and paste (MOD-22 review M-1), then `ratatui::try_restore`
+    /// (MOD-9 D22). `restored` is not touched: this is a pause, not the end. `mouse` is cleared
+    /// before the write, so whatever happens next the loop's `set_mouse_capture` re-asserts what
+    /// the app wants once the editor is gone — one place decides.
     fn leave(&mut self) -> std::io::Result<()> {
         self.terminal.show_cursor()?;
+        self.mouse = false;
+        disable_mouse_capture()?;
         disable_bracketed_paste()?;
         ratatui::try_restore()
     }
@@ -145,7 +186,8 @@ impl crate::editor::Suspend for TerminalGuard {
     /// Not `ratatui::init()`, and now for two reasons: it would stack another panic hook
     /// (`init.rs:398`), and since MOD-56 the hook it would wrap is the one that decides whether a
     /// panic gives the terminal back at all — so on every editor suspend it would re-break the
-    /// defect this file just closed (D221).
+    /// defect this file just closed (D221). Mouse capture is not turned back on here (MOD-71 D3):
+    /// the loop's next `set_mouse_capture` decides, in one place.
     fn enter(&mut self) -> std::io::Result<()> {
         crossterm::terminal::enable_raw_mode()?;
         crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
@@ -180,6 +222,30 @@ fn disable_bracketed_paste() -> std::io::Result<()> {
     tolerate_unsupported(crossterm::execute!(
         std::io::stdout(),
         crossterm::event::DisableBracketedPaste
+    ))
+    .map(|_| ())
+}
+
+/// MOD-71 D2: mouse capture on, in its own `execute!` (review R2-L6's shape). crossterm's
+/// `EnableMouseCapture` is any-motion reporting (`?1003h`, `crossterm-0.29.0/src/event.rs:325-333`),
+/// which `App::on_mouse` drops before it can cost a redraw (D4). `Unsupported` is a terminal with
+/// no mouse reporting, which runs keyboard-only.
+fn enable_mouse_capture() -> std::io::Result<()> {
+    let enabled = tolerate_unsupported(crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::EnableMouseCapture
+    ))?;
+    if !enabled {
+        tracing::debug!("this terminal has no mouse reporting; the flow view is keyboard-only");
+    }
+    Ok(())
+}
+
+/// Mouse capture off, in its own `execute!`, `Unsupported` tolerated as on the way in (MOD-71 D3).
+fn disable_mouse_capture() -> std::io::Result<()> {
+    tolerate_unsupported(crossterm::execute!(
+        std::io::stdout(),
+        crossterm::event::DisableMouseCapture
     ))
     .map(|_| ())
 }
