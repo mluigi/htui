@@ -12,8 +12,8 @@ Platform · DESKTOP-HTUI · memory · 1 run
 │  FEAT-1   in_progress        TUI scaffold           ││           ┌──────────────────┐            │
 │  FEAT-2   blocked            Agent driver and chat …││           │0.1 awaiting      │            │
 │  FEAT-3   queued             Postgres store and cac…││           │research          │            │
-│  FIX-1    closed             Terminal left raw afte…││           └──────────────────┘            │
-│  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
+│  FIX-1    closed             Terminal left raw afte…││           │                  │            │
+│  TOOL-1   awaiting_approval  CI matrix for the thre…││           └──────────────────┘            │
 │▾ agy (3)                                            ││                                           │
 │  ANA-1    done               Prompt assembly survey ││                                           │
 │  FEAT-1   open               ACP transport upgrade  ││                                           │

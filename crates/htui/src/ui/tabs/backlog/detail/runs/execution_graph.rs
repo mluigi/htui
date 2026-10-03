@@ -24,8 +24,8 @@ use crate::ui::cells;
 /// Plan D10: a node's width in cells at zoom 1. Two candidates and the gap are 41 columns, which a
 /// reveal's 1-cell margins keep inside the 43-column pane (fact-check R8; 21 cuts a border).
 const NODE_W: f64 = 20.0;
-/// Plan D10: a node's height, a border, two lines and a border.
-const NODE_H: f64 = 4.0;
+/// Plan D10, MOD-72 D5: a node's height, a border, three lines (head, phase, chips) and a border.
+const NODE_H: f64 = 5.0;
 /// Plan D10: the columns between two nodes of one layer.
 const H_GAP: f64 = 1.0;
 /// Plan D10: the rows between two layers. Three keep a `retry` label off the arrowhead (R7).
@@ -40,10 +40,8 @@ const RETRY: &str = "retry";
 /// reset viewport's left floor and top offset (blueprint E5).
 const MARGIN: f64 = 1.0;
 /// MOD-72 D6: the glyph that leads a node's chip line, once.
-#[expect(dead_code, reason = "MOD-72 T3's green commit draws the chips")]
 const TOOL: char = '\u{2692}';
 /// MOD-72 D6: the sign between a chip's label and its count.
-#[expect(dead_code, reason = "MOD-72 T3's green commit draws the chips")]
 const TIMES: char = '\u{d7}';
 
 /// One row of the flow (plan D6): the candidates of a `(position, attempt)`, or its judge.
@@ -245,58 +243,93 @@ impl StepNode {
 }
 
 impl NodeContent for StepNode {
-    /// The border, then the head and the phase inside it. `ctx.area` is the node's full size
-    /// at the current zoom; a node too small for an interior (zoom 0.5) is a bare box.
+    /// The border, then the head and the phase inside it, then the chips, dim. `ctx.area` is the
+    /// node's full size at the current zoom; a node too small for an interior (zoom 0.5) is a
+    /// bare box.
     fn render(&self, ctx: &NodeRenderContext, buf: &mut Buffer) {
         let block = Block::bordered().border_style(self.border(ctx.selected));
         let inner = block.inner(ctx.area);
         block.render(ctx.area, buf);
-        for (row, line) in (0u16..).zip([&self.head, &self.phase]) {
+        let width = usize::from(inner.width);
+        // Blueprint E10: fitted to the interior drawn, so `+N` is honest at every zoom.
+        let chips = chips(&self.calls, width);
+        let lines = [
+            (self.head.as_str(), self.text()),
+            (self.phase.as_str(), self.text()),
+            (chips.as_str(), self.theme.dim), // MOD-72 D6: secondary to the head and phase
+        ];
+        for (row, (line, style)) in (0u16..).zip(lines) {
             if row >= inner.height {
-                break;
+                break; // zoom 0.5: no interior, so no line (D5)
             }
-            buf.set_string(
-                inner.x,
-                inner.y + row,
-                cells::clip(line, usize::from(inner.width)),
-                self.text(),
-            );
+            buf.set_string(inner.x, inner.y + row, cells::clip(line, width), style);
         }
     }
 }
 
 /// MOD-72 D6: the short label of a `tool_kind` wire value (ACP's ten, `htui_agent::event::ToolKind`);
 /// an unknown value is drawn as itself.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "MOD-72 T3's green commit draws the chips")
-)]
 fn short_label(tool_kind: &str) -> &str {
-    let _ = tool_kind;
-    todo!("MOD-72 T3")
+    match tool_kind {
+        "delete" => "del",
+        "search" => "find",
+        "execute" => "exec",
+        "switch_mode" => "mode",
+        // `read`, `edit`, `move`, `think`, `fetch`, `other`, and any value a later protocol adds.
+        other => other,
+    }
 }
 
 /// MOD-72 D6: a step's tool calls as one line of at most `width` cells: the tool glyph, then
 /// `label×n` chips, larger counts first and ties by label, then `+N` for the `N` kinds that did
 /// not fit. Empty when the step made no call. Never wider than `width` once `width` holds the
 /// glyph and `+N`; `StepNode::render` clips anyway.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "MOD-72 T3's green commit draws the chips")
-)]
 pub(super) fn chips(calls: &[ToolCallCount], width: usize) -> String {
-    let _ = (calls, width);
-    todo!("MOD-72 T3")
+    // D6: never a `×0`.
+    let mut shown: Vec<(&str, u32)> = calls
+        .iter()
+        .filter(|call| call.calls > 0)
+        .map(|call| (short_label(&call.tool_kind), call.calls))
+        .collect();
+    if shown.is_empty() {
+        return String::new();
+    }
+    shown.sort_by(|(a_label, a_calls), (b_label, b_calls)| {
+        b_calls
+            .cmp(a_calls)
+            .then_with(|| a_label.as_bytes().cmp(b_label.as_bytes()))
+    });
+    let mut line = String::from(TOOL);
+    let mut used = cells::cell_width(&line);
+    let total = shown.len();
+    for (i, (label, count)) in shown.into_iter().enumerate() {
+        let chip = format!(" {label}{TIMES}{count}");
+        let left = total - i - 1;
+        // Blueprint E12: room for the `+N` this chip's failure would leave, unless it is the last.
+        let reserve = if left == 0 {
+            0
+        } else {
+            cells::cell_width(&format!(" +{left}"))
+        };
+        if used + cells::cell_width(&chip) + reserve > width {
+            // E11: stop at the first chip that does not fit, so the shown ones are the largest;
+            // the chip before this one reserved exactly this `+N`.
+            line.push_str(&format!(" +{}", total - i));
+            return line;
+        }
+        used += cells::cell_width(&chip);
+        line.push_str(&chip);
+    }
+    line
 }
 
 /// MOD-72 D7: a `ToolCalls` reply's rows by step, each step's rows in reply order.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "MOD-72 T3's green commit draws the chips")
-)]
 pub(super) fn by_step(counts: &[ToolCallCount]) -> BTreeMap<StepId, Vec<ToolCallCount>> {
-    let _ = counts;
-    todo!("MOD-72 T3")
+    let mut map: BTreeMap<StepId, Vec<ToolCallCount>> = BTreeMap::new();
+    for count in counts {
+        map.entry(count.step).or_default().push(count.clone());
+    }
+    map
 }
 
 /// Plan D9: one source on the bottom and one target on the top, both hidden. Baked into every

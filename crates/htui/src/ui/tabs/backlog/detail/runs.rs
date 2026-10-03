@@ -38,6 +38,10 @@
 //! node *is* the cursor, so every key above acts the same in both views (ANA-12 invariant 2).
 //! `PageUp`/`PageDown` do nothing there.
 //!
+//! MOD-72: in the flow, a node's third line counts its step's tool calls by kind
+//! (`⚒ read×5 exec×3`). Every `Runs` reply in the flow, and `v` into it, asks for them
+//! (`ToolCalls`); the list never does.
+//!
 //! At the close-out's counts `←`/`→` (and `h`/`l`) pick the resolution among the legal ones for
 //! the item's status (`Resolution::closes_from`), starting on `Resolution::default_for` (MOD-39
 //! plan P13).
@@ -62,7 +66,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
 
-use self::execution_graph::ExecutionGraph;
+use self::execution_graph::{ExecutionGraph, by_step};
 use crate::app::{Action, Ctx, Handled};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -432,6 +436,11 @@ impl RunsTab {
         }
         ctx.request(StoreRequest::RunActions(item));
         ctx.request(StoreRequest::RelayView { item });
+        // MOD-72 D4: the chips, only while they are drawn; last, so the list's requests are
+        // byte-identical to before.
+        if self.view == View::Flow {
+            ctx.request(StoreRequest::ToolCalls { item });
+        }
     }
 
     /// MOD-42 plan D14: the pending request on `step`, as the last `RelayView` had it.
@@ -1299,6 +1308,12 @@ impl DetailTab for RunsTab {
                     View::List => View::Flow,
                     View::Flow => View::List,
                 };
+                // MOD-72 D4: into the flow, the chips are asked for once.
+                if self.view == View::Flow
+                    && let Some(item) = self.item
+                {
+                    ctx.request(StoreRequest::ToolCalls { item });
+                }
                 self.sync_graph(ctx.theme);
             }
             KeyCode::Char('+') if self.view == View::Flow => self.graph.get_mut().zoom_in(),
@@ -1401,6 +1416,11 @@ impl DetailTab for RunsTab {
             // re-read brings a fresh view.
             StoreReply::RelayView { item, view } if Some(*item) == self.item => {
                 self.relay = Some((**view).clone());
+            }
+            // MOD-72 D4, D7: this item's chips; another item's reply is dropped.
+            StoreReply::ToolCalls { item, counts } if Some(*item) == self.item => {
+                self.tool_calls = by_step(counts);
+                self.sync_graph(ctx.theme);
             }
             StoreReply::PermissionAnswered { .. } => self.re_read(ctx),
             StoreReply::Failed { request, .. } if *request == ANSWER_PERMISSION => {
