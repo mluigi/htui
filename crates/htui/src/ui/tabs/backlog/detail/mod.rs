@@ -6,6 +6,9 @@
 //! `register` line, never a `match` arm in the Backlog tab. In MOD-1 every sub-tab is read-only
 //! and answers to nothing but scrolling (plan D11). MOD-39 plan P12 adds the seventh, [`ReqsTab`],
 //! and shortens "Documents" to "Docs" so the strip keeps its 40 columns.
+//!
+//! MOD-13 milestone 5: Notes and Docs write, each through a [`compose`] area of its own (D6), and
+//! an `$EDITOR` outcome comes back to the active sub-tab (D7).
 
 pub mod body;
 pub mod compose;
@@ -24,6 +27,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
+use crate::editor::ExternalEditOutcome;
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crossterm::event::{KeyCode, KeyEvent};
@@ -97,6 +101,9 @@ pub trait DetailTab {
     fn has_active_run(&self) -> bool {
         false
     }
+    /// MOD-13 milestone 5 D7: an `$EDITOR` outcome the Backlog had no item form for. Only the
+    /// sub-tab that emitted `Action::EditExternally` acts on it; the default drops it.
+    fn on_external_edit(&mut self, _outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {}
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -239,6 +246,15 @@ impl DetailRegistry {
         match self.tabs.get_mut(self.active) {
             Some(tab) => tab.on_key(key, ctx),
             None => Handled::Pass,
+        }
+    }
+
+    /// D7: hands an `$EDITOR` outcome to the active sub-tab, the only one that could have asked
+    /// (a capturing sub-tab keeps every key, so the strip cannot move while its area is open).
+    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
+        match self.tabs.get_mut(self.active) {
+            Some(tab) => tab.on_external_edit(outcome, ctx),
+            None => tracing::debug!("no detail sub-tab to take the $EDITOR outcome"),
         }
     }
 }
