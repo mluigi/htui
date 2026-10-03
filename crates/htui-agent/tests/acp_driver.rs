@@ -1857,6 +1857,54 @@ async fn updates_sent_before_a_resume_answer_never_reach_the_session() {
     let _ = restore.agent.await;
 }
 
+/// Fails unless `pid` is already reaped: no `/proc/{pid}` at all, checked once, with no window.
+///
+/// [`assert_reaped`]'s window is for the exits that reap on the task's timeline; a restore that
+/// failed reaps before it answers (review L-4), so by the time `start` returns there is nothing
+/// left to wait for.
+#[cfg(unix)]
+fn assert_reaped_already(pid: u32, what: &str) {
+    #[cfg(target_os = "linux")]
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "{what}: pid {pid} was still there when `start` returned"
+    );
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (pid, what);
+    }
+}
+
+/// Review L-4: a restore that fails kills and reaps its child before it answers, so a caller
+/// that falls back to a second adapter never runs it beside the first. Each way a restore
+/// fails: no route, a refused `session/resume`, a refused `session/load`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_failed_restore_has_reaped_its_child_when_start_returns() {
+    let resume = json!({ "sessionCapabilities": { "resume": {} } });
+    let load = json!({ "loadSession": true });
+    for (what, caps, on_resume, on_load) in [
+        ("no route", json!({}), Answer::Ok, Answer::Ok),
+        ("a refused resume", resume, Answer::Refuse, Answer::Ok),
+        ("a refused load", load, Answer::Ok, Answer::Refuse),
+    ] {
+        let tmp = tempfile::tempdir().expect("temp cwd");
+        let restore = open_restoring(
+            tmp.path(),
+            caps,
+            on_resume,
+            on_load,
+            SessionSettings::default(),
+            true,
+        )
+        .await;
+        assert!(restore.opened.is_err(), "{what}: the restore fails");
+        assert_reaped_already(restore.pid.expect("the case spawned a child"), what);
+        restore.agent.abort();
+        let _ = restore.agent.await;
+    }
+}
+
 /// (e) H-11: an ACP row resumes when either restore route is on, and hands off only with both off.
 #[test]
 fn caps_for_an_acp_row_resumes_when_load_or_resume_is_on() {

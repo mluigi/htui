@@ -685,6 +685,9 @@ struct ReadyCell {
     /// answer would be a second `start` outcome for one call.
     sender: Option<oneshot::Sender<Result<Ready>>>,
     step: &'static str,
+    /// A failed restore's error, composed by the foreground and answered by [`run_session`] once
+    /// the child is killed and reaped (MOD-37 review L-4).
+    owed: Option<DriverError>,
 }
 
 impl ReadyCell {
@@ -693,6 +696,7 @@ impl ReadyCell {
         Self {
             sender: Some(sender),
             step: "initialize",
+            owed: None,
         }
     }
 }
@@ -919,6 +923,25 @@ async fn run_session(
         })
         .await;
 
+    // MOD-37 review L-4: a failed restore is answered only once its child is killed and reaped, so
+    // a caller that falls back to a second adapter (the worker's handoff start) never runs it
+    // beside this one. The foreground owes the error rather than killing first itself: the kill
+    // ends the connection, and an actor that ends first drops the foreground mid-kill, and the
+    // answer with it ([`ReadyCell`]). Out here nothing can drop it. `session/new` keeps its own
+    // order (D61).
+    let owed = ready
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .owed
+        .take();
+    if let Some(failure) = owed {
+        if let Err(err) = connected {
+            tracing::debug!(%err, "the ACP connection ended after a failed restore");
+        }
+        kill(&child).await;
+        answer(&ready, Err(failure));
+        return;
+    }
     if let Err(err) = connected {
         // **Before the kill, and this is the whole of the headline fix.** A `session/new` the
         // agent refused fails a connection actor, which drops the foreground future before its own
@@ -1143,9 +1166,10 @@ async fn session_main(
                 };
             match restored {
                 Ok(session) => session,
+                // Review L-4: owed, not answered: `run_session` kills and reaps the child first.
+                // The error is already composed, stderr tail included, while the child is held.
                 Err(err) => {
-                    answer(ready, Err(err));
-                    kill(child).await;
+                    ready.lock().unwrap_or_else(PoisonError::into_inner).owed = Some(err);
                     return;
                 }
             }
