@@ -4,7 +4,7 @@
 **Routed**: plan path via `/handoff-run` (0 criteria fired; C4 judged borderline from the item text), accepted by
 the maintainer 2026-10-03. Sandbox run `hr/MOD-72`.
 **Complexity**: Medium (one new read through every store layer, plus one UI line)
-**Status**: confirmed 2026-10-03 (maintainer, as written)
+**Status**: done 2026-10-03 (`docs/decisions/mod/mod-72.md`)
 
 ## Summary
 
@@ -155,7 +155,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| A count query on every Runs poll is slow on a long log | Low | asked only in the flow view (D4); `idx_session_event_tool (run_step_id, tool_call_id) WHERE tool_call_id IS NOT NULL` covers the rows a `tool_call` has; the join is driven from the item's `run_step` ids |
+| A count query on every Runs poll is slow on a long log | Low | asked only in the flow view (D4); the join is driven from the item's `run_step` ids through `session_event`'s primary key. **Corrected at review (L4):** `idx_session_event_tool` is partial (`WHERE tool_call_id IS NOT NULL`) and this query cannot use it |
 | Backends disagree on order (collation vs bytes) | Medium | sort in Rust (D3); the `READ_CASES` entry runs on all three |
 | `⚒` drawn 2 cells wide by some terminals | Low | widths come from `ui::cells` (unicode-width, which says 1); the fit reserves by measured width; fact-check probes it |
 | `NODE_H` change breaks MOD-28 layout facts (fit, reveal, R8 width) | Low | width untouched; height-only literals updated; `fit_keeps_the_cursor_node_on_screen` and the reveal tests re-run unchanged |

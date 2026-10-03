@@ -4,7 +4,7 @@
 >
 > **Requirements addressed:** `R-TUI-4` (Runs tab step list and actions), `R-ORCH-7` (Fan-out selection), `R-ORCH-3` (Review loop).
 >
-> **Status (2026-09-14): concluded.** Implementation spawned as MOD-28 (rataflow execution view). MOD-28 is done (2026-10-02, `docs/decisions/mod/mod-28.md`): keyboard-driven flow view in the Runs sub-tab; the §3.3 mouse wiring moved to MOD-71 and the §3.2 tool-call chips to MOD-72.
+> **Status (2026-09-14): concluded.** Implementation spawned as MOD-28 (rataflow execution view). MOD-28 is done (2026-10-02, `docs/decisions/mod/mod-28.md`): keyboard-driven flow view in the Runs sub-tab; the §3.3 mouse wiring moved to MOD-71 and the §3.2 tool-call chips to MOD-72. MOD-72 is done (2026-10-03, `docs/decisions/mod/mod-72.md`): chips count tool calls by ACP kind (`⚒ read×5 exec×3`), not by tool name.
 
 ---
 

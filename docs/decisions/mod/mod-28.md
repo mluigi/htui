@@ -140,7 +140,7 @@ are 133 tracked snapshots. The HANDOFF pin said 129, but the tree already had 13
   - Click to select, drag to pan and scroll to zoom in the flow view (`rataflow`'s `crossterm`
     feature, `handle_mouse_event`, `FlowEvent::NodeClicked`).
   - The restore, panic-hook and editor-suspend paths.
-- **MOD-72, tool-call chips.** A per-step tool-call count read: Postgres, `MemStore`, `.sqlx`, and
+- **MOD-72, tool-call chips** (done 2026-10-03, `docs/decisions/mod/mod-72.md`). A per-step tool-call count read: Postgres, `MemStore`, `.sqlx`, and
   a `StoreRequest`/`StoreReply` pair. The counts are drawn as chips in `StepNode` (ANA-12 §3.2).
 - **Hierarchy edges.** Swarm `parent_step_id` edges wait for MOD-27.
 - **Fan-out width.** A fan-out of three or more candidates is wider than the 43-column pane at
