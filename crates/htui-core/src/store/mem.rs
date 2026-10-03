@@ -21,6 +21,7 @@ use serde_json::Value;
 use crate::clock::Clock;
 #[cfg(feature = "test-support")]
 use crate::clock::TestClock;
+use crate::model::link::{ProposeLink, WithdrawLink};
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
     BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile,
@@ -54,16 +55,18 @@ use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, ParkOutcome,
     ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
-    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary, expected_on_row,
-    failure_disagrees_with_status, finish_run_item_mirror, finish_run_needs_a_terminal_status,
-    graph_not_in_project, invalid_area_code, invalid_prefix, item_has_a_live_run,
-    item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move, new_persona_refusal,
-    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, persona_is_bound,
-    persona_patch_refusal, prompt_template_key, prompt_template_refusal, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
-    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_is_not_promotable, step_slot_is_taken, summary_names_another_item,
-    winner_is_not_settled, withdrawn_requirement_cited,
+    chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
+    document_needs_a_step, expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
+    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
+    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
+    link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
+    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
+    persona_is_bound, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_phase, row_names_another_step, run_is_terminal, self_link,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
+    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -5488,6 +5491,50 @@ impl State {
         Ok(row)
     }
 
+    /// MOD-11 F-21: `step` exists and its run carries `fence`'s lease (`NotFound`, then
+    /// `Fenced`: Postgres's `step_scope` order); answers the run's id, item and project.
+    fn step_scope(
+        &self,
+        step: StepId,
+        fence: StepFence,
+    ) -> Result<(RunId, Option<ItemId>, ProjectId)> {
+        let row = self.require_step(step)?;
+        Self::fence_holds(&self.lease_owners, row, fence)?;
+        let run = self.require_run(row.run_id)?;
+        Ok((run.id, run.item_id, run.project_id))
+    }
+
+    /// MOD-11 D13: `step_scope`, then the step's own item, then the step-less write. Every
+    /// refusal is decided before [`State::write_document`] writes.
+    fn write_step_document(&mut self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        let Some(step) = new.produced_by_step_id else {
+            return Err(StoreError::Constraint(document_needs_a_step()));
+        };
+        let (_, item, _) = self.step_scope(step, fence)?;
+        if item != Some(new.item_id) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                step,
+                new.item_id,
+            )));
+        }
+        self.write_document(new)
+    }
+
+    /// MOD-11 D13: [`State::write_step_document`]'s refusals for a note.
+    fn add_step_note(&mut self, fence: StepFence, note: NewNote) -> Result<Note> {
+        let Some(step) = note.via_step_id else {
+            return Err(StoreError::Constraint(note_needs_a_step()));
+        };
+        let (_, item, _) = self.step_scope(step, fence)?;
+        if item != Some(note.item_id) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                step,
+                note.item_id,
+            )));
+        }
+        self.add_note(note)
+    }
+
     /// `step_graph_id` of the item, else its kind's default (ANA-2 §8's `resolve_graph`).
     fn resolve_graph(&self, item: ItemId) -> Option<ResolvedGraph> {
         let row = self.items.get(&item)?;
@@ -6029,6 +6076,100 @@ impl State {
         row.deleted_at = Some(now);
         row.updated_at = now;
         Ok(())
+    }
+
+    /// MOD-11 D13, B-6: the upsert. Refusals run self link, step, fence, own item, `to`, its
+    /// project; then a new row is live and the step's, a tombstone revives as the step's, and a
+    /// live row keeps its proposer (only `updated_at` moves, as Postgres's trigger moves it).
+    fn propose_link(
+        &mut self,
+        fence: StepFence,
+        link: ProposeLink,
+        now: DateTime<Utc>,
+    ) -> Result<ItemLink> {
+        if link.from == link.to {
+            return Err(StoreError::Constraint(self_link(link.from)));
+        }
+        let (_, item, project) = self.step_scope(link.step, fence)?;
+        if item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+        if self.require_item(link.to)?.project_id != project {
+            return Err(StoreError::Constraint(link_outside_project(link.to)));
+        }
+        let at = self.links.iter().position(|row| {
+            row.from_item_id == link.from && row.to_item_id == link.to && row.kind == link.kind
+        });
+        let Some(at) = at else {
+            let row = ItemLink {
+                from_item_id: link.from,
+                to_item_id: link.to,
+                kind: link.kind,
+                proposed_by_step_id: Some(link.step),
+                created_at: now,
+                updated_at: now,
+                deleted_at: None,
+            };
+            self.links.push(row.clone());
+            return Ok(row);
+        };
+        let row = &mut self.links[at];
+        if row.deleted_at.is_some() {
+            row.proposed_by_step_id = Some(link.step);
+            row.deleted_at = None;
+        }
+        row.updated_at = now;
+        Ok(row.clone())
+    }
+
+    /// MOD-11 D13, B-5: tombstones the live `(from, to, kind)` when a step of `link.step`'s run
+    /// proposed it. Refusals run step, fence, own item, then `NotFound` for no live row and
+    /// [`link_not_proposed_by_run`] for a live row of anyone else's.
+    fn withdraw_link(
+        &mut self,
+        fence: StepFence,
+        link: WithdrawLink,
+        now: DateTime<Utc>,
+    ) -> Result<ItemLink> {
+        let (run, item, _) = self.step_scope(link.step, fence)?;
+        if item != Some(link.from) {
+            return Err(StoreError::Constraint(step_writes_own_item(
+                link.step, link.from,
+            )));
+        }
+        let key = link_key(link.from, link.to, link.kind);
+        let steps = &self.steps;
+        let Some(row) = self.links.iter_mut().find(|row| {
+            row.from_item_id == link.from
+                && row.to_item_id == link.to
+                && row.kind == link.kind
+                && row.deleted_at.is_none()
+        }) else {
+            return Err(StoreError::NotFound {
+                entity: "item_link",
+                id: key,
+            });
+        };
+        let ours = row
+            .proposed_by_step_id
+            .and_then(|proposer| steps.get(&proposer))
+            .is_some_and(|proposer| proposer.run_id == run);
+        if !ours {
+            return Err(StoreError::Constraint(link_not_proposed_by_run(&key)));
+        }
+        row.deleted_at = Some(now);
+        row.updated_at = now;
+        Ok(row.clone())
+    }
+
+    /// MOD-11 B-4: the item of `project` keyed `key`.
+    fn item_by_key(&self, project: ProjectId, key: &str) -> Option<ItemId> {
+        self.items
+            .values()
+            .find(|row| row.project_id == project && row.key == key)
+            .map(|row| row.id)
     }
 
     /// Re-stamps a live citation at the requirement's current version, clearing suspect.
@@ -7192,6 +7333,30 @@ impl WriteStore for MemStore {
 
     async fn add_note(&self, note: NewNote) -> Result<Note> {
         self.write(|state| state.add_note(note))
+    }
+
+    // ---- MOD-11 (plan D13, B-4..B-6): the agent writes, one `write` closure each ----
+
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        self.write(|state| state.write_step_document(fence, new))
+    }
+
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
+        self.write(|state| state.add_step_note(fence, note))
+    }
+
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
+        let now = self.now();
+        self.write(|state| state.propose_link(fence, link, now))
+    }
+
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
+        let now = self.now();
+        self.write(|state| state.withdraw_link(fence, link, now))
+    }
+
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        Ok(self.read(|state| state.item_by_key(project, key)))
     }
 
     // ---- ANA-11 §5.1 (MOD-38): requirements and citations, one `write` closure each ----

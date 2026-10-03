@@ -19,6 +19,7 @@
 //! trigger of the migration owns it, and `RETURNING` sees the trigger-modified row.
 
 use chrono::{DateTime, TimeDelta, Utc};
+use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BindingChange,
     BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
@@ -6434,6 +6435,28 @@ impl WriteStore for PgStore {
         box_id: BoxId,
     ) -> Result<AnswerOutcome> {
         super::relay::answer_permission(self, id, option_id, user, box_id).await
+    }
+
+    // ---- MOD-11 (D13) ----
+
+    async fn write_step_document(&self, _fence: StepFence, _new: NewDocument) -> Result<Document> {
+        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    }
+
+    async fn add_step_note(&self, _fence: StepFence, _note: NewNote) -> Result<Note> {
+        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    }
+
+    async fn propose_link(&self, _fence: StepFence, _link: ProposeLink) -> Result<ItemLink> {
+        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    }
+
+    async fn withdraw_link(&self, _fence: StepFence, _link: WithdrawLink) -> Result<ItemLink> {
+        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
+    }
+
+    async fn item_by_key(&self, _project: ProjectId, _key: &str) -> Result<Option<ItemId>> {
+        Err(StoreError::Backend("MOD-11 T1: not yet implemented".into()))
     }
 }
 
