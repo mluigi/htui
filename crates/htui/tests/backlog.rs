@@ -27,7 +27,7 @@ use htui_core::model::{
     GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemPatch, NewDocument, NewItem, NewRun,
     NewRunStep, OpenPermission, PermissionId, PermissionStatus, RelayOption, RelayOptionKind,
     RelaySessionId, Resolution, RunId, RunMode, RunStatus, RunStep, Scope, SnapshotGraph,
-    SnapshotPhase, SnapshotSettings, Status, StepId, Transport, WorkspaceSummary,
+    SnapshotPhase, SnapshotSettings, Status, StepId, StepStatus, Transport, WorkspaceSummary,
 };
 use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_orch::Clock;
@@ -760,6 +760,144 @@ async fn the_runs_pane_greys_a_key_with_the_guard_s_sentence() {
     harness.key("a");
     harness.drive().await;
     assert_eq!(harness.app().status.as_deref(), Some(sentence.as_str()));
+}
+
+/// MOD-11 T6: a session that writes its step's output through htui's `document_write`, on its own
+/// token, over the in-process client of the host the runtime opened its lease on — the production
+/// path, with no test author.
+#[derive(Debug, Clone)]
+struct ToolWriter(htui_mcp::McpHost<Backend>);
+
+impl htui_agent::registry::TransportBuilder for ToolWriter {
+    fn build(
+        &self,
+        agent: &Agent,
+        _on_box: Option<&AgentBox>,
+        caps: htui_agent::driver::DriverCaps,
+    ) -> Result<Box<dyn htui_agent::driver::AgentDriver>, htui_agent::error::DriverError> {
+        Ok(Box::new(ToolWriting {
+            inner: htui_agent::fake::FakeDriver::new(agent.name.clone(), caps, one_turn()),
+            host: self.0.clone(),
+        }))
+    }
+}
+
+/// [`ToolWriter`]'s driver.
+#[derive(Debug)]
+struct ToolWriting {
+    inner: htui_agent::fake::FakeDriver,
+    host: htui_mcp::McpHost<Backend>,
+}
+
+impl htui_agent::driver::AgentDriver for ToolWriting {
+    fn name(&self) -> &str {
+        htui_agent::driver::AgentDriver::name(&self.inner)
+    }
+
+    fn caps(&self) -> htui_agent::driver::DriverCaps {
+        htui_agent::driver::AgentDriver::caps(&self.inner)
+    }
+
+    fn start<'a>(
+        &'a self,
+        spec: htui_agent::driver::SessionSpec,
+        prompt: String,
+    ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>> {
+        let token = spec
+            .mcp
+            .first()
+            .and_then(|server| server.env.get(htui_mcp::ENV_TOKEN))
+            .cloned();
+        let host = self.host.clone();
+        let inner = htui_agent::driver::AgentDriver::start(&self.inner, spec, prompt);
+        Box::pin(async move {
+            let session = inner.await?;
+            let token = token.expect("the spec carries htui's server");
+            let mut client = host.client(&token).expect("the session's token is live");
+            client.initialize().await.expect("initialize is answered");
+            let written = client
+                .call(
+                    "document_write",
+                    json!({ "body": "What the step found, through the tool." }),
+                )
+                .await
+                .expect("the call is answered");
+            assert!(!written.is_error, "{}", written.text);
+            Ok(session)
+        })
+    }
+}
+
+/// MOD-11 T6 (B-9): `ANA-2` started with `R` on a runtime with a real `McpHost` and **no author**:
+/// the research step's document came through `document_write`, so the Runs pane's `a` is live on
+/// it and approving walks on.
+#[tokio::test]
+async fn runs_pane_approve_is_enabled_by_a_tool_written_document() {
+    let store = seeded_store().await;
+    let host = htui_mcp::McpHost::new(Backend::memory(store.clone())).expect("a binary path");
+    let mut factory = DriverFactory::new();
+    factory.register("acp", Box::new(ToolWriter(host.clone())));
+    let runtime = RunRuntime::with_parts(
+        Arc::new(FakeIsolator::new()),
+        Arc::new(FakeVerifier::new()),
+        factory,
+    )
+    .with_clock(Arc::new(Fixed))
+    .with_tool_host(Arc::new(host));
+    let mut harness = Harness::over(store.clone())
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_run_runtime(runtime);
+    harness.drive().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.drive().await;
+    for _ in 0..TO_ANA_2 {
+        harness.key("j");
+        harness.drive().await;
+    }
+    sub_tab(&mut harness, 1);
+    harness.key("R");
+    harness.drive().await;
+    assert_eq!(harness.app().status, None, "`R` started a run");
+
+    let run = store.runs(ids::HTUI_ANA_2).await.expect("the read")[0].id;
+    let research = store
+        .run_steps(run)
+        .await
+        .expect("the read")
+        .into_iter()
+        .find(|step| step.position == 0)
+        .expect("the research step");
+    assert_eq!(research.status, StepStatus::AwaitingApproval);
+    let heads = store.documents(ids::HTUI_ANA_2).await.expect("the read");
+    assert!(
+        heads
+            .iter()
+            .any(|head| head.kind == "research" && head.produced_by_step_id == Some(research.id)),
+        "the tool wrote the step's output: {heads:?}"
+    );
+    let verdicts = run_worker::actions(
+        &Backend::memory(store.clone()),
+        ids::HTUI_ANA_2,
+        &LiveChats::default(),
+    )
+    .await
+    .expect("the verdicts read");
+    assert_eq!(verdicts.steps[&research.id].approve, Ok(()));
+
+    harness.key("a");
+    harness.drive().await;
+    assert_eq!(harness.app().status, None, "the approval was not refused");
+    let approved = store
+        .run_steps(run)
+        .await
+        .expect("the read")
+        .into_iter()
+        .find(|step| step.id == research.id)
+        .expect("the research step");
+    assert_eq!(approved.status, StepStatus::Done, "approved and walked on");
 }
 
 // ---------------------------------------------------------------------------------------------
