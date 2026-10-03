@@ -437,6 +437,40 @@ where
     }
 }
 
+/// One instance of a listener that serves a single client per instance: a Windows named pipe's
+/// server end. A trait so the accept step ([`connect_next`]) is tested on every platform.
+#[cfg(any(windows, test))]
+trait PipeInstance: Sized {
+    /// Waits for a client on this instance.
+    fn connect(&self) -> impl Future<Output = std::io::Result<()>> + Send;
+}
+
+/// One accept on a pipe-like listener (tokio's named-pipe pattern): waits for a client on the
+/// instance in `slot`, puts a fresh instance from `create` in its place **before** handing the
+/// connected one off, and returns it.
+///
+/// A failed connect replaces the instance too, before the error goes back to the accept loop. A
+/// client that opens and closes the pipe before `ConnectNamedPipe` leaves the instance answering
+/// `ERROR_NO_DATA` to every later connect; retrying it would lock every later child out.
+#[cfg(any(windows, test))]
+async fn connect_next<P: PipeInstance>(
+    slot: &mut P,
+    create: impl Fn() -> std::io::Result<P>,
+) -> std::io::Result<P> {
+    if let Err(err) = slot.connect().await {
+        match create() {
+            // Dropping the broken instance closes it.
+            Ok(fresh) => *slot = fresh,
+            Err(create) => {
+                tracing::warn!(error = %create, "htui-mcp: cannot replace a failed pipe instance");
+            }
+        }
+        return Err(err);
+    }
+    let fresh = create()?;
+    Ok(std::mem::replace(slot, fresh))
+}
+
 #[cfg(unix)]
 mod platform {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -528,13 +562,21 @@ mod platform {
     };
     use tokio::sync::{Mutex, watch};
 
-    use super::{Address, Lookup, PIPE_BUSY_BUDGET, PIPE_BUSY_POLL, accept_loop};
+    use super::{
+        Address, Lookup, PIPE_BUSY_BUDGET, PIPE_BUSY_POLL, PipeInstance, accept_loop, connect_next,
+    };
 
     /// Unused on Windows: a pipe has no file to remove.
     pub(super) const SOCKET_NAME: &str = "s";
 
     /// `ERROR_PIPE_BUSY`: every instance is taken; the server is about to create the next.
     const ERROR_PIPE_BUSY: i32 = 231;
+
+    impl PipeInstance for NamedPipeServer {
+        fn connect(&self) -> impl Future<Output = std::io::Result<()>> + Send {
+            NamedPipeServer::connect(self)
+        }
+    }
 
     pub(super) fn bind(
         lookup: Lookup,
@@ -556,12 +598,12 @@ mod platform {
                 let pipe = pipe.clone();
                 async move {
                     let mut server = next.lock().await;
-                    server.connect().await?;
-                    let fresh = ServerOptions::new()
-                        .reject_remote_clients(true)
-                        .create(&pipe)?;
-                    let connected: NamedPipeServer = std::mem::replace(&mut *server, fresh);
-                    Ok(connected)
+                    connect_next(&mut *server, || {
+                        ServerOptions::new()
+                            .reject_remote_clients(true)
+                            .create(&pipe)
+                    })
+                    .await
                 }
             },
             lookup,
@@ -597,7 +639,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-    use super::{Listener, Lookup, Refusal, Token, splice};
+    use super::{Listener, Lookup, PipeInstance, Refusal, Token, connect_next, splice};
 
     #[test]
     fn a_token_is_64_lowercase_hex_and_debug_hides_it() {
@@ -726,6 +768,53 @@ mod tests {
             .expect("a clean end");
         assert_eq!(stdout, b"{\"answer\":1}\n");
         assert_eq!(request, b"{\"request\":1}\n");
+    }
+
+    /// A pipe instance for [`connect_next`]: `broken` fails every connect, as a Windows instance
+    /// does once a client opened and closed it before `ConnectNamedPipe` (`ERROR_NO_DATA`).
+    #[derive(Debug)]
+    struct FakeInstance {
+        serial: u32,
+        broken: bool,
+    }
+
+    impl PipeInstance for FakeInstance {
+        fn connect(&self) -> impl Future<Output = std::io::Result<()>> + Send {
+            let broken = self.broken;
+            async move {
+                if broken {
+                    Err(std::io::Error::from_raw_os_error(232))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
+
+    /// ADV-3: an instance whose connect failed is replaced before the error is returned, so the
+    /// accept loop's retry waits on a fresh instance instead of failing on the broken one forever.
+    #[tokio::test]
+    async fn a_failed_connect_replaces_the_instance() {
+        let made = std::sync::atomic::AtomicU32::new(1);
+        let create = || {
+            Ok(FakeInstance {
+                serial: made.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                broken: false,
+            })
+        };
+        let mut slot = FakeInstance {
+            serial: 0,
+            broken: true,
+        };
+        connect_next(&mut slot, create)
+            .await
+            .expect_err("the broken instance fails");
+        assert_eq!(slot.serial, 1, "a fresh instance replaced the broken one");
+        let connected = connect_next(&mut slot, create)
+            .await
+            .expect("the retry connects");
+        assert_eq!(connected.serial, 1);
+        assert_eq!(slot.serial, 2, "the next instance waits before the handoff");
     }
 
     #[cfg(unix)]
