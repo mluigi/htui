@@ -64,9 +64,9 @@ use crate::store::traits::{
     persona_is_bound, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
     references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
     row_names_another_phase, row_names_another_step, run_is_terminal, self_link,
-    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
-    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
+    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -5510,6 +5510,9 @@ impl State {
         let Some(step) = new.produced_by_step_id else {
             return Err(StoreError::Constraint(document_needs_a_step()));
         };
+        if let Some(refusal) = step_document_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
         let (_, item, _) = self.step_scope(step, fence)?;
         if item != Some(new.item_id) {
             return Err(StoreError::Constraint(step_writes_own_item(
@@ -5525,6 +5528,9 @@ impl State {
         let Some(step) = note.via_step_id else {
             return Err(StoreError::Constraint(note_needs_a_step()));
         };
+        if let Some(refusal) = step_note_refusal(&note) {
+            return Err(StoreError::Constraint(refusal));
+        }
         let (_, item, _) = self.step_scope(step, fence)?;
         if item != Some(note.item_id) {
             return Err(StoreError::Constraint(step_writes_own_item(
@@ -6166,6 +6172,9 @@ impl State {
 
     /// MOD-11 B-4: the item of `project` keyed `key`.
     fn item_by_key(&self, project: ProjectId, key: &str) -> Option<ItemId> {
+        if key.contains('\0') {
+            return None;
+        }
         self.items
             .values()
             .find(|row| row.project_id == project && row.key == key)

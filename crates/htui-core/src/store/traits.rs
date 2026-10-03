@@ -1819,8 +1819,9 @@ pub trait WriteStore: ReadStore {
     /// wins").
     ///
     /// # Errors
-    /// `Constraint(document_needs_a_step())` when `produced_by_step_id` is `None` (before any
-    /// read); [`StoreError::NotFound`](crate::store::StoreError::NotFound)
+    /// `Constraint(document_needs_a_step())` when `produced_by_step_id` is `None`, then
+    /// `Constraint(step_document_refusal(..))` for a NUL (both before any read);
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound)
     /// `{ entity: "run_step" }`; [`StoreError::Fenced`](crate::store::StoreError::Fenced)
     /// `{ step }`; `Constraint(step_writes_own_item(..))` when the run's `item_id` is not
     /// `new.item_id`; then `write_document`'s own errors.
@@ -1831,7 +1832,8 @@ pub trait WriteStore: ReadStore {
     /// [`write_step_document`](Self::write_step_document) (`note_needs_a_step()` first).
     ///
     /// # Errors
-    /// `Constraint(note_needs_a_step())`; `NotFound { entity: "run_step" }`; `Fenced { step }`;
+    /// `Constraint(note_needs_a_step())`; `Constraint(step_note_refusal(..))` for a NUL in the
+    /// body; `NotFound { entity: "run_step" }`; `Fenced { step }`;
     /// `Constraint(step_writes_own_item(..))`; then `add_note`'s own errors.
     async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note>;
 
@@ -1855,8 +1857,10 @@ pub trait WriteStore: ReadStore {
     /// `Constraint(link_not_proposed_by_run(..))`.
     async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink>;
 
-    /// B-4: the item of `project` whose `key` is `key`; `None` when there is none. A read on
-    /// `WriteStore` by the `command_runs` precedent: `WorkerStore`'s reads come from here.
+    /// B-4: the item of `project` whose `key` is `key`; `None` when there is none, a key holding
+    /// a NUL included (answered before any read: no key holds one, and Postgres would fail the
+    /// parameter, `22021`). A read on `WriteStore` by the `command_runs` precedent:
+    /// `WorkerStore`'s reads come from here.
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -2400,6 +2404,27 @@ pub fn document_needs_a_step() -> String {
 #[must_use]
 pub fn note_needs_a_step() -> String {
     "an agent note names the step that wrote it (via_step_id)".to_owned()
+}
+
+/// D13: the first of an agent document's `text` columns (`kind`, `title`, `body`) that holds a
+/// NUL ([`has_nul`]); [`WriteStore::write_step_document`] refuses it on both stores before any
+/// read, where Postgres alone would fail it as a backend error (`22021`).
+#[must_use]
+pub fn step_document_refusal(new: &NewDocument) -> Option<String> {
+    [
+        ("document.kind", &new.kind),
+        ("document.title", &new.title),
+        ("document.body", &new.body),
+    ]
+    .into_iter()
+    .find(|(_, text)| text.contains('\0'))
+    .map(|(column, _)| has_nul(column))
+}
+
+/// D13: [`step_document_refusal`] for [`WriteStore::add_step_note`]'s `item_note.body`.
+#[must_use]
+pub fn step_note_refusal(note: &NewNote) -> Option<String> {
+    note.body.contains('\0').then(|| has_nul("item_note.body"))
 }
 
 /// D13: a step writes only on its own run's item (PRD OQ-4).

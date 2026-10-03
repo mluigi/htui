@@ -16435,6 +16435,33 @@ async fn write_step_document_refuses_a_foreign_item<S: WriteStore>(store: &S) {
         &document_needs_a_step(),
         "a document naming no step on an unknown item",
     );
+    // A NUL Postgres cannot store (`22021`) is refused by rule on both stores, before any read:
+    // even an unknown step answers it, not `NotFound`.
+    let unknown_step = Some(StepId::new());
+    for (doc, column) in [
+        (new_document(item, "ju\0dge", unknown_step), "document.kind"),
+        (
+            NewDocument {
+                title: "a\0title".to_owned(),
+                ..new_document(item, "judge", unknown_step)
+            },
+            "document.title",
+        ),
+        (
+            NewDocument {
+                body: "a\0body".to_owned(),
+                ..new_document(item, "judge", unknown_step)
+            },
+            "document.body",
+        ),
+    ] {
+        constraint_exactly(
+            CASE,
+            store.write_step_document(StepFence::Lease(a), doc).await,
+            &has_nul(column),
+            "a document with a NUL",
+        );
+    }
     constraint_exactly(
         CASE,
         store
@@ -16521,6 +16548,17 @@ async fn add_step_note_fenced_on_its_own_item<S: WriteStore>(store: &S) {
             .await,
         &note_needs_a_step(),
         "a note naming no step",
+    );
+    // A NUL is refused before any read, as `write_step_document`'s is.
+    let nul = NewNote {
+        body: "Refused:\0 the tree was dirty.".to_owned(),
+        ..new_note(item, ids::USER, Some(StepId::new()))
+    };
+    constraint_exactly(
+        CASE,
+        store.add_step_note(StepFence::Lease(a), nul).await,
+        &has_nul("item_note.body"),
+        "a note with a NUL",
     );
     taken_by(CASE, store, run, a, b).await;
     let stale = store
@@ -16935,6 +16973,9 @@ async fn item_by_key_answers_within_its_project<S: WriteStore>(store: &S) {
         (ids::PROJECT_AGY, "ANA-2", None),
         (ids::PROJECT_HTUI, "NOPE-9", None),
         (ProjectId::new(), "ANA-1", None),
+        // A NUL no key holds (Postgres refuses it as text, `22021`): no item, on both stores.
+        (ids::PROJECT_HTUI, "ANA-2\0", None),
+        (ids::PROJECT_HTUI, "\0", None),
     ] {
         assert_eq!(
             store.item_by_key(project, key).await.expect(CASE),

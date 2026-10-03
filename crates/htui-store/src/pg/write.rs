@@ -46,7 +46,8 @@ use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     EXECUTOR_MUST_BE_KNOWN, document_needs_a_step, link_key, link_not_proposed_by_run,
-    link_outside_project, note_needs_a_step, self_link, step_writes_own_item,
+    link_outside_project, note_needs_a_step, self_link, step_document_refusal, step_note_refusal,
+    step_writes_own_item,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore as _, Result,
@@ -6503,6 +6504,9 @@ impl WriteStore for PgStore {
         let Some(step) = new.produced_by_step_id else {
             return Err(StoreError::Constraint(document_needs_a_step()));
         };
+        if let Some(refusal) = step_document_refusal(&new) {
+            return Err(StoreError::Constraint(refusal));
+        }
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let scope = step_scope(&mut tx, step, fence).await?;
         if scope.item != Some(new.item_id) {
@@ -6541,6 +6545,9 @@ impl WriteStore for PgStore {
         let Some(step) = note.via_step_id else {
             return Err(StoreError::Constraint(note_needs_a_step()));
         };
+        if let Some(refusal) = step_note_refusal(&note) {
+            return Err(StoreError::Constraint(refusal));
+        }
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let scope = step_scope(&mut tx, step, fence).await?;
         if scope.item != Some(note.item_id) {
@@ -6708,12 +6715,16 @@ impl WriteStore for PgStore {
         Ok(row)
     }
 
-    /// B-4: the item of `project` keyed `key`, on the pool.
+    /// B-4: the item of `project` keyed `key`, on the pool. A key holding a NUL is `None` before
+    /// the query, which Postgres would fail on the parameter (`22021`).
     ///
     /// # Errors
     ///
     /// The backend's own failures only.
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        if key.contains('\0') {
+            return Ok(None);
+        }
         sqlx::query_scalar!(
             r#"SELECT id AS "id: ItemId" FROM item WHERE project_id = $1 AND key = $2"#,
             project.as_uuid(),
