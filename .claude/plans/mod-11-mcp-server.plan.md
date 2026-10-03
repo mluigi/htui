@@ -1,6 +1,6 @@
 # Plan: MOD-11 — htui MCP server
 
-**Status: DRAFT — fact-checked 2026-10-03 (workflow `wf_33a62d14-658`, amendments in place); awaiting maintainer CONFIRM.**
+**Status: CONFIRMED by the maintainer 2026-10-03 ("yes" = every recommended default, OQ-1…OQ-10). Fact-checked 2026-10-03 (workflow `wf_33a62d14-658`, amendments in place). Next: code-architect blueprint.**
 
 **Source PRD**: `.claude/prds/mod-11-mcp-server.prd.md`, **all five milestones** (MOD-42 precedent:
 one plan, milestone-ordered tasks), with its resolved questions (cited **PRD OQ-1…7**).
