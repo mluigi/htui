@@ -368,7 +368,7 @@ graph ... Produced by steps or written by hand." `R-MCP-3` (`:238-241`) fixes th
 |---|---|---|
 | `input_kinds` resolves to *every* version of each named kind | Rejected | Unbounded prompt growth, and `R-PRM-3`'s trim order would spend its whole budget re-reading superseded drafts. |
 | `input_kinds` resolves to the latest version of each kind, full stop | Rejected | It reads fan-out losers. `document UNIQUE (item_id, kind, version)` forces N concurrent writers of one kind onto N versions, so "latest" is whichever loser finished last. |
-| `input_kinds` resolves to the latest version whose producing step is not a loser, preferring this run's own steps | **Adopted** | One query, decidable, and it is the only reading under which `R-ORCH-7`'s "the rest are kept as history" and "only the selected result continues" are both true. |
+| `input_kinds` resolves to the latest version whose producing step is not a loser, preferring this run's own steps | **Adopted** | One query, decidable, and it is the only reading under which `R-ORCH-7`'s "the rest are kept as history" and "only the selected result continues" are both true. Amended by MOD-73, 2026-10-03: a hand-written version newer than that pick wins (below). |
 | The agent allocates `document.version` | Rejected | N parallel `document_write` calls race on `UNIQUE (item_id, kind, version)`; an agent retrying a unique violation is an agent in a bookkeeping path (`R-ID-6`). |
 | The orchestrator allocates `document.version` inside the insert transaction | **Adopted** | `INSERT ... SELECT coalesce(max(version),0)+1` under the row lock of §8's `write_document`; the MCP tool calls it rather than writing directly. |
 | `verify_command`'s exit lands in `run_step.exit_code` | Rejected | `R-ORCH-11` already claims `exit_code` for the step's own exit code (`docs/REQUIREMENTS.md:185-186`); the column would be double-booked and the agent's code lost. |
@@ -395,20 +395,46 @@ verification and the commit hashes are durable.
 **Input resolution, exactly.** For each `kind` in `input_kinds`, in order:
 
 ```sql
-SELECT d.*
-  FROM document d
-  LEFT JOIN run_step s ON s.id = d.produced_by_step_id
- WHERE d.item_id = $item AND d.kind = $kind
-   AND (s.id IS NULL OR s.selected IS NOT FALSE)      -- hand-written, winner, or fan_out = 1
- ORDER BY (s.run_id = $run) DESC NULLS LAST,          -- this run's own output first
-          d.version DESC
+SELECT arm.*
+  FROM (SELECT d.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY d.produced_by_step_id IS NULL          -- two arms: step-produced, hand-written
+                   ORDER BY CASE WHEN s.id IS NULL     THEN 2
+                                 WHEN s.run_id = $run  THEN 0          -- this run's own output first
+                                 ELSE 1 END,
+                            d.version DESC) AS rank_in_arm
+          FROM document d
+          LEFT JOIN run_step s ON s.id = d.produced_by_step_id
+         WHERE d.item_id = $item AND d.kind = $kind
+           AND (s.id IS NULL OR s.selected IS NOT FALSE)) arm   -- hand-written, winner, or fan_out = 1
+ WHERE arm.rank_in_arm = 1
+ ORDER BY arm.version DESC                                       -- the newer of the two picks
  LIMIT 1;
 ```
 
 `s.selected IS NOT FALSE` is the loser exclusion of invariant 8: `NULL` (fan_out = 1) and `true`
-(winner) both pass, `false` does not. `(s.run_id = $run) DESC` is the rule that a phase reads what
-*this* run produced when it exists and falls back to the item's history otherwise, which is what
-makes a re-run of a graph on an item that already has documents behave sensibly.
+(winner) both pass, `false` does not. Inside the step-produced arm, `WHEN s.run_id = $run THEN 0` is
+the rule that a phase reads what *this* run produced when it exists and falls back to the item's
+history otherwise, which is what makes a re-run of a graph on an item that already has documents
+behave sensibly.
+
+*Amended by MOD-73, 2026-10-03 (plan D1-D4, `.claude/plans/mod-73-hand-written-inputs.plan.md`):*
+the first sketch ordered `(s.run_id = $run) DESC NULLS LAST, d.version DESC`, which ranks a
+hand-written document after any run's output whatever its version. The gate table's "edits the
+artifact" (a new version followed by `approved`, below) was therefore shown everywhere and never
+read by the next phase while a step-produced version of the kind existed. The resolver now takes
+two picks per kind and answers the higher version: the **step-produced** pick, ranked as before
+(this run's output, then another run's, then version), and the **hand-written** pick, the latest
+version with `produced_by_step_id IS NULL`. `document.version` is allocated in write order per
+`(item, kind)`, so newer is higher. An edit written after this run's output wins. A hand-written
+version older than this run's output loses to it. With no output of this run, the item's history
+is read newest first across hand-written versions and other runs' output. Another run's output
+still never overrides this run's. The arm is keyed on the column, not on `s.id IS NULL`. On
+Postgres the two coincide (`ON DELETE SET NULL`), but the offline mirror can briefly hold a fan-out
+loser's document without its step mid-refresh, and keyed on the join that row could win on version
+over the selected output. Both SQL backends run this as one statement, two `ROW_NUMBER()` windows
+rather than `DISTINCT ON` or a boolean `DESC NULLS LAST`, and `MemStore` mirrors it. `accept
+artifact` (§4.8) is unchanged: it still needs a document produced by the promoted step.
 
 A kind with no row is a **hard failure at stage 3**, before a token is spent: the step goes to
 `failed` with `run.failure = "missing input document: <kind>"`, the run parks per §4.3, and the item
@@ -419,7 +445,10 @@ produces an artefact that looks valid and is not.
 (`docs/ANA-9.md:262-264`), which would reclassify a loser's document as hand-written and readmit it
 to this query. The sweep is therefore amended in `0003`'s companion rule: **the sweep skips a step
 whose `selected IS FALSE`**, keeping the loser row (which is small: status, index and timings) while
-still dropping its `session_event` rows. That is stated in §9 rather than left as a latent bug.
+still dropping its `session_event` rows. Since MOD-73 the skip is load-bearing in a second way: a
+document whose `produced_by_step_id` was nulled joins the hand-written arm and competes on version,
+so a readmitted loser could be read over the selected output, not merely after it. That is stated in
+§9 rather than left as a latent bug.
 
 **Output.** Exactly one document of `output_kind` per step. It is written by MOD-11's
 `document_write` tool, which calls §8's `write_document` rather than the store directly, so version
@@ -463,7 +492,7 @@ a new document version followed by `approved`. The mapping is:
 |---|---|---|---|
 | approves | `approved` | `done` | `running` (next position) |
 | rejects with a note | `rejected` + `gate_note` | `failed` | `running` when the phase can loop and budget remains (§4.4), else `failed` |
-| edits the artifact | `approved` + a new `document` version | `done` | `running` |
+| edits the artifact | `approved` + a new `document` version, which the next phase reads because it is newer than the step's output (§4.2's resolver, amended by MOD-73, 2026-10-03) | `done` | `running` |
 | retries | `retried` | `superseded`, new step at `attempt + 1` | `running` |
 | (no stop) | `skipped` | `done` | `running` |
 
