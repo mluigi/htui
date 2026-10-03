@@ -264,6 +264,57 @@ mod tests {
         );
     }
 
+    /// MOD-71 D3: capture is the loop's alone to turn on, and every way the terminal is given back
+    /// turns it off, first and whatever the guard last set. A path that forgot leaves the shell, or
+    /// `$EDITOR`, printing an escape sequence for every mouse move.
+    #[test]
+    fn every_give_back_disables_mouse_capture_and_only_the_loop_enables_it() {
+        let code = code();
+        let restore = body(&code, "pub fn restore_terminal()");
+        let off = restore
+            .find("disable_mouse_capture()")
+            .expect("`restore_terminal` turns capture off");
+        let paste = restore
+            .find("disable_bracketed_paste()")
+            .expect("`restore_terminal` turns paste off");
+        assert!(off < paste, "capture goes first (D3)");
+        let leave = body(&code, "fn leave(&mut self)");
+        assert!(
+            leave.contains("disable_mouse_capture()") && leave.contains("self.mouse = false"),
+            "`leave` turns capture off and forgets it"
+        );
+        for taking in ["pub fn init()", "fn enter(&mut self)"] {
+            let body = body(&code, taking);
+            assert!(
+                !body.contains("MouseCapture") && !body.contains("mouse_capture"),
+                "`{taking}` leaves capture to the loop"
+            );
+        }
+        let toggle = body(&code, "pub fn set_mouse_capture(&mut self, on: bool)");
+        assert!(
+            toggle.contains("enable_mouse_capture()") && toggle.contains("disable_mouse_capture()")
+        );
+        assert!(
+            toggle.contains("self.mouse"),
+            "the toggle writes only a change"
+        );
+        for (helper, command) in [
+            ("fn enable_mouse_capture()", "EnableMouseCapture"),
+            ("fn disable_mouse_capture()", "DisableMouseCapture"),
+        ] {
+            let body = body(&code, helper);
+            assert!(body.contains(command), "`{helper}` issues `{command}`");
+            assert!(
+                body.contains("tolerate_unsupported("),
+                "`{helper}` tolerates an unsupported terminal"
+            );
+            assert!(
+                !body.contains("AlternateScreen") && !body.contains("BracketedPaste"),
+                "`{helper}` issues nothing else"
+            );
+        }
+    }
+
     /// Review R2-L6: crossterm's legacy Windows console answers `Unsupported` for bracketed paste;
     /// that is a terminal without paste mode, not a failure. Any other error still is one.
     #[test]
