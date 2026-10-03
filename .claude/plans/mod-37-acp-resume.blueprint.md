@@ -464,6 +464,13 @@ before `git branch -d`.
   `session/resume` or `session/load` (MOD-37 M5, R-48). The handoff text is built either way, as the
   fallback a failed resume opens with."
 - The module doc (`:1-5`) and `OpeningKind::Resume`'s doc gain "either transport".
+- **A-7 (maintainer, 2026-10-03):** `banner` (`:30-52`) takes the **latest** `session_started` row:
+  `.max_by_key(|(seq, _)| *seq)` replaces `.min_by_key`. Its doc becomes "The step's latest `other`
+  row whose update is `session_started` … (MOD-37 M5 A-7, amending D192: after a resume that failed
+  and fell back, the latest session is the handoff's, which holds the chat)". The message in
+  `a_resumable_cli_agent_with_a_banner_resumes` (`:266`) is reworded to "latest". New red test
+  `the_latest_banner_wins`: two banners (`seq` 1 `sess_old`, `seq` 5 `sess_new`), stored out of
+  order, give `Resume(sess_new)`. Today's code returns `sess_old`.
 - Tests (`:262-322`): every `opening_kind(caps, Transport::Cli, events)` becomes `opening_kind(caps, events)`.
   `an_acp_agent_hands_off_even_when_its_caps_say_resume` (`:315`) becomes
   `an_acp_agent_with_resume_caps_and_a_banner_resumes`. It asserts
@@ -932,12 +939,14 @@ write-up (it records the amendments below and H-4's open question), the DECISION
   count to forty-five.
 - **H-3 the pane strings do not fit.** There are 35 free columns. The strings are 40 and 55.
   **Resolution**: wrap at `; ` (amendment A-6).
-- **H-4 a re-promotion after `resume_failed` retries the dead id.** `promote::banner` takes the
+- **H-4 a re-promotion after `resume_failed` retries the dead id.** `promote::banner` took the
   **first** `session_started` row by `seq` (`promote.rs:30-52`, blueprint D192). The fallback handoff
-  session's banner comes later, so the next promotion resumes the dead session again, fails, and falls
-  back again. It is reported every time and never silent. **Resolution**: accepted for M5 and recorded
-  in the write-up. Taking the latest banner would resume the handoff conversation instead. That
-  changes D192, so it is the maintainer's call (amendment A-7, not implemented).
+  session's banner comes later, so the next promotion would resume the dead session again, fail and
+  fall back again. **Resolution (maintainer, 2026-10-03, A-7): `banner` takes the latest
+  `session_started` row by `seq`** (`max_by_key`). After a fallback, a re-promotion resumes the
+  handoff session, which holds the chat so far. After a successful resume, the restored session's
+  banner has the same id, so nothing changes. This amends MOD-4 D192. The work is in T3: see
+  "promote.rs".
 - **H-5 late replay.** An agent that streams `session/load` replay after its response would leave
   duplicate rows. That is visible, never lost. Accepted per the plan. T2 (b) pins the ordered case,
   and `session/resume` is preferred.
@@ -990,8 +999,8 @@ write-up (it records the amendments below and H-4's open question), the DECISION
   unchanged failure, and no reprobe.
 - **A-6** The Runs pane line is two lines, split at `; ` with the text verbatim, not "a fitted line"
   (H-3).
-- **A-7** (question, not implemented) Should `promote::banner` take the latest `session_started` row
-  instead of the first (H-4)?
+- **A-7** (decided by the maintainer 2026-10-03: **latest**) `promote::banner` takes the latest
+  `session_started` row by `seq`, not the first (H-4). This amends D192 and is implemented in T3.
 - **A-8** T3's file list grows: `htui-orch/src/conformance.rs`, the `engine.rs` test,
   `htui/tests/chat.rs` and `htui/tests/runs_pg.rs` (H-1). This stays disjoint from T2, which touches
   only `htui-agent`.

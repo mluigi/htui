@@ -4,7 +4,7 @@
 **Selected Milestone**: 5 - ACP resume (R-48, ANA-27 §5.1 T5)
 **Complexity**: Medium
 **Routing**: PRD path, M5 planned on its own (maintainer-confirmed 2026-10-03); ultracode not needed.
-**Status**: confirmed 2026-10-03 (fact-checked: 16 claims, 8 ✓, 8 amended); blueprint next
+**Status**: confirmed 2026-10-03 (fact-checked: 16 claims, 8 ✓, 8 amended); blueprint `.claude/plans/mod-37-acp-resume.blueprint.md` (amendments A-1..A-11, A-7 decided: latest banner); implementing
 
 ## Summary
 A promoted ACP step resumes its own agent session instead of always getting the handoff prompt.
@@ -23,6 +23,7 @@ real outcome (ANA-27 T5).
 | ACP call and replay | **`session/resume` first, `session/load` fallback.** Resume when `agentCapabilities.sessionCapabilities.resume` is advertised and `settings.acp.session.resume` allows it. Otherwise load when `loadSession` is advertised and `settings.acp.session.load` allows it, discarding every update queued before the load response, so the step log gains no duplicate rows. |
 | A requested resume that fails | **Report, then a labelled handoff in the same bind.** The failure sentence is recorded as an `other` row (`resume_failed`) in the step's own log, which the chat shows as it arrives, and the chat then opens with the handoff prompt, marked "context not carried; handoff prompt only". No silent fresh start and no dead end. A failed resume used to leave the step promoted with no chat, and a second promotion chose `Resume` again. *(Fact-check amendment: a step-log row instead of an item note. `ChatArgs` and `Promoted` carry no item or user for `NewNote`, and the row is durable, scoped to the step, and reaches the tab through the existing `ChatFrame::Event`.)* |
 | Where the note lives | **A new `run_step` column**, R-3's shape: both stores, the cache mirror and `RunStepSummary`. |
+| Which banner a promotion resumes (blueprint A-7, decided after the blueprint) | **The latest `session_started` row**, not the first (amends MOD-4 D192). A re-promotion after a fallback resumes the handoff session instead of retrying the dead one. |
 
 ## Grounding (facts this plan rests on)
 - SDK `agent-client-protocol` 2.1.0 (`Cargo.lock`) has `ConnectionTo::load_session(id, cwd)`
