@@ -2029,9 +2029,9 @@ pub fn spawn_with(
 }
 
 /// [`spawn_with`] hosting htui's MCP tools (MOD-11 D11): with `tools`, the chat runtime and the
-/// run runtime open their leases on the one host, and the loop hands it the current backend at
-/// the top of every iteration (B-2), so a session opened after a `SetDsn` writes to the new
-/// server. `None` is [`spawn_with`] exactly.
+/// run runtime open their leases on the one host, and the loop hands it the current writable
+/// backend at the top of every iteration (B-2, `host_the_backend`), so a session opened after a
+/// `SetDsn` writes to the new server. `None` is [`spawn_with`] exactly.
 pub fn spawn_hosted(
     started: Started,
     rx: mpsc::UnboundedReceiver<RequestEnvelope>,
@@ -2205,7 +2205,7 @@ pub(crate) fn spawn_with_concepts(
             // MOD-11 B-2 (H-10): the backend this iteration serves is the one a tool session
             // opened from now on writes to — robust to every site below that swaps or mutates it.
             if let Some(host) = &tools {
-                host.set_host(backend.clone());
+                host_the_backend(host, &backend);
             }
             // The first sweep reads `lease_ttl_seconds`; the ticker follows it.
             if runs.sweep_every() != sweep_every {
@@ -2355,6 +2355,12 @@ pub(crate) fn spawn_with_concepts(
                                 // `connecting`, because nothing is in flight (D12).
                                 since: if ctx.offline { Some(Utc::now()) } else { None },
                             };
+                            // MOD-11 B-2, T6 ADV-1: the one offline backend the tool host takes
+                            // (`host_the_backend` keeps the last writable one): every walk was
+                            // preempted above, and the old server's pool must not outlive it here.
+                            if let Some(host) = &tools {
+                                host.set_host(backend.clone());
+                            }
                             // (7) Every later tick dials the new server - unless this session was
                             // started with `--offline`, which is a choice the user typed.
                             reconnect = if ctx.offline {
@@ -2680,6 +2686,22 @@ pub(crate) fn spawn_with_concepts(
             beat.abort();
         }
     })
+}
+
+/// Hands `backend` to the shared tool host when it can write (MOD-11 B-2, T6 ADV-1).
+///
+/// A backend that went offline is **not** handed over: `go_offline` does not preempt a walk, and
+/// the walk's `Kit` keeps its own `Online` clone, so the server's last writable backend is still
+/// the one its next session's tool writes belong to. Handing over `Offline` would refuse that
+/// lease and fail the run (`agent spawn failed`) over a blip the walk's own pool survived. A
+/// chat needs a writer to start at all, so it never opens a lease in that window. Moving to
+/// another server is the one swap that must reach the host while offline: `SetDsn` preempts
+/// every walk and hands the host its `Offline` backend itself, so no session writes to the
+/// server the session has left and the old pool is not kept open by the host.
+fn host_the_backend(host: &htui_mcp::McpHost<Backend>, backend: &Backend) {
+    if backend.writer().is_some() {
+        host.set_host(backend.clone());
+    }
 }
 
 /// The sweep ticker (D190): first tick one period from now, `Delay` on a missed one.
@@ -4892,6 +4914,54 @@ mod tests {
             );
         }
 
+        cache.close().await;
+    }
+
+    /// A scope for the tool host tests below: no item, no fence, the ACP transport.
+    fn tool_scope() -> htui_orch::tools::ToolScope {
+        htui_orch::tools::ToolScope {
+            run_id: htui_core::model::RunId::new(),
+            step_id: htui_core::model::StepId::new(),
+            project_id: ids::PROJECT_HTUI,
+            item_id: None,
+            box_id: ids::BOX,
+            user: ids::USER,
+            fence: htui_core::store::StepFence::Unleased,
+            output_kind: None,
+            hostname: htui_core::prompt::render::HostnameLine::Omitted,
+            command_queue: false,
+            cwd: std::env::temp_dir(),
+            transport: htui_core::model::Transport::Acp,
+        }
+    }
+
+    /// MOD-11 T6 ADV-1: a backend that went offline is not handed to the tool host. `go_offline`
+    /// does not preempt a walk, which keeps its own `Online` clone across the blip, so the walk's
+    /// next session must still open on the server it was claimed on (B-2) rather than answer
+    /// `Offline` and fail the run with `agent spawn failed`.
+    #[tokio::test]
+    async fn an_offline_backend_leaves_the_tool_host_on_the_last_writable_one() {
+        use htui_orch::tools::ToolHost as _;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-host-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let host = htui_mcp::McpHost::new(demo()).expect("a tool host");
+
+        host_the_backend(
+            &host,
+            &Backend::Offline {
+                cache: cache.clone(),
+                since: Some(Utc::now()),
+            },
+        );
+        let lease = host.open(tool_scope()).unwrap_or_else(|err| {
+            panic!("a session opened across an offline blip keeps the last writable backend: {err}")
+        });
+
+        drop(lease);
+        host.close();
         cache.close().await;
     }
 }
