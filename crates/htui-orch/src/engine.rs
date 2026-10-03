@@ -16387,6 +16387,14 @@ mod tests {
         async fn a_hung_session_is_cut_at_the_step_deadline_and_settles_deadline_elapsed() {
             let harness = Harness::new().await;
             harness.free_feat_3().await;
+            // Review L5: a `verify_command`, so the cut session's verify is asked for at all.
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.verify_command = Some("cargo test".to_owned());
+                    }
+                })
+                .await;
             step_deadline(&harness, 1);
             harness.orch.script("prd", 1, parks("the prd"));
             let t0 = tokio::time::Instant::now();
@@ -16410,6 +16418,11 @@ mod tests {
             assert!(
                 elapsed >= Duration::from_secs(1) && elapsed < CLIENT_LIMIT,
                 "cut at the deadline: {elapsed:?}"
+            );
+            assert_eq!(
+                harness.orch.verifier.remaining(),
+                [(prd.id, Some(Duration::ZERO))],
+                "the cut session's verify is left no time (`deadline_cut`)"
             );
         }
 
@@ -16493,6 +16506,153 @@ mod tests {
                 "no failure note"
             );
             assert_cancel_answered_once(&harness.orch, prd.id).await;
+        }
+
+        /// An [`AgentDriver`](htui_agent::driver::AgentDriver) whose session is deaf to its
+        /// cancel until the grace runs out: a transport whose agent ignores `session/cancel`.
+        #[derive(Debug)]
+        struct DeafDriver {
+            inner: Box<dyn htui_agent::driver::AgentDriver>,
+        }
+
+        impl htui_agent::driver::AgentDriver for DeafDriver {
+            fn name(&self) -> &str {
+                self.inner.name()
+            }
+
+            fn caps(&self) -> htui_agent::driver::DriverCaps {
+                self.inner.caps()
+            }
+
+            fn start<'a>(
+                &'a self,
+                spec: htui_agent::driver::SessionSpec,
+                prompt: String,
+            ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>>
+            {
+                Box::pin(async move {
+                    let inner = self.inner.start(spec, prompt).await?;
+                    Ok(Box::new(DeafSession { inner, deaf: None })
+                        as Box<dyn htui_agent::driver::AgentSession>)
+                })
+            }
+        }
+
+        /// [`DeafDriver`]'s session: `cancel` only notes its grace, and the next pull waits the
+        /// grace out before the inner session's own cancel ends the turn, so `drive`'s
+        /// post-cancel drain stays open for the whole grace.
+        #[derive(Debug)]
+        struct DeafSession {
+            inner: Box<dyn htui_agent::driver::AgentSession>,
+            deaf: Option<Duration>,
+        }
+
+        impl htui_agent::driver::AgentSession for DeafSession {
+            fn session_ref(&self) -> Option<&htui_agent::driver::AgentSessionRef> {
+                self.inner.session_ref()
+            }
+
+            fn next_event<'a>(
+                &'a mut self,
+            ) -> htui_agent::driver::DriverFuture<'a, Option<htui_agent::event::DriverEnvelope>>
+            {
+                Box::pin(async move {
+                    if let Some(grace) = self.deaf {
+                        tokio::time::sleep(grace).await;
+                        self.deaf = None;
+                        self.inner.cancel(grace).await?;
+                    }
+                    self.inner.next_event().await
+                })
+            }
+
+            fn send_follow_up<'a>(
+                &'a mut self,
+                text: String,
+            ) -> htui_agent::driver::DriverFuture<'a, ()> {
+                self.inner.send_follow_up(text)
+            }
+
+            fn answer_permission<'a>(
+                &'a mut self,
+                request_id: PermissionRequestId,
+                answer: htui_agent::driver::PermissionAnswer,
+            ) -> htui_agent::driver::DriverFuture<'a, ()> {
+                self.inner.answer_permission(request_id, answer)
+            }
+
+            fn cancel<'a>(
+                &'a mut self,
+                grace: Duration,
+            ) -> htui_agent::driver::DriverFuture<'a, ()> {
+                self.deaf = Some(grace);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        /// MOD-37 M4 D1 (review M2): a run cancel that lands while the cut's drain is still open
+        /// ends the walk `Cancelled` and settles nothing. The deadline cuts at 1 s, the deaf
+        /// session holds the drain open until `1 s + RELAY_GRACE`, and the run's cancel arrives
+        /// at 1.5 s, after the deadline's own cancel: only `drive_once`'s read of the run control
+        /// after `drive` can tell it from a plain cut.
+        #[tokio::test(start_paused = true)]
+        async fn a_run_cancel_during_the_cuts_drain_still_ends_cancelled() {
+            let harness = Harness::new().await;
+            // `prd`'s `always` gate: a cut settle would park and answer `Started`.
+            harness.free_feat_3().await;
+            step_deadline(&harness, 1);
+            harness.orch.script("prd", 1, parks("the prd"));
+            let notes = note_count(&harness.orch, ids::HTUI_FEAT_3).await;
+            let orch = &harness.orch;
+            let graphs = orch.graphs();
+            let driver = |_candidate: &SnapshotCandidate,
+                          key: &SessionKey<'_>|
+             -> Box<dyn htui_agent::driver::AgentDriver> {
+                Box::new(DeafDriver {
+                    inner: orch.driver_for_key(key),
+                })
+            };
+            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let engine = Engine::new(
+                fake_parts(orch, &graphs, &driver, &scrubber)
+                    .await
+                    .expect("the harness has a box"),
+            );
+            let t0 = tokio::time::Instant::now();
+            let late_cancel = async {
+                tokio::time::sleep_until(t0 + Duration::from_millis(1500)).await;
+                orch.cancel_walks(GRACE);
+            };
+
+            let (walked, ()) = tokio::join!(walked(engine.dispatch(start_feat_3())), late_cancel);
+
+            let elapsed = t0.elapsed();
+            let rows = orch.store.relay_rows();
+            let run = rows.first().expect("the prd's request was relayed").run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the run's cancel wins over the cut: {walked:?}"
+            );
+            assert!(
+                elapsed >= Duration::from_secs(1) + htui_agent::record::RELAY_GRACE,
+                "the drain was open when the run's cancel landed: {elapsed:?}"
+            );
+            let prd = step_at(orch, run, 0, 0).await;
+            assert_eq!(
+                (prd.status, prd.finished_at),
+                (StepStatus::Running, None),
+                "a cancel settles nothing"
+            );
+            assert!(
+                deadline_notes(orch, ids::HTUI_FEAT_3).await.is_empty(),
+                "no deadline elapsed note"
+            );
+            assert_eq!(
+                note_count(orch, ids::HTUI_FEAT_3).await,
+                notes,
+                "no failure note"
+            );
+            assert_cancel_answered_once(orch, prd.id).await;
         }
 
         /// D1: a session that ends inside its deadline is not cut, and the dropped timer does
