@@ -88,6 +88,10 @@ pub(crate) struct Session<S> {
     pub(crate) clock: Arc<dyn Clock>,
     /// What the host offers beyond the store, for `advertised`.
     pub(crate) caps: HostCaps,
+    /// MOD-11 R1 L3: one permit — the session's one `command_run` at a time, held for the whole
+    /// call (a cancelled call's dropped future gives it back), so one agent cannot fill the
+    /// store's connection pool with waiting calls.
+    pub(crate) command_slot: Arc<tokio::sync::Semaphore>,
 }
 
 impl<S> Session<S> {
@@ -396,6 +400,7 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
                 caps: HostCaps {
                     search: config.search.is_some(),
                 },
+                command_slot: Arc::new(tokio::sync::Semaphore::new(1)),
             };
             (config.binary.clone(), Arc::new(session))
         };

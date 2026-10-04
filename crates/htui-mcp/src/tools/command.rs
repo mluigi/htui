@@ -39,6 +39,9 @@ pub(crate) const MAX_TIMEOUT_SECS: u64 = 1800;
 /// The classes an agent may queue; `verify` is the orchestrator's (PRD OQ-6).
 const CLASSES: [&str; 3] = ["build", "test", "run"];
 
+/// MOD-11 R1 L3: the answer to a call while the session's previous one is queued or running.
+pub(crate) const BUSY: &str = "refused: a command_run is already queued or running in this session";
+
 /// The line a cut tail opens with (OQ-7).
 const TRUNCATED: &str = "[… earlier output truncated]\n";
 
@@ -112,6 +115,10 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     // I-5: the row keeps the command line, so it is scrubbed, fail closed, before anything is
     // written; the shell runs what the agent wrote.
     let stored_command = scrubbed(session.scrubber.as_ref(), command.clone())?;
+    // MOD-11 R1 L3: one call per session past this point, held until the call ends or is dropped.
+    let _slot = std::sync::Arc::clone(&session.command_slot)
+        .try_acquire_owned()
+        .map_err(|_| ToolError(BUSY.to_owned()))?;
 
     // D15, read per call through the session's host: the box's own limits over the app's.
     let box_limits = ctx

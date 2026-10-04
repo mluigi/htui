@@ -261,7 +261,9 @@ The class `verify` belongs to the orchestrator's own verification: `command_run`
 
 1. **Checks.** `cwd`, when given, must be a relative path with no `..` that names an existing
    directory under the session's working directory; the default is that directory itself. The
-   command may not be empty. `timeout_secs` must be 1 to 1800.
+   command may not be empty. `timeout_secs` must be 1 to 1800. A session runs one `command_run`
+   at a time: a call while its previous one is still queued or running is refused at once with
+   `refused: a command_run is already queued or running in this session`, and queues nothing.
 2. **Queues.** A `queued` row is written to `command_run`, with the command line scrubbed (the
    shell still runs what the agent wrote).
 3. **Waits for admission.** Every second the call asks for a slot. Rows of one `(box, class)` are

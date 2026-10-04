@@ -604,6 +604,70 @@ async fn a_cancelled_call_cancels_its_row() {
     let cancelled = until_status(&store, CommandRunStatus::Cancelled).await;
     assert!(cancelled.finished_at.is_some());
     until_gone(PATTERN).await;
+
+    // MOD-11 R1 L3: the cancelled call gave its session's slot back.
+    let mut client = host
+        .client(&lease.spec.env[ENV_TOKEN])
+        .expect("a live session");
+    client.initialize().await.expect("initialize");
+    let again = client
+        .call(
+            "command_run",
+            json!({"class": "run", "command": "echo again"}),
+        )
+        .await
+        .expect("answered");
+    assert_eq!(ok(&again)["output"], "again\n");
+}
+
+/// MOD-11 R1 L3: one `command_run` at a time per session, so one agent cannot fill the store's
+/// connection pool with waiting calls. A second call while the first is queued or running is
+/// refused at once and queues nothing; once the first has answered, a new one is accepted.
+#[tokio::test]
+async fn a_second_concurrent_call_in_one_session_is_refused() {
+    let dir = tempfile::tempdir().expect("a scratch cwd");
+    let store = MemStore::demo();
+    let host = host(&store);
+    let (lease, mut first) = open(&host, scope(dir.path(), true)).await;
+    let mut second = host
+        .client(&lease.spec.env[ENV_TOKEN])
+        .expect("a live session");
+    second.initialize().await.expect("initialize");
+    let before = rows(&store).await.len();
+
+    let slow = first.call(
+        "command_run",
+        json!({"class": "run", "command": "sleep 1.2; echo a"}),
+    );
+    let busy = async {
+        until_status(&store, CommandRunStatus::Running).await;
+        let started = Instant::now();
+        let answer = second
+            .call("command_run", json!({"class": "run", "command": "echo b"}))
+            .await;
+        (answer, started.elapsed())
+    };
+    let (slow, (busy, waited)) = tokio::join!(slow, busy);
+    assert_eq!(ok(&slow.expect("first"))["output"], "a\n");
+    assert_eq!(
+        refused(&busy.expect("answered")),
+        "refused: a command_run is already queued or running in this session"
+    );
+    assert!(
+        waited < Duration::from_secs(1),
+        "refused at once: {waited:?}"
+    );
+    assert_eq!(
+        rows(&store).await.len(),
+        before + 1,
+        "the refusal queued nothing"
+    );
+
+    let after = second
+        .call("command_run", json!({"class": "run", "command": "echo c"}))
+        .await
+        .expect("answered");
+    assert_eq!(ok(&after)["output"], "c\n");
 }
 
 /// OQ-3: a claim whose heartbeat went stale is reaped by another claim of its `(box, class)`; the
