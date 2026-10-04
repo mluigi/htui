@@ -225,7 +225,8 @@ pub struct RunsTab {
     /// capturing mode end it.
     gesture: bool,
     /// MOD-69 plan D8: a reveal's run and step, applied by the next `Runs` reply (or at once by
-    /// `focus` when the loaded rows hold it). An item change disarms it.
+    /// `focus` when the loaded rows hold it). An item change and a cursor move (`J`, `K`, a
+    /// clicked node) disarm it.
     pending_focus: Option<(Option<RunId>, Option<StepId>)>,
 }
 
@@ -381,8 +382,10 @@ impl RunsTab {
         Some((run.id, step))
     }
 
-    /// Moves the cursor, clamped to both ends. A pane with no entry keeps `None`.
+    /// Moves the cursor, clamped to both ends. A pane with no entry keeps `None`. The user's move
+    /// disarms a reveal still waiting on its rows (MOD-69 plan D8).
     fn move_cursor(&mut self, delta: isize) {
+        self.pending_focus = None;
         let Some(last) = self.entries().len().checked_sub(1) else {
             self.selected = None;
             return;
@@ -413,6 +416,7 @@ impl RunsTab {
     /// that run is on the canvas), then the flow syncs, as `J`/`K` do. A step the entries don't
     /// hold leaves the cursor where it is.
     fn select_step(&mut self, step: StepId, theme: &Theme) {
+        self.pending_focus = None; // MOD-69 plan D8: the user's move beats a waiting reveal
         let run = match self.entry() {
             Some(Entry::Step { run, .. } | Entry::Run { run }) => run,
             None => return,
@@ -5316,5 +5320,42 @@ mod tests {
         let first = runs[0].steps[0].id;
         pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
         assert_eq!(pane.selected_step(), Some(first));
+    }
+    /// A move the user makes beats a reveal still waiting on its rows: `J`, `K` or a clicked
+    /// node disarms it, so a later `Runs` reply (a poll, a re-read after a failed one) keeps the
+    /// cursor where the user put it (repair round 1).
+    #[tokio::test]
+    async fn a_cursor_move_disarms_a_pending_focus() {
+        let shell = Shell::new();
+        let newer = vec![copied_run().await];
+        // The same copy plus `RUN_1` (`copied_run` mints fresh ids on every call).
+        let mut runs = newer.clone();
+        runs.extend(feat_1_runs().await);
+
+        for user_move in ["J", "K", "click"] {
+            let mut pane = RunsTab::new();
+            pane.on_item_change(Some(ids::HTUI_FEAT_1));
+            pane.on_reply(&StoreReply::Runs(newer.clone()), &mut shell.ctx());
+            pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+            // The rows lack the step: the focus stays armed for the next reply.
+            pane.focus(None, Some(ids::STEP_REVIEW), &shell.ctx());
+            assert!(pane.pending_focus.is_some(), "{user_move}: armed");
+
+            match user_move {
+                "J" => drop(pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx())),
+                "K" => drop(pane.on_key(key(KeyCode::Char('K')), &mut shell.ctx())),
+                _ => pane.select_step(newer[0].steps[0].id, &Theme::default()),
+            }
+            let moved = pane.selected_step();
+            assert_eq!(pane.pending_focus, None, "{user_move}: disarmed");
+
+            pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+            let _ = shell.emit.take();
+            assert_eq!(
+                pane.selected_step(),
+                moved,
+                "{user_move}: the reply keeps the user's cursor"
+            );
+        }
     }
 }
