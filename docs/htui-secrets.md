@@ -183,7 +183,7 @@ Every call fails with one of these. The sentence is what htui shows; `…` is fi
 |---|---|---|
 | `NoIdentity` | no Infisical machine identity is stored in the OS keyring | Enter the identity's client ID and client secret. |
 | `Config` | secret provider configuration: … | Fix what it names: the [base URL](#base-url), a blank client ID or client secret, a [scope](#scope) that does not parse, or an HTTP client that would not build. |
-| `Unreachable` | cannot reach Infisical at `<endpoint>`: … | Check the base URL, DNS, the network, the proxy and the server's TLS certificate; the cause after the colon says which. A timeout means no answer within 20 seconds. |
+| `Unreachable` | cannot reach Infisical at `<endpoint>`: … | Check the base URL, DNS, the network, the proxy and the server's TLS certificate; the cause after the colon says which. A timeout means no connection within 5 seconds, or no full answer within 20. |
 | `BadCredentials` | Infisical refused the machine identity's login: the client ID or client secret is wrong, expired or used up | Create a new client secret (or check the client ID) and enter the identity again. |
 | `IdentityLocked` | Infisical has temporarily locked the machine identity after repeated failed logins; wait for the lockout to end before trying again | Wait for the lockout to end (5 minutes by default), check the client secret, then enter the identity again. |
 | `LoginRefusedEarlier` | an earlier login with this machine identity was refused; no new login is tried until the identity is entered again | Read the earlier `BadCredentials` or `IdentityLocked`, fix the identity and enter it again. |
