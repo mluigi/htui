@@ -631,7 +631,8 @@ async fn the_mirror_counts_tool_calls_like_postgres() {
 
 /// MOD-69 plan D2: the mirror's `waiting_candidates` (three runtime reads over `item`, `run` and
 /// `run_step`) answers Postgres' rows whole after a pass: a gate park, a selection park on a
-/// minted item, a blocked `agy` item, and the fixture's two candidates.
+/// minted item, FEAT-3 blocked behind its queued run, a blocked `agy` item, and the fixture's two
+/// candidates.
 #[tokio::test]
 async fn the_mirror_lists_waiting_candidates_like_postgres() {
     use htui_core::model::{
@@ -780,6 +781,15 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
             .expect("transition")
     );
 
+    // FEAT-3 blocked behind its queued `RUN_2`: a candidate carries its queued run, not only its
+    // parked ones (T2's unblock reads the first active run, blueprint H-1).
+    assert!(
+        store
+            .transition(ids::HTUI_FEAT_3, Status::Queued, Status::Blocked)
+            .await
+            .expect("transition")
+    );
+
     // A blocked `agy` item.
     assert!(
         store
@@ -811,11 +821,25 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
         vec![
             ids::HTUI_ANA_2,
             ids::HTUI_FEAT_2,
+            ids::HTUI_FEAT_3,
             minted,
             ids::HTUI_TOOL_1,
             ids::AGY_FIX_1
         ],
-        "ANA-2, FEAT-2, the minted item and TOOL-1 of htui, then agy's FIX-1"
+        "ANA-2, FEAT-2, FEAT-3, the minted item and TOOL-1 of htui, then agy's FIX-1"
+    );
+    let feat_3 = mirrored
+        .iter()
+        .find(|row| row.item.id == ids::HTUI_FEAT_3)
+        .expect("FEAT-3 is listed");
+    assert_eq!(
+        feat_3
+            .runs
+            .iter()
+            .map(|(run, steps)| (run.id, run.status, steps.len()))
+            .collect::<Vec<_>>(),
+        vec![(ids::RUN_2, RunStatus::Queued, 1)],
+        "FEAT-3 carries its queued run and the run's pending step"
     );
 
     teardown(db, &[&cache]).await;

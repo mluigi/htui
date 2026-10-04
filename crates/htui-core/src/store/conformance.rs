@@ -15401,9 +15401,9 @@ async fn relay_view_lists_live_pending_requests_and_pending_cancels<S: WriteStor
 }
 
 /// MOD-69 plan D2: `waiting_candidates` lists every item of the scope that is `blocked` or
-/// `awaiting_approval`, or that owns a parked run, with its active runs and their steps, in
-/// canonical order. A walking item, a finished run, another workspace's item and a chat run are
-/// absent; an empty scope answers nothing.
+/// `awaiting_approval`, or that owns a parked run, with its active runs (queued, running and
+/// parked) and their steps, in canonical order. A walking item, a finished run, another
+/// workspace's item and a chat run are absent; an empty scope answers nothing.
 async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(store: &S) {
     const CASE: &str = "waiting_candidates_hold_every_park_and_nothing_else";
     let owner = Uuid::now_v7();
@@ -15509,6 +15509,33 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
     let walking_run = claimed(CASE, store, walking, owner, at).await;
     running_step(CASE, store, walking_run, (0, 1, 0), at).await;
 
+    // A blocked item whose run is still queued, and one blocked mid-walk: a candidate carries its
+    // queued and running runs, not only its parked ones (T2's unblock reads the first active run,
+    // blueprint H-1). The running run is the box's second (H-6), the queued one is never claimed.
+    let queued = minted(CASE, store, "blocked behind a queue").await;
+    let queued_run = store
+        .create_run(new_run(ids::PROJECT_HTUI, queued, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .transition(queued, Status::Queued, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: queued -> blocked is legal (create_run queued the item)"
+    );
+    let mid_walk = minted(CASE, store, "blocked mid-walk").await;
+    let mid_walk_run = claimed(CASE, store, mid_walk, owner, at).await;
+    let mid_walk_step = running_step(CASE, store, mid_walk_run, (0, 1, 0), at).await;
+    assert!(
+        store
+            .transition(mid_walk, Status::InProgress, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: in_progress -> blocked is legal"
+    );
+
     // Another workspace's item, and a chat run in scope.
     assert!(
         store
@@ -15582,6 +15609,20 @@ async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(stor
                 reopened_run,
                 RunStatus::AwaitingApproval,
                 vec![(reopened_step, StepStatus::AwaitingApproval)],
+            )],
+        ),
+        (
+            queued,
+            Status::Blocked,
+            vec![(queued_run, RunStatus::Queued, vec![])],
+        ),
+        (
+            mid_walk,
+            Status::Blocked,
+            vec![(
+                mid_walk_run,
+                RunStatus::Running,
+                vec![(mid_walk_step, StepStatus::Running)],
             )],
         ),
         (ids::HTUI_TOOL_1, Status::AwaitingApproval, vec![]),
