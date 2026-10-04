@@ -1,6 +1,12 @@
 # Plan: MOD-11 — htui MCP server
 
-**Status: CONFIRMED by the maintainer 2026-10-03 ("yes" = every recommended default, OQ-1…OQ-10). Fact-checked 2026-10-03 (workflow `wf_33a62d14-658`, amendments in place). Next: code-architect blueprint.**
+**Status: IMPLEMENTED 2026-10-04 (T0–T10 and review round R1; write-up `docs/decisions/mod/mod-11.md`). CONFIRMED by the maintainer 2026-10-03 ("yes" = every recommended default, OQ-1…OQ-10). Fact-checked 2026-10-03 (workflow `wf_33a62d14-658`, amendments in place).**
+
+**Implementation amendments (2026-10-04; detail in the write-up):**
+- **D16 amended by review R1-H1:** `command_run` is exposed when `base && persona && !deny_kinds ∋ execute`; an execute-denying persona loses it, and the prompt's persona term uses the same helper (`persona_keeps_command_run`). R1-C adds that an engine with no tool host exposes it to no step.
+- **I-3 reads "every item write is fenced".** `command_run` is not fenced (its queue rows take no lease); a lease check and a cancel on session end are MOD-78.
+- **D20 (new, review R1-M2): htui's own tools are pre-approved.** `htui_orch::tools::pre_approve` appends an `allow_once` rule per advertised tool except `command_run` and `permission_prompt`, after the R-MCP-4, persona and agent rules, and only under an `ask` default.
+- **D13's lock order is step → run → item.** A run-only lock deadlocked against `park_step` (40P01) in T1's Pg race test; the fenced writes lock `FOR SHARE OF s, r` through `step_scope`. The older writers still lock run first: MOD-77.
 
 **Source PRD**: `.claude/prds/mod-11-mcp-server.prd.md`, **all five milestones** (MOD-42 precedent:
 one plan, milestone-ordered tasks), with its resolved questions (cited **PRD OQ-1…7**).

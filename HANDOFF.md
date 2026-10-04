@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-03):** **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
+**Current status (2026-10-04):** **MOD-11 is done** (`docs/decisions/mod/mod-11.md`): every session
+htui launches (engine steps in the TUI and in `htui worker`, fresh and promoted chats) gets the `htui`
+MCP server: `box_profile`, `document_write`, `note_add`, `item_status` (a note, never a transition),
+`item_link`, `search_concepts`, `command_run`, and `permission_prompt` for `claude-cli`. Scope comes
+from a per-session token and every item write is fenced. Production judges and `approve`/`accept`
+now work on agent-written documents. `command_run` queues builds and tests per `(box, class)`.
+`claude-cli` permission prompts reach the Runs pane and the chat. New crate `htui-mcp`, migration
+`0014_command_queue`, user guide `docs/htui-mcp.md`. Follow-ups MOD-77, MOD-78, MOD-79 and ANA-28.
+Before it, **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
 the Runs flow view has a third line counting its step's tool calls by kind (`⚒ read×5 exec×3 +1`).
 `ReadStore::tool_call_counts` answers on Postgres, the mirror and `MemStore`; the pane asks
 `StoreRequest::ToolCalls` after each `Runs` reply only while the flow is shown. Nodes are 20×5. No
@@ -26,54 +34,35 @@ of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` an
 went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
 name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
 no new crate, no snapshot moved.
-Before it, **MOD-26 is done** (`docs/decisions/mod/mod-26.md`): agent
-personas are global registry rows (`0012_persona`; seeds `reviewer`, `architect`) bound to a
-step-graph phase. They are frozen into the run snapshot at `StartRun`, inlined as a protected frame
-before the template, and they only ever narrow the step's tools and permissions
-(`htui_agent::persona::narrow`). A persona carries no model. Milestone 2 added **Settings ›
-Personas**, the eighth section: it lists, edits (fields, body `b`, rules `r` in a one-line rule
-syntax), deletes (`d`, refused while any phase is bound, naming them) and imports (`I`, a `.md`
-file or a directory of them, `mcp__` tools dropped and named) personas. Settings › Kinds gained a
-`persona` field on the phase edit form. Migration `0013_persona_phase_index` is index only. Not
-done: `$EDITOR` for the body (OQ-12, with or after MOD-13 milestone 4). Operator guide
-`docs/personas.md`.
-Before it, **MOD-28 is done** (`docs/decisions/mod/mod-28.md`): `v` in the
-Backlog detail's Runs sub-tab switches to a **flow view**. It draws the run under the cursor as a
-`rataflow` node graph: fan-out candidates side by side, the judge below them, the winner feeding the
-next phase, and retries labelled. It shares the list's cursor, so every run action and permission
-digit works the same in both views. `+`/`-` zoom and `=` fits. The view is a pure projection,
-rebuilt from every `Runs` reply. It is keyboard only: mouse support is MOD-71 and tool-call chips
-are MOD-72 (done). No migration. The only new crate is `rataflow` (`default-features = false`).
-Before it, **MOD-49 is done** (`docs/decisions/mod/mod-49.md`): `b` in
-Settings > Hierarchy opens a popup that lists directories on this box (links to a directory marked
-`@`, their targets never shown) and chooses one for the workspace root or a repo checkout; the
-choice goes through the unchanged `SetWorkspaceRoot`/`SetRepoPath` and `canonical_root` (F-102).
-Listing is `StoreRequest::ListDir`, served off the store-worker loop under `spawn_blocking` with a
-10 s bound, so neither the UI nor the worker waits on a hung mount. No migration.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
 (MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
 comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested` (MOD-33, comment only)
-`0011_permission_relay` (MOD-42), `0012_persona` (MOD-26 milestone 1) and `0013_persona_phase_index`
-(MOD-26 milestone 2, index only; cache: `0001`..`0004`), so **the next migration is `0014`** (cache: `0005`).
+`0011_permission_relay` (MOD-42), `0012_persona` (MOD-26 milestone 1), `0013_persona_phase_index`
+(MOD-26 milestone 2, index only) and `0014_command_queue` (MOD-11, `command_run.claimed_by` and
+`heartbeat_at`; cache: `0001`..`0004`), so **the next migration is `0015`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72 and MOD-26 (done, both milestones)
-(re-counted 2026-10-01; `TABLES` and commented columns 2026-10-02; `CASES`, `READ_CASES`, `htui-orch`
-`CASES`, `StoreRequest`/`StoreReply`, the `REQUEST_NAMES` below, `.sqlx`, snapshots and Settings
-sections 2026-10-03): store conformance `CASES` 134, `READ_CASES` 14, `htui-orch` `CASES` 92,
+MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72, MOD-26 (done, both milestones) and
+MOD-11 (re-counted 2026-10-01; `StoreRequest`/`StoreReply`, the `REQUEST_NAMES` below and Settings
+sections 2026-10-03; `CASES`, `READ_CASES`, `htui-orch` `CASES`, `TABLES`, commented columns,
+`.sqlx`, snapshots and workspace members 2026-10-04): store conformance `CASES` 144, `READ_CASES` 15,
+`htui-orch` `CASES` 98,
 `GraphSource` 7 methods, `StoreRequest` 105, `StoreReply` 62, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `persona_settings::REQUEST_NAMES` 5, `TABLES` 42, 322 `.sqlx` files, 143
-`crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
-`MIRRORED_TABLES` 21, eight Settings sections (71 of the 100 strip columns), 44 pinned commented
-columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
+`skills::REQUEST_NAMES` 6, `persona_settings::REQUEST_NAMES` 5, `TABLES` 42, 341 `.sqlx` files, 143
+`crates/htui/tests/snapshots`, seven workspace members (`htui-worker` since MOD-41, `htui-mcp` since
+MOD-11), `MIRRORED_TABLES` 21 (`command_run` is not mirrored), eight Settings sections (71 of the 100
+strip columns), 46 pinned commented columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
 `matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
 Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
 2026-09-26 does not compare with a later one; since MOD-9 milestone 5 (2026-09-30) a matched `glob`
 skill renders and a retry's excerpts rank the previous attempt's changed paths, so those digests
 move too; handoff digests are unchanged. Since MOD-33 (2026-09-30) a phase prompt digests
 `[hostname]` in place of the box's hostname, so every box-bearing phase digest moved once more.
+Since MOD-11 (2026-10-04) a single-agent `fan_out_only` phase on an item without `heavy_build` no
+longer renders the `command_queue` section (plan OQ-6), and a session offered `document_write` ends
+with a protected `output` section, so those digests move too.
 `cargo doc --workspace --no-deps --keep-going` shows exactly six baseline errors (`htui-core`
 `MIRRORED_TABLES`; `htui-store` `step_exists`, `HashEmbedder` in `embed.rs`, and three private
 links MOD-38 added in `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
@@ -81,9 +70,10 @@ links MOD-38 added in `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amen
 `HashEmbedder` already failed at `98e6d2f`). With `-D warnings`, `cargo doc` also fails on four
 pre-existing private-item links (`store/traits.rs:1251`, `agent_worker.rs:729`,
 `ui/text_area.rs:18`, `ui/text_field.rs:5`; recorded at MOD-9's close, `docs/decisions/mod/mod-9.md`). `git` ≥ 2.33.0 is a runtime dependency
-of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
-greyed and every production judge fails until MOD-11**, because no agent can write its phase's
-`output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
+of the `worktree` isolation mode and of reconciliation. **Production judges and `approve`/`accept`
+work since MOD-11:** agents write their phase's `output_kind` document through the `htui` MCP
+server's `document_write` tool, and htui's own tools (all but `command_run`) are pre-approved under
+an `ask` default, so they never wait for a person (`docs/htui-mcp.md`).
 Adapters install under `HTUI_AGENTS_ROOT`, default
 `dirs::data_local_dir()/htui/agents`; `HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres
 via `compose.yaml` (port 5439, loopback only since TOOL-7); tests need
@@ -112,8 +102,8 @@ ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no 
 ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
 every model;
 ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11, MOD-12 and MOD-13
-can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
+`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-12 and MOD-13 can start now
+(MOD-11 is done, `docs/decisions/mod/mod-11.md`; MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
 `docs/decisions/mod/mod-7.md`; MOD-9 is done, `docs/decisions/mod/mod-9.md`).
 
 ---
@@ -126,8 +116,9 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 - [ ] **ANA-25 - Learn per-model weights from htui's own judge verdicts** (from ANA-21; ANA-21 is
   done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`, `R-ID-6`.
   ANA-21 deferred learned weights behind a volume trigger but the maintainer asked for it to be
-  tracked rather than remembered. **Trigger: do not start until MOD-36 and MOD-11 are both done and
-  a project holds on the order of 100 judged cross-model groups.** The data is already recorded —
+  tracked rather than remembered. **Trigger: do not start until MOD-36 is done and a project holds
+  on the order of 100 judged cross-model groups.** MOD-11 is done (`docs/decisions/mod/mod-11.md`):
+  production judges now resolve on agent-written `judge` documents, so verdicts accumulate. The data is already recorded —
   candidate `run_step` rows carry `agent_id`, `model`, `selected` and `verify_outcome`, and the
   judge row (`fanout_index = -1`) carries its own `agent_id`/`model` — so no new logging is needed.
   Fit a Bayesian Bradley-Terry model with a Plackett-Luce top-1 likelihood per verdict, taking
@@ -137,6 +128,16 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
+- [ ] **ANA-28 - `heavy_build`: queue switch vs required box capability** (from MOD-11,
+  `docs/decisions/mod/mod-11.md`). `R-MCP-3`, `R-ORCH-10`. R-MCP-3 says an item carrying the
+  `heavy_build` tag forces `command_run` on. MOD-11 reads that tag from `item.required_tags`, the only
+  item tag field, and that field is also the item's required box capabilities (R-ORCH-10). So
+  tagging an item `heavy_build` both exposes `command_run` and lets the item run only on a box that
+  declares `heavy_build`; elsewhere the run is refused with `missing tags: heavy_build`
+  (`docs/htui-mcp.md`, "When `command_run` is offered"). The other way to get the queue on a
+  single-agent step, a phase's `command_queue = always`, is settable only in Postgres (Settings ›
+  Kinds shows it read-only). Options to weigh: a non-routing item label, exempting `heavy_build`
+  from the box-tag match, or a phase/queue setting in the TUI.
 ### Next features
 - [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
   `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
@@ -283,7 +284,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   give the Runs flow view click to select (`FlowEvent::NodeClicked` moves the shared cursor),
   drag to pan and scroll to zoom (`rataflow`'s `crossterm` feature, `handle_mouse_event`). Nodes stay
   read-only (MOD-28 D9). Raised by the maintainer at MOD-28's plan gate, 2026-10-02.
-- [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`); the MCP half needs MOD-11.
+- [ ] **MOD-27 - Swarm RunKind & task MCP Tool (from ANA-13).** Add `RunKind::Swarm` to `htui-orch`, implement `spawn_subagent` MCP tool with JSON schema validation and isolated worktrees. `htui-orch`, its `Isolator` seam and `run_worker.rs` exist since MOD-4 (done, `docs/decisions/mod/mod-4.md`). The MCP half has its server since MOD-11 (done, `docs/decisions/mod/mod-11.md`): `crates/htui-mcp` hosts the `htui` server behind the `htui_orch::tools::ToolHost` seam, one file per tool under `crates/htui-mcp/src/tools/`, scoped by a per-session token (`docs/htui-mcp.md`), so `spawn_subagent` plugs in as one more tool.
   The named personas a `handoff` targets exist since MOD-26 (done, `docs/decisions/mod/mod-26.md`):
   `persona` registry rows, bound per phase, frozen into the run snapshot by name.
   **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T6-T7):** settle in the PRD, from OpenRig's queue
@@ -327,33 +328,6 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   The verifier's scrubber (`crates/htui-worker/src/runtime.rs:411`) stays pattern-only: handing it the map would put
   the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
   secret is stored as `[REDACTED]` belongs to this item.
-- [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
-  `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
-  per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
-  `document_write` calls `WriteStore::write_document` (orchestrator-allocated version), `command_run`
-  accepts class `verify` for `verify_command`, and an `item_status` request is recorded as an
-  `item_note` with `via_step_id`, never a transition. The `box_profile` read tool returns ANA-5's
-  box profile projection (`docs/ANA-5.md` §4.2) so the tool and the prompt section agree — MOD-2
-  shipped that projection as `htui_core::prompt::BoxProfile::project`, which drops `box_tool.path`
-  (ANA-5 §4.2 rule 5), so the tool must not re-add it. **Not blocked**: MOD-2 and MOD-4 are done
-  (`docs/decisions/mod/mod-2.md`, `docs/decisions/mod/mod-4.md`). MOD-2's own `permission_request`
-  gap over the CLI transport stays declared until this item lands, since the
-  `--permission-prompt-tool` contract is its route. **MOD-4 left two things waiting here**: every
-  production judge fails until an agent can write the `judge` document (MOD-4 milestone 4, OQ-4),
-  and production `approve`/`accept` are greyed in the Runs pane because production's `SessionSink`
-  is `NoSink`, so no step writes its `output_kind` document outside a test (MOD-4 risk R-50). Both
-  clear once `document_write` exists.
-  **Relates to ANA-16** (`docs/ANA-16.md` §8): the MCP server must be reachable inside a container
-  or on a remote box, and a stdio `McpServerSpec` must be launchable there (MOD-44; `htui worker`, MOD-41, done).
-  **MOD-41 left the sink fence here** (`docs/decisions/mod/mod-41.md`, PRD D5): the step sink's
-  `write_document` is still unfenced; fence it with the step's `StepFence` when this item adds the
-  first production author.
-  **MOD-34 left the `search_concepts` tool here** (`docs/decisions/mod/mod-34.md`): expose
-  `htui_store::vector::VectorStore::search` (`R-STO-8`), scoped to the step's projects. Since MOD-50
-  (`docs/decisions/mod/mod-50.md`) it also returns requirement hits; `Hit.owner` says which kind each
-  hit is.
-  **MOD-33 left one decision here** (`docs/decisions/mod/mod-33.md`, D277): the `box_profile` tool
-  returns `BoxProfile`, and this item decides whether it honours the project's hostname switch.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -554,6 +528,32 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   the engine has no follow-up verb and ANA-2 no state that accepts one (a walk's session ends at
   `done` before the step parks, `docs/ANA-2.md:1235-1238`), and the text is typed on one box but must
   be scrubbed on the executing box (`R-SEC-3`, `R-ID-7`). Not blocked.
+- [ ] **MOD-77 - Pg step writers lock the step before the run (`park_step` deadlock order)** (from
+  MOD-11, `docs/decisions/mod/mod-11.md`). `R-HIS-1`, `R-ORCH-11`. `park_step` locks
+  `FOR UPDATE OF s, r` (step, then run), and MOD-11's fenced writes follow it through `step_scope`
+  (`FOR SHARE OF s, r`, step → run → item). The older step writers go the other way. `append_events`,
+  `set_step_usage`, `set_step_prompt`, `finish_step`, `pass_step`, `upsert_step_tree`,
+  `record_commits`, and the relay's `open_permission`, fence through `step_fence` (`FOR SHARE OF r`, or
+  an `EXISTS … FOR SHARE`). They lock the run first and only then touch `run_step`. Not reachable
+  through MOD-11 (verified). The worst case is a detected `40P01` when a stale walk races the walk that
+  adopted its run. Fix: give `step_fence` the `FOR SHARE OF s, r` shape; writers that update
+  `run_step` take `FOR NO KEY UPDATE OF s FOR SHARE OF r`; regenerate `.sqlx`. Check the overlap with
+  MOD-76 first (leased by `hr/MOD-37`, "Orchestrator carried risks after MOD-37"). Not blocked.
+- [ ] **MOD-78 - `command_run` lifecycle: lease check and cancel on session end** (from MOD-11,
+  `docs/decisions/mod/mod-11.md`). `R-MCP-1`, `R-MCP-3`. `command_run` is not fenced (MOD-11's I-3
+  reads "every item write"). A session whose walk lost its lease can queue and run commands until the
+  walk notices at its next renewal (`docs/htui-mcp.md`, "Scope"). Add a lock-free `lease_owner` check
+  before `enqueue_command` and on each heartbeat, and kill the child on a loss. Review L5: dropping
+  the lease only sets the session's `ended`. Add a cancellation signal on `Session` (a `watch` or a
+  `CancellationToken`) that `Served::call` selects against, so an in-flight call ends with its
+  session. Not blocked.
+- [ ] **MOD-79 - MCP token off claude's argv** (from MOD-11, `docs/decisions/mod/mod-11.md`,
+  blueprint E-1 and review L2). `R-MCP-1`, `R-NF-1`. `claude-cli` gets the per-session
+  `HTUI_MCP_TOKEN` inline in `--mcp-config=<json>`, so any local user can read it from
+  `/proc/<pid>/cmdline`. It is useless without the `0700` socket directory, but it should not be
+  there. Pass a `0600` config file in the session's private directory instead (the CLI accepts a
+  path), and redact `--mcp-config` arguments in `ResolvedLaunch`'s `Debug`. A Windows equivalent for
+  the file's ACL is part of the item. Not blocked.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
@@ -579,6 +579,14 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
   registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
   A child box's hostname never moves a digest, and the project's hostname switch covers it by
   construction (MOD-33 D275, `docs/decisions/mod/mod-33.md`).
+  **MOD-11 note (2026-10-04, `docs/decisions/mod/mod-11.md`):** `R-MCP-1`'s server is a stdio
+  `htui mcp` relay the agent starts, with `HTUI_MCP_ADDR` and `HTUI_MCP_TOKEN`. It connects to the
+  hosting htui process's local channel: a Unix socket in a `0700` directory, or a named pipe on
+  Windows. That channel is the seam a container bridges (`docs/htui-mcp.md`, "The socket" and
+  "`htui mcp`: the relay"). Today the relay command is `/proc/<host pid>/exe` on Linux, which an
+  agent in a container that does not share the host's `/proc` cannot start, and the socket must be
+  bind-mounted into the container. A container launch needs a relay binary inside the image and the
+  socket directory mounted, or a relay over the `docker exec -i` stream (PRD OQ-1).
 - [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
   `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
   by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
@@ -680,7 +688,7 @@ can start now (MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
+| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-13 editing, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-71 mouse support; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

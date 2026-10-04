@@ -1,6 +1,6 @@
 # Blueprint: MOD-11 — htui MCP server, T0–T10
 
-**Status**: proposed (2026-10-03, code-architect; commits `24155c7b`, `1d3013ea`, `fe6d49d5` and the refinement after them). Implements `.claude/plans/mod-11-mcp-server.plan.md`
+**Status**: IMPLEMENTED 2026-10-04 (T0–T10 and review round R1; write-up `docs/decisions/mod/mod-11.md`). Proposed 2026-10-03 (code-architect; commits `24155c7b`, `1d3013ea`, `fe6d49d5` and the refinement after them). Implements `.claude/plans/mod-11-mcp-server.plan.md`
 (CONFIRMED 2026-10-03, OQ-1…OQ-10 as recommended, fact-checked `wf_33a62d14-658`) under
 `.claude/prds/mod-11-mcp-server.prd.md`. The plan's D1–D19, I-1…I-8, task order
 `T0 → {T1 ∥ T2 ∥ T3} → {T4 ∥ T5} → T6 → {T7 ∥ T8} → T9 → T10`, file sets and "Verified claims" are
