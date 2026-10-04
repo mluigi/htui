@@ -4,6 +4,7 @@
 mod cells;
 pub mod diff;
 pub mod layout;
+mod markdown;
 pub mod overlay;
 pub mod path_picker;
 pub mod tabs;
