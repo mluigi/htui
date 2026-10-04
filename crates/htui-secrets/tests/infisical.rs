@@ -402,11 +402,11 @@ async fn a_hidden_import_value_shadowed_by_the_folder_is_not_a_refusal() {
 async fn a_bad_key_name_is_refused_naming_it() {
     let stub = serving(json!([secret("my-key", VALUE)]));
     let err = provider(&stub).resolve(&scope()).await.unwrap_err();
-    assert_eq!(
-        err,
-        SecretError::InvalidKey {
+    assert!(
+        err == SecretError::InvalidKey {
             key: "my-key".into()
-        }
+        },
+        "expected InvalidKey for my-key"
     );
 }
 
@@ -1031,12 +1031,14 @@ async fn a_login_redirect_is_protocol_and_the_body_never_follows() {
     .on("POST", "/steal", login_ok(TOKEN, 2_592_000));
     let p = provider(&stub);
     for _ in 0..2 {
-        assert_eq!(
-            p.resolve(&scope()).await.unwrap_err(),
-            SecretError::Protocol {
-                endpoint: LOGIN,
-                detail: "the server answered a redirect (307); redirects are not followed".into()
-            }
+        assert!(
+            p.resolve(&scope()).await.unwrap_err()
+                == SecretError::Protocol {
+                    endpoint: LOGIN,
+                    detail: "the server answered a redirect (307); redirects are not followed"
+                        .into()
+                },
+            "expected the redirect Protocol at the login"
         );
     }
     assert_eq!(stub.count("POST", "/steal"), 0);
@@ -1066,13 +1068,10 @@ async fn an_empty_or_unusable_login_token_is_protocol_and_never_cached() {
         let p = provider(&stub);
         for _ in 0..2 {
             let err = p.resolve(&scope()).await.unwrap_err();
-            assert_eq!(
-                err,
-                SecretError::Protocol {
-                    endpoint: LOGIN,
-                    detail: detail.into()
-                },
-                "case {i}: wrong error"
+            assert!(
+                matches!(&err, SecretError::Protocol { endpoint, detail: got }
+                    if *endpoint == LOGIN && got == detail),
+                "case {i}: wrong error variant or detail"
             );
             assert!(!format!("{err} {err:?}").contains(TOKEN), "case {i}: leak");
         }
