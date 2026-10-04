@@ -75,9 +75,11 @@ fn list_is_open(harness: &mut Harness) -> bool {
 }
 
 /// A gate park on `htui` ANA-2, as the engine leaves one: a claimed run whose `prd` step at slot
-/// `0.1` ran and parked at `awaiting_approval`. The run carries the demo `RUN_1`'s snapshot,
-/// decoded, so the classifier reads the `feature` phases. Answers the run, the step and the
-/// claim's owner, which still holds the lease (a park keeps it).
+/// `0.1` is `done` and whose `plan` step at slot `1.1` ran and parked at `awaiting_approval`. Two
+/// steps, so a reveal that lands on the run's first step instead of the parked one is caught
+/// (review T1). The run carries the demo `RUN_1`'s snapshot, decoded, so the classifier reads the
+/// `feature` phases. Answers the run, the parked step and the claim's owner, which still holds the
+/// lease (a park keeps it).
 async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
     let snapshot = store
         .run(ids::RUN_1)
@@ -110,27 +112,39 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
             .expect("claim_run"),
         Claim::Admitted
     );
-    let step = store
-        .create_step(NewRunStep {
-            id: StepId::new(),
-            run_id: run,
-            position: 0,
-            attempt: 1,
-            fanout_index: 0,
-            phase_name: "prd".to_owned(),
-            agent_id: Some(ids::AGENT_CLAUDE),
-            model: Some("opus".to_owned()),
-        })
-        .await
-        .expect("create_step")
-        .id;
+    let running = |position: i32, phase: &'static str| async move {
+        let step = store
+            .create_step(NewRunStep {
+                id: StepId::new(),
+                run_id: run,
+                position,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: phase.to_owned(),
+                agent_id: Some(ids::AGENT_CLAUDE),
+                model: Some("opus".to_owned()),
+            })
+            .await
+            .expect("create_step")
+            .id;
+        assert!(
+            store
+                .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+                .await
+                .expect("transition_step"),
+            "pending -> running"
+        );
+        step
+    };
+    let prd = running(0, "prd").await;
     assert!(
         store
-            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .transition_step(prd, StepStatus::Running, StepStatus::Done, at)
             .await
             .expect("transition_step"),
-        "pending -> running"
+        "running -> done"
     );
+    let step = running(1, "plan").await;
     assert_eq!(
         store
             .park_step(StepFence::Lease(owner), step)
@@ -184,6 +198,20 @@ fn cursor_line(frame: &str) -> String {
     }
 }
 
+/// The index of the one frame line holding `columns`, a row of the list read column by column.
+fn row_at(frame: &str, columns: &str) -> usize {
+    let at: Vec<usize> = frame
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| line.contains(columns))
+        .map(|(index, _)| index)
+        .collect();
+    match at.as_slice() {
+        [index] => *index,
+        _ => panic!("expected one row reading {columns:?}, got {at:?}:\n{frame}"),
+    }
+}
+
 #[tokio::test]
 async fn the_top_bar_counts_working_and_waiting() {
     let store = MemStore::demo();
@@ -234,14 +262,14 @@ async fn the_open_list_follows_a_park_without_reopening() {
     harness.key("ctrl-w");
     let before = harness.render();
     assert!(before.contains("> FEAT-2"), "{before}");
-    assert!(!before.contains("prd 0.1"), "{before}");
+    assert!(!before.contains("plan 1.1"), "{before}");
 
     park_ana_2(&store).await;
     refresh(&mut harness).await;
     assert!(list_is_open(&mut harness), "the same list stays open");
     let after = harness.render();
     assert!(after.contains("> ANA-2"), "{after}");
-    assert!(after.contains("prd 0.1"), "{after}");
+    assert!(after.contains("plan 1.1"), "{after}");
     assert!(after.contains("  FEAT-2  \u{2014}"), "{after}");
 }
 
@@ -260,8 +288,10 @@ async fn enter_opens_the_rows_step_in_the_runs_pane() {
     assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
     let frame = harness.render();
     assert!(frame.contains("\u{250c} ANA-2 "), "{frame}");
+    // Review T1: the parked `plan`, not the run's first step `prd`.
     let line = cursor_line(&frame);
-    assert!(line.contains("prd"), "{line}\n{frame}");
+    assert!(line.contains("plan"), "{line}\n{frame}");
+    assert!(!line.contains("prd"), "{line}\n{frame}");
     assert_eq!(harness.app().status, None);
 }
 
@@ -287,9 +317,14 @@ async fn the_list_over_platform_holds_a_gate_a_permission_and_a_reopen() {
 
     harness.key("ctrl-w");
     let frame = harness.render();
-    let gate = frame.find("gate").expect("the gate row");
-    let permission = frame.find("edit: src/lib.rs").expect("the permission row");
-    let reopen = frame.find("u reopens it").expect("the Reopen row");
+    // Review T2: each row matched on its key, step and reason columns (padded to the widest
+    // value of each: `FEAT-2`, `plan 1.1`, `permission`), not on a bare substring.
+    let gate = row_at(&frame, "ANA-2   plan 1.1  gate        gate");
+    let permission = row_at(&frame, "ANA-2   plan 1.1  permission  edit: src/lib.rs");
+    let reopen = row_at(
+        &frame,
+        "FEAT-2  \u{2014}         unblock     blocked, no active run: u reopens it",
+    );
     assert!(gate < permission && permission < reopen, "{frame}");
     insta::assert_snapshot!("platform_mixed", frame);
 }

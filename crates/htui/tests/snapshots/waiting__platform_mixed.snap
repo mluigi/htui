@@ -14,13 +14,13 @@ Platform · DESKTOP-HTUI · memory · 1 working · 3 waiting
 │  FEAT-3   queued             Postgres store and cac…││other module reaches through, so it is     │
 │  FIX-1    closed             Terminal left raw afte…││settled first.                             │
 │  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
-│▾ agy (3)     ┌ Waiting on you ────────────────────────────────────────────────────┐ry box keeps a│
-│  ANA-1    don│> ANA-2   prd 0.1  gate        gate                                 │on connect.   │
-│  FEAT-1   ope│  ANA-2   prd 0.1  permission  edit: src/lib.rs                     │              │
-│  FIX-1    ope│  FEAT-2  —        unblock     blocked, no active run: u reopens it │column, so a  │
-│              │                                                                    │its common    │
-│              │  j/k move · Enter open · Esc close                                 │              │
-│              └────────────────────────────────────────────────────────────────────┘              │
+│▾ agy (3)     ┌ Waiting on you ─────────────────────────────────────────────────────┐y box keeps a│
+│  ANA-1    don│> ANA-2   plan 1.1  gate        gate                                 │n connect.   │
+│  FEAT-1   ope│  ANA-2   plan 1.1  permission  edit: src/lib.rs                     │             │
+│  FIX-1    ope│  FEAT-2  —         unblock     blocked, no active run: u reopens it │olumn, so a  │
+│              │                                                                     │ts common    │
+│              │  j/k move · Enter open · Esc close                                  │             │
+│              └─────────────────────────────────────────────────────────────────────┘             │
 │                                                     ││                                           │
 │                                                     ││Item keys are minted from a per-project    │
 │                                                     ││counter table, which keeps numbers gapless │
