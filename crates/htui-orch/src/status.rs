@@ -10,6 +10,7 @@ use core::fmt;
 use htui_core::model::{
     GateOutcome, GraphSnapshot, RunStep, StepId, StepStatus, missing_tags_failure,
 };
+use htui_core::scrub::Unmasked;
 
 /// The `run_step.fanout_index` a `fan_out = 1` phase walks, and the one every fan-out slot has.
 ///
@@ -104,6 +105,27 @@ pub enum RunFailure {
     /// `Claim::MissingTags` answer. The note at enqueue and at claim, and `run.failure` at claim,
     /// read the same bytes (D78).
     MissingTags(Vec<String>),
+    /// MOD-10 D5: a scrub refusal on a live step. It is either `TrimRecord::to_value` refusing the
+    /// step's record, or the recorder's `finish` reporting a dropped row. Names the phase and the
+    /// rule, **never** the text and never the JSON pointer.
+    ScrubRefused {
+        /// `step_graph_phase.name` of the step, `<phase>:judge` for a judge, `chat` for a chat.
+        phase: String,
+        /// The rule name `Unmasked::rule` carried, e.g. `anthropic_api_key`.
+        rule: String,
+    },
+}
+
+impl RunFailure {
+    /// The one projection of an [`Unmasked`] into the run vocabulary (MOD-10 D5): the rule, never
+    /// the path.
+    #[must_use]
+    pub fn scrub_refused(phase: impl Into<String>, unmasked: &Unmasked) -> Self {
+        Self::ScrubRefused {
+            phase: phase.into(),
+            rule: unmasked.rule.to_owned(),
+        }
+    }
 }
 
 impl fmt::Display for RunFailure {
@@ -139,6 +161,9 @@ impl fmt::Display for RunFailure {
                 write!(f, "prompt refused at `{phase}`: {reason}")
             }
             Self::MissingTags(missing) => f.write_str(&missing_tags_failure(missing)),
+            Self::ScrubRefused { phase, rule } => {
+                write!(f, "scrub refused at `{phase}`: unmasked {rule}")
+            }
         }
     }
 }
@@ -554,6 +579,40 @@ mod tests {
             "prompt refused at `prd`: unknown prompt placeholder: {{no_such_placeholder}}",
             "MOD-4 plan D162: ANA-5 criterion 3's stage-3 refusal"
         );
+        assert_eq!(
+            RunFailure::ScrubRefused {
+                phase: "implement".to_owned(),
+                rule: "anthropic_api_key".to_owned(),
+            }
+            .to_string(),
+            "scrub refused at `implement`: unmasked anthropic_api_key",
+            "MOD-10 D5: a scrub refusal names the phase and the rule, never the text or the pointer"
+        );
+    }
+
+    /// MOD-10 D5: the one projection of an [`htui_core::scrub::Unmasked`] keeps the rule and drops
+    /// the JSON pointer, so neither the `Display` nor the `Debug` can carry a path segment.
+    #[test]
+    fn scrub_refused_never_carries_the_pointer() {
+        let unmasked = htui_core::scrub::Unmasked {
+            path: "/payload/sk-secret".into(),
+            rule: "aws_access_key_id",
+        };
+        let failure = RunFailure::scrub_refused("prd", &unmasked);
+        assert_eq!(
+            failure,
+            RunFailure::ScrubRefused {
+                phase: "prd".to_owned(),
+                rule: "aws_access_key_id".to_owned(),
+            }
+        );
+        for rendered in [failure.to_string(), format!("{failure:?}")] {
+            assert!(!rendered.contains("/payload"), "no pointer: {rendered}");
+            assert!(
+                !rendered.contains("sk-secret"),
+                "no path segment: {rendered}"
+            );
+        }
     }
 
     /// Blueprint D196: exactly the three cursors a crashed command leaves under a parked run are

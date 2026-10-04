@@ -3419,7 +3419,8 @@ where
                 // `?` and not "report the original": if the settle write itself refused, the step
                 // is *still* `running`, and a caller handed the original error would believe a row
                 // that does not exist.
-                self.fail_hard(run, &step, &err.to_string()).await?;
+                self.fail_hard(run, &step, &failure_text(&phase.name, &err))
+                    .await?;
                 Err(err)
             }
         }
@@ -4087,8 +4088,13 @@ where
                 if matches!(err, EngineError::Cancelled { .. }) || is_fenced(&err) {
                     return Err(err);
                 }
-                self.fail_candidate(stage.run, stage.phase, stage.step, &err.to_string())
-                    .await
+                self.fail_candidate(
+                    stage.run,
+                    stage.phase,
+                    stage.step,
+                    &failure_text(&stage.phase.name, &err),
+                )
+                .await
             }
         }
     }
@@ -4655,7 +4661,10 @@ where
             // D4: nor for a lost fence; the run is a stranger's, and `heartbeaten` makes it
             // `LeaseLost`.
             Err(err) if is_fenced(&err) => return Err(err),
-            Err(err) => Err(JudgeFailure::SessionFailed(err.to_string())),
+            Err(err) => Err(JudgeFailure::SessionFailed(failure_text(
+                &judge_phase_name(&phase.name),
+                &err,
+            ))),
         };
         let (winner, reason) = match verdict {
             Ok(verdict) => verdict,
@@ -6421,6 +6430,19 @@ struct JudgePrompts {
     template: SnapshotTemplate,
 }
 
+/// MOD-10 D5: the text a live-step failure writes. A scrub refusal becomes
+/// [`RunFailure::ScrubRefused`]'s sentence, which names the phase and the rule and never the JSON
+/// pointer; every other error keeps its own `Display`. `DriverError::Scrub` is deliberately not
+/// mapped: its one producer is unreachable from a live step (MOD-10 plan, verified claims).
+fn failure_text(phase: &str, err: &EngineError) -> String {
+    match err {
+        EngineError::Record(htui_agent::RecordError::Unmasked(unmasked)) => {
+            RunFailure::scrub_refused(phase, unmasked).to_string()
+        }
+        other => other.to_string(),
+    }
+}
+
 /// MOD-40 review: whether `err` is the store's [`StoreError::Fenced`], however the walk carried
 /// it: a settle write's own, or the recorder's through [`htui_agent::RecordError`] or
 /// [`htui_agent::error::DriverError`].
@@ -7092,6 +7114,25 @@ mod tests {
                     id: repo,
                     project_id: ids::PROJECT_HTUI,
                     name: "htui".to_owned(),
+                    remote_url: None,
+                    default_branch: "main".to_owned(),
+                    is_primary: true,
+                })
+                .await
+                .expect("the demo project has no repo yet");
+            repo
+        }
+
+        /// [`Self::add_primary_repo`] under `name`, for a case whose repo slug must reach the
+        /// trim record (MOD-10 D5).
+        async fn add_primary_repo_named(&self, name: &str) -> RepoId {
+            let repo = RepoId::new();
+            self.orch
+                .store
+                .create_repo(NewRepo {
+                    id: repo,
+                    project_id: ids::PROJECT_HTUI,
+                    name: name.to_owned(),
                     remote_url: None,
                     default_branch: "main".to_owned(),
                     is_primary: true,
@@ -14938,10 +14979,9 @@ mod tests {
         let harness = Harness::new().await;
         let dir = tempfile::tempdir().expect("a throwaway root");
         glob_retry_prologue(&harness, dir.path()).await;
-        harness
-            .orch
-            .isolator
-            .fail_changed_paths("cannot lock /srv/sk-live-checkout/.git/index.lock");
+        harness.orch.isolator.fail_changed_paths(
+            "cannot lock /srv/sk-live0123456789abcdefghij-checkout/.git/index.lock",
+        );
 
         let (_, second) = run_two_attempts(&harness).await;
 
@@ -14972,7 +15012,7 @@ mod tests {
         harness
             .orch
             .isolator
-            .fail_diff("cannot lock /srv/sk-live-checkout/.git/index.lock");
+            .fail_diff("cannot lock /srv/sk-live0123456789abcdefghij-checkout/.git/index.lock");
 
         let (_, second) = run_two_attempts(&harness).await;
 
@@ -15835,21 +15875,26 @@ mod tests {
         use std::time::Duration;
 
         use chrono::TimeDelta;
+        use htui_agent::conformance::{Script, ScriptEvent};
         use htui_agent::driver::{PermissionDefault, PermissionPolicy, PermissionRequestId};
-        use htui_agent::event::{PermissionOption, PermissionOptionKind, PermissionRequestEvent};
+        use htui_agent::event::{
+            DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
+            StopReason, TextChunk,
+        };
         use htui_core::fixtures::ids;
         use htui_core::model::{
             EventKind, Gate, ItemId, PermissionStatus, RunId, RunMode, RunStatus, SessionEvent,
-            SnapshotCandidate, StepId, StepPermission, StepStatus,
+            SnapshotCandidate, Status, StepId, StepPermission, StepStatus,
         };
         use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
         use serde_json::Value;
 
         use super::Harness;
         use crate::command::{Command, CommandOutcome, EngineError};
-        use crate::engine::{Engine, SessionKey, fake_parts};
+        use crate::engine::{Engine, SessionKey, failure_text, fake_parts};
         use crate::fake::{FakeOrchestrator, ScriptedStep};
         use crate::isolate::Clock as _;
+        use crate::status::RunFailure;
 
         /// How long a client waits, in paused time, for a row that never comes.
         const CLIENT_LIMIT: Duration = Duration::from_secs(30);
@@ -16869,6 +16914,140 @@ mod tests {
                 (row.status, row.failure),
                 (RunStatus::Running, None),
                 "the stranger's run is not failed"
+            );
+        }
+
+        /// MOD-10 D5: one turn whose assistant text the scrubber refuses, so the recorder writes a
+        /// `scrub_residue` row and its `finish` answers `Unmasked`; then a document with `body`.
+        /// The key matches under both the bare-prefix and the whole-token rules (blueprint H-7).
+        fn leaks(body: &str) -> ScriptedStep {
+            ScriptedStep {
+                script: Script::one_turn(vec![
+                    ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                        text: "the key is sk-ant-api03-abcdefghijklmnopqrstuvwx".into(),
+                        message_id: None,
+                    })),
+                    ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                        stop_reason: StopReason::EndTurn,
+                    })),
+                ]),
+                output: Some(body.into()),
+                spawn_failure: None,
+            }
+        }
+
+        /// The `FEAT-3` run the walk started: the one that is not the seeded, cancelled `RUN_2`.
+        async fn started_run(orch: &FakeOrchestrator) -> RunId {
+            orch.store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .find(|run| run.id != ids::RUN_2)
+                .expect("the walk created a run")
+                .id
+        }
+
+        /// The `ScrubRefused` sentence for an Anthropic key at `phase`, built from the variant so
+        /// the bytes are pinned once, in `status.rs` (blueprint H-12).
+        fn scrub_sentence(phase: &str) -> String {
+            RunFailure::ScrubRefused {
+                phase: phase.to_owned(),
+                rule: "anthropic_api_key".to_owned(),
+            }
+            .to_string()
+        }
+
+        /// MOD-10 D5: only a scrub refusal is typed; every other error keeps its own `Display`.
+        #[test]
+        fn failure_text_types_only_a_scrub_refusal() {
+            let unmasked = htui_core::scrub::Unmasked {
+                path: "/payload/output".into(),
+                rule: "anthropic_api_key",
+            };
+            assert_eq!(
+                failure_text(
+                    "prd",
+                    &EngineError::Record(htui_agent::RecordError::Unmasked(unmasked))
+                ),
+                scrub_sentence("prd")
+            );
+            let encode = EngineError::Record(htui_agent::RecordError::Encode("x".into()));
+            assert_eq!(failure_text("prd", &encode), encode.to_string());
+            let stalled = EngineError::Stalled {
+                run: RunId::new(),
+                passes: 3,
+            };
+            assert_eq!(failure_text("prd", &stalled), stalled.to_string());
+        }
+
+        /// MOD-10 D5, plain-step path: a recorder whose `finish` refuses fails the run with the
+        /// typed scrub sentence, and the item mirrors `failed`, not `blocked` (MOD-32 D8).
+        #[tokio::test(start_paused = true)]
+        async fn a_recorder_refusal_fails_the_run_with_the_scrub_sentence() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness.orch.script("prd", 1, leaks("the prd"));
+
+            let walked = walked(Box::pin(harness.dispatch(start_feat_3()))).await;
+
+            assert!(
+                matches!(walked, Err(EngineError::Record(_))),
+                "the walk answers the recorder's refusal: {walked:?}"
+            );
+            let run = started_run(&harness.orch).await;
+            let row = harness.orch.run(run).await;
+            assert_eq!(
+                (row.status, row.failure),
+                (RunStatus::Failed, Some(scrub_sentence("prd")))
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.status, StepStatus::Failed);
+            assert_residue_recorded(&harness.orch.store, prd.id).await;
+            assert_ne!(
+                harness.orch.item(ids::HTUI_FEAT_3).await.status,
+                Status::Blocked,
+                "`fail_hard` never blocks the item"
+            );
+        }
+
+        /// MOD-10 D5, plain-step path: a credential-shaped repo name reaches the trim record's
+        /// `excerpts.roots[].repo`, so `TrimRecord::to_value` refuses it and the run fails with the
+        /// typed scrub sentence.
+        #[tokio::test(start_paused = true)]
+        async fn a_trim_record_refusal_fails_the_run_with_the_scrub_sentence() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .add_primary_repo_named("sk-ant-api03-abcdefghijklmnopqrstuvwx")
+                .await;
+            harness
+                .orch
+                .script("prd", 1, ScriptedStep::done_with_output("the prd"));
+
+            let walked = walked(Box::pin(harness.dispatch(start_feat_3()))).await;
+
+            let run = started_run(&harness.orch).await;
+            let row = harness.orch.run(run).await;
+            let failure = row.failure.clone().unwrap_or_default();
+            assert!(
+                !failure.starts_with("prompt refused"),
+                "blueprint H-15: the slug reached a rendered section, so the assembler refused \
+                 first; the trim path was not exercised: {failure}"
+            );
+            assert!(
+                matches!(walked, Err(EngineError::Record(_))),
+                "the walk answers the record's refusal: {walked:?}"
+            );
+            assert_eq!(
+                (row.status, row.failure),
+                (RunStatus::Failed, Some(scrub_sentence("prd")))
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.status, StepStatus::Failed);
+            assert_eq!(
+                prd.trim_record, None,
+                "the refused record was never written"
             );
         }
 
