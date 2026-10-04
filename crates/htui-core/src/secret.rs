@@ -61,8 +61,8 @@ impl SecretScope {
     ///
     /// # Errors
     ///
-    /// [`SecretError::Config`] when `project_id` or `environment` is empty or whitespace, or
-    /// `path` does not start with `/`.
+    /// [`SecretError::Config`] when `project_id` or `environment` is empty or whitespace, `path`
+    /// does not start with `/`, or any of the three holds a control character (`char::is_control`).
     pub fn new(
         project_id: impl Into<String>,
         environment: impl Into<String>,
@@ -83,6 +83,19 @@ impl SecretScope {
             return Err(SecretError::Config(
                 "the secret scope path must start with `/`".to_owned(),
             ));
+        }
+        // `PathNotFound`'s `Display` prints the environment and path raw: a control character
+        // would reach the terminal. The refusal names the field, never echoes the value.
+        for (field, value) in [
+            ("project_id", &project_id),
+            ("environment", &environment),
+            ("path", &path),
+        ] {
+            if value.chars().any(char::is_control) {
+                return Err(SecretError::Config(format!(
+                    "the secret scope's {field} holds a control character"
+                )));
+            }
         }
         Ok(Self {
             project_id,
@@ -440,6 +453,42 @@ mod tests {
                 "the secret scope path must start with `/`"
             );
         }
+    }
+
+    /// A control character would reach a terminal raw through `PathNotFound`'s `Display`; the
+    /// refusal names the field, never the value.
+    #[test]
+    fn scope_refuses_control_characters_naming_the_field_only() {
+        for bad in ["a\nb", "\u{1b}[2J", "x\u{7f}", "a\u{85}", "a\tb", "\0"] {
+            let path = format!("/{bad}");
+            let rows = [
+                (
+                    SecretScope::new(bad, "dev", "/"),
+                    "the secret scope's project_id holds a control character",
+                ),
+                (
+                    SecretScope::new("p1", bad, "/"),
+                    "the secret scope's environment holds a control character",
+                ),
+                (
+                    SecretScope::new("p1", "dev", path.as_str()),
+                    "the secret scope's path holds a control character",
+                ),
+            ];
+            for (result, want) in rows {
+                let sentence = config_sentence(result);
+                assert_eq!(sentence, want, "input {bad:?}");
+            }
+        }
+        // `parse` applies the same refusal.
+        assert_eq!(
+            config_sentence(SecretScope::parse(
+                r#"{"project_id":"p1","environment":"dev","path":"/a\u001b"}"#
+            )),
+            "the secret scope's path holds a control character"
+        );
+        // Printable non-ASCII is not a control character.
+        SecretScope::new("p1", "dév", "/é/✓").expect("printable Unicode is accepted");
     }
 
     #[test]

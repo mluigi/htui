@@ -105,8 +105,9 @@ A project reads one scope, kept in the project's `secret_scope` column as JSON, 
 - `environment`: the environment **slug** (`dev`, `staging`, `prod`), not its display name.
 - `path`: the folder, starting with `/`. Optional; defaults to `/`.
 
-Unknown fields are refused, as are an empty project ID or environment and a path without a
-leading `/`. Only the folder itself is read, not its subfolders. Secret references
+Unknown fields are refused, as are an empty project ID or environment, a path without a
+leading `/`, and a control character (a newline, a tab, an escape) in any of the three; the
+refusal names the field, not its value. Only the folder itself is read, not its subfolders. Secret references
 (`${OTHER_KEY}`) are expanded by Infisical before htui sees the values.
 
 ## Imports and precedence
