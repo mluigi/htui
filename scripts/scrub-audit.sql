@@ -39,7 +39,7 @@ CREATE TEMP VIEW scrub_audit_rules (rule, re) AS VALUES
     ('slack_user_token',   'xoxp-[A-Za-z0-9-]{10,}'),
     ('slack_token',        'xox[ars]-[A-Za-z0-9-]{10,}'),
     ('google_api_key',     'AIza[0-9A-Za-z_-]{35}'),
-    ('stripe_secret_key',  '[rs]k_(?:live|test)_[A-Za-z0-9]{20,}'),
+    ('stripe_secret_key',  '[rs]k_live_[A-Za-z0-9]{20,}'),
     ('npm_token',          'npm_[A-Za-z0-9]{36}'),
     ('pypi_token',         'pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}'),
     ('sendgrid_api_key',   'SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}'),

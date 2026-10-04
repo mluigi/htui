@@ -50,7 +50,7 @@ const PATTERN_RULES: &[(&str, &str)] = &[
     // New in MOD-10 (D2).
     ("gitlab_pat", r"glpat-[A-Za-z0-9_-]{20,}"),
     ("slack_token", r"xox[ars]-[A-Za-z0-9-]{10,}"),
-    ("stripe_secret_key", r"[rs]k_(?:live|test)_[A-Za-z0-9]{20,}"),
+    ("stripe_secret_key", r"[rs]k_live_[A-Za-z0-9]{20,}"),
     ("npm_token", r"npm_[A-Za-z0-9]{36}"),
     ("pypi_token", r"pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}"),
     (
@@ -806,14 +806,30 @@ mod tests {
         }
     }
 
+    /// Stripe test-mode keys are not refused (maintainer decision, MOD-10 M1 review M1): they cannot
+    /// move money, and Stripe's documentation sample key appears in code and READMEs an agent reads.
+    #[test]
+    fn stripe_test_mode_keys_are_not_refused() {
+        let scrubber = rules_only();
+        for text in [
+            "sk_test_abcdefghijklmnopqrstuvwx",
+            "rk_test_abcdefghijklmnopqrstuvwx",
+            "Stripe.api_key = \"sk_test_4eC39HqLyjWDarjtT1zdp7dc\"",
+        ] {
+            let mut value = json!({ "t": text });
+            scrubber
+                .scrub(&mut value)
+                .unwrap_or_else(|err| panic!("{text:?} must stay clean, got {err}"));
+        }
+    }
+
     #[test]
     fn every_slack_token_kind_and_stripe_key_kind_is_refused() {
         let scrubber = rules_only();
         for (text, rule) in [
             ("xoxr-0000000000-aaaaaaaaaaaa", "slack_token"),
             ("xoxs-0000000000-aaaaaaaaaaaa", "slack_token"),
-            ("rk_test_abcdefghijklmnopqrstuvwx", "stripe_secret_key"),
-            ("sk_test_abcdefghijklmnopqrstuvwx", "stripe_secret_key"),
+            ("rk_live_abcdefghijklmnopqrstuvwx", "stripe_secret_key"),
             ("gho_abcdefghijklmnopqrstuvwxyz0123456789", "github_token"),
             ("ghs_abcdefghijklmnopqrstuvwxyz0123456789", "github_token"),
             ("ASIAIOSFODNN7EXAMPLE", "aws_access_key_id"),

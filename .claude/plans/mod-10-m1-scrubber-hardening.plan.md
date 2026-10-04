@@ -116,7 +116,7 @@ check that `payload` already has. A scrub refusal gets one typed sentence wherev
   | `slack_bot_token` / `slack_user_token` | existing | `xoxb-[A-Za-z0-9-]{10,}` / `xoxp-[A-Za-z0-9-]{10,}` |
   | `slack_token` | new | `xox[ars]-[A-Za-z0-9-]{10,}` |
   | `google_api_key` | existing | `AIza[0-9A-Za-z_-]{35}` |
-  | `stripe_secret_key` | new | `[rs]k_(?:live\|test)_[A-Za-z0-9]{20,}` |
+  | `stripe_secret_key` | new, **narrowed** | `[rs]k_live_[A-Za-z0-9]{20,}` — live keys only; test-mode keys dropped by maintainer decision at review (M1), since they cannot move money and Stripe's doc sample key is common in code an agent reads |
   | `npm_token` | new | `npm_[A-Za-z0-9]{36}` |
   | `pypi_token` | new | `pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}` |
   | `sendgrid_api_key` | new | `SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}` |
@@ -361,7 +361,7 @@ actionable finding went through one adversarial verifier (review-phase ultracode
 | Finding | Verified | Disposition |
 |---|---|---|
 | H1 `openai_api_key` fails open on hyphenated/underscored `sk-` keys (LiteLLM ~47%, `sk-<uuid>` 100%) | real, high | **fixed** `0f2d0687` (gate + `SK_PROSE` filter; audit SQL mirrored) |
-| M1 T0 audit not run; `jwt` / `sk_test_` may fail closed on public sample tokens | process | **maintainer decision pending** |
+| M1 T0 audit not run; `jwt` / `sk_test_` may fail closed on public sample tokens | process | **decided 2026-10-04:** keep `jwt` (real bearer credentials; resolved ones are masked, not refused, once M3 lands); Stripe narrowed to live keys |
 | M2 cross-row split window widened | real, **low** | Risks row corrected; seam scan → M3 |
 | L1 token start misses `\n`-escaped / `%20`-encoded keys | real, low | → M3 (widens fail-closed; needs a fresh host audit) |
 | L2 weakened no-leak needles | real, nit | **fixed** `b8130def` |
