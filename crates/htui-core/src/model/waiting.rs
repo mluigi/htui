@@ -14,7 +14,7 @@ use crate::model::relay::StepPermission;
 use crate::model::run::{Run, RunStep};
 use crate::model::scope::Scope;
 
-/// One item of [`crate::store::ReadStore::waiting_candidates`] (MOD-69 plan D2): an item in scope
+/// One item of `crate::store::ReadStore::waiting_candidates` (MOD-69 plan D2): an item in scope
 /// that is `blocked` or `awaiting_approval`, or that owns a run at `awaiting_approval`, with its
 /// **active** runs (`RunStatus::is_active`) and each such run's steps.
 ///
@@ -98,7 +98,7 @@ impl WaitingCandidate {
     }
 }
 
-/// One row of [`crate::store::WriteStore::open_permissions`] (MOD-69 plan D4, blueprint A-1, A-2):
+/// One row of `crate::store::WriteStore::open_permissions` (MOD-69 plan D4, blueprint A-1, A-2):
 /// a pending permission request of an item run whose owner holds the run's lease live, with what
 /// the list sorts and labels it by (plan D9), so the classifier needs no second read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
