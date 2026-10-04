@@ -467,6 +467,11 @@ ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set sta
   path. Paths are repo-relative by contract (ANA-5 §4.2 rule 5) and the digest LF-normalises before
   any byte is counted (criterion 6), which is the Windows hazard that would otherwise change a
   `prompt_digest` between boxes. Criterion 11's CLI half also holds on **Linux only**.
+  **MOD-11 added the MCP host's Windows half** (`docs/decisions/mod/mod-11.md`): the named-pipe
+  listener (`\\.\pipe\htui-mcp-<uuid>`, first instance, remote clients refused), the relay's
+  1 s drain in place of a half-close, and a failed `connect` replacing its pipe instance. It
+  type-checks for `x86_64-pc-windows-gnu` and has never run; a Windows box should run
+  `crates/htui/tests/mcp_stdio.rs`'s cases by hand.
   **MOD-20 added a second body of Windows-only code** (`docs/decisions/mod/mod-20.md`), and it is
   the first that could not be lint-checked from Linux at all (**TOOL-3**), so it was reviewed by eye
   only. The runtime facts it defers here, by name: that `Layout::promote`'s three-attempt

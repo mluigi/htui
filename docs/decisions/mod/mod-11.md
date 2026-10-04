@@ -270,12 +270,13 @@ Refuted: **L2**. No current `Debug` path logs the token. The hardening is folded
 
 ## Gate
 
-<!-- GATE -->
+Run on the post-review tree (code at `a67e0321`, 2026-10-04), serially with Postgres:
+
 | Check | Result |
 |---|---|
 | `cargo fmt --all -- --check` | clean |
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` | clean |
-| `cargo test --workspace --all-features --no-fail-fast -- --test-threads=1` | 4243 passed, 0 failed, 30 ignored (before R1); SIGABRT 0 |
+| `cargo test --workspace --all-features --no-fail-fast -- --test-threads=1` | 4266 passed, 0 failed, 30 ignored; SIGABRT 0; no `htui mcp` process or socket directory left |
 | `cargo sqlx prepare --check` (`crates/htui-store`, migrated scratch DB) | exit 0 |
 | `cargo check -p htui-mcp --target x86_64-pc-windows-gnu` | clean (in this sandbox with `CC_x86_64_pc_windows_gnu=gcc AR_x86_64_pc_windows_gnu=ar`: no mingw) |
 | pending snapshots | none |
