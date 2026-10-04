@@ -1153,9 +1153,10 @@ pub enum StoreReply {
     BoxInfo(Option<BoxInfo>),
     /// Answer to [`StoreRequest::Waiting`].
     Waiting {
-        /// The asked scope's `workspace_id`: a reply for a workspace the shell has since left is
-        /// dropped, as `observe_reply` runs before the freshness gate (MOD-69 review M1).
-        workspace: WorkspaceId,
+        /// The asked scope: a reply for a scope the shell has since left - another workspace, or
+        /// the same one with another project set - is dropped, as `observe_reply` runs before the
+        /// freshness gate (MOD-69 review M1, R2).
+        scope: Scope,
         /// The list and the two counts.
         view: WaitingView,
     },
@@ -1745,7 +1746,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 None => None,
             };
             StoreReply::Waiting {
-                workspace: scope.workspace_id,
+                scope: scope.clone(),
                 // Review L3 with L4: no writer is offline; a writer with unknown permissions is a
                 // failed read online, which the overlay must not call offline.
                 view: WaitingView {
@@ -3215,16 +3216,16 @@ mod tests {
             .name(),
             "waiting"
         );
-        let workspace = scope.workspace_id;
+        let asked = scope.clone();
         let StoreReply::Waiting {
-            workspace: answered,
+            scope: answered,
             view,
         } = serve(&backend, &StoreRequest::Waiting { scope }).await
         else {
             panic!("wrong reply variant")
         };
         assert_eq!(
-            answered, workspace,
+            answered, asked,
             "the reply names the scope it read (review M1)"
         );
         assert_eq!(view.working, 1, "RUN_2 is the fixture's only active run");
@@ -4936,8 +4937,11 @@ mod tests {
             project_ids: vec![ids::PROJECT_HTUI],
         };
         match try_serve(&backend, &StoreRequest::Waiting { scope }).await {
-            Ok(StoreReply::Waiting { workspace, view }) => {
-                assert_eq!(workspace, ids::WORKSPACE_PLATFORM);
+            Ok(StoreReply::Waiting {
+                scope: answered,
+                view,
+            }) => {
+                assert_eq!(answered.workspace_id, ids::WORKSPACE_PLATFORM);
                 assert!(!view.permissions_known, "offline permissions are unknown");
                 assert!(
                     view.offline,

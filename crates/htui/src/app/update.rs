@@ -362,12 +362,17 @@ impl App {
                 }
             }
             StoreReply::BoxInfo(Some(info)) => self.top_bar.box_name = info.hostname.clone(),
-            // Review M1: the old scope's queued reply lands after `set_scope` (blueprint H-10).
-            StoreReply::Waiting { workspace, view } => {
-                if *workspace == self.scope.workspace_id {
+            // Review M1: the old scope's queued reply lands after `set_scope` (blueprint H-10). The
+            // whole scope is compared, not its workspace: Settings re-scopes the same workspace
+            // when a project is created, deleted or reordered (R2).
+            StoreReply::Waiting { scope, view } => {
+                if *scope == self.scope {
                     self.top_bar.waiting = Some(view.clone());
                 } else {
-                    tracing::debug!(%workspace, "a waiting reply for a workspace since left");
+                    tracing::debug!(
+                        workspace = %scope.workspace_id,
+                        "a waiting reply for a scope since left"
+                    );
                 }
             }
             StoreReply::StoreState {
@@ -698,7 +703,7 @@ mod tests {
             seq: UNSOLICITED,
             origin: Origin::Overlay(WaitingList::ID),
             reply: StoreReply::Waiting {
-                workspace: app.scope.workspace_id,
+                scope: app.scope.clone(),
                 view: view.clone(),
             },
         }));
@@ -719,29 +724,77 @@ mod tests {
             permissions_known: true,
             offline: false,
         };
-        let reply = |workspace, view| {
+        let scope_of = |workspace_id| Scope {
+            workspace_id,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let reply = |scope, view| {
             Action::Reply(ReplyEnvelope {
                 seq: UNSOLICITED,
                 origin: Origin::App,
-                reply: StoreReply::Waiting { workspace, view },
+                reply: StoreReply::Waiting { scope, view },
             })
         };
 
-        app.update(reply(ids::WORKSPACE_GRAPHICS, view(7)));
+        app.update(reply(scope_of(ids::WORKSPACE_GRAPHICS), view(7)));
         assert_eq!(
             app.top_bar.waiting, None,
             "the old workspace's counts never show"
         );
 
-        app.update(reply(ids::WORKSPACE_PLATFORM, view(2)));
+        app.update(reply(scope_of(ids::WORKSPACE_PLATFORM), view(2)));
         assert_eq!(app.top_bar.waiting, Some(view(2)));
 
-        app.update(reply(ids::WORKSPACE_GRAPHICS, view(7)));
+        app.update(reply(scope_of(ids::WORKSPACE_GRAPHICS), view(7)));
         assert_eq!(
             app.top_bar.waiting,
             Some(view(2)),
             "nor overwrite the new one"
         );
+    }
+
+    /// MOD-69 review R2 (M1): Settings re-scopes the *same* workspace when its project set
+    /// changes, and a reply read under the old project set is dropped all the same.
+    #[test]
+    fn a_waiting_reply_for_the_old_project_set_of_the_same_workspace_is_dropped() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        let old = app.scope.clone();
+        let mut grown = workspace("Platform");
+        grown.projects.push(ProjectRef {
+            project_id: ids::PROJECT_AGY,
+            slug: "q".to_owned(),
+            name: "Q".to_owned(),
+            position: 1,
+        });
+        app.update(Action::SetScope { workspace: grown });
+        assert_eq!(app.scope.workspace_id, old.workspace_id);
+        assert_ne!(app.scope, old);
+
+        let view = |working| WaitingView {
+            working,
+            rows: Vec::new(),
+            permissions_known: true,
+            offline: false,
+        };
+        let reply = |scope, view| {
+            Action::Reply(ReplyEnvelope {
+                seq: UNSOLICITED,
+                origin: Origin::App,
+                reply: StoreReply::Waiting { scope, view },
+            })
+        };
+
+        app.update(reply(old, view(7)));
+        assert_eq!(
+            app.top_bar.waiting, None,
+            "the old project set's rows never show"
+        );
+
+        app.update(reply(app.scope.clone(), view(2)));
+        assert_eq!(app.top_bar.waiting, Some(view(2)));
     }
 
     /// A `Failed` reply at `seq`, addressed to the recorder tab.
