@@ -161,10 +161,16 @@ so it never does.
 
 - **The token is the scope.** The session's run, step, item, project, box, working directory and
   fence come from the token, never from arguments.
-- **Every write is fenced.** An engine step writes under its walk's lease: once another process
-  has taken the run over (an adoption after a crash, a lapsed lease), every write answers
-  `fenced: lease lost` and writes nothing. A chat writes without a lease, and is refused the same
-  way once a walk holds the run again. A step only ever writes on its own run's item.
+- **Every item write is fenced.** An engine step writes under its walk's lease: once another
+  process has taken the run over (an adoption after a crash, a lapsed lease), every
+  `document_write`, `note_add`, `item_status` and `item_link` answers `fenced: lease lost` and
+  writes nothing. A chat writes without a lease, and is refused the same way once a walk holds the
+  run again. A step only ever writes on its own run's item.
+- **`command_run` is not fenced.** Its queue rows take no lease, so a step that has lost its lease
+  can still queue and run a command, and record it, until its walk notices the loss (at its next
+  lease renewal) and drops the step. The agent's connection then closes, and the command is killed
+  and its row `cancelled`, as when the agent exits (see
+  [Liveness](#liveness-crashes-and-cancellation)).
 - **No agent moves a status** (R-ENT-8): see `item_status`.
 - **Everything stored or returned is scrubbed first, and fails closed** (R-ID-7, R-SEC-3): a text
   that matches one of htui's credential rules (an API key's prefix, for example) is refused as
@@ -406,7 +412,8 @@ the chat ended, or htui quit. Nothing was written.
 
 **`fenced: lease lost`.** Another process took the run over while this session was still running
 (it had lost its lease, for example after a long database outage). Nothing was written; the run
-goes on in the process that holds it.
+goes on in the process that holds it. `command_run` never answers this: a command the session
+started meanwhile is [not fenced](#scope-what-a-session-can-touch).
 
 **`version mismatch: the host is htui <x>, this relay is <y>; restart the agent`** (exit 3). The
 binary the agent started is not the build the host runs: htui was upgraded on disk while it was
