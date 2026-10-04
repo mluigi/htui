@@ -2006,6 +2006,87 @@ mod tests {
         }
     }
 
+    /// MOD-76 D3 (R-44): a trailing `-YYYYMMDD` goes, then a leading `{agent}-`.
+    #[test]
+    fn the_model_loses_its_date_and_its_agent_prefix() {
+        assert_eq!(
+            who(Some("claude"), Some("claude-sonnet-4-5-20250929")),
+            "claude/sonnet-4-5"
+        );
+        assert_eq!(
+            who(Some("x"), Some("sonnet-4-5-20250929")),
+            "x/sonnet-4-5",
+            "the date goes without a prefix to strip"
+        );
+        assert_eq!(
+            who(Some("claude"), Some("claude-sonnet-4-5")),
+            "claude/sonnet-4-5",
+            "the prefix goes without a date to drop"
+        );
+    }
+
+    /// MOD-76 D3.3 (R-44): a model no rule matches is kept, and so is one a rule would empty.
+    #[test]
+    fn a_model_no_rule_matches_or_would_empty_is_kept() {
+        for (agent, model) in [
+            ("claude", "sonnet"),
+            ("agy", "default"),
+            ("scripted", "sonnet"),
+        ] {
+            assert_eq!(who(Some(agent), Some(model)), format!("{agent}/{model}"));
+        }
+        assert_eq!(
+            who(Some("claude"), Some("claude-")),
+            "claude/claude-",
+            "the prefix alone is kept"
+        );
+        assert_eq!(
+            who(Some("claude"), Some("-20250929")),
+            "claude/-20250929",
+            "the date alone is kept"
+        );
+        for tail in ["-2025092", "-202509290", "-2025092x"] {
+            let model = format!("sonnet{tail}");
+            assert_eq!(
+                who(Some("claude"), Some(&model)),
+                format!("claude/{model}"),
+                "`{tail}` is not eight digits"
+            );
+        }
+    }
+
+    /// MOD-76 D3.4 (R-44): a missing agent or model is still [`PENDING`].
+    #[test]
+    fn a_missing_agent_or_model_is_a_dash() {
+        assert_eq!(who(None, Some("m")), "\u{2014}/m");
+        assert_eq!(who(Some("a"), None), "a/\u{2014}");
+        assert_eq!(who(None, None), "\u{2014}/\u{2014}");
+    }
+
+    /// MOD-76 D3 (R-44): `claude/sonnet-4-5` (17 columns) fits beside `~36k ! ` in the 24-column
+    /// tail, uncut.
+    #[tokio::test]
+    async fn an_abbreviated_model_fits_beside_the_widest_indicator() {
+        let step = RunStepSummary {
+            prompt_tokens: Some(35_988),
+            trimmed: true,
+            agent_name: Some("claude".to_owned()),
+            model: Some("claude-sonnet-4-5-20250929".to_owned()),
+            ..feat_1_runs().await[0].steps[0].clone()
+        };
+        let [_, second] = step_lines(&step, std::slice::from_ref(&step), false, &Theme::default());
+        assert_eq!(second.width(), PANE, "{:?}", text(&second));
+        let rendered = text(&second);
+        assert!(
+            rendered.trim_end().ends_with("~36k ! claude/sonnet-4-5"),
+            "{rendered:?}"
+        );
+        assert!(
+            !rendered.contains('\u{2026}'),
+            "nothing is cut: {rendered:?}"
+        );
+    }
+
     /// Every step is two lines (D169), whether or not it has a prompt record: the second line
     /// always carries the gate and the agent/model, so the figure no longer decides the height.
     #[tokio::test]
