@@ -346,6 +346,8 @@ Fact-checked 2026-10-03 by two parallel read-only agents (store/engine S1–S12,
 | 27 | Overlays use a `J`/`K` cursor | FALSE → T3 uses `j`/`k` + arrows | workspace_switcher.rs:161-170 |
 
 ## Acceptance
-- [ ] All tasks complete
-- [ ] Validation passes
-- [ ] Patterns mirrored, not reinvented
+- [x] All tasks complete (T0, T1, T2, T5, T3; review round R1)
+- [x] Validation passes (see `docs/decisions/mod/mod-69.md` Verification)
+- [x] Patterns mirrored, not reinvented
+
+**Status: done 2026-10-04.**

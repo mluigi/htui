@@ -14,7 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-03):** **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
+**Current status (2026-10-04):** **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
+waiting-on-you list. `Ctrl+W` opens, from every screen, an overlay listing every run in the active
+workspace that waits on a person, one row per reason (gate, selection, judge failed, unblock,
+interrupted, open permission with its tool); `Enter` opens the item's Runs tab on that step. The top
+bar reads `N working · M waiting`. It is derived each tick by `StoreRequest::Waiting` (replacing
+`ActiveRuns`) from `ReadStore::waiting_candidates` + `WriteStore::open_permissions` and the pure
+`htui_worker::waiting`, which reuses the Runs pane's guards; the list keeps no state. `R-TUI-11`
+added, `R-TUI-1` amended. No migration, no new crate, four new `.sqlx` entries. It spawned **MOD-75**
+(agent question tool, blocked on MOD-11).
+Before it, **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
 flow view takes the mouse. A click on a node moves the shared cursor, a drag on empty canvas pans,
 and the wheel zooms at the pointer; nodes stay read-only. Capture is on only while that view is
 shown in browse mode with a run to draw. Everywhere else htui is keyboard-only and the terminal
@@ -31,18 +40,6 @@ kind (an editable `summary` included) and `v` a new version prefilled from the l
 is refused offline before any read; a write whose answer may have been lost settles itself on a
 re-read and never invites a duplicate. Conformance case 135; no migration. It spawned **MOD-73**
 (hand-written versions as step inputs).
-Before it, **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
-the Runs flow view has a third line counting its step's tool calls by kind (`⚒ read×5 exec×3 +1`).
-`ReadStore::tool_call_counts` answers on Postgres, the mirror and `MemStore`; the pane asks
-`StoreRequest::ToolCalls` after each `Runs` reply only while the flow is shown. Nodes are 20×5. No
-migration, no new crate, one new `.sqlx` entry.
-Before it, **MOD-60 is done** (`docs/decisions/mod/mod-60.md`): every
-hand-laid-out row in the TUI measures, pads, clips and wraps in terminal cells, the way ratatui draws
-them, so CJK, emoji, combining marks and halfwidth kana no longer overrun a pane or push a column out
-of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` and ~16 local copies
-went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
-name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
-no new crate, no snapshot moved.
 Earlier completions are in `DECISIONS.md`.
 **Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
 `0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
@@ -52,12 +49,12 @@ comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested
 (MOD-26 milestone 2, index only; cache: `0001`..`0004`), so **the next migration is `0014`** (cache: `0005`).
 `max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
 (done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72 and MOD-26 (done, both milestones)
+MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72, MOD-26 (done, both milestones) and MOD-69
 (re-counted 2026-10-01; `TABLES` and commented columns 2026-10-02; `CASES`, `READ_CASES`, `htui-orch`
 `CASES`, `StoreRequest`/`StoreReply`, the `REQUEST_NAMES` below, `.sqlx`, snapshots and Settings
-sections 2026-10-03): store conformance `CASES` 134, `READ_CASES` 14, `htui-orch` `CASES` 92,
-`GraphSource` 7 methods, `StoreRequest` 105, `StoreReply` 62, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `persona_settings::REQUEST_NAMES` 5, `TABLES` 42, 322 `.sqlx` files, 143
+sections 2026-10-04): store conformance `CASES` 137, `READ_CASES` 15, `htui-orch` `CASES` 92,
+`GraphSource` 7 methods, `StoreRequest` 109, `StoreReply` 66, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
+`skills::REQUEST_NAMES` 6, `persona_settings::REQUEST_NAMES` 5, `TABLES` 42, 326 `.sqlx` files, 147
 `crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
 `MIRRORED_TABLES` 21, eight Settings sections (71 of the 100 strip columns), 44 pinned commented
 columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
@@ -576,18 +573,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   passes `Tab` to the tab bar. Six milestones (ANA-26 §8): M1 catalogue and resolver, M2 the file,
   M3 Settings and overlays, M4 Skills and Requirements, M5 Backlog and Chat, M6 close-out; M3-M5
   are independent but share snapshots. Not blocked.
-- [ ] **MOD-69 - Waiting-on-you list across items** (from ANA-27, `docs/ANA-27.md` §5.1 T8,
-  `docs/decisions/ana/ana-27.md`). `R-TUI-1`, `R-TUI-4`, `R-ORCH-2`, `R-ORCH-4`, `R-NF-3`. The Runs
-  pane shows what waits on a person only for the selected item, and the top bar counts active runs,
-  so with several items running a parked gate, a fan-out awaiting selection, a judge park or a
-  blocked run is found by visiting items one by one. Add an overlay, opened from every screen, that
-  lists every run in the active workspace waiting on a person, one row per reason (gate, selection,
-  judge failure, unblock, and, once MOD-42 lands, each open permission request with its tool), read
-  by one store query. `Enter` opens the item's Runs pane on that step, and the top bar gains the
-  count. The list is derived at read time and keeps no state of its own; MOD-12's planned escalation
-  list can reuse the query, and the opening key is a MOD-67 action. **Open question for the
-  maintainer:** it needs the proposed `R-TUI-11` and the matching `R-TUI-1` top-bar line (ANA-27
-  §7), not yet applied. Not blocked; the permission rows are added after MOD-42.
 - [ ] **MOD-75 - Agent question tool: an MCP tool that parks the step for a person** (from MOD-69,
   `.claude/prds/mod-69-waiting-on-you.prd.md`). `R-MCP-1..4`, `R-TUI-11`. A step's agent that
   finds something it did not expect, or needs an opinion, has no way to ask: the question lands in
@@ -619,6 +604,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 23 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups, MOD-75 agent question tool; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups, MOD-75 agent question tool; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

@@ -118,8 +118,8 @@ active workspace appears in the list and the waiting count, each reaching its st
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | See what waits | Top bar shows working vs waiting counts; the overlay lists every waiting reason in the active workspace (gate, selection, judge failure, unblock, open permission) from every screen | in-progress | `.claude/plans/mod-69-waiting-on-you.plan.md` |
-| 2 | Jump to it | `Enter` on a row opens the item's Runs pane on that step; close-out | in-progress | `.claude/plans/mod-69-waiting-on-you.plan.md` |
+| 1 | See what waits | Top bar shows working vs waiting counts; the overlay lists every waiting reason in the active workspace (gate, selection, judge failure, unblock, open permission) from every screen | complete | `.claude/plans/mod-69-waiting-on-you.plan.md` |
+| 2 | Jump to it | `Enter` on a row opens the item's Runs pane on that step; close-out | complete | `.claude/plans/mod-69-waiting-on-you.plan.md` |
 
 ## Open Questions
 
@@ -143,4 +143,4 @@ active workspace appears in the list and the waiting count, each reaching its st
 | The fixed key collides with an existing global binding before MOD-67 lands | Low | Low | Pick a free global key; MOD-67 later makes it remappable |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — both milestones shipped 2026-10-04 (`docs/decisions/mod/mod-69.md`).*
