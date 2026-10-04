@@ -1737,15 +1737,21 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::Waiting { scope } => {
             let active = backend.active_runs(scope).await?;
             let candidates = backend.waiting_candidates(scope).await?;
-            let permissions = match backend.writer() {
+            let writer = backend.writer();
+            let permissions = match &writer {
                 Some(writer) => {
-                    permissions_or_unknown(WriteStore::open_permissions(&writer, scope).await)?
+                    permissions_or_unknown(WriteStore::open_permissions(writer, scope).await)?
                 }
                 None => None,
             };
             StoreReply::Waiting {
                 workspace: scope.workspace_id,
-                view: htui_worker::waiting(scope, active, &candidates, permissions.as_deref()),
+                // Review L3 with L4: no writer is offline; a writer with unknown permissions is a
+                // failed read online, which the overlay must not call offline.
+                view: WaitingView {
+                    offline: writer.is_none(),
+                    ..htui_worker::waiting(scope, active, &candidates, permissions.as_deref())
+                },
             }
         }
         StoreRequest::Items {
@@ -3223,6 +3229,7 @@ mod tests {
         );
         assert_eq!(view.working, 1, "RUN_2 is the fixture's only active run");
         assert!(view.permissions_known, "a Memory backend has a writer");
+        assert!(!view.offline, "a Memory backend is not offline");
         assert_eq!(
             view.rows,
             vec![WaitingRow {
@@ -4932,6 +4939,10 @@ mod tests {
             Ok(StoreReply::Waiting { workspace, view }) => {
                 assert_eq!(workspace, ids::WORKSPACE_PLATFORM);
                 assert!(!view.permissions_known, "offline permissions are unknown");
+                assert!(
+                    view.offline,
+                    "the reply says it was read offline (review L3)"
+                );
                 assert!(view.rows.is_empty(), "an empty mirror owes nothing");
                 assert_eq!(view.working, 0);
             }

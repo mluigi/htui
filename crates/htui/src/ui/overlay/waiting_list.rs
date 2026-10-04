@@ -44,6 +44,10 @@ const READING: &str = "reading the store";
 /// is read-only: the Runs pane refuses the answer (review L3).
 const OFFLINE: &str = "permissions unavailable (read-only offline)";
 
+/// Online, the permission read failed with anything but `Unreachable` (review L4): none can be
+/// listed, yet every row can still be answered, so the line claims neither offline nor read-only.
+const UNREADABLE: &str = "permissions unavailable: the read failed";
+
 /// The step column of a row with no step: the Runs pane's `PENDING` dash.
 const NO_STEP: &str = "\u{2014}";
 
@@ -112,8 +116,8 @@ impl WaitingList {
         }));
     }
 
-    /// The box's contents: the visible rows (or the empty or reading line), the offline line when
-    /// permissions are unknown, a blank line, then the hint.
+    /// The box's contents: the visible rows (or the empty or reading line), the offline or
+    /// unreadable line when permissions are unknown, a blank line, then the hint.
     ///
     /// `text_width` is the room the text column gets; `None` is its widest text, unclipped.
     /// `visible` is how many rows fit: the window always holds the cursor.
@@ -147,8 +151,9 @@ impl WaitingList {
                     .collect()
             }
         };
-        if waiting.is_some_and(|view| !view.permissions_known) {
-            lines.push(Line::styled(format!("{NO_CURSOR}{OFFLINE}"), theme.dim));
+        if let Some(view) = waiting.filter(|view| !view.permissions_known) {
+            let why = if view.offline { OFFLINE } else { UNREADABLE };
+            lines.push(Line::styled(format!("{NO_CURSOR}{why}"), theme.dim));
         }
         lines.push(Line::raw(""));
         lines.push(Line::styled(format!("{NO_CURSOR}{HINT}"), theme.dim));
@@ -434,6 +439,7 @@ mod tests {
             working: 0,
             rows,
             permissions_known: true,
+            offline: false,
         }
     }
 
@@ -632,7 +638,25 @@ mod tests {
                 reopen("FEAT-2", ids::HTUI_FEAT_2),
             ],
             permissions_known: false,
+            offline: true,
         }));
         insta::assert_snapshot!("offline", bench.render(&WaitingList::new()));
+    }
+
+    /// MOD-69 review R1 (L3 with L4): online, a failed permission read leaves the permissions
+    /// unknown, but the rows can still be answered, so the line claims neither offline nor
+    /// read-only.
+    #[test]
+    fn online_a_failed_permission_read_does_not_claim_offline() {
+        let bench = Bench::over(Some(WaitingView {
+            working: 1,
+            rows: vec![gate("ANA-2", ids::HTUI_ANA_2)],
+            permissions_known: false,
+            offline: false,
+        }));
+        let rendered = bench.render(&WaitingList::new());
+        assert!(rendered.contains(UNREADABLE), "{rendered}");
+        assert!(!rendered.contains("offline"), "{rendered}");
+        assert!(!rendered.contains("read-only"), "{rendered}");
     }
 }

@@ -692,6 +692,7 @@ mod tests {
             working: 3,
             rows: Vec::new(),
             permissions_known: true,
+            offline: false,
         };
         app.update(Action::Reply(ReplyEnvelope {
             seq: UNSOLICITED,
@@ -716,6 +717,7 @@ mod tests {
             working,
             rows: Vec::new(),
             permissions_known: true,
+            offline: false,
         };
         let reply = |workspace, view| {
             Action::Reply(ReplyEnvelope {

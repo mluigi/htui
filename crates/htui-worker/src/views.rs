@@ -542,10 +542,14 @@ pub struct WaitingView {
     pub working: usize,
     /// Every row, in plan D9's order.
     pub rows: Vec<WaitingRow>,
-    /// `false` offline: permission requests are not mirrored, so none are listed (plan D4).
-    /// Offline every row is read-only too (review L3): `Enter` still reveals it, and the Runs
-    /// pane refuses the answer, as every write is refused offline.
+    /// Whether the open permission requests were listed. `false` offline, where they are not
+    /// mirrored (plan D4), and also online when the permission read failed with anything but
+    /// `Unreachable` (review L4): [`Self::offline`] tells the two apart.
     pub permissions_known: bool,
+    /// The reply was read from the offline mirror (the backend had no writer). Every row is then
+    /// read-only (review L3): `Enter` still reveals it, and the Runs pane refuses the answer, as
+    /// every write is refused offline. Set by the store worker; [`waiting`] leaves it `false`.
+    pub offline: bool,
 }
 
 impl WaitingView {
@@ -579,8 +583,8 @@ const INTERRUPTED_TEXT: &str = "interrupted";
 /// guards: [`selectable_slots`] (`verdicts`' own `select` with no live chat; heads feed only
 /// approve/accept/open, plan D3) decides a slot's `select`, one [`unblock_case`] per candidate the
 /// item's `u`, step status a gate, and a parked run none of them lists is an Interrupted row
-/// (review H1). `permissions` is `None` offline. `active` is `Backend::active_runs` over the same
-/// scope.
+/// (review H1). `permissions` is `None` offline or when the permission read failed (review L4).
+/// `active` is `Backend::active_runs` over the same scope.
 #[must_use]
 pub fn waiting(
     scope: &Scope,
@@ -790,6 +794,7 @@ pub fn waiting(
         working: active.saturating_sub(owning),
         rows,
         permissions_known: permissions.is_some(),
+        offline: false,
     }
 }
 

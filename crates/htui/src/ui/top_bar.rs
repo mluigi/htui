@@ -102,6 +102,7 @@ mod tests {
                 working: 1,
                 rows: Vec::new(),
                 permissions_known: true,
+                offline: false,
             }),
         };
         let idle = draw(&state, &theme);
@@ -121,6 +122,7 @@ mod tests {
             working: 0,
             rows: vec![row("FEAT-2"), row("FEAT-3")],
             permissions_known: true,
+            offline: false,
         });
         let owed = draw(&state, &theme);
         let text = line(&owed);
