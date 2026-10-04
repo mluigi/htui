@@ -270,7 +270,10 @@ The class `verify` belongs to the orchestrator's own verification: `command_run`
    admitted oldest first, while fewer than the limit are running.
 4. **Runs.** `sh -c <command>` (`cmd /C` on Windows) in that directory, with stdin closed and stdout
    and stderr merged. When the timeout elapses, the command and everything it started are killed
-   (the whole process group; a job object on Windows).
+   (the whole process group; a job object on Windows). When the shell exits, output still in
+   flight is read for up to 2 more seconds, then whatever the command left running in the
+   background is killed the same way, so `server & echo started` neither holds the call nor
+   outlives it (a process that left the group, for example with `setsid`, is not reached).
 5. **Answers.** The last 64 KiB of output is kept, scrubbed and stored on the row, then returned.
    When more was printed, `truncated` is `true` and the tail opens with the line
    `[… earlier output truncated]`. A timed-out command's output opens with the line

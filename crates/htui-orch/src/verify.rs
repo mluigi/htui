@@ -458,6 +458,10 @@ async fn drain(reader: Option<impl tokio::io::AsyncRead + Unpin>, captured: &Mut
 
 // -- MOD-11 OQ-7 (blueprint B-15): `command_run`'s executor -------------------------------------
 
+/// MOD-11 R1 M1: how long [`run_shell`] keeps reading the pipes after the shell exited, for the
+/// output still in flight; a background child that holds them longer is killed with the group.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
+
 /// How a [`run_shell`] child ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShellEnd {
@@ -490,9 +494,11 @@ pub struct ShellRun {
 
 /// MOD-11 OQ-7 (blueprint B-15): runs `command` through the platform shell in `cwd` with the
 /// process environment unchanged, both pipes drained into one tail, until it exits, `budget`
-/// elapses, or `stop` resolves — the last two kill the whole process group (job object on
-/// Windows), so a `cargo test`'s test binaries die with it. Infallible: a shell that cannot start
-/// is [`ShellEnd::SpawnFailed`].
+/// elapses, or `stop` resolves — each of the three kills the whole process group (job object on
+/// Windows), so a `cargo test`'s test binaries die with it, and a background child the shell left
+/// behind does not outlive the call (R1 M1: after an exit the pipes get [`PIPE_GRACE`], then the
+/// output read so far is the answer). Infallible: a shell that cannot start is
+/// [`ShellEnd::SpawnFailed`].
 pub async fn run_shell(
     command: &str,
     cwd: &Path,
@@ -540,12 +546,30 @@ pub async fn run_shell(
     let stderr = child.child.stderr().take();
     let race = {
         let run = async {
-            tokio::join!(
-                drain_counting(stdout, &captured, &printed),
-                drain_counting(stderr, &captured, &printed),
-                async { child.child.wait().await }
-            )
-            .2
+            let mut drains = std::pin::pin!(async {
+                tokio::join!(
+                    drain_counting(stdout, &captured, &printed),
+                    drain_counting(stderr, &captured, &printed),
+                );
+            });
+            let mut drained = false;
+            let waited = {
+                let mut wait = std::pin::pin!(child.child.wait());
+                loop {
+                    tokio::select! {
+                        waited = &mut wait => break waited,
+                        () = &mut drains, if !drained => drained = true,
+                    }
+                }
+            };
+            // MOD-11 R1 M1: the shell is gone, but a background child that inherited a pipe
+            // (`sleep 600 & echo ok`) would hold its EOF — and the call, and the class slot —
+            // until the budget. The drains get a short grace, then stop: what was read is kept,
+            // and the group kill below ends the holder.
+            if !drained {
+                let _ = tokio::time::timeout(PIPE_GRACE, &mut drains).await;
+            }
+            waited
         };
         let stop = std::pin::pin!(stop);
         tokio::select! {
@@ -554,6 +578,12 @@ pub async fn run_shell(
             () = stop => Race::Stopped,
         }
     };
+    if matches!(race, Race::Waited(_)) {
+        // MOD-11 R1 M1: the shell exited, cleanly or not; whatever it left in its group — a
+        // background child, redirected or not — dies with the call rather than outliving it.
+        // The group may already be empty, which is the usual case and not an error.
+        let _ = child.child.start_kill();
+    }
     let (exit_code, ended, reason) = match race {
         Race::Waited(Ok(status)) => match status.code() {
             Some(code) => (Some(code), ShellEnd::Exited, None),
@@ -784,6 +814,70 @@ mod shell_tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Polls until no process matches `pattern`, or fails after five seconds.
+    #[cfg(unix)]
+    async fn until_gone(pattern: &str, why: &str) {
+        let started = std::time::Instant::now();
+        while std::process::Command::new("pgrep")
+            .args(["-f", pattern])
+            .output()
+            .is_ok_and(|out| out.status.success())
+        {
+            assert!(started.elapsed() < Duration::from_secs(5), "{why}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// MOD-11 R1 M1: a background child that inherited stdout does not hold the call until the
+    /// budget: once the shell exits the pipes get a short grace, then the group is killed and the
+    /// output read so far is the answer.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_background_child_holding_the_pipe_does_not_hold_the_call() {
+        const PATTERN: &str = "sleep 30.4231";
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let started = std::time::Instant::now();
+        let ran = run_shell(
+            &format!("{PATTERN} & echo ok"),
+            dir.path(),
+            Duration::from_secs(60),
+            never(),
+        )
+        .await;
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "answered after the grace, not the budget: {:?}",
+            started.elapsed()
+        );
+        assert_eq!((ran.exit_code, ran.ended), (Some(0), ShellEnd::Exited));
+        assert_eq!(ran.output, "ok\n");
+        until_gone(PATTERN, "the background child outlived the call").await;
+    }
+
+    /// MOD-11 R1 M1: on a clean exit the group is killed too, so a background child with its
+    /// output redirected away (which never held the pipes) does not outlive the call.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_redirected_background_child_dies_with_the_group() {
+        const PATTERN: &str = "sleep 30.4232";
+        let dir = tempfile::tempdir().expect("a scratch dir");
+        let ran = run_shell(
+            &format!("{PATTERN} >/dev/null 2>&1 & echo $!"),
+            dir.path(),
+            Duration::from_secs(60),
+            never(),
+        )
+        .await;
+        assert_eq!((ran.exit_code, ran.ended), (Some(0), ShellEnd::Exited));
+        let pid: u32 = ran
+            .output
+            .trim()
+            .parse()
+            .expect("the shell printed the pid");
+        assert_ne!(pid, 0);
+        until_gone(PATTERN, "the redirected background child outlived the call").await;
     }
 
     /// MOD-11 OQ-7: a `cwd` that is gone is a spawn failure, reported, not a panic.
