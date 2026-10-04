@@ -572,6 +572,8 @@ DSN; a failure there with no body/snapshot in it is environmental, re-run before
   and no row for a trailing newline.
 - **Plan-accepted deviations from CommonMark** (no change, recorded so the reviewer does not re-raise them): any
   ordered marker interrupts a paragraph (CommonMark allows only `1.`); after a blank line, a 4-space-indented list
-  continuation paragraph is indented code; backslash escapes are not interpreted.
+  continuation paragraph is indented code; backslash escapes are not interpreted; an item's continuation after a
+  fence or a blank line inside a list item is a paragraph of its own and starts at column 0 (review LOW-2:
+  `- a\n  ```\n  x\n  ```\n  more` draws `more` at column 0, `- a\n\n  b` draws `b` there).
 - **Flakiness**: all new tests are pure or use `MemStore::demo()` with no timers; none depends on scheduling. Snapshot
   churn collides with MOD-81/82/83 (same files): re-accept after review on merge.
