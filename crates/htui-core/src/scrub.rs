@@ -748,6 +748,64 @@ mod tests {
         }
     }
 
+    /// One value per quantifier minimum, exactly one character short of it (sendgrid and jwt once
+    /// per segment), under its rule's name.
+    fn one_short() -> Vec<(&'static str, String)> {
+        let a = |n: usize| "a".repeat(n);
+        vec![
+            ("anthropic_api_key", format!("sk-ant-{}", a(19))),
+            ("github_pat", format!("github_pat_{}", a(19))),
+            ("github_token", format!("ghp_{}", a(29))),
+            ("aws_access_key_id", format!("AKIA{}", "A".repeat(15))),
+            ("slack_bot_token", format!("xoxb-{}", "0".repeat(9))),
+            ("slack_user_token", format!("xoxp-{}", "0".repeat(9))),
+            ("google_api_key", format!("AIza{}", a(34))),
+            ("openai_api_key", format!("sk-{}", a(19))),
+            ("openai_api_key", format!("sk-proj-{}", a(19))),
+            ("gitlab_pat", format!("glpat-{}", a(19))),
+            ("slack_token", format!("xoxa-{}", "0".repeat(9))),
+            ("stripe_secret_key", format!("sk_live_{}", a(19))),
+            ("npm_token", format!("npm_{}", a(35))),
+            ("pypi_token", format!("pypi-AgEIcHlwaS5vcmc{}", a(49))),
+            ("sendgrid_api_key", format!("SG.{}.{}", a(21), a(43))),
+            ("sendgrid_api_key", format!("SG.{}.{}", a(22), a(42))),
+            ("jwt", format!("eyJ{}.eyJ{}.{}", a(9), a(10), a(10))),
+            ("jwt", format!("eyJ{}.eyJ{}.{}", a(10), a(9), a(10))),
+            ("jwt", format!("eyJ{}.eyJ{}.{}", a(10), a(10), a(9))),
+        ]
+    }
+
+    #[test]
+    fn one_character_short_of_every_minimum_is_clean_under_all_rules() {
+        let scrubber = rules_only();
+        for (rule, short) in one_short() {
+            for text in [
+                short.clone(),
+                format!("the key {short} here"),
+                format!("Authorization: Bearer {short}"),
+            ] {
+                let mut value = json!({ "t": text });
+                scrubber.scrub(&mut value).unwrap_or_else(|err| {
+                    panic!(
+                        "one short of {rule} must be clean, got {}: {text}",
+                        err.rule
+                    )
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn every_pattern_rule_has_a_one_short_fixture() {
+        let fixtures = one_short();
+        for (rule, _) in PATTERN_RULES {
+            assert!(
+                fixtures.iter().any(|(name, _)| name == rule),
+                "no one-short fixture for {rule}"
+            );
+        }
+    }
+
     #[test]
     fn every_slack_token_kind_and_stripe_key_kind_is_refused() {
         let scrubber = rules_only();
