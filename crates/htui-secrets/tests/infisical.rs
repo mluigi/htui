@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use htui_core::secret::{MachineIdentity, SecretError, SecretProvider, SecretScope};
 use htui_secrets::{InfisicalConfig, InfisicalProvider};
 use serde_json::{Value, json};
-use support::{Reply, Stub};
+use support::{Reply, Stub, closed_port_base};
 
 const CLIENT_ID: &str = "cid-sentinel-1";
 const CLIENT_SECRET: &str = "csecret-sentinel-1";
@@ -21,6 +21,7 @@ const VALUE: &str = "value-sentinel-1";
 
 const LOGIN: &str = "/api/v1/auth/universal-auth/login";
 const SECRETS: &str = "/api/v4/secrets";
+const STATUS: &str = "/api/status";
 
 fn identity() -> MachineIdentity {
     MachineIdentity::new(CLIENT_ID, CLIENT_SECRET)
@@ -42,6 +43,15 @@ fn error(status: u16, name: &str, message: &str) -> Reply {
     Reply::json(
         status,
         &json!({"reqId": "req-1", "statusCode": status, "message": message, "error": name}),
+    )
+}
+
+/// Fastify's default 404 for an unknown route.
+fn fastify_404(method: &str, path: &str) -> Reply {
+    Reply::json(
+        404,
+        &json!({"message": format!("Route {method}:{path} not found"), "error": "Not Found",
+                "statusCode": 404}),
     )
 }
 
@@ -670,5 +680,515 @@ async fn a_refused_relogin_latches() {
         stub.requests().len(),
         before,
         "a latched provider made a request"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Login errors
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_login_429_is_rate_limited_and_does_not_latch() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        error(429, "RateLimitExceeded", "slow down").header("Retry-After", "12"),
+    )
+    .on("POST", LOGIN, login_ok(TOKEN, 2_592_000))
+    .on(
+        "GET",
+        SECRETS,
+        list_ok(json!([secret("A", VALUE)]), json!([])),
+    );
+    let p = provider(&stub);
+    assert_eq!(
+        p.resolve(&scope()).await.unwrap_err(),
+        SecretError::RateLimited {
+            retry_after_secs: Some(12)
+        }
+    );
+    p.resolve(&scope()).await.expect("the next call logs in");
+    assert_eq!(stub.count("POST", LOGIN), 2);
+}
+
+#[tokio::test]
+async fn a_login_network_failure_is_unreachable_and_does_not_latch() {
+    let p = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
+        .expect("a provider on a closed port");
+    for _ in 0..2 {
+        match p.resolve(&scope()).await {
+            Err(SecretError::Unreachable { endpoint, cause }) => {
+                assert_eq!(endpoint, LOGIN);
+                assert!(!cause.is_empty(), "an empty cause");
+                assert!(
+                    !cause.contains("http://") && !cause.contains("/api/"),
+                    "the cause carries the URL"
+                );
+            }
+            Err(_) => panic!("expected Unreachable"),
+            Ok(_) => panic!("a closed port resolved"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_login_route_404_is_unsupported_server() {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, fastify_404("POST", LOGIN));
+    let p = provider(&stub);
+    for _ in 0..2 {
+        assert_eq!(
+            p.resolve(&scope()).await.unwrap_err(),
+            SecretError::UnsupportedServer { endpoint: LOGIN }
+        );
+    }
+    assert_eq!(
+        stub.count("POST", LOGIN),
+        2,
+        "an unsupported server latched"
+    );
+}
+
+#[tokio::test]
+async fn a_login_500_is_protocol_and_never_quotes_the_body() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        error(
+            500,
+            "InternalServerError",
+            &format!("{CLIENT_SECRET} {TOKEN}"),
+        ),
+    );
+    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    let text = format!("{err} {err:?}");
+    assert!(
+        !text.contains(CLIENT_SECRET),
+        "the login error quotes the client secret"
+    );
+    assert!(!text.contains(TOKEN), "the login error quotes the token");
+    assert!(
+        err == SecretError::Protocol {
+            endpoint: LOGIN,
+            detail: "status 500".into()
+        },
+        "expected Protocol status 500 at the login"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Data errors
+// ---------------------------------------------------------------------------------------------
+
+/// A stub with a good login whose list answers `reply`; returns the first resolve's error.
+async fn list_error(reply: Reply) -> SecretError {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login_ok(TOKEN, 2_592_000))
+        .on("GET", SECRETS, reply);
+    match provider(&stub).resolve(&scope()).await {
+        Err(e) => e,
+        Ok(_) => panic!("the list answer was accepted"),
+    }
+}
+
+#[tokio::test]
+async fn a_fastify_route_404_is_unsupported_server() {
+    let err = list_error(fastify_404("GET", "/api/v4/secrets?projectId=proj-1")).await;
+    assert_eq!(err, SecretError::UnsupportedServer { endpoint: SECRETS });
+    assert!(err.to_string().contains("v0.150"));
+}
+
+#[tokio::test]
+async fn a_not_found_404_is_project_not_found() {
+    let err = list_error(error(404, "NotFound", "Project with ID proj-1 not found")).await;
+    assert_eq!(err, SecretError::ProjectNotFound);
+}
+
+#[tokio::test]
+async fn a_secret_path_404_is_path_not_found_naming_the_scope() {
+    let err = list_error(error(404, "SecretPathNotFound", "Folder not found")).await;
+    assert_eq!(
+        err,
+        SecretError::PathNotFound {
+            environment: "dev".into(),
+            path: "/app".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_permission_denied_403_carries_the_cleaned_message() {
+    let err = list_error(error(
+        403,
+        "PermissionDenied",
+        "You are not allowed to\r\nread secrets in dev",
+    ))
+    .await;
+    assert_eq!(
+        err,
+        SecretError::PermissionDenied {
+            detail: "You are not allowed toread secrets in dev".into()
+        }
+    );
+    let err = list_error(error(403, "Forbidden", "")).await;
+    assert_eq!(
+        err,
+        SecretError::PermissionDenied {
+            detail: "status 403 Forbidden".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_membership_403_is_permission_denied() {
+    let err = list_error(error(
+        403,
+        "ProjectMembershipNotFound",
+        "Identity is not a member of the project",
+    ))
+    .await;
+    assert_eq!(
+        err,
+        SecretError::PermissionDenied {
+            detail: "Identity is not a member of the project".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_429_is_rate_limited_with_or_without_retry_after() {
+    let err = list_error(error(429, "RateLimitExceeded", "slow").header("Retry-After", "30")).await;
+    assert_eq!(
+        err,
+        SecretError::RateLimited {
+            retry_after_secs: Some(30)
+        }
+    );
+    let err = list_error(error(429, "RateLimitExceeded", "slow")).await;
+    assert_eq!(
+        err,
+        SecretError::RateLimited {
+            retry_after_secs: None
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_long_server_message_is_cleaned_and_cut() {
+    let message = format!("{}\r\n{}", "x".repeat(150), "y".repeat(150));
+    let SecretError::PermissionDenied { detail } =
+        list_error(error(403, "PermissionDenied", &message)).await
+    else {
+        panic!("expected PermissionDenied");
+    };
+    assert!(detail.chars().count() <= 200, "the detail is not cut");
+    assert!(
+        !detail.chars().any(char::is_control),
+        "control characters kept"
+    );
+}
+
+#[tokio::test]
+async fn an_unexpected_status_is_protocol_naming_the_endpoint() {
+    let err = list_error(error(500, "InternalServerError", "boom")).await;
+    assert_eq!(
+        err,
+        SecretError::Protocol {
+            endpoint: SECRETS,
+            detail: "status 500: boom".into()
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_non_json_list_body_is_protocol() {
+    match list_error(Reply::text(200, "<html>")).await {
+        SecretError::Protocol { endpoint, detail } => {
+            assert_eq!(endpoint, SECRETS);
+            assert!(
+                detail.contains("not the expected JSON"),
+                "not the decode detail"
+            );
+        }
+        _ => panic!("expected Protocol"),
+    }
+}
+
+#[tokio::test]
+async fn a_data_redirect_is_protocol_and_never_followed() {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login_ok(TOKEN, 2_592_000))
+        .on(
+            "GET",
+            SECRETS,
+            Reply::redirect(302, &format!("{}/elsewhere", stub.base())),
+        )
+        .on("GET", "/elsewhere", list_ok(json!([]), json!([])));
+    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    assert_eq!(
+        err,
+        SecretError::Protocol {
+            endpoint: SECRETS,
+            detail: "the server answered a redirect (302); redirects are not followed".into()
+        }
+    );
+    assert_eq!(stub.count("GET", "/elsewhere"), 0);
+}
+
+#[tokio::test]
+async fn a_login_redirect_is_protocol_and_the_body_never_follows() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        Reply::redirect(307, &format!("{}/steal", stub.base())),
+    )
+    .on("POST", "/steal", login_ok(TOKEN, 2_592_000));
+    let p = provider(&stub);
+    for _ in 0..2 {
+        assert_eq!(
+            p.resolve(&scope()).await.unwrap_err(),
+            SecretError::Protocol {
+                endpoint: LOGIN,
+                detail: "the server answered a redirect (307); redirects are not followed".into()
+            }
+        );
+    }
+    assert_eq!(stub.count("POST", "/steal"), 0);
+    assert_eq!(stub.count("POST", LOGIN), 2, "a login redirect latched");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Health
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn health_reads_the_status_then_logs_in() {
+    let stub = Stub::start();
+    stub.on("GET", STATUS, Reply::json(200, &json!({"message": "Ok"})))
+        .on("POST", LOGIN, login_ok(TOKEN, 2_592_000));
+    let health = provider(&stub).health().await.expect("healthy");
+    assert_eq!(
+        routes(&stub),
+        [
+            ("GET".to_owned(), STATUS.to_owned()),
+            ("POST".to_owned(), LOGIN.to_owned())
+        ]
+    );
+    assert_eq!(health.base_url, stub.base());
+    assert!(health.server_ok);
+}
+
+#[tokio::test]
+async fn health_reports_a_failing_status_and_still_logs_in() {
+    let stub = Stub::start();
+    stub.on("GET", STATUS, error(503, "ServiceUnavailable", "down"))
+        .on("POST", LOGIN, login_ok(TOKEN, 2_592_000));
+    let health = provider(&stub).health().await.expect("health answers");
+    assert!(!health.server_ok);
+    assert_eq!(stub.count("POST", LOGIN), 1);
+}
+
+#[tokio::test]
+async fn health_always_logs_in_afresh() {
+    let stub = serving(json!([secret("A", VALUE)]));
+    stub.on("GET", STATUS, Reply::json(200, &json!({})));
+    let p = provider(&stub);
+    p.resolve(&scope()).await.expect("resolves");
+    p.health().await.expect("healthy");
+    assert_eq!(stub.count("POST", LOGIN), 2);
+}
+
+#[tokio::test]
+async fn health_on_an_unreachable_server_names_the_status_endpoint() {
+    let p = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
+        .expect("a provider on a closed port");
+    assert!(
+        matches!(
+            p.health().await,
+            Err(SecretError::Unreachable { endpoint, .. }) if endpoint == STATUS
+        ),
+        "expected Unreachable at the status endpoint"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Leak (D10)
+// ---------------------------------------------------------------------------------------------
+
+/// Exhaustive, no wildcard: a new variant fails to compile here and needs a scenario.
+fn variant(e: &SecretError) -> &'static str {
+    match e {
+        SecretError::NoIdentity => "NoIdentity",
+        SecretError::Config(_) => "Config",
+        SecretError::Unreachable { .. } => "Unreachable",
+        SecretError::BadCredentials => "BadCredentials",
+        SecretError::IdentityLocked => "IdentityLocked",
+        SecretError::LoginRefusedEarlier => "LoginRefusedEarlier",
+        SecretError::ProjectNotFound => "ProjectNotFound",
+        SecretError::PathNotFound { .. } => "PathNotFound",
+        SecretError::PermissionDenied { .. } => "PermissionDenied",
+        SecretError::RateLimited { .. } => "RateLimited",
+        SecretError::UnsupportedServer { .. } => "UnsupportedServer",
+        SecretError::InvalidKey { .. } => "InvalidKey",
+        SecretError::InvalidValue { .. } => "InvalidValue",
+        SecretError::Protocol { .. } => "Protocol",
+    }
+}
+
+/// The first resolve's error on a stub with `login` and `list` scripted.
+async fn scenario(login: Reply, list: Reply) -> SecretError {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login).on("GET", SECRETS, list);
+    match provider(&stub).resolve(&scope()).await {
+        Err(e) => e,
+        Ok(_) => panic!("a leak scenario resolved"),
+    }
+}
+
+#[tokio::test]
+async fn no_error_or_debug_carries_a_value_the_client_secret_or_the_token() {
+    let good = || login_ok(TOKEN, 2_592_000);
+    let unused = || list_ok(json!([]), json!([]));
+    let leaky_login = |status: u16, message: &str| {
+        error(
+            status,
+            "UnauthorizedError",
+            &format!("{message} {CLIENT_SECRET} {TOKEN}"),
+        )
+    };
+    let mut errors = vec![SecretError::NoIdentity];
+
+    errors.push(
+        InfisicalProvider::new(InfisicalConfig::new("http://192.168.1.10"), identity())
+            .expect_err("a LAN http URL is refused"),
+    );
+    let closed = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
+        .expect("a provider on a closed port");
+    errors.push(
+        closed
+            .resolve(&scope())
+            .await
+            .expect_err("a closed port fails"),
+    );
+
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, leaky_login(401, "Invalid credentials"));
+    let latched = provider(&stub);
+    errors.push(latched.resolve(&scope()).await.expect_err("refused"));
+    errors.push(latched.resolve(&scope()).await.expect_err("latched"));
+
+    errors.push(scenario(leaky_login(401, "Identity is temporarily locked"), unused()).await);
+    errors.push(scenario(leaky_login(500, "Internal error"), unused()).await);
+    errors.push(scenario(good(), error(404, "NotFound", "Project not found")).await);
+    errors.push(scenario(good(), error(404, "SecretPathNotFound", "Folder not found")).await);
+    errors.push(
+        scenario(
+            good(),
+            list_ok(json!([secret("OPEN", VALUE), hidden("SHUT")]), json!([])),
+        )
+        .await,
+    );
+    errors.push(scenario(good(), error(429, "RateLimitExceeded", "slow")).await);
+    errors.push(scenario(good(), fastify_404("GET", SECRETS)).await);
+    errors.push(
+        scenario(
+            good(),
+            list_ok(json!([secret("bad-key", VALUE)]), json!([])),
+        )
+        .await,
+    );
+    errors.push(
+        scenario(
+            good(),
+            list_ok(json!([secret("NUL", &format!("{VALUE}\u{0}"))]), json!([])),
+        )
+        .await,
+    );
+    errors.push(
+        scenario(
+            good(),
+            Reply::json(
+                200,
+                &json!({"secrets": [{"secretKey": "K", "secretValue": "x",
+                                     "secretValueHidden": VALUE}]}),
+            ),
+        )
+        .await,
+    );
+    errors.push(
+        scenario(
+            Reply::json(200, &json!({"accessToken": TOKEN, "expiresIn": TOKEN})),
+            unused(),
+        )
+        .await,
+    );
+
+    let names: std::collections::BTreeSet<&str> = errors.iter().map(variant).collect();
+    assert_eq!(names.len(), 14, "not every variant was produced: {names:?}");
+    for e in &errors {
+        let name = variant(e);
+        for text in [e.to_string(), format!("{e:?}")] {
+            assert!(!text.contains(VALUE), "{name} carries a secret value");
+            assert!(
+                !text.contains(CLIENT_SECRET),
+                "{name} carries the client secret"
+            );
+            assert!(!text.contains(TOKEN), "{name} carries the token");
+            assert!(!text.contains(TOKEN_2), "{name} carries the second token");
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_provider_debug_shows_neither_the_secret_nor_the_token() {
+    let stub = serving(json!([secret("A", VALUE)]));
+    let p = provider(&stub);
+    p.resolve(&scope()).await.expect("resolves");
+    let debug = format!("{p:?}");
+    assert!(debug.contains(CLIENT_ID), "the Debug lacks the client ID");
+    assert!(debug.contains(&stub.base()), "the Debug lacks the base URL");
+    assert!(
+        !debug.contains(CLIENT_SECRET),
+        "the Debug carries the client secret"
+    );
+    assert!(!debug.contains(TOKEN), "the Debug carries the token");
+}
+
+#[tokio::test]
+async fn a_malformed_login_answer_never_quotes_the_token() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        Reply::json(200, &json!({"accessToken": TOKEN, "expiresIn": TOKEN})),
+    );
+    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    assert!(
+        matches!(err, SecretError::Protocol { endpoint, .. } if endpoint == LOGIN),
+        "expected Protocol at the login"
+    );
+    assert!(
+        !format!("{err} {err:?}").contains(TOKEN),
+        "the error quotes the token"
+    );
+}
+
+#[tokio::test]
+async fn a_malformed_list_answer_never_quotes_a_value() {
+    let err = list_error(Reply::json(
+        200,
+        &json!({"secrets": [{"secretKey": "K", "secretValue": "x", "secretValueHidden": VALUE}]}),
+    ))
+    .await;
+    assert!(
+        matches!(err, SecretError::Protocol { endpoint, .. } if endpoint == SECRETS),
+        "expected Protocol at the list"
+    );
+    assert!(
+        !format!("{err} {err:?}").contains(VALUE),
+        "the error quotes a value"
     );
 }

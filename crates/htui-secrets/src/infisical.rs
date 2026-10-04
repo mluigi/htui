@@ -216,6 +216,7 @@ impl InfisicalProvider {
             .await
             .map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
         let status = response.status();
+        let retry_after_secs = retry_after(response.headers());
         let body = response
             .bytes()
             .await
@@ -231,10 +232,19 @@ impl InfisicalProvider {
             }
             return Ok((token, Instant::now() + reuse_window(answer.expires_in)));
         }
+        if status.is_redirection() {
+            return Err(LoginFailure::Other(redirect(LOGIN_PATH, status.as_u16())));
+        }
         let error = ErrorBody::from_bytes(&body);
         Err(match status.as_u16() {
             401 if is_lockout(&error) => LoginFailure::Refused(SecretError::IdentityLocked),
             401 => LoginFailure::Refused(SecretError::BadCredentials),
+            404 if is_fastify_not_found(&error) => {
+                LoginFailure::Other(SecretError::UnsupportedServer {
+                    endpoint: LOGIN_PATH,
+                })
+            }
+            429 => LoginFailure::Other(SecretError::RateLimited { retry_after_secs }),
             code => LoginFailure::Other(protocol(LOGIN_PATH, format!("status {code}"))),
         })
     }
@@ -251,8 +261,12 @@ impl InfisicalProvider {
             .send()
             .await
             .map_err(|e| unreachable(STATUS_PATH, e))?;
-        let server_ok = response.status().is_success();
+        let status = response.status();
         drop(response);
+        if status.is_redirection() {
+            return Err(redirect(STATUS_PATH, status.as_u16()));
+        }
+        let server_ok = status.is_success();
         self.fresh_login().await?;
         Ok(ProviderHealth {
             base_url: self.base.clone(),
@@ -294,6 +308,7 @@ impl InfisicalProvider {
             .await
             .map_err(|e| unreachable(SECRETS_PATH, e))?;
         let status = response.status();
+        let retry_after_secs = retry_after(response.headers());
         let body = response
             .bytes()
             .await
@@ -301,11 +316,31 @@ impl InfisicalProvider {
         if status.is_success() {
             return decode(SECRETS_PATH, &body).map(Some);
         }
+        if status.is_redirection() {
+            return Err(redirect(SECRETS_PATH, status.as_u16()));
+        }
         let error = ErrorBody::from_bytes(&body);
         let message = clean_message(&error);
         match status.as_u16() {
             401 => Ok(None),
             403 if error.error() == "TokenError" => Ok(None),
+            403 => Err(SecretError::PermissionDenied {
+                detail: if message.is_empty() {
+                    format!("status 403 {}", error.error())
+                } else {
+                    message
+                },
+            }),
+            404 if is_fastify_not_found(&error) => Err(SecretError::UnsupportedServer {
+                endpoint: SECRETS_PATH,
+            }),
+            404 if error.error() == "NotFound" => Err(SecretError::ProjectNotFound),
+            404 if error.error() == "SecretPathNotFound" => Err(SecretError::PathNotFound {
+                environment: scope.environment().to_owned(),
+                path: scope.path().to_owned(),
+            }),
+            404 => Err(protocol(SECRETS_PATH, format!("status 404: {message}"))),
+            429 => Err(SecretError::RateLimited { retry_after_secs }),
             code => Err(protocol(SECRETS_PATH, status_detail(code, &message))),
         }
     }
@@ -457,6 +492,14 @@ fn protocol(endpoint: &'static str, detail: String) -> SecretError {
     SecretError::Protocol { endpoint, detail }
 }
 
+/// A 3xx: redirects are never followed (D9), so the answer is unexpected.
+fn redirect(endpoint: &'static str, code: u16) -> SecretError {
+    protocol(
+        endpoint,
+        format!("the server answered a redirect ({code}); redirects are not followed"),
+    )
+}
+
 /// `"status {code}: {message}"`, or `"status {code}"` without a message.
 fn status_detail(code: u16, message: &str) -> String {
     if message.is_empty() {
@@ -493,6 +536,24 @@ fn clean_message(body: &ErrorBody) -> String {
         .filter(|c| !c.is_control())
         .take(200)
         .collect()
+}
+
+/// Fastify's default 404 for an unknown route: `Route GET:/… not found`. Infisical's own
+/// `NotFound` has another message, so this check runs first.
+fn is_fastify_not_found(body: &ErrorBody) -> bool {
+    let message = body.message();
+    message.starts_with("Route ") && message.ends_with(" not found")
+}
+
+/// `Retry-After` in whole seconds; an HTTP-date or anything else is `None`.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 /// A login 401 whose message says the identity is temporarily locked.
@@ -720,6 +781,33 @@ mod tests {
         assert_eq!(cleaned.chars().count(), 200);
         assert!(!cleaned.chars().any(char::is_control));
         assert_eq!(clean_message(&ErrorBody::default()), "");
+    }
+
+    #[test]
+    fn the_fastify_not_found_body_is_recognised() {
+        let fastify = ErrorBody::from_bytes(
+            br#"{"message":"Route GET:/api/v4/secrets?projectId=p not found","error":"Not Found","statusCode":404}"#,
+        );
+        assert!(is_fastify_not_found(&fastify));
+        let infisical = ErrorBody::from_bytes(
+            br#"{"message":"Project with ID p not found","error":"NotFound","statusCode":404}"#,
+        );
+        assert!(!is_fastify_not_found(&infisical));
+        assert!(!is_fastify_not_found(&ErrorBody::default()));
+    }
+
+    #[test]
+    fn retry_after_reads_whole_seconds_only() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+        let with = |v: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(RETRY_AFTER, HeaderValue::from_static(v));
+            headers
+        };
+        assert_eq!(retry_after(&with("30")), Some(30));
+        assert_eq!(retry_after(&with(" 7 ")), Some(7));
+        assert_eq!(retry_after(&with("Wed, 21 Oct 2026 07:28:00 GMT")), None);
+        assert_eq!(retry_after(&HeaderMap::new()), None);
     }
 
     #[test]

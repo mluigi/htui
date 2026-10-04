@@ -29,6 +29,31 @@ impl Reply {
             body: serde_json::to_vec(body).expect("a JSON value serialises"),
         }
     }
+
+    /// `status` with a raw text body (a non-JSON answer).
+    pub fn text(status: u16, body: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("Content-Type".to_owned(), "text/html".to_owned())],
+            body: body.as_bytes().to_vec(),
+        }
+    }
+
+    /// `status` with `Location: location` and no body.
+    pub fn redirect(status: u16, location: &str) -> Self {
+        Self {
+            status,
+            headers: vec![("Location".to_owned(), location.to_owned())],
+            body: Vec::new(),
+        }
+    }
+
+    /// One extra header (e.g. `Retry-After`).
+    #[must_use]
+    pub fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
 }
 
 /// One recorded request.
@@ -126,6 +151,15 @@ impl Stub {
             .filter(|r| r.method == method && r.path == path)
             .count()
     }
+}
+
+/// A loopback base URL nothing listens on (bind port 0, read it, drop the listener), for the
+/// `Unreachable` cases.
+pub fn closed_port_base() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let addr = listener.local_addr().expect("the port's address");
+    drop(listener);
+    format!("http://{addr}")
 }
 
 /// One request on one connection, recorded, then answered with `Connection: close`.
