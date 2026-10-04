@@ -88,7 +88,7 @@ const PATTERN_RULES: &[(&str, &str)] = &[
     ("slack_bot_token",   r"xoxb-[A-Za-z0-9-]{10,}"),
     ("slack_user_token",  r"xoxp-[A-Za-z0-9-]{10,}"),
     ("google_api_key",    r"AIza[0-9A-Za-z_-]{35}"),
-    ("openai_api_key",    r"sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})"),
+    ("openai_api_key",    r"sk-(?:(?:proj|svcacct|admin|None|or-v[0-9]+|lf)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})"),
     // new in MOD-10 (D2); the T0 checkpoint may tighten or drop any of these
     ("gitlab_pat",        r"glpat-[A-Za-z0-9_-]{20,}"),
     ("slack_token",       r"xox[ars]-[A-Za-z0-9-]{10,}"),
@@ -526,7 +526,7 @@ The tests:
   - `every_case_name_dispatches` (`conformance.rs:7334`) runs every `CASES` entry in one future near the 2 MiB test stack.
   - The new conformance tests go in `mod fanout_paths`, **never** in `CASES`.
   - `failure_text` is sync and adds nothing to engine futures.
-  - Gate: `cargo test -p htui-orch --features testkit --no-fail-fast 2>&1 | tee /tmp/orch.log; grep -c SIGABRT /tmp/orch.log` must be 0. If a new test overflows, `Box::pin` its dispatch future rather than raising the stack.
+  - Gate: `cargo test -p htui-orch --features test-support --no-fail-fast 2>&1 | tee /tmp/orch.log; grep -c SIGABRT /tmp/orch.log` must be 0. If a new test overflows, `Box::pin` its dispatch future rather than raising the stack.
 - **H-2 `--features testkit`.** Without it, `crates/*/tests/*.rs` integration binaries run 0 tests and still say `ok` (`recorder.rs`, `excerpt.rs`, the `htui-orch` suites). Every validate command carries it.
 - **H-3 `Cargo.lock`.** Only T1 touches it, and the only change is `htui-core`'s dependency list. Build with `--offline`; never `cargo update`. Lanes B and C must not commit a `Cargo.lock` change. If they see one, it is lane A's leaking through a shared tree.
 - **H-4 Clippy `-D warnings`.**
@@ -596,11 +596,11 @@ Lane intersections:
   - there are no `.sqlx` files and no snapshots.
 
 Within each lane:
-1. **T1**: tests (D.1) red → `Cargo.toml`/`Cargo.lock` → rule table, `LazyLock`, `residue_rule` → fixtures (§B.1) → module docs → `cargo test -p htui-core`, `-p htui-agent --features testkit --test excerpt`, `-p htui-orch --features testkit verify`. Commit.
+1. **T1**: tests (D.1) red → `Cargo.toml`/`Cargo.lock` → rule table, `LazyLock`, `residue_rule` → fixtures (§B.1) → module docs → `cargo test -p htui-core`, `-p htui-agent --features test-support --test excerpt`, `-p htui-orch --features test-support verify`. Commit.
 2. **T2**: tests (D.2) red → `MIN_MASKED_LEN` and `from_resolved` → `cargo test -p htui-core scrub`. Commit.
-3. **T3**: `status.rs` row red → variant, `Display`, constructor → engine and conformance tests red → `failure_text` and the three sites → `:14944`/`:14975` fixtures → `cargo test -p htui-orch --features testkit --no-fail-fast` and the SIGABRT grep. Commit.
+3. **T3**: `status.rs` row red → variant, `Display`, constructor → engine and conformance tests red → `failure_text` and the three sites → `:14944`/`:14975` fixtures → `cargo test -p htui-orch --features test-support --no-fail-fast` and the SIGABRT grep. Commit.
 4. **T4** (needs T3's variant): test red → `chat_failure`, `record_failure`, the `:4143` arm → `cargo test -p htui --features testkit agent_worker`. Commit.
-5. **T5**: unit and integration tests red → counter → `joined_raw_leaves` → `withhold_split_raw` → both call sites → `cargo test -p htui-agent --features testkit --test recorder` plus `cargo test -p htui-agent --lib record`. Commit.
+5. **T5**: unit and integration tests red → counter → `joined_raw_leaves` → `withhold_split_raw` → both call sites → `cargo test -p htui-agent --features test-support --test recorder` plus `cargo test -p htui-agent --lib record`. Commit.
 6. **T6**: docs → `validate-workflow-docs.sh`. Commit.
 7. **Merged tree**:
    - `cargo fmt --all -- --check`;

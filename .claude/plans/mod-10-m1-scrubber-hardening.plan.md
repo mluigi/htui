@@ -108,7 +108,7 @@ check that `payload` already has. A scrub refusal gets one typed sentence wherev
   | Rule | Status | Regex |
   |---|---|---|
   | `anthropic_api_key` | existing | `sk-ant-[A-Za-z0-9_-]{20,}` |
-  | `openai_api_key` | existing, **amended** | `sk-(?:(?:proj\|svcacct\|admin)-[A-Za-z0-9_-]{20,}\|[A-Za-z0-9]{20,})` — the hyphen-free legacy form stops kebab-case prose (`sk-learn-preprocessing-pipeline-v2`) failing closed, and a short `sk-ant-` is no longer reported as OpenAI |
+  | `openai_api_key` | existing, **amended twice** | `sk-(?:(?:proj\|svcacct\|admin\|None\|or-v[0-9]+\|lf)-[A-Za-z0-9_-]{20,}\|[A-Za-z0-9]{20,})` — the hyphen-free legacy form stops kebab-case prose (`sk-learn-preprocessing-pipeline-v2`) failing closed and a short `sk-ant-` is no longer reported as OpenAI; the lane A leak verifier then found hyphenated vendor keys (OpenRouter `sk-or-v1-`, OpenAI `sk-None-`, Langfuse `sk-lf-`) no longer refused, so they are named explicitly (fix `6242d4a8`) |
   | `github_pat` | existing | `github_pat_[A-Za-z0-9_]{20,}` |
   | `github_token` | existing, broadened | `gh[pousr]_[A-Za-z0-9]{30,}` |
   | `gitlab_pat` | new | `glpat-[A-Za-z0-9_-]{20,}` |
@@ -216,8 +216,8 @@ check that `payload` already has. A scrub refusal gets one typed sentence wherev
   3. Lengthen the listed fixtures. Each new value has 20 or more `[A-Za-z0-9]` characters after
      `sk-` (or meets its rule's own length) and still starts at a token start. `Xsk-…` keeps its
      `X` so the unjoined path stays clean.
-- **Validate**: `cargo test -p htui-core`, `-p htui-agent --features testkit --test excerpt`,
-  `-p htui-orch --features testkit verify`.
+- **Validate**: `cargo test -p htui-core`, `-p htui-agent --features test-support --test excerpt`,
+  `-p htui-orch --features test-support verify`.
 
 ### T2: `from_resolved` and the short-value floor (TDD; after T1, same file)
 - **Action**: Write tests first:
@@ -243,7 +243,7 @@ check that `payload` already has. A scrub refusal gets one typed sentence wherev
        unchanged.
   - Then add the helper and mappings at `:3422`, `:4090` and `:4658`.
   - Lengthen the fixtures at `:14944` and `:14975` so they match under both the old and new rules.
-- **Validate**: `cargo test -p htui-orch --features testkit --no-fail-fast`, then grep for
+- **Validate**: `cargo test -p htui-orch --features test-support --no-fail-fast`, then grep for
   `SIGABRT` (stack headroom).
 
 ### T4: Chat records the typed sentence (TDD; after T3 for the variant)
@@ -262,7 +262,7 @@ check that `payload` already has. A scrub refusal gets one typed sentence wherev
     3. A clean coalesced row keeps its `raw` array.
     4. A single-chunk row is unchanged.
   - Then implement D8.
-- **Validate**: `cargo test -p htui-agent --features testkit --test recorder`, plus the lib tests.
+- **Validate**: `cargo test -p htui-agent --features test-support --test recorder`, plus the lib tests.
 
 ### T6: Documents
 - **Action**: D7. Also `scrub.rs` module docs: `MinimalScrubber` stops being described as a
