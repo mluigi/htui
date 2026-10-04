@@ -37,7 +37,7 @@ use htui_core::model::{
     RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
     StepGraphId, StepId, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId,
-    VerifyOutcome, WorkspaceId, WorkspaceSummary,
+    VerifyOutcome, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -1279,6 +1279,10 @@ impl ReadStore for CacheStore {
             .collect::<Result<Vec<_>>>()?;
         ToolCallCount::sort_canonical(&mut counts);
         Ok(counts)
+    }
+
+    async fn waiting_candidates(&self, _scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        todo!("MOD-69 T1")
     }
 }
 

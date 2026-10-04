@@ -41,9 +41,10 @@ use crate::model::{
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
+    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary,
+    scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -6565,6 +6566,10 @@ impl ReadStore for MemStore {
     async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
         Ok(self.read(|state| state.tool_call_counts(item)))
     }
+
+    async fn waiting_candidates(&self, _scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        todo!("MOD-69 T1")
+    }
 }
 
 impl WriteStore for MemStore {
@@ -7367,6 +7372,10 @@ impl WriteStore for MemStore {
     ) -> Result<AnswerOutcome> {
         let now = self.now();
         self.write(|state| state.answer_permission(id, option_id, user, box_id, now))
+    }
+
+    async fn open_permissions(&self, _scope: &Scope) -> Result<Vec<WaitingPermission>> {
+        todo!("MOD-69 T1")
     }
 }
 

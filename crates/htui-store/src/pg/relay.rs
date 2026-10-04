@@ -19,7 +19,8 @@ use chrono::{DateTime, Utc};
 use htui_core::model::{
     AnswerOutcome, AnswerRefusal, BoxId, CancelRequest, ItemId, OpenPermission, PermissionChoice,
     PermissionId, PermissionStatus, RelayOption, RelaySessionId, RelayView, RunCommand,
-    RunCommandId, RunCommandKind, RunCommandStatus, RunId, StepId, StepPermission, UserId,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, Scope, StepId, StepPermission, UserId,
+    WaitingPermission,
 };
 use htui_core::store::{Result, StoreError, references_no_row};
 use sqlx::types::Json;
@@ -542,4 +543,13 @@ pub(super) async fn relay_view(store: &PgStore, item: ItemId) -> Result<RelayVie
         permissions: permissions.into_iter().map(StepPermission::from).collect(),
         cancels,
     })
+}
+
+/// [`WriteStore::open_permissions`](htui_core::store::WriteStore::open_permissions) (MOD-69 plan
+/// D4).
+pub(super) async fn open_permissions(
+    _store: &PgStore,
+    _scope: &Scope,
+) -> Result<Vec<WaitingPermission>> {
+    todo!("MOD-69 T1")
 }

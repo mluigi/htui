@@ -26,8 +26,8 @@ use htui_core::model::{
     RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillVersion,
     Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, ToolCallCount,
-    UpstreamEntry, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspaceProject, WorkspaceSummary,
+    UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1152,6 +1152,10 @@ impl ReadStore for PgStore {
             .collect();
         ToolCallCount::sort_canonical(&mut counts);
         Ok(counts)
+    }
+
+    async fn waiting_candidates(&self, _scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        todo!("MOD-69 T1")
     }
 }
 
