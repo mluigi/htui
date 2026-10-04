@@ -944,7 +944,7 @@ mod tests {
         assert!(
             harness
                 .render()
-                .starts_with("Graphics · DESKTOP-HTUI · memory · 0 runs")
+                .starts_with("Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting")
         );
     }
 

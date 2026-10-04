@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::mem::Discriminant;
 
 use htui_core::model::{ProjectRef, Scope, WorkspaceId};
+use htui_worker::WaitingView;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
@@ -38,8 +39,9 @@ pub struct TopBarState {
     pub box_name: String,
     /// `Backend::label()`: `"memory"` in MOD-1, `"online"` / `"offline · 3m"` in MOD-6.
     pub store: String,
-    /// Active runs in scope (`RunStatus::is_active`).
-    pub active_runs: usize,
+    /// MOD-69 plan D6: the last `Waiting` reply, which the top bar counts and the overlay lists;
+    /// `None` until the first one (blueprint A-6).
+    pub waiting: Option<WaitingView>,
 }
 
 /// The action sink handed to views.
