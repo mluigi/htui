@@ -230,7 +230,7 @@ impl InfisicalProvider {
                     "the login answer carried no access token".to_owned(),
                 )));
             }
-            return Ok((token, Instant::now() + reuse_window(answer.expires_in)));
+            return Ok((token, reuse_until(Instant::now(), answer.expires_in)));
         }
         if status.is_redirection() {
             return Err(LoginFailure::Other(redirect(LOGIN_PATH, status.as_u16())));
@@ -477,6 +477,17 @@ fn is_loopback(host: &Host<&str>) -> bool {
 /// `expires_in - max(60, expires_in / 10)`, saturating at zero (§B.4.3).
 fn reuse_window(expires_in_secs: u64) -> Duration {
     Duration::from_secs(expires_in_secs.saturating_sub((expires_in_secs / 10).max(60)))
+}
+
+/// The longest a token is reused, whatever `expiresIn` says. `expiresIn` is server input and
+/// `Instant + Duration` panics on overflow; ten years is far beyond any Infisical token TTL.
+const MAX_REUSE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
+
+/// `now + reuse_window(expires_in_secs)`, the window capped at [`MAX_REUSE`]. Never panics: should
+/// the addition still overflow, the deadline is `now` and the token is simply not reused.
+fn reuse_until(now: Instant, expires_in_secs: u64) -> Instant {
+    now.checked_add(reuse_window(expires_in_secs).min(MAX_REUSE))
+        .unwrap_or(now)
 }
 
 /// `Unreachable` for a transport error, its URL stripped.
@@ -739,6 +750,23 @@ mod tests {
             panic!("userinfo must be refused");
         };
         assert!(!why.contains("pw"), "the refusal echoes the password");
+    }
+
+    #[test]
+    fn the_reuse_deadline_never_overflows() {
+        let now = Instant::now();
+        assert_eq!(
+            reuse_until(now, 600),
+            now + Duration::from_secs(540),
+            "an ordinary expiresIn"
+        );
+        for expires_in in [u64::MAX, u64::MAX / 2, 1 << 63] {
+            assert_eq!(
+                reuse_until(now, expires_in),
+                now + MAX_REUSE,
+                "expiresIn {expires_in}"
+            );
+        }
     }
 
     #[test]

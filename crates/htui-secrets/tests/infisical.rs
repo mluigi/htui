@@ -596,6 +596,23 @@ async fn a_token_inside_the_margin_is_replaced() {
     assert_eq!(stub.count("POST", LOGIN), 2);
 }
 
+/// `Instant + Duration` panics on overflow: an absurd `expiresIn` must be an ordinary login whose
+/// token is reused, never a panic in the caller's task.
+#[tokio::test]
+async fn a_huge_expires_in_is_reused_and_never_panics() {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login_ok(TOKEN, u64::MAX)).on(
+        "GET",
+        SECRETS,
+        list_ok(json!([secret("A", VALUE)]), json!([])),
+    );
+    let p = provider(&stub);
+    p.resolve(&scope()).await.expect("resolves");
+    p.resolve(&scope()).await.expect("resolves again");
+    assert_eq!(stub.count("POST", LOGIN), 1);
+    assert_eq!(stub.count("GET", SECRETS), 2);
+}
+
 /// Logins `[TOKEN, TOKEN_2]`, the first list answer `first`, then a good one.
 async fn relogin_after(first: Reply) {
     let stub = Stub::start();
