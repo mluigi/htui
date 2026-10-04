@@ -612,21 +612,32 @@ mod tests {
         );
     }
 
-    /// MOD-80 D2: a selected requirement row is one even block; its key's own style does not
-    /// show through the selection.
+    /// MOD-80 D2: a selected requirement row is one even block. The row is a withdrawn one, every
+    /// span `dim` and so coloured, so a `Line::style` alone (which leaves a span's own `fg`
+    /// showing) fails here.
     #[tokio::test]
     async fn a_selected_requirement_row_is_one_even_block() {
-        let (snapshot, projects, _) = platform().await;
+        let (mut snapshot, projects, _) = platform().await;
+        for entry in &mut snapshot.projects {
+            for row in &mut entry.requirements {
+                if row.id == ids::REQ_ENT_2 {
+                    row.state = RequirementState::Withdrawn;
+                }
+            }
+        }
         let view = TreeView {
             snapshot: &snapshot,
             projects: &projects,
             folded: &[],
             filter: "",
-            selected: Some(Row::Requirement(ids::REQ_ENT_1)),
+            selected: Some(Row::Requirement(ids::REQ_ENT_2)),
         };
         let (lines, cursor) = lines(&view, 45, &Theme::default());
-        let y = cursor.expect("R-ENT-1 is drawn");
-        assert!(line_text(&lines[y]).contains("R-ENT-1"), "{lines:#?}");
+        let y = cursor.expect("R-ENT-2 is drawn");
+        assert!(
+            line_text(&lines[y]).starts_with("  \u{2715} R-ENT-2"),
+            "the withdrawn row: {lines:#?}"
+        );
         let height = u16::try_from(lines.len()).expect("a short tree");
         let area = Rect::new(0, 0, 45, height);
         let mut buffer = Buffer::empty(area);
