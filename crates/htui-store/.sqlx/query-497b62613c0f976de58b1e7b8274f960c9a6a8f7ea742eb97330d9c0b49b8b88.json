@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH locked AS ( SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id WHERE s.id = $1 AND s.status = 'running' AND r.lease_owner IS NOT DISTINCT FROM $4 FOR NO KEY UPDATE OF s FOR SHARE OF r) UPDATE run_step SET status = 'done', gate_outcome = 'skipped', gate_note = COALESCE($2, gate_note), finished_at = COALESCE(finished_at, $3) FROM locked WHERE run_step.id = locked.id AND run_step.status = 'running'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "497b62613c0f976de58b1e7b8274f960c9a6a8f7ea742eb97330d9c0b49b8b88"
+}

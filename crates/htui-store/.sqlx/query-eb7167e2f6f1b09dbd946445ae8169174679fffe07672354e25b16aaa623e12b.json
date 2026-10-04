@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.lease_owner AS \"lease_owner?\"\n                     FROM run_step s JOIN run r ON r.id = s.run_id\n                    WHERE s.id = $1\n                      FOR NO KEY UPDATE OF s FOR SHARE OF r",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "lease_owner?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "lease_owner"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "eb7167e2f6f1b09dbd946445ae8169174679fffe07672354e25b16aaa623e12b"
+}

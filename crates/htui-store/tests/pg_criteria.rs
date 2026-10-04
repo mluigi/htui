@@ -5139,9 +5139,9 @@ async fn a_lease_take_committed_mid_write_fences_it() {
     db.drop_db().await;
 }
 
-/// MOD-40 blueprint B2, the settle's shape: `finish_step`'s fence is an `EXISTS … FOR SHARE`
-/// sub-select rather than the append's CTE, and a take committed while it waits fences it the
-/// same way. The step's settle columns are left as they were.
+/// MOD-40 blueprint B2, the settle's shape: `finish_step`'s fence is a locking CTE (`FOR NO KEY
+/// UPDATE OF s FOR SHARE OF r`, MOD-77) rather than the append's `lease` CTE, and a take committed
+/// while it waits fences it the same way. The step's settle columns are left as they were.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lease_take_committed_mid_settle_fences_it() {
     let Some(db) = common::demo_db().await else {

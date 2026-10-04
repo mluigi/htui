@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH locked AS ( SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id WHERE s.id = $1 AND r.lease_owner IS NOT DISTINCT FROM $4 FOR NO KEY UPDATE OF s FOR SHARE OF r) UPDATE run_step SET usage = $2, prompt_digest = COALESCE($3, prompt_digest) FROM locked WHERE run_step.id = locked.id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Jsonb",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aad9f44343f488a5702769d1724e0f52436bf9294362aa537c4e03bc8e8a8f44"
+}

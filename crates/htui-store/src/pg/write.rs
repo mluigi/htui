@@ -194,21 +194,66 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
     Ok(())
 }
 
-/// MOD-41 plan D1: `step` exists and its run carries `fence`'s lease, read `FOR SHARE OF r`
-/// inside the caller's transaction, so an adoption cannot commit between this check and the
-/// batch's writes. [`StoreError::NotFound`] first, then [`StoreError::Fenced`]: `append_events`'
-/// order. The fenced twin of [`step_exists`], for `upsert_step_tree` and `record_commits`;
-/// `close_out` keeps the unfenced check (blueprint B-1).
-async fn step_fence(conn: &mut PgConnection, step: StepId, fence: StepFence) -> Result<()> {
-    let owner = sqlx::query_scalar!(
-        r#"SELECT r.lease_owner AS "lease_owner?"
-             FROM run_step s JOIN run r ON r.id = s.run_id
-            WHERE s.id = $1
-              FOR SHARE OF r"#,
-        step.as_uuid(),
-    )
-    .fetch_optional(conn)
-    .await
+/// MOD-77 plan D1: the lock [`step_fence`] takes on the step's row. The run's is always
+/// `FOR SHARE`, and is always taken **after** the step's.
+#[derive(Clone, Copy)]
+enum StepLock {
+    /// `FOR SHARE OF s, r`: the caller reads the step and inserts rows whose foreign key names
+    /// it, and never updates it (`record_commits`, [`fenced_miss`]).
+    Share,
+    /// `FOR NO KEY UPDATE OF s FOR SHARE OF r`: the caller goes on to `UPDATE run_step`
+    /// (`upsert_step_tree`'s `isolation_path`), so it takes the update lock up front. A share
+    /// lock upgraded later would deadlock two such writers of one step against each other.
+    Update,
+}
+
+/// MOD-41 plan D1: `step` exists and its run carries `fence`'s lease, read under row locks on the
+/// step and then the run, inside the caller's transaction, so an adoption cannot commit between
+/// this check and the batch's writes. [`StoreError::NotFound`] first, then
+/// [`StoreError::Fenced`]: `append_events`' order. The fenced twin of [`step_exists`], for
+/// `upsert_step_tree`, `record_commits` and [`fenced_miss`]; `close_out` keeps the unfenced
+/// check (blueprint B-1).
+///
+/// MOD-77 plan D1: the step is locked **before** the run, `park_step`'s `FOR UPDATE OF s, r`
+/// order. MOD-41 locked the run alone (`FOR SHARE OF r`) and left the step to the writes that
+/// follow: an insert's foreign key takes `FOR KEY SHARE` on it, and `upsert_step_tree`'s
+/// `UPDATE run_step` a row lock. Against a park that held the step and waited for the run, that
+/// closed a cycle and Postgres aborted one side (`40P01`). Holding the step first makes
+/// whichever of the two reaches it first run to its commit. The clause order is load-bearing:
+/// Postgres locks a joined row in the order the locking clauses are written. `lock` chooses the
+/// step's mode ([`StepLock`]); `pg_criteria.rs`'s `upsert_step_tree_takes_the_step_first` and
+/// `record_commits_takes_the_step_first` pin the order.
+async fn step_fence(
+    conn: &mut PgConnection,
+    step: StepId,
+    fence: StepFence,
+    lock: StepLock,
+) -> Result<()> {
+    // Two statements, not one with a spliced clause: `query_scalar!` needs literal SQL.
+    let owner = match lock {
+        StepLock::Share => {
+            sqlx::query_scalar!(
+                r#"SELECT r.lease_owner AS "lease_owner?"
+                     FROM run_step s JOIN run r ON r.id = s.run_id
+                    WHERE s.id = $1
+                      FOR SHARE OF s, r"#,
+                step.as_uuid(),
+            )
+            .fetch_optional(conn)
+            .await
+        }
+        StepLock::Update => {
+            sqlx::query_scalar!(
+                r#"SELECT r.lease_owner AS "lease_owner?"
+                     FROM run_step s JOIN run r ON r.id = s.run_id
+                    WHERE s.id = $1
+                      FOR NO KEY UPDATE OF s FOR SHARE OF r"#,
+                step.as_uuid(),
+            )
+            .fetch_optional(conn)
+            .await
+        }
+    }
     .map_err(map_sqlx)?
     .ok_or_else(|| StoreError::NotFound {
         entity: "run_step",
@@ -237,10 +282,10 @@ struct StepScope {
 /// `step_fence`'s order.
 ///
 /// It locks the **step** as well as the run (`FOR SHARE OF s, r`, the order of `park_step`'s
-/// `FOR UPDATE OF s, r`), where `step_fence` locks the run alone. The writes that follow insert a
-/// row whose foreign key takes `FOR KEY SHARE` on the step; with the run alone held, a park that
-/// had locked the step and was waiting for the run made that key lock wait on the park, and the
-/// two deadlocked (`40P01`, round 0 of
+/// `FOR UPDATE OF s, r`, which [`step_fence`] has taken too since MOD-77). The writes that follow
+/// insert a row whose foreign key takes `FOR KEY SHARE` on the step; with the run alone held, a
+/// park that had locked the step and was waiting for the run made that key lock wait on the park,
+/// and the two deadlocked (`40P01`, round 0 of
 /// `pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`). Holding the step first
 /// makes whichever of the two reaches it first run to its commit.
 async fn step_scope(conn: &mut PgConnection, step: StepId, fence: StepFence) -> Result<StepScope> {
@@ -293,9 +338,13 @@ async fn fenced_or_missing(pool: &sqlx::PgPool, step: StepId) -> StoreError {
 /// [`StoreError::NotFound`] and then [`StoreError::Fenced`]; a step that passes both is simply not
 /// at the status the write wanted, `Ok(false)`. Boxed by its callers for [`fenced_or_missing`]'s
 /// stack reason.
+///
+/// [`StepLock::Share`] (MOD-77 plan D1): it runs on a pooled connection outside any transaction,
+/// so the lock lasts one statement and only makes this read wait for a writer that holds the step
+/// or its run; no `UPDATE` follows that would need the step's update lock.
 async fn fenced_miss(pool: &sqlx::PgPool, step: StepId, fence: StepFence) -> Result<bool> {
     let mut conn = pool.acquire().await.map_err(map_sqlx)?;
-    step_fence(&mut conn, step, fence).await?;
+    step_fence(&mut conn, step, fence, StepLock::Share).await?;
     Ok(false)
 }
 
@@ -1105,13 +1154,18 @@ impl WriteStore for PgStore {
     /// field names are the column names verbatim - and nullable `text[]` / `jsonb[]` parameters
     /// are avoided entirely.
     ///
-    /// The fence is decided **inside** the statement (MOD-40 blueprint B1, B2). `lease` reads the
-    /// named steps' runs and share-locks them, so a `take_lease` or `adopt_runs` either waits for
-    /// this write or is seen by it; `fenced` is the lowest step whose run's `lease_owner` is not
-    /// `$2`. The insert runs only when nothing is fenced, **or** when a named step does not exist
-    /// at all, so that such a row still reaches the foreign key and refuses the batch (`23503`)
-    /// ahead of the fence. The statement answers both facts, so no second read is needed and none
-    /// can race.
+    /// The fence is decided **inside** the statement (MOD-40 blueprint B1, B2). `lease`
+    /// share-locks each named step and then its run (`FOR SHARE OF s, r`, MOD-77 plan D3:
+    /// `park_step`'s order, so a park holding the step cannot deadlock against the insert's
+    /// foreign-key lock on it), so a `take_lease` or `adopt_runs` either waits for this write or is
+    /// seen by it; `fenced` is the lowest step whose run's `lease_owner` is not `$2`. The insert
+    /// runs only when nothing is fenced, **or** when a named step does not exist at all, so that
+    /// such a row still reaches the foreign key and refuses the batch (`23503`) ahead of the
+    /// fence. The statement answers both facts, so no second read is needed and none can race.
+    ///
+    /// A batch naming two steps of one run may still lock them in either order against a park of
+    /// the second (MOD-77 plan D7); the only production caller, `Recorder::flush`, writes one
+    /// step per batch.
     ///
     /// `inserted` counts inserts only, because `ON CONFLICT ... DO NOTHING` skips a stored row: that
     /// is the "how many landed" answer §4.1 asks for, and what tells a recorder's replay (short is
@@ -1144,7 +1198,7 @@ impl WriteStore for PgStore {
                   FROM run_step s
                   JOIN run r ON r.id = s.run_id
                  WHERE s.id IN (SELECT run_step_id FROM e)
-                   FOR SHARE OF r
+                   FOR SHARE OF s, r
             ),
             fenced AS (
                 SELECT run_step_id
@@ -1194,8 +1248,12 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] when the step does not exist and [`StoreError::Fenced`] when it
     /// does and its run does not carry `fence`'s lease, told apart by `step_exists`' follow-up read
-    /// on a miss (`interrupt_step`'s shape). `FOR SHARE` on the run for `append_events`' reason
-    /// (MOD-40 blueprint B2).
+    /// on a miss (`interrupt_step`'s shape). The fence is a locking CTE (MOD-77 plan D2): the step
+    /// `FOR NO KEY UPDATE`, then its run `FOR SHARE`. The run lock is `append_events`' reason
+    /// (MOD-40 blueprint B2). Holding the step first is `park_step`'s order, so a park on the same
+    /// step cannot deadlock against this write (`40P01`,
+    /// `pg_criteria.rs::set_step_usage_takes_the_step_first`), and the step's update lock is taken
+    /// up front rather than upgraded. The clause order is load-bearing.
     async fn set_step_usage(
         &self,
         fence: StepFence,
@@ -1204,13 +1262,15 @@ impl WriteStore for PgStore {
         prompt_digest: Option<String>,
     ) -> Result<()> {
         let updated = sqlx::query!(
-            "UPDATE run_step \
+            "WITH locked AS ( \
+                 SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+                  WHERE s.id = $1 \
+                    AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                    FOR NO KEY UPDATE OF s FOR SHARE OF r) \
+             UPDATE run_step \
                 SET usage = $2, prompt_digest = COALESCE($3, prompt_digest) \
-              WHERE id = $1 \
-                AND EXISTS (SELECT 1 FROM run r \
-                             WHERE r.id = run_step.run_id \
-                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
-                               FOR SHARE)",
+               FROM locked \
+              WHERE run_step.id = locked.id",
             step.as_uuid(),
             usage,
             prompt_digest.as_deref(),
@@ -1885,6 +1945,12 @@ impl WriteStore for PgStore {
     /// accepted, so a live status is refused before either row is touched rather than leaving the
     /// pair half-closed.
     ///
+    /// MOD-77 plan D5: the step is locked `FOR NO KEY UPDATE` before the run is updated. A chat's
+    /// `set_step_usage` locks the step and then the run; closing the run first and the step second
+    /// would close a cycle against it (`40P01`,
+    /// `pg_criteria.rs::finish_chat_run_takes_the_step_first`). Errors keep their order: the run's
+    /// `NotFound` before the step's.
+    ///
     /// # Errors
     ///
     /// [`StoreError::Constraint`] for a non-terminal `status`; [`StoreError::NotFound`] when the
@@ -1901,6 +1967,18 @@ impl WriteStore for PgStore {
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
+        // MOD-77 plan D5: the step first, so this close and a usage write on the same chat lock in
+        // one order. Absence is remembered, not answered yet: an unknown run is `NotFound { run }`
+        // before an unknown step (conformance `start_chat_run_mints_chat_rows`).
+        let step_found = sqlx::query_scalar!(
+            "SELECT 1 FROM run_step WHERE id = $1 FOR NO KEY UPDATE",
+            step.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .is_some();
+
         let closed_run = sqlx::query!(
             "UPDATE run SET status = $2, finished_at = $3 WHERE id = $1",
             run.as_uuid(),
@@ -1915,6 +1993,12 @@ impl WriteStore for PgStore {
             return Err(StoreError::NotFound {
                 entity: "run",
                 id: run.to_string(),
+            });
+        }
+        if !step_found {
+            return Err(StoreError::NotFound {
+                entity: "run_step",
+                id: step.to_string(),
             });
         }
 
@@ -1949,8 +2033,8 @@ impl WriteStore for PgStore {
     ///
     /// `updated_at` is not in the `SET` list: the migration's `BEFORE UPDATE` trigger owns it.
     ///
-    /// Written only while the step's run carries `fence`'s lease: `set_step_usage`'s predicate,
-    /// verbatim (MOD-41 plan D1), `FOR SHARE` on the run for `append_events`' reason.
+    /// Written only while the step's run carries `fence`'s lease: `set_step_usage`'s locking CTE,
+    /// verbatim (MOD-41 plan D1, MOD-77 plan D2), the step and then its run.
     ///
     /// # Errors
     ///
@@ -1965,12 +2049,14 @@ impl WriteStore for PgStore {
         trim: &Value,
     ) -> Result<()> {
         let updated = sqlx::query!(
-            "UPDATE run_step SET prompt_digest = $2, trim_record = $3 \
-              WHERE id = $1 \
-                AND EXISTS (SELECT 1 FROM run r \
-                             WHERE r.id = run_step.run_id \
-                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
-                               FOR SHARE)",
+            "WITH locked AS ( \
+                 SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+                  WHERE s.id = $1 \
+                    AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                    FOR NO KEY UPDATE OF s FOR SHARE OF r) \
+             UPDATE run_step SET prompt_digest = $2, trim_record = $3 \
+               FROM locked \
+              WHERE run_step.id = locked.id",
             step.as_uuid(),
             digest,
             trim,
@@ -4795,8 +4881,8 @@ impl WriteStore for PgStore {
     ///
     /// [`StoreError::NotFound`] `{ entity: "run_step" }` when the step does not exist and
     /// [`StoreError::Fenced`] when it does and its run does not carry `fence`'s lease, told apart
-    /// by `step_exists`' follow-up read on a miss (`interrupt_step`'s shape). `FOR SHARE` on the
-    /// run for `append_events`' reason (MOD-40 blueprint B2).
+    /// by `step_exists`' follow-up read on a miss (`interrupt_step`'s shape). `set_step_usage`'s
+    /// locking CTE (MOD-40 blueprint B2, MOD-77 plan D2): the step, then its run.
     async fn finish_step(
         &self,
         fence: StepFence,
@@ -4804,18 +4890,20 @@ impl WriteStore for PgStore {
         outcome: StepOutcome,
     ) -> Result<()> {
         let updated = sqlx::query!(
-            "UPDATE run_step \
+            "WITH locked AS ( \
+                 SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+                  WHERE s.id = $1 \
+                    AND r.lease_owner IS NOT DISTINCT FROM $8 \
+                    FOR NO KEY UPDATE OF s FOR SHARE OF r) \
+             UPDATE run_step \
                 SET exit_code        = $2, \
                     usage            = COALESCE($3, usage), \
                     trim_record      = COALESCE($4, trim_record), \
                     verify_outcome   = $5, \
                     verify_exit_code = $6, \
                     finished_at      = $7 \
-              WHERE id = $1 \
-                AND EXISTS (SELECT 1 FROM run r \
-                             WHERE r.id = run_step.run_id \
-                               AND r.lease_owner IS NOT DISTINCT FROM $8 \
-                               FOR SHARE)",
+               FROM locked \
+              WHERE run_step.id = locked.id",
             step.as_uuid(),
             outcome.exit_code,
             outcome.usage,
@@ -5125,6 +5213,9 @@ impl WriteStore for PgStore {
     /// per repo in scope.
     ///
     /// An empty slice still runs the existence and fence check (`step_fence`) and writes nothing.
+    /// The fence takes the step's update lock ([`StepLock::Update`], MOD-77 plan D1), because this
+    /// transaction may go on to update `run_step.isolation_path`. It is taken before the run's
+    /// share lock, `park_step`'s order.
     ///
     /// The transaction also writes `run_step.isolation_path` (ANA-2 `:903`, plan D33), because a
     /// step has many trees and one isolation path and this is the only call that sees both. The
@@ -5149,7 +5240,7 @@ impl WriteStore for PgStore {
         trees: &[RunStepTree],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_fence(&mut tx, step, fence).await?;
+        step_fence(&mut tx, step, fence, StepLock::Update).await?;
 
         for row in trees {
             if row.run_step_id != step {
@@ -5222,6 +5313,9 @@ impl WriteStore for PgStore {
     /// `before` hash when it takes the tree and the `after` hash when it commits, and a second call
     /// carrying `None` means the step produced no commit after all.
     ///
+    /// The fence share-locks the step and then its run ([`StepLock::Share`], MOD-77 plan D1). The
+    /// inserts only key-share the step.
+    ///
     /// # Errors
     ///
     /// In this order: [`StoreError::NotFound`] `{ entity: "run_step" }`; [`StoreError::Fenced`]
@@ -5235,7 +5329,7 @@ impl WriteStore for PgStore {
         commits: &[RunStepCommit],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_fence(&mut tx, step, fence).await?;
+        step_fence(&mut tx, step, fence, StepLock::Share).await?;
 
         for row in commits {
             if row.run_step_id != step {
@@ -5502,7 +5596,8 @@ impl WriteStore for PgStore {
     }
 
     /// MOD-37 R-5: one fenced compare-and-set, `running -> done` with `gate_outcome = 'skipped'`.
-    /// `FOR SHARE` on the run for `finish_step`'s reason.
+    /// `finish_step`'s locking CTE (MOD-77 plan D2), with `status = 'running'` in the CTE, so a
+    /// park committed first matches no row.
     ///
     /// # Errors
     ///
@@ -5516,15 +5611,17 @@ impl WriteStore for PgStore {
         at: DateTime<Utc>,
     ) -> Result<bool> {
         let moved = sqlx::query!(
-            "UPDATE run_step \
+            "WITH locked AS ( \
+                 SELECT s.id FROM run_step s JOIN run r ON r.id = s.run_id \
+                  WHERE s.id = $1 AND s.status = 'running' \
+                    AND r.lease_owner IS NOT DISTINCT FROM $4 \
+                    FOR NO KEY UPDATE OF s FOR SHARE OF r) \
+             UPDATE run_step \
                 SET status = 'done', gate_outcome = 'skipped', \
                     gate_note = COALESCE($2, gate_note), \
                     finished_at = COALESCE(finished_at, $3) \
-              WHERE id = $1 AND status = 'running' \
-                AND EXISTS (SELECT 1 FROM run r \
-                             WHERE r.id = run_step.run_id \
-                               AND r.lease_owner IS NOT DISTINCT FROM $4 \
-                               FOR SHARE)",
+               FROM locked \
+              WHERE run_step.id = locked.id AND run_step.status = 'running'",
             step.as_uuid(),
             note,
             at,
