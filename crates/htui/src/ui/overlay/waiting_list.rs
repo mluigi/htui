@@ -3,6 +3,8 @@
 //! cursor and refreshes on every tick with no request of its own. `Enter` reveals the row's step;
 //! the Runs pane stays the one place that answers (PRD scope).
 
+use std::cell::Cell;
+
 use htui_core::model::{ItemId, RunId, Scope, StepId};
 use htui_worker::{WaitingReason, WaitingRow, WaitingView};
 use ratatui::Frame;
@@ -63,12 +65,14 @@ const fn id_of(row: &WaitingRow) -> RowId {
 /// Lists what waits on a person and reveals the selected row's step.
 #[derive(Debug, Default)]
 pub struct WaitingList {
-    /// The highlighted row's index when it was last moved to, stored unclamped; every read clamps
-    /// it to the rows on hand (H-3), and it is the fallback when the anchor's row is gone.
-    cursor: usize,
-    /// The highlighted row's identity, re-found on every read (review M2); `None` until a key
-    /// first moves the cursor.
-    anchor: Option<RowId>,
+    /// The highlighted row's index at the last read or key; a key stores it unclamped, every read
+    /// clamps it to the rows on hand (H-3) and writes back where it found the anchor, so it is the
+    /// fallback when the anchor's row is gone (review R1).
+    cursor: Cell<usize>,
+    /// The highlighted row's identity, re-found on every read (review M2). The first read with
+    /// rows sets it, so the row shown on open is anchored before any key (review R1); `None`
+    /// only while no read has had a row. A `Cell` because a read (`render`) takes `&self`.
+    anchor: Cell<Option<RowId>>,
 }
 
 impl WaitingList {
@@ -83,22 +87,27 @@ impl WaitingList {
 
     /// The highlighted row of `rows`: the anchor's row (of several sharing its identity, the one
     /// nearest the stored index), else the stored index clamped; `None` while there are none.
+    /// The answer becomes the cursor, index and identity both (review R1), so whatever row a read
+    /// highlights is the one the next re-sort keeps.
     fn at(&self, rows: &[WaitingRow]) -> Option<usize> {
         let last = rows.len().checked_sub(1)?;
-        let anchored = self.anchor.and_then(|anchor| {
+        let cursor = self.cursor.get();
+        let anchored = self.anchor.get().and_then(|anchor| {
             rows.iter()
                 .enumerate()
                 .filter(|(_, row)| id_of(row) == anchor)
                 .map(|(index, _)| index)
-                .min_by_key(|index| index.abs_diff(self.cursor))
+                .min_by_key(|index| index.abs_diff(cursor))
         });
-        Some(anchored.unwrap_or_else(|| self.cursor.min(last)))
+        let at = anchored.unwrap_or_else(|| cursor.min(last));
+        self.put(rows, at);
+        Some(at)
     }
 
     /// Puts the cursor on `rows[index]`, index and identity both.
-    fn put(&mut self, rows: &[WaitingRow], index: usize) {
-        self.cursor = index;
-        self.anchor = rows.get(index).map(id_of);
+    fn put(&self, rows: &[WaitingRow], index: usize) {
+        self.cursor.set(index);
+        self.anchor.set(rows.get(index).map(id_of));
     }
 
     /// `Enter`: close, then reveal the selected row's step, both applied by the same drain (the
@@ -498,7 +507,7 @@ mod tests {
         assert_eq!(bench.code(&mut list, KeyCode::Enter), Handled::Consumed);
         assert_closes_then_reveals(&bench.emit.take(), &rows[0]);
         assert_eq!(bench.code(&mut list, KeyCode::Char('k')), Handled::Consumed);
-        assert_eq!(list.cursor, 0, "k writes the clamped cursor back");
+        assert_eq!(list.cursor.get(), 0, "k writes the clamped cursor back");
     }
 
     /// MOD-69 review M2: the list is re-sorted on every tick, so the cursor follows its row, not
@@ -529,6 +538,51 @@ mod tests {
         bench.code(&mut list, KeyCode::Char('k'));
         bench.code(&mut list, KeyCode::Enter);
         assert_closes_then_reveals(&bench.emit.take(), &rows[0]);
+    }
+
+    /// MOD-69 review R1: the row highlighted on open is anchored by the first read, before any
+    /// key, so a park that sorts above it leaves the highlight (and `Enter`) on the row shown.
+    #[test]
+    fn the_first_highlighted_row_is_anchored_before_any_key() {
+        let rows = vec![reopen("FEAT-2", ids::HTUI_FEAT_2)];
+        let mut bench = Bench::over(Some(view(rows.clone())));
+        let mut list = WaitingList::new();
+        let opened = bench.render(&list);
+        assert!(opened.contains("> FEAT-2 "), "{opened}");
+
+        bench.top_bar.waiting = Some(view(vec![gate("ANA-2", ids::HTUI_ANA_2), rows[0].clone()]));
+        let rendered = bench.render(&list);
+        assert!(rendered.contains("> FEAT-2 "), "{rendered}");
+        bench.code(&mut list, KeyCode::Enter);
+        assert_closes_then_reveals(&bench.emit.take(), &rows[0]);
+    }
+
+    /// MOD-69 review R1: a re-found anchor writes its index back, so when its row then goes the
+    /// fallback is the index it last sat at, not the one of the last key press.
+    #[test]
+    fn a_refound_anchor_writes_its_index_back() {
+        let parked = gate("ANA-2", ids::HTUI_ANA_2);
+        let blocked = reopen("FEAT-2", ids::HTUI_FEAT_2);
+        let mut bench = Bench::over(Some(view(vec![parked.clone(), blocked.clone()])));
+        let mut list = WaitingList::new();
+        bench.render(&list);
+
+        let above = [gate("ANA-1", ItemId::new()), gate("ANA-3", ItemId::new())];
+        bench.top_bar.waiting = Some(view(vec![
+            above[0].clone(),
+            above[1].clone(),
+            parked,
+            blocked.clone(),
+        ]));
+        bench.render(&list);
+
+        bench.top_bar.waiting = Some(view(vec![
+            above[0].clone(),
+            above[1].clone(),
+            blocked.clone(),
+        ]));
+        bench.code(&mut list, KeyCode::Enter);
+        assert_closes_then_reveals(&bench.emit.take(), &blocked);
     }
 
     /// Two permission requests of one step share an identity; the cursor still steps from one to

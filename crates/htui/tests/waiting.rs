@@ -254,7 +254,8 @@ async fn ctrl_w_opens_the_list_from_every_tab_and_esc_closes_it() {
 }
 
 /// Plan D6: the open list reads the shell's last reply, so a refresh redraws it with no request
-/// of its own and no reopening.
+/// of its own and no reopening. Review R1: the row highlighted on open stays highlighted when the
+/// park sorts a new row above it, before any key.
 #[tokio::test]
 async fn the_open_list_follows_a_park_without_reopening() {
     let store = MemStore::demo();
@@ -268,9 +269,9 @@ async fn the_open_list_follows_a_park_without_reopening() {
     refresh(&mut harness).await;
     assert!(list_is_open(&mut harness), "the same list stays open");
     let after = harness.render();
-    assert!(after.contains("> ANA-2"), "{after}");
+    assert!(after.contains("  ANA-2"), "{after}");
     assert!(after.contains("plan 1.1"), "{after}");
-    assert!(after.contains("  FEAT-2  \u{2014}"), "{after}");
+    assert!(after.contains("> FEAT-2  \u{2014}"), "{after}");
 }
 
 /// Plan D8: `Enter` closes the list and lands on the row's step in the Runs pane.
