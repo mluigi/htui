@@ -324,16 +324,26 @@ impl DocumentsTab {
                 } else {
                     BY_HAND
                 };
+                // MOD-80 D2: a row style does not override a cell's own colour, so the cursor
+                // row's cells are selected one by one; the row style paints the column gaps.
+                let on_cursor = at == self.cursor;
+                let cell = |line: Line<'static>| {
+                    Cell::from(if on_cursor {
+                        ctx.theme.select(line)
+                    } else {
+                        line
+                    })
+                };
                 let row = Row::new(vec![
-                    Cell::from(Line::styled(document.kind.clone(), ctx.theme.accent)),
-                    Cell::from(Line::styled(
+                    cell(Line::styled(document.kind.clone(), ctx.theme.accent)),
+                    cell(Line::styled(
                         format!("v{}", document.version),
                         ctx.theme.base,
                     )),
-                    Cell::from(Line::styled(by, ctx.theme.dim)),
-                    Cell::from(Line::styled(document.title.clone(), ctx.theme.base)),
+                    cell(Line::styled(by, ctx.theme.dim)),
+                    cell(Line::styled(document.title.clone(), ctx.theme.base)),
                 ]);
-                if at == self.cursor {
+                if on_cursor {
                     row.style(ctx.theme.selected)
                 } else {
                     row
@@ -628,12 +638,13 @@ mod tests {
     use htui_core::model::item_spec::NOTHING_TO_SAVE;
     use htui_core::store::{MemStore, ReadStore as _, StoreError};
     use htui_store::Backend;
-    use ratatui::style::Modifier;
+    use ratatui::style::Color;
 
     use super::*;
     use crate::app::Action;
     use crate::hand_written::{self, DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME};
     use crate::store_worker::StoreRequest;
+    use crate::ui::Theme;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key};
     use crate::ui::tabs::backlog::detail::compose::{
         Part, could_not_check, may_have_landed, not_written,
@@ -1525,11 +1536,24 @@ mod tests {
             .draw(|frame| pane.render(frame, frame.area(), &shell.ctx()))
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
-        let reversed = |y: u16| buffer[(0, y)].modifier.contains(Modifier::REVERSED);
-        assert!(!reversed(0), "the header");
-        assert!(!reversed(1), "plan v1");
-        assert!(reversed(2), "plan v2, under the cursor");
-        assert!(!reversed(3), "prd v1");
+        // MOD-80 D2: every cell of the cursor row, the kind column's and the gaps included.
+        let selected = Theme::default().selected;
+        for x in 0..43 {
+            let cell = &buffer[(x, 2)];
+            assert_eq!(
+                cell.fg,
+                selected.fg.expect("selected has a foreground"),
+                "plan v2, under the cursor, x = {x}"
+            );
+            assert_eq!(
+                cell.bg,
+                selected.bg.expect("selected has a background"),
+                "plan v2, under the cursor, x = {x}"
+            );
+        }
+        for (y, row) in [(0, "the header"), (1, "plan v1"), (3, "prd v1")] {
+            assert_ne!(buffer[(0, y)].bg, Color::Cyan, "{row}");
+        }
     }
 
     #[test]

@@ -330,17 +330,13 @@ const fn marker(folded: bool) -> char {
 }
 
 /// The line cut to `width` cells (MOD-60 D7: `cells::clip_spans`, so a body row cuts its body),
-/// padded out to it so the selected style covers the whole row.
+/// padded out to it so the selection covers the whole row.
 fn pad(line: Line<'static>, width: usize, selected: bool, theme: &Theme) -> Line<'static> {
     let mut spans = cells::clip_spans(&line.spans, width);
     let used: usize = spans.iter().map(|span| cell_width(&span.content)).sum();
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
     let line = Line::from(spans);
-    if selected {
-        line.style(theme.selected)
-    } else {
-        line
-    }
+    if selected { theme.select(line) } else { line }
 }
 
 #[cfg(test)]
@@ -352,7 +348,11 @@ mod tests {
     use crate::ui::tabs::requirements::tests::platform;
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectRef, RequirementAreaId, RequirementState};
+    use ratatui::buffer::Buffer;
+    use ratatui::layout::Rect;
+    use ratatui::style::Color;
     use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Widget as _};
     use uuid::Uuid;
 
     /// A line's text, span after span.
@@ -610,6 +610,33 @@ mod tests {
                 Row::Project(ids::PROJECT_AGY),
             ]
         );
+    }
+
+    /// MOD-80 D2: a selected requirement row is one even block; its key's own style does not
+    /// show through the selection.
+    #[tokio::test]
+    async fn a_selected_requirement_row_is_one_even_block() {
+        let (snapshot, projects, _) = platform().await;
+        let view = TreeView {
+            snapshot: &snapshot,
+            projects: &projects,
+            folded: &[],
+            filter: "",
+            selected: Some(Row::Requirement(ids::REQ_ENT_1)),
+        };
+        let (lines, cursor) = lines(&view, 45, &Theme::default());
+        let y = cursor.expect("R-ENT-1 is drawn");
+        assert!(line_text(&lines[y]).contains("R-ENT-1"), "{lines:#?}");
+        let height = u16::try_from(lines.len()).expect("a short tree");
+        let area = Rect::new(0, 0, 45, height);
+        let mut buffer = Buffer::empty(area);
+        Paragraph::new(lines).render(area, &mut buffer);
+        let y = u16::try_from(y).expect("a short tree");
+        for x in 0..45 {
+            let cell = &buffer[(x, y)];
+            assert_eq!(cell.fg, Color::Black, "x = {x}: {cell:?}");
+            assert_eq!(cell.bg, Color::Cyan, "x = {x}: {cell:?}");
+        }
     }
 
     #[tokio::test]

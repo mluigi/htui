@@ -54,7 +54,7 @@ impl Default for Theme {
             dim: Style::new().fg(Color::Indexed(244)),
             title: Style::new().fg(Color::Reset).add_modifier(Modifier::BOLD),
             accent,
-            selected: Style::new().add_modifier(Modifier::REVERSED),
+            selected: Style::new().fg(Color::Black).bg(Color::Cyan),
             error: Style::new().fg(Color::Red),
             key: base.add_modifier(Modifier::BOLD),
             running: Style::new().fg(Color::Blue),
@@ -155,6 +155,10 @@ mod tests {
                 .contains(Modifier::BOLD | Modifier::UNDERLINED)
         );
         assert!(theme.cursor.add_modifier.contains(Modifier::REVERSED));
+        assert_eq!(
+            theme.selected,
+            Style::new().fg(Color::Black).bg(Color::Cyan)
+        );
     }
 
     #[test]

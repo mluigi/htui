@@ -225,10 +225,10 @@ impl StepNode {
         }
     }
 
-    /// The border: `selected` on the cursor, else by status (plan D10).
+    /// The border: `cursor` on the cursor node, else by status (plan D10).
     fn border(&self, selected: bool) -> Style {
         if selected {
-            return self.theme.selected;
+            return self.theme.cursor;
         }
         match self.status {
             StepStatus::Failed => self.theme.error,
