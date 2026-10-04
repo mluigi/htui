@@ -104,9 +104,11 @@ moved by a person, or by the engine's own rules, never by this tool.
 link always starts at the run's item. `to` is a key looked up in the session's project only; a key
 the project does not have answers `out of scope: <key> is not an item of this project`.
 `add` revives a withdrawn link, and leaves a live link exactly as it was, proposer included. A run
-can withdraw only a link one of its own steps proposed; any other answers
-`not yours: <from> <kind> <to> was not proposed by this run`. `live` says whether the link is in
-force after the call.
+can withdraw only a link one of its own steps proposed; a live link another run (or a person)
+proposed answers `not yours: <from> <kind> <to> was not proposed by this run`. A `remove` of a
+link that is not live (it never existed, or it is already withdrawn) answers
+`not found: item_link <from-id>-<kind>-><to-id>`, with the two items' ids. `live` says whether
+the link is in force after the call.
 
 **`search_concepts`** searches the concepts index (see the README's
 [Search](../README.md#search)) within the session's project only. `types` keeps `item`,
