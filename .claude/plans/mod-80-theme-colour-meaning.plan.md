@@ -6,7 +6,7 @@ https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 5-8, 12; `R-TUI-1`, `
 accepted by the maintainer 2026-10-04. Sandbox run `hr/MOD-80`.
 **Complexity**: Medium. Style only, about 25 files, mostly one-line style swaps. No store, engine, migration or
 `.sqlx` change.
-**Status**: draft, awaiting CONFIRM
+**Status**: confirmed 2026-10-04 (all six decisions as proposed, recommendations taken on the four maintainer calls); implementation in progress
 
 ## Summary
 
