@@ -395,7 +395,7 @@ impl Tab for SettingsTab {
     }
 }
 
-/// Draws the section strip, the active one accented.
+/// Draws the section strip, the active one in `active_tab` (bold, underlined).
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegistry, theme: &Theme) {
     let active = registry.active_id();
     let spans: Vec<Span<'_>> = registry
@@ -403,7 +403,7 @@ pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &SettingsRegist
         .into_iter()
         .map(|(id, title)| {
             let style: Style = if Some(id) == active {
-                theme.accent
+                theme.active_tab
             } else {
                 theme.dim
             };
@@ -425,6 +425,29 @@ pub fn message(frame: &mut Frame<'_>, area: Rect, text: &str, theme: &Theme) {
 mod tests {
     use super::*;
     use crate::ui::cells::cell_width;
+
+    /// MOD-80 D5: under the monochrome theme only modifiers can mark the active section.
+    #[test]
+    fn active_section_is_bold_and_underlined_without_colour() {
+        let tab = SettingsTab::with_sections(vec![
+            Box::new(ConnectionSection::new()),
+            Box::new(QdrantSection::new()),
+        ]);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), &tab.sections, &Theme::monochrome()))
+            .expect("the strip draws");
+        let buffer = terminal.backend().buffer();
+        let marked = ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED;
+        let active = &buffer[(1, 0)];
+        assert_eq!(active.symbol(), "C");
+        assert!(active.modifier.contains(marked), "{active:?}");
+        let second = u16::try_from(1 + cell_width(" Connection ")).expect("narrow");
+        let other = &buffer[(second, 0)];
+        assert_eq!(other.symbol(), "Q");
+        assert!(!other.modifier.intersects(marked), "{other:?}");
+    }
 
     /// A ZWJ family: one cluster of five code points, 2 cells.
     const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
