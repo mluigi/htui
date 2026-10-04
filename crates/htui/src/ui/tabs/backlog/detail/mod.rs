@@ -19,7 +19,7 @@ pub mod prompt;
 pub mod requirements;
 pub mod runs;
 
-use htui_core::model::ItemId;
+use htui_core::model::{ItemId, RunId, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -115,6 +115,10 @@ pub trait DetailTab {
     fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
         Handled::Pass
     }
+    /// MOD-69 plan D8 (blueprint A-5): a reveal asks for this run and step under the cursor. Only
+    /// [`RunsTab`] answers; the default ignores it. Called after the item change, so it survives
+    /// `on_item_change`'s reset.
+    fn focus(&mut self, _run: Option<RunId>, _step: Option<StepId>, _ctx: &Ctx<'_>) {}
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -189,6 +193,24 @@ impl DetailRegistry {
     pub fn select_id(&mut self, id: DetailId) -> bool {
         match self.tabs.iter().position(|tab| tab.id() == id) {
             Some(idx) => self.select(idx),
+            None => false,
+        }
+    }
+
+    /// Hands a reveal's run and step to the sub-tab registered under `id` (MOD-69 plan D8).
+    /// `false` when nothing is registered under it.
+    pub fn focus(
+        &mut self,
+        id: DetailId,
+        run: Option<RunId>,
+        step: Option<StepId>,
+        ctx: &Ctx<'_>,
+    ) -> bool {
+        match self.tabs.iter_mut().find(|tab| tab.id() == id) {
+            Some(tab) => {
+                tab.focus(run, step, ctx);
+                true
+            }
             None => false,
         }
     }
