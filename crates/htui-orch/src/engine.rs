@@ -5466,6 +5466,15 @@ where
         Ok(())
     }
 
+    /// MOD-11 D16, R1 C: whether `phase`'s step is offered `command_run` — a tool host serves the
+    /// session (as D19's `document_tool` reads it) and the phase's queue mode exposes it for its
+    /// fan-out and the item's `required_tags`. `drive_once`'s base exposure and `phase_spec`'s
+    /// section both read this (the persona's term is applied on top), so a host-less engine
+    /// neither denies the heavy commands nor names a tool nothing serves.
+    fn command_run_exposed(&self, phase: &SnapshotPhase, required_tags: &[String]) -> bool {
+        self.parts.tools.is_some() && phase.command_queue.exposed(phase.fan_out, required_tags)
+    }
+
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
     /// upstream summaries and, from attempt 2, the loop's forwarded sections (plan D67).
     ///
@@ -5603,9 +5612,7 @@ where
             // MOD-11 D16 (OQ-6): the one resolver — `fan_out_only` renders the section only for a
             // fanned-out phase or a `heavy_build` item — and MOD-26 D13's persona term, which R1
             // H1 makes `narrow`'s own rule (an `execute` denial drops the tool too).
-            command_queue: phase
-                .command_queue
-                .exposed(phase.fan_out, &row.required_tags)
+            command_queue: self.command_run_exposed(phase, &row.required_tags)
                 && persona.is_none_or(|persona| {
                     htui_agent::persona::persona_keeps_command_run(&persona.tools)
                 }),
@@ -5915,14 +5922,15 @@ where
         // over the judge phase).
         let policy = (self.parts.policy)(candidate.agent_id);
         // MOD-11 D16: the base exposure carries `command_run` per the phase's queue mode, the
-        // fan-out and the item's tags (the prompt's section uses the same resolver). A judge's
-        // phase is `off` (`fanout.rs`), so it never reads the item.
-        let exposed = phase.command_queue != htui_core::model::CommandQueue::Off && {
-            let item = self.item(Self::item_of(run)?).await?;
-            phase
-                .command_queue
-                .exposed(phase.fan_out, &item.required_tags)
-        };
+        // fan-out and the item's tags, and (R1 C) only when a tool host can serve it; the prompt's
+        // section uses the same helper. A judge's phase is `off` (`fanout.rs`) and a host-less
+        // engine exposes nothing, so neither reads the item.
+        let exposed = self.parts.tools.is_some()
+            && phase.command_queue != htui_core::model::CommandQueue::Off
+            && {
+                let item = self.item(Self::item_of(run)?).await?;
+                self.command_run_exposed(phase, &item.required_tags)
+            };
         let base = ToolExposure {
             command_run: exposed,
             ..ToolExposure::default()
@@ -12654,7 +12662,11 @@ mod tests {
     async fn a_persona_narrows_every_fanout_candidate_s_session() {
         use htui_agent::event::ToolKind;
 
-        let harness = Harness::new().await;
+        // MOD-11 R1 C: hosted, as only a hosted engine offers `command_run`.
+        let harness = Harness {
+            orch: FakeOrchestrator::demo()
+                .with_tool_host(std::sync::Arc::new(crate::fake::FakeToolHost::default())),
+        };
         harness.free_feat_3().await;
         harness
             .repoint(ids::HTUI_FEAT_3, |phase| {
@@ -16304,9 +16316,6 @@ mod tests {
                 .repoint(ids::HTUI_FEAT_3, |phase| {
                     if phase.name == "prd" {
                         phase.fan_out = 2;
-                        // MOD-11 D17: the scripted call is `cargo test`, which an exposed
-                        // candidate's denials would answer before the relay; this case is the relay's.
-                        phase.command_queue = htui_core::model::CommandQueue::Off;
                         phase.gate = Gate::Never;
                     }
                 })
@@ -16447,9 +16456,6 @@ mod tests {
                 .repoint(ids::HTUI_FEAT_3, |phase| {
                     if phase.name == "prd" {
                         phase.fan_out = 2;
-                        // MOD-11 D17: the scripted call is `cargo test`, which an exposed
-                        // candidate's denials would answer before the relay; this case is the relay's.
-                        phase.command_queue = htui_core::model::CommandQueue::Off;
                         phase.gate = Gate::Never;
                     }
                 })
@@ -16734,9 +16740,6 @@ mod tests {
                 .repoint(ids::HTUI_FEAT_3, |phase| {
                     if phase.name == "prd" {
                         phase.fan_out = 2;
-                        // MOD-11 D17: the scripted call is `cargo test`, which an exposed
-                        // candidate's denials would answer before the relay; this case is the relay's.
-                        phase.command_queue = htui_core::model::CommandQueue::Off;
                         phase.gate = Gate::Never;
                     }
                 })
@@ -17135,6 +17138,40 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [true],
                 "the scope advertises `command_run`"
+            );
+        }
+
+        /// MOD-11 R1 C: with no tool host nothing can serve `command_run`, so an exposed phase's
+        /// step gets neither the tool nor the R-MCP-4 denials nor the prompt's `command_queue`
+        /// section (D19's `document_tool` precedent).
+        #[tokio::test]
+        async fn a_host_less_exposed_step_gets_no_command_run_no_denials_no_section() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            assert!(harness.orch.tool_host().is_none(), "the premise");
+
+            let (spec, prompt) = super::spied_start(&harness.orch).await;
+
+            assert!(!spec.tools.command_run, "no host, no tool");
+            assert!(
+                !spec
+                    .permission
+                    .rules
+                    .iter()
+                    .any(|rule| rule.reason.ends_with("(R-MCP-4)")),
+                "no denials: {:?}",
+                spec.permission.rules
+            );
+            assert!(
+                !prompt.contains("<section name=\"command_queue\""),
+                "no section:\n{prompt}"
             );
         }
 

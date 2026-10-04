@@ -211,6 +211,12 @@ pub trait Orchestrate {
     /// MOD-42 plan D9: `agent`'s own permission policy in every engine this orchestrator builds,
     /// so a case can tell the agent's rules from the ones the walk splices in (MOD-11 D17).
     fn set_policy(&self, agent: AgentId, policy: PermissionPolicy);
+
+    /// MOD-11 R1 C: this orchestrator with a tool host lent to every engine it builds. Only a
+    /// hosted engine offers `command_run`, so every case about the command queue's exposure starts
+    /// here.
+    #[must_use]
+    fn hosted(self) -> Self;
 }
 
 impl Orchestrate for FakeOrchestrator {
@@ -320,6 +326,10 @@ impl Orchestrate for FakeOrchestrator {
 
     fn set_policy(&self, agent: AgentId, policy: PermissionPolicy) {
         Self::set_policy(self, agent, policy);
+    }
+
+    fn hosted(self) -> Self {
+        self.with_tool_host(Arc::new(crate::fake::FakeToolHost::default()))
     }
 }
 
@@ -7156,7 +7166,7 @@ async fn a_persona_without_command_run_drops_the_command_queue_section<H: CaseHa
         }
     };
 
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     free_feat_3(&orch).await;
     repoint(&orch, ids::HTUI_FEAT_3, queued).await;
     orch.store()
@@ -7185,7 +7195,7 @@ async fn a_persona_without_command_run_drops_the_command_queue_section<H: CaseHa
         "a persona without `command_run` drops the section: {sections:?}"
     );
 
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     free_feat_3(&orch).await;
     repoint(&orch, ids::HTUI_FEAT_3, queued).await;
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
@@ -7306,7 +7316,7 @@ fn has_denials(spec: &SessionSpec) -> bool {
 async fn a_single_fan_out_fan_out_only_step_has_no_command_queue_section<H: CaseHarness>(
     harness: &H,
 ) {
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     free_feat_3(&orch).await;
     let (run, _) = start(&orch, ids::HTUI_FEAT_3).await;
     let sections = prompt_sections(&orch, at(&steps_of(&orch, run).await, 0, 1).id).await;
@@ -7322,7 +7332,7 @@ async fn a_single_fan_out_fan_out_only_step_has_no_command_queue_section<H: Case
 /// MOD-11 D16: `research` fanned out to two agents under `fan_out_only` exposes `command_run` to
 /// both candidates, with the section and the denials.
 async fn a_fan_out_two_step_has_it<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     repoint(&orch, ids::HTUI_ANA_2, |phase| {
         if phase.name == "research" {
             phase.fan_out = 2;
@@ -7362,7 +7372,7 @@ async fn a_fan_out_two_step_has_it<H: CaseHarness>(harness: &H) {
 /// MOD-11 D16, R-MCP-3: a `heavy_build` item queues its commands under `fan_out_only` without a
 /// fan-out.
 async fn a_heavy_build_item_has_it<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     free_feat_3(&orch).await;
     declare_tags(&orch, &["heavy_build"]).await;
     require_tags(&orch, ids::HTUI_FEAT_3, &["heavy_build"]).await;
@@ -7380,7 +7390,7 @@ async fn a_heavy_build_item_has_it<H: CaseHarness>(harness: &H) {
 /// MOD-11 D17: a persona-less exposed step's rules are the fifteen denials, in OQ-5's order, then
 /// the agent's own, untouched.
 async fn a_persona_less_exposed_step_gets_the_denials_first<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     free_feat_3(&orch).await;
     repoint(&orch, ids::HTUI_FEAT_3, |phase| {
         if phase.name == "prd" {
@@ -7409,7 +7419,7 @@ async fn a_persona_less_exposed_step_gets_the_denials_first<H: CaseHarness>(harn
 /// MOD-11 D17: with a persona bound the denials still come first — ahead of the persona's
 /// narrowing rules and the agent's own — because they are spliced after `narrow`, not in it.
 async fn a_persona_step_gets_the_denials_first_too<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     free_feat_3(&orch).await;
     repoint(&orch, ids::HTUI_FEAT_3, |phase| {
         if phase.name == "prd" {
@@ -7452,7 +7462,7 @@ async fn a_persona_step_gets_the_denials_first_too<H: CaseHarness>(harness: &H) 
 /// MOD-11 D16: a judged fan-out exposes `command_run` to its candidates, never to the judge,
 /// whose phase is `off`: no section, no tool, no denial.
 async fn judges_never_get_command_run<H: CaseHarness>(harness: &H) {
-    let orch = harness.fresh();
+    let orch = harness.fresh().hosted();
     fan_research(&orch, Gate::Never, false).await;
     set_judge(&orch, ids::HTUI_ANA_2).await;
     research_candidates(&orch, 1);

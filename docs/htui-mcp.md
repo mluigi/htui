@@ -234,11 +234,12 @@ note `missing tags: heavy_build`, and auto mode does not pick the item there. A 
 Settings › Kinds shows that setting but does not edit it (it is the `step_graph_phase` row's
 `command_queue` column). A persona with `command-run: false`, or one that denies the `execute`
 kind, takes it away (see
-[`docs/personas.md`](personas.md#narrow-only-what-a-persona-can-and-cannot-change)). The
-prompt's `command_queue` section follows the same rule, so the prompt never names a tool the
-session lacks. Judge calls and chats never get it. Before MOD-11 a `fan_out_only` phase rendered
-that section on every step; a single-agent step without `heavy_build` no longer does, so its
-prompt digest differs from the same step's before the upgrade.
+[`docs/personas.md`](personas.md#narrow-only-what-a-persona-can-and-cannot-change)), and an
+engine that does not host htui's tools offers it to no step, nor refuses the heavy commands
+below. The prompt's `command_queue` section follows the same rules, so the prompt never names a
+tool the session lacks. Judge calls and chats never get it. Before MOD-11 a `fan_out_only` phase
+rendered that section on every step; a single-agent step without `heavy_build` no longer does, so
+its prompt digest differs from the same step's before the upgrade.
 
 ### Limits
 
