@@ -6,9 +6,10 @@
 //! on the row lock, re-evaluates its `status` predicate against the committed row and matches
 //! nothing. Every miss is told apart by one re-read, the `take_lease` shape. Every instant is
 //! `clock_timestamp()`, never a box clock (I-4). The only transaction is `open_permission`'s,
-//! which share-locks the step and then its run (`FOR SHARE OF s, r`, MOD-77 plan D4: `park_step`'s
-//! order) so an adoption cannot commit between its fence and its insert (MOD-41's `step_fence`
-//! shape).
+//! which key-share-locks the step and then share-locks its run (`FOR KEY SHARE OF s FOR SHARE OF
+//! r`, MOD-77 plan D4, review L1: `park_step`'s order, and `KEY SHARE` is the lock the insert's
+//! foreign key takes anyway) so an adoption cannot commit between its fence and its insert
+//! (MOD-41's `step_fence` shape).
 //!
 //! An answer or a cancel request names an actor (`answered_by`/`answered_box`,
 //! `issued_by`/`issued_box`, blueprint B-7). `MemStore` checks the actor **before** the row's
@@ -127,14 +128,14 @@ pub(super) async fn open_permission(store: &PgStore, open: OpenPermission) -> Re
     })?;
     let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
 
-    // MOD-77 plan D4: the step and then its run are share-locked, `park_step`'s order, so an
-    // adoption cannot commit between this check and the insert, and a park holding the step
-    // cannot deadlock against the insert's foreign-key lock on it.
+    // MOD-77 plan D4, review L1: the step is key-share-locked (the insert's foreign-key lock) and
+    // then its run share-locked, `park_step`'s order, so an adoption cannot commit between this
+    // check and the insert, and a park holding the step cannot deadlock against the insert.
     let fence = sqlx::query!(
         r#"SELECT s.run_id, r.lease_owner AS "lease_owner?"
              FROM run_step s JOIN run r ON r.id = s.run_id
             WHERE s.id = $1
-              FOR SHARE OF s, r"#,
+              FOR KEY SHARE OF s FOR SHARE OF r"#,
         open.run_step_id.as_uuid(),
     )
     .fetch_optional(&mut *tx)

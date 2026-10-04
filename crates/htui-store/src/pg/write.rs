@@ -196,11 +196,18 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
 
 /// MOD-77 plan D1: the lock [`step_fence`] takes on the step's row. The run's is always
 /// `FOR SHARE`, and is always taken **after** the step's.
+///
+/// `FOR KEY SHARE` (review L1) is the lock an insert's foreign key takes on the step anyway. It
+/// still conflicts with a park's `FOR UPDATE OF s`, so the writer queues at the step before it
+/// touches the run (the step → run order), and it does not conflict with `FOR NO KEY UPDATE`, so a
+/// reader-inserter does not serialise behind the step's own usage, settle and transition writes.
+/// [`step_scope`] keeps MOD-11's `FOR SHARE OF s, r`: it is out of MOD-77's scope, and the
+/// stronger step lock changes no lock order, only how much it waits.
 #[derive(Clone, Copy, Debug)]
 enum StepLock {
-    /// `FOR SHARE OF s, r`: the caller reads the step and inserts rows whose foreign key names
-    /// it, and never updates it (`record_commits`, [`fenced_miss`]).
-    Share,
+    /// `FOR KEY SHARE OF s FOR SHARE OF r`: the caller reads the step and inserts rows whose
+    /// foreign key names it, and never updates it (`record_commits`, [`fenced_miss`]).
+    KeyShare,
     /// `FOR NO KEY UPDATE OF s FOR SHARE OF r`: the caller goes on to `UPDATE run_step`
     /// (`upsert_step_tree`'s `isolation_path`), so it takes the update lock up front. A share
     /// lock upgraded later would deadlock two such writers of one step against each other.
@@ -231,12 +238,12 @@ async fn step_fence(
 ) -> Result<()> {
     // Two statements, not one with a spliced clause: `query_scalar!` needs literal SQL.
     let owner = match lock {
-        StepLock::Share => {
+        StepLock::KeyShare => {
             sqlx::query_scalar!(
                 r#"SELECT r.lease_owner AS "lease_owner?"
                      FROM run_step s JOIN run r ON r.id = s.run_id
                     WHERE s.id = $1
-                      FOR SHARE OF s, r"#,
+                      FOR KEY SHARE OF s FOR SHARE OF r"#,
                 step.as_uuid(),
             )
             .fetch_optional(conn)
@@ -339,12 +346,13 @@ async fn fenced_or_missing(pool: &sqlx::PgPool, step: StepId) -> StoreError {
 /// at the status the write wanted, `Ok(false)`. Boxed by its callers for [`fenced_or_missing`]'s
 /// stack reason.
 ///
-/// [`StepLock::Share`] (MOD-77 plan D1): it runs on a pooled connection outside any transaction,
-/// so the lock lasts one statement and only makes this read wait for a writer that holds the step
-/// or its run; no `UPDATE` follows that would need the step's update lock.
+/// [`StepLock::KeyShare`] (MOD-77 plan D1, review L1): it runs on a pooled connection outside any
+/// transaction, so the lock lasts one statement and only makes this read wait for a park holding
+/// the step or a lease writer holding its run; no `UPDATE` follows that would need the step's
+/// update lock.
 async fn fenced_miss(pool: &sqlx::PgPool, step: StepId, fence: StepFence) -> Result<bool> {
     let mut conn = pool.acquire().await.map_err(map_sqlx)?;
-    step_fence(&mut conn, step, fence, StepLock::Share).await?;
+    step_fence(&mut conn, step, fence, StepLock::KeyShare).await?;
     Ok(false)
 }
 
@@ -1155,13 +1163,15 @@ impl WriteStore for PgStore {
     /// are avoided entirely.
     ///
     /// The fence is decided **inside** the statement (MOD-40 blueprint B1, B2). `lease`
-    /// share-locks each named step and then its run (`FOR SHARE OF s, r`, MOD-77 plan D3:
-    /// `park_step`'s order, so a park holding the step cannot deadlock against the insert's
-    /// foreign-key lock on it), so a `take_lease` or `adopt_runs` either waits for this write or is
-    /// seen by it; `fenced` is the lowest step whose run's `lease_owner` is not `$2`. The insert
-    /// runs only when nothing is fenced, **or** when a named step does not exist at all, so that
-    /// such a row still reaches the foreign key and refuses the batch (`23503`) ahead of the
-    /// fence. The statement answers both facts, so no second read is needed and none can race.
+    /// key-share-locks each named step and then share-locks its run (`FOR KEY SHARE OF s FOR SHARE
+    /// OF r`, MOD-77 plan D3, review L1: `park_step`'s order, so a park holding the step cannot
+    /// deadlock against the insert's foreign-key lock on it; `KEY SHARE` is that lock, so the
+    /// append does not wait behind the step's own usage, settle or transition writes), so a
+    /// `take_lease` or `adopt_runs` either waits for this write or is seen by it; `fenced` is the
+    /// lowest step whose run's `lease_owner` is not `$2`. The insert runs only when nothing is
+    /// fenced, **or** when a named step does not exist at all, so that such a row still reaches the
+    /// foreign key and refuses the batch (`23503`) ahead of the fence. The statement answers both
+    /// facts, so no second read is needed and none can race.
     ///
     /// A batch naming two steps of one run may still lock them in either order against a park of
     /// the second (MOD-77 plan D7); the only production caller, `Recorder::flush`, writes one
@@ -1198,7 +1208,7 @@ impl WriteStore for PgStore {
                   FROM run_step s
                   JOIN run r ON r.id = s.run_id
                  WHERE s.id IN (SELECT run_step_id FROM e)
-                   FOR SHARE OF s, r
+                   FOR KEY SHARE OF s FOR SHARE OF r
             ),
             fenced AS (
                 SELECT run_step_id
@@ -5315,8 +5325,8 @@ impl WriteStore for PgStore {
     /// `before` hash when it takes the tree and the `after` hash when it commits, and a second call
     /// carrying `None` means the step produced no commit after all.
     ///
-    /// The fence share-locks the step and then its run ([`StepLock::Share`], MOD-77 plan D1). The
-    /// inserts only key-share the step.
+    /// The fence key-share-locks the step and then share-locks its run ([`StepLock::KeyShare`],
+    /// MOD-77 plan D1, review L1): the lock the inserts' foreign keys take on the step anyway.
     ///
     /// # Errors
     ///
@@ -5331,7 +5341,7 @@ impl WriteStore for PgStore {
         commits: &[RunStepCommit],
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        step_fence(&mut tx, step, fence, StepLock::Share).await?;
+        step_fence(&mut tx, step, fence, StepLock::KeyShare).await?;
 
         for row in commits {
             if row.run_step_id != step {

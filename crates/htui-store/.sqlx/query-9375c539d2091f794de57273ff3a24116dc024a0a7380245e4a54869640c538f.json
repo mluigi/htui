@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT s.run_id, r.lease_owner AS \"lease_owner?\"\n             FROM run_step s JOIN run r ON r.id = s.run_id\n            WHERE s.id = $1\n              FOR SHARE OF s, r",
+  "query": "SELECT s.run_id, r.lease_owner AS \"lease_owner?\"\n             FROM run_step s JOIN run r ON r.id = s.run_id\n            WHERE s.id = $1\n              FOR KEY SHARE OF s FOR SHARE OF r",
   "describe": {
     "columns": [
       {
@@ -36,5 +36,5 @@
       true
     ]
   },
-  "hash": "98faa4f04ac48f6da55f0f18d7163194000c23d9b69d150a9a7646681730c01f"
+  "hash": "9375c539d2091f794de57273ff3a24116dc024a0a7380245e4a54869640c538f"
 }
