@@ -310,10 +310,10 @@ impl Scrubber for MinimalScrubber {
 /// `is_match` is the cheap gate (clean leaves dominate); only a hit pays for `matches`, whose
 /// indices come back in ascending order, so the first one is the first rule in table order.
 fn residue_rule(text: &str) -> Option<&'static str> {
-    if PATTERNS.is_match(text) {
-        if let Some(index) = PATTERNS.matches(text).iter().next() {
-            return Some(PATTERN_RULES[index].0);
-        }
+    if PATTERNS.is_match(text)
+        && let Some(index) = PATTERNS.matches(text).iter().next()
+    {
+        return Some(PATTERN_RULES[index].0);
     }
     text.contains(PEM_MARKER).then_some(PEM_RULE)
 }
