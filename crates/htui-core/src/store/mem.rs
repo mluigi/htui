@@ -1398,6 +1398,42 @@ impl State {
         rows
     }
 
+    /// MOD-69 plan D2: the scope's candidates, grouped and sorted by `WaitingCandidate::assemble`.
+    fn waiting_candidates(&self, scope: &Scope) -> Vec<WaitingCandidate> {
+        let parked: BTreeSet<ItemId> = self
+            .runs
+            .values()
+            .filter(|run| run.status == RunStatus::AwaitingApproval)
+            .filter_map(|run| run.item_id)
+            .collect();
+        let items: Vec<Item> = self
+            .items
+            .values()
+            .filter(|item| scope.contains(item.project_id))
+            .filter(|item| {
+                matches!(item.status, Status::Blocked | Status::AwaitingApproval)
+                    || parked.contains(&item.id)
+            })
+            .cloned()
+            .collect();
+        let wanted: BTreeSet<ItemId> = items.iter().map(|item| item.id).collect();
+        let runs: Vec<Run> = self
+            .runs
+            .values()
+            .filter(|run| run.status.is_active())
+            .filter(|run| run.item_id.is_some_and(|item| wanted.contains(&item)))
+            .cloned()
+            .collect();
+        let owners: BTreeSet<RunId> = runs.iter().map(|run| run.id).collect();
+        let steps: Vec<RunStep> = self
+            .steps
+            .values()
+            .filter(|step| owners.contains(&step.run_id))
+            .cloned()
+            .collect();
+        WaitingCandidate::assemble(scope, items, runs, steps)
+    }
+
     /// Mints an item: counter upsert, key assembly and revision 1, all in one lock (§7.1, §4.1).
     fn mint(&mut self, new: NewItem, now: DateTime<Utc>) -> Result<Item> {
         let kind = self.kinds.get(&new.kind_id).ok_or_else(|| {
@@ -6356,6 +6392,42 @@ impl State {
         }
     }
 
+    /// MOD-69 plan D4: `relay_view`'s predicate over the scope's item runs, joined to the item and
+    /// the step.
+    fn open_permissions(&self, scope: &Scope, now: DateTime<Utc>) -> Vec<WaitingPermission> {
+        let mut rows: Vec<WaitingPermission> = self
+            .permissions
+            .values()
+            .filter(|p| {
+                p.row.status == PermissionStatus::Pending
+                    && self.live_owner(p.row.run_id, now) == Some(p.owner)
+            })
+            .filter_map(|p| {
+                let run = self.runs.get(&p.row.run_id)?;
+                let item = self.items.get(&run.item_id?)?;
+                if !scope.contains(item.project_id) {
+                    return None;
+                }
+                let step = self.steps.get(&p.row.run_step_id)?;
+                Some(WaitingPermission {
+                    item: item.id,
+                    project: item.project_id,
+                    item_key: item.key.clone(),
+                    key_prefix: item.key_prefix.clone(),
+                    key_number: item.key_number,
+                    run_queued_at: run.queued_at,
+                    step_position: step.position,
+                    step_attempt: step.attempt,
+                    step_fanout_index: step.fanout_index,
+                    phase_name: step.phase_name.clone(),
+                    permission: p.row.clone(),
+                })
+            })
+            .collect();
+        WaitingPermission::sort_canonical(&mut rows);
+        rows
+    }
+
     fn request_cancel(
         &mut self,
         run: RunId,
@@ -6567,8 +6639,8 @@ impl ReadStore for MemStore {
         Ok(self.read(|state| state.tool_call_counts(item)))
     }
 
-    async fn waiting_candidates(&self, _scope: &Scope) -> Result<Vec<WaitingCandidate>> {
-        todo!("MOD-69 T1")
+    async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        Ok(self.read(|state| state.waiting_candidates(scope)))
     }
 }
 
@@ -7374,8 +7446,9 @@ impl WriteStore for MemStore {
         self.write(|state| state.answer_permission(id, option_id, user, box_id, now))
     }
 
-    async fn open_permissions(&self, _scope: &Scope) -> Result<Vec<WaitingPermission>> {
-        todo!("MOD-69 T1")
+    async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {
+        let now = self.now();
+        Ok(self.read(|state| state.open_permissions(scope, now)))
     }
 }
 
