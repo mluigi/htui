@@ -231,7 +231,8 @@ in [`docs/htui-mcp.md`](htui-mcp.md).
   resolves the worker's own binary, so this happens off Linux only, when that binary has no
   absolute path. The socket is bound at the first session, not at start: a socket directory that
   cannot be created or is not private leaves the worker running and fails each step with
-  `htui's MCP listener could not start: …`. Under the systemd unit, check that `/tmp` is writable.
+  `agent spawn failed: htui's MCP listener could not start: …`. Under the systemd unit, check that
+  `/tmp` is writable.
 - **`search_concepts`** is offered only when the keyring held a Qdrant URL at start (see
   [The concepts index](#the-concepts-index)), so a provisioned worker never offers it.
 - **`command_run`** runs on this box, as the worker's user and with the worker's environment, in

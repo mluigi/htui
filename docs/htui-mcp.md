@@ -57,7 +57,7 @@ Creating the host only resolves htui's own binary, so it fails only off Linux, w
 has no absolute path; on Linux it never fails. The [socket](#the-socket) is bound later, at the
 first session: a socket directory that cannot be created or is not private does not stop the TUI
 or the worker from starting, and instead fails each step with
-[`htui's MCP listener could not start: …`](#troubleshooting).
+[`agent spawn failed: htui's MCP listener could not start: …`](#troubleshooting).
 
 ## The tools
 
@@ -340,7 +340,8 @@ call is recorded once, by its answer.
 Before MOD-11 every `claude-cli` candidate was skipped there (`missing_capability:
 inline_approval`). An engine with a tool host now admits it, because the prompt tool asks inline.
 If such a session nevertheless starts without the prompt tool, the step fails at once with
-`missing_capability: inline_approval — a gated CLI step needs htui's permission_prompt tool`.
+`agent spawn failed: missing_capability: inline_approval — a gated CLI step needs htui's
+permission_prompt tool` (unlike the selection-time skip above, it carries the spawn prefix).
 
 ## Personas can hide htui's tools
 
@@ -405,12 +406,13 @@ keep the server. Look at the agent's own MCP log or status (Claude Code reports 
 - The TUI logged "htui's MCP tools are not hosted this session" at start.
 - A [persona](#personas-can-hide-htuis-tools) hides the tools.
 
-**A step fails with `htui's tools cannot be hosted offline: no store to write to`.** The TUI had
+**A step fails with `agent spawn failed: htui's tools cannot be hosted offline: no store to write
+to`.** The TUI had
 no database connection when the session started. Reconnect, then retry.
 
-**A step fails with `htui's MCP listener could not start: …`.** The socket directory could not be
-created or is not private: check that `$XDG_RUNTIME_DIR` (or the temporary directory) is writable
-and yours.
+**A step fails with `agent spawn failed: htui's MCP listener could not start: …`.** The socket
+directory could not be created or is not private: check that `$XDG_RUNTIME_DIR` (or the temporary
+directory) is writable and yours.
 
 **`session ended`.** The call came after its session ended: the step settled or was cancelled,
 the chat ended, or htui quit. Nothing was written.
