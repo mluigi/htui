@@ -802,32 +802,72 @@ mod shell_tests {
                 .is_err(),
             "still running when dropped"
         );
-        let started = std::time::Instant::now();
-        while std::process::Command::new("pgrep")
-            .args(["-f", PATTERN])
-            .output()
-            .is_ok_and(|out| out.status.success())
-        {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "the group outlived the dropped future"
-            );
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
+        until_gone(PATTERN, "the group outlived the dropped future").await;
     }
 
-    /// Polls until no process matches `pattern`, or fails after five seconds.
+    /// Polls until no process matches `pattern`, or fails after five seconds. A host without
+    /// `pgrep` fails the check rather than passing it vacuously (R1 ADV-1).
     #[cfg(unix)]
     async fn until_gone(pattern: &str, why: &str) {
         let started = std::time::Instant::now();
         while std::process::Command::new("pgrep")
             .args(["-f", pattern])
             .output()
-            .is_ok_and(|out| out.status.success())
+            .expect("`pgrep` runs: without it this check would pass vacuously")
+            .status
+            .success()
         {
             assert!(started.elapsed() < Duration::from_secs(5), "{why}");
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Whether `pid` is a live process; a zombie (killed, not yet reaped by its new parent) is
+    /// not. Linux reads `/proc/<pid>/stat`; elsewhere `kill -0`, which must be spawnable.
+    #[cfg(unix)]
+    fn pid_alive(pid: u32) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            assert!(
+                std::path::Path::new("/proc/self/stat").exists(),
+                "`/proc` is mounted: without it this check would pass vacuously"
+            );
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+                stat.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.trim_start().chars().next())
+                    .is_some_and(|state| !matches!(state, 'Z' | 'X'))
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            std::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .stderr(std::process::Stdio::null())
+                .status()
+                .expect("`kill` runs: without it this check would pass vacuously")
+                .success()
+        }
+    }
+
+    /// Polls until `pid` is no longer a live process, or fails after five seconds.
+    #[cfg(unix)]
+    async fn until_pid_gone(pid: u32, why: &str) {
+        let started = std::time::Instant::now();
+        while pid_alive(pid) {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "{why}: pid {pid}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The liveness probe itself: this process is alive, a pid past `pid_max` is not.
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_tells_a_live_pid_from_a_gone_one() {
+        assert!(pid_alive(std::process::id()));
+        assert!(!pid_alive(u32::MAX >> 1));
     }
 
     /// MOD-11 R1 M1: a background child that inherited stdout does not hold the call until the
@@ -877,6 +917,7 @@ mod shell_tests {
             .parse()
             .expect("the shell printed the pid");
         assert_ne!(pid, 0);
+        until_pid_gone(pid, "the redirected background child outlived the call").await;
         until_gone(PATTERN, "the redirected background child outlived the call").await;
     }
 
