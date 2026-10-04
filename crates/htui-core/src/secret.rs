@@ -8,7 +8,10 @@
 //! **No type here prints a secret.** `ResolvedSecrets` and `MachineIdentity` have hand-written
 //! `Debug`s, and no `SecretError` variant carries a value, a client secret or a token.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
 
 /// Which secrets a project reads: an Infisical project, environment slug and folder path (D3).
 /// Stored in `project.secret_scope` as compact JSON (`to_column`); M4 writes it, M3 reads it.
@@ -111,6 +114,117 @@ impl SecretScope {
     pub fn path(&self) -> &str {
         &self.path
     }
+}
+
+/// A resolved `key → value` map (D3). Lends `&BTreeMap<String, String>` to
+/// `MinimalScrubber::from_resolved` and `SessionSpec.env` (M3). Its `Debug` prints key names only,
+/// and dropping it zeroizes every value. Not `Clone`, `Serialize` or `Display`.
+///
+/// M3 note: `from_resolved` and `SessionSpec.env` take unzeroized copies; the zeroize covers this
+/// wrapper only.
+pub struct ResolvedSecrets {
+    map: BTreeMap<String, String>,
+}
+
+impl ResolvedSecrets {
+    /// Wraps an already validated map (providers call this after their own validation).
+    #[must_use]
+    pub fn new(map: BTreeMap<String, String>) -> Self {
+        Self { map }
+    }
+
+    /// The map, for `from_resolved` and `SessionSpec.env`.
+    #[must_use]
+    pub fn as_map(&self) -> &BTreeMap<String, String> {
+        &self.map
+    }
+
+    /// The key names, sorted (map order).
+    #[must_use]
+    pub fn keys(&self) -> Vec<String> {
+        self.map.keys().cloned().collect()
+    }
+
+    /// How many keys.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    /// Whether there are none.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+}
+
+impl core::fmt::Debug for ResolvedSecrets {
+    /// `ResolvedSecrets { keys: ["A", "B"] }`: names only.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ResolvedSecrets")
+            .field("keys", &self.map.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl Drop for ResolvedSecrets {
+    fn drop(&mut self) {
+        for value in self.map.values_mut() {
+            value.zeroize();
+        }
+    }
+}
+
+/// An Infisical Universal Auth machine identity (D3). Both halves are held wiped-on-drop.
+/// `Debug` is hand-written and never prints the secret; there is no `Display`, `Serialize`,
+/// `Clone` or `PartialEq`.
+pub struct MachineIdentity {
+    client_id: Zeroizing<String>,
+    client_secret: Zeroizing<String>,
+}
+
+impl MachineIdentity {
+    /// Wraps both halves at once. No validation here: blank halves are refused by the provider's
+    /// constructor (`Config`) and read as absent by the keyring (`htui-store`'s `Slot::get`).
+    #[must_use]
+    pub fn new(client_id: impl Into<String>, client_secret: impl Into<String>) -> Self {
+        Self {
+            client_id: Zeroizing::new(client_id.into()),
+            client_secret: Zeroizing::new(client_secret.into()),
+        }
+    }
+
+    /// The client ID. Not secret (it is shown in `Debug`).
+    #[must_use]
+    pub fn client_id(&self) -> &str {
+        &self.client_id
+    }
+
+    /// The client secret. **Secret**: for the login body and the keyring write only; never log,
+    /// format or compare it in an assert message.
+    #[must_use]
+    pub fn client_secret(&self) -> &str {
+        &self.client_secret
+    }
+}
+
+impl core::fmt::Debug for MachineIdentity {
+    /// `MachineIdentity { client_id: "…", client_secret: "<redacted>" }`.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("MachineIdentity")
+            .field("client_id", &self.client_id.as_str())
+            .field("client_secret", &"<redacted>")
+            .finish()
+    }
+}
+
+/// What `SecretProvider::health` reports. No token and no secret.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderHealth {
+    /// The normalised base URL the provider talks to.
+    pub base_url: String,
+    /// Whether the server's unauthenticated status endpoint answered 2xx.
+    pub server_ok: bool,
 }
 
 /// Why a secret-provider call failed (D4). **No variant ever carries a secret value, the client
@@ -311,6 +425,76 @@ mod tests {
         assert!(
             sentence.starts_with("the secret scope is not valid: "),
             "unexpected sentence: {sentence}"
+        );
+    }
+
+    #[test]
+    fn resolved_secrets_debug_prints_keys_only() {
+        let resolved = ResolvedSecrets::new(BTreeMap::from([
+            ("A".to_owned(), "s3cret-a".to_owned()),
+            ("B".to_owned(), "s3cret-b".to_owned()),
+        ]));
+        let debug = format!("{resolved:?}");
+        assert!(
+            !debug.contains("s3cret-a") && !debug.contains("s3cret-b"),
+            "ResolvedSecrets' Debug prints a value"
+        );
+        assert!(
+            debug == r#"ResolvedSecrets { keys: ["A", "B"] }"#,
+            "ResolvedSecrets' Debug is not the key list"
+        );
+    }
+
+    #[test]
+    fn resolved_secrets_lends_the_map_and_sorted_keys() {
+        let mut input = BTreeMap::new();
+        input.insert("B".to_owned(), "vb".to_owned());
+        input.insert("A".to_owned(), "va".to_owned());
+        let resolved = ResolvedSecrets::new(input.clone());
+        assert!(resolved.as_map() == &input, "as_map differs from the input");
+        assert_eq!(resolved.keys(), vec!["A".to_owned(), "B".to_owned()]);
+        assert_eq!(resolved.len(), 2);
+        assert!(!resolved.is_empty());
+
+        let empty = ResolvedSecrets::new(BTreeMap::new());
+        assert_eq!(empty.len(), 0);
+        assert!(empty.is_empty());
+        assert!(empty.keys().is_empty());
+    }
+
+    #[test]
+    fn machine_identity_debug_redacts_the_secret() {
+        let identity = MachineIdentity::new("cid-1", "csecret-xyz");
+        let debug = format!("{identity:?}");
+        assert!(
+            debug.contains("cid-1"),
+            "MachineIdentity's Debug hides the client ID"
+        );
+        assert!(
+            debug.contains("<redacted>"),
+            "MachineIdentity's Debug has no redaction marker"
+        );
+        assert!(
+            !debug.contains("csecret-xyz"),
+            "MachineIdentity's Debug prints the client secret"
+        );
+        assert_eq!(identity.client_id(), "cid-1");
+        assert!(
+            identity.client_secret() == "csecret-xyz",
+            "client_secret() does not return the secret half"
+        );
+    }
+
+    #[test]
+    fn provider_health_is_plain_data() {
+        let health = ProviderHealth {
+            base_url: "https://infisical.example".to_owned(),
+            server_ok: true,
+        };
+        assert_eq!(health.clone(), health);
+        assert_eq!(
+            format!("{health:?}"),
+            r#"ProviderHealth { base_url: "https://infisical.example", server_ok: true }"#
         );
     }
 }
