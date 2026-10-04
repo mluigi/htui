@@ -14,7 +14,7 @@ use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
 use htui_orch::status::{group_at, resumable};
 use htui_orch::{
-    Command, CommandOutcome, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
+    Command, CommandOutcome, EngineError, GateAnswer, Rest, SessionKey, SessionSink, UnblockCase,
     accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled,
     retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
@@ -341,8 +341,6 @@ fn verdicts(
         steps: BTreeMap::new(),
     };
 
-    let mut active: Vec<(Run, bool)> = Vec::new();
-    let mut unblock_refusal = None;
     for (run, steps) in runs {
         // D212: while a step of this run is chatted with, the verbs that would move the run grey
         // with the refusal the worker answers them with, ahead of the engine's own guards.
@@ -360,18 +358,12 @@ fn verdicts(
             Ok(snapshot) => snapshot,
             Err(err) => {
                 let refusal = err.to_string();
-                if run.status.is_active() {
-                    unblock_refusal.get_or_insert_with(|| refusal.clone());
-                }
                 for step in steps {
                     actions.steps.insert(step.id, refused_step(&refusal));
                 }
                 continue;
             }
         };
-        if run.status.is_active() {
-            active.push((run.clone(), resumable(&cursor(&snapshot, steps), steps)));
-        }
         for step in steps {
             let phase = match phase_at(run.id, &snapshot, step.position) {
                 Ok(phase) => phase,
@@ -436,11 +428,27 @@ fn verdicts(
             );
         }
     }
-    actions.unblock = match unblock_refusal {
-        Some(refusal) => Err(refusal),
-        None => unblock_enabled(item, &active).map(drop).map_err(sentence),
-    };
+    actions.unblock = unblock_case(item, runs).map(drop);
     actions
+}
+
+/// `u`'s case for `item` over its runs (MOD-69 blueprint E2): the one place both the Runs pane's
+/// verdict ([`verdicts`], `.map(drop)`) and the waiting list read it, so the two cannot disagree on
+/// whether, or how, an item is unblocked.
+///
+/// Every active run must decode its snapshot; the first that does not refuses with its sentence,
+/// as [`verdicts`] always has. `runs` is in `ReadStore::runs` order (newest first), which
+/// `unblock_enabled` is sensitive to (blueprint H-1).
+fn unblock_case(item: &Item, runs: &[(Run, Vec<RunStep>)]) -> Result<UnblockCase, String> {
+    let mut active = Vec::new();
+    for (run, steps) in runs {
+        if !run.status.is_active() {
+            continue;
+        }
+        let snapshot = snapshot_of(run).map_err(|err| err.to_string())?;
+        active.push((run.clone(), resumable(&cursor(&snapshot, steps), steps)));
+    }
+    unblock_enabled(item, &active).map_err(|err| err.to_string())
 }
 
 /// Blueprint D212 (review H3): `Ok` unless a chat of this process is live on one of `steps` — the
