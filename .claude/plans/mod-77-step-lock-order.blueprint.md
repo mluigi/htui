@@ -605,7 +605,8 @@ the `HANDOFF.md` line per `lifecycle.md` P2. Then `bash .claude/skills/handoff-r
    one commit, not their content.
 2. **The CTE must stay materialized.** Postgres does not inline a CTE carrying row marks: probed on the sandbox PG
    16, `EXPLAIN` shows `CTE locked -> LockRows -> Nested Loop` beneath `Update`. Do **not** add `NOT MATERIALIZED`.
-   It would be refused or would fold the locks into the `UPDATE`'s own row marks, and the order guarantee would go.
+   Postgres keeps a CTE with row marks materialized even then, so the hint would do nothing but suggest that inlining
+   is safe. The order guarantee rests on the CTE's own `LockRows` step.
 3. **Clause order.** `FOR NO KEY UPDATE OF s FOR SHARE OF r` and `FOR SHARE OF s, r`: `s` first, always. The D6 tests
    catch a reversal. `rustfmt` doesn't touch string contents, but a "tidy-up" that alphabetises `OF r, s` silently
    restores run-first.
