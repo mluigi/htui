@@ -196,7 +196,7 @@ async fn step_exists(conn: &mut PgConnection, step: StepId) -> Result<()> {
 
 /// MOD-77 plan D1: the lock [`step_fence`] takes on the step's row. The run's is always
 /// `FOR SHARE`, and is always taken **after** the step's.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StepLock {
     /// `FOR SHARE OF s, r`: the caller reads the step and inserts rows whose foreign key names
     /// it, and never updates it (`record_commits`, [`fenced_miss`]).
@@ -2012,6 +2012,8 @@ impl WriteStore for PgStore {
         .await
         .map_err(map_sqlx)?
         .rows_affected();
+        // Unreachable under the up-front step lock (a held row cannot be deleted); kept as a
+        // defensive check.
         if closed_step == 0 {
             return Err(StoreError::NotFound {
                 entity: "run_step",
