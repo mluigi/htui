@@ -537,11 +537,14 @@ pub struct WaitingRow {
 /// The waiting-on-you list and the top bar's two counts (MOD-69 plan D5, D6).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct WaitingView {
-    /// Active runs in scope that own no row.
+    /// Active runs in scope that own no row. Chat runs count too (review L6): `active_runs`
+    /// counts every active run of the scope, and a chat run never owns a row.
     pub working: usize,
     /// Every row, in plan D9's order.
     pub rows: Vec<WaitingRow>,
     /// `false` offline: permission requests are not mirrored, so none are listed (plan D4).
+    /// Offline every row is read-only too (review L3): `Enter` still reveals it, and the Runs
+    /// pane refuses the answer, as every write is refused offline.
     pub permissions_known: bool,
 }
 
@@ -650,6 +653,8 @@ pub fn waiting(
             }
             // A slot waits on a selection exactly when the pane enables `select` on one of its
             // candidates; a run whose snapshot does not decode has every `select` refused.
+            // Review L2: read with no live chat, by design. A chat on the run greys the pane's
+            // `select` only while it lasts, and the slot still waits on a person meanwhile.
             for (position, attempt) in selectable_slots(run, steps) {
                 let failed_judge = judge_at(steps, position, attempt)
                     .filter(|judge| judge.status == StepStatus::Failed)

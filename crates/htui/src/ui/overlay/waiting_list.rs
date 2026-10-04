@@ -40,8 +40,9 @@ const EMPTY: &str = "nothing is waiting on you";
 /// What the list says before the first `Waiting` reply (blueprint A-6).
 const READING: &str = "reading the store";
 
-/// Offline, permission requests are not mirrored, so none can be listed (plan D4).
-const OFFLINE: &str = "permissions unavailable offline";
+/// Offline, permission requests are not mirrored, so none can be listed (plan D4), and every row
+/// is read-only: the Runs pane refuses the answer (review L3).
+const OFFLINE: &str = "permissions unavailable (read-only offline)";
 
 /// The step column of a row with no step: the Runs pane's `PENDING` dash.
 const NO_STEP: &str = "\u{2014}";
