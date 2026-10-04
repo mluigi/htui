@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
-use regex::RegexSet;
+use regex::{Regex, RegexSet};
 use serde_json::Value;
 
 /// What every masked occurrence is replaced with.
@@ -40,15 +40,13 @@ const PATTERN_RULES: &[(&str, &str)] = &[
     ("slack_bot_token", r"xoxb-[A-Za-z0-9-]{10,}"),
     ("slack_user_token", r"xoxp-[A-Za-z0-9-]{10,}"),
     ("google_api_key", r"AIza[0-9A-Za-z_-]{35}"),
-    // The hyphen-free legacy form keeps kebab-case prose (`sk-learn-preprocessing-pipeline-v2`)
-    // from failing closed, and leaves every `sk-ant-` key to `anthropic_api_key`. The named
-    // hyphenated segments keep the `sk-` keys the bare prefix used to refuse under this name:
-    // OpenAI project, service-account, admin and user-scoped (`None`) keys, OpenRouter
-    // (`or-v1`) and Langfuse secret keys (`lf`).
-    (
-        "openai_api_key",
-        r"sk-(?:(?:proj|svcacct|admin|None|or-v[0-9]+|lf)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})",
-    ),
+    // A wide gate only: any `sk-` token with a 20+ character URL-safe body. The set match alone
+    // never refuses; [`residue_rule`] confirms it with [`openai_key_in`], which refuses on
+    // [`OPENAI_STRICT`] or on any gated body that is neither an `ant-` body (left to
+    // `anthropic_api_key`) nor word-shaped prose ([`SK_PROSE`], e.g.
+    // `sk-learn-preprocessing-pipeline-v2`). So LiteLLM virtual keys (`token_urlsafe` bodies)
+    // and `sk-<uuid4>` keys stay refused under this name, as the bare prefix refused them.
+    ("openai_api_key", r"sk-[A-Za-z0-9_-]{20,}"),
     // New in MOD-10 (D2).
     ("gitlab_pat", r"glpat-[A-Za-z0-9_-]{20,}"),
     ("slack_token", r"xox[ars]-[A-Za-z0-9-]{10,}"),
@@ -81,6 +79,43 @@ static PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
     )
     .expect("the pattern rules are literals and compile")
 });
+
+/// Index of `openai_api_key` in [`PATTERN_RULES`]: the one gate that needs [`openai_key_in`].
+const OPENAI_RULE: usize = 7;
+
+/// `sk-` keys that always refuse: the hyphen-free legacy form, plus the named hyphenated vendor
+/// segments the bare prefix used to refuse under `openai_api_key` (OpenAI project,
+/// service-account, admin and user-scoped `None` keys, OpenRouter `or-v1`, Langfuse `lf`).
+static OPENAI_STRICT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"{TOKEN_START}sk-(?:(?:proj|svcacct|admin|None|or-v[0-9]+|lf)-[A-Za-z0-9_-]{{20,}}|[A-Za-z0-9]{{20,}})"
+    ))
+    .expect("a literal pattern compiles")
+});
+
+/// Every `sk-` token the `openai_api_key` gate admits, with its body captured.
+static SK_CANDIDATE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(r"{TOKEN_START}sk-([A-Za-z0-9_-]{{20,}})"))
+        .expect("a literal pattern compiles")
+});
+
+/// An `sk-` body that reads as prose: `-`/`_`-separated segments, each either words (an optional
+/// capital, then lowercase, repeated: `learn`, `StandardScaler`) with optional trailing digits
+/// (`py311`, `x86`), or digits alone (`2024`). Random key bodies almost never fit.
+static SK_PROSE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^(?:(?:[A-Z]?[a-z]+)+[0-9]*|[0-9]+)(?:[-_](?:(?:[A-Z]?[a-z]+)+[0-9]*|[0-9]+))*$")
+        .expect("a literal pattern compiles")
+});
+
+/// Whether `text` holds an `openai_api_key`: a strict hit, or a gated `sk-` body that is neither
+/// an `ant-` body nor prose.
+fn openai_key_in(text: &str) -> bool {
+    OPENAI_STRICT.is_match(text)
+        || SK_CANDIDATE.captures_iter(text).any(|caps| {
+            let body = &caps[1];
+            !body.starts_with("ant-") && !SK_PROSE.is_match(body)
+        })
+}
 
 /// Rule name for a PEM private key block.
 const PEM_RULE: &str = "private_key_pem";
@@ -311,10 +346,14 @@ impl Scrubber for MinimalScrubber {
 /// The rule a string still matches after masking, if any.
 ///
 /// `is_match` is the cheap gate (clean leaves dominate); only a hit pays for `matches`, whose
-/// indices come back in ascending order, so the first one is the first rule in table order.
+/// indices come back in ascending order, so the first one that holds is the first rule in table
+/// order. Every set hit holds except `openai_api_key`, a wide gate confirmed by [`openai_key_in`].
 fn residue_rule(text: &str) -> Option<&'static str> {
     if PATTERNS.is_match(text)
-        && let Some(index) = PATTERNS.matches(text).iter().next()
+        && let Some(index) = PATTERNS
+            .matches(text)
+            .iter()
+            .find(|&index| index != OPENAI_RULE || openai_key_in(text))
     {
         return Some(PATTERN_RULES[index].0);
     }
@@ -633,10 +672,15 @@ mod tests {
     #[test]
     fn every_pattern_rule_compiles_alone() {
         for (rule, body) in PATTERN_RULES {
-            regex::Regex::new(&format!("{TOKEN_START}(?:{body})"))
+            Regex::new(&format!("{TOKEN_START}(?:{body})"))
                 .unwrap_or_else(|err| panic!("rule {rule} does not compile: {err}"));
         }
         assert_eq!(PATTERNS.len(), PATTERN_RULES.len());
+    }
+
+    #[test]
+    fn the_openai_rule_index_names_the_openai_rule() {
+        assert_eq!(PATTERN_RULES[OPENAI_RULE].0, "openai_api_key");
     }
 
     #[test]
@@ -727,8 +771,9 @@ mod tests {
     }
 
     /// `sk-` keys whose body opens with a short hyphenated vendor segment (OpenRouter, OpenAI
-    /// user-scoped, Langfuse). The bare-prefix rule refused all three as `openai_api_key`; the
-    /// whole-token rule must keep doing so, under the same name.
+    /// user-scoped, Langfuse), plus a LiteLLM virtual key and an `sk-<uuid4>` key. The bare-prefix
+    /// rule refused all of them as `openai_api_key`; the whole-token rule must keep doing so, under
+    /// the same name.
     #[test]
     fn hyphenated_vendor_sk_keys_are_still_refused_as_openai() {
         let scrubber = rules_only();
@@ -736,6 +781,9 @@ mod tests {
             "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "sk-None-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST0123",
             "sk-lf-1234abcd-12ab-34cd-56ef-1234567890ab",
+            // A LiteLLM virtual key (`sk-` + `secrets.token_urlsafe(16)`) and an `sk-<uuid4>` key.
+            "sk-Ab3_xY9-kLmN0pQrStUvWx",
+            "sk-1b4e28ba-2fa1-11d2-883f-0016d3cca427",
         ] {
             for text in [
                 key.to_owned(),
@@ -751,6 +799,61 @@ mod tests {
         }
     }
 
+    /// LiteLLM virtual keys: `sk-` + Python `secrets.token_urlsafe(16)`, 22 URL-safe base64
+    /// characters. Generated once with that call, so roughly half carry a `-` or `_` the
+    /// hyphen-free legacy form cannot see.
+    const LITELLM_KEYS: &[&str] = &[
+        "sk-azlCm5Hgj1tql0YuyTTtEQ",
+        "sk-WboMMTvsTp7-LGJtbJppkQ",
+        "sk-UVDOuCJwC1Y_9hZPjvyYKQ",
+        "sk-AdDm9_ti3KL1WuYgGJ_VmQ",
+        "sk-qQ4ZHehxkVBhRl_7-o05Hw",
+        "sk-e2wyYk2B4jNkKm31wSjE7A",
+        "sk-FsRN_fUN_6yeQLX5C0tDww",
+        "sk-CHEPrtIa8Shs-lWbzuwlGQ",
+        "sk-IyDFVTtNpKytzcit9Ui55g",
+        "sk-ZOpihlALQ0-poFS2uaF8Yw",
+        "sk-fXIVi4rxZCClaoYQnKmMuQ",
+        "sk-gdvxQAgQEK0AJA516oyPeA",
+        "sk-urdnfAKhq8YQqa4XSaLELQ",
+        "sk-l7yOopBiQy5GX9d4kUbGwQ",
+        "sk-hBMqJXpQm6ajCebTVgKiig",
+        "sk-65HN9oWR3PwhZaiQEFr-BQ",
+        "sk-9LD212pxNuHTETFZtnDusA",
+        "sk-Eh-us4w8J9PYjRg57KtmGw",
+        "sk-1lN5jOPBWIfdHa25xKwYcA",
+        "sk-fq0y51fvCwkU0yVyOX-J9g",
+        "sk-kf2SOIYvkGyTtEFrQupbPg",
+        "sk-tuDCyKvJm8FaNVXfhZsunQ",
+        "sk-C875ktqnml9WsKhUrfizQg",
+        "sk-tTVV1vcFFuo4ATYCk5ZqRQ",
+        "sk-g-XVa2U_d1gX-r-FqLdLlw",
+        "sk-02UWGoUEKjGg3AnRgxjcHA",
+        "sk-T1yhtfSyC760PRmmLBR1nA",
+        "sk-xhJyi-PbETXQ90WfUptfPw",
+        "sk-LjvBnymJeIXRCphZC_0CVQ",
+        "sk-pTmPnZuhMgFCVZOfCnbZag",
+    ];
+
+    #[test]
+    fn litellm_virtual_keys_are_refused_as_openai() {
+        let scrubber = rules_only();
+        for key in LITELLM_KEYS {
+            for text in [
+                (*key).to_owned(),
+                format!("the key {key} here"),
+                format!("Authorization: Bearer {key}"),
+            ] {
+                let mut value = json!({ "t": text });
+                let err = scrubber
+                    .scrub(&mut value)
+                    .err()
+                    .unwrap_or_else(|| panic!("a LiteLLM key must refuse the write: {key}"));
+                assert_eq!(err.rule, "openai_api_key", "rule for {key}");
+            }
+        }
+    }
+
     #[test]
     fn prose_that_shares_a_prefix_is_not_a_credential() {
         let scrubber = rules_only();
@@ -761,6 +864,12 @@ mod tests {
             "sk-lf-config",
             "sk-or-v1-docs",
             "sk-None-yet",
+            "sk-learn-2024-release-notes-final",
+            "sk-learn-py311-wheels-linux",
+            "sk-learn_preprocessing_utils_v2",
+            "sk-learn-StandardScaler-notes",
+            "sk-learn-x86_64-manylinux2014",
+            "sk-ant-abcdefghijklm",
             "AKIA",
             "the AKIA prefix marks a long-term key",
             "subtask-x",

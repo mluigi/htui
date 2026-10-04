@@ -14,6 +14,11 @@
 -- anchored at a token start as in D1. Plain '...' literals only (standard_conforming_strings);
 -- an E'...' literal would need `\\.`.
 --
+-- openai_api_key mirrors scrub.rs `openai_key_in`: its row in scrub_audit_rules is the strict
+-- regex (always a hit), and scrub_audit_hits adds every token-start `sk-` body of 20+ URL-safe
+-- characters that neither starts `ant-` (anthropic_api_key's) nor reads as prose (SK_PROSE:
+-- `-`/`_`-separated segments of words with optional trailing digits, or digits alone).
+--
 -- Rows already stored passed today's bare-prefix rules, so a hit here is either a new rule's
 -- false positive or a credential the old rules missed. Both are worth knowing before the list is
 -- fixed. The last query counts the refusals the current rules already made, by rule.
@@ -65,23 +70,34 @@ CREATE TEMP VIEW scrub_audit_strings (src, row_key, s) AS
       CROSS JOIN LATERAL jsonb_object_keys(o) AS k
      WHERE jsonb_typeof(o) = 'object';
 
+-- One row per (rule, string) hit; openai_api_key is the strict regex OR a non-prose `sk-` body.
+CREATE TEMP VIEW scrub_audit_hits (rule, src, row_key) AS
+    SELECT r.rule, s.src, s.row_key
+      FROM scrub_audit_rules r
+      JOIN scrub_audit_strings s
+        ON s.s ~ ('(^|[^A-Za-z0-9_])' || r.re)
+        OR (r.rule = 'openai_api_key' AND EXISTS (
+               SELECT 1
+                 FROM regexp_matches(s.s, '(?:^|[^A-Za-z0-9_])sk-([A-Za-z0-9_-]{20,})', 'g') AS m
+                WHERE m[1] !~ '^ant-'
+                  AND m[1] !~ '^(?:(?:[A-Z]?[a-z]+)+[0-9]*|[0-9]+)(?:[-_](?:(?:[A-Z]?[a-z]+)+[0-9]*|[0-9]+))*$'));
+
 \echo '== 1. rows scanned per source'
 SELECT src, count(*) AS rows FROM scrub_audit_docs GROUP BY src ORDER BY src;
 
 \echo '== 2. candidate rule hits (rows = distinct rows with >= 1 hit; strings = matching values/keys)'
-SELECT r.rule, s.src,
-       count(DISTINCT s.row_key) AS rows,
-       count(*)                  AS strings
-  FROM scrub_audit_rules r
-  JOIN scrub_audit_strings s ON s.s ~ ('(^|[^A-Za-z0-9_])' || r.re)
- GROUP BY r.rule, s.src
- ORDER BY r.rule, s.src;
+SELECT rule, src,
+       count(DISTINCT row_key) AS rows,
+       count(*)                AS strings
+  FROM scrub_audit_hits
+ GROUP BY rule, src
+ ORDER BY rule, src;
 
 \echo '== 3. rules with no hit at all'
 SELECT r.rule
   FROM scrub_audit_rules r
  WHERE NOT EXISTS (
-       SELECT 1 FROM scrub_audit_strings s WHERE s.s ~ ('(^|[^A-Za-z0-9_])' || r.re))
+       SELECT 1 FROM scrub_audit_hits h WHERE h.rule = r.rule)
  ORDER BY r.rule;
 
 \echo '== 4. refusals the current rules already made (scrub_residue rows, by rule)'
