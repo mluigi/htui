@@ -1094,7 +1094,7 @@ fn run_lines(run: &RunSummary, cancel_requested: bool, theme: &Theme) -> Vec<Lin
     if cancel_requested {
         lines.push(Line::from(Span::styled(
             cells::fit(CANCEL_REQUESTED_LINE, PANE),
-            theme.accent,
+            theme.warning,
         )));
     }
     if let Some(failure) = &run.failure {
@@ -1220,7 +1220,7 @@ fn note_line(step: &RunStepSummary, theme: &Theme) -> Option<Line<'static>> {
     let note = step.gate_note.as_deref().filter(|note| !note.is_empty())?;
     Some(Line::from(vec![
         Span::raw(blank(INDENT)),
-        Span::styled(cells::fit(note, PANE - INDENT), theme.accent),
+        Span::styled(cells::fit(note, PANE - INDENT), theme.warning),
     ]))
 }
 
@@ -1277,7 +1277,7 @@ fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 
         Span::raw(blank(INDENT)),
         Span::styled(
             cells::fit(&format!("asks: {summary}"), PANE - INDENT),
-            theme.accent,
+            theme.warning,
         ),
     ]);
     let mut spans = cells::clip_spans(
@@ -1734,7 +1734,7 @@ impl RunsTab {
     fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
         if self.waiting.contains(&run.id) {
-            lines.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.accent));
+            lines.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.warning));
         }
         if let Some((_, step)) = self.entry_step() {
             lines.extend(note_line(step, theme));
@@ -1756,7 +1756,7 @@ impl RunsTab {
         for (at, run) in self.runs.iter().enumerate().skip(self.first_visible()) {
             let mut header = run_lines(run, self.cancel_requested(run.id), theme);
             if self.waiting.contains(&run.id) {
-                header.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.accent));
+                header.push(Line::styled(cells::fit(WAITING_LINE, PANE), theme.warning));
             }
             if cursor == Some(Entry::Run { run: at }) {
                 // A run with no step is its own entry (D198); the run grid has no cursor column,
@@ -2248,6 +2248,71 @@ mod tests {
             2 + 2 + 4 * 2 + 1,
             "only the parked step with a note grew"
         );
+    }
+
+    /// MOD-80 review M1: what waits on a person reads as a warning, not as focus: a pending
+    /// cancel, a parked step's reason, the `asks:` line and the waiting-for-the-walk line.
+    #[tokio::test]
+    async fn the_lines_that_need_a_person_are_warnings() {
+        let theme = Theme::default();
+        // The styled, non-blank spans of `line`.
+        let styles = |line: &Line<'static>| -> Vec<Style> {
+            line.spans
+                .iter()
+                .filter(|span| !span.content.trim().is_empty())
+                .map(|span| span.style)
+                .collect()
+        };
+        let run = feat_1_runs().await.remove(0);
+        let lines = run_lines(&run, true, &theme);
+        let cancel = lines
+            .iter()
+            .find(|line| text(line).trim() == CANCEL_REQUESTED_LINE)
+            .expect("a pending cancel has its line");
+        assert_eq!(styles(cancel), [theme.warning], "cancel requested");
+
+        let mut step = run.steps[0].clone();
+        step.status = StepStatus::AwaitingApproval;
+        step.gate_note = Some("needs a second look".to_owned());
+        let note = note_line(&step, &theme).expect("a parked step with a note has a line");
+        assert_eq!(styles(&note), [theme.warning], "the parked reason");
+
+        let pending = pending_on(
+            ids::RUN_1,
+            ids::STEP_PRD,
+            Some("execute: cargo test"),
+            two_options(),
+        );
+        let [asks, _] = permission_lines(&pending, &theme);
+        assert_eq!(styles(&asks), [theme.warning], "the asks: line");
+
+        let shell = Shell::new();
+        let (mut pane, _) = driven(&shell, true).await;
+        pane.on_reply(
+            &StoreReply::RunStream(RunFrame {
+                item: ids::HTUI_FEAT_1,
+                run: Some(ids::RUN_1),
+                kind: FrameKind::Waiting,
+            }),
+            &mut shell.ctx(),
+        );
+        let (listed, _) = pane.list_lines(&theme);
+        let waiting = listed
+            .iter()
+            .find(|line| text(line).trim() == WAITING_LINE)
+            .expect("the list shows the wait");
+        assert_eq!(waiting.style, theme.warning, "the list's waiting line");
+        let run = pane
+            .runs
+            .iter()
+            .find(|run| run.id == ids::RUN_1)
+            .expect("RUN_1 is listed");
+        let head = pane.flow_head(run, &theme);
+        let waiting = head
+            .iter()
+            .find(|line| text(line).trim() == WAITING_LINE)
+            .expect("the flow head shows the wait");
+        assert_eq!(waiting.style, theme.warning, "the flow head's waiting line");
     }
 
     /// R-3: the reason line is the pane's 43 columns whatever the note holds, cut with

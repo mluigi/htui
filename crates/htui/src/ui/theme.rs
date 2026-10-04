@@ -1,7 +1,7 @@
 //! The one place a colour is chosen.
 //!
 //! Views take the theme out of their [`Ctx`](crate::app::Ctx) instead of naming colours. Each
-//! role is one meaning (MOD-80 D1): `accent` is focus only, `key` keys, `running` work in
+//! role is one meaning (MOD-80 D1): `accent` is focus, `key` keys, `running` work in
 //! progress, `warning` what needs a person, `added` a diff's `+`, `active_tab` the strip entry
 //! you are on, `cursor` the text cursor, and `selected` a selected row, which
 //! [`Theme::select`] paints over every span (D2).
@@ -26,8 +26,9 @@ pub struct Theme {
     /// Block titles, group headers and the top bar's workspace: the terminal's own foreground,
     /// bold, so it reads on any profile (D3).
     pub title: Style,
-    /// Focus: the row an overlay or form is on, a focused form label, the composer prompt, the
-    /// Agents table highlight. Nothing else is cyan (D1).
+    /// Focus and selection: the row an overlay or form is on, a focused form label, the composer
+    /// prompt, the Agents table highlight, a list's cursor cell (D1). A few legacy uses (labels,
+    /// headers, data columns) remain and are tracked by a follow-up item.
     pub accent: Style,
     /// The selected row of a list. It replaces every cell's colours: a multi-span row goes
     /// through [`Theme::select`], so no span's own colour shows through (D2).
@@ -39,7 +40,8 @@ pub struct Theme {
     /// Something in progress: an `in_progress` item, a running run or step or graph node (D1).
     pub running: Style,
     /// Something that needs a person: `awaiting_approval`, a degraded store, the waiting
-    /// count (D1, D6).
+    /// count (D1, D6); in the Runs pane a pending cancel, a parked step's reason, the `asks:`
+    /// line and the waiting-for-the-walk line.
     pub warning: Style,
     /// A diff's `+` lines (D1).
     pub added: Style,
