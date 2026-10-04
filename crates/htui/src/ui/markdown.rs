@@ -3,9 +3,9 @@
 //! quote, text), soft-wrapped lines of a paragraph or list item are joined with one space, and the
 //! result is wrapped at the pane's width by [`cells::wrap_spans`](crate::ui::cells::wrap_spans), a
 //! list item's rows hanging under its text. Blank lines, markers, code and structural lines are
-//! kept as written; a hard break (two trailing spaces, or `\`) starts a new row. Inline code is
-//! drawn without its backticks in `theme.accent`, except in code and table rows. Emphasis, links
-//! and heading styles are not rendered (MOD-80, MOD-82).
+//! kept as written; a hard break (two trailing spaces, or `\` before a continuation line) starts
+//! a new row. Inline code is drawn without its backticks in `theme.accent`, except in code and
+//! table rows. Emphasis, links and heading styles are not rendered (MOD-80, MOD-82).
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -46,6 +46,9 @@ struct Open {
     at: usize,
     /// Its last line ended in a hard break: the next text starts a new segment.
     broken: bool,
+    /// The break is a trailing `\`, still on the last segment: a continuation line drops it, and
+    /// at the block's end it stays, as written (review LOW-1).
+    slash: bool,
 }
 
 /// `body` as drawn at `width` (0: before the first render, unwrapped), one `Line` per row.
@@ -120,6 +123,7 @@ fn blocks(body: &str) -> Vec<Block<'_>> {
             let mut item = Open {
                 at: out.len(),
                 broken: false,
+                slash: false,
             };
             out.push(Block::Item {
                 lead,
@@ -151,6 +155,7 @@ fn blocks(body: &str) -> Vec<Block<'_>> {
             Open {
                 at: out.len() - 1,
                 broken: false,
+                slash: false,
             }
         });
         add(&mut out, &mut joined, line);
@@ -160,16 +165,23 @@ fn blocks(body: &str) -> Vec<Block<'_>> {
 }
 
 /// `raw` onto the open block (D2.5): trimmed, joined to its last segment with one space, or a
-/// new segment after a hard break. A trailing `\` (dropped) or two spaces is a hard break.
+/// new segment after a hard break. A trailing `\` or two spaces is a hard break; the `\` is
+/// dropped only when a continuation line arrives, so on a block's last line it stays.
 fn add(blocks: &mut [Block<'_>], open: &mut Open, raw: &str) {
-    let (text, hard) = match raw.strip_suffix('\\') {
-        Some(head) => (head.trim(), true),
-        None => (raw.trim(), raw.ends_with("  ")),
-    };
+    let text = raw.trim();
+    let slash = raw.ends_with('\\');
+    let hard = slash || raw.ends_with("  ");
     let Some(Block::Paragraph(segments) | Block::Item { segments, .. }) = blocks.get_mut(open.at)
     else {
         return;
     };
+    if open.slash
+        && let Some(last) = segments.last_mut()
+    {
+        // `raw` continues the block: the `\` was a break, and goes with any space before it.
+        last.pop();
+        last.truncate(last.trim_end().len());
+    }
     match segments.last_mut() {
         Some(last) if !open.broken => {
             if !last.is_empty() && !text.is_empty() {
@@ -180,6 +192,7 @@ fn add(blocks: &mut [Block<'_>], open: &mut Open, raw: &str) {
         _ => segments.push(text.to_owned()),
     }
     open.broken = hard;
+    open.slash = slash;
 }
 
 /// The count of `line`'s leading spaces (a tab is not one).
@@ -228,10 +241,11 @@ fn closes(line: &str, ch: u8, n: usize) -> bool {
     m >= n && rest[m..].trim().is_empty()
 }
 
-/// `line` is a rule or setext underline: up to 3 spaces, then 3 or more of one of `-*_=`, with
-/// spaces and tabs between.
+/// `line` is a rule or setext underline: indented under 4 cells, then 3 or more of one of `-*_=`,
+/// with spaces and tabs between. A tab indents as it is drawn, so `\t---` is no rule, as
+/// `    ---` is not (review LOW-3).
 fn is_rule(line: &str) -> bool {
-    if indent(line) > 3 {
+    if indented(line) {
         return false;
     }
     let mut marks = line.chars().filter(|c| *c != ' ' && *c != '\t');
@@ -560,6 +574,21 @@ mod tests {
     }
 
     #[test]
+    fn an_indented_rule_is_code_or_text() {
+        // LOW-3: a tab indents as 4 spaces do, so neither is a rule.
+        check(&[
+            ("\t---", 80, &["    ---"]),
+            (" \t---", 80, &["    ---"]),
+            ("    ---", 80, &["    ---"]),
+            ("a\n\t---", 80, &["a ---"]),
+            ("a\n    ---", 80, &["a ---"]),
+            ("- a\n\t---", 80, &["- a ---"]),
+            // Up to 3 spaces it still is.
+            ("a\n   ---\nb", 80, &["a", "   ---", "b"]),
+        ]);
+    }
+
+    #[test]
     fn a_fenced_block_is_verbatim() {
         check(&[
             (
@@ -605,6 +634,23 @@ mod tests {
             ("- one\\\ntwo", 80, &["- one", "  two"]),
             // A break at a block's end adds nothing.
             ("one  \n\ntwo", 80, &["one", "", "two"]),
+        ]);
+    }
+
+    #[test]
+    fn a_trailing_backslash_at_a_blocks_end_stays() {
+        // LOW-1: `\` is a hard break only before a continuation line of its block.
+        check(&[
+            ("a\\", 80, &["a\\"]),
+            ("See C:\\", 80, &["See C:\\"]),
+            ("a\\\n\nb", 80, &["a\\", "", "b"]),
+            ("a\\\n# h", 80, &["a\\", "# h"]),
+            ("x\ny \\", 80, &["x y \\"]),
+            ("- a\\", 80, &["- a\\"]),
+            // Before a continuation it is still a break, and goes.
+            ("a\\\nb", 80, &["a", "b"]),
+            ("a \\\nb\\", 80, &["a", "b\\"]),
+            ("- a\\\n  b", 80, &["- a", "  b"]),
         ]);
     }
 
