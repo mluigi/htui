@@ -1682,8 +1682,9 @@ mod tests {
             permission(&ana, &ana_run, &ana_step, Some("edit: b"), 1),
         ];
 
+        // `agy` first in the scope though its id sorts after `htui`'s: a sort by id fails.
         let view = waiting(
-            &scope(&[ids::PROJECT_HTUI, ids::PROJECT_AGY]),
+            &scope(&[ids::PROJECT_AGY, ids::PROJECT_HTUI]),
             4,
             &candidates,
             Some(&perms),
@@ -1710,6 +1711,13 @@ mod tests {
         assert_eq!(
             keys,
             [
+                (
+                    ids::PROJECT_AGY,
+                    "FEAT-1",
+                    Some(agy_run.id),
+                    "prd 0.1",
+                    WaitingReason::Gate
+                ),
                 (
                     ids::PROJECT_HTUI,
                     "ANA-1",
@@ -1744,13 +1752,6 @@ mod tests {
                     None,
                     "",
                     WaitingReason::Unblock
-                ),
-                (
-                    ids::PROJECT_AGY,
-                    "FEAT-1",
-                    Some(agy_run.id),
-                    "prd 0.1",
-                    WaitingReason::Gate
                 ),
             ]
         );
