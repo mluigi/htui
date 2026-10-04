@@ -361,8 +361,10 @@ impl<P: ReplySink> Shared<P> {
     /// The process's isolator and verifier (D156, D202). A `StartRun`, and each sweep of the
     /// worker (MOD-41 review R-1), re-reads the repo map and rebuilds the production isolator and
     /// verifier when it moved and no walk of this process is live, and is refused with
-    /// [`REPOS_MOVED`] when one is (R-39). The rebuild reads `copy_max_total_bytes` and the box's
-    /// `command_limits` afresh.
+    /// [`REPOS_MOVED`] when one is (R-39). Each such call also re-reads the box's `command_limits`
+    /// and rebuilds the verifier when they changed and no walk is live; while one is, the cached
+    /// verifier stays and nothing is refused (MOD-76 D4, R-55). A repo-map rebuild reads
+    /// `copy_max_total_bytes` afresh.
     async fn singletons<H: htui_core::store::WorkerHost>(
         &self,
         host: &H,
@@ -426,8 +428,8 @@ impl<P: ReplySink> Shared<P> {
                 .map_err(|err| err.to_string())?;
             built.isolator = Some(Arc::new(isolator));
             built.repos = Some(repos);
-            // MOD-41 review R-1: the verifier is rebuilt at the same point, so the box's
-            // `command_limits` refresh with the repo map.
+            // MOD-41 review R-1: the verifier is rebuilt at the same point, from the
+            // `command_limits` read below (MOD-76 D4).
             built.verifier = None;
             self.isolator_builds.fetch_add(1, Ordering::SeqCst);
         }
@@ -810,8 +812,9 @@ async fn repo_map<H: htui_core::store::WorkerHost>(
 ///
 /// D216 (review L7): a read that fails is not the default. `singletons` passes it up like the
 /// reads beside it, so no verifier is cached from it and the next command reads again. The limits
-/// are read once per build of the parts (per server): an edit to them reaches the next process
-/// (R-55), or this one when its repo map next moves (MOD-41 review R-1).
+/// are read at every walking `StartRun` and every worker sweep, and the verifier is rebuilt from
+/// an edit once no walk of the process is live (MOD-76 D4, R-55): [`stored_limits`] then
+/// [`parse_limits`].
 ///
 /// # Errors
 /// The store's own read failure.
@@ -1867,7 +1870,8 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// executor adopts or claims, so the executor is read first, at every sweep. The worker, which has
 /// no `StartRun` of its own, then re-reads its repo map (MOD-41 review R-1, blueprint D202): a
 /// repo or checkout change rebuilds the isolator and the verifier, with the limits read afresh,
-/// when no walk of this process is live, and while one is ([`REPOS_MOVED`]) the sweep still adopts
+/// when no walk of this process is live (a change to the limits alone rebuilds the verifier then
+/// too, MOD-76 D4), and while one is ([`REPOS_MOVED`]) the sweep still adopts
 /// but skips its claim scan this tick (a refused claim's retry, M5 D84, still runs when a walk
 /// rests, with the parts the process has). Then the adoption
 /// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
