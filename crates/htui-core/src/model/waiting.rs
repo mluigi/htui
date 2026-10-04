@@ -21,7 +21,9 @@ use crate::model::scope::Scope;
 /// Derives no `Eq`: `Item`, `Run` and `RunStep` derive none (they hold `serde_json::Value`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WaitingCandidate {
-    /// The item row, body included: `verdicts` and `unblock_enabled` read it whole.
+    /// The item row whole, `body` included. The classifier reads only its id, key, key parts,
+    /// project and status (`unblock_enabled` reads `status`), so `body` rides along unread;
+    /// trimming it from the per-tick read is deferred to the maintainer (MOD-69 review M3).
     pub item: Item,
     /// Its active runs, newest first (`queued_at DESC, id DESC`: `ReadStore::runs`' order, which
     /// `unblock_enabled` is sensitive to, blueprint H-1), each with its steps in

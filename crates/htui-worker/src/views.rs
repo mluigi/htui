@@ -378,20 +378,9 @@ fn verdicts(
             };
             let open = newest_output(heads, &phase.output_kind, step.id);
             let has_output = open.is_ok();
-            let select = chatting.clone().and_then(|()| {
-                if step.fanout_index >= 0 && phase.fan_out > 1 {
-                    select_enabled(
-                        run,
-                        &group_at(steps, step.position, step.attempt),
-                        step.id,
-                        step.position,
-                        step.attempt,
-                    )
-                    .map_err(sentence)
-                } else {
-                    Err(not_a_candidate(step.id))
-                }
-            });
+            let select = chatting
+                .clone()
+                .and_then(|()| select_of(run, steps, step, &phase));
             actions.steps.insert(
                 step.id,
                 StepActions {
@@ -432,6 +421,42 @@ fn verdicts(
     }
     actions.unblock = unblock_case(item, runs).map(drop);
     actions
+}
+
+/// `select` on `step` of `run`, ahead of the live-chat refusal: the one place [`verdicts`] and
+/// [`selectable_slots`] read it (MOD-69 review M3).
+fn select_of(run: &Run, steps: &[RunStep], step: &RunStep, phase: &SnapshotPhase) -> Enabled {
+    if step.fanout_index >= 0 && phase.fan_out > 1 {
+        select_enabled(
+            run,
+            &group_at(steps, step.position, step.attempt),
+            step.id,
+            step.position,
+            step.attempt,
+        )
+        .map_err(|err| err.to_string())
+    } else {
+        Err(not_a_candidate(step.id))
+    }
+}
+
+/// The `(position, attempt)` slots of `run` on whose candidates the Runs pane enables `select`
+/// with no live chat: [`verdicts`]' `select` alone, without its clones of every run and its other
+/// verdicts (MOD-69 review M3). A run whose snapshot does not decode has none, as every `select`
+/// is refused there.
+fn selectable_slots(run: &Run, steps: &[RunStep]) -> BTreeSet<(i32, i32)> {
+    let Ok(snapshot) = snapshot_of(run) else {
+        return BTreeSet::new();
+    };
+    steps
+        .iter()
+        .filter(|step| step.fanout_index >= 0)
+        .filter(|step| {
+            phase_at(run.id, &snapshot, step.position)
+                .is_ok_and(|phase| select_of(run, steps, step, &phase).is_ok())
+        })
+        .map(|step| (step.position, step.attempt))
+        .collect()
 }
 
 /// `u`'s case for `item` over its runs (MOD-69 blueprint E2): the one place both the Runs pane's
@@ -546,9 +571,11 @@ const RESUME_TEXT: &str = "parked by an interrupted command: u resumes it";
 const INTERRUPTED_TEXT: &str = "interrupted";
 
 /// The waiting-on-you list over one candidate read (MOD-69 plan D1-D5, D9), with the engine's own
-/// guards: `verdicts` (empty heads, no live chat; heads feed only approve/accept/open, plan D3)
-/// decides a slot's `select`, `unblock_case` the item's `u`, step status a gate. `permissions` is
-/// `None` offline. `active` is `Backend::active_runs` over the same scope.
+/// guards: [`selectable_slots`] (`verdicts`' own `select` with no live chat; heads feed only
+/// approve/accept/open, plan D3) decides a slot's `select`, one [`unblock_case`] per candidate the
+/// item's `u`, step status a gate, and a parked run none of them lists is an Interrupted row
+/// (review H1). `permissions` is `None` offline. `active` is `Backend::active_runs` over the same
+/// scope.
 #[must_use]
 pub fn waiting(
     scope: &Scope,
@@ -596,8 +623,6 @@ pub fn waiting(
             };
             (key, row)
         };
-        let verdict = verdicts(item, &candidate.runs, &[], &LiveChats::default());
-
         for (run, steps) in &candidate.runs {
             // Step status decides a gate, not `approve`: a gate parked without its output greys
             // `approve` but still waits on a person (plan D3).
@@ -624,18 +649,7 @@ pub fn waiting(
             }
             // A slot waits on a selection exactly when the pane enables `select` on one of its
             // candidates; a run whose snapshot does not decode has every `select` refused.
-            let slots: BTreeSet<(i32, i32)> = steps
-                .iter()
-                .filter(|step| {
-                    step.fanout_index >= 0
-                        && verdict
-                            .steps
-                            .get(&step.id)
-                            .is_some_and(|actions| actions.select.is_ok())
-                })
-                .map(|step| (step.position, step.attempt))
-                .collect();
-            for (position, attempt) in slots {
+            for (position, attempt) in selectable_slots(run, steps) {
                 let failed_judge = judge_at(steps, position, attempt)
                     .filter(|judge| judge.status == StepStatus::Failed)
                     .and_then(|judge| judge.gate_note.clone().map(|note| (judge, note)));
@@ -974,9 +988,10 @@ mod tests {
 
     use super::{
         Enabled, FOLLOW_TEXT, GATE_TEXT, ItemActions, LiveChats, PERMISSION_TEXT, REOPEN_TEXT,
-        RESUME_TEXT, SELECTION_TEXT, WaitingReason, WaitingRow, WaitingView, unblock_case,
-        verdicts, waiting,
+        RESUME_TEXT, SELECTION_TEXT, WaitingReason, WaitingRow, WaitingView, selectable_slots,
+        unblock_case, verdicts, waiting,
     };
+    use std::collections::BTreeSet;
 
     /// [`verdicts`]' `u` for `item`, over the rows [`super::actions`] reads.
     async fn unblock_verdict(store: &MemStore, item: ItemId) -> Enabled {
@@ -1929,6 +1944,39 @@ mod tests {
                     WaitingReason::Unblock
                 ),
             ]
+        );
+    }
+
+    /// Review M3: the list reads a slot's `select` through `selectable_slots`, which shares
+    /// `verdicts`' select logic without its deep clones; both agree on every fixture.
+    #[test]
+    fn selectable_slots_are_verdicts_select() {
+        let fixtures = [
+            escalation(),
+            crashed_rejection(),
+            over_a_gate(Status::AwaitingApproval),
+            slot(None),
+            slot(Some((Some(GateOutcome::Rejected), "judge: tie"))),
+            slot(Some((None, "interrupted"))),
+            resolved_selection(true),
+            resolved_selection(false),
+            undecodable(|run| vec![step(1, run, (0, 1, 0), StepStatus::Done)]),
+            interrupted_park(Some("interrupted")),
+        ];
+        for candidate in &fixtures {
+            let verdict = verdict(candidate);
+            for (run, steps) in &candidate.runs {
+                let expected: BTreeSet<(i32, i32)> = steps
+                    .iter()
+                    .filter(|step| verdict.steps[&step.id].select.is_ok())
+                    .map(|step| (step.position, step.attempt))
+                    .collect();
+                assert_eq!(selectable_slots(run, steps), expected, "{candidate:?}");
+            }
+        }
+        assert_eq!(
+            selectable_slots(run_of(&slot(None)), &slot(None).runs[0].1),
+            BTreeSet::from([(0, 1)])
         );
     }
 
