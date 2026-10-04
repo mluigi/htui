@@ -127,6 +127,9 @@ No two parallel tasks share a file. T3 runs alone, after the merge.
   for a person.
 - **M-3 (E5).** The wording of the three Unblock texts (§3.3), which the overlay shows verbatim.
 
+**Decided by the maintainer 2026-10-04:** M-1 (a) accept the clipped help line; M-2 list promoted
+steps as gate rows (`promoted to chat`); M-3 the §3.3 wording as written.
+
 ---
 
 ## 1. T0: model types (`crates/htui-core/src/model/waiting.rs`, new)

@@ -237,7 +237,7 @@ mod tests {
             (ProjectId::new(), ProjectId::new(), ProjectId::new());
         let t = demo_at(1, 0);
         let later = t + Duration::hours(1);
-        let (oldest, tie_low, tie_high) = (run_id(10), run_id(20), run_id(30));
+        let (oldest, tie_low, tie_high) = (run_id(40), run_id(20), run_id(30));
         let judge = step(tie_high, 0, 1, -1);
         let fan_one = step(tie_high, 0, 1, 1);
         let retry = step(tie_high, 0, 2, 0);
