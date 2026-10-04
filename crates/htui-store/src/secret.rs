@@ -34,6 +34,12 @@ pub const USER: &str = "postgres-dsn";
 pub const QDRANT_URL_USER: &str = "qdrant-url";
 /// The OS keyring username used to store the Qdrant API key.
 pub const QDRANT_KEY_USER: &str = "qdrant-key";
+/// Keyring user name of the Infisical base URL (MOD-10 D7).
+pub const INFISICAL_URL_USER: &str = "infisical-url";
+/// Keyring user name of the Infisical machine identity's client ID (MOD-10 D7, ANA-7 §3.3).
+pub const INFISICAL_CLIENT_ID_USER: &str = "infisical-client-id";
+/// Keyring user name of the Infisical machine identity's client secret (MOD-10 D7, ANA-7 §3.3).
+pub const INFISICAL_CLIENT_SECRET_USER: &str = "infisical-client-secret";
 
 /// What an installed stand-in answers with (D18, flag L).
 ///
@@ -47,6 +53,13 @@ pub(crate) struct FakeSlots {
     pub pg: Option<String>,
     pub qdrant_url: Option<String>,
     pub qdrant_key: Option<String>,
+    pub infisical_url: Option<String>,
+    pub infisical_client_id: Option<String>,
+    pub infisical_client_secret: Option<String>,
+    /// MOD-10 T2: the user name whose **store** fails, as `Fake::Broken` would fail it. Every
+    /// other call still answers. Honoured by the Infisical slots only. `Fake::Broken` cannot test
+    /// "the second write fails" because it fails the first one too.
+    pub refuse_store: Option<&'static str>,
 }
 
 #[cfg(feature = "test-support")]
@@ -356,6 +369,93 @@ pub fn clear_qdrant_api_key() -> Result<()> {
         };
     }
     Slot::open(SERVICE, QDRANT_KEY_USER)?.clear()
+}
+
+/// The fake field for one of the Infisical users.
+#[cfg(feature = "test-support")]
+fn infisical_field<'a>(slots: &'a mut FakeSlots, user: &str) -> &'a mut Option<String> {
+    match user {
+        INFISICAL_URL_USER => &mut slots.infisical_url,
+        INFISICAL_CLIENT_ID_USER => &mut slots.infisical_client_id,
+        INFISICAL_CLIENT_SECRET_USER => &mut slots.infisical_client_secret,
+        other => unreachable!("not an Infisical keyring user: {other}"),
+    }
+}
+
+/// Reads one Infisical entry; blank reads as `None` (as [`Slot::get`]).
+fn read_slot(user: &'static str) -> Result<Option<String>> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => Ok(infisical_field(slots, user)
+                .clone()
+                .filter(|value| !value.trim().is_empty())),
+            Fake::Broken(why) => Err(fake_failure("read", user, why)),
+        };
+    }
+    Slot::open(SERVICE, user)?.get()
+}
+
+/// Writes one Infisical entry. Under the fake, `refuse_store == Some(user)` fails the write the way
+/// `Fake::Broken` would, and changes nothing.
+fn write_slot(user: &'static str, value: &str) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) if slots.refuse_store == Some(user) => {
+                Err(fake_failure("store", user, "refused by the test"))
+            }
+            Fake::Slot(slots) => {
+                *infisical_field(slots, user) = Some(value.to_owned());
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("store", user, why)),
+        };
+    }
+    Slot::open(SERVICE, user)?.set(value)
+}
+
+/// Removes one Infisical entry; a missing entry is `Ok(())`.
+fn remove_slot(user: &'static str) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => {
+                *infisical_field(slots, user) = None;
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("remove", user, why)),
+        };
+    }
+    Slot::open(SERVICE, user)?.clear()
+}
+
+/// The stored Infisical base URL, if any (D7; the Qdrant URL's shape).
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] for any keyring failure other than a missing entry.
+pub fn get_infisical_url() -> Result<Option<String>> {
+    read_slot(INFISICAL_URL_USER)
+}
+
+/// Stores the Infisical base URL. Not validated here: `htui-secrets` normalises it, and M4 calls
+/// that before storing.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when the keyring refuses the write.
+pub fn set_infisical_url(url: &str) -> Result<()> {
+    write_slot(INFISICAL_URL_USER, url)
+}
+
+/// Removes the Infisical base URL. A missing entry is `Ok(())`.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when the keyring refuses the delete.
+pub fn clear_infisical_url() -> Result<()> {
+    remove_slot(INFISICAL_URL_USER)
 }
 
 /// One keyring entry, plus the `service/user` pair its error messages quote.
@@ -693,5 +793,51 @@ mod headless_dsn_tests {
             matches!(err, DsnSourceError::NoSource { .. }),
             "got {err:?}"
         );
+    }
+}
+
+/// The Infisical base URL and machine identity slots (MOD-10 D7), over the process-wide fake
+/// keyring: never the developer's. Every case takes its guard as its first statement (H-15), and no
+/// assertion message ever prints a secret or an error text that could carry one (H-8).
+#[cfg(test)]
+mod machine_identity_tests {
+    use super::{
+        INFISICAL_CLIENT_ID_USER, INFISICAL_CLIENT_SECRET_USER, INFISICAL_URL_USER, SERVICE,
+        clear_infisical_url, get_infisical_url, set_infisical_url,
+    };
+    use crate::testkit::mock_keyring;
+
+    #[tokio::test]
+    async fn the_infisical_entries_are_named_exactly_as_the_plan_says() {
+        let _guard = mock_keyring().await;
+        assert_eq!(SERVICE, "htui");
+        assert_eq!(INFISICAL_URL_USER, "infisical-url");
+        assert_eq!(INFISICAL_CLIENT_ID_USER, "infisical-client-id");
+        assert_eq!(INFISICAL_CLIENT_SECRET_USER, "infisical-client-secret");
+    }
+
+    #[tokio::test]
+    async fn the_infisical_url_round_trips_and_blank_reads_as_none() {
+        let _guard = mock_keyring().await;
+        assert_eq!(
+            get_infisical_url().expect("an empty fake reads"),
+            None,
+            "nothing stored yet"
+        );
+        set_infisical_url("https://infisical.example").expect("the fake keyring stores");
+        assert_eq!(
+            get_infisical_url().expect("read"),
+            Some("https://infisical.example".to_owned())
+        );
+        set_infisical_url("  ").expect("the fake keyring stores");
+        assert_eq!(
+            get_infisical_url().expect("read"),
+            None,
+            "a blank URL is no URL"
+        );
+        set_infisical_url("https://infisical.example").expect("the fake keyring stores");
+        clear_infisical_url().expect("clear");
+        assert_eq!(get_infisical_url().expect("read"), None);
+        clear_infisical_url().expect("clearing twice is not an error");
     }
 }
