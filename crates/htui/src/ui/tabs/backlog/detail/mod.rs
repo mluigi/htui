@@ -197,21 +197,11 @@ impl DetailRegistry {
         }
     }
 
-    /// Hands a reveal's run and step to the sub-tab registered under `id` (MOD-69 plan D8).
-    /// `false` when nothing is registered under it.
-    pub fn focus(
-        &mut self,
-        id: DetailId,
-        run: Option<RunId>,
-        step: Option<StepId>,
-        ctx: &Ctx<'_>,
-    ) -> bool {
-        match self.tabs.iter_mut().find(|tab| tab.id() == id) {
-            Some(tab) => {
-                tab.focus(run, step, ctx);
-                true
-            }
-            None => false,
+    /// Hands a reveal's run and step to the sub-tab registered under `id` (MOD-69 plan D8);
+    /// nothing when nothing is registered under it. No answer: the one caller has no use for it.
+    pub fn focus(&mut self, id: DetailId, run: Option<RunId>, step: Option<StepId>, ctx: &Ctx<'_>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id() == id) {
+            tab.focus(run, step, ctx);
         }
     }
 
