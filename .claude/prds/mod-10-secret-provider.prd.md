@@ -137,7 +137,7 @@ completes a run whose tests need a secret, and no resolved value appears in any 
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Scrubber hardening | Exact-match masking from a resolved map and a broader pattern rule set guard every persisted byte; a fail-closed scrub fails the run with a typed, visible reason | in-progress | `.claude/plans/mod-10-m1-scrubber-hardening.plan.md` |
+| 1 | Scrubber hardening | Exact-match masking from a resolved map and a broader pattern rule set guard every persisted byte; a fail-closed scrub fails the run with a typed, visible reason | complete | `.claude/plans/mod-10-m1-scrubber-hardening.plan.md` |
 | 2 | Infisical provider | A box with a machine identity in its keyring can authenticate to the configured Infisical, list and resolve a project scope's secrets, and report health; every failure is a typed, non-leaking error | pending | — |
 | 3 | Run-start injection | Graph runs and chat on a configured project receive its secrets in the agent environment only, with the scrubber built from the same map; failures refuse the run; the verifier never sees them | pending | — |
 | 4 | Settings section | The maintainer enters the machine identity and base URL, sees provider health, and sets each project's scope, without leaving the TUI | pending | — |

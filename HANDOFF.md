@@ -329,14 +329,23 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   htui's own process environment (plan D30) and scrubs its output. A test pinning that the verify
   child does not see a resolved secret belongs to this item.
   **Run engine scrubber (MOD-61, folded in 2026-09-29):** the run engine's `MinimalScrubber` is
-  built with an empty secret list (`crates/htui-worker/src/runtime.rs:764`, since MOD-41), so `scrub`'s masking half
+  built with an empty secret list (`crates/htui-worker/src/runtime.rs:929`, since MOD-41), so `scrub`'s masking half
   is inert on the run path and a `trim_record` string equal to a secret would be stored verbatim.
   When this item resolves a run's secrets, build that scrubber from the **same** map that fills the
-  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5656`), so the two cannot drift;
-  the chat path already does this from `spec.env` (`agent_worker.rs:3599`) and needs the same map.
-  The verifier's scrubber (`crates/htui-worker/src/runtime.rs:411`) stays pattern-only: handing it the map would put
+  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5987`), so the two cannot drift;
+  the chat path already does this from `spec.env` (`agent_worker.rs:3961`) and needs the same map.
+  The verifier's scrubber (`crates/htui-worker/src/runtime.rs:437`) stays pattern-only: handing it the map would put
   the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
   secret is stored as `[REDACTED]` belongs to this item.
+  PRD `.claude/prds/mod-10-secret-provider.prd.md` (4 milestones; maintainer decisions: identity from
+  the executing box's keyring, typed run failure, per-project whole-run scope, self-hosted Infisical).
+  **Phase 1 landed (`857be690`..`7b2bfd0e`, 2026-10-04):** scrubber hardening. Whole-token pattern
+  rules (15, `regex` in `htui-core`; `openai_api_key` gate + prose filter; Stripe live keys only),
+  `MinimalScrubber::from_resolved` with a 6-char floor, one typed `RunFailure::ScrubRefused` sentence
+  on the plain-step, candidate, judge and chat paths, the opt-in `raw` re-checked per JSON pointer at
+  the flush, `R-SEC-3` amended. Plan `.claude/plans/mod-10-m1-scrubber-hardening.plan.md`; host audit
+  (T0) skipped. Remaining: M2 Infisical provider, M3 run-start injection (owns the MOD-61/MOD-62
+  tests and the review carry-overs listed in the PRD), M4 Settings section.
 - [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
   `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
   per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):

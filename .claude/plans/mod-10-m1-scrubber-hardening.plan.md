@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-10-secret-provider.prd.md`
 **Selected Milestone**: 1 — Scrubber hardening
 **Complexity**: Medium
-**Status**: CONFIRMED by the maintainer 2026-10-04 (fact-checked: 33 claims; 7 amended, 3 falsified)
+**Status**: COMPLETE 2026-10-04 (confirmed by the maintainer; fact-checked: 33 claims; 7 amended, 3 falsified; reviewed and fixed)
 
 ## Summary
 
@@ -307,9 +307,9 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Acceptance
 
-- [ ] T0 counts reviewed by the maintainer; D2 final list recorded here
+- [x] T0 audit **skipped by maintainer decision 2026-10-04** (no psql on the host; the sandbox cannot reach the host database). D2 final list is the table above as amended at review
 - [x] All tasks complete, tests written first
-- [ ] Validation passes on the merged tree
+- [x] Validation passes on the merged tree (4244 passed / 0 failed, fmt + clippy clean, after review fixes)
 - [x] Patterns mirrored, not reinvented
 
 ## Verified claims
