@@ -6,7 +6,7 @@ use ratatui::layout::{Constraint, Flex, Layout, Rect};
 /// the whole frame and centre themselves with [`centered`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Chrome {
-    /// One line: `workspace · box · store · N runs`.
+    /// One line: `workspace · box · store · N working · M waiting`.
     pub top_bar: Rect,
     /// One line: the registered tabs in registration order.
     pub tab_strip: Rect,

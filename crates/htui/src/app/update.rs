@@ -15,7 +15,7 @@ use crate::ui::overlay::{Overlay, OverlayId};
 use crate::ui::tabs::SettingsTab;
 use crate::ui::tabs::settings::ConnectionSection;
 
-/// The top bar's run count is re-read once a second, i.e. every fourth 250 ms tick.
+/// The top bar's counts are re-read once a second, i.e. every fourth 250 ms tick.
 const TICKS_PER_REFRESH: u64 = 4;
 
 impl App {
@@ -117,7 +117,7 @@ impl App {
     }
 
     /// The 250 ms timer. Only every fourth tick costs a redraw, and it is the one that re-reads
-    /// the store state and the active-run count so the top bar stays live without a request per
+    /// the store state and the waiting list so the top bar stays live without a request per
     /// tick.
     ///
     /// `StoreState` is **not** gated on a non-empty scope: `connecting`, `offline · 3m` and a
@@ -129,7 +129,7 @@ impl App {
             self.dispatch(Origin::App, StoreRequest::StoreState);
             if !self.scope.is_empty() {
                 let scope = self.scope.clone();
-                self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
+                self.dispatch(Origin::App, StoreRequest::Waiting { scope });
             }
             self.refresh_active_tab();
             self.dirty = true;
@@ -185,7 +185,9 @@ impl App {
         }
         self.close_every_overlay();
         self.activate_tab();
-        self.dispatch(Origin::App, StoreRequest::ActiveRuns { scope });
+        // MOD-69 blueprint E9, H-10: the old workspace's rows never show under the new name.
+        self.top_bar.waiting = None;
+        self.dispatch(Origin::App, StoreRequest::Waiting { scope });
     }
 
     /// Reopens a past step: focus the replay tab, then ask for its rows on that tab's behalf
@@ -360,7 +362,19 @@ impl App {
                 }
             }
             StoreReply::BoxInfo(Some(info)) => self.top_bar.box_name = info.hostname.clone(),
-            StoreReply::ActiveRuns(count) => self.top_bar.active_runs = *count,
+            // Review M1: the old scope's queued reply lands after `set_scope` (blueprint H-10). The
+            // whole scope is compared, not its workspace: Settings re-scopes the same workspace
+            // when a project is created, deleted or reordered (R2).
+            StoreReply::Waiting { scope, view } => {
+                if *scope == self.scope {
+                    self.top_bar.waiting = Some(view.clone());
+                } else {
+                    tracing::debug!(
+                        workspace = %scope.workspace_id,
+                        "a waiting reply for a scope since left"
+                    );
+                }
+            }
             StoreReply::StoreState {
                 label,
                 migrations_pending,
@@ -489,8 +503,8 @@ mod tests {
     use crate::app::{Handled, RevealKind};
     use crate::editor::{ExternalEdit, ExternalEditOutcome};
     use crate::keymap::Keymap;
-    use crate::store_worker::RequestEnvelope;
-    use crate::ui::overlay::{MigrationPrompt, Overlay, OverlayId};
+    use crate::store_worker::{RequestEnvelope, UNSOLICITED};
+    use crate::ui::overlay::{MigrationPrompt, Overlay, OverlayId, WaitingList};
     use crate::ui::tabs::{Tab, TabId};
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -500,6 +514,7 @@ mod tests {
         ItemFilter, ItemId, ItemKindId, ItemSummary, ProjectId, ProjectRef, Status,
     };
     use htui_orch::Command;
+    use htui_worker::WaitingView;
     use ratatui::Frame;
     use ratatui::layout::Rect;
     use std::cell::{Cell, RefCell};
@@ -657,17 +672,129 @@ mod tests {
     }
 
     #[test]
-    fn a_scope_change_closes_every_overlay_and_re_reads_the_run_count() {
+    fn a_scope_change_closes_every_overlay_and_re_reads_the_waiting_list() {
         let (mut app, mut rx, _seen) = shell();
+        app.top_bar.waiting = Some(WaitingView::default());
         app.update(Action::SetScope {
             workspace: workspace("Platform"),
         });
         assert!(app.overlays.is_empty());
-        let mut saw_active_runs = false;
+        // MOD-69 blueprint E9: the old workspace's rows never show under the new name.
+        assert!(app.top_bar.waiting.is_none());
+        let mut saw_waiting = false;
         while let Ok(envelope) = rx.try_recv() {
-            saw_active_runs |= matches!(envelope.request, StoreRequest::ActiveRuns { .. });
+            saw_waiting |= matches!(envelope.request, StoreRequest::Waiting { .. });
         }
-        assert!(saw_active_runs);
+        assert!(saw_waiting);
+    }
+
+    /// MOD-69 plan D6: `observe_reply` runs before the freshness gate, so a `Waiting` reply sets
+    /// the top bar whoever it is addressed to, even an unsolicited one.
+    #[test]
+    fn a_waiting_reply_sets_the_top_bar_whatever_its_origin() {
+        let (mut app, _rx, _seen) = shell();
+        let view = WaitingView {
+            working: 3,
+            rows: Vec::new(),
+            permissions_known: true,
+            offline: false,
+        };
+        app.update(Action::Reply(ReplyEnvelope {
+            seq: UNSOLICITED,
+            origin: Origin::Overlay(WaitingList::ID),
+            reply: StoreReply::Waiting {
+                scope: app.scope.clone(),
+                view: view.clone(),
+            },
+        }));
+        assert_eq!(app.top_bar.waiting, Some(view));
+    }
+
+    /// MOD-69 review M1: a reply for the workspace the shell just left lands after `set_scope`
+    /// (blueprint H-10) and is dropped; the new workspace's reply is taken.
+    #[test]
+    fn a_waiting_reply_for_the_old_workspace_is_dropped_after_a_scope_change() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        let view = |working| WaitingView {
+            working,
+            rows: Vec::new(),
+            permissions_known: true,
+            offline: false,
+        };
+        let scope_of = |workspace_id| Scope {
+            workspace_id,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let reply = |scope, view| {
+            Action::Reply(ReplyEnvelope {
+                seq: UNSOLICITED,
+                origin: Origin::App,
+                reply: StoreReply::Waiting { scope, view },
+            })
+        };
+
+        app.update(reply(scope_of(ids::WORKSPACE_GRAPHICS), view(7)));
+        assert_eq!(
+            app.top_bar.waiting, None,
+            "the old workspace's counts never show"
+        );
+
+        app.update(reply(scope_of(ids::WORKSPACE_PLATFORM), view(2)));
+        assert_eq!(app.top_bar.waiting, Some(view(2)));
+
+        app.update(reply(scope_of(ids::WORKSPACE_GRAPHICS), view(7)));
+        assert_eq!(
+            app.top_bar.waiting,
+            Some(view(2)),
+            "nor overwrite the new one"
+        );
+    }
+
+    /// MOD-69 review R2 (M1): Settings re-scopes the *same* workspace when its project set
+    /// changes, and a reply read under the old project set is dropped all the same.
+    #[test]
+    fn a_waiting_reply_for_the_old_project_set_of_the_same_workspace_is_dropped() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        let old = app.scope.clone();
+        let mut grown = workspace("Platform");
+        grown.projects.push(ProjectRef {
+            project_id: ids::PROJECT_AGY,
+            slug: "q".to_owned(),
+            name: "Q".to_owned(),
+            position: 1,
+        });
+        app.update(Action::SetScope { workspace: grown });
+        assert_eq!(app.scope.workspace_id, old.workspace_id);
+        assert_ne!(app.scope, old);
+
+        let view = |working| WaitingView {
+            working,
+            rows: Vec::new(),
+            permissions_known: true,
+            offline: false,
+        };
+        let reply = |scope, view| {
+            Action::Reply(ReplyEnvelope {
+                seq: UNSOLICITED,
+                origin: Origin::App,
+                reply: StoreReply::Waiting { scope, view },
+            })
+        };
+
+        app.update(reply(old, view(7)));
+        assert_eq!(
+            app.top_bar.waiting, None,
+            "the old project set's rows never show"
+        );
+
+        app.update(reply(app.scope.clone(), view(2)));
+        assert_eq!(app.top_bar.waiting, Some(view(2)));
     }
 
     /// A `Failed` reply at `seq`, addressed to the recorder tab.
@@ -734,10 +861,7 @@ mod tests {
         let requests: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert_eq!(requests.len(), 2, "one refresh per second, not per tick");
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
-        assert!(matches!(
-            requests[1].request,
-            StoreRequest::ActiveRuns { .. }
-        ));
+        assert!(matches!(requests[1].request, StoreRequest::Waiting { .. }));
     }
 
     #[test]
@@ -1055,7 +1179,7 @@ mod tests {
             ..Default::default()
         };
         app.update(Action::Reply(ReplyEnvelope {
-            seq: crate::store_worker::UNSOLICITED,
+            seq: UNSOLICITED,
             origin: Origin::App,
             reply: StoreReply::BoxProbed(report.clone()),
         }));

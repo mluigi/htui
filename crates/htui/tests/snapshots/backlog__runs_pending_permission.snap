@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 run
+Platform · DESKTOP-HTUI · memory · 0 working · 2 waiting
  1 Backlog
 ┌ Backlog (11) ───────────────────────────────────────┐┌ FEAT-3 ───────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │

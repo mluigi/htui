@@ -2,7 +2,7 @@
 source: crates/htui/tests/chat.rs
 expression: rendered
 ---
-Graphics · DESKTOP-HTUI · memory · 0 runs
+Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
  1 Chat
 ┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
 │promoted · research · handoff · scripted · sonnet · fake-<session>     │

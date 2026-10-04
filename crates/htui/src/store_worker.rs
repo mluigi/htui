@@ -28,7 +28,7 @@ use htui_core::model::{
     PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView,
     RepoId, RepoPatch, RequirementAreaId, RequirementId, RunSummary, Scope, SessionEvent,
     SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch, StepId,
-    ToolCallCount, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -38,7 +38,10 @@ use htui_core::store::{
 };
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::vector::SearchQuery;
-use htui_store::{Backend, ConnEvent, DATABASE_UNREACHABLE, Dsn, PgStore, Started, connect};
+use htui_store::{
+    Backend, ConnEvent, DATABASE_UNREACHABLE, Dsn, PgStore, Started, Writer, connect,
+};
+use htui_worker::WaitingView;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
@@ -129,9 +132,10 @@ pub enum StoreRequest {
     Workspaces,
     /// This box's row for the top bar.
     BoxInfo,
-    /// How many runs of the scope are active (top bar).
-    ActiveRuns {
-        /// The workspace scope to count in.
+    /// MOD-69 plan D6: the waiting-on-you list and the top bar's two counts, re-read on the
+    /// shell's refresh tick and on a scope change.
+    Waiting {
+        /// The workspace scope to read.
         scope: Scope,
     },
     /// The Backlog list.
@@ -1012,7 +1016,7 @@ impl StoreRequest {
         match self {
             Self::Workspaces => "workspaces",
             Self::BoxInfo => "box_info",
-            Self::ActiveRuns { .. } => "active_runs",
+            Self::Waiting { .. } => "waiting",
             Self::Items { .. } => "items",
             Self::Item(_) => "item",
             Self::Links { .. } => "links",
@@ -1150,8 +1154,15 @@ pub enum StoreReply {
     Workspaces(Vec<WorkspaceSummary>),
     /// Answer to [`StoreRequest::BoxInfo`]; `None` when no box row is registered.
     BoxInfo(Option<BoxInfo>),
-    /// Answer to [`StoreRequest::ActiveRuns`].
-    ActiveRuns(usize),
+    /// Answer to [`StoreRequest::Waiting`].
+    Waiting {
+        /// The asked scope: a reply for a scope the shell has since left - another workspace, or
+        /// the same one with another project set - is dropped, as `observe_reply` runs before the
+        /// freshness gate (MOD-69 review M1, R2).
+        scope: Scope,
+        /// The list and the two counts.
+        view: WaitingView,
+    },
     /// Answer to [`StoreRequest::Items`].
     Items(Vec<ItemSummary>),
     /// Answer to [`StoreRequest::Item`]; boxed because `Item` dwarfs every other variant.
@@ -1701,6 +1712,53 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
     }
 }
 
+/// MOD-69 review L4: the open permissions, or `None` (unknown, as offline) when their read fails
+/// for any reason but [`StoreError::Unreachable`], which propagates so `go_offline` still fires.
+/// A broken permission read then costs the list its permission rows, not the whole reply.
+fn permissions_or_unknown(
+    read: StoreResult<Vec<WaitingPermission>>,
+) -> StoreResult<Option<Vec<WaitingPermission>>> {
+    match read {
+        Ok(permissions) => Ok(Some(permissions)),
+        Err(err @ StoreError::Unreachable(_)) => Err(err),
+        Err(err) => {
+            tracing::warn!(%err, "the waiting list's permission read failed; listing none");
+            Ok(None)
+        }
+    }
+}
+
+/// [`StoreRequest::Waiting`]. MOD-69 plan D1, D4, D6: one candidate read, plus the open
+/// permissions online; the classification is the engine's own guards (`htui_worker::waiting`). An
+/// `Unreachable` from either read propagates, so `go_offline` still drops the backend (blueprint
+/// H-12); any other failure of the permission read only leaves them unknown (review L4).
+///
+/// `read_permissions` is the writer's permission read. [`try_serve`] passes
+/// [`WriteStore::open_permissions`]; it is a parameter only so a test can make it fail with
+/// something other than `Unreachable`, which no [`Backend`] can be made to do (review R2).
+async fn serve_waiting(
+    backend: &Backend,
+    scope: &Scope,
+    read_permissions: impl AsyncFnOnce(&Writer, &Scope) -> StoreResult<Vec<WaitingPermission>>,
+) -> StoreResult<StoreReply> {
+    let active = backend.active_runs(scope).await?;
+    let candidates = backend.waiting_candidates(scope).await?;
+    let writer = backend.writer();
+    let permissions = match &writer {
+        Some(writer) => permissions_or_unknown(read_permissions(writer, scope).await)?,
+        None => None,
+    };
+    Ok(StoreReply::Waiting {
+        scope: scope.clone(),
+        // Review L3 with L4: no writer is offline; a writer with unknown permissions is a failed
+        // read online, which the overlay must not call offline.
+        view: WaitingView {
+            offline: writer.is_none(),
+            ..htui_worker::waiting(scope, active, &candidates, permissions.as_deref())
+        },
+    })
+}
+
 /// [`serve`] with the `StoreError` still visible, for the one caller that has to act on it.
 ///
 /// [`spawn`] needs to tell [`StoreError::Unreachable`] from every other failure so it can drop an
@@ -1711,8 +1769,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
     Ok(match request {
         StoreRequest::Workspaces => StoreReply::Workspaces(backend.workspaces().await?),
         StoreRequest::BoxInfo => StoreReply::BoxInfo(backend.box_info().await?),
-        StoreRequest::ActiveRuns { scope } => {
-            StoreReply::ActiveRuns(backend.active_runs(scope).await?)
+        StoreRequest::Waiting { scope } => {
+            serve_waiting(backend, scope, async |writer, scope| {
+                WriteStore::open_permissions(writer, scope).await
+            })
+            .await?
         }
         StoreRequest::Items {
             scope,
@@ -3029,6 +3090,7 @@ mod tests {
     use htui_core::model::{BoxId, NewItem, OsFamily, Status};
     use htui_core::store::MemStore;
     use htui_store::{CacheStore, Identity};
+    use htui_worker::{WaitingReason, WaitingRow};
 
     fn demo() -> Backend {
         Backend::memory(MemStore::demo())
@@ -3257,16 +3319,47 @@ mod tests {
         );
     }
 
+    /// MOD-69 plan D6, blueprint H-5: over the demo's Platform scope, `RUN_2` is the only active
+    /// run and owns no row, `htui` FEAT-2 (blocked, no run) is the one Reopen row, and TOOL-1
+    /// (awaiting approval, no run) is a candidate with no row.
     #[tokio::test]
-    async fn serve_active_runs_counts_the_queued_run() {
+    async fn serve_waiting_reads_the_demo_platform() {
         let backend = demo();
         let scope = platform_scope(&backend).await;
-        let StoreReply::ActiveRuns(count) =
-            serve(&backend, &StoreRequest::ActiveRuns { scope }).await
+        assert_eq!(
+            StoreRequest::Waiting {
+                scope: scope.clone()
+            }
+            .name(),
+            "waiting"
+        );
+        let asked = scope.clone();
+        let StoreReply::Waiting {
+            scope: answered,
+            view,
+        } = serve(&backend, &StoreRequest::Waiting { scope }).await
         else {
             panic!("wrong reply variant")
         };
-        assert_eq!(count, 1, "RUN_2 is the fixture's only active run");
+        assert_eq!(
+            answered, asked,
+            "the reply names the scope it read (review M1)"
+        );
+        assert_eq!(view.working, 1, "RUN_2 is the fixture's only active run");
+        assert!(view.permissions_known, "a Memory backend has a writer");
+        assert!(!view.offline, "a Memory backend is not offline");
+        assert_eq!(
+            view.rows,
+            vec![WaitingRow {
+                item: ids::HTUI_FEAT_2,
+                item_key: "FEAT-2".into(),
+                run: None,
+                step: None,
+                step_label: String::new(),
+                reason: WaitingReason::Unblock,
+                text: "blocked, no active run: u reopens it".into(),
+            }]
+        );
     }
 
     #[tokio::test]
@@ -4940,6 +5033,112 @@ mod tests {
             "the chat is bound to the promoted step: {:?}",
             second.reply
         );
+    }
+
+    /// MOD-69 plan D4: offline the waiting list reads the mirror and leaves the permissions
+    /// unknown (they are not mirrored), rather than failing the whole reply.
+    #[tokio::test]
+    async fn serve_waiting_offline_leaves_permissions_unknown() {
+        // A non-`Memory` backend: nothing here may reach the developer's own OS keyring.
+        let _keyring = htui_store::testkit::mock_keyring().await;
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-waiting-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let backend = Backend::Offline {
+            cache,
+            since: Some(Utc::now()),
+        };
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        match try_serve(&backend, &StoreRequest::Waiting { scope }).await {
+            Ok(StoreReply::Waiting {
+                scope: answered,
+                view,
+            }) => {
+                assert_eq!(answered.workspace_id, ids::WORKSPACE_PLATFORM);
+                assert!(!view.permissions_known, "offline permissions are unknown");
+                assert!(
+                    view.offline,
+                    "the reply says it was read offline (review L3)"
+                );
+                assert!(view.rows.is_empty(), "an empty mirror owes nothing");
+                assert_eq!(view.working, 0);
+            }
+            other => panic!("an offline waiting read is a view: {other:?}"),
+        }
+    }
+
+    /// MOD-69 review R2 (L4): the `Waiting` arm itself, over a backend with a writer whose
+    /// permission read fails. Anything but `Unreachable` still answers the candidate rows with the
+    /// permissions unknown (and not offline); `Unreachable` fails the reply, so `go_offline` fires.
+    #[tokio::test]
+    async fn a_waiting_read_survives_a_failing_permission_read_but_not_an_unreachable_one() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let StoreReply::Waiting { view: expected, .. } = serve(
+            &backend,
+            &StoreRequest::Waiting {
+                scope: scope.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert!(!expected.rows.is_empty(), "the demo platform owes rows");
+
+        match serve_waiting(&backend, &scope, async |_, _| {
+            Err(StoreError::Backend("relation gone".into()))
+        })
+        .await
+        {
+            Ok(StoreReply::Waiting {
+                scope: answered,
+                view,
+            }) => {
+                assert_eq!(answered, scope);
+                assert!(
+                    !view.permissions_known,
+                    "the failed read leaves them unknown"
+                );
+                assert!(!view.offline, "a backend with a writer is not offline");
+                assert_eq!(view.rows, expected.rows, "the candidate rows survive");
+                assert_eq!(view.working, expected.working);
+            }
+            other => panic!("a failed permission read degrades: {other:?}"),
+        }
+
+        assert!(matches!(
+            serve_waiting(&backend, &scope, async |_, _| {
+                Err(StoreError::Unreachable("down".into()))
+            })
+            .await,
+            Err(StoreError::Unreachable(_))
+        ));
+    }
+
+    /// MOD-69 review L4: a permission read that fails for any reason but `Unreachable` leaves the
+    /// permissions unknown rather than failing the whole `Waiting` reply; `Unreachable` still
+    /// propagates, so `go_offline` drops the backend.
+    #[test]
+    fn a_failing_permission_read_degrades_and_unreachable_propagates() {
+        assert_eq!(
+            permissions_or_unknown(Ok(Vec::new())).expect("a read"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            permissions_or_unknown(Err(StoreError::Backend("relation gone".into())))
+                .expect("degraded, not failed"),
+            None,
+            "permissions_known = false"
+        );
+        assert!(matches!(
+            permissions_or_unknown(Err(StoreError::Unreachable("down".into()))),
+            Err(StoreError::Unreachable(_))
+        ));
     }
 
     /// MOD-42 plan D14, OQ-4: offline the Runs pane's relay read is an **empty** view, never a

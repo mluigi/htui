@@ -19,7 +19,7 @@ pub mod prompt;
 pub mod requirements;
 pub mod runs;
 
-use htui_core::model::ItemId;
+use htui_core::model::{ItemId, RunId, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -123,6 +123,11 @@ pub trait DetailTab {
     /// view must also handle a switch between two capturing views (e.g. by tracking the capture
     /// holder), or the review-L3 stale anchor returns.
     fn on_mouse_lost(&mut self) {}
+
+    /// MOD-69 plan D8 (blueprint A-5): a reveal asks for this run and step under the cursor. Only
+    /// [`RunsTab`] answers; the default ignores it. Called after the item change, so it survives
+    /// `on_item_change`'s reset.
+    fn focus(&mut self, _run: Option<RunId>, _step: Option<StepId>, _ctx: &Ctx<'_>) {}
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -198,6 +203,14 @@ impl DetailRegistry {
         match self.tabs.iter().position(|tab| tab.id() == id) {
             Some(idx) => self.select(idx),
             None => false,
+        }
+    }
+
+    /// Hands a reveal's run and step to the sub-tab registered under `id` (MOD-69 plan D8);
+    /// nothing when nothing is registered under it. No answer: the one caller has no use for it.
+    pub fn focus(&mut self, id: DetailId, run: Option<RunId>, step: Option<StepId>, ctx: &Ctx<'_>) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id() == id) {
+            tab.focus(run, step, ctx);
         }
     }
 

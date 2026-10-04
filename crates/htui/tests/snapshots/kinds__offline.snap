@@ -2,7 +2,7 @@
 source: crates/htui/tests/kinds.rs
 expression: frame
 ---
-no workspace · no box · offline · 0s · 0 runs
+no workspace · no box · offline · 0s · 0 working · 0 waiting
  1 Settings
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents  Hierarchy  Kinds                                                                         │

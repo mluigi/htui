@@ -111,7 +111,7 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
     let mut harness = open_over_demo().await;
     assert_eq!(
         top_bar(&harness.render()),
-        "Graphics · DESKTOP-HTUI · memory · 0 runs",
+        "Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting",
         "the fixture's only active run is in the other workspace"
     );
 
@@ -143,7 +143,7 @@ async fn enter_switches_the_scope_and_the_top_bar_follows() {
     let frame = harness.render();
     assert_eq!(
         top_bar(&frame),
-        "Platform · DESKTOP-HTUI · memory · 1 run",
+        "Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting",
         "the top bar reads the new workspace and its active-run count"
     );
     insta::assert_snapshot!("after_switch", frame);
@@ -201,7 +201,7 @@ async fn the_top_bar_shows_the_offline_age() {
 
     assert_eq!(
         top_bar(&frame),
-        "Graphics · DESKTOP-HTUI · offline · 3m · 0 runs",
+        "Graphics · DESKTOP-HTUI · offline · 3m · 0 working · 0 waiting",
         "the store field is `Backend::label()` verbatim (plan D11)"
     );
     assert!(

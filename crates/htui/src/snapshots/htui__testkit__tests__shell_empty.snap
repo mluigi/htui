@@ -2,7 +2,7 @@
 source: crates/htui/src/testkit.rs
 expression: harness.render()
 ---
-no workspace · no box · memory · 0 runs
+no workspace · no box · memory · 0 working · 0 waiting
  1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
 ┌ Backlog (0) ────────────────────────────────────────┐┌ Detail ───────────────────────────────────┐
 │No items in this workspace.                          ││ Body Runs Graph Docs Notes Prompt Reqs    │

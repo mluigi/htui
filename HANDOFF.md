@@ -14,7 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-76 is done** (`docs/decisions/mod/mod-76.md`): MOD-37's four
+**Current status (2026-10-04):** **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
+waiting-on-you list. `Ctrl+W` opens, from every screen, an overlay listing every run in the active
+workspace that waits on a person, one row per reason (gate, selection, judge failed, unblock,
+interrupted, open permission with its tool); `Enter` opens the item's Runs tab on that step. The top
+bar reads `N working ยท M waiting`. It is derived each tick by `StoreRequest::Waiting` (replacing
+`ActiveRuns`) from `ReadStore::waiting_candidates` + `WriteStore::open_permissions` and the pure
+`htui_worker::waiting`, which reuses the Runs pane's guards; the list keeps no state. `R-TUI-11`
+added, `R-TUI-1` amended. No migration, no new crate, four new `.sqlx` entries. It spawned **MOD-75**
+(agent question tool, blocked on MOD-11).
+Before it, **MOD-76 is done** (`docs/decisions/mod/mod-76.md`): MOD-37's four
 carried risks. R-32 and R-53 closed as accepted with no code. The Runs pane shortens `agent/model`
 before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
 `claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
@@ -31,7 +40,7 @@ now work on agent-written documents. `command_run` queues builds and tests per `
 Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
 `heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
 MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
-conformance `CASES` 146, `READ_CASES` 15, `htui-orch` `CASES` 100.
+conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES` 15, `htui-orch` `CASES` 100.
 Before it, **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator
 hardening closed in five milestones (run state, store and engine correctness, git cost, deadline and
 sessions, ACP resume). A promoted ACP step now resumes its own session (`session/resume`, else
@@ -396,21 +405,6 @@ document version newer than a step's output is what the next step reads (ANA-2 ย
   in four places and spell one action four ways (`j/k move`/`select`/`rows`, `J/K move`, `Up/Dn
   move`), and Backlog has no hint row; generated hints go in one fixed row for every tab. MOD-81
   and MOD-82 come after this item.
-- [ ] **MOD-69 - Waiting-on-you list across items** (from ANA-27, `docs/ANA-27.md` ยง5.1 T8,
-  `docs/decisions/ana/ana-27.md`). `R-TUI-1`, `R-TUI-4`, `R-ORCH-2`, `R-ORCH-4`, `R-NF-3`. The Runs
-  pane shows what waits on a person only for the selected item, and the top bar counts active runs,
-  so with several items running a parked gate, a fan-out awaiting selection, a judge park or a
-  blocked run is found by visiting items one by one. Add an overlay, opened from every screen, that
-  lists every run in the active workspace waiting on a person, one row per reason (gate, selection,
-  judge failure, unblock, and, once MOD-42 lands, each open permission request with its tool), read
-  by one store query. `Enter` opens the item's Runs pane on that step, and the top bar gains the
-  count. The list is derived at read time and keeps no state of its own; MOD-12's planned escalation
-  list can reuse the query, and the opening key is a MOD-67 action. **Open question for the
-  maintainer:** it needs the proposed `R-TUI-11` and the matching `R-TUI-1` top-bar line (ANA-27
-  ยง7), not yet applied. Not blocked; the permission rows are added after MOD-42.
-  The TUI design review (2026-10-04, https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH finding 2)
-  found the same gap: a run parked on a permission shows only in that item's Runs pane, and the top
-  bar reads `1 run`.
 - [ ] **MOD-80 - Theme and colour meaning** (from the TUI design review of 2026-10-04,
   https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 5-8, 12). `R-TUI-1`, `R-NF-1`. Every
   colour comes from `ui/theme.rs` plus a few literals (`ui/cells.rs`, `backlog/detail/runs.rs`,
@@ -466,6 +460,16 @@ document version newer than a step's output is what the next step reads (ANA-2 ย
   inline code shows its backticks. Join soft-wrapped lines inside a paragraph and list item before
   wrapping, keep blank lines, list markers and fenced blocks as they are, and style inline code
   instead of printing backticks. Not blocked.
+- [ ] **MOD-75 - Agent question tool: an MCP tool that parks the step for a person** (from MOD-69,
+  `.claude/prds/mod-69-waiting-on-you.prd.md`). `R-MCP-1..4`, `R-TUI-11`. A step's agent that
+  finds something it did not expect, or needs an opinion, has no way to ask: the question lands in
+  the transcript, and an ungated step still ends `done`, so nobody sees it. Add an MCP tool the
+  agent calls with the question (and optional choices); the call is recorded durably, the step
+  parks waiting on a person, and the answer goes back to the agent as the tool result or a
+  follow-up turn. MOD-69's waiting-on-you list shows each open question as its own row. Whether a
+  parked question holds its session and compute slot (like a permission request) or releases them
+  and resumes later is this item's design call. Not blocked: MOD-11 is done (`docs/decisions/mod/mod-11.md`), so the MCP
+  server exists.
 
 ### Deferred backlog
 
@@ -487,6 +491,6 @@ document version newer than a step's output is what the next step reads (ANA-2 ย
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 26 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 26 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

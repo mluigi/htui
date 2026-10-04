@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-69](docs/decisions/mod/mod-69.md)** - Waiting-on-you list across items (done, 2026-10-04)
 - **[MOD-76](docs/decisions/mod/mod-76.md)** - Orchestrator carried risks after MOD-37 (done, 2026-10-04)
 - **[MOD-11](docs/decisions/mod/mod-11.md)** - htui MCP server (done, 2026-10-04)
 - **[MOD-37](docs/decisions/mod/mod-37.md)** - Orchestrator hardening follow-ups (done, 2026-10-04)

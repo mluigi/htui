@@ -31,7 +31,7 @@ pub mod filter;
 pub mod item_form;
 pub mod list;
 
-use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, Scope};
+use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 
@@ -71,6 +71,18 @@ const ITEMS_READ: &str = "items";
 /// plan D16, OQ-3).
 const REFRESHES_PER_RUNS_POLL: u32 = 5;
 
+/// A reveal waiting for the next `Items` reply (MOD-64 D235), with the key its miss is reported by
+/// and, for `RevealTarget::Step`, the run and step the Runs pane is to focus (MOD-69 plan D8).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingReveal {
+    /// The item to select.
+    id: ItemId,
+    /// Its key, for the miss sentence.
+    key: String,
+    /// The Runs pane's focus; `None` for an item reveal.
+    focus: Option<(Option<RunId>, Option<StepId>)>,
+}
+
 /// The Backlog screen.
 ///
 /// Holds no store handle and no channel (`R-NF-3`): rows arrive through [`Tab::on_reply`] and
@@ -86,8 +98,8 @@ pub struct BacklogTab {
     /// Body, Runs, Graph, Docs, Notes, Prompt, Reqs, in that order.
     detail: DetailRegistry,
     /// A reveal waiting for the next `Items` reply (MOD-64 D235), with the key its miss is
-    /// reported by.
-    pending_reveal: Option<(ItemId, String)>,
+    /// reported by and a step reveal's focus (MOD-69 plan D8).
+    pending_reveal: Option<PendingReveal>,
     /// The shell's refreshes this tab has seen while active; every
     /// [`REFRESHES_PER_RUNS_POLL`]th is a `Runs` poll (MOD-41 plan D16).
     refreshes: u32,
@@ -285,6 +297,27 @@ impl BacklogTab {
     fn select_item(&mut self, id: ItemId, project: ProjectId, ctx: &Ctx<'_>) {
         self.folded.retain(|folded| *folded != project);
         self.go(Some(Selection::Item(id)), ctx);
+    }
+
+    /// MOD-69 plan D8: opens the Runs sub-tab and hands it the reveal's run and step. The item is
+    /// already selected; `was_selected` says `go` short-circuited, so no `Runs` read went out and
+    /// one is asked here for the pane to apply the focus to (blueprint A-5).
+    fn focus_runs(
+        &mut self,
+        id: ItemId,
+        run: Option<RunId>,
+        step: Option<StepId>,
+        was_selected: bool,
+        ctx: &Ctx<'_>,
+    ) {
+        self.detail.select_id(RunsTab::ID);
+        if run.is_none() && step.is_none() {
+            return; // a Reopen row: the item and its Runs pane are the target
+        }
+        self.detail.focus(RunsTab::ID, run, step, ctx);
+        if was_selected {
+            ctx.request(StoreRequest::Runs(id));
+        }
     }
 
     /// A key while the filter form is open (MOD-13 D1).
@@ -685,9 +718,18 @@ impl Tab for BacklogTab {
                     .any(|scoped| scoped.project_id == *project)
             });
             // MOD-64 D251: a reveal of an item that was not loaded is decided by this list.
-            if let Some((id, key)) = self.pending_reveal.take() {
+            if let Some(PendingReveal { id, key, focus }) = self.pending_reveal.take() {
                 match self.items.iter().find(|item| item.id == id) {
-                    Some(item) => self.select_item(id, item.project_id, ctx),
+                    Some(item) => {
+                        let project = item.project_id;
+                        let was_selected = self.selected == Some(Selection::Item(id));
+                        self.select_item(id, project, ctx);
+                        // MOD-69 plan D8: armed after `go`'s item change, so its reset cannot
+                        // eat the focus.
+                        if let Some((run, step)) = focus {
+                            self.focus_runs(id, run, step, was_selected, ctx);
+                        }
+                    }
                     None => ctx.emit(Action::Error(not_in_this_backlog(&key))),
                 }
             }
@@ -789,8 +831,15 @@ impl Tab for BacklogTab {
     }
 
     fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
-        let RevealTarget::Item { id, key } = target else {
-            return false;
+        let (id, key, focus) = match target {
+            RevealTarget::Item { id, key } => (*id, key, None),
+            RevealTarget::Step {
+                item,
+                key,
+                run,
+                step,
+            } => (*item, key, Some((*run, *step))),
+            RevealTarget::Requirement { .. } => return false,
         };
         // A half-typed note or reject reason would be lost by the move (`go` resets the sub-tabs),
         // and so would a half-edited filter or a half-typed item.
@@ -798,11 +847,17 @@ impl Tab for BacklogTab {
             ctx.emit(Action::Error(CLOSE_THE_FIELD_FIRST.to_owned()));
             return true;
         }
-        match self.items.iter().find(|item| item.id == *id) {
+        match self.items.iter().find(|item| item.id == id) {
             Some(item) => {
                 let project = item.project_id;
+                let was_selected = self.selected == Some(Selection::Item(id));
                 self.pending_reveal = None;
-                self.select_item(*id, project, ctx);
+                self.select_item(id, project, ctx);
+                // MOD-69 plan D8: the focus is armed after `go`'s item change, which resets the
+                // pane; `on_item_change` keeps the active sub-tab, so Runs stays open.
+                if let Some((run, step)) = focus {
+                    self.focus_runs(id, run, step, was_selected, ctx);
+                }
             }
             // Not loaded, or not in the rows read so far: re-read and decide on arrival (D251).
             // MOD-13 D4: the re-read is unfiltered. The tab cannot tell "hidden by the filter"
@@ -810,7 +865,11 @@ impl Tab for BacklogTab {
             // D251's error then speaks for the whole workspace.
             None => {
                 self.filter = BacklogFilter::default();
-                self.pending_reveal = Some((*id, key.clone()));
+                self.pending_reveal = Some(PendingReveal {
+                    id,
+                    key: key.clone(),
+                    focus,
+                });
                 ctx.request(self.filter.to_request(ctx.scope));
             }
         }
@@ -1692,6 +1751,163 @@ mod tests {
         );
     }
 
+    // ---- MOD-69 plan D8: a reveal to a run's step (blueprint §4.3) ----------------------------
+
+    /// The `Runs` reads among `actions`, by item.
+    fn runs_reads(actions: &[Action]) -> Vec<ItemId> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::Runs(id)) => Some(*id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `FEAT-1`'s `review` step, as a waiting-list row names it.
+    fn feat_1_review() -> RevealTarget {
+        RevealTarget::Step {
+            item: htui_core::fixtures::ids::HTUI_FEAT_1,
+            key: "FEAT-1".to_owned(),
+            run: Some(htui_core::fixtures::ids::RUN_1),
+            step: Some(htui_core::fixtures::ids::STEP_REVIEW),
+        }
+    }
+
+    #[tokio::test]
+    async fn revealing_a_step_of_a_loaded_item_selects_it_opens_runs_and_reads_once() {
+        use htui_core::fixtures::ids;
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab {
+            selected: None,
+            ..bench.tab()
+        };
+        assert!(tab.reveal(&feat_1_review(), &mut bench.ctx()));
+        assert_eq!(tab.selected, Some(Selection::Item(ids::HTUI_FEAT_1)));
+        assert_eq!(tab.detail.active_id(), Some(RunsTab::ID));
+        assert_eq!(tab.pending_reveal, None);
+        let actions = bench.actions();
+        assert_eq!(
+            runs_reads(&actions),
+            [ids::HTUI_FEAT_1],
+            "the selection's own read carries the focus: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revealing_a_step_of_the_selected_item_re_reads_its_runs() {
+        use htui_core::fixtures::ids;
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ids::HTUI_FEAT_1)),
+            ..bench.tab()
+        };
+        assert!(tab.reveal(&feat_1_review(), &mut bench.ctx()));
+        assert_eq!(tab.selected, Some(Selection::Item(ids::HTUI_FEAT_1)));
+        assert_eq!(tab.detail.active_id(), Some(RunsTab::ID));
+        let actions = bench.actions();
+        assert_eq!(
+            runs_reads(&actions),
+            [ids::HTUI_FEAT_1],
+            "`go` short-circuited, so the reveal asks for the rows: {actions:?}"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Store(StoreRequest::Item(_)))),
+            "and nothing else of the item is re-read: {actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn revealing_a_step_of_an_unloaded_item_carries_the_focus_to_the_items_reply() {
+        use htui_core::fixtures::ids;
+        let bench = Bench::new().await;
+        let others: Vec<ItemSummary> = bench
+            .items
+            .iter()
+            .filter(|item| item.id != ids::HTUI_FEAT_1)
+            .cloned()
+            .collect();
+        let mut tab = BacklogTab {
+            items: others,
+            selected: None,
+            ..bench.tab()
+        };
+        assert!(tab.reveal(&feat_1_review(), &mut bench.ctx()));
+        assert_eq!(
+            tab.pending_reveal,
+            Some(PendingReveal {
+                id: ids::HTUI_FEAT_1,
+                key: "FEAT-1".to_owned(),
+                focus: Some((Some(ids::RUN_1), Some(ids::STEP_REVIEW))),
+            })
+        );
+        let actions = bench.actions();
+        assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
+        assert!(runs_reads(&actions).is_empty(), "{actions:?}");
+
+        tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
+        assert_eq!(tab.selected, Some(Selection::Item(ids::HTUI_FEAT_1)));
+        assert_eq!(tab.detail.active_id(), Some(RunsTab::ID));
+        assert_eq!(tab.pending_reveal, None);
+        let actions = bench.actions();
+        assert_eq!(runs_reads(&actions), [ids::HTUI_FEAT_1], "{actions:?}");
+        assert!(
+            !actions
+                .iter()
+                .any(|action| matches!(action, Action::Error(_))),
+            "{actions:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_step_reveal_while_a_field_is_open_asks_to_close_it_first() {
+        let bench = Bench::new().await;
+        let mut tab = BacklogTab {
+            selected: None,
+            ..bench.tab()
+        };
+        press(&mut tab, &bench, KeyCode::Char('f'));
+        assert!(tab.reveal(&feat_1_review(), &mut bench.ctx()));
+        let actions = bench.actions();
+        assert!(
+            matches!(actions.as_slice(), [Action::Error(sentence)] if sentence == CLOSE_THE_FIELD_FIRST),
+            "{actions:?}"
+        );
+        assert!(tab.form.is_some());
+        assert_eq!(tab.selected, None, "the cursor did not move");
+        assert_ne!(tab.detail.active_id(), Some(RunsTab::ID));
+        assert!(tab.pending_reveal.is_none());
+    }
+
+    /// A Reopen row names no run: the item and its Runs pane are the target, and only the
+    /// selection's own read goes out (none at all when the item was already selected).
+    #[tokio::test]
+    async fn a_step_reveal_with_no_run_opens_runs_without_asking_twice() {
+        use htui_core::fixtures::ids;
+        let bench = Bench::new().await;
+        let reopen = RevealTarget::Step {
+            item: ids::HTUI_FEAT_1,
+            key: "FEAT-1".to_owned(),
+            run: None,
+            step: None,
+        };
+        let mut tab = BacklogTab {
+            selected: None,
+            ..bench.tab()
+        };
+        assert!(tab.reveal(&reopen, &mut bench.ctx()));
+        assert_eq!(tab.selected, Some(Selection::Item(ids::HTUI_FEAT_1)));
+        assert_eq!(tab.detail.active_id(), Some(RunsTab::ID));
+        let actions = bench.actions();
+        assert_eq!(runs_reads(&actions), [ids::HTUI_FEAT_1], "{actions:?}");
+
+        assert!(tab.reveal(&reopen, &mut bench.ctx()));
+        let actions = bench.actions();
+        assert!(runs_reads(&actions).is_empty(), "{actions:?}");
+    }
+
     /// MOD-13 review L4: the open form passes every chord but `SHIFT`, as `TextField` does, so an
     /// `Alt` chord reaches the shell instead of acting as its letter.
     #[tokio::test]
@@ -2395,7 +2611,14 @@ mod tests {
         tab.on_reply(&reply, &mut bench.ctx());
         assert!(tab.item_form.is_none(), "the form closed");
         assert!(tab.filter.is_empty(), "the filter is cleared");
-        assert_eq!(tab.pending_reveal, Some((minted, "ANA-3".to_owned())));
+        assert_eq!(
+            tab.pending_reveal,
+            Some(PendingReveal {
+                id: minted,
+                key: "ANA-3".to_owned(),
+                focus: None,
+            })
+        );
         let actions = bench.actions();
         assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
         assert_eq!(actions.len(), 1, "{actions:?}");

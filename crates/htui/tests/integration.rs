@@ -52,7 +52,7 @@ async fn the_demo_shell_starts_inside_the_first_workspace_on_the_backlog_tab() {
     );
     assert_eq!(
         top_bar(&frame),
-        "Graphics · DESKTOP-HTUI · memory · 0 runs",
+        "Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting",
         "the top bar reads the startup scope"
     );
     assert!(

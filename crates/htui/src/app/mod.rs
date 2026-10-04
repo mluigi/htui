@@ -10,7 +10,7 @@ pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::keymap::{Binding, KeyChord, KeyScope};
-use crate::ui::overlay::{ConceptsSearch, MigrationPrompt, WorkspaceSwitcher};
+use crate::ui::overlay::{ConceptsSearch, MigrationPrompt, WaitingList, WorkspaceSwitcher};
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
     PersonasSection, PromptSection, QdrantSection,
@@ -52,6 +52,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    (MOD-13 D1), for the same reason: the tab's own arms open and clear the filter.
 /// 10. The Backlog tab's `N` and `e` are bound to their `new item` and `edit item` help texts
 ///     (MOD-13 milestone 2 D7), for the same reason: the tab's own arms read the item form.
+/// 11. The waiting list's factory goes in and global `Ctrl+W` is bound to opening it (MOD-69 D7),
+///     a chord for `Ctrl+F`'s reason.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -93,6 +95,17 @@ pub fn register_all(app: &mut App) {
         key: KeyChord::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
         action: Action::Overlay(OverlayAction::Open(ConceptsSearch::ID)),
         help: "find",
+    });
+
+    // MOD-69 D7: the waiting-on-you list, global `Ctrl+W`. A chord, for `Ctrl+F`'s reason; MOD-67
+    // makes it a named action.
+    app.overlay_factories
+        .register(WaitingList::ID, || Box::new(WaitingList::new()));
+    app.keymap.bind(Binding {
+        scope: KeyScope::Global,
+        key: KeyChord::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+        action: Action::Overlay(OverlayAction::Open(WaitingList::ID)),
+        help: "waiting",
     });
 
     app.startup_overlay = Some(WorkspaceSwitcher::ID);

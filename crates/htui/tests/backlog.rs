@@ -2553,7 +2553,7 @@ async fn ctrl_e_hands_the_body_out_and_ctrl_s_saves_what_came_back() {
     );
 }
 
-/// The PRD risk (blueprint E2). Two batches of app-origin polls (`StoreState`, `ActiveRuns`) are
+/// The PRD risk (blueprint E2). Two batches of app-origin polls (`StoreState`, `Waiting`) are
 /// served, one on each side of the editor's outcome: they are addressed to the shell, not the
 /// tab, so this pins only that they cannot reach or disturb the open form (nothing Backlog-bound
 /// can be in flight while an idle form is open). The real asserts are the rest: another writer
@@ -2566,7 +2566,7 @@ async fn a_reply_and_a_concurrent_write_around_the_editor_end_in_the_divergence_
     keys(&mut harness, &["e"]).await;
     keys(&mut harness, &TITLE_TO_BODY).await;
     // One shell refresh (`update.rs`'s private `TICKS_PER_REFRESH` is 4): `StoreState` and
-    // `ActiveRuns` are queued, not served.
+    // `Waiting` are queued, not served.
     for _ in 0..4 {
         harness.app().update(Action::Tick);
     }

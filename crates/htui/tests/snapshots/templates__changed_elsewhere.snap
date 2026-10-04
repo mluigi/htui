@@ -2,7 +2,7 @@
 source: crates/htui/tests/templates.rs
 expression: frame
 ---
-Graphics · DESKTOP-HTUI · memory · 0 runs
+Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
  1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
  Skills │ Templates
 ┌ implement · editing from v1, saves v3 ─────────────────────┐┌ phase placeholders ────────────────┐

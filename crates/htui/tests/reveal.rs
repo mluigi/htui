@@ -249,3 +249,91 @@ fn the_refusal_asks_for_a_new_search_not_the_same_hit() {
         "{CLOSE_THE_FIELD_FIRST}"
     );
 }
+
+// ---- MOD-69 plan D8: a reveal to a run's step (blueprint §4.6) ------------------------------
+
+/// `htui` FEAT-1's `RUN_1` at `step`.
+fn feat_1_at(step: htui_core::model::StepId) -> RevealTarget {
+    RevealTarget::Step {
+        item: ids::HTUI_FEAT_1,
+        key: "FEAT-1".to_owned(),
+        run: Some(ids::RUN_1),
+        step: Some(step),
+    }
+}
+
+/// The Runs pane's cursor line: the detail pane's row that starts with the pane's `▸`, past the
+/// list's right border and the detail's left one.
+fn cursor_line(frame: &str) -> String {
+    let rows: Vec<&str> = frame
+        .lines()
+        .filter_map(|line| {
+            line.split_once("\u{2502}\u{2502}")
+                .map(|(_, detail)| detail)
+        })
+        .filter(|detail| detail.starts_with('\u{25b8}'))
+        .collect();
+    match rows.as_slice() {
+        [row] => (*row).to_owned(),
+        _ => panic!("expected one cursor line in the detail pane, got {rows:?}:\n{frame}"),
+    }
+}
+
+/// The Runs pane is the one drawn: its run grid's header.
+fn shows_runs(frame: &str) -> bool {
+    frame.contains("\u{2502}kind   status    box")
+}
+
+#[tokio::test]
+async fn revealing_a_step_lands_on_the_runs_pane_with_that_step_selected() {
+    let mut harness = platform().await;
+    reveal(&mut harness, feat_1_at(ids::STEP_REVIEW)).await;
+    assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
+    let frame = harness.render();
+    assert!(frame.contains(&titled("FEAT-1")), "{frame}");
+    assert!(shows_runs(&frame), "the Runs sub-tab is open: {frame}");
+    let line = cursor_line(&frame);
+    assert!(line.contains("review"), "{line}\n{frame}");
+    assert!(!line.contains("prd"), "{line}\n{frame}");
+    assert_eq!(harness.app().status, None);
+}
+
+#[tokio::test]
+async fn revealing_a_step_of_the_already_selected_item_moves_the_cursor() {
+    let mut harness = platform().await;
+    reveal(
+        &mut harness,
+        RevealTarget::Item {
+            id: ids::HTUI_FEAT_1,
+            key: "FEAT-1".to_owned(),
+        },
+    )
+    .await;
+    harness.key("l");
+    harness.drive_to_end().await;
+    let before = harness.render();
+    assert!(shows_runs(&before), "l lands on Runs: {before}");
+    assert!(cursor_line(&before).contains("prd"), "{before}");
+
+    reveal(&mut harness, feat_1_at(ids::STEP_IMPL)).await;
+    let frame = harness.render();
+    assert!(frame.contains(&titled("FEAT-1")), "{frame}");
+    assert!(shows_runs(&frame), "{frame}");
+    let line = cursor_line(&frame);
+    assert!(line.contains("implement"), "{line}\n{frame}");
+    assert_eq!(harness.app().status, None);
+}
+
+#[tokio::test]
+async fn revealing_a_step_before_the_list_lands_selects_it_on_arrival() {
+    let mut harness = platform_unserved().await;
+    reveal(&mut harness, feat_1_at(ids::STEP_REVIEW)).await;
+    assert_eq!(harness.app().top_bar.workspace, "Platform");
+    let frame = harness.render();
+    assert!(frame.contains(&titled("FEAT-1")), "{frame}");
+    assert!(shows_runs(&frame), "{frame}");
+    let line = cursor_line(&frame);
+    assert!(line.contains("review"), "{line}\n{frame}");
+    assert!(!line.contains("prd"), "{line}\n{frame}");
+    assert_eq!(harness.app().status, None);
+}

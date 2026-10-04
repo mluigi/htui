@@ -104,6 +104,7 @@ pub mod skill_import;
 pub mod skill_language;
 pub mod usage;
 pub mod user;
+pub mod waiting;
 
 pub use agent::{Agent, AgentBox, AgentSummary, Billing, Transport};
 pub use box_::{
@@ -175,6 +176,7 @@ pub use skill_glob::{GlobError, SkillGlob, SkillGlobs};
 pub use skill_language::UnknownLanguage;
 pub use usage::UsageTotals;
 pub use user::{AppUser, CapabilityTag};
+pub use waiting::{WaitingCandidate, WaitingPermission};
 
 #[cfg(test)]
 mod tests {

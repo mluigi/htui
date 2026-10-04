@@ -1,0 +1,23 @@
+---
+source: crates/htui/src/ui/overlay/waiting_list.rs
+expression: "bench.render(&WaitingList::new())"
+---
+
+
+
+
+
+
+
+
+
+
+
+
+                 ┌ Waiting on you ─────────────────────────────────────────────────┐
+                 │> ANA-2   prd 0.1  gate     gate                                 │
+                 │  FEAT-2  —        unblock  blocked, no active run: u reopens it │
+                 │  permissions unavailable (read-only offline)                    │
+                 │                                                                 │
+                 │  j/k move · Enter open · Esc close                              │
+                 └─────────────────────────────────────────────────────────────────┘

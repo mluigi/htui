@@ -2,7 +2,7 @@
 source: crates/htui/tests/backlog.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 run
+Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
  1 Backlog
 ┌ ANA-1  v1 → theirs v2 ───────────────────────────────────────────────────────────────────────────┐
 │field     state     ancestor v1               theirs v2                 mine                      │
