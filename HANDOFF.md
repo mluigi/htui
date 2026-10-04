@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
+**Current status (2026-10-04):** **MOD-77 is done** (`docs/decisions/mod/mod-77.md`): every fenced
+Postgres step writer locks the step before the run, `park_step`'s order, so none can deadlock (`40P01`)
+against a park. Step updaters take `FOR NO KEY UPDATE OF s FOR SHARE OF r` up front; reader-inserters
+(`append_events`, `record_commits`, the relay's `open_permission`) take `FOR KEY SHARE OF s FOR SHARE OF
+r`; `finish_chat_run` locks its step first. Fifteen deterministic lock-order tests. No migration; `.sqlx`
+regenerated.
+Before it, **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
 waiting-on-you list. `Ctrl+W` opens, from every screen, an overlay listing every run in the active
 workspace that waits on a person, one row per reason (gate, selection, judge failed, unblock,
 interrupted, open permission with its tool); `Enter` opens the item's Runs tab on that step. The top
@@ -29,14 +35,6 @@ before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
 `claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
 the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
 with no run walking, never under a live walk. No migration.
-Before it, **MOD-11 is done** (`docs/decisions/mod/mod-11.md`): every session
-htui launches (engine steps in the TUI and in `htui worker`, fresh and promoted chats) gets the `htui`
-MCP server: `box_profile`, `document_write`, `note_add`, `item_status` (a note, never a transition),
-`item_link`, `search_concepts`, `command_run`, and `permission_prompt` for `claude-cli`. Scope comes
-from a per-session token and every item write is fenced. Production judges and `approve`/`accept`
-now work on agent-written documents. `command_run` queues builds and tests per `(box, class)`.
-`claude-cli` permission prompts reach the Runs pane and the chat. New crate `htui-mcp`, migration
-`0015_command_queue`, user guide `docs/htui-mcp.md`. Follow-ups MOD-77, MOD-78, MOD-79 and ANA-28.
 Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
 `heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
 MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
@@ -271,17 +269,6 @@ document version newer than a step's output is what the next step reads (ANA-2 Â
   the engine has no follow-up verb and ANA-2 no state that accepts one (a walk's session ends at
   `done` before the step parks, `docs/ANA-2.md:1235-1238`), and the text is typed on one box but must
   be scrubbed on the executing box (`R-SEC-3`, `R-ID-7`). Not blocked.
-- [ ] **MOD-77 - Pg step writers lock the step before the run (`park_step` deadlock order)** (from
-  MOD-11, `docs/decisions/mod/mod-11.md`). `R-HIS-1`, `R-ORCH-11`. `park_step` locks
-  `FOR UPDATE OF s, r` (step, then run), and MOD-11's fenced writes follow it through `step_scope`
-  (`FOR SHARE OF s, r`, step â†’ run â†’ item). The older step writers go the other way. `append_events`,
-  `set_step_usage`, `set_step_prompt`, `finish_step`, `pass_step`, `upsert_step_tree`,
-  `record_commits`, and the relay's `open_permission`, fence through `step_fence` (`FOR SHARE OF r`, or
-  an `EXISTS â€¦ FOR SHARE`). They lock the run first and only then touch `run_step`. Not reachable
-  through MOD-11 (verified). The worst case is a detected `40P01` when a stale walk races the walk that
-  adopted its run. Fix: give `step_fence` the `FOR SHARE OF s, r` shape; writers that update
-  `run_step` take `FOR NO KEY UPDATE OF s FOR SHARE OF r`; regenerate `.sqlx`. MOD-76
-  (done, `docs/decisions/mod/mod-76.md`) did not touch it. Not blocked.
 - [ ] **MOD-78 - `command_run` lifecycle: lease check and cancel on session end** (from MOD-11,
   `docs/decisions/mod/mod-11.md`). `R-MCP-1`, `R-MCP-3`. `command_run` is not fenced (MOD-11's I-3
   reads "every item write"). A session whose walk lost its lease can queue and run commands until the
@@ -491,6 +478,6 @@ document version newer than a step's output is what the next step reads (ANA-2 Â
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 26 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

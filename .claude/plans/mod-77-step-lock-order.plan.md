@@ -5,7 +5,7 @@
 `hr/MOD-77`.
 **Complexity**: Small (Postgres store only: two source files, one test file, regenerated `.sqlx`; no migration, no
 trait or signature change, `MemStore` untouched)
-**Status**: plan, awaiting CONFIRM
+**Status**: done 2026-10-04 (`docs/decisions/mod/mod-77.md`); review L1 amended D1/D3/D4 to `FOR KEY SHARE OF s` for the reader-inserters
 
 ## Summary
 
