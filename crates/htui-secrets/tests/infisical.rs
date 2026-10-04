@@ -999,6 +999,52 @@ async fn a_login_redirect_is_protocol_and_the_body_never_follows() {
     assert_eq!(stub.count("POST", LOGIN), 2, "a login redirect latched");
 }
 
+#[tokio::test]
+async fn an_empty_or_unusable_login_token_is_protocol_and_never_cached() {
+    let cases = [
+        ("", "the login answer carried no access token"),
+        (
+            "tok-sentinel-1\nX",
+            "the login answer carried an access token that is not a valid header value",
+        ),
+        (
+            "tok sentinel-1",
+            "the login answer carried an access token that is not a valid header value",
+        ),
+    ];
+    for (i, (token, detail)) in cases.into_iter().enumerate() {
+        let stub = Stub::start();
+        stub.on("POST", LOGIN, login_ok(token, 2_592_000)).on(
+            "GET",
+            SECRETS,
+            list_ok(json!([]), json!([])),
+        );
+        let p = provider(&stub);
+        for _ in 0..2 {
+            let err = p.resolve(&scope()).await.unwrap_err();
+            assert_eq!(
+                err,
+                SecretError::Protocol {
+                    endpoint: LOGIN,
+                    detail: detail.into()
+                },
+                "case {i}: wrong error"
+            );
+            assert!(!format!("{err} {err:?}").contains(TOKEN), "case {i}: leak");
+        }
+        assert_eq!(
+            stub.count("POST", LOGIN),
+            2,
+            "case {i}: the token was cached"
+        );
+        assert_eq!(
+            stub.count("GET", SECRETS),
+            0,
+            "case {i}: a data call went out"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------------------------

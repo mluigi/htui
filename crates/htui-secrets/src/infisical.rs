@@ -230,6 +230,15 @@ impl InfisicalProvider {
                     "the login answer carried no access token".to_owned(),
                 )));
             }
+            // A token that cannot ride an `Authorization` header would fail every data call
+            // before it is sent, as an `Unreachable` that never triggers a re-login.
+            if !token.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(LoginFailure::Other(protocol(
+                    LOGIN_PATH,
+                    "the login answer carried an access token that is not a valid header value"
+                        .to_owned(),
+                )));
+            }
             return Ok((token, reuse_until(Instant::now(), answer.expires_in)));
         }
         if status.is_redirection() {
