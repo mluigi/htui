@@ -1717,6 +1717,62 @@ fn residue_row(unmasked: &Unmasked, at: DateTime<Utc>) -> PendingRow {
     }
 }
 
+/// MOD-10 D8 (blueprint A-1): every string leaf of `chunks`, concatenated **per JSON pointer**
+/// across chunks in chunk order with no separator, as one array of strings in pointer order.
+/// Object keys only form the pointer; they are never joined text.
+///
+/// **Why per pointer and not one flat join.** Each raw chunk is a whole wire message, so an ACP
+/// `session/update` carries `jsonrpc`, `method`, `sessionId`, the `sessionUpdate` tag and
+/// `content.type` around `content.text` in every chunk. A flat join would put chunk 2's protocol
+/// leaves between the two halves of a split secret, where neither an exact-match mask nor a pattern
+/// rule could see it. Streamed text lives at one fixed pointer in every chunk (ACP
+/// `/params/update/content/text`, claude stream-json `/event/delta/text`), so joining per pointer
+/// rebuilds exactly the split the flush check targets.
+///
+/// Keys are left out because they are protocol field names, already scanned per chunk at capture
+/// ([`Recorder::scrub_envelope`]). The output is ordered by pointer (a [`BTreeMap`]), so it does
+/// not depend on the key order `serde_json/preserve_order` may or may not impose (blueprint H-11).
+fn joined_raw_leaves(chunks: &[Value]) -> Value {
+    let mut joined = BTreeMap::<String, String>::new();
+    let mut pointer = String::new();
+    for chunk in chunks {
+        collect_leaves(chunk, &mut pointer, &mut joined);
+    }
+    Value::Array(joined.into_values().map(Value::String).collect())
+}
+
+/// [`joined_raw_leaves`]' walk: appends each string leaf of `value` to the entry of its RFC 6901
+/// pointer. `pointer` is the pointer of `value` itself; it is grown and truncated in place.
+fn collect_leaves(value: &Value, pointer: &mut String, joined: &mut BTreeMap<String, String>) {
+    match value {
+        Value::String(text) => match joined.get_mut(pointer.as_str()) {
+            Some(open) => open.push_str(text),
+            None => {
+                joined.insert(pointer.clone(), text.clone());
+            }
+        },
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let base = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                collect_leaves(item, pointer, joined);
+                pointer.truncate(base);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                let base = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                collect_leaves(item, pointer, joined);
+                pointer.truncate(base);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
 /// One of the recorder's own events as the payload document it persists.
 ///
 /// Pinned to the serde form rather than hand-built, unlike [`residue_row`]'s two constant strings:
@@ -1947,7 +2003,7 @@ mod tests {
     use htui_core::store::{MemStore, ReadStore, StepFence, WriteStore};
     use serde_json::{Value, json};
 
-    use super::{Recorder, RecorderSummary};
+    use super::{Recorder, RecorderSummary, joined_raw_leaves};
     use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, TextChunk, UsageEvent};
 
     /// A fixed capture time, so a persisted row is a function of the script alone.
@@ -2292,5 +2348,44 @@ mod tests {
             "run_step.usage is the earlier spend plus the continuation's"
         );
         assert_eq!(summary.usage, expected, "the summary carries the same sum");
+    }
+
+    /// MOD-10 D8 (blueprint A-1): the join is **per JSON pointer**, so the protocol leaves a real
+    /// wire message carries around its text never land between the two halves of a split value.
+    /// Keys only address a leaf; their text is never part of the output. The output is ordered by
+    /// pointer, never by insertion (H-11), which is why the second chunk's keys are out of order.
+    #[test]
+    fn joined_raw_leaves_joins_per_pointer_in_chunk_order_and_excludes_keys() {
+        let chunks = [
+            json!({ "a": "x1", "b": { "c": "y1" } }),
+            json!({ "b": { "c": "y2" }, "a": "x2", "k-key": "z" }),
+        ];
+
+        let joined = joined_raw_leaves(&chunks);
+
+        assert_eq!(
+            joined,
+            json!(["x1x2", "y1y2", "z"]),
+            "one joined string per pointer, chunk order within a pointer, pointer order overall"
+        );
+        let rendered = joined.to_string();
+        for key in ["\"a\"", "\"b\"", "\"c\"", "k-key"] {
+            assert!(
+                !rendered.contains(key),
+                "a key is never joined text: {key} in {rendered}"
+            );
+        }
+    }
+
+    /// Array indices are pointer tokens too, and numbers, booleans and nulls are structural: a
+    /// leaf that is not a string joins nothing.
+    #[test]
+    fn joined_raw_leaves_addresses_array_elements_and_skips_non_strings() {
+        let chunks = [
+            json!({ "list": ["p1", 1, true], "n": null }),
+            json!({ "list": ["p2", "q2"], "n": 7 }),
+        ];
+
+        assert_eq!(joined_raw_leaves(&chunks), json!(["p1p2", "q2"]));
     }
 }
