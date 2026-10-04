@@ -115,9 +115,11 @@ the link is in force after the call.
 `document` or `requirement` points (an unknown name answers `invalid arguments: unknown type
 <name>`); `statuses` keeps items in those statuses, and naming any status leaves requirements out.
 A hit carries `point_type`, `owner_kind` (`item` or `requirement`), `key`, `score`, `snippet`, and
-when they apply `document_kind`, `resolution` (a closed item's) and `state` (a requirement's). It
-looks nothing else up. An index that cannot answer (no Qdrant URL stored, Qdrant down, the model
-not loaded) answers `search unavailable: <cause>`.
+when they apply `document_kind`, `resolution` (a closed item's) and `state` (a requirement's). The
+`snippet` is the start of the indexed text as stored (whitespace folded, control characters
+dropped, at most 280 characters), not scrubbed. It looks nothing else up. An index that cannot
+answer (no Qdrant URL stored, Qdrant down, the model not loaded) answers
+`search unavailable: <cause>`.
 
 **`command_run`**: see [below](#command_run-and-the-command-queue).
 
@@ -172,10 +174,13 @@ so it never does.
   and its row `cancelled`, as when the agent exits (see
   [Liveness](#liveness-crashes-and-cancellation)).
 - **No agent moves a status** (R-ENT-8): see `item_status`.
-- **Everything stored or returned is scrubbed first, and fails closed** (R-ID-7, R-SEC-3): a text
-  that matches one of htui's credential rules (an API key's prefix, for example) is refused as
-  `refused: the text matched credential rule <rule>; nothing was written`. The answer names the
-  rule, never the text.
+- **Every text an agent writes, and every command's output, is scrubbed first, and fails
+  closed** (R-ID-7, R-SEC-3): note and document bodies, document titles, command lines and output
+  tails. A text that matches one of htui's credential rules (an API key's prefix, for example) is
+  refused as `refused: the text matched credential rule <rule>; nothing was written`; an output
+  tail is [withheld](#what-a-call-does) instead. The answer names the rule, never the
+  text. What a tool reads back from htui (`box_profile`'s profile, `search_concepts`' snippets) is
+  returned as stored, unscrubbed.
 - **A token outlives nothing.** It is registered for exactly the session's life and never logged.
   When the session ends (the agent exits, the step settles, the chat ends, htui quits), the token
   is unregistered, and a call on a connection still open answers `session ended`.
