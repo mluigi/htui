@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-10-secret-provider.prd.md`
 **Selected Milestone**: 1 — Scrubber hardening
 **Complexity**: Medium
-**Status**: fact-checked (33 claims; 7 amended, 3 falsified, see the table at the end) — awaiting CONFIRM
+**Status**: CONFIRMED by the maintainer 2026-10-04 (fact-checked: 33 claims; 7 amended, 3 falsified)
 
 ## Summary
 
