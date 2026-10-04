@@ -1,7 +1,13 @@
 //! The one place a colour is chosen.
 //!
-//! Views take the theme out of their [`Ctx`](crate::app::Ctx) instead of naming colours, so a
-//! future palette (MOD-12 settings) changes one file and every tab follows.
+//! Views take the theme out of their [`Ctx`](crate::app::Ctx) instead of naming colours. Each
+//! role is one meaning (MOD-80 D1): `accent` is focus only, `key` keys, `running` work in
+//! progress, `warning` what needs a person, `added` a diff's `+`, `active_tab` the strip entry
+//! you are on, `cursor` the text cursor, and `selected` a selected row, which
+//! [`Theme::select`] paints over every span (D2).
+//!
+//! `NO_COLOR` set and non-empty selects [`Theme::monochrome`], the same roles drawn with
+//! modifiers alone (D4); `run` applies it once at startup.
 
 use std::ffi::OsStr;
 
@@ -67,10 +73,11 @@ impl Default for Theme {
 }
 
 impl Theme {
-    /// MOD-80 D4: no colour, only modifiers, for `NO_COLOR` terminals (crossterm 0.29 drops colour
-    /// codes there and keeps attributes). `selected`/`cursor` reverse, `accent`/`key`/`title` are bold,
-    /// `dim` is DIM, `active_tab` bold+underlined; `error`, `warning`, `running`, `added` are plain,
-    /// because the status word or diff gutter already says what they mean.
+    /// MOD-80 D4: no colour, only modifiers, for `NO_COLOR` terminals (crossterm 0.29 drops
+    /// colour codes there and keeps attributes). `selected`/`cursor` reverse, `accent`/`key`/
+    /// `title` are bold, `dim` is DIM, `active_tab` bold+underlined; `error`, `warning`,
+    /// `running`, `added` are plain, because the status word or diff gutter already says what
+    /// they mean.
     #[must_use]
     pub fn monochrome() -> Self {
         let plain = Style::new();
@@ -92,9 +99,9 @@ impl Theme {
         }
     }
 
-    /// crossterm's `NO_COLOR` rule (`style/types/colored.rs` `ansi_color_disabled`): set and non-empty
-    /// means [`Theme::monochrome`], anything else [`Theme::default`]. Takes the value, not the
-    /// environment, so it is testable.
+    /// crossterm's `NO_COLOR` rule (`style/types/colored.rs` `ansi_color_disabled`): set and
+    /// non-empty means [`Theme::monochrome`], anything else [`Theme::default`]. Takes the value,
+    /// not the environment, so it is testable.
     #[must_use]
     pub fn from_no_color(value: Option<&OsStr>) -> Self {
         match value {
@@ -103,9 +110,9 @@ impl Theme {
         }
     }
 
-    /// D2: `line` with [`Self::selected`] patched over the line **and over every span**, so a span's
-    /// own `fg` cannot show through (a `Line::style` alone leaves a cyan key cyan-on-cyan).
-    /// Modifiers a span had (a key's BOLD) survive.
+    /// D2: `line` with [`Self::selected`] patched over the line **and over every span**, so a
+    /// span's own `fg` cannot show through (a `Line::style` alone leaves a cyan key
+    /// cyan-on-cyan). Modifiers a span had (a key's BOLD) survive.
     #[must_use]
     pub fn select<'a>(&self, line: Line<'a>) -> Line<'a> {
         let mut line = line.patch_style(self.selected);
