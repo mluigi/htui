@@ -4,7 +4,8 @@
 //! - **Keys**: `J`/`K` move a cursor over the rows, drawn by style only; `PgUp`/`PgDn` scroll.
 //!   `a` sends `DocumentForm` with no kind (a new document: kind, title and body typed); `v`
 //!   sends it with the kind under the cursor (a new version: the kind fixed, title and body from
-//!   that kind's latest version, the cursor on the body). Its answer opens a [`Compose`] area over
+//!   the version of that kind the next step reads, never a fan-out loser's (MOD-73 review M1), the
+//!   cursor on the body). Its answer opens a [`Compose`] area over
 //!   the pane, which then captures every key; Ctrl+S sends `WriteDocument`, Ctrl+E hands the body
 //!   to `$EDITOR`, `Esc` drops it. Every other key passes while browsing.
 //! - **Nothing to save** (the plan's maintainer answer to blueprint §6 Q1): Ctrl+S on a `v` form
@@ -20,15 +21,18 @@
 //!   and says the sentence; any other failure may have followed a COMMIT whose answer was lost, so
 //!   it is hedged and the list re-read.
 //! - **Review M1**: the form covers the list, so the pane looks, not the user. The form stays
-//!   busy under the hedge while the list is re-read and the kind's latest version, body included,
-//!   is read with `DocumentForm` (round 2). The pane holds no `UserId` (`R-NF-3`), and a head no
-//!   body: a `v` form copies its base's title, so another user's version from the same base has
-//!   the sent kind and title, and a head cannot tell it from this write. The latest version can:
+//!   busy under the hedge while the list is re-read and the kind's checked version, body included,
+//!   is read with `DocumentForm` (round 2). That read answers the next step's input, the higher of
+//!   the latest hand-written version and the step-produced pick (MOD-73), so this write, landed
+//!   (hand-written, at or past the expected version), is at or below it: the rule below holds as
+//!   it did over the latest version. The pane holds no `UserId` (`R-NF-3`), and a head no body: a
+//!   `v` form copies its base's title, so another user's version from the same base has the sent
+//!   kind and title, and a head cannot tell it from this write. The checked version can:
 //!   - hand-written, with the sent title and body, at or past the expected version: it was
 //!     written (the form closes with D5's sentence for that version);
 //!   - none, or below the expected version, or another's at exactly the expected version: it was
 //!     not (the text stays, Ctrl+S tries again); the store allocates past every version, so this
-//!     write, landed, would be at or past the expected one and at or below the latest;
+//!     write, landed, would be at or past the expected one and at or below the checked one;
 //!   - another's past the expected version: this write may be below it, and the pane cannot tell
 //!     ([`cannot_tell`]); the text stays.
 //!
@@ -68,7 +72,7 @@ const BY_HAND: &str = "hand";
 const HINT: &str = "J/K move \u{b7} a new \u{b7} v new version";
 
 /// Review M1: a `WriteDocument` whose `Failed` may have followed a lost COMMIT, kept while the
-/// check that settles it, the kind's latest version, is in flight (round 2).
+/// check that settles it, the kind's checked version, is in flight (round 2).
 #[derive(Debug)]
 struct Hedged {
     /// The failure's sentence, for the settled notice.
@@ -84,14 +88,14 @@ struct Hedged {
     expected: Expected,
 }
 
-/// What the latest version says of a hedged write (review M1, round 2).
+/// What the checked version says of a hedged write (review M1, round 2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Settled {
-    /// The latest version is this write, at this version.
+    /// The checked version is this write, at this version.
     Written(i32),
     /// Nothing at or past the expected version is this write.
     NotWritten,
-    /// The latest version is another's, past the expected one: this write may be below it.
+    /// The checked version is another's, past the expected one: this write may be below it.
     CannotTell,
 }
 
@@ -222,7 +226,7 @@ impl DocumentsTab {
     }
 
     /// D10: a `WriteDocument` failed. A refusal keeps the text and says the sentence; anything
-    /// else is hedged, the form kept busy, the list re-read, and the kind's latest version read
+    /// else is hedged, the form kept busy, the list re-read, and the kind's checked version read
     /// to settle it (review M1, round 2). A failure with no busy area (an item change dropped it)
     /// is ignored.
     fn on_write_failed(&mut self, message: &str, ctx: &Ctx<'_>) {
@@ -261,7 +265,7 @@ impl DocumentsTab {
         }
     }
 
-    /// Review M1, round 2: the kind's latest version after a hedge settles it ([`Settled`]).
+    /// Review M1, round 2: the kind's checked version after a hedge settles it ([`Settled`]).
     fn settle_hedge(&mut self, latest: Option<&Document>) {
         let Some(hedged) = self.hedged.take() else {
             return;
@@ -360,8 +364,10 @@ impl DocumentsTab {
     }
 }
 
-/// Review M1, round 2: what the kind's latest version says of `hedged`. Versions only grow, so
-/// this write, landed, is at or past the expected version and at or below the latest.
+/// Review M1, round 2: what the kind's checked version (`DocumentForm`'s base) says of `hedged`.
+/// Versions only grow, so this write, landed, is at or past the expected version; it is
+/// hand-written, so it is at or below the checked version, which is never below the latest
+/// hand-written one (MOD-73).
 fn settled(hedged: &Hedged, latest: Option<&Document>) -> Settled {
     let Some(latest) = latest.filter(|latest| latest.version >= hedged.expected.version) else {
         return Settled::NotWritten;
@@ -378,7 +384,7 @@ fn settled(hedged: &Hedged, latest: Option<&Document>) -> Settled {
     }
 }
 
-/// Review round 2: the hedge's sentence when the latest version is another user's, past the
+/// Review round 2: the hedge's sentence when the checked version is another user's, past the
 /// expected one, and this write may lie below it.
 #[must_use]
 fn cannot_tell(why: &str) -> String {
@@ -499,7 +505,7 @@ impl DetailTab for DocumentsTab {
                     self.key = Some(row.key.clone());
                 }
             }
-            // Review M1, round 2: the hedge's check, the latest version of the sent kind.
+            // Review M1, round 2: the hedge's check, the checked version of the sent kind.
             StoreReply::DocumentForm(context)
                 if Some(context.item) == self.item
                     && self.hedged.as_ref().is_some_and(|hedged| {
@@ -1111,7 +1117,7 @@ mod tests {
         assert_eq!(pane.opened, Some(2), "the form still comes from v2");
     }
 
-    /// The check a hedge on FEAT-1's plan sends: its latest version (review M1, round 2).
+    /// The check a hedge on FEAT-1's plan sends: its checked version (review M1, round 2).
     fn check() -> StoreRequest {
         StoreRequest::DocumentForm {
             item: ITEM,
@@ -1175,7 +1181,7 @@ mod tests {
         }
     }
 
-    /// Review M1: the latest version is this write, at the expected version: the form closes and
+    /// Review M1: the checked version is this write, at the expected version: the form closes and
     /// says D5's sentence for it.
     #[tokio::test]
     async fn a_check_with_the_version_closes_the_form_and_says_saved() {

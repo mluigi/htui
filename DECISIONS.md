@@ -3,6 +3,7 @@
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
 - **[MOD-37](docs/decisions/mod/mod-37.md)** - Orchestrator hardening follow-ups (done, 2026-10-04)
+- **[MOD-73](docs/decisions/mod/mod-73.md)** - Hand-written document versions as step inputs (done, 2026-10-03)
 - **[MOD-71](docs/decisions/mod/mod-71.md)** - Mouse support: capture policy and the Runs flow view (done, 2026-10-03)
 - **[MOD-72](docs/decisions/mod/mod-72.md)** - Tool-call chips in the Runs flow view (done, 2026-10-03)
 - **[MOD-13](docs/decisions/mod/mod-13.md)** - Backlog filters and item editing (done, 2026-10-03)

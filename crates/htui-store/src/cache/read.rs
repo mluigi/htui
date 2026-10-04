@@ -978,13 +978,16 @@ impl ReadStore for CacheStore {
             .collect()
     }
 
-    /// The Postgres statement's twin, down to the three-armed `CASE`.
+    /// The Postgres statement's twin, down to the three-armed `CASE` and the two arms (MOD-73
+    /// plan D2, D4).
     ///
     /// Blueprint H-14: `(s.run_id = ?) DESC NULLS LAST` is not a spelling both engines sort the
-    /// same way, so the rank is written out — this run's own output 0, another run's 1, a
-    /// hand-written document 2 — and the pick is `ROW_NUMBER() OVER (PARTITION BY kind ...)`,
-    /// which is one statement Postgres and SQLite both run, rather than `DISTINCT ON`. The
-    /// conformance read case is what proves the two agree.
+    /// same way, so the rank is written out (this run's own output 0, another run's 1, a row whose
+    /// step is absent 2), and each pick is a `ROW_NUMBER()` window, which is one statement Postgres
+    /// and SQLite both run, rather than `DISTINCT ON`. The inner window is partitioned by
+    /// `(kind, produced_by_step_id IS NULL)`, so a kind's step-produced rows and its hand-written
+    /// rows each yield their best; the outer one keeps, per kind, the higher version of the two.
+    /// The conformance read case and `tests/cache.rs`'s parity test are what prove the two agree.
     ///
     /// `s.selected IS NOT FALSE` is the one deliberate divergence in text: the mirror stores the
     /// column as `0`/`1`/`NULL`, so the eligibility test is written over integers here. The two
@@ -994,10 +997,13 @@ impl ReadStore for CacheStore {
     /// statement's.** [`run_pass`](crate::cache::refresh::run_pass) walks one table at a time and
     /// commits each batch on its own, with `document` seventh and `run_step` ninth, so a reader
     /// between those two commits sees a document whose producing step has not arrived: the
-    /// `LEFT JOIN` yields `s.id IS NULL`, which both ranks it 2 and — the consequence that matters
-    /// — passes the eligibility test, so a fan-out **loser's** document can be answered here where
-    /// Postgres excludes it. ANA-9 §6.2 promises whole-table consistency, not cross-table, so this
-    /// is by design; a caller that cannot tolerate a loser's output must read Postgres.
+    /// `LEFT JOIN` yields `s.id IS NULL`, which passes the eligibility test and ranks the row 2
+    /// **inside the step-produced arm**. The hand-written arm is keyed on the
+    /// `d.produced_by_step_id IS NULL` column, not on the join (MOD-73 plan D3), so such a row
+    /// never competes as hand-written. A fan-out **loser's** document can still be answered here
+    /// where Postgres excludes it, when nothing in its arm ranks above it and it is newer than the
+    /// hand-written pick. ANA-9 §6.2 promises whole-table consistency, not cross-table, so this is
+    /// by design; a caller that cannot tolerate a loser's output must read Postgres.
     async fn resolve_inputs(
         &self,
         item: ItemId,
@@ -1023,19 +1029,25 @@ impl ReadStore for CacheStore {
         let rows = sqlx::query(
             "SELECT id, item_id, kind, version, title, body, produced_by_step_id, created_by, \
                     created_at \
-               FROM (SELECT d.id, d.item_id, d.kind, d.version, d.title, d.body, \
-                            d.produced_by_step_id, d.created_by, d.created_at, \
+               FROM (SELECT id, item_id, kind, version, title, body, produced_by_step_id, \
+                            created_by, created_at, \
                             ROW_NUMBER() OVER ( \
-                                PARTITION BY d.kind \
-                                ORDER BY CASE WHEN s.id IS NULL      THEN 2 \
-                                              WHEN s.run_id = ?      THEN 0 \
-                                              ELSE 1 END, \
-                                         d.version DESC) AS rank_in_kind \
-                       FROM document d \
-                       LEFT JOIN run_step s ON s.id = d.produced_by_step_id \
-                      WHERE d.item_id = ? \
-                        AND d.kind IN (SELECT k.value FROM json_each(?) k) \
-                        AND (s.id IS NULL OR COALESCE(s.selected, 1) <> 0)) \
+                                PARTITION BY kind \
+                                ORDER BY version DESC) AS rank_in_kind \
+                       FROM (SELECT d.id, d.item_id, d.kind, d.version, d.title, d.body, \
+                                    d.produced_by_step_id, d.created_by, d.created_at, \
+                                    ROW_NUMBER() OVER ( \
+                                        PARTITION BY d.kind, d.produced_by_step_id IS NULL \
+                                        ORDER BY CASE WHEN s.id IS NULL      THEN 2 \
+                                                      WHEN s.run_id = ?      THEN 0 \
+                                                      ELSE 1 END, \
+                                                 d.version DESC) AS rank_in_arm \
+                               FROM document d \
+                               LEFT JOIN run_step s ON s.id = d.produced_by_step_id \
+                              WHERE d.item_id = ? \
+                                AND d.kind IN (SELECT k.value FROM json_each(?) k) \
+                                AND (s.id IS NULL OR COALESCE(s.selected, 1) <> 0)) \
+                      WHERE rank_in_arm = 1) \
               WHERE rank_in_kind = 1",
         )
         .bind(run.to_string())

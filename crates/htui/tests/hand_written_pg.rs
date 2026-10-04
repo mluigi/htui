@@ -199,8 +199,9 @@ async fn a_note_and_a_document_land_on_postgres_as_on_memory() {
     stack.finish().await;
 }
 
-/// D9: the `v` form's read prefills from the kind's latest version on Postgres as on memory; the
-/// `a` read prefills nothing.
+/// D9: the `v` form's read prefills from the version the next step reads on Postgres as on memory
+/// (MOD-73 review M1: `ANA-1`'s research loser, v3, is never the base); the `a` read prefills
+/// nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_document_form_on_postgres_matches_memory() {
     let Some(stack) = Stack::new("hand-written-pg-form").await else {
@@ -228,6 +229,18 @@ async fn the_document_form_on_postgres_matches_memory() {
             2,
             "Plan: TUI scaffold (revised)".to_owned()
         ))
+    );
+
+    let request = StoreRequest::DocumentForm {
+        item: ids::HTUI_ANA_1,
+        kind: Some("research".to_owned()),
+    };
+    let on_pg = base(store_worker::serve(pg, &request).await);
+    assert_eq!(on_pg, base(store_worker::serve(&memory, &request).await));
+    assert_eq!(
+        on_pg.map(|(id, version, _)| (id, version)),
+        Some((ids::DOC_ANA_1_RESEARCH_V2, 2)),
+        "the selected output, not the loser's v3"
     );
 
     let request = StoreRequest::DocumentForm {

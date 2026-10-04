@@ -30,7 +30,7 @@
 
 use chrono::Utc;
 use htui_core::model::hand_written::{self as rules, HandWrittenError};
-use htui_core::model::{Document, DocumentId, Item, ItemId, NewDocument, NewNote, NoteId};
+use htui_core::model::{Document, DocumentId, Item, ItemId, NewDocument, NewNote, NoteId, RunId};
 use htui_core::store::{ReadStore as _, Result, StoreError, WriteStore as _};
 use htui_store::{Backend, DATABASE_UNREACHABLE, Writer};
 
@@ -87,15 +87,18 @@ impl core::fmt::Debug for HandText {
     }
 }
 
-/// The answer to `StoreRequest::DocumentForm` (D1, D3): the item, and for `v` the latest version
-/// of the asked kind, hand-written included (`documents_of_kinds`).
+/// The answer to `StoreRequest::DocumentForm` (D1, D3): the item, and for `v` the version of the
+/// asked kind the next step reads (`resolve_inputs`, ANA-2 §4.2 as amended by MOD-73), not the
+/// latest of any producer: a fan-out loser's output is never the base (`R-ORCH-7`), and a
+/// hand-written version newer than the step-produced pick is. See [`v_base`] for the seat.
 ///
 /// `Debug` is hand-written (milestone 2 review L2): see the impl.
 #[derive(Clone, PartialEq)]
 pub struct DocumentFormContext {
     /// The item the form writes for.
     pub item: ItemId,
-    /// The kind's latest version, body included, for `v`; `None` for `a` or a kind with no rows.
+    /// The version of the kind the next step reads, body included, for `v`; `None` for `a` or a
+    /// kind with no eligible row.
     pub base: Option<Document>,
 }
 
@@ -198,11 +201,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let writer = write_access(backend)?;
             existing(&writer, *item).await?;
             let base = match kind {
-                Some(kind) => writer
-                    .documents_of_kinds(*item, core::slice::from_ref(kind))
-                    .await?
-                    .into_iter()
-                    .next(),
+                Some(kind) => v_base(&writer, *item, kind).await?,
                 None => None,
             };
             Ok(StoreReply::DocumentForm(Box::new(DocumentFormContext {
@@ -245,6 +244,31 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             other.name()
         ))),
     }
+}
+
+/// `v`'s base (MOD-73 review M1): the version of `kind` the item's next step reads, so an edit
+/// saved from it and approved at a gate carries the selected output forward, never a fan-out
+/// loser's (`R-ORCH-7`). `MOD-13`'s "latest version" (`documents_of_kinds`) was that until a newer
+/// hand-written version became a step input.
+///
+/// The seat is the item's most recent run (latest `queued_at`): at a gate, the run whose next step
+/// reads the edit, so its own output ranks first exactly as the engine ranks it. With no run, a
+/// fresh [`RunId`] matches no step, so every run's non-loser output ranks equally by version, as
+/// a first run's would. One extra read (`runs`) on a key press; versions only grow, so the two
+/// seats differ only when another run's output is newer than the most recent run's.
+async fn v_base(writer: &Writer, item: ItemId, kind: &str) -> Result<Option<Document>> {
+    let run = writer
+        .runs(item)
+        .await?
+        .into_iter()
+        .max_by_key(|run| run.queued_at)
+        .map_or_else(RunId::new, |run| run.id);
+    Ok(writer
+        .resolve_inputs(item, run, &[kind.to_owned()])
+        .await?
+        .into_iter()
+        .next()
+        .and_then(|input| input.document))
 }
 
 /// The writer, or the refusal every hand-written request answers offline (D2).
@@ -410,8 +434,12 @@ mod tests {
     }
 
     async fn form(backend: &Backend, kind: Option<&str>) -> DocumentFormContext {
+        form_of(backend, ids::HTUI_FEAT_1, kind).await
+    }
+
+    async fn form_of(backend: &Backend, item: ItemId, kind: Option<&str>) -> DocumentFormContext {
         let request = StoreRequest::DocumentForm {
-            item: ids::HTUI_FEAT_1,
+            item,
             kind: kind.map(str::to_owned),
         };
         match serve(backend, &request).await {
@@ -436,6 +464,47 @@ mod tests {
         assert!(!base.body.is_empty(), "the base carries its body");
 
         assert_eq!(form(&backend, Some("review")).await.base, None);
+    }
+
+    /// MOD-73 review M1: `v`'s base is the version the next step reads (`resolve_inputs`), not
+    /// the latest of any producer. The seed's `ANA-1` research fan-out has a loser at v3 over the
+    /// selected v2; prefilling v3 and saving it as a hand-written edit would carry the loser
+    /// forward (`R-ORCH-7`). A newer hand-written version is then the base, as it is the input.
+    #[tokio::test]
+    async fn the_document_form_base_is_what_the_next_step_reads_never_a_loser() {
+        let (store, backend) = demo();
+        assert_eq!(
+            latest(&store, ids::HTUI_ANA_1, "research").await.id,
+            ids::DOC_ANA_1_RESEARCH_V3,
+            "the seed's loser is the kind's highest version"
+        );
+
+        let base = form_of(&backend, ids::HTUI_ANA_1, Some("research"))
+            .await
+            .base
+            .expect("research has an eligible version");
+        assert_eq!(
+            base.id,
+            ids::DOC_ANA_1_RESEARCH_V2,
+            "the selected output, not the loser"
+        );
+
+        let reply = serve(
+            &backend,
+            &write(ids::HTUI_ANA_1, "research", "Research, by hand", "Edited."),
+        )
+        .await;
+        assert!(
+            matches!(reply, Ok(StoreReply::DocumentWritten { version: 4, .. })),
+            "{reply:?}"
+        );
+        let base = form_of(&backend, ids::HTUI_ANA_1, Some("research"))
+            .await
+            .base
+            .expect("research has an eligible version");
+        assert_eq!(base.version, 4);
+        assert_eq!(base.produced_by_step_id, None);
+        assert_eq!(base.body, "Edited.");
     }
 
     #[tokio::test]

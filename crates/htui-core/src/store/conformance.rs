@@ -11180,7 +11180,8 @@ async fn verify_run_is_recorded<S: WriteStore>(store: &S) {
 }
 
 /// The version is allocated per `(item, kind)` inside the transaction (plan D6), and ANA-2 §4.2's
-/// resolver ranks this run's output above another run's above a hand-written document.
+/// resolver, as amended by MOD-73, answers the newer of the step-produced pick (this run's output
+/// when it has one, else another run's) and the latest hand-written version.
 ///
 /// The `MemStore` twin is `mem.rs::write_document_allocates_the_next_version_of_its_kind`; the
 /// thing only Postgres can show — that two concurrent writers cannot allocate the same version —
@@ -11238,9 +11239,9 @@ async fn write_document_allocates_its_version<S: WriteStore>(store: &S) {
         "{CASE}: a duplicate id is Constraint, got {duplicate:?}"
     );
 
-    // The preference leg: two runs of one item, each with a step, and a hand-written version on
-    // top. Nothing here is a fan-out loser, so `selected IS NOT FALSE` admits every row and the
-    // ranking is what decides.
+    // The preference leg (MOD-73 plan D2): two runs of one item, each with a step, and a
+    // hand-written version between their outputs. Nothing here is a fan-out loser, so
+    // `selected IS NOT FALSE` admits every row and the two arms decide.
     let second_run = store
         .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
         .await
@@ -11269,18 +11270,18 @@ async fn write_document_allocates_its_version<S: WriteStore>(store: &S) {
         .write_document(new_document(ids::HTUI_ANA_2, "research", Some(second_step)))
         .await
         .expect(CASE);
-    let by_third = store
-        .write_document(new_document(ids::HTUI_ANA_2, "research", Some(third_step)))
-        .await
-        .expect(CASE);
     let by_hand = store
         .write_document(new_document(ids::HTUI_ANA_2, "research", None))
         .await
         .expect(CASE);
+    let by_third = store
+        .write_document(new_document(ids::HTUI_ANA_2, "research", Some(third_step)))
+        .await
+        .expect(CASE);
     assert_eq!(
-        (by_second.version, by_third.version, by_hand.version),
+        (by_second.version, by_hand.version, by_third.version),
         (1, 2, 3),
-        "{CASE}: the hand-written version is the highest, so the ranking has to bite"
+        "{CASE}: the hand-written version sits between the two runs' outputs, so both arms bite"
     );
 
     let picked = |run| async move {
@@ -11294,19 +11295,20 @@ async fn write_document_allocates_its_version<S: WriteStore>(store: &S) {
     };
     assert_eq!(
         picked(second_run).await,
-        Some(by_second.id),
-        "{CASE}: this run's own output wins"
+        Some(by_hand.id),
+        "{CASE}: a hand-written version newer than this run's output wins, and this run's v1 \
+         was the step-produced pick over the other run's v3"
     );
     assert_eq!(
         picked(third_run).await,
         Some(by_third.id),
-        "{CASE}: and so does the other run's, for the other run"
+        "{CASE}: this run's output newer than the hand-written version wins"
     );
     assert_eq!(
         picked(ids::RUN_1).await,
         Some(by_third.id),
-        "{CASE}: for a third run, any run's output outranks hand-written and the highest \
-         version wins among equals"
+        "{CASE}: for a third run, the newer of another run's output and the hand-written version \
+         wins"
     );
     assert_eq!(
         store
@@ -11315,9 +11317,26 @@ async fn write_document_allocates_its_version<S: WriteStore>(store: &S) {
             .expect(CASE)
             .first()
             .map(|row| row.id),
-        Some(by_hand.id),
-        "{CASE}: documents_of_kinds ranks by version alone — plan D2's contrast"
+        Some(by_third.id),
+        "{CASE}: documents_of_kinds ranks by version alone — plan D2's contrast with \
+         second_run's pick"
     );
+
+    let later_hand = store
+        .write_document(new_document(ids::HTUI_ANA_2, "research", None))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        later_hand.version, 4,
+        "{CASE}: the next call takes the next number"
+    );
+    for run in [second_run, third_run, ids::RUN_1] {
+        assert_eq!(
+            picked(run).await,
+            Some(later_hand.id),
+            "{CASE}: a hand-written v4 is newer than every run's output, so {run} reads it"
+        );
+    }
     let with_gap = store
         .resolve_inputs(
             ids::HTUI_ANA_2,
@@ -13832,7 +13851,7 @@ async fn resolve_inputs_prefers_this_run_and_skips_losers<S: ReadStore>(store: &
             .and_then(|row| row.document.as_ref())
             .map(|row| row.id),
         Some(ids::DOC_ANA_1_RESEARCH_V2),
-        "{CASE}: another run's selected output still outranks the hand-written v1"
+        "{CASE}: another run's selected v2 is newer than the hand-written v1, so it is read"
     );
 
     let every_kind = store
