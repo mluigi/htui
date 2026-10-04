@@ -389,6 +389,33 @@ mod tests {
         }
     }
 
+    /// MOD-80 review L2, D4: under the monochrome theme the selection is REVERSED in every cell
+    /// of the selected row and in no cell of the next.
+    #[test]
+    fn a_selected_item_row_is_reversed_without_colour() {
+        let (items, projects) = two_items();
+        let view = ListView {
+            items: &items,
+            projects: &projects,
+            folded: &[],
+            selected: Some(Selection::Item(items[0].id)),
+            filter: None,
+        };
+        let buffer = drawn(&view, &Theme::monochrome(), 50);
+        for x in 0..50 {
+            let selected = &buffer[(x, 1)];
+            assert!(
+                selected.modifier.contains(Modifier::REVERSED),
+                "x = {x}: {selected:?}"
+            );
+            let next = &buffer[(x, 2)];
+            assert!(
+                !next.modifier.contains(Modifier::REVERSED),
+                "x = {x}: {next:?}"
+            );
+        }
+    }
+
     /// MOD-80 D1: a key is bold in the terminal's own colour, not cyan, and `in_progress` is
     /// drawn `running`.
     #[test]
