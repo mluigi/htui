@@ -1437,7 +1437,10 @@ mod tests {
         let gate = step(3, &run, (1, 1, 0), StepStatus::AwaitingApproval);
         let resolved = candidate(
             &item,
-            vec![(run.clone(), vec![winner, loser, gate.clone()])],
+            vec![(
+                run.clone(),
+                vec![winner.clone(), loser.clone(), gate.clone()],
+            )],
         );
 
         assert_eq!(
@@ -1449,6 +1452,21 @@ mod tests {
                 "plan 1.1",
                 WaitingReason::Gate,
                 GATE_TEXT
+            )]
+        );
+
+        // The run still parked with no step parked, so the slot is read: decided, it is no
+        // Selection row, and only the interrupted run's Resume row is left.
+        let unparked = candidate(&item, vec![(run.clone(), vec![winner, loser])]);
+        assert_eq!(
+            one(&unparked).rows,
+            [row(
+                &unparked,
+                Some(run.id),
+                None,
+                "",
+                WaitingReason::Unblock,
+                RESUME_TEXT
             )]
         );
     }
