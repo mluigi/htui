@@ -106,6 +106,18 @@ pub enum RevealTarget {
         /// Its key, e.g. `FEAT-1`.
         key: String,
     },
+    /// MOD-69 plan D8: an item, opened on its Runs sub-tab with the cursor on `step` (or on
+    /// `run`'s first entry when `step` is `None`; with neither, on whatever the pane selects).
+    Step {
+        /// The item.
+        item: ItemId,
+        /// Its key, for the miss sentence (blueprint D248).
+        key: String,
+        /// The run, when the row has one.
+        run: Option<RunId>,
+        /// The step, when the row has one.
+        step: Option<StepId>,
+    },
     /// A requirement.
     Requirement {
         /// The requirement.
@@ -120,7 +132,7 @@ impl RevealTarget {
     #[must_use]
     pub const fn kind(&self) -> RevealKind {
         match self {
-            Self::Item { .. } => RevealKind::Item,
+            Self::Item { .. } | Self::Step { .. } => RevealKind::Item,
             Self::Requirement { .. } => RevealKind::Requirement,
         }
     }
@@ -129,7 +141,7 @@ impl RevealTarget {
     #[must_use]
     pub fn key(&self) -> &str {
         match self {
-            Self::Item { key, .. } | Self::Requirement { key, .. } => key,
+            Self::Item { key, .. } | Self::Step { key, .. } | Self::Requirement { key, .. } => key,
         }
     }
 }
@@ -154,4 +166,32 @@ pub enum Handled {
     Consumed,
     /// The key was ignored; the next stop in the chain gets it.
     Pass,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MOD-69 plan D8: a step reveal is routed to the Backlog, as an item's is, and its miss
+    /// sentence names the item's key.
+    #[test]
+    fn a_step_target_routes_as_an_item_and_keeps_its_key() {
+        let target = RevealTarget::Step {
+            item: ItemId::new(),
+            key: "FEAT-1".to_owned(),
+            run: Some(RunId::new()),
+            step: Some(StepId::new()),
+        };
+        assert_eq!(target.kind(), RevealKind::Item);
+        assert_eq!(target.key(), "FEAT-1");
+
+        let reopen = RevealTarget::Step {
+            item: ItemId::new(),
+            key: "FEAT-2".to_owned(),
+            run: None,
+            step: None,
+        };
+        assert_eq!(reopen.kind(), RevealKind::Item);
+        assert_eq!(reopen.key(), "FEAT-2");
+    }
 }

@@ -224,6 +224,10 @@ pub struct RunsTab {
     /// drag and release reach the flow even past the pane's edge. `v`, an item change and a
     /// capturing mode end it.
     gesture: bool,
+    /// MOD-69 plan D8: a reveal's run and step, applied by the next `Runs` reply (or at once by
+    /// `focus` when the loaded rows hold it). An item change and a cursor move (`J`, `K`, a
+    /// clicked node) disarm it.
+    pending_focus: Option<(Option<RunId>, Option<StepId>)>,
 }
 
 /// One place the cursor can be (blueprint D198): a step, or the header of a run with no step.
@@ -378,8 +382,10 @@ impl RunsTab {
         Some((run.id, step))
     }
 
-    /// Moves the cursor, clamped to both ends. A pane with no entry keeps `None`.
+    /// Moves the cursor, clamped to both ends. A pane with no entry keeps `None`. The user's move
+    /// disarms a reveal still waiting on its rows (MOD-69 plan D8).
     fn move_cursor(&mut self, delta: isize) {
+        self.pending_focus = None;
         let Some(last) = self.entries().len().checked_sub(1) else {
             self.selected = None;
             return;
@@ -410,6 +416,7 @@ impl RunsTab {
     /// that run is on the canvas), then the flow syncs, as `J`/`K` do. A step the entries don't
     /// hold leaves the cursor where it is.
     fn select_step(&mut self, step: StepId, theme: &Theme) {
+        self.pending_focus = None; // MOD-69 plan D8: the user's move beats a waiting reveal
         let run = match self.entry() {
             Some(Entry::Step { run, .. } | Entry::Run { run }) => run,
             None => return,
@@ -421,6 +428,40 @@ impl RunsTab {
             self.selected = at;
         }
         self.sync_graph(theme);
+    }
+
+    /// The entry a reveal targets (MOD-69 plan D8): the step's entry in **any** run (`select_step`
+    /// searches only the cursor's run), else — `step` being `None` — the run's first entry. `None`
+    /// when the rows do not hold it: a `step` the rows lack does not fall back to its run.
+    fn focus_index(&self, run: Option<RunId>, step: Option<StepId>) -> Option<usize> {
+        let entries = self.entries();
+        if let Some(step) = step {
+            return entries
+                .iter()
+                .position(|entry| matches!(entry, Entry::Step { step: s, .. } if *s == step));
+        }
+        let index = self
+            .runs
+            .iter()
+            .position(|summary| Some(summary.id) == run)?;
+        entries.iter().position(|entry| {
+            matches!(entry, Entry::Step { run: r, .. } | Entry::Run { run: r } if *r == index)
+        })
+    }
+
+    /// Applies the pending focus to the rows on hand. `true` = it landed, and is disarmed.
+    fn apply_focus(&mut self) -> bool {
+        let Some((run, step)) = self.pending_focus else {
+            return false;
+        };
+        match self.focus_index(run, step) {
+            Some(at) => {
+                self.selected = Some(at);
+                self.pending_focus = None;
+                true
+            }
+            None => false,
+        }
     }
 
     /// First run to draw: the scrolled-to one, except that the cursor is never scrolled off the
@@ -454,6 +495,12 @@ impl RunsTab {
                     .position(|entry| self.entry_key(*entry) == Some(kept))
             })
             .or_else(|| (!entries.is_empty()).then_some(0));
+        // MOD-69 plan D8: a reveal's focus beats the kept cursor; one the reply does not hold is
+        // dropped silently and the cursor stays where D198 put it.
+        if self.pending_focus.is_some() && !self.apply_focus() {
+            tracing::debug!("the revealed step is not in the runs reply");
+            self.pending_focus = None;
+        }
         self.sync_graph(ctx.theme);
         let Some(item) = self.item else {
             return;
@@ -1278,6 +1325,16 @@ impl DetailTab for RunsTab {
         self.answering = None;
         self.mode = Mode::Browse;
         self.gesture = false; // MOD-71 D11
+        self.pending_focus = None; // MOD-69 plan D8
+    }
+
+    fn focus(&mut self, run: Option<RunId>, step: Option<StepId>, ctx: &Ctx<'_>) {
+        self.pending_focus = Some((run, step));
+        // The item was already selected (`go` short-circuited): the rows are loaded, and a target
+        // they hold lands now; the Backlog's `Runs` re-read covers one they do not (blueprint A-5).
+        if self.apply_focus() {
+            self.sync_graph(ctx.theme);
+        }
     }
 
     /// `J` / `K` move the cursor, `Enter` replays the step under it, the action keys act, and
@@ -5128,5 +5185,177 @@ mod tests {
             &requests(shell.emit.take()),
             ids::HTUI_FEAT_1
         ));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-69 plan D8: a reveal's run and step (blueprint §4.4).
+    // -----------------------------------------------------------------------------------------
+
+    /// Two runs, newest first: a copy of `FEAT-1`'s run with fresh ids, then the fixture's
+    /// `RUN_1` with `STEP_PRD`..`STEP_REVIEW`. The cursor's first entry is the copy's first step.
+    async fn two_runs() -> Vec<RunSummary> {
+        let mut runs = vec![copied_run().await];
+        runs.extend(feat_1_runs().await);
+        runs
+    }
+
+    /// A pane holding [`two_runs`] for `FEAT-1`, what the reply asked for drained.
+    async fn two_run_pane(shell: &Shell) -> RunsTab {
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(two_runs().await), &mut shell.ctx());
+        let _ = shell.emit.take();
+        pane
+    }
+
+    #[tokio::test]
+    async fn a_focus_armed_before_the_runs_reply_moves_the_cursor_to_the_step() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.focus(None, Some(ids::STEP_REVIEW), &shell.ctx());
+        assert_eq!(pane.selected_step(), None, "no rows yet: the focus waits");
+
+        pane.on_reply(&StoreReply::Runs(two_runs().await), &mut shell.ctx());
+        assert_eq!(pane.selected_step(), Some(ids::STEP_REVIEW));
+        assert_eq!(pane.pending_focus, None, "a landed focus is disarmed");
+    }
+
+    #[tokio::test]
+    async fn a_focus_on_loaded_runs_applies_at_once() {
+        let shell = Shell::new();
+        let mut pane = two_run_pane(&shell).await;
+        pane.focus(Some(ids::RUN_1), Some(ids::STEP_IMPL), &shell.ctx());
+        assert_eq!(pane.selected_step(), Some(ids::STEP_IMPL));
+        assert_eq!(pane.pending_focus, None);
+        assert!(
+            shell.emit.is_empty(),
+            "the rows are on hand: nothing is asked"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_focus_finds_a_step_in_a_run_other_than_the_cursors() {
+        let shell = Shell::new();
+        let mut pane = two_run_pane(&shell).await;
+        let newer = pane.runs[0].id;
+        assert_eq!(pane.entry_run().map(|run| run.id), Some(newer));
+
+        pane.focus(None, Some(ids::STEP_PLAN), &shell.ctx());
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PLAN));
+        assert_eq!(pane.entry_run().map(|run| run.id), Some(ids::RUN_1));
+    }
+
+    #[tokio::test]
+    async fn a_focus_with_no_step_lands_on_the_runs_first_entry() {
+        let shell = Shell::new();
+        let stepless = stepless_run().await;
+        let mut runs = two_runs().await;
+        runs.push(stepless.clone());
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+
+        pane.focus(Some(ids::RUN_1), None, &shell.ctx());
+        assert_eq!(
+            pane.selected_step(),
+            Some(ids::STEP_PRD),
+            "the run's first step"
+        );
+
+        pane.focus(Some(stepless.id), None, &shell.ctx());
+        assert_eq!(pane.entry_run().map(|run| run.id), Some(stepless.id));
+        assert_eq!(
+            pane.selected_step(),
+            None,
+            "a run with no step is its own entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_focus_the_reply_does_not_hold_leaves_the_cursor_and_says_nothing() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.focus(None, Some(StepId::new()), &shell.ctx());
+        let runs = two_runs().await;
+        let first = runs[0].steps[0].id;
+        pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+
+        assert_eq!(pane.selected_step(), Some(first), "D198's first entry");
+        assert_eq!(pane.pending_focus, None, "a missed focus is dropped");
+        assert!(
+            !shell
+                .emit
+                .take()
+                .iter()
+                .any(|action| matches!(action, Action::Error(_))),
+            "a missed focus is silent"
+        );
+
+        pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+        let moved = pane.selected_step();
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        assert_eq!(
+            pane.selected_step(),
+            moved,
+            "a second reply does not move it"
+        );
+
+        // A step the rows lack does not fall back to its run's first entry.
+        pane.focus(Some(ids::RUN_1), Some(StepId::new()), &shell.ctx());
+        assert_eq!(pane.selected_step(), moved);
+    }
+
+    #[tokio::test]
+    async fn an_item_change_disarms_a_pending_focus() {
+        let shell = Shell::new();
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.focus(None, Some(ids::STEP_REVIEW), &shell.ctx());
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        assert_eq!(pane.pending_focus, None);
+
+        let runs = two_runs().await;
+        let first = runs[0].steps[0].id;
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        assert_eq!(pane.selected_step(), Some(first));
+    }
+    /// A move the user makes beats a reveal still waiting on its rows: `J`, `K` or a clicked
+    /// node disarms it, so a later `Runs` reply (a poll, a re-read after a failed one) keeps the
+    /// cursor where the user put it (repair round 1).
+    #[tokio::test]
+    async fn a_cursor_move_disarms_a_pending_focus() {
+        let shell = Shell::new();
+        let newer = vec![copied_run().await];
+        // The same copy plus `RUN_1` (`copied_run` mints fresh ids on every call).
+        let mut runs = newer.clone();
+        runs.extend(feat_1_runs().await);
+
+        for user_move in ["J", "K", "click"] {
+            let mut pane = RunsTab::new();
+            pane.on_item_change(Some(ids::HTUI_FEAT_1));
+            pane.on_reply(&StoreReply::Runs(newer.clone()), &mut shell.ctx());
+            pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx());
+            // The rows lack the step: the focus stays armed for the next reply.
+            pane.focus(None, Some(ids::STEP_REVIEW), &shell.ctx());
+            assert!(pane.pending_focus.is_some(), "{user_move}: armed");
+
+            match user_move {
+                "J" => drop(pane.on_key(key(KeyCode::Char('J')), &mut shell.ctx())),
+                "K" => drop(pane.on_key(key(KeyCode::Char('K')), &mut shell.ctx())),
+                _ => pane.select_step(newer[0].steps[0].id, &Theme::default()),
+            }
+            let moved = pane.selected_step();
+            assert_eq!(pane.pending_focus, None, "{user_move}: disarmed");
+
+            pane.on_reply(&StoreReply::Runs(runs.clone()), &mut shell.ctx());
+            let _ = shell.emit.take();
+            assert_eq!(
+                pane.selected_step(),
+                moved,
+                "{user_move}: the reply keeps the user's cursor"
+            );
+        }
     }
 }
