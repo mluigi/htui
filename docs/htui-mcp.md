@@ -53,6 +53,12 @@ Which processes host the tools:
 - **`htui worker`** runs one for the runs it walks. A worker that cannot create it refuses to start
   (exit 2, "htui's MCP tools cannot be hosted: …"), because every document phase would fail.
 
+Creating the host only resolves htui's own binary, so it fails only off Linux, when that binary
+has no absolute path; on Linux it never fails. The [socket](#the-socket) is bound later, at the
+first session: a socket directory that cannot be created or is not private does not stop the TUI
+or the worker from starting, and instead fails each step with
+[`htui's MCP listener could not start: …`](#troubleshooting).
+
 ## The tools
 
 Every answer is one text item. A successful call answers compact JSON; a refused one answers a

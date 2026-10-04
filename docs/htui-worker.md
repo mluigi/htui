@@ -227,7 +227,11 @@ in [`docs/htui-mcp.md`](htui-mcp.md).
   `XDG_RUNTIME_DIR`, so the directory is in `/tmp`. A worker that is killed leaves it behind; it is
   safe to delete once that pid is gone (see [The socket](htui-mcp.md#the-socket)).
 - **A worker that cannot host the tools refuses to start** (exit 2, "htui's MCP tools cannot be
-  hosted: …"): every document phase would fail `missing_output` without them.
+  hosted: …"): every document phase would fail `missing_output` without them. Hosting only
+  resolves the worker's own binary, so this happens off Linux only, when that binary has no
+  absolute path. The socket is bound at the first session, not at start: a socket directory that
+  cannot be created or is not private leaves the worker running and fails each step with
+  `htui's MCP listener could not start: …`. Under the systemd unit, check that `/tmp` is writable.
 - **`search_concepts`** is offered only when the keyring held a Qdrant URL at start (see
   [The concepts index](#the-concepts-index)), so a provisioned worker never offers it.
 - **`command_run`** runs on this box, as the worker's user and with the worker's environment, in
@@ -341,7 +345,7 @@ read again after every sync; without it, or with any other value, the interval i
 |---|---|
 | `0` | Clean shutdown on a signal. |
 | `1` | Reserved for a failure after the worker started. This build produces none: a store outage is logged, not an exit (below). |
-| `2` | A startup refusal: no DSN, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, htui's MCP tools that cannot be hosted, or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
+| `2` | A startup refusal: no DSN, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, htui's MCP tools that cannot be hosted (off Linux only, when the worker's own binary has no absolute path), or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
 | `101` | A panic that stops the process: a bug in `htui`. It is reported to GlitchTip (see [Error reports](#error-reports)). A panic inside a run's walk is reported too, but does not stop the worker: the run is adopted again, [backed off](#a-run-whose-resume-keeps-failing). |
 
 A store outage while running is not an exit: the worker logs it and carries on, and its walks fence
