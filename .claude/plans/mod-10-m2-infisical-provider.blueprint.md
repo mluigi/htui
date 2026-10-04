@@ -763,7 +763,7 @@ let client = builder.build().map_err(|e| SecretError::Config(format!("cannot bui
   `.json` sets `Content-Type: application/json` and needs reqwest's `json` feature (§B.5).
 - **List**: `GET {list_url}` with `.bearer_auth(token)`.
 - **Status**: `GET {base}/api/status`, no auth, body ignored.
-- Bodies are always read with `.bytes().await` (`Err` → `Unreachable`), then `decode`/`ErrorBody::from_bytes`. `Response::json` is **never** used (A-5).
+- Bodies are always read with `.bytes().await` (`Err` → `Unreachable`, except that a 401 is decided on its status first; see the login and data tables), then `decode`/`ErrorBody::from_bytes`. `Response::json` is **never** used (A-5).
 
 #### B.3.4 `src/wire.rs` — serde shapes (all `pub(crate)`, **no `Debug` on any of them**, H-2)
 
@@ -878,7 +878,8 @@ Algorithm:
 
 | Answer | Result | Latches? |
 |---|---|---|
-| network error from `send()` or `bytes()` | `Unreachable { endpoint: LOGIN_PATH, cause }` | no |
+| network error from `send()`, or from `bytes()` on a non-401 status | `Unreachable { endpoint: LOGIN_PATH, cause }` | no |
+| 401 whose body cannot be read (cut short, timed out) — decided on status first (D5; amended after T3's verify, `d8f4a7ca`) | `BadCredentials` (`IdentityLocked` only from a fully read body carrying the lockout text) | **yes** |
 | 2xx, `LoginResponse` decodes, `access_token` non-empty | token; `reuse_until = now + reuse_window(expires_in)` | — |
 | 2xx, decode fails | `Protocol { LOGIN_PATH, A-5 detail }` | no |
 | 2xx, empty `accessToken` | `Protocol { LOGIN_PATH, "the login answer carried no access token" }` | no |
@@ -893,7 +894,8 @@ Algorithm:
 
 | Answer | Result |
 |---|---|
-| network error from `send()` or `bytes()` | `Unreachable { endpoint: SECRETS_PATH, cause }` |
+| network error from `send()`, or from `bytes()` on a non-401 status | `Unreachable { endpoint: SECRETS_PATH, cause }` |
+| 401, decided before the body is read (amended after T3's verify, `d8f4a7ca`) | token refused → the one refresh (the 401 row above), even when the body cannot be read |
 | 2xx, decodes | merge (§B.4.5) → validate (§B.4.6) |
 | 2xx, decode fails | `Protocol { SECRETS_PATH, A-5 detail }` |
 | 3xx | `Protocol { SECRETS_PATH, "the server answered a redirect ({code}); redirects are not followed" }` |
