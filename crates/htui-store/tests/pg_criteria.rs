@@ -6523,25 +6523,28 @@ async fn mod_77_repo(db: &common::TestDb) -> RepoId {
         .id
 }
 
-/// MOD-77 plan D6: `write` must wait on a held step while holding **nothing** on its run.
+/// MOD-77: the shared body of [`assert_takes_the_step_first`] and
+/// [`assert_locks_the_step_for_update_up_front`].
 ///
-/// A raw transaction takes the step `FOR UPDATE`, the first half of a `park_step`. `write` is
-/// spawned, and once a backend of this database waits on a lock the holder owns, the holder asks
-/// for the run `FOR UPDATE NOWAIT`, the second half of the park. If `write` held the run while it
-/// waited, that is `55P03`, and a real park would have closed a cycle with it (`40P01`). The
-/// holder then rolls back and `write`'s answer is returned for the caller's own assertion.
-async fn assert_takes_the_step_first<T: Send + 'static>(
+/// A raw transaction runs `hold` (bound to `step`), `write` is spawned, and once a backend of this
+/// database waits on a lock the holder owns, the holder runs `probe` (a `NOWAIT` statement bound
+/// to `probe_id`). The holder then rolls back and `write` is joined **before** the caller asserts,
+/// so a red run never leaves the writer hanging on a dropped transaction. Answers the probe's
+/// outcome (`Err` carries its SQLSTATE) and `write`'s answer.
+async fn probe_while_the_write_waits<T: Send + 'static>(
     db: &common::TestDb,
-    run: RunId,
     step: StepId,
+    hold: &'static str,
+    probe: &'static str,
+    probe_id: uuid::Uuid,
     write: impl Future<Output = T> + Send + 'static,
-) -> T {
+) -> (Result<(), Option<String>>, T) {
     let mut holder = db.pool.begin().await.expect("begin the holder");
     let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(&mut *holder)
         .await
         .expect("read the holder's pid");
-    sqlx::query("SELECT 1 FROM run_step WHERE id = $1 FOR UPDATE")
+    sqlx::query(hold)
         .bind(step.as_uuid())
         .fetch_one(&mut *holder)
         .await
@@ -6573,26 +6576,86 @@ async fn assert_takes_the_step_first<T: Send + 'static>(
         "the write answered while the step was held"
     );
 
-    let nowait = sqlx::query("SELECT 1 FROM run WHERE id = $1 FOR UPDATE NOWAIT")
-        .bind(run.as_uuid())
+    let probed = sqlx::query(probe)
+        .bind(probe_id)
         .fetch_one(&mut *holder)
-        .await;
-    let code: Option<String> = nowait
-        .as_ref()
-        .err()
-        .and_then(sqlx::Error::as_database_error)
-        .and_then(|error| error.code())
-        .map(std::borrow::Cow::into_owned);
+        .await
+        .map(|_| ())
+        .map_err(|error| {
+            error
+                .as_database_error()
+                .and_then(|error| error.code())
+                .map(std::borrow::Cow::into_owned)
+        });
     holder.rollback().await.expect("roll back the holder");
     let answer = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
         .await
         .expect("the write lands once the step is free")
         .expect("the write task must not panic");
-    assert!(
-        nowait.is_ok(),
-        "the write held the run while it waited on the step (SQLSTATE {code:?}); a park holding \
-         this step would deadlock against it"
-    );
+    (probed, answer)
+}
+
+/// MOD-77 plan D6: `write` must wait on a held step while holding **nothing** on its run.
+///
+/// A raw transaction takes the step `FOR UPDATE`, the first half of a `park_step`. `write` is
+/// spawned, and once a backend of this database waits on a lock the holder owns, the holder asks
+/// for the run `FOR UPDATE NOWAIT`, the second half of the park. If `write` held the run while it
+/// waited, that is `55P03`, and a real park would have closed a cycle with it (`40P01`). The
+/// holder then rolls back and `write`'s answer is returned for the caller's own assertion.
+async fn assert_takes_the_step_first<T: Send + 'static>(
+    db: &common::TestDb,
+    run: RunId,
+    step: StepId,
+    write: impl Future<Output = T> + Send + 'static,
+) -> T {
+    let (nowait, answer) = probe_while_the_write_waits(
+        db,
+        step,
+        "SELECT 1 FROM run_step WHERE id = $1 FOR UPDATE",
+        "SELECT 1 FROM run WHERE id = $1 FOR UPDATE NOWAIT",
+        run.as_uuid(),
+        write,
+    )
+    .await;
+    if let Err(code) = nowait {
+        panic!(
+            "the write held the run while it waited on the step (SQLSTATE {code:?}); a park \
+             holding this step would deadlock against it"
+        );
+    }
+    answer
+}
+
+/// MOD-77 plan D1/D2/D5: `write`, which goes on to `UPDATE run_step`, must take the step's update
+/// lock **up front**, never a share lock upgraded later in its transaction.
+///
+/// A raw transaction share-locks the step. A writer asking for `FOR NO KEY UPDATE` up front
+/// queues behind it holding nothing on the step; a writer that share-locked the step first (which
+/// the holder's `FOR SHARE` admits) and then reached its `UPDATE` waits there **holding** that
+/// share lock. The holder then upgrades its own lock `FOR NO KEY UPDATE NOWAIT`: a queued waiter
+/// does not stop that, a second share holder does (`55P03`, both probed on PG 16). Two such
+/// writers of one step would each hold a share lock and wait for the other's to go: `40P01`. The
+/// holder then rolls back and `write`'s answer is returned for the caller's own assertion.
+async fn assert_locks_the_step_for_update_up_front<T: Send + 'static>(
+    db: &common::TestDb,
+    step: StepId,
+    write: impl Future<Output = T> + Send + 'static,
+) -> T {
+    let (nowait, answer) = probe_while_the_write_waits(
+        db,
+        step,
+        "SELECT 1 FROM run_step WHERE id = $1 FOR SHARE",
+        "SELECT 1 FROM run_step WHERE id = $1 FOR NO KEY UPDATE NOWAIT",
+        step.as_uuid(),
+        write,
+    )
+    .await;
+    if let Err(code) = nowait {
+        panic!(
+            "the write held a share lock on the step while it waited to update it (SQLSTATE \
+             {code:?}); two such writers of one step would deadlock"
+        );
+    }
     answer
 }
 
@@ -6833,6 +6896,175 @@ async fn finish_chat_run_takes_the_step_first() {
     let (run, step) = (chat.run_id, chat.step_id);
     let store = db.store.clone();
     let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .finish_chat_run(run, step, RunStatus::Done, Utc::now())
+            .await
+    })
+    .await;
+    answer.expect("the close lands");
+    assert_eq!(
+        db.store
+            .run(run)
+            .await
+            .expect("read the run")
+            .map(|r| r.status),
+        Some(RunStatus::Done),
+        "the chat run is closed"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `set_step_usage` takes the step's update lock up front, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_step_usage_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (_, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        store
+            .set_step_usage(
+                StepFence::Lease(owner),
+                step,
+                serde_json::json!({ "input_tokens": 1 }),
+                None,
+            )
+            .await
+    })
+    .await;
+    answer.expect("the usage write lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `set_step_prompt` takes the step's update lock up front, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_step_prompt_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (_, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        let trim = serde_json::json!({});
+        store
+            .set_step_prompt(StepFence::Lease(owner), step, "sha256:mod-77", &trim)
+            .await
+    })
+    .await;
+    answer.expect("the prompt write lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `finish_step` takes the step's update lock up front, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn finish_step_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (_, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let outcome = StepOutcome {
+        exit_code: None,
+        usage: None,
+        trim_record: None,
+        verify_outcome: None,
+        verify_exit_code: Some(0),
+        finished_at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+    };
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        store
+            .finish_step(StepFence::Lease(owner), step, outcome)
+            .await
+    })
+    .await;
+    answer.expect("the settle lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `pass_step` takes the step's update lock up front, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn pass_step_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (_, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        store
+            .pass_step(StepFence::Lease(owner), step, None, Utc::now())
+            .await
+    })
+    .await;
+    assert!(answer.expect("the pass lands"), "the running step passes");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D1: `upsert_step_tree` with a one-row batch, so its `isolation_path` update runs,
+/// takes the step's update lock up front (`StepLock::Update`), then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_step_tree_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (_, step, owner) = leased_running_step(&db).await;
+    let repo_id = mod_77_repo(&db).await;
+    let store = db.store.clone();
+    let tree = RunStepTree {
+        run_step_id: step,
+        repo_id,
+        mode: Isolation::Worktree,
+        path: "/srv/trees/mod-77".to_owned(),
+        base_ref: "main".to_owned(),
+        dirty: false,
+    };
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
+        store
+            .upsert_step_tree(StepFence::Lease(owner), step, &[tree])
+            .await
+    })
+    .await;
+    answer.expect("the tree write lands");
+    let path: Option<String> =
+        sqlx::query_scalar("SELECT isolation_path FROM run_step WHERE id = $1")
+            .bind(step.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the isolation path");
+    assert_eq!(
+        path.as_deref(),
+        Some("/srv/trees/mod-77"),
+        "the primary's tree is the step's isolation path"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D5: `finish_chat_run` takes the step's update lock up front, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn finish_chat_run_locks_the_step_for_update_up_front() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        None,
+    );
+    db.store
+        .start_chat_run(&chat)
+        .await
+        .expect("start the chat");
+    let (run, step) = (chat.run_id, chat.step_id);
+    let store = db.store.clone();
+    let answer = assert_locks_the_step_for_update_up_front(&db, step, async move {
         store
             .finish_chat_run(run, step, RunStatus::Done, Utc::now())
             .await
