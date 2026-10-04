@@ -304,6 +304,9 @@ pub struct RecorderSummary {
     pub usage: Value,
     /// Render frames the bounded UI channel could not take.
     pub dropped: usize,
+    /// Coalesced rows whose `raw` was withheld because their chunks, joined, held a secret no
+    /// chunk held alone (MOD-10 D8). Their payload was kept; only the debug copy was dropped.
+    pub raw_withheld: usize,
     /// The one per-run cap breach of this session, if it had one (plan D70).
     ///
     /// A property of the *session*, not of the last row: it is set once, by the row that reached
@@ -447,6 +450,8 @@ pub struct Recorder<'a, S: htui_core::store::RecorderStore> {
     cap_breached: Option<CapBreach>,
     residue: Option<Unmasked>,
     dropped: usize,
+    /// MOD-10 D8: rows stored with `raw = NULL` by [`Recorder::withhold_split_raw`]. A count only.
+    raw_withheld: usize,
     rows: usize,
 }
 
@@ -466,6 +471,7 @@ impl<S: htui_core::store::RecorderStore> core::fmt::Debug for Recorder<'_, S> {
             .field("next_seq", &self.next_seq)
             .field("turn", &self.turn)
             .field("dropped", &self.dropped)
+            .field("raw_withheld", &self.raw_withheld)
             .field("residue", &self.residue)
             // Whether a latch is configured, not which row it names: the identity of the row is
             // not what a recorder log is about either.
@@ -516,6 +522,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             cap_breached: None,
             residue: None,
             dropped: 0,
+            raw_withheld: 0,
             rows: 0,
         }
     }
@@ -628,6 +635,13 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     #[must_use]
     pub const fn dropped(&self) -> usize {
         self.dropped
+    }
+
+    /// Coalesced rows whose `raw` was withheld because their chunks, joined, held a secret no chunk
+    /// held alone (MOD-10 D8), so far. Each such row was stored with its payload and `raw = NULL`.
+    #[must_use]
+    pub const fn raw_withheld(&self) -> usize {
+        self.raw_withheld
     }
 
     /// The step this recorder writes.
@@ -1074,6 +1088,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             prompt_digest: self.prompt_digest.clone(),
             usage: self.usage.to_value(),
             dropped: self.dropped,
+            raw_withheld: self.raw_withheld,
             cap_breach: self.cap_breached,
         })
     }
@@ -1121,7 +1136,11 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         for mut row in pending {
             let outcome = self.scrubber.scrub(&mut row.payload);
             let row = match outcome {
-                Ok(()) => row,
+                Ok(()) => {
+                    // `next_seq` is the number this row is given just below.
+                    self.withhold_split_raw(&mut row, self.next_seq);
+                    row
+                }
                 Err(unmasked) => {
                     self.note_residue(&unmasked);
                     residue_row(&unmasked, row.at)
@@ -1207,7 +1226,12 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             };
             let outcome = self.scrubber.scrub(&mut row.payload);
             let row = match outcome {
-                Ok(()) => row,
+                // Re-announcements accumulate raw on the held row (plan D77), so a split can live
+                // here just as in a coalesced run.
+                Ok(()) => {
+                    self.withhold_split_raw(&mut row, seq);
+                    row
+                }
                 Err(unmasked) => {
                     self.note_residue(&unmasked);
                     residue_row(&unmasked, row.at)
@@ -1610,6 +1634,43 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         self.note_residue(&unmasked);
         self.push(residue_row(&unmasked, at));
         self.flush().await
+    }
+
+    /// MOD-10 D8: a row of two or more raw chunks whose per-pointer join ([`joined_raw_leaves`])
+    /// masking changes, or that still trips a rule, is stored with `raw = NULL`. The payload is
+    /// kept. Counted ([`Recorder::raw_withheld`]) and logged by rule name and cause only.
+    ///
+    /// **Never** [`Recorder::note_residue`]: `raw` is opt-in debug data, and a raw-only finding must
+    /// not fail the session (blueprint H-10). The fail-safe direction is to lose `raw`, which is all
+    /// a false positive costs.
+    ///
+    /// A single chunk needs nothing: it was scrubbed whole at capture ([`Recorder::scrub_envelope`]).
+    /// Already-masked chunks register no change, because re-masking `[REDACTED]` is idempotent.
+    ///
+    /// The log carries the step, the `seq`, the chunk count, the cause and the rule name - never
+    /// the joined text, a pointer or a key.
+    fn withhold_split_raw(&mut self, row: &mut PendingRow, seq: i32) {
+        if row.raw.len() < 2 {
+            return;
+        }
+        let joined = joined_raw_leaves(&row.raw);
+        let mut probe = joined.clone();
+        let (cause, rule) = match self.scrubber.scrub(&mut probe) {
+            Err(unmasked) => ("residue", Some(unmasked.rule)),
+            Ok(()) if probe != joined => ("masked", None),
+            Ok(()) => return,
+        };
+        let chunks = row.raw.len();
+        row.raw.clear();
+        self.raw_withheld += 1;
+        tracing::warn!(
+            step = %self.step,
+            seq,
+            chunks,
+            cause,
+            rule = rule.unwrap_or("none"),
+            "a coalesced row's raw was withheld: its chunks joined hold what no chunk held alone"
+        );
     }
 
     /// Keeps the first residue of the session; the rest are already visible as their own rows.
