@@ -112,7 +112,8 @@ pub fn evaluate(
 ///   identifier on the wire. Milestone 8's CLI transport has real names; until then a `tool_name`
 ///   rule is a title rule, and this doc comment is the contract;
 /// - `path_prefix` against `locations[0].path`, falling back to `input.path` / `input.file_path`;
-/// - `command_prefix` against `input.command` (`R-MCP-4`'s shell rules).
+/// - `command_prefix` against `input.command` (`R-MCP-4`'s shell rules), as a raw prefix, or
+///   ending at a word when `command_word` is set (MOD-11 R1 L4).
 #[must_use]
 pub fn matches(matcher: &PermissionMatch, call: Option<&ToolCallEvent>) -> bool {
     if matcher == &PermissionMatch::default() {
@@ -137,11 +138,23 @@ pub fn matches(matcher: &PermissionMatch, call: Option<&ToolCallEvent>) -> bool 
         return false;
     }
     if let Some(prefix) = &matcher.command_prefix
-        && !string_at(call, "command").is_some_and(|command| command.starts_with(prefix.as_str()))
+        && !string_at(call, "command")
+            .is_some_and(|command| command_matches(command, prefix, matcher.command_word))
     {
         return false;
     }
     true
+}
+
+/// `command` starts with `prefix`; with `word` (MOD-11 R1 L4), the prefix also ends a word: the
+/// command ends there, whitespace follows, or the prefix itself ends in whitespace.
+fn command_matches(command: &str, prefix: &str, word: bool) -> bool {
+    let Some(rest) = command.strip_prefix(prefix) else {
+        return false;
+    };
+    !word
+        || prefix.ends_with(char::is_whitespace)
+        || rest.chars().next().is_none_or(char::is_whitespace)
 }
 
 /// The option that answers `kind`: the exact kind when the agent offers it, else its `_once` /
@@ -452,6 +465,55 @@ mod tests {
         assert!(matches(&matcher, Some(&rm)));
         assert!(!matches(&matcher, Some(&ls)), "the command must match too");
         assert!(!matches(&matcher, Some(&edit)), "the kind must match too");
+    }
+
+    /// MOD-11 R1 L4: a `command_word` prefix ends where the command's word does — `make`
+    /// refuses `make` and `make -j8`, never `makepkg`; `cargo build` never `cargo build-sbf`.
+    #[test]
+    fn a_command_word_prefix_matches_whole_words_only() {
+        let word = |prefix: &str| PermissionMatch {
+            command_prefix: Some(prefix.to_owned()),
+            command_word: true,
+            ..PermissionMatch::default()
+        };
+        let run = |command: &str| call(ToolKind::Execute, "Bash", json!({ "command": command }));
+        assert!(matches(&word("make"), Some(&run("make"))), "the bare word");
+        assert!(matches(&word("make"), Some(&run("make -j8"))));
+        assert!(matches(&word("make"), Some(&run("make\tall"))));
+        assert!(!matches(&word("make"), Some(&run("makepkg -si"))));
+        assert!(matches(
+            &word("cargo build"),
+            Some(&run("cargo build --release"))
+        ));
+        assert!(!matches(
+            &word("cargo build"),
+            Some(&run("cargo build-sbf"))
+        ));
+        assert!(
+            matches(&word("rm "), Some(&run("rm -rf /"))),
+            "a prefix ending in whitespace is already a word"
+        );
+    }
+
+    /// MOD-11 R1 L4: without `command_word` a prefix stays a raw prefix, as persisted rules
+    /// were written (`rm ` and `git push` above); the field defaults off and is never written
+    /// when off.
+    #[test]
+    fn a_plain_command_prefix_stays_a_raw_prefix() {
+        let raw = PermissionMatch {
+            command_prefix: Some("make".to_owned()),
+            ..PermissionMatch::default()
+        };
+        let makepkg = call(ToolKind::Execute, "Bash", json!({ "command": "makepkg" }));
+        assert!(matches(&raw, Some(&makepkg)));
+        let decoded: PermissionMatch =
+            serde_json::from_value(json!({ "command_prefix": "make" })).expect("decodes");
+        assert_eq!(decoded, raw, "an old row decodes with the flag off");
+        assert_eq!(
+            serde_json::to_value(&raw).expect("encodes"),
+            json!({ "command_prefix": "make" }),
+            "the flag off is not written"
+        );
     }
 
     /// ACP v1 carries no tool name, so a `tool_name` rule matches the title (documented on

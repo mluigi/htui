@@ -34,7 +34,7 @@ async fn demo_store_loads_the_fixture() {
     );
     assert_eq!(
         conformance::CASES.len(),
-        136,
+        146,
         "B.9's fifteen cases, MOD-2's five store-seam cases (plan D3), milestone 7's two quota \
          cases (plans D67 and D74), milestone 9's `set_step_prompt`, MOD-15 milestone 1's \
          twelve, one per entity group (plan D12), milestone 2's seed case (plan D7), MOD-4 \
@@ -60,7 +60,8 @@ async fn demo_store_loads_the_fixture() {
          pass and park (R-5), MOD-26 T1's five persona cases (plan D3-D5), MOD-26 \
          milestone 2's three persona delete cases (plan D14), MOD-72's one for the \
          tool-call counts (plan D1-D3), MOD-13 milestone 5's one for hand-written rows \
-         (plan D12), and MOD-37 milestone 5's one for `run_step.opening` (R-48)"
+         (plan D12), MOD-37 milestone 5's one for `run_step.opening` (R-48), MOD-11 T1's six \
+         fenced-write cases (plan D13, B-4) and MOD-11 T8's four command-queue cases (plan D14)"
     );
     assert_eq!(
         conformance::READ_CASES.len(),

@@ -237,6 +237,7 @@ pub fn phase_implement_attempt2() -> PromptSpec {
         },
         step_files: StepFiles::default(),
         command_queue: true,
+        document_tool: false,
         verify_failure: Some(VerifyFailure {
             exit_code: 101,
             output: "running 3 tests\ntest recorder::flushes ... FAILED\n".to_owned(),
@@ -296,6 +297,7 @@ pub fn phase_all_empty() -> PromptSpec {
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
+        document_tool: false,
         verify_failure: None,
         previous_diff: None,
         judge: None,
@@ -389,6 +391,7 @@ pub fn judge_three_candidates() -> PromptSpec {
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
+        document_tool: false,
         verify_failure: None,
         previous_diff: None,
         judge: Some(JudgeInputs {
@@ -534,6 +537,7 @@ pub fn handoff_basic() -> PromptSpec {
         excerpts: ExcerptSet::default(),
         step_files: StepFiles::default(),
         command_queue: false,
+        document_tool: false,
         verify_failure: None,
         previous_diff: None,
         judge: None,

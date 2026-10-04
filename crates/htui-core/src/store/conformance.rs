@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use uuid::Uuid;
 
 use crate::fixtures::ids;
+use crate::model::link::{ProposeLink, WithdrawLink};
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Attachment, Billing,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
@@ -44,10 +45,12 @@ use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome,
     RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
-    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, has_nul, illegal_move,
-    invalid_area_code, invalid_persona_name, kind_not_narrowable, not_a_tool_name,
+    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, command_finish_status,
+    command_not_claimable, command_not_queued, document_needs_a_step, has_nul, illegal_move,
+    invalid_area_code, invalid_persona_name, kind_not_narrowable, link_key,
+    link_not_proposed_by_run, link_outside_project, not_a_tool_name, note_needs_a_step,
     references_no_row, requirement_withdrawn, resolution_not_closable, rule_kind_unknown,
-    withdrawn_requirement_cited,
+    self_link, step_writes_own_item, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -188,6 +191,16 @@ pub const CASES: &[&str] = &[
     "a_persona_bound_to_many_phases_names_five_and_counts_the_rest",
     "hand_written_rows_round_trip",
     "record_opening_lands_on_the_run_summary_and_bumps_updated_at",
+    "write_step_document_fenced_and_versioned",
+    "write_step_document_refuses_a_foreign_item",
+    "add_step_note_fenced_on_its_own_item",
+    "propose_link_upserts_revives_and_keeps_a_live_proposer",
+    "withdraw_link_only_what_this_run_proposed",
+    "item_by_key_answers_within_its_project",
+    "enqueue_command_queues_on_an_existing_step",
+    "claim_command_admits_up_to_the_limit_in_queue_order",
+    "beat_and_finish_need_the_claimant",
+    "cancel_command_ends_a_queued_or_running_row",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -480,6 +493,32 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "hand_written_rows_round_trip" => hand_written_rows_round_trip(store).await,
         "record_opening_lands_on_the_run_summary_and_bumps_updated_at" => {
             record_opening_lands_on_the_run_summary_and_bumps_updated_at(store).await;
+        }
+        "write_step_document_fenced_and_versioned" => {
+            write_step_document_fenced_and_versioned(store).await;
+        }
+        "write_step_document_refuses_a_foreign_item" => {
+            write_step_document_refuses_a_foreign_item(store).await;
+        }
+        "add_step_note_fenced_on_its_own_item" => add_step_note_fenced_on_its_own_item(store).await,
+        "propose_link_upserts_revives_and_keeps_a_live_proposer" => {
+            propose_link_upserts_revives_and_keeps_a_live_proposer(store).await;
+        }
+        "withdraw_link_only_what_this_run_proposed" => {
+            withdraw_link_only_what_this_run_proposed(store).await;
+        }
+        "item_by_key_answers_within_its_project" => {
+            item_by_key_answers_within_its_project(store).await;
+        }
+        "enqueue_command_queues_on_an_existing_step" => {
+            enqueue_command_queues_on_an_existing_step(store).await;
+        }
+        "claim_command_admits_up_to_the_limit_in_queue_order" => {
+            claim_command_admits_up_to_the_limit_in_queue_order(store).await;
+        }
+        "beat_and_finish_need_the_claimant" => beat_and_finish_need_the_claimant(store).await,
+        "cancel_command_ends_a_queued_or_running_row" => {
+            cancel_command_ends_a_queued_or_running_row(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -16432,6 +16471,1182 @@ async fn record_opening_lands_on_the_run_summary_and_bumps_updated_at<S: WriteSt
             })
         ),
         "{CASE}: an unknown step is `NotFound`, got {missing:?}"
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-11 T1 (plan D13, blueprint B-4..B-6): the agent writes. A step writes a document, a note
+// or a link only on its own run's item and only under its run's fence; a link it proposes keeps
+// a live row's proposer, and it tombstones only what its own run proposed.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-11 D13: a fresh run of `item` in `project` with one step at `position` 0. `Some(owner)`
+/// claims the run for [`LEASE`] (a walk's fence); `None` leaves its lease free, which is the
+/// fence [`StepFence::Unleased`] writes under.
+async fn agent_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    project: ProjectId,
+    item: ItemId,
+    owner: Option<Uuid>,
+) -> (RunId, StepId) {
+    let run = store
+        .create_run(new_run(project, item, Vec::new()))
+        .await
+        .expect(case)
+        .id;
+    if let Some(owner) = owner {
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, seam_clock(), LEASE)
+                .await
+                .expect(case),
+            Claim::Admitted,
+            "{case}: the owner claims the run of {item}"
+        );
+    }
+    let step = store
+        .create_step(new_run_step(run, 0, 1, 0))
+        .await
+        .expect(case)
+        .id;
+    (run, step)
+}
+
+/// How many documents `item` holds, every version counted.
+async fn document_count<S: ReadStore>(case: &str, store: &S, item: ItemId) -> usize {
+    store.documents(item).await.expect(case).len()
+}
+
+/// Whether `from --kind--> to` is a live edge of `from`'s one-hop graph.
+async fn live_link<S: ReadStore>(
+    case: &str,
+    store: &S,
+    from: ItemId,
+    to: ItemId,
+    kind: LinkKind,
+) -> bool {
+    store
+        .links(from, 1)
+        .await
+        .expect(case)
+        .edges
+        .iter()
+        .any(|edge| edge.from_item_id == from && edge.to_item_id == to && edge.kind == kind)
+}
+
+/// MOD-11 D13: [`WriteStore::write_step_document`] writes the step's own item under its run's
+/// lease, a new version per call ("newest wins"); after a stranger takes the lease the old
+/// owner is `Fenced` and writes nothing, and so is an unleased fence on a leased run. The
+/// concurrency half, a step's document racing its own park, is Postgres-only:
+/// `pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`.
+async fn write_step_document_fenced_and_versioned<S: WriteStore>(store: &S) {
+    const CASE: &str = "write_step_document_fenced_and_versioned";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let item = ids::HTUI_ANA_2;
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+
+    let first = store
+        .write_step_document(StepFence::Lease(a), new_document(item, "judge", Some(step)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (first.item_id, first.version, first.produced_by_step_id),
+        (item, 1, Some(step)),
+        "{CASE}: the first document of its kind is version 1, produced by the step"
+    );
+    let second = store
+        .write_step_document(StepFence::Lease(a), new_document(item, "judge", Some(step)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (second.version, second.produced_by_step_id),
+        (2, Some(step)),
+        "{CASE}: the same step writes again, and the newer version wins"
+    );
+    let heads = store.documents(item).await.expect(CASE);
+    for id in [first.id, second.id] {
+        assert!(
+            heads.iter().any(|head| head.id == id),
+            "{CASE}: {id} is listed among the item's documents"
+        );
+    }
+
+    let before = document_count(CASE, store, item).await;
+    for fence in [StepFence::Unleased, StepFence::Lease(b)] {
+        let refused = store
+            .write_step_document(fence, new_document(item, "judge", Some(step)))
+            .await;
+        assert!(
+            matches!(refused, Err(StoreError::Fenced { step: s }) if s == step),
+            "{CASE}: a write under {fence:?} on A's run is fenced, got {refused:?}"
+        );
+    }
+    taken_by(CASE, store, run, a, b).await;
+    let stale = store
+        .write_step_document(StepFence::Lease(a), new_document(item, "judge", Some(step)))
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's write after B took the run is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        document_count(CASE, store, item).await,
+        before,
+        "{CASE}: the fenced writes wrote no row"
+    );
+    let third = store
+        .write_step_document(StepFence::Lease(b), new_document(item, "judge", Some(step)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        third.version, 3,
+        "{CASE}: the new owner writes the next version"
+    );
+}
+
+/// MOD-11 D13: a step document names its step before anything is read, lands only on the run's
+/// own item, and an unknown step is `NotFound`. No refusal writes a row.
+async fn write_step_document_refuses_a_foreign_item<S: WriteStore>(store: &S) {
+    const CASE: &str = "write_step_document_refuses_a_foreign_item";
+    let a = Uuid::now_v7();
+    let (item, foreign) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_1);
+    let (_run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let (own_before, foreign_before) = (
+        document_count(CASE, store, item).await,
+        document_count(CASE, store, foreign).await,
+    );
+
+    constraint_exactly(
+        CASE,
+        store
+            .write_step_document(StepFence::Lease(a), new_document(item, "judge", None))
+            .await,
+        &document_needs_a_step(),
+        "a document naming no step",
+    );
+    // Before any read: an item nothing has is refused for the missing step, not `NotFound`.
+    constraint_exactly(
+        CASE,
+        store
+            .write_step_document(
+                StepFence::Lease(a),
+                new_document(ItemId::new(), "judge", None),
+            )
+            .await,
+        &document_needs_a_step(),
+        "a document naming no step on an unknown item",
+    );
+    // A NUL Postgres cannot store (`22021`) is refused by rule on both stores, before any read:
+    // even an unknown step answers it, not `NotFound`.
+    let unknown_step = Some(StepId::new());
+    for (doc, column) in [
+        (new_document(item, "ju\0dge", unknown_step), "document.kind"),
+        (
+            NewDocument {
+                title: "a\0title".to_owned(),
+                ..new_document(item, "judge", unknown_step)
+            },
+            "document.title",
+        ),
+        (
+            NewDocument {
+                body: "a\0body".to_owned(),
+                ..new_document(item, "judge", unknown_step)
+            },
+            "document.body",
+        ),
+    ] {
+        constraint_exactly(
+            CASE,
+            store.write_step_document(StepFence::Lease(a), doc).await,
+            &has_nul(column),
+            "a document with a NUL",
+        );
+    }
+    constraint_exactly(
+        CASE,
+        store
+            .write_step_document(
+                StepFence::Lease(a),
+                new_document(foreign, "judge", Some(step)),
+            )
+            .await,
+        &step_writes_own_item(step, foreign),
+        "a document on another item than the run's",
+    );
+    let unknown = store
+        .write_step_document(
+            StepFence::Lease(a),
+            new_document(item, "judge", Some(StepId::new())),
+        )
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {unknown:?}"
+    );
+    assert_eq!(
+        (
+            document_count(CASE, store, item).await,
+            document_count(CASE, store, foreign).await,
+        ),
+        (own_before, foreign_before),
+        "{CASE}: the refusals wrote no row"
+    );
+}
+
+/// MOD-11 D13: [`WriteStore::add_step_note`] lands with its `via_step_id` on the run's own item;
+/// a foreign item, a stale fence and a note naming no step are refused and write nothing.
+async fn add_step_note_fenced_on_its_own_item<S: WriteStore>(store: &S) {
+    const CASE: &str = "add_step_note_fenced_on_its_own_item";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (item, foreign) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_1);
+    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+
+    let note = store
+        .add_step_note(StepFence::Lease(a), new_note(item, ids::USER, Some(step)))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (note.item_id, note.via_step_id),
+        (item, Some(step)),
+        "{CASE}: the note lands on the run's item, naming the step"
+    );
+    assert!(
+        store
+            .notes(item)
+            .await
+            .expect(CASE)
+            .iter()
+            .any(|row| row.id == note.id),
+        "{CASE}: the note is listed on its item"
+    );
+
+    let (own_before, foreign_before) = (
+        store.notes(item).await.expect(CASE).len(),
+        store.notes(foreign).await.expect(CASE).len(),
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .add_step_note(
+                StepFence::Lease(a),
+                new_note(foreign, ids::USER, Some(step)),
+            )
+            .await,
+        &step_writes_own_item(step, foreign),
+        "a note on another item than the run's",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .add_step_note(StepFence::Lease(a), new_note(item, ids::USER, None))
+            .await,
+        &note_needs_a_step(),
+        "a note naming no step",
+    );
+    // A NUL is refused before any read, as `write_step_document`'s is.
+    let nul = NewNote {
+        body: "Refused:\0 the tree was dirty.".to_owned(),
+        ..new_note(item, ids::USER, Some(StepId::new()))
+    };
+    constraint_exactly(
+        CASE,
+        store.add_step_note(StepFence::Lease(a), nul).await,
+        &has_nul("item_note.body"),
+        "a note with a NUL",
+    );
+    taken_by(CASE, store, run, a, b).await;
+    let stale = store
+        .add_step_note(StepFence::Lease(a), new_note(item, ids::USER, Some(step)))
+        .await;
+    assert!(
+        matches!(stale, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's note after B took the run is fenced, got {stale:?}"
+    );
+    assert_eq!(
+        (
+            store.notes(item).await.expect(CASE).len(),
+            store.notes(foreign).await.expect(CASE).len(),
+        ),
+        (own_before, foreign_before),
+        "{CASE}: the refusals wrote no note"
+    );
+}
+
+/// MOD-11 D13, B-6: [`WriteStore::propose_link`] inserts a live link proposed by the step; a
+/// live row keeps the proposer it has (an importer's `None` included), a tombstone revives with
+/// the new proposer. A self link, a foreign `from`, an unknown or out-of-project `to` and a stale
+/// fence are refused; after a stranger takes the run, the old owner's proposal and withdraw are
+/// `Fenced` and write nothing.
+async fn propose_link_upserts_revives_and_keeps_a_live_proposer<S: WriteStore>(store: &S) {
+    const CASE: &str = "propose_link_upserts_revives_and_keeps_a_live_proposer";
+    let a = Uuid::now_v7();
+    let item = ids::AGY_FIX_1;
+    let (run, step) = agent_step(CASE, store, ids::PROJECT_AGY, item, Some(a)).await;
+    let propose = |to: ItemId, kind: LinkKind, step: StepId| ProposeLink {
+        from: item,
+        to,
+        kind,
+        step,
+    };
+
+    let fresh = store
+        .propose_link(
+            StepFence::Lease(a),
+            propose(ids::AGY_FEAT_1, LinkKind::Relates, step),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            fresh.from_item_id,
+            fresh.to_item_id,
+            fresh.kind,
+            fresh.proposed_by_step_id,
+            fresh.deleted_at,
+        ),
+        (item, ids::AGY_FEAT_1, LinkKind::Relates, Some(step), None),
+        "{CASE}: a new link is live and proposed by the step"
+    );
+    assert!(
+        live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Relates).await,
+        "{CASE}: the new link is a live edge"
+    );
+
+    // The fixture's importer link `FIX-1 --blocked_by--> ANA-1` (proposer NULL) stays the
+    // importer's: re-proposing a live row never makes the agent its proposer (B-6).
+    let importer = store
+        .propose_link(
+            StepFence::Lease(a),
+            propose(ids::AGY_ANA_1, LinkKind::BlockedBy, step),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (importer.proposed_by_step_id, importer.deleted_at),
+        (None, None),
+        "{CASE}: a live importer link keeps its NULL proposer"
+    );
+
+    // A tombstone revives with the new proposer: withdraw the step's own link, re-propose it
+    // from a second step of the run.
+    let withdrawn = store
+        .withdraw_link(
+            StepFence::Lease(a),
+            WithdrawLink {
+                from: item,
+                to: ids::AGY_FEAT_1,
+                kind: LinkKind::Relates,
+                step,
+            },
+        )
+        .await
+        .expect(CASE);
+    assert!(
+        withdrawn.deleted_at.is_some(),
+        "{CASE}: the withdraw tombstoned the link"
+    );
+    let later = store
+        .create_step(new_run_step(run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let revived = store
+        .propose_link(
+            StepFence::Lease(a),
+            propose(ids::AGY_FEAT_1, LinkKind::Relates, later),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            revived.proposed_by_step_id,
+            revived.deleted_at,
+            revived.created_at
+        ),
+        (Some(later), None, fresh.created_at),
+        "{CASE}: the tombstone revives with the new proposer, the same row"
+    );
+    let again = store
+        .propose_link(
+            StepFence::Lease(a),
+            propose(ids::AGY_FEAT_1, LinkKind::Relates, step),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        again.proposed_by_step_id,
+        Some(later),
+        "{CASE}: a live row keeps its proposer against another step too"
+    );
+
+    // Self link first, before any read: even an unknown step is refused for it.
+    constraint_exactly(
+        CASE,
+        store
+            .propose_link(
+                StepFence::Lease(a),
+                ProposeLink {
+                    from: item,
+                    to: item,
+                    kind: LinkKind::Relates,
+                    step: StepId::new(),
+                },
+            )
+            .await,
+        &self_link(item),
+        "a link from an item to itself",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .propose_link(
+                StepFence::Lease(a),
+                ProposeLink {
+                    from: ids::AGY_FEAT_1,
+                    to: item,
+                    kind: LinkKind::Relates,
+                    step,
+                },
+            )
+            .await,
+        &step_writes_own_item(step, ids::AGY_FEAT_1),
+        "a link from another item than the run's",
+    );
+    constraint_exactly(
+        CASE,
+        store
+            .propose_link(
+                StepFence::Lease(a),
+                propose(ids::HTUI_FEAT_1, LinkKind::Relates, step),
+            )
+            .await,
+        &link_outside_project(ids::HTUI_FEAT_1),
+        "a link to another project's item",
+    );
+    let unknown = ItemId::new();
+    let missing = store
+        .propose_link(
+            StepFence::Lease(a),
+            propose(unknown, LinkKind::Relates, step),
+        )
+        .await;
+    assert!(
+        matches!(&missing, Err(StoreError::NotFound { entity: "item", id }) if *id == unknown.to_string()),
+        "{CASE}: an unknown `to` is NotFound, got {missing:?}"
+    );
+    let fenced = store
+        .propose_link(
+            StepFence::Unleased,
+            propose(ids::AGY_FEAT_1, LinkKind::Origin, step),
+        )
+        .await;
+    assert!(
+        matches!(fenced, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: an unleased proposal on a leased run is fenced, got {fenced:?}"
+    );
+    assert!(
+        !live_link(CASE, store, item, ids::HTUI_FEAT_1, LinkKind::Relates).await
+            && !live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Origin).await,
+        "{CASE}: the refusals wrote no link"
+    );
+
+    // I-3: after a stranger takes the run, its old owner neither withdraws nor proposes.
+    let b = Uuid::now_v7();
+    taken_by(CASE, store, run, a, b).await;
+    let stale_withdraw = store
+        .withdraw_link(
+            StepFence::Lease(a),
+            WithdrawLink {
+                from: item,
+                to: ids::AGY_FEAT_1,
+                kind: LinkKind::Relates,
+                step,
+            },
+        )
+        .await;
+    assert!(
+        matches!(stale_withdraw, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's withdraw after B took the run is fenced, got {stale_withdraw:?}"
+    );
+    let stale_propose = store
+        .propose_link(
+            StepFence::Lease(a),
+            propose(ids::AGY_FEAT_1, LinkKind::Supersedes, step),
+        )
+        .await;
+    assert!(
+        matches!(stale_propose, Err(StoreError::Fenced { step: s }) if s == step),
+        "{CASE}: A's proposal after B took the run is fenced, got {stale_propose:?}"
+    );
+    assert!(
+        !live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Supersedes).await,
+        "{CASE}: the fenced proposal wrote no link"
+    );
+    // A tombstone would revive under `step`; a live row keeps `later`, so the withdraw wrote
+    // nothing.
+    let kept = store
+        .propose_link(
+            StepFence::Lease(b),
+            propose(ids::AGY_FEAT_1, LinkKind::Relates, step),
+        )
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (kept.proposed_by_step_id, kept.deleted_at),
+        (Some(later), None),
+        "{CASE}: the fenced withdraw left the link live under its proposer"
+    );
+}
+
+/// MOD-11 D13, B-5: [`WriteStore::withdraw_link`] tombstones a live link only when a step of the
+/// withdrawing step's run proposed it; another run's link and an importer's are refused, and a
+/// link with no live row is `NotFound`.
+async fn withdraw_link_only_what_this_run_proposed<S: WriteStore>(store: &S) {
+    const CASE: &str = "withdraw_link_only_what_this_run_proposed";
+    let item = ids::AGY_FIX_1;
+    let fence = StepFence::Unleased;
+    let (earlier_run, earlier) = agent_step(CASE, store, ids::PROJECT_AGY, item, None).await;
+    let theirs = ProposeLink {
+        from: item,
+        to: ids::AGY_FEAT_1,
+        kind: LinkKind::Relates,
+        step: earlier,
+    };
+    store.propose_link(fence, theirs).await.expect(CASE);
+    assert!(
+        store
+            .transition(item, Status::Queued, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: queued -> open frees the item for a second run"
+    );
+    let (_run, step) = agent_step(CASE, store, ids::PROJECT_AGY, item, None).await;
+    let ours = ProposeLink {
+        from: item,
+        to: ids::AGY_ANA_1,
+        kind: LinkKind::Origin,
+        step,
+    };
+    store.propose_link(fence, ours).await.expect(CASE);
+    let withdraw = |link: ProposeLink, step: StepId| WithdrawLink {
+        from: link.from,
+        to: link.to,
+        kind: link.kind,
+        step,
+    };
+
+    constraint_exactly(
+        CASE,
+        store.withdraw_link(fence, withdraw(theirs, step)).await,
+        &link_not_proposed_by_run(&link_key(item, ids::AGY_FEAT_1, LinkKind::Relates)),
+        "a live link another run proposed",
+    );
+    let importer = WithdrawLink {
+        from: item,
+        to: ids::AGY_ANA_1,
+        kind: LinkKind::BlockedBy,
+        step,
+    };
+    constraint_exactly(
+        CASE,
+        store.withdraw_link(fence, importer).await,
+        &link_not_proposed_by_run(&link_key(item, ids::AGY_ANA_1, LinkKind::BlockedBy)),
+        "a live importer link",
+    );
+    assert!(
+        live_link(CASE, store, item, ids::AGY_FEAT_1, LinkKind::Relates).await
+            && live_link(CASE, store, item, ids::AGY_ANA_1, LinkKind::BlockedBy).await,
+        "{CASE}: the refused withdraws left both links live"
+    );
+
+    let gone = store
+        .withdraw_link(fence, withdraw(ours, step))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            gone.from_item_id,
+            gone.to_item_id,
+            gone.kind,
+            gone.proposed_by_step_id
+        ),
+        (item, ids::AGY_ANA_1, LinkKind::Origin, Some(step)),
+        "{CASE}: the withdraw answers the run's own link"
+    );
+    assert!(
+        gone.deleted_at.is_some(),
+        "{CASE}: the answered row is the tombstone"
+    );
+    assert!(
+        !live_link(CASE, store, item, ids::AGY_ANA_1, LinkKind::Origin).await,
+        "{CASE}: `links` no longer shows the tombstoned edge"
+    );
+    assert!(
+        live_link(CASE, store, item, ids::AGY_ANA_1, LinkKind::BlockedBy).await,
+        "{CASE}: the importer's edge between the same items is another row and stays"
+    );
+
+    for (link, what) in [
+        (withdraw(ours, step), "the tombstone just written"),
+        (
+            WithdrawLink {
+                from: item,
+                to: ids::AGY_FEAT_1,
+                kind: LinkKind::Supersedes,
+                step,
+            },
+            "a link no row has",
+        ),
+    ] {
+        let missing = store.withdraw_link(fence, link).await;
+        let key = link_key(link.from, link.to, link.kind);
+        assert!(
+            matches!(&missing, Err(StoreError::NotFound { entity: "item_link", id }) if *id == key),
+            "{CASE}: {what} is NotFound by its key, got {missing:?}"
+        );
+    }
+    constraint_exactly(
+        CASE,
+        store
+            .withdraw_link(
+                fence,
+                WithdrawLink {
+                    from: ids::AGY_FEAT_1,
+                    to: item,
+                    kind: LinkKind::Relates,
+                    step,
+                },
+            )
+            .await,
+        &step_writes_own_item(step, ids::AGY_FEAT_1),
+        "a withdraw from another item than the run's",
+    );
+
+    // The run is the unit, not the step: a second step of the earlier run withdraws the link its
+    // first step proposed.
+    let sibling = store
+        .create_step(new_run_step(earlier_run, 1, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    let theirs_gone = store
+        .withdraw_link(fence, withdraw(theirs, sibling))
+        .await
+        .expect(CASE);
+    assert_eq!(
+        (
+            theirs_gone.proposed_by_step_id,
+            theirs_gone.deleted_at.is_some()
+        ),
+        (Some(earlier), true),
+        "{CASE}: a step of the proposing run withdraws its sibling's link"
+    );
+    let unknown = store
+        .withdraw_link(fence, withdraw(theirs, StepId::new()))
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {unknown:?}"
+    );
+}
+
+/// MOD-11 B-4: [`WriteStore::item_by_key`] resolves a key inside one project: the same key is
+/// another item (or none) in another project, and an unknown key is `None`.
+async fn item_by_key_answers_within_its_project<S: WriteStore>(store: &S) {
+    const CASE: &str = "item_by_key_answers_within_its_project";
+    for (project, key, expected) in [
+        (ids::PROJECT_HTUI, "ANA-2", Some(ids::HTUI_ANA_2)),
+        (ids::PROJECT_HTUI, "ANA-1", Some(ids::HTUI_ANA_1)),
+        (ids::PROJECT_AGY, "ANA-1", Some(ids::AGY_ANA_1)),
+        (ids::PROJECT_AGY, "ANA-2", None),
+        (ids::PROJECT_HTUI, "NOPE-9", None),
+        (ProjectId::new(), "ANA-1", None),
+        // A NUL no key holds (Postgres refuses it as text, `22021`): no item, on both stores.
+        (ids::PROJECT_HTUI, "ANA-2\0", None),
+        (ids::PROJECT_HTUI, "\0", None),
+    ] {
+        assert_eq!(
+            store.item_by_key(project, key).await.expect(CASE),
+            expected,
+            "{CASE}: `{key}` in project {project}"
+        );
+    }
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-11 T8 (plan D14, OQ-3, blueprint B-16): the command queue. A row is enqueued `queued`, a
+// claim admits the oldest `queued` row of its `(box, class)` while fewer than the class limit
+// run, only the claimant beats or finishes it, and a cancel ends it from either live state. The
+// reaping of a stale heartbeat needs a clock the suite cannot move on Postgres (F-22).
+// ------------------------------------------------------------------------------------------
+
+/// MOD-11 D14: a `queued` row of `class` on the fixture's `R2/prd` step and box, queued at `at`.
+fn queued_command(class: &str, at: DateTime<Utc>) -> NewCommandRun {
+    NewCommandRun {
+        id: CommandRunId::new(),
+        run_step_id: ids::STEP_R2_PRD,
+        box_id: ids::BOX,
+        class: class.to_owned(),
+        command: format!("make {class}"),
+        cwd: "/srv/trees/prd/core".to_owned(),
+        status: CommandRunStatus::Queued,
+        exit_code: None,
+        output: None,
+        queued_at: at,
+        started_at: None,
+        finished_at: None,
+    }
+}
+
+/// The one `command_run` row `id` names, read back through the step's list.
+async fn command_row<S: WriteStore>(case: &str, store: &S, id: CommandRunId) -> CommandRun {
+    store
+        .command_runs(ids::STEP_R2_PRD)
+        .await
+        .expect(case)
+        .into_iter()
+        .find(|row| row.id == id)
+        .unwrap_or_else(|| panic!("{case}: command run {id} reads back"))
+}
+
+/// MOD-11 D14, B-16: [`WriteStore::enqueue_command`] writes a `queued` row that
+/// [`WriteStore::command_runs`] reads back as written; a row that is not `queued`, or carries a
+/// start, a finish, an exit code or an output, is refused before anything is read, and an unknown
+/// step is `NotFound` as `record_command_run` answers it.
+async fn enqueue_command_queues_on_an_existing_step<S: WriteStore>(store: &S) {
+    const CASE: &str = "enqueue_command_queues_on_an_existing_step";
+    let t0 = seam_clock();
+    let new = queued_command("build", t0);
+    let written = store.enqueue_command(new.clone()).await.expect(CASE);
+    assert_eq!(
+        written,
+        CommandRun::from(new.clone()),
+        "{CASE}: every column is the caller's"
+    );
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        written,
+        "{CASE}: the queued row reads back"
+    );
+
+    let refusals = [
+        NewCommandRun {
+            status: CommandRunStatus::Running,
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            status: CommandRunStatus::Done,
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            started_at: Some(t0),
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            finished_at: Some(t0),
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            exit_code: Some(0),
+            ..queued_command("build", t0)
+        },
+        NewCommandRun {
+            output: Some("early".to_owned()),
+            ..queued_command("build", t0)
+        },
+        // Refused before the step is read: the B-16 shape first.
+        NewCommandRun {
+            run_step_id: StepId::new(),
+            status: CommandRunStatus::Running,
+            ..queued_command("build", t0)
+        },
+    ];
+    for refused in refusals {
+        let answer = store.enqueue_command(refused.clone()).await;
+        assert_eq!(
+            answer,
+            Err(StoreError::Constraint(command_not_queued())),
+            "{CASE}: {refused:?} is not a queued row"
+        );
+    }
+
+    let unknown = store
+        .enqueue_command(NewCommandRun {
+            run_step_id: StepId::new(),
+            ..queued_command("build", t0)
+        })
+        .await;
+    assert!(
+        matches!(
+            unknown,
+            Err(StoreError::NotFound {
+                entity: "run_step",
+                ..
+            })
+        ),
+        "{CASE}: an unknown step is NotFound, got {unknown:?}"
+    );
+    assert_eq!(
+        store
+            .command_runs(ids::STEP_R2_PRD)
+            .await
+            .expect(CASE)
+            .len(),
+        1,
+        "{CASE}: no refusal wrote a row"
+    );
+}
+
+/// MOD-11 D14: [`WriteStore::claim_command`] admits in `(queued_at, id)` order up to the limit.
+/// Three `build` rows on one box under a limit of 2: the youngest asked first is not admitted
+/// ahead of the older two, the two oldest run, the third waits until one of them finishes; a
+/// `test` row on the same box is another class with its own slots; a limit of 0 reads as 1; an
+/// unknown row is `NotFound` and a row already running is not claimable again. Two halves are
+/// not here: the limit under racing claimants on two pools,
+/// `pg_criteria.rs::concurrent_claims_never_exceed_the_class_limit`, and the reaping of a stale
+/// heartbeat, which needs a clock the suite cannot move on Postgres —
+/// `a_stale_running_row_is_reaped_by_the_next_claim` on `MemStore` and
+/// `pg_criteria.rs::a_stale_heartbeat_is_reaped_by_the_next_claim` by a raw-SQL backdate.
+async fn claim_command_admits_up_to_the_limit_in_queue_order<S: WriteStore>(store: &S) {
+    const CASE: &str = "claim_command_admits_up_to_the_limit_in_queue_order";
+    let t0 = seam_clock();
+    let first = queued_command("build", t0);
+    let second = queued_command("build", t0 + TimeDelta::seconds(1));
+    let third = queued_command("build", t0 + TimeDelta::seconds(2));
+    // Written youngest first: the order is the rows' `queued_at`, not insertion.
+    for new in [&third, &second, &first] {
+        store.enqueue_command(new.clone()).await.expect(CASE);
+    }
+    let claimant = Uuid::now_v7();
+
+    assert_eq!(
+        store
+            .claim_command(third.id, claimant, 2)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: the youngest is not admitted ahead of two older rows"
+    );
+    assert_eq!(
+        store
+            .claim_command(second.id, claimant, 2)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: nor the second ahead of the first"
+    );
+    let admitted = store
+        .claim_command(first.id, claimant, 2)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the oldest is admitted"));
+    assert_eq!(
+        (admitted.id, admitted.status, admitted.started_at.is_some()),
+        (first.id, CommandRunStatus::Running, true),
+        "{CASE}: the admitted row is running, started now"
+    );
+    assert_eq!(
+        (
+            admitted.finished_at,
+            admitted.exit_code,
+            admitted.output.clone()
+        ),
+        (None, None, None),
+        "{CASE}: and nothing else moved"
+    );
+    assert_eq!(
+        command_row(CASE, store, first.id).await,
+        admitted,
+        "{CASE}: the answer is the stored row"
+    );
+    assert!(
+        store
+            .claim_command(second.id, Uuid::now_v7(), 2)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: the second is admitted under the limit, by any claimant"
+    );
+    assert_eq!(
+        store
+            .claim_command(third.id, claimant, 2)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: two running: the third waits"
+    );
+
+    // Another class on the same box has its own slots.
+    let other_class = queued_command("test", t0 + TimeDelta::seconds(3));
+    store
+        .enqueue_command(other_class.clone())
+        .await
+        .expect(CASE);
+    assert!(
+        store
+            .claim_command(other_class.id, claimant, 0)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: `test` is admitted beside two `build` rows; a limit of 0 reads as 1"
+    );
+    let crowded = queued_command("test", t0 + TimeDelta::seconds(4));
+    store.enqueue_command(crowded.clone()).await.expect(CASE);
+    assert_eq!(
+        store
+            .claim_command(crowded.id, claimant, 0)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: and a limit of 0 admits exactly one"
+    );
+
+    assert!(
+        store
+            .finish_command(
+                first.id,
+                claimant,
+                CommandRunStatus::Done,
+                Some(0),
+                Some("built".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the first finishes"
+    );
+    let third_admitted = store
+        .claim_command(third.id, claimant, 2)
+        .await
+        .expect(CASE);
+    assert_eq!(
+        third_admitted.map(|row| (row.id, row.status)),
+        Some((third.id, CommandRunStatus::Running)),
+        "{CASE}: a finished row frees its slot for the next in line"
+    );
+
+    let again = store.claim_command(third.id, claimant, 2).await;
+    assert_eq!(
+        again,
+        Err(StoreError::Constraint(command_not_claimable(
+            CommandRunStatus::Running
+        ))),
+        "{CASE}: a running row is not claimable again"
+    );
+    let unknown_id = CommandRunId::new();
+    let unknown = store.claim_command(unknown_id, claimant, 2).await;
+    assert_eq!(
+        unknown,
+        Err(StoreError::NotFound {
+            entity: "command_run",
+            id: unknown_id.to_string(),
+        }),
+        "{CASE}: an unknown row is NotFound"
+    );
+}
+
+/// MOD-11 D14: only the claimant beats or finishes a running row. A stranger's beat and finish
+/// answer `false` and move nothing; the claimant's finish lands its status, exit code and output
+/// with a finish instant, after which its own beat is `false`; finishing to `queued` or `running`
+/// is refused before anything is read.
+async fn beat_and_finish_need_the_claimant<S: WriteStore>(store: &S) {
+    const CASE: &str = "beat_and_finish_need_the_claimant";
+    let new = queued_command("build", seam_clock());
+    store.enqueue_command(new.clone()).await.expect(CASE);
+    let claimant = Uuid::now_v7();
+    let stranger = Uuid::now_v7();
+
+    assert!(
+        !store.beat_command(new.id, claimant).await.expect(CASE),
+        "{CASE}: a queued row has no claimant to beat"
+    );
+    let running = store
+        .claim_command(new.id, claimant, 1)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the row is admitted"));
+
+    assert!(
+        store.beat_command(new.id, claimant).await.expect(CASE),
+        "{CASE}: the claimant beats"
+    );
+    assert!(
+        !store.beat_command(new.id, stranger).await.expect(CASE),
+        "{CASE}: a stranger does not"
+    );
+    assert!(
+        !store
+            .finish_command(
+                new.id,
+                stranger,
+                CommandRunStatus::Done,
+                Some(0),
+                Some("not mine".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: nor finishes it"
+    );
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        running,
+        "{CASE}: the stranger moved nothing"
+    );
+
+    for status in [CommandRunStatus::Queued, CommandRunStatus::Running] {
+        let refused = store
+            .finish_command(new.id, claimant, status, None, None)
+            .await;
+        assert_eq!(
+            refused,
+            Err(StoreError::Constraint(command_finish_status(status))),
+            "{CASE}: `{status}` is not an end"
+        );
+    }
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        running,
+        "{CASE}: the refusals moved nothing"
+    );
+
+    assert!(
+        store
+            .finish_command(
+                new.id,
+                claimant,
+                CommandRunStatus::Done,
+                Some(3),
+                Some("3 tests failed".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the claimant finishes"
+    );
+    let done = command_row(CASE, store, new.id).await;
+    assert_eq!(
+        (done.status, done.exit_code, done.output.as_deref()),
+        (CommandRunStatus::Done, Some(3), Some("3 tests failed")),
+        "{CASE}: status, exit code and output land"
+    );
+    assert!(done.finished_at.is_some(), "{CASE}: with a finish instant");
+    assert_eq!(
+        done.started_at, running.started_at,
+        "{CASE}: the start is the claim's"
+    );
+    assert!(
+        !store.beat_command(new.id, claimant).await.expect(CASE),
+        "{CASE}: a finished row has no claimant to beat"
+    );
+    assert!(
+        !store
+            .finish_command(new.id, claimant, CommandRunStatus::Failed, None, None)
+            .await
+            .expect(CASE),
+        "{CASE}: nor to finish it twice"
+    );
+    assert_eq!(
+        command_row(CASE, store, new.id).await,
+        done,
+        "{CASE}: the second finish moved nothing"
+    );
+}
+
+/// MOD-11 D14: [`WriteStore::cancel_command`] ends a `queued` or `running` row as `cancelled`
+/// with a finish instant; a running row's claimant then beats `false`, which is the executor's
+/// signal to kill its child. A terminal row answers `false` and stays as it is, a cancelled row
+/// is not claimable, and an unknown row is `NotFound`.
+async fn cancel_command_ends_a_queued_or_running_row<S: WriteStore>(store: &S) {
+    const CASE: &str = "cancel_command_ends_a_queued_or_running_row";
+    let t0 = seam_clock();
+    let queued = queued_command("build", t0);
+    let running = queued_command("build", t0 + TimeDelta::seconds(1));
+    store.enqueue_command(queued.clone()).await.expect(CASE);
+    store.enqueue_command(running.clone()).await.expect(CASE);
+
+    assert!(
+        store.cancel_command(queued.id).await.expect(CASE),
+        "{CASE}: a queued row is cancelled"
+    );
+    let cancelled = command_row(CASE, store, queued.id).await;
+    assert_eq!(
+        (cancelled.status, cancelled.finished_at.is_some()),
+        (CommandRunStatus::Cancelled, true),
+        "{CASE}: cancelled, with a finish instant"
+    );
+    assert_eq!(
+        store.claim_command(queued.id, Uuid::now_v7(), 1).await,
+        Err(StoreError::Constraint(command_not_claimable(
+            CommandRunStatus::Cancelled
+        ))),
+        "{CASE}: a cancelled row is not claimable"
+    );
+
+    let claimant = Uuid::now_v7();
+    assert!(
+        store
+            .claim_command(running.id, claimant, 1)
+            .await
+            .expect(CASE)
+            .is_some(),
+        "{CASE}: the next row is admitted: a cancelled row is no longer in line"
+    );
+    assert!(
+        store.cancel_command(running.id).await.expect(CASE),
+        "{CASE}: a running row is cancelled"
+    );
+    let stopped = command_row(CASE, store, running.id).await;
+    assert_eq!(
+        (stopped.status, stopped.finished_at.is_some()),
+        (CommandRunStatus::Cancelled, true),
+        "{CASE}: cancelled, with a finish instant"
+    );
+    assert!(
+        !store.beat_command(running.id, claimant).await.expect(CASE),
+        "{CASE}: the claimant's next beat answers false"
+    );
+    assert!(
+        !store
+            .finish_command(running.id, claimant, CommandRunStatus::Done, Some(0), None)
+            .await
+            .expect(CASE),
+        "{CASE}: and its finish lands nothing"
+    );
+    assert_eq!(
+        command_row(CASE, store, running.id).await,
+        stopped,
+        "{CASE}: the row stays cancelled"
+    );
+
+    assert!(
+        !store.cancel_command(running.id).await.expect(CASE),
+        "{CASE}: a terminal row answers false"
+    );
+    assert_eq!(
+        command_row(CASE, store, running.id).await,
+        stopped,
+        "{CASE}: and stays as it is"
+    );
+    let unknown_id = CommandRunId::new();
+    assert_eq!(
+        store.cancel_command(unknown_id).await,
+        Err(StoreError::NotFound {
+            entity: "command_run",
+            id: unknown_id.to_string(),
+        }),
+        "{CASE}: an unknown row is NotFound"
     );
 }
 

@@ -13,6 +13,7 @@ htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
 - [Who executes on a box: the executor setting](#who-executes-on-a-box-the-executor-setting)
 - [The TUI on a worker box](#the-tui-on-a-worker-box)
 - [Permission requests on worker steps](#permission-requests-on-worker-steps)
+- [htui's MCP tools on worker steps](#htuis-mcp-tools-on-worker-steps)
 - [Cancelling a run the worker walks](#cancelling-a-run-the-worker-walks)
 - [Upgrading: migrate from a TUI first](#upgrading-migrate-from-a-tui-first)
 - [Where the DSN comes from](#where-the-dsn-comes-from)
@@ -52,6 +53,8 @@ What it does:
 - Marks the box as seen (`box.last_seen_at`) once at start and then every minute, whatever the
   executor.
 - Logs `htui worker ready` once connected, with the box id and the pool size.
+- Hosts htui's MCP tools for the sessions it starts, on a private local socket; nothing listens
+  on the network (see [htui's MCP tools](#htuis-mcp-tools-on-worker-steps)).
 - Parks a step whose agent asks for a permission its policy does not settle, until someone
   answers it from the **Runs** pane of any TUI that holds the DSN (see
   [Permission requests](#permission-requests-on-worker-steps)).
@@ -175,8 +178,10 @@ process at each of these points and restarts it (MOD-24).
 
 ## Permission requests on worker steps
 
-An ACP agent may ask for permission before it runs a tool. On a step the worker walks, as on one
-the TUI walks:
+An agent may ask for permission before it runs a tool: an ACP agent over ACP, a `claude-cli` agent
+through htui's `permission_prompt` tool (see
+[`docs/htui-mcp.md`](htui-mcp.md#permission-prompts-for-claude-cli)). On a step the worker walks,
+as on one the TUI walks:
 
 1. **The agent's own policy decides first**, the same policy its chat uses: a rule that allows or
    rejects the call answers at once, and the answer is recorded in the step's log as the policy's.
@@ -204,6 +209,36 @@ Things to know:
   once, a parked one included; the request is left unanswerable and disappears from the pane once
   the lease is given back. The next sweep resets the step and retries it, and its session asks
   again. Cancel the run first if you want it to end as `cancelled` instead.
+
+## htui's MCP tools on worker steps
+
+Every session the worker starts gets htui's MCP server, `htui`, and the worker itself answers it:
+the agent writes its document, notes and link proposals through the worker's own connection and
+under the walk's lease, and never sees the DSN. What the tools do, and which session gets which, is
+in [`docs/htui-mcp.md`](htui-mcp.md).
+
+- **Nothing listens on the network.** The worker opens one local listener, at its first session: a
+  Unix socket in a `0700` directory `htui-mcp-<pid>-<8 hex>` under `$XDG_RUNTIME_DIR`, else the
+  temporary directory (a named pipe on Windows), and every connection must present its session's
+  token. ANA-16 §5.4's "no worker listener socket" is about a control plane other machines could
+  reach; this socket is per process, local, gated per session, and gone when the worker stops
+  (MOD-11 OQ-1).
+- **Under the [systemd unit](#running-it-as-a-systemd-service)** a system service has no
+  `XDG_RUNTIME_DIR`, so the directory is in `/tmp`. A worker that is killed leaves it behind; it is
+  safe to delete once that pid is gone (see [The socket](htui-mcp.md#the-socket)).
+- **A worker that cannot host the tools refuses to start** (exit 2, "htui's MCP tools cannot be
+  hosted: …"): every document phase would fail `missing_output` without them. Hosting only
+  resolves the worker's own binary, so this happens off Linux only, when that binary has no
+  absolute path. The socket is bound at the first session, not at start: a socket directory that
+  cannot be created or is not private leaves the worker running and fails each step with
+  `agent spawn failed: htui's MCP listener could not start: …`. Under the systemd unit, check that
+  `/tmp` is writable.
+- **`search_concepts`** is offered only when the keyring held a Qdrant URL at start (see
+  [The concepts index](#the-concepts-index)), so a provisioned worker never offers it.
+- **`command_run`** runs on this box, as the worker's user and with the worker's environment, in
+  the box's command queue, which the worker shares with a TUI on the same box. A worker killed
+  mid-command holds its slot until the next command of that class asks, 30 seconds later at the
+  earliest.
 
 ## Cancelling a run the worker walks
 
@@ -311,7 +346,7 @@ read again after every sync; without it, or with any other value, the interval i
 |---|---|
 | `0` | Clean shutdown on a signal. |
 | `1` | Reserved for a failure after the worker started. This build produces none: a store outage is logged, not an exit (below). |
-| `2` | A startup refusal: no DSN, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
+| `2` | A startup refusal: no DSN, a connection that could not be made, a schema or build the database refuses, a `--log` file that cannot be opened, a signal handler that cannot be installed, htui's MCP tools that cannot be hosted (off Linux only, when the worker's own binary has no absolute path), or a command line `htui` refuses (a usage error, such as `htui --log PATH worker`). A schema or build refusal writes nothing to the database. Other refusals may not be clean: a first start mints `box.toml` before it connects, and a refusal while seeding or registering this box comes after some of those rows are written, as the TUI's start would write them. |
 | `101` | A panic that stops the process: a bug in `htui`. It is reported to GlitchTip (see [Error reports](#error-reports)). A panic inside a run's walk is reported too, but does not stop the worker: the run is adopted again, [backed off](#a-run-whose-resume-keeps-failing). |
 
 A store outage while running is not an exit: the worker logs it and carries on, and its walks fence

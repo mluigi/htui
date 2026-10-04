@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id AS \"id: ItemId\" FROM item WHERE project_id = $1 AND key = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "9b8006122353cc28e78483844cd2db49b1053eb71cac31fbbc7234e3500f3fe3"
+}

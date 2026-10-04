@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE command_run SET heartbeat_at = clock_timestamp() WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e855c9129787941620679519c8c834c85239b9a0ed807619ad1594d1e8a66db"
+}

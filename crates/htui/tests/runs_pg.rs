@@ -139,6 +139,94 @@ impl TransportBuilder for Walks {
     }
 }
 
+/// MOD-11 T6: every session plays one `done` turn after writing its document through
+/// `document_write` on its own token (the in-process client of the runtime's host); the bodies
+/// are taken in build order.
+#[derive(Debug, Clone, Default)]
+struct ToolWriter(
+    Arc<std::sync::Mutex<Option<htui_mcp::McpHost<Backend>>>>,
+    Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+);
+
+impl ToolWriter {
+    fn with_bodies(bodies: impl IntoIterator<Item = String>) -> Self {
+        let writer = Self::default();
+        writer.1.lock().expect("the body queue").extend(bodies);
+        writer
+    }
+}
+
+impl TransportBuilder for ToolWriter {
+    fn build(
+        &self,
+        agent: &Agent,
+        _on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
+        Ok(Box::new(ToolWriting {
+            inner: FakeDriver::new(agent.name.clone(), caps, Script::one_turn(vec![done()])),
+            host: self
+                .0
+                .lock()
+                .expect("the host cell")
+                .clone()
+                .expect("the stack set the host"),
+            body: self
+                .1
+                .lock()
+                .expect("the body queue")
+                .pop_front()
+                .unwrap_or_else(|| "a document".to_owned()),
+        }))
+    }
+}
+
+/// [`ToolWriter`]'s driver.
+#[derive(Debug)]
+struct ToolWriting {
+    inner: FakeDriver,
+    host: htui_mcp::McpHost<Backend>,
+    body: String,
+}
+
+impl AgentDriver for ToolWriting {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn caps(&self) -> DriverCaps {
+        self.inner.caps()
+    }
+
+    fn start<'a>(
+        &'a self,
+        spec: htui_agent::driver::SessionSpec,
+        prompt: String,
+    ) -> htui_agent::driver::DriverFuture<'a, Box<dyn htui_agent::driver::AgentSession>> {
+        let token = spec
+            .mcp
+            .first()
+            .and_then(|server| server.env.get(htui_mcp::ENV_TOKEN))
+            .cloned();
+        let inner = self.inner.start(spec, prompt);
+        Box::pin(async move {
+            let session = inner.await?;
+            let token = token.expect("the spec carries htui's server");
+            let mut client = self
+                .host
+                .client(&token)
+                .expect("the session's token is live");
+            client.initialize().await.expect("initialize is answered");
+            let written = client
+                .call("document_write", json!({ "body": self.body }))
+                .await
+                .expect("the call is answered");
+            assert!(!written.is_error, "{}", written.text);
+            Ok(session)
+        })
+    }
+}
+
 /// MOD-42 T6: the first session plays a gated `execute` call and parks on its permission request
 /// (one allow and one reject option), then ends its turn once answered; every later session plays
 /// [`Walks`].
@@ -347,6 +435,75 @@ impl Stack {
             "online",
             "the shell runs over the Postgres backend, not a memory one"
         );
+        Some(Self {
+            db,
+            _root: root,
+            cache,
+            _keyring: keyring,
+            harness,
+        })
+    }
+
+    /// MOD-11 T6 (B-9): the production path over Postgres. `ANA-2`'s graph fans `research` out
+    /// two ways with every phase ungated and the scripted agent judging; the run runtime hosts a
+    /// real `McpHost` over the online backend and has **no author**, and every session plays
+    /// [`ToolWriter`], which writes its document through `document_write`.
+    async fn judged(writer: ToolWriter) -> Option<Self> {
+        let db = testkit::demo_db().await?;
+        seed(&db.store).await;
+        sqlx::query("UPDATE step_graph_phase SET gate = 'never' WHERE graph_id = $1")
+            .bind(ids::GRAPH_HTUI_ANA.as_uuid())
+            .execute(&db.pool)
+            .await
+            .expect("the ANA graph is ungated");
+        sqlx::query(
+            "UPDATE step_graph_phase SET fan_out = 2 WHERE graph_id = $1 AND name = 'research'",
+        )
+        .bind(ids::GRAPH_HTUI_ANA.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("research fans out");
+        let judge = db
+            .store
+            .agents()
+            .await
+            .expect("the agents read")
+            .into_iter()
+            .find(|summary| summary.agent.enabled)
+            .expect("the scripted row")
+            .agent
+            .id;
+        sqlx::query(
+            "UPDATE project SET settings = COALESCE(settings, '{}'::jsonb) \
+             || jsonb_build_object('judge_agent_id', $1::text) \
+             WHERE id = $2",
+        )
+        .bind(judge.to_string())
+        .bind(ids::PROJECT_HTUI.as_uuid())
+        .execute(&db.pool)
+        .await
+        .expect("the scripted agent judges");
+        let root = tempfile::tempdir().expect("a throwaway config root");
+        let cache = CacheStore::open(root.path(), "runs-pg", PgStore::schema_version())
+            .await
+            .expect("a fresh mirror");
+        let keyring = testkit::mock_keyring().await;
+        let backend = Backend::Online {
+            pg: db.store.clone(),
+            cache: cache.clone(),
+        };
+        let host = htui_mcp::McpHost::new(backend.clone()).expect("an absolute binary path");
+        *writer.0.lock().expect("the host cell") = Some(host.clone());
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(writer));
+        let runtime = RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()),
+            Arc::new(FakeVerifier::new()),
+            factory,
+        )
+        .with_tool_host(Arc::new(host));
+        let mut harness = Harness::over_backend(backend).with_run_runtime(runtime);
+        harness.drive().await;
         Some(Self {
             db,
             _root: root,
@@ -1512,5 +1669,69 @@ async fn an_in_process_walk_resumes_on_an_answer_from_another_box() {
         "the TUI's own relay view is empty afterwards: {view:?}"
     );
 
+    stack.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-11 T6: the production judge on Postgres
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-11 T6 (plan D10, B-9): fan-out 2 plus a judge, every session writing its document through
+/// `document_write` into **Postgres** — `write_step_document` under the walk's lease — with no test
+/// author: the judge reads both calls' verdicts and resolves the group with no human pick, and the
+/// run walks on to `done`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_production_judge_resolves_through_document_write_on_postgres() {
+    let verdict = format!(
+        "Compared.\n\n```json\n{}\n```",
+        json!({ "winner": 1, "reasons": { "1": "the deeper one" } })
+    );
+    let writer = ToolWriter::with_bodies([
+        "research by candidate 0".to_owned(),
+        "research by candidate 1".to_owned(),
+        verdict.clone(),
+        verdict,
+        "the verdict".to_owned(),
+    ]);
+    let Some(mut stack) = Stack::judged(writer).await else {
+        return;
+    };
+    let run = stack.start(ids::HTUI_ANA_2).await;
+    stack
+        .drive_until("the run to finish", |store| async move {
+            store
+                .run(run)
+                .await
+                .expect("the read answers")
+                .is_some_and(|row| row.status == RunStatus::Done)
+        })
+        .await;
+
+    let steps = stack.steps(run).await;
+    let judge = steps
+        .iter()
+        .find(|step| step.position == 0 && step.fanout_index == -1)
+        .expect("the judge is a step");
+    assert_eq!(
+        (judge.status, judge.gate_note.as_deref()),
+        (StepStatus::Done, Some("the deeper one"))
+    );
+    let winner = steps
+        .iter()
+        .find(|step| step.position == 0 && step.fanout_index == 1)
+        .expect("candidate 1");
+    assert_eq!(winner.selected, Some(true), "no human pick");
+    let judged: Vec<DocumentHead> = stack
+        .documents(ids::HTUI_ANA_2)
+        .await
+        .into_iter()
+        .filter(|head| head.produced_by_step_id == Some(judge.id))
+        .collect();
+    assert_eq!(
+        judged.len(),
+        2,
+        "one tool-written verdict per judge call: {judged:?}"
+    );
+    assert!(judged.iter().all(|head| head.kind == "judge"));
     stack.finish().await;
 }

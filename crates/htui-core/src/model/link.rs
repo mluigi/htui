@@ -41,6 +41,32 @@ pub struct ItemLink {
     pub deleted_at: Option<DateTime<Utc>>,
 }
 
+/// Arguments of `WriteStore::propose_link` (MOD-11 D13).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProposeLink {
+    /// `item_link.from_item_id`: the proposing step's own item.
+    pub from: ItemId,
+    /// `item_link.to_item_id`: an item of the same project.
+    pub to: ItemId,
+    /// `item_link.kind`.
+    pub kind: LinkKind,
+    /// The proposing step, written to `item_link.proposed_by_step_id`.
+    pub step: StepId,
+}
+
+/// Arguments of `WriteStore::withdraw_link` (MOD-11 D13, B-5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WithdrawLink {
+    /// `item_link.from_item_id`: the withdrawing step's own item.
+    pub from: ItemId,
+    /// `item_link.to_item_id`.
+    pub to: ItemId,
+    /// `item_link.kind`.
+    pub kind: LinkKind,
+    /// The withdrawing step; the link must have been proposed by a step of its run.
+    pub step: StepId,
+}
+
 /// One item reached by a traversal, with the hop distance from the root. Not a table.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LinkNode {

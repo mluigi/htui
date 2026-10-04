@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_agent::registry::caps_for;
 use htui_core::model::quota::{self, Availability, SkipReason};
-use htui_core::model::{Agent, AgentBox, AgentId, Gate, RunStep, SnapshotCandidate};
+use htui_core::model::{Agent, AgentBox, AgentId, Gate, RunStep, SnapshotCandidate, Transport};
 
 /// Everything [`walk`] reads, borrowed from the caller (plan D60).
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +26,8 @@ pub struct SelectInput<'a> {
     pub boxes: &'a BTreeMap<AgentId, AgentBox>,
     /// The phase's `gate_effective`: any gate but `never` needs an inline-approval transport.
     pub gate_effective: Gate,
+    /// MOD-11 D18: the engine hosts `permission_prompt`; a CLI agent may take a gated phase.
+    pub inline_prompt: bool,
     /// What the run has spent so far, in USD micros ([`run_spend`]); `None` when unknown.
     pub spent_micros: Option<i64>,
     /// `snapshot.settings.per_token_cap_run`, in USD micros; `None` is unbounded.
@@ -42,7 +44,8 @@ pub enum SkipCause {
     /// Rule 2: ANA-4 §7's quota predicate (`quota::available`) skipped the row.
     Quota(SkipReason),
     /// Rule 3: the phase is gated and the transport can answer neither a permission request nor
-    /// an edit proposal inline (`docs/ANA-2.md:482`).
+    /// an edit proposal inline (`docs/ANA-2.md:482`), nor — a CLI row with
+    /// [`SelectInput::inline_prompt`] — through htui's `permission_prompt` tool (MOD-11 D18).
     InlineApproval,
     /// Rule 4: the agent or its `agent_box` row is disabled, or its probe is not `ready`.
     NotReady(String),
@@ -130,7 +133,9 @@ impl Walk {
 /// 2. `quota::available` over the box row's quota and the caller's spend and cap skips →
 ///    [`SkipCause::Quota`] (it runs with an absent box row too, so the cap rule still applies);
 /// 3. a gate other than `never` and a transport with neither `permission_requests` nor
-///    `edit_proposals` → [`SkipCause::InlineApproval`];
+///    `edit_proposals` → [`SkipCause::InlineApproval`] — unless the row is `Transport::Cli` and
+///    [`SelectInput::inline_prompt`] is set (MOD-11 D18: the prompt tool answers inline; the caps
+///    stay the row's);
 /// 4. a disabled agent, a disabled box row, or a probe that parses with a status other than
 ///    `ready` → [`SkipCause::NotReady`]; an absent or unparseable probe is unknown and does not
 ///    skip;
@@ -166,7 +171,10 @@ fn skip_cause(input: &SelectInput<'_>, candidate: &SnapshotCandidate) -> Option<
     }
     if input.gate_effective != Gate::Never {
         let caps = caps_for(agent);
-        if !(caps.permission_requests || caps.edit_proposals) {
+        if !(caps.permission_requests
+            || caps.edit_proposals
+            || (input.inline_prompt && agent.transport == Transport::Cli))
+        {
             return Some(SkipCause::InlineApproval);
         }
     }
@@ -328,6 +336,7 @@ mod tests {
             agents,
             boxes,
             gate_effective: Gate::Never,
+            inline_prompt: false,
             spent_micros: None,
             cap_micros: None,
             min_budget_micros: 0,
@@ -514,6 +523,59 @@ mod tests {
             ..input(&acp, &agents, &boxes)
         });
         assert_eq!(walked.eligible, acp, "an acp row answers inline");
+    }
+
+    /// MOD-11 D18, rule 3: a CLI row takes a gated phase only when the engine hosts htui's
+    /// `permission_prompt` tool (`inline_prompt`); its caps stay all-false either way.
+    #[test]
+    fn a_cli_agent_takes_a_gated_phase_only_with_inline_prompt() {
+        let candidates = [candidate(ids::AGENT_CLAUDE_CLI, "claude-cli")];
+        let agents = agents();
+        let boxes = BTreeMap::new();
+        for gate in [Gate::Always, Gate::OnFailure] {
+            let without = walk(&SelectInput {
+                gate_effective: gate,
+                inline_prompt: false,
+                ..input(&candidates, &agents, &boxes)
+            });
+            assert_eq!(
+                first_cause(&without),
+                &SkipCause::InlineApproval,
+                "{gate:?}"
+            );
+            assert!(without.only_inline_approval());
+
+            let with = walk(&SelectInput {
+                gate_effective: gate,
+                inline_prompt: true,
+                ..input(&candidates, &agents, &boxes)
+            });
+            assert_eq!(
+                with.eligible, candidates,
+                "{gate:?}: the prompt tool answers inline"
+            );
+            assert!(with.skipped.is_empty());
+        }
+    }
+
+    /// MOD-11 D18: `inline_prompt` is about CLI rows only; an ACP row answers inline already and
+    /// walks the same either way, gated or not.
+    #[test]
+    fn an_acp_agent_is_unaffected_by_inline_prompt() {
+        let candidates = two_acp();
+        let agents = agents();
+        let boxes = BTreeMap::new();
+        for gate in [Gate::Never, Gate::Always, Gate::OnFailure] {
+            for inline_prompt in [false, true] {
+                let walked = walk(&SelectInput {
+                    gate_effective: gate,
+                    inline_prompt,
+                    ..input(&candidates, &agents, &boxes)
+                });
+                assert_eq!(walked.eligible, candidates, "{gate:?}, {inline_prompt}");
+                assert!(walked.skipped.is_empty());
+            }
+        }
     }
 
     /// The cap rule reads the caller's run spend, and applies with or without a box row.

@@ -512,7 +512,8 @@ impl<'a> Trimmer<'a> {
             | SectionName::Box
             | SectionName::Skills
             | SectionName::CommandQueue
-            | SectionName::FailureReason => Source::Fixed,
+            | SectionName::FailureReason
+            | SectionName::Output => Source::Fixed,
         }
     }
 
@@ -827,7 +828,8 @@ impl<'a> Trimmer<'a> {
             | SectionName::JudgeTask
             | SectionName::JudgeCandidate(_)
             | SectionName::StepSummary
-            | SectionName::FailureReason => None,
+            | SectionName::FailureReason
+            | SectionName::Output => None,
         };
         if let (Some(block), Source::Diff(false)) = (block, &self.entries[index].source) {
             self.entries[index].rendered = render::diff(name.clone(), block, true);

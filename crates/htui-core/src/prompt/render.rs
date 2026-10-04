@@ -633,6 +633,21 @@ pub fn command_queue() -> Rendered {
     }
 }
 
+/// MOD-11 D19 (OQ-9): the protected `output` trailer, one fixed sentence naming the
+/// `document_write` tool with `kind` substituted. Every byte is a digest input, so the sentence is
+/// pinned (blueprint §16); `kind` is the spec's already-scrubbed `output_kind`.
+#[must_use]
+pub fn output(kind: &str) -> Rendered {
+    Rendered {
+        name: SectionName::Output,
+        attrs: Vec::new(),
+        content: content_of(&format!(
+            "Write your `{kind}` document by calling the `document_write` tool of the `htui` MCP \
+             server; text left only in your reply is not recorded."
+        )),
+    }
+}
+
 /// MOD-26 D13: `<section name="persona" persona="…">` then the persona's body (B-20).
 #[must_use]
 pub fn persona(block: &PersonaBlock) -> Rendered {
@@ -643,13 +658,36 @@ pub fn persona(block: &PersonaBlock) -> Rendered {
     }
 }
 
-/// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim.
+/// §4.6a's `judge_task`: the judged step's own stored prompt text, replayed verbatim — less the
+/// candidate's own MOD-11 D19 `output` trailer ([`without_output_trailer`]), so a judge is told to
+/// write exactly one document, its own `judge` one.
 #[must_use]
 pub fn judge_task(text: &str) -> Rendered {
     Rendered {
         name: SectionName::JudgeTask,
         attrs: Vec::new(),
-        content: content_of(text),
+        content: content_of(without_output_trailer(text)),
+    }
+}
+
+/// MOD-11 D19: `text` less a trailing `output` trailer, the bytes [`output`] renders for some kind
+/// after the body's trailing newlines; any other `text` is returned whole. The sentence is pinned,
+/// so the match is exact: a body that merely quotes `<section name="output">` keeps it.
+#[must_use]
+pub fn without_output_trailer(text: &str) -> &str {
+    const OPEN: &str = "<section name=\"output\">\n";
+    let trimmed = text.trim_end_matches('\n');
+    let Some(at) = trimmed.rfind(OPEN) else {
+        return text;
+    };
+    let section = &trimmed[at..];
+    let kind = section[OPEN.len()..]
+        .strip_prefix("Write your `")
+        .and_then(|rest| rest.split_once("` document by calling the `document_write` tool"))
+        .map(|(kind, _)| kind);
+    match kind {
+        Some(kind) if section == wrap(&output(kind)) => trimmed[..at].trim_end_matches('\n'),
+        _ => text,
     }
 }
 

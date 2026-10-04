@@ -19,6 +19,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures::future::Either;
 
@@ -37,11 +38,12 @@ use htui_core::model::{
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
     RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotPersona,
     SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome, missing_tags_failure,
+    TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
 };
+use htui_core::prompt::render::HostnameLine;
 use htui_core::prompt::{
     AssembledPrompt, DiffBlock, InputDocument, JudgeCandidate, PersonaBlock, PromptSpec,
     SectionName, TemplateRef, TemplateRole, TokenEstimator, TrimStrategy, VerifyFailure, assemble,
@@ -481,6 +483,8 @@ where
     pub user: UserId,
     /// Plan D12 (MOD-41): walk command tails, or hand them back to the box's worker.
     pub tails: Tails,
+    /// MOD-11 D4: htui's MCP host; `None` keeps `mcp: Vec::new()` exactly.
+    pub tools: Option<Arc<dyn crate::tools::ToolHost>>,
 }
 
 /// `Debug` is hand written for one field: a driver factory is a `dyn Fn` and `dyn Fn` is not
@@ -507,6 +511,7 @@ where
             .field("owner", &self.owner)
             .field("user", &self.user)
             .field("tails", &self.tails)
+            .field("tools", &self.tools)
             .finish_non_exhaustive()
     }
 }
@@ -3288,6 +3293,8 @@ where
             agents: &agents,
             boxes: &boxes,
             gate_effective: gate,
+            // MOD-11 D18: a host lends a CLI session a prompt port (guarded in `open_tools`).
+            inline_prompt: self.parts.tools.is_some(),
             spent_micros: select::run_spend(&steps),
             cap_micros: snapshot.settings.per_token_cap_run,
             min_budget_micros: min_budget(&self.parts.app),
@@ -4941,6 +4948,9 @@ where
             // judge body places no `{{skills}}` and records `not_placed`.
             step_files: StepFiles::default(),
             command_queue: false,
+            // MOD-11 D19: the judge's own kind is `JUDGE_KIND`, never empty, so the trailer
+            // follows the tool host alone.
+            document_tool: self.parts.tools.is_some(),
             verify_failure: None,
             previous_diff: None,
             judge: Some(judge_inputs(task.clone(), candidates.clone(), reverse)),
@@ -5554,6 +5564,15 @@ where
         Ok(())
     }
 
+    /// MOD-11 D16, R1 C: whether `phase`'s step is offered `command_run` — a tool host serves the
+    /// session (as D19's `document_tool` reads it) and the phase's queue mode exposes it for its
+    /// fan-out and the item's `required_tags`. `drive_once`'s base exposure and `phase_spec`'s
+    /// section both read this (the persona's term is applied on top), so a host-less engine
+    /// neither denies the heavy commands nor names a tool nothing serves.
+    fn command_run_exposed(&self, phase: &SnapshotPhase, required_tags: &[String]) -> bool {
+        self.parts.tools.is_some() && phase.command_queue.exposed(phase.fan_out, required_tags)
+    }
+
     /// The phase's [`PromptSpec`] for `step`: its resolved inputs, its pinned template, its
     /// upstream summaries and, from attempt 2, the loop's forwarded sections (plan D67).
     ///
@@ -5688,9 +5707,16 @@ where
             // MOD-9 D117: reaches no repo here, for the same reason as `excerpts`: the handoff
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.
             step_files: StepFiles::default(),
-            // MOD-26 D13: the one place `command_run` acts before MOD-11.
-            command_queue: phase.command_queue != htui_core::model::CommandQueue::Off
-                && persona.is_none_or(|persona| persona.tools.command_run),
+            // MOD-11 D16 (OQ-6): the one resolver — `fan_out_only` renders the section only for a
+            // fanned-out phase or a `heavy_build` item — and MOD-26 D13's persona term, which R1
+            // H1 makes `narrow`'s own rule (an `execute` denial drops the tool too).
+            command_queue: self.command_run_exposed(phase, &row.required_tags)
+                && persona.is_none_or(|persona| {
+                    htui_agent::persona::persona_keeps_command_run(&persona.tools)
+                }),
+            // MOD-11 D19: a phase step always has an item; the trailer names `document_write`
+            // whenever a tool host serves the session and the phase writes a document.
+            document_tool: self.parts.tools.is_some() && !phase.output_kind.is_empty(),
             // Plan D67: what the previous attempt's winner left — its failed verify and its diff —
             // forwarded to a phase step's next attempt; `None` on attempt 1 and for a judge.
             verify_failure,
@@ -6000,14 +6026,66 @@ where
         // MOD-42 D9: the agent's own policy (a judge call's is the judge agent's: `candidate_of`
         // over the judge phase).
         let policy = (self.parts.policy)(candidate.agent_id);
+        // MOD-11 D16: the base exposure carries `command_run` per the phase's queue mode, the
+        // fan-out and the item's tags, and (R1 C) only when a tool host can serve it; the prompt's
+        // section uses the same helper. A judge's phase is `off` (`fanout.rs`) and a host-less
+        // engine exposes nothing, so neither reads the item.
+        let exposed = self.parts.tools.is_some()
+            && phase.command_queue != htui_core::model::CommandQueue::Off
+            && {
+                let item = self.item(Self::item_of(run)?).await?;
+                self.command_run_exposed(phase, &item.required_tags)
+            };
+        let base = ToolExposure {
+            command_run: exposed,
+            ..ToolExposure::default()
+        };
         // MOD-26 D10, D12: the persona narrows the agent's exposure and policy, never widens them
         // (I-1); a persona-less step is exactly today's (I-7).
-        let (tools, policy) = match persona {
-            Some(persona) => {
-                htui_agent::persona::narrow(&ToolExposure::default(), &policy, persona)
-            }
-            None => (ToolExposure::default(), policy),
+        let (tools, mut policy) = match persona {
+            Some(persona) => htui_agent::persona::narrow(&base, &policy, persona),
+            None => (base, policy),
         };
+        // MOD-11 D17 (R-MCP-4): an exposed step's policy opens with one `reject_once` per OQ-5
+        // prefix, ahead of the persona's and the agent's rules, on both branches.
+        if tools.command_run {
+            let denials = htui_core::model::kind::HEAVY_COMMAND_PREFIXES
+                .iter()
+                .map(|prefix| htui_agent::driver::PermissionRule {
+                    matcher: htui_agent::driver::PermissionMatch {
+                        tool_kind: Some("execute".to_owned()),
+                        command_prefix: Some((*prefix).to_owned()),
+                        command_word: true,
+                        ..htui_agent::driver::PermissionMatch::default()
+                    },
+                    answer: htui_agent::event::PermissionOptionKind::RejectOnce,
+                    reason: format!("run `{prefix}` through htui's `command_run` tool (R-MCP-4)"),
+                });
+            policy.rules.splice(0..0, denials);
+        }
+        // MOD-11 D10, B-17 (H-25): declared before `session`, so the session — and its agent
+        // process — drops first and the token dies after it. Boxed (I-8).
+        let lease = match &self.parts.tools {
+            Some(host) => Some(
+                Box::pin(self.open_tools(
+                    host.as_ref(),
+                    run,
+                    step,
+                    phase,
+                    &candidate,
+                    &project,
+                    &cwd,
+                    tools.command_run,
+                ))
+                .await?,
+            ),
+            None => None,
+        };
+        // MOD-11 R1 M2: htui's own advertised tools (but `command_run` and `permission_prompt`)
+        // are pre-approved after every rule above, so they only replace the default `ask`.
+        if let Some(lease) = &lease {
+            crate::tools::pre_approve(&mut policy, lease);
+        }
         let driver = (self.parts.driver)(&candidate, key);
 
         let spec = SessionSpec {
@@ -6023,11 +6101,12 @@ where
             env: BTreeMap::new(),
             model: Some(candidate.model.clone()),
             tools,
-            mcp: Vec::new(),
+            mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
             permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
             resume: None,
             budget_micros: settings.per_token_cap_run,
+            prompt: lease.as_ref().and_then(|lease| lease.prompt.clone()),
         };
         // MOD-37 M4 (review L3): `deadline` was fixed before the start, so the start counts
         // against it; the start itself is not under it - a hung start is bounded by the driver's
@@ -6098,6 +6177,72 @@ where
             }
             result => Ok(Driven { result, cut: false }),
         }
+    }
+
+    /// MOD-11 D10: the session's [`ToolScope`](crate::tools::ToolScope), built from what the walk
+    /// holds (never from tool arguments, I-1), opened on `host`. A refusal fails the step as a
+    /// spawn failure (never silently drops the server).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the session's coordinates as `drive_once` holds them, read here only"
+    )]
+    async fn open_tools(
+        &self,
+        host: &dyn crate::tools::ToolHost,
+        run: &Run,
+        step: &RunStep,
+        phase: &SnapshotPhase,
+        candidate: &SnapshotCandidate,
+        project: &Project,
+        cwd: &std::path::Path,
+        command_queue: bool,
+    ) -> Result<crate::tools::ToolLease, EngineError> {
+        // B-18: the candidate's transport from its agent row; no row advertises no prompt tool.
+        let transport = self
+            .parts
+            .graphs
+            .agent(candidate.agent_id)
+            .await?
+            .map_or(Transport::Acp, |agent| agent.transport);
+        let scope = crate::tools::ToolScope {
+            run_id: run.id,
+            step_id: step.id,
+            project_id: run.project_id,
+            item_id: run.item_id,
+            box_id: self.parts.box_id,
+            user: self.parts.user,
+            fence: StepFence::Lease(self.parts.owner),
+            // PRD OQ-5: no item, or no kind, withholds `document_write`.
+            output_kind: run
+                .item_id
+                .and(Some(phase.output_kind.clone()))
+                .filter(|kind| !kind.is_empty()),
+            hostname: if settings::resolve_box_hostname(Some(&project.settings)) {
+                HostnameLine::Shown
+            } else {
+                HostnameLine::Omitted
+            },
+            // MOD-11 D16: the exposure `drive_once` resolved, after the persona's narrowing.
+            command_queue,
+            cwd: cwd.to_path_buf(),
+            transport,
+        };
+        let lease = host
+            .open(scope)
+            .map_err(|err| EngineError::Driver(DriverError::Spawn(err.to_string())))?;
+        // MOD-11 D18, the start-time guard: `walk` admitted a CLI agent to a gated phase because
+        // this engine hosts the prompt tool; a lease without a port would run it unanswerable.
+        if transport == Transport::Cli
+            && phase.gate_effective != Gate::Never
+            && lease.prompt.is_none()
+        {
+            return Err(EngineError::Driver(DriverError::Spawn(
+                "missing_capability: inline_approval — a gated CLI step needs htui's \
+                 permission_prompt tool"
+                    .into(),
+            )));
+        }
+        Ok(lease)
     }
 
     // -- helpers -------------------------------------------------------------------------------
@@ -6973,6 +7118,7 @@ pub(crate) async fn fake_parts<'a>(
         dead_walks: &orch.dead_walks,
         user: orch.user(),
         tails: orch.tails(),
+        tools: orch.tool_host(),
     })
 }
 
@@ -7343,6 +7489,7 @@ mod tests {
             dead_walks: &orch.dead_walks,
             user: orch.user(),
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let CommandOutcome::Started { run, .. } = engine
@@ -7433,6 +7580,7 @@ mod tests {
             dead_walks: &orch.dead_walks,
             user: orch.user(),
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let CommandOutcome::Started { run, rest } = engine
@@ -10125,6 +10273,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let refused = engine
@@ -10226,6 +10375,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         engine
@@ -12762,7 +12912,11 @@ mod tests {
     async fn a_persona_narrows_every_fanout_candidate_s_session() {
         use htui_agent::event::ToolKind;
 
-        let harness = Harness::new().await;
+        // MOD-11 R1 C: hosted, as only a hosted engine offers `command_run`.
+        let harness = Harness {
+            orch: FakeOrchestrator::demo()
+                .with_tool_host(std::sync::Arc::new(crate::fake::FakeToolHost::default())),
+        };
         harness.free_feat_3().await;
         harness
             .repoint(ids::HTUI_FEAT_3, |phase| {
@@ -12804,6 +12958,9 @@ mod tests {
 
         let seen = seen.lock().expect("no panic holds the spy's lock").clone();
         assert_eq!(seen.len(), 2, "both candidates reached stage 4");
+        // MOD-11 D16, D17: a `fan_out_only` phase fanned out to two exposes `command_run`, so the
+        // R-MCP-4 denials open each candidate's policy, ahead of the persona's.
+        let denials = htui_core::model::kind::HEAVY_COMMAND_PREFIXES.len();
         for (index, (spec, prompt)) in seen.iter().enumerate() {
             assert_eq!(
                 spec.tools.deny_kinds,
@@ -12811,10 +12968,18 @@ mod tests {
                 "candidate {index}'s exposure is narrowed"
             );
             assert!(spec.tools.allow.is_empty(), "{:?}", spec.tools.allow);
+            assert!(spec.tools.command_run, "candidate {index} is exposed");
+            assert!(
+                spec.permission.rules[..denials]
+                    .iter()
+                    .all(|rule| rule.reason.ends_with("(R-MCP-4)")),
+                "candidate {index}: the denials come first"
+            );
             assert_eq!(
                 spec.permission
                     .rules
                     .iter()
+                    .skip(denials)
                     .take(3)
                     .map(|rule| rule.reason.as_str())
                     .collect::<Vec<_>>(),
@@ -12823,10 +12988,10 @@ mod tests {
                     "persona reviewer denies delete",
                     "persona reviewer denies move",
                 ],
-                "candidate {index}: the persona's kind rejects come first"
+                "candidate {index}: the persona's kind rejects follow the denials"
             );
             assert_eq!(
-                spec.permission.rules.get(3..),
+                spec.permission.rules.get(denials + 3..),
                 Some(policy.rules.as_slice()),
                 "candidate {index}: the agent's own rules follow"
             );
@@ -13122,6 +13287,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         let refused = engine
@@ -14239,6 +14405,7 @@ mod tests {
             dead_walks: parts.dead_walks,
             user: parts.user,
             tails: super::Tails::Walk,
+            tools: None,
         });
 
         assert_send(&engine.dispatch(Command::CancelRun { run: ids::RUN_2 }));
@@ -16454,6 +16621,243 @@ mod tests {
             assert_eq!(answers[0]["option_id"], "reject-once");
         }
 
+        /// MOD-11 R1 M2: a harness whose engines carry a tool host advertising `box_profile`,
+        /// `document_write`, `note_add` and `command_run` — and so not `item_link`.
+        fn htui_hosted() -> Harness {
+            Harness {
+                orch: FakeOrchestrator::demo().with_tool_host(Arc::new(
+                    crate::fake::FakeToolHost::default().advertising(&[
+                        "box_profile",
+                        "document_write",
+                        "note_add",
+                        "command_run",
+                    ]),
+                )),
+            }
+        }
+
+        /// A turn that calls htui's `tool`, titled as both transports title it, with `kind`,
+        /// and parks on its permission request.
+        fn parks_on_htui(tool: &str, kind: htui_agent::event::ToolKind) -> ScriptedStep {
+            ScriptedStep::parks_on(
+                htui_agent::event::ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: format!("mcp__htui__{tool}"),
+                    tool_kind: kind,
+                    input: serde_json::json!({ "body": "the prd" }),
+                    locations: Vec::new(),
+                },
+                request(),
+                "the prd",
+            )
+        }
+
+        /// The walk settled `prd` on one `by: policy` answer `option`, and nothing was relayed.
+        async fn assert_answered_by_policy(harness: &Harness, option: &str) {
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+                panic!("the walk started: {walked:?}");
+            };
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert!(
+                harness.orch.store.relay_rows().is_empty(),
+                "a policy answer is never relayed"
+            );
+            let answers = answers_in(&log(&harness.orch.store, prd.id).await);
+            assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
+            assert_eq!(answers[0]["by"], "policy");
+            assert_eq!(answers[0]["option_id"], option);
+        }
+
+        /// MOD-11 R1 M2 on ACP: `claude-agent-acp` titles an MCP call by its raw name with kind
+        /// `other`, and the step's policy pre-approves htui's own `document_write` — under an
+        /// agent policy whose default asks — so it needs no human.
+        #[tokio::test(start_paused = true)]
+        async fn htui_s_own_tool_is_answered_by_policy_on_acp() {
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui("document_write", htui_agent::event::ToolKind::Other),
+            );
+            assert_answered_by_policy(&harness, "allow-once").await;
+        }
+
+        /// MOD-11 R1 M2 on `claude-cli`: the prompt tool's call is titled by the CLI's tool name,
+        /// with the kind the CLI dialect maps it to; the same pre-approval answers it.
+        #[tokio::test(start_paused = true)]
+        async fn htui_s_own_tool_is_answered_by_policy_on_claude_cli() {
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE_CLI, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui(
+                    "document_write",
+                    htui_agent::cli::claude::tool_kind("mcp__htui__document_write"),
+                ),
+            );
+            assert_answered_by_policy(&harness, "allow-once").await;
+        }
+
+        /// MOD-11 R1 M2, MOD-26 I-1: a persona that rejects kind `other` still rejects htui's own
+        /// tool on ACP — the pre-approval follows the persona's rules, it never widens them. (A
+        /// `deny_kinds` entry cannot name `other` (D3); its kind rule is the same reject, which
+        /// `tools.rs` pins.)
+        #[tokio::test(start_paused = true)]
+        async fn a_persona_denying_other_still_rejects_htui_s_own_tool() {
+            use htui_core::model::{
+                NewPersona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPermission, PersonaRule,
+                PersonaTools,
+            };
+
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            let persona = harness
+                .orch
+                .store
+                .create_persona(NewPersona {
+                    id: PersonaId::new(),
+                    name: "no-other".to_owned(),
+                    description: "uses no other tool".to_owned(),
+                    body: "You use no other tool.\n".to_owned(),
+                    tools: PersonaTools::default(),
+                    permission: PersonaPermission {
+                        default: None,
+                        rules: vec![PersonaRule {
+                            matcher: PersonaMatch {
+                                tool_kind: Some("other".to_owned()),
+                                ..PersonaMatch::default()
+                            },
+                            answer: PersonaAnswer::RejectOnce,
+                            reason: "no other tool".to_owned(),
+                        }],
+                    },
+                })
+                .await
+                .expect("a valid persona");
+            super::bind_persona(&harness.orch, ids::HTUI_FEAT_3, "prd", persona.id).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui("document_write", htui_agent::event::ToolKind::Other),
+            );
+            assert_answered_by_policy(&harness, "reject-once").await;
+        }
+
+        /// MOD-11 R1 M2, MOD-26 I-1: a persona whose `permission-default` is `deny` still rejects
+        /// htui's own tool on ACP — by its default, since the pre-approval only replaces an `ask`
+        /// default and so adds no rule here.
+        #[tokio::test(start_paused = true)]
+        async fn a_persona_defaulting_to_deny_still_rejects_htui_s_own_tool() {
+            use htui_core::model::{
+                NewPersona, PersonaDefault, PersonaId, PersonaPermission, PersonaTools,
+            };
+
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            let persona = harness
+                .orch
+                .store
+                .create_persona(NewPersona {
+                    id: PersonaId::new(),
+                    name: "deny-all".to_owned(),
+                    description: "is asked nothing".to_owned(),
+                    body: "You are denied every tool no rule allows.\n".to_owned(),
+                    tools: PersonaTools::default(),
+                    permission: PersonaPermission {
+                        default: Some(PersonaDefault::Deny),
+                        rules: Vec::new(),
+                    },
+                })
+                .await
+                .expect("a valid persona");
+            super::bind_persona(&harness.orch, ids::HTUI_FEAT_3, "prd", persona.id).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui("document_write", htui_agent::event::ToolKind::Other),
+            );
+            assert_answered_by_policy(&harness, "reject-once").await;
+            let spec = harness
+                .orch
+                .spec_for(&SessionKey {
+                    phase: "prd",
+                    attempt: 1,
+                    fanout_index: 0,
+                    call: 0,
+                })
+                .expect("the prd session started");
+            assert!(
+                spec.permission.rules.iter().all(|rule| rule
+                    .matcher
+                    .tool_name
+                    .as_deref()
+                    .is_none_or(|name| !name.starts_with("mcp__htui__"))),
+                "no pre-approval under a deny default: {:?}",
+                spec.permission.rules
+            );
+        }
+
+        /// MOD-11 R1 M2: `command_run` is never pre-approved (it runs anything; under the default
+        /// `ask` it asks), nor is a tool the scope does not advertise; the pre-approvals close
+        /// the rules, after the agent's own.
+        #[tokio::test(start_paused = true)]
+        async fn command_run_and_unadvertised_tools_still_ask() {
+            use htui_agent::event::{ToolCallEvent, ToolKind};
+
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness
+                .orch
+                .script("prd", 1, ScriptedStep::done_with_output("the prd"));
+            let _ = walked(harness.dispatch(start_feat_3())).await;
+            let spec = harness
+                .orch
+                .spec_for(&SessionKey {
+                    phase: "prd",
+                    attempt: 1,
+                    fanout_index: 0,
+                    call: 0,
+                })
+                .expect("the prd session started");
+            let answer = |tool: &str| {
+                let call = ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: format!("mcp__htui__{tool}"),
+                    tool_kind: ToolKind::Other,
+                    input: serde_json::json!({}),
+                    locations: Vec::new(),
+                };
+                htui_agent::permission::evaluate(&spec.permission, Some(&call), &request().options)
+                    .map(|answer| answer.option_id)
+            };
+            assert_eq!(answer("box_profile").as_deref(), Some("allow-once"));
+            assert_eq!(answer("note_add").as_deref(), Some("allow-once"));
+            assert_eq!(answer("command_run"), None, "command_run asks");
+            assert_eq!(answer("item_link"), None, "an unadvertised tool asks");
+            assert_eq!(answer("permission_prompt"), None);
+        }
+
         /// D10, I-6, I-7: a cancel reaching a parked single step ends the walk with
         /// `Cancelled`, answers the parked request `cancelled` once, and settles nothing:
         /// `cancel_run` owns every terminal status.
@@ -17578,6 +17982,752 @@ mod tests {
                 "no driver was built or started"
             );
             assert!(orch.store.relay_rows().is_empty());
+        }
+    }
+
+    /// MOD-11 T6 (D4, D10, D19, B-9, B-17, B-18): the engine's tool seam over a
+    /// [`FakeToolHost`](crate::fake::FakeToolHost). The host records every scope it opened and
+    /// lends a spec with a fake token; a session scripted with
+    /// [`writes_through_tools`](FakeOrchestrator::writes_through_tools) writes its document through
+    /// the scope's fence in `start`, as `document_write` would, while the harness sink writes
+    /// nothing (`done_without_output`), which is production's `author: None`.
+    mod tool_host {
+        use std::sync::Arc;
+
+        use htui_agent::error::DriverError;
+        use htui_core::fixtures::ids;
+        use htui_core::model::{
+            Gate, ItemId, RunId, RunMode, RunStatus, RunStep, StepStatus, Transport,
+        };
+        use htui_core::prompt::render::HostnameLine;
+        use htui_core::store::{ReadStore as _, StepFence, StoreError};
+
+        use super::Harness;
+        use crate::command::{Command, CommandOutcome, EngineError};
+        use crate::engine::SessionKey;
+        use crate::fake::{FakeOrchestrator, FakeToolHost, ScriptedStep};
+        use crate::status::RunFailure;
+        use crate::tools::ToolHostError;
+
+        /// A harness whose engines carry `host`.
+        fn hosted(host: &Arc<FakeToolHost>) -> Harness {
+            Harness {
+                orch: FakeOrchestrator::demo().with_tool_host(Arc::clone(host)),
+            }
+        }
+
+        fn key<'k>(phase: &'k str, fanout_index: i32, call: u32) -> SessionKey<'k> {
+            SessionKey {
+                phase,
+                attempt: 1,
+                fanout_index,
+                call,
+            }
+        }
+
+        /// `FEAT-3` freed, `prd` ungated so the walk settles it and parks at `plan`'s gate.
+        async fn feat_3_prd_ungated(harness: &Harness) {
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+        }
+
+        async fn start(harness: &Harness, item: ItemId) -> Result<CommandOutcome, EngineError> {
+            harness
+                .dispatch(Command::StartRun {
+                    item,
+                    mode: RunMode::Manual,
+                    repo_scope: None,
+                })
+                .await
+        }
+
+        async fn started(harness: &Harness, item: ItemId) -> (RunId, crate::command::Rest) {
+            match start(harness, item).await {
+                Ok(CommandOutcome::Started { run, rest }) => (run, rest),
+                other => panic!("`StartRun` answers `Started`: {other:?}"),
+            }
+        }
+
+        async fn step_at(
+            orch: &FakeOrchestrator,
+            run: RunId,
+            position: i32,
+            fanout_index: i32,
+        ) -> RunStep {
+            orch.steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.position == position && step.fanout_index == fanout_index)
+                .expect("the walk created the step")
+        }
+
+        /// The seq-0 prompt text the recorder stored for `step`.
+        async fn prompt_of(orch: &FakeOrchestrator, step: &RunStep) -> String {
+            orch.store
+                .step_events(step.id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the step recorded its session")
+                .iter()
+                .find(|event| event.seq == 0)
+                .expect("seq 0 is the prompt")
+                .payload["text"]
+                .as_str()
+                .expect("the prompt payload carries its text")
+                .to_owned()
+        }
+
+        /// `ANA-2` with `research` fanned out two ways, every phase ungated and `agy` judging.
+        async fn ana_2_fanned_and_judged(harness: &Harness) {
+            harness
+                .repoint(ids::HTUI_ANA_2, |phase| {
+                    if phase.name == "research" {
+                        phase.fan_out = 2;
+                    }
+                    phase.gate = Gate::Never;
+                })
+                .await;
+            let project = harness.orch.item(ids::HTUI_ANA_2).await.project_id;
+            let mut settings = harness
+                .orch
+                .store
+                .project_settings(project)
+                .await
+                .expect("MemStore never fails a read")
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            settings["judge_agent_id"] = serde_json::json!(ids::AGENT_AGY);
+            harness.orch.store.set_project_settings(project, settings);
+            for index in 0..2 {
+                harness.orch.script_candidate(
+                    "research",
+                    1,
+                    index,
+                    0,
+                    ScriptedStep::done_without_output(),
+                );
+                harness.orch.writes_through_tools(
+                    &key("research", index, 0),
+                    &format!("research by candidate {index}"),
+                );
+            }
+            for call in 0..2 {
+                harness.orch.script_candidate(
+                    "research:judge",
+                    1,
+                    -1,
+                    call,
+                    ScriptedStep::done_without_output(),
+                );
+            }
+        }
+
+        /// The verdict body a judge call writes through the tool.
+        fn verdict(winner: i32, reason: &str) -> String {
+            let json =
+                serde_json::json!({ "winner": winner, "reasons": { winner.to_string(): reason } });
+            format!("Compared.\n\n```json\n{json}\n```")
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn without_a_tool_host_the_spec_has_no_server_and_no_port() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert!(spec.mcp.is_empty(), "{:?}", spec.mcp);
+            assert_eq!(spec.prompt, None);
+            assert!(harness.orch.tool_host().is_none());
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_phase_session_registers_its_scope() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let (run, _) = started(&harness, ids::HTUI_FEAT_3).await;
+            let step = step_at(&harness.orch, run, 0, 0).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            let project = harness
+                .orch
+                .store
+                .project(harness.orch.run(run).await.project_id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the run's project");
+            let hostname =
+                if htui_core::prompt::settings::resolve_box_hostname(Some(&project.settings)) {
+                    HostnameLine::Shown
+                } else {
+                    HostnameLine::Omitted
+                };
+
+            assert_eq!(
+                host.opened(),
+                [crate::tools::ToolScope {
+                    run_id: run,
+                    step_id: step.id,
+                    project_id: project.id,
+                    item_id: Some(ids::HTUI_FEAT_3),
+                    box_id: harness.orch.box_id(),
+                    user: harness.orch.user(),
+                    fence: StepFence::Lease(harness.orch.owner()),
+                    output_kind: Some("prd".to_owned()),
+                    hostname,
+                    command_queue: false,
+                    cwd: spec.cwd.clone(),
+                    transport: Transport::Acp,
+                }]
+            );
+        }
+
+        /// MOD-11 D16: the scope's `command_queue` is the exposure `drive_once` resolved — on for
+        /// an `always` phase, and the spec agrees.
+        #[tokio::test(start_paused = true)]
+        async fn an_exposed_phase_s_scope_carries_the_command_queue() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert!(spec.tools.command_run, "the exposure");
+            assert_eq!(
+                host.opened()
+                    .iter()
+                    .map(|scope| scope.command_queue)
+                    .collect::<Vec<_>>(),
+                [true],
+                "the scope advertises `command_run`"
+            );
+        }
+
+        /// MOD-11 R1 C: with no tool host nothing can serve `command_run`, so an exposed phase's
+        /// step gets neither the tool nor the R-MCP-4 denials nor the prompt's `command_queue`
+        /// section (D19's `document_tool` precedent).
+        #[tokio::test]
+        async fn a_host_less_exposed_step_gets_no_command_run_no_denials_no_section() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            assert!(harness.orch.tool_host().is_none(), "the premise");
+
+            let (spec, prompt) = super::spied_start(&harness.orch).await;
+
+            assert!(!spec.tools.command_run, "no host, no tool");
+            assert!(
+                !spec
+                    .permission
+                    .rules
+                    .iter()
+                    .any(|rule| rule.reason.ends_with("(R-MCP-4)")),
+                "no denials: {:?}",
+                spec.permission.rules
+            );
+            assert!(
+                !prompt.contains("<section name=\"command_queue\""),
+                "no section:\n{prompt}"
+            );
+        }
+
+        /// MOD-11 R1 H1 (amends D16): a persona that denies `execute` on an exposed phase gets
+        /// no `command_run`, no R-MCP-4 denial and no `command_queue` section — the prompt never
+        /// names a tool the session lacks.
+        #[tokio::test]
+        async fn an_execute_denying_persona_loses_command_run_and_its_section() {
+            use htui_core::model::{NewPersona, PersonaId, PersonaPermission, PersonaTools};
+            use htui_core::store::WriteStore as _;
+
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            let persona = harness
+                .orch
+                .store
+                .create_persona(NewPersona {
+                    id: PersonaId::new(),
+                    name: "no-shell".to_owned(),
+                    description: "never runs a command".to_owned(),
+                    body: "You never run shell commands.\n".to_owned(),
+                    tools: PersonaTools {
+                        deny_kinds: vec!["execute".to_owned()],
+                        ..PersonaTools::default()
+                    },
+                    permission: PersonaPermission::default(),
+                })
+                .await
+                .expect("a valid persona");
+            super::bind_persona(&harness.orch, ids::HTUI_FEAT_3, "prd", persona.id).await;
+
+            let (spec, prompt) = super::spied_start(&harness.orch).await;
+
+            assert!(!spec.tools.command_run, "an execute denial drops the tool");
+            assert!(
+                !spec
+                    .permission
+                    .rules
+                    .iter()
+                    .any(|rule| rule.reason.ends_with("(R-MCP-4)")),
+                "and the denials: {:?}",
+                spec.permission.rules
+            );
+            assert!(
+                !prompt.contains("<section name=\"command_queue\""),
+                "and the section:\n{prompt}"
+            );
+            assert_eq!(
+                host.opened()
+                    .iter()
+                    .map(|scope| scope.command_queue)
+                    .collect::<Vec<_>>(),
+                [false],
+                "the scope advertises no `command_run`"
+            );
+        }
+
+        /// MOD-11 R1 L4: the R-MCP-4 denials end at a word — `make` and `make -j8` are refused,
+        /// `makepkg` and `cargo build-sbf` are not.
+        #[tokio::test(start_paused = true)]
+        async fn the_heavy_denials_match_whole_command_words() {
+            use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent};
+
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            let options = [PermissionOption {
+                id: "reject-once".to_owned(),
+                label: "Reject".to_owned(),
+                kind: PermissionOptionKind::RejectOnce,
+            }];
+            let refused = |command: &str| {
+                let call = ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: "Bash".to_owned(),
+                    tool_kind: htui_agent::event::ToolKind::Execute,
+                    input: serde_json::json!({ "command": command }),
+                    locations: Vec::new(),
+                };
+                htui_agent::permission::evaluate(&spec.permission, Some(&call), &options)
+                    .is_some_and(|answer| answer.reason.ends_with("(R-MCP-4)"))
+            };
+            assert!(refused("make"), "the bare word");
+            assert!(refused("make -j8"));
+            assert!(refused("cargo build --release"));
+            assert!(!refused("makepkg -si"), "another word");
+            assert!(!refused("cargo build-sbf"), "another subcommand");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_spec_carries_the_leases_server() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert_eq!(spec.mcp.len(), 1, "one server: htui");
+            assert_eq!(spec.mcp[0].name, "htui");
+            assert_eq!(spec.mcp[0].args, ["mcp"]);
+            let token = spec.mcp[0]
+                .env
+                .get("HTUI_MCP_TOKEN")
+                .expect("the lease's token");
+            assert_eq!(
+                host.scope_for_token(token).map(|scope| scope.step_id),
+                Some(spec.step_id),
+                "the token names this session's scope"
+            );
+            assert_eq!(spec.prompt, None, "an ACP scope gets no prompt port");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_cli_candidate_s_spec_carries_the_leases_prompt_port() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let opened = host.opened();
+            assert_eq!(opened[0].transport, Transport::Cli, "B-18: the agent row's");
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            assert!(
+                spec.prompt.is_some(),
+                "B-21: a CLI scope's lease lends a port"
+            );
+        }
+
+        /// MOD-11 D18: a host that lends prompt ports admits a CLI agent to a gated phase
+        /// (`inline_prompt`), and its session starts with the lease's port.
+        #[tokio::test(start_paused = true)]
+        async fn a_gated_cli_step_with_a_port_starts() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            let (run, rest) = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_ne!(
+                rest.failure,
+                Some(RunFailure::MissingCapability),
+                "the interlock admits a CLI agent with a prompt port"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.phase_name, "prd");
+            let opened = host.opened();
+            assert_eq!(opened[0].transport, Transport::Cli);
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the gated prd session started");
+            assert!(spec.prompt.is_some(), "the session carries the port");
+        }
+
+        /// MOD-11 D18: the start-time guard. A gated CLI step whose lease came back without a
+        /// prompt port is refused before its agent starts, so the interlock cannot be bypassed.
+        #[tokio::test(start_paused = true)]
+        async fn a_gated_cli_step_without_a_prompt_port_is_refused_at_start() {
+            let host = Arc::new(FakeToolHost::default().without_prompt_ports());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            let refused = start(&harness, ids::HTUI_FEAT_3)
+                .await
+                .expect_err("the guard refuses the step");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::Driver(DriverError::Spawn(why))
+                        if why.starts_with("missing_capability: inline_approval")
+                ),
+                "{refused}"
+            );
+            assert!(
+                harness.orch.spec_for(&key("prd", 0, 0)).is_none(),
+                "no session started"
+            );
+            assert_eq!(host.live(), 0, "the portless lease was dropped");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_lease_ends_with_the_session() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_eq!(host.opened().len(), 1);
+            assert_eq!(host.live(), 0, "B-17: dropped when `drive_once` returns");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_written_document_is_the_candidates_output() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            harness
+                .orch
+                .script("prd", 1, ScriptedStep::done_without_output());
+            harness
+                .orch
+                .writes_through_tools(&key("prd", 0, 0), "the prd, through the tool");
+
+            let (run, rest) = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_eq!(
+                rest.run,
+                RunStatus::AwaitingApproval,
+                "parked at `plan`'s gate"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.status, StepStatus::Done);
+            let writes = harness.orch.tool_writes();
+            assert_eq!(writes.len(), 1);
+            let written = writes[0].clone().expect("the fenced write landed");
+            assert_eq!(
+                (
+                    written.kind.as_str(),
+                    written.body.as_str(),
+                    written.produced_by_step_id
+                ),
+                ("prd", "the prd, through the tool", Some(prd.id))
+            );
+            let plan = step_at(&harness.orch, run, 1, 0).await;
+            assert_eq!(plan.phase_name, "plan", "the walk went on to `plan`");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_judge_opens_two_leases_and_resolves_on_two_tool_documents() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            ana_2_fanned_and_judged(&harness).await;
+            for call in 0..2 {
+                harness
+                    .orch
+                    .writes_through_tools(&key("research:judge", -1, call), &verdict(1, "deeper"));
+            }
+
+            let (run, _rest) = started(&harness, ids::HTUI_ANA_2).await;
+            let judge = step_at(&harness.orch, run, 0, -1).await;
+            assert_eq!(
+                (judge.status, judge.gate_note.as_deref()),
+                (StepStatus::Done, Some("deeper")),
+                "both tool-written verdicts agree"
+            );
+            let winner = step_at(&harness.orch, run, 0, 1).await;
+            assert_eq!(winner.selected, Some(true));
+            let judge_scopes: Vec<_> = host
+                .opened()
+                .into_iter()
+                .filter(|scope| scope.step_id == judge.id)
+                .collect();
+            assert_eq!(judge_scopes.len(), 2, "one lease per judge call");
+            assert!(
+                judge_scopes
+                    .iter()
+                    .all(|scope| scope.output_kind.as_deref() == Some("judge")),
+                "{judge_scopes:?}"
+            );
+            assert_eq!(host.live(), 0);
+            assert!(
+                harness.orch.tool_writes().iter().all(Result::is_ok),
+                "every write landed"
+            );
+        }
+
+        /// D19: the judge's replayed `{{task}}` is the candidate's prompt less the candidate's own
+        /// `output` trailer, so the hosted judge prompt carries exactly one, naming `judge`.
+        #[tokio::test(start_paused = true)]
+        async fn a_hosted_judge_prompt_has_one_output_trailer_naming_judge() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            ana_2_fanned_and_judged(&harness).await;
+            for call in 0..2 {
+                harness
+                    .orch
+                    .writes_through_tools(&key("research:judge", -1, call), &verdict(1, "deeper"));
+            }
+
+            let (run, _rest) = started(&harness, ids::HTUI_ANA_2).await;
+            let candidate =
+                prompt_of(&harness.orch, &step_at(&harness.orch, run, 0, 0).await).await;
+            assert!(
+                candidate.contains("Write your `research` document"),
+                "the candidate's own trailer: {candidate}"
+            );
+            let judge = prompt_of(&harness.orch, &step_at(&harness.orch, run, 0, -1).await).await;
+            assert_eq!(
+                judge.matches("<section name=\"output\">").count(),
+                1,
+                "{judge}"
+            );
+            assert!(
+                !judge.contains("Write your `research` document"),
+                "the replayed task drops the candidate's trailer: {judge}"
+            );
+            assert!(
+                judge.trim_end().ends_with(
+                    "<section name=\"output\">\nWrite your `judge` document by calling the \
+                     `document_write` tool of the `htui` MCP server; text left only in your \
+                     reply is not recorded.\n</section>"
+                ),
+                "{judge}"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_write_after_the_lease_moved_is_fenced_and_the_walk_loses_its_lease() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            harness
+                .orch
+                .script("prd", 1, ScriptedStep::done_without_output());
+            harness
+                .orch
+                .writes_through_tools(&key("prd", 0, 0), "too late");
+            harness.orch.take_lease_before_tool_writes();
+            let prd_documents = || async {
+                harness
+                    .orch
+                    .store
+                    .documents(ids::HTUI_FEAT_3)
+                    .await
+                    .expect("MemStore never fails a read")
+                    .into_iter()
+                    .filter(|head| head.kind == "prd")
+                    .count()
+            };
+            let before = prd_documents().await;
+
+            let walked = start(&harness, ids::HTUI_FEAT_3).await;
+            assert!(
+                matches!(walked, Err(EngineError::LeaseLost { .. })),
+                "{walked:?}"
+            );
+            let writes = harness.orch.tool_writes();
+            assert!(
+                matches!(writes.as_slice(), [Err(StoreError::Fenced { .. })]),
+                "{writes:?}"
+            );
+            assert_eq!(prd_documents().await, before, "I-3: nothing written");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn no_tool_document_still_fails_missing_output() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            feat_3_prd_ungated(&harness).await;
+            for attempt in 1..=2 {
+                harness
+                    .orch
+                    .script("prd", attempt, ScriptedStep::done_without_output());
+            }
+            let (_, rest) = started(&harness, ids::HTUI_FEAT_3).await;
+            assert_eq!(rest.run, RunStatus::Failed);
+            assert_eq!(
+                rest.failure,
+                Some(RunFailure::MissingOutput),
+                "OQ-9: no fallback"
+            );
+            assert_eq!(host.opened().len(), 2, "one lease per attempt");
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_judge_without_tool_documents_is_missing_document() {
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            ana_2_fanned_and_judged(&harness).await;
+
+            let (run, rest) = started(&harness, ids::HTUI_ANA_2).await;
+            assert_eq!(rest.run, RunStatus::AwaitingApproval);
+            let judge = step_at(&harness.orch, run, 0, -1).await;
+            assert_eq!(
+                (judge.status, judge.gate_note.as_deref()),
+                (StepStatus::Failed, Some("judge_missing_document: call 0"))
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn a_tool_host_error_fails_the_step_as_a_spawn_failure() {
+            let host = Arc::new(
+                FakeToolHost::default().failing(ToolHostError::Listener("no socket".to_owned())),
+            );
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            let refused = start(&harness, ids::HTUI_FEAT_3)
+                .await
+                .expect_err("the lease could not open");
+            assert!(
+                matches!(
+                    &refused,
+                    EngineError::Driver(DriverError::Spawn(why)) if why.contains("no socket")
+                ),
+                "{refused}"
+            );
+            assert!(
+                harness.orch.spec_for(&key("prd", 0, 0)).is_none(),
+                "no session started"
+            );
+            let summary = harness
+                .orch
+                .store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .find(|run| run.id != ids::RUN_2)
+                .expect("the walk created its run before the lease refused");
+            let prd = step_at(&harness.orch, summary.id, 0, 0).await;
+            assert_eq!(
+                prd.status,
+                StepStatus::Failed,
+                "a spawn failure, not a park"
+            );
+            let row = harness.orch.run(summary.id).await;
+            assert_eq!(row.status, RunStatus::Failed);
+            assert!(
+                row.failure
+                    .as_deref()
+                    .is_some_and(|failure| failure.starts_with("agent spawn failed: ")
+                        && failure.contains("no socket")),
+                "{:?}",
+                row.failure
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn the_output_trailer_appears_only_with_a_tool_host() {
+            let trailer = "<section name=\"output\">\nWrite your `prd` document by calling the \
+                           `document_write` tool of the `htui` MCP server; text left only in \
+                           your reply is not recorded.\n</section>";
+
+            let host = Arc::new(FakeToolHost::default());
+            let with = hosted(&host);
+            with.free_feat_3().await;
+            let (run, _) = started(&with, ids::HTUI_FEAT_3).await;
+            let text = prompt_of(&with.orch, &step_at(&with.orch, run, 0, 0).await).await;
+            assert!(text.ends_with(&format!("{trailer}\n")), "{text}");
+
+            let without = Harness::new().await;
+            without.free_feat_3().await;
+            let (run, _) = started(&without, ids::HTUI_FEAT_3).await;
+            let text = prompt_of(&without.orch, &step_at(&without.orch, run, 0, 0).await).await;
+            assert!(!text.contains("name=\"output\""), "{text}");
+            assert!(!text.contains("document_write"), "{text}");
         }
     }
 }

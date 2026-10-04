@@ -87,6 +87,10 @@ pub enum Command {
     /// new box's executor to `worker`. The DSN comes from the OS keyring or `--dsn-stdin`; never
     /// argv or the environment.
     Provision(ProvisionArgs),
+    /// Serve htui's MCP tools to one agent session over stdio. Started by the agent htui launched,
+    /// never by hand: it reads HTUI_MCP_ADDR and HTUI_MCP_TOKEN, writes only MCP to stdout, and exits
+    /// when the agent closes stdin.
+    Mcp,
 }
 
 /// `htui provision`'s arguments. None reads the environment (MOD-45 D291).

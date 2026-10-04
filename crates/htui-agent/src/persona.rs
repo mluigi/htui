@@ -1,7 +1,9 @@
 //! MOD-26 D10: a persona narrows a step's tool exposure and permission policy, never widens them
 //! (I-1). Pure: no store, no transport, no clock.
 
-use htui_core::model::persona::{PersonaAnswer, PersonaDefault, PersonaMatch, SnapshotPersona};
+use htui_core::model::persona::{
+    PersonaAnswer, PersonaDefault, PersonaMatch, PersonaTools, SnapshotPersona,
+};
 
 use crate::driver::{
     PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRule, ToolExposure,
@@ -17,6 +19,19 @@ pub fn tool_kind_of(text: &str) -> Option<ToolKind> {
         .find(|kind| kind.as_str() == text)
 }
 
+/// MOD-11 R1 H1 (amends D16): whether a persona leaves a step `htui`'s `command_run` — its own
+/// `command_run`, and no `execute` among its `deny_kinds` (a step that may not run a command
+/// does not queue one either). [`narrow`] applies the same rule over the merged kinds, and the
+/// engine's prompt term reads this, so the prompt never names a tool the session lacks.
+#[must_use]
+pub fn persona_keeps_command_run(tools: &PersonaTools) -> bool {
+    tools.command_run
+        && !tools
+            .deny_kinds
+            .iter()
+            .any(|text| tool_kind_of(text) == Some(ToolKind::Execute))
+}
+
 /// The step's exposure and policy under `persona`, from the agent row's (I-1):
 ///
 /// - `allow`: base empty → persona's; persona empty → base's; both non-empty → `base ∩ persona`
@@ -25,7 +40,8 @@ pub fn tool_kind_of(text: &str) -> Option<ToolKind> {
 /// - `deny`: base, then persona's, then B-8's additions, first occurrence kept;
 /// - `deny_kinds`: base, then persona's (`tool_kind_of`, an unknown string → `Other`, B-19),
 ///   first occurrence kept;
-/// - `command_run`: `base && persona`;
+/// - `command_run`: `base && persona`, and off when the merged `deny_kinds` hold `execute`
+///   (MOD-11 R1 H1);
 /// - rules: persona rules (reject-only; empty reason → `persona <name>`, B-21), then one
 ///   `{match: {tool_kind}, answer: reject_once, reason: "persona <name> denies <kind>"}` per
 ///   distinct persona `deny_kinds` entry, then the base rules;
@@ -84,7 +100,9 @@ pub fn narrow(
     let exposure = ToolExposure {
         allow,
         deny,
-        command_run: base.command_run && own.command_run,
+        command_run: base.command_run
+            && own.command_run
+            && !deny_kinds.contains(&ToolKind::Execute),
         deny_kinds,
     };
 
@@ -157,6 +175,7 @@ fn matcher(m: &PersonaMatch) -> PermissionMatch {
         tool_name: m.tool_name.clone(),
         path_prefix: m.path_prefix.clone(),
         command_prefix: m.command_prefix.clone(),
+        command_word: false,
     }
 }
 
@@ -176,7 +195,7 @@ mod tests {
     };
     use serde_json::json;
 
-    use super::{narrow, tool_kind_of};
+    use super::{narrow, persona_keeps_command_run, tool_kind_of};
     use crate::driver::{
         PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRule, RememberedPermission,
         ToolExposure,
@@ -375,6 +394,55 @@ mod tests {
                 "base {base_run} persona {persona_run}"
             );
         }
+    }
+
+    /// MOD-11 R1 H1 (amends D16): a step that may not use `execute` gets no `command_run`, whether
+    /// the persona or the base denies the kind; any other denied kind keeps it.
+    #[test]
+    fn an_execute_denial_drops_command_run() {
+        let on = ToolExposure {
+            command_run: true,
+            ..ToolExposure::default()
+        };
+        let (narrowed, _) = narrow(
+            &on,
+            &PermissionPolicy::default(),
+            &tooled(denying_kinds(&["execute"])),
+        );
+        assert!(!narrowed.command_run, "the persona denies execute");
+
+        let (narrowed, _) = narrow(
+            &ToolExposure {
+                deny_kinds: vec![ToolKind::Execute],
+                ..on.clone()
+            },
+            &PermissionPolicy::default(),
+            &tooled(PersonaTools::default()),
+        );
+        assert!(!narrowed.command_run, "the base denies execute");
+
+        let (narrowed, _) = narrow(
+            &on,
+            &PermissionPolicy::default(),
+            &tooled(denying_kinds(&["edit", "bogus"])),
+        );
+        assert!(narrowed.command_run, "another kind keeps it");
+    }
+
+    /// MOD-11 R1 H1: the one rule the prompt's persona term reads.
+    #[test]
+    fn a_persona_keeps_command_run_unless_it_denies_it_or_execute() {
+        assert!(persona_keeps_command_run(&PersonaTools::default()));
+        assert!(!persona_keeps_command_run(&PersonaTools {
+            command_run: false,
+            ..PersonaTools::default()
+        }));
+        assert!(!persona_keeps_command_run(&denying_kinds(&[
+            "read", "execute"
+        ])));
+        assert!(persona_keeps_command_run(&denying_kinds(&[
+            "edit", "bogus"
+        ])));
     }
 
     /// I-1 "persona rules only reject and run before the base rules" (D10, B-21).
@@ -638,6 +706,7 @@ mod tests {
                     rules: Vec::new(),
                 },
             ),
+            tooled(denying_kinds(&["execute"])),
         ];
 
         for (base, policy) in &bases {
@@ -671,6 +740,10 @@ mod tests {
                 assert!(
                     !tools.command_run || base.command_run,
                     "command_run never turns on: {case}"
+                );
+                assert!(
+                    !tools.command_run || !tools.deny_kinds.contains(&ToolKind::Execute),
+                    "an execute denial never keeps command_run (MOD-11 R1 H1): {case}"
                 );
                 assert!(
                     rank(narrowed.default) >= rank(policy.default),

@@ -15,28 +15,31 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use chrono::TimeDelta;
 use htui_agent::conformance::{Script, ScriptEvent, epoch};
 use htui_agent::driver::{
-    AgentDriver, AgentSession, DriverCaps, DriverFuture, PermissionPolicy, SessionSpec,
+    AgentDriver, AgentSession, DriverCaps, DriverFuture, McpServerSpec, PermissionPolicy,
+    SessionSpec,
 };
 use htui_agent::error::DriverError;
 use htui_agent::event::{
     DoneEvent, DriverEvent, ErrorEvent, PermissionRequestEvent, StopReason, ToolCallEvent,
     ToolKind, UsageEvent,
 };
-use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver};
+use htui_agent::fake::{FAKE_AGENT_NAME, FakeDriver, SpecSlot};
 use htui_agent::record::{Control, Signal};
 use htui_core::fixtures::ids;
+use htui_core::model::Transport;
 use htui_core::model::{
     Agent, AgentBox, AgentId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item, ItemId,
     NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId,
     RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
-use htui_core::store::{MemStore, ReadStore, Result, WriteStore};
+use htui_core::store::{MemStore, ReadStore, Result, StoreError, WriteStore};
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
 
@@ -49,6 +52,7 @@ use crate::isolate::{
     ChangedPaths, Clock, FanoutSlot, IsolateError, Isolator, IsolatorFuture, Prepared,
     PreparedTree, ResetReport,
 };
+use crate::tools::{ToolHost, ToolHostError, ToolLease, ToolScope};
 use crate::verify::{Verifier, VerifierFuture, VerifyReport, VerifyRequest};
 
 /// The root every synthetic tree path hangs from. Nothing ever creates it.
@@ -1105,15 +1109,26 @@ impl ScriptedStep {
             .tool_call_id
             .clone()
             .unwrap_or_else(|| "call-1".to_owned());
+        Self::parks_on(
+            ToolCallEvent {
+                tool_call_id: call,
+                title: "run the suite".to_owned(),
+                tool_kind: ToolKind::Execute,
+                input: serde_json::json!({ "command": "cargo test" }),
+                locations: Vec::new(),
+            },
+            request,
+            body,
+        )
+    }
+
+    /// [`parks`](Self::parks) on a call of the case's own (MOD-11 R1 M2: one of htui's tools):
+    /// `call`, then `request`, then `Done { EndTurn }`, and a document with `body`.
+    #[must_use]
+    pub fn parks_on(call: ToolCallEvent, request: PermissionRequestEvent, body: &str) -> Self {
         Self {
             script: Script::one_turn(vec![
-                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
-                    tool_call_id: call,
-                    title: "run the suite".to_owned(),
-                    tool_kind: ToolKind::Execute,
-                    input: serde_json::json!({ "command": "cargo test" }),
-                    locations: Vec::new(),
-                })),
+                ScriptEvent::Emit(DriverEvent::ToolCall(call)),
                 ScriptEvent::ParkPermission(request),
                 ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
                     stop_reason: StopReason::EndTurn,
@@ -1279,6 +1294,227 @@ impl AgentDriver for RefusingDriver {
     }
 }
 
+/// MOD-11 B-9: the engine tests' [`ToolHost`]. It speaks no MCP and does no I/O (H-20): `open`
+/// records the [`ToolScope`], counts the lease live until it drops, and lends a spec whose
+/// [`FAKE_TOKEN_ENV`] names the scope ([`scope_for_token`](Self::scope_for_token)); a
+/// `Transport::Cli` scope also gets a prompt port (B-21), whose asking end is dropped.
+#[derive(Debug, Default)]
+pub struct FakeToolHost {
+    opened: Mutex<Vec<ToolScope>>,
+    live: Arc<AtomicUsize>,
+    fail: Mutex<Option<ToolHostError>>,
+    closed: AtomicBool,
+    portless: AtomicBool,
+    advertised: Mutex<Vec<String>>,
+}
+
+impl FakeToolHost {
+    /// Every scope `open` was asked for, in order (refused ones excluded).
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn opened(&self) -> Vec<ToolScope> {
+        self.opened
+            .lock()
+            .expect("no panic holds the fake tool host's lock")
+            .clone()
+    }
+
+    /// Leases opened and not yet dropped.
+    #[must_use]
+    pub fn live(&self) -> usize {
+        self.live.load(Ordering::SeqCst)
+    }
+
+    /// Every `open` answers `err` from now on.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn failing(self, err: ToolHostError) -> Self {
+        *self
+            .fail
+            .lock()
+            .expect("no panic holds the fake tool host's lock") = Some(err);
+        self
+    }
+
+    /// The scope a lease's token names, as `McpHost` resolves a handshake.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn scope_for_token(&self, token: &str) -> Option<ToolScope> {
+        let index: usize = token.strip_prefix("fake-token-")?.parse().ok()?;
+        self.opened
+            .lock()
+            .expect("no panic holds the fake tool host's lock")
+            .get(index)
+            .cloned()
+    }
+
+    /// MOD-11 T9: every lease from now on comes back without a prompt port, even for a
+    /// `Transport::Cli` scope — the host the engine's start-time guard refuses.
+    #[must_use]
+    pub fn without_prompt_ports(self) -> Self {
+        self.portless.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// MOD-11 R1 M2: every lease from now on names `tools` as advertised (none by default, so
+    /// a case that does not ask sees no pre-approval). The fake reads no scope for it.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn advertising(self, tools: &[&str]) -> Self {
+        *self
+            .advertised
+            .lock()
+            .expect("no panic holds the fake tool host's lock") =
+            tools.iter().map(|tool| (*tool).to_owned()).collect();
+        self
+    }
+
+    /// Whether [`ToolHost::close`] was called (B-19).
+    #[must_use]
+    pub fn closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+}
+
+impl ToolHost for FakeToolHost {
+    fn open(&self, scope: ToolScope) -> std::result::Result<ToolLease, ToolHostError> {
+        if let Some(err) = self
+            .fail
+            .lock()
+            .expect("no panic holds the fake tool host's lock")
+            .clone()
+        {
+            return Err(err);
+        }
+        let prompt = (scope.transport == Transport::Cli && !self.portless.load(Ordering::SeqCst))
+            .then(|| htui_agent::prompt_bridge().0);
+        let token = {
+            let mut opened = self
+                .opened
+                .lock()
+                .expect("no panic holds the fake tool host's lock");
+            opened.push(scope);
+            format!("fake-token-{}", opened.len() - 1)
+        };
+        self.live.fetch_add(1, Ordering::SeqCst);
+        let live = Arc::clone(&self.live);
+        let spec = McpServerSpec {
+            name: "htui".to_owned(),
+            command: "/fake/htui".to_owned(),
+            args: vec!["mcp".to_owned()],
+            env: BTreeMap::from([
+                (FAKE_ADDR_ENV.to_owned(), "/fake/htui-mcp/s".to_owned()),
+                (FAKE_TOKEN_ENV.to_owned(), token),
+            ]),
+        };
+        let advertised = self
+            .advertised
+            .lock()
+            .expect("no panic holds the fake tool host's lock")
+            .clone();
+        Ok(ToolLease::new(spec, prompt, move || {
+            live.fetch_sub(1, Ordering::SeqCst);
+        })
+        .with_tools(advertised))
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+    }
+}
+
+/// MOD-11 B-9: a session that writes its output document **through its scope's fence** when it
+/// starts — what the agent's `document_write` call does — then plays its script.
+///
+/// The scope is the one the lease's token names on the [`FakeToolHost`]; a spec with no server
+/// (no host) writes nothing and records a refusal. With `steal`, the run's lease is first lapsed and
+/// taken by a stranger, so the write is fenced (I-3).
+#[derive(Debug)]
+struct ToolWriting {
+    inner: FakeDriver,
+    store: MemStore,
+    clock: TestClock,
+    host: Option<Arc<FakeToolHost>>,
+    body: String,
+    steal: Option<Uuid>,
+    outcomes: Arc<Mutex<Vec<ToolWrite>>>,
+}
+
+impl ToolWriting {
+    /// The write `document_write` would make for `spec`'s session.
+    async fn write(&self, spec: &SessionSpec) -> ToolWrite {
+        let scope = spec
+            .mcp
+            .first()
+            .and_then(|server| server.env.get(FAKE_TOKEN_ENV))
+            .zip(self.host.as_ref())
+            .and_then(|(token, host)| host.scope_for_token(token))
+            .ok_or_else(|| StoreError::Constraint("no htui server on this session".to_owned()))?;
+        let (Some(item), Some(kind)) = (scope.item_id, scope.output_kind.clone()) else {
+            return Err(StoreError::Constraint(
+                "document_write is not advertised to this session".to_owned(),
+            ));
+        };
+        if let Some(owner) = self.steal {
+            let ttl = crate::recover::LeaseTimes::from_app(&BTreeMap::new()).ttl;
+            self.store
+                .refresh_lease(scope.run_id, owner, TimeDelta::zero())
+                .await?;
+            self.store
+                .take_lease(scope.run_id, scope.box_id, Uuid::now_v7(), ttl)
+                .await?;
+        }
+        self.store
+            .write_step_document(
+                scope.fence,
+                NewDocument {
+                    id: DocumentId::new(),
+                    item_id: item,
+                    kind: kind.clone(),
+                    title: kind,
+                    body: self.body.clone(),
+                    produced_by_step_id: Some(scope.step_id),
+                    created_by: scope.user,
+                    created_at: self.clock.now(),
+                },
+            )
+            .await
+    }
+}
+
+impl AgentDriver for ToolWriting {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn caps(&self) -> DriverCaps {
+        self.inner.caps()
+    }
+
+    fn start<'a>(
+        &'a self,
+        spec: SessionSpec,
+        prompt: String,
+    ) -> DriverFuture<'a, Box<dyn AgentSession>> {
+        Box::pin(async move {
+            let outcome = self.write(&spec).await;
+            self.outcomes
+                .lock()
+                .expect("no panic holds the fake orchestrator's lock")
+                .push(outcome);
+            self.inner.start(spec, prompt).await
+        })
+    }
+}
+
 /// How far [`FakeOrchestrator::restarted`] moves the clock past the crashed process's: ten
 /// minutes, above every seeded (`lease_ttl_seconds = 120`) and fallback TTL, so every lease the
 /// first process wrote has expired when the second one looks (plan D118).
@@ -1287,6 +1523,29 @@ pub const RESTART_GAP: TimeDelta = TimeDelta::minutes(10);
 /// What [`FakeOrchestrator`] scripts by: `(phase, attempt)` and, for one session of a group,
 /// `(fanout_index, call)` (plan D68).
 type ScriptKey = (String, i32, Option<(i32, u32)>);
+
+/// A [`SessionKey`] owned: `(phase, attempt, fanout_index, call)` (MOD-11 D9's per-key handles).
+type OwnedKey = (String, i32, i32, u32);
+
+/// `key`, owned.
+fn owned(key: &SessionKey<'_>) -> OwnedKey {
+    (
+        key.phase.to_owned(),
+        key.attempt,
+        key.fanout_index,
+        key.call,
+    )
+}
+
+/// What [`FakeOrchestrator::writes_through_tools`] recorded: one `Ok` per landed write, the
+/// store's refusal otherwise.
+pub type ToolWrite = std::result::Result<Document, StoreError>;
+
+/// The env key the [`FakeToolHost`]'s lease carries its token under, as `htui_mcp`'s does.
+pub const FAKE_TOKEN_ENV: &str = "HTUI_MCP_TOKEN";
+
+/// The env key the [`FakeToolHost`]'s lease carries its address under, as `htui_mcp`'s does.
+pub const FAKE_ADDR_ENV: &str = "HTUI_MCP_ADDR";
 
 /// One session's stall (blueprint A-2; MOD-40 T2): whether the document is written first, the
 /// signal raised when the session stalls, and, for a suspend, the signal that wakes it.
@@ -1383,6 +1642,17 @@ pub struct FakeOrchestrator {
     /// borrows. A [`restarted`](Self::restarted) process carries the policies (they are the
     /// agents') and none of the signal (it is the process's).
     relays: Relays,
+    /// MOD-11 D4, B-9: the tool host every engine over this harness opens leases on, or none.
+    /// Not carried by [`restarted`](Self::restarted): a listener is the process's.
+    tools: Option<Arc<FakeToolHost>>,
+    /// MOD-11 D9: each session's spec handle, taken before its driver is boxed.
+    specs: Mutex<BTreeMap<OwnedKey, SpecSlot>>,
+    /// MOD-11 B-9: the sessions that write their document through the tool, by exact key.
+    tool_bodies: Mutex<BTreeMap<OwnedKey, String>>,
+    /// Whether a tool write first lets a stranger take the run's lease.
+    steal_before_tool_writes: AtomicBool,
+    /// Every tool write's outcome, in order.
+    tool_writes: Arc<Mutex<Vec<ToolWrite>>>,
 }
 
 impl FakeOrchestrator {
@@ -1420,6 +1690,11 @@ impl FakeOrchestrator {
             user,
             owner: Uuid::now_v7(),
             relays: Relays::new(Arc::new(Mutex::new(BTreeMap::new()))),
+            tools: None,
+            specs: Mutex::new(BTreeMap::new()),
+            tool_bodies: Mutex::new(BTreeMap::new()),
+            steal_before_tool_writes: AtomicBool::new(false),
+            tool_writes: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -1482,7 +1757,71 @@ impl FakeOrchestrator {
             user: self.user,
             owner: Uuid::now_v7(),
             relays: Relays::new(Arc::clone(&self.relays.policies)),
+            tools: None,
+            specs: Mutex::new(BTreeMap::new()),
+            tool_bodies: Mutex::new(BTreeMap::new()),
+            steal_before_tool_writes: AtomicBool::new(false),
+            tool_writes: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+
+    /// MOD-11 D4, B-9: every engine built over this harness opens a lease on `tools` per session.
+    #[must_use]
+    pub fn with_tool_host(mut self, tools: Arc<FakeToolHost>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// The tool host `fake_parts` lends the engine, or `None` (today's specs exactly).
+    #[must_use]
+    pub fn tool_host(&self) -> Option<Arc<dyn ToolHost>> {
+        self.tools
+            .as_ref()
+            .map(|tools| Arc::clone(tools) as Arc<dyn ToolHost>)
+    }
+
+    /// MOD-11 D9: the spec the session at `key` was started with, or `None` before it started.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn spec_for(&self, key: &SessionKey<'_>) -> Option<SessionSpec> {
+        self.specs
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .get(&owned(key))
+            .and_then(SpecSlot::get)
+    }
+
+    /// MOD-11 B-9: the session at `key` writes its output document with `body` through its
+    /// scope's fence when it starts, as an agent calling `document_write` would: kind, item, step
+    /// and author are the scope's. Script the session `done_without_output` so the harness sink
+    /// writes nothing (production's `author: None`).
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    pub fn writes_through_tools(&self, key: &SessionKey<'_>, body: &str) {
+        self.tool_bodies
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .insert(owned(key), body.to_owned());
+    }
+
+    /// Every tool write lets a stranger take the run's lease first, so it is fenced.
+    pub fn take_lease_before_tool_writes(&self) {
+        self.steal_before_tool_writes.store(true, Ordering::SeqCst);
+    }
+
+    /// Every tool write's outcome so far, in order.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn tool_writes(&self) -> Vec<ToolWrite> {
+        self.tool_writes
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .clone()
     }
 
     /// MOD-42 plan D9: `agent`'s policy in every engine built over this harness.
@@ -1763,7 +2102,35 @@ impl FakeOrchestrator {
                 caps: self.caps,
                 reason,
             }),
-            None => Box::new(FakeDriver::new(FAKE_AGENT_NAME, self.caps, scripted.script)),
+            None => {
+                let driver = FakeDriver::new(FAKE_AGENT_NAME, self.caps, scripted.script);
+                // MOD-11 D9: the handle is taken before the driver is boxed.
+                self.specs
+                    .lock()
+                    .expect("no panic holds the fake orchestrator's lock")
+                    .insert(owned(key), driver.spec_handle());
+                let body = self
+                    .tool_bodies
+                    .lock()
+                    .expect("no panic holds the fake orchestrator's lock")
+                    .get(&owned(key))
+                    .cloned();
+                match body {
+                    Some(body) => Box::new(ToolWriting {
+                        inner: driver,
+                        store: self.store.clone(),
+                        clock: self.clock.clone(),
+                        host: self.tools.clone(),
+                        body,
+                        steal: self
+                            .steal_before_tool_writes
+                            .load(Ordering::SeqCst)
+                            .then_some(self.owner),
+                        outcomes: Arc::clone(&self.tool_writes),
+                    }),
+                    None => Box::new(driver),
+                }
+            }
         }
     }
 

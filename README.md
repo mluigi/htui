@@ -362,8 +362,10 @@ start `htui`, and the agent tells you which one.
 
 Use `claude` when you can. `claude-cli` uses the same Claude Code login but has fewer abilities:
 
-- It can't ask you for permission. Its permission mode setting decides instead, and refusals show
-  up in the transcript.
+- It asks you for permission through htui's own MCP tool (`permission_prompt`), not its own
+  channel: whatever its permission mode does not settle reaches you in the Runs pane or the chat.
+  When htui hosts no MCP tools, its permission mode decides alone, and refusals show up in the
+  transcript. See [`docs/htui-mcp.md`](docs/htui-mcp.md#permission-prompts-for-claude-cli).
 - It shows edits as the tool calls that made them, not as diffs you can review.
 - It doesn't produce plans.
 
@@ -537,3 +539,4 @@ arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 - [`CONCEPTS.md`](CONCEPTS.md): what `htui` is, and the design decisions behind it.
 - [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md): the full requirements.
 - [`docs/personas.md`](docs/personas.md): agent personas and how they narrow a step.
+- [`docs/htui-mcp.md`](docs/htui-mcp.md): htui's MCP server, the tools every agent session gets.

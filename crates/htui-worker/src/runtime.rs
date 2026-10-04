@@ -22,6 +22,7 @@ use htui_core::model::{
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::kill_point::{KillPoint, Site};
+use htui_orch::tools::ToolHost;
 use htui_orch::{
     Adopted, Clock, Command, CommandOutcome, DeadWalks, DriverFor, Engine, EngineError,
     EngineParts, FirstCandidate, GixIsolator, Isolator, IsolatorConfig, LeaseTimes, Next,
@@ -185,6 +186,9 @@ struct Shared<P: ReplySink> {
     drivers: Arc<DriverFactory>,
     clock: Arc<dyn Clock>,
     author: Option<Arc<dyn StepAuthor>>,
+    /// MOD-11 D11: htui's MCP host every engine of this runtime opens its leases on; closed by
+    /// [`RunRuntime::shutdown`] (B-19).
+    tools: Option<Arc<dyn ToolHost>>,
     owner: Uuid,
     dead_walks: Arc<DeadWalks>,
     publisher: Publisher<P>,
@@ -794,32 +798,39 @@ async fn repo_map<H: htui_core::store::WorkerHost>(
     Ok(repos)
 }
 
-/// The box row's `settings.command_limits`, else `{"verify": 1}` (D156): no row, no key, or a
-/// stored value that does not parse (warned) all get the default.
+/// MOD-11 D15: `app_setting.command_limits` overlaid key by key with the box row's
+/// `settings.command_limits` ([`resolve_command_limits`]). No row or no key is the app setting
+/// alone; a stored value that does not parse as a map of `u32` is warned, and its entries that do
+/// parse still overlay. A class neither names reads 1 (`ShellVerifier::new` for `verify`,
+/// `command_limit` for the queue), which was D156's `{"verify": 1}` default.
 ///
 /// D216 (review L7): a read that fails is not the default. `singletons` passes it up like the
 /// reads beside it, so no verifier is cached from it and the next command reads again. The limits
 /// are read once per build of the parts (per server): an edit to them reaches the next process
 /// (R-55), or this one when its repo map next moves (MOD-41 review R-1).
 ///
+/// [`resolve_command_limits`]: htui_core::model::kind::resolve_command_limits
+///
 /// # Errors
-/// The store's own read failure.
+/// The store's own read failures (the box row, then the app settings).
 async fn command_limits<H: htui_core::store::WorkerHost>(
     host: &H,
     box_id: BoxId,
 ) -> StoreResult<BTreeMap<String, u32>> {
-    let default = || BTreeMap::from([("verify".to_owned(), 1)]);
-    let Some(stored) = host
+    let stored = host
         .box_row(box_id)
         .await?
-        .and_then(|row| row.settings.get("command_limits").cloned())
-    else {
-        return Ok(default());
-    };
-    Ok(serde_json::from_value(stored).unwrap_or_else(|err| {
-        tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; verify runs one at a time");
-        default()
-    }))
+        .and_then(|row| row.settings.get("command_limits").cloned());
+    let app = host.app_settings().await?;
+    if let Some(stored) = &stored
+        && let Err(err) = serde_json::from_value::<BTreeMap<String, u32>>(stored.clone())
+    {
+        tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; the app setting stands where it does not");
+    }
+    Ok(htui_core::model::kind::resolve_command_limits(
+        stored.as_ref(),
+        &app,
+    ))
 }
 
 /// The engine every task builds, per step of work, over [`Kit`]'s parts: over the host's store
@@ -872,6 +883,8 @@ struct Kit<H: htui_core::store::WorkerHost> {
     policy: Box<dyn Fn(AgentId) -> PermissionPolicy + Send + Sync>,
     /// MOD-42 plan D10: each run's control: its live `Walks` parent's, else never signalled.
     control: Box<dyn Fn(RunId) -> Control + Send + Sync>,
+    /// MOD-11 D11: the runtime's tool host, handed to every engine.
+    tools: Option<Arc<dyn ToolHost>>,
 }
 
 impl<H: htui_core::store::WorkerHost> Kit<H> {
@@ -920,6 +933,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
                 publisher: Arc::new(shared.publisher.clone()),
                 writer: writer.clone(),
                 author: shared.author.clone(),
+                owner: shared.owner,
             },
             writer,
             graphs: HostGraphs(host.clone()),
@@ -940,6 +954,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             tails,
             policy,
             control: Box::new(move |run| walks.control(run)),
+            tools: shared.tools.clone(),
         })
     }
 
@@ -1012,6 +1027,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             dead_walks: &self.dead_walks,
             user: self.user,
             tails: self.tails,
+            tools: self.tools.clone(),
         })
     }
 }
@@ -1112,6 +1128,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 drivers: Arc::new(drivers),
                 clock: Arc::new(SystemClock),
                 author: None,
+                tools: None,
                 owner: Uuid::now_v7(),
                 dead_walks: Arc::new(DeadWalks::new()),
                 publisher: Publisher::default(),
@@ -1318,6 +1335,18 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
         self
     }
 
+    /// MOD-11 D11: a runtime whose engines open one tool lease per session on `tools` (the
+    /// worker's `McpHost<PgStore>`, the TUI's `McpHost<Backend>`). [`shutdown`](Self::shutdown)
+    /// closes it.
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_tool_host(mut self, tools: Arc<dyn ToolHost>) -> Self {
+        self.configure().tools = Some(tools);
+        self
+    }
+
     /// D202: the production isolator's scratch root, instead of `identity::config_root()/trees`.
     ///
     /// # Panics
@@ -1485,7 +1514,10 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// The UI is gone: the runtime closes, so no walk, task or sweep starts after this; every
     /// walk is cancelled — its lease given back through `abandoned` — and every task, including
     /// one spawned while this waits, is awaited within **one** shared window of `2 × grace`, then
-    /// aborted. The loop cancels the chats beside this, inside the same bounded quit.
+    /// aborted. The loop cancels the chats beside this, inside the same bounded quit. Then the
+    /// tool host is closed (MOD-11 B-19): its listener and socket go, and every session ends. A
+    /// host shared with the chat runtime (the TUI) is handed in behind a view whose `close` is a
+    /// no-op, and its owner closes it after both shutdowns (T6 ADV-2).
     pub async fn shutdown(&mut self, grace: Duration) {
         self.shared.walks.close();
         let deadline = tokio::time::Instant::now() + grace * 2;
@@ -1498,7 +1530,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                     .unwrap_or_else(PoisonError::into_inner),
             );
             if tasks.is_empty() {
-                return;
+                break;
             }
             for Tracked { tag, handle } in tasks {
                 let abort = handle.abort_handle();
@@ -1507,6 +1539,9 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                     tracing::warn!(run = ?tag.run.get(), "a run task did not end within the grace window");
                 }
             }
+        }
+        if let Some(tools) = &self.shared.tools {
+            tools.close();
         }
     }
 }
@@ -2990,7 +3025,8 @@ pub mod testing {
         super::retry_claims(ctx).await;
     }
 
-    /// `command_limits`: the box row's `settings.command_limits`, else the default.
+    /// `command_limits`: the box row's `settings.command_limits` over the app setting (MOD-11
+    /// D15).
     ///
     /// # Errors
     /// The store's own read failure.
@@ -3143,6 +3179,88 @@ mod tests {
 
         runtime.shared.publisher.publish(&changed(ids::HTUI_FEAT_1));
         assert_eq!(sink.frames_of(ids::HTUI_FEAT_1), [30]);
+    }
+
+    /// MOD-11 D15: with no box value the limits are `app_setting.command_limits`; a box's own
+    /// `settings.command_limits` overlays them key by key; a box value that does not parse
+    /// leaves the app's; with neither, nothing (every class then reads 1).
+    #[tokio::test]
+    async fn command_limits_falls_back_to_the_app_setting() {
+        use std::collections::BTreeMap;
+
+        use htui_core::model::BoxId;
+        use serde_json::json;
+
+        let with_box = |stored: Option<serde_json::Value>| {
+            let mut data = htui_core::fixtures::demo_data();
+            let row = data
+                .boxes
+                .iter_mut()
+                .find(|row| row.id == ids::BOX)
+                .expect("the demo box");
+            match stored {
+                Some(limits) => row.settings["command_limits"] = limits,
+                None => row.settings = json!({}),
+            }
+            MemStore::from_demo(data)
+        };
+        let seeded = json!({"build": 1, "test": 4, "verify": 1});
+        let app = BTreeMap::from([
+            ("build".to_owned(), 1),
+            ("test".to_owned(), 4),
+            ("verify".to_owned(), 1),
+        ]);
+
+        let store = with_box(None);
+        store.set_app_setting("command_limits", seeded.clone());
+        let backend = Backend::memory(store);
+        assert_eq!(
+            super::command_limits(&backend, BoxId::new())
+                .await
+                .expect("the read answers"),
+            app,
+            "no box row: the app setting"
+        );
+        assert_eq!(
+            super::command_limits(&backend, ids::BOX)
+                .await
+                .expect("the read answers"),
+            app,
+            "no box value: the app setting"
+        );
+
+        let store = with_box(Some(json!({"test": 2, "run": 3})));
+        store.set_app_setting("command_limits", seeded.clone());
+        assert_eq!(
+            super::command_limits(&Backend::memory(store), ids::BOX)
+                .await
+                .expect("the read answers"),
+            BTreeMap::from([
+                ("build".to_owned(), 1),
+                ("run".to_owned(), 3),
+                ("test".to_owned(), 2),
+                ("verify".to_owned(), 1),
+            ]),
+            "the box overlays the app key by key"
+        );
+
+        let store = with_box(Some(json!("many")));
+        store.set_app_setting("command_limits", seeded);
+        assert_eq!(
+            super::command_limits(&Backend::memory(store), ids::BOX)
+                .await
+                .expect("the read answers"),
+            app,
+            "a box value that does not parse leaves the app's"
+        );
+
+        assert_eq!(
+            super::command_limits(&Backend::memory(with_box(None)), ids::BOX)
+                .await
+                .expect("the read answers"),
+            BTreeMap::new(),
+            "neither: nothing, and every class reads 1"
+        );
     }
 
     /// Blueprint §0a point 3: a later subscription of the same subscriber replaces the earlier
@@ -3574,6 +3692,47 @@ mod role_gate {
         runtime.sweep_with(&backend, &sink);
         rests_at(&store, later, RunStatus::AwaitingApproval).await;
         assert!(runtime.settle(PATIENCE).await.is_empty());
+    }
+
+    /// MOD-11 D11: a runtime built `with_tool_host` hands the host to every engine it builds:
+    /// the claimed run's first session opened a lease scoped to its step, under the runtime's
+    /// own fence, and gave it back when the session ended.
+    #[tokio::test]
+    async fn with_tool_host_reaches_the_engine() {
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let run = queued(&store, ids::HTUI_ANA_2, Utc::now()).await;
+        let host = Arc::new(htui_orch::fake::FakeToolHost::default());
+        let mut runtime = worker_runtime()
+            .with_tool_host(Arc::clone(&host) as Arc<dyn htui_orch::tools::ToolHost>);
+        let backend = Backend::memory(store.clone());
+
+        runtime.sweep_with(&backend, &Timed::new());
+        rests_at(&store, run, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+
+        let steps = store.run_steps(run).await.expect("the read");
+        let opened = host.opened();
+        assert!(!opened.is_empty(), "the walk's session opened a lease");
+        assert_eq!(opened[0].run_id, run);
+        assert_eq!(opened[0].step_id, steps[0].id);
+        assert!(
+            matches!(opened[0].fence, htui_core::store::StepFence::Lease(_)),
+            "{:?}",
+            opened[0].fence
+        );
+        assert_eq!(host.live(), 0, "the lease ended with the session");
+    }
+
+    /// MOD-11 B-19: `shutdown` closes the tool host once the tasks have ended.
+    #[tokio::test]
+    async fn shutdown_closes_the_tool_host() {
+        let host = Arc::new(htui_orch::fake::FakeToolHost::default());
+        let mut runtime = worker_runtime()
+            .with_tool_host(Arc::clone(&host) as Arc<dyn htui_orch::tools::ToolHost>);
+        assert!(!host.closed());
+        runtime.shutdown(Duration::from_millis(10)).await;
+        assert!(host.closed(), "the listener is the runtime's to close");
     }
 
     /// OQ-6, blueprint B-10: a stranded run whose live graph no longer resolves (`NoGraph`) fails

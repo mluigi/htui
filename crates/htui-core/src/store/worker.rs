@@ -12,8 +12,10 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 48 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
-//! `write_document` and MOD-42's three command methods; [`RelayStore`] is four (MOD-42 plan D2).
+//! `WorkerStore` is 58 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
+//! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
+//! `item_by_key` (plan D13, B-4) and its five command-queue methods (plan D14); [`RelayStore`] is
+//! four (MOD-42 plan D2).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`.
 
@@ -24,16 +26,17 @@ use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use crate::model::{
     AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CancelRequest,
-    Claim, CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind,
-    NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
-    PromptScope, PromptTemplate, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
-    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, Status, StepGraphId,
-    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId,
-    WorkspaceSummary,
+    Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead, DocumentId,
+    GateOutcome, Item, ItemId, ItemKind, NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
+    Project, ProjectId, PromptScope, PromptTemplate, RelaySessionId, Repo, RepoBoxPath, RepoId,
+    Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
+    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, Status,
+    StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
+    UserId, WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -351,6 +354,69 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         to: RunCommandStatus,
         resolution: Option<String>,
     ) -> impl Future<Output = Result<bool>> + Send;
+
+    // -- MOD-11 (plan D13, B-4): the agent writes and the key lookup the MCP tools make
+    /// [`WriteStore::write_step_document`].
+    fn write_step_document(
+        &self,
+        fence: StepFence,
+        new: NewDocument,
+    ) -> impl Future<Output = Result<Document>> + Send;
+    /// [`WriteStore::add_step_note`].
+    fn add_step_note(
+        &self,
+        fence: StepFence,
+        note: NewNote,
+    ) -> impl Future<Output = Result<Note>> + Send;
+    /// [`WriteStore::propose_link`].
+    fn propose_link(
+        &self,
+        fence: StepFence,
+        link: ProposeLink,
+    ) -> impl Future<Output = Result<ItemLink>> + Send;
+    /// [`WriteStore::withdraw_link`].
+    fn withdraw_link(
+        &self,
+        fence: StepFence,
+        link: WithdrawLink,
+    ) -> impl Future<Output = Result<ItemLink>> + Send;
+    /// [`WriteStore::item_by_key`].
+    fn item_by_key(
+        &self,
+        project: ProjectId,
+        key: &str,
+    ) -> impl Future<Output = Result<Option<ItemId>>> + Send;
+
+    // -- MOD-11 M4 (plan D14): the command queue `command_run` drives
+    /// [`WriteStore::enqueue_command`].
+    fn enqueue_command(
+        &self,
+        new: NewCommandRun,
+    ) -> impl Future<Output = Result<CommandRun>> + Send;
+    /// [`WriteStore::claim_command`].
+    fn claim_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> impl Future<Output = Result<Option<CommandRun>>> + Send;
+    /// [`WriteStore::beat_command`].
+    fn beat_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::finish_command`].
+    fn finish_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        status: CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::cancel_command`].
+    fn cancel_command(&self, id: CommandRunId) -> impl Future<Output = Result<bool>> + Send;
 }
 
 /// The supervisor's source (plan D4): the process's store and every read the runtime makes.
@@ -723,6 +789,48 @@ impl WorkerStore for MemStore {
         resolution: Option<String>,
     ) -> Result<bool> {
         WriteStore::resolve_command(self, id, to, resolution).await
+    }
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        WriteStore::write_step_document(self, fence, new).await
+    }
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
+        WriteStore::add_step_note(self, fence, note).await
+    }
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
+        WriteStore::propose_link(self, fence, link).await
+    }
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
+        WriteStore::withdraw_link(self, fence, link).await
+    }
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        WriteStore::item_by_key(self, project, key).await
+    }
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
+        WriteStore::enqueue_command(self, new).await
+    }
+    async fn claim_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> Result<Option<CommandRun>> {
+        WriteStore::claim_command(self, id, claimant, limit).await
+    }
+    async fn beat_command(&self, id: CommandRunId, claimant: Uuid) -> Result<bool> {
+        WriteStore::beat_command(self, id, claimant).await
+    }
+    async fn finish_command(
+        &self,
+        id: CommandRunId,
+        claimant: Uuid,
+        status: CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> Result<bool> {
+        WriteStore::finish_command(self, id, claimant, status, exit_code, output).await
+    }
+    async fn cancel_command(&self, id: CommandRunId) -> Result<bool> {
+        WriteStore::cancel_command(self, id).await
     }
 }
 

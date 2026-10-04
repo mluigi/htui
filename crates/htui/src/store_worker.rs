@@ -1218,6 +1218,10 @@ pub enum StoreReply {
         session_ref: Option<AgentSessionRef>,
         /// What this transport can do, for the tab's capability banner.
         caps: DriverCaps,
+        /// MOD-11 D18: the session carries `htui`'s permission-prompt port, so it announces and
+        /// answers permission requests although `caps` — the row's, which the interlock reads —
+        /// says it cannot (a CLI session).
+        prompts: bool,
     },
     /// Answer to [`StoreRequest::StoreState`].
     StoreState {
@@ -2096,6 +2100,68 @@ pub fn spawn_with(
     spawn_with_runtimes(started, rx, tx, runtime, runs)
 }
 
+/// [`spawn_with`] hosting htui's MCP tools (MOD-11 D11): with `tools`, the chat runtime and the
+/// run runtime open their leases on the one host, and the loop hands it the current writable
+/// backend at the top of every iteration (B-2, `host_the_backend`), so a session opened after a
+/// `SetDsn` writes to the new server. `None` is [`spawn_with`] exactly.
+pub fn spawn_hosted(
+    started: Started,
+    rx: mpsc::UnboundedReceiver<RequestEnvelope>,
+    tx: mpsc::UnboundedSender<ReplyEnvelope>,
+    runtime: AgentRuntime,
+    tools: Option<Arc<htui_mcp::McpHost<Backend>>>,
+) -> tokio::task::JoinHandle<()> {
+    let mut runtime = runtime;
+    let mut runs = crate::run_worker::production_for(&started.backend);
+    if let Some(host) = &tools {
+        (runtime, runs) = host_the_runtimes(runtime, runs, host);
+    }
+    spawn_with_concepts(
+        started,
+        rx,
+        tx,
+        runtime,
+        runs,
+        ConceptsRuntime::production(),
+        tools,
+    )
+}
+
+/// Both runtimes open their leases on `host` (MOD-11 D11). The run runtime gets it through
+/// [`SharedToolHost`], so its shutdown leaves the host to the loop (T6 ADV-2).
+fn host_the_runtimes(
+    runtime: AgentRuntime,
+    runs: RunRuntime,
+    host: &Arc<htui_mcp::McpHost<Backend>>,
+) -> (AgentRuntime, RunRuntime) {
+    (
+        runtime.with_tool_host(Arc::clone(host) as Arc<dyn htui_orch::tools::ToolHost>),
+        runs.with_tool_host(Arc::new(SharedToolHost(Arc::clone(host)))),
+    )
+}
+
+/// The run runtime's view of the tool host the loop shares with the chat runtime (MOD-11 T6
+/// ADV-2): `open` is the host's; `close` is a no-op.
+///
+/// `RunRuntime::shutdown` closes its tool host once its walks are done (B-19), which is right in
+/// `htui worker`, where it owns the host alone. In the TUI the loop joins that shutdown with the
+/// chat runtime's, so with no walk left the run runtime would close the host while every chat is
+/// still inside its cancel window, ending the sessions of agents that have not stopped yet (H-25).
+/// The loop closes the host itself, once, after both shutdowns.
+#[derive(Debug)]
+struct SharedToolHost(Arc<htui_mcp::McpHost<Backend>>);
+
+impl htui_orch::tools::ToolHost for SharedToolHost {
+    fn open(
+        &self,
+        scope: htui_orch::tools::ToolScope,
+    ) -> Result<htui_orch::tools::ToolLease, htui_orch::tools::ToolHostError> {
+        self.0.open(scope)
+    }
+
+    fn close(&self) {}
+}
+
 /// The steps a chat of this process is live on (blueprint D206): the runtime's chats whose
 /// session task is still running (`AgentRuntime::live_steps`).
 pub(crate) fn live_chats(runtime: &AgentRuntime) -> LiveChats {
@@ -2167,6 +2233,7 @@ pub fn spawn_with_runtimes(
         runtime,
         runs,
         ConceptsRuntime::production(),
+        None,
     )
 }
 
@@ -2179,6 +2246,7 @@ pub(crate) fn spawn_with_concepts(
     mut runtime: AgentRuntime,
     mut runs: RunRuntime,
     mut concepts: ConceptsRuntime,
+    tools: Option<Arc<htui_mcp::McpHost<Backend>>>,
 ) -> tokio::task::JoinHandle<()> {
     let Started {
         mut backend,
@@ -2240,6 +2308,11 @@ pub(crate) fn spawn_with_concepts(
         let mut beat: Option<tokio::task::JoinHandle<()>> = None;
 
         loop {
+            // MOD-11 B-2 (H-10): the backend this iteration serves is the one a tool session
+            // opened from now on writes to — robust to every site below that swaps or mutates it.
+            if let Some(host) = &tools {
+                host_the_backend(host, &backend);
+            }
             // The first sweep reads `lease_ttl_seconds`; the ticker follows it.
             if runs.sweep_every() != sweep_every {
                 sweep_every = runs.sweep_every();
@@ -2388,6 +2461,12 @@ pub(crate) fn spawn_with_concepts(
                                 // `connecting`, because nothing is in flight (D12).
                                 since: if ctx.offline { Some(Utc::now()) } else { None },
                             };
+                            // MOD-11 B-2, T6 ADV-1: the one offline backend the tool host takes
+                            // (`host_the_backend` keeps the last writable one): every walk was
+                            // preempted above, and the old server's pool must not outlive it here.
+                            if let Some(host) = &tools {
+                                host.set_host(backend.clone());
+                            }
                             // (7) Every later tick dials the new server - unless this session was
                             // started with `--offline`, which is a choice the user typed.
                             reconnect = if ctx.offline {
@@ -2713,6 +2792,11 @@ pub(crate) fn spawn_with_concepts(
             runs.shutdown(crate::agent_worker::CANCEL_GRACE),
             runtime.shutdown(crate::agent_worker::CANCEL_GRACE),
         );
+        // MOD-11 B-19, T6 ADV-2: the shared tool host goes once both runtimes are down, so no chat
+        // loses its session while its agent is still winding down.
+        if let Some(host) = &tools {
+            htui_orch::tools::ToolHost::close(host.as_ref());
+        }
         concepts.shutdown();
 
         if let Some(refresher) = refresher {
@@ -2722,6 +2806,22 @@ pub(crate) fn spawn_with_concepts(
             beat.abort();
         }
     })
+}
+
+/// Hands `backend` to the shared tool host when it can write (MOD-11 B-2, T6 ADV-1).
+///
+/// A backend that went offline is **not** handed over: `go_offline` does not preempt a walk, and
+/// the walk's `Kit` keeps its own `Online` clone, so the server's last writable backend is still
+/// the one its next session's tool writes belong to. Handing over `Offline` would refuse that
+/// lease and fail the run (`agent spawn failed`) over a blip the walk's own pool survived. A
+/// chat needs a writer to start at all, so it never opens a lease in that window. Moving to
+/// another server is the one swap that must reach the host while offline: `SetDsn` preempts
+/// every walk and hands the host its `Offline` backend itself, so no session writes to the
+/// server the session has left and the old pool is not kept open by the host.
+fn host_the_backend(host: &htui_mcp::McpHost<Backend>, backend: &Backend) {
+    if backend.writer().is_some() {
+        host.set_host(backend.clone());
+    }
 }
 
 /// The sweep ticker (D190): first tick one period from now, `Delay` on a missed one.
@@ -2997,6 +3097,7 @@ mod tests {
             AgentRuntime::production(),
             RunRuntime::production(),
             ConceptsRuntime::new(Arc::new(index)),
+            None,
         );
         let query = crate::concepts::query("anything", scope.project_ids, false, 10);
         for (seq, request) in [
@@ -5123,5 +5224,108 @@ mod tests {
         }
 
         cache.close().await;
+    }
+
+    /// A scope for the tool host tests below: no item, no fence, the ACP transport.
+    fn tool_scope() -> htui_orch::tools::ToolScope {
+        htui_orch::tools::ToolScope {
+            run_id: htui_core::model::RunId::new(),
+            step_id: StepId::new(),
+            project_id: ids::PROJECT_HTUI,
+            item_id: None,
+            box_id: ids::BOX,
+            user: ids::USER,
+            fence: htui_core::store::StepFence::Unleased,
+            output_kind: None,
+            hostname: htui_core::prompt::render::HostnameLine::Omitted,
+            command_queue: false,
+            cwd: std::env::temp_dir(),
+            transport: htui_core::model::Transport::Acp,
+        }
+    }
+
+    /// MOD-11 T6 ADV-1: a backend that went offline is not handed to the tool host. `go_offline`
+    /// does not preempt a walk, which keeps its own `Online` clone across the blip, so the walk's
+    /// next session must still open on the server it was claimed on (B-2) rather than answer
+    /// `Offline` and fail the run with `agent spawn failed`.
+    #[tokio::test]
+    async fn an_offline_backend_leaves_the_tool_host_on_the_last_writable_one() {
+        use htui_orch::tools::ToolHost as _;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "worker-host-offline", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let host = htui_mcp::McpHost::new(demo()).expect("a tool host");
+
+        host_the_backend(
+            &host,
+            &Backend::Offline {
+                cache: cache.clone(),
+                since: Some(Utc::now()),
+            },
+        );
+        let lease = host.open(tool_scope()).unwrap_or_else(|err| {
+            panic!("a session opened across an offline blip keeps the last writable backend: {err}")
+        });
+
+        drop(lease);
+        host.close();
+        cache.close().await;
+    }
+
+    /// MOD-11 T6 ADV-2: the run runtime's shutdown does not close the host it shares with the
+    /// chat runtime. The loop joins the two shutdowns, so with no walk left the run runtime is
+    /// done while the chats are still inside their cancel window; a chat agent's last tool call
+    /// (a `note_add` flushed while it winds down) must still find its session and the listener.
+    #[tokio::test]
+    async fn the_run_runtime_shutdown_leaves_the_shared_tool_host_open() {
+        use htui_orch::tools::ToolHost as _;
+
+        let host = Arc::new(htui_mcp::McpHost::new(demo()).expect("a tool host"));
+        let chat = host.open(tool_scope()).expect("a chat's lease");
+        let (_runtime, mut runs) =
+            host_the_runtimes(AgentRuntime::production(), RunRuntime::production(), &host);
+
+        runs.shutdown(std::time::Duration::ZERO).await;
+
+        assert!(
+            host.address().is_some(),
+            "the listener outlives the run runtime's shutdown"
+        );
+        assert!(
+            host.client(&chat.spec.env[htui_mcp::ENV_TOKEN]).is_ok(),
+            "the chat's session outlives the run runtime's shutdown"
+        );
+        drop(chat);
+        host.close();
+    }
+
+    /// MOD-11 T6 ADV-2: the loop closes the shared tool host itself once the UI is gone: its
+    /// listener goes and every session it still served ends.
+    #[tokio::test]
+    async fn the_loop_closes_the_shared_tool_host_after_both_runtimes() {
+        use htui_orch::tools::ToolHost as _;
+
+        let host = Arc::new(htui_mcp::McpHost::new(demo()).expect("a tool host"));
+        let lease = host.open(tool_scope()).expect("a lease");
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, _rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_hosted(
+            Started::detached(demo()),
+            req_rx,
+            rep_tx,
+            AgentRuntime::production(),
+            Some(Arc::clone(&host)),
+        );
+
+        drop(req_tx);
+        worker.await.expect("the loop ends");
+
+        assert!(host.address().is_none(), "the listener is gone");
+        assert!(
+            host.client(&lease.spec.env[htui_mcp::ENV_TOKEN]).is_err(),
+            "the session ended with the host"
+        );
     }
 }

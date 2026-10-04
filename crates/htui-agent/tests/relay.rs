@@ -206,6 +206,7 @@ fn spec(step: StepId) -> SessionSpec {
         retain_raw: false,
         resume: None,
         budget_micros: None,
+        prompt: None,
     }
 }
 
@@ -1924,5 +1925,183 @@ async fn a_parked_poll_survives_a_few_failed_reads() {
             PermissionAnswer::Selected(ALLOW.to_owned())
         )],
         "the live session got the client's option"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-11 D18: a CLI session's prompt, relayed like any other request
+// ---------------------------------------------------------------------------------------------
+
+/// The gated call's tool-use id, as the CLI reports it and the prompt tool forwards it.
+#[cfg(unix)]
+const PROMPTED: &str = "toolu_relay_1";
+
+/// A `cli_driver.rs`-style child double: `system/init`, the gated call, a mark that it is now
+/// waiting on its prompt tool, then the turn's `result` once the case creates `$HTUI_GO_FILE`.
+#[cfg(unix)]
+const PROMPTING_CLI: &str = r#"#!/bin/sh
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"cli-picked","claude_code_version":"9.9.9","model":"scripted-model"}'
+IFS= read -r line
+printf '%s\n' '{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_relay_1","name":"Bash","input":{"command":"cargo test"}}]}}'
+: > "$HTUI_ASKING_FILE"
+while [ ! -f "$HTUI_GO_FILE" ]; do sleep 0.05; done
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"terminal_reason":"completed","total_cost_usd":0.000002,"modelUsage":{"m":{"inputTokens":1,"outputTokens":2,"cacheReadInputTokens":0,"cacheCreationInputTokens":0}}}'
+exit 0
+"#;
+
+/// Polls for `path` on the real clock, failing after half the [`LIMIT`].
+#[cfg(unix)]
+async fn appears(path: &std::path::Path) {
+    let wait = async {
+        while !path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::time::timeout(LIMIT / 2, wait)
+        .await
+        .expect("the child double got that far");
+}
+
+/// A CLI session over [`PROMPTING_CLI`] written into `dir`, started with `port`.
+#[cfg(unix)]
+async fn prompting_cli(
+    dir: &std::path::Path,
+    step: StepId,
+    port: htui_agent::prompt_bridge::PromptPort,
+) -> Box<dyn AgentSession> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let command = dir.join("prompting-cli");
+    std::fs::write(&command, PROMPTING_CLI).expect("write the child double");
+    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    let row = htui_core::model::Agent {
+        id: htui_core::model::AgentId::new(),
+        name: "scripted-cli".to_owned(),
+        transport: htui_core::model::Transport::Cli,
+        launch: json!({
+            "command": command.to_string_lossy(),
+            "args": [],
+            "env": {
+                "HTUI_ASKING_FILE": dir.join("asking").to_string_lossy(),
+                "HTUI_GO_FILE": dir.join("go").to_string_lossy(),
+            },
+            "discovery": { "handshake": false, "tools": {} },
+        }),
+        models: vec!["row-model".to_owned()],
+        default_model: None,
+        billing: htui_core::model::Billing::Subscription,
+        enabled: true,
+        settings: json!({
+            "cli": { "stream": htui_agent::cli::STREAM, "permission_mode": "", "extra_args": [] },
+            "usage": { "scope": "model_usage" },
+        }),
+        created_at: at(),
+        updated_at: at(),
+    };
+    let mut factory = htui_agent::registry::DriverFactory::new();
+    factory.register(
+        htui_agent::cli::ADAPTER_ID,
+        Box::new(htui_agent::cli::ClaudeStreamAdapter)
+            as Box<dyn htui_agent::registry::TransportBuilder>,
+    );
+    let driver = factory
+        .driver_for(&row, None)
+        .expect("the cli adapter builds the row");
+    let mut spec = spec(step);
+    spec.cwd = dir.to_path_buf();
+    spec.prompt = Some(port);
+    driver
+        .start(spec, "summarise the backlog".to_owned())
+        .await
+        .expect("the child double sends its `system/init`")
+}
+
+/// MOD-11 D18 end to end over the MOD-42 relay: the CLI's prompt tool call parks through the
+/// port, `drive` relays it as a stage-3 row, a client answers it from the store, and the prompt
+/// tool gets `allow` — the turn then finishes as any answered turn does. Real clock: the session
+/// runs a child process.
+#[cfg(unix)]
+#[tokio::test]
+async fn the_relay_answers_a_cli_prompt_from_the_store() {
+    use htui_agent::prompt_bridge::{PromptCall, PromptVerdict, bridge};
+
+    let fx = leased().await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let tmp = tempfile::tempdir().expect("temp box");
+    let (port, ask) = bridge();
+    let mut session = prompting_cli(tmp.path(), fx.step, port).await;
+    let policy = PermissionPolicy::default();
+    let relay = relay(&fx, &policy);
+    let mut control = Control::never();
+
+    let (out, (verdict, parked)) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            // The CLI asks once it has announced the call, as it does before running a tool.
+            appears(&tmp.path().join("asking")).await;
+            let call = PromptCall {
+                tool_name: "Bash".to_owned(),
+                input: json!({ "command": "cargo test" }),
+                tool_use_id: Some(PROMPTED.to_owned()),
+            };
+            let client = async {
+                let row = parked_row(&fx.store).await?;
+                answer(&fx.store, &row, &row.options[0].id).await;
+                Some(row)
+            };
+            let (verdict, parked) = tokio::join!(ask.ask(call), client);
+            std::fs::write(tmp.path().join("go"), b"").expect("go");
+            (verdict, parked)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+    session
+        .cancel(Duration::ZERO)
+        .await
+        .expect("the ended session cancels");
+
+    assert_eq!(
+        verdict,
+        Ok(PromptVerdict::Allow),
+        "the prompt tool got the client's allow"
+    );
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "the answered turn finishes"
+    );
+    let parked = parked.expect("the client saw the parked request");
+    assert_eq!(parked.request_id, PROMPTED, "the CLI's tool-use id");
+    assert_eq!(parked.tool_call_id.as_deref(), Some(PROMPTED));
+    assert_eq!(
+        parked
+            .options
+            .iter()
+            .map(|option| (option.id.as_str(), option.kind))
+            .collect::<Vec<_>>(),
+        vec![
+            ("allow", RelayOptionKind::AllowOnce),
+            ("reject", RelayOptionKind::RejectOnce)
+        ],
+        "the bridge's two options, relayed verbatim"
+    );
+    assert_eq!(the_one_row(&fx.store).status, PermissionStatus::Applied);
+
+    let log = log(&fx.store, fx.step).await;
+    let answers = answers_in(&log);
+    assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
+    assert_eq!(answers[0]["by"], "user");
+    assert_eq!(answers[0]["option_id"], "allow");
+    assert!(
+        position(&log, EventKind::PermissionRequest) < position(&log, EventKind::PermissionAnswer),
+        "the echo follows its request"
     );
 }

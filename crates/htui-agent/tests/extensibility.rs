@@ -549,6 +549,7 @@ async fn the_resolved_token_reaches_no_persisted_row() {
         retain_raw: true,
         resume: None,
         budget_micros: None,
+        prompt: None,
     };
 
     // The scrubber is built from the same resolved env the session runs with, which is the wiring

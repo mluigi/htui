@@ -14,7 +14,19 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator
+**Current status (2026-10-04):** **MOD-11 is done** (`docs/decisions/mod/mod-11.md`): every session
+htui launches (engine steps in the TUI and in `htui worker`, fresh and promoted chats) gets the `htui`
+MCP server: `box_profile`, `document_write`, `note_add`, `item_status` (a note, never a transition),
+`item_link`, `search_concepts`, `command_run`, and `permission_prompt` for `claude-cli`. Scope comes
+from a per-session token and every item write is fenced. Production judges and `approve`/`accept`
+now work on agent-written documents. `command_run` queues builds and tests per `(box, class)`.
+`claude-cli` permission prompts reach the Runs pane and the chat. New crate `htui-mcp`, migration
+`0015_command_queue`, user guide `docs/htui-mcp.md`. Follow-ups MOD-77, MOD-78, MOD-79 and ANA-28.
+Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
+`heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
+MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
+conformance `CASES` 146, `READ_CASES` 15, `htui-orch` `CASES` 100.
+Before it, **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator
 hardening closed in five milestones (run state, store and engine correctness, git cost, deadline and
 sessions, ACP resume). A promoted ACP step now resumes its own session (`session/resume`, else
 `session/load` with the replay discarded), and a promotion resumes the step's latest banner. A
@@ -46,8 +58,9 @@ migration, no new crate, no rataflow change.
 - [ ] **ANA-25 - Learn per-model weights from htui's own judge verdicts** (from ANA-21; ANA-21 is
   done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`, `R-ORCH-7`, `R-ID-6`.
   ANA-21 deferred learned weights behind a volume trigger but the maintainer asked for it to be
-  tracked rather than remembered. **Trigger: do not start until MOD-36 and MOD-11 are both done and
-  a project holds on the order of 100 judged cross-model groups.** The data is already recorded —
+  tracked rather than remembered. **Trigger: do not start until MOD-36 is done and a project holds
+  on the order of 100 judged cross-model groups.** MOD-11 is done (`docs/decisions/mod/mod-11.md`):
+  production judges now resolve on agent-written `judge` documents, so verdicts accumulate. The data is already recorded —
   candidate `run_step` rows carry `agent_id`, `model`, `selected` and `verify_outcome`, and the
   judge row (`fanout_index = -1`) carries its own `agent_id`/`model` — so no new logging is needed.
   Fit a Bayesian Bradley-Terry model with a Plackett-Luce top-1 likelihood per verdict, taking
@@ -57,6 +70,16 @@ migration, no new crate, no rataflow change.
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
+- [ ] **ANA-28 - `heavy_build`: queue switch vs required box capability** (from MOD-11,
+  `docs/decisions/mod/mod-11.md`). `R-MCP-3`, `R-ORCH-10`. R-MCP-3 says an item carrying the
+  `heavy_build` tag forces `command_run` on. MOD-11 reads that tag from `item.required_tags`, the only
+  item tag field, and that field is also the item's required box capabilities (R-ORCH-10). So
+  tagging an item `heavy_build` both exposes `command_run` and lets the item run only on a box that
+  declares `heavy_build`; elsewhere the run is refused with `missing tags: heavy_build`
+  (`docs/htui-mcp.md`, "When `command_run` is offered"). The other way to get the queue on a
+  single-agent step, a phase's `command_queue = always`, is settable only in Postgres (Settings ›
+  Kinds shows it read-only). Options to weigh: a non-routing item label, exempting `heavy_build`
+  from the box-tag match, or a phase/queue setting in the TUI.
 ### Next features
 - [ ] **MOD-76 - Orchestrator carried risks after MOD-37** (from MOD-37,
   `docs/decisions/mod/mod-37.md` "Carried"). `R-ORCH-3`, `R-ORCH-8`, `R-TUI-4`. MOD-37 closed with
@@ -152,33 +175,6 @@ migration, no new crate, no rataflow change.
   The verifier's scrubber (`crates/htui-worker/src/runtime.rs:411`) stays pattern-only: handing it the map would put
   the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
   secret is stored as `[REDACTED]` belongs to this item.
-- [ ] **MOD-11 - htui MCP server.** `R-MCP-1..4`. Tools `item_link`, `item_status`,
-  `document_write`, `note_add`, `box_profile`, `command_run`; per-step scoping; command queue with
-  per-box class limits; per-phase exposure. Per ANA-2 (`docs/ANA-2.md` §4.2, §8, risk 11):
-  `document_write` calls `WriteStore::write_document` (orchestrator-allocated version), `command_run`
-  accepts class `verify` for `verify_command`, and an `item_status` request is recorded as an
-  `item_note` with `via_step_id`, never a transition. The `box_profile` read tool returns ANA-5's
-  box profile projection (`docs/ANA-5.md` §4.2) so the tool and the prompt section agree — MOD-2
-  shipped that projection as `htui_core::prompt::BoxProfile::project`, which drops `box_tool.path`
-  (ANA-5 §4.2 rule 5), so the tool must not re-add it. **Not blocked**: MOD-2 and MOD-4 are done
-  (`docs/decisions/mod/mod-2.md`, `docs/decisions/mod/mod-4.md`). MOD-2's own `permission_request`
-  gap over the CLI transport stays declared until this item lands, since the
-  `--permission-prompt-tool` contract is its route. **MOD-4 left two things waiting here**: every
-  production judge fails until an agent can write the `judge` document (MOD-4 milestone 4, OQ-4),
-  and production `approve`/`accept` are greyed in the Runs pane because production's `SessionSink`
-  is `NoSink`, so no step writes its `output_kind` document outside a test (MOD-4 risk R-50). Both
-  clear once `document_write` exists.
-  **Relates to ANA-16** (`docs/ANA-16.md` §8): the MCP server must be reachable inside a container
-  or on a remote box, and a stdio `McpServerSpec` must be launchable there (MOD-44; `htui worker`, MOD-41, done).
-  **MOD-41 left the sink fence here** (`docs/decisions/mod/mod-41.md`, PRD D5): the step sink's
-  `write_document` is still unfenced; fence it with the step's `StepFence` when this item adds the
-  first production author.
-  **MOD-34 left the `search_concepts` tool here** (`docs/decisions/mod/mod-34.md`): expose
-  `htui_store::vector::VectorStore::search` (`R-STO-8`), scoped to the step's projects. Since MOD-50
-  (`docs/decisions/mod/mod-50.md`) it also returns requirement hits; `Hit.owner` says which kind each
-  hit is.
-  **MOD-33 left one decision here** (`docs/decisions/mod/mod-33.md`, D277): the `box_profile` tool
-  returns `BoxProfile`, and this item decides whether it honours the project's hostname switch.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -225,6 +221,11 @@ migration, no new crate, no rataflow change.
   path. Paths are repo-relative by contract (ANA-5 §4.2 rule 5) and the digest LF-normalises before
   any byte is counted (criterion 6), which is the Windows hazard that would otherwise change a
   `prompt_digest` between boxes. Criterion 11's CLI half also holds on **Linux only**.
+  **MOD-11 added the MCP host's Windows half** (`docs/decisions/mod/mod-11.md`): the named-pipe
+  listener (`\\.\pipe\htui-mcp-<uuid>`, first instance, remote clients refused), the relay's
+  1 s drain in place of a half-close, and a failed `connect` replacing its pipe instance. It
+  type-checks for `x86_64-pc-windows-gnu` and has never run; a Windows box should run
+  `crates/htui/tests/mcp_stdio.rs`'s cases by hand.
   **MOD-20 added a second body of Windows-only code** (`docs/decisions/mod/mod-20.md`), and it is
   the first that could not be lint-checked from Linux at all (**TOOL-3**), so it was reviewed by eye
   only. The runtime facts it defers here, by name: that `Layout::promote`'s three-attempt
@@ -291,6 +292,32 @@ migration, no new crate, no rataflow change.
   the engine has no follow-up verb and ANA-2 no state that accepts one (a walk's session ends at
   `done` before the step parks, `docs/ANA-2.md:1235-1238`), and the text is typed on one box but must
   be scrubbed on the executing box (`R-SEC-3`, `R-ID-7`). Not blocked.
+- [ ] **MOD-77 - Pg step writers lock the step before the run (`park_step` deadlock order)** (from
+  MOD-11, `docs/decisions/mod/mod-11.md`). `R-HIS-1`, `R-ORCH-11`. `park_step` locks
+  `FOR UPDATE OF s, r` (step, then run), and MOD-11's fenced writes follow it through `step_scope`
+  (`FOR SHARE OF s, r`, step → run → item). The older step writers go the other way. `append_events`,
+  `set_step_usage`, `set_step_prompt`, `finish_step`, `pass_step`, `upsert_step_tree`,
+  `record_commits`, and the relay's `open_permission`, fence through `step_fence` (`FOR SHARE OF r`, or
+  an `EXISTS … FOR SHARE`). They lock the run first and only then touch `run_step`. Not reachable
+  through MOD-11 (verified). The worst case is a detected `40P01` when a stale walk races the walk that
+  adopted its run. Fix: give `step_fence` the `FOR SHARE OF s, r` shape; writers that update
+  `run_step` take `FOR NO KEY UPDATE OF s FOR SHARE OF r`; regenerate `.sqlx`. Check the overlap with
+  MOD-76 first (leased by `hr/MOD-37`, "Orchestrator carried risks after MOD-37"). Not blocked.
+- [ ] **MOD-78 - `command_run` lifecycle: lease check and cancel on session end** (from MOD-11,
+  `docs/decisions/mod/mod-11.md`). `R-MCP-1`, `R-MCP-3`. `command_run` is not fenced (MOD-11's I-3
+  reads "every item write"). A session whose walk lost its lease can queue and run commands until the
+  walk notices at its next renewal (`docs/htui-mcp.md`, "Scope"). Add a lock-free `lease_owner` check
+  before `enqueue_command` and on each heartbeat, and kill the child on a loss. Review L5: dropping
+  the lease only sets the session's `ended`. Add a cancellation signal on `Session` (a `watch` or a
+  `CancellationToken`) that `Served::call` selects against, so an in-flight call ends with its
+  session. Not blocked.
+- [ ] **MOD-79 - MCP token off claude's argv** (from MOD-11, `docs/decisions/mod/mod-11.md`,
+  blueprint E-1 and review L2). `R-MCP-1`, `R-NF-1`. `claude-cli` gets the per-session
+  `HTUI_MCP_TOKEN` inline in `--mcp-config=<json>`, so any local user can read it from
+  `/proc/<pid>/cmdline`. It is useless without the `0700` socket directory, but it should not be
+  there. Pass a `0600` config file in the session's private directory instead (the CLI accepts a
+  path), and redact `--mcp-config` arguments in `ResolvedLaunch`'s `Debug`. A Windows equivalent for
+  the file's ACL is part of the item. Not blocked.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
@@ -316,6 +343,14 @@ migration, no new crate, no rataflow change.
   registration, the box probe, capability tags); survives TUI exit through `htui worker` (MOD-41, done: `docs/decisions/mod/mod-41.md`).
   A child box's hostname never moves a digest, and the project's hostname switch covers it by
   construction (MOD-33 D275, `docs/decisions/mod/mod-33.md`).
+  **MOD-11 note (2026-10-04, `docs/decisions/mod/mod-11.md`):** `R-MCP-1`'s server is a stdio
+  `htui mcp` relay the agent starts, with `HTUI_MCP_ADDR` and `HTUI_MCP_TOKEN`. It connects to the
+  hosting htui process's local channel: a Unix socket in a `0700` directory, or a named pipe on
+  Windows. That channel is the seam a container bridges (`docs/htui-mcp.md`, "The socket" and
+  "`htui mcp`: the relay"). Today the relay command is `/proc/<host pid>/exe` on Linux, which an
+  agent in a container that does not share the host's `/proc` cannot start, and the socket must be
+  bind-mounted into the container. A container launch needs a relay binary inside the image and the
+  socket directory mounted, or a relay over the `docker exec -i` stream (PRD OQ-1).
 - [ ] **MOD-46 - Live streaming via `NOTIFY` (optional)** (from ANA-16, §8 item 7). `R-HIS-1`,
   `R-NF-3`. Transient `NOTIFY` deltas under 8000 bytes between recorder flushes, droppable, superseded
   by durable `session_event` rows. Start only if 16 KiB flush bursts prove unusable; replaced by
@@ -417,7 +452,7 @@ migration, no new crate, no rataflow change.
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 20 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-76 orchestrator carried risks; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
+| MOD-N   | 22 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-76 orchestrator carried risks; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

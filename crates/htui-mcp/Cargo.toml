@@ -1,0 +1,49 @@
+[package]
+name        = "htui-mcp"
+version     = "0.1.0"
+description = "htui's MCP server: the per-session tool host and the stdio relay's channel (MOD-11)"
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[dependencies]
+# MOD-11 D1: the store traits, the model, the scrubber and the prompt's `box_profile` render come
+# from `htui-core`; `McpServerSpec`, the prompt bridge and `contained` from `htui-agent`; the
+# `ToolHost` seam (D4) from `htui-orch`. Never `htui-store`: tests reach it as a dev-dependency
+# only (blueprint B-1).
+htui-core  = { workspace = true }
+htui-agent = { workspace = true }
+htui-orch  = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+# MOD-11 D1: promoted from the lock (1.2.2); every tool's input schema is derived.
+schemars   = { workspace = true }
+thiserror  = { workspace = true }
+tracing    = { workspace = true }
+chrono     = { workspace = true }
+# D3: the token is two `Uuid::new_v4()`. `v4` is declared here only (blueprint H-9); `v7`'s
+# `rng` already compiles the generator.
+uuid       = { workspace = true, features = ["v4"] }
+# The workspace `tokio` has neither `net` nor `io-std` (blueprint H-15): the listener and the
+# relay's stdio need both, so they are named here rather than left to feature unification.
+tokio      = { workspace = true, features = ["net", "io-util", "sync", "time", "process", "rt",
+                                            "macros", "io-std"] }
+
+[target.'cfg(windows)'.dependencies]
+# nothing yet: tokio::net::windows::named_pipe is enough
+
+[dev-dependencies]
+htui-core  = { workspace = true, features = ["test-support"] }
+htui-agent = { workspace = true, features = ["test-support"] }
+htui-orch  = { workspace = true, features = ["test-support"] }
+# Blueprint B-1: `WorkerHost` is implemented by `PgStore` and `Backend` only, so the tests host
+# `McpHost<Backend>` over `Backend::memory(MemStore::demo())`.
+htui-store = { workspace = true, features = ["demo", "test-support"] }
+tokio      = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util", "net"] }
+tempfile   = "3"
+insta      = { workspace = true }
+
+[lints]
+workspace = true

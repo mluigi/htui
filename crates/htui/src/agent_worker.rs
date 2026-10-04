@@ -62,6 +62,7 @@ use htui_core::model::{
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
 use htui_orch::OpeningPath;
+use htui_orch::tools::{ToolHost, ToolLease, ToolScope};
 use htui_store::{Backend, Writer};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -507,6 +508,9 @@ pub struct AgentRuntime {
     /// The hardware seam the box probe reads when a test injected one; `None` is
     /// [`SystemHardware::host`].
     hardware: Option<Arc<dyn HardwareSource>>,
+    /// MOD-11 D11: htui's MCP host, which every chat opens one lease on (OQ-8); `None` keeps
+    /// every chat's `mcp` empty.
+    tools: Option<Arc<dyn ToolHost>>,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -645,7 +649,16 @@ impl AgentRuntime {
             registration_probe: false,
             probe_env: None,
             hardware: None,
+            tools: None,
         }
+    }
+
+    /// MOD-11 D11: every chat this runtime starts or binds opens a lease on `tools` (the TUI's
+    /// `McpHost<Backend>`, shared with its run runtime).
+    #[must_use]
+    pub fn with_tool_host(mut self, tools: Arc<dyn ToolHost>) -> Self {
+        self.tools = Some(tools);
+        self
     }
 
     /// Opts in to the registration probe (MOD-7 D11): only the binary's entry point does.
@@ -985,10 +998,10 @@ impl AgentRuntime {
             return Ok(Served::Deferred);
         }
         let crate::run_worker::Promoted {
+            run,
             step: step_id,
             project: project_id,
             opening,
-            ..
         } = promoted;
 
         let writer = backend
@@ -1021,8 +1034,8 @@ impl AgentRuntime {
             .map_err(|err| StoreError::Backend(err.to_string()))?;
         let settings: AgentSettings =
             serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
-        let project_caps =
-            project_caps_for(project_id, backend.project_settings(project_id).await?)?;
+        let project_settings = backend.project_settings(project_id).await?;
+        let project_caps = project_caps_for(project_id, project_settings.clone())?;
         let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
         let Some(tail) = writer.step_events(step_id).await? else {
             return Ok(Served::Reply(StoreReply::Failed {
@@ -1031,6 +1044,32 @@ impl AgentRuntime {
             }));
         };
 
+        // MOD-11 D11, OQ-8: the step's own item and the kind its run's snapshot names, unleased
+        // (a promoted step's park released the walk's lease).
+        let lease = match &self.tools {
+            Some(tools) => {
+                let (item_id, output_kind) = promoted_output(&writer, run, step_id).await;
+                Some(open_chat_lease(
+                    tools.as_ref(),
+                    ToolScope {
+                        run_id: run,
+                        step_id,
+                        project_id,
+                        item_id,
+                        box_id,
+                        user: backend.this_user().await?,
+                        fence: htui_core::store::StepFence::Unleased,
+                        output_kind,
+                        hostname: hostname_line(project_settings.as_ref()),
+                        command_queue: false,
+                        cwd: opening.cwd.clone(),
+                        transport: summary.agent.transport,
+                    },
+                )?)
+            }
+            None => None,
+        };
+        let policy = chat_policy(settings.permission, lease.as_ref());
         let (resume, opening_text, fallback) = match opening.path {
             // Review M-1: a resume whose handoff could not be built has no fallback.
             OpeningPath::Resume {
@@ -1057,11 +1096,12 @@ impl AgentRuntime {
                 .model
                 .or_else(|| summary.agent.default_model.clone()),
             tools: htui_agent::driver::ToolExposure::default(),
-            mcp: Vec::new(),
-            permission: settings.permission.clone(),
+            mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
+            permission: policy.clone(),
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
             resume,
             budget_micros: project_caps.run_micros,
+            prompt: lease.as_ref().and_then(|lease| lease.prompt.clone()),
         };
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -1091,7 +1131,7 @@ impl AgentRuntime {
             },
             spec,
             prompt: opening_text,
-            policy: settings.permission,
+            policy,
             caps,
             commands: commands_rx,
             frames,
@@ -1099,6 +1139,7 @@ impl AgentRuntime {
             reprobe: None,
             project_caps,
             quota_latch,
+            lease,
         };
         Ok(Served::Start {
             step_id,
@@ -2064,8 +2105,8 @@ impl AgentRuntime {
         // a cap an operator wrote and `htui` ignored is the risk table's "wrong by a factor of a
         // million" pointing the other way — a run that was supposed to be bounded and was not. An
         // absent *row* is [`project_caps_for`]'s question.
-        let project_caps =
-            project_caps_for(project_id, backend.project_settings(project_id).await?)?;
+        let project_settings = backend.project_settings(project_id).await?;
+        let project_caps = project_caps_for(project_id, project_settings.clone())?;
         if project_caps.batch_micros.is_some() {
             // Plan D71: read and reported, never compared. A batch spans runs MOD-4 does not yet
             // create, so enforcing it here would mean inventing the batch identity
@@ -2079,6 +2120,29 @@ impl AgentRuntime {
         let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
 
         let chat = ChatRunSpec::mint(project_id, box_id, user, Some(agent_id), model.clone());
+        // MOD-11 D11, OQ-8: a fresh chat has no item, so no item tool is advertised; opened
+        // before the run is written, so a host that refuses leaves no run behind.
+        let lease = match &self.tools {
+            Some(tools) => Some(open_chat_lease(
+                tools.as_ref(),
+                ToolScope {
+                    run_id: chat.run_id,
+                    step_id: chat.step_id,
+                    project_id,
+                    item_id: None,
+                    box_id,
+                    user,
+                    fence: htui_core::store::StepFence::Unleased,
+                    output_kind: None,
+                    hostname: hostname_line(project_settings.as_ref()),
+                    command_queue: false,
+                    cwd: cwd.clone(),
+                    transport: summary.agent.transport,
+                },
+            )?),
+            None => None,
+        };
+        let policy = chat_policy(settings.permission, lease.as_ref());
         writer.start_chat_run(&chat).await?;
         #[cfg(test)]
         tests::minted(&chat);
@@ -2100,8 +2164,8 @@ impl AgentRuntime {
             env: BTreeMap::new(),
             model: model.clone(),
             tools: htui_agent::driver::ToolExposure::default(),
-            mcp: Vec::new(),
-            permission: settings.permission.clone(),
+            mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
+            permission: policy.clone(),
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
             resume: None,
             // Plan D83/D90: the per-run cap the recorder enforces client-side, handed to the
@@ -2109,6 +2173,7 @@ impl AgentRuntime {
             // the same number. `project_caps` is read once, above, and both readers take it from
             // there — two reads of the setting would be two chances to convert it differently.
             budget_micros: project_caps.run_micros,
+            prompt: lease.as_ref().and_then(|lease| lease.prompt.clone()),
         };
 
         let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -2183,7 +2248,7 @@ impl AgentRuntime {
             binding: ChatBinding::Fresh(chat, closed),
             spec,
             prompt,
-            policy: settings.permission,
+            policy,
             caps,
             commands: commands_rx,
             frames,
@@ -2191,12 +2256,91 @@ impl AgentRuntime {
             reprobe,
             project_caps,
             quota_latch,
+            lease,
         };
         Ok(Served::Start {
             step_id,
             task: Box::pin(answering("chat", run_chat(args), Some(answer))),
         })
     }
+}
+
+/// MOD-11 R1 M2: the agent row's policy with htui's own advertised tools pre-approved after its
+/// rules, as the engine's `drive_once` does (`htui_orch::tools::pre_approve`); unchanged without a
+/// lease.
+fn chat_policy(mut policy: PermissionPolicy, lease: Option<&ToolLease>) -> PermissionPolicy {
+    if let Some(lease) = lease {
+        htui_orch::tools::pre_approve(&mut policy, lease);
+    }
+    policy
+}
+
+/// MOD-11 D11: `scope`'s lease on `tools`. A host that cannot serve refuses the chat, as the
+/// engine fails a step (never a session silently without its server).
+fn open_chat_lease(tools: &dyn ToolHost, scope: ToolScope) -> Result<ToolLease, StoreError> {
+    tools
+        .open(scope)
+        .map_err(|err| StoreError::Backend(err.to_string()))
+}
+
+/// PRD OQ-3: the project's `box_hostname` switch, as the tool scope carries it.
+fn hostname_line(project_settings: Option<&Value>) -> htui_core::prompt::render::HostnameLine {
+    if htui_core::prompt::settings::resolve_box_hostname(project_settings) {
+        htui_core::prompt::render::HostnameLine::Shown
+    } else {
+        htui_core::prompt::render::HostnameLine::Omitted
+    }
+}
+
+/// MOD-11 D11, OQ-8: a promoted step's item and the output kind its run's snapshot names at the
+/// step's position, as `Engine::promote` resolves the phase. Any read that fails, or a snapshot
+/// that does not decode, withholds the kind (and so `document_write`) with a `debug!` — it never
+/// fails the chat.
+async fn promoted_output(
+    writer: &Writer,
+    run: htui_core::model::RunId,
+    step: StepId,
+) -> (Option<ItemId>, Option<String>) {
+    let row = match writer.run(run).await {
+        Ok(Some(row)) => row,
+        Ok(None) => {
+            tracing::debug!(%run, "a promoted chat's run is gone; no item tools");
+            return (None, None);
+        }
+        Err(err) => {
+            tracing::debug!(%run, %err, "a promoted chat's run did not read; no item tools");
+            return (None, None);
+        }
+    };
+    let snapshot = match htui_orch::snapshot_of(&row) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            tracing::debug!(%run, %err, "a promoted chat withholds `document_write`");
+            return (row.item_id, None);
+        }
+    };
+    let position = match writer.run_steps(run).await {
+        Ok(steps) => steps
+            .iter()
+            .find(|row| row.id == step)
+            .map(|row| row.position),
+        Err(err) => {
+            tracing::debug!(%run, %err, "a promoted chat's steps did not read");
+            None
+        }
+    };
+    let kind = position
+        .and_then(
+            |position| match htui_orch::phase_at(run, &snapshot, position) {
+                Ok(phase) => Some(phase.output_kind),
+                Err(err) => {
+                    tracing::debug!(%run, %err, "a promoted chat withholds `document_write`");
+                    None
+                }
+            },
+        )
+        .filter(|kind| !kind.is_empty());
+    (row.item_id, kind)
 }
 
 /// Blueprint D205: what a chat session records against.
@@ -2308,6 +2452,9 @@ pub struct ChatArgs {
     /// gets this far has a store with an `agent_box` table. `Recorder`'s own latch stays an
     /// `Option` for the recorders that have none.
     quota_latch: QuotaLatch,
+    /// MOD-11 D11: the chat's tool lease, held by the chat task until it returns; dropping it
+    /// ends the session's token (I-6). `None` without a tool host.
+    lease: Option<ToolLease>,
 }
 
 impl core::fmt::Debug for ChatArgs {
@@ -2317,6 +2464,7 @@ impl core::fmt::Debug for ChatArgs {
             .field("step", &self.binding.step_id())
             .field("spec", &self.spec)
             .field("project_caps", &self.project_caps)
+            .field("lease", &self.lease)
             .finish()
     }
 }
@@ -3984,10 +4132,14 @@ pub async fn run_chat(args: ChatArgs) {
         reprobe,
         project_caps,
         quota_latch,
+        // Bound, not `_`: the lease lives until this task returns (MOD-11 D11, I-6).
+        lease: _lease,
     } = args;
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
     let step_id = binding.step_id();
+    // Read before the spec moves into the driver: the tab's banner needs it (MOD-11 D18).
+    let prompts = spec.prompt.is_some();
 
     // MOD-37 M5 (blueprint D5, H-6): one recorder, built before the first start, so a
     // `resume_failed` row and the handoff's `follow_up` after it come from the same continuing
@@ -4102,6 +4254,7 @@ pub async fn run_chat(args: ChatArgs) {
         step_id,
         session_ref: session.session_ref().cloned(),
         caps,
+        prompts,
     });
     // MOD-37 M5 (H-8): a promoted chat's opening, written only once its start succeeded.
     // `resume_failed` was written before the fallback start; a fresh chat records none.
@@ -5026,6 +5179,15 @@ pub(crate) mod tests {
                 }
             }
         }
+        fixture_over(script, data).await
+    }
+
+    /// [`fixture_with_spec_spy`] over an edited demo fixture (MOD-11 T6: a run whose snapshot a
+    /// case broke).
+    async fn fixture_over(
+        script: Script,
+        data: htui_core::fixtures::DemoData,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId, SpecSlot) {
         let store = MemStore::from_demo(data);
         let agent_id = AgentId::new();
         store
@@ -5822,6 +5984,7 @@ pub(crate) mod tests {
             retain_raw: false,
             resume: Some(session_ref.clone()),
             budget_micros: None,
+            prompt: None,
         };
         let (tx, mut rx) = mpsc::unbounded_channel();
         let (_commands_tx, commands) = mpsc::unbounded_channel();
@@ -5854,6 +6017,7 @@ pub(crate) mod tests {
             )
             .expect("the demo project's caps"),
             quota_latch: quota_latch_for(&agent, box_id, settings.quota.source),
+            lease: None,
         })
         .await;
         let mut replies = Vec::new();
@@ -6277,6 +6441,416 @@ pub(crate) mod tests {
     // -----------------------------------------------------------------------------------------
     // The per-run token cap (`docs/ANA-4.md` §7 `:1143-1150`, §11 criterion 8, plan D69-D71)
     // -----------------------------------------------------------------------------------------
+
+    /// MOD-11 T6 (D11, OQ-8): a chat opens a lease on the runtime's tool host — a fresh chat is
+    /// scoped to its own run with no item, a promoted one to its step with the item and the kind
+    /// its run's snapshot names — and the lease lives exactly as long as the chat task.
+    mod tool_leases {
+        use std::sync::{Arc, PoisonError};
+        use std::time::Duration;
+
+        use htui_agent::conformance::Script;
+        use htui_agent::event::StopReason;
+        use htui_core::fixtures::ids;
+        use htui_mcp::{McpClient, McpHost};
+        use htui_orch::OpeningPath;
+        use htui_store::Backend;
+        use serde_json::{Value, json};
+        use tokio::sync::mpsc;
+
+        use super::{
+            SpecSlot, ends, envelope, fixture_over, fixture_with_spec_spy, promote_addr, promoted,
+            start,
+        };
+        use crate::agent_worker::{AgentRuntime, Served};
+        use crate::store_worker::{ReplyEnvelope, StoreReply, StoreRequest};
+
+        /// A live chat: its step, its task, a client on its token and the spec it started with.
+        struct Live {
+            step_id: htui_core::model::StepId,
+            task: tokio::task::JoinHandle<()>,
+            client: McpClient,
+            tools: Vec<String>,
+            spec: htui_agent::driver::SessionSpec,
+            replies: mpsc::UnboundedSender<ReplyEnvelope>,
+        }
+
+        fn hosted(runtime: AgentRuntime, backend: &Backend) -> (AgentRuntime, McpHost<Backend>) {
+            let host = McpHost::new(backend.clone()).expect("an absolute binary path");
+            let runtime = runtime.with_tool_host(Arc::new(host.clone()));
+            (runtime, host)
+        }
+
+        /// Runs `served`'s task on its own, waits for the driver's start, and lists the tools
+        /// the session's token is advertised.
+        async fn live(
+            served: Served,
+            replies: mpsc::UnboundedSender<ReplyEnvelope>,
+            host: &McpHost<Backend>,
+            slot: &SpecSlot,
+        ) -> Live {
+            let Served::Start { step_id, task } = served else {
+                panic!("the chat opens a session: {served:?}")
+            };
+            let task = tokio::spawn(task);
+            let spec = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let seen = slot.lock().unwrap_or_else(PoisonError::into_inner).clone();
+                    if let Some(spec) = seen {
+                        return spec;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the driver starts");
+            assert_eq!(spec.mcp.len(), 1, "one server: {:?}", spec.mcp);
+            assert_eq!(spec.mcp[0].name, "htui");
+            let token = spec.mcp[0]
+                .env
+                .get(htui_mcp::ENV_TOKEN)
+                .expect("the lease's token")
+                .clone();
+            let mut client = host.client(&token).expect("the session is live");
+            client.initialize().await.expect("initialize");
+            let tools = client.tool_names().await.expect("tools/list");
+            Live {
+                step_id,
+                task,
+                client,
+                tools,
+                spec,
+                replies,
+            }
+        }
+
+        /// The user's `Esc Esc`, then the task's end.
+        async fn end(runtime: &mut AgentRuntime, backend: &Backend, live: &mut Live) {
+            let cancel = runtime
+                .serve(
+                    backend,
+                    &live.replies,
+                    &envelope(
+                        8,
+                        StoreRequest::ChatCancel {
+                            step_id: live.step_id,
+                        },
+                    ),
+                )
+                .await;
+            assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+            (&mut live.task).await.expect("the chat task ends");
+        }
+
+        fn one_turn() -> Script {
+            Script::one_turn(vec![ends(StopReason::EndTurn)])
+        }
+
+        fn handoff() -> OpeningPath {
+            OpeningPath::Handoff {
+                text: "pick up where the step stopped".to_owned(),
+                digest: "d-handoff".to_owned(),
+            }
+        }
+
+        /// OQ-8, as far as T6 can pin it: a fresh chat has no item, so it sees `box_profile`
+        /// alone (T7 adds `search_concepts`) — plus, because the fake row is `cli`, MOD-11 D18's
+        /// `permission_prompt`, which the CLI hides from the model and `run_turn` answers.
+        #[tokio::test]
+        async fn a_fresh_chat_sees_box_profile_only() {
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+                .await;
+            let mut live = live(served, tx, &host, &slot).await;
+
+            assert_eq!(live.tools, ["box_profile", "permission_prompt"]);
+            assert!(
+                live.spec.prompt.is_some(),
+                "the CLI chat's lease lends a port"
+            );
+            // T9-ADV-3: the tab hears it, so its banner does not deny what the session does.
+            let accepted = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let reply = rx.recv().await.expect("the chat answers").reply;
+                    if let StoreReply::ChatAccepted { prompts, .. } = reply {
+                        return prompts;
+                    }
+                }
+            })
+            .await
+            .expect("the chat is accepted");
+            assert!(accepted, "ChatAccepted reports the prompt port");
+            let profile = live
+                .client
+                .call("box_profile", json!({}))
+                .await
+                .expect("the call is answered");
+            assert!(!profile.is_error, "{}", profile.text);
+            assert_eq!(live.spec.step_id, live.step_id);
+            end(&mut runtime, &backend, &mut live).await;
+        }
+
+        /// MOD-11 R1 M2: an agent row whose default is `deny` gets no pre-approval in a chat —
+        /// htui's tools stay rejected by its default, never widened — while one whose default
+        /// asks does.
+        #[test]
+        fn a_chat_under_a_deny_default_pre_approves_nothing() {
+            use htui_agent::driver::{McpServerSpec, PermissionDefault, PermissionPolicy};
+            use htui_orch::tools::ToolLease;
+
+            let lease = || {
+                ToolLease::new(
+                    McpServerSpec {
+                        name: "htui".to_owned(),
+                        command: "/proc/1/exe".to_owned(),
+                        args: Vec::new(),
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    None,
+                    || {},
+                )
+                .with_tools(vec!["box_profile".to_owned(), "note_add".to_owned()])
+            };
+            let deny = PermissionPolicy {
+                default: PermissionDefault::Deny,
+                ..PermissionPolicy::default()
+            };
+            assert_eq!(
+                super::super::chat_policy(deny.clone(), Some(&lease())),
+                deny,
+                "a deny default is left alone"
+            );
+            assert_eq!(
+                super::super::chat_policy(PermissionPolicy::default(), Some(&lease()))
+                    .rules
+                    .len(),
+                2,
+                "an asking default is pre-approved"
+            );
+        }
+
+        /// MOD-11 R1 M2: a chat's policy pre-approves every htui tool its scope advertises —
+        /// after the agent's own rules — except `permission_prompt` (and `command_run`, which no
+        /// chat is offered); a fresh chat's is `box_profile` alone.
+        #[tokio::test]
+        async fn a_chat_pre_approves_the_htui_tools_it_is_offered() {
+            let allowed = |spec: &htui_agent::driver::SessionSpec| -> Vec<String> {
+                spec.permission
+                    .rules
+                    .iter()
+                    .filter(|rule| {
+                        rule.answer == htui_agent::event::PermissionOptionKind::AllowOnce
+                    })
+                    .filter_map(|rule| rule.matcher.tool_name.clone())
+                    .collect()
+            };
+
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+                .await;
+            let mut fresh = live(served, tx, &host, &slot).await;
+            assert_eq!(allowed(&fresh.spec), ["mcp__htui__box_profile"]);
+            end(&mut runtime, &backend, &mut fresh).await;
+
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .attach_promoted(&backend, &tx, promote_addr(), promoted(agent_id, handoff()))
+                .await;
+            let mut attached = live(served, tx, &host, &slot).await;
+            assert_eq!(
+                allowed(&attached.spec),
+                [
+                    "mcp__htui__box_profile",
+                    "mcp__htui__document_write",
+                    "mcp__htui__note_add",
+                    "mcp__htui__item_status",
+                    "mcp__htui__item_link",
+                ]
+            );
+            end(&mut runtime, &backend, &mut attached).await;
+        }
+
+        /// MOD-11 R1 M2 on the chat path (`claude-cli`, whose prompt tool titles a call by its
+        /// raw name): htui's own `box_profile` is answered by policy under a default that asks.
+        #[tokio::test]
+        async fn a_chat_s_htui_tool_call_is_answered_by_policy() {
+            use htui_agent::conformance::ScriptEvent;
+            use htui_agent::driver::PermissionRequestId;
+            use htui_agent::event::{
+                DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind,
+                PermissionRequestEvent, ToolCallEvent,
+            };
+            use htui_core::model::EventKind;
+            use htui_core::store::ReadStore as _;
+
+            let script = Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: "mcp__htui__box_profile".to_owned(),
+                    tool_kind: htui_agent::cli::claude::tool_kind("mcp__htui__box_profile"),
+                    input: json!({}),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(PermissionRequestEvent {
+                    request_id: PermissionRequestId::new("req-1"),
+                    tool_call_id: Some("call-1".to_owned()),
+                    options: vec![
+                        PermissionOption {
+                            id: "allow".to_owned(),
+                            label: "Allow".to_owned(),
+                            kind: PermissionOptionKind::AllowOnce,
+                        },
+                        PermissionOption {
+                            id: "reject".to_owned(),
+                            label: "Reject".to_owned(),
+                            kind: PermissionOptionKind::RejectOnce,
+                        },
+                    ],
+                }),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ]);
+            let (store, backend, runtime, agent_id, _slot) =
+                fixture_with_spec_spy(script, None).await;
+            let (mut runtime, _host) = hosted(runtime, &backend);
+
+            let (step_id, _replies) =
+                super::run(&mut runtime, &backend, start(agent_id, "profile")).await;
+
+            let log = store
+                .step_events(step_id)
+                .await
+                .expect("the log reads")
+                .expect("a log");
+            let answer = log
+                .iter()
+                .find(|row| row.kind == EventKind::PermissionAnswer)
+                .expect("the request was answered");
+            assert_eq!(
+                answer.payload.get("by").and_then(Value::as_str),
+                Some("policy"),
+                "{answer:?}"
+            );
+            assert_eq!(
+                answer.payload.get("option_id").and_then(Value::as_str),
+                Some("allow")
+            );
+        }
+
+        /// OQ-8: a promoted chat sees the item tools, and `document_write` writes the kind its
+        /// run's snapshot names for the step's position.
+        #[tokio::test]
+        async fn a_promoted_chat_sees_the_item_tools_with_the_snapshot_kind() {
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .attach_promoted(&backend, &tx, promote_addr(), promoted(agent_id, handoff()))
+                .await;
+            let mut live = live(served, tx, &host, &slot).await;
+
+            for tool in [
+                "box_profile",
+                "document_write",
+                "note_add",
+                "item_status",
+                "item_link",
+            ] {
+                assert!(
+                    live.tools.iter().any(|name| name == tool),
+                    "{tool}: {:?}",
+                    live.tools
+                );
+            }
+            let written = live
+                .client
+                .call("document_write", json!({ "body": "the plan, continued" }))
+                .await
+                .expect("the call is answered");
+            assert!(!written.is_error, "{}", written.text);
+            let answer: Value = serde_json::from_str(&written.text).expect("JSON");
+            assert_eq!(
+                answer["kind"], "plan",
+                "the snapshot's kind at the step's position"
+            );
+            let heads = htui_core::store::ReadStore::documents(&store, ids::HTUI_FEAT_1)
+                .await
+                .expect("MemStore reads");
+            assert!(
+                heads.iter().any(|head| head.kind == "plan"
+                    && head.produced_by_step_id == Some(ids::STEP_PLAN)
+                    && head.version > 2),
+                "a new `plan` version of the promoted step: {heads:?}"
+            );
+            end(&mut runtime, &backend, &mut live).await;
+        }
+
+        /// D11: a snapshot that does not decode withholds `document_write` and never fails the
+        /// chat; the item tools stay.
+        #[tokio::test]
+        async fn a_promoted_chat_with_an_undecodable_snapshot_withholds_document_write() {
+            let mut data = htui_core::fixtures::demo_data();
+            for run in &mut data.runs {
+                if run.id == ids::RUN_1 {
+                    run.graph_snapshot = Some(json!({ "not": "a snapshot" }));
+                }
+            }
+            let (_store, backend, runtime, agent_id, slot) = fixture_over(one_turn(), data).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .attach_promoted(&backend, &tx, promote_addr(), promoted(agent_id, handoff()))
+                .await;
+            let mut live = live(served, tx, &host, &slot).await;
+
+            assert!(
+                !live.tools.iter().any(|name| name == "document_write"),
+                "{:?}",
+                live.tools
+            );
+            assert!(
+                live.tools.iter().any(|name| name == "note_add"),
+                "{:?}",
+                live.tools
+            );
+            end(&mut runtime, &backend, &mut live).await;
+        }
+
+        /// I-6: the lease dies with the chat task; a call after it answers `session ended`.
+        #[tokio::test]
+        async fn the_chat_lease_ends_with_the_chat() {
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+                .await;
+            let mut live = live(served, tx, &host, &slot).await;
+            end(&mut runtime, &backend, &mut live).await;
+
+            let after = live
+                .client
+                .call("box_profile", json!({}))
+                .await
+                .expect("the call is answered");
+            assert!(after.is_error);
+            assert_eq!(after.text, "session ended");
+        }
+    }
 
     /// One `usage` report costing `cost` USD micros, with a context reading beside it.
     fn usage(cost: i64) -> ScriptEvent {

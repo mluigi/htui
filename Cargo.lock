@@ -3033,6 +3033,7 @@ dependencies = [
  "futures",
  "htui-agent",
  "htui-core",
+ "htui-mcp",
  "htui-orch",
  "htui-store",
  "htui-worker",
@@ -3111,6 +3112,26 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "htui-mcp"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "htui-agent",
+ "htui-core",
+ "htui-orch",
+ "htui-store",
+ "insta",
+ "schemars 1.2.2",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
  "uuid",
 ]
 

@@ -387,7 +387,9 @@ persona)`, and every clause of it only removes:
 - **`deny`**: the base's, then the persona's, then the names added above, each kept once.
 - **`deny_kinds`**: the base's, then the persona's. A kind string htui cannot read is denied as
   `other`, never dropped (the save rules make that impossible to store).
-- **`command_run`**: the base's AND the persona's, so a persona can only turn it off.
+- **`command_run`**: the base's AND the persona's, so a persona can only turn it off. It is also
+  off when the merged `deny_kinds` include `execute`: a step that may not run a command does not
+  queue one either.
 - **Rules**: the persona's own rules first (each rejects; an empty reason is recorded as
   `persona <name>`), then one rule per denied kind, `{match: {tool_kind: <kind>}, answer:
   reject_once, reason: "persona <name> denies <kind>"}`, then the agent's own rules.
@@ -433,9 +435,10 @@ and a body that cannot be masked refuses the prompt. A template cannot place it:
 not one of the twenty placeholders, and a template that writes it is refused as an unknown
 placeholder.
 
-A persona with `command-run: false` also removes the prompt's `command_queue` section. That is the
-only effect `command_run` has today: no transport reads `ToolExposure.command_run` until
-MOD-11 exposes the `command_run` tool.
+A persona with `command-run: false`, or one whose `deny-kinds` include `execute`, also removes the
+prompt's `command_queue` section, and with it htui's `command_run` tool and the refusals of heavy
+shell commands that come with it (MOD-11; see
+[`docs/htui-mcp.md`](htui-mcp.md#command_run-and-the-command-queue)).
 
 A prompt for a phase without a persona is byte-for-byte what it was before MOD-26.
 
@@ -478,7 +481,7 @@ transport.
 
 | Transport | Tool names | Denied kinds | Persona `rules` and `default` |
 |---|---|---|---|
-| CLI (`claude-cli`) | `allow` becomes `--tools=<a,b>`, which restricts the built-in tool set; it is omitted when `allow` is empty (`--tools=""` would disable every tool). `deny` becomes `--disallowedTools=<x,y>`. | Inverted to Claude tool names and appended to `--disallowedTools`: `read` → `Read`, `NotebookRead`; `edit` → `Edit`, `Write`, `MultiEdit`, `NotebookEdit`; `execute` → `Bash`, `BashOutput`, `KillShell`; `search` → `Glob`, `Grep`; `fetch` → `WebFetch`, `WebSearch`. Denying a name a given CLI release lacks is harmless. | No effect: the CLI transport has no permission channel. |
+| CLI (`claude-cli`) | `allow` becomes `--tools=<a,b>`, which restricts the built-in tool set; it is omitted when `allow` is empty (`--tools=""` would disable every tool). `deny` becomes `--disallowedTools=<x,y>`. | Inverted to Claude tool names and appended to `--disallowedTools`: `read` → `Read`, `NotebookRead`; `edit` → `Edit`, `Write`, `MultiEdit`, `NotebookEdit`; `execute` → `Bash`, `BashOutput`, `KillShell`; `search` → `Glob`, `Grep`; `fetch` → `WebFetch`, `WebSearch`. Denying a name a given CLI release lacks is harmless. | Applied by the relay to the calls the CLI asks about through htui's `permission_prompt` tool (MOD-11), before the agent's own rules; a call the CLI's permission mode settles by itself never asks. Without htui's tool host there is no permission channel and they have no effect. |
 | ACP (`claude`, `agy`) | Kept on the row, not enforced. | The permission relay rejects a request whose tool call is of a denied kind (`reject_once`, reason `persona <name> denies <kind>`). htui's own file handlers refuse `fs/read_text_file` when `read` is denied and `fs/write_text_file` when `edit` is denied. | Applied by the relay, before the agent's own rules and remembered choices. |
 
 Both CLI flags are single `=`-joined arguments, placed after htui's own flag pairs and before the
@@ -489,6 +492,17 @@ On ACP, a denied file request is refused before htui checks the path, reads the 
 records an edit proposal: the file is not touched. The agent gets a JSON-RPC `invalid_params`
 error, and the step records a `DriverEvent::Error` with code `tool_kind_denied` and the message
 "the step's persona denies \`<kind>\`: <method> of \`<path>\` refused".
+
+### htui's own MCP tools
+
+Every session gets htui's own MCP server, `htui` (see [`docs/htui-mcp.md`](htui-mcp.md)), and a
+persona can hide its tools like any other MCP tool. A `disallowed-tools` entry that covers them,
+such as `mcp__*` or `mcp__htui__*`, reaches `claude-cli`'s `--disallowedTools`, and the agent no
+longer sees `document_write`, `note_add` and the rest. htui honours that as a deliberate choice of
+the persona: saving and importing do not refuse it, and nothing warns. A step bound to such a
+persona whose phase must write a document then cannot, and fails `missing_output`. To remove one of
+your own MCP servers' tools, name that server (`mcp__gortex__*`) rather than every MCP tool. On ACP,
+tool names are not enforced, so such an entry has no effect there.
 
 ### What is not enforced (residuals)
 
@@ -506,7 +520,9 @@ These gaps are real; a persona narrows what htui can see, not everything an agen
   option, the relay does not guess: the request parks and asks the user.
 - **`delete` and `move` on the CLI.** Claude has no tool of either kind, so denying them adds no
   name to `--disallowedTools`.
-- **Persona `rules` and `default` on the CLI.** They have no effect there (no permission channel).
+- **Persona `rules` and `default` on the CLI.** They apply only to the calls the CLI asks htui
+  about through the `permission_prompt` tool. A call its permission mode allows by itself (an edit
+  under `acceptEdits`, the seeded `claude-cli`'s mode) never reaches them.
 - **MCP tools on the CLI.** `--tools` filters built-in tools only, and `deny_kinds` inverts to
   built-in names only. An MCP tool is removed only by naming it in `disallowed-tools`.
 - **Tool names on ACP.** `allow` and `deny` are stored but no ACP transport enforces them.

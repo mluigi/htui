@@ -146,6 +146,12 @@ pub struct PermissionMatch {
     /// Matches the first command argument by prefix (`R-MCP-4`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub command_prefix: Option<String>,
+    /// MOD-11 R1 L4: `command_prefix` must end at a word — the command is the prefix itself, or
+    /// whitespace follows it (a prefix that already ends in whitespace is unchanged). Off, the
+    /// prefix is a raw `starts_with`, which is what every persisted rule was written against;
+    /// the engine's synthetic R-MCP-4 rules set it, so `make` never refuses `makepkg`.
+    #[serde(skip_serializing_if = "core::ops::Not::not")]
+    pub command_word: bool,
 }
 
 /// One entry of `agent.settings.permission.rules[]` (§5.2), evaluated in order.
@@ -280,6 +286,9 @@ pub struct SessionSpec {
     /// server-side knob passes it too, so the two caps read **one** number — `claude
     /// --max-budget-usd` (D83). ACP has no such knob and ignores it.
     pub budget_micros: Option<i64>,
+    /// MOD-11 D18: the CLI permission bridge, when `htui`'s MCP server hosts `permission_prompt`
+    /// for this session. `None` everywhere else, and on every ACP session.
+    pub prompt: Option<crate::prompt_bridge::PromptPort>,
 }
 
 impl core::fmt::Debug for SessionSpec {
@@ -297,6 +306,13 @@ impl core::fmt::Debug for SessionSpec {
             .field("retain_raw", &self.retain_raw)
             .field("resume", &self.resume)
             .field("budget_micros", &self.budget_micros)
+            .field(
+                "prompt",
+                &self
+                    .prompt
+                    .as_ref()
+                    .map(crate::prompt_bridge::PromptPort::id),
+            )
             .finish()
     }
 }

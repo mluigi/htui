@@ -21,6 +21,7 @@
 //! no test covers.
 
 use chrono::{DateTime, TimeDelta, Utc};
+use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
@@ -1153,6 +1154,99 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.add_note(note).await,
             Self::Online(pg) => pg.add_note(note).await,
+        }
+    }
+
+    // ---- MOD-11 (plan D13, B-4): the agent writes ----
+
+    async fn write_step_document(&self, fence: StepFence, new: NewDocument) -> Result<Document> {
+        match self {
+            Self::Memory(store) => store.write_step_document(fence, new).await,
+            Self::Online(pg) => pg.write_step_document(fence, new).await,
+        }
+    }
+
+    async fn add_step_note(&self, fence: StepFence, note: NewNote) -> Result<Note> {
+        match self {
+            Self::Memory(store) => store.add_step_note(fence, note).await,
+            Self::Online(pg) => pg.add_step_note(fence, note).await,
+        }
+    }
+
+    async fn propose_link(&self, fence: StepFence, link: ProposeLink) -> Result<ItemLink> {
+        match self {
+            Self::Memory(store) => store.propose_link(fence, link).await,
+            Self::Online(pg) => pg.propose_link(fence, link).await,
+        }
+    }
+
+    async fn withdraw_link(&self, fence: StepFence, link: WithdrawLink) -> Result<ItemLink> {
+        match self {
+            Self::Memory(store) => store.withdraw_link(fence, link).await,
+            Self::Online(pg) => pg.withdraw_link(fence, link).await,
+        }
+    }
+
+    async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
+        match self {
+            Self::Memory(store) => store.item_by_key(project, key).await,
+            Self::Online(pg) => pg.item_by_key(project, key).await,
+        }
+    }
+
+    // ---- MOD-11 M4 (plan D14): the command queue ----
+
+    async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
+        match self {
+            Self::Memory(store) => store.enqueue_command(new).await,
+            Self::Online(pg) => pg.enqueue_command(new).await,
+        }
+    }
+    async fn claim_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        limit: u32,
+    ) -> Result<Option<CommandRun>> {
+        match self {
+            Self::Memory(store) => store.claim_command(id, claimant, limit).await,
+            Self::Online(pg) => pg.claim_command(id, claimant, limit).await,
+        }
+    }
+    async fn beat_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.beat_command(id, claimant).await,
+            Self::Online(pg) => pg.beat_command(id, claimant).await,
+        }
+    }
+    async fn finish_command(
+        &self,
+        id: htui_core::model::CommandRunId,
+        claimant: Uuid,
+        status: htui_core::model::CommandRunStatus,
+        exit_code: Option<i32>,
+        output: Option<String>,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => {
+                store
+                    .finish_command(id, claimant, status, exit_code, output)
+                    .await
+            }
+            Self::Online(pg) => {
+                pg.finish_command(id, claimant, status, exit_code, output)
+                    .await
+            }
+        }
+    }
+    async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.cancel_command(id).await,
+            Self::Online(pg) => pg.cancel_command(id).await,
         }
     }
 

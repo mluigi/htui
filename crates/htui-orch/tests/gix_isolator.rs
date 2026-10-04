@@ -108,6 +108,7 @@ macro_rules! engine_as {
             dead_walks: &dead_walks,
             user: fix.orch.user(),
             tails: htui_orch::Tails::Walk,
+            tools: None,
         });
         $body
     }};
