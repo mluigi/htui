@@ -7,6 +7,7 @@
 #![warn(missing_docs)]
 
 mod infisical;
+mod wire;
 
 pub use infisical::{
     DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT, InfisicalConfig, InfisicalProvider,

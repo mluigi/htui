@@ -5,11 +5,19 @@
 //! state and the wire shapes have no `Debug` at all (H-2); every error is built from a status, a
 //! known message, a cleaned non-login server message, a scope field, a key name or a cause chain.
 
+use std::collections::BTreeMap;
 use std::sync::Once;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use htui_core::secret::{MachineIdentity, SecretError};
+use htui_core::secret::{
+    MachineIdentity, ProviderHealth, ResolvedSecrets, SecretError, SecretFuture, SecretProvider,
+    SecretScope,
+};
+use tokio::sync::Mutex;
 use url::{Host, Position, Url};
+use zeroize::Zeroizing;
+
+use crate::wire::{ErrorBody, ListResponse, LoginRequest, LoginResponse};
 
 /// D9: the connect timeout.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -18,6 +26,12 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// `htui/<version>`, so a server log line names the client.
 const USER_AGENT: &str = concat!("htui/", env!("CARGO_PKG_VERSION"));
+/// Universal Auth login.
+const LOGIN_PATH: &str = "/api/v1/auth/universal-auth/login";
+/// The secrets list (v0.150+).
+const SECRETS_PATH: &str = "/api/v4/secrets";
+/// The unauthenticated status endpoint (health only).
+const STATUS_PATH: &str = "/api/status";
 
 /// Guards [`install_crypto_provider`]: the process installs one default provider, once.
 static PROVIDER: Once = Once::new();
@@ -50,8 +64,32 @@ pub struct InfisicalProvider {
     /// Normalised: origin plus optional prefix, no trailing `/`.
     base: String,
     identity: MachineIdentity,
-    #[allow(dead_code)] // MOD-10 T3: read by the login and list requests (next commit).
     client: reqwest::Client,
+    /// D5: held across the login request (single flight), never across a data request.
+    state: Mutex<TokenState>,
+}
+
+/// D5 token state. **No `Debug`** (it holds the token, H-2).
+enum TokenState {
+    /// No token yet, or the last login failed without a refusal.
+    Empty,
+    /// A token, reused while `Instant::now() < reuse_until`.
+    Valid {
+        /// The access token, wiped on drop.
+        token: Zeroizing<String>,
+        /// When to stop reusing it.
+        reuse_until: Instant,
+    },
+    /// A login was refused: every later call is `LoginRefusedEarlier`, with no request.
+    Refused,
+}
+
+/// Why [`InfisicalProvider::login`] failed: `Refused` latches (D5), `Other` does not.
+enum LoginFailure {
+    /// `BadCredentials` or `IdentityLocked`.
+    Refused(SecretError),
+    /// Anything else: unreachable, rate-limited, an unexpected answer.
+    Other(SecretError),
 }
 
 impl InfisicalProvider {
@@ -93,6 +131,7 @@ impl InfisicalProvider {
             base,
             identity,
             client,
+            state: Mutex::new(TokenState::Empty),
         })
     }
 
@@ -100,6 +139,215 @@ impl InfisicalProvider {
     #[must_use]
     pub fn base_url(&self) -> &str {
         &self.base
+    }
+
+    /// A token for a data request: the cached one while it is reusable, else a login with the
+    /// lock held (single flight). A refused login latches (§B.4.3).
+    async fn token(&self) -> Result<Zeroizing<String>, SecretError> {
+        let mut state = self.state.lock().await;
+        match &*state {
+            TokenState::Refused => return Err(SecretError::LoginRefusedEarlier),
+            TokenState::Valid { token, reuse_until } if Instant::now() < *reuse_until => {
+                return Ok(token.clone());
+            }
+            TokenState::Valid { .. } | TokenState::Empty => {}
+        }
+        self.login_into(&mut state).await
+    }
+
+    /// After a data 401 / 403 `TokenError` with `used`: one more login, unless another caller
+    /// already replaced the token (H-18: not a security comparison, never logged).
+    async fn refresh(&self, used: &str) -> Result<Zeroizing<String>, SecretError> {
+        let mut state = self.state.lock().await;
+        match &*state {
+            TokenState::Refused => return Err(SecretError::LoginRefusedEarlier),
+            TokenState::Valid { token, reuse_until }
+                if token.as_str() != used && Instant::now() < *reuse_until =>
+            {
+                return Ok(token.clone());
+            }
+            TokenState::Valid { .. } | TokenState::Empty => {}
+        }
+        self.login_into(&mut state).await
+    }
+
+    /// Health always logs in afresh (D2); the new token replaces any cached one.
+    async fn fresh_login(&self) -> Result<Zeroizing<String>, SecretError> {
+        let mut state = self.state.lock().await;
+        if matches!(*state, TokenState::Refused) {
+            return Err(SecretError::LoginRefusedEarlier);
+        }
+        self.login_into(&mut state).await
+    }
+
+    /// Logs in and records the outcome in `state`, whose lock the caller holds.
+    async fn login_into(&self, state: &mut TokenState) -> Result<Zeroizing<String>, SecretError> {
+        match self.login().await {
+            Ok((token, reuse_until)) => {
+                *state = TokenState::Valid {
+                    token: token.clone(),
+                    reuse_until,
+                };
+                Ok(token)
+            }
+            Err(LoginFailure::Refused(e)) => {
+                *state = TokenState::Refused;
+                Err(e)
+            }
+            Err(LoginFailure::Other(e)) => {
+                *state = TokenState::Empty;
+                Err(e)
+            }
+        }
+    }
+
+    /// The login POST and its mapping (§B.4.2). The body of a failed login is never quoted.
+    async fn login(&self) -> Result<(Zeroizing<String>, Instant), LoginFailure> {
+        let url = self.endpoint_url(LOGIN_PATH).map_err(LoginFailure::Other)?;
+        let request = LoginRequest {
+            client_id: self.identity.client_id(),
+            client_secret: self.identity.client_secret(),
+        };
+        let response = self
+            .client
+            .post(url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
+        if status.is_success() {
+            let answer: LoginResponse = decode(LOGIN_PATH, &body).map_err(LoginFailure::Other)?;
+            let token = Zeroizing::new(answer.access_token);
+            if token.is_empty() {
+                return Err(LoginFailure::Other(protocol(
+                    LOGIN_PATH,
+                    "the login answer carried no access token".to_owned(),
+                )));
+            }
+            return Ok((token, Instant::now() + reuse_window(answer.expires_in)));
+        }
+        let error = ErrorBody::from_bytes(&body);
+        Err(match status.as_u16() {
+            401 if is_lockout(&error) => LoginFailure::Refused(SecretError::IdentityLocked),
+            401 => LoginFailure::Refused(SecretError::BadCredentials),
+            code => LoginFailure::Other(protocol(LOGIN_PATH, format!("status {code}"))),
+        })
+    }
+
+    /// Latch peek, the status GET, then a fresh login (§B.4.3).
+    async fn health_inner(&self) -> Result<ProviderHealth, SecretError> {
+        if matches!(*self.state.lock().await, TokenState::Refused) {
+            return Err(SecretError::LoginRefusedEarlier);
+        }
+        let url = self.endpoint_url(STATUS_PATH)?;
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(|e| unreachable(STATUS_PATH, e))?;
+        let server_ok = response.status().is_success();
+        drop(response);
+        self.fresh_login().await?;
+        Ok(ProviderHealth {
+            base_url: self.base.clone(),
+            server_ok,
+        })
+    }
+
+    /// Token, list, one refresh on a refused token, then merge and validate (§B.4.3).
+    async fn resolve_inner(&self, scope: &SecretScope) -> Result<ResolvedSecrets, SecretError> {
+        let token = self.token().await?;
+        let list = match self.list(scope, &token).await? {
+            Some(list) => list,
+            None => {
+                let token = self.refresh(&token).await?;
+                self.list(scope, &token).await?.ok_or_else(|| {
+                    protocol(
+                        SECRETS_PATH,
+                        "the access token was refused right after a fresh login".to_owned(),
+                    )
+                })?
+            }
+        };
+        validate(merge(list))
+    }
+
+    /// One GET of the list endpoint with `token`; `Ok(None)` means "token refused" (401, or 403
+    /// `TokenError`). §B.4.2.
+    async fn list(
+        &self,
+        scope: &SecretScope,
+        token: &str,
+    ) -> Result<Option<ListResponse>, SecretError> {
+        let url = self.list_url(scope)?;
+        let response = self
+            .client
+            .get(url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| unreachable(SECRETS_PATH, e))?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|e| unreachable(SECRETS_PATH, e))?;
+        if status.is_success() {
+            return decode(SECRETS_PATH, &body).map(Some);
+        }
+        let error = ErrorBody::from_bytes(&body);
+        let message = clean_message(&error);
+        match status.as_u16() {
+            401 => Ok(None),
+            403 if error.error() == "TokenError" => Ok(None),
+            code => Err(protocol(SECRETS_PATH, status_detail(code, &message))),
+        }
+    }
+
+    /// `{base}/api/v4/secrets?…` with the D6 flags, in order (§B.4.4).
+    fn list_url(&self, scope: &SecretScope) -> Result<Url, SecretError> {
+        let mut url = self.endpoint_url(SECRETS_PATH)?;
+        url.query_pairs_mut()
+            .append_pair("projectId", scope.project_id())
+            .append_pair("environment", scope.environment())
+            .append_pair("secretPath", scope.path())
+            .append_pair("viewSecretValue", "true")
+            .append_pair("expandSecretReferences", "true")
+            .append_pair("includeImports", "true")
+            .append_pair("include_imports", "true")
+            .append_pair("recursive", "false")
+            .append_pair("includePersonalOverrides", "false");
+        Ok(url)
+    }
+
+    /// `base + path` as a URL.
+    fn endpoint_url(&self, path: &'static str) -> Result<Url, SecretError> {
+        Url::parse(&format!("{}{path}", self.base))
+            .map_err(|e| SecretError::Config(format!("cannot build the URL of {path}: {e}")))
+    }
+}
+
+impl SecretProvider for InfisicalProvider {
+    fn kind(&self) -> &'static str {
+        Self::KIND
+    }
+
+    fn health(&self) -> SecretFuture<'_, ProviderHealth> {
+        Box::pin(self.health_inner())
+    }
+
+    fn list_keys<'a>(&'a self, scope: &'a SecretScope) -> SecretFuture<'a, Vec<String>> {
+        Box::pin(async move { Ok(self.resolve_inner(scope).await?.keys()) })
+    }
+
+    fn resolve<'a>(&'a self, scope: &'a SecretScope) -> SecretFuture<'a, ResolvedSecrets> {
+        Box::pin(self.resolve_inner(scope))
     }
 }
 
@@ -189,6 +437,133 @@ fn is_loopback(host: &Host<&str>) -> bool {
         Host::Ipv4(ip) => ip.is_loopback(),
         Host::Ipv6(ip) => ip.is_loopback(),
     }
+}
+
+/// `expires_in - max(60, expires_in / 10)`, saturating at zero (§B.4.3).
+fn reuse_window(expires_in_secs: u64) -> Duration {
+    Duration::from_secs(expires_in_secs.saturating_sub((expires_in_secs / 10).max(60)))
+}
+
+/// `Unreachable` for a transport error, its URL stripped.
+fn unreachable(endpoint: &'static str, err: reqwest::Error) -> SecretError {
+    SecretError::Unreachable {
+        endpoint,
+        cause: cause_chain(err),
+    }
+}
+
+/// `Protocol` at `endpoint`.
+fn protocol(endpoint: &'static str, detail: String) -> SecretError {
+    SecretError::Protocol { endpoint, detail }
+}
+
+/// `"status {code}: {message}"`, or `"status {code}"` without a message.
+fn status_detail(code: u16, message: &str) -> String {
+    if message.is_empty() {
+        format!("status {code}")
+    } else {
+        format!("status {code}: {message}")
+    }
+}
+
+/// The body as `T`; on failure `Protocol` with the category and position only, never serde's
+/// message, which quotes mistyped values (A-5, H-4).
+fn decode<T: serde::de::DeserializeOwned>(
+    endpoint: &'static str,
+    body: &[u8],
+) -> Result<T, SecretError> {
+    serde_json::from_slice(body).map_err(|e| {
+        protocol(
+            endpoint,
+            format!(
+                "the body is not the expected JSON ({:?} error at line {}, column {})",
+                e.classify(),
+                e.line(),
+                e.column()
+            ),
+        )
+    })
+}
+
+/// The server `message`: non-string → `""`; control characters removed; the first 200 `char`s
+/// (H-17: never a byte slice).
+fn clean_message(body: &ErrorBody) -> String {
+    body.message()
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect()
+}
+
+/// A login 401 whose message says the identity is temporarily locked.
+fn is_lockout(body: &ErrorBody) -> bool {
+    body.message().to_lowercase().contains("temporarily locked")
+}
+
+/// `^[A-Za-z_][A-Za-z0-9_]*$`.
+fn is_env_name(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// One merged entry (D6). **No `Debug`** (it holds a value, H-2).
+pub(crate) struct Merged {
+    /// The value, wiped on drop.
+    pub(crate) value: Zeroizing<String>,
+    /// `secretValueHidden`.
+    pub(crate) hidden: bool,
+}
+
+/// D6 merge (§B.4.5): the folder first, then the imports last to first; a key already present is
+/// kept; `personal` entries are skipped. Values are moved into `Zeroizing` as they are read, so
+/// shadowed entries drop wiped.
+pub(crate) fn merge(list: ListResponse) -> BTreeMap<String, Merged> {
+    let mut out = BTreeMap::new();
+    let imports = list.imports.unwrap_or_default();
+    let entries = list
+        .secrets
+        .into_iter()
+        .chain(imports.into_iter().rev().flat_map(|import| import.secrets));
+    for entry in entries {
+        if entry.kind.as_deref().is_some_and(|kind| kind != "shared") {
+            continue;
+        }
+        let merged = Merged {
+            value: Zeroizing::new(entry.secret_value),
+            hidden: entry.secret_value_hidden,
+        };
+        out.entry(entry.secret_key).or_insert(merged);
+    }
+    out
+}
+
+/// D6 validation (§B.4.6): hidden, then names, then NUL, each the first in key order; then the
+/// values are moved out with `std::mem::take`, byte for byte.
+pub(crate) fn validate(merged: BTreeMap<String, Merged>) -> Result<ResolvedSecrets, SecretError> {
+    if let Some(key) = merged.iter().find(|(_, m)| m.hidden).map(|(k, _)| k) {
+        return Err(SecretError::PermissionDenied {
+            detail: format!("the value of {key:?} is hidden from this identity"),
+        });
+    }
+    if let Some(key) = merged.keys().find(|k| !is_env_name(k)) {
+        return Err(SecretError::InvalidKey { key: key.clone() });
+    }
+    if let Some(key) = merged
+        .iter()
+        .find(|(_, m)| m.value.contains('\0'))
+        .map(|(k, _)| k)
+    {
+        return Err(SecretError::InvalidValue { key: key.clone() });
+    }
+    Ok(ResolvedSecrets::new(
+        merged
+            .into_iter()
+            .map(|(key, mut m)| (key, std::mem::take(&mut *m.value)))
+            .collect(),
+    ))
 }
 
 /// The cause chain of `err.without_url()`: top-level `Display` then every `source()`, joined
@@ -303,6 +678,93 @@ mod tests {
             panic!("userinfo must be refused");
         };
         assert!(!why.contains("pw"), "the refusal echoes the password");
+    }
+
+    #[test]
+    fn the_reuse_margin_is_the_larger_of_a_minute_and_a_tenth() {
+        let rows = [
+            (2_592_000, 2_332_800),
+            (600, 540),
+            (300, 240),
+            (60, 0),
+            (30, 0),
+        ];
+        for (expires_in, window) in rows {
+            assert_eq!(
+                reuse_window(expires_in),
+                Duration::from_secs(window),
+                "expiresIn {expires_in}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_names_match_the_posix_shape() {
+        for yes in ["A", "_A1", "a_b"] {
+            assert!(is_env_name(yes), "{yes:?}");
+        }
+        for no in ["", "1A", "A-B", "A.B", "É", "A B", "A\n"] {
+            assert!(!is_env_name(no), "{no:?}");
+        }
+    }
+
+    #[test]
+    fn server_messages_lose_control_characters_and_stop_at_200_characters() {
+        let message = format!("\r\n\x1b{}", "é".repeat(300));
+        let body = ErrorBody::from_bytes(
+            serde_json::to_vec(&serde_json::json!({ "message": message }))
+                .expect("serialises")
+                .as_slice(),
+        );
+        let cleaned = clean_message(&body);
+        assert_eq!(cleaned.chars().count(), 200);
+        assert!(!cleaned.chars().any(char::is_control));
+        assert_eq!(clean_message(&ErrorBody::default()), "");
+    }
+
+    #[test]
+    fn the_lockout_message_is_recognised_case_insensitively() {
+        let body = |m: &str| ErrorBody::from_bytes(format!(r#"{{"message":"{m}"}}"#).as_bytes());
+        assert!(is_lockout(&body("Identity is temporarily locked")));
+        assert!(is_lockout(&body("IDENTITY TEMPORARILY LOCKED, try later")));
+        assert!(!is_lockout(&body("Invalid credentials")));
+        assert!(!is_lockout(&ErrorBody::default()));
+    }
+
+    fn merged(rows: &[(&str, &str, bool)]) -> BTreeMap<String, Merged> {
+        rows.iter()
+            .map(|(k, v, hidden)| {
+                (
+                    (*k).to_owned(),
+                    Merged {
+                        value: Zeroizing::new((*v).to_owned()),
+                        hidden: *hidden,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn validation_reports_hidden_then_name_then_nul() {
+        let all = merged(&[("1A", "x", false), ("B", "", true), ("C", "a\0b", false)]);
+        assert!(matches!(
+            validate(all),
+            Err(SecretError::PermissionDenied { detail }) if detail.contains("\"B\"")
+        ));
+        let name_and_nul = merged(&[("A", "a\0b", false), ("Z-Z", "x", false)]);
+        assert!(matches!(
+            validate(name_and_nul),
+            Err(SecretError::InvalidKey { key }) if key == "Z-Z"
+        ));
+        let nul = merged(&[("A", "ok", false), ("B", "a\0b", false)]);
+        assert!(matches!(
+            validate(nul),
+            Err(SecretError::InvalidValue { key }) if key == "B"
+        ));
+        let good = validate(merged(&[("B", " b\n", false), ("A", "a", false)])).expect("valid");
+        assert_eq!(good.keys(), ["A", "B"]);
+        assert_eq!(good.as_map()["B"], " b\n");
     }
 
     #[test]
