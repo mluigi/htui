@@ -56,8 +56,10 @@ Which processes host the tools:
 ## The tools
 
 Every answer is one text item. A successful call answers compact JSON; a refused one answers a
-one-line reason with `isError: true`. Every argument object refuses keys it does not list, so a
-`run_id`, `item_id` or `box_id` argument is refused as `invalid arguments: unknown field …`.
+one-line reason with `isError: true`. Every argument object except `permission_prompt`'s refuses
+keys it does not list, so a `run_id`, `item_id` or `box_id` argument is refused as
+`invalid arguments: unknown field …`. `permission_prompt`'s object stays open, because the Claude
+Code CLI may add keys to its call: an extra key there is ignored.
 
 | Tool | Arguments | Answer |
 |---|---|---|
