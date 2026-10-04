@@ -55,5 +55,6 @@ pub use runtime::{
 };
 pub use views::{
     Enabled, FrameKind, ItemActions, LiveChats, ORCH_NAMES, OrchReply, OrchRequest, ProgressSink,
-    RunActions, RunFrame, StepActions, StepAuthor, Via, actions,
+    RunActions, RunFrame, StepActions, StepAuthor, Via, WaitingReason, WaitingRow, WaitingView,
+    actions, waiting,
 };
