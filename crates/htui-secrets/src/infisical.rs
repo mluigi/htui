@@ -219,52 +219,19 @@ impl InfisicalProvider {
         let retry_after_secs = retry_after(response.headers());
         let body = response.bytes().await;
         // D5: a 401 refuses the identity whatever happens to its body, so a body cut short can
-        // never turn a rejected login into a retried one. Only a body read in full can prove the
-        // lockout text.
+        // never turn a rejected login into a retried one.
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            let locked = body
-                .as_ref()
-                .is_ok_and(|body| is_lockout(&ErrorBody::from_bytes(body)));
-            return Err(LoginFailure::Refused(if locked {
-                SecretError::IdentityLocked
-            } else {
-                SecretError::BadCredentials
-            }));
+            return Err(LoginFailure::Refused(login_refusal(body.as_deref().ok())));
         }
         let body = body.map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
         if status.is_success() {
-            let answer: LoginResponse = decode(LOGIN_PATH, &body).map_err(LoginFailure::Other)?;
-            let token = Zeroizing::new(answer.access_token);
-            if token.is_empty() {
-                return Err(LoginFailure::Other(protocol(
-                    LOGIN_PATH,
-                    "the login answer carried no access token".to_owned(),
-                )));
-            }
-            // A token that cannot ride an `Authorization` header would fail every data call
-            // before it is sent, as an `Unreachable` that never triggers a re-login.
-            if !token.bytes().all(|b| b.is_ascii_graphic()) {
-                return Err(LoginFailure::Other(protocol(
-                    LOGIN_PATH,
-                    "the login answer carried an access token that is not a valid header value"
-                        .to_owned(),
-                )));
-            }
-            return Ok((token, reuse_until(Instant::now(), answer.expires_in)));
+            return accept_login(&body, Instant::now()).map_err(LoginFailure::Other);
         }
-        if status.is_redirection() {
-            return Err(LoginFailure::Other(redirect(LOGIN_PATH, status.as_u16())));
-        }
-        let error = ErrorBody::from_bytes(&body);
-        Err(match status.as_u16() {
-            404 if is_fastify_not_found(&error) => {
-                LoginFailure::Other(SecretError::UnsupportedServer {
-                    endpoint: LOGIN_PATH,
-                })
-            }
-            429 => LoginFailure::Other(SecretError::RateLimited { retry_after_secs }),
-            code => LoginFailure::Other(protocol(LOGIN_PATH, format!("status {code}"))),
-        })
+        Err(LoginFailure::Other(map_login_status(
+            status,
+            &body,
+            retry_after_secs,
+        )))
     }
 
     /// Latch peek, the status GET, then a fresh login (§B.4.3).
@@ -340,32 +307,7 @@ impl InfisicalProvider {
         if status.is_success() {
             return decode(SECRETS_PATH, &body).map(Some);
         }
-        if status.is_redirection() {
-            return Err(redirect(SECRETS_PATH, status.as_u16()));
-        }
-        let error = ErrorBody::from_bytes(&body);
-        let message = clean_message(&error);
-        match status.as_u16() {
-            403 if error.error() == "TokenError" => Ok(None),
-            403 => Err(SecretError::PermissionDenied {
-                detail: if message.is_empty() {
-                    format!("status 403 {}", clean(error.error()))
-                } else {
-                    message
-                },
-            }),
-            404 if is_fastify_not_found(&error) => Err(SecretError::UnsupportedServer {
-                endpoint: SECRETS_PATH,
-            }),
-            404 if error.error() == "NotFound" => Err(SecretError::ProjectNotFound),
-            404 if error.error() == "SecretPathNotFound" => Err(SecretError::PathNotFound {
-                environment: scope.environment().to_owned(),
-                path: scope.path().to_owned(),
-            }),
-            404 => Err(protocol(SECRETS_PATH, format!("status 404: {message}"))),
-            429 => Err(SecretError::RateLimited { retry_after_secs }),
-            code => Err(protocol(SECRETS_PATH, status_detail(code, &message))),
-        }
+        map_list_status(status, &body, scope, retry_after_secs).map_or(Ok(None), Err)
     }
 
     /// `{base}/api/v4/secrets?…` with the D6 flags, in order (§B.4.4).
@@ -418,6 +360,97 @@ impl core::fmt::Debug for InfisicalProvider {
             .field("client_id", &self.identity.client_id())
             .finish_non_exhaustive()
     }
+}
+
+/// A login 200's body as the token and its reuse deadline (§B.4.2). Never quotes the body.
+fn accept_login(body: &[u8], now: Instant) -> Result<(Zeroizing<String>, Instant), SecretError> {
+    let answer: LoginResponse = decode(LOGIN_PATH, body)?;
+    let token = Zeroizing::new(answer.access_token);
+    if token.is_empty() {
+        return Err(protocol(
+            LOGIN_PATH,
+            "the login answer carried no access token".to_owned(),
+        ));
+    }
+    // A token that cannot ride an `Authorization` header would fail every data call before it is
+    // sent, as an `Unreachable` that never triggers a re-login.
+    if !token.bytes().all(|b| b.is_ascii_graphic()) {
+        return Err(protocol(
+            LOGIN_PATH,
+            "the login answer carried an access token that is not a valid header value".to_owned(),
+        ));
+    }
+    Ok((token, reuse_until(now, answer.expires_in)))
+}
+
+/// A login 401 (D5): `IdentityLocked` when a body read in full (`Some`) carries the lockout
+/// text, else `BadCredentials`. A body that was cut short or not read is `None`.
+fn login_refusal(body: Option<&[u8]>) -> SecretError {
+    if body.is_some_and(|body| is_lockout(&ErrorBody::from_bytes(body))) {
+        SecretError::IdentityLocked
+    } else {
+        SecretError::BadCredentials
+    }
+}
+
+/// A login answer that is neither 2xx nor 401, as its error (§B.4.2). The body only decides
+/// between variants; it is never quoted.
+fn map_login_status(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    retry_after_secs: Option<u64>,
+) -> SecretError {
+    if status.is_redirection() {
+        return redirect(LOGIN_PATH, status.as_u16());
+    }
+    match status.as_u16() {
+        404 if is_fastify_not_found(&ErrorBody::from_bytes(body)) => {
+            SecretError::UnsupportedServer {
+                endpoint: LOGIN_PATH,
+            }
+        }
+        429 => SecretError::RateLimited { retry_after_secs },
+        code => protocol(LOGIN_PATH, format!("status {code}")),
+    }
+}
+
+/// A list answer that is not 2xx, as its error (§B.4.2); `None` means the token was refused
+/// (401, or 403 `TokenError`), which earns one re-login.
+fn map_list_status(
+    status: reqwest::StatusCode,
+    body: &[u8],
+    scope: &SecretScope,
+    retry_after_secs: Option<u64>,
+) -> Option<SecretError> {
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    if status.is_redirection() {
+        return Some(redirect(SECRETS_PATH, status.as_u16()));
+    }
+    let error = ErrorBody::from_bytes(body);
+    let message = clean_message(&error);
+    Some(match status.as_u16() {
+        403 if error.error() == "TokenError" => return None,
+        403 => SecretError::PermissionDenied {
+            detail: if message.is_empty() {
+                format!("status 403 {}", clean(error.error()))
+            } else {
+                message
+            },
+        },
+        404 if is_fastify_not_found(&error) => SecretError::UnsupportedServer {
+            endpoint: SECRETS_PATH,
+        },
+        404 if error.error() == "NotFound" => SecretError::ProjectNotFound,
+        404 if error.error() == "SecretPathNotFound" => SecretError::PathNotFound {
+            environment: scope.environment().to_owned(),
+            path: scope.path().to_owned(),
+        },
+        404 => protocol(SECRETS_PATH, format!("status 404: {message}")),
+        429 => SecretError::RateLimited { retry_after_secs },
+        code => protocol(SECRETS_PATH, status_detail(code, &message)),
+    })
 }
 
 /// Normalises an Infisical base URL (D8): origin plus optional path prefix, no trailing `/`, a
@@ -869,6 +902,163 @@ mod tests {
         assert!(is_lockout(&body("IDENTITY TEMPORARILY LOCKED, try later")));
         assert!(!is_lockout(&body("Invalid credentials")));
         assert!(!is_lockout(&ErrorBody::default()));
+    }
+
+    fn status(code: u16) -> reqwest::StatusCode {
+        reqwest::StatusCode::from_u16(code).expect("a valid status")
+    }
+
+    fn error_body(error: &str, message: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({"error": error, "message": message}))
+            .expect("serialises")
+    }
+
+    fn fastify_body(path: &str) -> Vec<u8> {
+        error_body("Not Found", &format!("Route GET:{path} not found"))
+    }
+
+    #[test]
+    fn login_statuses_map_to_their_errors() {
+        let rows = [
+            (307, Vec::new(), None, redirect(LOGIN_PATH, 307)),
+            (
+                404,
+                fastify_body(LOGIN_PATH),
+                None,
+                SecretError::UnsupportedServer {
+                    endpoint: LOGIN_PATH,
+                },
+            ),
+            (
+                404,
+                error_body("NotFound", "no such route here"),
+                None,
+                protocol(LOGIN_PATH, "status 404".to_owned()),
+            ),
+            (
+                429,
+                error_body("RateLimitExceeded", "slow down"),
+                Some(12),
+                SecretError::RateLimited {
+                    retry_after_secs: Some(12),
+                },
+            ),
+            (
+                403,
+                error_body("Forbidden", "quoted nowhere"),
+                None,
+                protocol(LOGIN_PATH, "status 403".to_owned()),
+            ),
+            (
+                500,
+                error_body("InternalServerError", "quoted nowhere"),
+                None,
+                protocol(LOGIN_PATH, "status 500".to_owned()),
+            ),
+        ];
+        for (code, body, retry, want) in rows {
+            assert_eq!(
+                map_login_status(status(code), &body, retry),
+                want,
+                "status {code}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_login_401_is_locked_only_when_a_whole_body_says_so() {
+        let locked = error_body("UnauthorizedError", "Identity is temporarily locked");
+        assert_eq!(login_refusal(Some(&locked)), SecretError::IdentityLocked);
+        let wrong = error_body("UnauthorizedError", "Invalid credentials");
+        assert_eq!(login_refusal(Some(&wrong)), SecretError::BadCredentials);
+        assert_eq!(login_refusal(Some(b"<html>")), SecretError::BadCredentials);
+        assert_eq!(login_refusal(None), SecretError::BadCredentials);
+    }
+
+    #[test]
+    fn list_statuses_map_to_their_errors() {
+        let scope = SecretScope::new("p1", "dev", "/app").expect("a valid scope");
+        let denied = |detail: &str| SecretError::PermissionDenied {
+            detail: detail.to_owned(),
+        };
+        let rows = [
+            (
+                401,
+                error_body("UnauthorizedError", "Invalid token"),
+                None,
+                None,
+            ),
+            (403, error_body("TokenError", "Token expired"), None, None),
+            (
+                403,
+                error_body("PermissionDenied", "no read\r\non dev"),
+                None,
+                Some(denied("no readon dev")),
+            ),
+            (
+                403,
+                error_body("Forbidden", ""),
+                None,
+                Some(denied("status 403 Forbidden")),
+            ),
+            (
+                404,
+                fastify_body(SECRETS_PATH),
+                None,
+                Some(SecretError::UnsupportedServer {
+                    endpoint: SECRETS_PATH,
+                }),
+            ),
+            (
+                404,
+                error_body("NotFound", "Project not found"),
+                None,
+                Some(SecretError::ProjectNotFound),
+            ),
+            (
+                404,
+                error_body("SecretPathNotFound", "Folder not found"),
+                None,
+                Some(SecretError::PathNotFound {
+                    environment: "dev".to_owned(),
+                    path: "/app".to_owned(),
+                }),
+            ),
+            (
+                404,
+                error_body("Other", "gone"),
+                None,
+                Some(protocol(SECRETS_PATH, "status 404: gone".to_owned())),
+            ),
+            (
+                429,
+                Vec::new(),
+                Some(3),
+                Some(SecretError::RateLimited {
+                    retry_after_secs: Some(3),
+                }),
+            ),
+            (302, Vec::new(), None, Some(redirect(SECRETS_PATH, 302))),
+            (
+                500,
+                error_body("InternalServerError", "boom"),
+                None,
+                Some(protocol(SECRETS_PATH, "status 500: boom".to_owned())),
+            ),
+            (
+                502,
+                b"<html>".to_vec(),
+                None,
+                Some(protocol(SECRETS_PATH, "status 502".to_owned())),
+            ),
+        ];
+        for (code, body, retry, want) in rows {
+            assert_eq!(
+                map_list_status(status(code), &body, &scope, retry),
+                want,
+                "status {code}"
+            );
+        }
     }
 
     fn merged(rows: &[(&str, &str, bool)]) -> BTreeMap<String, Merged> {
