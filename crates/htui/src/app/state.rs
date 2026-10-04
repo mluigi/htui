@@ -148,7 +148,7 @@ pub struct App {
     pub overlay_factories: OverlayRegistry,
     /// The key table.
     pub keymap: Keymap,
-    /// The palette.
+    /// The palette: `Theme::default()` until `run` applies `NO_COLOR` (MOD-80 D4).
     pub theme: Theme,
     /// Whether the help box is up.
     pub help_visible: bool,

@@ -1220,8 +1220,9 @@ mod tests {
             "{rows:#?}"
         );
         let (x, y) = corner_of(&buf, "0.1/1 superseded");
-        assert_eq!(buf[(x, y)].fg, Color::DarkGray);
-        assert_eq!(buf[(x + 1, y + 1)].fg, Color::DarkGray);
+        let dim = Theme::default().dim.fg.expect("dim has a colour");
+        assert_eq!(buf[(x, y)].fg, dim);
+        assert_eq!(buf[(x + 1, y + 1)].fg, dim);
     }
 
     /// MOD-60 review L3: a node's text is `cells::clip`'s, flattened per cluster, so `"\r\n"` is
@@ -1673,7 +1674,8 @@ mod tests {
             rows[usize::from(y + 3)].contains("\u{2692} read\u{d7}1"),
             "{rows:#?}"
         );
-        assert_eq!(buf[(x + 1, y + 3)].fg, Color::DarkGray);
+        let dim = Theme::default().dim.fg.expect("dim has a colour");
+        assert_eq!(buf[(x + 1, y + 3)].fg, dim);
         assert_eq!(buf[(x, y + 4)].symbol(), "\u{2514}", "{rows:#?}");
     }
 
