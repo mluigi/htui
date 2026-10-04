@@ -92,6 +92,11 @@ pub trait Tab {
     /// terminal's own text selection away, so the event loop turns it on only while the active
     /// tab says yes and nothing is drawn over it. Defaulted to `false`, so no other tab changes:
     /// only the Backlog answers, for its Runs pane's flow view.
+    ///
+    /// Being the sole implementor is load-bearing (MOD-74 review L1): a loss is the shell's
+    /// on-to-off capture edge, and a switch between two views that both want the mouse keeps
+    /// capture on. A second implementor must handle that switch too (e.g. by tracking the capture
+    /// holder), or the review-L3 stale anchor returns.
     fn wants_mouse(&self) -> bool {
         false
     }
@@ -101,6 +106,16 @@ pub trait Tab {
     fn on_mouse(&mut self, _mouse: MouseEvent, _ctx: &mut Ctx<'_>) -> Handled {
         Handled::Pass
     }
+    /// MOD-74 D1, D3: mouse capture went off while this tab may hold a gesture: an overlay, `?`, a
+    /// form, a sub-tab or tab switch, or an `$EDITOR` handoff. Told to every registered tab, active
+    /// or not, once per on-to-off edge. Defaulted to nothing, so no other tab changes.
+    ///
+    /// A "loss" is that on-to-off capture edge, which equals "the gesture holder lost the
+    /// pointer" only because `RunsTab` is the sole view that wants the mouse. A second
+    /// [`wants_mouse`](Tab::wants_mouse) implementor must also handle a switch between two
+    /// capturing views (e.g. by tracking the capture holder), or the review-L3 stale anchor
+    /// returns.
+    fn on_mouse_lost(&mut self) {}
 }
 
 /// Every registered tab, in registration order, plus which one is active.

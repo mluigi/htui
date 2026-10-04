@@ -25,6 +25,9 @@
 //! and [`TerminalGuard::set_mouse_capture`] writes only a change. [`init`] and `Suspend::enter`
 //! never turn it on; every way the terminal is given back turns it off first: [`restore_terminal`]
 //! unconditionally and best effort, `Suspend::leave` when the guard turned it on (review H1).
+//! Capture is button-event reporting (`?1000h ?1002h ?1015h ?1006h`, MOD-74 D5): there is no
+//! any-motion mode (`?1003h`), so the terminal sends no hover stream. Windows keeps crossterm's
+//! WinAPI path.
 
 use ratatui::{DefaultTerminal, Terminal, backend::CrosstermBackend};
 
@@ -145,9 +148,10 @@ impl TerminalGuard {
 
     /// MOD-71 D2: mouse capture on or off, written only when `on` differs from what this guard
     /// last set, so the event loop can ask after every step for nothing. The loop is the only
-    /// caller, with `App::wants_mouse` (D1). A terminal without mouse reporting answers
-    /// `Unsupported`, which is recorded as done so it is not asked again every step: the view runs
-    /// keyboard-only (review R2-L6's shape, blueprint H-14).
+    /// caller, with `App::mouse_capture` (MOD-74 D1), which also tells the tabs when capture goes
+    /// off. A terminal without mouse reporting answers `Unsupported`, which is recorded as done so
+    /// it is not asked again every step: the view runs keyboard-only (review R2-L6's shape,
+    /// blueprint H-14).
     ///
     /// # Errors
     ///
@@ -234,14 +238,15 @@ fn disable_bracketed_paste() -> std::io::Result<()> {
     .map(|_| ())
 }
 
-/// MOD-71 D2: mouse capture on, in its own `execute!` (review R2-L6's shape). crossterm's
-/// `EnableMouseCapture` is any-motion reporting (`?1003h`, `crossterm-0.29.0/src/event.rs:325-333`),
-/// which `App::on_mouse` drops before it can cost a redraw (D4). `Unsupported` is a terminal with
-/// no mouse reporting, which runs keyboard-only.
+/// MOD-71 D2: mouse capture on, in its own `execute!` (review R2-L6's shape). It issues
+/// `EnableButtonMouseCapture` (MOD-74 D5), crossterm's `EnableMouseCapture` minus any-motion
+/// `?1003h`, so the terminal sends no hover stream. `App::on_mouse` still drops `Moved`: Windows
+/// reports it, and a terminal may ignore the narrower mode. `Unsupported` is a terminal with no
+/// mouse reporting, which runs keyboard-only.
 fn enable_mouse_capture() -> std::io::Result<()> {
     let enabled = tolerate_unsupported(crossterm::execute!(
         std::io::stdout(),
-        crossterm::event::EnableMouseCapture
+        EnableButtonMouseCapture
     ))?;
     if !enabled {
         tracing::debug!("this terminal has no mouse reporting; the flow view is keyboard-only");
@@ -268,8 +273,41 @@ fn tolerate_unsupported(result: std::io::Result<()>) -> std::io::Result<bool> {
     }
 }
 
+/// MOD-74 D5: crossterm's `EnableMouseCapture` (`crossterm-0.29.0/src/event.rs:321-345`) minus
+/// any-motion `?1003h`: press/release (`?1000h`), drag (`?1002h`), RXVT coordinates past 223
+/// (`?1015h`, kept for terminals without SGR) and SGR (`?1006h`). `DisableMouseCapture` clears
+/// every one of them. On Windows it is crossterm's own WinAPI command, `is_ansi_code_supported`
+/// false as crossterm's is, so the console path never changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableButtonMouseCapture;
+
+impl crossterm::Command for EnableButtonMouseCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str("\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::Command::execute_winapi(&crossterm::event::EnableMouseCapture)
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// What a command writes to an ANSI terminal.
+    fn ansi(command: impl crossterm::Command) -> String {
+        let mut out = String::new();
+        command
+            .write_ansi(&mut out)
+            .expect("a String takes any write");
+        out
+    }
+
     /// This file with its comments removed, as `tests/panic_hook_order.rs` reads it.
     fn code() -> String {
         include_str!("terminal.rs")
@@ -398,8 +436,14 @@ mod tests {
             same < on.min(off) && on.max(off) < recorded,
             "no change returns, then the write, then the record: {toggle}"
         );
+        // MOD-74 D5: on, button-only reporting; off, crossterm's superset, which also clears
+        // any-motion.
+        assert!(
+            !body(&code, "fn enable_mouse_capture()").contains("event::EnableMouseCapture"),
+            "the enable issues button-only capture, not crossterm's any-motion command"
+        );
         for (helper, command) in [
-            ("fn enable_mouse_capture()", "EnableMouseCapture"),
+            ("fn enable_mouse_capture()", "EnableButtonMouseCapture"),
             ("fn disable_mouse_capture()", "DisableMouseCapture"),
         ] {
             let body = body(&code, helper);
@@ -411,6 +455,37 @@ mod tests {
             assert!(
                 !body.contains("AlternateScreen") && !body.contains("BracketedPaste"),
                 "`{helper}` issues nothing else"
+            );
+        }
+    }
+
+    /// MOD-74 D5: presses, drags and releases, with RXVT and SGR coordinates; no any-motion
+    /// `?1003h`, so the terminal sends no hover stream.
+    #[test]
+    fn button_capture_reports_presses_drags_and_releases_and_no_motion() {
+        let written = ansi(super::EnableButtonMouseCapture);
+        assert_eq!(written, "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h");
+        assert!(!written.contains("?1003h"), "no any-motion: {written:?}");
+    }
+
+    /// MOD-74 D5: every give-back stays crossterm's `DisableMouseCapture`, so every mode the
+    /// button-only enable sets must be one it clears.
+    #[test]
+    fn the_disable_clears_every_mode_button_capture_sets() {
+        let enable = ansi(super::EnableButtonMouseCapture);
+        let disable = ansi(crossterm::event::DisableMouseCapture);
+        let modes: Vec<&str> = enable
+            .split("\x1b[")
+            .filter(|mode| !mode.is_empty())
+            .collect();
+        assert_eq!(modes.len(), 4, "four modes: {enable:?}");
+        for mode in modes {
+            let number = mode
+                .strip_suffix('h')
+                .unwrap_or_else(|| panic!("`{mode}` turns a mode on"));
+            assert!(
+                disable.contains(&format!("\x1b[{number}l")),
+                "`{number}` is never cleared: {disable:?}"
             );
         }
     }

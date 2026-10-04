@@ -4,7 +4,7 @@
 //! worker's replies and the tick; everything else is an [`Action`] that
 //! [`App::update`](crate::app::App::update) applies. Two post-steps, not arms: one suspends the
 //! terminal for `$EDITOR` (MOD-9 D9), and one sets mouse capture to what the view on screen wants
-//! (MOD-71 D2).
+//! (MOD-71 D2), through `App::mouse_capture`, which tells the tabs when it goes off (MOD-74 D1).
 
 use std::time::Duration;
 
@@ -66,8 +66,9 @@ pub async fn run(
         }
         // MOD-71 D2: capture follows the view on screen. Asked after every step, the editor's
         // included, so a toggle `v` or `Esc` caused lands before the frame it changed; the guard
-        // writes only a change.
-        term.set_mouse_capture(app.wants_mouse())?;
+        // writes only a change. MOD-74 D1: `mouse_capture` also tells the tabs when capture goes
+        // off.
+        term.set_mouse_capture(app.mouse_capture())?;
         if std::mem::take(&mut app.dirty) {
             term.terminal_mut().draw(|frame| app.render(frame))?;
         }
@@ -97,8 +98,12 @@ mod tests {
             .find("app.finish_external_edit(")
             .expect("the editor post-step");
         let capture = code
-            .find("term.set_mouse_capture(app.wants_mouse())?;")
-            .expect("the loop sets capture to what the app wants");
+            .find("term.set_mouse_capture(app.mouse_capture())?;")
+            .expect("the loop sets capture through the app's edge (MOD-74 D1)");
+        assert!(
+            !code.contains("app.wants_mouse()"),
+            "the loop never bypasses the edge (MOD-74 D1)"
+        );
         let draw = code
             .find("std::mem::take(&mut app.dirty)")
             .expect("the dirty draw");

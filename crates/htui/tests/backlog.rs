@@ -1016,6 +1016,57 @@ async fn a_drag_pans_and_the_wheel_zooms_the_flow() {
     );
 }
 
+/// MOD-74 D1, D3, review L3, end to end (App -> Backlog -> DetailRegistry -> RunsTab): a pan
+/// whose release `?` swallowed ends when capture goes off, so once the box closes a bare drag,
+/// with no press first, pans nothing from the stale anchor.
+#[tokio::test]
+async fn a_lost_capture_ends_the_flow_s_pan_end_to_end() {
+    let mut harness = backlog().await;
+    sub_tab(&mut harness, 1);
+    harness.key("v");
+    harness.drive_to_end().await;
+    assert!(harness.app().mouse_capture(), "the flow takes the mouse");
+    let frame = harness.render();
+    let (column, row) = cell_of(&frame, "0.1/0 done");
+    let below = frame
+        .lines()
+        .nth(usize::from(row + 8))
+        .and_then(|line| line.chars().nth(usize::from(column)));
+    assert_eq!(below, Some(' '), "a blank canvas cell:\n{frame}");
+
+    harness.mouse(MouseEventKind::Down(MouseButton::Left), column, row + 8);
+    harness.mouse(MouseEventKind::Drag(MouseButton::Left), column + 2, row + 9);
+    let panned = harness.render();
+    assert_eq!(
+        cell_of(&panned, "0.1/0 done"),
+        (column + 2, row + 1),
+        "the drag pans:\n{panned}"
+    );
+
+    harness.key("?");
+    assert!(harness.app().help_visible, "`?` opened the box");
+    assert!(
+        !harness.app().mouse_capture(),
+        "the box takes the mouse away"
+    );
+    harness.key("?");
+    assert!(!harness.app().help_visible, "`?` closed the box");
+    assert!(harness.app().mouse_capture(), "the flow takes it back");
+
+    let _ = harness.render();
+    harness.mouse(
+        MouseEventKind::Drag(MouseButton::Left),
+        column + 5,
+        row + 11,
+    );
+    let after = harness.render();
+    assert_eq!(
+        cell_of(&after, "0.1/0 done"),
+        (column + 2, row + 1),
+        "a bare drag pans nothing:\n{after}"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The Graph sub-tab (MOD-14 plan D2-D8, blueprint §3 T3).
 // ---------------------------------------------------------------------------------------------

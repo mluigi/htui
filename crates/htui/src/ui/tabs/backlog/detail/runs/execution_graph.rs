@@ -10,10 +10,13 @@
 //! zooms at the pointer (D9), and a press on a node is a click on release that moves the cursor
 //! (D6); no node ever moves (MOD-28 D9). A pan or a zoom survives a re-read: only a cursor
 //! change, a resize or a new run moves the viewport (D7).
+//!
+//! MOD-74 D6: a live pan re-anchors at its last pointer on every draw, so a re-read's shift, a
+//! canvas moved by the head and a wheel zoom all pan on from what is on screen.
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use htui_core::model::{RunId, RunStepSummary, RunSummary, StepId, StepStatus, ToolCallCount};
 use rataflow::{
     ControlsAction, Edge, EdgeStyle, Flow, FlowEvent, Handle, HandlePosition, Node, NodeContent,
@@ -420,6 +423,10 @@ pub(super) struct ExecutionGraph {
     /// the cursor; a pan or a zoom alone never does, and neither does a head line that comes or
     /// goes, which moves the canvas inside the same pane (review M1).
     drawn: Option<(u16, u16)>,
+    /// MOD-74 D6: the terminal cell of a live pan's last pointer, `None` with no pan. Assigned by
+    /// every left press (a pan only on rataflow's `PaneClicked`, `mouse.rs:263-273`; B-1),
+    /// moved by its drags, cleared by its release and by `end_gesture`.
+    pan: Option<(u16, u16)>,
 }
 
 impl Default for ExecutionGraph {
@@ -435,6 +442,7 @@ impl Default for ExecutionGraph {
             width: 0.0,
             reveal: Reveal::None,
             drawn: None,
+            pan: None,
         }
     }
 }
@@ -600,6 +608,25 @@ impl ExecutionGraph {
             return None;
         }
         let response = self.flow.handle_mouse_event(mouse);
+        // MOD-74 D6, B-1: every left press assigns the pan, so a press on a node forgets one
+        // whose release was never reported; only rataflow's empty-canvas start is a pan.
+        let at = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let pans = response
+                    .events()
+                    .iter()
+                    .any(|event| matches!(event, FlowEvent::PaneClicked { .. }));
+                self.pan = pans.then_some(at);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pan) = self.pan.as_mut() {
+                    *pan = at;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.pan = None,
+            _ => {}
+        }
         match self.cursor {
             Some(cursor) => self.flow.select_node(&cursor.to_string()),
             None => self.flow.clear_selection(),
@@ -608,6 +635,32 @@ impl ExecutionGraph {
             FlowEvent::NodeClicked { node_id } => node_id.parse().ok(),
             _ => None,
         })
+    }
+
+    /// MOD-74 D4: ends a live gesture without a click. A pan's drag state, or a node press's
+    /// `AwaitingNodeClick`, gets a **locked** left release (`event_handlers.rs:496-509`): it
+    /// resets the drag state and emits nothing, where an unlocked one would click the node.
+    pub(super) fn end_gesture(&mut self) {
+        self.pan = None;
+        if self.flow.is_dragging() {
+            self.locked_left(MouseEventKind::Up(MouseButton::Left), (0, 0));
+        }
+    }
+
+    /// MOD-74 D4, D6: one left-button event fed to rataflow with `locked` set: a press starts
+    /// `Panning` at the pointer with no hit test, a release only ends the drag. The lock is put
+    /// back as it was, with no early return between (plan Risks; the flow never renders
+    /// rataflow's `Controls`, the only other reader, D7).
+    fn locked_left(&mut self, kind: MouseEventKind, (column, row): (u16, u16)) {
+        let locked = self.flow.locked;
+        self.flow.locked = true;
+        let _ = self.flow.handle_mouse_event(MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        self.flow.locked = locked;
     }
 
     /// Plan D7, blueprint B-2/E6: draws `area`, revealing first when a reveal is pending.
@@ -647,6 +700,17 @@ impl ExecutionGraph {
             }
         }
         frame.render_widget(&mut self.flow, area);
+        // MOD-74 D6: rataflow's `Panning` keeps its own `initial_viewport` (`mouse.rs:818-825`),
+        // so a sync's review-L2 shift, a canvas moved by the head or a wheel zoom would be
+        // overwritten by the next drag. A locked press at the last pointer re-anchors it on what
+        // was just drawn, with this frame's canvas origin. Deltas are whole cells: with nothing
+        // changed it is a no-op up to float association. A sub-2x2 canvas returned above and
+        // skips the re-anchor: accepted, there is no visible canvas to drag on (review N5).
+        if let Some(at) = self.pan
+            && self.flow.is_dragging()
+        {
+            self.locked_left(MouseEventKind::Down(MouseButton::Left), at);
+        }
     }
 
     /// The canvas's pan and zoom, which the pane compares across a mouse event to tell one that
@@ -671,6 +735,12 @@ impl ExecutionGraph {
     #[cfg(test)]
     pub(super) fn zoom(&self) -> f64 {
         self.flow.viewport.zoom
+    }
+
+    /// Whether rataflow holds a drag, for the tests.
+    #[cfg(test)]
+    pub(super) fn is_dragging(&self) -> bool {
+        self.flow.is_dragging()
     }
 }
 
@@ -1942,5 +2012,224 @@ mod tests {
         let mut graph = panned();
         let rows = rows(&draw_at(&mut graph, 43, 20));
         assert!(rows.iter().any(|row| row.contains("0.1 done")), "{rows:#?}");
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-74 T2: ending a gesture (plan D4).
+    // ---------------------------------------------------------------------------------------------
+
+    /// D4: an ended pan forgets its anchor: a drag with no new press moves nothing, and the lock
+    /// is put back.
+    #[test]
+    fn ending_a_pan_forgets_its_anchor() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (5, 14))), None);
+        assert!(graph.is_dragging());
+        graph.end_gesture();
+        assert!(!graph.is_dragging());
+        assert!(!graph.flow.locked);
+        let before = graph.flow.viewport;
+        assert_eq!(graph.on_mouse(mouse(DRAG, (9, 16))), None);
+        assert_eq!(graph.flow.viewport, before);
+    }
+
+    /// D4, H-10: an ended node press clicks nothing, then or on a later release.
+    #[test]
+    fn ending_a_node_press_clicks_nothing() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "1.1 done");
+        let at = (x + 2, y + 2);
+        assert_eq!(graph.on_mouse(mouse(DOWN, at)), None);
+        graph.end_gesture();
+        assert!(!graph.is_dragging());
+        assert_eq!(graph.on_mouse(mouse(UP, at)), None, "no click");
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+        assert!(!graph.flow.locked);
+    }
+
+    /// D4: with no gesture live, ending one changes nothing.
+    #[test]
+    fn ending_no_gesture_changes_nothing() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        draw(&mut graph);
+        let before = graph.flow.viewport;
+        graph.end_gesture();
+        assert_eq!(graph.flow.viewport, before);
+        assert_eq!(graph.selected(), Some(id(0).to_string()));
+        assert!(!graph.flow.locked);
+        assert!(!graph.is_dragging());
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // MOD-74 T3: a live pan re-anchors (plan D6). The app redraws after every consumed event, so
+    // these draw between events.
+    // ---------------------------------------------------------------------------------------------
+
+    /// The viewport is `(x, y, zoom)` up to float association (blueprint H-8, E4): after a wheel
+    /// zoom the offset is fractional, and one ulp there is past `f64::EPSILON`.
+    fn assert_near(now: Viewport, (x, y, zoom): (f64, f64, f64)) {
+        assert!(
+            (now.x - x).abs() < 1e-9 && (now.y - y).abs() < 1e-9 && (now.zoom - zoom).abs() < 1e-9,
+            "{now:?} vs ({x}, {y}, {zoom})"
+        );
+    }
+
+    /// One frame with the canvas at `area` inside a constant 43x24 pane, so moving the canvas
+    /// (a head line coming) is no resize and reveals nothing.
+    fn draw_in(graph: &mut ExecutionGraph, area: Rect) -> Buffer {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(43, 24))
+            .expect("the test backend is constructible");
+        term.draw(|frame| graph.render(frame, area, frame.area()))
+            .expect("the graph draws");
+        term.backend().buffer().clone()
+    }
+
+    /// D6, the item: a same-run re-read mid-pan moves the viewport by the layout shift (review
+    /// L2); the next drag pans on from there instead of from the press's viewport.
+    #[test]
+    fn a_re_read_mid_pan_pans_on_from_the_shifted_viewport() {
+        let before = run(1, vec![step(1, 0, 1, 0)]);
+        let mut graph = synced(&before, Some(id(1)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (5, 14))), None);
+        draw(&mut graph);
+        let pre = graph.flow.viewport;
+
+        let mut after = before.clone();
+        after.steps.extend([
+            candidate(2, 1, 1, 0, None),
+            candidate(3, 1, 1, 1, None),
+            candidate(4, 1, 1, 2, None),
+        ]);
+        graph.sync(
+            Some(&after),
+            Some(id(1)),
+            &BTreeMap::new(),
+            &Theme::default(),
+        );
+        let post = graph.flow.viewport;
+        assert!(
+            (post.x - pre.x).abs() > 1.0,
+            "the re-read shifted the viewport: {pre:?} -> {post:?}"
+        );
+        let buf = draw(&mut graph);
+        let (x0, y0) = corner_of(&buf, "0.1 done");
+        assert_eq!(graph.on_mouse(mouse(DRAG, (7, 15))), None);
+        let buf = draw(&mut graph);
+        assert_near(graph.flow.viewport, (post.x + 2.0, post.y + 1.0, 1.0));
+        assert_eq!(
+            corner_of(&buf, "0.1 done"),
+            (x0 + 2, y0 + 1),
+            "the node follows the pointer"
+        );
+        assert!(!graph.flow.locked);
+    }
+
+    /// D6, the fact-check's finding: a wheel tick mid-pan keeps its zoom, and the next drag pans
+    /// on from the zoomed viewport.
+    #[test]
+    fn a_wheel_tick_mid_pan_keeps_its_zoom() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (5, 14))), None);
+        draw(&mut graph);
+        let v1 = graph.flow.viewport;
+        assert_eq!(
+            graph.on_mouse(mouse(MouseEventKind::ScrollUp, (5, 14))),
+            None
+        );
+        let z = graph.flow.viewport;
+        assert!((z.zoom - 1.2).abs() < 1e-9, "{z:?}");
+        assert!(
+            (z.x - v1.x).abs() > 0.05,
+            "the zoom moved the offset: {v1:?} -> {z:?}"
+        );
+        draw(&mut graph);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (7, 15))), None);
+        assert_near(graph.flow.viewport, (z.x + 2.0, z.y + 1.0, z.zoom));
+        assert!(!graph.flow.locked);
+    }
+
+    /// D6: a press on a node never starts a pan, so no draw re-anchors it, and its release is
+    /// still the click.
+    #[test]
+    fn a_node_press_never_starts_a_pan() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        let (x, y) = corner_of(&buf, "1.1 done");
+        let before = graph.flow.viewport;
+        let nodes = positions(&graph);
+        assert_eq!(graph.on_mouse(mouse(DOWN, (x + 2, y + 2))), None);
+        assert_eq!(graph.pan, None);
+        draw(&mut graph);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (x + 7, y + 5))), None);
+        draw(&mut graph);
+        assert_eq!(graph.on_mouse(mouse(UP, (x + 7, y + 5))), Some(id(1)));
+        assert_eq!(graph.flow.viewport, before);
+        assert_eq!(positions(&graph), nodes);
+        assert!(!graph.flow.locked);
+    }
+
+    /// D6, B-1: a pan whose release was never reported is forgotten by the next press; a node
+    /// press then is not turned into a pan by the draw, and its release is still the click.
+    #[test]
+    fn a_node_press_after_a_lost_release_forgets_the_old_pan() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        let (x, y) = corner_of(&buf, "1.1 done");
+        assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
+        assert_eq!(graph.on_mouse(mouse(DOWN, (x + 2, y + 2))), None);
+        assert_eq!(graph.pan, None);
+        draw(&mut graph);
+        assert_eq!(graph.on_mouse(mouse(UP, (x + 2, y + 2))), Some(id(1)));
+        assert!(!graph.flow.locked);
+    }
+
+    /// D6, H-9: a released pan is not re-anchored, and the lock never leaks: a later click on a
+    /// node still answers its step.
+    #[test]
+    fn a_released_pan_is_not_re_anchored() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw(&mut graph);
+        assert_blank(&buf, (2, 12));
+        assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (5, 14))), None);
+        draw(&mut graph);
+        assert_eq!(graph.on_mouse(mouse(UP, (5, 14))), None);
+        assert_eq!(graph.pan, None);
+        assert!(!graph.is_dragging());
+        let buf = draw(&mut graph);
+        let before = graph.flow.viewport;
+        assert_eq!(graph.on_mouse(mouse(DRAG, (9, 16))), None);
+        assert_eq!(graph.flow.viewport, before);
+        assert!(!graph.flow.locked);
+        let (x, y) = corner_of(&buf, "1.1 done");
+        assert_eq!(click(&mut graph, (x + 2, y + 2)), Some(id(1)));
+    }
+
+    /// D6, blueprint E2: a head line that comes mid-pan moves the canvas down a row inside the
+    /// same pane; the next drag pans from what is on screen, not by an extra row.
+    #[test]
+    fn a_canvas_that_moves_mid_pan_does_not_jump() {
+        let mut graph = synced(&linear(2), Some(id(0)));
+        let buf = draw_in(&mut graph, Rect::new(0, 0, 43, 23));
+        assert_blank(&buf, (2, 12));
+        assert_eq!(graph.on_mouse(mouse(DOWN, (2, 12))), None);
+        assert_eq!(graph.on_mouse(mouse(DRAG, (5, 14))), None);
+        draw_in(&mut graph, Rect::new(0, 0, 43, 23));
+        let v1 = graph.flow.viewport;
+        draw_in(&mut graph, Rect::new(0, 1, 43, 23));
+        assert_eq!(graph.on_mouse(mouse(DRAG, (7, 15))), None);
+        assert_near(graph.flow.viewport, (v1.x + 2.0, v1.y + 1.0, 1.0));
+        assert!(!graph.flow.locked);
     }
 }
