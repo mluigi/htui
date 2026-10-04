@@ -156,6 +156,21 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | `accent` for code reads as "selected" | Low | Code is not underlined or reversed; MOD-80 can give it its own palette slot |
 | Scroll clamp before the first render | Low | Width 0 counts unwrapped rows, the old lower bound (notes' rule) |
 
+## Amendments after the blueprint (accepted by the maintainer 2026-10-04)
+
+The blueprint (`mod-84-body-reflow.blueprint.md`) found these; the blueprint is authoritative where it differs.
+
+- **A-1**: the rule check (R3) runs before the list-item check (R4), per CommonMark 4.1. Otherwise `* * *` would open a
+  list item, and `a\n* * *\nb` would draw as `a` / `* * * b`.
+- **A-2**: the T3 width-43 test asserts the row `top bar and a backlog tab, all reading`. `a top bar and a backlog
+  tab` does not fit on one row at that width.
+- **A-3**: 13 snapshots carry the head meta line, not 12. Six show a body (FEAT-1 in `backlog__detail_body`, ANA-1 in
+  five), and only those may change. The other seven show `No body for this item.` and must not change.
+- **A-4**: a backtick fence's opening line holds no further backtick (CommonMark), so a paragraph line like
+  `` ```x``` `` does not open a fence.
+- **B-2**: table rows keep their backticks and are only tab-expanded, so their columns stay aligned. Headings, rules
+  and quotes do get inline code. This is the maintainer's choice.
+
 ## Verified claims
 
 | Claim | Verdict | Evidence |
