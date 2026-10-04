@@ -3,6 +3,8 @@
 //!
 //! Sentinel rule (H-8): no assert message interpolates `CLIENT_SECRET`, `TOKEN`, `TOKEN_2`,
 //! `VALUE` or an error that might carry one. Messages name the case only.
+//! So errors are compared with `assert_err` and unwrapped with `Quiet::must`/`must_fail`, which
+//! name the variant, never with `assert_eq!`, `expect` or `unwrap_err`, which print it.
 
 mod support;
 
@@ -22,6 +24,42 @@ const VALUE: &str = "value-sentinel-1";
 const LOGIN: &str = "/api/v1/auth/universal-auth/login";
 const SECRETS: &str = "/api/v4/secrets";
 const STATUS: &str = "/api/status";
+
+/// H-8: `expect` and `unwrap_err` print the other side of the `Result` on failure, which for a
+/// `SecretError` could be a leak. These name the case and the error variant only.
+trait Quiet<T> {
+    fn must(self, case: &str) -> T;
+    fn must_fail(self, case: &str) -> SecretError;
+}
+
+impl<T> Quiet<T> for Result<T, SecretError> {
+    #[track_caller]
+    fn must(self, case: &str) -> T {
+        match self {
+            Ok(v) => v,
+            Err(e) => panic!("{case}: failed with {}", variant(&e)),
+        }
+    }
+
+    #[track_caller]
+    fn must_fail(self, case: &str) -> SecretError {
+        match self {
+            Ok(_) => panic!("{case}: succeeded"),
+            Err(e) => e,
+        }
+    }
+}
+
+/// H-8: `assert_eq!` on errors prints both on failure; this names the two variants only.
+#[track_caller]
+fn assert_err(got: &SecretError, want: &SecretError) {
+    assert!(
+        got == want,
+        "wrong error: got {} where {} was expected",
+        variant(got),
+        variant(want)
+    );
+}
 
 fn identity() -> MachineIdentity {
     MachineIdentity::new(CLIENT_ID, CLIENT_SECRET)
@@ -72,11 +110,11 @@ fn personal(key: &str, value: &str) -> Value {
 
 fn provider(stub: &Stub) -> InfisicalProvider {
     InfisicalProvider::new(InfisicalConfig::new(stub.base()), identity())
-        .expect("a provider on the stub")
+        .must("a provider on the stub")
 }
 
 fn scope() -> SecretScope {
-    SecretScope::new("proj-1", "dev", "/app").expect("a valid scope")
+    SecretScope::new("proj-1", "dev", "/app").must("a valid scope")
 }
 
 /// A stub whose login answers `TOKEN` for 30 days and whose list answers `secrets`, no imports.
@@ -123,7 +161,7 @@ fn a_provider_builds_with_only_this_crate_installing_ring() {
             InfisicalConfig::new("https://app.infisical.com"),
             identity(),
         )
-        .expect("the provider builds with ring installed by htui-secrets");
+        .must("the provider builds with ring installed by htui-secrets");
     }
 }
 
@@ -166,8 +204,8 @@ async fn the_base_url_is_normalised_before_use() {
         InfisicalConfig::new(format!("{}/api/", stub.base())),
         identity(),
     )
-    .expect("a provider on the stub");
-    p.resolve(&scope()).await.expect("resolves");
+    .must("a provider on the stub");
+    p.resolve(&scope()).await.must("resolves");
     assert_eq!(p.base_url(), stub.base());
     let first = &stub.requests()[0];
     assert_eq!(first.path, LOGIN);
@@ -179,7 +217,7 @@ fn kind_is_infisical() {
         InfisicalConfig::new("https://app.infisical.com"),
         identity(),
     )
-    .expect("builds");
+    .must("builds");
     assert_eq!(p.kind(), "infisical");
     assert_eq!(InfisicalProvider::KIND, "infisical");
 }
@@ -191,7 +229,7 @@ fn kind_is_infisical() {
 #[tokio::test]
 async fn resolve_logs_in_then_lists_the_scope() {
     let stub = serving(json!([secret("B", VALUE), secret("A", "plain")]));
-    let resolved = provider(&stub).resolve(&scope()).await.expect("resolves");
+    let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
     let seen = stub.requests();
     assert_eq!(
         routes(&stub),
@@ -234,7 +272,7 @@ async fn resolve_logs_in_then_lists_the_scope() {
 #[tokio::test]
 async fn the_list_query_carries_every_flag_and_both_imports_spellings() {
     let stub = serving(json!([]));
-    provider(&stub).resolve(&scope()).await.expect("resolves");
+    provider(&stub).resolve(&scope()).await.must("resolves");
     let list = &stub.requests()[1];
     let want = [
         ("projectId", "proj-1"),
@@ -263,9 +301,9 @@ async fn list_keys_returns_sorted_names_matching_resolve() {
         secret("MID", VALUE)
     ]));
     let p = provider(&stub);
-    let keys = p.list_keys(&scope()).await.expect("lists");
+    let keys = p.list_keys(&scope()).await.must("lists");
     assert_eq!(keys, ["ALPHA", "MID", "ZED"]);
-    let resolved = p.resolve(&scope()).await.expect("resolves");
+    let resolved = p.resolve(&scope()).await.must("resolves");
     assert_eq!(keys, resolved.keys());
 }
 
@@ -284,7 +322,7 @@ async fn the_folder_beats_every_import() {
             json!([{"secrets": [secret("A", "import-0")]}, {"secrets": [secret("A", "import-1")]}]),
         ),
     );
-    let resolved = provider(&stub).resolve(&scope()).await.expect("resolves");
+    let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
     assert_eq!(pairs(resolved.as_map()), owned(&[("A", "folder")]));
 }
 
@@ -302,7 +340,7 @@ async fn the_last_import_beats_earlier_ones() {
             ]),
         ),
     );
-    let resolved = provider(&stub).resolve(&scope()).await.expect("resolves");
+    let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
     assert_eq!(
         pairs(resolved.as_map()),
         owned(&[("C", "i1c"), ("D", "i0d"), ("F", "folder")])
@@ -324,7 +362,7 @@ async fn personal_entries_are_ignored() {
             json!([{"secrets": [secret("A", "imported"), personal("E", "e1")]}]),
         ),
     );
-    let resolved = provider(&stub).resolve(&scope()).await.expect("resolves");
+    let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
     assert_eq!(
         pairs(resolved.as_map()),
         owned(&[("A", "imported"), ("B", "shared")])
@@ -342,7 +380,7 @@ async fn values_pass_through_byte_for_byte() {
     let stub = serving(Value::Array(
         rows.iter().map(|(k, v)| secret(k, v)).collect(),
     ));
-    let resolved = provider(&stub).resolve(&scope()).await.expect("resolves");
+    let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
     let mut want = owned(&rows);
     want.sort();
     assert_eq!(pairs(resolved.as_map()), want);
@@ -360,7 +398,7 @@ async fn an_absent_or_null_imports_field_is_no_imports() {
             SECRETS,
             Reply::json(200, &body),
         );
-        let resolved = provider(&stub).resolve(&scope()).await.expect("resolves");
+        let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
         assert_eq!(pairs(resolved.as_map()), owned(&[("A", "x")]));
     }
 }
@@ -396,14 +434,17 @@ async fn a_hidden_import_value_shadowed_by_the_folder_is_not_a_refusal() {
             json!([{"secrets": [hidden("K")]}]),
         ),
     );
-    let resolved = provider(&stub).resolve(&scope()).await.expect("resolves");
+    let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
     assert_eq!(pairs(resolved.as_map()), owned(&[("K", "folder")]));
 }
 
 #[tokio::test]
 async fn a_bad_key_name_is_refused_naming_it() {
     let stub = serving(json!([secret("my-key", VALUE)]));
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
     assert!(
         err == SecretError::InvalidKey {
             key: "my-key".into()
@@ -415,7 +456,10 @@ async fn a_bad_key_name_is_refused_naming_it() {
 #[tokio::test]
 async fn a_nul_in_a_value_is_refused_naming_the_key() {
     let stub = serving(json!([secret("NUL_KEY", &format!("{VALUE}a\u{0}b"))]));
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
     assert!(
         err == SecretError::InvalidValue {
             key: "NUL_KEY".into()
@@ -435,18 +479,24 @@ async fn hidden_is_reported_before_a_bad_name_before_a_nul() {
         hidden("Z_HIDDEN"),
         secret("B", "a\u{0}")
     ]));
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
     assert!(
         matches!(err, SecretError::PermissionDenied { .. }),
         "hidden was not reported first"
     );
     let stub = serving(json!([secret("B", "a\u{0}"), secret("Z-BAD", "x")]));
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
-    assert_eq!(
-        err,
-        SecretError::InvalidKey {
-            key: "Z-BAD".into()
-        }
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
+    assert_err(
+        &err,
+        &SecretError::InvalidKey {
+            key: "Z-BAD".into(),
+        },
     );
 }
 
@@ -463,18 +513,18 @@ async fn a_refused_login_is_bad_credentials_and_never_retried() {
         error(401, "UnauthorizedError", "Invalid credentials"),
     );
     let p = provider(&stub);
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::BadCredentials
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::BadCredentials,
     );
     let before = stub.requests().len();
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::LoginRefusedEarlier
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::LoginRefusedEarlier,
     );
-    assert_eq!(
-        p.list_keys(&scope()).await.unwrap_err(),
-        SecretError::LoginRefusedEarlier
+    assert_err(
+        &p.list_keys(&scope()).await.must_fail("expected an error"),
+        &SecretError::LoginRefusedEarlier,
     );
     assert_eq!(
         stub.requests().len(),
@@ -497,14 +547,14 @@ async fn the_lockout_text_is_identity_locked_and_latches() {
         ),
     );
     let p = provider(&stub);
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::IdentityLocked
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::IdentityLocked,
     );
     let before = stub.requests().len();
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::LoginRefusedEarlier
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::LoginRefusedEarlier,
     );
     assert_eq!(
         stub.requests().len(),
@@ -559,14 +609,14 @@ async fn health_after_a_refused_login_makes_no_request() {
         error(401, "UnauthorizedError", "Invalid credentials"),
     );
     let p = provider(&stub);
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::BadCredentials
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::BadCredentials,
     );
     let before = stub.requests().len();
-    assert_eq!(
-        p.health().await.unwrap_err(),
-        SecretError::LoginRefusedEarlier
+    assert_err(
+        &p.health().await.must_fail("expected an error"),
+        &SecretError::LoginRefusedEarlier,
     );
     assert_eq!(
         stub.requests().len(),
@@ -585,14 +635,20 @@ async fn concurrent_first_calls_share_one_login() {
     );
     let (p, s) = (provider(&stub), scope());
     let (a, b) = tokio::join!(p.resolve(&s), p.resolve(&s));
-    let mut errors = [a.unwrap_err().to_string(), b.unwrap_err().to_string()];
+    let mut errors = [
+        a.must_fail("expected an error").to_string(),
+        b.must_fail("expected an error").to_string(),
+    ];
     errors.sort();
     let mut want = [
         SecretError::BadCredentials.to_string(),
         SecretError::LoginRefusedEarlier.to_string(),
     ];
     want.sort();
-    assert_eq!(errors, want);
+    assert!(
+        errors == want,
+        "the two calls are not one BadCredentials and one LoginRefusedEarlier"
+    );
     assert_eq!(stub.count("POST", LOGIN), 1);
 }
 
@@ -614,9 +670,9 @@ async fn concurrent_first_calls_with_a_good_login_share_one_login() {
 async fn a_live_token_is_reused_across_calls() {
     let stub = serving(json!([secret("A", VALUE)]));
     let p = provider(&stub);
-    p.resolve(&scope()).await.expect("resolves");
-    p.list_keys(&scope()).await.expect("lists");
-    p.resolve(&scope()).await.expect("resolves again");
+    p.resolve(&scope()).await.must("resolves");
+    p.list_keys(&scope()).await.must("lists");
+    p.resolve(&scope()).await.must("resolves again");
     assert_eq!(stub.count("POST", LOGIN), 1);
     assert_eq!(stub.count("GET", SECRETS), 3);
 }
@@ -630,8 +686,8 @@ async fn a_token_inside_the_margin_is_replaced() {
         list_ok(json!([secret("A", VALUE)]), json!([])),
     );
     let p = provider(&stub);
-    p.resolve(&scope()).await.expect("resolves");
-    p.resolve(&scope()).await.expect("resolves again");
+    p.resolve(&scope()).await.must("resolves");
+    p.resolve(&scope()).await.must("resolves again");
     assert_eq!(stub.count("POST", LOGIN), 2);
 }
 
@@ -646,8 +702,8 @@ async fn a_huge_expires_in_is_reused_and_never_panics() {
         list_ok(json!([secret("A", VALUE)]), json!([])),
     );
     let p = provider(&stub);
-    p.resolve(&scope()).await.expect("resolves");
-    p.resolve(&scope()).await.expect("resolves again");
+    p.resolve(&scope()).await.must("resolves");
+    p.resolve(&scope()).await.must("resolves again");
     assert_eq!(stub.count("POST", LOGIN), 1);
     assert_eq!(stub.count("GET", SECRETS), 2);
 }
@@ -668,7 +724,7 @@ async fn relogin_after(first: Reply) {
     let resolved = provider(&stub)
         .resolve(&scope())
         .await
-        .expect("resolves after a re-login");
+        .must("resolves after a re-login");
     assert_eq!(resolved.keys(), ["A"]);
     assert_eq!(stub.count("POST", LOGIN), 2);
     let gets: Vec<_> = stub
@@ -708,13 +764,16 @@ async fn a_token_refused_twice_is_protocol_after_one_relogin() {
         SECRETS,
         error(403, "TokenError", "Token expired"),
     );
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
-    assert_eq!(
-        err,
-        SecretError::Protocol {
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
+    assert_err(
+        &err,
+        &SecretError::Protocol {
             endpoint: SECRETS,
-            detail: "the access token was refused right after a fresh login".into()
-        }
+            detail: "the access token was refused right after a fresh login".into(),
+        },
     );
     assert_eq!(stub.count("POST", LOGIN), 2);
     assert_eq!(stub.count("GET", SECRETS), 2);
@@ -730,14 +789,14 @@ async fn a_refused_relogin_latches() {
     );
     stub.on("GET", SECRETS, error(403, "TokenError", "Token expired"));
     let p = provider(&stub);
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::BadCredentials
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::BadCredentials,
     );
     let before = stub.requests().len();
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::LoginRefusedEarlier
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::LoginRefusedEarlier,
     );
     assert_eq!(
         stub.requests().len(),
@@ -765,20 +824,20 @@ async fn a_login_429_is_rate_limited_and_does_not_latch() {
         list_ok(json!([secret("A", VALUE)]), json!([])),
     );
     let p = provider(&stub);
-    assert_eq!(
-        p.resolve(&scope()).await.unwrap_err(),
-        SecretError::RateLimited {
-            retry_after_secs: Some(12)
-        }
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::RateLimited {
+            retry_after_secs: Some(12),
+        },
     );
-    p.resolve(&scope()).await.expect("the next call logs in");
+    p.resolve(&scope()).await.must("the next call logs in");
     assert_eq!(stub.count("POST", LOGIN), 2);
 }
 
 #[tokio::test]
 async fn a_login_network_failure_is_unreachable_and_does_not_latch() {
     let p = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
-        .expect("a provider on a closed port");
+        .must("a provider on a closed port");
     for _ in 0..2 {
         match p.resolve(&scope()).await {
             Err(SecretError::Unreachable { endpoint, cause }) => {
@@ -801,9 +860,9 @@ async fn a_login_route_404_is_unsupported_server() {
     stub.on("POST", LOGIN, fastify_404("POST", LOGIN));
     let p = provider(&stub);
     for _ in 0..2 {
-        assert_eq!(
-            p.resolve(&scope()).await.unwrap_err(),
-            SecretError::UnsupportedServer { endpoint: LOGIN }
+        assert_err(
+            &p.resolve(&scope()).await.must_fail("expected an error"),
+            &SecretError::UnsupportedServer { endpoint: LOGIN },
         );
     }
     assert_eq!(
@@ -825,7 +884,10 @@ async fn a_login_500_is_protocol_and_never_quotes_the_body() {
             &format!("{CLIENT_SECRET} {TOKEN}"),
         ),
     );
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
     let text = format!("{err} {err:?}");
     assert!(
         !text.contains(CLIENT_SECRET),
@@ -859,25 +921,25 @@ async fn list_error(reply: Reply) -> SecretError {
 #[tokio::test]
 async fn a_fastify_route_404_is_unsupported_server() {
     let err = list_error(fastify_404("GET", "/api/v4/secrets?projectId=proj-1")).await;
-    assert_eq!(err, SecretError::UnsupportedServer { endpoint: SECRETS });
+    assert_err(&err, &SecretError::UnsupportedServer { endpoint: SECRETS });
     assert!(err.to_string().contains("v0.150"));
 }
 
 #[tokio::test]
 async fn a_not_found_404_is_project_not_found() {
     let err = list_error(error(404, "NotFound", "Project with ID proj-1 not found")).await;
-    assert_eq!(err, SecretError::ProjectNotFound);
+    assert_err(&err, &SecretError::ProjectNotFound);
 }
 
 #[tokio::test]
 async fn a_secret_path_404_is_path_not_found_naming_the_scope() {
     let err = list_error(error(404, "SecretPathNotFound", "Folder not found")).await;
-    assert_eq!(
-        err,
-        SecretError::PathNotFound {
+    assert_err(
+        &err,
+        &SecretError::PathNotFound {
             environment: "dev".into(),
-            path: "/app".into()
-        }
+            path: "/app".into(),
+        },
     );
 }
 
@@ -889,18 +951,18 @@ async fn a_permission_denied_403_carries_the_cleaned_message() {
         "You are not allowed to\r\nread secrets in dev",
     ))
     .await;
-    assert_eq!(
-        err,
-        SecretError::PermissionDenied {
-            detail: "You are not allowed toread secrets in dev".into()
-        }
+    assert_err(
+        &err,
+        &SecretError::PermissionDenied {
+            detail: "You are not allowed toread secrets in dev".into(),
+        },
     );
     let err = list_error(error(403, "Forbidden", "")).await;
-    assert_eq!(
-        err,
-        SecretError::PermissionDenied {
-            detail: "status 403 Forbidden".into()
-        }
+    assert_err(
+        &err,
+        &SecretError::PermissionDenied {
+            detail: "status 403 Forbidden".into(),
+        },
     );
 }
 
@@ -912,29 +974,29 @@ async fn a_membership_403_is_permission_denied() {
         "Identity is not a member of the project",
     ))
     .await;
-    assert_eq!(
-        err,
-        SecretError::PermissionDenied {
-            detail: "Identity is not a member of the project".into()
-        }
+    assert_err(
+        &err,
+        &SecretError::PermissionDenied {
+            detail: "Identity is not a member of the project".into(),
+        },
     );
 }
 
 #[tokio::test]
 async fn a_429_is_rate_limited_with_or_without_retry_after() {
     let err = list_error(error(429, "RateLimitExceeded", "slow").header("Retry-After", "30")).await;
-    assert_eq!(
-        err,
-        SecretError::RateLimited {
-            retry_after_secs: Some(30)
-        }
+    assert_err(
+        &err,
+        &SecretError::RateLimited {
+            retry_after_secs: Some(30),
+        },
     );
     let err = list_error(error(429, "RateLimitExceeded", "slow")).await;
-    assert_eq!(
-        err,
-        SecretError::RateLimited {
-            retry_after_secs: None
-        }
+    assert_err(
+        &err,
+        &SecretError::RateLimited {
+            retry_after_secs: None,
+        },
     );
 }
 
@@ -978,12 +1040,12 @@ async fn a_403_error_name_is_cleaned_and_cut_too() {
 #[tokio::test]
 async fn an_unexpected_status_is_protocol_naming_the_endpoint() {
     let err = list_error(error(500, "InternalServerError", "boom")).await;
-    assert_eq!(
-        err,
-        SecretError::Protocol {
+    assert_err(
+        &err,
+        &SecretError::Protocol {
             endpoint: SECRETS,
-            detail: "status 500: boom".into()
-        }
+            detail: "status 500: boom".into(),
+        },
     );
 }
 
@@ -1011,13 +1073,16 @@ async fn a_data_redirect_is_protocol_and_never_followed() {
             Reply::redirect(302, &format!("{}/elsewhere", stub.base())),
         )
         .on("GET", "/elsewhere", list_ok(json!([]), json!([])));
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
-    assert_eq!(
-        err,
-        SecretError::Protocol {
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
+    assert_err(
+        &err,
+        &SecretError::Protocol {
             endpoint: SECRETS,
-            detail: "the server answered a redirect (302); redirects are not followed".into()
-        }
+            detail: "the server answered a redirect (302); redirects are not followed".into(),
+        },
     );
     assert_eq!(stub.count("GET", "/elsewhere"), 0);
 }
@@ -1034,7 +1099,7 @@ async fn a_login_redirect_is_protocol_and_the_body_never_follows() {
     let p = provider(&stub);
     for _ in 0..2 {
         assert!(
-            p.resolve(&scope()).await.unwrap_err()
+            p.resolve(&scope()).await.must_fail("expected an error")
                 == SecretError::Protocol {
                     endpoint: LOGIN,
                     detail: "the server answered a redirect (307); redirects are not followed"
@@ -1069,7 +1134,7 @@ async fn an_empty_or_unusable_login_token_is_protocol_and_never_cached() {
         );
         let p = provider(&stub);
         for _ in 0..2 {
-            let err = p.resolve(&scope()).await.unwrap_err();
+            let err = p.resolve(&scope()).await.must_fail("expected an error");
             assert!(
                 matches!(&err, SecretError::Protocol { endpoint, detail: got }
                     if *endpoint == LOGIN && got == detail),
@@ -1099,7 +1164,7 @@ async fn health_reads_the_status_then_logs_in() {
     let stub = Stub::start();
     stub.on("GET", STATUS, Reply::json(200, &json!({"message": "Ok"})))
         .on("POST", LOGIN, login_ok(TOKEN, 2_592_000));
-    let health = provider(&stub).health().await.expect("healthy");
+    let health = provider(&stub).health().await.must("healthy");
     assert_eq!(
         routes(&stub),
         [
@@ -1116,7 +1181,7 @@ async fn health_reports_a_failing_status_and_still_logs_in() {
     let stub = Stub::start();
     stub.on("GET", STATUS, error(503, "ServiceUnavailable", "down"))
         .on("POST", LOGIN, login_ok(TOKEN, 2_592_000));
-    let health = provider(&stub).health().await.expect("health answers");
+    let health = provider(&stub).health().await.must("health answers");
     assert!(!health.server_ok);
     assert_eq!(stub.count("POST", LOGIN), 1);
 }
@@ -1126,15 +1191,15 @@ async fn health_always_logs_in_afresh() {
     let stub = serving(json!([secret("A", VALUE)]));
     stub.on("GET", STATUS, Reply::json(200, &json!({})));
     let p = provider(&stub);
-    p.resolve(&scope()).await.expect("resolves");
-    p.health().await.expect("healthy");
+    p.resolve(&scope()).await.must("resolves");
+    p.health().await.must("healthy");
     assert_eq!(stub.count("POST", LOGIN), 2);
 }
 
 #[tokio::test]
 async fn health_on_an_unreachable_server_names_the_status_endpoint() {
     let p = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
-        .expect("a provider on a closed port");
+        .must("a provider on a closed port");
     assert!(
         matches!(
             p.health().await,
@@ -1193,22 +1258,22 @@ async fn no_error_or_debug_carries_a_value_the_client_secret_or_the_token() {
 
     errors.push(
         InfisicalProvider::new(InfisicalConfig::new("http://192.168.1.10"), identity())
-            .expect_err("a LAN http URL is refused"),
+            .must_fail("a LAN http URL is refused"),
     );
     let closed = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
-        .expect("a provider on a closed port");
+        .must("a provider on a closed port");
     errors.push(
         closed
             .resolve(&scope())
             .await
-            .expect_err("a closed port fails"),
+            .must_fail("a closed port fails"),
     );
 
     let stub = Stub::start();
     stub.on("POST", LOGIN, leaky_login(401, "Invalid credentials"));
     let latched = provider(&stub);
-    errors.push(latched.resolve(&scope()).await.expect_err("refused"));
-    errors.push(latched.resolve(&scope()).await.expect_err("latched"));
+    errors.push(latched.resolve(&scope()).await.must_fail("refused"));
+    errors.push(latched.resolve(&scope()).await.must_fail("latched"));
 
     errors.push(scenario(leaky_login(401, "Identity is temporarily locked"), unused()).await);
     errors.push(scenario(leaky_login(500, "Internal error"), unused()).await);
@@ -1276,7 +1341,7 @@ async fn no_error_or_debug_carries_a_value_the_client_secret_or_the_token() {
 async fn the_provider_debug_shows_neither_the_secret_nor_the_token() {
     let stub = serving(json!([secret("A", VALUE)]));
     let p = provider(&stub);
-    p.resolve(&scope()).await.expect("resolves");
+    p.resolve(&scope()).await.must("resolves");
     let debug = format!("{p:?}");
     assert!(debug.contains(CLIENT_ID), "the Debug lacks the client ID");
     assert!(debug.contains(&stub.base()), "the Debug lacks the base URL");
@@ -1295,7 +1360,10 @@ async fn a_malformed_login_answer_never_quotes_the_token() {
         LOGIN,
         Reply::json(200, &json!({"accessToken": TOKEN, "expiresIn": TOKEN})),
     );
-    let err = provider(&stub).resolve(&scope()).await.unwrap_err();
+    let err = provider(&stub)
+        .resolve(&scope())
+        .await
+        .must_fail("expected an error");
     assert!(
         matches!(err, SecretError::Protocol { endpoint, .. } if endpoint == LOGIN),
         "expected Protocol at the login"
