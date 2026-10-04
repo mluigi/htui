@@ -118,7 +118,7 @@ fn coverage(rows: &[CoverageRow], theme: &Theme) -> Vec<Line<'static>> {
                 |resolution| resolution.to_string(),
             );
             let mut spans = vec![
-                Span::styled(cells::pad(&row.item.key, key_width), theme.accent),
+                Span::styled(cells::pad(&row.item.key, key_width), theme.key),
                 Span::raw("  "),
                 Span::styled(cells::pad(row.kind.as_str(), KIND_WIDTH), theme.base),
                 Span::raw(" "),
@@ -159,7 +159,7 @@ fn revision(row: &RevisionRow, theme: &Theme) -> Line<'static> {
         Span::raw(" "),
         Span::styled(cells::pad(&row.revision.reason, REASON_WIDTH), theme.base),
         Span::raw(" "),
-        Span::styled(cells::pad(&by, 12), theme.accent),
+        Span::styled(cells::pad(&by, 12), theme.key),
         Span::raw(" "),
         Span::styled(row.revision.created_at.format(STAMP).to_string(), theme.dim),
     ])

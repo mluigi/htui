@@ -203,7 +203,7 @@ fn lines(view: &ListView<'_>, theme: &Theme, width: usize) -> Vec<Line<'static>>
             out.push(row(
                 vec![
                     Span::raw(" ".repeat(INDENT)),
-                    Span::styled(cells::pad(&item.key, key_width), theme.accent),
+                    Span::styled(cells::pad(&item.key, key_width), theme.key),
                     Span::raw(" ".repeat(GAP)),
                     Span::styled(
                         cells::pad(item.status.as_str(), status_width),
@@ -253,7 +253,7 @@ mod tests {
     use htui_core::fixtures::ids;
     use htui_core::model::Status;
     use ratatui::buffer::Buffer;
-    use ratatui::style::Color;
+    use ratatui::style::{Color, Modifier};
     use ratatui::widgets::Widget as _;
 
     /// MOD-13 D5: no filter, the title every existing snapshot pins.
@@ -379,5 +379,42 @@ mod tests {
             Color::Reset,
             "the next row is not selected"
         );
+        let key_width = cell_width("FEAT-12");
+        for x in INDENT..INDENT + key_width {
+            let x = u16::try_from(x).expect("a narrow row");
+            assert!(
+                buffer[(x, 1)].modifier.contains(Modifier::BOLD),
+                "the key stays bold under the selection, x = {x}"
+            );
+        }
+    }
+
+    /// MOD-80 D1: a key is bold in the terminal's own colour, not cyan, and `in_progress` is
+    /// drawn `running`.
+    #[test]
+    fn an_item_key_is_bold_and_in_progress_is_running() {
+        let (items, projects) = two_items();
+        let view = ListView {
+            items: &items,
+            projects: &projects,
+            folded: &[],
+            selected: None,
+            filter: None,
+        };
+        let theme = Theme::default();
+        let buffer = drawn(&view, &theme, 50);
+        let key = &buffer[(u16::try_from(INDENT).expect("small"), 1)];
+        assert_eq!(key.symbol(), "F");
+        assert!(key.modifier.contains(Modifier::BOLD), "{key:?}");
+        assert_eq!(key.fg, Color::Reset, "a key is not cyan: {key:?}");
+        let status_x = INDENT + cell_width("FEAT-12") + GAP;
+        let status = &buffer[(u16::try_from(status_x).expect("small"), 1)];
+        assert_eq!(status.symbol(), "i", "in_progress starts here");
+        assert_eq!(
+            status.fg,
+            theme.running.fg.expect("running has a colour"),
+            "{status:?}"
+        );
+        assert_eq!(status.fg, Color::Blue);
     }
 }

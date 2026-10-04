@@ -25,7 +25,7 @@ pub fn unified(old: &str, new: &str, old_label: &str, new_label: &str) -> String
         .to_string()
 }
 
-/// `+` accents, `-` errors, the `---`/`+++` headers and everything else dim — the two gutters a
+/// `+` in `added`, `-` in `error`, the `---`/`+++` headers and everything else dim — the two gutters a
 /// reader looks for. Moved here from the chat transcript (D12), byte for byte, so its frames do not
 /// move.
 #[must_use]
@@ -33,7 +33,7 @@ pub fn diff_style(line: &str, theme: &Theme) -> Style {
     if line.starts_with("+++") || line.starts_with("---") {
         theme.dim
     } else if line.starts_with('+') {
-        theme.accent
+        theme.added
     } else if line.starts_with('-') {
         theme.error
     } else {
@@ -70,7 +70,7 @@ mod tests {
     }
 
     #[test]
-    fn an_added_line_is_accented() {
+    fn an_added_line_is_drawn_added() {
         let theme = Theme::default();
         let diff = unified("one\ntwo\n", "one\nadded\ntwo\n", "v1", "v2");
         assert!(
@@ -82,7 +82,7 @@ mod tests {
             .iter()
             .find(|line| line.to_string() == "+added")
             .unwrap_or_else(|| panic!("no `+added` line in {diff}"));
-        assert_eq!(added.style, theme.accent);
+        assert_eq!(added.style, theme.added);
         let header = lines
             .iter()
             .find(|line| line.to_string() == "+++ v2")

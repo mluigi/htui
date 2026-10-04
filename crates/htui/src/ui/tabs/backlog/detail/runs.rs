@@ -65,7 +65,7 @@ use htui_orch::closeout::Preview;
 use htui_orch::{Command, CommandOutcome, GateAnswer};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::Value;
@@ -959,8 +959,8 @@ fn command(command: Command) -> StoreRequest {
 fn run_style(theme: &Theme, status: RunStatus) -> Style {
     match status {
         RunStatus::Queued => theme.base,
-        RunStatus::Running => Style::new().fg(Color::Cyan),
-        RunStatus::AwaitingApproval => Style::new().fg(Color::Yellow),
+        RunStatus::Running => theme.running,
+        RunStatus::AwaitingApproval => theme.warning,
         RunStatus::Done => theme.dim,
         RunStatus::Failed | RunStatus::Cancelled => theme.error,
     }
@@ -970,8 +970,8 @@ fn run_style(theme: &Theme, status: RunStatus) -> Style {
 fn step_style(theme: &Theme, status: StepStatus) -> Style {
     match status {
         StepStatus::Pending | StepStatus::Superseded => theme.dim,
-        StepStatus::Running => Style::new().fg(Color::Cyan),
-        StepStatus::AwaitingApproval => Style::new().fg(Color::Yellow),
+        StepStatus::Running => theme.running,
+        StepStatus::AwaitingApproval => theme.warning,
         StepStatus::Done => theme.dim,
         StepStatus::Failed | StepStatus::Cancelled => theme.error,
     }
@@ -2032,6 +2032,22 @@ mod tests {
             column(second, "~36k"),
             column(&lines[at], "implement"),
             "and in the same column: the tail starts where the phase does"
+        );
+    }
+
+    /// MOD-80 D1: a running run or step is `running`, a parked one a `warning`; cyan is focus.
+    #[test]
+    fn run_and_step_statuses_take_the_running_and_warning_roles() {
+        let theme = Theme::default();
+        assert_eq!(run_style(&theme, RunStatus::Running), theme.running);
+        assert_eq!(
+            run_style(&theme, RunStatus::AwaitingApproval),
+            theme.warning
+        );
+        assert_eq!(step_style(&theme, StepStatus::Running), theme.running);
+        assert_eq!(
+            step_style(&theme, StepStatus::AwaitingApproval),
+            theme.warning
         );
     }
 

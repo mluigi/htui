@@ -232,7 +232,8 @@ impl StepNode {
         }
         match self.status {
             StepStatus::Failed => self.theme.error,
-            StepStatus::Running | StepStatus::AwaitingApproval => self.theme.accent,
+            StepStatus::Running => self.theme.running,
+            StepStatus::AwaitingApproval => self.theme.warning,
             StepStatus::Superseded | StepStatus::Cancelled => self.theme.dim,
             StepStatus::Pending | StepStatus::Done => self.theme.base,
         }
@@ -1517,9 +1518,9 @@ mod tests {
         assert_no_ghost_corner(term.backend().buffer());
     }
 
-    /// Review N4: a running and a parked step take the accent border.
+    /// Review N4, MOD-80 D1: a running and a parked step take the `running` and `warning` borders.
     #[test]
-    fn running_and_awaiting_steps_have_the_accent_border() {
+    fn running_and_awaiting_steps_have_their_status_border() {
         let run = run(
             1,
             vec![
@@ -1530,8 +1531,15 @@ mod tests {
         );
         let mut graph = synced(&run, Some(id(1)));
         let buf = draw(&mut graph);
-        assert_eq!(buf[corner_of(&buf, "1.1 running")].fg, Color::Cyan);
-        assert_eq!(buf[corner_of(&buf, "2.1 awaiting")].fg, Color::Cyan);
+        let theme = Theme::default();
+        assert_eq!(
+            buf[corner_of(&buf, "1.1 running")].fg,
+            theme.running.fg.expect("running has a colour")
+        );
+        assert_eq!(
+            buf[corner_of(&buf, "2.1 awaiting")].fg,
+            theme.warning.fg.expect("warning has a colour")
+        );
     }
 
     #[test]

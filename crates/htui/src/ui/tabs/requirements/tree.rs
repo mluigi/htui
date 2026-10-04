@@ -292,7 +292,7 @@ fn project_header(group: &Group<'_>, folded: bool, width: usize, theme: &Theme) 
     }
 }
 
-/// `    R-ENT-1  must   <first line of body>`: the key accented, the rest in
+/// `    R-ENT-1  must   <first line of body>`: the key in `key`, the rest in
 /// [`requirement_style`]; a withdrawn requirement is `  ✕ R-ENT-2  …`, every span dim.
 fn requirement_line(
     requirement: &Requirement,
@@ -302,7 +302,7 @@ fn requirement_line(
 ) -> Line<'static> {
     let style = requirement_style(requirement, theme);
     let withdrawn = requirement.state == RequirementState::Withdrawn;
-    let key_style = if withdrawn { theme.dim } else { theme.accent };
+    let key_style = if withdrawn { theme.dim } else { theme.key };
     let indent = if withdrawn {
         format!("{}{WITHDRAWN_MARK} ", " ".repeat(AREA_INDENT))
     } else {
@@ -685,8 +685,8 @@ mod tests {
             .find(|line| text(line).contains("R-ENT-1"))
             .expect("R-ENT-1 is listed");
         assert!(
-            active.spans.iter().any(|span| span.style == theme.accent),
-            "an active key is accented"
+            active.spans.iter().any(|span| span.style == theme.key),
+            "an active key is bold"
         );
         assert!(
             active

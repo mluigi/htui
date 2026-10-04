@@ -352,7 +352,7 @@ impl ReqsTab {
             let (key_style, text_style): (Style, Style) = if withdrawn {
                 (theme.dim, theme.dim)
             } else {
-                (theme.accent, theme.base)
+                (theme.key, theme.base)
             };
             let marker = if index == self.cursor { CURSOR } else { " " };
             let mut head = vec![
@@ -903,8 +903,8 @@ mod tests {
         assert!(!nothing_left.captures_input(), "no picker over nothing");
     }
 
-    /// Blueprint §5.3: a withdrawn requirement's key and text are dim; an active one's key is
-    /// accented. The `! suspect` marker keeps its colour either way.
+    /// Blueprint §5.3: a withdrawn requirement's key and text are dim; an active one's key is in
+    /// `key`. The `! suspect` marker keeps its colour either way.
     #[tokio::test]
     async fn withdrawn_rows_render_dim() {
         let shell = Shell::new();
@@ -934,7 +934,7 @@ mod tests {
             .iter()
             .find(|span| span.content == "R-ENT-1")
             .expect("the key is its own span");
-        assert_eq!(key.style, theme.accent, "an active key is accented");
+        assert_eq!(key.style, theme.key, "an active key is a key");
     }
 
     /// Review of T4: `r` on a suspect citation of a withdrawn requirement answers the store's
