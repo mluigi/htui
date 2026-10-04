@@ -362,7 +362,14 @@ impl App {
                 }
             }
             StoreReply::BoxInfo(Some(info)) => self.top_bar.box_name = info.hostname.clone(),
-            StoreReply::Waiting(view) => self.top_bar.waiting = Some(view.clone()),
+            // Review M1: the old scope's queued reply lands after `set_scope` (blueprint H-10).
+            StoreReply::Waiting { workspace, view } => {
+                if *workspace == self.scope.workspace_id {
+                    self.top_bar.waiting = Some(view.clone());
+                } else {
+                    tracing::debug!(%workspace, "a waiting reply for a workspace since left");
+                }
+            }
             StoreReply::StoreState {
                 label,
                 migrations_pending,
@@ -689,9 +696,50 @@ mod tests {
         app.update(Action::Reply(ReplyEnvelope {
             seq: UNSOLICITED,
             origin: Origin::Overlay(WaitingList::ID),
-            reply: StoreReply::Waiting(view.clone()),
+            reply: StoreReply::Waiting {
+                workspace: app.scope.workspace_id,
+                view: view.clone(),
+            },
         }));
         assert_eq!(app.top_bar.waiting, Some(view));
+    }
+
+    /// MOD-69 review M1: a reply for the workspace the shell just left lands after `set_scope`
+    /// (blueprint H-10) and is dropped; the new workspace's reply is taken.
+    #[test]
+    fn a_waiting_reply_for_the_old_workspace_is_dropped_after_a_scope_change() {
+        let (mut app, _rx, _seen) = shell();
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        let view = |working| WaitingView {
+            working,
+            rows: Vec::new(),
+            permissions_known: true,
+        };
+        let reply = |workspace, view| {
+            Action::Reply(ReplyEnvelope {
+                seq: UNSOLICITED,
+                origin: Origin::App,
+                reply: StoreReply::Waiting { workspace, view },
+            })
+        };
+
+        app.update(reply(ids::WORKSPACE_GRAPHICS, view(7)));
+        assert_eq!(
+            app.top_bar.waiting, None,
+            "the old workspace's counts never show"
+        );
+
+        app.update(reply(ids::WORKSPACE_PLATFORM, view(2)));
+        assert_eq!(app.top_bar.waiting, Some(view(2)));
+
+        app.update(reply(ids::WORKSPACE_GRAPHICS, view(7)));
+        assert_eq!(
+            app.top_bar.waiting,
+            Some(view(2)),
+            "nor overwrite the new one"
+        );
     }
 
     /// A `Failed` reply at `seq`, addressed to the recorder tab.

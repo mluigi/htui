@@ -1152,7 +1152,13 @@ pub enum StoreReply {
     /// Answer to [`StoreRequest::BoxInfo`]; `None` when no box row is registered.
     BoxInfo(Option<BoxInfo>),
     /// Answer to [`StoreRequest::Waiting`].
-    Waiting(WaitingView),
+    Waiting {
+        /// The asked scope's `workspace_id`: a reply for a workspace the shell has since left is
+        /// dropped, as `observe_reply` runs before the freshness gate (MOD-69 review M1).
+        workspace: WorkspaceId,
+        /// The list and the two counts.
+        view: WaitingView,
+    },
     /// Answer to [`StoreRequest::Items`].
     Items(Vec<ItemSummary>),
     /// Answer to [`StoreRequest::Item`]; boxed because `Item` dwarfs every other variant.
@@ -1718,12 +1724,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 Some(writer) => Some(WriteStore::open_permissions(&writer, scope).await?),
                 None => None,
             };
-            StoreReply::Waiting(htui_worker::waiting(
-                scope,
-                active,
-                &candidates,
-                permissions.as_deref(),
-            ))
+            StoreReply::Waiting {
+                workspace: scope.workspace_id,
+                view: htui_worker::waiting(scope, active, &candidates, permissions.as_deref()),
+            }
         }
         StoreRequest::Items {
             scope,
@@ -3186,10 +3190,18 @@ mod tests {
             .name(),
             "waiting"
         );
-        let StoreReply::Waiting(view) = serve(&backend, &StoreRequest::Waiting { scope }).await
+        let workspace = scope.workspace_id;
+        let StoreReply::Waiting {
+            workspace: answered,
+            view,
+        } = serve(&backend, &StoreRequest::Waiting { scope }).await
         else {
             panic!("wrong reply variant")
         };
+        assert_eq!(
+            answered, workspace,
+            "the reply names the scope it read (review M1)"
+        );
         assert_eq!(view.working, 1, "RUN_2 is the fixture's only active run");
         assert!(view.permissions_known, "a Memory backend has a writer");
         assert_eq!(
@@ -4898,7 +4910,8 @@ mod tests {
             project_ids: vec![ids::PROJECT_HTUI],
         };
         match try_serve(&backend, &StoreRequest::Waiting { scope }).await {
-            Ok(StoreReply::Waiting(view)) => {
+            Ok(StoreReply::Waiting { workspace, view }) => {
+                assert_eq!(workspace, ids::WORKSPACE_PLATFORM);
                 assert!(!view.permissions_known, "offline permissions are unknown");
                 assert!(view.rows.is_empty(), "an empty mirror owes nothing");
                 assert_eq!(view.working, 0);
