@@ -28,7 +28,7 @@ use htui_core::model::{
     PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView,
     RepoId, RepoPatch, RequirementAreaId, RequirementId, RunSummary, Scope, SessionEvent,
     SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch, StepId,
-    ToolCallCount, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -1704,6 +1704,22 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> StoreReply {
     }
 }
 
+/// MOD-69 review L4: the open permissions, or `None` (unknown, as offline) when their read fails
+/// for any reason but [`StoreError::Unreachable`], which propagates so `go_offline` still fires.
+/// A broken permission read then costs the list its permission rows, not the whole reply.
+fn permissions_or_unknown(
+    read: StoreResult<Vec<WaitingPermission>>,
+) -> StoreResult<Option<Vec<WaitingPermission>>> {
+    match read {
+        Ok(permissions) => Ok(Some(permissions)),
+        Err(err @ StoreError::Unreachable(_)) => Err(err),
+        Err(err) => {
+            tracing::warn!(%err, "the waiting list's permission read failed; listing none");
+            Ok(None)
+        }
+    }
+}
+
 /// [`serve`] with the `StoreError` still visible, for the one caller that has to act on it.
 ///
 /// [`spawn`] needs to tell [`StoreError::Unreachable`] from every other failure so it can drop an
@@ -1716,12 +1732,15 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         StoreRequest::BoxInfo => StoreReply::BoxInfo(backend.box_info().await?),
         // MOD-69 plan D1, D4, D6: one candidate read, plus the open permissions online; the
         // classification is the engine's own guards (`htui_worker::waiting`). An `Unreachable`
-        // from either read propagates, so `go_offline` still drops the backend (blueprint H-12).
+        // from either read propagates, so `go_offline` still drops the backend (blueprint H-12);
+        // any other failure of the permission read only leaves them unknown (review L4).
         StoreRequest::Waiting { scope } => {
             let active = backend.active_runs(scope).await?;
             let candidates = backend.waiting_candidates(scope).await?;
             let permissions = match backend.writer() {
-                Some(writer) => Some(WriteStore::open_permissions(&writer, scope).await?),
+                Some(writer) => {
+                    permissions_or_unknown(WriteStore::open_permissions(&writer, scope).await)?
+                }
                 None => None,
             };
             StoreReply::Waiting {
@@ -4918,6 +4937,27 @@ mod tests {
             }
             other => panic!("an offline waiting read is a view: {other:?}"),
         }
+    }
+
+    /// MOD-69 review L4: a permission read that fails for any reason but `Unreachable` leaves the
+    /// permissions unknown rather than failing the whole `Waiting` reply; `Unreachable` still
+    /// propagates, so `go_offline` drops the backend.
+    #[test]
+    fn a_failing_permission_read_degrades_and_unreachable_propagates() {
+        assert_eq!(
+            permissions_or_unknown(Ok(Vec::new())).expect("a read"),
+            Some(Vec::new())
+        );
+        assert_eq!(
+            permissions_or_unknown(Err(StoreError::Backend("relation gone".into())))
+                .expect("degraded, not failed"),
+            None,
+            "permissions_known = false"
+        );
+        assert!(matches!(
+            permissions_or_unknown(Err(StoreError::Unreachable("down".into()))),
+            Err(StoreError::Unreachable(_))
+        ));
     }
 
     /// MOD-42 plan D14, OQ-4: offline the Runs pane's relay read is an **empty** view, never a
