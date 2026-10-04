@@ -898,9 +898,13 @@ impl MemStore {
         self.read(|state| state.run_commands.values().cloned().collect())
     }
 
-    /// MOD-76 D4 (R-55): sets `settings[key]` on box `id`'s row, on this store and every clone of
-    /// it, as no `BoxEdit` field writes it (`command_limits`). `edit_version` does not move. Whether
-    /// the row exists.
+    /// MOD-76 D4 (R-55): sets `settings[key]` on box `id`'s row, on this store and every clone
+    /// of it, as no `BoxEdit` field writes it (`command_limits`). `edit_version` does not move.
+    /// Whether the row exists.
+    ///
+    /// # Panics
+    /// When the row's `settings` is neither an object nor `null` (`edit_box` refuses to write
+    /// one, so only a hand-built fixture has it).
     #[cfg(feature = "test-support")]
     pub fn set_box_setting(&self, id: BoxId, key: &str, value: Value) -> bool {
         self.write(|state| {

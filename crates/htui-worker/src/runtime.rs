@@ -443,7 +443,7 @@ impl<P: ReplySink> Shared<P> {
             built.verifier = None;
         }
         if built.verifier.is_none() {
-            let limits = parse_limits(box_id, stored.clone());
+            let limits = parse_limits(box_id, stored.as_ref());
             built.verifier = Some(Arc::new(ShellVerifier::new(
                 &limits,
                 Arc::new(MinimalScrubber::new(std::iter::empty::<String>())),
@@ -807,30 +807,17 @@ async fn repo_map<H: htui_core::store::WorkerHost>(
     Ok(repos)
 }
 
-/// The box row's `settings.command_limits`, else `{"verify": 1}` (D156): no row, no key, or a
-/// stored value that does not parse (warned) all get the default.
+/// MOD-76 B-1 (R-55): the box row's `settings.command_limits` as stored, `None` for no row or no
+/// key. [`Shared::singletons`] compares it raw, so a value that does not parse is parsed (and
+/// warned) once per build, not once per sweep. The limits are read at every walking `StartRun`
+/// and every worker sweep, and the verifier is rebuilt from an edit once no walk of the process is
+/// live (MOD-76 D4).
 ///
 /// D216 (review L7): a read that fails is not the default. `singletons` passes it up like the
-/// reads beside it, so no verifier is cached from it and the next command reads again. The limits
-/// are read at every walking `StartRun` and every worker sweep, and the verifier is rebuilt from
-/// an edit once no walk of the process is live (MOD-76 D4, R-55): [`stored_limits`] then
-/// [`parse_limits`].
+/// reads beside it, so no verifier is cached from it and the next command reads again.
 ///
 /// # Errors
 /// The store's own read failure.
-async fn command_limits<H: htui_core::store::WorkerHost>(
-    host: &H,
-    box_id: BoxId,
-) -> StoreResult<BTreeMap<String, u32>> {
-    Ok(parse_limits(box_id, stored_limits(host, box_id).await?))
-}
-
-/// MOD-76 B-1 (R-55): the box row's `settings.command_limits` as stored, `None` for no row or no
-/// key. [`Shared::singletons`] compares it raw, so a value that does not parse is parsed (and
-/// warned) once per build, not once per sweep.
-///
-/// # Errors
-/// The store's own read failure (D216).
 async fn stored_limits<H: htui_core::store::WorkerHost>(
     host: &H,
     box_id: BoxId,
@@ -843,12 +830,12 @@ async fn stored_limits<H: htui_core::store::WorkerHost>(
 
 /// MOD-76 B-1 (R-55): `stored` parsed, else `{"verify": 1}` (D156): no value, or one that does
 /// not parse (warned).
-fn parse_limits(box_id: BoxId, stored: Option<Value>) -> BTreeMap<String, u32> {
+fn parse_limits(box_id: BoxId, stored: Option<&Value>) -> BTreeMap<String, u32> {
     let default = || BTreeMap::from([("verify".to_owned(), 1)]);
     let Some(stored) = stored else {
         return default();
     };
-    serde_json::from_value(stored).unwrap_or_else(|err| {
+    serde_json::from_value(stored.clone()).unwrap_or_else(|err| {
         tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; verify runs one at a time");
         default()
     })
@@ -3031,7 +3018,10 @@ pub mod testing {
         host: &H,
         box_id: BoxId,
     ) -> StoreResult<BTreeMap<String, u32>> {
-        super::command_limits(host, box_id).await
+        Ok(super::parse_limits(
+            box_id,
+            super::stored_limits(host, box_id).await?.as_ref(),
+        ))
     }
 
     /// The verdicts of an item the mirror does not hold, off the server: nothing is enabled.
@@ -3935,7 +3925,7 @@ mod role_gate {
         );
     }
 
-    /// MOD-76 D4 (R-55): a worker runtime over the seeded demo, with no run queued.
+    /// MOD-76 D4 (R-55): a runtime of `role` with the `acp` driver and a scratch root.
     fn limits_runtime(scratch: &Scratch, role: Role) -> RunRuntime<Backend, Timed> {
         let mut factory = DriverFactory::new();
         factory.register("acp", Box::new(OneTurn));

@@ -43,9 +43,8 @@ What it does:
   lapse, exactly as the TUI does.
 - Picks up a repo or checkout change (a repo added, a checkout path set or moved) at the next
   sweep when no run is walking, with no restart; `copy_max_total_bytes` is read again at that
-  point. While a run is walking, the worker keeps
-  adopting but its sweep claims no queued run until its walks rest, so no walk has its checkouts
-  moved under it. A run whose claim the worker already had to put back (its slot full, or its
+  point. While a run is walking, the worker keeps adopting but its sweep claims no queued run
+  until its walks rest, so no walk has its checkouts moved under it. A run whose claim the worker already had to put back (its slot full, or its
   scope overlapping a walk) is still claimed when one of the walks rests, with the checkouts the
   worker read before the change. A change to the box's command limits alone reaches the worker
   at its next sweep with no run walking, with no restart; while a run is walking, the worker keeps
