@@ -2,7 +2,7 @@
 source: crates/htui/tests/settings.rs
 expression: frame
 ---
-no workspace · no box · memory · 0 runs
+no workspace · no box · memory · 0 working · 0 waiting
  1 Settings
 ┌ Settings ────────────────────────────────────────────────────────────────────────────────────────┐
 │ Agents                                                                                           │

@@ -2,7 +2,7 @@
 source: crates/htui/tests/concepts_search.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 run
+Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
  1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
 ┌ Backlog (11) ───────────────────────────────────────┐┌ ANA-1 ────────────────────────────────────┐
 │▾ htui (8)                                           ││ Body Runs Graph Docs Notes Prompt Reqs    │

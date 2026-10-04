@@ -2,7 +2,7 @@
 source: crates/htui/tests/requirements.rs
 expression: frame
 ---
-Platform · DESKTOP-HTUI · memory · 1 run
+Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
  1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
 ┌ Requirements (1) · /STO ──────────────────┐┌ R-STO-1 ────────────────────────────────────────────┐
 │▾ htui (1)                                 ││Postgres is the source of truth; the cache is a      │

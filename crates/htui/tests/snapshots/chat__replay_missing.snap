@@ -2,7 +2,7 @@
 source: crates/htui/tests/chat.rs
 expression: harness.render()
 ---
-Graphics · DESKTOP-HTUI · memory · 0 runs
+Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
  1 Chat
 ┌ Chat ────────────────────────────────────────────────────────────────────────────────────────────┐
 │replay · step …00000d00 · 0 rows · read-only · Esc leave                                          │
