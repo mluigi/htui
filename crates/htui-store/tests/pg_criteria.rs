@@ -18,14 +18,14 @@ use chrono::{DateTime, SubsecRound as _, TimeDelta, Utc};
 use futures::future::join_all;
 use htui_core::fixtures::ids;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest, Claim,
-    CommandRunId, CommandRunStatus, EventKind, EventRole, GraphSnapshot, Isolation, ItemFilter,
-    ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem, NewProject, NewRepo,
-    NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId, PermissionStatus, Priority,
-    ProjectId, RelayOption, RelayOptionKind, RelaySessionId, RepoId, RequirementId,
-    RunCommandStatus, RunId, RunMode, RunStatus, RunStepTree, SessionEvent, SnapshotGraph,
-    SnapshotSettings, Status, StepId, StepOutcome, TIMESTAMPTZ_DIGITS, Transport, UserId,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    Agent, AgentBox, AgentId, AnswerOutcome, AnswerRefusal, Billing, BoxId, CancelRequest,
+    ChatRunSpec, Claim, CommandRunId, CommandRunStatus, EventKind, EventRole, GraphSnapshot,
+    Isolation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, NewCommandRun, NewItem,
+    NewProject, NewRepo, NewRequirement, NewRun, NewWorkspace, OpenPermission, PermissionId,
+    PermissionStatus, Priority, ProjectId, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
+    RequirementId, RunCommandStatus, RunId, RunMode, RunStatus, RunStepCommit, RunStepTree,
+    SessionEvent, SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, TIMESTAMPTZ_DIGITS,
+    Transport, UserId, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -6451,6 +6451,403 @@ async fn a_step_document_racing_a_park_never_deadlocks() {
             "round {round}: the item resumes"
         );
     }
+
+    db.drop_db().await;
+}
+
+// ------------------------------------------------------------------------------------------------
+// MOD-77 (plan D1-D6): every fenced step writer locks the step before its run, `park_step`'s order.
+// ------------------------------------------------------------------------------------------------
+
+/// MOD-77: a graph run on `HTUI_ANA_2` leased by a fresh owner, and one running step of it:
+/// `a_step_document_racing_a_park_never_deadlocks`' round, once.
+async fn leased_running_step(db: &common::TestDb) -> (RunId, StepId, uuid::Uuid) {
+    let owner = uuid::Uuid::now_v7();
+    let run = db
+        .store
+        .create_run(race_run(ids::HTUI_ANA_2))
+        .await
+        .expect("queue a graph run")
+        .id;
+    assert_eq!(
+        db.store
+            .claim_run(run, ids::BOX, owner, Utc::now(), TimeDelta::minutes(30))
+            .await
+            .expect("claim the run"),
+        Claim::Admitted,
+        "the owner leases the run"
+    );
+    let step = db
+        .store
+        .create_step(htui_core::model::NewRunStep {
+            id: StepId::new(),
+            run_id: run,
+            position: 0,
+            attempt: 1,
+            fanout_index: 0,
+            phase_name: "implement".to_owned(),
+            agent_id: Some(ids::AGENT_CLAUDE),
+            model: None,
+        })
+        .await
+        .expect("create the step")
+        .id;
+    assert!(
+        db.store
+            .transition_step(
+                step,
+                htui_core::model::StepStatus::Pending,
+                htui_core::model::StepStatus::Running,
+                Utc::now(),
+            )
+            .await
+            .expect("start the step"),
+        "the step starts"
+    );
+    (run, step, owner)
+}
+
+/// MOD-77: one repo of the fixture's `htui` project, for the tree and commit writers.
+async fn mod_77_repo(db: &common::TestDb) -> RepoId {
+    db.store
+        .create_repo(NewRepo {
+            id: RepoId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "mod-77".to_owned(),
+            remote_url: None,
+            default_branch: "main".to_owned(),
+            is_primary: true,
+        })
+        .await
+        .expect("create the repo")
+        .id
+}
+
+/// MOD-77 plan D6: `write` must wait on a held step while holding **nothing** on its run.
+///
+/// A raw transaction takes the step `FOR UPDATE`, the first half of a `park_step`. `write` is
+/// spawned, and once a backend of this database waits on a lock the holder owns, the holder asks
+/// for the run `FOR UPDATE NOWAIT`, the second half of the park. If `write` held the run while it
+/// waited, that is `55P03`, and a real park would have closed a cycle with it (`40P01`). The
+/// holder then rolls back and `write`'s answer is returned for the caller's own assertion.
+async fn assert_takes_the_step_first<T: Send + 'static>(
+    db: &common::TestDb,
+    run: RunId,
+    step: StepId,
+    write: impl Future<Output = T> + Send + 'static,
+) -> T {
+    let mut holder = db.pool.begin().await.expect("begin the holder");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the holder's pid");
+    sqlx::query("SELECT 1 FROM run_step WHERE id = $1 FOR UPDATE")
+        .bind(step.as_uuid())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("the holder locks the step");
+
+    let handle = tokio::spawn(write);
+    let started = std::time::Instant::now();
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock' \
+                AND $1 = ANY(pg_blocking_pids(pid))",
+        )
+        .bind(holder_pid)
+        .fetch_one(&db.pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "the write never waited on the held step"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        !handle.is_finished(),
+        "the write answered while the step was held"
+    );
+
+    let nowait = sqlx::query("SELECT 1 FROM run WHERE id = $1 FOR UPDATE NOWAIT")
+        .bind(run.as_uuid())
+        .fetch_one(&mut *holder)
+        .await;
+    let code: Option<String> = nowait
+        .as_ref()
+        .err()
+        .and_then(sqlx::Error::as_database_error)
+        .and_then(|error| error.code())
+        .map(std::borrow::Cow::into_owned);
+    holder.rollback().await.expect("roll back the holder");
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+        .await
+        .expect("the write lands once the step is free")
+        .expect("the write task must not panic");
+    assert!(
+        nowait.is_ok(),
+        "the write held the run while it waited on the step (SQLSTATE {code:?}); a park holding \
+         this step would deadlock against it"
+    );
+    answer
+}
+
+/// MOD-77 plan D3: `append_events` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn append_events_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let row = SessionEvent {
+        run_step_id: step,
+        seq: 0,
+        turn: 0,
+        kind: EventKind::AssistantText,
+        role: EventRole::Agent,
+        tool_call_id: None,
+        payload: serde_json::json!({ "text": "MOD-77" }),
+        raw: None,
+        at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+    };
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store.append_events(StepFence::Lease(owner), &[row]).await
+    })
+    .await;
+    assert_eq!(answer.expect("the append lands"), 1, "one row appended");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `set_step_usage` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_step_usage_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .set_step_usage(
+                StepFence::Lease(owner),
+                step,
+                serde_json::json!({ "input_tokens": 1 }),
+                None,
+            )
+            .await
+    })
+    .await;
+    answer.expect("the usage write lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `set_step_prompt` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_step_prompt_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        let trim = serde_json::json!({});
+        store
+            .set_step_prompt(StepFence::Lease(owner), step, "sha256:mod-77", &trim)
+            .await
+    })
+    .await;
+    answer.expect("the prompt write lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `finish_step` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn finish_step_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let outcome = StepOutcome {
+        exit_code: None,
+        usage: None,
+        trim_record: None,
+        verify_outcome: None,
+        verify_exit_code: Some(0),
+        finished_at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+    };
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .finish_step(StepFence::Lease(owner), step, outcome)
+            .await
+    })
+    .await;
+    answer.expect("the settle lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D2: `pass_step` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn pass_step_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .pass_step(StepFence::Lease(owner), step, None, Utc::now())
+            .await
+    })
+    .await;
+    assert!(answer.expect("the pass lands"), "the running step passes");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D1: `upsert_step_tree` waits on a held step holding nothing on its run, then lands
+/// and writes the primary's `isolation_path`.
+#[tokio::test(flavor = "multi_thread")]
+async fn upsert_step_tree_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let repo_id = mod_77_repo(&db).await;
+    let store = db.store.clone();
+    let tree = RunStepTree {
+        run_step_id: step,
+        repo_id,
+        mode: Isolation::Worktree,
+        path: "/srv/trees/mod-77".to_owned(),
+        base_ref: "main".to_owned(),
+        dirty: false,
+    };
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .upsert_step_tree(StepFence::Lease(owner), step, &[tree])
+            .await
+    })
+    .await;
+    answer.expect("the tree write lands");
+    let path: Option<String> =
+        sqlx::query_scalar("SELECT isolation_path FROM run_step WHERE id = $1")
+            .bind(step.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("read the isolation path");
+    assert_eq!(
+        path.as_deref(),
+        Some("/srv/trees/mod-77"),
+        "the primary's tree is the step's isolation path"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D1: `record_commits` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn record_commits_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let repo_id = mod_77_repo(&db).await;
+    let store = db.store.clone();
+    let commit = RunStepCommit {
+        run_step_id: step,
+        repo_id,
+        before_hash: "a".repeat(40),
+        after_hash: None,
+    };
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .record_commits(StepFence::Lease(owner), step, &[commit])
+            .await
+    })
+    .await;
+    answer.expect("the commit write lands");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D4: `open_permission` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn open_permission_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, owner) = leased_running_step(&db).await;
+    let store = db.store.clone();
+    let id = PermissionId::new();
+    let open = OpenPermission {
+        id,
+        run_id: run,
+        run_step_id: step,
+        session: RelaySessionId::new(),
+        request_id: "r1".to_owned(),
+        tool_call_id: None,
+        summary: None,
+        options: relay_options(),
+        owner,
+    };
+    let answer =
+        assert_takes_the_step_first(
+            &db,
+            run,
+            step,
+            async move { store.open_permission(open).await },
+        )
+        .await;
+    assert_eq!(answer.expect("the permission opens"), id, "the row is ours");
+
+    db.drop_db().await;
+}
+
+/// MOD-77 plan D5: `finish_chat_run` waits on a held step holding nothing on its run, then lands.
+#[tokio::test(flavor = "multi_thread")]
+async fn finish_chat_run_takes_the_step_first() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        None,
+    );
+    db.store
+        .start_chat_run(&chat)
+        .await
+        .expect("start the chat");
+    let (run, step) = (chat.run_id, chat.step_id);
+    let store = db.store.clone();
+    let answer = assert_takes_the_step_first(&db, run, step, async move {
+        store
+            .finish_chat_run(run, step, RunStatus::Done, Utc::now())
+            .await
+    })
+    .await;
+    answer.expect("the close lands");
+    assert_eq!(
+        db.store
+            .run(run)
+            .await
+            .expect("read the run")
+            .map(|r| r.status),
+        Some(RunStatus::Done),
+        "the chat run is closed"
+    );
 
     db.drop_db().await;
 }
