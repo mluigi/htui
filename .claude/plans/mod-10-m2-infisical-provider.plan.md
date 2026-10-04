@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-10-secret-provider.prd.md`
 **Selected Milestone**: 2 — Infisical provider
 **Complexity**: Medium
-**Status**: DRAFT — awaiting fact-check and CONFIRM
+**Status**: DRAFT — fact-checked (47 claims: 33 verified, 9 amended, 5 falsified; all folded in); awaiting CONFIRM
 
 ## Summary
 
@@ -28,7 +28,8 @@ ultracode for the implement phase).
 - **Keyring slots** live in `crates/htui-store/src/secret.rs`:
   - the constants are `SERVICE = "htui"` (`:27`), `USER = "postgres-dsn"` (`:30`),
     `QDRANT_URL_USER` (`:34`) and `QDRANT_KEY_USER` (`:36`);
-  - each slot has its own `get_*`/`set_*`/`clear_*` free functions (`:278-357`), and each function
+  - each slot has its own `get_*`/`set_*`/`clear_*` free functions (`:113-161` DSN, `:278-358`
+    Qdrant), and each function
     consults the `test-support` `FAKE` first (`:46-91`);
   - `Slot` reads a blank entry as `None` (`:383`), and `backend()` (`:413`) is the module's one
     error shape;
@@ -50,17 +51,34 @@ ultracode for the implement phase).
   - `crates/htui-agent/src/install/http.rs:40-53` gives the same reason in full.
   - The workspace `reqwest` is `default-features = false, features = ["rustls-no-provider",
     "stream", "system-proxy"]` (`Cargo.toml`).
+  - `model.rs`'s client has a connect and a read timeout but **no total**. D9's connect + total
+    shape mirrors `install/http.rs`'s `short` client.
+  - With `rustls-no-provider` and no installed provider, `Client::build` **panics** (probed).
+    Workspace-wide builds hide this because `sentry` turns on reqwest's `rustls` (aws-lc), so
+    `cargo test -p htui-secrets` is the gate that proves the `ring` install.
+  - The workspace `reqwest` has **no `json` and no `query` feature**. `.json()` fails with E0599
+    under `cargo check -p htui-secrets` and builds workspace-wide only because `sentry` enables
+    `json` (probed). Declaring `features = ["json"]` leaves `Cargo.lock` unchanged.
+  - `system-proxy` sends `127.0.0.1` requests through `HTTP_PROXY` when it is set (probed).
+    `.no_proxy()` avoids that, and tests cannot unset the variable (`set_var` is `unsafe` in
+    edition 2024).
 - **HTTP tests** use a loopback stub on a std thread with scripted routes, no new dev-dependency
-  (`crates/htui-store/src/model.rs:657-720`, `Stub::start`).
+  (`crates/htui-store/src/model.rs:655-744`, `Stub::start`). That stub is GET-only and
+  path-only. The Infisical stub must parse the method, the headers and a `Content-Length` body.
 - **Live-service tests** are gated on an env var that prints a skip line and passes when unset
-  (`crates/htui-store/tests/qdrant_live.rs:1-35`, `HTUI_TEST_QDRANT_URL`).
+  (`crates/htui-store/tests/qdrant_live.rs:1-40`, `HTUI_TEST_QDRANT_URL`).
 - **Project columns** `project.secret_provider TEXT` and `project.secret_scope TEXT` already exist
-  (`crates/htui-store/migrations/0001_init.sql:148-149`) and surface as `Option<String>` on
-  `Project` (`crates/htui-core/src/model/hierarchy.rs:66-68`). No writer exists yet (M4).
+  (`crates/htui-store/migrations/0001_init.sql:148-149`, mirrored in
+  `cache_migrations/0001_mirror.sql:59`) and surface as `Option<String>` on `Project`
+  (`crates/htui-core/src/model/hierarchy.rs:66-68`). No writer exists yet (M4).
+- **`zeroize::Zeroizing<String>` derives a `Debug` that prints the value** (probed:
+  `Zeroizing("SUPERSECRET")`). Any struct holding one needs a hand-written `Debug`.
 - **New crate precedent:** `htui-mcp` (MOD-11), whose `Cargo.toml` shape (workspace package keys,
-  commented dependencies, `[lints] workspace = true`) is what we mirror.
+  reason comments on the non-obvious dependencies, `[lints] workspace = true`) is what we mirror.
   - Workspace lints are `unsafe_code = "forbid"`, `missing_debug_implementations = "warn"`,
-    `unused_qualifications = "warn"` and `clippy::all = warn`.
+    `unused_qualifications = "warn"` and `clippy::all = warn`, plus the rustdoc lints
+    `broken_intra_doc_links`, `private_intra_doc_links` and `redundant_explicit_links` set to
+    deny.
 - **Infisical API facts** come from a survey run 2026-10-04 against `Infisical/infisical` main and
   `Infisical/cli`:
   - **Login:** `POST /api/v1/auth/universal-auth/login` with `{clientId, clientSecret}` returns
@@ -101,12 +119,12 @@ ultracode for the implement phase).
 | Category | Source | Pattern |
 |---|---|---|
 | Naming | `crates/htui-store/src/secret.rs:27-36` | `*_USER` constants under `SERVICE`; `get_/set_/clear_` free functions per slot |
-| Errors | `crates/htui-orch/src/isolate.rs:44-58` | `#[derive(Debug, thiserror::Error)]` enum whose doc says what each variant means and who builds it |
+| Errors | `crates/htui-orch/src/isolate.rs:36-54` | `#[derive(Debug, thiserror::Error)]` enum whose doc says what each variant means and who builds it |
 | Async seam | `crates/htui-orch/src/isolate.rs:33-34` | `pub type XFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>` |
-| HTTP client | `crates/htui-store/src/model.rs:605-628` | one `reqwest::Client`, explicit timeouts, `ring` provider installed once |
+| HTTP client | `crates/htui-store/src/model.rs:604-628`, `crates/htui-agent/src/install/http.rs:51-55,77` | one `reqwest::Client`, explicit timeouts (connect + total, as `install/http.rs`'s `short`), `ring` provider installed once |
 | Keyring fake | `crates/htui-store/src/secret.rs:46-91`, `testkit.rs:334-364` | `FakeSlots` field per slot, `mock_keyring()` guard |
-| Tests (HTTP) | `crates/htui-store/src/model.rs:657-720` | std-thread loopback stub, scripted routes, requests recorded |
-| Tests (live) | `crates/htui-store/tests/qdrant_live.rs:1-35` | env-gated; prints the skip line and passes when unset |
+| Tests (HTTP) | `crates/htui-store/src/model.rs:655-744` | std-thread loopback stub, scripted routes, requests recorded (extended to POST, headers and body) |
+| Tests (live) | `crates/htui-store/tests/qdrant_live.rs:1-40` | env-gated; prints the skip line and passes when unset |
 | Crate shape | `crates/htui-mcp/Cargo.toml` | workspace package keys, a reason comment per dependency, `[lints] workspace = true` |
 
 ## Decisions (proposed; CONFIRM accepts or overrides)
@@ -120,9 +138,14 @@ ultracode for the implement phase).
   - **Rejected: `htui-store`**, whose `reqwest` is optional behind `local-embed`. That would be a
     second feature gate on a crate whose subject is the store.
   - **Rejected: `htui-agent`**, which has `reqwest` for the installer but is about driving agents.
-  - Like `htui-mcp`, the new crate depends on `htui-core` only. It never reads the keyring: the
-    caller hands it a `MachineIdentity`, and M3 composes keyring → provider in the process that runs
-    the run.
+  - Among workspace crates it depends on `htui-core` only (unlike `htui-mcp`, which also takes
+    `htui-agent` and `htui-orch`). External dependencies, all already locked:
+    - `reqwest` (workspace, plus `features = ["json"]`, no lock change);
+    - `rustls` (workspace, to name the `ring` install);
+    - `serde`, `serde_json`, `thiserror`, `zeroize`, `url` and `tokio` (`sync`).
+    - Dev: `tokio` (workspace).
+  - It never reads the keyring: the caller hands it a `MachineIdentity`, and M3 composes
+    keyring → provider in the process that runs the run.
 
 **D2 — The seam.** In `htui-core::secret`:
 
@@ -156,8 +179,12 @@ perform it when no usable token is cached. Writing an identity into the keyring 
   - `keys()` returns the key names;
   - its `Debug` prints key names only, and `Drop` zeroizes the values.
   - It is not `Clone`, `Serialize` or `Display`.
+  - *M3 note:* `from_resolved` and `SessionSpec.env` take unzeroized copies, so the zeroize covers
+    this wrapper only.
 - **`MachineIdentity { client_id, client_secret }`** holds both as `Zeroizing<String>`. Its `Debug`
-  prints `client_id` and `<redacted>`. It has no `Display` and no `Serialize`.
+  is **hand-written** and prints `client_id` and `<redacted>`; a derive would print the secret
+  (Grounding, probed). It has no `Display` and no `Serialize`. The provider's token state likewise
+  never derives `Debug`.
 - **`ProviderHealth { base_url, server_ok: bool }`** contains no token and no secret.
 - `htui-core` gains `zeroize` (already in the lock; no new compiled crate).
 
@@ -185,11 +212,18 @@ Rules for every variant:
 - Login errors never quote the server's body; they map status plus a known message.
 - Other endpoints may quote the server's `message`, truncated to 200 characters, with `\r` and
   `\n` removed. Those messages name projects, folders and permissions, never values.
-- `cause` is `reqwest::Error`'s text with the URL stripped (`without_url()`).
-- Key names are not secret (they are what the scrubber's `[REDACTED: KEY]` prints, per ANA-7 §3.4).
+- `cause` is the `source()` chain of `err.without_url()`, joined with `: `. The top-level
+  `Display` alone is just "error sending request" (probed).
+- Key names are not secret: `MinimalScrubber::from_resolved` already returns key names as
+  non-secret, while the scrubber itself prints plain `[REDACTED]`.
 
 **D5 — Login and lockout safety.**
-- The access token is held in memory as `Mutex<TokenState>`, with the token in a
+- **Login is single-flight.** `TokenState` sits behind a `tokio::sync::Mutex` held across the login
+  request, so concurrent first calls produce one login. A `std::sync::Mutex` cannot be held across
+  the `await`, and without single-flight two concurrent calls could each fail a login.
+  - *M3 must share one provider per process and identity.* Otherwise the latch below is per run,
+    and three runs can lock the identity.
+- The access token is held in memory in that `TokenState`, with the token in a
   `Zeroizing<String>` and its expiry. It is reused until `expires_at - margin`, where
   `margin = max(60 s, expiresIn / 10)`, and then a fresh login replaces it. Renewal is not used
   (equal TTLs by default; survey §2).
@@ -243,8 +277,13 @@ Rules for every variant:
   and a 20 s overall timeout.
 - **Redirects off** (`redirect::Policy::none()`): a 3xx becomes `Protocol`, so neither the login
   body nor the bearer token can follow a redirect.
-- `ring` is installed once, mirroring `model.rs`. The system proxy is left as the workspace feature
-  sets it.
+- `ring` is installed once, as `model.rs` does it. The timeouts mirror `install/http.rs`'s `short`
+  client (connect plus total); `model.rs` has no total.
+- Query strings are built with `url::Url::query_pairs_mut`, because the workspace reqwest has no
+  `query` feature. The crate's own manifest declares reqwest `json` (Grounding: workspace-wide
+  builds get it from `sentry`).
+- **`.no_proxy()` when the base URL host is loopback**, because `system-proxy` would otherwise route
+  `127.0.0.1` through `HTTP_PROXY` (probed). Other hosts keep the system proxy.
 
 **D10 — Tests owe the PRD's metrics for this milestone.**
 - **"Lockout-safe"**: a refused login, then a second call, gives a stub that saw exactly one
@@ -276,7 +315,7 @@ Rules for every variant:
 | `crates/htui-secrets/tests/support/mod.rs` | CREATE | loopback stub (method, path+query, headers, body recorded; scripted answers) |
 | `crates/htui-secrets/tests/infisical.rs` | CREATE | D10 stub-backed behaviour tests |
 | `crates/htui-secrets/tests/infisical_live.rs` | CREATE | D10 env-gated live test |
-| `README.md` | UPDATE | crate list; the live test's env vars beside `HTUI_TEST_QDRANT_URL` |
+| `README.md` | UPDATE | the live test's env vars in Development → Tests (beside `HTUI_TEST_QDRANT_URL`, ~:481); `docs/htui-secrets.md` in Further reading (:537-542). README has no crate list |
 | `docs/htui-secrets.md` | CREATE | operator page: identity setup in Infisical, base URL policy, errors and what to do |
 
 ## Tasks
@@ -300,8 +339,9 @@ TDD per repo convention: each task writes its failing tests first.
   - round trip;
   - both absent → `None`;
   - one half → `Err` naming it;
-  - `set_machine_identity` with a broken second write leaves nothing (needs a `Fake` hook or a
-    broken-keyring case);
+  - `set_machine_identity` with a broken second write leaves nothing. This needs a new hook, for
+    example a `FakeSlots` field `refuse_store: Option<&'static str>` naming the user whose write
+    fails, because `Fake::Broken` fails the first write too;
   - `clear` removes both;
   - `mock_keyring_broken()` → `Err`, never `None`;
   - the URL slot round trip.
@@ -329,15 +369,19 @@ TDD per repo convention: each task writes its failing tests first.
   - an `http` non-loopback base URL → `Config`;
   - `health` hits `/api/status` and then logs in;
   - every error's and the provider's `Debug`/`Display` free of the stub's value, the client secret
-    and the token.
+    and the token;
+  - a client built under `cargo test -p htui-secrets` alone, with no sentry or aws-lc in that
+    graph, proves the `ring` install.
+  - If `tests/support/mod.rs` is shared with `infisical_live.rs`, guard it against dead-code
+    warnings under `-D warnings`.
 - **Mirror**: `model.rs` client and stub; `htui-mcp/Cargo.toml` shape.
 - **Validate**: `cargo test -p htui-secrets`; `cargo clippy -p htui-secrets --all-targets -- -D warnings`.
 
 ### T4: Live test and documents (after T3)
 - **Files**: `crates/htui-secrets/tests/infisical_live.rs`, `README.md`, `docs/htui-secrets.md`.
 - **Action**: the D10 live test, which resolves the configured scope and asserts a non-empty map
-  plus a `list_keys` equal to `resolve().keys()`. The README crate list and test env vars. The
-  operator page covers:
+  plus a `list_keys` equal to `resolve().keys()`. The README gets the test env vars (Development →
+  Tests) and a Further-reading link. The operator page covers:
   - creating a Universal Auth identity;
   - granting it read on the project and environment;
   - the base URL policy;
@@ -373,7 +417,10 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | Pre-v0.150 self-hosted server | Low | `UnsupportedServer` names the upgrade; test on Fastify's 404 body |
 | Plain-`http` self-hosted instance refused by D8 | Medium | Override at CONFIRM; loopback stays allowed for tests |
 | A secret key that is not a valid env name blocks every run of the project | Medium | Refusal names the key, so the fix is a rename in Infisical; documented in `docs/htui-secrets.md` |
-| `htui-core` gaining `zeroize` changes its compile set | Low | Already in the lock as a transitive dependency; verified by the fact-check |
+| `htui-core` gaining `zeroize` changes its compile set | Low | Already in the lock (1.9.0); the probe's lock diff is one line |
+| Stub tests routed through `HTTP_PROXY` | Low here (unset in the sandbox), real elsewhere | `.no_proxy()` for loopback bases (D9) |
+| Concurrent first calls each fail a login | Low | Single-flight login (D5); M3 shares one provider per process and identity |
+| `json` missing in a single-crate build | Medium | Declared in htui-secrets' manifest; `cargo test -p htui-secrets` is in the gate |
 
 ## Acceptance
 
@@ -385,4 +432,57 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Verified claims
 
-*(filled by the fact-check, before CONFIRM)*
+*(Fact-check 2026-10-04 on `815528d1`. Code was read through Gortex; compile probes ran offline
+against the workspace lock (reqwest 0.13.5, rustls 0.23.43, zeroize 1.9.0, toolchain 1.98.1) in
+`/tmp`, which has since been removed. Every amendment and falsification has been folded into the
+sections above.)*
+
+| claim | verdict | evidence |
+|---|---|---|
+| `SERVICE`/`USER`/`QDRANT_URL_USER`/`QDRANT_KEY_USER` at secret.rs:27/30/34/36 | verified | secret.rs:27,30,34,36 |
+| Per-slot get/set/clear at :278-357 | amended | That range is Qdrant only (:278-358); the DSN functions are at :113-161 |
+| Fake consulted first (`FakeSlots` :46, `Fake` :54, `FAKE` :71, `fake()` ~:87) | verified | secret.rs |
+| `Slot::get` reads blank as `None` (:383); `backend()` (:413) | verified | secret.rs:383, :413 |
+| `FakeSlots` has one field per slot, `pub(crate)`, built only by `default()` | verified | secret.rs:46; testkit.rs:337 |
+| `mock_keyring` :334 / `mock_keyring_broken` :360 share `KEYRING` | verified | testkit.rs:307,334,360 |
+| `fake_qdrant_dsn` exists | verified | testkit.rs:373 |
+| `from_resolved(&BTreeMap<String,String>) -> (Self, Vec<String>)` at scrub.rs:211 | verified | scrub.rs:211 |
+| `SessionSpec.env: BTreeMap<String,String>` at driver.rs:270 | verified | driver.rs:270 (redacting Debug) |
+| `IsolatorFuture` isolate.rs:33-34; `DriverFuture` exists | verified | isolate.rs:34; driver.rs:37 |
+| `async_trait` not used | verified | no manifest declares it (transitive only) |
+| Error-enum pattern at isolate.rs:44-58 | amended | :36-54 |
+| `http_client`/`install_crypto_provider` model.rs:605-628 | verified | :604-628 |
+| model.rs client has connect + read timeout | verified | no total; D9 now mirrors install/http.rs `short` |
+| `ring` installed once, Err ignored | verified | model.rs:624-628; install/http.rs:51-55 |
+| Workspace reqwest features | verified | Cargo.toml:118-119 |
+| Stub pattern model.rs:657-720 | amended | :655-744; GET-only, path-only, no body |
+| Live gate qdrant_live.rs:1-35 | amended | :1-40; also `#![cfg(feature="test-support")]` |
+| `secret_provider`/`secret_scope` at 0001_init.sql:148-149 | verified | also cache_migrations/0001_mirror.sql:59 |
+| `Project` fields at hierarchy.rs:66-68 | verified | :66, :68 |
+| htui-mcp manifest: every dependency commented | amended | only some are |
+| Workspace lints list | amended | rustdoc denies were missing; added |
+| D1 "like htui-mcp, htui-core only" | falsified | htui-mcp also takes htui-agent, htui-orch; reworded |
+| htui-store reqwest optional behind `local-embed` | verified | htui-store Cargo.toml |
+| htui-agent has reqwest for the installer | verified | htui-agent Cargo.toml:50-51 |
+| No `secret` module or seam-type name collision in htui-core | verified | lib.rs modules; symbol search empty |
+| No crate named `htui-secrets` | verified | 7 crates, no hit |
+| `zeroize` in lock; adding to htui-core adds no crate | verified | 1.9.0; probe lock diff = one line |
+| `String: Zeroize` with workspace declaration | verified | default `alloc`; probe compiles under `forbid(unsafe_code)` |
+| `Zeroizing<String>` Debug prints the value | verified | probe printed `Zeroizing("SUPERSECRET")`; hand-written Debug made mandatory (D3) |
+| Boxed-future trait + `Send + Sync + Debug` is dyn-compatible | verified | probe `Arc<dyn SecretProvider>` ran |
+| `redirect::Policy::none()` + `ClientBuilder::redirect` | verified | probe: 302 returned, target never requested |
+| `Error::without_url()` gives the cause | amended | exists (error.rs:91), but Display is "error sending request"; cause = source chain (D4) |
+| `timeout`/`connect_timeout`/`no_proxy` exist | verified | client.rs:1450/1475/1436 |
+| `rustls-no-provider` without a provider install | verified | probe panics; htui-secrets declares rustls and installs ring |
+| Client needs `json`/`query` reqwest features | falsified | absent from workspace; `json` comes only via sentry; declared in the crate (D1/D9), queries via `url` |
+| system-proxy is harmless to loopback stubs | falsified | probe: `HTTP_PROXY` set → loopback routed to proxy; `.no_proxy()` for loopback (D9) |
+| Workspace tokio covers `#[tokio::test]` | verified | rt-multi-thread, sync, macros, time |
+| D5 "at most one failed login per provider" | amended | needs single-flight login; tokio Mutex across the login (D5) |
+| D4 "scrubber prints `[REDACTED: KEY]`" | falsified | prints `[REDACTED]` (scrub.rs:18); grounding moved to `from_resolved` |
+| ANA-7 §4 asks for slots beside the DSN | verified | names client-id/secret; `infisical-url` is this plan's addition |
+| README has a crate list | falsified | none; README row and T4 retargeted |
+| validator script exists | verified | `.claude/skills/handoff-run/scripts/` |
+| T2 ∩ T3 file sets = ∅ | verified | htui-store secret.rs/testkit.rs vs Cargo.toml/Cargo.lock/crates/htui-secrets/** |
+| T2 needs nothing outside its files | verified | `Fake`/`FakeSlots` touched only in secret.rs, testkit.rs |
+| T2 "broken second write" via `Fake::Broken` | amended | Broken fails the first write too; a new `refuse_store` hook |
+| T1 then T3 Cargo.lock edits are serial and non-overlapping | verified | probe: T1 adds one line; T3 adds a new package block |
