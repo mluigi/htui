@@ -1772,7 +1772,15 @@ mod tests {
         ];
 
         for candidate in &fixtures {
-            let view = one(candidate);
+            assert_parked_runs_own_rows(std::slice::from_ref(candidate), &one(candidate));
+        }
+    }
+
+    /// Review H1's invariant: every active run at `AwaitingApproval` among `candidates` owns at
+    /// least one row of `view`. Called by every test that builds its candidates inline as well
+    /// (review R2), so no fixture escapes it.
+    fn assert_parked_runs_own_rows(candidates: &[WaitingCandidate], view: &WaitingView) {
+        for candidate in candidates {
             for (run, _) in &candidate.runs {
                 if run.status.is_active() && run.status == RunStatus::AwaitingApproval {
                     assert!(
@@ -1861,6 +1869,7 @@ mod tests {
         let candidates = [reopen, blocked];
 
         let view = waiting(&scope, 5, &candidates, Some(&perms));
+        assert_parked_runs_own_rows(&candidates, &view);
         assert_eq!(view.waiting(), 4, "Reopen, gate, FollowRun, permission");
         assert_eq!(view.working, 5 - 2, "R1 owns two rows and counts once");
 
@@ -1916,6 +1925,7 @@ mod tests {
             &candidates,
             Some(&perms),
         );
+        assert_parked_runs_own_rows(&candidates, &view);
 
         let keys: Vec<(ProjectId, &str, Option<RunId>, &str, WaitingReason)> = view
             .rows
