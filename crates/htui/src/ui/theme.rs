@@ -6,8 +6,9 @@
 //! you are on, `cursor` the text cursor, and `selected` a selected row, which
 //! [`Theme::select`] paints over every span (D2).
 //!
-//! `NO_COLOR` set and non-empty selects [`Theme::monochrome`], the same roles drawn with
-//! modifiers alone (D4); `run` applies it once at startup.
+//! `NO_COLOR` set and non-empty (per no-color.org) selects [`Theme::monochrome`], the same roles
+//! drawn with modifiers alone (D4): selection and the cursor reversed, focus, keys, titles and
+//! errors bold, the active tab bold and underlined. `run` applies it once at startup.
 
 use std::ffi::OsStr;
 
@@ -77,9 +78,9 @@ impl Default for Theme {
 impl Theme {
     /// MOD-80 D4: no colour, only modifiers, for `NO_COLOR` terminals (crossterm 0.29 drops
     /// colour codes there and keeps attributes). `selected`/`cursor` reverse, `accent`/`key`/
-    /// `title` are bold, `dim` is DIM, `active_tab` bold+underlined; `error`, `warning`,
-    /// `running`, `added` are plain, because the status word or diff gutter already says what
-    /// they mean.
+    /// `title`/`error` are bold (an error is bold so a failure still stands out; D4 as amended
+    /// in review), `dim` is DIM, `active_tab` bold+underlined; `warning`, `running` and `added`
+    /// are plain, because the status word or diff gutter already says what they mean.
     #[must_use]
     pub fn monochrome() -> Self {
         let plain = Style::new();
@@ -91,7 +92,7 @@ impl Theme {
             title: bold,
             accent: bold,
             selected: reversed,
-            error: plain,
+            error: bold,
             key: bold,
             running: plain,
             warning: plain,
@@ -101,9 +102,11 @@ impl Theme {
         }
     }
 
-    /// crossterm's `NO_COLOR` rule (`style/types/colored.rs` `ansi_color_disabled`): set and
-    /// non-empty means [`Theme::monochrome`], anything else [`Theme::default`]. Takes the value,
-    /// not the environment, so it is testable.
+    /// `NO_COLOR` set and non-empty (per no-color.org) means [`Theme::monochrome`], anything else
+    /// [`Theme::default`]. crossterm's own check (`ansi_color_disabled`) reads the variable with
+    /// `env::var`, so a value that is not UTF-8 counts as unset there; `run` passes `var_os`, so
+    /// here it counts as set, which only drops colours crossterm would have drawn. Takes the
+    /// value, not the environment, so it is testable.
     #[must_use]
     pub fn from_no_color(value: Option<&OsStr>) -> Self {
         match value {
@@ -113,8 +116,8 @@ impl Theme {
     }
 
     /// D2: `line` with [`Self::selected`] patched over the line **and over every span**, so a
-    /// span's own `fg` cannot show through (a `Line::style` alone leaves a cyan key
-    /// cyan-on-cyan). Modifiers a span had (a key's BOLD) survive.
+    /// span's own `fg` cannot show through (a `Line::style` alone leaves a coloured span in its
+    /// own colour on the selection). Modifiers a span had (a key's BOLD) survive.
     #[must_use]
     pub fn select<'a>(&self, line: Line<'a>) -> Line<'a> {
         let mut line = line.patch_style(self.selected);
@@ -198,10 +201,7 @@ mod tests {
 
     #[test]
     fn select_paints_the_selection_over_every_span() {
-        let theme = Theme {
-            selected: Style::new().fg(Color::Black).bg(Color::Cyan),
-            ..Theme::default()
-        };
+        let theme = Theme::default();
         let line = theme.select(sample(&theme));
         for span in &line.spans {
             assert_eq!(span.style.fg, Some(Color::Black), "{span:?}");
@@ -271,5 +271,13 @@ mod tests {
                 .contains(Modifier::BOLD | Modifier::UNDERLINED)
         );
         assert!(theme.dim.add_modifier.contains(Modifier::DIM));
+        assert_eq!(
+            theme.error,
+            Style::new().add_modifier(Modifier::BOLD),
+            "a failure stands out without colour (D4 as amended in review)"
+        );
+        for plain in [theme.base, theme.running, theme.warning, theme.added] {
+            assert_eq!(plain, Style::new(), "{plain:?}");
+        }
     }
 }

@@ -26,8 +26,8 @@ pub fn unified(old: &str, new: &str, old_label: &str, new_label: &str) -> String
 }
 
 /// `+` in `added`, `-` in `error`, the `---`/`+++` headers and everything else dim — the two
-/// gutters a reader looks for. Moved here from the chat transcript (D12), byte for byte, so its frames do not
-/// move.
+/// gutters a reader looks for. Moved here from the chat transcript (D12), byte for byte, so its
+/// frames do not move.
 #[must_use]
 pub fn diff_style(line: &str, theme: &Theme) -> Style {
     if line.starts_with("+++") || line.starts_with("---") {
