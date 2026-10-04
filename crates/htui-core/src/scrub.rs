@@ -8,6 +8,7 @@
 //! MOD-10 and is kept): exact-match masking of known secrets, then whole-token pattern rules for
 //! known credential formats (MOD-10 D1/D2) plus a PEM private-key marker.
 
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use regex::RegexSet;
@@ -15,6 +16,13 @@ use serde_json::Value;
 
 /// What every masked occurrence is replaced with.
 const REDACTED: &str = "[REDACTED]";
+
+/// ANA-7 §3.4's floor: a resolved value shorter than this many characters is injected but not
+/// masked, because masking a 3-character value would shred every transcript (MOD-10 D3).
+///
+/// Applies only to [`MinimalScrubber::from_resolved`]; [`MinimalScrubber::new`] masks every
+/// non-empty value it is given.
+pub const MIN_MASKED_LEN: usize = 6;
 
 /// Whole-token credential rules, as `(rule name, pattern body)`, in reporting order (MOD-10 D1,
 /// D2).
@@ -152,6 +160,27 @@ impl MinimalScrubber {
         secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
         secrets.dedup();
         Self { secrets }
+    }
+
+    /// A scrubber over a resolved `key → value` map (MOD-10 D3).
+    ///
+    /// Masks every value of at least [`MIN_MASKED_LEN`] characters (`chars().count()`). Returns
+    /// the **key names** of the values below the floor, in map order; those values are still
+    /// injected by the caller, just not masked. An empty value is below the floor and is listed.
+    /// No value is ever returned or logged. An empty map is legal and still fails closed on the
+    /// pattern rules.
+    #[must_use]
+    pub fn from_resolved(resolved: &BTreeMap<String, String>) -> (Self, Vec<String>) {
+        let mut masked = Vec::with_capacity(resolved.len());
+        let mut short = Vec::new();
+        for (key, value) in resolved {
+            if value.chars().count() >= MIN_MASKED_LEN {
+                masked.push(value.clone());
+            } else {
+                short.push(key.clone());
+            }
+        }
+        (Self::new(masked), short)
     }
 
     /// Replaces every occurrence of every secret in `text` with `[REDACTED]`.
@@ -774,6 +803,77 @@ mod tests {
             .expect_err("residue must refuse the write");
         assert_eq!(err.path, "/a~1b~0c/1");
         assert_eq!(err.rule, "slack_bot_token");
+    }
+
+    fn resolved(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect()
+    }
+
+    #[test]
+    fn from_resolved_masks_values_at_the_floor() {
+        let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[("K", "abcdef")]));
+        assert!(short.is_empty(), "{short:?}");
+        let mut value = json!({ "t": "value abcdef here" });
+        scrubber.scrub(&mut value).expect("clean");
+        assert_eq!(value["t"], json!("value [REDACTED] here"));
+    }
+
+    #[test]
+    fn from_resolved_lists_the_keys_below_the_floor() {
+        let (scrubber, short) =
+            MinimalScrubber::from_resolved(&resolved(&[("A", "abcde"), ("B", "longvalue")]));
+        assert_eq!(short, vec!["A".to_owned()]);
+        let mut value = json!({ "t": "abcde and longvalue" });
+        scrubber.scrub(&mut value).expect("clean");
+        assert_eq!(value["t"], json!("abcde and [REDACTED]"));
+    }
+
+    #[test]
+    fn from_resolved_returns_key_names_never_values() {
+        let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[
+            ("SHORT_KEY", "tiny"),
+            ("EMPTY_KEY", ""),
+            ("LONG_KEY", "a-long-resolved-value"),
+        ]));
+        assert_eq!(short, vec!["EMPTY_KEY".to_owned(), "SHORT_KEY".to_owned()]);
+        let rendered = format!("{short:?} {scrubber:?}");
+        for value in ["tiny", "a-long-resolved-value"] {
+            assert!(!rendered.contains(value), "leaked: {rendered}");
+        }
+    }
+
+    #[test]
+    fn from_resolved_counts_only_in_debug() {
+        let (scrubber, _) = MinimalScrubber::from_resolved(&resolved(&[
+            ("TOKEN", "resolved-token-value"),
+            ("PIN", "123"),
+        ]));
+        let rendered = format!("{scrubber:?}");
+        assert_eq!(rendered, "MinimalScrubber { secrets: 1 }");
+        assert!(!rendered.contains("TOKEN"), "{rendered}");
+    }
+
+    #[test]
+    fn from_resolved_accepts_an_empty_map_and_still_fails_closed() {
+        let (scrubber, short) = MinimalScrubber::from_resolved(&BTreeMap::new());
+        assert!(short.is_empty());
+        let mut dirty = json!({ "text": "AKIAIOSFODNN7EXAMPLE" });
+        let err = scrubber
+            .scrub(&mut dirty)
+            .expect_err("pattern rules run with an empty resolved map");
+        assert_eq!(err.rule, "aws_access_key_id");
+    }
+
+    #[test]
+    fn the_floor_counts_characters_not_bytes() {
+        assert_eq!(MIN_MASKED_LEN, 6);
+        let (scrubber, short) =
+            MinimalScrubber::from_resolved(&resolved(&[("FIVE", "ééééé"), ("SIX", "éééééé")]));
+        assert_eq!(short, vec!["FIVE".to_owned()]);
+        assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 1 }");
     }
 
     #[test]
