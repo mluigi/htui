@@ -814,7 +814,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let report = verifier()
             .run(request(
-                "echo token=sk-ant-notarealkey; exit 2",
+                "echo token=sk-ant-notarealkeynotarealkey00; exit 2",
                 dir.path().to_path_buf(),
             ))
             .await

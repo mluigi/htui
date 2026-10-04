@@ -21,6 +21,8 @@ serde_json = { workspace = true }
 thiserror  = { workspace = true }
 sha2       = { workspace = true }
 globset    = { workspace = true }
+# MOD-10 D1: the scrubber's whole-token credential rules (`scrub.rs`).
+regex      = { workspace = true }
 sqlx       = { version = "0.9.0", default-features = false, features = [
                "derive", "postgres", "sqlite", "uuid"], optional = true }
 

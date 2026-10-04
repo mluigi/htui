@@ -1592,7 +1592,11 @@ async fn step_pass_feeds_changed_paths_to_tier_2() {
 async fn step_pass_withholds_an_unmaskable_path_from_files() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
-    write(dir.path(), "src/sk-live.rs", b"pub fn live() {}\n");
+    write(
+        dir.path(),
+        "src/sk-live0123456789abcdefghij.rs",
+        b"pub fn live() {}\n",
+    );
     let mut input = readable_input(dir.path());
     input.touched_prefixes = Vec::new();
 
@@ -1628,7 +1632,11 @@ async fn step_pass_builds_no_listing_file_set_without_a_glob_winner() {
     let dir = tempfile::tempdir().expect("a throwaway root");
     write(dir.path(), "src/lib.rs", b"pub fn marker() {}\n");
     write(dir.path(), "src/other.rs", b"pub fn other() {}\n");
-    write(dir.path(), "src/sk-live.rs", b"pub fn live() {}\n");
+    write(
+        dir.path(),
+        "src/sk-live0123456789abcdefghij.rs",
+        b"pub fn live() {}\n",
+    );
     let changed = vec![
         RepoPath {
             repo: "htui".to_owned(),
@@ -1636,7 +1644,7 @@ async fn step_pass_builds_no_listing_file_set_without_a_glob_winner() {
         },
         RepoPath {
             repo: "htui".to_owned(),
-            path: "src/sk-live.rs".to_owned(),
+            path: "src/sk-live0123456789abcdefghij.rs".to_owned(),
         },
     ];
 
@@ -1728,7 +1736,7 @@ async fn step_pass_withholds_an_unmaskable_caller_note() {
     for mut spec in [phase_spec(), verdict_spec(Vec::new())] {
         let mut input = readable_input(dir.path());
         input.notes = vec![
-            "changed paths unavailable: cannot lock /srv/sk-live-checkout/.git/index.lock"
+            "changed paths unavailable: cannot lock /srv/sk-live0123456789abcdefghij-checkout/.git/index.lock"
                 .to_owned(),
             "excerpt: a caller's own note".to_owned(),
         ];

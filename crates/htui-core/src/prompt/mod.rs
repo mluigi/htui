@@ -1368,9 +1368,9 @@ mod tests {
         let mut files = StepFiles::default();
         for (repo, path) in [
             ("htui", "src/a.rs"),
-            ("htui", "src/sk-live.rs"),
-            ("htui", "docs/ghp_token.md"),
-            ("sk-repo", "x.rs"),
+            ("htui", "src/sk-live0123456789abcdefghij.rs"),
+            ("htui", "docs/ghp_0123456789abcdefghijklmnopqrstuvwxyz.md"),
+            ("sk-repo0123456789abcdefghij", "x.rs"),
         ] {
             files.insert(repo, path);
         }
@@ -1387,7 +1387,7 @@ mod tests {
         );
         let mut kept = StepFiles::default();
         kept.insert("htui", "src/a.rs");
-        kept.reach("sk-repo");
+        kept.reach("sk-repo0123456789abcdefghij");
         assert_eq!(files, kept, "the refused repo stays reached with no file");
 
         assert_eq!(
@@ -1400,19 +1400,19 @@ mod tests {
 
     /// MOD-9 D116, D117 (review finding 2): `assemble` masks the joined `repo:path`, so a path
     /// whose repo and path each scrub clean but whose join the scrubber refuses is withheld too.
-    /// A secret `i:X` spans the separator: `htui:Xsk-1.rs` masks to `htu[REDACTED]sk-1.rs`, where
-    /// `sk-` now starts a token.
+    /// A secret `i:X` spans the separator: `htui:Xsk-1234567890abcdefghij.rs` masks to
+    /// `htu[REDACTED]sk-1234567890abcdefghij.rs`, where `sk-` now starts a token.
     #[test]
     fn drop_unmaskable_files_withholds_a_path_whose_join_the_scrubber_refuses() {
         let scrubber = crate::scrub::MinimalScrubber::new(["i:X".to_owned()]);
         assert_eq!(refused_rule(&scrubber, "htui"), None);
-        assert_eq!(refused_rule(&scrubber, "Xsk-1.rs"), None);
+        assert_eq!(refused_rule(&scrubber, "Xsk-1234567890abcdefghij.rs"), None);
         assert!(
-            refused_rule(&scrubber, "htui:Xsk-1.rs").is_some(),
-            "the joined form trips a prefix rule once masked"
+            refused_rule(&scrubber, "htui:Xsk-1234567890abcdefghij.rs").is_some(),
+            "the joined form trips a pattern rule once masked"
         );
         let mut files = StepFiles::default();
-        files.insert("htui", "Xsk-1.rs");
+        files.insert("htui", "Xsk-1234567890abcdefghij.rs");
         files.insert("htui", "src/a.rs");
 
         assert_eq!(
@@ -1424,7 +1424,7 @@ mod tests {
         assert_eq!(files, kept);
 
         // What `assemble` would have done with it as the recorded match.
-        let mut matched = "htui:Xsk-1.rs".to_owned();
+        let mut matched = "htui:Xsk-1234567890abcdefghij.rs".to_owned();
         assert!(
             mask(&scrubber, &mut matched, "skills").is_err(),
             "`assemble` refuses the joined path"
@@ -1456,7 +1456,12 @@ mod tests {
             calls: std::sync::atomic::AtomicUsize::new(0),
         };
         let mut files = StepFiles::default();
-        for path in ["src/a.rs", "src/b.rs", "src/c.rs", "src/sk-live.rs"] {
+        for path in [
+            "src/a.rs",
+            "src/b.rs",
+            "src/c.rs",
+            "src/sk-live0123456789abcdefghij.rs",
+        ] {
             files.insert("htui", path);
         }
         files.insert("docs", "guide.md");
@@ -1598,7 +1603,12 @@ mod residual_tests {
                     "fn quiet() {}\n",
                     1,
                 ),
-                file("sk-repo0123456789", "src/lib.rs", "fn quiet() {}\n", 2),
+                file(
+                    "sk-repo0123456789abcdefghij",
+                    "src/lib.rs",
+                    "fn quiet() {}\n",
+                    2,
+                ),
             ],
             ..ExcerptSet::default()
         };
