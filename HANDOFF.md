@@ -167,12 +167,12 @@ migration, no new crate, no rataflow change.
   htui's own process environment (plan D30) and scrubs its output. A test pinning that the verify
   child does not see a resolved secret belongs to this item.
   **Run engine scrubber (MOD-61, folded in 2026-09-29):** the run engine's `MinimalScrubber` is
-  built with an empty secret list (`crates/htui-worker/src/runtime.rs:764`, since MOD-41), so `scrub`'s masking half
+  built with an empty secret list (`crates/htui-worker/src/runtime.rs:929`, since MOD-41), so `scrub`'s masking half
   is inert on the run path and a `trim_record` string equal to a secret would be stored verbatim.
   When this item resolves a run's secrets, build that scrubber from the **same** map that fills the
-  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5656`), so the two cannot drift;
-  the chat path already does this from `spec.env` (`agent_worker.rs:3599`) and needs the same map.
-  The verifier's scrubber (`crates/htui-worker/src/runtime.rs:411`) stays pattern-only: handing it the map would put
+  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5987`), so the two cannot drift;
+  the chat path already does this from `spec.env` (`agent_worker.rs:3961`) and needs the same map.
+  The verifier's scrubber (`crates/htui-worker/src/runtime.rs:437`) stays pattern-only: handing it the map would put
   the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
   secret is stored as `[REDACTED]` belongs to this item.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
