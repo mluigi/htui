@@ -492,7 +492,7 @@ mod tests {
     use crate::editor::{ExternalEdit, ExternalEditOutcome};
     use crate::keymap::Keymap;
     use crate::store_worker::{RequestEnvelope, UNSOLICITED};
-    use crate::ui::overlay::{MigrationPrompt, Overlay, OverlayId};
+    use crate::ui::overlay::{MigrationPrompt, Overlay, OverlayId, WaitingList};
     use crate::ui::tabs::{Tab, TabId};
     use crossterm::event::{
         Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -688,7 +688,7 @@ mod tests {
         };
         app.update(Action::Reply(ReplyEnvelope {
             seq: UNSOLICITED,
-            origin: Origin::Overlay(OverlayId("waiting_list")),
+            origin: Origin::Overlay(WaitingList::ID),
             reply: StoreReply::Waiting(view.clone()),
         }));
         assert_eq!(app.top_bar.waiting, Some(view));

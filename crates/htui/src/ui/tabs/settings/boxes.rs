@@ -708,8 +708,13 @@ impl SettingsSection for BoxesSection {
                 self.open_quirks();
                 Handled::Consumed
             }
+            // MOD-69 D7: `Ctrl+W` is the global waiting list, not this section's executor.
             KeyCode::Char('w')
-                if self.unavailable.is_none() && self.selected_record().is_some() =>
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && self.unavailable.is_none()
+                    && self.selected_record().is_some() =>
             {
                 self.open_executor();
                 Handled::Consumed
@@ -1281,5 +1286,31 @@ mod tests {
         assert!(cell_width(&out) <= room, "{out:?} against {room}");
         // ` (this box)` takes 11 cells and leaves the hostname 13: six two-cell clusters and `…`.
         assert_eq!(out, format!("{}\u{2026} (this box)", "\u{6f22}".repeat(6)));
+    }
+
+    /// MOD-69 D7 (blueprint H-14): `Ctrl+W` is the global waiting list, so over a listed box it
+    /// passes on to the shell; a plain `w` still opens the executor confirmation.
+    #[cfg(feature = "testkit")]
+    #[tokio::test]
+    async fn ctrl_w_over_a_listed_box_passes_and_w_still_opens_the_executor() {
+        use crate::store_worker::serve;
+        use crate::testkit::SectionBench;
+        use htui_core::store::MemStore;
+        use htui_store::Backend;
+
+        let reply = serve(&Backend::memory(MemStore::demo()), &StoreRequest::Boxes).await;
+        assert!(matches!(reply, StoreReply::Boxes(_)), "{reply:?}");
+        let bench = SectionBench::new().await;
+        let mut section = BoxesSection::new();
+        bench.reply(&mut section, &reply);
+        let _ = bench.drained();
+
+        assert_eq!(bench.key(&mut section, "ctrl-w"), Handled::Pass);
+        assert!(!section.captures_input(), "Ctrl+W opens no confirmation");
+        assert_eq!(bench.key(&mut section, "w"), Handled::Consumed);
+        assert!(
+            section.captures_input(),
+            "w opens the executor confirmation"
+        );
     }
 }
