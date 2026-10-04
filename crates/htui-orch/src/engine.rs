@@ -16384,6 +16384,63 @@ mod tests {
             assert_answered_by_policy(&harness, "reject-once").await;
         }
 
+        /// MOD-11 R1 M2, MOD-26 I-1: a persona whose `permission-default` is `deny` still rejects
+        /// htui's own tool on ACP — by its default, since the pre-approval only replaces an `ask`
+        /// default and so adds no rule here.
+        #[tokio::test(start_paused = true)]
+        async fn a_persona_defaulting_to_deny_still_rejects_htui_s_own_tool() {
+            use htui_core::model::{
+                NewPersona, PersonaDefault, PersonaId, PersonaPermission, PersonaTools,
+            };
+
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            let persona = harness
+                .orch
+                .store
+                .create_persona(NewPersona {
+                    id: PersonaId::new(),
+                    name: "deny-all".to_owned(),
+                    description: "is asked nothing".to_owned(),
+                    body: "You are denied every tool no rule allows.\n".to_owned(),
+                    tools: PersonaTools::default(),
+                    permission: PersonaPermission {
+                        default: Some(PersonaDefault::Deny),
+                        rules: Vec::new(),
+                    },
+                })
+                .await
+                .expect("a valid persona");
+            super::bind_persona(&harness.orch, ids::HTUI_FEAT_3, "prd", persona.id).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui("document_write", htui_agent::event::ToolKind::Other),
+            );
+            assert_answered_by_policy(&harness, "reject-once").await;
+            let spec = harness
+                .orch
+                .spec_for(&SessionKey {
+                    phase: "prd",
+                    attempt: 1,
+                    fanout_index: 0,
+                    call: 0,
+                })
+                .expect("the prd session started");
+            assert!(
+                spec.permission.rules.iter().all(|rule| rule
+                    .matcher
+                    .tool_name
+                    .as_deref()
+                    .is_none_or(|name| !name.starts_with("mcp__htui__"))),
+                "no pre-approval under a deny default: {:?}",
+                spec.permission.rules
+            );
+        }
+
         /// MOD-11 R1 M2: `command_run` is never pre-approved (it runs anything; under the default
         /// `ask` it asks), nor is a tool the scope does not advertise; the pre-approvals close
         /// the rules, after the agent's own.

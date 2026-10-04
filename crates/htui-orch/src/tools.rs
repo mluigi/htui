@@ -9,7 +9,9 @@
 
 use std::path::PathBuf;
 
-use htui_agent::driver::{McpServerSpec, PermissionMatch, PermissionPolicy, PermissionRule};
+use htui_agent::driver::{
+    McpServerSpec, PermissionDefault, PermissionMatch, PermissionPolicy, PermissionRule,
+};
 use htui_agent::event::PermissionOptionKind;
 use htui_agent::prompt_bridge::PromptPort;
 use htui_core::model::{BoxId, ItemId, ProjectId, RunId, StepId, Transport, UserId};
@@ -103,9 +105,15 @@ pub fn qualified_tool_name(server: &str, tool: &str) -> String {
 /// Appended, so they run after every rule already there — the R-MCP-4 denials, a persona's rules
 /// and the agent's own — and just ahead of the remembered choices and the default: they only
 /// replace the default `ask`, never widen a persona (MOD-26 I-1: a `deny_kinds: [other]` reject
-/// still wins on ACP, where htui's tools are kind `other`) nor override an operator's rule. Both
-/// the engine's `drive_once` and the chat path call this once the lease is open.
+/// still wins on ACP, where htui's tools are kind `other`) nor override an operator's rule. A
+/// policy whose default is not `ask` gets none: under `deny` (a persona's or the agent's) they
+/// would widen it, and under `allow` the default already answers. Both the engine's `drive_once`
+/// and the chat path call this once the lease is open — `drive_once` after the persona's narrowing
+/// has set the default.
 pub fn pre_approve(policy: &mut PermissionPolicy, lease: &ToolLease) {
+    if policy.default != PermissionDefault::Ask {
+        return;
+    }
     let server = lease.spec.name.as_str();
     policy.rules.extend(
         lease
@@ -342,6 +350,35 @@ mod tests {
         .expect("a rule answers");
         assert_eq!(answer.kind, PermissionOptionKind::RejectOnce);
         assert_eq!(answer.reason, "persona reviewer denies other");
+    }
+
+    /// MOD-11 R1 M2: a policy whose default is not `ask` gets no pre-approval. Under `deny` — a
+    /// persona's `permission-default: deny`, an agent row's — htui's tools stay rejected by the
+    /// default (MOD-26 I-1: never widened); under `allow` the default already allows them.
+    #[test]
+    fn a_default_that_does_not_ask_gets_no_pre_approval() {
+        use htui_agent::driver::PermissionDefault;
+        use htui_agent::permission::PolicyStage;
+
+        for (default, kind) in [
+            (PermissionDefault::Deny, PermissionOptionKind::RejectOnce),
+            (PermissionDefault::Allow, PermissionOptionKind::AllowOnce),
+        ] {
+            let mut policy = PermissionPolicy {
+                default,
+                ..PermissionPolicy::default()
+            };
+            pre_approve(&mut policy, &advertising(&["document_write", "note_add"]));
+            assert!(policy.rules.is_empty(), "{default:?}: {:?}", policy.rules);
+            let answer = evaluate(
+                &policy,
+                Some(&call("mcp__htui__document_write")),
+                &options(),
+            )
+            .expect("the default answers");
+            assert_eq!(answer.kind, kind, "{default:?}");
+            assert_eq!(answer.stage, PolicyStage::Default, "{default:?}");
+        }
     }
 
     #[test]

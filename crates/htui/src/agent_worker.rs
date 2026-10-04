@@ -5608,6 +5608,45 @@ pub(crate) mod tests {
             end(&mut runtime, &backend, &mut live).await;
         }
 
+        /// MOD-11 R1 M2: an agent row whose default is `deny` gets no pre-approval in a chat —
+        /// htui's tools stay rejected by its default, never widened — while one whose default
+        /// asks does.
+        #[test]
+        fn a_chat_under_a_deny_default_pre_approves_nothing() {
+            use htui_agent::driver::{McpServerSpec, PermissionDefault, PermissionPolicy};
+            use htui_orch::tools::ToolLease;
+
+            let lease = || {
+                ToolLease::new(
+                    McpServerSpec {
+                        name: "htui".to_owned(),
+                        command: "/proc/1/exe".to_owned(),
+                        args: Vec::new(),
+                        env: std::collections::BTreeMap::new(),
+                    },
+                    None,
+                    || {},
+                )
+                .with_tools(vec!["box_profile".to_owned(), "note_add".to_owned()])
+            };
+            let deny = PermissionPolicy {
+                default: PermissionDefault::Deny,
+                ..PermissionPolicy::default()
+            };
+            assert_eq!(
+                super::super::chat_policy(deny.clone(), Some(&lease())),
+                deny,
+                "a deny default is left alone"
+            );
+            assert_eq!(
+                super::super::chat_policy(PermissionPolicy::default(), Some(&lease()))
+                    .rules
+                    .len(),
+                2,
+                "an asking default is pre-approved"
+            );
+        }
+
         /// MOD-11 R1 M2: a chat's policy pre-approves every htui tool its scope advertises —
         /// after the agent's own rules — except `permission_prompt` (and `command_run`, which no
         /// chat is offered); a fresh chat's is `box_profile` alone.

@@ -346,7 +346,9 @@ policy answers `allow_once` for every htui tool the session is offered except `c
 These rules come after the R-MCP-4 refusals, the persona's rules and the agent's own, just ahead of
 the remembered choices and the default, so they only replace the default `ask`: a persona that
 rejects the kind htui's tools carry (`other`), or a rule of yours that names one of them, still
-wins. `command_run` runs any command, so under the default `ask` it still asks.
+wins. A policy whose default is not `ask` gets none of them: under a persona's or an agent's
+`deny` default htui's tools stay rejected, and under `allow` the default already allows them.
+`command_run` runs any command, so under the default `ask` it still asks.
 
 The options are **Allow** and **Reject**. An allow lets the call run with its input unchanged; a
 reject answers the CLI `denied in htui`. A cancel answers every pending prompt
