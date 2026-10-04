@@ -3035,3 +3035,45 @@ async fn a_directory_gone_before_the_choice_is_refused_on_the_status_line() {
         "the picker is still open: {frame}"
     );
 }
+
+/// MOD-80 review L1: the rows a section drew in `theme.selected`, as `(y, text)`, each checked to
+/// be black on cyan over its whole text so no span's own colour shows through the cursor.
+fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
+    let selected = Theme::default().selected;
+    let (fg, bg) = (
+        selected.fg.expect("selected has a foreground"),
+        selected.bg.expect("selected has a background"),
+    );
+    (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].bg == bg)
+        .map(|y| {
+            let text: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned();
+            for x in 0..u16::try_from(text.chars().count()).expect("a narrow row") {
+                let cell = &buffer[(x, y)];
+                assert_eq!((cell.fg, cell.bg), (fg, bg), "{text:?} at x = {x}");
+            }
+            (y, text)
+        })
+        .collect()
+}
+
+/// MOD-80 review L1: the Hierarchy cursor row is drawn in `theme.selected`, as Connection's is.
+#[tokio::test]
+async fn the_cursor_row_is_drawn_selected() {
+    let bench = SectionBench::new().await;
+    let mut section = HierarchySection::new();
+    let backend = demo();
+    let opened = demo_tree(&backend, ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+    let first = selected_rows(&drawn(&bench, &section, 100));
+    assert_eq!(first.len(), 1, "{first:?}");
+    bench.key(&mut section, "j");
+    let second = selected_rows(&drawn(&bench, &section, 100));
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert_eq!(second[0].0, first[0].0 + 1, "the cursor moved one row");
+}

@@ -1111,7 +1111,7 @@ impl PersonasSection {
         }
     }
 
-    /// The registry: one line per persona, the cursor row accented with its detail under it,
+    /// The registry: one line per persona, the cursor row selected with its detail under it,
     /// scrolled so the cursor row and its detail are on screen.
     fn list_lines(&self, width: u16, height: u16, theme: &Theme) -> Vec<Line<'static>> {
         if let Some(why) = &self.unavailable {
@@ -1131,7 +1131,7 @@ impl PersonasSection {
         let mut cursor_end = 0;
         for (index, row) in self.personas.iter().enumerate() {
             if index == self.cursor {
-                lines.push(Line::styled(row_line(row, width), theme.accent));
+                lines.push(Line::styled(row_line(row, width), theme.selected));
                 let detail = detail_line(row);
                 for line in wrapped(&detail, width.saturating_sub(4).max(1)) {
                     lines.push(Line::styled(format!("    {line}"), theme.dim));

@@ -1193,7 +1193,8 @@ impl KindsSection {
         let mut lines = Vec::new();
         for (index, row) in self.rows().into_iter().enumerate() {
             let selected = index == self.cursor;
-            let style = if selected { theme.accent } else { theme.base };
+            // MOD-80 review L1: the cursor row in `selected`, as Connection's and Boxes' are.
+            let style = if selected { theme.selected } else { theme.base };
             match row {
                 Row::Project { p } => {
                     if let Some(entry) = self.project(p) {
@@ -1218,15 +1219,18 @@ impl KindsSection {
                         )),
                         // The tail is the one thing on this line the user has to act on, so it is
                         // the one thing in `theme.error`.
-                        None => lines.push(Line::from(vec![
-                            Span::styled(head, style),
-                            Span::styled(GRAPH_MISSING.to_owned(), theme.error),
-                        ])),
+                        None => {
+                            let line = Line::from(vec![
+                                Span::styled(head, style),
+                                Span::styled(GRAPH_MISSING.to_owned(), theme.error),
+                            ]);
+                            lines.push(if selected { theme.select(line) } else { line });
+                        }
                     }
                 }
                 Row::Graph { p, g } => {
                     if let Some(entry) = self.graph_at(p, g) {
-                        let style = if selected { theme.accent } else { theme.dim };
+                        let style = if selected { theme.selected } else { theme.dim };
                         lines.push(Line::styled(
                             format!("  {} \u{b7} graph, no kind", entry.graph.name),
                             style,

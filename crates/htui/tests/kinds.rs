@@ -2403,3 +2403,57 @@ async fn d_on_a_phase_or_graph_is_refused() {
         "a phase row says so in this section's own words"
     );
 }
+
+/// MOD-80 review L1: the rows a section drew in `theme.selected`, as `(y, text)`, each checked to
+/// be black on cyan over its whole text so no span's own colour shows through the cursor.
+fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
+    let selected = Theme::default().selected;
+    let (fg, bg) = (
+        selected.fg.expect("selected has a foreground"),
+        selected.bg.expect("selected has a background"),
+    );
+    (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].bg == bg)
+        .map(|y| {
+            let text: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned();
+            for x in 0..u16::try_from(text.chars().count()).expect("a narrow row") {
+                let cell = &buffer[(x, y)];
+                assert_eq!((cell.fg, cell.bg), (fg, bg), "{text:?} at x = {x}");
+            }
+            (y, text)
+        })
+        .collect()
+}
+
+/// MOD-80 review L1: the Kinds cursor row is drawn in `theme.selected`, as Connection's is, and a
+/// kind whose graph is missing is one block too, its `graph missing` tail included.
+#[tokio::test]
+async fn the_cursor_row_is_drawn_selected() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    let on_project = selected_rows(&drawn(&bench, &section, 100));
+    assert_eq!(on_project.len(), 1, "{on_project:?}");
+    bench.key(&mut section, "j");
+    let on_kind = selected_rows(&drawn(&bench, &section, 100));
+    assert_eq!(on_kind.len(), 1, "{on_kind:?}");
+    assert_eq!(
+        on_kind[0].0,
+        on_project[0].0 + 1,
+        "the cursor moved one row"
+    );
+    assert!(on_kind[0].1.trim_start().starts_with("ANA"), "{on_kind:?}");
+
+    let bench = SectionBench::new().await;
+    let mut section = KindsSection::new();
+    let mut snapshot = demo_catalogue(&demo()).await;
+    snapshot.projects[0].kinds[0].default_graph_id = StepGraphId::new();
+    bench.reply(&mut section, &StoreReply::Catalogue(Box::new(snapshot)));
+    let _ = bench.drained();
+    bench.key(&mut section, "j");
+    let missing = selected_rows(&drawn(&bench, &section, 100));
+    assert_eq!(missing.len(), 1, "{missing:?}");
+    assert_eq!(missing[0].1.trim(), "ANA  analysis \u{b7} graph missing");
+}
