@@ -172,6 +172,9 @@ struct Built {
     repos: Option<BTreeMap<RepoId, RepoCheckout>>,
     isolator: Option<Arc<dyn Isolator>>,
     verifier: Option<Arc<dyn Verifier>>,
+    /// MOD-76 D4 (R-55): the stored `command_limits` [`Self::verifier`] was built from (`None`
+    /// inside: no key).
+    limits: Option<Option<Value>>,
 }
 
 /// Everything the runtime's tasks share. `P` is where the runtime's answers go (MOD-41 plan D7).
@@ -428,15 +431,23 @@ impl<P: ReplySink> Shared<P> {
             built.verifier = None;
             self.isolator_builds.fetch_add(1, Ordering::SeqCst);
         }
+        // MOD-76 D4 (R-55): the limits are read wherever the repo map is, so an edit to them alone
+        // rebuilds the verifier. Never under a live walk: two verifiers are two `verify` semaphores
+        // (verify.rs `ShellVerifier`), so the swap waits for the next call with none live.
+        let stored = stored_limits(host, box_id)
+            .await
+            .map_err(|err| err.to_string())?;
+        if built.limits.as_ref() != Some(&stored) && !self.any_live() {
+            built.verifier = None;
+        }
         if built.verifier.is_none() {
-            let limits = command_limits(host, box_id)
-                .await
-                .map_err(|err| err.to_string())?;
+            let limits = parse_limits(box_id, stored.clone());
             built.verifier = Some(Arc::new(ShellVerifier::new(
                 &limits,
                 Arc::new(MinimalScrubber::new(std::iter::empty::<String>())),
                 Arc::clone(&self.clock),
             )));
+            built.limits = Some(stored);
         }
         match (&built.isolator, &built.verifier) {
             (Some(isolator), Some(verifier)) => Ok((Arc::clone(isolator), Arc::clone(verifier))),
@@ -808,18 +819,36 @@ async fn command_limits<H: htui_core::store::WorkerHost>(
     host: &H,
     box_id: BoxId,
 ) -> StoreResult<BTreeMap<String, u32>> {
-    let default = || BTreeMap::from([("verify".to_owned(), 1)]);
-    let Some(stored) = host
+    Ok(parse_limits(box_id, stored_limits(host, box_id).await?))
+}
+
+/// MOD-76 B-1 (R-55): the box row's `settings.command_limits` as stored, `None` for no row or no
+/// key. [`Shared::singletons`] compares it raw, so a value that does not parse is parsed (and
+/// warned) once per build, not once per sweep.
+///
+/// # Errors
+/// The store's own read failure (D216).
+async fn stored_limits<H: htui_core::store::WorkerHost>(
+    host: &H,
+    box_id: BoxId,
+) -> StoreResult<Option<Value>> {
+    Ok(host
         .box_row(box_id)
         .await?
-        .and_then(|row| row.settings.get("command_limits").cloned())
-    else {
-        return Ok(default());
+        .and_then(|row| row.settings.get("command_limits").cloned()))
+}
+
+/// MOD-76 B-1 (R-55): `stored` parsed, else `{"verify": 1}` (D156): no value, or one that does
+/// not parse (warned).
+fn parse_limits(box_id: BoxId, stored: Option<Value>) -> BTreeMap<String, u32> {
+    let default = || BTreeMap::from([("verify".to_owned(), 1)]);
+    let Some(stored) = stored else {
+        return default();
     };
-    Ok(serde_json::from_value(stored).unwrap_or_else(|err| {
+    serde_json::from_value(stored).unwrap_or_else(|err| {
         tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; verify runs one at a time");
         default()
-    }))
+    })
 }
 
 /// The engine every task builds, per step of work, over [`Kit`]'s parts: over the host's store
