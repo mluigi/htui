@@ -9,9 +9,29 @@
 //! `Debug`s, and no `SecretError` variant carries a value, a client secret or a token.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::pin::Pin;
 
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
+
+/// The boxed future every [`SecretProvider`] method returns: the shape of `IsolatorFuture`
+/// (`htui-orch`) and `DriverFuture` (`htui-agent`), for the same reason. A provider is held as
+/// `Arc<dyn SecretProvider>`, and a plain `async fn` in a trait is not dyn-compatible.
+pub type SecretFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SecretError>> + Send + 'a>>;
+
+/// A secret provider (MOD-10 D2). One instance per process and identity (D5: the login latch is
+/// per instance, so M3 must share it).
+pub trait SecretProvider: Send + Sync + core::fmt::Debug {
+    /// Stable provider name, the value `project.secret_provider` holds (`"infisical"`).
+    fn kind(&self) -> &'static str;
+    /// Reachability plus a fresh login with the configured identity.
+    fn health(&self) -> SecretFuture<'_, ProviderHealth>;
+    /// Key names visible in `scope`, sorted; never values.
+    fn list_keys<'a>(&'a self, scope: &'a SecretScope) -> SecretFuture<'a, Vec<String>>;
+    /// Every key → value in `scope`, imports merged, validated for an environment block.
+    fn resolve<'a>(&'a self, scope: &'a SecretScope) -> SecretFuture<'a, ResolvedSecrets>;
+}
 
 /// Which secrets a project reads: an Infisical project, environment slug and folder path (D3).
 /// Stored in `project.secret_scope` as compact JSON (`to_column`); M4 writes it, M3 reads it.
@@ -218,7 +238,7 @@ impl core::fmt::Debug for MachineIdentity {
     }
 }
 
-/// What `SecretProvider::health` reports. No token and no secret.
+/// What [`SecretProvider::health`] reports. No token and no secret.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderHealth {
     /// The normalised base URL the provider talks to.
@@ -335,6 +355,9 @@ fn retry_hint(secs: &Option<u64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+    use std::sync::Arc;
+
     use super::*;
 
     fn config_sentence(result: Result<SecretScope, SecretError>) -> String {
@@ -496,5 +519,300 @@ mod tests {
             format!("{health:?}"),
             r#"ProviderHealth { base_url: "https://infisical.example", server_ok: true }"#
         );
+    }
+
+    #[test]
+    fn secret_error_display_is_exact() {
+        assert_eq!(
+            SecretError::NoIdentity.to_string(),
+            "no Infisical machine identity is stored in the OS keyring"
+        );
+        assert_eq!(
+            SecretError::Config("the Infisical base URL is empty".into()).to_string(),
+            "secret provider configuration: the Infisical base URL is empty"
+        );
+        assert_eq!(
+            SecretError::Unreachable {
+                endpoint: "/api/status",
+                cause: "error sending request: connection refused".into(),
+            }
+            .to_string(),
+            "cannot reach Infisical at /api/status: error sending request: connection refused"
+        );
+        assert_eq!(
+            SecretError::BadCredentials.to_string(),
+            "Infisical refused the machine identity's login: the client ID or client secret is \
+             wrong, expired or used up"
+        );
+        assert_eq!(
+            SecretError::IdentityLocked.to_string(),
+            "Infisical has temporarily locked the machine identity after repeated failed logins; \
+             wait for the lockout to end before trying again"
+        );
+        assert_eq!(
+            SecretError::LoginRefusedEarlier.to_string(),
+            "an earlier login with this machine identity was refused; no new login is tried until \
+             the identity is entered again"
+        );
+        assert_eq!(
+            SecretError::ProjectNotFound.to_string(),
+            "Infisical has no project with the configured project ID"
+        );
+        assert_eq!(
+            SecretError::PathNotFound {
+                environment: "dev".into(),
+                path: "/app".into(),
+            }
+            .to_string(),
+            "Infisical has no environment `dev` or folder `/app` in the project"
+        );
+        assert_eq!(
+            SecretError::PermissionDenied {
+                detail: "no read on dev".into(),
+            }
+            .to_string(),
+            "the machine identity may not read these secrets: no read on dev"
+        );
+        assert_eq!(
+            SecretError::RateLimited {
+                retry_after_secs: Some(30),
+            }
+            .to_string(),
+            "Infisical rate-limited the request; retry after 30 s"
+        );
+        assert_eq!(
+            SecretError::RateLimited {
+                retry_after_secs: None,
+            }
+            .to_string(),
+            "Infisical rate-limited the request"
+        );
+        assert_eq!(
+            SecretError::UnsupportedServer {
+                endpoint: "/api/v4/secrets",
+            }
+            .to_string(),
+            "this Infisical predates v0.150 (/api/v4/secrets does not exist); upgrade it"
+        );
+        assert_eq!(
+            SecretError::InvalidKey { key: "1BAD".into() }.to_string(),
+            "the secret name \"1BAD\" is not a valid environment variable name; rename it in \
+             Infisical"
+        );
+        assert_eq!(
+            SecretError::InvalidValue {
+                key: "TOKEN".into(),
+            }
+            .to_string(),
+            "the secret TOKEN holds a NUL byte, which an environment variable cannot carry; fix \
+             its value in Infisical"
+        );
+        assert_eq!(
+            SecretError::Protocol {
+                endpoint: "/api/v4/secrets",
+                detail: "status 500".into(),
+            }
+            .to_string(),
+            "unexpected answer from Infisical at /api/v4/secrets: status 500"
+        );
+    }
+
+    /// Sentinels standing in for a secret value, a client secret and an access token.
+    const VALUE: &str = "leak-value-1";
+    const SECRET: &str = "leak-secret-1";
+    const TOKEN: &str = "leak-token-1";
+
+    /// The variant's name. No wildcard arm: a new variant fails to compile here until it is
+    /// added to [`every_variant`] too.
+    fn variant(e: &SecretError) -> &'static str {
+        match e {
+            SecretError::NoIdentity => "NoIdentity",
+            SecretError::Config(_) => "Config",
+            SecretError::Unreachable { .. } => "Unreachable",
+            SecretError::BadCredentials => "BadCredentials",
+            SecretError::IdentityLocked => "IdentityLocked",
+            SecretError::LoginRefusedEarlier => "LoginRefusedEarlier",
+            SecretError::ProjectNotFound => "ProjectNotFound",
+            SecretError::PathNotFound { .. } => "PathNotFound",
+            SecretError::PermissionDenied { .. } => "PermissionDenied",
+            SecretError::RateLimited { .. } => "RateLimited",
+            SecretError::UnsupportedServer { .. } => "UnsupportedServer",
+            SecretError::InvalidKey { .. } => "InvalidKey",
+            SecretError::InvalidValue { .. } => "InvalidValue",
+            SecretError::Protocol { .. } => "Protocol",
+        }
+    }
+
+    /// One of each variant. The sentinels go only into the fields that are free text by design
+    /// (`Config`, `cause`, `detail`); every other field holds what it would in production.
+    fn every_variant() -> Vec<SecretError> {
+        let free_text = format!("{VALUE} {SECRET} {TOKEN}");
+        vec![
+            SecretError::NoIdentity,
+            SecretError::Config(free_text.clone()),
+            SecretError::Unreachable {
+                endpoint: "/api/status",
+                cause: free_text.clone(),
+            },
+            SecretError::BadCredentials,
+            SecretError::IdentityLocked,
+            SecretError::LoginRefusedEarlier,
+            SecretError::ProjectNotFound,
+            SecretError::PathNotFound {
+                environment: "dev".into(),
+                path: "/app".into(),
+            },
+            SecretError::PermissionDenied {
+                detail: free_text.clone(),
+            },
+            SecretError::RateLimited {
+                retry_after_secs: Some(7),
+            },
+            SecretError::UnsupportedServer {
+                endpoint: "/api/v4/secrets",
+            },
+            SecretError::InvalidKey {
+                key: "BAD-KEY".into(),
+            },
+            SecretError::InvalidValue {
+                key: "NUL_KEY".into(),
+            },
+            SecretError::Protocol {
+                endpoint: "/api/v4/secrets",
+                detail: free_text,
+            },
+        ]
+    }
+
+    fn carries_a_sentinel(text: &str) -> bool {
+        [VALUE, SECRET, TOKEN].iter().any(|s| text.contains(s))
+    }
+
+    #[test]
+    fn every_secret_error_variant_is_covered() {
+        let all = every_variant();
+        let names: BTreeSet<&'static str> = all.iter().map(variant).collect();
+        assert_eq!(
+            names.len(),
+            14,
+            "every_variant() misses or repeats a variant"
+        );
+        assert_eq!(all.len(), 14, "every_variant() repeats a variant");
+
+        for e in &all {
+            let name = variant(e);
+            let (display, debug) = (e.to_string(), format!("{e:?}"));
+            match e {
+                // Free text by design: the structure is what this test pins.
+                SecretError::Config(_)
+                | SecretError::Unreachable { .. }
+                | SecretError::PermissionDenied { .. }
+                | SecretError::Protocol { .. } => {}
+                // Key-carrying variants print their key and nothing else of the secret.
+                SecretError::InvalidKey { key } | SecretError::InvalidValue { key } => {
+                    assert!(
+                        display.contains(key.as_str()),
+                        "{name} does not name its key"
+                    );
+                    assert!(
+                        !carries_a_sentinel(&display),
+                        "{name}'s Display carries a sentinel"
+                    );
+                    assert!(
+                        !carries_a_sentinel(&debug),
+                        "{name}'s Debug carries a sentinel"
+                    );
+                }
+                SecretError::NoIdentity
+                | SecretError::BadCredentials
+                | SecretError::IdentityLocked
+                | SecretError::LoginRefusedEarlier
+                | SecretError::ProjectNotFound
+                | SecretError::PathNotFound { .. }
+                | SecretError::RateLimited { .. }
+                | SecretError::UnsupportedServer { .. } => {
+                    assert!(
+                        !carries_a_sentinel(&display),
+                        "{name}'s Display carries a sentinel"
+                    );
+                    assert!(
+                        !carries_a_sentinel(&debug),
+                        "{name}'s Debug carries a sentinel"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A provider answering fixed data, to prove the trait is dyn-compatible and `Send`.
+    #[derive(Debug)]
+    struct Fixed;
+
+    impl SecretProvider for Fixed {
+        fn kind(&self) -> &'static str {
+            "fixed"
+        }
+
+        fn health(&self) -> SecretFuture<'_, ProviderHealth> {
+            Box::pin(async {
+                Ok(ProviderHealth {
+                    base_url: "https://fixed.invalid".to_owned(),
+                    server_ok: true,
+                })
+            })
+        }
+
+        fn list_keys<'a>(&'a self, scope: &'a SecretScope) -> SecretFuture<'a, Vec<String>> {
+            Box::pin(async move { Ok(vec![format!("{}_KEY", scope.environment().to_uppercase())]) })
+        }
+
+        fn resolve<'a>(&'a self, scope: &'a SecretScope) -> SecretFuture<'a, ResolvedSecrets> {
+            Box::pin(async move {
+                if scope.path() != "/" {
+                    return Err(SecretError::PathNotFound {
+                        environment: scope.environment().to_owned(),
+                        path: scope.path().to_owned(),
+                    });
+                }
+                Ok(ResolvedSecrets::new(BTreeMap::from([(
+                    format!("{}_KEY", scope.environment().to_uppercase()),
+                    "fixed-value".to_owned(),
+                )])))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_is_usable_as_arc_dyn() {
+        let provider: Arc<dyn SecretProvider> = Arc::new(Fixed);
+        let scope = SecretScope::new("p1", "dev", "/").expect("valid scope");
+
+        assert_eq!(provider.kind(), "fixed");
+        assert_eq!(
+            provider.health().await.expect("health answers"),
+            ProviderHealth {
+                base_url: "https://fixed.invalid".to_owned(),
+                server_ok: true,
+            }
+        );
+        assert_eq!(
+            provider.list_keys(&scope).await.expect("list_keys answers"),
+            vec!["DEV_KEY".to_owned()]
+        );
+        let resolved = provider.resolve(&scope).await.expect("resolve answers");
+        assert_eq!(resolved.keys(), vec!["DEV_KEY".to_owned()]);
+
+        let elsewhere = SecretScope::new("p1", "dev", "/app").expect("valid scope");
+        assert_eq!(
+            provider.resolve(&elsewhere).await.map(|r| r.keys()),
+            Err(SecretError::PathNotFound {
+                environment: "dev".into(),
+                path: "/app".into(),
+            })
+        );
+
+        // The futures cross threads: a provider is shared by the worker's tasks.
+        fn assert_send<T: Send>(_: &T) {}
+        assert_send(&provider.resolve(&scope));
     }
 }
