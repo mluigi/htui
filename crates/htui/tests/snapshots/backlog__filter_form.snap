@@ -16,17 +16,17 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
 │▾ agy (3)                                            ││Postgres holds the truth; every box keeps a│
 │  ANA-1    done               Prompt assembly survey ││read-only cache it refreshes on connect.   │
-│  FEAT-1   open               ACP transport upgrade  ││Writes are                                 │
-│  FIX-1    open               Session leak on cancel ││compare-and-set on a version column, so a  │
-│                                                     ││losing edit is shown against its common    │
-│                                                     ││ancestor rather                            │
-│                                                     ││than silently dropped.                     │
+│  FEAT-1   open               ACP transport upgrade  ││Writes are compare-and-set on a version    │
+│  FIX-1    open               Session leak on cancel ││column, so a losing edit is shown against  │
+│                                                     ││its common ancestor rather than silently   │
+│                                                     ││dropped.                                   │
 │                                                     ││                                           │
 │                                                     ││Item keys are minted from a per-project    │
-└─────────────────────────────────────────────────────┘│counter table, which keeps numbers gapless │
-┌ Filter ─────────────────────────────────────────────┐│and lets the                               │
-│  status  ‹[x] done›  done                           ││legacy importer align the counter above the│
-│  project ‹[ ] htui›  any                            ││numbers it brings in.                      │
+│                                                     ││counter table, which keeps numbers gapless │
+└─────────────────────────────────────────────────────┘│and lets the legacy importer align the     │
+┌ Filter ─────────────────────────────────────────────┐│counter above the numbers it brings in.    │
+│  status  ‹[x] done›  done                           ││                                           │
+│  project ‹[ ] htui›  any                            ││                                           │
 │> tags    rust                                       ││                                           │
 │  ready   [ ] only what this box can start           ││                                           │
 │comma list · ↑/↓ row · Enter apply · Esc cancel      ││                                           │
