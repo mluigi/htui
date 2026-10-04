@@ -4,7 +4,8 @@
 //! answer the token, a listed secret its value. No `deny_unknown_fields` either: a server upgrade
 //! adds fields.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use zeroize::Zeroizing;
 
 /// `POST /api/v1/auth/universal-auth/login` body.
 #[derive(Serialize)]
@@ -44,15 +45,22 @@ pub(crate) struct ListResponse {
 pub(crate) struct WireSecret {
     /// `secretKey`.
     pub(crate) secret_key: String,
-    /// `secretValue`.
-    #[serde(default)]
-    pub(crate) secret_value: String,
+    /// `secretValue`, wiped on drop from the moment it is decoded, whether `merge` keeps the
+    /// entry or skips it.
+    #[serde(default, deserialize_with = "zeroizing")]
+    pub(crate) secret_value: Zeroizing<String>,
     /// `secretValueHidden`.
     #[serde(default)]
     pub(crate) secret_value_hidden: bool,
     /// `type`: `"shared"` | `"personal"`; absent → shared.
     #[serde(rename = "type", default)]
     pub(crate) kind: Option<String>,
+}
+
+/// A string straight into `Zeroizing` (`zeroize` 1.9 has no `serde` feature). serde's own
+/// buffers stay unwiped (H-20).
+fn zeroizing<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Zeroizing<String>, D::Error> {
+    String::deserialize(deserializer).map(Zeroizing::new)
 }
 
 /// One import. `secretPath` and `environment` are not read, so not declared (H-10).
@@ -146,6 +154,15 @@ mod tests {
         assert_eq!(values(&merged), [("A", "first"), ("B", "one")]);
     }
 
+    /// R1 #4: a value is `Zeroizing` from the moment it is decoded, so an entry `merge` skips
+    /// (personal), shadows or never reaches (a decode that fails later) drops wiped.
+    #[test]
+    fn a_listed_value_is_zeroizing_from_the_moment_it_is_decoded() {
+        let parsed = list(json!({"secrets": [personal("P", "p1"), shared("A", "a")]}));
+        let value: &Zeroizing<String> = &parsed.secrets[0].secret_value;
+        assert_eq!(value.as_str(), "p1");
+    }
+
     #[test]
     fn the_login_request_serialises_camel_case() {
         let body = serde_json::to_value(LoginRequest {
@@ -168,7 +185,7 @@ mod tests {
         assert!(parsed.imports.is_none());
         let absent = list(json!({"secrets": [{"secretKey": "K"}]}));
         assert!(absent.imports.is_none());
-        assert_eq!(absent.secrets[0].secret_value, "");
+        assert_eq!(absent.secrets[0].secret_value.as_str(), "");
         assert!(!absent.secrets[0].secret_value_hidden);
         assert!(absent.secrets[0].kind.is_none());
     }

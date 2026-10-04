@@ -614,8 +614,8 @@ pub(crate) struct Merged {
 }
 
 /// D6 merge (§B.4.5): the folder first, then the imports last to first; a key already present is
-/// kept; `personal` entries are skipped. Values are moved into `Zeroizing` as they are read, so
-/// shadowed entries drop wiped.
+/// kept; `personal` entries are skipped. Values arrive already in `Zeroizing` (`wire.rs`), so
+/// skipped and shadowed entries drop wiped.
 pub(crate) fn merge(list: ListResponse) -> BTreeMap<String, Merged> {
     let mut out = BTreeMap::new();
     let imports = list.imports.unwrap_or_default();
@@ -628,7 +628,7 @@ pub(crate) fn merge(list: ListResponse) -> BTreeMap<String, Merged> {
             continue;
         }
         let merged = Merged {
-            value: Zeroizing::new(entry.secret_value),
+            value: entry.secret_value,
             hidden: entry.secret_value_hidden,
         };
         out.entry(entry.secret_key).or_insert(merged);
