@@ -9,7 +9,8 @@
 
 use std::path::PathBuf;
 
-use htui_agent::driver::McpServerSpec;
+use htui_agent::driver::{McpServerSpec, PermissionMatch, PermissionPolicy, PermissionRule};
+use htui_agent::event::PermissionOptionKind;
 use htui_agent::prompt_bridge::PromptPort;
 use htui_core::model::{BoxId, ItemId, ProjectId, RunId, StepId, Transport, UserId};
 use htui_core::prompt::render::HostnameLine;
@@ -54,6 +55,9 @@ pub struct ToolLease {
     pub spec: McpServerSpec,
     /// B-21: `Some` for a `Transport::Cli` scope.
     pub prompt: Option<PromptPort>,
+    /// MOD-11 R1 M2: the tools the scope is advertised, by their bare names, in `tools/list`
+    /// order — what [`pre_approve`] reads. Empty unless the host says ([`ToolLease::with_tools`]).
+    pub tools: Vec<String>,
     on_drop: Option<OnDrop>,
 }
 
@@ -68,9 +72,55 @@ impl ToolLease {
         Self {
             spec,
             prompt,
+            tools: Vec::new(),
             on_drop: Some(Box::new(on_drop)),
         }
     }
+
+    /// MOD-11 R1 M2: this lease, naming `tools` as the ones its scope is advertised.
+    #[must_use]
+    pub fn with_tools(mut self, tools: Vec<String>) -> Self {
+        self.tools = tools;
+        self
+    }
+}
+
+/// MOD-11 R1 M2: htui's tools that are never pre-approved. `command_run` runs any command, so under
+/// the default `ask` a human sees it; `permission_prompt` is `claude-cli`'s own permission channel.
+pub const ASKING_TOOLS: [&str; 2] = ["command_run", "permission_prompt"];
+
+/// MOD-11 R1 M2: `tool` of the MCP server `server` as an agent calls it — and as both transports
+/// title the call a permission request names: `mcp__<server>__<tool>`.
+#[must_use]
+pub fn qualified_tool_name(server: &str, tool: &str) -> String {
+    format!("mcp__{server}__{tool}")
+}
+
+/// MOD-11 R1 M2: appends to `policy.rules` one `allow_once` per tool `lease` is advertised, except
+/// [`ASKING_TOOLS`], matched on the tool's qualified name under the lease's server (whose name the
+/// host sets from `htui_mcp::SERVER_NAME`).
+///
+/// Appended, so they run after every rule already there — the R-MCP-4 denials, a persona's rules
+/// and the agent's own — and just ahead of the remembered choices and the default: they only
+/// replace the default `ask`, never widen a persona (MOD-26 I-1: a `deny_kinds: [other]` reject
+/// still wins on ACP, where htui's tools are kind `other`) nor override an operator's rule. Both
+/// the engine's `drive_once` and the chat path call this once the lease is open.
+pub fn pre_approve(policy: &mut PermissionPolicy, lease: &ToolLease) {
+    let server = lease.spec.name.as_str();
+    policy.rules.extend(
+        lease
+            .tools
+            .iter()
+            .filter(|tool| !ASKING_TOOLS.contains(&tool.as_str()))
+            .map(|tool| PermissionRule {
+                matcher: PermissionMatch {
+                    tool_name: Some(qualified_tool_name(server, tool)),
+                    ..PermissionMatch::default()
+                },
+                answer: PermissionOptionKind::AllowOnce,
+                reason: format!("htui's own `{tool}` tool (MOD-11)"),
+            }),
+    );
 }
 
 impl Drop for ToolLease {
@@ -87,6 +137,7 @@ impl core::fmt::Debug for ToolLease {
         f.debug_struct("ToolLease")
             .field("spec", &self.spec)
             .field("prompt", &self.prompt.as_ref().map(PromptPort::id))
+            .field("tools", &self.tools)
             .finish_non_exhaustive()
     }
 }
@@ -121,9 +172,11 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use htui_agent::driver::McpServerSpec;
+    use htui_agent::driver::{McpServerSpec, PermissionMatch, PermissionPolicy, PermissionRule};
+    use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent, ToolKind};
+    use htui_agent::permission::evaluate;
 
-    use super::ToolLease;
+    use super::{ToolLease, pre_approve};
 
     const SECRET: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -160,6 +213,135 @@ mod tests {
             1,
             "the drop runs the unregister once"
         );
+    }
+
+    fn advertising(tools: &[&str]) -> ToolLease {
+        ToolLease::new(spec(), None, || {})
+            .with_tools(tools.iter().map(|tool| (*tool).to_owned()).collect())
+    }
+
+    fn call(title: &str) -> ToolCallEvent {
+        ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: title.to_owned(),
+            tool_kind: ToolKind::Other,
+            input: serde_json::json!({}),
+            locations: Vec::new(),
+        }
+    }
+
+    fn options() -> Vec<PermissionOption> {
+        [
+            ("allow-once", PermissionOptionKind::AllowOnce),
+            ("reject-once", PermissionOptionKind::RejectOnce),
+        ]
+        .into_iter()
+        .map(|(id, kind)| PermissionOption {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            kind,
+        })
+        .collect()
+    }
+
+    /// MOD-11 R1 M2: one `allow_once` per advertised tool, named as both transports title it,
+    /// appended after every rule the policy already holds; `command_run` and `permission_prompt`
+    /// get none, and neither does a tool the scope does not advertise.
+    #[test]
+    fn pre_approve_appends_one_allow_per_advertised_tool_but_the_asking_two() {
+        let operator = PermissionRule {
+            matcher: PermissionMatch {
+                tool_name: Some("Write".to_owned()),
+                ..PermissionMatch::default()
+            },
+            answer: PermissionOptionKind::RejectOnce,
+            reason: "the operator's".to_owned(),
+        };
+        let mut policy = PermissionPolicy {
+            rules: vec![operator.clone()],
+            ..PermissionPolicy::default()
+        };
+        let lease = advertising(&[
+            "box_profile",
+            "document_write",
+            "command_run",
+            "permission_prompt",
+        ]);
+        pre_approve(&mut policy, &lease);
+
+        assert_eq!(
+            policy.rules.first(),
+            Some(&operator),
+            "the operator's rule stays first"
+        );
+        let named: Vec<(Option<&str>, PermissionOptionKind)> = policy.rules[1..]
+            .iter()
+            .map(|rule| (rule.matcher.tool_name.as_deref(), rule.answer))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                (
+                    Some("mcp__htui__box_profile"),
+                    PermissionOptionKind::AllowOnce
+                ),
+                (
+                    Some("mcp__htui__document_write"),
+                    PermissionOptionKind::AllowOnce
+                ),
+            ]
+        );
+        assert!(
+            policy.rules[1..].iter().all(|rule| rule.matcher
+                == PermissionMatch {
+                    tool_name: rule.matcher.tool_name.clone(),
+                    ..PermissionMatch::default()
+                }),
+            "a name rule only"
+        );
+
+        let answer = |title: &str| evaluate(&policy, Some(&call(title)), &options());
+        assert_eq!(
+            answer("mcp__htui__document_write").map(|answer| answer.kind),
+            Some(PermissionOptionKind::AllowOnce)
+        );
+        assert_eq!(answer("mcp__htui__command_run"), None, "command_run asks");
+        assert_eq!(
+            answer("mcp__htui__note_add"),
+            None,
+            "an unadvertised tool asks"
+        );
+        assert_eq!(
+            answer("mcp__other__document_write"),
+            None,
+            "another server's asks"
+        );
+    }
+
+    /// MOD-11 R1 M2, MOD-26 I-1: a rule already in the policy — a persona's `other` reject, an
+    /// operator's — wins over the pre-approval, which only replaces the default `ask`.
+    #[test]
+    fn a_persona_other_reject_still_wins() {
+        let mut policy = PermissionPolicy {
+            rules: vec![PermissionRule {
+                matcher: PermissionMatch {
+                    tool_kind: Some("other".to_owned()),
+                    ..PermissionMatch::default()
+                },
+                answer: PermissionOptionKind::RejectOnce,
+                reason: "persona reviewer denies other".to_owned(),
+            }],
+            ..PermissionPolicy::default()
+        };
+        pre_approve(&mut policy, &advertising(&["document_write"]));
+        let answer = evaluate(
+            &policy,
+            Some(&call("mcp__htui__document_write")),
+            &options(),
+        )
+        .expect("a rule answers");
+        assert_eq!(answer.kind, PermissionOptionKind::RejectOnce);
+        assert_eq!(answer.reason, "persona reviewer denies other");
     }
 
     #[test]

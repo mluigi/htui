@@ -5976,6 +5976,11 @@ where
             ),
             None => None,
         };
+        // MOD-11 R1 M2: htui's own advertised tools (but `command_run` and `permission_prompt`)
+        // are pre-approved after every rule above, so they only replace the default `ask`.
+        if let Some(lease) = &lease {
+            crate::tools::pre_approve(&mut policy, lease);
+        }
         let driver = (self.parts.driver)(&candidate, key);
 
         let spec = SessionSpec {
@@ -16240,6 +16245,186 @@ mod tests {
             assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
             assert_eq!(answers[0]["by"], "policy");
             assert_eq!(answers[0]["option_id"], "reject-once");
+        }
+
+        /// MOD-11 R1 M2: a harness whose engines carry a tool host advertising `box_profile`,
+        /// `document_write`, `note_add` and `command_run` — and so not `item_link`.
+        fn htui_hosted() -> Harness {
+            Harness {
+                orch: FakeOrchestrator::demo().with_tool_host(Arc::new(
+                    crate::fake::FakeToolHost::default().advertising(&[
+                        "box_profile",
+                        "document_write",
+                        "note_add",
+                        "command_run",
+                    ]),
+                )),
+            }
+        }
+
+        /// A turn that calls htui's `tool`, titled as both transports title it, with `kind`,
+        /// and parks on its permission request.
+        fn parks_on_htui(tool: &str, kind: htui_agent::event::ToolKind) -> ScriptedStep {
+            ScriptedStep::parks_on(
+                htui_agent::event::ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: format!("mcp__htui__{tool}"),
+                    tool_kind: kind,
+                    input: serde_json::json!({ "body": "the prd" }),
+                    locations: Vec::new(),
+                },
+                request(),
+                "the prd",
+            )
+        }
+
+        /// The walk settled `prd` on one `by: policy` answer `option`, and nothing was relayed.
+        async fn assert_answered_by_policy(harness: &Harness, option: &str) {
+            let walked = walked(harness.dispatch(start_feat_3())).await;
+            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+                panic!("the walk started: {walked:?}");
+            };
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert!(
+                harness.orch.store.relay_rows().is_empty(),
+                "a policy answer is never relayed"
+            );
+            let answers = answers_in(&log(&harness.orch.store, prd.id).await);
+            assert_eq!(answers.len(), 1, "one recorded answer: {answers:?}");
+            assert_eq!(answers[0]["by"], "policy");
+            assert_eq!(answers[0]["option_id"], option);
+        }
+
+        /// MOD-11 R1 M2 on ACP: `claude-agent-acp` titles an MCP call by its raw name with kind
+        /// `other`, and the step's policy pre-approves htui's own `document_write` — under an
+        /// agent policy whose default asks — so it needs no human.
+        #[tokio::test(start_paused = true)]
+        async fn htui_s_own_tool_is_answered_by_policy_on_acp() {
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui("document_write", htui_agent::event::ToolKind::Other),
+            );
+            assert_answered_by_policy(&harness, "allow-once").await;
+        }
+
+        /// MOD-11 R1 M2 on `claude-cli`: the prompt tool's call is titled by the CLI's tool name,
+        /// with the kind the CLI dialect maps it to; the same pre-approval answers it.
+        #[tokio::test(start_paused = true)]
+        async fn htui_s_own_tool_is_answered_by_policy_on_claude_cli() {
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .with_candidates("prd", vec![(ids::AGENT_CLAUDE_CLI, "default")]);
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE_CLI, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui(
+                    "document_write",
+                    htui_agent::cli::claude::tool_kind("mcp__htui__document_write"),
+                ),
+            );
+            assert_answered_by_policy(&harness, "allow-once").await;
+        }
+
+        /// MOD-11 R1 M2, MOD-26 I-1: a persona that rejects kind `other` still rejects htui's own
+        /// tool on ACP — the pre-approval follows the persona's rules, it never widens them. (A
+        /// `deny_kinds` entry cannot name `other` (D3); its kind rule is the same reject, which
+        /// `tools.rs` pins.)
+        #[tokio::test(start_paused = true)]
+        async fn a_persona_denying_other_still_rejects_htui_s_own_tool() {
+            use htui_core::model::{
+                NewPersona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPermission, PersonaRule,
+                PersonaTools,
+            };
+
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            let persona = harness
+                .orch
+                .store
+                .create_persona(NewPersona {
+                    id: PersonaId::new(),
+                    name: "no-other".to_owned(),
+                    description: "uses no other tool".to_owned(),
+                    body: "You use no other tool.\n".to_owned(),
+                    tools: PersonaTools::default(),
+                    permission: PersonaPermission {
+                        default: None,
+                        rules: vec![PersonaRule {
+                            matcher: PersonaMatch {
+                                tool_kind: Some("other".to_owned()),
+                                ..PersonaMatch::default()
+                            },
+                            answer: PersonaAnswer::RejectOnce,
+                            reason: "no other tool".to_owned(),
+                        }],
+                    },
+                })
+                .await
+                .expect("a valid persona");
+            super::bind_persona(&harness.orch, ids::HTUI_FEAT_3, "prd", persona.id).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness.orch.script(
+                "prd",
+                1,
+                parks_on_htui("document_write", htui_agent::event::ToolKind::Other),
+            );
+            assert_answered_by_policy(&harness, "reject-once").await;
+        }
+
+        /// MOD-11 R1 M2: `command_run` is never pre-approved (it runs anything; under the default
+        /// `ask` it asks), nor is a tool the scope does not advertise; the pre-approvals close
+        /// the rules, after the agent's own.
+        #[tokio::test(start_paused = true)]
+        async fn command_run_and_unadvertised_tools_still_ask() {
+            use htui_agent::event::{ToolCallEvent, ToolKind};
+
+            let harness = htui_hosted();
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .set_policy(ids::AGENT_CLAUDE, PermissionPolicy::default());
+            harness
+                .orch
+                .script("prd", 1, ScriptedStep::done_with_output("the prd"));
+            let _ = walked(harness.dispatch(start_feat_3())).await;
+            let spec = harness
+                .orch
+                .spec_for(&SessionKey {
+                    phase: "prd",
+                    attempt: 1,
+                    fanout_index: 0,
+                    call: 0,
+                })
+                .expect("the prd session started");
+            let answer = |tool: &str| {
+                let call = ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: format!("mcp__htui__{tool}"),
+                    tool_kind: ToolKind::Other,
+                    input: serde_json::json!({}),
+                    locations: Vec::new(),
+                };
+                htui_agent::permission::evaluate(&spec.permission, Some(&call), &request().options)
+                    .map(|answer| answer.option_id)
+            };
+            assert_eq!(answer("box_profile").as_deref(), Some("allow-once"));
+            assert_eq!(answer("note_add").as_deref(), Some("allow-once"));
+            assert_eq!(answer("command_run"), None, "command_run asks");
+            assert_eq!(answer("item_link"), None, "an unadvertised tool asks");
+            assert_eq!(answer("permission_prompt"), None);
         }
 
         /// D10, I-6, I-7: a cancel reaching a parked single step ends the walk with

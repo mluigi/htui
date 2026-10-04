@@ -1103,15 +1103,26 @@ impl ScriptedStep {
             .tool_call_id
             .clone()
             .unwrap_or_else(|| "call-1".to_owned());
+        Self::parks_on(
+            ToolCallEvent {
+                tool_call_id: call,
+                title: "run the suite".to_owned(),
+                tool_kind: ToolKind::Execute,
+                input: serde_json::json!({ "command": "cargo test" }),
+                locations: Vec::new(),
+            },
+            request,
+            body,
+        )
+    }
+
+    /// [`parks`](Self::parks) on a call of the case's own (MOD-11 R1 M2: one of htui's tools):
+    /// `call`, then `request`, then `Done { EndTurn }`, and a document with `body`.
+    #[must_use]
+    pub fn parks_on(call: ToolCallEvent, request: PermissionRequestEvent, body: &str) -> Self {
         Self {
             script: Script::one_turn(vec![
-                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
-                    tool_call_id: call,
-                    title: "run the suite".to_owned(),
-                    tool_kind: ToolKind::Execute,
-                    input: serde_json::json!({ "command": "cargo test" }),
-                    locations: Vec::new(),
-                })),
+                ScriptEvent::Emit(DriverEvent::ToolCall(call)),
                 ScriptEvent::ParkPermission(request),
                 ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
                     stop_reason: StopReason::EndTurn,
@@ -1288,6 +1299,7 @@ pub struct FakeToolHost {
     fail: Mutex<Option<ToolHostError>>,
     closed: AtomicBool,
     portless: AtomicBool,
+    advertised: Mutex<Vec<String>>,
 }
 
 impl FakeToolHost {
@@ -1344,6 +1356,21 @@ impl FakeToolHost {
         self
     }
 
+    /// MOD-11 R1 M2: every lease from now on names `tools` as advertised (none by default, so
+    /// a case that does not ask sees no pre-approval). The fake reads no scope for it.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn advertising(self, tools: &[&str]) -> Self {
+        *self
+            .advertised
+            .lock()
+            .expect("no panic holds the fake tool host's lock") =
+            tools.iter().map(|tool| (*tool).to_owned()).collect();
+        self
+    }
+
     /// Whether [`ToolHost::close`] was called (B-19).
     #[must_use]
     pub fn closed(&self) -> bool {
@@ -1382,9 +1409,15 @@ impl ToolHost for FakeToolHost {
                 (FAKE_TOKEN_ENV.to_owned(), token),
             ]),
         };
+        let advertised = self
+            .advertised
+            .lock()
+            .expect("no panic holds the fake tool host's lock")
+            .clone();
         Ok(ToolLease::new(spec, prompt, move || {
             live.fetch_sub(1, Ordering::SeqCst);
-        }))
+        })
+        .with_tools(advertised))
     }
 
     fn close(&self) {

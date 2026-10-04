@@ -1068,6 +1068,7 @@ impl AgentRuntime {
             }
             None => None,
         };
+        let policy = chat_policy(settings.permission, lease.as_ref());
         let (resume, opening_text) = match opening.path {
             OpeningPath::Resume { session_ref, text } => (Some(session_ref), text),
             OpeningPath::Handoff { text, .. } => (None, text),
@@ -1083,7 +1084,7 @@ impl AgentRuntime {
                 .or_else(|| summary.agent.default_model.clone()),
             tools: htui_agent::driver::ToolExposure::default(),
             mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
-            permission: settings.permission.clone(),
+            permission: policy.clone(),
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
             resume,
             budget_micros: project_caps.run_micros,
@@ -1113,7 +1114,7 @@ impl AgentRuntime {
             binding: ChatBinding::Promoted { step_id, tail },
             spec,
             prompt: opening_text,
-            policy: settings.permission,
+            policy,
             caps,
             commands: commands_rx,
             frames,
@@ -2124,6 +2125,7 @@ impl AgentRuntime {
             )?),
             None => None,
         };
+        let policy = chat_policy(settings.permission, lease.as_ref());
         writer.start_chat_run(&chat).await?;
         #[cfg(test)]
         tests::minted(&chat);
@@ -2146,7 +2148,7 @@ impl AgentRuntime {
             model: model.clone(),
             tools: htui_agent::driver::ToolExposure::default(),
             mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
-            permission: settings.permission.clone(),
+            permission: policy.clone(),
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
             resume: None,
             // Plan D83/D90: the per-run cap the recorder enforces client-side, handed to the
@@ -2229,7 +2231,7 @@ impl AgentRuntime {
             binding: ChatBinding::Fresh(chat, closed),
             spec,
             prompt,
-            policy: settings.permission,
+            policy,
             caps,
             commands: commands_rx,
             frames,
@@ -2244,6 +2246,16 @@ impl AgentRuntime {
             task: Box::pin(answering("chat", run_chat(args), Some(answer))),
         })
     }
+}
+
+/// MOD-11 R1 M2: the agent row's policy with htui's own advertised tools pre-approved after its
+/// rules, as the engine's `drive_once` does (`htui_orch::tools::pre_approve`); unchanged without a
+/// lease.
+fn chat_policy(mut policy: PermissionPolicy, lease: Option<&ToolLease>) -> PermissionPolicy {
+    if let Some(lease) = lease {
+        htui_orch::tools::pre_approve(&mut policy, lease);
+    }
+    policy
 }
 
 /// MOD-11 D11: `scope`'s lease on `tools`. A host that cannot serve refuses the chat, as the
@@ -5594,6 +5606,122 @@ pub(crate) mod tests {
             assert!(!profile.is_error, "{}", profile.text);
             assert_eq!(live.spec.step_id, live.step_id);
             end(&mut runtime, &backend, &mut live).await;
+        }
+
+        /// MOD-11 R1 M2: a chat's policy pre-approves every htui tool its scope advertises —
+        /// after the agent's own rules — except `permission_prompt` (and `command_run`, which no
+        /// chat is offered); a fresh chat's is `box_profile` alone.
+        #[tokio::test]
+        async fn a_chat_pre_approves_the_htui_tools_it_is_offered() {
+            let allowed = |spec: &htui_agent::driver::SessionSpec| -> Vec<String> {
+                spec.permission
+                    .rules
+                    .iter()
+                    .filter(|rule| {
+                        rule.answer == htui_agent::event::PermissionOptionKind::AllowOnce
+                    })
+                    .filter_map(|rule| rule.matcher.tool_name.clone())
+                    .collect()
+            };
+
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+                .await;
+            let mut fresh = live(served, tx, &host, &slot).await;
+            assert_eq!(allowed(&fresh.spec), ["mcp__htui__box_profile"]);
+            end(&mut runtime, &backend, &mut fresh).await;
+
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .attach_promoted(&backend, &tx, promote_addr(), promoted(agent_id, handoff()))
+                .await;
+            let mut attached = live(served, tx, &host, &slot).await;
+            assert_eq!(
+                allowed(&attached.spec),
+                [
+                    "mcp__htui__box_profile",
+                    "mcp__htui__document_write",
+                    "mcp__htui__note_add",
+                    "mcp__htui__item_status",
+                    "mcp__htui__item_link",
+                ]
+            );
+            end(&mut runtime, &backend, &mut attached).await;
+        }
+
+        /// MOD-11 R1 M2 on the chat path (`claude-cli`, whose prompt tool titles a call by its
+        /// raw name): htui's own `box_profile` is answered by policy under a default that asks.
+        #[tokio::test]
+        async fn a_chat_s_htui_tool_call_is_answered_by_policy() {
+            use htui_agent::conformance::ScriptEvent;
+            use htui_agent::driver::PermissionRequestId;
+            use htui_agent::event::{
+                DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind,
+                PermissionRequestEvent, ToolCallEvent,
+            };
+            use htui_core::model::EventKind;
+            use htui_core::store::ReadStore as _;
+
+            let script = Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: "mcp__htui__box_profile".to_owned(),
+                    tool_kind: htui_agent::cli::claude::tool_kind("mcp__htui__box_profile"),
+                    input: json!({}),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(PermissionRequestEvent {
+                    request_id: PermissionRequestId::new("req-1"),
+                    tool_call_id: Some("call-1".to_owned()),
+                    options: vec![
+                        PermissionOption {
+                            id: "allow".to_owned(),
+                            label: "Allow".to_owned(),
+                            kind: PermissionOptionKind::AllowOnce,
+                        },
+                        PermissionOption {
+                            id: "reject".to_owned(),
+                            label: "Reject".to_owned(),
+                            kind: PermissionOptionKind::RejectOnce,
+                        },
+                    ],
+                }),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ]);
+            let (store, backend, runtime, agent_id, _slot) =
+                fixture_with_spec_spy(script, None).await;
+            let (mut runtime, _host) = hosted(runtime, &backend);
+
+            let (step_id, _replies) =
+                super::run(&mut runtime, &backend, start(agent_id, "profile")).await;
+
+            let log = store
+                .step_events(step_id)
+                .await
+                .expect("the log reads")
+                .expect("a log");
+            let answer = log
+                .iter()
+                .find(|row| row.kind == EventKind::PermissionAnswer)
+                .expect("the request was answered");
+            assert_eq!(
+                answer.payload.get("by").and_then(Value::as_str),
+                Some("policy"),
+                "{answer:?}"
+            );
+            assert_eq!(
+                answer.payload.get("option_id").and_then(Value::as_str),
+                Some("allow")
+            );
         }
 
         /// OQ-8: a promoted chat sees the item tools, and `document_write` writes the kind its

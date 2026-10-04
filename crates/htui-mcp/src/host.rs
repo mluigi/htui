@@ -415,13 +415,19 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
                 (ENV_TOKEN.to_owned(), token.as_str().to_owned()),
             ]),
         };
+        // MOD-11 R1 M2: the advertised names, which the engine and the chat pre-approve.
+        let advertised = session
+            .advertised()
+            .map(|def| def.name.to_owned())
+            .collect();
         let weak: Weak<Inner<H>> = Arc::downgrade(&self.inner);
         Ok(ToolLease::new(spec, port, move || {
             session.ended.store(true, Ordering::SeqCst);
             if let Some(inner) = weak.upgrade() {
                 lock(&inner.sessions).remove(&token);
             }
-        }))
+        })
+        .with_tools(advertised))
     }
 
     fn close(&self) {
@@ -637,6 +643,39 @@ pub(crate) mod tests {
         assert_eq!(ask.id(), port.id(), "one bridge");
         let acp_token = Token::parse(&acp.spec.env[ENV_TOKEN]).expect("a token");
         assert!(sessions[&acp_token].session.ask.is_none());
+    }
+
+    /// MOD-11 R1 M2: the lease names exactly the tools the scope is advertised, in table order,
+    /// so the engine and the chat pre-approve no tool the session cannot call.
+    #[tokio::test]
+    async fn the_lease_names_the_advertised_tools() {
+        let host = demo_host();
+        let acp = host.open(scope(Transport::Acp)).expect("a lease");
+        assert_eq!(
+            acp.tools,
+            ["box_profile"],
+            "no item, no queue, no prompt tool"
+        );
+        let cli = host
+            .open(ToolScope {
+                item_id: Some(ids::HTUI_FEAT_1),
+                output_kind: Some("plan".to_owned()),
+                command_queue: true,
+                ..scope(Transport::Cli)
+            })
+            .expect("a lease");
+        assert_eq!(
+            cli.tools,
+            [
+                "box_profile",
+                "document_write",
+                "note_add",
+                "item_status",
+                "item_link",
+                "command_run",
+                "permission_prompt",
+            ]
+        );
     }
 
     #[cfg(target_os = "linux")]

@@ -335,6 +335,14 @@ edits proceed and shell commands ask) is sent to htui as an ordinary permission 
 - **In a chat**, the chat asks you with the usual `1` … `9`, and no banner says the agent cannot
   ask.
 
+**htui's own tools are pre-approved.** On both transports, in a step and in a chat, the session's
+policy answers `allow_once` for every htui tool the session is offered except `command_run` (and
+`permission_prompt`, the channel itself), so `document_write` or `note_add` never waits for you.
+These rules come after the R-MCP-4 refusals, the persona's rules and the agent's own, just ahead of
+the remembered choices and the default, so they only replace the default `ask`: a persona that
+rejects the kind htui's tools carry (`other`), or a rule of yours that names one of them, still
+wins. `command_run` runs any command, so under the default `ask` it still asks.
+
 The options are **Allow** and **Reject**. An allow lets the call run with its input unchanged; a
 reject answers the CLI `denied in htui`. A cancel answers every pending prompt
 `the session was cancelled`, and a session that ends answers them `the session ended`. A denied
