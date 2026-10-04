@@ -5,7 +5,7 @@
 `hr/MOD-84`.
 **Complexity**: Small (one new pure module, one span-aware wrap beside `cells::wrap`, the Body pane's render and
 scroll clamp, snapshot updates)
-**Status**: confirmed by the maintainer 2026-10-04; implementation in progress
+**Status**: done 2026-10-04 (`docs/decisions/mod/mod-84.md`)
 
 ## Summary
 

@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
+**Current status (2026-10-04):** **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
+pane reflows an item's hard-wrapped Markdown before wrapping it. Soft-wrapped lines of a paragraph or list item
+join, list items hang under their text, blank lines, fences, headings, tables and quotes stay as written, and inline
+code is drawn in the accent style without its backticks (`ui::markdown`, `cells::wrap_spans`). The scroll counts
+the rows on screen. No dependency, no migration; 11 snapshots moved body rows only.
+Before it, **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
 waiting-on-you list. `Ctrl+W` opens, from every screen, an overlay listing every run in the active
 workspace that waits on a person, one row per reason (gate, selection, judge failed, unblock,
 interrupted, open permission with its tool); `Enter` opens the item's Runs tab on that step. The top
@@ -29,27 +34,10 @@ before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
 `claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
 the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
 with no run walking, never under a live walk. No migration.
-Before it, **MOD-11 is done** (`docs/decisions/mod/mod-11.md`): every session
-htui launches (engine steps in the TUI and in `htui worker`, fresh and promoted chats) gets the `htui`
-MCP server: `box_profile`, `document_write`, `note_add`, `item_status` (a note, never a transition),
-`item_link`, `search_concepts`, `command_run`, and `permission_prompt` for `claude-cli`. Scope comes
-from a per-session token and every item write is fenced. Production judges and `approve`/`accept`
-now work on agent-written documents. `command_run` queues builds and tests per `(box, class)`.
-`claude-cli` permission prompts reach the Runs pane and the chat. New crate `htui-mcp`, migration
-`0015_command_queue`, user guide `docs/htui-mcp.md`. Follow-ups MOD-77, MOD-78, MOD-79 and ANA-28.
 Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
 `heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
 MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
 conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES` 15, `htui-orch` `CASES` 100.
-Before it, **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator
-hardening closed in five milestones (run state, store and engine correctness, git cost, deadline and
-sessions, ACP resume). A promoted ACP step now resumes its own session (`session/resume`, else
-`session/load` with the replay discarded), and a promotion resumes the step's latest banner. A
-resume that fails is reported and opens the handoff prompt in the same bind. `run_step.opening`
-(migration 0014) records which way the chat opened, and the Runs pane and the Chat tab say "context
-not carried; handoff prompt only". The four re-deferred risks are MOD-76.
-Before it, **MOD-73 is done** (`docs/decisions/mod/mod-73.md`): a hand-written
-document version newer than a step's output is what the next step reads (ANA-2 ยง4.2 amended).
 
 ---
 
@@ -454,12 +442,6 @@ document version newer than a step's output is what the next step reads (ANA-2 ย
   (`qdrant: query: connection refused`, `hierarchy needs Postgres`); each one says where to fix it
   (for example Settings > Connection or Settings > Qdrant). Not blocked; copy only, but it shares
   snapshots with MOD-81 and MOD-82, so it lands beside or after them.
-- [ ] **MOD-84 - Reflow item bodies before wrapping** (from the TUI design review of 2026-10-04,
-  https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH finding 11). `R-TUI-3`. The Body pane wraps a
-  hard-wrapped Markdown body a second time, so lines break as `a top bar and a` / `backlog tab`, and
-  inline code shows its backticks. Join soft-wrapped lines inside a paragraph and list item before
-  wrapping, keep blank lines, list markers and fenced blocks as they are, and style inline code
-  instead of printing backticks. Not blocked.
 - [ ] **MOD-75 - Agent question tool: an MCP tool that parks the step for a person** (from MOD-69,
   `.claude/prds/mod-69-waiting-on-you.prd.md`). `R-MCP-1..4`, `R-TUI-11`. A step's agent that
   finds something it did not expect, or needs an opinion, has no way to ask: the question lands in
@@ -491,6 +473,6 @@ document version newer than a step's output is what the next step reads (ANA-2 ย
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 26 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
