@@ -34,6 +34,14 @@ the way the assembler's own refusals do through `refuse_prompt`, so an item whos
 re-run into the same abort. Plan **D8** chose that shape over moving the scrub into `assemble`;
 the maintainer reviewed the consequence and chose to document it rather than change it.
 
+**Correction (2026-10-04, MOD-10 M1):** the paragraph above is wrong for two of the three paths.
+Only the plain-step path (`fail_hard`) settles the run `Failed` with the message in `run.failure`.
+The candidate path (`fail_candidate`) fails that candidate and writes the message only to an item
+note, and the run goes on. The judge path wraps it as `JudgeFailure::SessionFailed`, writes it to
+the judge's `gate_note` and **parks** the run with `run.failure` NULL. Since MOD-10 milestone 1,
+all three write `RunFailure::ScrubRefused`'s typed sentence (`.claude/plans/mod-10-m1-scrubber-hardening.plan.md`
+D5). The item is still not blocked; D8 stands.
+
 The pass is **whole-record and enumerates nothing**: one `scrub` over the serialised `Value`,
 reaching every string leaf and every object key. That is the point of the fix, not a stylistic
 choice — the defect *was* a guarantee expressed as an enumeration.

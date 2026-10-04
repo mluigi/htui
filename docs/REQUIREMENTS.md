@@ -32,6 +32,9 @@ D1-D3, `docs/ANA-16.md` §7) — R-ID-2, R-STO-1 and R-ORCH-12 amended in place 
 worker; its DSN source; remote dispatch promoted to must), R-LATER-4 narrowed to scheduling.
 amended 2026-10-01 by maintainer decision on MOD-45 (`docs/decisions/mod/mod-45.md`, plan OQ-1) —
 R-STO-1 amended in place (a TUI session may read the DSN once from stdin, held only in memory).
+amended 2026-10-04 by maintainer decision on MOD-10 (`.claude/prds/mod-10-secret-provider.prd.md`,
+plan D7, blueprint A-5) — R-SEC-3 amended in place (a scrub refusal is recorded with a typed reason
+on whichever path it lands: the run fails, the fan-out candidate fails, or the judge parks).
 **Governed by:** `.claude/rules/workflow-docs.md`
 
 This file is the product requirements for `htui`. It sits above every `ANA-N` analysis and every
@@ -309,8 +312,9 @@ conflict. Their verdicts survive only where restated here.
   into the agent subprocess environment only. Agents never receive a tool that reads secrets, and
   `htui`'s own credentials (R-STO-1) are never exposed to a session.
 - **R-SEC-3 (must).** Scrubber builds exact-match masks from every resolved secret value plus a
-  pattern rule set for known key formats, runs before any transcript row persists, and marks the
-  step failed and blocks persistence when an unmasked pattern remains.
+  pattern rule set for known key formats, runs before any transcript row persists, and blocks
+  persistence when an unmasked pattern remains. It records a typed scrub refusal on the run —
+  failing it, or failing the fan-out candidate, or parking the judge.
 - **R-SEC-4 (must).** When the provider is unreachable, runs needing its secrets are refused with a
   clear error; there is no plaintext fallback.
 

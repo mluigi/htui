@@ -276,13 +276,20 @@ impl TrimRecord {
     ///
     /// **What that costs the caller, stated plainly.** The refusal is raised before the record is
     /// written and before this step's own session starts, so nothing is persisted and this step
-    /// spends no token. It is not, however, a *step* failure in the sense the word usually means:
-    /// at the engine's three call sites the `?` propagates to `fail_hard` / `fail_candidate` /
-    /// `fail_judge`, each of which settles the run as `RunStatus::Failed` with the rendered
-    /// message as an **untyped** reason (`run.failure`, outside the closed `RunFailure` vocabulary)
-    /// and runs `cleanup_run`. It does **not** block the item the way the assembler's own
-    /// refusals do through `refuse_prompt`, so an item whose `template.name`, a caller note or a
-    /// repo slug trips a prefix rule is left actionable and will be re-run into the same abort.
+    /// spends no token. It is not, however, a *step* failure in the sense the word usually means.
+    /// At the engine's three call sites the `?` reaches a different catch-all, and each writes
+    /// `RunFailure::ScrubRefused`'s sentence where it already writes text (MOD-10 M1 D5):
+    ///
+    /// - `fail_hard` (a plain step): the run is `Failed`, with the sentence as `run.failure`, and
+    ///   `cleanup_run` runs;
+    /// - `fail_candidate` (a fan-out candidate): that candidate is `failed` with the sentence in
+    ///   its item note, and the run goes on — a sibling may still win;
+    /// - `fail_judge` (the judge): the judge's `gate_note` is `judge_session_failed: <sentence>`
+    ///   and the run **parks**, with `run.failure` NULL.
+    ///
+    /// None of them blocks the item the way the assembler's own refusals do through
+    /// `refuse_prompt`, so an item whose `template.name`, a caller note or a repo slug trips a
+    /// pattern rule is left actionable and will be re-run into the same refusal.
     /// That is the shape plan D8 chose over moving the scrub into `assemble`, and the trade is
     /// recorded there rather than smoothed over here.
     ///
