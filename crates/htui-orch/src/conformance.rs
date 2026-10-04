@@ -7466,9 +7466,22 @@ mod fanout_paths {
         orch.script_candidate("research", 1, 0, 0, leaks("research by candidate 0"));
         judge_both(&orch, "research", 1, 1, "best");
 
-        let (run, _) = start(&orch, ids::HTUI_ANA_2).await;
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::Done, None, None),
+            "the surviving sibling wins and the run completes"
+        );
         let steps = steps_of(&orch, run).await;
-        assert_eq!(candidate(&steps, 0, 1, 0).status, StepStatus::Failed);
+        assert_eq!(
+            slot_of(&steps, 0, 1),
+            [
+                (0, StepStatus::Failed, Some(false)),
+                (1, StepStatus::Done, Some(true)),
+                (2, StepStatus::Superseded, Some(false)),
+            ],
+            "the refused candidate keeps `failed`; its sibling is selected"
+        );
         let expected = format!(
             "fan-out candidate 0 of `research` attempt 1: {}",
             scrub_sentence("research")
@@ -7482,12 +7495,10 @@ mod fanout_paths {
             notes.iter().all(|note| !note.contains("sk-ant-")),
             "no note repeats the key: {notes:?}"
         );
-        let failure = run_of(&orch, run).await.failure;
-        assert!(
-            !failure
-                .as_deref()
-                .is_some_and(|text| text.contains("scrub refused")),
-            "the candidate's refusal does not fail the run: {failure:?}"
+        assert_eq!(
+            run_of(&orch, run).await.failure,
+            None,
+            "the candidate's refusal does not fail the run"
         );
     }
 
