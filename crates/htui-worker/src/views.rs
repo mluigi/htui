@@ -557,6 +557,8 @@ impl WaitingView {
 const GATE_TEXT: &str = "gate";
 /// A promoted step's gate row text when it carries no note (MOD-69 blueprint E6).
 const PROMOTED_TEXT: &str = "promoted to chat";
+/// What a JudgeFailed row's text appends to the judge's note: the person's next move (review L5).
+const JUDGE_HINT: &str = " - pick a candidate";
 /// A Selection row's text.
 const SELECTION_TEXT: &str = "awaits selection";
 /// A Permission row's text when the request carries no summary.
@@ -652,7 +654,12 @@ pub fn waiting(
             for (position, attempt) in selectable_slots(run, steps) {
                 let failed_judge = judge_at(steps, position, attempt)
                     .filter(|judge| judge.status == StepStatus::Failed)
-                    .and_then(|judge| judge.gate_note.clone().map(|note| (judge, note)));
+                    .and_then(|judge| {
+                        judge
+                            .gate_note
+                            .as_ref()
+                            .map(|note| (judge, format!("{note}{JUDGE_HINT}")))
+                    });
                 if let Some((judge, note)) = failed_judge {
                     keyed.push(row(
                         Some(run),
@@ -1473,7 +1480,7 @@ mod tests {
                 Some(judge.id),
                 "prd 0.1/j",
                 WaitingReason::JudgeFailed,
-                "judge: tie"
+                "judge: tie - pick a candidate"
             )]
         );
     }
@@ -1491,7 +1498,7 @@ mod tests {
                 Some(judge.id),
                 "prd 0.1/j",
                 WaitingReason::JudgeFailed,
-                "interrupted"
+                "interrupted - pick a candidate"
             )]
         );
     }
