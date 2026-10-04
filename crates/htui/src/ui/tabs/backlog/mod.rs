@@ -2195,6 +2195,36 @@ mod tests {
         );
     }
 
+    /// MOD-80 D5: under the monochrome theme only modifiers can mark the active sub-tab; the
+    /// separators carry no style at all.
+    #[test]
+    fn the_active_sub_tab_is_bold_and_underlined_without_colour() {
+        let tab = BacklogTab::new();
+        let strip = detail::strip_line(&tab.detail, &Theme::monochrome());
+        let marked = ratatui::style::Modifier::BOLD | ratatui::style::Modifier::UNDERLINED;
+        let titles: Vec<_> = strip
+            .spans
+            .iter()
+            .filter(|span| !span.content.trim().is_empty())
+            .collect();
+        assert!(titles.len() > 1, "{strip:?}");
+        assert!(
+            titles[0].style.add_modifier.contains(marked),
+            "the first registered sub-tab is active: {:?}",
+            titles[0]
+        );
+        for span in &titles[1..] {
+            assert!(!span.style.add_modifier.intersects(marked), "{span:?}");
+        }
+        for span in strip
+            .spans
+            .iter()
+            .filter(|span| span.content.trim().is_empty())
+        {
+            assert_eq!(span.style, ratatui::style::Style::default(), "{span:?}");
+        }
+    }
+
     // ---- MOD-13 milestone 2: new and edit ----------------------------------------------------
 
     /// The store requests among everything emitted since the last drain.

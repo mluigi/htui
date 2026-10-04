@@ -1413,3 +1413,42 @@ async fn the_product_registers_personas_last() {
         "the active section is Personas: {frame}"
     );
 }
+
+/// MOD-80 review L1: the rows a section drew in `theme.selected`, as `(y, text)`, each checked to
+/// be black on cyan over its whole text so no span's own colour shows through the cursor.
+fn selected_rows(buffer: &Buffer) -> Vec<(u16, String)> {
+    let selected = Theme::default().selected;
+    let (fg, bg) = (
+        selected.fg.expect("selected has a foreground"),
+        selected.bg.expect("selected has a background"),
+    );
+    (0..buffer.area.height)
+        .filter(|y| buffer[(0, *y)].bg == bg)
+        .map(|y| {
+            let text: String = (0..buffer.area.width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_owned();
+            for x in 0..u16::try_from(text.chars().count()).expect("a narrow row") {
+                let cell = &buffer[(x, y)];
+                assert_eq!((cell.fg, cell.bg), (fg, bg), "{text:?} at x = {x}");
+            }
+            (y, text)
+        })
+        .collect()
+}
+
+/// MOD-80 review L1: the Personas cursor row is drawn in `theme.selected`, as Connection's is; its
+/// detail line under it is not.
+#[tokio::test]
+async fn the_cursor_row_is_drawn_selected() {
+    let (bench, mut section) = bench_with_demo().await;
+    let first = selected_rows(&drawn(&bench, &section));
+    assert_eq!(first.len(), 1, "{first:?}");
+    assert!(first[0].1.starts_with("architect"), "{first:?}");
+    bench.key(&mut section, "j");
+    let second = selected_rows(&drawn(&bench, &section));
+    assert_eq!(second.len(), 1, "{second:?}");
+    assert!(second[0].1.starts_with("reviewer"), "{second:?}");
+}

@@ -384,7 +384,7 @@ impl HierarchySection {
                         }),
                 };
                 let style = if index == self.cursor {
-                    theme.accent
+                    theme.selected
                 } else {
                     theme.base
                 };

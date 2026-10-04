@@ -85,7 +85,7 @@ impl DetailTab for BodyTab {
         let head = Text::from(vec![
             Line::styled(item.title.as_str(), ctx.theme.title),
             Line::from(vec![
-                Span::styled(item.key.as_str(), ctx.theme.accent),
+                Span::styled(item.key.as_str(), ctx.theme.key),
                 Span::raw("  "),
                 Span::styled(item.key_prefix.as_str(), ctx.theme.dim),
                 Span::raw("  "),

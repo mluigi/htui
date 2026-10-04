@@ -230,17 +230,52 @@ impl TabRegistry {
     }
 }
 
-/// Draws the tab strip: `1 Backlog  2 Skills  3 Settings`, the active one accented.
+/// Draws the tab strip: `1 Backlog  2 Skills  3 Settings`, the active one in `active_tab` (bold,
+/// underlined).
 pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &TabRegistry, theme: &Theme) {
     let active = registry.active_id();
     let mut spans: Vec<Span<'_>> = Vec::new();
     for (idx, (id, title)) in registry.titles().into_iter().enumerate() {
         let style: Style = if Some(id) == active {
-            theme.accent
+            theme.active_tab
         } else {
             theme.dim
         };
         spans.push(Span::styled(format!(" {} {title} ", idx + 1), style));
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+    use ratatui::style::{Color, Modifier};
+
+    use super::*;
+    use crate::ui::tabs::{BacklogTab, SkillsTab};
+
+    /// MOD-80 D5: under the monochrome theme only modifiers can mark the active tab, so it is
+    /// bold and underlined and the others are neither.
+    #[test]
+    fn active_main_tab_is_bold_and_underlined_without_colour() {
+        let mut registry = TabRegistry::new();
+        registry.register(Box::new(BacklogTab::new()));
+        registry.register(Box::new(SkillsTab::new()));
+        let mut terminal = Terminal::new(TestBackend::new(40, 1)).expect("terminal");
+        terminal
+            .draw(|frame| render_strip(frame, frame.area(), &registry, &Theme::monochrome()))
+            .expect("the strip draws");
+        let buffer = terminal.backend().buffer();
+        let marked = Modifier::BOLD | Modifier::UNDERLINED;
+        let active = &buffer[(1, 0)];
+        assert_eq!(active.symbol(), "1");
+        assert!(active.modifier.contains(marked), "{active:?}");
+        let other = &buffer[(12, 0)];
+        assert_eq!(other.symbol(), "2");
+        assert!(!other.modifier.intersects(marked), "{other:?}");
+        for x in 0..40 {
+            assert_eq!(buffer[(x, 0)].fg, Color::Reset, "no colour at x = {x}");
+        }
+    }
 }

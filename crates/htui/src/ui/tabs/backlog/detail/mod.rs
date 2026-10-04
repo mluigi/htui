@@ -379,7 +379,7 @@ pub fn render_strip(frame: &mut Frame<'_>, area: Rect, registry: &DetailRegistry
 ///
 /// One leading space, one space between titles and one trailing space — a single space, not the
 /// two the Settings and top-level strips use, because the detail pane is the narrow one (MOD-30
-/// D1). The accent covers the title only, never a separator. The Backlog tab's
+/// D1). `active_tab` covers the title only, never a separator. The Backlog tab's
 /// `the_detail_strip_fits_the_detail_pane` pins the width.
 #[must_use]
 pub(crate) fn strip_line<'a>(registry: &'a DetailRegistry, theme: &Theme) -> Line<'a> {
@@ -387,7 +387,7 @@ pub(crate) fn strip_line<'a>(registry: &'a DetailRegistry, theme: &Theme) -> Lin
     let mut spans: Vec<Span<'a>> = vec![Span::raw(" ")];
     for (id, title) in registry.titles() {
         let style: Style = if Some(id) == active {
-            theme.accent
+            theme.active_tab
         } else {
             theme.dim
         };

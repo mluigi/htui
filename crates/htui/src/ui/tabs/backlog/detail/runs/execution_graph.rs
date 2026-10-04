@@ -225,14 +225,15 @@ impl StepNode {
         }
     }
 
-    /// The border: `selected` on the cursor, else by status (plan D10).
+    /// The border: `cursor` on the cursor node, else by status (plan D10).
     fn border(&self, selected: bool) -> Style {
         if selected {
-            return self.theme.selected;
+            return self.theme.cursor;
         }
         match self.status {
             StepStatus::Failed => self.theme.error,
-            StepStatus::Running | StepStatus::AwaitingApproval => self.theme.accent,
+            StepStatus::Running => self.theme.running,
+            StepStatus::AwaitingApproval => self.theme.warning,
             StepStatus::Superseded | StepStatus::Cancelled => self.theme.dim,
             StepStatus::Pending | StepStatus::Done => self.theme.base,
         }
@@ -1220,8 +1221,9 @@ mod tests {
             "{rows:#?}"
         );
         let (x, y) = corner_of(&buf, "0.1/1 superseded");
-        assert_eq!(buf[(x, y)].fg, Color::DarkGray);
-        assert_eq!(buf[(x + 1, y + 1)].fg, Color::DarkGray);
+        let dim = Theme::default().dim.fg.expect("dim has a colour");
+        assert_eq!(buf[(x, y)].fg, dim);
+        assert_eq!(buf[(x + 1, y + 1)].fg, dim);
     }
 
     /// MOD-60 review L3: a node's text is `cells::clip`'s, flattened per cluster, so `"\r\n"` is
@@ -1516,9 +1518,9 @@ mod tests {
         assert_no_ghost_corner(term.backend().buffer());
     }
 
-    /// Review N4: a running and a parked step take the accent border.
+    /// Review N4, MOD-80 D1: a running and a parked step take the `running` and `warning` borders.
     #[test]
-    fn running_and_awaiting_steps_have_the_accent_border() {
+    fn running_and_awaiting_steps_have_their_status_border() {
         let run = run(
             1,
             vec![
@@ -1529,8 +1531,15 @@ mod tests {
         );
         let mut graph = synced(&run, Some(id(1)));
         let buf = draw(&mut graph);
-        assert_eq!(buf[corner_of(&buf, "1.1 running")].fg, Color::Cyan);
-        assert_eq!(buf[corner_of(&buf, "2.1 awaiting")].fg, Color::Cyan);
+        let theme = Theme::default();
+        assert_eq!(
+            buf[corner_of(&buf, "1.1 running")].fg,
+            theme.running.fg.expect("running has a colour")
+        );
+        assert_eq!(
+            buf[corner_of(&buf, "2.1 awaiting")].fg,
+            theme.warning.fg.expect("warning has a colour")
+        );
     }
 
     #[test]
@@ -1673,7 +1682,8 @@ mod tests {
             rows[usize::from(y + 3)].contains("\u{2692} read\u{d7}1"),
             "{rows:#?}"
         );
-        assert_eq!(buf[(x + 1, y + 3)].fg, Color::DarkGray);
+        let dim = Theme::default().dim.fg.expect("dim has a colour");
+        assert_eq!(buf[(x + 1, y + 3)].fg, dim);
         assert_eq!(buf[(x, y + 4)].symbol(), "\u{2514}", "{rows:#?}");
     }
 

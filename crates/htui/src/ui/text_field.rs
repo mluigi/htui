@@ -298,7 +298,7 @@ impl TextField {
     ///
     /// A window of the graphemes ending at the cursor, counted in display cells, with a leading `…`
     /// when the start is clipped and nothing at all when the end is; the cursor cell carries
-    /// `theme.selected` while `focused`. A masked field appends a dim ` (n)` and the window is
+    /// `theme.cursor` while `focused`. A masked field appends a dim ` (n)` and the window is
     /// sized around it. Computed on every call — nothing is cached, so a resize needs no event.
     ///
     /// Two invariants hold at any width: the drawn line is never wider than `width` cells, and the
@@ -335,7 +335,7 @@ impl TextField {
             .map(|g| cell_width(g))
             .sum();
 
-        let cursor_style: Style = if focused { theme.selected } else { theme.base };
+        let cursor_style: Style = if focused { theme.cursor } else { theme.base };
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(5);
 
         // A cluster wider than the whole window cannot be drawn and cannot be split, and

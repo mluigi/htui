@@ -255,7 +255,7 @@ impl TextArea {
     /// cursor moving inside the window does not scroll it; every line shares its horizontal offset.
     /// Two invariants hold (MOD-54 D10): **no line is ever drawn wider than `width` cells**, and a
     /// grapheme that would straddle either edge is dropped whole rather than split. Every line is
-    /// `theme.base`; while `focused`, the cursor cell is `theme.selected`. No room, no lines.
+    /// `theme.base`; while `focused`, the cursor cell is `theme.cursor`. No room, no lines.
     #[must_use]
     pub fn lines(
         &self,
@@ -330,7 +330,7 @@ impl TextArea {
                 if !before.is_empty() {
                     spans.push(Span::styled(before, theme.base));
                 }
-                spans.push(Span::styled(at, theme.selected));
+                spans.push(Span::styled(at, theme.cursor));
                 if !after.is_empty() {
                     spans.push(Span::styled(after, theme.base));
                 }
@@ -1257,7 +1257,7 @@ mod tests {
         assert_eq!(rendered, "vwxyz0123 ", "the tail and the cursor cell");
         let cursor_cell = drawn[0].spans.last().expect("a span");
         assert_eq!(cursor_cell.content, " ");
-        assert_eq!(cursor_cell.style, theme.selected);
+        assert_eq!(cursor_cell.style, theme.cursor);
     }
 
     /// The inverted form of the test that used to name this bug (MOD-54 D19). It was rewritten

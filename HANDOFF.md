@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-77 is done** (`docs/decisions/mod/mod-77.md`): every fenced
+**Current status (2026-10-04):** **MOD-80 is done** (`docs/decisions/mod/mod-80.md`): theme
+and colour meaning. A selected row is one black-on-cyan block over every cell (`Theme::select`), cyan
+means focus and selection, and keys (bold), running (blue), warnings (yellow: `awaiting_approval`, a
+degraded store label, the waiting count) and diff-added (green) have their own `Theme` roles. `title` is
+the terminal foreground plus bold, `dim` is `Indexed(244)`, and active tabs are bold and underlined.
+`NO_COLOR` selects `Theme::monochrome()`, which marks everything with modifiers alone. Style only, no
+text or snapshot change. The remaining non-focus cyan is **MOD-85**.
+Before it, **MOD-77 is done** (`docs/decisions/mod/mod-77.md`): every fenced
 Postgres step writer locks the step before the run, `park_step`'s order, so none can deadlock (`40P01`)
 against a park. Step updaters take `FOR NO KEY UPDATE OF s FOR SHARE OF r` up front; reader-inserters
 (`append_events`, `record_commits`, the relay's `open_permission`) take `FOR KEY SHARE OF s FOR SHARE OF
@@ -35,19 +42,18 @@ before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
 `claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
 the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
 with no run walking, never under a live walk. No migration.
+Before it, **MOD-11 is done** (`docs/decisions/mod/mod-11.md`): every session
+htui launches (engine steps in the TUI and in `htui worker`, fresh and promoted chats) gets the `htui`
+MCP server: `box_profile`, `document_write`, `note_add`, `item_status` (a note, never a transition),
+`item_link`, `search_concepts`, `command_run`, and `permission_prompt` for `claude-cli`. Scope comes
+from a per-session token and every item write is fenced. Production judges and `approve`/`accept`
+now work on agent-written documents. `command_run` queues builds and tests per `(box, class)`.
+`claude-cli` permission prompts reach the Runs pane and the chat. New crate `htui-mcp`, migration
+`0015_command_queue`, user guide `docs/htui-mcp.md`. Follow-ups MOD-77, MOD-78, MOD-79 and ANA-28.
 Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
 `heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
 MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
 conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES` 15, `htui-orch` `CASES` 100.
-Before it, **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator
-hardening closed in five milestones (run state, store and engine correctness, git cost, deadline and
-sessions, ACP resume). A promoted ACP step now resumes its own session (`session/resume`, else
-`session/load` with the replay discarded), and a promotion resumes the step's latest banner. A
-resume that fails is reported and opens the handoff prompt in the same bind. `run_step.opening`
-(migration 0014) records which way the chat opened, and the Runs pane and the Chat tab say "context
-not carried; handoff prompt only". The four re-deferred risks are MOD-76.
-Before it, **MOD-73 is done** (`docs/decisions/mod/mod-73.md`): a hand-written
-document version newer than a step's output is what the next step reads (ANA-2 ยง4.2 amended).
 
 ---
 
@@ -392,22 +398,18 @@ document version newer than a step's output is what the next step reads (ANA-2 ย
   in four places and spell one action four ways (`j/k move`/`select`/`rows`, `J/K move`, `Up/Dn
   move`), and Backlog has no hint row; generated hints go in one fixed row for every tab. MOD-81
   and MOD-82 come after this item.
-- [ ] **MOD-80 - Theme and colour meaning** (from the TUI design review of 2026-10-04,
-  https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 5-8, 12). `R-TUI-1`, `R-NF-1`. Every
-  colour comes from `ui/theme.rs` plus a few literals (`ui/cells.rs`, `backlog/detail/runs.rs`,
-  `runs/execution_graph.rs`). Five defects: `selected` is `REVERSED`, which inverts each cell's own
-  colour, so a selected Backlog row reads as separate cyan and grey blocks (give selection an explicit
-  background that overrides cell colours); cyan means the active tab, the active sub-tab, item keys,
-  `in_progress` and cross-reference links, and the skill diff colours added lines cyan (keep the
-  accent for focus and selection, give keys bold, `in_progress` and diff-added their own colours);
-  `title` is `Color::White` bold, 1.3:1 on a light terminal profile, and `dim` (`DarkGray`, about a
-  quarter of all visible glyphs, every hint and empty state) is 2.7:1 on One Dark (title becomes
-  `Reset` + bold, a dim style that reads on both backgrounds); the active tab in the main strip,
-  the detail sub-tabs and the Settings sections is marked by colour alone, so `NO_COLOR` and
-  monochrome terminals show none (add bold and underline or brackets); the top bar's store label
-  draws `offline` in the base style (draw degraded states in the warning colour). Snapshots are
-  text-only, so the tests pin styles on the buffer. Not blocked; touches style only, so it runs
-  beside MOD-67.
+- [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
+  `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
+  `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,
+  and moved the Runs pane's needs-a-person lines to `warning`. About twenty `accent` uses still mean
+  something else: the Documents kind column (`detail/documents.rs`), flow edge labels
+  (`runs/execution_graph.rs` `edge`), divergence Theirs/Mine (`backlog/divergence.rs`), chat headers,
+  transcript `you` and notes, permission-strip digits, and the requirements form `[value]`. Decide
+  each one (`key`, `dim`, `warning` or `base`), and pin the decisions with buffer-style tests. Also:
+  the Skills attach activation field marks focus with `selected` rather than `accent`, and the
+  concepts-search, workspace-switcher and path-picker overlays mark their cursor row with `accent`
+  alone, which is bold-only under `NO_COLOR`. Style only. Not blocked; touches views that MOD-67,
+  MOD-81 and MOD-82 also rewrite, so run it after them or beside them with care.
 - [ ] **MOD-81 - Narrow and wide terminal widths** (from the TUI design review of 2026-10-04,
   https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 4, 14). `R-TUI-1`, `R-TUI-2`,
   `R-TUI-8`. Below 100 columns the Settings > Agents table drops its name column, the only
@@ -478,6 +480,6 @@ document version newer than a step's output is what the next step reads (ANA-2 ย
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, MOD-85 remaining accent uses, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

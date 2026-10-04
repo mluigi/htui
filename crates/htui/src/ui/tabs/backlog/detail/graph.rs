@@ -545,7 +545,7 @@ fn line(
     let node = row.node;
     // D7: a node outside the workspace is drawn, but dim, so it does not read as reachable.
     let (label_style, status_style, title_style) = if in_workspace {
-        (theme.accent, theme.status_style(node.status), theme.base)
+        (theme.key, theme.status_style(node.status), theme.base)
     } else {
         (theme.dim, theme.dim, theme.dim)
     };

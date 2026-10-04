@@ -175,6 +175,8 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
 
     let mut app = App::new(request_tx, Keymap::default_global());
     app.top_bar.store = label;
+    // MOD-80 D4: a NO_COLOR terminal gets the modifier-only theme.
+    app.theme = ui::Theme::from_no_color(std::env::var_os("NO_COLOR").as_deref());
     app::register_all(&mut app);
     app.start();
 
