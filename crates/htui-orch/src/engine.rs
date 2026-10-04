@@ -5939,6 +5939,7 @@ where
                     matcher: htui_agent::driver::PermissionMatch {
                         tool_kind: Some("execute".to_owned()),
                         command_prefix: Some((*prefix).to_owned()),
+                        command_word: true,
                         ..htui_agent::driver::PermissionMatch::default()
                     },
                     answer: htui_agent::event::PermissionOptionKind::RejectOnce,
@@ -17132,6 +17133,50 @@ mod tests {
                 [true],
                 "the scope advertises `command_run`"
             );
+        }
+
+        /// MOD-11 R1 L4: the R-MCP-4 denials end at a word — `make` and `make -j8` are refused,
+        /// `makepkg` and `cargo build-sbf` are not.
+        #[tokio::test(start_paused = true)]
+        async fn the_heavy_denials_match_whole_command_words() {
+            use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent};
+
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            let _ = started(&harness, ids::HTUI_FEAT_3).await;
+            let spec = harness
+                .orch
+                .spec_for(&key("prd", 0, 0))
+                .expect("the prd session started");
+            let options = [PermissionOption {
+                id: "reject-once".to_owned(),
+                label: "Reject".to_owned(),
+                kind: PermissionOptionKind::RejectOnce,
+            }];
+            let refused = |command: &str| {
+                let call = ToolCallEvent {
+                    tool_call_id: "call-1".to_owned(),
+                    title: "Bash".to_owned(),
+                    tool_kind: htui_agent::event::ToolKind::Execute,
+                    input: serde_json::json!({ "command": command }),
+                    locations: Vec::new(),
+                };
+                htui_agent::permission::evaluate(&spec.permission, Some(&call), &options)
+                    .is_some_and(|answer| answer.reason.ends_with("(R-MCP-4)"))
+            };
+            assert!(refused("make"), "the bare word");
+            assert!(refused("make -j8"));
+            assert!(refused("cargo build --release"));
+            assert!(!refused("makepkg -si"), "another word");
+            assert!(!refused("cargo build-sbf"), "another subcommand");
         }
 
         #[tokio::test(start_paused = true)]

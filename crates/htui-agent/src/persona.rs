@@ -157,6 +157,7 @@ fn matcher(m: &PersonaMatch) -> PermissionMatch {
         tool_name: m.tool_name.clone(),
         path_prefix: m.path_prefix.clone(),
         command_prefix: m.command_prefix.clone(),
+        command_word: false,
     }
 }
 

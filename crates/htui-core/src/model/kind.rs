@@ -76,8 +76,9 @@ pub fn command_queue_exposed(mode: CommandQueue, fan_out: i32, item_tags: &[Stri
 pub const HEAVY_BUILD_TAG: &str = "heavy_build";
 
 /// MOD-11 OQ-5: the shell prefixes refused once (`reject_once`) while `command_run` is exposed
-/// (R-MCP-4), so an agent routes them through the queue. A prefix match only: `cd x && cargo
-/// build` passes (R-6). The order is a pin.
+/// (R-MCP-4), so an agent routes them through the queue. A prefix match only, ending at a word
+/// (MOD-11 R1 L4: `make` never refuses `makepkg`): `cd x && cargo build` passes (R-6). The order
+/// is a pin.
 pub const HEAVY_COMMAND_PREFIXES: &[&str] = &[
     "cargo build",
     "cargo test",

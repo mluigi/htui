@@ -302,7 +302,9 @@ htui is started from) or pass a shorter `timeout_secs`.
 ## Heavy commands outside the queue (R-MCP-4)
 
 While a step has `command_run`, htui refuses the heavy commands an agent might run in its own shell
-instead, so it routes them through the queue. A command is refused when it **starts with** one of:
+instead, so it routes them through the queue. A command is refused when it **starts with** one of
+these, as a whole word (the command ends there or a space follows, so `make` refuses `make` and
+`make -j8` but not `makepkg`, and `cargo build` does not refuse `cargo build-sbf`):
 
 `cargo build`, `cargo test`, `cargo nextest`, `cargo clippy`, `cmake --build`, `ctest`, `make`,
 `ninja`, `msbuild`, `dotnet build`, `dotnet test`, `npm test`, `pnpm test`, `go build`, `go test`.
@@ -313,8 +315,8 @@ instead, so it routes them through the queue. A command is refused when it **sta
 - **`claude-cli`:** `Bash(<prefix>:*)` per prefix is added to `--disallowedTools`.
 
 This is a nudge, not a fence. On ACP a rule compares the start of the command string only, so
-`cd app && cargo build`, `env cargo build` or a script that runs `make` are not refused, `make`
-also refuses `makepkg`, and only a command the agent asks permission for can be refused at all. On
+`cd app && cargo build`, `env cargo build` or a script that runs `make` are not refused, and only
+a command the agent asks permission for can be refused at all. On
 `claude-cli` the CLI matches `Bash(<prefix>:*)` by its own rules, and a script that runs `make`
 still passes. The list is fixed in this build; it is not a setting.
 

@@ -7270,6 +7270,7 @@ fn heavy_denials() -> Vec<PermissionRule> {
             matcher: PermissionMatch {
                 tool_kind: Some("execute".to_owned()),
                 command_prefix: Some((*prefix).to_owned()),
+                command_word: true,
                 ..PermissionMatch::default()
             },
             answer: PermissionOptionKind::RejectOnce,
