@@ -38,7 +38,9 @@ use htui_core::store::{
 };
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::vector::SearchQuery;
-use htui_store::{Backend, ConnEvent, DATABASE_UNREACHABLE, Dsn, PgStore, Started, connect};
+use htui_store::{
+    Backend, ConnEvent, DATABASE_UNREACHABLE, Dsn, PgStore, Started, Writer, connect,
+};
 use htui_worker::WaitingView;
 use serde_json::Value;
 use tokio::sync::{mpsc, watch};
@@ -1721,6 +1723,37 @@ fn permissions_or_unknown(
     }
 }
 
+/// [`StoreRequest::Waiting`]. MOD-69 plan D1, D4, D6: one candidate read, plus the open
+/// permissions online; the classification is the engine's own guards (`htui_worker::waiting`). An
+/// `Unreachable` from either read propagates, so `go_offline` still drops the backend (blueprint
+/// H-12); any other failure of the permission read only leaves them unknown (review L4).
+///
+/// `read_permissions` is the writer's permission read. [`try_serve`] passes
+/// [`WriteStore::open_permissions`]; it is a parameter only so a test can make it fail with
+/// something other than `Unreachable`, which no [`Backend`] can be made to do (review R2).
+async fn serve_waiting(
+    backend: &Backend,
+    scope: &Scope,
+    read_permissions: impl AsyncFnOnce(&Writer, &Scope) -> StoreResult<Vec<WaitingPermission>>,
+) -> StoreResult<StoreReply> {
+    let active = backend.active_runs(scope).await?;
+    let candidates = backend.waiting_candidates(scope).await?;
+    let writer = backend.writer();
+    let permissions = match &writer {
+        Some(writer) => permissions_or_unknown(read_permissions(writer, scope).await)?,
+        None => None,
+    };
+    Ok(StoreReply::Waiting {
+        scope: scope.clone(),
+        // Review L3 with L4: no writer is offline; a writer with unknown permissions is a failed
+        // read online, which the overlay must not call offline.
+        view: WaitingView {
+            offline: writer.is_none(),
+            ..htui_worker::waiting(scope, active, &candidates, permissions.as_deref())
+        },
+    })
+}
+
 /// [`serve`] with the `StoreError` still visible, for the one caller that has to act on it.
 ///
 /// [`spawn`] needs to tell [`StoreError::Unreachable`] from every other failure so it can drop an
@@ -1731,29 +1764,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
     Ok(match request {
         StoreRequest::Workspaces => StoreReply::Workspaces(backend.workspaces().await?),
         StoreRequest::BoxInfo => StoreReply::BoxInfo(backend.box_info().await?),
-        // MOD-69 plan D1, D4, D6: one candidate read, plus the open permissions online; the
-        // classification is the engine's own guards (`htui_worker::waiting`). An `Unreachable`
-        // from either read propagates, so `go_offline` still drops the backend (blueprint H-12);
-        // any other failure of the permission read only leaves them unknown (review L4).
         StoreRequest::Waiting { scope } => {
-            let active = backend.active_runs(scope).await?;
-            let candidates = backend.waiting_candidates(scope).await?;
-            let writer = backend.writer();
-            let permissions = match &writer {
-                Some(writer) => {
-                    permissions_or_unknown(WriteStore::open_permissions(writer, scope).await)?
-                }
-                None => None,
-            };
-            StoreReply::Waiting {
-                scope: scope.clone(),
-                // Review L3 with L4: no writer is offline; a writer with unknown permissions is a
-                // failed read online, which the overlay must not call offline.
-                view: WaitingView {
-                    offline: writer.is_none(),
-                    ..htui_worker::waiting(scope, active, &candidates, permissions.as_deref())
-                },
-            }
+            serve_waiting(backend, scope, async |writer, scope| {
+                WriteStore::open_permissions(writer, scope).await
+            })
+            .await?
         }
         StoreRequest::Items {
             scope,
@@ -4952,6 +4967,55 @@ mod tests {
             }
             other => panic!("an offline waiting read is a view: {other:?}"),
         }
+    }
+
+    /// MOD-69 review R2 (L4): the `Waiting` arm itself, over a backend with a writer whose
+    /// permission read fails. Anything but `Unreachable` still answers the candidate rows with the
+    /// permissions unknown (and not offline); `Unreachable` fails the reply, so `go_offline` fires.
+    #[tokio::test]
+    async fn a_waiting_read_survives_a_failing_permission_read_but_not_an_unreachable_one() {
+        let backend = demo();
+        let scope = platform_scope(&backend).await;
+        let StoreReply::Waiting { view: expected, .. } = serve(
+            &backend,
+            &StoreRequest::Waiting {
+                scope: scope.clone(),
+            },
+        )
+        .await
+        else {
+            panic!("wrong reply variant")
+        };
+        assert!(!expected.rows.is_empty(), "the demo platform owes rows");
+
+        match serve_waiting(&backend, &scope, async |_, _| {
+            Err(StoreError::Backend("relation gone".into()))
+        })
+        .await
+        {
+            Ok(StoreReply::Waiting {
+                scope: answered,
+                view,
+            }) => {
+                assert_eq!(answered, scope);
+                assert!(
+                    !view.permissions_known,
+                    "the failed read leaves them unknown"
+                );
+                assert!(!view.offline, "a backend with a writer is not offline");
+                assert_eq!(view.rows, expected.rows, "the candidate rows survive");
+                assert_eq!(view.working, expected.working);
+            }
+            other => panic!("a failed permission read degrades: {other:?}"),
+        }
+
+        assert!(matches!(
+            serve_waiting(&backend, &scope, async |_, _| {
+                Err(StoreError::Unreachable("down".into()))
+            })
+            .await,
+            Err(StoreError::Unreachable(_))
+        ));
     }
 
     /// MOD-69 review L4: a permission read that fails for any reason but `Unreachable` leaves the
