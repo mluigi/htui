@@ -75,24 +75,16 @@ pub(crate) struct Session<S> {
     /// Everything the tools are scoped to (I-1).
     pub(crate) scope: ToolScope,
     /// The store captured at `open` (B-2).
-    #[allow(
-        dead_code,
-        reason = "written through by the write tools (MOD-11 T4, T8)"
-    )]
     pub(crate) store: S,
     /// B-21: the asking end of the CLI permission bridge, for a `Transport::Cli` scope.
-    #[allow(dead_code, reason = "asked by `permission_prompt` (MOD-11 T9)")]
     pub(crate) ask: Option<PromptAsk>,
     /// Set when the lease drops or the host closes (I-6).
     pub(crate) ended: AtomicBool,
     /// D12: the concept index, when the host has one.
-    #[allow(dead_code, reason = "queried by `search_concepts` (MOD-11 T7)")]
     pub(crate) search: Option<Arc<dyn ConceptSearch>>,
     /// I-5: the host's scrubber.
-    #[allow(dead_code, reason = "used by the write tools (MOD-11 T4, T8)")]
     pub(crate) scrubber: Arc<dyn Scrubber>,
     /// The host's clock.
-    #[allow(dead_code, reason = "read by `command_run` (MOD-11 T8)")]
     pub(crate) clock: Arc<dyn Clock>,
     /// What the host offers beyond the store, for `advertised`.
     pub(crate) caps: HostCaps,

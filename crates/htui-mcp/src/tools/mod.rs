@@ -38,7 +38,6 @@ pub(crate) struct ToolDef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct HostCaps {
     /// A concept index is attached (D12): `search_concepts` can be offered.
-    #[allow(dead_code, reason = "read by `search_concepts` (MOD-11 T7)")]
     pub(crate) search: bool,
 }
 
@@ -62,7 +61,6 @@ pub(crate) struct Ctx<'a, H: htui_core::store::WorkerHost> {
     /// The host the session was opened on: reads (`box_profile`) go through it.
     pub(crate) host: H,
     /// `Some` when the client asked for progress (B-11).
-    #[allow(dead_code, reason = "read by `command_run` (MOD-11 T8)")]
     pub(crate) progress: Option<Progress>,
 }
 
@@ -108,7 +106,6 @@ pub(crate) fn schema_of<T: schemars::JsonSchema>() -> Value {
 
 /// `text` masked by the session's scrubber, or refused when a credential survives (I-5, fail
 /// closed). The refusal names the rule, never the text.
-#[allow(dead_code, reason = "called by the write tools (MOD-11 T4, T8)")]
 pub(crate) fn scrubbed(s: &dyn Scrubber, text: String) -> Result<String, ToolError> {
     let mut value = Value::String(text);
     s.scrub(&mut value).map_err(|unmasked| {
