@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-10-secret-provider.prd.md`
 **Selected Milestone**: 2 — Infisical provider
 **Complexity**: Medium
-**Status**: DRAFT — fact-checked (47 claims: 33 verified, 9 amended, 5 falsified; all folded in); awaiting CONFIRM
+**Status**: DRAFT — fact-checked (46 claims: 32 verified, 9 amended, 5 falsified; all folded in); awaiting CONFIRM
 
 ## Summary
 
