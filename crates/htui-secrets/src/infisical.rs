@@ -217,10 +217,21 @@ impl InfisicalProvider {
             .map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
         let status = response.status();
         let retry_after_secs = retry_after(response.headers());
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
+        let body = response.bytes().await;
+        // D5: a 401 refuses the identity whatever happens to its body, so a body cut short can
+        // never turn a rejected login into a retried one. Only a body read in full can prove the
+        // lockout text.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let locked = body
+                .as_ref()
+                .is_ok_and(|body| is_lockout(&ErrorBody::from_bytes(body)));
+            return Err(LoginFailure::Refused(if locked {
+                SecretError::IdentityLocked
+            } else {
+                SecretError::BadCredentials
+            }));
+        }
+        let body = body.map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
         if status.is_success() {
             let answer: LoginResponse = decode(LOGIN_PATH, &body).map_err(LoginFailure::Other)?;
             let token = Zeroizing::new(answer.access_token);
@@ -246,8 +257,6 @@ impl InfisicalProvider {
         }
         let error = ErrorBody::from_bytes(&body);
         Err(match status.as_u16() {
-            401 if is_lockout(&error) => LoginFailure::Refused(SecretError::IdentityLocked),
-            401 => LoginFailure::Refused(SecretError::BadCredentials),
             404 if is_fastify_not_found(&error) => {
                 LoginFailure::Other(SecretError::UnsupportedServer {
                     endpoint: LOGIN_PATH,
@@ -317,6 +326,12 @@ impl InfisicalProvider {
             .await
             .map_err(|e| unreachable(SECRETS_PATH, e))?;
         let status = response.status();
+        // A 401 refuses the token whatever its body: decided before the read, so a body cut
+        // short still earns the one re-login instead of an `Unreachable` that keeps the refused
+        // token cached. A 403 needs its `error` field, so it still waits for the body.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Ok(None);
+        }
         let retry_after_secs = retry_after(response.headers());
         let body = response
             .bytes()
@@ -331,7 +346,6 @@ impl InfisicalProvider {
         let error = ErrorBody::from_bytes(&body);
         let message = clean_message(&error);
         match status.as_u16() {
-            401 => Ok(None),
             403 if error.error() == "TokenError" => Ok(None),
             403 => Err(SecretError::PermissionDenied {
                 detail: if message.is_empty() {

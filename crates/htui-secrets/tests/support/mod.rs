@@ -18,6 +18,8 @@ pub struct Reply {
     pub status: u16,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    /// The `Content-Length` announced instead of `body.len()` (see [`Reply::truncated`]).
+    pub declared_length: Option<usize>,
 }
 
 impl Reply {
@@ -27,6 +29,7 @@ impl Reply {
             status,
             headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
             body: serde_json::to_vec(body).expect("a JSON value serialises"),
+            declared_length: None,
         }
     }
 
@@ -36,6 +39,7 @@ impl Reply {
             status,
             headers: vec![("Content-Type".to_owned(), "text/html".to_owned())],
             body: body.as_bytes().to_vec(),
+            declared_length: None,
         }
     }
 
@@ -45,6 +49,7 @@ impl Reply {
             status,
             headers: vec![("Location".to_owned(), location.to_owned())],
             body: Vec::new(),
+            declared_length: None,
         }
     }
 
@@ -52,6 +57,18 @@ impl Reply {
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Announces a `Content-Length` of `declared` but sends only the body, then closes: the
+    /// client sees the status and headers, and its body read fails part-way.
+    #[must_use]
+    pub fn truncated(mut self, declared: usize) -> Self {
+        assert!(
+            declared > self.body.len(),
+            "a truncated reply must announce more than it sends"
+        );
+        self.declared_length = Some(declared);
         self
     }
 }
@@ -232,7 +249,7 @@ fn serve(stream: &TcpStream, script: &Script, seen: &Mutex<Vec<Request>>) {
     let mut head = format!(
         "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
         reply.status,
-        reply.body.len()
+        reply.declared_length.unwrap_or(reply.body.len())
     );
     for (name, value) in &reply.headers {
         head.push_str(&format!("{name}: {value}\r\n"));

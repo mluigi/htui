@@ -511,6 +511,43 @@ async fn the_lockout_text_is_identity_locked_and_latches() {
     );
 }
 
+/// D5 rests on the status alone: a 401 whose body is cut short is still a refusal and latches,
+/// so a truncated answer can never turn a rejected login into a retried one. An unread body
+/// cannot prove the lockout text, so the refusal is `BadCredentials`.
+#[tokio::test]
+async fn a_refused_login_with_a_cut_body_still_latches() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        error(
+            401,
+            "UnauthorizedError",
+            "Identity is Temporarily Locked due to too many failed login attempts",
+        )
+        .truncated(4096),
+    );
+    let p = provider(&stub);
+    assert!(
+        matches!(p.resolve(&scope()).await, Err(SecretError::BadCredentials)),
+        "a cut 401 login body is not BadCredentials"
+    );
+    let before = stub.requests().len();
+    assert!(
+        matches!(
+            p.resolve(&scope()).await,
+            Err(SecretError::LoginRefusedEarlier)
+        ),
+        "a cut 401 login body did not latch"
+    );
+    assert_eq!(
+        stub.requests().len(),
+        before,
+        "a latched provider made a request"
+    );
+    assert_eq!(stub.count("POST", LOGIN), 1);
+}
+
 #[tokio::test]
 async fn health_after_a_refused_login_makes_no_request() {
     let stub = Stub::start();
@@ -652,6 +689,13 @@ async fn a_token_error_403_logs_in_once_more_then_succeeds() {
 #[tokio::test]
 async fn a_data_401_logs_in_once_more_then_succeeds() {
     relogin_after(error(401, "UnauthorizedError", "Invalid token")).await;
+}
+
+/// A data 401 refuses the token whatever its body: a cut body still earns the one re-login,
+/// instead of an `Unreachable` that keeps the refused token cached.
+#[tokio::test]
+async fn a_data_401_with_a_cut_body_logs_in_once_more_then_succeeds() {
+    relogin_after(error(401, "UnauthorizedError", "Invalid token").truncated(4096)).await;
 }
 
 #[tokio::test]
