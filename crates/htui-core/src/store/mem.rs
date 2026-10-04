@@ -41,9 +41,10 @@ use crate::model::{
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
-    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
+    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary,
+    scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -1395,6 +1396,42 @@ impl State {
             .collect();
         ToolCallCount::sort_canonical(&mut rows);
         rows
+    }
+
+    /// MOD-69 plan D2: the scope's candidates, grouped and sorted by `WaitingCandidate::assemble`.
+    fn waiting_candidates(&self, scope: &Scope) -> Vec<WaitingCandidate> {
+        let parked: BTreeSet<ItemId> = self
+            .runs
+            .values()
+            .filter(|run| run.status == RunStatus::AwaitingApproval)
+            .filter_map(|run| run.item_id)
+            .collect();
+        let items: Vec<Item> = self
+            .items
+            .values()
+            .filter(|item| scope.contains(item.project_id))
+            .filter(|item| {
+                matches!(item.status, Status::Blocked | Status::AwaitingApproval)
+                    || parked.contains(&item.id)
+            })
+            .cloned()
+            .collect();
+        let wanted: BTreeSet<ItemId> = items.iter().map(|item| item.id).collect();
+        let runs: Vec<Run> = self
+            .runs
+            .values()
+            .filter(|run| run.status.is_active())
+            .filter(|run| run.item_id.is_some_and(|item| wanted.contains(&item)))
+            .cloned()
+            .collect();
+        let owners: BTreeSet<RunId> = runs.iter().map(|run| run.id).collect();
+        let steps: Vec<RunStep> = self
+            .steps
+            .values()
+            .filter(|step| owners.contains(&step.run_id))
+            .cloned()
+            .collect();
+        WaitingCandidate::assemble(scope, items, runs, steps)
     }
 
     /// Mints an item: counter upsert, key assembly and revision 1, all in one lock (§7.1, §4.1).
@@ -6355,6 +6392,42 @@ impl State {
         }
     }
 
+    /// MOD-69 plan D4: `relay_view`'s predicate over the scope's item runs, joined to the item and
+    /// the step.
+    fn open_permissions(&self, scope: &Scope, now: DateTime<Utc>) -> Vec<WaitingPermission> {
+        let mut rows: Vec<WaitingPermission> = self
+            .permissions
+            .values()
+            .filter(|p| {
+                p.row.status == PermissionStatus::Pending
+                    && self.live_owner(p.row.run_id, now) == Some(p.owner)
+            })
+            .filter_map(|p| {
+                let run = self.runs.get(&p.row.run_id)?;
+                let item = self.items.get(&run.item_id?)?;
+                if !scope.contains(item.project_id) {
+                    return None;
+                }
+                let step = self.steps.get(&p.row.run_step_id)?;
+                Some(WaitingPermission {
+                    item: item.id,
+                    project: item.project_id,
+                    item_key: item.key.clone(),
+                    key_prefix: item.key_prefix.clone(),
+                    key_number: item.key_number,
+                    run_queued_at: run.queued_at,
+                    step_position: step.position,
+                    step_attempt: step.attempt,
+                    step_fanout_index: step.fanout_index,
+                    phase_name: step.phase_name.clone(),
+                    permission: p.row.clone(),
+                })
+            })
+            .collect();
+        WaitingPermission::sort_canonical(&mut rows);
+        rows
+    }
+
     fn request_cancel(
         &mut self,
         run: RunId,
@@ -6564,6 +6637,10 @@ impl ReadStore for MemStore {
 
     async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>> {
         Ok(self.read(|state| state.tool_call_counts(item)))
+    }
+
+    async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        Ok(self.read(|state| state.waiting_candidates(scope)))
     }
 }
 
@@ -7367,6 +7444,11 @@ impl WriteStore for MemStore {
     ) -> Result<AnswerOutcome> {
         let now = self.now();
         self.write(|state| state.answer_permission(id, option_id, user, box_id, now))
+    }
+
+    async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {
+        let now = self.now();
+        Ok(self.read(|state| state.open_permissions(scope, now)))
     }
 }
 

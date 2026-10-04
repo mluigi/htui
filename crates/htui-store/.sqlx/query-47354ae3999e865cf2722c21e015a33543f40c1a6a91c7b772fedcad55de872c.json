@@ -1,0 +1,316 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT p.id           AS \"id: PermissionId\",\n                  p.run_id       AS \"run_id: RunId\",\n                  p.run_step_id  AS \"run_step_id: StepId\",\n                  p.session      AS \"session: RelaySessionId\",\n                  p.request_id,\n                  p.tool_call_id,\n                  p.summary,\n                  p.options      AS \"options: Json<Vec<RelayOption>>\",\n                  p.status       AS \"status: PermissionStatus\",\n                  p.option_id,\n                  p.answered_by  AS \"answered_by: UserId\",\n                  p.answered_box AS \"answered_box: BoxId\",\n                  p.created_at,\n                  p.answered_at,\n                  p.resolved_at,\n                  i.id           AS \"item_id: ItemId\",\n                  i.project_id   AS \"project_id: ProjectId\",\n                  i.key          AS \"item_key!\",\n                  i.key_prefix,\n                  i.key_number,\n                  r.queued_at    AS run_queued_at,\n                  s.position     AS step_position,\n                  s.attempt      AS step_attempt,\n                  s.fanout_index AS step_fanout_index,\n                  s.phase_name\n             FROM step_permission p\n             JOIN run r      ON r.id = p.run_id\n             JOIN item i     ON i.id = r.item_id\n             JOIN run_step s ON s.id = p.run_step_id\n            WHERE i.project_id = ANY($1) AND r.item_id IS NOT NULL\n              AND p.status = 'pending'\n              AND r.lease_owner = p.owner AND r.lease_expires_at > clock_timestamp()\n            ORDER BY p.created_at, p.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: PermissionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "run_id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "run_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "run_step_id: StepId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "run_step_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "session: RelaySessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "session"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "request_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "request_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "tool_call_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "tool_call_id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "summary",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "summary"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "options: Json<Vec<RelayOption>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "options"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status: PermissionStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "option_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "option_id"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "answered_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "answered_by"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "answered_box: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "answered_box"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "answered_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "answered_at"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "resolved_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "step_permission",
+            "name": "resolved_at"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "item_key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "key_prefix",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_prefix"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "key_number",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key_number"
+          }
+        }
+      },
+      {
+        "ordinal": 20,
+        "name": "run_queued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "queued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 21,
+        "name": "step_position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 22,
+        "name": "step_attempt",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "attempt"
+          }
+        }
+      },
+      {
+        "ordinal": 23,
+        "name": "step_fanout_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "fanout_index"
+          }
+        }
+      },
+      {
+        "ordinal": 24,
+        "name": "phase_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "phase_name"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "47354ae3999e865cf2722c21e015a33543f40c1a6a91c7b772fedcad55de872c"
+}

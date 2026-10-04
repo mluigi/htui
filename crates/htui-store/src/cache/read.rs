@@ -37,7 +37,7 @@ use htui_core::model::{
     RequirementState, Resolution, ResolvedInput, Run, RunId, RunKind, RunMode, RunStatus, RunStep,
     RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Status,
     StepGraphId, StepId, StepStatus, ToolCallCount, Transport, UpstreamEntry, UserId,
-    VerifyOutcome, WorkspaceId, WorkspaceSummary,
+    VerifyOutcome, WaitingCandidate, WorkspaceId, WorkspaceSummary,
 };
 use htui_core::store::{ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -215,6 +215,93 @@ fn document_of(row: &SqliteRow) -> Result<Document> {
         )?,
         created_by: uuid_col::<UserId>("document.created_by", &text(row, "created_by")?)?,
         created_at: ts_col("document.created_at", get(row, "created_at")?)?,
+    })
+}
+
+/// Every `item` column, aliased `i`, in [`item_of`]'s names (SQLite names a result column `i.id`
+/// as `id`).
+const ITEM_SELECT: &str = "i.id, i.project_id, i.kind_id, i.key_prefix, i.key_number, i.key, \
+     i.title, i.body, i.status, i.priority, i.required_tags, i.touched_paths, i.step_graph_id, \
+     i.version, i.created_by, i.created_at, i.updated_at, i.closed_at, i.resolution";
+
+/// Every mirrored `run` column, in [`run_of`]'s names. `lease_owner` is absent from the mirror by
+/// design (plan D7) and absent from `Run` for the same reason: another process's liveness token
+/// is no use to a reader.
+const RUN_SELECT: &str = "id, project_id, item_id, kind, mode, status, target_box_id, \
+     executing_box_id, graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
+     repo_scope, lease_box_id, lease_expires_at, updated_at";
+
+/// One `run` row, every column of [`RUN_SELECT`].
+fn run_of(row: &SqliteRow) -> Result<Run> {
+    Ok(Run {
+        id: uuid_col::<RunId>("run.id", &text(row, "id")?)?,
+        project_id: uuid_col("run.project_id", &text(row, "project_id")?)?,
+        item_id: opt_uuid_col::<ItemId>("run.item_id", opt_text(row, "item_id")?.as_deref())?,
+        kind: get::<RunKind>(row, "kind")?,
+        mode: get::<RunMode>(row, "mode")?,
+        status: get::<RunStatus>(row, "status")?,
+        target_box_id: uuid_col("run.target_box_id", &text(row, "target_box_id")?)?,
+        executing_box_id: opt_uuid_col::<BoxId>(
+            "run.executing_box_id",
+            opt_text(row, "executing_box_id")?.as_deref(),
+        )?,
+        graph_snapshot: opt_json_col(
+            "run.graph_snapshot",
+            opt_text(row, "graph_snapshot")?.as_deref(),
+        )?,
+        started_by: uuid_col::<UserId>("run.started_by", &text(row, "started_by")?)?,
+        queued_at: ts_col("run.queued_at", get(row, "queued_at")?)?,
+        started_at: opt_ts_col("run.started_at", get(row, "started_at")?)?,
+        finished_at: opt_ts_col("run.finished_at", get(row, "finished_at")?)?,
+        failure: opt_text(row, "failure")?,
+        repo_scope: repos_col("run.repo_scope", &text(row, "repo_scope")?)?,
+        lease_box_id: opt_uuid_col::<BoxId>(
+            "run.lease_box_id",
+            opt_text(row, "lease_box_id")?.as_deref(),
+        )?,
+        lease_expires_at: opt_ts_col("run.lease_expires_at", get(row, "lease_expires_at")?)?,
+        updated_at: ts_col("run.updated_at", get(row, "updated_at")?)?,
+    })
+}
+
+/// Every `run_step` column, in [`run_step_of`]'s names.
+const RUN_STEP_SELECT: &str = "id, run_id, position, attempt, fanout_index, phase_name, agent_id, \
+     model, status, gate_outcome, gate_note, selected, exit_code, prompt_digest, trim_record, \
+     usage, isolation_path, started_at, finished_at, verify_outcome, verify_exit_code, \
+     promoted_at, updated_at";
+
+/// One `run_step` row, every column of [`RUN_STEP_SELECT`].
+fn run_step_of(row: &SqliteRow) -> Result<RunStep> {
+    Ok(RunStep {
+        id: uuid_col::<StepId>("run_step.id", &text(row, "id")?)?,
+        run_id: uuid_col("run_step.run_id", &text(row, "run_id")?)?,
+        position: get(row, "position")?,
+        attempt: get(row, "attempt")?,
+        fanout_index: get(row, "fanout_index")?,
+        phase_name: text(row, "phase_name")?,
+        agent_id: opt_uuid_col::<AgentId>(
+            "run_step.agent_id",
+            opt_text(row, "agent_id")?.as_deref(),
+        )?,
+        model: opt_text(row, "model")?,
+        status: get::<StepStatus>(row, "status")?,
+        gate_outcome: get::<Option<GateOutcome>>(row, "gate_outcome")?,
+        gate_note: opt_text(row, "gate_note")?,
+        selected: get::<Option<i64>>(row, "selected")?.map(bool_col),
+        exit_code: get(row, "exit_code")?,
+        prompt_digest: opt_text(row, "prompt_digest")?,
+        trim_record: opt_json_col(
+            "run_step.trim_record",
+            opt_text(row, "trim_record")?.as_deref(),
+        )?,
+        usage: opt_json_col("run_step.usage", opt_text(row, "usage")?.as_deref())?,
+        isolation_path: opt_text(row, "isolation_path")?,
+        started_at: opt_ts_col("run_step.started_at", get(row, "started_at")?)?,
+        finished_at: opt_ts_col("run_step.finished_at", get(row, "finished_at")?)?,
+        verify_outcome: get::<Option<VerifyOutcome>>(row, "verify_outcome")?,
+        verify_exit_code: get(row, "verify_exit_code")?,
+        promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
+        updated_at: ts_col("run_step.updated_at", get(row, "updated_at")?)?,
     })
 }
 
@@ -833,98 +920,26 @@ impl ReadStore for CacheStore {
     // `run_step_tree` since this milestone's companion migration.
 
     async fn run(&self, id: RunId) -> Result<Option<Run>> {
-        // `lease_owner` is absent from the mirror by design (plan D7) and absent from `Run` for
-        // the same reason: another process's liveness token is no use to a reader.
-        let row = sqlx::query(
-            "SELECT id, project_id, item_id, kind, mode, status, target_box_id, executing_box_id, \
-                    graph_snapshot, started_by, queued_at, started_at, finished_at, failure, \
-                    repo_scope, lease_box_id, lease_expires_at, updated_at \
-               FROM run WHERE id = ?",
-        )
+        let row = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {RUN_SELECT} FROM run WHERE id = ?"
+        )))
         .bind(id.to_string())
         .fetch_optional(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        let Some(row) = row else { return Ok(None) };
-        Ok(Some(Run {
-            id: uuid_col::<RunId>("run.id", &text(&row, "id")?)?,
-            project_id: uuid_col("run.project_id", &text(&row, "project_id")?)?,
-            item_id: opt_uuid_col::<ItemId>("run.item_id", opt_text(&row, "item_id")?.as_deref())?,
-            kind: get::<RunKind>(&row, "kind")?,
-            mode: get::<RunMode>(&row, "mode")?,
-            status: get::<RunStatus>(&row, "status")?,
-            target_box_id: uuid_col("run.target_box_id", &text(&row, "target_box_id")?)?,
-            executing_box_id: opt_uuid_col::<BoxId>(
-                "run.executing_box_id",
-                opt_text(&row, "executing_box_id")?.as_deref(),
-            )?,
-            graph_snapshot: opt_json_col(
-                "run.graph_snapshot",
-                opt_text(&row, "graph_snapshot")?.as_deref(),
-            )?,
-            started_by: uuid_col::<UserId>("run.started_by", &text(&row, "started_by")?)?,
-            queued_at: ts_col("run.queued_at", get(&row, "queued_at")?)?,
-            started_at: opt_ts_col("run.started_at", get(&row, "started_at")?)?,
-            finished_at: opt_ts_col("run.finished_at", get(&row, "finished_at")?)?,
-            failure: opt_text(&row, "failure")?,
-            repo_scope: repos_col("run.repo_scope", &text(&row, "repo_scope")?)?,
-            lease_box_id: opt_uuid_col::<BoxId>(
-                "run.lease_box_id",
-                opt_text(&row, "lease_box_id")?.as_deref(),
-            )?,
-            lease_expires_at: opt_ts_col("run.lease_expires_at", get(&row, "lease_expires_at")?)?,
-            updated_at: ts_col("run.updated_at", get(&row, "updated_at")?)?,
-        }))
+        row.as_ref().map(run_of).transpose()
     }
 
     async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
-        let rows = sqlx::query(
-            "SELECT id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, \
-                    status, gate_outcome, gate_note, selected, exit_code, prompt_digest, \
-                    trim_record, usage, isolation_path, started_at, finished_at, verify_outcome, \
-                    verify_exit_code, promoted_at, updated_at \
-               FROM run_step WHERE run_id = ? \
-              ORDER BY position, attempt, fanout_index",
-        )
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {RUN_STEP_SELECT} FROM run_step WHERE run_id = ? \
+              ORDER BY position, attempt, fanout_index"
+        )))
         .bind(run.to_string())
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)?;
-        rows.iter()
-            .map(|row| {
-                Ok(RunStep {
-                    id: uuid_col::<StepId>("run_step.id", &text(row, "id")?)?,
-                    run_id: uuid_col("run_step.run_id", &text(row, "run_id")?)?,
-                    position: get(row, "position")?,
-                    attempt: get(row, "attempt")?,
-                    fanout_index: get(row, "fanout_index")?,
-                    phase_name: text(row, "phase_name")?,
-                    agent_id: opt_uuid_col::<AgentId>(
-                        "run_step.agent_id",
-                        opt_text(row, "agent_id")?.as_deref(),
-                    )?,
-                    model: opt_text(row, "model")?,
-                    status: get::<StepStatus>(row, "status")?,
-                    gate_outcome: get::<Option<GateOutcome>>(row, "gate_outcome")?,
-                    gate_note: opt_text(row, "gate_note")?,
-                    selected: get::<Option<i64>>(row, "selected")?.map(bool_col),
-                    exit_code: get(row, "exit_code")?,
-                    prompt_digest: opt_text(row, "prompt_digest")?,
-                    trim_record: opt_json_col(
-                        "run_step.trim_record",
-                        opt_text(row, "trim_record")?.as_deref(),
-                    )?,
-                    usage: opt_json_col("run_step.usage", opt_text(row, "usage")?.as_deref())?,
-                    isolation_path: opt_text(row, "isolation_path")?,
-                    started_at: opt_ts_col("run_step.started_at", get(row, "started_at")?)?,
-                    finished_at: opt_ts_col("run_step.finished_at", get(row, "finished_at")?)?,
-                    verify_outcome: get::<Option<VerifyOutcome>>(row, "verify_outcome")?,
-                    verify_exit_code: get(row, "verify_exit_code")?,
-                    promoted_at: opt_ts_col("run_step.promoted_at", get(row, "promoted_at")?)?,
-                    updated_at: ts_col("run_step.updated_at", get(row, "updated_at")?)?,
-                })
-            })
-            .collect()
+        rows.iter().map(run_step_of).collect()
     }
 
     async fn step_trees(&self, step: StepId) -> Result<Vec<RunStepTree>> {
@@ -1279,6 +1294,72 @@ impl ReadStore for CacheStore {
             .collect::<Result<Vec<_>>>()?;
         ToolCallCount::sort_canonical(&mut counts);
         Ok(counts)
+    }
+
+    /// MOD-69 plan D1, D2: Postgres' three reads over the mirror, grouped and ordered by
+    /// `WaitingCandidate::assemble`. The mirror carries every `run` and `run_step` row of a
+    /// project, so after a pass this answers what Postgres does.
+    async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        if scope.project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {ITEM_SELECT} FROM item i WHERE i.project_id IN ({}) \
+               AND (i.status IN ('blocked', 'awaiting_approval') \
+                    OR EXISTS (SELECT 1 FROM run r \
+                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))",
+            placeholders(scope.project_ids.len()),
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql));
+        for id in &scope.project_ids {
+            query = query.bind(id.to_string());
+        }
+        let items = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .iter()
+            .map(item_of)
+            .collect::<Result<Vec<_>>>()?;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let sql = format!(
+            "SELECT {RUN_SELECT} FROM run WHERE item_id IN ({}) \
+               AND status IN ('queued','running','awaiting_approval')",
+            placeholders(items.len()),
+        );
+        let mut query = sqlx::query(AssertSqlSafe(sql));
+        for item in &items {
+            query = query.bind(item.id.to_string());
+        }
+        let runs = query
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .iter()
+            .map(run_of)
+            .collect::<Result<Vec<_>>>()?;
+        let steps = if runs.is_empty() {
+            Vec::new()
+        } else {
+            let sql = format!(
+                "SELECT {RUN_STEP_SELECT} FROM run_step WHERE run_id IN ({})",
+                placeholders(runs.len()),
+            );
+            let mut query = sqlx::query(AssertSqlSafe(sql));
+            for run in &runs {
+                query = query.bind(run.id.to_string());
+            }
+            query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .iter()
+                .map(run_step_of)
+                .collect::<Result<Vec<_>>>()?
+        };
+        Ok(WaitingCandidate::assemble(scope, items, runs, steps))
     }
 }
 

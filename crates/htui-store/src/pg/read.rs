@@ -26,8 +26,8 @@ use htui_core::model::{
     RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillVersion,
     Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, ToolCallCount,
-    UpstreamEntry, UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspaceProject, WorkspaceSummary,
+    UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, Workspace, WorkspaceBoxPath,
+    WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -1152,6 +1152,126 @@ impl ReadStore for PgStore {
             .collect();
         ToolCallCount::sort_canonical(&mut counts);
         Ok(counts)
+    }
+
+    /// MOD-69 plan D1, D2: three reads — the candidate items, their active runs, those runs' steps —
+    /// grouped and ordered by `WaitingCandidate::assemble`. A display read: the statements need not
+    /// share a snapshot (blueprint H-7). The run read's `status IN (...)` is `ACTIVE_RUN_STATUSES`'
+    /// literal (blueprint H-24).
+    async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        if scope.is_empty() {
+            return Ok(Vec::new());
+        }
+        let projects = project_uuids(scope);
+        let items = sqlx::query_as!(
+            Item,
+            r#"
+            SELECT i.id            AS "id: ItemId",
+                   i.project_id    AS "project_id: ProjectId",
+                   i.kind_id       AS "kind_id: htui_core::model::ItemKindId",
+                   i.key_prefix,
+                   i.key_number,
+                   i.key           AS "key!",
+                   i.title,
+                   i.body,
+                   i.status        AS "status: htui_core::model::Status",
+                   i.priority,
+                   i.required_tags,
+                   i.touched_paths,
+                   i.step_graph_id AS "step_graph_id: htui_core::model::StepGraphId",
+                   i.version,
+                   i.created_by    AS "created_by: htui_core::model::UserId",
+                   i.created_at,
+                   i.updated_at,
+                   i.closed_at,
+                   i.resolution    AS "resolution: htui_core::model::Resolution"
+              FROM item i
+             WHERE i.project_id = ANY($1)
+               AND (i.status IN ('blocked', 'awaiting_approval')
+                    OR EXISTS (SELECT 1 FROM run r
+                                WHERE r.item_id = i.id AND r.status = 'awaiting_approval'))
+            "#,
+            &projects[..],
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let item_ids: Vec<Uuid> = items.iter().map(|item| item.id.as_uuid()).collect();
+        let runs = sqlx::query_as!(
+            Run,
+            r#"
+            SELECT id               AS "id: RunId",
+                   project_id       AS "project_id: ProjectId",
+                   item_id          AS "item_id: ItemId",
+                   kind             AS "kind: RunKind",
+                   mode             AS "mode: RunMode",
+                   status           AS "status: RunStatus",
+                   target_box_id    AS "target_box_id: BoxId",
+                   executing_box_id AS "executing_box_id: BoxId",
+                   graph_snapshot,
+                   started_by       AS "started_by: UserId",
+                   queued_at,
+                   started_at,
+                   finished_at,
+                   failure,
+                   repo_scope       AS "repo_scope: Vec<RepoId>",
+                   lease_box_id     AS "lease_box_id: BoxId",
+                   lease_expires_at,
+                   updated_at
+              FROM run
+             WHERE item_id = ANY($1)
+               AND status IN ('queued','running','awaiting_approval')
+            "#,
+            &item_ids[..],
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        let run_ids: Vec<Uuid> = runs.iter().map(|run| run.id.as_uuid()).collect();
+        let steps = if run_ids.is_empty() {
+            Vec::new()
+        } else {
+            sqlx::query_as!(
+                RunStep,
+                r#"
+                SELECT id                  AS "id: StepId",
+                       run_id              AS "run_id: RunId",
+                       position,
+                       attempt,
+                       fanout_index,
+                       phase_name,
+                       agent_id            AS "agent_id: AgentId",
+                       model,
+                       status              AS "status: StepStatus",
+                       gate_outcome        AS "gate_outcome: GateOutcome",
+                       gate_note,
+                       selected,
+                       exit_code,
+                       prompt_digest,
+                       trim_record,
+                       usage,
+                       isolation_path,
+                       started_at,
+                       finished_at,
+                       verify_outcome      AS "verify_outcome: VerifyOutcome",
+                       verify_exit_code,
+                       promoted_at,
+                       updated_at
+                  FROM run_step
+                 WHERE run_id = ANY($1)
+                "#,
+                &run_ids[..],
+            )
+            .fetch_all(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+        };
+        Ok(WaitingCandidate::assemble(scope, items, runs, steps))
     }
 }
 

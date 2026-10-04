@@ -31,7 +31,7 @@ use htui_core::model::{
     PromptTemplate, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter,
     RequirementId, RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId,
     RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
-    StepId, ToolCallCount, UpstreamEntry, UserId, WorkspaceSummary,
+    StepId, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -838,6 +838,14 @@ impl ReadStore for Backend {
             Self::Memory(store) => store.tool_call_counts(item).await,
             Self::Online { pg, .. } => pg.tool_call_counts(item).await,
             Self::Offline { cache, .. } => cache.tool_call_counts(item).await,
+        }
+    }
+
+    async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        match self {
+            Self::Memory(store) => store.waiting_candidates(scope).await,
+            Self::Online { pg, .. } => pg.waiting_candidates(scope).await,
+            Self::Offline { cache, .. } => cache.waiting_candidates(scope).await,
         }
     }
 }

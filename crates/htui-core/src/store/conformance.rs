@@ -33,8 +33,9 @@ use crate::model::{
     RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
     SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
     StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
-    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure,
+    ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate,
+    WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    canonical_declared_tags, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -186,6 +187,8 @@ pub const CASES: &[&str] = &[
     "a_bound_persona_is_not_deleted_and_names_its_phases",
     "a_persona_bound_to_many_phases_names_five_and_counts_the_rest",
     "hand_written_rows_round_trip",
+    "waiting_candidates_hold_every_park_and_nothing_else",
+    "open_permissions_list_live_pending_item_requests",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -476,6 +479,12 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             a_persona_bound_to_many_phases_names_five_and_counts_the_rest(store).await;
         }
         "hand_written_rows_round_trip" => hand_written_rows_round_trip(store).await,
+        "waiting_candidates_hold_every_park_and_nothing_else" => {
+            waiting_candidates_hold_every_park_and_nothing_else(store).await;
+        }
+        "open_permissions_list_live_pending_item_requests" => {
+            open_permissions_list_live_pending_item_requests(store).await;
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -6597,6 +6606,135 @@ async fn leased_step<S: WriteStore>(
         .expect(case)
         .id;
     (run, step)
+}
+
+/// MOD-69: a run of `item` created and claimed by `owner` (the run `running`, the item
+/// `in_progress`). Blueprint H-6: a box runs at most two runs at once, so the waiting-list cases
+/// park each run before claiming the next.
+async fn claimed<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    owner: Uuid,
+    at: DateTime<Utc>,
+) -> RunId {
+    let run = store
+        .create_run(new_run(ids::PROJECT_HTUI, item, Vec::new()))
+        .await
+        .expect(case)
+        .id;
+    assert_eq!(
+        store
+            .claim_run(run, ids::BOX, owner, at, LEASE)
+            .await
+            .expect(case),
+        Claim::Admitted,
+        "{case}: the claim is admitted (blueprint H-6: one running run at a time)"
+    );
+    run
+}
+
+/// MOD-69: a step of `run` at the `(position, attempt, fanout_index)` slot, moved
+/// `pending -> running`.
+async fn running_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    (position, attempt, fanout): (i32, i32, i32),
+    at: DateTime<Utc>,
+) -> StepId {
+    let step = store
+        .create_step(new_run_step(run, position, attempt, fanout))
+        .await
+        .expect(case)
+        .id;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(case),
+        "{case}: pending -> running is a sanctioned move"
+    );
+    step
+}
+
+/// MOD-69: a step of `run` at the slot, moved `pending -> running -> done`.
+async fn done_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    slot: (i32, i32, i32),
+    at: DateTime<Utc>,
+) -> StepId {
+    let step = running_step(case, store, run, slot, at).await;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Running, StepStatus::Done, at)
+            .await
+            .expect(case),
+        "{case}: running -> done is a sanctioned move"
+    );
+    step
+}
+
+/// MOD-69: a fresh open item of `htui` (no tags, so `claim_run` admits it).
+async fn minted<S: WriteStore>(case: &str, store: &S, title: &str) -> ItemId {
+    store
+        .mint_item(new_item(ids::PROJECT_HTUI, ids::KIND_HTUI_FEAT, title))
+        .await
+        .expect(case)
+        .id
+}
+
+/// MOD-69: parks `run` without a step (`park_selection`'s and `escalate`'s run move), and moves
+/// its item `in_progress -> to`.
+async fn parked_run<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    item: ItemId,
+    to: Status,
+    at: DateTime<Utc>,
+) {
+    assert!(
+        store
+            .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect(case),
+        "{case}: the run parks"
+    );
+    assert!(
+        store
+            .transition(item, Status::InProgress, to)
+            .await
+            .expect(case),
+        "{case}: the item moves in_progress -> {to}"
+    );
+}
+
+/// MOD-69: `(item, item status, [(run, run status, [(step, step status)])])`, what a
+/// waiting-list case compares, since the rows' timestamps are the stores'.
+type CandidateShape = Vec<(
+    ItemId,
+    Status,
+    Vec<(RunId, RunStatus, Vec<(StepId, StepStatus)>)>,
+)>;
+
+/// MOD-69: the shape of [`ReadStore::waiting_candidates`]' answer, order kept.
+fn shape_of(rows: &[WaitingCandidate]) -> CandidateShape {
+    rows.iter()
+        .map(|row| {
+            let runs = row
+                .runs
+                .iter()
+                .map(|(run, steps)| {
+                    let steps = steps.iter().map(|step| (step.id, step.status)).collect();
+                    (run.id, run.status, steps)
+                })
+                .collect();
+            (row.item.id, row.item.status, runs)
+        })
+        .collect()
 }
 
 /// B takes the run's lapsed lease, as a sweep's `adopt_runs` does to a suspended holder. A's
@@ -15259,6 +15397,408 @@ async fn relay_view_lists_live_pending_requests_and_pending_cancels<S: WriteStor
             .cancels
             .is_empty(),
         "{CASE}: a terminal run's pending cancel is not listed (B-4)"
+    );
+}
+
+/// MOD-69 plan D2: `waiting_candidates` lists every item of the scope that is `blocked` or
+/// `awaiting_approval`, or that owns a parked run, with its active runs (queued, running and
+/// parked) and their steps, in canonical order. A walking item, a finished run, another
+/// workspace's item and a chat run are absent; an empty scope answers nothing.
+async fn waiting_candidates_hold_every_park_and_nothing_else<S: WriteStore>(store: &S) {
+    const CASE: &str = "waiting_candidates_hold_every_park_and_nothing_else";
+    let owner = Uuid::now_v7();
+    let at = seam_clock();
+
+    // A gate park, after a cancelled run of the same item.
+    let gate = minted(CASE, store, "gate").await;
+    let cancelled = store
+        .create_run(new_run(ids::PROJECT_HTUI, gate, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    store
+        .finish_run(cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect(CASE);
+    let gate_run = claimed(CASE, store, gate, owner, at).await;
+    let gate_step = running_step(CASE, store, gate_run, (0, 1, 0), at).await;
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(owner), gate_step)
+            .await
+            .expect(CASE),
+        ParkOutcome::Parked,
+        "{CASE}: the gate parks"
+    );
+
+    // A selection park: two done candidates, the run and item parked by hand.
+    let selection = minted(CASE, store, "selection").await;
+    let selection_run = claimed(CASE, store, selection, owner, at).await;
+    let selection_a = done_step(CASE, store, selection_run, (0, 1, 0), at).await;
+    let selection_b = done_step(CASE, store, selection_run, (0, 1, 1), at).await;
+    parked_run(
+        CASE,
+        store,
+        selection_run,
+        selection,
+        Status::AwaitingApproval,
+        at,
+    )
+    .await;
+
+    // A failed judge: the selection's shape plus the judge, rejected.
+    let judge = minted(CASE, store, "judge").await;
+    let judge_run = claimed(CASE, store, judge, owner, at).await;
+    let judge_a = done_step(CASE, store, judge_run, (0, 1, 0), at).await;
+    let judge_b = done_step(CASE, store, judge_run, (0, 1, 1), at).await;
+    let judge_step = running_step(CASE, store, judge_run, (0, 1, -1), at).await;
+    assert!(
+        store
+            .transition_step(
+                judge_step,
+                StepStatus::Running,
+                StepStatus::AwaitingApproval,
+                at
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the judge awaits"
+    );
+    assert!(
+        store
+            .answer_gate(
+                judge_step,
+                GateOutcome::Rejected,
+                Some("judge: no verdict".to_owned()),
+                at
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the judge fails"
+    );
+    parked_run(CASE, store, judge_run, judge, Status::AwaitingApproval, at).await;
+
+    // An escalation: the run parked, the item blocked, no step parked.
+    let escalation = minted(CASE, store, "escalation").await;
+    let escalation_run = claimed(CASE, store, escalation, owner, at).await;
+    let escalation_step = done_step(CASE, store, escalation_run, (0, 1, 0), at).await;
+    parked_run(CASE, store, escalation_run, escalation, Status::Blocked, at).await;
+
+    // A gate park whose item was moved back to open: the run still anchors it.
+    let reopened = minted(CASE, store, "open under park").await;
+    let reopened_run = claimed(CASE, store, reopened, owner, at).await;
+    let reopened_step = running_step(CASE, store, reopened_run, (0, 1, 0), at).await;
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(owner), reopened_step)
+            .await
+            .expect(CASE),
+        ParkOutcome::Parked,
+        "{CASE}: the second gate parks"
+    );
+    assert!(
+        store
+            .transition(reopened, Status::AwaitingApproval, Status::Open)
+            .await
+            .expect(CASE),
+        "{CASE}: awaiting_approval -> open is legal"
+    );
+
+    // The negative: a walking run, claimed last (H-6).
+    let walking = minted(CASE, store, "walking").await;
+    let walking_run = claimed(CASE, store, walking, owner, at).await;
+    running_step(CASE, store, walking_run, (0, 1, 0), at).await;
+
+    // A blocked item whose run is still queued, and one blocked mid-walk: a candidate carries its
+    // queued and running runs, not only its parked ones (T2's unblock reads the first active run,
+    // blueprint H-1). The running run is the box's second (H-6), the queued one is never claimed.
+    let queued = minted(CASE, store, "blocked behind a queue").await;
+    let queued_run = store
+        .create_run(new_run(ids::PROJECT_HTUI, queued, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    assert!(
+        store
+            .transition(queued, Status::Queued, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: queued -> blocked is legal (create_run queued the item)"
+    );
+    let mid_walk = minted(CASE, store, "blocked mid-walk").await;
+    let mid_walk_run = claimed(CASE, store, mid_walk, owner, at).await;
+    let mid_walk_step = running_step(CASE, store, mid_walk_run, (0, 1, 0), at).await;
+    assert!(
+        store
+            .transition(mid_walk, Status::InProgress, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: in_progress -> blocked is legal"
+    );
+
+    // Another workspace's item, and a chat run in scope.
+    assert!(
+        store
+            .transition(ids::VULKAN_TOOL_1, Status::Open, Status::Blocked)
+            .await
+            .expect(CASE),
+        "{CASE}: Vulkan TOOL-1 blocks"
+    );
+    let platform = platform_scope();
+    let before_chat = store.waiting_candidates(&platform).await.expect(CASE);
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+
+    let rows = store.waiting_candidates(&platform).await.expect(CASE);
+    assert_eq!(rows, before_chat, "{CASE}: a chat run changes nothing");
+    let expected: CandidateShape = vec![
+        (ids::HTUI_FEAT_2, Status::Blocked, vec![]),
+        (
+            gate,
+            Status::AwaitingApproval,
+            vec![(
+                gate_run,
+                RunStatus::AwaitingApproval,
+                vec![(gate_step, StepStatus::AwaitingApproval)],
+            )],
+        ),
+        (
+            selection,
+            Status::AwaitingApproval,
+            vec![(
+                selection_run,
+                RunStatus::AwaitingApproval,
+                vec![
+                    (selection_a, StepStatus::Done),
+                    (selection_b, StepStatus::Done),
+                ],
+            )],
+        ),
+        (
+            judge,
+            Status::AwaitingApproval,
+            vec![(
+                judge_run,
+                RunStatus::AwaitingApproval,
+                vec![
+                    (judge_step, StepStatus::Failed),
+                    (judge_a, StepStatus::Done),
+                    (judge_b, StepStatus::Done),
+                ],
+            )],
+        ),
+        (
+            escalation,
+            Status::Blocked,
+            vec![(
+                escalation_run,
+                RunStatus::AwaitingApproval,
+                vec![(escalation_step, StepStatus::Done)],
+            )],
+        ),
+        (
+            reopened,
+            Status::Open,
+            vec![(
+                reopened_run,
+                RunStatus::AwaitingApproval,
+                vec![(reopened_step, StepStatus::AwaitingApproval)],
+            )],
+        ),
+        (
+            queued,
+            Status::Blocked,
+            vec![(queued_run, RunStatus::Queued, vec![])],
+        ),
+        (
+            mid_walk,
+            Status::Blocked,
+            vec![(
+                mid_walk_run,
+                RunStatus::Running,
+                vec![(mid_walk_step, StepStatus::Running)],
+            )],
+        ),
+        (ids::HTUI_TOOL_1, Status::AwaitingApproval, vec![]),
+    ];
+    assert_eq!(
+        shape_of(&rows),
+        expected,
+        "{CASE}: every park of the Platform scope, in canonical order, and nothing else"
+    );
+    let judge_row = rows
+        .iter()
+        .find(|row| row.item.id == judge)
+        .and_then(|row| row.runs.first())
+        .and_then(|(_, steps)| steps.first())
+        .unwrap_or_else(|| panic!("{CASE}: the judge's run carries its judge first"));
+    assert_eq!(
+        (judge_row.gate_outcome, judge_row.gate_note.as_deref()),
+        (Some(GateOutcome::Rejected), Some("judge: no verdict")),
+        "{CASE}: the failed judge's rows, as fail_judge writes them"
+    );
+    for absent in [ids::HTUI_FEAT_3, ids::HTUI_FEAT_1, walking] {
+        assert!(
+            rows.iter().all(|row| row.item.id != absent),
+            "{CASE}: {absent} waits on no one"
+        );
+    }
+
+    let graphics = Scope {
+        workspace_id: ids::WORKSPACE_GRAPHICS,
+        project_ids: vec![ids::PROJECT_VULKAN],
+    };
+    assert_eq!(
+        shape_of(&store.waiting_candidates(&graphics).await.expect(CASE)),
+        vec![(ids::VULKAN_TOOL_1, Status::Blocked, vec![])],
+        "{CASE}: the Graphics scope lists its own blocked item only"
+    );
+    let empty = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![],
+    };
+    assert!(
+        store
+            .waiting_candidates(&empty)
+            .await
+            .expect(CASE)
+            .is_empty(),
+        "{CASE}: an empty scope lists nothing"
+    );
+}
+
+/// MOD-69 plan D4: `open_permissions` lists the scope's pending requests of item runs whose owner
+/// holds the run's lease live, with the item's key and the step's slot. An answered request, a
+/// lapsed lease, an owner whose lapsed lease another took, and a chat run's request are absent.
+async fn open_permissions_list_live_pending_item_requests<S: WriteStore>(store: &S) {
+    const CASE: &str = "open_permissions_list_live_pending_item_requests";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+
+    // The live request, and an answered one on the same step and session.
+    let (run, step) = leased_step(CASE, store, a, at).await;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(CASE),
+        "{CASE}: the step runs"
+    );
+    let session = RelaySessionId::new();
+    let live = parked(CASE, store, open_request(run, step, session, "req-1", a)).await;
+    let answered = parked(CASE, store, open_request(run, step, session, "req-2", a)).await;
+    assert_eq!(
+        answer(CASE, store, answered, "allow-once").await,
+        AnswerOutcome::Answered,
+        "{CASE}: precondition: req-2 is answered"
+    );
+
+    // A request whose lease lapses, then is taken by another owner.
+    let lapsing = minted(CASE, store, "lapsing").await;
+    let run2 = claimed(CASE, store, lapsing, a, at).await;
+    let step2 = running_step(CASE, store, run2, (0, 1, 0), at).await;
+    parked(
+        CASE,
+        store,
+        open_request(run2, step2, RelaySessionId::new(), "req-3", a),
+    )
+    .await;
+    assert!(
+        store
+            .refresh_lease(run2, a, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: A's lease on the second run lapses"
+    );
+    let platform = platform_scope();
+    let expected = vec![WaitingPermission {
+        item: ids::HTUI_ANA_2,
+        project: ids::PROJECT_HTUI,
+        item_key: "ANA-2".to_owned(),
+        key_prefix: "ANA".to_owned(),
+        key_number: 2,
+        run_queued_at: run_row(CASE, store, run).await.queued_at,
+        step_position: 0,
+        step_attempt: 1,
+        step_fanout_index: 0,
+        phase_name: "implement".to_owned(),
+        permission: permission_row(CASE, store, live).await,
+    }];
+    assert_eq!(
+        store.open_permissions(&platform).await.expect(CASE),
+        expected,
+        "{CASE}: a lapsed lease's request is not listed"
+    );
+    assert!(
+        store
+            .take_lease(run2, ids::BOX, b, TimeDelta::minutes(14))
+            .await
+            .expect(CASE),
+        "{CASE}: B takes A's lapsed lease"
+    );
+    assert_eq!(
+        store.open_permissions(&platform).await.expect(CASE),
+        expected,
+        "{CASE}: A's request is not listed under B's live lease (owner match)"
+    );
+
+    // A chat run's request (blueprint A-12): the chat run admits a lease, but has no item.
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    assert!(
+        store
+            .take_lease(chat.run_id, ids::BOX, a, LEASE)
+            .await
+            .expect(CASE),
+        "{CASE}: precondition: A takes the chat run's free lease"
+    );
+    parked(
+        CASE,
+        store,
+        open_request(
+            chat.run_id,
+            chat.step_id,
+            RelaySessionId::new(),
+            "req-chat",
+            a,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        store.open_permissions(&platform).await.expect(CASE),
+        expected,
+        "{CASE}: only the live pending item request is listed"
+    );
+    let graphics = Scope {
+        workspace_id: ids::WORKSPACE_GRAPHICS,
+        project_ids: vec![ids::PROJECT_VULKAN],
+    };
+    assert_eq!(
+        store.open_permissions(&graphics).await.expect(CASE),
+        vec![],
+        "{CASE}: another workspace lists nothing"
+    );
+    let empty = Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![],
+    };
+    assert_eq!(
+        store.open_permissions(&empty).await.expect(CASE),
+        vec![],
+        "{CASE}: an empty scope lists nothing"
     );
 }
 

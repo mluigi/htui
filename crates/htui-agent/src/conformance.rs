@@ -45,8 +45,8 @@ use htui_core::model::{
     RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, normalize,
+    StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::scrub::MinimalScrubber;
@@ -741,6 +741,9 @@ impl<S: WriteStore> ReadStore for UsageSpy<'_, S> {
     async fn tool_call_counts(&self, item: ItemId) -> StoreResult<Vec<ToolCallCount>> {
         self.inner.tool_call_counts(item).await
     }
+    async fn waiting_candidates(&self, scope: &Scope) -> StoreResult<Vec<WaitingCandidate>> {
+        self.inner.waiting_candidates(scope).await
+    }
 }
 
 impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
@@ -1395,6 +1398,10 @@ impl<S: WriteStore> WriteStore for UsageSpy<'_, S> {
         self.inner
             .answer_permission(id, option_id, user, box_id)
             .await
+    }
+
+    async fn open_permissions(&self, scope: &Scope) -> StoreResult<Vec<WaitingPermission>> {
+        self.inner.open_permissions(scope).await
     }
 }
 

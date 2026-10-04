@@ -60,8 +60,8 @@ use crate::model::{
     RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
     SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
     StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -279,6 +279,28 @@ pub trait ReadStore: Send + Sync {
     /// # Errors
     /// The backend's own failures only.
     async fn tool_call_counts(&self, item: ItemId) -> Result<Vec<ToolCallCount>>;
+
+    // ---- MOD-69: the waiting-on-you list (ANA-27 §5.1 T8) ------------------------------------
+
+    /// The scope's candidates for the waiting-on-you list (MOD-69 plan D2): every item of a scope
+    /// project that is `blocked` or `awaiting_approval`, **or** owns a run at `awaiting_approval`
+    /// (parks move the item only from `in_progress`, so run status is the anchor), each with its
+    /// active runs (`queued | running | awaiting_approval`) and each such run's steps. A finished
+    /// run of a candidate is not carried; a chat run (no item) never is. In
+    /// [`WaitingCandidate::sort_canonical`](crate::model::WaitingCandidate::sort_canonical) order.
+    /// Empty for an empty scope.
+    ///
+    /// Rows only: what waits, and why, is `htui-worker`'s classification over them (plan D1),
+    /// because the Resume case needs `status::cursor` over the run's snapshot. A display read: its
+    /// statements need not share a snapshot, and the next refresh corrects a park that landed
+    /// between them.
+    ///
+    /// On `ReadStore` because `item`, `run` and `run_step` are mirrored: offline the mirror answers
+    /// from its last refresh.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>>;
 }
 
 /// Everything a write path needs.
@@ -1809,6 +1831,21 @@ pub trait WriteStore: ReadStore {
         user: UserId,
         box_id: BoxId,
     ) -> Result<AnswerOutcome>;
+
+    /// MOD-69 plan D4: every `pending` permission request of a scope project's **item** runs whose
+    /// owner holds the run's lease live by the store's clock — [`relay_view`](Self::relay_view)'s
+    /// predicate over a scope instead of one item — each with the item's key and project, the
+    /// run's `queued_at` and the step's slot and phase (blueprint A-2). A chat run's request is
+    /// never listed: it is answered in its Chat tab and has no item to reveal. In
+    /// [`WaitingPermission::sort_canonical`](crate::model::WaitingPermission::sort_canonical)
+    /// order. Empty for an empty scope.
+    ///
+    /// A read on `WriteStore` by `relay_view`'s precedent: `step_permission` is not mirrored
+    /// (MOD-42 OQ-4), so offline there is nothing to answer from.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>>;
 }
 
 /// The `run_step.status` a terminal [`RunStatus`] closes a chat step with, or `None` when the

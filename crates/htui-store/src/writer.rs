@@ -37,8 +37,8 @@ use htui_core::model::{
     RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
     SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    ToolCallCount, UpstreamEntry, UserId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -313,6 +313,13 @@ impl ReadStore for Writer {
         match self {
             Self::Memory(store) => store.tool_call_counts(item).await,
             Self::Online(pg) => pg.tool_call_counts(item).await,
+        }
+    }
+
+    async fn waiting_candidates(&self, scope: &Scope) -> Result<Vec<WaitingCandidate>> {
+        match self {
+            Self::Memory(store) => store.waiting_candidates(scope).await,
+            Self::Online(pg) => pg.waiting_candidates(scope).await,
         }
     }
 }
@@ -1353,6 +1360,13 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.answer_permission(id, option_id, user, box_id).await,
             Self::Online(pg) => pg.answer_permission(id, option_id, user, box_id).await,
+        }
+    }
+
+    async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {
+        match self {
+            Self::Memory(store) => store.open_permissions(scope).await,
+            Self::Online(pg) => pg.open_permissions(scope).await,
         }
     }
 }

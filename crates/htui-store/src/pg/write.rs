@@ -33,11 +33,12 @@ use htui_core::model::{
     Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
     RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
     RequirementUpdate, Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, SessionEvent, Skill, SkillBinding,
-    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
-    UserId, VerifyOutcome, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOutcome, StepPermission,
+    StepStatus, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps,
+    scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -6434,6 +6435,10 @@ impl WriteStore for PgStore {
         box_id: BoxId,
     ) -> Result<AnswerOutcome> {
         super::relay::answer_permission(self, id, option_id, user, box_id).await
+    }
+
+    async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {
+        super::relay::open_permissions(self, scope).await
     }
 }
 

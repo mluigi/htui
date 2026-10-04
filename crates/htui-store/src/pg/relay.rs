@@ -18,8 +18,9 @@
 use chrono::{DateTime, Utc};
 use htui_core::model::{
     AnswerOutcome, AnswerRefusal, BoxId, CancelRequest, ItemId, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, RelayOption, RelaySessionId, RelayView, RunCommand,
-    RunCommandId, RunCommandKind, RunCommandStatus, RunId, StepId, StepPermission, UserId,
+    PermissionId, PermissionStatus, ProjectId, RelayOption, RelaySessionId, RelayView, RunCommand,
+    RunCommandId, RunCommandKind, RunCommandStatus, RunId, Scope, StepId, StepPermission, UserId,
+    WaitingPermission,
 };
 use htui_core::store::{Result, StoreError, references_no_row};
 use sqlx::types::Json;
@@ -542,4 +543,91 @@ pub(super) async fn relay_view(store: &PgStore, item: ItemId) -> Result<RelayVie
         permissions: permissions.into_iter().map(StepPermission::from).collect(),
         cancels,
     })
+}
+
+/// [`WriteStore::open_permissions`](htui_core::store::WriteStore::open_permissions) (MOD-69 plan
+/// D4): `relay_view`'s open predicate over the scope's item runs, joined to the item and the step.
+/// `r.item_id IS NOT NULL` is implied by the item join and kept explicit: plan D4's chat-run rule.
+pub(super) async fn open_permissions(
+    store: &PgStore,
+    scope: &Scope,
+) -> Result<Vec<WaitingPermission>> {
+    if scope.is_empty() {
+        return Ok(Vec::new());
+    }
+    let projects: Vec<Uuid> = scope.project_ids.iter().map(|id| id.as_uuid()).collect();
+    let rows = sqlx::query!(
+        r#"SELECT p.id           AS "id: PermissionId",
+                  p.run_id       AS "run_id: RunId",
+                  p.run_step_id  AS "run_step_id: StepId",
+                  p.session      AS "session: RelaySessionId",
+                  p.request_id,
+                  p.tool_call_id,
+                  p.summary,
+                  p.options      AS "options: Json<Vec<RelayOption>>",
+                  p.status       AS "status: PermissionStatus",
+                  p.option_id,
+                  p.answered_by  AS "answered_by: UserId",
+                  p.answered_box AS "answered_box: BoxId",
+                  p.created_at,
+                  p.answered_at,
+                  p.resolved_at,
+                  i.id           AS "item_id: ItemId",
+                  i.project_id   AS "project_id: ProjectId",
+                  i.key          AS "item_key!",
+                  i.key_prefix,
+                  i.key_number,
+                  r.queued_at    AS run_queued_at,
+                  s.position     AS step_position,
+                  s.attempt      AS step_attempt,
+                  s.fanout_index AS step_fanout_index,
+                  s.phase_name
+             FROM step_permission p
+             JOIN run r      ON r.id = p.run_id
+             JOIN item i     ON i.id = r.item_id
+             JOIN run_step s ON s.id = p.run_step_id
+            WHERE i.project_id = ANY($1) AND r.item_id IS NOT NULL
+              AND p.status = 'pending'
+              AND r.lease_owner = p.owner AND r.lease_expires_at > clock_timestamp()
+            ORDER BY p.created_at, p.id"#,
+        &projects[..],
+    )
+    .fetch_all(&store.pool)
+    .await
+    .map_err(map_sqlx)?;
+
+    let mut out: Vec<WaitingPermission> = rows
+        .into_iter()
+        .map(|row| WaitingPermission {
+            item: row.item_id,
+            project: row.project_id,
+            item_key: row.item_key,
+            key_prefix: row.key_prefix,
+            key_number: row.key_number,
+            run_queued_at: row.run_queued_at,
+            step_position: row.step_position,
+            step_attempt: row.step_attempt,
+            step_fanout_index: row.step_fanout_index,
+            phase_name: row.phase_name,
+            permission: StepPermission {
+                id: row.id,
+                run_id: row.run_id,
+                run_step_id: row.run_step_id,
+                session: row.session,
+                request_id: row.request_id,
+                tool_call_id: row.tool_call_id,
+                summary: row.summary,
+                options: row.options.0,
+                status: row.status,
+                option_id: row.option_id,
+                answered_by: row.answered_by,
+                answered_box: row.answered_box,
+                created_at: row.created_at,
+                answered_at: row.answered_at,
+                resolved_at: row.resolved_at,
+            },
+        })
+        .collect();
+    WaitingPermission::sort_canonical(&mut out);
+    Ok(out)
 }
