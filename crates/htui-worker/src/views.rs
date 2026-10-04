@@ -1654,12 +1654,13 @@ mod tests {
         let feat_10 = item("FEAT", 10, ids::PROJECT_HTUI, Status::Blocked);
 
         let feat_2 = item("FEAT", 2, ids::PROJECT_HTUI, Status::AwaitingApproval);
-        let old = parked(20, &feat_2, 1, 1);
+        // The older run takes the higher id, so a sort by run id alone fails.
+        let old = parked(21, &feat_2, 1, 1);
         let old_steps = vec![
             step(20, &old, (0, 1, 0), StepStatus::Done),
             step(21, &old, (1, 1, 0), StepStatus::AwaitingApproval),
         ];
-        let new = parked(21, &feat_2, 1, 2);
+        let new = parked(20, &feat_2, 1, 2);
         let new_gate = step(22, &new, (0, 1, 0), StepStatus::AwaitingApproval);
 
         let ana = item("ANA", 1, ids::PROJECT_HTUI, Status::InProgress);
