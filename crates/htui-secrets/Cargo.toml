@@ -1,0 +1,38 @@
+[package]
+name        = "htui-secrets"
+version     = "0.1.0"
+description = "htui's secret providers: the Infisical client behind htui-core's SecretProvider (MOD-10)"
+
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+publish.workspace      = true
+
+[dependencies]
+# MOD-10 D1: the seam (`SecretProvider`, `SecretScope`, `ResolvedSecrets`, `MachineIdentity`,
+# `SecretError`) is htui-core's. Never htui-store: the caller reads the keyring and hands the
+# provider a `MachineIdentity` (M3).
+htui-core  = { workspace = true }
+# D9: the workspace reqwest has no `json` feature. Workspace-wide builds get it only through
+# `sentry`, so `-p htui-secrets` must name it. `Cargo.lock` does not move.
+reqwest    = { workspace = true, features = ["json"] }
+# D9: named only so the `ring` provider can be installed; with `rustls-no-provider` and no
+# provider, `Client::build` panics (as `htui-agent`'s `install/http.rs` explains).
+rustls     = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+zeroize    = { workspace = true }
+# D9: the base URL's host and the list query (`query_pairs_mut`); the workspace reqwest has no
+# `query` feature. 2.5.8, the same crate `reqwest::Url` is.
+url        = { workspace = true }
+# D5: `tokio::sync::Mutex`, held across the login. `sync` is in the workspace set; named for intent.
+tokio      = { workspace = true, features = ["sync"] }
+
+[dev-dependencies]
+# `#[tokio::test]`: `macros` and `rt-multi-thread` come from the workspace set. Nothing else:
+# a dev-dependency that pulls `sentry` (aws-lc) would hide a missing `ring` install (H-1).
+tokio      = { workspace = true }
+
+[lints]
+workspace = true
