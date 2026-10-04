@@ -16,17 +16,17 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││Postgres holds the truth; every box keeps a│
 │                                                     ││read-only cache it refreshes on connect.   │
-│                                                     ││Writes are                                 │
-│                                                     ││compare-and-set on a version column, so a  │
-│                                                     ││losing edit is shown against its common    │
-│                                                     ││ancestor rather                            │
-│                                                     ││than silently dropped.                     │
+│                                                     ││Writes are compare-and-set on a version    │
+│                                                     ││column, so a losing edit is shown against  │
+│                                                     ││its common ancestor rather than silently   │
+│                                                     ││dropped.                                   │
 │                                                     ││                                           │
 │                                                     ││Item keys are minted from a per-project    │
 │                                                     ││counter table, which keeps numbers gapless │
-│                                                     ││and lets the                               │
-│                                                     ││legacy importer align the counter above the│
-│                                                     ││numbers it brings in.                      │
+│                                                     ││and lets the legacy importer align the     │
+│                                                     ││counter above the numbers it brings in.    │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │

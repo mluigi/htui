@@ -16,17 +16,17 @@ Platform · DESKTOP-HTUI · memory · 1 working · 3 waiting
 │  TOOL-1   awaiting_approval  CI matrix for the thre…││                                           │
 │▾ agy (3)     ┌ Waiting on you ─────────────────────────────────────────────────────┐y box keeps a│
 │  ANA-1    don│> ANA-2   plan 1.1  gate        gate                                 │n connect.   │
-│  FEAT-1   ope│  ANA-2   plan 1.1  permission  edit: src/lib.rs                     │             │
-│  FIX-1    ope│  FEAT-2  —         unblock     blocked, no active run: u reopens it │olumn, so a  │
-│              │                                                                     │ts common    │
+│  FEAT-1   ope│  ANA-2   plan 1.1  permission  edit: src/lib.rs                     │a version    │
+│  FIX-1    ope│  FEAT-2  —         unblock     blocked, no active run: u reopens it │own against  │
+│              │                                                                     │n silently   │
 │              │  j/k move · Enter open · Esc close                                  │             │
 │              └─────────────────────────────────────────────────────────────────────┘             │
-│                                                     ││                                           │
 │                                                     ││Item keys are minted from a per-project    │
 │                                                     ││counter table, which keeps numbers gapless │
-│                                                     ││and lets the                               │
-│                                                     ││legacy importer align the counter above the│
-│                                                     ││numbers it brings in.                      │
+│                                                     ││and lets the legacy importer align the     │
+│                                                     ││counter above the numbers it brings in.    │
+│                                                     ││                                           │
+│                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
