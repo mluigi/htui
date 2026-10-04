@@ -21,7 +21,6 @@ reqwest    = { workspace = true, features = ["json"] }
 rustls     = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
-thiserror  = { workspace = true }
 zeroize    = { workspace = true }
 # D9: the base URL's host and the list query (`query_pairs_mut`); the workspace reqwest has no
 # `query` feature. 2.5.8, the same crate `reqwest::Url` is.
