@@ -3159,6 +3159,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "htui-secrets"
+version = "0.1.0"
+dependencies = [
+ "htui-core",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "url",
+ "zeroize",
+]
+
+[[package]]
 name = "htui-store"
 version = "0.1.0"
 dependencies = [
