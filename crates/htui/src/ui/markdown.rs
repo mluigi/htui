@@ -515,6 +515,39 @@ mod tests {
     }
 
     #[test]
+    fn a_wide_character_hangs_by_cells() {
+        // LOW-6: the room and the hang are cells, not chars.
+        check(&[
+            (
+                "- 日本語 日本語 日本語",
+                14,
+                &["- 日本語", "  日本語", "  日本語"],
+            ),
+            (
+                "- 日本語 日本語 日本語",
+                15,
+                &["- 日本語 日本語", "  日本語"],
+            ),
+            // A word wider than the room breaks by cluster, under the text.
+            ("- 日本語日本語", 12, &["- 日本語日本", "  語"]),
+        ]);
+    }
+
+    #[test]
+    fn a_tab_led_marker_hangs_by_its_drawn_width() {
+        // LOW-6: `\t-` draws as 4 cells and the marker, so the text hangs at 6.
+        check(&[
+            (
+                "\t- alpha beta gamma",
+                18,
+                &["    - alpha beta", "      gamma"],
+            ),
+            // Room 9: column 0.
+            ("\t- alpha beta gamma", 15, &["    - alpha", "beta gamma"]),
+        ]);
+    }
+
+    #[test]
     fn nested_and_ordered_markers_are_kept() {
         check(&[
             (
@@ -682,6 +715,25 @@ mod tests {
         for (body, want) in cases {
             assert_eq!(lines(body, 80, &t), [Line::from(want)], "{body:?}");
         }
+    }
+
+    #[test]
+    fn inline_code_in_a_column_0_item_is_accent() {
+        // LOW-6: room 9, so the item's rows start at column 0 and keep the code's style.
+        let t = Theme::default();
+        let s = Span::styled;
+        let want = [
+            Line::from(vec![
+                s("- ", t.base),
+                s("abc", t.accent),
+                s(" defgh", t.base),
+            ]),
+            Line::from(vec![s("ij", t.accent)]),
+            Line::from(vec![s("g", t.accent), s(" h", t.base)]),
+        ];
+        let body = "- `abc` defgh `ij`  \n`g` h";
+        assert_eq!(lines(body, 11, &t), want);
+        assert_eq!(row_count(body, 11), want.len());
     }
 
     #[tokio::test]

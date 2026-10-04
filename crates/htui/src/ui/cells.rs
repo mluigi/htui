@@ -24,12 +24,13 @@
 //!
 //! Every clip with a cut mark, pad, fit and word wrap in `ui/` goes through the operations below
 //! (MOD-60 D1), so a row is never measured one way and drawn another: [`clip`], [`pad`],
-//! [`pad_left`], [`fit`], [`wrap`], [`wrap_spans`] and [`clip_spans`], all cutting at
-//! [`ELLIPSIS`] and all drawing a control character as one blank cell (D3). [`expand_tabs`]
-//! draws a `\t` as `TextArea` does (MOD-84 D6). A few walks are other operations and keep their
-//! own loop over the two measures above: the text widgets' cursor windows, `path_picker`'s cut
-//! from the left and its word wrap (which keeps controls raw; out of MOD-60's scope, D10), the
-//! graph pane's edge cut (no mark), and `concepts_search`'s unmarked clip and grapheme-only wrap.
+//! [`pad_left`], [`fit`], [`wrap`], [`wrap_spans`] and [`clip_spans`], all drawing a control
+//! character as one blank cell (D3); the clips ([`clip`], [`fit`] and [`clip_spans`]) cut at
+//! [`ELLIPSIS`]. [`expand_tabs`] draws a `\t` as `TextArea` does (MOD-84 D6). A few walks are
+//! other operations and keep their own loop over the two measures above: the text widgets' cursor
+//! windows, `path_picker`'s cut from the left and its word wrap (which keeps controls raw; out of
+//! MOD-60's scope, D10), the graph pane's edge cut (no mark), and `concepts_search`'s unmarked
+//! clip and grapheme-only wrap.
 
 use std::borrow::Cow;
 use std::iter;

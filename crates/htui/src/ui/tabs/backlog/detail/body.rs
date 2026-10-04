@@ -5,9 +5,10 @@
 //! rules, table rows, quotes and text), joins the soft-wrapped lines of a paragraph or list item,
 //! and wraps the result at the pane's width with a list item's rows hanging under its text. Blank
 //! lines, markers and structural lines are kept as written, a hard break keeps its row, and
-//! inline code is drawn in the accent style without its backticks. Nothing else is rendered: no
-//! emphasis, links or heading styles. The scroll clamps against the rows on screen at the last
-//! render's width, as the Notes pane does (MOD-13 review L1).
+//! inline code is drawn in the accent style without its backticks, except in code and table rows,
+//! which keep theirs. Nothing else is rendered: no emphasis, links or heading styles. The scroll
+//! clamps against the rows on screen at the last render's width, as the Notes pane does (MOD-13
+//! review L1).
 
 use std::borrow::Cow;
 use std::cell::Cell;
