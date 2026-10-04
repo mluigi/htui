@@ -130,8 +130,8 @@ fn a_provider_builds_with_only_this_crate_installing_ring() {
 #[test]
 fn an_http_base_url_on_a_lan_host_is_refused_before_any_request() {
     match InfisicalProvider::new(InfisicalConfig::new("http://192.168.1.10"), identity()) {
-        Err(SecretError::Config(why)) => assert!(why.contains("https"), "{why}"),
-        Err(other) => panic!("expected Config, got {other}"),
+        Err(SecretError::Config(why)) => assert!(why.contains("https"), "the reason omits https"),
+        Err(_) => panic!("expected Config"),
         Ok(_) => panic!("a plain-text LAN URL was accepted"),
     }
 }

@@ -741,9 +741,9 @@ mod tests {
         for (input, reason) in rows {
             match normalise_base_url(input) {
                 Err(SecretError::Config(why)) => {
-                    assert!(why.contains(reason), "input {input:?}: {why}");
+                    assert!(why.contains(reason), "input {input:?}: another reason");
                 }
-                other => panic!("input {input:?}: expected Config, got {other:?}"),
+                _ => panic!("input {input:?}: expected Config"),
             }
         }
         let Err(SecretError::Config(why)) = normalise_base_url("https://user:pw@example.com")
