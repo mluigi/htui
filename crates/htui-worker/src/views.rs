@@ -8,7 +8,8 @@ use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, Se
 use htui_agent::error::DriverError;
 use htui_agent::event::DoneEvent;
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, ItemId, NewDocument, Run, RunId, RunStep, SnapshotPhase, StepId,
+    DocumentHead, DocumentId, Item, ItemId, NewDocument, Run, RunId, RunStep, Scope, SnapshotPhase,
+    StepId, WaitingCandidate, WaitingPermission,
 };
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
@@ -451,6 +452,106 @@ fn unblock_case(item: &Item, runs: &[(Run, Vec<RunStep>)]) -> Result<UnblockCase
     unblock_enabled(item, &active).map_err(|err| err.to_string())
 }
 
+/// Why a row of the waiting-on-you list waits on a person (MOD-69 plan D3). Declaration order is
+/// plan D9's last sort key, so `Ord` is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WaitingReason {
+    /// A step parked at `awaiting_approval`: approve or reject it.
+    Gate,
+    /// A parked fan-out slot whose judge failed: pick a winner.
+    JudgeFailed,
+    /// A parked fan-out slot with no judge verdict: pick a winner.
+    Selection,
+    /// `u` clears the item: reopen it, follow its parked run, or resume the run.
+    Unblock,
+    /// An open permission request of a live session.
+    Permission,
+}
+
+impl WaitingReason {
+    /// The overlay's reason column.
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Gate => "gate",
+            Self::JudgeFailed => "judge failed",
+            Self::Selection => "selection",
+            Self::Unblock => "unblock",
+            Self::Permission => "permission",
+        }
+    }
+}
+
+/// One row of the waiting-on-you list: ids, strings and counts only, so `TopBarState` keeps `Eq`
+/// (MOD-69 plan D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WaitingRow {
+    /// The item, which `Enter` reveals.
+    pub item: ItemId,
+    /// `item.key`.
+    pub item_key: String,
+    /// The run the row is about; `None` for a Reopen row.
+    pub run: Option<RunId>,
+    /// The step `Enter` puts the cursor on; `None` focuses the run (or, with no run, nothing).
+    pub step: Option<StepId>,
+    /// The step as the Runs pane's slot column reads it, after the phase: `prd 0.1`,
+    /// `research 0.1/1`, `research 0.1/j`; empty when `step` is `None`.
+    pub step_label: String,
+    /// Why it waits.
+    pub reason: WaitingReason,
+    /// The reason's text: a gate or judge note, the tool, or the Unblock case's sentence.
+    pub text: String,
+}
+
+/// The waiting-on-you list and the top bar's two counts (MOD-69 plan D5, D6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WaitingView {
+    /// Active runs in scope that own no row.
+    pub working: usize,
+    /// Every row, in plan D9's order.
+    pub rows: Vec<WaitingRow>,
+    /// `false` offline: permission requests are not mirrored, so none are listed (plan D4).
+    pub permissions_known: bool,
+}
+
+impl WaitingView {
+    /// How many rows wait on a person: the top bar's second count.
+    #[must_use]
+    pub fn waiting(&self) -> usize {
+        self.rows.len()
+    }
+}
+
+/// A gate row's text when the step carries no note.
+const GATE_TEXT: &str = "gate";
+/// A promoted step's gate row text when it carries no note (MOD-69 blueprint E6).
+const PROMOTED_TEXT: &str = "promoted to chat";
+/// A Selection row's text.
+const SELECTION_TEXT: &str = "awaits selection";
+/// A Permission row's text when the request carries no summary.
+const PERMISSION_TEXT: &str = "permission";
+/// [`UnblockCase::Reopen`]'s row text.
+const REOPEN_TEXT: &str = "blocked, no active run: u reopens it";
+/// [`UnblockCase::FollowRun`]'s row text.
+const FOLLOW_TEXT: &str = "blocked over a parked run: u follows it";
+/// [`UnblockCase::Resume`]'s row text.
+const RESUME_TEXT: &str = "parked by an interrupted command: u resumes it";
+
+/// The waiting-on-you list over one candidate read (MOD-69 plan D1-D5, D9), with the engine's own
+/// guards: `verdicts` (empty heads, no live chat; heads feed only approve/accept/open, plan D3)
+/// decides a slot's `select`, `unblock_case` the item's `u`, step status a gate. `permissions` is
+/// `None` offline. `active` is `Backend::active_runs` over the same scope.
+#[must_use]
+pub fn waiting(
+    scope: &Scope,
+    active: usize,
+    candidates: &[WaitingCandidate],
+    permissions: Option<&[WaitingPermission]>,
+) -> WaitingView {
+    let _ = (scope, active, candidates, permissions);
+    todo!("MOD-69 T2")
+}
+
 /// Blueprint D212 (review H3): `Ok` unless a chat of this process is live on one of `steps` — the
 /// steps of one run — and then `ChatLive(Some)` naming it (D185 allows one live chat per process,
 /// so there is at most one).
@@ -588,14 +689,26 @@ impl AgentDriver for RefusedDriver {
 
 #[cfg(test)]
 mod tests {
-    use htui_core::fixtures::ids;
-    use htui_core::model::{GateOutcome, ItemId, RunId, RunMode, RunStatus, Status, StepStatus};
+    use chrono::Duration;
+    use htui_core::fixtures::{demo_at, demo_data, ids};
+    use htui_core::model::{
+        GateOutcome, GraphSnapshot, Item, ItemId, PermissionId, PermissionStatus, ProjectId,
+        RelaySessionId, Run, RunId, RunMode, RunStatus, RunStep, Scope, Status, StepId,
+        StepPermission, StepStatus, WaitingCandidate, WaitingPermission,
+    };
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
     use htui_orch::conformance::Orchestrate as _;
     use htui_orch::fake::{FakeOrchestrator, ScriptedStep};
     use htui_orch::{Clock as _, Command, CommandOutcome, GateAnswer, UnblockCase};
 
-    use super::{Enabled, LiveChats, verdicts};
+    use serde_json::{Value, json};
+    use uuid::Uuid;
+
+    use super::{
+        Enabled, FOLLOW_TEXT, GATE_TEXT, ItemActions, LiveChats, PERMISSION_TEXT, REOPEN_TEXT,
+        RESUME_TEXT, SELECTION_TEXT, WaitingReason, WaitingRow, WaitingView, unblock_case,
+        verdicts, waiting,
+    };
 
     /// [`verdicts`]' `u` for `item`, over the rows [`super::actions`] reads.
     async fn unblock_verdict(store: &MemStore, item: ItemId) -> Enabled {
@@ -753,5 +866,712 @@ mod tests {
             Ok(()),
             "the followed escalation reads as a crashed rejection and is resumed"
         );
+    }
+
+    // MOD-69 T2: the waiting-on-you classifier over hand-built rows, no store (blueprint §3.6).
+
+    /// The demo `FEAT` graph's phases by position, as `RUN_1`'s snapshot holds them.
+    const PHASES: [&str; 4] = ["prd", "plan", "implement", "review"];
+
+    /// The demo `feature` snapshot (`RUN_1`'s) with phase 0's `fan_out` set: 1 = no slot, 2 = a slot.
+    fn snapshot(fan_out: i32) -> Value {
+        let mut graph: GraphSnapshot = serde_json::from_value(
+            demo_data()
+                .runs
+                .into_iter()
+                .find(|run| run.id == ids::RUN_1)
+                .and_then(|run| run.graph_snapshot)
+                .expect("RUN_1 carries a snapshot"),
+        )
+        .expect("the demo snapshot decodes");
+        graph.phases[0].fan_out = fan_out;
+        serde_json::to_value(graph).expect("it encodes")
+    }
+
+    /// The demo `FEAT-2` row as `prefix-number` of `project`, at `status`, with an id of its own.
+    fn item(prefix: &str, number: i32, project: ProjectId, status: Status) -> Item {
+        let mut item = demo_data()
+            .items
+            .into_iter()
+            .find(|item| item.id == ids::HTUI_FEAT_2)
+            .expect("the demo holds FEAT-2");
+        item.id = ItemId::new();
+        item.project_id = project;
+        item.key_prefix = prefix.to_owned();
+        item.key_number = number;
+        item.key = format!("{prefix}-{number}");
+        item.status = status;
+        item
+    }
+
+    /// The demo `RUN_2` row as run `n` of `item`, queued at day 2, `hour`.
+    fn run(n: u128, item: &Item, status: RunStatus, snapshot: Option<Value>, hour: i64) -> Run {
+        let mut run = demo_data()
+            .runs
+            .into_iter()
+            .find(|run| run.id == ids::RUN_2)
+            .expect("the demo holds RUN_2");
+        run.id = RunId::from_uuid(Uuid::from_u128(n));
+        run.item_id = Some(item.id);
+        run.project_id = item.project_id;
+        run.status = status;
+        run.graph_snapshot = snapshot;
+        run.queued_at = demo_at(2, hour);
+        run
+    }
+
+    /// A parked run over the `fan_out` snapshot.
+    fn parked(n: u128, item: &Item, fan_out: i32, hour: i64) -> Run {
+        run(
+            n,
+            item,
+            RunStatus::AwaitingApproval,
+            Some(snapshot(fan_out)),
+            hour,
+        )
+    }
+
+    /// The demo `STEP_R2_PRD` row as step `n` of `run` at `(position, attempt, fanout_index)`.
+    fn step(
+        n: u128,
+        run: &Run,
+        (position, attempt, fanout): (i32, i32, i32),
+        status: StepStatus,
+    ) -> RunStep {
+        let mut step = demo_data()
+            .steps
+            .into_iter()
+            .find(|step| step.id == ids::STEP_R2_PRD)
+            .expect("the demo holds STEP_R2_PRD");
+        step.id = StepId::from_uuid(Uuid::from_u128(n));
+        step.run_id = run.id;
+        step.position = position;
+        step.attempt = attempt;
+        step.fanout_index = fanout;
+        step.phase_name = PHASES[usize::try_from(position).expect("a demo position")].to_owned();
+        step.status = status;
+        step
+    }
+
+    /// `step`, rejected at its gate: `failed` + `rejected`.
+    fn rejected(mut step: RunStep) -> RunStep {
+        step.gate_outcome = Some(GateOutcome::Rejected);
+        step.gate_note = Some("not like this".to_owned());
+        step
+    }
+
+    fn scope(projects: &[ProjectId]) -> Scope {
+        Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: projects.to_vec(),
+        }
+    }
+
+    /// An open permission request of `step`, created `created_minute` minutes into day 2.
+    fn permission(
+        item: &Item,
+        run: &Run,
+        step: &RunStep,
+        summary: Option<&str>,
+        created_minute: i64,
+    ) -> WaitingPermission {
+        WaitingPermission {
+            item: item.id,
+            project: item.project_id,
+            item_key: item.key.clone(),
+            key_prefix: item.key_prefix.clone(),
+            key_number: item.key_number,
+            run_queued_at: run.queued_at,
+            step_position: step.position,
+            step_attempt: step.attempt,
+            step_fanout_index: step.fanout_index,
+            phase_name: step.phase_name.clone(),
+            permission: StepPermission {
+                id: PermissionId::new(),
+                run_id: run.id,
+                run_step_id: step.id,
+                session: RelaySessionId::new(),
+                request_id: format!("req-{created_minute}"),
+                tool_call_id: None,
+                summary: summary.map(str::to_owned),
+                options: vec![],
+                status: PermissionStatus::Pending,
+                option_id: None,
+                answered_by: None,
+                answered_box: None,
+                created_at: demo_at(2, 0) + Duration::minutes(created_minute),
+                answered_at: None,
+                resolved_at: None,
+            },
+        }
+    }
+
+    fn candidate(item: &Item, runs: Vec<(Run, Vec<RunStep>)>) -> WaitingCandidate {
+        WaitingCandidate {
+            item: item.clone(),
+            runs,
+        }
+    }
+
+    /// `verdicts` over the candidate as the list reads it: no heads, no live chat.
+    fn verdict(candidate: &WaitingCandidate) -> ItemActions {
+        verdicts(&candidate.item, &candidate.runs, &[], &LiveChats::default())
+    }
+
+    /// The list of one `htui` candidate, online with no permission, under two active runs.
+    fn one(candidate: &WaitingCandidate) -> WaitingView {
+        waiting(
+            &scope(&[ids::PROJECT_HTUI]),
+            2,
+            std::slice::from_ref(candidate),
+            Some(&[]),
+        )
+    }
+
+    /// The row the list holds for `candidate` at `run`/`step`.
+    fn row(
+        candidate: &WaitingCandidate,
+        run: Option<RunId>,
+        step: Option<StepId>,
+        step_label: &str,
+        reason: WaitingReason,
+        text: &str,
+    ) -> WaitingRow {
+        WaitingRow {
+            item: candidate.item.id,
+            item_key: candidate.item.key.clone(),
+            run,
+            step,
+            step_label: step_label.to_owned(),
+            reason,
+            text: text.to_owned(),
+        }
+    }
+
+    /// An escalated item: `blocked` over a parked run whose `plan` was rejected.
+    fn escalation() -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Blocked);
+        let run = parked(1, &item, 1, 1);
+        let steps = vec![
+            step(1, &run, (0, 1, 0), StepStatus::Done),
+            rejected(step(2, &run, (1, 1, 0), StepStatus::Failed)),
+        ];
+        candidate(&item, vec![(run, steps)])
+    }
+
+    /// A rejection a crash left parked: the item and run `awaiting_approval` over `failed` +
+    /// `rejected`.
+    fn crashed_rejection() -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let run = parked(1, &item, 1, 1);
+        let steps = vec![rejected(step(1, &run, (0, 1, 0), StepStatus::Failed))];
+        candidate(&item, vec![(run, steps)])
+    }
+
+    /// A `blocked` item with no run.
+    fn reopen() -> WaitingCandidate {
+        candidate(
+            &item("FEAT", 1, ids::PROJECT_HTUI, Status::Blocked),
+            Vec::new(),
+        )
+    }
+
+    /// An item at `status` over a run parked at `prd`'s gate.
+    fn over_a_gate(status: Status) -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, status);
+        let run = parked(1, &item, 1, 1);
+        let steps = vec![step(1, &run, (0, 1, 0), StepStatus::AwaitingApproval)];
+        candidate(&item, vec![(run, steps)])
+    }
+
+    /// A parked fan-out slot at `prd`: two `done` candidates and, when given, a `failed` judge
+    /// with that outcome and note.
+    fn slot(judge: Option<(Option<GateOutcome>, &str)>) -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let run = parked(1, &item, 2, 1);
+        let mut steps = vec![
+            step(1, &run, (0, 1, 0), StepStatus::Done),
+            step(2, &run, (0, 1, 1), StepStatus::Done),
+        ];
+        if let Some((outcome, note)) = judge {
+            let mut judge = step(3, &run, (0, 1, -1), StepStatus::Failed);
+            judge.gate_outcome = outcome;
+            judge.gate_note = Some(note.to_owned());
+            steps.push(judge);
+        }
+        candidate(&item, vec![(run, steps)])
+    }
+
+    fn run_of(candidate: &WaitingCandidate) -> &Run {
+        &candidate.runs[0].0
+    }
+
+    fn step_of(candidate: &WaitingCandidate, index: usize) -> &RunStep {
+        &candidate.runs[0].1[index]
+    }
+
+    #[test]
+    fn a_parked_gate_without_output_is_one_gate_row() {
+        let gate = over_a_gate(Status::AwaitingApproval);
+        let step = step_of(&gate, 0);
+
+        let view = one(&gate);
+
+        assert_eq!(
+            view.rows,
+            [row(
+                &gate,
+                Some(run_of(&gate).id),
+                Some(step.id),
+                "prd 0.1",
+                WaitingReason::Gate,
+                GATE_TEXT
+            )]
+        );
+        assert_eq!(view.working, 1, "two active runs, one of them owns a row");
+        assert!(
+            verdict(&gate).steps[&step.id].approve.is_err(),
+            "approve greys without the output, and the gate still waits on a person"
+        );
+    }
+
+    #[test]
+    fn a_judge_failed_slot_is_a_judge_row_not_a_selection_row() {
+        let slot = slot(Some((Some(GateOutcome::Rejected), "judge: tie")));
+        let judge = step_of(&slot, 2);
+
+        assert_eq!(
+            one(&slot).rows,
+            [row(
+                &slot,
+                Some(run_of(&slot).id),
+                Some(judge.id),
+                "prd 0.1/j",
+                WaitingReason::JudgeFailed,
+                "judge: tie"
+            )]
+        );
+    }
+
+    #[test]
+    fn an_interrupted_judge_is_a_judge_row() {
+        let slot = slot(Some((None, "interrupted")));
+        let judge = step_of(&slot, 2);
+
+        assert_eq!(
+            one(&slot).rows,
+            [row(
+                &slot,
+                Some(run_of(&slot).id),
+                Some(judge.id),
+                "prd 0.1/j",
+                WaitingReason::JudgeFailed,
+                "interrupted"
+            )]
+        );
+    }
+
+    #[test]
+    fn an_unjudged_parked_slot_is_a_selection_row_on_its_first_candidate() {
+        let slot = slot(None);
+        let first = step_of(&slot, 0);
+
+        assert_eq!(
+            one(&slot).rows,
+            [row(
+                &slot,
+                Some(run_of(&slot).id),
+                Some(first.id),
+                "prd 0.1/0",
+                WaitingReason::Selection,
+                SELECTION_TEXT
+            )]
+        );
+        let verdict = verdict(&slot);
+        assert!(
+            slot.runs[0]
+                .1
+                .iter()
+                .any(|step| verdict.steps[&step.id].select.is_ok()),
+            "the pane enables `select` on the slot"
+        );
+    }
+
+    #[test]
+    fn a_resolved_selection_is_no_row() {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let run = parked(1, &item, 2, 1);
+        let mut winner = step(1, &run, (0, 1, 0), StepStatus::Done);
+        winner.selected = Some(true);
+        let mut loser = step(2, &run, (0, 1, 1), StepStatus::Superseded);
+        loser.selected = Some(false);
+        let gate = step(3, &run, (1, 1, 0), StepStatus::AwaitingApproval);
+        let resolved = candidate(
+            &item,
+            vec![(run.clone(), vec![winner, loser, gate.clone()])],
+        );
+
+        assert_eq!(
+            one(&resolved).rows,
+            [row(
+                &resolved,
+                Some(run.id),
+                Some(gate.id),
+                "plan 1.1",
+                WaitingReason::Gate,
+                GATE_TEXT
+            )]
+        );
+    }
+
+    #[test]
+    fn an_escalation_is_one_follow_run_row_and_no_gate_row() {
+        let escalation = escalation();
+
+        assert_eq!(
+            one(&escalation).rows,
+            [row(
+                &escalation,
+                Some(run_of(&escalation).id),
+                None,
+                "",
+                WaitingReason::Unblock,
+                FOLLOW_TEXT
+            )]
+        );
+        assert_eq!(verdict(&escalation).unblock, Ok(()));
+    }
+
+    #[test]
+    fn a_person_blocked_item_over_a_parked_gate_is_a_gate_row_and_an_unblock_row() {
+        let blocked = over_a_gate(Status::Blocked);
+        let run = run_of(&blocked).id;
+
+        assert_eq!(
+            one(&blocked).rows,
+            [
+                row(
+                    &blocked,
+                    Some(run),
+                    Some(step_of(&blocked, 0).id),
+                    "prd 0.1",
+                    WaitingReason::Gate,
+                    GATE_TEXT
+                ),
+                row(
+                    &blocked,
+                    Some(run),
+                    None,
+                    "",
+                    WaitingReason::Unblock,
+                    FOLLOW_TEXT
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_open_item_under_a_parked_gate_is_a_gate_row_only() {
+        let open = over_a_gate(Status::Open);
+
+        assert_eq!(
+            one(&open).rows,
+            [row(
+                &open,
+                Some(run_of(&open).id),
+                Some(step_of(&open, 0).id),
+                "prd 0.1",
+                WaitingReason::Gate,
+                GATE_TEXT
+            )]
+        );
+        assert!(verdict(&open).unblock.is_err());
+    }
+
+    #[test]
+    fn a_blocked_item_with_no_run_is_a_reopen_row() {
+        let reopen = reopen();
+
+        assert_eq!(
+            one(&reopen).rows,
+            [row(
+                &reopen,
+                None,
+                None,
+                "",
+                WaitingReason::Unblock,
+                REOPEN_TEXT
+            )]
+        );
+    }
+
+    #[test]
+    fn a_crashed_rejection_is_a_resume_row() {
+        let crashed = crashed_rejection();
+
+        assert_eq!(
+            one(&crashed).rows,
+            [row(
+                &crashed,
+                Some(run_of(&crashed).id),
+                None,
+                "",
+                WaitingReason::Unblock,
+                RESUME_TEXT
+            )]
+        );
+    }
+
+    #[test]
+    fn a_snapshot_that_does_not_decode_keeps_its_gate_row_and_loses_the_rest() {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Blocked);
+        let run = run(
+            1,
+            &item,
+            RunStatus::AwaitingApproval,
+            Some(json!({ "v": 999 })),
+            1,
+        );
+        let gate = step(1, &run, (0, 1, 0), StepStatus::AwaitingApproval);
+        let undecodable = candidate(&item, vec![(run.clone(), vec![gate.clone()])]);
+
+        assert_eq!(
+            one(&undecodable).rows,
+            [row(
+                &undecodable,
+                Some(run.id),
+                Some(gate.id),
+                "prd 0.1",
+                WaitingReason::Gate,
+                GATE_TEXT
+            )]
+        );
+        assert!(verdict(&undecodable).unblock.is_err());
+    }
+
+    #[test]
+    fn a_promoted_step_without_a_note_reads_promoted_to_chat() {
+        let mut promoted = over_a_gate(Status::AwaitingApproval);
+        promoted.runs[0].1[0].promoted_at = Some(demo_at(2, 3));
+
+        assert_eq!(one(&promoted).rows[0].text, super::PROMOTED_TEXT);
+
+        promoted.runs[0].1[0].gate_note = Some("look at the tests".to_owned());
+        assert_eq!(one(&promoted).rows[0].text, "look at the tests");
+    }
+
+    #[test]
+    fn permissions_are_rows_online_and_unknown_offline() {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let run = run(1, &item, RunStatus::Running, Some(snapshot(1)), 1);
+        let live = step(1, &run, (0, 1, 0), StepStatus::Running);
+        let perms = [
+            permission(&item, &run, &live, None, 0),
+            permission(&item, &run, &live, Some("edit: src/main.rs"), 1),
+        ];
+        let scope = scope(&[ids::PROJECT_HTUI]);
+
+        let online = waiting(&scope, 1, &[], Some(&perms));
+        let rows: Vec<(WaitingReason, Option<RunId>, Option<StepId>, &str, &str)> = online
+            .rows
+            .iter()
+            .map(|row| {
+                (
+                    row.reason,
+                    row.run,
+                    row.step,
+                    row.step_label.as_str(),
+                    row.text.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            [
+                (
+                    WaitingReason::Permission,
+                    Some(run.id),
+                    Some(live.id),
+                    "prd 0.1",
+                    "edit: src/main.rs"
+                ),
+                (
+                    WaitingReason::Permission,
+                    Some(run.id),
+                    Some(live.id),
+                    "prd 0.1",
+                    PERMISSION_TEXT
+                ),
+            ]
+        );
+        assert!(online.permissions_known);
+        assert_eq!(online.working, 0);
+
+        let offline = waiting(&scope, 1, &[], None);
+        assert!(offline.rows.is_empty());
+        assert!(!offline.permissions_known);
+        assert_eq!(offline.working, 1);
+    }
+
+    #[test]
+    fn counts_split_working_from_waiting_and_never_count_a_run_twice() {
+        let reopen = reopen();
+        let blocked = over_a_gate(Status::Blocked);
+        let busy = item("FIX", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let r2 = run(2, &busy, RunStatus::Running, Some(snapshot(1)), 2);
+        let live = step(2, &r2, (0, 1, 0), StepStatus::Running);
+        let perms = [permission(&busy, &r2, &live, Some("bash: ls"), 0)];
+        let scope = scope(&[ids::PROJECT_HTUI]);
+        let candidates = [reopen, blocked];
+
+        let view = waiting(&scope, 5, &candidates, Some(&perms));
+        assert_eq!(view.waiting(), 4, "Reopen, gate, FollowRun, permission");
+        assert_eq!(view.working, 5 - 2, "R1 owns two rows and counts once");
+
+        assert_eq!(
+            waiting(&scope, 1, &candidates, Some(&perms)).working,
+            0,
+            "saturating"
+        );
+    }
+
+    #[test]
+    fn rows_sort_by_project_key_run_step_then_reason() {
+        let agy = item("FEAT", 1, ids::PROJECT_AGY, Status::AwaitingApproval);
+        let agy_run = parked(30, &agy, 1, 1);
+        let agy_gate = step(30, &agy_run, (0, 1, 0), StepStatus::AwaitingApproval);
+
+        let feat_10 = item("FEAT", 10, ids::PROJECT_HTUI, Status::Blocked);
+
+        let feat_2 = item("FEAT", 2, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let old = parked(20, &feat_2, 1, 1);
+        let old_steps = vec![
+            step(20, &old, (0, 1, 0), StepStatus::Done),
+            step(21, &old, (1, 1, 0), StepStatus::AwaitingApproval),
+        ];
+        let new = parked(21, &feat_2, 1, 2);
+        let new_gate = step(22, &new, (0, 1, 0), StepStatus::AwaitingApproval);
+
+        let ana = item("ANA", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let ana_run = run(10, &ana, RunStatus::Running, Some(snapshot(1)), 3);
+        let ana_step = step(10, &ana_run, (0, 1, 0), StepStatus::Running);
+
+        let candidates = [
+            candidate(&agy, vec![(agy_run.clone(), vec![agy_gate])]),
+            candidate(&feat_10, Vec::new()),
+            candidate(
+                &feat_2,
+                vec![
+                    (new.clone(), vec![new_gate.clone()]),
+                    (old.clone(), old_steps),
+                ],
+            ),
+        ];
+        let perms = [
+            permission(&feat_2, &new, &new_gate, Some("edit: a"), 0),
+            permission(&ana, &ana_run, &ana_step, Some("edit: b"), 1),
+        ];
+
+        let view = waiting(
+            &scope(&[ids::PROJECT_HTUI, ids::PROJECT_AGY]),
+            4,
+            &candidates,
+            Some(&perms),
+        );
+
+        let keys: Vec<(ProjectId, &str, Option<RunId>, &str, WaitingReason)> = view
+            .rows
+            .iter()
+            .map(|row| {
+                let project = if row.item == agy.id {
+                    ids::PROJECT_AGY
+                } else {
+                    ids::PROJECT_HTUI
+                };
+                (
+                    project,
+                    row.item_key.as_str(),
+                    row.run,
+                    row.step_label.as_str(),
+                    row.reason,
+                )
+            })
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                (
+                    ids::PROJECT_HTUI,
+                    "ANA-1",
+                    Some(ana_run.id),
+                    "prd 0.1",
+                    WaitingReason::Permission
+                ),
+                (
+                    ids::PROJECT_HTUI,
+                    "FEAT-2",
+                    Some(old.id),
+                    "plan 1.1",
+                    WaitingReason::Gate
+                ),
+                (
+                    ids::PROJECT_HTUI,
+                    "FEAT-2",
+                    Some(new.id),
+                    "prd 0.1",
+                    WaitingReason::Gate
+                ),
+                (
+                    ids::PROJECT_HTUI,
+                    "FEAT-2",
+                    Some(new.id),
+                    "prd 0.1",
+                    WaitingReason::Permission
+                ),
+                (
+                    ids::PROJECT_HTUI,
+                    "FEAT-10",
+                    None,
+                    "",
+                    WaitingReason::Unblock
+                ),
+                (
+                    ids::PROJECT_AGY,
+                    "FEAT-1",
+                    Some(agy_run.id),
+                    "prd 0.1",
+                    WaitingReason::Gate
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn unblock_case_is_verdicts_unblock_with_the_case_kept() {
+        let escalation = escalation();
+        let crashed = crashed_rejection();
+        let reopen = reopen();
+        let open = over_a_gate(Status::Open);
+
+        for candidate in [&escalation, &crashed, &reopen, &open] {
+            assert_eq!(
+                unblock_case(&candidate.item, &candidate.runs).map(drop),
+                verdict(candidate).unblock,
+                "{candidate:?}"
+            );
+        }
+        assert_eq!(
+            unblock_case(&escalation.item, &escalation.runs),
+            Ok(UnblockCase::FollowRun(run_of(&escalation).id))
+        );
+        assert_eq!(
+            unblock_case(&crashed.item, &crashed.runs),
+            Ok(UnblockCase::Resume(run_of(&crashed).id))
+        );
+        assert_eq!(
+            unblock_case(&reopen.item, &reopen.runs),
+            Ok(UnblockCase::Reopen)
+        );
+        assert!(unblock_case(&open.item, &open.runs).is_err());
     }
 }
