@@ -4,7 +4,7 @@
 **Selected Milestone**: 5 - ACP resume (R-48, ANA-27 §5.1 T5)
 **Complexity**: Medium
 **Routing**: PRD path, M5 planned on its own (maintainer-confirmed 2026-10-03); ultracode not needed.
-**Status**: confirmed 2026-10-03 (fact-checked: 16 claims, 8 ✓, 8 amended); blueprint `.claude/plans/mod-37-acp-resume.blueprint.md` (amendments A-1..A-11, A-7 decided: latest banner); implementing
+**Status**: complete 2026-10-04 (`1b31282e`..`736edef8`); review M-1/L-1/L-2/L-4/L-5/L-6/N-1/N-4 applied
 
 ## Summary
 A promoted ACP step resumes its own agent session instead of always getting the handoff prompt.

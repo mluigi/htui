@@ -53,11 +53,10 @@ window, and the ANA-27 agent-session deadline. Cites `R-ORCH-3`, `R-ORCH-5`, `R-
 | 2 | Store and engine correctness | Crash and store-parity windows closed; override copies record their agent (R-5, R-6, R-29, R-30, R-31 remainder, R-32); R-32's D131 half re-deferred | complete | `.claude/plans/mod-37-store-engine.plan.md` |
 | 3 | Git cost | Reconciling a diff opens the repository once (R-37) | complete | `.claude/plans/mod-37-git-cost.plan.md` |
 | 4 | Deadline and sessions | A hung agent session is cancelled at the step deadline; no other run can prepare a promoted chat's checkout; an offline swap no longer strands a walk (deadline, R-49, R-46); R-49 closed by overlap admission plus a pin | complete | `.claude/plans/mod-37-deadline-sessions.plan.md` |
-| 5 | ACP resume | A promoted ACP step resumes its context, or says it did not (R-48, ANA-27 T5) | in-progress | `.claude/plans/mod-37-acp-resume.plan.md` |
+| 5 | ACP resume | A promoted ACP step resumes its context, or says it did not (R-48, ANA-27 T5); a failed resume reports and opens a labelled handoff | complete | `.claude/plans/mod-37-acp-resume.plan.md` |
 
 ## Open Questions
-- [ ] R-48: land the full ACP `session/load`, or only the ANA-27 T5 "context not carried" note and
-  defer `session/load`? Decide in M5's plan.
+- [x] R-48: full ACP resume plus the T5 note (M5 plan, maintainer 2026-10-03).
 - [ ] R-55: confirm it stays carried as documentation only (current reading) rather than gaining a
   limits re-read hook now.
 - [ ] M1 breadth: R-3 touches three summary builders and the mirror; decide in M1's plan whether
@@ -72,4 +71,4 @@ window, and the ANA-27 agent-session deadline. Cites `R-ORCH-3`, `R-ORCH-5`, `R-
 | ACP `session/load` is larger than one milestone | M | M | the T5 note is the fallback |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: complete 2026-10-04 — all five milestones landed; write-up `docs/decisions/mod/mod-37.md`.*

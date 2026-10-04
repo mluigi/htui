@@ -1240,6 +1240,14 @@ the handoff path, and ACP `session/load` is carried in MOD-37. A resumed session
 `htui`'s own one-sentence follow-up (`promote::RESUME_OPENING`), recorded as the `follow_up` at the
 next `turn`. Either way the step's `prompt_digest` and `trim_record` are never rewritten.
 
+*Amended by MOD-37 milestone 5, 2026-10-03 (R-48, ANA-27 T5, `docs/decisions/mod/mod-37.md`):* the
+second path now serves both transports. An ACP step resumes through `session/resume`, or else
+`session/load` with the replay discarded. A promotion resumes the step's **latest**
+`session_started` banner (amending D192). A resume that fails on the wire is reported as a
+`resume_failed` row, then opens the handoff prompt in the same bind. `run_step.opening`
+(`resumed` | `handoff` | `resume_failed`) records which way the chat opened, and the Runs pane says
+"context not carried; handoff prompt only" for the latter two.
+
 The third path is what makes `R-ORCH-5` true for every agent rather than only for resumable ones.
 Claude Code's Explore and Plan agents "return no agent ID, so Claude can't resume them"
 (https://code.claude.com/docs/en/sub-agents), and an ACP agent may advertise neither `loadSession`

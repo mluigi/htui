@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-03):** **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
+**Current status (2026-10-04):** **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator
+hardening closed in five milestones (run state, store and engine correctness, git cost, deadline and
+sessions, ACP resume). A promoted ACP step now resumes its own session (`session/resume`, else
+`session/load` with the replay discarded), and a promotion resumes the step's latest banner. A
+resume that fails is reported and opens the handoff prompt in the same bind. `run_step.opening`
+(migration 0014) records which way the chat opened, and the Runs pane and the Chat tab say "context
+not carried; handoff prompt only". The four re-deferred risks are MOD-76.
+Before it, **MOD-71 is done** (`docs/decisions/mod/mod-71.md`): the Runs
 flow view takes the mouse. A click on a node moves the shared cursor, a drag on empty canvas pans,
 and the wheel zooms at the pointer; nodes stay read-only. Capture is on only while that view is
 shown in browse mode with a run to draw. Everywhere else htui is keyboard-only and the terminal
@@ -22,92 +29,6 @@ keeps its own text selection (in the flow view, the terminal's bypass modifier, 
 still selects). Every terminal give-back (restore, panic hook, `$EDITOR`) turns capture off. A pan
 survives the active-run poll. No migration, no new crate (`rataflow` gained its `crossterm`
 feature). Follow-ups are MOD-74.
-Before it, **MOD-13 is done** (`docs/decisions/mod/mod-13.md`): the Backlog
-filters and edits items. `f`/`F` filter by status, project, tags and "ready here"; `N`/`e` mint and
-edit through ANA-9 §7.1/§7.2, and a stale edit opens a three-way divergence view that resolves to a
-`divergence_resolution` revision; Ctrl+E hands long text to `$EDITOR`. Milestone 5 made the Notes
-and Docs sub-tabs writable: `a` adds a note, and in Docs `a` writes a hand-written document of any
-kind (an editable `summary` included) and `v` a new version prefilled from the latest. Every write
-is refused offline before any read; a write whose answer may have been lost settles itself on a
-re-read and never invites a duplicate. Conformance case 135; no migration. It spawned **MOD-73**
-(hand-written versions as step inputs).
-Before it, **MOD-72 is done** (`docs/decisions/mod/mod-72.md`): every node of
-the Runs flow view has a third line counting its step's tool calls by kind (`⚒ read×5 exec×3 +1`).
-`ReadStore::tool_call_counts` answers on Postgres, the mirror and `MemStore`; the pane asks
-`StoreRequest::ToolCalls` after each `Runs` reply only while the flow is shown. Nodes are 20×5. No
-migration, no new crate, one new `.sqlx` entry.
-Before it, **MOD-60 is done** (`docs/decisions/mod/mod-60.md`): every
-hand-laid-out row in the TUI measures, pads, clips and wraps in terminal cells, the way ratatui draws
-them, so CJK, emoji, combining marks and halfwidth kana no longer overrun a pane or push a column out
-of line. `ui::cells` gained `clip`/`pad`/`pad_left`/`fit`/`wrap`/`clip_spans` and ~16 local copies
-went; `cell_width` is now a per-grapheme sum (B10); the requirements tree elides a narrow project
-name before its ` · read-only` marker; the MOD-13 divergence columns stay fixed-width. No migration,
-no new crate, no snapshot moved.
-Earlier completions are in `DECISIONS.md`.
-**Live coordinates.** The migrations are `0001_init`, `0002_agent_probe`, `0003_orchestration`,
-`0004_max_agents_per_run_default`, `0005_box_identity` (MOD-7 milestone 1), `0006_requirements`
-(MOD-38), `0007_skill_attachments` (MOD-9 milestone 2), `0008_trim_record_v3` (MOD-9 milestone 5,
-comment only) `0009_agent_box_user_off` (MOD-23), `0010_prompt_digest_undigested` (MOD-33, comment only)
-`0011_permission_relay` (MOD-42), `0012_persona` (MOD-26 milestone 1) and `0013_persona_phase_index`
-(MOD-26 milestone 2, index only; cache: `0001`..`0004`), so **the next migration is `0014`** (cache: `0005`).
-`max_agents_per_run` defaults to **8** (`0004` moves an untouched seeded `6`). Pins after MOD-7
-(done, all four milestones), MOD-38, MOD-9 (done, all five milestones), MOD-40, MOD-39, MOD-64,
-MOD-23, MOD-22, MOD-41, MOD-59, MOD-24, MOD-49, MOD-28, MOD-72 and MOD-26 (done, both milestones)
-(re-counted 2026-10-01; `TABLES` and commented columns 2026-10-02; `CASES`, `READ_CASES`, `htui-orch`
-`CASES`, `StoreRequest`/`StoreReply`, the `REQUEST_NAMES` below, `.sqlx`, snapshots and Settings
-sections 2026-10-03): store conformance `CASES` 134, `READ_CASES` 14, `htui-orch` `CASES` 92,
-`GraphSource` 7 methods, `StoreRequest` 105, `StoreReply` 62, `AuthFrame` 11, `hierarchy::REQUEST_NAMES` 13,
-`skills::REQUEST_NAMES` 6, `persona_settings::REQUEST_NAMES` 5, `TABLES` 42, 322 `.sqlx` files, 143
-`crates/htui/tests/snapshots`, six workspace members (`htui-worker` since MOD-41),
-`MIRRORED_TABLES` 21, eight Settings sections (71 of the 100 strip columns), 44 pinned commented
-columns (`tests/migrations.rs`), and `run_step.trim_record` at `v: 4` (MOD-33 `undigested`) with `skill_choices` (a
-`matched` choice carries `path`, `<repo>:<path>`); `Isolator` gained `changed_paths` (MOD-9 D119).
-Excerpts reach phase prompts since MOD-7 milestone 4, so a phase-prompt digest recorded before
-2026-09-26 does not compare with a later one; since MOD-9 milestone 5 (2026-09-30) a matched `glob`
-skill renders and a retry's excerpts rank the previous attempt's changed paths, so those digests
-move too; handoff digests are unchanged. Since MOD-33 (2026-09-30) a phase prompt digests
-`[hostname]` in place of the box's hostname, so every box-bearing phase digest moved once more.
-`cargo doc --workspace --no-deps --keep-going` shows exactly six baseline errors (`htui-core`
-`MIRRORED_TABLES`; `htui-store` `step_exists`, `HashEmbedder` in `embed.rs`, and three private
-links MOD-38 added in `pg/write.rs`: `set_requirement_spec` to `cas_miss`, `amend_requirement` and
-`withdraw_requirement` to `revise_requirement`; the count read five before 2026-09-26, but
-`HashEmbedder` already failed at `98e6d2f`). With `-D warnings`, `cargo doc` also fails on four
-pre-existing private-item links (`store/traits.rs:1251`, `agent_worker.rs:729`,
-`ui/text_area.rs:18`, `ui/text_field.rs:5`; recorded at MOD-9's close, `docs/decisions/mod/mod-9.md`). `git` ≥ 2.33.0 is a runtime dependency
-of the `worktree` isolation mode and of reconciliation. **Production `approve` and `accept` are
-greyed and every production judge fails until MOD-11**, because no agent can write its phase's
-`output_kind` document yet, so production fan-outs go to the human (`s` in the Runs pane).
-Adapters install under `HTUI_AGENTS_ROOT`, default
-`dirs::data_local_dir()/htui/agents`; `HTUI_TOOL_<NAME>` still overrides everything. Dev Postgres
-via `compose.yaml` (port 5439, loopback only since TOOL-7); tests need
-`HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres` and the
-`USERNAME=htui-ci` prefix of TOOL-2 (`docs/decisions/mod/mod-6.md`). Under load the dev Postgres
-goes into recovery (`57P03`) and a failure seen then is re-run alone before it is believed;
-`htui-store` `tests/cache.rs::the_spawned_refresher_passes_and_follows_the_scope` has timed out
-once that way.
-**Live coordinates the agent work left, kept here because open items depend on them.** `claude` on
-this box is **2.1.267** (2.1.272 at the last estimator re-measure); the seed passes no `--bare`;
-`--permission-prompts none` is the deterministic way to provoke a policy denial, and
-`~/.claude/settings.json`'s allow list (`Bash(ls *)`) is why the obvious way does not. The CLI
-reports `claude_code_version` on `system/init` (there is no `version` key), re-emits `system/init`
-on **every turn** of a multi-turn session, and emits a `system/status` row per turn that
-`docs/ANA-4.md` §6.2 does not name. This box's live quota blob is `status: "allowed_warning"` at
-0.77 utilization; MOD-4 milestone 4 (D61) made `allowed_warning` selectable, so the `claude-cli`
-row is no longer skipped for it. `agy_acp_server` **1.1.1** is installed here and emits **no `usage_update`
-whatsoever**, which is why its seed keeps `quota.source: "none"` and why the GPT/Gemini estimator
-row cannot be measured on this box (MOD-2 F-17). `--uid=` is **mandatory** for it. Its credentials
-live in `$GEMINI_HOME/antigravity-acp/acp_token.json`, a sibling of and separate from the `agy`
-CLI's own directory (MOD-21).
-**Concluded analyses the open items lean on:** ANA-10 (`docs/decisions/ana/ana-10.md`) — **its
-verdict is withdrawn**, see MOD-25 (`docs/decisions/mod/mod-25.md`); the document stays in the tree
-as the analysis that was done and not taken, and anything leaning on its local-only half is stale;
-ANA-5 (`docs/decisions/ana/ana-5.md`) — the prompt contract, no new crate, no new migration, with
-ANA-17 (`docs/decisions/ana/ana-17.md`) settling its block separator and keeping one frame for
-every model;
-ANA-2 (`docs/decisions/ana/ana-2.md`) — step graphs, three compare-and-set status tables,
-`htui-orch`, now built (MOD-4, `docs/decisions/mod/mod-4.md`). MOD-11 and MOD-12 can start
-now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decisions/mod/mod-14.md`; MOD-15 is done, `docs/decisions/mod/mod-15.md`; MOD-7 is done,
-`docs/decisions/mod/mod-7.md`; MOD-9 is done, `docs/decisions/mod/mod-9.md`).
 
 ---
 
@@ -131,110 +52,19 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
 ### Next features
-- [ ] **MOD-37 - Orchestrator hardening follow-ups** (from MOD-4). `R-ORCH-3`, `R-ORCH-5`,
-  `R-ORCH-8`, `R-ORCH-9`, `R-TUI-4`, `R-HIS-1`, `R-NF-3`. MOD-4 closed with these risks carried and
-  no other item owns them. Each is small, known and recorded; none blocks a manual run today. Pick
-  them off singly or in batches. Sources are under `.claude/plans/mod-4-orch-*`, and the context is
-  in the MOD-4 write-up's "Carried" section (`docs/decisions/mod/mod-4.md`).
-  PRD `.claude/prds/mod-37-orchestrator-hardening.prd.md`, five milestones.
-  **Phase 1 landed (`19ca229`..`151c87e`, 2026-10-02):** run state and visibility. R-3, R-40,
-  R-41, R-51 and T7 are closed. R-44 and R-53 are re-deferred with reasons. Plan and blueprint are
-  `.claude/plans/mod-37-run-state.plan.md` and `.claude/plans/mod-37-run-state.blueprint.md`. The review left one LOW unfixed: the Chat
-  tab's `followed` stays set after a failed bind until the next `Promoted` overwrites it, which is
-  harmless.
-  **Phase 2 landed (`1d1118f3`..`7df69d33`, 2026-10-02):** store and engine correctness. R-5, R-6,
-  R-29, R-30 and the R-31 remainder are closed; R-32 is half closed (D138's `part_way`) and its
-  D131 half is re-deferred. Plan and blueprint are `.claude/plans/mod-37-store-engine.plan.md` and
-  `.claude/plans/mod-37-store-engine.blueprint.md`. Maintainer-accepted side effect of R-31:
-  `Unblock` on a followed review-loop escalation now resumes it, re-runs the loop and, with nothing
-  changed, escalates again (it used to be refused); a test pins it. rust-reviewer approved; its
-  three LOWs and one NIT were applied. Two NITs were left: `unblock_enabled`'s bare `bool` and a
-  `Vec<String>` copy in the `phase_agent` insert.
-  **Phase 3 landed (`7cf455a8`..`a387249c`, 2026-10-02):** git cost. R-37 is closed. Plan and
-  blueprint are `.claude/plans/mod-37-git-cost.plan.md` and
-  `.claude/plans/mod-37-git-cost.blueprint.md`. rust-reviewer approved; its two LOWs and three NITs
-  were applied, and one NIT (a hash parsed twice, which is negligible) was left. Not in R-37 and not
-  changed: `RealIsolator`'s reconcile still opens the checkout once per `blocking` hop
-  (`isolate/real.rs`, `head`, `merge_of`, `is_ancestor` twice) under the admin lock.
-  **Phase 4 landed (`68a7c7e9`..`1787fd69`, 2026-10-03):** deadline and sessions. The ANA-27 T4
-  deadline, R-46 and R-49 are closed. Plan and blueprint are
-  `.claude/plans/mod-37-deadline-sessions.plan.md` and
-  `.claude/plans/mod-37-deadline-sessions.blueprint.md`. R-49 was closed by a pin, not a guard
-  (maintainer amendment): `claim_run`'s overlap admission already keeps other runs off the repo.
-  R-46 preempts only on the refresher's verdict, because a TUI read that fails `Unreachable`
-  includes a `PoolTimedOut` under local load. rust-reviewer approved with fixes; its two MEDIUMs,
-  three LOWs and one NIT were applied, and one NIT (a `Debug`-string comparison in a pin test) was
-  left.
-  - ~~**R-3**~~: closed by MOD-37 phase 1. `RunStepSummary` carries `gate_note` from all three
-    builders (Mem, Pg, cache mirror), and the Runs pane shows a parked step's reason on a third
-    line. `run.failure` stays NULL on a park, as before.
-  - ~~**R-5**~~: closed by MOD-37 phase 2. The gate parks through one fenced `park_step` (step, run
-    and item in one transaction, `promote_step`'s shape), and a `never`/`on_failure` pass goes
-    through `pass_step`, which writes `gate_outcome = 'skipped'` as ANA-2 §4.2's table says. D96's
-    recovery stays for rows written before.
-  - ~~**R-6**~~: closed by MOD-37 phase 2. `WriteStore::create_phase_agents` writes a phase's agent
-    rows, `override_graph` copies each phase's agents onto its clone, and `MemStore` now holds
-    `phase_agent` rows instead of always answering empty.
-  - ~~**R-29**~~: closed by MOD-37 phase 2. `MemStore` truncates a graph run's `queued_at` to the
-    microsecond, as Postgres does, so a tie inside one microsecond breaks on `id` in both stores.
-    `open_chat` still stores a chat run's `queued_at`/`started_at` untruncated (review NIT, outside
-    R-29's graph-run scope).
-  - ~~**R-30**~~: closed by MOD-37 phase 2. `classify` adopts a step whose capture changed only some
-    repos: one `after_hash` on a scope repo proves the one-transaction capture landed. Candidates
-    keep the every-repo rule (a failing candidate's trees are captured too), and a step that changed
-    nothing and crashed before `finish_step` is still retried, safely.
-  - ~~**R-31, the rejected-crash remainder**~~: closed by MOD-37 phase 2. `status::resumable`
-    (D196's one predicate, widened) treats a parked run over a `failed` + `rejected` step as
-    resumable, so `Unblock` unparks it and runs the rejection's tail; the worker-box hand-back does
-    the same. Side effect accepted by the maintainer: see the phase 2 note.
+- [ ] **MOD-76 - Orchestrator carried risks after MOD-37** (from MOD-37,
+  `docs/decisions/mod/mod-37.md` "Carried"). `R-ORCH-3`, `R-ORCH-8`, `R-TUI-4`. MOD-37 closed with
+  these four risks re-deferred, each with its reason. None blocks a run. Pick them off when the
+  trigger named on each one arrives.
   - **R-32** (D138 half closed by MOD-37 phase 2: `part_way` keeps an `Io` error as `Io`, kind
     included): D131's not-reset park loses its detail. Re-deferred: `labelled` is always empty on a
     refusal, and the lost part is the reason text, which only `never_reset` holds in memory;
     keeping it needs a new column or a change to `gate_note`, which the engine and four tests match
     exactly. Diagnostics only (lease blueprint §22.3).
-  - ~~**R-37**~~: closed by MOD-37 phase 3. `reconcile_parent` opens the checkout once and hands
-    the `gix::Repository` to private workers; the public path-taking functions keep their
-    signatures, their error order and their text. A test-only open counter pins it (6 opens before,
-    1 after). `merge_of`'s first-parent walk down to the base stays: it is D136's semantics, and
-    D142 already bounds it.
-  - ~~**R-38**~~: closed by MOD-42 (`docs/decisions/mod/mod-42.md`): a `cancel` or `promote`
-    preempt signals the walk, which answers parked requests `cancelled` and cancels the session
-    with grace before the walk is dropped.
-  - ~~**R-40**~~: closed by MOD-37 phase 1. `SessionSink::started` runs after each
-    `pending → running` move, and `ProgressSink` publishes `FrameKind::Changed` for it.
-  - ~~**R-41**~~: closed by MOD-37 phase 1. A `RunStream` `Error` frame puts its sentence on the
-    status line even when the `Orch` reply that carried the failure was dropped as stale.
   - **R-44** (re-deferred by MOD-37 phase 1): step rows at 43 columns truncate `agent/model` for
     long model ids. `…` marks the cut and the width test keeps it from clipping silently (drive
     plan, Risks). Any real fix is a layout decision (drop the indent, abbreviate the model, or add
     a line), so it waits for the Runs pane's next layout change.
-  - ~~**R-46**~~: closed by MOD-37 phase 4. When the refresher reports the server gone, the
-    store loop calls `RunRuntime::preempt_walks`, so every live walk is abandoned at once and the
-    sweep after reconnect adopts it as a new attempt. Previously it ran blind for up to about 80 s,
-    until the heartbeat fence. A short blip now ends the session (maintainer decision). A loss
-    that a TUI read notices first does not preempt, because the read can be a pool timeout with the
-    server up and `go_offline` stops the refresher. Those walks keep the heartbeat-fence path.
-  - **R-48**: the ACP driver ignores `SessionSpec.resume` (only `cli/mod.rs` reads it), so a
-    promoted ACP step always gets the handoff prompt and a fresh model context. It needs ACP
-    `session/load`. The blueprint named "a MOD-2 follow-up" as the owner, and MOD-2 is closed (drive
-    blueprint §18).
-    ANA-27 (`docs/ANA-27.md` §5.1 T5): until ACP `session/load` lands, a promotion that was not
-    resumed says so. When `promote::opening_kind` chooses `Handoff`, or when the CLI driver's
-    `--resume` fails, the step gets a note ("context not carried; handoff prompt only") that the
-    Runs pane and the Chat tab show, so a fresh context is never mistaken for a resumed one. A
-    failed CLI `--resume` is reported, never silently replaced by a fresh session. Do not key the
-    note on `DriverCaps.resume`: for ACP rows it comes from `settings.acp.session.resume`, which
-    defaults to `true` (`crates/htui-agent/src/registry.rs:165`).
-  - ~~**R-49**~~: closed by MOD-37 phase 4, by admission rather than a guard. While a promoted
-    step's run is `awaiting_approval`, `claim_run` refuses every other run on a
-    `shared_serialized` repo of the box (rule I, `NotIsolated`), across processes. The conformance
-    pin `a_promoted_shared_serialized_step_keeps_other_runs_off_its_repo` holds it. The
-    in-process guard is still not re-taken, which leaves three windows open (LOW): a same-run
-    command between `Promoted` and the chat bind, a second promotion of the same step (D185), and
-    an isolator rebuilt during the chat.
-  - ~~**R-51**~~: closed by MOD-37 phase 1. A command that queues behind a live walk publishes
-    `FrameKind::Waiting`, and the pane shows "waiting for the walk" until the walk rests, fails or is
-    adopted. The walk keeps its D157 lock.
   - **R-53** (re-deferred by MOD-37 phase 1; mitigated, no code change): `ItemActions` is as of the
     last `Runs` reply, so a verdict can flip before the key is pressed. The engine re-checks with
     the same admission function (D184) and the pane re-reads (D171) (drive blueprint §18). The
@@ -246,17 +76,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
     restart (`docs/htui-worker.md`). Nothing edits it today;
     whoever adds an editor re-reads the limits or rebuilds the verifier when no walk is live (drive
     blueprint §21.3).
-  - ~~**T7's residual window**~~: closed by MOD-37 phase 1. The Chat tab sends `ChatFollow` as soon
-    as the `Promoted` reply arrives, and the worker keeps a follow served before the bind for that
-    bind, so the chat's frames carry the follow's address from the first one. Moving the stream
-    inside the worker was ruled out: only `App::dispatch` mints a fresh seq.
-  - ~~**Deadline (from ANA-27, `docs/ANA-27.md` §5.1 T4)**~~: closed by MOD-37 phase 4.
-    `drive_once` runs a step session, and each fan-out candidate's, under a timer for the rest of
-    `deadline_seconds`. When it fires, the session is cancelled gracefully through MOD-42's
-    control, and the step settles `DeadlineElapsed` through `SettleInput::deadline_cut`, so the
-    result does not depend on the clock at settle. A run cancel, even one during the cut's drain,
-    still ends as `Cancelled`. Judge calls and `driver.start` are not timed; the start is bounded
-    by the driver's handshake timeout.
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
@@ -609,6 +428,6 @@ now (MOD-13 is done, `docs/decisions/mod/mod-13.md`; MOD-14 is done, `docs/decis
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-37 orchestrator hardening, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-73 hand-written step inputs, MOD-74 mouse follow-ups, MOD-76 orchestrator carried risks; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
