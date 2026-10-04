@@ -5,7 +5,7 @@
 # collides. Credentials are development-only; the real DSN lives in the OS keyring (R-STO-1).
 #
 #   docker compose up -d
-#   export HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres
+#   export HTUI_TEST_DATABASE_URL=postgres://postgres:<password from POSTGRES_PASSWORD below>@localhost:5439/postgres
 #   cargo test -p htui-store --all-features
 #
 # The store tests create and drop `htui_test_*` databases through this maintenance DSN; the
@@ -18,7 +18,7 @@ services:
     restart: unless-stopped
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: htui
+      POSTGRES_PASSWORD: e08e7c24bdd7bb84d88c526fa11d48b6393bfb092e1368c1
       POSTGRES_DB: htui
     # Loopback only (TOOL-7 review H2): published on 0.0.0.0, the dev database was reachable from
     # every TOOL-7 sandbox through its bridge gateway, with the password in this very file.
