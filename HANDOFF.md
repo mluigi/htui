@@ -390,6 +390,12 @@ document version newer than a step's output is what the next step reads (ANA-2 �
   passes `Tab` to the tab bar. Six milestones (ANA-26 §8): M1 catalogue and resolver, M2 the file,
   M3 Settings and overlays, M4 Skills and Requirements, M5 Backlog and Chat, M6 close-out; M3-M5
   are independent but share snapshots. Not blocked.
+  **TUI design review (2026-10-04, https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 1,
+  3):** `?` lists only the global keys and the tab's action bindings, missing j/k, h/l, J/K and every
+  detail-pane key, so the generated sheet must list every key of the focused tab and pane. Hints sit
+  in four places and spell one action four ways (`j/k move`/`select`/`rows`, `J/K move`, `Up/Dn
+  move`), and Backlog has no hint row; generated hints go in one fixed row for every tab. MOD-81
+  and MOD-82 come after this item.
 - [ ] **MOD-69 - Waiting-on-you list across items** (from ANA-27, `docs/ANA-27.md` §5.1 T8,
   `docs/decisions/ana/ana-27.md`). `R-TUI-1`, `R-TUI-4`, `R-ORCH-2`, `R-ORCH-4`, `R-NF-3`. The Runs
   pane shows what waits on a person only for the selected item, and the top bar counts active runs,
@@ -402,6 +408,64 @@ document version newer than a step's output is what the next step reads (ANA-2 �
   list can reuse the query, and the opening key is a MOD-67 action. **Open question for the
   maintainer:** it needs the proposed `R-TUI-11` and the matching `R-TUI-1` top-bar line (ANA-27
   §7), not yet applied. Not blocked; the permission rows are added after MOD-42.
+  The TUI design review (2026-10-04, https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH finding 2)
+  found the same gap: a run parked on a permission shows only in that item's Runs pane, and the top
+  bar reads `1 run`.
+- [ ] **MOD-80 - Theme and colour meaning** (from the TUI design review of 2026-10-04,
+  https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 5-8, 12). `R-TUI-1`, `R-NF-1`. Every
+  colour comes from `ui/theme.rs` plus a few literals (`ui/cells.rs`, `backlog/detail/runs.rs`,
+  `runs/execution_graph.rs`). Five defects: `selected` is `REVERSED`, which inverts each cell's own
+  colour, so a selected Backlog row reads as separate cyan and grey blocks (give selection an explicit
+  background that overrides cell colours); cyan means the active tab, the active sub-tab, item keys,
+  `in_progress` and cross-reference links, and the skill diff colours added lines cyan (keep the
+  accent for focus and selection, give keys bold, `in_progress` and diff-added their own colours);
+  `title` is `Color::White` bold, 1.3:1 on a light terminal profile, and `dim` (`DarkGray`, about a
+  quarter of all visible glyphs, every hint and empty state) is 2.7:1 on One Dark (title becomes
+  `Reset` + bold, a dim style that reads on both backgrounds); the active tab in the main strip,
+  the detail sub-tabs and the Settings sections is marked by colour alone, so `NO_COLOR` and
+  monochrome terminals show none (add bold and underline or brackets); the top bar's store label
+  draws `offline` in the base style (draw degraded states in the warning colour). Snapshots are
+  text-only, so the tests pin styles on the buffer. Not blocked; touches style only, so it runs
+  beside MOD-67.
+- [ ] **MOD-81 - Narrow and wide terminal widths** (from the TUI design review of 2026-10-04,
+  https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 4, 14). `R-TUI-1`, `R-TUI-2`,
+  `R-TUI-8`. Below 100 columns the Settings > Agents table drops its name column, the only
+  `Constraint::Fill` (`ui/tabs/settings/agents.rs:1842`), and rows lose what identifies them; the
+  Backlog detail sub-tab strip clips `Notes Prompt Reqs` with no overflow mark; Backlog titles shrink
+  to `Chapter…` at 60-80 columns because the status column is sized for `awaiting_approval`; the
+  Prompt pane clips its right edge without wrapping. At 160 columns the fixed list/detail ratio gives
+  the mostly empty list 86 columns and the reading pane 70. Give identifying columns a minimum
+  width, shorten statuses below about 90 columns, mark a clipped strip with `›`, wrap or scroll the
+  Prompt pane, and cap the list width so the detail pane takes the rest. Rows fit through
+  `ui::cells` (MOD-60). After MOD-67, which rewrites the same views' hint rows and snapshots.
+- [ ] **MOD-82 - Shared pane chrome: sub-tabs, detail header, overlays, Settings layouts** (from
+  the TUI design review of 2026-10-04, https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 9,
+  13, 15, 16). `R-TUI-1`, `R-TUI-3`, `R-TUI-7`, `R-TUI-8`. Secondary navigation comes in three
+  forms: Skills draws `Skills │ Templates` outside its box with the active tab white bold, while
+  Backlog detail and Settings draw a row inside the box with the active tab cyan; make one sub-tab
+  widget. The Backlog detail header repeats itself (block title `FEAT-1`, then `FEAT-1  FEAT
+  in_progress`, the kind being the key's prefix); put key and title in the block title and status,
+  tags and priority on the meta line. The concepts search overlay leaves a one-column strip of the
+  panes below at its edges and at 60 columns covers the tab strip; clear a margin around overlays or
+  dim the backdrop. The eight Settings sections use five layouts (table, tree, key-value,
+  master-detail, one-line records) with different indents, and Connection says `press Enter or R`
+  where its hint row says `R rebuild cache`; settle on table and key-value with shared label widths.
+  After MOD-67.
+- [ ] **MOD-83 - Display labels and actionable errors** (from the TUI design review of 2026-10-04,
+  https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH findings 10, 12). `R-TUI-1`, `R-TUI-4`,
+  `R-TUI-8`. Internal values reach the screen: snake_case statuses (`awaiting_approval`), source tags
+  (`(app_setting_default)`), units (`1000 bp`), raw scores (`3.000`), `hit(s)`, `template(s)`, `1
+  options`, `gate soft · in none · budget inherit`, and step ids such as `0.1/0` in the Runs flow.
+  Give each shown enum a display label and add one pluralising helper. Errors name no next step
+  (`qdrant: query: connection refused`, `hierarchy needs Postgres`); each one says where to fix it
+  (for example Settings > Connection or Settings > Qdrant). Not blocked; copy only, but it shares
+  snapshots with MOD-81 and MOD-82, so it lands beside or after them.
+- [ ] **MOD-84 - Reflow item bodies before wrapping** (from the TUI design review of 2026-10-04,
+  https://claude.ai/artifact/TxAriNUvRpTifJy8Wq6HeH finding 11). `R-TUI-3`. The Body pane wraps a
+  hard-wrapped Markdown body a second time, so lines break as `a top bar and a` / `backlog tab`, and
+  inline code shows its backticks. Join soft-wrapped lines inside a paragraph and list item before
+  wrapping, keep blank lines, list markers and fenced blocks as they are, and style inline code
+  instead of printing backticks. Not blocked.
 
 ### Deferred backlog
 
@@ -423,6 +487,6 @@ document version newer than a step's output is what the next step reads (ANA-2 �
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 21 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 26 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-77 step-before-run lock order, MOD-78 command_run lifecycle, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-80 theme and colour, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-84 body reflow, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
