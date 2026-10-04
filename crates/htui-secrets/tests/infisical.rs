@@ -150,7 +150,9 @@ fn a_blank_identity_half_is_refused_at_build() {
     ];
     for (id, sentence) in cases {
         match InfisicalProvider::new(InfisicalConfig::new("https://app.infisical.com"), id) {
-            Err(SecretError::Config(why)) => assert_eq!(why, sentence),
+            Err(SecretError::Config(why)) => {
+                assert!(why == sentence, "wrong Config reason for {sentence:?}")
+            }
             Err(_) => panic!("expected Config for {sentence:?}"),
             Ok(_) => panic!("a blank half was accepted ({sentence})"),
         }
