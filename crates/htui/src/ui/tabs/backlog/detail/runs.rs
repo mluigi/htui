@@ -1089,17 +1089,38 @@ fn gate(step: &RunStepSummary) -> String {
     gate
 }
 
-/// Line 2's tail: D106's indicator, then `agent/model`.
+/// Line 2's tail: D106's indicator, then [`who`].
 fn tail(step: &RunStepSummary) -> String {
-    let who = format!(
-        "{}/{}",
-        step.agent_name.as_deref().unwrap_or(PENDING),
-        step.model.as_deref().unwrap_or(PENDING)
-    );
+    let who = who(step.agent_name.as_deref(), step.model.as_deref());
     match indicator(step) {
         Some(figure) => format!("{figure} {who}"),
         None => who,
     }
+}
+
+/// MOD-76 D3 (R-44): `agent/model`, the model shortened before it is fitted: a trailing
+/// `-YYYYMMDD` goes, then a leading `{agent}-`, each skipped when it would leave the model empty.
+/// A missing agent or model is [`PENDING`], and the rules run only when both are present.
+fn who(agent: Option<&str>, model: Option<&str>) -> String {
+    let (Some(agent), Some(model)) = (agent, model) else {
+        return format!("{}/{}", agent.unwrap_or(PENDING), model.unwrap_or(PENDING));
+    };
+    let model = match model.rsplit_once('-') {
+        Some((head, date))
+            if !head.is_empty()
+                && date.len() == 8
+                && date.bytes().all(|byte| byte.is_ascii_digit()) =>
+        {
+            head
+        }
+        _ => model,
+    };
+    let model = model
+        .strip_prefix(agent)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or(model);
+    format!("{agent}/{model}")
 }
 
 /// One step's two lines (D197). `siblings` are the steps of its run: a fan-out slot is known by a
@@ -2320,6 +2341,14 @@ mod tests {
         steps.push(RunStepSummary {
             usage: Some(json!({ "input_tokens": i64::MAX, "output_tokens": i64::MAX })),
             status: StepStatus::Superseded,
+            ..base.clone()
+        });
+        // MOD-76 D3 (R-44): the widest indicator beside a dated, agent-prefixed model.
+        steps.push(RunStepSummary {
+            prompt_tokens: Some(35_988),
+            trimmed: true,
+            agent_name: Some("claude".to_owned()),
+            model: Some("claude-sonnet-4-5-20250929".to_owned()),
             ..base
         });
         steps
