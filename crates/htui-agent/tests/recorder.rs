@@ -3446,6 +3446,354 @@ async fn a_credential_split_across_chunks_is_refused_at_the_flush() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// MOD-10 D8 (blueprint A-1, A-2, §D.5): `raw` re-checked at the flush
+// ---------------------------------------------------------------------------------------------
+
+/// The known secret the D8 cases split: neither half is the secret, so capture masks nothing.
+const SPLIT_SECRET: &str = "hunter2hunter2";
+
+/// A pattern credential (`anthropic_api_key`) split at its **first** character, so neither half
+/// starts a token under either the bare-prefix rules or the whole-token rules (blueprint H-7),
+/// while the join is caught by both (30 characters after `sk-ant-`).
+const SPLIT_KEY_HEAD: &str = "s";
+/// The tail half of the split credential; see [`SPLIT_KEY_HEAD`].
+const SPLIT_KEY_TAIL: &str = "k-ant-api03-abcdefghijklmnopqrstuvwx";
+
+/// The full ACP `session/update` wire message of one `agent_message_chunk`.
+///
+/// The whole shape, not just the text, is what proves blueprint A-1: `jsonrpc`, `method`,
+/// `sessionId`, the `sessionUpdate` tag and `content.type` sit around `content.text` in every
+/// chunk, so a flat join would put them between the halves of a split value. `meta` is a leaf the
+/// payload does not mirror (`_meta.trace`), which is where a raw-only split lives.
+fn acp_wire(text: &str, meta: Option<&str>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "session/update",
+        "params": {
+            "sessionId": "s-1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "text", "text": text },
+            },
+        },
+        "_meta": { "trace": meta },
+    })
+}
+
+/// One assistant chunk of message `m1`, carrying [`acp_wire`] as its `raw`.
+fn acp_chunk(text: &str, meta: Option<&str>) -> DriverEnvelope {
+    raw_env(
+        DriverEvent::AssistantChunk(TextChunk {
+            text: text.to_owned(),
+            message_id: Some("m1".to_owned()),
+        }),
+        acp_wire(text, meta),
+    )
+}
+
+/// A turn's `done`, with no `raw`: it flushes the open run, so the counter can be read before
+/// `finish`.
+fn end_turn() -> DriverEnvelope {
+    env(DriverEvent::Done(DoneEvent {
+        stop_reason: StopReason::EndTurn,
+    }))
+}
+
+/// A known secret split across two chunks: the flush masks the coalesced payload and the row is
+/// kept, so before D8 its two raw halves persisted and the secret could be read back by joining
+/// them. Now the row is stored with `raw = NULL`, the payload kept, and the drop counted.
+#[tokio::test]
+async fn a_known_secret_split_across_chunks_withholds_raw() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SPLIT_SECRET.to_owned()]);
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+
+    recorder
+        .record(acp_chunk("pass hunter2", None))
+        .await
+        .expect("neither half is the secret");
+    recorder
+        .record(acp_chunk("hunter2 ok", None))
+        .await
+        .expect("neither half is the secret");
+    recorder.record(end_turn()).await.expect("the turn closes");
+    assert_eq!(
+        recorder.raw_withheld(),
+        1,
+        "the coalesced row's raw was withheld at the flush"
+    );
+    let summary = recorder
+        .finish()
+        .await
+        .expect("a withheld raw is not a refusal");
+    assert_eq!(
+        summary.raw_withheld, 1,
+        "the summary carries the same count"
+    );
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::AssistantText, EventKind::Done]
+    );
+    assert_eq!(
+        text_of(&log[0]),
+        "pass [REDACTED] ok",
+        "the payload is masked and kept"
+    );
+    assert_eq!(log[0].raw, None, "the raw halves are withheld");
+    assert!(
+        !serde_json::to_string(&log)
+            .expect("the log serialises")
+            .contains("hunter2"),
+        "no half of the secret reaches the store"
+    );
+}
+
+/// Blueprint A-2: a pattern credential split in a leaf the payload does **not** mirror. The
+/// payload is clean and kept unchanged, `raw` is withheld, and - because `raw` is opt-in debug
+/// data (H-10) - the session still finishes `Ok`, with no `scrub_residue` row.
+#[tokio::test]
+async fn a_pattern_credential_split_in_a_raw_only_leaf_withholds_raw() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+
+    recorder
+        .record(acp_chunk("hello ", Some(SPLIT_KEY_HEAD)))
+        .await
+        .expect("neither half trips a rule on its own");
+    recorder
+        .record(acp_chunk("world", Some(SPLIT_KEY_TAIL)))
+        .await
+        .expect("neither half trips a rule on its own");
+    recorder.record(end_turn()).await.expect("the turn closes");
+    assert_eq!(recorder.raw_withheld(), 1);
+    let outcome = recorder.finish().await;
+    let summary = outcome.expect("a raw-only finding never fails the session");
+    assert_eq!(summary.raw_withheld, 1);
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::AssistantText, EventKind::Done],
+        "no scrub_residue row: the withhold is not a refusal"
+    );
+    assert_eq!(text_of(&log[0]), "hello world", "the payload is unchanged");
+    assert_eq!(log[0].raw, None, "the raw halves are withheld");
+    assert!(
+        !serde_json::to_string(&log)
+            .expect("the log serialises")
+            .contains(SPLIT_KEY_TAIL),
+        "no half of the credential reaches the store"
+    );
+}
+
+/// Blueprint A-2, pinning existing behaviour: the same split in the **payload** text is caught by
+/// the flush's payload re-scrub first, and the whole row - raw included - becomes a
+/// `scrub_residue` row. That is a refusal, not a withhold, so the counter does not move.
+#[tokio::test]
+async fn a_pattern_credential_split_in_the_payload_is_still_a_residue_row() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+
+    recorder
+        .record(acp_chunk(SPLIT_KEY_HEAD, None))
+        .await
+        .expect("neither half trips a rule on its own");
+    recorder
+        .record(acp_chunk(SPLIT_KEY_TAIL, None))
+        .await
+        .expect("neither half trips a rule on its own");
+    recorder.record(end_turn()).await.expect("the turn closes");
+    assert_eq!(
+        recorder.raw_withheld(),
+        0,
+        "a refused row is not a withheld raw"
+    );
+    let outcome = recorder.finish().await;
+    assert!(
+        matches!(outcome, Err(RecordError::Unmasked(_))),
+        "the assembled payload is refused, got {outcome:?}"
+    );
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::Error, EventKind::Done],
+        "the coalesced row is replaced in place"
+    );
+    assert_eq!(
+        log[0].payload.get("code").and_then(Value::as_str),
+        Some("scrub_residue")
+    );
+    assert_eq!(log[0].raw, None, "a residue row carries no raw");
+    assert!(
+        !serde_json::to_string(&log)
+            .expect("the log serialises")
+            .contains(SPLIT_KEY_TAIL),
+        "the offending text never reaches the store"
+    );
+}
+
+/// Two clean chunks: nothing changes on the join, so the row keeps both wire messages, as an array
+/// in chunk order.
+#[tokio::test]
+async fn a_clean_coalesced_row_keeps_its_raw_array() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+
+    recorder
+        .record(acp_chunk("hello ", Some("t-1")))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(acp_chunk("world", Some("t-2")))
+        .await
+        .expect("recording must land");
+    recorder.record(end_turn()).await.expect("the turn closes");
+    assert_eq!(recorder.raw_withheld(), 0);
+    let summary = recorder.finish().await.expect("close");
+    assert_eq!(summary.raw_withheld, 0);
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(text_of(&log[0]), "hello world");
+    assert_eq!(
+        log[0].raw,
+        Some(json!([
+            acp_wire("hello ", Some("t-1")),
+            acp_wire("world", Some("t-2"))
+        ])),
+        "a clean coalesced row keeps every wire message behind it"
+    );
+}
+
+/// A secret each chunk carries **whole** is masked at capture, and re-masking `[REDACTED]` is
+/// idempotent, so the join registers no change: the raw array is kept, masked. This is what keeps
+/// D8 from withholding every row of a session that merely mentions a secret twice.
+#[tokio::test]
+async fn a_secret_masked_whole_in_each_chunk_keeps_the_raw_array() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+
+    recorder
+        .record(acp_chunk(&format!("use {SECRET}"), None))
+        .await
+        .expect("recording must land");
+    recorder
+        .record(acp_chunk(&format!(" and {SECRET}"), None))
+        .await
+        .expect("recording must land");
+    recorder.record(end_turn()).await.expect("the turn closes");
+    let summary = recorder.finish().await.expect("close");
+    assert_eq!(summary.raw_withheld, 0, "nothing new appeared on the join");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(text_of(&log[0]), "use [REDACTED] and [REDACTED]");
+    assert_eq!(
+        log[0].raw,
+        Some(json!([
+            acp_wire("use [REDACTED]", None),
+            acp_wire(" and [REDACTED]", None)
+        ])),
+        "the capture-time masked wire messages are kept"
+    );
+}
+
+/// One chunk was scrubbed whole at capture, so there is nothing to join: the row keeps that one
+/// wire message as an object, not a one-element array.
+#[tokio::test]
+async fn a_single_chunk_row_keeps_its_raw_object() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+
+    recorder
+        .record(acp_chunk("hello", Some("t-1")))
+        .await
+        .expect("recording must land");
+    recorder.record(end_turn()).await.expect("the turn closes");
+    let summary = recorder.finish().await.expect("close");
+    assert_eq!(summary.raw_withheld, 0);
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(log[0].raw, Some(acp_wire("hello", Some("t-1"))));
+}
+
+/// A held `edit_proposal` accumulates raw across its announcements too (plan D77), and is written
+/// by `release_held` rather than by the flush, so the D8 check runs there as well.
+#[tokio::test]
+async fn a_split_edit_proposal_raw_is_withheld_too() {
+    let proposal = |diff: &str, wire: &str| DriverEnvelope {
+        event: DriverEvent::EditProposal(EditProposalEvent {
+            tool_call_id: Some("call-1".to_owned()),
+            path: "src/a.rs".to_owned(),
+            diff: diff.to_owned(),
+            accepted: None,
+        }),
+        raw: Some(json!({ "wire": wire })),
+        at: at(),
+    };
+    let (head, tail) = SPLIT_SECRET.split_at(7);
+
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SPLIT_SECRET.to_owned()]);
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, true, None);
+
+    recorder
+        .record(proposal("@@ first", head))
+        .await
+        .expect("neither half is the secret");
+    recorder
+        .record(proposal("@@ second", tail))
+        .await
+        .expect("neither half is the secret");
+    recorder
+        .record(tool_result("call-1", json!("written")))
+        .await
+        .expect("the call closes");
+    assert_eq!(
+        recorder.raw_withheld(),
+        1,
+        "the held row's raw was withheld when the call closed"
+    );
+    let summary = recorder
+        .finish()
+        .await
+        .expect("a withheld raw is not a refusal");
+    assert_eq!(summary.raw_withheld, 1);
+
+    let log = rows(&store, chat.step_id).await;
+    let edits: Vec<&SessionEvent> = log
+        .iter()
+        .filter(|row| row.kind == EventKind::EditProposal)
+        .collect();
+    assert_eq!(edits.len(), 1, "one row per (tool_call_id, path)");
+    assert_eq!(
+        edits[0].payload.get("diff").and_then(Value::as_str),
+        Some("@@ second"),
+        "the payload is kept"
+    );
+    assert_eq!(edits[0].raw, None, "the raw halves are withheld");
+    assert!(
+        !serde_json::to_string(&log)
+            .expect("the log serialises")
+            .contains("hunter2"),
+        "no half of the secret reaches the store"
+    );
+}
+
 /// A paused chat tab must never stall the agent: the UI channel is bounded and `try_send`, every
 /// row still persists, and the drops are counted (`docs/ANA-4.md` §4.1 "Persistence and the UI").
 #[tokio::test]

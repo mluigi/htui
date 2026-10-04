@@ -7494,6 +7494,8 @@ mod tests {
 /// `MemStore` write no transport-neutral binding promises.
 #[cfg(test)]
 mod fanout_paths {
+    use htui_agent::conformance::{Script, ScriptEvent};
+    use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
     use htui_core::fixtures::ids;
     use htui_core::model::{
         Gate, Isolation, NewRunStep, RunStatus, RunStep, RunStepCommit, Status, StepId, StepStatus,
@@ -7563,6 +7565,107 @@ mod fanout_paths {
     /// Candidate `index` of `(0, 1)`'s id.
     fn candidate_id(steps: &[RunStep], index: i32) -> StepId {
         candidate(steps, 0, 1, index).id
+    }
+
+    /// MOD-10 D5: one turn whose assistant text the scrubber refuses, so the recorder writes a
+    /// `scrub_residue` row and its `finish` answers `Unmasked`; then a document with `body`. The
+    /// key matches under both the bare-prefix and the whole-token rules (blueprint H-7).
+    fn leaks(body: &str) -> ScriptedStep {
+        ScriptedStep {
+            script: Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                    text: "the key is sk-ant-api03-abcdefghijklmnopqrstuvwx".into(),
+                    message_id: None,
+                })),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ]),
+            output: Some(body.into()),
+            spawn_failure: None,
+        }
+    }
+
+    /// The `ScrubRefused` sentence for an Anthropic key at `phase`, built from the variant so the
+    /// bytes are pinned once, in `status.rs` (blueprint H-12).
+    fn scrub_sentence(phase: &str) -> String {
+        RunFailure::ScrubRefused {
+            phase: phase.to_owned(),
+            rule: "anthropic_api_key".to_owned(),
+        }
+        .to_string()
+    }
+
+    /// MOD-10 D5, candidate path: a candidate whose recorder refuses is `failed` with the typed
+    /// scrub sentence in its note; the run is not failed by it, its siblings carry on.
+    #[tokio::test]
+    async fn a_candidate_whose_recorder_refuses_fails_with_the_scrub_sentence() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        orch.script_candidate("research", 1, 0, 0, leaks("research by candidate 0"));
+        judge_both(&orch, "research", 1, 1, "best");
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (RunStatus::Done, None, None),
+            "the surviving sibling wins and the run completes"
+        );
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            slot_of(&steps, 0, 1),
+            [
+                (0, StepStatus::Failed, Some(false)),
+                (1, StepStatus::Done, Some(true)),
+                (2, StepStatus::Superseded, Some(false)),
+            ],
+            "the refused candidate keeps `failed`; its sibling is selected"
+        );
+        let expected = format!(
+            "fan-out candidate 0 of `research` attempt 1: {}",
+            scrub_sentence("research")
+        );
+        let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+        assert!(
+            notes.contains(&expected),
+            "the candidate's note carries the sentence: {notes:?}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.contains("sk-ant-")),
+            "no note repeats the key: {notes:?}"
+        );
+        assert_eq!(
+            run_of(&orch, run).await.failure,
+            None,
+            "the candidate's refusal does not fail the run"
+        );
+    }
+
+    /// MOD-10 D5, judge path: a judge whose recorder refuses is `failed` with
+    /// `judge_session_failed: <sentence>` as its `gate_note`, and the run parks with no failure.
+    /// Both calls succeed, because `judge_sessions` reads `finish` only then.
+    #[tokio::test]
+    async fn a_judge_whose_recorder_refuses_parks_with_the_scrub_sentence() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        let verdict = "Compared.\n\n```json\n{\"winner\": 1, \"reasons\": {\"1\": \"best\"}}\n```";
+        orch.script_candidate("research:judge", 1, -1, 0, leaks(verdict));
+        orch.script_candidate("research:judge", 1, -1, 1, ScriptedStep::judge(1, &[]));
+
+        let (run, rest) = start(&orch, ids::HTUI_ANA_2).await;
+        assert_eq!(rest.run, RunStatus::AwaitingApproval);
+        assert_eq!(run_of(&orch, run).await.failure, None);
+        let steps = steps_of(&orch, run).await;
+        let judge = judge_of(&steps, 0, 1).expect("the judge ran");
+        let expected = format!("judge_session_failed: {}", scrub_sentence("research:judge"));
+        assert_eq!(
+            (judge.status, judge.gate_note.as_deref()),
+            (StepStatus::Failed, Some(expected.as_str()))
+        );
     }
 
     /// Plan D48's second clause and plan D78. Candidate 0's `prepare` errors (nothing to release)
@@ -8120,7 +8223,7 @@ mod fanout_paths {
             step: &RunStep,
             phase: &htui_core::model::SnapshotPhase,
             key: &crate::engine::SessionKey<'_>,
-            done: &htui_agent::event::DoneEvent,
+            done: &DoneEvent,
         ) -> Result<(), htui_core::store::StoreError> {
             if step.fanout_index < 0 {
                 let steps = self.orch.store().run_steps(step.run_id).await?;

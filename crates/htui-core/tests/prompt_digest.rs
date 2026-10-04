@@ -727,13 +727,21 @@ fn the_frame_literals_are_scrubbed_like_every_other_digested_byte() {
 
     // And a secret the scrubber cannot mask refuses, naming the frame rather than the text.
     let mut residue = fixtures::phase_implement_attempt2();
-    residue.body = format!("Use the key sk-ant-api03-DEADBEEF.\n\n{}", residue.body);
+    residue.body = format!(
+        "Use the key sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF.\n\n{}",
+        residue.body
+    );
     let error = assemble(&residue, &scrubber()).expect_err("`R-SEC-3` fails closed on the frame");
     let AssembleError::Unmasked { ref section, .. } = error else {
         panic!("expected an unmasked refusal, got {error:?}");
     };
     assert_eq!(section, "template");
-    assert!(!error.to_string().contains("sk-ant-api03-DEADBEEF"));
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
+    );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
 }
 
 #[test]
@@ -1119,7 +1127,9 @@ fn scrub_residue_names_the_section_not_the_text() {
     // D100: the scrub runs per section, before the digest, so `Unmasked.section` names the fact a
     // maintainer can act on — and never the secret.
     let mut spec = fixtures::phase_implement_attempt2();
-    spec.item_body = "The token is sk-ant-api03-DEADBEEF and it must never be stored.\n".to_owned();
+    spec.item_body =
+        "The token is sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF and it must never be stored.\n"
+            .to_owned();
     let error = assemble(&spec, &scrubber()).expect_err("`R-SEC-3` fails closed");
     let AssembleError::Unmasked {
         ref section,
@@ -1134,9 +1144,10 @@ fn scrub_residue_names_the_section_not_the_text() {
     assert_eq!(path, "", "the whole wrapped string is the leaf");
     let rendered = error.to_string();
     assert!(
-        !rendered.contains("sk-ant-api03-DEADBEEF"),
-        "the error must not repeat the secret: {rendered}"
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
     );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
 
     // A secret the scrubber *can* mask is masked, and assembly continues.
     let mut masked = fixtures::phase_implement_attempt2();
@@ -1474,7 +1485,7 @@ fn the_template_name_is_reached_by_a_pass_that_enumerates_nothing() {
     // it. This case is what a future reversion to a field list fails on, and the mutation in the
     // task report (mask `self.notes` only) is exactly that reversion.
     let mut spec = fixtures::phase_implement_attempt2();
-    spec.template.name = "sk-ant-api03-DEADBEEF".to_owned();
+    spec.template.name = "sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF".to_owned();
     let prompt = ok(&spec);
 
     let error = prompt
@@ -1502,7 +1513,7 @@ fn the_audit_root_and_provider_strings_are_reached_by_the_pass() {
         !roots_spec.excerpts.audit.roots.is_empty(),
         "the fixture carries a root record, which is what this case mutates"
     );
-    roots_spec.excerpts.audit.roots[0].repo = "sk-ant-api03-ROOTSLUG".to_owned();
+    roots_spec.excerpts.audit.roots[0].repo = "sk-ant-api03-ROOTSLUGROOTSLUGROOTSLUG".to_owned();
     let root_error = ok(&roots_spec)
         .trim
         .to_value(&scrubber())

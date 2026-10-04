@@ -51,7 +51,8 @@ use htui_agent::probe::{
     probe_agent, probe_snapshot,
 };
 use htui_agent::record::{
-    AnsweredBy, CapBreach, QuotaLatch, Recorder, RunCap, enforce_breach as enforce_cap_breach,
+    AnsweredBy, CapBreach, QuotaLatch, RecordError, Recorder, RunCap,
+    enforce_breach as enforce_cap_breach,
 };
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
@@ -2259,6 +2260,20 @@ impl ChatBinding {
             Self::Promoted { .. } => {}
         }
     }
+
+    /// MOD-10 D6: writes `failure` onto a fresh chat's run **before** [`Self::close`].
+    /// `fail_run` refuses a terminal run, and `finish_chat_run` neither guards the status nor
+    /// touches `failure`, so this order is the one in which both writes land. A promoted step's
+    /// run is the engine's (blueprint D205) and is never failed from here. A refused write is
+    /// logged and the close still lands `failed` with no text, which is the behaviour before
+    /// MOD-10.
+    async fn record_failure(&self, writer: &Writer, failure: &str) {
+        if let Self::Fresh(chat, _) = self
+            && let Err(err) = writer.fail_run(chat.run_id, failure, Utc::now()).await
+        {
+            tracing::error!(%err, run = %chat.run_id, "the chat run's failure could not be written");
+        }
+    }
 }
 
 /// [`StoreRequest::name`] of a promotion (blueprint D209): what a promoted chat's refusals are
@@ -4240,6 +4255,9 @@ pub async fn run_chat(args: ChatArgs) {
     if let Err(err) = recorder.finish().await {
         tracing::error!(%err, "the recorder did not close cleanly");
         status = RunStatus::Failed;
+        if let Some(failure) = chat_failure(&err) {
+            binding.record_failure(&writer, &failure).await;
+        }
     }
     binding.close(&writer, status).await;
     frames.ended(last_stop);
@@ -4576,6 +4594,18 @@ fn follow_up_frame(text: &str, at: DateTime<Utc>) -> DriverEnvelope {
 /// the real section list in milestone 9, and the row's shape does not change when it does.
 fn prompt_sections() -> Value {
     json!([{ "name": "chat", "tokens": Value::Null, "trimmed": false }])
+}
+
+/// MOD-10 D6: the `run.failure` a chat records when its recorder refused a payload, or `None`
+/// for any other recorder error (which closes `failed` with no text, as before). Names the rule,
+/// never the text or the JSON pointer.
+fn chat_failure(err: &RecordError) -> Option<String> {
+    match err {
+        RecordError::Unmasked(unmasked) => {
+            Some(htui_orch::RunFailure::scrub_refused("chat", unmasked).to_string())
+        }
+        RecordError::Store(_) | RecordError::Encode(_) => None,
+    }
 }
 
 /// Closes the chat's `run` / `run_step` pair, so it stops counting as an active run. Whether the
@@ -11680,6 +11710,99 @@ done
         MINTED
             .with(|minted| minted.borrow().get(&step).copied())
             .expect("serve minted this step's run on this thread")
+    }
+
+    /// MOD-10 D6: a chat whose recorder refused a payload ends with its run `failed` and the
+    /// typed scrub sentence as `run.failure` (phase `chat`), and its step closed with it. Pins the
+    /// blueprint's order: `fail_run` first, then `finish_chat_run`, so both writes land (H-9).
+    #[tokio::test]
+    async fn a_chat_whose_recorder_refuses_fails_its_run_with_the_scrub_sentence() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                text: "sk-ant-api03-abcdefghijklmnopqrstuvwx".to_owned(),
+                message_id: Some("m1".to_owned()),
+            })),
+            ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            })),
+        ]);
+        let (store, backend, mut runtime, agent_id) = fixture(script).await;
+
+        let (step_id, _) = run(&mut runtime, &backend, start(agent_id, "leak")).await;
+
+        let run = run_of(step_id);
+        let row = store
+            .run(run)
+            .await
+            .expect("the read answers")
+            .expect("the chat's run");
+        assert_eq!(
+            (row.status, row.failure),
+            (
+                RunStatus::Failed,
+                Some(
+                    htui_orch::RunFailure::ScrubRefused {
+                        phase: "chat".into(),
+                        rule: "anthropic_api_key".into(),
+                    }
+                    .to_string()
+                )
+            )
+        );
+        assert!(row.finished_at.is_some(), "the run's `finished_at` is set");
+        let steps = store.run_steps(run).await.expect("the read answers");
+        let chat_step = steps
+            .iter()
+            .find(|row| row.id == step_id)
+            .expect("the run's step is the chat's");
+        assert_eq!(
+            chat_step.status,
+            StepStatus::Failed,
+            "the step closed with it"
+        );
+        assert!(
+            chat_step.finished_at.is_some(),
+            "and its `finished_at` is set"
+        );
+        let events = store
+            .step_events(step_id)
+            .await
+            .expect("the read answers")
+            .unwrap_or_default();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.kind == EventKind::Error
+                    && event.payload["code"] == "scrub_residue"),
+            "the refused chunk left a scrub_residue row"
+        );
+        let logged = format!("{events:?}");
+        assert!(!logged.contains("sk-ant-"), "no stored row holds the key");
+    }
+
+    /// MOD-10 D6: only the recorder's `Unmasked` is typed; a store or encode failure closes the
+    /// chat `failed` with no text, as before.
+    #[test]
+    fn chat_failure_types_only_unmasked() {
+        let unmasked = htui_core::scrub::Unmasked {
+            path: "/text".into(),
+            rule: "anthropic_api_key",
+        };
+        assert_eq!(
+            chat_failure(&RecordError::Unmasked(unmasked)),
+            Some(
+                htui_orch::RunFailure::ScrubRefused {
+                    phase: "chat".into(),
+                    rule: "anthropic_api_key".into(),
+                }
+                .to_string()
+            )
+        );
+        assert_eq!(
+            chat_failure(&RecordError::Store(StoreError::Backend("x".into()))),
+            None
+        );
+        assert_eq!(chat_failure(&RecordError::Encode("x".into())), None);
     }
 
     /// MOD-24 review L1: `task` spawned, its stream received up to and including its `Failed`

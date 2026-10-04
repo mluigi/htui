@@ -199,13 +199,18 @@ fn a_secret_in_the_persona_body_is_masked() {
 
 #[test]
 fn an_unmaskable_persona_body_refuses_the_prompt() {
-    let spec = with_persona("Use the key sk-ant-api03-DEADBEEF.\n");
-    let error = assemble(&spec, &scrubber()).expect_err("a prefix-rule secret cannot be masked");
+    let spec = with_persona("Use the key sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF.\n");
+    let error = assemble(&spec, &scrubber()).expect_err("a pattern-rule secret cannot be masked");
     let AssembleError::Unmasked { ref section, .. } = error else {
         panic!("expected Unmasked, got {error:?}");
     };
     assert_eq!(section, "persona");
-    assert!(!error.to_string().contains("sk-ant-api03-DEADBEEF"));
+    let rendered = error.to_string();
+    assert!(
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
+    );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
 }
 
 #[test]

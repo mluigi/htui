@@ -304,6 +304,9 @@ pub struct RecorderSummary {
     pub usage: Value,
     /// Render frames the bounded UI channel could not take.
     pub dropped: usize,
+    /// Coalesced rows whose `raw` was withheld because their chunks, joined, held a secret no
+    /// chunk held alone (MOD-10 D8). Their payload was kept; only the debug copy was dropped.
+    pub raw_withheld: usize,
     /// The one per-run cap breach of this session, if it had one (plan D70).
     ///
     /// A property of the *session*, not of the last row: it is set once, by the row that reached
@@ -447,6 +450,8 @@ pub struct Recorder<'a, S: htui_core::store::RecorderStore> {
     cap_breached: Option<CapBreach>,
     residue: Option<Unmasked>,
     dropped: usize,
+    /// MOD-10 D8: rows stored with `raw = NULL` by [`Recorder::withhold_split_raw`]. A count only.
+    raw_withheld: usize,
     rows: usize,
 }
 
@@ -466,6 +471,7 @@ impl<S: htui_core::store::RecorderStore> core::fmt::Debug for Recorder<'_, S> {
             .field("next_seq", &self.next_seq)
             .field("turn", &self.turn)
             .field("dropped", &self.dropped)
+            .field("raw_withheld", &self.raw_withheld)
             .field("residue", &self.residue)
             // Whether a latch is configured, not which row it names: the identity of the row is
             // not what a recorder log is about either.
@@ -516,6 +522,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             cap_breached: None,
             residue: None,
             dropped: 0,
+            raw_withheld: 0,
             rows: 0,
         }
     }
@@ -628,6 +635,13 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     #[must_use]
     pub const fn dropped(&self) -> usize {
         self.dropped
+    }
+
+    /// Coalesced rows whose `raw` was withheld because their chunks, joined, held a secret no chunk
+    /// held alone (MOD-10 D8), so far. Each such row was stored with its payload and `raw = NULL`.
+    #[must_use]
+    pub const fn raw_withheld(&self) -> usize {
+        self.raw_withheld
     }
 
     /// The step this recorder writes.
@@ -1128,6 +1142,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             prompt_digest: self.prompt_digest.clone(),
             usage: self.usage.to_value(),
             dropped: self.dropped,
+            raw_withheld: self.raw_withheld,
             cap_breach: self.cap_breached,
         })
     }
@@ -1175,7 +1190,11 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         for mut row in pending {
             let outcome = self.scrubber.scrub(&mut row.payload);
             let row = match outcome {
-                Ok(()) => row,
+                Ok(()) => {
+                    // `next_seq` is the number this row is given just below.
+                    self.withhold_split_raw(&mut row, self.next_seq);
+                    row
+                }
                 Err(unmasked) => {
                     self.note_residue(&unmasked);
                     residue_row(&unmasked, row.at)
@@ -1261,7 +1280,12 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             };
             let outcome = self.scrubber.scrub(&mut row.payload);
             let row = match outcome {
-                Ok(()) => row,
+                // Re-announcements accumulate raw on the held row (plan D77), so a split can live
+                // here just as in a coalesced run.
+                Ok(()) => {
+                    self.withhold_split_raw(&mut row, seq);
+                    row
+                }
                 Err(unmasked) => {
                     self.note_residue(&unmasked);
                     residue_row(&unmasked, row.at)
@@ -1666,6 +1690,43 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         self.flush().await
     }
 
+    /// MOD-10 D8: a row of two or more raw chunks whose per-pointer join ([`joined_raw_leaves`])
+    /// masking changes, or that still trips a rule, is stored with `raw = NULL`. The payload is
+    /// kept. Counted ([`Recorder::raw_withheld`]) and logged by rule name and cause only.
+    ///
+    /// **Never** [`Recorder::note_residue`]: `raw` is opt-in debug data, and a raw-only finding must
+    /// not fail the session (blueprint H-10). The fail-safe direction is to lose `raw`, which is all
+    /// a false positive costs.
+    ///
+    /// A single chunk needs nothing: it was scrubbed whole at capture ([`Recorder::scrub_envelope`]).
+    /// Already-masked chunks register no change, because re-masking `[REDACTED]` is idempotent.
+    ///
+    /// The log carries the step, the `seq`, the chunk count, the cause and the rule name - never
+    /// the joined text, a pointer or a key.
+    fn withhold_split_raw(&mut self, row: &mut PendingRow, seq: i32) {
+        if row.raw.len() < 2 {
+            return;
+        }
+        let joined = joined_raw_leaves(&row.raw);
+        let mut probe = joined.clone();
+        let (cause, rule) = match self.scrubber.scrub(&mut probe) {
+            Err(unmasked) => ("residue", Some(unmasked.rule)),
+            Ok(()) if probe != joined => ("masked", None),
+            Ok(()) => return,
+        };
+        let chunks = row.raw.len();
+        row.raw.clear();
+        self.raw_withheld += 1;
+        tracing::warn!(
+            step = %self.step,
+            seq,
+            chunks,
+            cause,
+            rule = rule.unwrap_or("none"),
+            "a coalesced row's raw was withheld: its chunks joined hold what no chunk held alone"
+        );
+    }
+
     /// Keeps the first residue of the session; the rest are already visible as their own rows.
     fn note_residue(&mut self, unmasked: &Unmasked) {
         if self.residue.is_none() {
@@ -1774,6 +1835,62 @@ fn residue_row(unmasked: &Unmasked, at: DateTime<Utc>) -> PendingRow {
 /// A residue row's `message`: the rule and the pointer, never the text.
 fn residue_message(unmasked: &Unmasked) -> String {
     format!("{} at {}", unmasked.rule, unmasked.path)
+}
+
+/// MOD-10 D8 (blueprint A-1): every string leaf of `chunks`, concatenated **per JSON pointer**
+/// across chunks in chunk order with no separator, as one array of strings in pointer order.
+/// Object keys only form the pointer; they are never joined text.
+///
+/// **Why per pointer and not one flat join.** Each raw chunk is a whole wire message, so an ACP
+/// `session/update` carries `jsonrpc`, `method`, `sessionId`, the `sessionUpdate` tag and
+/// `content.type` around `content.text` in every chunk. A flat join would put chunk 2's protocol
+/// leaves between the two halves of a split secret, where neither an exact-match mask nor a pattern
+/// rule could see it. Streamed text lives at one fixed pointer in every chunk (ACP
+/// `/params/update/content/text`, claude stream-json `/event/delta/text`), so joining per pointer
+/// rebuilds exactly the split the flush check targets.
+///
+/// Keys are left out because they are protocol field names, already scanned per chunk at capture
+/// ([`Recorder::scrub_envelope`]). The output is ordered by pointer (a [`BTreeMap`]), so it does
+/// not depend on the key order `serde_json/preserve_order` may or may not impose (blueprint H-11).
+fn joined_raw_leaves(chunks: &[Value]) -> Value {
+    let mut joined = BTreeMap::<String, String>::new();
+    let mut pointer = String::new();
+    for chunk in chunks {
+        collect_leaves(chunk, &mut pointer, &mut joined);
+    }
+    Value::Array(joined.into_values().map(Value::String).collect())
+}
+
+/// [`joined_raw_leaves`]' walk: appends each string leaf of `value` to the entry of its RFC 6901
+/// pointer. `pointer` is the pointer of `value` itself; it is grown and truncated in place.
+fn collect_leaves(value: &Value, pointer: &mut String, joined: &mut BTreeMap<String, String>) {
+    match value {
+        Value::String(text) => match joined.get_mut(pointer.as_str()) {
+            Some(open) => open.push_str(text),
+            None => {
+                joined.insert(pointer.clone(), text.clone());
+            }
+        },
+        Value::Array(items) => {
+            for (index, item) in items.iter().enumerate() {
+                let base = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&index.to_string());
+                collect_leaves(item, pointer, joined);
+                pointer.truncate(base);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                let base = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&key.replace('~', "~0").replace('/', "~1"));
+                collect_leaves(item, pointer, joined);
+                pointer.truncate(base);
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
 }
 
 /// One of the recorder's own events as the payload document it persists.
@@ -2006,7 +2123,7 @@ mod tests {
     use htui_core::store::{MemStore, ReadStore, StepFence, WriteStore};
     use serde_json::{Value, json};
 
-    use super::{Recorder, RecorderSummary};
+    use super::{Recorder, RecorderSummary, joined_raw_leaves};
     use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, TextChunk, UsageEvent};
 
     /// A fixed capture time, so a persisted row is a function of the script alone.
@@ -2351,5 +2468,44 @@ mod tests {
             "run_step.usage is the earlier spend plus the continuation's"
         );
         assert_eq!(summary.usage, expected, "the summary carries the same sum");
+    }
+
+    /// MOD-10 D8 (blueprint A-1): the join is **per JSON pointer**, so the protocol leaves a real
+    /// wire message carries around its text never land between the two halves of a split value.
+    /// Keys only address a leaf; their text is never part of the output. The output is ordered by
+    /// pointer, never by insertion (H-11), which is why the second chunk's keys are out of order.
+    #[test]
+    fn joined_raw_leaves_joins_per_pointer_in_chunk_order_and_excludes_keys() {
+        let chunks = [
+            json!({ "a": "x1", "b": { "c": "y1" } }),
+            json!({ "b": { "c": "y2" }, "a": "x2", "k-key": "z" }),
+        ];
+
+        let joined = joined_raw_leaves(&chunks);
+
+        assert_eq!(
+            joined,
+            json!(["x1x2", "y1y2", "z"]),
+            "one joined string per pointer, chunk order within a pointer, pointer order overall"
+        );
+        let rendered = joined.to_string();
+        for key in ["\"a\"", "\"b\"", "\"c\"", "k-key"] {
+            assert!(
+                !rendered.contains(key),
+                "a key is never joined text: {key} in {rendered}"
+            );
+        }
+    }
+
+    /// Array indices are pointer tokens too, and numbers, booleans and nulls are structural: a
+    /// leaf that is not a string joins nothing.
+    #[test]
+    fn joined_raw_leaves_addresses_array_elements_and_skips_non_strings() {
+        let chunks = [
+            json!({ "list": ["p1", 1, true], "n": null }),
+            json!({ "list": ["p2", "q2"], "n": 7 }),
+        ];
+
+        assert_eq!(joined_raw_leaves(&chunks), json!(["p1p2", "q2"]));
     }
 }
