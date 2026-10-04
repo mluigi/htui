@@ -142,6 +142,17 @@ completes a run whose tests need a secret, and no resolved value appears in any 
 | 3 | Run-start injection | Graph runs and chat on a configured project receive its secrets in the agent environment only, with the scrubber built from the same map; failures refuse the run; the verifier never sees them | pending | — |
 | 4 | Settings section | The maintainer enters the machine identity and base URL, sees provider health, and sets each project's scope, without leaving the TUI | pending | — |
 
+## Carried into M3 from M1's review (2026-10-04)
+
+- **Seam scan across persisted rows** (review M2): a key cut at the 16 KiB flush boundary persists
+  in two rows; carry the scrubbed tail of the previous text row and check tail+head, sized for the
+  longest resolved secret, not only the pattern rules.
+- **Escaped token starts** (review L1): treat `\n`/`\uXXXX`-style escapes and `%XX` as token starts;
+  re-run the host audit before shipping, since it widens what fails closed.
+- **`(?-u:\b)` anchor** (review N1): equivalent; adopt only with a benchmark.
+- **`from_resolved` normalisation**: a provider value with a trailing newline must mask its trimmed
+  occurrence too.
+
 ## Open Questions
 
 - [x] **`.env` in the worktree.** Should `htui` detect a `.env` (or similar) in a run's tree and warn

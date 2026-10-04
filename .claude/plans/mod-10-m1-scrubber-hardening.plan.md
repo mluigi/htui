@@ -108,7 +108,7 @@ check that `payload` already has. A scrub refusal gets one typed sentence wherev
   | Rule | Status | Regex |
   |---|---|---|
   | `anthropic_api_key` | existing | `sk-ant-[A-Za-z0-9_-]{20,}` |
-  | `openai_api_key` | existing, **amended twice** | `sk-(?:(?:proj\|svcacct\|admin\|None\|or-v[0-9]+\|lf)-[A-Za-z0-9_-]{20,}\|[A-Za-z0-9]{20,})` — the hyphen-free legacy form stops kebab-case prose (`sk-learn-preprocessing-pipeline-v2`) failing closed and a short `sk-ant-` is no longer reported as OpenAI; the lane A leak verifier then found hyphenated vendor keys (OpenRouter `sk-or-v1-`, OpenAI `sk-None-`, Langfuse `sk-lf-`) no longer refused, so they are named explicitly (fix `6242d4a8`) |
+  | `openai_api_key` | existing, **amended three times** | Gate `sk-[A-Za-z0-9_-]{20,}`, then refuse when the strict form `sk-(?:(?:proj\|svcacct\|admin\|None\|or-v[0-9]+\|lf)-[A-Za-z0-9_-]{20,}\|[A-Za-z0-9]{20,})` hits, **or** some `sk-` body is neither `ant-…` nor prose (`SK_PROSE`: every `-`/`_` segment a lower/Title/CamelCase word with optional trailing digits, or all digits). History: (1) the hyphen-free legacy form stops `sk-learn-preprocessing-pipeline-v2` failing closed; (2) lane A's leak verifier found OpenRouter `sk-or-v1-` / `sk-None-` / Langfuse `sk-lf-` unrefused (`6242d4a8`); (3) review H1 found ~47% of LiteLLM keys (`sk-`+`token_urlsafe(16)`) and every `sk-<uuid>` unrefused (`0f2d0687`) |
   | `github_pat` | existing | `github_pat_[A-Za-z0-9_]{20,}` |
   | `github_token` | existing, broadened | `gh[pousr]_[A-Za-z0-9]{30,}` |
   | `gitlab_pat` | new | `glpat-[A-Za-z0-9_-]{20,}` |
@@ -300,7 +300,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 |---|---|---|
 | A new rule hits real stored text, so runs fail closed | Medium | T0 counts on the host database before the list is fixed |
 | Tightening drops a fail-closed catch the bare prefix had | Low | `payload` is scrubbed whole; D8 extends the same check to `raw` |
-| A flush cut (trigger 4, `record.rs:125`) splits a key across two persisted rows | Low | Pre-existing. Not widened for `payload`, and D8 does not join across rows. Noted in the write-up |
+| A flush cut splits a key across two persisted rows | Low | **Corrected at review (M2):** pre-existing for every rule, and **widened** by M1 for the 8 legacy rules — the window where both halves persist grows from the bare prefix (3–7 chars) to prefix + minimum length (15–39 chars), e.g. `sk-ant-` 7 → 27. Before, a cut in that window left a partial key; now rows n and n+1 can rebuild it. Needs a message over 16 KiB with a key at the cut. The seam scan is deferred to M3, where it must also cover exact-match secrets |
 | Judge path: `judge_sessions` reads `finished?` only when both calls succeed (`:5061-5070`), so a residue alongside a failing judge call is not reported (the row was still dropped) | Low | Pre-existing; T3 does not widen it. Noted in the write-up |
 | `fail_run` / `finish_chat_run` ordering in chat | Medium | Blueprint fixes it; T4 test pins it |
 | `htui-orch` tests near the 2 MiB stack | Low | No new futures; `--no-fail-fast` with a `SIGABRT` grep |
@@ -308,9 +308,9 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 ## Acceptance
 
 - [ ] T0 counts reviewed by the maintainer; D2 final list recorded here
-- [ ] All tasks complete, tests written first
+- [x] All tasks complete, tests written first
 - [ ] Validation passes on the merged tree
-- [ ] Patterns mirrored, not reinvented
+- [x] Patterns mirrored, not reinvented
 
 ## Verified claims
 
@@ -352,3 +352,22 @@ Fact-check 2026-10-03: two parallel checkers, plus inline reads. Compile probes 
 | `scrub_residue` message is `<rule> at <path>` | CONFIRMED | `record.rs:90` |
 | The sandbox Postgres is reachable with trust auth | CONFIRMED | `psql -h localhost -p 5439 -U postgres` lists databases |
 | ASCII token start changes behaviour on non-ASCII input | CONFIRMED (accepted) | Current check uses Unicode `is_alphanumeric`; D1 errs toward failing closed |
+
+## Review (2026-10-04)
+
+`rust-reviewer` over `187ca50e..HEAD`: **approve with fixes** (1 HIGH, 2 MEDIUM, 4 LOW, NITs). Each
+actionable finding went through one adversarial verifier (review-phase ultracode).
+
+| Finding | Verified | Disposition |
+|---|---|---|
+| H1 `openai_api_key` fails open on hyphenated/underscored `sk-` keys (LiteLLM ~47%, `sk-<uuid>` 100%) | real, high | **fixed** `0f2d0687` (gate + `SK_PROSE` filter; audit SQL mirrored) |
+| M1 T0 audit not run; `jwt` / `sk_test_` may fail closed on public sample tokens | process | **maintainer decision pending** |
+| M2 cross-row split window widened | real, **low** | Risks row corrected; seam scan → M3 |
+| L1 token start misses `\n`-escaped / `%20`-encoded keys | real, low | → M3 (widens fail-closed; needs a fresh host audit) |
+| L2 weakened no-leak needles | real, nit | **fixed** `b8130def` |
+| L3 no one-character-short boundary tests | real, low | **fixed** `a7c7acc9` (`ONE_SHORT`) |
+| L4 residue beside a failing judge call unreported | pre-existing | documented (write-up) |
+| N1 `(?-u:\b)` anchor for literal-prefix acceleration | equivalent, nit | → M3 with a benchmark |
+| N2 loose candidate-path assertion | real, nit | **fixed** `3c3403e2` (sibling-wins pinned) |
+| `unrecovered` sweep path writes untyped `Unmasked` | **refuted** | no producer reachable on the recovery path |
+| `from_resolved` masks values verbatim (trailing newline) | note | → M3 |
