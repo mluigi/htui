@@ -256,9 +256,11 @@ mod tests {
         .map(|item| WaitingCandidate { item, runs: vec![] })
         .collect();
         if let Some(row) = rows.iter_mut().find(|row| row.item.title == "runs") {
+            // Shuffled on purpose: neither the input reversed nor a stable
+            // sort on `queued_at` alone yields the expected order.
             row.runs = vec![
-                (run(oldest, Some(row.item.id), t), vec![]),
                 (run(tie_low, Some(row.item.id), later), vec![]),
+                (run(oldest, Some(row.item.id), t), vec![]),
                 (
                     run(tie_high, Some(row.item.id), later),
                     vec![next.clone(), retry.clone(), judge.clone(), fan_one.clone()],
