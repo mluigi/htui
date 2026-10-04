@@ -3,8 +3,8 @@
 //! cursor and refreshes on every tick with no request of its own. `Enter` reveals the row's step;
 //! the Runs pane stays the one place that answers (PRD scope).
 
-use htui_core::model::Scope;
-use htui_worker::{WaitingRow, WaitingView};
+use htui_core::model::{ItemId, RunId, Scope, StepId};
+use htui_worker::{WaitingReason, WaitingRow, WaitingView};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
@@ -46,11 +46,24 @@ const OFFLINE: &str = "permissions unavailable offline";
 /// The step column of a row with no step: the Runs pane's `PENDING` dash.
 const NO_STEP: &str = "\u{2014}";
 
+/// A row's identity across ticks (MOD-69 review M2): the list is re-read and re-sorted on every
+/// tick, so an index alone would slide to another row when one sorts above it.
+type RowId = (ItemId, Option<RunId>, Option<StepId>, WaitingReason);
+
+/// `row`'s [`RowId`].
+const fn id_of(row: &WaitingRow) -> RowId {
+    (row.item, row.run, row.step, row.reason)
+}
+
 /// Lists what waits on a person and reveals the selected row's step.
 #[derive(Debug, Default)]
 pub struct WaitingList {
-    /// The highlighted row, stored unclamped; every read clamps it to the rows on hand (H-3).
+    /// The highlighted row's index when it was last moved to, stored unclamped; every read clamps
+    /// it to the rows on hand (H-3), and it is the fallback when the anchor's row is gone.
     cursor: usize,
+    /// The highlighted row's identity, re-found on every read (review M2); `None` until a key
+    /// first moves the cursor.
+    anchor: Option<RowId>,
 }
 
 impl WaitingList {
@@ -63,15 +76,30 @@ impl WaitingList {
         Self::default()
     }
 
-    /// The cursor clamped to `len` rows; `None` while there are none.
-    fn at(&self, len: usize) -> Option<usize> {
-        len.checked_sub(1).map(|last| self.cursor.min(last))
+    /// The highlighted row of `rows`: the anchor's row (of several sharing its identity, the one
+    /// nearest the stored index), else the stored index clamped; `None` while there are none.
+    fn at(&self, rows: &[WaitingRow]) -> Option<usize> {
+        let last = rows.len().checked_sub(1)?;
+        let anchored = self.anchor.and_then(|anchor| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| id_of(row) == anchor)
+                .map(|(index, _)| index)
+                .min_by_key(|index| index.abs_diff(self.cursor))
+        });
+        Some(anchored.unwrap_or_else(|| self.cursor.min(last)))
+    }
+
+    /// Puts the cursor on `rows[index]`, index and identity both.
+    fn put(&mut self, rows: &[WaitingRow], index: usize) {
+        self.cursor = index;
+        self.anchor = rows.get(index).map(id_of);
     }
 
     /// `Enter`: close, then reveal the selected row's step, both applied by the same drain (the
     /// `ConceptsSearch` order). Nothing on an empty list.
     fn enter(&self, rows: &[WaitingRow], ctx: &Ctx<'_>) {
-        let Some(row) = self.at(rows.len()).and_then(|at| rows.get(at)) else {
+        let Some(row) = self.at(rows).and_then(|at| rows.get(at)) else {
             return;
         };
         ctx.emit(Action::Overlay(OverlayAction::Close));
@@ -103,7 +131,7 @@ impl WaitingList {
             Some(view) => {
                 let columns = Columns::of(&view.rows);
                 let text_width = text_width.unwrap_or(columns.text);
-                let at = self.at(view.rows.len()).unwrap_or(0);
+                let at = self.at(&view.rows).unwrap_or(0);
                 let first = if visible > 0 && at >= visible {
                     at + 1 - visible
                 } else {
@@ -229,11 +257,13 @@ impl Overlay for WaitingList {
         let len = rows.len();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                self.cursor = self.at(len).map_or(0, |at| (at + 1).min(len - 1));
+                let next = self.at(rows).map_or(0, |at| (at + 1).min(len - 1));
+                self.put(rows, next);
                 Handled::Consumed
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.cursor = self.at(len).map_or(0, |at| at.saturating_sub(1));
+                let next = self.at(rows).map_or(0, |at| at.saturating_sub(1));
+                self.put(rows, next);
                 Handled::Consumed
             }
             KeyCode::Enter => {
@@ -449,14 +479,70 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(bench.code(&mut list, KeyCode::Char('j')), Handled::Consumed);
         }
-        assert_eq!(list.at(3), Some(2), "j stops at the last row");
+        assert_eq!(list.at(&rows), Some(2), "j stops at the last row");
 
-        bench.top_bar.waiting = Some(view(vec![rows[0].clone()]));
-        assert_eq!(list.at(1), Some(0));
+        let shrunk = vec![rows[0].clone()];
+        bench.top_bar.waiting = Some(view(shrunk.clone()));
+        assert_eq!(
+            list.at(&shrunk),
+            Some(0),
+            "the anchor is gone: the clamped index"
+        );
         assert_eq!(bench.code(&mut list, KeyCode::Enter), Handled::Consumed);
         assert_closes_then_reveals(&bench.emit.take(), &rows[0]);
         assert_eq!(bench.code(&mut list, KeyCode::Char('k')), Handled::Consumed);
         assert_eq!(list.cursor, 0, "k writes the clamped cursor back");
+    }
+
+    /// MOD-69 review M2: the list is re-sorted on every tick, so the cursor follows its row, not
+    /// its index: a park that sorts above it leaves the cursor on the row it was on.
+    #[test]
+    fn the_cursor_follows_its_row_when_a_park_sorts_above_it() {
+        let rows = vec![
+            gate("ANA-2", ids::HTUI_ANA_2),
+            reopen("FEAT-2", ids::HTUI_FEAT_2),
+        ];
+        let mut bench = Bench::over(Some(view(rows.clone())));
+        let mut list = WaitingList::new();
+        bench.code(&mut list, KeyCode::Char('j'));
+
+        let resorted = vec![
+            gate("ANA-1", ItemId::new()),
+            rows[0].clone(),
+            rows[1].clone(),
+        ];
+        bench.top_bar.waiting = Some(view(resorted.clone()));
+        assert_eq!(list.at(&resorted), Some(2));
+        let rendered = bench.render(&list);
+        assert!(rendered.contains("> FEAT-2 "), "{rendered}");
+        bench.code(&mut list, KeyCode::Enter);
+        assert_closes_then_reveals(&bench.emit.take(), &rows[1]);
+
+        // `k` moves from the row the cursor is on, wherever it now sorts.
+        bench.code(&mut list, KeyCode::Char('k'));
+        bench.code(&mut list, KeyCode::Enter);
+        assert_closes_then_reveals(&bench.emit.take(), &rows[0]);
+    }
+
+    /// Two permission requests of one step share an identity; the cursor still steps from one to
+    /// the other, as the nearest match to its index wins.
+    #[test]
+    fn the_cursor_steps_between_rows_sharing_an_identity() {
+        let first = permission("ANA-2", ids::HTUI_ANA_2);
+        let second = WaitingRow {
+            text: "bash: ls".to_owned(),
+            ..first.clone()
+        };
+        let rows = vec![first, second.clone(), reopen("FEAT-2", ids::HTUI_FEAT_2)];
+        let bench = Bench::over(Some(view(rows.clone())));
+        let mut list = WaitingList::new();
+        bench.code(&mut list, KeyCode::Char('j'));
+        assert_eq!(list.at(&rows), Some(1));
+        bench.code(&mut list, KeyCode::Char('j'));
+        assert_eq!(list.at(&rows), Some(2));
+        bench.code(&mut list, KeyCode::Char('k'));
+        bench.code(&mut list, KeyCode::Enter);
+        assert_closes_then_reveals(&bench.emit.take(), &second);
     }
 
     #[test]
