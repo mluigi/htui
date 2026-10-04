@@ -629,6 +629,198 @@ async fn the_mirror_counts_tool_calls_like_postgres() {
     teardown(db, &[&cache]).await;
 }
 
+/// MOD-69 plan D2: the mirror's `waiting_candidates` (three runtime reads over `item`, `run` and
+/// `run_step`) answers Postgres' rows whole after a pass: a gate park, a selection park on a
+/// minted item, a blocked `agy` item, and the fixture's two candidates.
+#[tokio::test]
+async fn the_mirror_lists_waiting_candidates_like_postgres() {
+    use htui_core::model::{
+        Claim, GraphSnapshot, Isolation, ItemId, NewItem, NewRun, NewRunStep, RunMode, RunStatus,
+        SnapshotGraph, SnapshotSettings, StepStatus,
+    };
+    use htui_core::store::ParkOutcome;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let owner = uuid::Uuid::now_v7();
+    let at = Utc::now().trunc_subsecs(6);
+    let new_run = |item: ItemId| NewRun {
+        id: RunId::new(),
+        project_id: ids::PROJECT_HTUI,
+        item_id: item,
+        mode: RunMode::Manual,
+        target_box_id: ids::BOX,
+        started_by: ids::USER,
+        graph_snapshot: GraphSnapshot {
+            v: GraphSnapshot::V,
+            graph: SnapshotGraph {
+                id: ids::GRAPH_HTUI_FEAT,
+                name: "feature".to_owned(),
+                is_override: false,
+            },
+            topology: "sha256:cache".to_owned(),
+            mode: RunMode::Manual,
+            phases: Vec::new(),
+            settings: SnapshotSettings {
+                default_isolation: Isolation::Worktree,
+                per_token_cap_run: None,
+                per_token_cap_batch: None,
+                max_fan_out: 4,
+                max_agents_per_run: 8,
+            },
+            scope: None,
+            personas: Vec::new(),
+        },
+        repo_scope: Vec::new(),
+        queued_at: at,
+    };
+    let new_step = |run: RunId, fanout_index: i32| NewRunStep {
+        id: StepId::new(),
+        run_id: run,
+        position: 0,
+        attempt: 1,
+        fanout_index,
+        phase_name: "implement".to_owned(),
+        agent_id: Some(ids::AGENT_CLAUDE),
+        model: Some("opus".to_owned()),
+    };
+    let store = &db.store;
+    let claim = |run: RunId| async move {
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
+                .await
+                .expect("claim_run"),
+            Claim::Admitted,
+            "the claim is admitted"
+        );
+    };
+    let running = |run: RunId, fanout_index: i32| async move {
+        let step = store
+            .create_step(new_step(run, fanout_index))
+            .await
+            .expect("create_step")
+            .id;
+        assert!(
+            store
+                .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+                .await
+                .expect("transition_step"),
+            "pending -> running"
+        );
+        step
+    };
+
+    // A gate park on ANA-2.
+    let gate_run = store
+        .create_run(new_run(ids::HTUI_ANA_2))
+        .await
+        .expect("create_run")
+        .id;
+    claim(gate_run).await;
+    let gate_step = running(gate_run, 0).await;
+    assert_eq!(
+        store
+            .park_step(StepFence::Lease(owner), gate_step)
+            .await
+            .expect("park_step"),
+        ParkOutcome::Parked
+    );
+
+    // A selection park on a minted item.
+    let minted = store
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: "selection".to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("mint_item")
+        .id;
+    let selection_run = store
+        .create_run(new_run(minted))
+        .await
+        .expect("create_run")
+        .id;
+    claim(selection_run).await;
+    for fanout_index in [0, 1] {
+        let step = running(selection_run, fanout_index).await;
+        assert!(
+            store
+                .transition_step(step, StepStatus::Running, StepStatus::Done, at)
+                .await
+                .expect("transition_step"),
+            "running -> done"
+        );
+    }
+    assert!(
+        store
+            .transition_run(
+                selection_run,
+                RunStatus::Running,
+                RunStatus::AwaitingApproval,
+                at
+            )
+            .await
+            .expect("transition_run")
+    );
+    assert!(
+        store
+            .transition(minted, Status::InProgress, Status::AwaitingApproval)
+            .await
+            .expect("transition")
+    );
+
+    // A blocked `agy` item.
+    assert!(
+        store
+            .transition(ids::AGY_FIX_1, Status::Open, Status::Blocked)
+            .await
+            .expect("transition")
+    );
+
+    let cache = open_cache(&db).await;
+    run_pass(&db.pool, &cache, &all_projects(), &settings(&db, 20))
+        .await
+        .expect("one pass");
+
+    let scope = platform_scope().await;
+    let mirrored = cache
+        .waiting_candidates(&scope)
+        .await
+        .expect("mirror waiting_candidates");
+    assert_eq!(
+        mirrored,
+        store
+            .waiting_candidates(&scope)
+            .await
+            .expect("pg waiting_candidates"),
+        "the mirror and Postgres list the same rows, whole"
+    );
+    assert_eq!(
+        mirrored.iter().map(|row| row.item.id).collect::<Vec<_>>(),
+        vec![
+            ids::HTUI_ANA_2,
+            ids::HTUI_FEAT_2,
+            minted,
+            ids::HTUI_TOOL_1,
+            ids::AGY_FIX_1
+        ],
+        "ANA-2, FEAT-2, the minted item and TOOL-1 of htui, then agy's FIX-1"
+    );
+
+    teardown(db, &[&cache]).await;
+}
+
 /// Every column `0003_orchestration.sql` adds reaches the mirror, and the ones a projection
 /// carries read back through it (MOD-4 milestone 1, blueprint §3.8).
 ///
