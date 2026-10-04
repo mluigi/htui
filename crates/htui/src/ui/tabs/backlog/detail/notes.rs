@@ -75,31 +75,6 @@ struct Hedged {
     mirror: bool,
 }
 
-/// Columns between tab stops: `TextArea`'s, so a `\t` from `$EDITOR` reads in the thread as it
-/// did in the compose area (review L2).
-const TAB_STOP: usize = 4;
-
-/// `row` with each `\t` as spaces to the next [`TAB_STOP`], counted in cells from the row's
-/// start, as `TextArea` draws it; `ratatui` would drop it (review L2). Borrowed without one.
-fn expand_tabs(row: &str) -> Cow<'_, str> {
-    if !row.contains('\t') {
-        return Cow::Borrowed(row);
-    }
-    let mut out = String::with_capacity(row.len() + TAB_STOP);
-    let mut col = 0;
-    for cluster in cells::graphemes(row) {
-        if cluster == "\t" {
-            let cells = TAB_STOP - col % TAB_STOP;
-            out.extend(iter::repeat_n(' ', cells));
-            col += cells;
-        } else {
-            out.push_str(cluster);
-            col += cells::cell_width(cluster);
-        }
-    }
-    Cow::Owned(out)
-}
-
 /// The cells to wrap the thread at: `width`, or no wrap before the first render (each row one,
 /// the old lower bound on what is drawn).
 fn wrap_width(width: u16) -> usize {
@@ -163,7 +138,11 @@ impl NotesTab {
                     true,
                     Cow::Owned(note.created_at.format(STAMP).to_string()),
                 )))
-                .chain(note.body.split('\n').map(|row| (false, expand_tabs(row))))
+                .chain(
+                    note.body
+                        .split('\n')
+                        .map(|row| (false, cells::expand_tabs(row))),
+                )
         })
     }
 

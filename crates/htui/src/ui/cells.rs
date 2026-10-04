@@ -24,13 +24,15 @@
 //!
 //! Every clip with a cut mark, pad, fit and word wrap in `ui/` goes through the operations below
 //! (MOD-60 D1), so a row is never measured one way and drawn another: [`clip`], [`pad`],
-//! [`pad_left`], [`fit`], [`wrap`] and [`clip_spans`], all cutting at [`ELLIPSIS`] and all drawing
-//! a control character as one blank cell (D3). A few walks are other operations and keep their
+//! [`pad_left`], [`fit`], [`wrap`], [`wrap_spans`] and [`clip_spans`], all cutting at
+//! [`ELLIPSIS`] and all drawing a control character as one blank cell (D3). [`expand_tabs`]
+//! draws a `\t` as `TextArea` does (MOD-84 D6). A few walks are other operations and keep their
 //! own loop over the two measures above: the text widgets' cursor windows, `path_picker`'s cut
 //! from the left and its word wrap (which keeps controls raw; out of MOD-60's scope, D10), the
 //! graph pane's edge cut (no mark), and `concepts_search`'s unmarked clip and grapheme-only wrap.
 
 use std::borrow::Cow;
+use std::iter;
 
 use ratatui::style::Style;
 use ratatui::text::Span;
@@ -227,6 +229,98 @@ pub(crate) fn wrap(line: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// `spans`, one line, in rows of at most `width` cells, every piece keeping its span's style
+/// (MOD-84 D5): [`wrap`]'s rules over the spans' concatenation. Broken at U+0020 where one fits,
+/// inside a word by grapheme only when the word alone is wider; leading spaces kept; a space that
+/// does not fit is the break and is dropped; width 0 reads as 1; controls flattened per piece (D3),
+/// so only U+0020 splits words. A word may cross a style boundary and moves to the next row whole.
+/// A space keeps the style of the span it is in. Adjacent pieces of one style on a row are one
+/// span. With one style, the rows' text is exactly [`wrap`]'s. No spans is one empty row.
+#[must_use]
+pub(crate) fn wrap_spans(spans: &[Span<'_>], width: usize) -> Vec<Vec<Span<'static>>> {
+    // Words as `line.split(' ')` over the concatenation; split before flattening, because a
+    // flattened control is a space that must not split (as `wrap` flattens per word).
+    let mut words = vec![Word::default()];
+    // The style of the space before each word after the first.
+    let mut gaps: Vec<Style> = Vec::new();
+    for span in spans {
+        for (at, raw) in span.content.split(' ').enumerate() {
+            if at > 0 {
+                gaps.push(span.style);
+                words.push(Word::default());
+            }
+            if raw.is_empty() {
+                continue;
+            }
+            let piece = flatten(raw);
+            if let Some(word) = words.last_mut() {
+                word.cells += cell_width(&piece);
+                word.pieces.push((piece, span.style));
+            }
+        }
+    }
+    let width = width.max(1);
+    let mut rows: Vec<Vec<Span<'static>>> = vec![Vec::new()];
+    // The last row's cells, a running sum as in `wrap`.
+    let mut used = 0;
+    for (gap, word) in iter::once(None)
+        .chain(gaps.into_iter().map(Some))
+        .zip(&words)
+    {
+        if let Some(gap) = gap {
+            if used + 1 + word.cells <= width {
+                push_styled(&mut rows, " ", gap);
+                for (piece, style) in &word.pieces {
+                    push_styled(&mut rows, piece, *style);
+                }
+                used += 1 + word.cells;
+                continue;
+            }
+            if word.pieces.is_empty() {
+                // A space that does not fit is the break itself.
+                continue;
+            }
+            if used > 0 {
+                rows.push(Vec::new());
+                used = 0;
+            }
+        }
+        // Per piece, so per span: a cluster split across two spans is two, as `ratatui` draws them.
+        for (piece, style) in &word.pieces {
+            for cluster in graphemes(piece) {
+                let cells = cell_width(cluster);
+                if rows.last().is_some_and(|row| !row.is_empty()) && used + cells > width {
+                    rows.push(Vec::new());
+                    used = 0;
+                }
+                push_styled(&mut rows, cluster, *style);
+                used += cells;
+            }
+        }
+    }
+    rows
+}
+
+/// One word of [`wrap_spans`]: its flattened pieces with their spans' styles, and its cells.
+#[derive(Debug, Default)]
+struct Word<'a> {
+    /// The word's text per span it crosses; never an empty piece.
+    pieces: Vec<(Cow<'a, str>, Style)>,
+    /// The sum of the pieces' cells.
+    cells: usize,
+}
+
+/// `text` onto the last row: into its last span when the style is the same, else a new span.
+fn push_styled(rows: &mut [Vec<Span<'static>>], text: &str, style: Style) {
+    let Some(row) = rows.last_mut() else {
+        return;
+    };
+    match row.last_mut() {
+        Some(last) if last.style == style => last.content.to_mut().push_str(text),
+        _ => row.push(Span::styled(text.to_owned(), style)),
+    }
+}
+
 /// `spans` cut from the end to at most `width` cells, every kept span keeping its style; when
 /// anything was cut, [`ELLIPSIS`] ends the line in the style of the span the cut fell in (B1).
 /// Controls flattened per span (D3). No padding. Width 0 is no spans.
@@ -262,6 +356,33 @@ pub(crate) fn clip_spans(spans: &[Span<'_>], width: usize) -> Vec<Span<'static>>
         break;
     }
     out
+}
+
+/// Columns between tab stops: `TextArea`'s, so a `\t` reads in the Notes thread and in an item
+/// body's code as it did in the compose area (MOD-13 review L2, MOD-84 D6).
+pub(crate) const TAB_STOP: usize = 4;
+
+/// `row` with each `\t` as spaces to the next [`TAB_STOP`], counted in cells from the row's
+/// start, as `TextArea` draws it; `ratatui` would drop it (review L2). Borrowed without one.
+/// Shared by the Notes thread and the Body pane's code lines (MOD-84 D6).
+#[must_use]
+pub(crate) fn expand_tabs(row: &str) -> Cow<'_, str> {
+    if !row.contains('\t') {
+        return Cow::Borrowed(row);
+    }
+    let mut out = String::with_capacity(row.len() + TAB_STOP);
+    let mut col = 0;
+    for cluster in graphemes(row) {
+        if cluster == "\t" {
+            let cells = TAB_STOP - col % TAB_STOP;
+            out.extend(iter::repeat_n(' ', cells));
+            col += cells;
+        } else {
+            out.push_str(cluster);
+            col += cell_width(cluster);
+        }
+    }
+    Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -690,8 +811,9 @@ mod tests {
         rows
     }
 
-    #[test]
-    fn wrap_with_a_running_sum_matches_the_remeasuring_wrap() {
+    /// Every line the running-sum and span-wrap parity tests wrap: words of every shape, joined
+    /// by one and two spaces, with leading and trailing spaces.
+    fn wrap_lines() -> Vec<String> {
         let words = [
             "ab".to_owned(),
             "abcdefghij".to_owned(),
@@ -718,7 +840,12 @@ mod tests {
         }
         lines.push(words.join(" "));
         lines.push(words.join("  "));
-        for line in &lines {
+        lines
+    }
+
+    #[test]
+    fn wrap_with_a_running_sum_matches_the_remeasuring_wrap() {
+        for line in &wrap_lines() {
             for width in 0..=12 {
                 assert_eq!(
                     wrap(line, width),
@@ -753,6 +880,106 @@ mod tests {
             .iter()
             .map(|(text, style)| Span::styled((*text).to_owned(), *style))
             .collect()
+    }
+
+    /// Each row's text, its spans' contents concatenated.
+    fn texts(rows: &[Vec<Span<'_>>]) -> Vec<String> {
+        rows.iter()
+            .map(|row| row.iter().map(|span| span.content.as_ref()).collect())
+            .collect()
+    }
+
+    /// MOD-84 D5: with one style, `wrap_spans` is `wrap`, whether the line is one span or a span
+    /// per word and per space; and adjacent pieces of one style merge into one span.
+    #[test]
+    fn wrap_spans_with_one_style_is_wrap() {
+        let a = style_a();
+        for line in wrap_lines().into_iter().chain(cross_cluster_inputs()) {
+            let whole = vec![Span::styled(line.clone(), a)];
+            let mut split = Vec::new();
+            for (at, word) in line.split(' ').enumerate() {
+                if at > 0 {
+                    split.push(Span::styled(" ", a));
+                }
+                split.push(Span::styled(word.to_owned(), a));
+            }
+            for width in 0..=12 {
+                for input in [&whole, &split] {
+                    let rows = wrap_spans(input, width);
+                    assert_eq!(texts(&rows), wrap(&line, width), "{input:?} at {width}");
+                    for row in &rows {
+                        assert!(row.len() <= 1, "{row:?}: one style is one span");
+                        assert!(row.iter().all(|span| span.style == a), "{row:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_word_crossing_a_style_boundary_moves_whole() {
+        let (a, b) = (style_a(), style_b());
+        assert_eq!(
+            wrap_spans(&spans(&[("ab ", a), ("c", b), ("d", a)]), 3),
+            [spans(&[("ab", a)]), spans(&[("c", b), ("d", a)])]
+        );
+    }
+
+    #[test]
+    fn a_space_keeps_its_span_s_style() {
+        let (a, b) = (style_a(), style_b());
+        assert_eq!(
+            wrap_spans(&spans(&[("a ", a), ("b", b)]), 80),
+            [spans(&[("a ", a), ("b", b)])]
+        );
+    }
+
+    #[test]
+    fn an_overlong_word_splits_by_grapheme_and_keeps_styles() {
+        let (a, b) = (style_a(), style_b());
+        assert_eq!(
+            wrap_spans(&spans(&[("(", a), ("code", b), ("),", a), (" next", a)]), 6),
+            [
+                spans(&[("(", a), ("code", b), (")", a)]),
+                spans(&[(", next", a)])
+            ]
+        );
+    }
+
+    #[test]
+    fn wrap_spans_width_0_reads_as_1_and_nothing_is_one_row() {
+        let a = style_a();
+        assert_eq!(
+            wrap_spans(&spans(&[("ab", a)]), 0),
+            [spans(&[("a", a)]), spans(&[("b", a)])]
+        );
+        assert_eq!(wrap_spans(&[], 5), vec![Vec::<Span<'static>>::new()]);
+        assert_eq!(
+            wrap_spans(&spans(&[("", a)]), 5),
+            vec![Vec::<Span<'static>>::new()]
+        );
+    }
+
+    #[test]
+    fn wrap_spans_flattens_controls_without_splitting_at_them() {
+        let (a, b) = (style_a(), style_b());
+        assert_eq!(
+            wrap_spans(&spans(&[("a\tb c", a)]), 3),
+            [spans(&[("a b", a)]), spans(&[("c", a)])]
+        );
+        assert_eq!(
+            wrap_spans(&spans(&[("x\u{1}", a), ("y", b)]), 80),
+            [spans(&[("x ", a), ("y", b)])]
+        );
+    }
+
+    #[test]
+    fn expand_tabs_pads_to_the_next_stop_in_cells() {
+        assert_eq!(expand_tabs("a\tb"), "a   b");
+        assert_eq!(expand_tabs("\tc"), "    c");
+        assert_eq!(expand_tabs("abcd\te"), "abcd    e");
+        assert_eq!(expand_tabs("\u{6f22}\tx"), "\u{6f22}  x");
+        assert!(matches!(expand_tabs("plain"), Cow::Borrowed(_)));
     }
 
     #[test]
