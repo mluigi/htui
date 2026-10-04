@@ -736,11 +736,12 @@ fn the_frame_literals_are_scrubbed_like_every_other_digested_byte() {
         panic!("expected an unmasked refusal, got {error:?}");
     };
     assert_eq!(section, "template");
+    let rendered = error.to_string();
     assert!(
-        !error
-            .to_string()
-            .contains("sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF")
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
     );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
 }
 
 #[test]
@@ -1143,9 +1144,10 @@ fn scrub_residue_names_the_section_not_the_text() {
     assert_eq!(path, "", "the whole wrapped string is the leaf");
     let rendered = error.to_string();
     assert!(
-        !rendered.contains("sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF"),
-        "the error must not repeat the secret: {rendered}"
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
     );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
 
     // A secret the scrubber *can* mask is masked, and assembly continues.
     let mut masked = fixtures::phase_implement_attempt2();

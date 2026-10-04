@@ -205,11 +205,12 @@ fn an_unmaskable_persona_body_refuses_the_prompt() {
         panic!("expected Unmasked, got {error:?}");
     };
     assert_eq!(section, "persona");
+    let rendered = error.to_string();
     assert!(
-        !error
-            .to_string()
-            .contains("sk-ant-api03-DEADBEEFDEADBEEFDEADBEEF")
+        !rendered.contains("DEADBEEF"),
+        "the error must not repeat any of the secret: {rendered}"
     );
+    assert!(!rendered.contains("sk-ant-"), "{rendered}");
 }
 
 #[test]
