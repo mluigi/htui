@@ -149,7 +149,8 @@ One load flake was seen once and passed on rerun: `htui-agent` `tests/auth.rs`
 
 ## Carried
 
-**MOD-76** owns the risks re-deferred with reasons:
+**MOD-76** owns the risks re-deferred with reasons (done, `docs/decisions/mod/mod-76.md`: R-32 and
+R-53 closed as accepted, R-44 and R-55 fixed):
 - **R-32**, the D131 half: a not-reset park loses its detail. Diagnostics only.
 - **R-44**: step rows at 43 columns truncate `agent/model`. A layout decision, which waits for the
   Runs pane's next layout change.

@@ -14,27 +14,19 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator
-hardening closed in five milestones (run state, store and engine correctness, git cost, deadline and
-sessions, ACP resume). A promoted ACP step now resumes its own session (`session/resume`, else
-`session/load` with the replay discarded), and a promotion resumes the step's latest banner. A
-resume that fails is reported and opens the handoff prompt in the same bind. `run_step.opening`
-(migration 0014) records which way the chat opened, and the Runs pane and the Chat tab say "context
-not carried; handoff prompt only". The four re-deferred risks are MOD-76.
+**Current status (2026-10-04):** **MOD-76 is done** (`docs/decisions/mod/mod-76.md`): MOD-37's four
+carried risks. R-32 and R-53 closed as accepted with no code. The Runs pane shortens `agent/model`
+before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
+`claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
+the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
+with no run walking, never under a live walk. No migration.
+Before it, **MOD-37 is done** (`docs/decisions/mod/mod-37.md`): orchestrator hardening closed in
+five milestones (run state, store and engine correctness, git cost, deadline and sessions, ACP
+resume). A promoted ACP step now resumes its own session (`session/resume`, else `session/load` with
+the replay discarded), and a resume that fails opens the handoff prompt in the same bind;
+`run_step.opening` (migration 0014) records which way the chat opened.
 Before it, **MOD-73 is done** (`docs/decisions/mod/mod-73.md`): a hand-written
-document version newer than a step's output is what the next step reads. `resolve_inputs` answers,
-per kind, the higher version of the step-produced pick (this run first, losers excluded) and the
-latest document no step produced, on `MemStore`, Postgres and the mirror (one statement on both
-engines, one `.sqlx` entry replaced), so a gate edit made with Docs `v` reaches the next phase
-(ANA-2 §4.2 amended). Docs `v` now prefills from that same read, never a fan-out loser's body.
-`htui-orch` conformance case 94; no migration.
-Before it, **MOD-74 is done** (`docs/decisions/mod/mod-74.md`): the three
-follow-ups from MOD-71's review. A capture that goes off (an overlay, `?`, a form, a sub-tab or tab
-switch, an `$EDITOR` handoff) now tells every tab, so a button held across the off-and-on no longer
-resumes the old pan. Capture is button-only reporting on ANSI terminals (`?1003h` dropped, so no
-hover stream; Windows keeps crossterm's WinAPI path). A live pan re-anchors on every draw, so a
-`Runs` re-read, a moved canvas or a wheel zoom mid-pan no longer jumps on the next drag. No
-migration, no new crate, no rataflow change.
+document version newer than a step's output is what the next step reads (ANA-2 §4.2 amended).
 
 ---
 
@@ -58,30 +50,6 @@ migration, no new crate, no rataflow change.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
 ### Next features
-- [ ] **MOD-76 - Orchestrator carried risks after MOD-37** (from MOD-37,
-  `docs/decisions/mod/mod-37.md` "Carried"). `R-ORCH-3`, `R-ORCH-8`, `R-TUI-4`. MOD-37 closed with
-  these four risks re-deferred, each with its reason. None blocks a run. Pick them off when the
-  trigger named on each one arrives.
-  - **R-32** (D138 half closed by MOD-37 phase 2: `part_way` keeps an `Io` error as `Io`, kind
-    included): D131's not-reset park loses its detail. Re-deferred: `labelled` is always empty on a
-    refusal, and the lost part is the reason text, which only `never_reset` holds in memory;
-    keeping it needs a new column or a change to `gate_note`, which the engine and four tests match
-    exactly. Diagnostics only (lease blueprint §22.3).
-  - **R-44** (re-deferred by MOD-37 phase 1): step rows at 43 columns truncate `agent/model` for
-    long model ids. `…` marks the cut and the width test keeps it from clipping silently (drive
-    plan, Risks). Any real fix is a layout decision (drop the indent, abbreviate the model, or add
-    a line), so it waits for the Runs pane's next layout change.
-  - **R-53** (re-deferred by MOD-37 phase 1; mitigated, no code change): `ItemActions` is as of the
-    last `Runs` reply, so a verdict can flip before the key is pressed. The engine re-checks with
-    the same admission function (D184) and the pane re-reads (D171) (drive blueprint §18). The
-    pane re-requests the actions with every `Runs` read, so what is left is the interval between
-    that reply and the key press, which D184 already guards.
-  - **R-55**: the TUI reads `box.settings.command_limits` once per process, per server, so an edit
-    does not reach its verifier until a restart or a server switch. `htui worker` re-reads them at a
-    sweep with no live walk after a repo or checkout change, and a change to the limits alone at
-    restart (`docs/htui-worker.md`). Nothing edits it today;
-    whoever adds an editor re-reads the limits or rebuilds the verifier when no walk is live (drive
-    blueprint §21.3).
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
   `R-ORCH-7`. Milestone 4 runs every candidate of a group on the
@@ -418,6 +386,6 @@ migration, no new crate, no rataflow change.
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 1 (ANA-25 learned weights) |
-| MOD-N   | 20 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list, MOD-76 orchestrator carried risks; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 19 (MOD-10 secrets, MOD-11 MCP, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-69 waiting-on-you list; deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

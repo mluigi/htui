@@ -6,7 +6,7 @@ maintainer 2026-10-04. Sandbox run `hr/MOD-76`.
 **Scope**: chosen by the maintainer per risk, 2026-10-04: R-32 closed as accepted, R-44 abbreviate the model, R-53
 closed as accepted, R-55 fixed now.
 **Complexity**: Small (one pure function in the Runs pane, one comparison in the worker runtime's parts cache, docs)
-**Status**: confirmed 2026-10-04 (fact-checked)
+**Status**: done 2026-10-04 (`docs/decisions/mod/mod-76.md`)
 
 ## Summary
 
