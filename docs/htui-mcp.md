@@ -204,8 +204,14 @@ A phase's `command_queue` setting decides (shown in Settings › Kinds):
 | `fan_out_only` | when the phase fans out to more than one agent, or the item carries the tag `heavy_build` |
 
 Every seeded phase is `fan_out_only`, so a single-agent step gets the queue only on an item tagged
-`heavy_build` (the `tags` field of the item's form in Backlog). A persona with `command-run: false`
-takes it away (see
+`heavy_build` (the `tags` field of the item's form in Backlog). That field is the item's required
+box tags (`R-ORCH-10`), so the tag is also a requirement: the item runs only on a box whose tags
+include `heavy_build`. No probe sets it, so declare it on each box meant to take such items
+(**Settings › Boxes**, `t`); on any other box a run is refused and the item is blocked with the
+note `missing tags: heavy_build`, and auto mode does not pick the item there. A phase whose
+`command_queue` is `always` gives a single-agent step the queue without tying the item to a box;
+Settings › Kinds shows that setting but does not edit it (it is the `step_graph_phase` row's
+`command_queue` column). A persona with `command-run: false` takes it away (see
 [`docs/personas.md`](personas.md#narrow-only-what-a-persona-can-and-cannot-change)). The
 prompt's `command_queue` section follows the same rule, so the prompt never names a tool the
 session lacks. Judge calls and chats never get it. Before MOD-11 a `fan_out_only` phase rendered
