@@ -190,7 +190,7 @@ Every call fails with one of these. The sentence is what htui shows; `…` is fi
 | `ProjectNotFound` | Infisical has no project with the configured project ID | Copy the project ID (not its name) from the project's settings into the scope. |
 | `PathNotFound` | Infisical has no environment `<environment>` or folder `<path>` in the project | Use the environment's slug and an existing folder. |
 | `PermissionDenied` | the machine identity may not read these secrets: … | Add the identity to the project, or give its role read access to the secret values in that environment and folder (the detail says which, or names a hidden key). |
-| `RateLimited` | Infisical rate-limited the request; retry after `<n>` s | Wait and try again; htui does not retry by itself. Infisical Cloud only. |
+| `RateLimited` | Infisical rate-limited the request, followed by `; retry after <n> s` when the server sent `Retry-After` as whole seconds | Wait (the `<n>` seconds, when given) and try again; htui does not retry by itself. Infisical Cloud only. |
 | `UnsupportedServer` | this Infisical predates v0.150 (`<endpoint>` does not exist); upgrade it | Upgrade the server, or enable Universal Auth on it when the endpoint is the login's. |
 | `InvalidKey` | the secret name `"<key>"` is not a valid environment variable name; rename it in Infisical | Rename the secret to letters, digits and `_`, not starting with a digit. |
 | `InvalidValue` | the secret `<key>` holds a NUL byte, which an environment variable cannot carry; fix its value in Infisical | Remove the NUL from the value in Infisical. |
