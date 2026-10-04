@@ -165,6 +165,60 @@ mod tests {
         assert_eq!(store_style("offline · 3m", &theme), theme.warning);
     }
 
+    /// MOD-80 review L3: `store_style` keys on the text `Backend::label` writes, so it is fed
+    /// the real labels: a renamed label fails here rather than silently drawing `base`.
+    #[tokio::test]
+    async fn store_style_reads_the_labels_the_backend_writes() {
+        use chrono::{TimeDelta, Utc};
+        use htui_core::model::BoxId;
+        use htui_core::store::MemStore;
+        use htui_store::{Backend, CacheStore, Identity, PgStore};
+
+        let theme = Theme::default();
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = CacheStore::open(root.path(), "top-bar-labels", 1)
+            .await
+            .expect("open a throwaway mirror");
+        let identity = Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".to_owned(),
+        };
+        let pg = PgStore::lazy(
+            "postgres://nobody:nothing@127.0.0.1:1/none",
+            &identity,
+            std::time::Duration::from_millis(250),
+        )
+        .expect("a lazy pool opens no socket");
+        let cases = [
+            (Backend::memory(MemStore::new()), theme.base),
+            (
+                Backend::Online {
+                    pg,
+                    cache: cache.clone(),
+                },
+                theme.base,
+            ),
+            (
+                Backend::Offline {
+                    cache: cache.clone(),
+                    since: None,
+                },
+                theme.warning,
+            ),
+            (
+                Backend::Offline {
+                    cache,
+                    since: Some(Utc::now() - TimeDelta::seconds(220)),
+                },
+                theme.warning,
+            ),
+        ];
+        for (backend, style) in cases {
+            let label = backend.label();
+            assert_eq!(store_style(&label, &theme), style, "{label}");
+        }
+    }
+
     /// MOD-80 D6: the top bar draws a degraded store label as a warning.
     #[test]
     fn a_degraded_store_label_is_drawn_as_a_warning() {
