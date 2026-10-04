@@ -4,16 +4,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use htui_agent::driver::{AgentDriver, AgentSession, DriverCaps, DriverFuture, SessionSpec};
 use htui_agent::error::DriverError;
 use htui_agent::event::DoneEvent;
 use htui_core::model::{
-    DocumentHead, DocumentId, Item, ItemId, NewDocument, Run, RunId, RunStep, Scope, SnapshotPhase,
-    StepId, WaitingCandidate, WaitingPermission,
+    DocumentHead, DocumentId, Item, ItemId, NewDocument, ProjectId, Run, RunId, RunStatus, RunStep,
+    Scope, SnapshotPhase, StepId, StepStatus, WaitingCandidate, WaitingPermission,
 };
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
-use htui_orch::status::{group_at, resumable};
+use htui_orch::status::{group_at, judge_at, resumable};
 use htui_orch::{
     Command, CommandOutcome, EngineError, GateAnswer, Rest, SessionKey, SessionSink, UnblockCase,
     accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled,
@@ -548,8 +549,236 @@ pub fn waiting(
     candidates: &[WaitingCandidate],
     permissions: Option<&[WaitingPermission]>,
 ) -> WaitingView {
-    let _ = (scope, active, candidates, permissions);
-    todo!("MOD-69 T2")
+    let project_at = |project: ProjectId| {
+        scope
+            .project_ids
+            .iter()
+            .position(|id| *id == project)
+            .unwrap_or(usize::MAX)
+    };
+    let mut keyed: Vec<(RowKey, WaitingRow)> = Vec::new();
+
+    for candidate in candidates {
+        let item = &candidate.item;
+        let row = |run: Option<&Run>,
+                   step: Option<&RunStep>,
+                   step_label: String,
+                   reason: WaitingReason,
+                   text: String| {
+            let key = RowKey {
+                project: project_at(item.project_id),
+                key_prefix: item.key_prefix.clone(),
+                key_number: item.key_number,
+                item: item.id,
+                run_missing: run.is_none(),
+                run: run.map(|run| (run.queued_at, run.id)),
+                step_missing: step.is_none(),
+                step: step.map(|step| (step.position, step.attempt, step.fanout_index)),
+                reason,
+                text: text.clone(),
+            };
+            let row = WaitingRow {
+                item: item.id,
+                item_key: item.key.clone(),
+                run: run.map(|run| run.id),
+                step: step.map(|step| step.id),
+                step_label,
+                reason,
+                text,
+            };
+            (key, row)
+        };
+        let verdict = verdicts(item, &candidate.runs, &[], &LiveChats::default());
+
+        for (run, steps) in &candidate.runs {
+            // Step status decides a gate, not `approve`: a gate parked without its output greys
+            // `approve` but still waits on a person (plan D3).
+            let parked: Vec<&RunStep> = steps
+                .iter()
+                .filter(|step| step.status == StepStatus::AwaitingApproval)
+                .collect();
+            for step in &parked {
+                let text = match &step.gate_note {
+                    Some(note) if !note.is_empty() => note.clone(),
+                    _ if step.promoted_at.is_some() => PROMOTED_TEXT.to_owned(),
+                    _ => GATE_TEXT.to_owned(),
+                };
+                keyed.push(row(
+                    Some(run),
+                    Some(step),
+                    label_of(step, steps),
+                    WaitingReason::Gate,
+                    text,
+                ));
+            }
+            if run.status != RunStatus::AwaitingApproval || !parked.is_empty() {
+                continue;
+            }
+            // A slot waits on a selection exactly when the pane enables `select` on one of its
+            // candidates; a run whose snapshot does not decode has every `select` refused.
+            let slots: BTreeSet<(i32, i32)> = steps
+                .iter()
+                .filter(|step| {
+                    step.fanout_index >= 0
+                        && verdict
+                            .steps
+                            .get(&step.id)
+                            .is_some_and(|actions| actions.select.is_ok())
+                })
+                .map(|step| (step.position, step.attempt))
+                .collect();
+            for (position, attempt) in slots {
+                let failed_judge = judge_at(steps, position, attempt)
+                    .filter(|judge| judge.status == StepStatus::Failed)
+                    .and_then(|judge| judge.gate_note.clone().map(|note| (judge, note)));
+                if let Some((judge, note)) = failed_judge {
+                    keyed.push(row(
+                        Some(run),
+                        Some(judge),
+                        label_of(judge, steps),
+                        WaitingReason::JudgeFailed,
+                        note,
+                    ));
+                } else if let Some(first) = group_at(steps, position, attempt).first() {
+                    keyed.push(row(
+                        Some(run),
+                        Some(first),
+                        label_of(first, steps),
+                        WaitingReason::Selection,
+                        SELECTION_TEXT.to_owned(),
+                    ));
+                }
+            }
+        }
+
+        let run_of = |id: RunId| {
+            candidate
+                .runs
+                .iter()
+                .map(|(run, _)| run)
+                .find(|run| run.id == id)
+        };
+        let unblock = match unblock_case(item, &candidate.runs) {
+            Ok(UnblockCase::Reopen) => Some((None, REOPEN_TEXT)),
+            Ok(UnblockCase::FollowRun(id)) => run_of(id).map(|run| (Some(run), FOLLOW_TEXT)),
+            Ok(UnblockCase::Resume(id)) => run_of(id).map(|run| (Some(run), RESUME_TEXT)),
+            Err(_) => None,
+        };
+        if let Some((run, text)) = unblock {
+            keyed.push(row(
+                run,
+                None,
+                String::new(),
+                WaitingReason::Unblock,
+                text.to_owned(),
+            ));
+        }
+    }
+
+    for p in permissions.unwrap_or_default() {
+        let text = p
+            .permission
+            .summary
+            .clone()
+            .filter(|summary| !summary.is_empty())
+            .unwrap_or_else(|| PERMISSION_TEXT.to_owned());
+        let key = RowKey {
+            project: project_at(p.project),
+            key_prefix: p.key_prefix.clone(),
+            key_number: p.key_number,
+            item: p.item,
+            run_missing: false,
+            run: Some((p.run_queued_at, p.permission.run_id)),
+            step_missing: false,
+            step: Some((p.step_position, p.step_attempt, p.step_fanout_index)),
+            reason: WaitingReason::Permission,
+            text: text.clone(),
+        };
+        let row = WaitingRow {
+            item: p.item,
+            item_key: p.item_key.clone(),
+            run: Some(p.permission.run_id),
+            step: Some(p.permission.run_step_id),
+            step_label: slot_label(
+                &p.phase_name,
+                p.step_position,
+                p.step_attempt,
+                p.step_fanout_index,
+                p.step_fanout_index != 0,
+            ),
+            reason: WaitingReason::Permission,
+            text,
+        };
+        keyed.push((key, row));
+    }
+
+    keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let rows: Vec<WaitingRow> = keyed.into_iter().map(|(_, row)| row).collect();
+    // Plan D5, blueprint H-19: a run owning several rows counts once; `saturating_sub` also
+    // absorbs the race between `active_runs` and the candidate read.
+    let owning = rows
+        .iter()
+        .filter_map(|row| row.run)
+        .collect::<BTreeSet<_>>()
+        .len();
+    WaitingView {
+        working: active.saturating_sub(owning),
+        rows,
+        permissions_known: permissions.is_some(),
+    }
+}
+
+/// A row's place in the list: plan D9 (project position, item key, run creation, step position),
+/// then blueprint E8's ties — inside an item, rows with a run before the Reopen row; inside a run,
+/// step rows before its Unblock row; then the reason (plan D3 order) and the text.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct RowKey {
+    /// The project's position in `scope.project_ids`; `usize::MAX` when absent.
+    project: usize,
+    /// Byte order (`String`'s `Ord`), so the order does not depend on a collation.
+    key_prefix: String,
+    /// By number, so `FEAT-2` sorts before `FEAT-10`.
+    key_number: i32,
+    item: ItemId,
+    /// `false` first: rows with a run before the item's Reopen row.
+    run_missing: bool,
+    /// `(queued_at, id)` ascending: plan D9's run creation.
+    run: Option<(DateTime<Utc>, RunId)>,
+    /// `false` first: a run's step rows before its Unblock row.
+    step_missing: bool,
+    /// `(position, attempt, fanout_index)`.
+    step: Option<(i32, i32, i32)>,
+    reason: WaitingReason,
+    /// The last tie-break: two permissions on one step.
+    text: String,
+}
+
+/// `phase p.a`, then `/i` in a fan-out slot and `/j` for its judge (the Runs pane's slot column,
+/// MOD-69 blueprint E7).
+fn slot_label(phase: &str, position: i32, attempt: i32, fanout_index: i32, fanned: bool) -> String {
+    let at = format!("{phase} {position}.{attempt}");
+    match (fanned, fanout_index) {
+        (false, _) => at,
+        (true, -1) => format!("{at}/j"),
+        (true, index) => format!("{at}/{index}"),
+    }
+}
+
+/// [`slot_label`] of a step among its run's steps: a slot is fanned when a step at the same
+/// `(position, attempt)` has a non-zero `fanout_index`.
+fn label_of(step: &RunStep, steps: &[RunStep]) -> String {
+    let fanned = steps.iter().any(|sibling| {
+        sibling.position == step.position
+            && sibling.attempt == step.attempt
+            && sibling.fanout_index != 0
+    });
+    slot_label(
+        &step.phase_name,
+        step.position,
+        step.attempt,
+        step.fanout_index,
+        fanned,
+    )
 }
 
 /// Blueprint D212 (review H3): `Ok` unless a chat of this process is live on one of `steps` — the
@@ -1372,37 +1601,18 @@ mod tests {
         let scope = scope(&[ids::PROJECT_HTUI]);
 
         let online = waiting(&scope, 1, &[], Some(&perms));
-        let rows: Vec<(WaitingReason, Option<RunId>, Option<StepId>, &str, &str)> = online
-            .rows
-            .iter()
-            .map(|row| {
-                (
-                    row.reason,
-                    row.run,
-                    row.step,
-                    row.step_label.as_str(),
-                    row.text.as_str(),
-                )
-            })
-            .collect();
+        let expected = |text: &str| WaitingRow {
+            item: item.id,
+            item_key: "FEAT-1".to_owned(),
+            run: Some(run.id),
+            step: Some(live.id),
+            step_label: "prd 0.1".to_owned(),
+            reason: WaitingReason::Permission,
+            text: text.to_owned(),
+        };
         assert_eq!(
-            rows,
-            [
-                (
-                    WaitingReason::Permission,
-                    Some(run.id),
-                    Some(live.id),
-                    "prd 0.1",
-                    "edit: src/main.rs"
-                ),
-                (
-                    WaitingReason::Permission,
-                    Some(run.id),
-                    Some(live.id),
-                    "prd 0.1",
-                    PERMISSION_TEXT
-                ),
-            ]
+            online.rows,
+            [expected("edit: src/main.rs"), expected(PERMISSION_TEXT)]
         );
         assert!(online.permissions_known);
         assert_eq!(online.working, 0);
