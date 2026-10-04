@@ -6409,6 +6409,13 @@ impl State {
                     return None;
                 }
                 let step = self.steps.get(&p.row.run_step_id)?;
+                // Review L1: the Runs pane's rule, a sibling at the slot with a non-zero index.
+                let step_fanned = self.steps.values().any(|sibling| {
+                    sibling.run_id == step.run_id
+                        && sibling.position == step.position
+                        && sibling.attempt == step.attempt
+                        && sibling.fanout_index != 0
+                });
                 Some(WaitingPermission {
                     item: item.id,
                     project: item.project_id,
@@ -6419,6 +6426,7 @@ impl State {
                     step_position: step.position,
                     step_attempt: step.attempt,
                     step_fanout_index: step.fanout_index,
+                    step_fanned,
                     phase_name: step.phase_name.clone(),
                     permission: p.row.clone(),
                 })

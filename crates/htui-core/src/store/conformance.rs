@@ -15727,6 +15727,7 @@ async fn open_permissions_list_live_pending_item_requests<S: WriteStore>(store: 
         step_position: 0,
         step_attempt: 1,
         step_fanout_index: 0,
+        step_fanned: false,
         phase_name: "implement".to_owned(),
         permission: permission_row(CASE, store, live).await,
     }];
@@ -15799,6 +15800,22 @@ async fn open_permissions_list_live_pending_item_requests<S: WriteStore>(store: 
         store.open_permissions(&empty).await.expect(CASE),
         vec![],
         "{CASE}: an empty scope lists nothing"
+    );
+
+    // MOD-69 review L1: a sibling at the same slot with a non-zero index fans it out, so the
+    // index-0 step's row says so (the Runs pane labels it `/0`).
+    running_step(CASE, store, run, (0, 1, 1), at).await;
+    let fanned: Vec<WaitingPermission> = expected
+        .into_iter()
+        .map(|row| WaitingPermission {
+            step_fanned: true,
+            ..row
+        })
+        .collect();
+    assert_eq!(
+        store.open_permissions(&platform).await.expect(CASE),
+        fanned,
+        "{CASE}: candidate 0 of a fanned slot reads fanned"
     );
 }
 

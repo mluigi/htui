@@ -123,6 +123,10 @@ pub struct WaitingPermission {
     pub step_attempt: i32,
     /// `run_step.fanout_index` (`-1` = the slot's judge).
     pub step_fanout_index: i32,
+    /// Whether the step's slot is fanned out: a step of the same run at the same
+    /// `(position, attempt)`, this one included, has a non-zero `fanout_index`. The Runs pane's
+    /// rule, so the list labels candidate 0 of a slot `/0` as the pane does (MOD-69 review L1).
+    pub step_fanned: bool,
     /// `run_step.phase_name`.
     pub phase_name: String,
     /// The request, as `relay_view` lists it.
@@ -297,6 +301,7 @@ mod tests {
             step_position: 0,
             step_attempt: 1,
             step_fanout_index: 0,
+            step_fanned: false,
             phase_name: "implement".to_owned(),
             permission: StepPermission {
                 id: PermissionId::from_uuid(Uuid::from_u128(id)),

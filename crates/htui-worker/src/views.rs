@@ -762,7 +762,7 @@ pub fn waiting(
                 p.step_position,
                 p.step_attempt,
                 p.step_fanout_index,
-                p.step_fanout_index != 0,
+                p.step_fanned,
             ),
             reason: WaitingReason::Permission,
             text,
@@ -1274,6 +1274,7 @@ mod tests {
             step_position: step.position,
             step_attempt: step.attempt,
             step_fanout_index: step.fanout_index,
+            step_fanned: step.fanout_index != 0,
             phase_name: step.phase_name.clone(),
             permission: StepPermission {
                 id: PermissionId::new(),
@@ -1816,6 +1817,26 @@ mod tests {
         assert!(offline.rows.is_empty());
         assert!(!offline.permissions_known);
         assert_eq!(offline.working, 1);
+    }
+
+    /// Review L1: the Runs pane labels candidate 0 of a fanned slot `/0`, and so does its
+    /// permission row; an unfanned step stays bare.
+    #[test]
+    fn a_permission_on_candidate_zero_of_a_fanned_slot_reads_its_index() {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::InProgress);
+        let run = run(1, &item, RunStatus::Running, Some(snapshot(2)), 1);
+        let first = step(1, &run, (0, 1, 0), StepStatus::Running);
+        let mut fanned = permission(&item, &run, &first, None, 0);
+        fanned.step_fanned = true;
+        let bare = permission(&item, &run, &first, Some("bare"), 1);
+        let scope = scope(&[ids::PROJECT_HTUI]);
+
+        let labels: Vec<String> = waiting(&scope, 1, &[], Some(&[fanned, bare]))
+            .rows
+            .into_iter()
+            .map(|row| format!("{} {}", row.step_label, row.text))
+            .collect();
+        assert_eq!(labels, ["prd 0.1 bare", "prd 0.1/0 permission"]);
     }
 
     #[test]

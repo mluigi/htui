@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT p.id           AS \"id: PermissionId\",\n                  p.run_id       AS \"run_id: RunId\",\n                  p.run_step_id  AS \"run_step_id: StepId\",\n                  p.session      AS \"session: RelaySessionId\",\n                  p.request_id,\n                  p.tool_call_id,\n                  p.summary,\n                  p.options      AS \"options: Json<Vec<RelayOption>>\",\n                  p.status       AS \"status: PermissionStatus\",\n                  p.option_id,\n                  p.answered_by  AS \"answered_by: UserId\",\n                  p.answered_box AS \"answered_box: BoxId\",\n                  p.created_at,\n                  p.answered_at,\n                  p.resolved_at,\n                  i.id           AS \"item_id: ItemId\",\n                  i.project_id   AS \"project_id: ProjectId\",\n                  i.key          AS \"item_key!\",\n                  i.key_prefix,\n                  i.key_number,\n                  r.queued_at    AS run_queued_at,\n                  s.position     AS step_position,\n                  s.attempt      AS step_attempt,\n                  s.fanout_index AS step_fanout_index,\n                  s.phase_name\n             FROM step_permission p\n             JOIN run r      ON r.id = p.run_id\n             JOIN item i     ON i.id = r.item_id\n             JOIN run_step s ON s.id = p.run_step_id\n            WHERE i.project_id = ANY($1) AND r.item_id IS NOT NULL\n              AND p.status = 'pending'\n              AND r.lease_owner = p.owner AND r.lease_expires_at > clock_timestamp()\n            ORDER BY p.created_at, p.id",
+  "query": "SELECT p.id           AS \"id: PermissionId\",\n                  p.run_id       AS \"run_id: RunId\",\n                  p.run_step_id  AS \"run_step_id: StepId\",\n                  p.session      AS \"session: RelaySessionId\",\n                  p.request_id,\n                  p.tool_call_id,\n                  p.summary,\n                  p.options      AS \"options: Json<Vec<RelayOption>>\",\n                  p.status       AS \"status: PermissionStatus\",\n                  p.option_id,\n                  p.answered_by  AS \"answered_by: UserId\",\n                  p.answered_box AS \"answered_box: BoxId\",\n                  p.created_at,\n                  p.answered_at,\n                  p.resolved_at,\n                  i.id           AS \"item_id: ItemId\",\n                  i.project_id   AS \"project_id: ProjectId\",\n                  i.key          AS \"item_key!\",\n                  i.key_prefix,\n                  i.key_number,\n                  r.queued_at    AS run_queued_at,\n                  s.position     AS step_position,\n                  s.attempt      AS step_attempt,\n                  s.fanout_index AS step_fanout_index,\n                  EXISTS (SELECT 1 FROM run_step f\n                           WHERE f.run_id = s.run_id AND f.position = s.position\n                             AND f.attempt = s.attempt AND f.fanout_index <> 0) AS \"step_fanned!\",\n                  s.phase_name\n             FROM step_permission p\n             JOIN run r      ON r.id = p.run_id\n             JOIN item i     ON i.id = r.item_id\n             JOIN run_step s ON s.id = p.run_step_id\n            WHERE i.project_id = ANY($1) AND r.item_id IS NOT NULL\n              AND p.status = 'pending'\n              AND r.lease_owner = p.owner AND r.lease_expires_at > clock_timestamp()\n            ORDER BY p.created_at, p.id",
   "describe": {
     "columns": [
       {
@@ -269,6 +269,12 @@
       },
       {
         "ordinal": 24,
+        "name": "step_fanned!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 25,
         "name": "phase_name",
         "type_info": "Text",
         "origin": {
@@ -309,8 +315,9 @@
       false,
       false,
       false,
+      null,
       false
     ]
   },
-  "hash": "47354ae3999e865cf2722c21e015a33543f40c1a6a91c7b772fedcad55de872c"
+  "hash": "47a4ea4a6ae8697c17e72c29edac1a5a80d675a71808d0edbaba05ce9b6b863b"
 }

@@ -548,6 +548,8 @@ pub(super) async fn relay_view(store: &PgStore, item: ItemId) -> Result<RelayVie
 /// [`WriteStore::open_permissions`](htui_core::store::WriteStore::open_permissions) (MOD-69 plan
 /// D4): `relay_view`'s open predicate over the scope's item runs, joined to the item and the step.
 /// `r.item_id IS NOT NULL` is implied by the item join and kept explicit: plan D4's chat-run rule.
+/// `step_fanned` is the Runs pane's slot rule, a sibling at the step's slot with a non-zero index
+/// (MOD-69 review L1).
 pub(super) async fn open_permissions(
     store: &PgStore,
     scope: &Scope,
@@ -581,6 +583,9 @@ pub(super) async fn open_permissions(
                   s.position     AS step_position,
                   s.attempt      AS step_attempt,
                   s.fanout_index AS step_fanout_index,
+                  EXISTS (SELECT 1 FROM run_step f
+                           WHERE f.run_id = s.run_id AND f.position = s.position
+                             AND f.attempt = s.attempt AND f.fanout_index <> 0) AS "step_fanned!",
                   s.phase_name
              FROM step_permission p
              JOIN run r      ON r.id = p.run_id
@@ -608,6 +613,7 @@ pub(super) async fn open_permissions(
             step_position: row.step_position,
             step_attempt: row.step_attempt,
             step_fanout_index: row.step_fanout_index,
+            step_fanned: row.step_fanned,
             phase_name: row.phase_name,
             permission: StepPermission {
                 id: row.id,
