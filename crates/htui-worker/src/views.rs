@@ -604,7 +604,7 @@ pub fn waiting(
                    text: String| {
             let key = RowKey {
                 project: project_at(item.project_id),
-                key_prefix: item.key_prefix.clone(),
+                key_prefix: item.key_prefix.as_str(),
                 key_number: item.key_number,
                 item: item.id,
                 run_missing: run.is_none(),
@@ -612,7 +612,6 @@ pub fn waiting(
                 step_missing: step.is_none(),
                 step: step.map(|step| (step.position, step.attempt, step.fanout_index)),
                 reason,
-                text: text.clone(),
             };
             let row = WaitingRow {
                 item: item.id,
@@ -744,7 +743,7 @@ pub fn waiting(
             .unwrap_or_else(|| PERMISSION_TEXT.to_owned());
         let key = RowKey {
             project: project_at(p.project),
-            key_prefix: p.key_prefix.clone(),
+            key_prefix: p.key_prefix.as_str(),
             key_number: p.key_number,
             item: p.item,
             run_missing: false,
@@ -752,7 +751,6 @@ pub fn waiting(
             step_missing: false,
             step: Some((p.step_position, p.step_attempt, p.step_fanout_index)),
             reason: WaitingReason::Permission,
-            text: text.clone(),
         };
         let row = WaitingRow {
             item: p.item,
@@ -772,7 +770,9 @@ pub fn waiting(
         keyed.push((key, row));
     }
 
-    keyed.sort_by(|(a, _), (b, _)| a.cmp(b));
+    // The row's text is the last tie-break (two permissions on one step), read from the row
+    // rather than cloned into the key.
+    keyed.sort_by(|(a, a_row), (b, b_row)| a.cmp(b).then_with(|| a_row.text.cmp(&b_row.text)));
     let rows: Vec<WaitingRow> = keyed.into_iter().map(|(_, row)| row).collect();
     // Plan D5, blueprint H-19: a run owning several rows counts once; `saturating_sub` also
     // absorbs the race between `active_runs` and the candidate read.
@@ -790,13 +790,14 @@ pub fn waiting(
 
 /// A row's place in the list: plan D9 (project position, item key, run creation, step position),
 /// then blueprint E8's ties — inside an item, rows with a run before the Reopen row; inside a run,
-/// step rows before its Unblock row; then the reason (plan D3 order) and the text.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct RowKey {
+/// step rows before its Unblock row; then the reason (plan D3 order) and, outside the key, the
+/// row's text. Borrowed from the candidate and permission rows, so building a key clones nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RowKey<'a> {
     /// The project's position in `scope.project_ids`; `usize::MAX` when absent.
     project: usize,
-    /// Byte order (`String`'s `Ord`), so the order does not depend on a collation.
-    key_prefix: String,
+    /// Byte order (`str`'s `Ord`), so the order does not depend on a collation.
+    key_prefix: &'a str,
     /// By number, so `FEAT-2` sorts before `FEAT-10`.
     key_number: i32,
     item: ItemId,
@@ -809,8 +810,6 @@ struct RowKey {
     /// `(position, attempt, fanout_index)`.
     step: Option<(i32, i32, i32)>,
     reason: WaitingReason,
-    /// The last tie-break: two permissions on one step.
-    text: String,
 }
 
 /// `phase p.a`, then `/i` in a fan-out slot and `/j` for its judge (the Runs pane's slot column,
