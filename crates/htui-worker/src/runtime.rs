@@ -3902,6 +3902,200 @@ mod role_gate {
         );
     }
 
+    /// MOD-76 D4 (R-55): a worker runtime over the seeded demo, with no run queued.
+    fn limits_runtime(scratch: &Scratch, role: Role) -> RunRuntime<Backend, Timed> {
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(OneTurn));
+        RunRuntime::new(factory)
+            .with_author(Arc::new(OutputAuthor))
+            .with_role(role)
+            .with_scratch_root(scratch.0.join("trees"))
+    }
+
+    /// One sweep of `runtime`, settled.
+    async fn tick(runtime: &mut RunRuntime<Backend, Timed>, backend: &Backend, sink: &Timed) {
+        runtime.sweep_with(backend, sink);
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+    }
+
+    /// The demo box's `settings.command_limits` set to `value`, which it did not hold.
+    async fn set_limits(store: &MemStore, value: serde_json::Value) {
+        let row = store
+            .box_row(ids::BOX)
+            .await
+            .expect("the read answers")
+            .expect("the demo box");
+        assert_ne!(
+            row.settings.get("command_limits"),
+            Some(&value),
+            "the limits change"
+        );
+        assert!(store.set_box_setting(ids::BOX, "command_limits", value));
+    }
+
+    /// MOD-76 D4 (R-55): with no walk live, a change to the box's `command_limits` alone (the
+    /// repo map unchanged) reaches the worker's next sweep: a new verifier, the same isolator.
+    #[tokio::test]
+    async fn a_worker_sweep_applies_a_limits_change_alone() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (isolator, verifier) = parts(&runtime, &backend).await;
+
+        set_limits(&store, json!({ "verify": 2 })).await;
+        tick(&mut runtime, &backend, &sink).await;
+        let (still, rebuilt) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &rebuilt),
+            "the verifier is rebuilt from the new limits"
+        );
+        assert!(Arc::ptr_eq(&isolator, &still), "the isolator stays");
+        assert_eq!(runtime.isolator_builds(), 1, "the repo map did not move");
+    }
+
+    /// MOD-76 D4 (R-55): a sweep that finds the limits unchanged keeps the verifier.
+    #[tokio::test]
+    async fn a_worker_sweep_with_the_same_limits_keeps_its_verifier() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, verifier) = parts(&runtime, &backend).await;
+
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, still) = parts(&runtime, &backend).await;
+        assert!(Arc::ptr_eq(&verifier, &still));
+        assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// MOD-76 D4 (R-55): while a walk is live, a limits change keeps the cached verifier and
+    /// refuses nothing (two verifiers would be two `verify` semaphores); the first sweep after
+    /// the walk rests rebuilds it.
+    #[tokio::test]
+    async fn a_limits_change_under_a_live_walk_waits_for_the_rest() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (isolator, verifier) = parts(&runtime, &backend).await;
+
+        let walk = runtime.shared.walks.child(RunId::new());
+        set_limits(&store, json!({ "verify": 2 })).await;
+        tick(&mut runtime, &backend, &sink).await;
+        let writer = htui_core::store::WorkerHost::writer(&backend).expect("the backend writes");
+        let (still, kept) = runtime
+            .shared
+            .singletons(&backend, &writer, true)
+            .await
+            .expect("a limits change under a live walk refuses nothing");
+        assert!(
+            Arc::ptr_eq(&verifier, &kept),
+            "no verifier is swapped under a live walk"
+        );
+        assert!(Arc::ptr_eq(&isolator, &still));
+        assert_eq!(runtime.isolator_builds(), 1);
+
+        drop(walk);
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, rebuilt) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &rebuilt),
+            "the rest's sweep rebuilds the verifier from the new limits"
+        );
+        assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// MOD-76 D4 (R-55): the TUI, which has no sweep re-read, applies a limits change at its next
+    /// walking `StartRun`; a call that walks nothing keeps the verifier.
+    #[tokio::test]
+    async fn a_walking_start_run_applies_a_limits_change() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        let runtime = limits_runtime(&scratch, Role::Tui);
+        let backend = Backend::memory(store.clone());
+        super::Kit::read(&runtime.shared, &backend, true)
+            .await
+            .expect("the kit reads");
+        let (_, verifier) = parts(&runtime, &backend).await;
+
+        set_limits(&store, json!({ "verify": 2 })).await;
+        super::Kit::read(&runtime.shared, &backend, false)
+            .await
+            .expect("the kit reads");
+        let (_, cached) = parts(&runtime, &backend).await;
+        assert!(
+            Arc::ptr_eq(&verifier, &cached),
+            "a call that is no walking `StartRun` serves the cached parts"
+        );
+        super::Kit::read(&runtime.shared, &backend, true)
+            .await
+            .expect("the kit reads");
+        let (_, rebuilt) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &rebuilt),
+            "the walking `StartRun` rebuilds the verifier from the new limits"
+        );
+        assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// MOD-76 B-1 (R-55): a stored value that does not parse is compared as stored, so it
+    /// builds the verifier once (warned once) and the next sweep keeps it.
+    #[tokio::test]
+    async fn a_bad_stored_limits_value_is_parsed_once() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, verifier) = parts(&runtime, &backend).await;
+
+        set_limits(&store, json!("not a map")).await;
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, bad) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &bad),
+            "the stored value changed, so the verifier is built from it"
+        );
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, still) = parts(&runtime, &backend).await;
+        assert!(
+            Arc::ptr_eq(&bad, &still),
+            "the same stored value is not parsed and built again"
+        );
+    }
+
     /// The runs `shared` keeps a backoff entry for.
     fn backed_off(shared: &super::Shared<Timed>) -> std::collections::BTreeSet<RunId> {
         shared
