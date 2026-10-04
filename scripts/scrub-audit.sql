@@ -25,7 +25,7 @@ BEGIN;
 
 CREATE TEMP VIEW scrub_audit_rules (rule, re) AS VALUES
     ('anthropic_api_key',  'sk-ant-[A-Za-z0-9_-]{20,}'),
-    ('openai_api_key',     'sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})'),
+    ('openai_api_key',     'sk-(?:(?:proj|svcacct|admin|None|or-v[0-9]+|lf)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})'),
     ('github_pat',         'github_pat_[A-Za-z0-9_]{20,}'),
     ('github_token',       'gh[pousr]_[A-Za-z0-9]{30,}'),
     ('gitlab_pat',         'glpat-[A-Za-z0-9_-]{20,}'),

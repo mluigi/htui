@@ -41,10 +41,13 @@ const PATTERN_RULES: &[(&str, &str)] = &[
     ("slack_user_token", r"xoxp-[A-Za-z0-9-]{10,}"),
     ("google_api_key", r"AIza[0-9A-Za-z_-]{35}"),
     // The hyphen-free legacy form keeps kebab-case prose (`sk-learn-preprocessing-pipeline-v2`)
-    // from failing closed, and leaves every `sk-ant-` key to `anthropic_api_key`.
+    // from failing closed, and leaves every `sk-ant-` key to `anthropic_api_key`. The named
+    // hyphenated segments keep the `sk-` keys the bare prefix used to refuse under this name:
+    // OpenAI project, service-account, admin and user-scoped (`None`) keys, OpenRouter
+    // (`or-v1`) and Langfuse secret keys (`lf`).
     (
         "openai_api_key",
-        r"sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})",
+        r"sk-(?:(?:proj|svcacct|admin|None|or-v[0-9]+|lf)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})",
     ),
     // New in MOD-10 (D2).
     ("gitlab_pat", r"glpat-[A-Za-z0-9_-]{20,}"),
@@ -723,6 +726,31 @@ mod tests {
         }
     }
 
+    /// `sk-` keys whose body opens with a short hyphenated vendor segment (OpenRouter, OpenAI
+    /// user-scoped, Langfuse). The bare-prefix rule refused all three as `openai_api_key`; the
+    /// whole-token rule must keep doing so, under the same name.
+    #[test]
+    fn hyphenated_vendor_sk_keys_are_still_refused_as_openai() {
+        let scrubber = rules_only();
+        for key in [
+            "sk-or-v1-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "sk-None-abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRST0123",
+            "sk-lf-1234abcd-12ab-34cd-56ef-1234567890ab",
+        ] {
+            for text in [
+                key.to_owned(),
+                format!("the key {key} here"),
+                format!("Authorization: Bearer {key}"),
+            ] {
+                let mut value = json!({ "t": text });
+                let err = scrubber
+                    .scrub(&mut value)
+                    .expect_err("a hyphenated vendor sk- key must refuse the write");
+                assert_eq!(err.rule, "openai_api_key", "rule for {key}");
+            }
+        }
+    }
+
     #[test]
     fn prose_that_shares_a_prefix_is_not_a_credential() {
         let scrubber = rules_only();
@@ -730,6 +758,9 @@ mod tests {
             "sk-learn",
             "pip install sk-learn-preprocessing-pipeline-v2",
             "sk-learn-preprocessing-pipeline-v2",
+            "sk-lf-config",
+            "sk-or-v1-docs",
+            "sk-None-yet",
             "AKIA",
             "the AKIA prefix marks a long-term key",
             "subtask-x",
