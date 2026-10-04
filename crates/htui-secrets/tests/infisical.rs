@@ -907,6 +907,28 @@ async fn a_long_server_message_is_cleaned_and_cut() {
     );
 }
 
+/// A-4 covers the `error` field too: with no `message`, the 403 detail quotes it, so a server
+/// cannot reach the terminal with control characters or flood it through that field either.
+#[tokio::test]
+async fn a_403_error_name_is_cleaned_and_cut_too() {
+    let name = format!("X\u{1b}[2J\r\nY{}", "z".repeat(300));
+    let SecretError::PermissionDenied { detail } = list_error(error(403, &name, "")).await else {
+        panic!("expected PermissionDenied");
+    };
+    assert!(
+        detail.starts_with("status 403 X[2JYz"),
+        "the name is not quoted"
+    );
+    assert!(
+        !detail.chars().any(char::is_control),
+        "control characters kept"
+    );
+    assert!(
+        detail.chars().count() <= "status 403 ".len() + 200,
+        "the name is not cut"
+    );
+}
+
 #[tokio::test]
 async fn an_unexpected_status_is_protocol_naming_the_endpoint() {
     let err = list_error(error(500, "InternalServerError", "boom")).await;

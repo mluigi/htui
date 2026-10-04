@@ -326,7 +326,7 @@ impl InfisicalProvider {
             403 if error.error() == "TokenError" => Ok(None),
             403 => Err(SecretError::PermissionDenied {
                 detail: if message.is_empty() {
-                    format!("status 403 {}", error.error())
+                    format!("status 403 {}", clean(error.error()))
                 } else {
                     message
                 },
@@ -539,14 +539,15 @@ fn decode<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// The server `message`: non-string → `""`; control characters removed; the first 200 `char`s
-/// (H-17: never a byte slice).
+/// The server `message`, cleaned by [`clean`]; non-string → `""`.
 fn clean_message(body: &ErrorBody) -> String {
-    body.message()
-        .chars()
-        .filter(|c| !c.is_control())
-        .take(200)
-        .collect()
+    clean(body.message())
+}
+
+/// Server text fit for a terminal (A-4): control characters removed, the first 200 `char`s
+/// (H-17: never a byte slice).
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(200).collect()
 }
 
 /// Fastify's default 404 for an unknown route: `Route GET:/… not found`. Infisical's own
