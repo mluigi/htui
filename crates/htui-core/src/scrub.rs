@@ -4,29 +4,72 @@
 //! `R-SEC-3` is fail-closed, so [`Scrubber::scrub`] returning [`Unmasked`] means the caller must
 //! not persist that value at all (plan MOD-2 D5, `docs/ANA-4.md` §9: "a `Scrubber` … that the
 //! recorder calls on every payload and on every `raw` blob before either write path").
-//! [`MinimalScrubber`] is the deliberately small built-in that stands in for the real ANA-7
-//! scrubber until MOD-10 replaces the implementation behind this unchanged trait.
+//! [`MinimalScrubber`] is the built-in implementation behind this trait (the name predates
+//! MOD-10 and is kept): exact-match masking of known secrets, then whole-token pattern rules for
+//! known credential formats (MOD-10 D1/D2) plus a PEM private-key marker.
 
+use std::sync::LazyLock;
+
+use regex::RegexSet;
 use serde_json::Value;
 
 /// What every masked occurrence is replaced with.
 const REDACTED: &str = "[REDACTED]";
 
-/// Known credential prefixes, as `(rule name, prefix)` pairs, checked in this order.
+/// Whole-token credential rules, as `(rule name, pattern body)`, in reporting order (MOD-10 D1,
+/// D2).
 ///
-/// The order is the reporting order: `sk-ant-` precedes `sk-` so an Anthropic key is named as one
-/// rather than as the generic case. This is the PRD's "known credential prefixes" list and nothing
-/// more; ANA-7's real rule set is MOD-10's.
-const PREFIX_RULES: &[(&str, &str)] = &[
-    ("anthropic_api_key", "sk-ant-"),
-    ("github_pat", "github_pat_"),
-    ("github_token", "ghp_"),
-    ("aws_access_key_id", "AKIA"),
-    ("slack_bot_token", "xoxb-"),
-    ("slack_user_token", "xoxp-"),
-    ("google_api_key", "AIza"),
-    ("openai_api_key", "sk-"),
+/// Each body is a prefix plus a charset plus a minimum length, so a bare prefix in prose
+/// (`sk-learn`, `ghp_short`, `AKIA` alone) is not a credential. It is anchored at an ASCII token
+/// start by [`TOKEN_START`] when compiled. Names are persisted in `scrub_residue` rows, so an
+/// existing name never changes. The order is the reporting order: when one string trips two rules
+/// the first in this table is named, so the eight pre-MOD-10 names keep their old order.
+const PATTERN_RULES: &[(&str, &str)] = &[
+    ("anthropic_api_key", r"sk-ant-[A-Za-z0-9_-]{20,}"),
+    ("github_pat", r"github_pat_[A-Za-z0-9_]{20,}"),
+    ("github_token", r"gh[pousr]_[A-Za-z0-9]{30,}"),
+    ("aws_access_key_id", r"(?:AKIA|ASIA|ABIA|ACCA)[A-Z0-9]{16}"),
+    ("slack_bot_token", r"xoxb-[A-Za-z0-9-]{10,}"),
+    ("slack_user_token", r"xoxp-[A-Za-z0-9-]{10,}"),
+    ("google_api_key", r"AIza[0-9A-Za-z_-]{35}"),
+    // The hyphen-free legacy form keeps kebab-case prose (`sk-learn-preprocessing-pipeline-v2`)
+    // from failing closed, and leaves every `sk-ant-` key to `anthropic_api_key`.
+    (
+        "openai_api_key",
+        r"sk-(?:(?:proj|svcacct|admin)-[A-Za-z0-9_-]{20,}|[A-Za-z0-9]{20,})",
+    ),
+    // New in MOD-10 (D2).
+    ("gitlab_pat", r"glpat-[A-Za-z0-9_-]{20,}"),
+    ("slack_token", r"xox[ars]-[A-Za-z0-9-]{10,}"),
+    ("stripe_secret_key", r"[rs]k_(?:live|test)_[A-Za-z0-9]{20,}"),
+    ("npm_token", r"npm_[A-Za-z0-9]{36}"),
+    ("pypi_token", r"pypi-AgEIcHlwaS5vcmc[A-Za-z0-9_-]{50,}"),
+    (
+        "sendgrid_api_key",
+        r"SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}",
+    ),
+    (
+        "jwt",
+        r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    ),
 ];
+
+/// An ASCII token start: the string start, or one character that is not `[A-Za-z0-9_]` (D1).
+///
+/// `subtask-…` is therefore not an `sk-` credential while `Bearer sk-…`, `--sk-…` and
+/// `[REDACTED]sk-…` are. A non-ASCII letter before a key (`éAKIA…`) also counts as a token start,
+/// which errs towards failing closed.
+const TOKEN_START: &str = r"(?:^|[^A-Za-z0-9_])";
+
+/// [`PATTERN_RULES`] compiled once per process, index for index.
+static PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
+    RegexSet::new(
+        PATTERN_RULES
+            .iter()
+            .map(|(_, body)| format!("{TOKEN_START}(?:{body})")),
+    )
+    .expect("the pattern rules are literals and compile")
+});
 
 /// Rule name for a PEM private key block.
 const PEM_RULE: &str = "private_key_pem";
@@ -77,19 +120,20 @@ pub struct Unmasked {
     pub rule: &'static str,
 }
 
-/// The minimal built-in [`Scrubber`]: exact-match masking plus known credential prefixes.
+/// The built-in [`Scrubber`]: exact-match masking plus whole-token pattern rules.
 ///
 /// Two passes over the document, in this order (plan D5):
 ///
 /// 1. every occurrence of every non-empty secret in every string leaf *and every object key*
 ///    becomes `[REDACTED]`, longest secret first so a secret that is a prefix of another cannot
 ///    leave residue;
-/// 2. every string leaf and every object key is scanned for the known credential prefixes and for
+/// 2. every string leaf and every object key is scanned for the whole-token pattern rules and for
 ///    a PEM private-key marker; the first survivor is returned as [`Unmasked`], which blocks the
 ///    write.
 ///
-/// A prefix counts only at a token start (string start, or after a character that is neither
-/// alphanumeric nor `_`), so `subtask-list` is not an `sk-` credential while `Bearer sk-…` is.
+/// A pattern rule is a known prefix plus a charset plus a minimum length, and counts only at an
+/// ASCII token start (string start, or after a character that is not `[A-Za-z0-9_]`), so
+/// `subtask-list` and `sk-learn` are not credentials while `Bearer sk-ant-api03-…` is.
 /// Numbers and booleans are structural and are never rewritten; strings are masked and scanned
 /// wherever they appear, as a value or as a key.
 pub struct MinimalScrubber {
@@ -101,7 +145,7 @@ impl MinimalScrubber {
     /// Builds a scrubber that masks every non-empty `secret`, longest first.
     ///
     /// Empty secrets are dropped: masking on an empty needle would match everywhere. An empty
-    /// list is legal and still fails closed on the prefix rules.
+    /// list is legal and still fails closed on the pattern rules.
     #[must_use]
     pub fn new(secrets: impl IntoIterator<Item = String>) -> Self {
         let mut secrets: Vec<String> = secrets.into_iter().filter(|s| !s.is_empty()).collect();
@@ -233,30 +277,16 @@ impl Scrubber for MinimalScrubber {
 }
 
 /// The rule a string still matches after masking, if any.
+///
+/// `is_match` is the cheap gate (clean leaves dominate); only a hit pays for `matches`, whose
+/// indices come back in ascending order, so the first one is the first rule in table order.
 fn residue_rule(text: &str) -> Option<&'static str> {
-    for (rule, prefix) in PREFIX_RULES {
-        if starts_a_token_with(text, prefix) {
-            return Some(rule);
+    if PATTERNS.is_match(text) {
+        if let Some(index) = PATTERNS.matches(text).iter().next() {
+            return Some(PATTERN_RULES[index].0);
         }
     }
-    if text.contains(PEM_MARKER) {
-        return Some(PEM_RULE);
-    }
-    None
-}
-
-/// Whether `prefix` occurs in `text` at a token start.
-///
-/// A token starts at the beginning of the string or after a character that is neither
-/// alphanumeric nor `_`, so `subtask-42` does not read as an `sk-` credential while `--sk-…` and
-/// `Bearer sk-…` do. Erring towards a match is the fail-closed direction.
-fn starts_a_token_with(text: &str, prefix: &str) -> bool {
-    text.match_indices(prefix).any(|(at, _)| {
-        text[..at]
-            .chars()
-            .next_back()
-            .is_none_or(|before| !before.is_alphanumeric() && before != '_')
-    })
+    text.contains(PEM_MARKER).then_some(PEM_RULE)
 }
 
 /// Escapes one JSON pointer reference token (RFC 6901: `~` → `~0`, `/` → `~1`).
@@ -271,6 +301,12 @@ mod tests {
 
     fn scrubber() -> MinimalScrubber {
         MinimalScrubber::new(["alpha-secret".to_string(), "1234".to_string()])
+    }
+
+    /// No masking at all, so a fixture's digits never collide with `scrubber()`'s `1234` and only
+    /// the pattern rules decide.
+    fn rules_only() -> MinimalScrubber {
+        MinimalScrubber::new(Vec::<String>::new())
     }
 
     #[test]
@@ -316,9 +352,9 @@ mod tests {
     fn an_unknown_credential_prefix_fails_closed_with_a_json_pointer() {
         let scrubber = scrubber();
         for (text, rule) in [
-            ("sk-ant-api03-aaaaaaaaaaaa", "anthropic_api_key"),
-            ("sk-proj-aaaaaaaaaaaaaaaa", "openai_api_key"),
-            ("ghp_aaaaaaaaaaaaaaaaaaaa", "github_token"),
+            ("sk-ant-api03-aaaaaaaaaaaaaaaaaaaa", "anthropic_api_key"),
+            ("sk-proj-aaaaaaaaaaaaaaaaaaaa", "openai_api_key"),
+            ("ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "github_token"),
             ("github_pat_11AAAAAAA0aaaaaaaaaaaa", "github_pat"),
             ("AKIAAAAAAAAAAAAAAAAA", "aws_access_key_id"),
             ("xoxb-0000000000-aaaaaaaaaaaa", "slack_bot_token"),
@@ -362,7 +398,8 @@ mod tests {
 
     #[test]
     fn a_masked_secret_never_appears_in_the_error_path() {
-        let mut value = json!({ "alpha-secret": { "output": "ghp_aaaaaaaaaaaaaaaaaaaa" } });
+        let mut value =
+            json!({ "alpha-secret": { "output": "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" } });
         let err = scrubber()
             .scrub(&mut value)
             .expect_err("residue must refuse the write");
@@ -372,7 +409,7 @@ mod tests {
 
     #[test]
     fn a_credential_shaped_object_key_is_refused() {
-        let mut value = json!({ "payload": { "sk-ant-api03-AAAA": "harmless" } });
+        let mut value = json!({ "payload": { "sk-ant-api03-AAAAAAAAAAAAAAAAAAAA": "harmless" } });
         let err = scrubber()
             .scrub(&mut value)
             .expect_err("a credential-shaped key must refuse the write");
@@ -515,7 +552,7 @@ mod tests {
         let mut dirty = json!({ "text": "AKIAAAAAAAAAAAAAAAAA" });
         let err = scrubber
             .scrub(&mut dirty)
-            .expect_err("prefix rules run with an empty mask list");
+            .expect_err("pattern rules run with an empty mask list");
         assert_eq!(err.rule, "aws_access_key_id");
         assert_eq!(err.path, "/text");
     }
@@ -562,8 +599,166 @@ mod tests {
     }
 
     #[test]
+    fn every_pattern_rule_compiles_alone() {
+        for (rule, body) in PATTERN_RULES {
+            regex::Regex::new(&format!("{TOKEN_START}(?:{body})"))
+                .unwrap_or_else(|err| panic!("rule {rule} does not compile: {err}"));
+        }
+        assert_eq!(PATTERNS.len(), PATTERN_RULES.len());
+    }
+
+    #[test]
+    fn every_pattern_rule_has_a_real_shaped_fixture() {
+        let names: Vec<&str> = PATTERN_RULES.iter().map(|(rule, _)| *rule).collect();
+        let covered: Vec<&str> = REAL_SHAPED.iter().map(|(rule, _)| *rule).collect();
+        assert_eq!(names, covered, "one fixture per rule, in table order");
+    }
+
+    /// One real-shaped value per pattern rule (MOD-10 D2), each well past its rule's minimum.
+    const REAL_SHAPED: &[(&str, &str)] = &[
+        (
+            "anthropic_api_key",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123",
+        ),
+        ("github_pat", "github_pat_11ABCDEFG0abcdefghijklmnopqrstuv"),
+        ("github_token", "ghp_abcdefghijklmnopqrstuvwxyz0123456789"),
+        ("aws_access_key_id", "AKIAIOSFODNN7EXAMPLE"),
+        ("slack_bot_token", "xoxb-0000000000-aaaaaaaaaaaa"),
+        ("slack_user_token", "xoxp-0000000000-aaaaaaaaaaaa"),
+        ("google_api_key", "AIzaSyA0123456789abcdefghijklmnopqrstuv"),
+        ("openai_api_key", "sk-proj-abcdefghijklmnopqrstuvwxyz"),
+        ("gitlab_pat", "glpat-abcdefghijklmnopqrst"),
+        ("slack_token", "xoxa-0000000000-aaaaaaaaaaaa"),
+        ("stripe_secret_key", "sk_live_abcdefghijklmnopqrstuvwx"),
+        ("npm_token", "npm_abcdefghijklmnopqrstuvwxyz0123456789"),
+        (
+            "pypi_token",
+            "pypi-AgEIcHlwaS5vcmcabcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz",
+        ),
+        (
+            "sendgrid_api_key",
+            "SG.abcdefghijklmnopqrstuv.abcdefghijklmnopqrstuvwxyz0123456789ABCDEFG",
+        ),
+        (
+            "jwt",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnopqrstuvwxyz",
+        ),
+    ];
+
+    #[test]
+    fn each_rule_refuses_a_real_shaped_key_in_four_positions() {
+        let scrubber = rules_only();
+        for (rule, key) in REAL_SHAPED {
+            for text in [
+                (*key).to_owned(),
+                format!("the key {key} here"),
+                format!("Authorization: Bearer {key}"),
+            ] {
+                let mut value = json!({ "payload": { "output": text } });
+                let err = scrubber
+                    .scrub(&mut value)
+                    .err()
+                    .unwrap_or_else(|| panic!("a real-shaped {rule} key must refuse the write"));
+                assert_eq!(err.rule, *rule, "rule for {rule} in a value");
+                assert_eq!(err.path, "/payload/output", "pointer for {rule}");
+            }
+            let mut value = json!({ "payload": { *key: "harmless" } });
+            let err = scrubber
+                .scrub(&mut value)
+                .err()
+                .unwrap_or_else(|| panic!("a real-shaped {rule} object key must refuse the write"));
+            assert_eq!(err.rule, *rule, "rule for {rule} as a key");
+            assert_eq!(err.path, "/payload", "the parent pointer for {rule}");
+        }
+    }
+
+    #[test]
+    fn every_slack_token_kind_and_stripe_key_kind_is_refused() {
+        let scrubber = rules_only();
+        for (text, rule) in [
+            ("xoxr-0000000000-aaaaaaaaaaaa", "slack_token"),
+            ("xoxs-0000000000-aaaaaaaaaaaa", "slack_token"),
+            ("rk_test_abcdefghijklmnopqrstuvwx", "stripe_secret_key"),
+            ("sk_test_abcdefghijklmnopqrstuvwx", "stripe_secret_key"),
+            ("gho_abcdefghijklmnopqrstuvwxyz0123456789", "github_token"),
+            ("ghs_abcdefghijklmnopqrstuvwxyz0123456789", "github_token"),
+            ("ASIAIOSFODNN7EXAMPLE", "aws_access_key_id"),
+            ("sk-svcacct-abcdefghijklmnopqrstuvwxyz", "openai_api_key"),
+            ("sk-abcdefghijklmnopqrstuvwxyz0123", "openai_api_key"),
+        ] {
+            let mut value = json!({ "t": text });
+            let err = scrubber
+                .scrub(&mut value)
+                .expect_err("a real-shaped key must refuse the write");
+            assert_eq!(err.rule, rule, "rule for {rule}");
+        }
+    }
+
+    #[test]
+    fn prose_that_shares_a_prefix_is_not_a_credential() {
+        let scrubber = rules_only();
+        for text in [
+            "sk-learn",
+            "pip install sk-learn-preprocessing-pipeline-v2",
+            "sk-learn-preprocessing-pipeline-v2",
+            "AKIA",
+            "the AKIA prefix marks a long-term key",
+            "subtask-x",
+            "ghp_short",
+            "src/sk-live.rs",
+            "task-list, subtask-42, whisk-broom",
+            "xoxb-short",
+            "eyJhbGciOiJIUzI1NiJ9",
+            "npm_token",
+        ] {
+            let mut value = json!({ "t": text, text: "key" });
+            scrubber
+                .scrub(&mut value)
+                .unwrap_or_else(|err| panic!("prose must not be residue: {err} for {text}"));
+        }
+    }
+
+    #[test]
+    fn a_short_sk_ant_key_is_never_reported_as_openai() {
+        let scrubber = rules_only();
+        for text in [
+            "sk-ant-abcdefghijklmnopqrst",
+            "sk-ant-api03-abcdefghijklmnopqrstuvwx",
+        ] {
+            let mut value = json!({ "t": text });
+            let err = scrubber
+                .scrub(&mut value)
+                .expect_err("an Anthropic key must refuse the write");
+            assert_eq!(err.rule, "anthropic_api_key", "rule for {text}");
+        }
+        let mut short = json!({ "t": "sk-ant-short" });
+        scrubber
+            .scrub(&mut short)
+            .expect("a short sk-ant- word is not a credential");
+    }
+
+    #[test]
+    fn the_first_rule_in_table_order_is_reported() {
+        let mut value =
+            json!({ "t": "AKIAIOSFODNN7EXAMPLE then sk-ant-api03-abcdefghijklmnopqrstuvwx" });
+        let err = rules_only()
+            .scrub(&mut value)
+            .expect_err("residue must refuse the write");
+        assert_eq!(err.rule, "anthropic_api_key");
+    }
+
+    #[test]
+    fn a_non_ascii_letter_before_a_key_is_a_token_start() {
+        let mut value = json!({ "t": "éAKIA0123456789ABCDEF" });
+        let err = rules_only()
+            .scrub(&mut value)
+            .expect_err("a non-ASCII letter is a token start (fails closed)");
+        assert_eq!(err.rule, "aws_access_key_id");
+    }
+
+    #[test]
     fn a_credential_mid_sentence_is_caught_and_the_root_pointer_is_empty() {
-        let mut value = json!("the key is sk-ant-api03-zzzzzzzzzzzz, keep it");
+        let mut value = json!("the key is sk-ant-api03-zzzzzzzzzzzzzzzzzzzz, keep it");
         let err = scrubber()
             .scrub(&mut value)
             .expect_err("residue must refuse the write");
