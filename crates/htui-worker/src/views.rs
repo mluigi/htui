@@ -16,9 +16,9 @@ use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::command::{answer_gate_enabled, cancel_enabled, select_enabled};
 use htui_orch::status::{group_at, judge_at, resumable};
 use htui_orch::{
-    Command, CommandOutcome, EngineError, GateAnswer, Rest, SessionKey, SessionSink, UnblockCase,
-    accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at, promote_enabled,
-    retry_admitted, snapshot_of, start_enabled, unblock_enabled,
+    Command, CommandOutcome, Cursor, EngineError, GateAnswer, Rest, SessionKey, SessionSink,
+    UnblockCase, accept_enabled, cleanup_enabled, close_out_enabled, cursor, phase_at,
+    promote_enabled, retry_admitted, snapshot_of, start_enabled, unblock_enabled,
 };
 use htui_store::DATABASE_UNREACHABLE;
 
@@ -465,6 +465,10 @@ pub enum WaitingReason {
     Selection,
     /// `u` clears the item: reopen it, follow its parked run, or resume the run.
     Unblock,
+    /// A run parked by an interrupt (the engine's `park_interrupted`: the run `awaiting_approval`
+    /// over a `failed` step with no gate outcome and an `interrupted…` note), which no rule above
+    /// lists: retry, promote or cancel it from the Runs pane (MOD-69 review H1).
+    Interrupted,
     /// An open permission request of a live session.
     Permission,
 }
@@ -478,6 +482,7 @@ impl WaitingReason {
             Self::JudgeFailed => "judge failed",
             Self::Selection => "selection",
             Self::Unblock => "unblock",
+            Self::Interrupted => "interrupted",
             Self::Permission => "permission",
         }
     }
@@ -537,6 +542,8 @@ const REOPEN_TEXT: &str = "blocked, no active run: u reopens it";
 const FOLLOW_TEXT: &str = "blocked over a parked run: u follows it";
 /// [`UnblockCase::Resume`]'s row text.
 const RESUME_TEXT: &str = "parked by an interrupted command: u resumes it";
+/// An Interrupted row's text when its rest step carries no note (MOD-69 review H1).
+const INTERRUPTED_TEXT: &str = "interrupted";
 
 /// The waiting-on-you list over one candidate read (MOD-69 plan D1-D5, D9), with the engine's own
 /// guards: `verdicts` (empty heads, no live chat; heads feed only approve/accept/open, plan D3)
@@ -560,6 +567,7 @@ pub fn waiting(
 
     for candidate in candidates {
         let item = &candidate.item;
+        let first = keyed.len();
         let row = |run: Option<&Run>,
                    step: Option<&RunStep>,
                    step_label: String,
@@ -671,6 +679,37 @@ pub fn waiting(
                 String::new(),
                 WaitingReason::Unblock,
                 text.to_owned(),
+            ));
+        }
+
+        // Review H1: a parked run no rule above lists (the engine's `park_interrupted`, whose
+        // `failed` step has no gate outcome and which `u` refuses) still waits on a person, so it
+        // is never counted working. The row sits on the cursor's rest step; with no rest step, or
+        // a snapshot that does not decode, on the run alone.
+        for (run, steps) in &candidate.runs {
+            if run.status != RunStatus::AwaitingApproval
+                || keyed[first..]
+                    .iter()
+                    .any(|(_, row)| row.run == Some(run.id))
+            {
+                continue;
+            }
+            let rest = snapshot_of(run)
+                .ok()
+                .and_then(|snapshot| match cursor(&snapshot, steps) {
+                    Cursor::Rest { step, .. } => steps.iter().find(|row| row.id == step),
+                    _ => None,
+                });
+            let text = rest
+                .and_then(|step| step.gate_note.clone())
+                .filter(|note| !note.is_empty())
+                .unwrap_or_else(|| INTERRUPTED_TEXT.to_owned());
+            keyed.push(row(
+                Some(run),
+                rest,
+                rest.map_or_else(String::new, |step| label_of(step, steps)),
+                WaitingReason::Interrupted,
+                text,
             ));
         }
     }
@@ -1331,6 +1370,48 @@ mod tests {
         candidate(&item, vec![(run, steps)])
     }
 
+    /// A run the engine's `park_interrupted` left (engine.rs `settle_failed`/`reset_interrupted`):
+    /// the item and run `awaiting_approval`, `prd` done at position 0, `plan` at position 1
+    /// `failed` with no gate outcome and the note `note`.
+    fn interrupted_park(note: Option<&str>) -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let run = parked(1, &item, 1, 1);
+        let mut plan = step(2, &run, (1, 1, 0), StepStatus::Failed);
+        plan.gate_note = note.map(str::to_owned);
+        let steps = vec![step(1, &run, (0, 1, 0), StepStatus::Done), plan];
+        candidate(&item, vec![(run, steps)])
+    }
+
+    /// A parked run whose snapshot does not decode, over `steps(run)`.
+    fn undecodable(steps: impl FnOnce(&Run) -> Vec<RunStep>) -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Blocked);
+        let run = run(
+            1,
+            &item,
+            RunStatus::AwaitingApproval,
+            Some(json!({ "v": 999 })),
+            1,
+        );
+        let steps = steps(&run);
+        candidate(&item, vec![(run, steps)])
+    }
+
+    /// A decided slot at `prd` (winner and loser) under a parked run, with `plan`'s gate parked
+    /// after it when `gate`.
+    fn resolved_selection(gate: bool) -> WaitingCandidate {
+        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
+        let run = parked(1, &item, 2, 1);
+        let mut winner = step(1, &run, (0, 1, 0), StepStatus::Done);
+        winner.selected = Some(true);
+        let mut loser = step(2, &run, (0, 1, 1), StepStatus::Superseded);
+        loser.selected = Some(false);
+        let mut steps = vec![winner, loser];
+        if gate {
+            steps.push(step(3, &run, (1, 1, 0), StepStatus::AwaitingApproval));
+        }
+        candidate(&item, vec![(run, steps)])
+    }
+
     fn run_of(candidate: &WaitingCandidate) -> &Run {
         &candidate.runs[0].0
     }
@@ -1428,27 +1509,14 @@ mod tests {
 
     #[test]
     fn a_resolved_selection_is_no_row() {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::AwaitingApproval);
-        let run = parked(1, &item, 2, 1);
-        let mut winner = step(1, &run, (0, 1, 0), StepStatus::Done);
-        winner.selected = Some(true);
-        let mut loser = step(2, &run, (0, 1, 1), StepStatus::Superseded);
-        loser.selected = Some(false);
-        let gate = step(3, &run, (1, 1, 0), StepStatus::AwaitingApproval);
-        let resolved = candidate(
-            &item,
-            vec![(
-                run.clone(),
-                vec![winner.clone(), loser.clone(), gate.clone()],
-            )],
-        );
+        let resolved = resolved_selection(true);
 
         assert_eq!(
             one(&resolved).rows,
             [row(
                 &resolved,
-                Some(run.id),
-                Some(gate.id),
+                Some(run_of(&resolved).id),
+                Some(step_of(&resolved, 2).id),
                 "plan 1.1",
                 WaitingReason::Gate,
                 GATE_TEXT
@@ -1457,12 +1525,12 @@ mod tests {
 
         // The run still parked with no step parked, so the slot is read: decided, it is no
         // Selection row, and only the interrupted run's Resume row is left.
-        let unparked = candidate(&item, vec![(run.clone(), vec![winner, loser])]);
+        let unparked = resolved_selection(false);
         assert_eq!(
             one(&unparked).rows,
             [row(
                 &unparked,
-                Some(run.id),
+                Some(run_of(&unparked).id),
                 None,
                 "",
                 WaitingReason::Unblock,
@@ -1571,29 +1639,117 @@ mod tests {
 
     #[test]
     fn a_snapshot_that_does_not_decode_keeps_its_gate_row_and_loses_the_rest() {
-        let item = item("FEAT", 1, ids::PROJECT_HTUI, Status::Blocked);
-        let run = run(
-            1,
-            &item,
-            RunStatus::AwaitingApproval,
-            Some(json!({ "v": 999 })),
-            1,
-        );
-        let gate = step(1, &run, (0, 1, 0), StepStatus::AwaitingApproval);
-        let undecodable = candidate(&item, vec![(run.clone(), vec![gate.clone()])]);
+        let undecodable =
+            undecodable(|run| vec![step(1, run, (0, 1, 0), StepStatus::AwaitingApproval)]);
 
         assert_eq!(
             one(&undecodable).rows,
             [row(
                 &undecodable,
-                Some(run.id),
-                Some(gate.id),
+                Some(run_of(&undecodable).id),
+                Some(step_of(&undecodable, 0).id),
                 "prd 0.1",
                 WaitingReason::Gate,
                 GATE_TEXT
             )]
         );
         assert!(verdict(&undecodable).unblock.is_err());
+    }
+
+    /// MOD-69 review H1: `park_interrupted` leaves the run `awaiting_approval` over a `failed`
+    /// step with no gate outcome. No gate, slot or `u` lists it, so the fallback does, on the
+    /// cursor's rest step with its note.
+    #[test]
+    fn an_interrupted_park_is_a_row() {
+        let parked = interrupted_park(Some("interrupted"));
+        let view = one(&parked);
+
+        assert_eq!(
+            view.rows,
+            [row(
+                &parked,
+                Some(run_of(&parked).id),
+                Some(step_of(&parked, 1).id),
+                "plan 1.1",
+                WaitingReason::Interrupted,
+                "interrupted"
+            )]
+        );
+        assert_eq!(view.working, 1, "the parked run is not working");
+        assert!(
+            verdict(&parked).unblock.is_err(),
+            "`u` refuses it: the list's row is not an Unblock row"
+        );
+
+        let not_reset = interrupted_park(Some("interrupted, tree not reset"));
+        assert_eq!(one(&not_reset).rows[0].text, "interrupted, tree not reset");
+        let silent = interrupted_park(None);
+        assert_eq!(one(&silent).rows[0].text, super::INTERRUPTED_TEXT);
+        assert_eq!(WaitingReason::Interrupted.label(), "interrupted");
+    }
+
+    /// The fallback over a run whose snapshot does not decode names the run and no step.
+    #[test]
+    fn an_undecodable_park_without_a_gate_is_an_interrupted_run_row() {
+        let undecodable = undecodable(|run| {
+            vec![
+                step(1, run, (0, 1, 0), StepStatus::Done),
+                step(2, run, (1, 1, 0), StepStatus::Failed),
+            ]
+        });
+
+        assert_eq!(
+            one(&undecodable).rows,
+            [row(
+                &undecodable,
+                Some(run_of(&undecodable).id),
+                None,
+                "",
+                WaitingReason::Interrupted,
+                super::INTERRUPTED_TEXT
+            )]
+        );
+    }
+
+    /// MOD-69 review H1's invariant over every fixture: an active run parked at
+    /// `awaiting_approval` always owns at least one row, so the top bar never counts it working.
+    #[test]
+    fn every_parked_run_owns_a_row() {
+        let mut promoted = over_a_gate(Status::AwaitingApproval);
+        promoted.runs[0].1[0].promoted_at = Some(demo_at(2, 3));
+        let fixtures = [
+            escalation(),
+            crashed_rejection(),
+            reopen(),
+            over_a_gate(Status::AwaitingApproval),
+            over_a_gate(Status::Blocked),
+            over_a_gate(Status::Open),
+            over_a_gate(Status::InProgress),
+            slot(None),
+            slot(Some((Some(GateOutcome::Rejected), "judge: tie"))),
+            slot(Some((None, "interrupted"))),
+            resolved_selection(true),
+            resolved_selection(false),
+            undecodable(|run| vec![step(1, run, (0, 1, 0), StepStatus::AwaitingApproval)]),
+            undecodable(|run| vec![step(1, run, (0, 1, 0), StepStatus::Failed)]),
+            undecodable(|_| Vec::new()),
+            promoted,
+            interrupted_park(Some("interrupted")),
+            interrupted_park(Some("interrupted, tree not reset")),
+            interrupted_park(None),
+        ];
+
+        for candidate in &fixtures {
+            let view = one(candidate);
+            for (run, _) in &candidate.runs {
+                if run.status.is_active() && run.status == RunStatus::AwaitingApproval {
+                    assert!(
+                        view.rows.iter().any(|row| row.run == Some(run.id)),
+                        "{candidate:?} -> {view:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
