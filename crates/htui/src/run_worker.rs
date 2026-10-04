@@ -1479,6 +1479,56 @@ pub(crate) mod tests {
         }
         assert!(answered >= 2, "both starts were answered");
         assert_eq!(runtime.isolator_builds(), 1);
+        assert_eq!(
+            runtime.verifier_builds(),
+            1,
+            "the limits did not move either"
+        );
+    }
+
+    /// MOD-76 D4 (R-55, review L-2): a real walking `StartRun` reads its parts before it mints its
+    /// walk, so an edit to the box's `command_limits` alone reaches the next one, with no restart:
+    /// the verifier is rebuilt and the isolator kept.
+    #[tokio::test]
+    async fn a_walking_start_run_applies_a_command_limits_edit() {
+        let fixture = Fixture::new().await;
+        let scratch = tempfile::tempdir().expect("a scratch root");
+        let mut runtime = RunRuntime::new(fixture.factory())
+            .with_clock(Arc::new(TokioClock::new()))
+            .with_scratch_root(scratch.path().to_path_buf());
+        let backend = Backend::memory(fixture.store.clone());
+        let (replies, _answers) = mpsc::unbounded_channel();
+
+        for (seq, item) in [(1, ids::HTUI_ANA_2), (2, ids::AGY_FEAT_1)] {
+            if seq == 2 {
+                assert!(
+                    fixture
+                        .store
+                        .set_box_setting(ids::BOX, "command_limits", json!({"verify": 2})),
+                    "the demo box has a row"
+                );
+            }
+            let served = runtime
+                .serve(
+                    &backend,
+                    &replies,
+                    &RequestEnvelope {
+                        seq,
+                        origin: Origin::App,
+                        request: start_run(item),
+                    },
+                    &LiveChats::default(),
+                )
+                .await;
+            assert!(matches!(served, RunServed::Deferred));
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+        }
+        assert_eq!(
+            runtime.verifier_builds(),
+            2,
+            "the edit rebuilt the verifier"
+        );
+        assert_eq!(runtime.isolator_builds(), 1, "and kept the isolator");
     }
 
     /// D216 (review L7): a failed `box_row` read is an error — `singletons` then caches no

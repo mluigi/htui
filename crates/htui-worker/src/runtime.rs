@@ -173,7 +173,13 @@ struct Built {
     repos: Option<BTreeMap<RepoId, RepoCheckout>>,
     isolator: Option<Arc<dyn Isolator>>,
     verifier: Option<Arc<dyn Verifier>>,
+    /// MOD-76 D4 (R-55): the stored `command_limits` [`Self::verifier`] was built from (`None`
+    /// inside: no key).
+    limits: Option<Box<StoredLimits>>,
 }
+
+/// The raw `command_limits` layers: the box row's value, then the app setting's.
+type StoredLimits = (Option<Value>, Option<Value>);
 
 /// Everything the runtime's tasks share. `P` is where the runtime's answers go (MOD-41 plan D7).
 struct Shared<P: ReplySink> {
@@ -195,6 +201,8 @@ struct Shared<P: ReplySink> {
     events: mpsc::UnboundedSender<RunServed<P::Addr>>,
     tasks: StdMutex<Vec<Tracked>>,
     isolator_builds: AtomicUsize,
+    /// MOD-76 review L-2: how many verifiers this process has built.
+    verifier_builds: AtomicUsize,
     locks: RunLocks,
     walks: Walks,
     /// M5 D84: this process's runs a claim refused, by `queued_at`.
@@ -362,8 +370,10 @@ impl<P: ReplySink> Shared<P> {
     /// The process's isolator and verifier (D156, D202). A `StartRun`, and each sweep of the
     /// worker (MOD-41 review R-1), re-reads the repo map and rebuilds the production isolator and
     /// verifier when it moved and no walk of this process is live, and is refused with
-    /// [`REPOS_MOVED`] when one is (R-39). The rebuild reads `copy_max_total_bytes` and the box's
-    /// `command_limits` afresh.
+    /// [`REPOS_MOVED`] when one is (R-39). Each such call also re-reads the box's `command_limits`
+    /// and rebuilds the verifier when they changed and no walk is live; while one is, the cached
+    /// verifier stays and nothing is refused (MOD-76 D4, R-55). A repo-map rebuild reads
+    /// `copy_max_total_bytes` afresh.
     async fn singletons<H: htui_core::store::WorkerHost>(
         &self,
         host: &H,
@@ -427,20 +437,29 @@ impl<P: ReplySink> Shared<P> {
                 .map_err(|err| err.to_string())?;
             built.isolator = Some(Arc::new(isolator));
             built.repos = Some(repos);
-            // MOD-41 review R-1: the verifier is rebuilt at the same point, so the box's
-            // `command_limits` refresh with the repo map.
+            // MOD-41 review R-1: the verifier is rebuilt at the same point, from the
+            // `command_limits` read below (MOD-76 D4).
             built.verifier = None;
             self.isolator_builds.fetch_add(1, Ordering::SeqCst);
         }
+        // MOD-76 D4 (R-55): the limits are read wherever the repo map is, so an edit to them alone
+        // rebuilds the verifier. Never under a live walk: two verifiers are two `verify` semaphores
+        // (verify.rs `ShellVerifier`), so the swap waits for the next call with none live.
+        let stored = stored_limits(host, box_id)
+            .await
+            .map_err(|err| err.to_string())?;
+        if built.limits.as_deref() != Some(&stored) && !self.any_live() {
+            built.verifier = None;
+        }
         if built.verifier.is_none() {
-            let limits = command_limits(host, box_id)
-                .await
-                .map_err(|err| err.to_string())?;
+            let limits = parse_limits(box_id, &stored);
             built.verifier = Some(Arc::new(ShellVerifier::new(
                 &limits,
                 Arc::new(MinimalScrubber::new(std::iter::empty::<String>())),
                 Arc::clone(&self.clock),
             )));
+            built.limits = Some(Box::new(stored));
+            self.verifier_builds.fetch_add(1, Ordering::SeqCst);
         }
         match (&built.isolator, &built.verifier) {
             (Some(isolator), Some(verifier)) => Ok((Arc::clone(isolator), Arc::clone(verifier))),
@@ -798,39 +817,46 @@ async fn repo_map<H: htui_core::store::WorkerHost>(
     Ok(repos)
 }
 
-/// MOD-11 D15: `app_setting.command_limits` overlaid key by key with the box row's
-/// `settings.command_limits` ([`resolve_command_limits`]). No row or no key is the app setting
-/// alone; a stored value that does not parse as a map of `u32` is warned, and its entries that do
-/// parse still overlay. A class neither names reads 1 (`ShellVerifier::new` for `verify`,
-/// `command_limit` for the queue), which was D156's `{"verify": 1}` default.
+/// MOD-11 D15 and MOD-76 B-1 (R-55): the two raw layers of the box's command limits, the box row's
+/// `settings.command_limits` (`None` for no row or no key) and the `app_setting.command_limits`
+/// value. [`Shared::singletons`] compares them raw, so a value that does not parse is parsed (and
+/// warned) once per build, not once per sweep. The limits are read at every walking `StartRun`
+/// and every worker sweep, and the verifier is rebuilt from an edit once no walk of the process is
+/// live (MOD-76 D4).
 ///
 /// D216 (review L7): a read that fails is not the default. `singletons` passes it up like the
-/// reads beside it, so no verifier is cached from it and the next command reads again. The limits
-/// are read once per build of the parts (per server): an edit to them reaches the next process
-/// (R-55), or this one when its repo map next moves (MOD-41 review R-1).
+/// reads beside it, so no verifier is cached from it and the next command reads again.
 ///
 /// [`resolve_command_limits`]: htui_core::model::kind::resolve_command_limits
 ///
 /// # Errors
 /// The store's own read failures (the box row, then the app settings).
-async fn command_limits<H: htui_core::store::WorkerHost>(
+async fn stored_limits<H: htui_core::store::WorkerHost>(
     host: &H,
     box_id: BoxId,
-) -> StoreResult<BTreeMap<String, u32>> {
+) -> StoreResult<StoredLimits> {
     let stored = host
         .box_row(box_id)
         .await?
         .and_then(|row| row.settings.get("command_limits").cloned());
-    let app = host.app_settings().await?;
-    if let Some(stored) = &stored
+    let app = host.app_settings().await?.remove("command_limits");
+    Ok((stored, app))
+}
+
+/// MOD-76 B-1 (R-55) over MOD-11 D15: `stored` resolved, the box's keys over the app setting's. A
+/// box value that does not parse as a map of `u32` is warned.
+fn parse_limits(box_id: BoxId, stored: &StoredLimits) -> BTreeMap<String, u32> {
+    let (stored, app) = stored;
+    if let Some(stored) = stored
         && let Err(err) = serde_json::from_value::<BTreeMap<String, u32>>(stored.clone())
     {
         tracing::warn!(%box_id, %err, "box.settings.command_limits does not parse; the app setting stands where it does not");
     }
-    Ok(htui_core::model::kind::resolve_command_limits(
-        stored.as_ref(),
-        &app,
-    ))
+    let app: BTreeMap<String, Value> = app
+        .iter()
+        .map(|value| ("command_limits".to_owned(), value.clone()))
+        .collect();
+    htui_core::model::kind::resolve_command_limits(stored.as_ref(), &app)
 }
 
 /// The engine every task builds, per step of work, over [`Kit`]'s parts: over the host's store
@@ -1135,6 +1161,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 events,
                 tasks: StdMutex::default(),
                 isolator_builds: AtomicUsize::new(0),
+                verifier_builds: AtomicUsize::new(0),
                 locks: RunLocks::default(),
                 walks: Walks::default(),
                 queued: StdMutex::default(),
@@ -1401,6 +1428,13 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     #[must_use]
     pub fn isolator_builds(&self) -> usize {
         self.shared.isolator_builds.load(Ordering::SeqCst)
+    }
+
+    /// How many verifiers this process has built (MOD-76 review L-2's test hook): one per build
+    /// of the parts, and one more per `command_limits` edit applied (D4).
+    #[must_use]
+    pub fn verifier_builds(&self) -> usize {
+        self.shared.verifier_builds.load(Ordering::SeqCst)
     }
 
     /// How many tasks this runtime still owns, finished ones included until the next `serve` or
@@ -1873,7 +1907,8 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// executor adopts or claims, so the executor is read first, at every sweep. The worker, which has
 /// no `StartRun` of its own, then re-reads its repo map (MOD-41 review R-1, blueprint D202): a
 /// repo or checkout change rebuilds the isolator and the verifier, with the limits read afresh,
-/// when no walk of this process is live, and while one is ([`REPOS_MOVED`]) the sweep still adopts
+/// when no walk of this process is live (a change to the limits alone rebuilds the verifier then
+/// too, MOD-76 D4), and while one is ([`REPOS_MOVED`]) the sweep still adopts
 /// but skips its claim scan this tick (a refused claim's retry, M5 D84, still runs when a walk
 /// rests, with the parts the process has). Then the adoption
 /// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
@@ -3034,7 +3069,10 @@ pub mod testing {
         host: &H,
         box_id: BoxId,
     ) -> StoreResult<BTreeMap<String, u32>> {
-        super::command_limits(host, box_id).await
+        Ok(super::parse_limits(
+            box_id,
+            &super::stored_limits(host, box_id).await?,
+        ))
     }
 
     /// The verdicts of an item the mirror does not hold, off the server: nothing is enabled.
@@ -3215,14 +3253,14 @@ mod tests {
         store.set_app_setting("command_limits", seeded.clone());
         let backend = Backend::memory(store);
         assert_eq!(
-            super::command_limits(&backend, BoxId::new())
+            super::testing::command_limits(&backend, BoxId::new())
                 .await
                 .expect("the read answers"),
             app,
             "no box row: the app setting"
         );
         assert_eq!(
-            super::command_limits(&backend, ids::BOX)
+            super::testing::command_limits(&backend, ids::BOX)
                 .await
                 .expect("the read answers"),
             app,
@@ -3232,7 +3270,7 @@ mod tests {
         let store = with_box(Some(json!({"test": 2, "run": 3})));
         store.set_app_setting("command_limits", seeded.clone());
         assert_eq!(
-            super::command_limits(&Backend::memory(store), ids::BOX)
+            super::testing::command_limits(&Backend::memory(store), ids::BOX)
                 .await
                 .expect("the read answers"),
             BTreeMap::from([
@@ -3247,7 +3285,7 @@ mod tests {
         let store = with_box(Some(json!("many")));
         store.set_app_setting("command_limits", seeded);
         assert_eq!(
-            super::command_limits(&Backend::memory(store), ids::BOX)
+            super::testing::command_limits(&Backend::memory(store), ids::BOX)
                 .await
                 .expect("the read answers"),
             app,
@@ -3255,7 +3293,7 @@ mod tests {
         );
 
         assert_eq!(
-            super::command_limits(&Backend::memory(with_box(None)), ids::BOX)
+            super::testing::command_limits(&Backend::memory(with_box(None)), ids::BOX)
                 .await
                 .expect("the read answers"),
             BTreeMap::new(),
@@ -4058,6 +4096,200 @@ mod role_gate {
         assert!(
             !Arc::ptr_eq(&verifier, &rebuilt),
             "the verifier is rebuilt with the isolator, so the limits are read afresh"
+        );
+    }
+
+    /// MOD-76 D4 (R-55): a runtime of `role` with the `acp` driver and a scratch root.
+    fn limits_runtime(scratch: &Scratch, role: Role) -> RunRuntime<Backend, Timed> {
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(OneTurn));
+        RunRuntime::new(factory)
+            .with_author(Arc::new(OutputAuthor))
+            .with_role(role)
+            .with_scratch_root(scratch.0.join("trees"))
+    }
+
+    /// One sweep of `runtime`, settled.
+    async fn tick(runtime: &mut RunRuntime<Backend, Timed>, backend: &Backend, sink: &Timed) {
+        runtime.sweep_with(backend, sink);
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+    }
+
+    /// The demo box's `settings.command_limits` set to `value`, which it did not hold.
+    async fn set_limits(store: &MemStore, value: serde_json::Value) {
+        let row = store
+            .box_row(ids::BOX)
+            .await
+            .expect("the read answers")
+            .expect("the demo box");
+        assert_ne!(
+            row.settings.get("command_limits"),
+            Some(&value),
+            "the limits change"
+        );
+        assert!(store.set_box_setting(ids::BOX, "command_limits", value));
+    }
+
+    /// MOD-76 D4 (R-55): with no walk live, a change to the box's `command_limits` alone (the
+    /// repo map unchanged) reaches the worker's next sweep: a new verifier, the same isolator.
+    #[tokio::test]
+    async fn a_worker_sweep_applies_a_limits_change_alone() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (isolator, verifier) = parts(&runtime, &backend).await;
+
+        set_limits(&store, json!({ "verify": 2 })).await;
+        tick(&mut runtime, &backend, &sink).await;
+        let (still, rebuilt) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &rebuilt),
+            "the verifier is rebuilt from the new limits"
+        );
+        assert!(Arc::ptr_eq(&isolator, &still), "the isolator stays");
+        assert_eq!(runtime.isolator_builds(), 1, "the repo map did not move");
+    }
+
+    /// MOD-76 D4 (R-55): a sweep that finds the limits unchanged keeps the verifier.
+    #[tokio::test]
+    async fn a_worker_sweep_with_the_same_limits_keeps_its_verifier() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, verifier) = parts(&runtime, &backend).await;
+
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, still) = parts(&runtime, &backend).await;
+        assert!(Arc::ptr_eq(&verifier, &still));
+        assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// MOD-76 D4 (R-55): while a walk is live, a limits change keeps the cached verifier and
+    /// refuses nothing (two verifiers would be two `verify` semaphores); the first sweep after
+    /// the walk rests rebuilds it.
+    #[tokio::test]
+    async fn a_limits_change_under_a_live_walk_waits_for_the_rest() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (isolator, verifier) = parts(&runtime, &backend).await;
+
+        let walk = runtime.shared.walks.child(RunId::new());
+        set_limits(&store, json!({ "verify": 2 })).await;
+        tick(&mut runtime, &backend, &sink).await;
+        let writer = htui_core::store::WorkerHost::writer(&backend).expect("the backend writes");
+        let (still, kept) = runtime
+            .shared
+            .singletons(&backend, &writer, true)
+            .await
+            .expect("a limits change under a live walk refuses nothing");
+        assert!(
+            Arc::ptr_eq(&verifier, &kept),
+            "no verifier is swapped under a live walk"
+        );
+        assert!(Arc::ptr_eq(&isolator, &still));
+        assert_eq!(runtime.isolator_builds(), 1);
+
+        drop(walk);
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, rebuilt) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &rebuilt),
+            "the rest's sweep rebuilds the verifier from the new limits"
+        );
+        assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// MOD-76 D4 (R-55): the TUI, which has no sweep re-read, applies a limits change at its next
+    /// walking `StartRun`; a call that walks nothing keeps the verifier.
+    #[tokio::test]
+    async fn a_walking_start_run_applies_a_limits_change() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        let runtime = limits_runtime(&scratch, Role::Tui);
+        let backend = Backend::memory(store.clone());
+        super::Kit::read(&runtime.shared, &backend, true)
+            .await
+            .expect("the kit reads");
+        let (_, verifier) = parts(&runtime, &backend).await;
+
+        set_limits(&store, json!({ "verify": 2 })).await;
+        super::Kit::read(&runtime.shared, &backend, false)
+            .await
+            .expect("the kit reads");
+        let (_, cached) = parts(&runtime, &backend).await;
+        assert!(
+            Arc::ptr_eq(&verifier, &cached),
+            "a call that is no walking `StartRun` serves the cached parts"
+        );
+        super::Kit::read(&runtime.shared, &backend, true)
+            .await
+            .expect("the kit reads");
+        let (_, rebuilt) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &rebuilt),
+            "the walking `StartRun` rebuilds the verifier from the new limits"
+        );
+        assert_eq!(runtime.isolator_builds(), 1);
+    }
+
+    /// MOD-76 B-1 (R-55): a stored value that does not parse is compared as stored, so it
+    /// builds the verifier once (warned once) and the next sweep keeps it.
+    #[tokio::test]
+    async fn a_bad_stored_limits_value_is_parsed_once() {
+        if let Err(skip) = htui_orch::isolate::git::testkit::usable_git() {
+            println!("{skip}");
+            return;
+        }
+        let scratch = Scratch::new();
+        let store = seeded(MemStore::demo()).await;
+        set_executor(&store, Executor::Worker).await;
+        let mut runtime = limits_runtime(&scratch, Role::Worker);
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, verifier) = parts(&runtime, &backend).await;
+
+        set_limits(&store, json!("not a map")).await;
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, bad) = parts(&runtime, &backend).await;
+        assert!(
+            !Arc::ptr_eq(&verifier, &bad),
+            "the stored value changed, so the verifier is built from it"
+        );
+        tick(&mut runtime, &backend, &sink).await;
+        let (_, still) = parts(&runtime, &backend).await;
+        assert!(
+            Arc::ptr_eq(&bad, &still),
+            "the same stored value is not parsed and built again"
         );
     }
 

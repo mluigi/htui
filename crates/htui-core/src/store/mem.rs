@@ -919,6 +919,24 @@ impl MemStore {
         self.read(|state| state.run_commands.values().cloned().collect())
     }
 
+    /// MOD-76 D4 (R-55): sets `settings[key]` on box `id`'s row, on this store and every clone
+    /// of it, as no `BoxEdit` field writes it (`command_limits`). `edit_version` does not move.
+    /// Whether the row exists.
+    ///
+    /// # Panics
+    /// When the row's `settings` is neither an object nor `null` (`edit_box` refuses to write
+    /// one, so only a hand-built fixture has it).
+    #[cfg(feature = "test-support")]
+    pub fn set_box_setting(&self, id: BoxId, key: &str, value: Value) -> bool {
+        self.write(|state| {
+            state
+                .boxes
+                .get_mut(&id)
+                .map(|row| row.settings[key] = value)
+                .is_some()
+        })
+    }
+
     /// This handle's "now": its injected clock, else `Utc::now()` untruncated (blueprint B21).
     fn now(&self) -> DateTime<Utc> {
         self.clock.now()
@@ -7893,6 +7911,37 @@ mod tests {
     use chrono::{SubsecRound as _, TimeDelta, Utc};
     use serde_json::{Value, json};
     use uuid::Uuid;
+
+    /// MOD-76 D4 (R-55): `set_box_setting` writes the key on every clone's row, leaves the
+    /// other keys and `edit_version` alone, and answers whether the row exists.
+    #[tokio::test]
+    async fn a_box_setting_is_set_on_every_clone() {
+        let store = MemStore::demo();
+        let before = store
+            .box_row(ids::BOX)
+            .await
+            .expect("the read")
+            .expect("the demo box");
+        let clone = store.clone();
+        assert!(store.set_box_setting(ids::BOX, "command_limits", json!({ "verify": 3 })));
+        let after = clone
+            .box_row(ids::BOX)
+            .await
+            .expect("the read")
+            .expect("the demo box");
+        assert_eq!(after.settings["command_limits"], json!({ "verify": 3 }));
+        assert_eq!(after.edit_version, before.edit_version);
+        let mut kept = after.settings.clone();
+        let mut was = before.settings.clone();
+        kept.as_object_mut()
+            .expect("an object")
+            .remove("command_limits");
+        if let Some(object) = was.as_object_mut() {
+            object.remove("command_limits");
+        }
+        assert_eq!(kept, was, "no other key moves");
+        assert!(!store.set_box_setting(BoxId::new(), "command_limits", json!({})));
+    }
 
     /// MOD-40 plan D11 (T7): a `MemStore` stamps with the clock its handle was given, and a
     /// clone given another clock stamps with that one. Without a clock it stamps the wall clock,
