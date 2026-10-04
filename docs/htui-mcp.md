@@ -232,7 +232,8 @@ include `heavy_build`. No probe sets it, so declare it on each box meant to take
 note `missing tags: heavy_build`, and auto mode does not pick the item there. A phase whose
 `command_queue` is `always` gives a single-agent step the queue without tying the item to a box;
 Settings › Kinds shows that setting but does not edit it (it is the `step_graph_phase` row's
-`command_queue` column). A persona with `command-run: false` takes it away (see
+`command_queue` column). A persona with `command-run: false`, or one that denies the `execute`
+kind, takes it away (see
 [`docs/personas.md`](personas.md#narrow-only-what-a-persona-can-and-cannot-change)). The
 prompt's `command_queue` section follows the same rule, so the prompt never names a tool the
 session lacks. Judge calls and chats never get it. Before MOD-11 a `fan_out_only` phase rendered

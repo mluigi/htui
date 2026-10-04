@@ -387,7 +387,9 @@ persona)`, and every clause of it only removes:
 - **`deny`**: the base's, then the persona's, then the names added above, each kept once.
 - **`deny_kinds`**: the base's, then the persona's. A kind string htui cannot read is denied as
   `other`, never dropped (the save rules make that impossible to store).
-- **`command_run`**: the base's AND the persona's, so a persona can only turn it off.
+- **`command_run`**: the base's AND the persona's, so a persona can only turn it off. It is also
+  off when the merged `deny_kinds` include `execute`: a step that may not run a command does not
+  queue one either.
 - **Rules**: the persona's own rules first (each rejects; an empty reason is recorded as
   `persona <name>`), then one rule per denied kind, `{match: {tool_kind: <kind>}, answer:
   reject_once, reason: "persona <name> denies <kind>"}`, then the agent's own rules.
@@ -433,8 +435,9 @@ and a body that cannot be masked refuses the prompt. A template cannot place it:
 not one of the twenty placeholders, and a template that writes it is refused as an unknown
 placeholder.
 
-A persona with `command-run: false` also removes the prompt's `command_queue` section, and with it
-htui's `command_run` tool and the refusals of heavy shell commands that come with it (MOD-11; see
+A persona with `command-run: false`, or one whose `deny-kinds` include `execute`, also removes the
+prompt's `command_queue` section, and with it htui's `command_run` tool and the refusals of heavy
+shell commands that come with it (MOD-11; see
 [`docs/htui-mcp.md`](htui-mcp.md#command_run-and-the-command-queue)).
 
 A prompt for a phase without a persona is byte-for-byte what it was before MOD-26.

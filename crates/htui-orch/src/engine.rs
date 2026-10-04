@@ -5601,11 +5601,14 @@ where
             // matches nothing, and `with_excerpts` replaces it for a phase prompt.
             step_files: StepFiles::default(),
             // MOD-11 D16 (OQ-6): the one resolver — `fan_out_only` renders the section only for a
-            // fanned-out phase or a `heavy_build` item — and MOD-26 D13's persona term.
+            // fanned-out phase or a `heavy_build` item — and MOD-26 D13's persona term, which R1
+            // H1 makes `narrow`'s own rule (an `execute` denial drops the tool too).
             command_queue: phase
                 .command_queue
                 .exposed(phase.fan_out, &row.required_tags)
-                && persona.is_none_or(|persona| persona.tools.command_run),
+                && persona.is_none_or(|persona| {
+                    htui_agent::persona::persona_keeps_command_run(&persona.tools)
+                }),
             // MOD-11 D19: a phase step always has an item; the trailer names `document_write`
             // whenever a tool host serves the session and the phase writes a document.
             document_tool: self.parts.tools.is_some() && !phase.output_kind.is_empty(),
@@ -17132,6 +17135,68 @@ mod tests {
                     .collect::<Vec<_>>(),
                 [true],
                 "the scope advertises `command_run`"
+            );
+        }
+
+        /// MOD-11 R1 H1 (amends D16): a persona that denies `execute` on an exposed phase gets
+        /// no `command_run`, no R-MCP-4 denial and no `command_queue` section — the prompt never
+        /// names a tool the session lacks.
+        #[tokio::test]
+        async fn an_execute_denying_persona_loses_command_run_and_its_section() {
+            use htui_core::model::{NewPersona, PersonaId, PersonaPermission, PersonaTools};
+            use htui_core::store::WriteStore as _;
+
+            let host = Arc::new(FakeToolHost::default());
+            let harness = hosted(&host);
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.command_queue = htui_core::model::CommandQueue::Always;
+                    }
+                })
+                .await;
+            let persona = harness
+                .orch
+                .store
+                .create_persona(NewPersona {
+                    id: PersonaId::new(),
+                    name: "no-shell".to_owned(),
+                    description: "never runs a command".to_owned(),
+                    body: "You never run shell commands.\n".to_owned(),
+                    tools: PersonaTools {
+                        deny_kinds: vec!["execute".to_owned()],
+                        ..PersonaTools::default()
+                    },
+                    permission: PersonaPermission::default(),
+                })
+                .await
+                .expect("a valid persona");
+            super::bind_persona(&harness.orch, ids::HTUI_FEAT_3, "prd", persona.id).await;
+
+            let (spec, prompt) = super::spied_start(&harness.orch).await;
+
+            assert!(!spec.tools.command_run, "an execute denial drops the tool");
+            assert!(
+                !spec
+                    .permission
+                    .rules
+                    .iter()
+                    .any(|rule| rule.reason.ends_with("(R-MCP-4)")),
+                "and the denials: {:?}",
+                spec.permission.rules
+            );
+            assert!(
+                !prompt.contains("<section name=\"command_queue\""),
+                "and the section:\n{prompt}"
+            );
+            assert_eq!(
+                host.opened()
+                    .iter()
+                    .map(|scope| scope.command_queue)
+                    .collect::<Vec<_>>(),
+                [false],
+                "the scope advertises no `command_run`"
             );
         }
 
