@@ -194,6 +194,8 @@ struct Shared<P: ReplySink> {
     events: mpsc::UnboundedSender<RunServed<P::Addr>>,
     tasks: StdMutex<Vec<Tracked>>,
     isolator_builds: AtomicUsize,
+    /// MOD-76 review L-2: how many verifiers this process has built.
+    verifier_builds: AtomicUsize,
     locks: RunLocks,
     walks: Walks,
     /// M5 D84: this process's runs a claim refused, by `queued_at`.
@@ -450,6 +452,7 @@ impl<P: ReplySink> Shared<P> {
                 Arc::clone(&self.clock),
             )));
             built.limits = Some(stored);
+            self.verifier_builds.fetch_add(1, Ordering::SeqCst);
         }
         match (&built.isolator, &built.verifier) {
             (Some(isolator), Some(verifier)) => Ok((Arc::clone(isolator), Arc::clone(verifier))),
@@ -1137,6 +1140,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 events,
                 tasks: StdMutex::default(),
                 isolator_builds: AtomicUsize::new(0),
+                verifier_builds: AtomicUsize::new(0),
                 locks: RunLocks::default(),
                 walks: Walks::default(),
                 queued: StdMutex::default(),
@@ -1391,6 +1395,13 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     #[must_use]
     pub fn isolator_builds(&self) -> usize {
         self.shared.isolator_builds.load(Ordering::SeqCst)
+    }
+
+    /// How many verifiers this process has built (MOD-76 review L-2's test hook): one per build
+    /// of the parts, and one more per `command_limits` edit applied (D4).
+    #[must_use]
+    pub fn verifier_builds(&self) -> usize {
+        self.shared.verifier_builds.load(Ordering::SeqCst)
     }
 
     /// How many tasks this runtime still owns, finished ones included until the next `serve` or
