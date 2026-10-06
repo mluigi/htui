@@ -6,7 +6,7 @@ but ANA-26 §6–§9 already is the requirements document. Ultracode accepted fo
 review-finding verification; `rust-reviewer` stays the gate.
 **Selected milestone**: M1 only (maintainer, 2026-10-06). M2–M6 are later runs.
 **Complexity**: Medium (~10 files, one new module, no snapshot churn intended)
-**Status**: approved (maintainer CONFIRM 2026-10-06) — implementing
+**Status**: done (M1 landed 2026-10-06, `c3b3f7bd`..`add7fb39`); M2-M6 are later runs
 
 ## Summary
 
