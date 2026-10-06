@@ -163,6 +163,33 @@ pub fn placeholder_table(role: TemplateRole) -> Vec<String> {
 /// the last closed block is empty.
 #[must_use]
 pub fn proposal(reply: &str) -> Option<String> {
+    let scan = scan(reply);
+    if scan.open {
+        return None;
+    }
+    scan.last.filter(|content| !content.is_empty())
+}
+
+/// MOD-55 review L2: how many fenced blocks `reply` closes, by [`proposal`]'s scan. More than one
+/// means the proposal (the last) may be a trailing example rather than the body, so the help says
+/// so; the extraction rule itself stays the last closed block.
+#[must_use]
+pub fn closed_blocks(reply: &str) -> usize {
+    scan(reply).closed
+}
+
+/// What [`scan`] found in a reply.
+struct Scan {
+    /// The last closed block's content.
+    last: Option<String>,
+    /// The closed blocks, empty ones included.
+    closed: usize,
+    /// A block is still open at the end.
+    open: bool,
+}
+
+/// [`proposal`]'s fence scan, once for it and for [`closed_blocks`].
+fn scan(reply: &str) -> Scan {
     /// The block being read: its fence character, run length, indent and content so far.
     struct Open {
         /// `` ` `` or `~`.
@@ -177,6 +204,7 @@ pub fn proposal(reply: &str) -> Option<String> {
 
     let mut open: Option<Open> = None;
     let mut last: Option<String> = None;
+    let mut closed = 0;
     for line in reply.lines() {
         let indent = line.len() - line.trim_start_matches(' ').len();
         let rest = &line[indent..];
@@ -187,6 +215,7 @@ pub fn proposal(reply: &str) -> Option<String> {
                     rest.len() - after.len() >= block.run && after.trim().is_empty()
                 };
                 if closes {
+                    closed += 1;
                     last = Some(block.content);
                 } else {
                     let strip = indent.min(block.indent);
@@ -215,10 +244,11 @@ pub fn proposal(reply: &str) -> Option<String> {
             }
         }
     }
-    if open.is_some() {
-        return None;
+    Scan {
+        last,
+        closed,
+        open: open.is_some(),
     }
-    last.filter(|content| !content.is_empty())
 }
 
 /// MOD-55 P9: whether `proposed` holds the mask marker more often than `sent` did: a masked
@@ -417,6 +447,30 @@ mod tests {
         for (reply, expected) in cases {
             assert_eq!(proposal(reply).as_deref(), expected, "reply: {reply:?}");
         }
+    }
+
+    /// MOD-55 review L2: every closed block counts, so a reply whose last block may be a
+    /// trailing example rather than the body can say so; an unclosed or a nested block does not.
+    #[test]
+    fn closed_blocks_counts_every_closed_block() {
+        let cases: [(&str, usize); 8] = [
+            ("no block at all", 0),
+            ("Here:\n```\nnew body\n```\nDone.", 1),
+            ("```\nbody\n```\nRun it:\n```sh\ncargo test\n```\n", 2),
+            ("```\na\n```\n~~~\nb\n~~~\n```\nc\n```", 3),
+            ("````markdown\nA\n```rust\nx\n```\nB\n````", 1),
+            ("```\na\n```\n```\nb", 1),
+            ("```\n```\n```\nx\n```", 2),
+            ("```a`b\nx\n```", 0),
+        ];
+        for (reply, expected) in cases {
+            assert_eq!(closed_blocks(reply), expected, "reply: {reply:?}");
+        }
+        assert_eq!(
+            proposal("```\nbody\n```\nRun it:\n```sh\ncargo test\n```\n").as_deref(),
+            Some("cargo test\n"),
+            "the extraction rule stays the last closed block"
+        );
     }
 
     /// E-8: a known value is masked; a credential pattern refuses, naming the section.
