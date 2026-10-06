@@ -236,8 +236,9 @@ impl InfisicalProvider {
             Ok(result) => result,
             Err(e) => match e.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
-                // Only a runtime shutting down cancels the task; its `LoginGuard` has already
-                // recorded the cool-down an unanswered login gets.
+                // Only a runtime shutting down cancels the task. Once it ran, its `LoginGuard`
+                // has recorded the cool-down an unanswered login gets; cancelled before its first
+                // poll, it sent nothing and left the state as it was.
                 Err(_) => Err(protocol(
                     LOGIN_PATH,
                     "the login was cancelled before it answered".to_owned(),
