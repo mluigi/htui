@@ -9,6 +9,7 @@
 mod support;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use htui_core::secret::{MachineIdentity, SecretError, SecretProvider, SecretScope};
 use htui_secrets::{InfisicalConfig, InfisicalProvider};
@@ -660,6 +661,143 @@ async fn concurrent_first_calls_with_a_good_login_share_one_login() {
     assert!(a.is_ok() && b.is_ok(), "both resolves succeed");
     assert_eq!(stub.count("POST", LOGIN), 1);
     assert_eq!(stub.count("GET", SECRETS), 2);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cancel safety and the cool-down (D5, R1 #1)
+// ---------------------------------------------------------------------------------------------
+
+/// How long the stub sits on a login in the cancel and cool-down tests.
+const SLOW: Duration = Duration::from_millis(300);
+/// A caller's patience, or the request timeout, below `SLOW`.
+const IMPATIENT: Duration = Duration::from_millis(100);
+
+/// A provider on `stub` whose requests time out after `IMPATIENT` and whose cool-down after a
+/// login without an answer lasts `cool_down`.
+fn impatient(stub: &Stub, cool_down: Duration) -> InfisicalProvider {
+    let mut config = InfisicalConfig::new(stub.base());
+    config.timeout = IMPATIENT;
+    config.login_cool_down = cool_down;
+    InfisicalProvider::new(config, identity()).must("an impatient provider on the stub")
+}
+
+/// The reviewer's reproduction: three callers that give up (`tokio::time::timeout`) before a slow
+/// 401 arrives. The login runs on its own task, so the dropped callers never lose its outcome:
+/// one login, and the refusal still latches.
+#[tokio::test]
+async fn cancelled_callers_around_a_slow_refusal_cost_one_login() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        error(401, "UnauthorizedError", "Invalid credentials").delayed(SLOW),
+    );
+    let p = provider(&stub);
+    // The first two give up for sure; the third may already see the latch as the 401 lands.
+    for _ in 0..3 {
+        let _ = tokio::time::timeout(IMPATIENT, p.resolve(&scope())).await;
+    }
+    assert_err(
+        &p.resolve(&scope()).await.must_fail("expected an error"),
+        &SecretError::LoginRefusedEarlier,
+    );
+    assert_eq!(
+        stub.count("POST", LOGIN),
+        1,
+        "a cancelled caller cost a login"
+    );
+}
+
+/// A caller that gives up during a good login does not waste it: the token is cached.
+#[tokio::test]
+async fn a_cancelled_caller_s_login_still_caches_the_token() {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login_ok(TOKEN, 2_592_000).delayed(SLOW))
+        .on(
+            "GET",
+            SECRETS,
+            list_ok(json!([secret("A", VALUE)]), json!([])),
+        );
+    let p = provider(&stub);
+    let gave_up = tokio::time::timeout(IMPATIENT, p.resolve(&scope())).await;
+    assert!(gave_up.is_err(), "the caller did not give up");
+    p.resolve(&scope())
+        .await
+        .must("resolves with the cached token");
+    assert_eq!(stub.count("POST", LOGIN), 1);
+    assert_eq!(stub.count("GET", SECRETS), 1);
+}
+
+/// A login sent but unanswered (the request timeout) may have counted as a failed attempt: the
+/// caller sees `Unreachable`; for the cool-down every call, health included, is
+/// `LoginCoolingDown` with no request; after it, concurrent callers share exactly one new login.
+#[tokio::test]
+async fn a_login_without_an_answer_cools_down_then_allows_one_attempt() {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login_ok(TOKEN, 2_592_000).delayed(SLOW))
+        .on("POST", LOGIN, login_ok(TOKEN_2, 2_592_000))
+        .on(
+            "GET",
+            SECRETS,
+            list_ok(json!([secret("A", VALUE)]), json!([])),
+        )
+        .on("GET", STATUS, Reply::json(200, &json!({})));
+    let cool_down = Duration::from_millis(600);
+    let p = impatient(&stub, cool_down);
+    assert!(
+        matches!(
+            p.resolve(&scope()).await,
+            Err(SecretError::Unreachable { endpoint, .. }) if endpoint == LOGIN
+        ),
+        "an unanswered login is not Unreachable at the login"
+    );
+    let cooling = SecretError::LoginCoolingDown {
+        retry_after_secs: 1,
+    };
+    assert_err(
+        &p.resolve(&scope())
+            .await
+            .must_fail("resolve while cooling down"),
+        &cooling,
+    );
+    assert_err(
+        &p.list_keys(&scope())
+            .await
+            .must_fail("list_keys while cooling down"),
+        &cooling,
+    );
+    assert_err(
+        &p.health().await.must_fail("health while cooling down"),
+        &cooling,
+    );
+    assert_eq!(
+        stub.requests().len(),
+        1,
+        "a cooling-down provider made a request"
+    );
+    tokio::time::sleep(cool_down + Duration::from_millis(200)).await;
+    let s = scope();
+    let (a, b) = tokio::join!(p.resolve(&s), p.resolve(&s));
+    a.must("the first call after the cool-down");
+    b.must("the second call after the cool-down");
+    assert_eq!(
+        stub.count("POST", LOGIN),
+        2,
+        "not exactly one login after the cool-down"
+    );
+}
+
+/// The default cool-down is Infisical's lockout counter-reset window.
+#[test]
+fn the_default_cool_down_is_thirty_seconds() {
+    assert_eq!(
+        InfisicalConfig::new("https://app.infisical.com").login_cool_down,
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        htui_secrets::DEFAULT_LOGIN_COOL_DOWN,
+        Duration::from_secs(30)
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1325,8 +1463,18 @@ async fn no_error_or_debug_carries_a_value_the_client_secret_or_the_token() {
         .await,
     );
 
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        leaky_login(401, "Invalid credentials").delayed(SLOW),
+    );
+    let cooling = impatient(&stub, Duration::from_secs(30));
+    errors.push(cooling.resolve(&scope()).await.must_fail("unanswered"));
+    errors.push(cooling.resolve(&scope()).await.must_fail("cooling down"));
+
     let names: std::collections::BTreeSet<&str> = errors.iter().map(variant).collect();
-    assert_eq!(names.len(), 14, "not every variant was produced: {names:?}");
+    assert_eq!(names.len(), 15, "not every variant was produced: {names:?}");
     for e in &errors {
         let name = variant(e);
         for text in [e.to_string(), format!("{e:?}")] {

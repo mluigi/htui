@@ -10,6 +10,6 @@ mod infisical;
 mod wire;
 
 pub use infisical::{
-    DEFAULT_CONNECT_TIMEOUT, DEFAULT_TIMEOUT, InfisicalConfig, InfisicalProvider,
-    normalise_base_url,
+    DEFAULT_CONNECT_TIMEOUT, DEFAULT_LOGIN_COOL_DOWN, DEFAULT_TIMEOUT, InfisicalConfig,
+    InfisicalProvider, normalise_base_url,
 };

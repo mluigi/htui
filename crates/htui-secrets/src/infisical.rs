@@ -6,7 +6,7 @@
 //! known message, a cleaned non-login server message, a scope field, a key name or a cause chain.
 
 use std::collections::BTreeMap;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 use std::time::{Duration, Instant};
 
 use htui_core::secret::{
@@ -23,6 +23,9 @@ use crate::wire::{ErrorBody, ListResponse, LoginRequest, LoginResponse};
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// D9: the whole-request timeout (`install/http.rs`'s `short` client shape).
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(20);
+/// D5: after a login that was sent but got no answer, how long no new login is tried. Infisical's
+/// default lockout counter-reset window, so the unknown attempt has expired from the count.
+pub const DEFAULT_LOGIN_COOL_DOWN: Duration = Duration::from_secs(30);
 
 /// `htui/<version>`, so a server log line names the client.
 const USER_AGENT: &str = concat!("htui/", env!("CARGO_PKG_VERSION"));
@@ -45,33 +48,48 @@ pub struct InfisicalConfig {
     pub connect_timeout: Duration,
     /// Whole-request timeout.
     pub timeout: Duration,
+    /// D5: no login is tried for this long after a login that got no answer
+    /// ([`SecretError::LoginCoolingDown`]).
+    pub login_cool_down: Duration,
 }
 
 impl InfisicalConfig {
-    /// `base_url` with the D9 timeouts.
+    /// `base_url` with the D9 timeouts and the D5 cool-down.
     #[must_use]
     pub fn new(base_url: impl Into<String>) -> Self {
         Self {
             base_url: base_url.into(),
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             timeout: DEFAULT_TIMEOUT,
+            login_cool_down: DEFAULT_LOGIN_COOL_DOWN,
         }
     }
 }
 
 /// The Infisical client (D5, D6, D9). `Debug` is hand-written: base URL and client ID only.
 pub struct InfisicalProvider {
+    /// What the login task needs; shared with it so a dropped caller cannot cancel a login.
+    inner: Arc<Inner>,
+    /// D5: held across the login (single flight) by the login task itself, so it stays held
+    /// until the outcome is recorded even when every caller gave up. Never held across a data
+    /// request.
+    state: Arc<Mutex<TokenState>>,
+}
+
+/// The provider's fixed parts. **No `Debug`** (it holds the identity, H-2).
+struct Inner {
     /// Normalised: origin plus optional prefix, no trailing `/`.
     base: String,
     identity: MachineIdentity,
     client: reqwest::Client,
-    /// D5: held across the login request (single flight), never across a data request.
-    state: Mutex<TokenState>,
+    /// D5: how long no login is tried after one that got no answer.
+    login_cool_down: Duration,
 }
 
 /// D5 token state. **No `Debug`** (it holds the token, H-2).
 enum TokenState {
-    /// No token yet, or the last login failed without a refusal.
+    /// No token yet, or the last login failed in a way Infisical did not count against the
+    /// identity (nothing sent, or an answer that is not a refusal).
     Empty,
     /// A token, reused while `Instant::now() < reuse_until`.
     Valid {
@@ -80,16 +98,37 @@ enum TokenState {
         /// When to stop reusing it.
         reuse_until: Instant,
     },
+    /// A login was sent and got no answer, so it may have counted as a failed attempt: until
+    /// `until` every call is `LoginCoolingDown`, with no request; then one new login.
+    CoolingDown {
+        /// When the next login may be tried.
+        until: Instant,
+    },
     /// A login was refused: every later call is `LoginRefusedEarlier`, with no request.
     Refused,
 }
 
-/// Why [`InfisicalProvider::login`] failed: `Refused` latches (D5), `Other` does not.
+/// Why [`Inner::login`] failed, which decides the next [`TokenState`].
 enum LoginFailure {
-    /// `BadCredentials` or `IdentityLocked`.
+    /// `BadCredentials` or `IdentityLocked`: latches (`Refused`).
     Refused(SecretError),
-    /// Anything else: unreachable, rate-limited, an unexpected answer.
+    /// Not counted against the identity: nothing was sent (connect error), or the server answered
+    /// with something other than a refusal. Back to `Empty`; the next call logs in again.
     Other(SecretError),
+    /// Sent but unanswered (a timeout or a reset after the send): the server may have counted a
+    /// failed attempt. `CoolingDown`.
+    Unanswered(SecretError),
+}
+
+/// What a caller of [`InfisicalProvider::token`] needs.
+#[derive(Clone, Copy)]
+enum Need<'a> {
+    /// Any reusable token (a data request).
+    Cached,
+    /// A token other than this refused one (H-18: not a security comparison, never logged).
+    Replacing(&'a str),
+    /// A fresh login whatever is cached (health, D2).
+    Fresh,
 }
 
 impl InfisicalProvider {
@@ -128,119 +167,68 @@ impl InfisicalProvider {
             SecretError::Config(format!("cannot build the HTTP client: {}", cause_chain(e)))
         })?;
         Ok(Self {
-            base,
-            identity,
-            client,
-            state: Mutex::new(TokenState::Empty),
+            inner: Arc::new(Inner {
+                base,
+                identity,
+                client,
+                login_cool_down: config.login_cool_down,
+            }),
+            state: Arc::new(Mutex::new(TokenState::Empty)),
         })
     }
 
     /// The normalised base URL.
     #[must_use]
     pub fn base_url(&self) -> &str {
-        &self.base
+        &self.inner.base
     }
 
-    /// A token for a data request: the cached one while it is reusable, else a login with the
-    /// lock held (single flight). A refused login latches (§B.4.3).
-    async fn token(&self) -> Result<Zeroizing<String>, SecretError> {
-        let mut state = self.state.lock().await;
-        match &*state {
-            TokenState::Refused => return Err(SecretError::LoginRefusedEarlier),
-            TokenState::Valid { token, reuse_until } if Instant::now() < *reuse_until => {
-                return Ok(token.clone());
-            }
-            TokenState::Valid { .. } | TokenState::Empty => {}
+    /// A token as `need` asks (§B.4.3): the cached one when it serves, else one login, single
+    /// flight. The login runs on its own task, which owns the lock guard and records the outcome
+    /// before releasing it: a caller dropped mid-login (a timeout, a `select!`) loses nothing, and
+    /// the callers queued behind it see the outcome instead of logging in again (D5).
+    async fn token(&self, need: Need<'_>) -> Result<Zeroizing<String>, SecretError> {
+        let state = Arc::clone(&self.state).lock_owned().await;
+        let now = Instant::now();
+        if let Some(e) = no_login(&state, now) {
+            return Err(e);
         }
-        self.login_into(&mut state).await
-    }
-
-    /// After a data 401 / 403 `TokenError` with `used`: one more login, unless another caller
-    /// already replaced the token (H-18: not a security comparison, never logged).
-    async fn refresh(&self, used: &str) -> Result<Zeroizing<String>, SecretError> {
-        let mut state = self.state.lock().await;
-        match &*state {
-            TokenState::Refused => return Err(SecretError::LoginRefusedEarlier),
-            TokenState::Valid { token, reuse_until }
-                if token.as_str() != used && Instant::now() < *reuse_until =>
-            {
-                return Ok(token.clone());
-            }
-            TokenState::Valid { .. } | TokenState::Empty => {}
-        }
-        self.login_into(&mut state).await
-    }
-
-    /// Health always logs in afresh (D2); the new token replaces any cached one.
-    async fn fresh_login(&self) -> Result<Zeroizing<String>, SecretError> {
-        let mut state = self.state.lock().await;
-        if matches!(*state, TokenState::Refused) {
-            return Err(SecretError::LoginRefusedEarlier);
-        }
-        self.login_into(&mut state).await
-    }
-
-    /// Logs in and records the outcome in `state`, whose lock the caller holds.
-    async fn login_into(&self, state: &mut TokenState) -> Result<Zeroizing<String>, SecretError> {
-        match self.login().await {
-            Ok((token, reuse_until)) => {
-                *state = TokenState::Valid {
-                    token: token.clone(),
-                    reuse_until,
-                };
-                Ok(token)
-            }
-            Err(LoginFailure::Refused(e)) => {
-                *state = TokenState::Refused;
-                Err(e)
-            }
-            Err(LoginFailure::Other(e)) => {
-                *state = TokenState::Empty;
-                Err(e)
+        if let TokenState::Valid { token, reuse_until } = &*state
+            && now < *reuse_until
+        {
+            match need {
+                Need::Cached => return Ok(token.clone()),
+                Need::Replacing(used) if token.as_str() != used => return Ok(token.clone()),
+                Need::Replacing(_) | Need::Fresh => {}
             }
         }
+        let inner = Arc::clone(&self.inner);
+        let login = tokio::spawn(async move {
+            let mut state = state;
+            let outcome = inner.login().await;
+            record(&mut state, outcome, inner.login_cool_down)
+        });
+        match login.await {
+            Ok(result) => result,
+            Err(e) => match e.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                // Only a runtime shutting down cancels the task; its outcome is unknown.
+                Err(_) => Err(protocol(
+                    LOGIN_PATH,
+                    "the login was cancelled before it answered".to_owned(),
+                )),
+            },
+        }
     }
 
-    /// The login POST and its mapping (§B.4.2). The body of a failed login is never quoted.
-    async fn login(&self) -> Result<(Zeroizing<String>, Instant), LoginFailure> {
-        let url = self.endpoint_url(LOGIN_PATH).map_err(LoginFailure::Other)?;
-        let request = LoginRequest {
-            client_id: self.identity.client_id(),
-            client_secret: self.identity.client_secret(),
-        };
-        let response = self
-            .client
-            .post(url)
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
-        let status = response.status();
-        let retry_after_secs = retry_after(response.headers());
-        let body = response.bytes().await;
-        // D5: a 401 refuses the identity whatever happens to its body, so a body cut short can
-        // never turn a rejected login into a retried one.
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(LoginFailure::Refused(login_refusal(body.as_deref().ok())));
-        }
-        let body = body.map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
-        if status.is_success() {
-            return accept_login(&body, Instant::now()).map_err(LoginFailure::Other);
-        }
-        Err(LoginFailure::Other(map_login_status(
-            status,
-            &body,
-            retry_after_secs,
-        )))
-    }
-
-    /// Latch peek, the status GET, then a fresh login (§B.4.3).
+    /// Latch and cool-down peek, the status GET, then a fresh login (§B.4.3).
     async fn health_inner(&self) -> Result<ProviderHealth, SecretError> {
-        if matches!(*self.state.lock().await, TokenState::Refused) {
-            return Err(SecretError::LoginRefusedEarlier);
+        if let Some(e) = no_login(&*self.state.lock().await, Instant::now()) {
+            return Err(e);
         }
-        let url = self.endpoint_url(STATUS_PATH)?;
+        let url = self.inner.endpoint_url(STATUS_PATH)?;
         let response = self
+            .inner
             .client
             .get(url)
             .send()
@@ -252,20 +240,20 @@ impl InfisicalProvider {
             return Err(redirect(STATUS_PATH, status.as_u16()));
         }
         let server_ok = status.is_success();
-        self.fresh_login().await?;
+        self.token(Need::Fresh).await?;
         Ok(ProviderHealth {
-            base_url: self.base.clone(),
+            base_url: self.inner.base.clone(),
             server_ok,
         })
     }
 
     /// Token, list, one refresh on a refused token, then merge and validate (§B.4.3).
     async fn resolve_inner(&self, scope: &SecretScope) -> Result<ResolvedSecrets, SecretError> {
-        let token = self.token().await?;
+        let token = self.token(Need::Cached).await?;
         let list = match self.list(scope, &token).await? {
             Some(list) => list,
             None => {
-                let token = self.refresh(&token).await?;
+                let token = self.token(Need::Replacing(&token)).await?;
                 self.list(scope, &token).await?.ok_or_else(|| {
                     protocol(
                         SECRETS_PATH,
@@ -286,6 +274,7 @@ impl InfisicalProvider {
     ) -> Result<Option<ListResponse>, SecretError> {
         let url = self.list_url(scope)?;
         let response = self
+            .inner
             .client
             .get(url)
             .bearer_auth(token)
@@ -312,7 +301,7 @@ impl InfisicalProvider {
 
     /// `{base}/api/v4/secrets?…` with the D6 flags, in order (§B.4.4).
     fn list_url(&self, scope: &SecretScope) -> Result<Url, SecretError> {
-        let mut url = self.endpoint_url(SECRETS_PATH)?;
+        let mut url = self.inner.endpoint_url(SECRETS_PATH)?;
         url.query_pairs_mut()
             .append_pair("projectId", scope.project_id())
             .append_pair("environment", scope.environment())
@@ -325,12 +314,100 @@ impl InfisicalProvider {
             .append_pair("includePersonalOverrides", "false");
         Ok(url)
     }
+}
+
+impl Inner {
+    /// The login POST and its mapping (§B.4.2). The body of a failed login is never quoted.
+    async fn login(&self) -> Result<(Zeroizing<String>, Instant), LoginFailure> {
+        let url = self.endpoint_url(LOGIN_PATH).map_err(LoginFailure::Other)?;
+        let request = LoginRequest {
+            client_id: self.identity.client_id(),
+            client_secret: self.identity.client_secret(),
+        };
+        let response = self
+            .client
+            .post(url)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| {
+                // D5: a connect error (DNS, refused, TLS, connect timeout) or a request that
+                // never built sent no credentials. Anything else failed after the send: the
+                // server may have counted a failed login.
+                let nothing_sent = e.is_connect() || e.is_builder();
+                let err = unreachable(LOGIN_PATH, e);
+                if nothing_sent {
+                    LoginFailure::Other(err)
+                } else {
+                    LoginFailure::Unanswered(err)
+                }
+            })?;
+        let status = response.status();
+        let retry_after_secs = retry_after(response.headers());
+        let body = response.bytes().await;
+        // D5: a 401 refuses the identity whatever happens to its body, so a body cut short can
+        // never turn a rejected login into a retried one.
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(LoginFailure::Refused(login_refusal(body.as_deref().ok())));
+        }
+        let body = body.map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
+        if status.is_success() {
+            return accept_login(&body, Instant::now()).map_err(LoginFailure::Other);
+        }
+        Err(LoginFailure::Other(map_login_status(
+            status,
+            &body,
+            retry_after_secs,
+        )))
+    }
 
     /// `base + path` as a URL.
     fn endpoint_url(&self, path: &'static str) -> Result<Url, SecretError> {
         Url::parse(&format!("{}{path}", self.base))
             .map_err(|e| SecretError::Config(format!("cannot build the URL of {path}: {e}")))
     }
+}
+
+/// The error a call gets without a login (and so without any request), if the state forbids one:
+/// a latched refusal, or a cool-down still running at `now`.
+fn no_login(state: &TokenState, now: Instant) -> Option<SecretError> {
+    match state {
+        TokenState::Refused => Some(SecretError::LoginRefusedEarlier),
+        TokenState::CoolingDown { until } if now < *until => {
+            let left = *until - now;
+            Some(SecretError::LoginCoolingDown {
+                retry_after_secs: left.as_secs() + u64::from(left.subsec_nanos() > 0),
+            })
+        }
+        TokenState::Empty | TokenState::Valid { .. } | TokenState::CoolingDown { .. } => None,
+    }
+}
+
+/// Records a login's outcome in `state` (§B.4.3) and returns it to the caller.
+fn record(
+    state: &mut TokenState,
+    outcome: Result<(Zeroizing<String>, Instant), LoginFailure>,
+    cool_down: Duration,
+) -> Result<Zeroizing<String>, SecretError> {
+    let (next, result) = match outcome {
+        Ok((token, reuse_until)) => (
+            TokenState::Valid {
+                token: token.clone(),
+                reuse_until,
+            },
+            Ok(token),
+        ),
+        Err(LoginFailure::Refused(e)) => (TokenState::Refused, Err(e)),
+        Err(LoginFailure::Other(e)) => (TokenState::Empty, Err(e)),
+        Err(LoginFailure::Unanswered(e)) => {
+            let now = Instant::now();
+            // Never panics: a cool-down past `Instant`'s range is capped like a reuse window.
+            let until = now.checked_add(cool_down.min(MAX_REUSE)).unwrap_or(now);
+            (TokenState::CoolingDown { until }, Err(e))
+        }
+    };
+    *state = next;
+    result
 }
 
 impl SecretProvider for InfisicalProvider {
@@ -356,8 +433,8 @@ impl core::fmt::Debug for InfisicalProvider {
     /// token, and no lock taken.
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("InfisicalProvider")
-            .field("base_url", &self.base)
-            .field("client_id", &self.identity.client_id())
+            .field("base_url", &self.inner.base)
+            .field("client_id", &self.inner.identity.client_id())
             .finish_non_exhaustive()
     }
 }
@@ -824,6 +901,31 @@ mod tests {
                 "expiresIn {expires_in}"
             );
         }
+    }
+
+    #[test]
+    fn a_cool_down_forbids_a_login_until_it_ends_rounding_seconds_up() {
+        let now = Instant::now();
+        let cooling = |left: Duration| TokenState::CoolingDown { until: now + left };
+        let rows = [
+            (Duration::from_secs(30), Some(30)),
+            (Duration::from_millis(29_100), Some(30)),
+            (Duration::from_millis(1), Some(1)),
+            (Duration::ZERO, None),
+        ];
+        for (left, want) in rows {
+            let got = no_login(&cooling(left), now);
+            assert_eq!(
+                got,
+                want.map(|retry_after_secs| SecretError::LoginCoolingDown { retry_after_secs }),
+                "{left:?} left"
+            );
+        }
+        assert_eq!(
+            no_login(&TokenState::Refused, now),
+            Some(SecretError::LoginRefusedEarlier)
+        );
+        assert_eq!(no_login(&TokenState::Empty, now), None);
     }
 
     #[test]

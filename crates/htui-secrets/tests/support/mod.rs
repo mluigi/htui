@@ -8,6 +8,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The scripted routes: `(method, path)` → the answers still to give.
 type Script = Arc<Mutex<HashMap<(String, String), VecDeque<Reply>>>>;
@@ -20,6 +21,8 @@ pub struct Reply {
     pub body: Vec<u8>,
     /// The `Content-Length` announced instead of `body.len()` (see [`Reply::truncated`]).
     pub declared_length: Option<usize>,
+    /// How long to wait, after recording the request, before answering (see [`Reply::delayed`]).
+    pub delay: Option<Duration>,
 }
 
 impl Reply {
@@ -30,6 +33,7 @@ impl Reply {
             headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
             body: serde_json::to_vec(body).expect("a JSON value serialises"),
             declared_length: None,
+            delay: None,
         }
     }
 
@@ -40,6 +44,7 @@ impl Reply {
             headers: vec![("Content-Type".to_owned(), "text/html".to_owned())],
             body: body.as_bytes().to_vec(),
             declared_length: None,
+            delay: None,
         }
     }
 
@@ -50,6 +55,7 @@ impl Reply {
             headers: vec![("Location".to_owned(), location.to_owned())],
             body: Vec::new(),
             declared_length: None,
+            delay: None,
         }
     }
 
@@ -57,6 +63,15 @@ impl Reply {
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Answers only after `delay`: the request is recorded at once, so a client that gives up
+    /// earlier has still been seen. The stub serves one connection at a time, so later
+    /// connections wait behind it.
+    #[must_use]
+    pub fn delayed(mut self, delay: Duration) -> Self {
+        self.delay = Some(delay);
         self
     }
 
@@ -269,6 +284,9 @@ fn serve(stream: &TcpStream, script: &Script, seen: &Mutex<Vec<Request>>) {
             &serde_json::json!({"message": "stub: unscripted route"}),
         )
     });
+    if let Some(delay) = reply.delay {
+        std::thread::sleep(delay);
+    }
     let mut head = format!(
         "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
         reply.status,
