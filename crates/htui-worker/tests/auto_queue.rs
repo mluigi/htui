@@ -7,8 +7,10 @@
 //! admitted without waiting for the ticker (D8, the walk-end half).
 //!
 //! The harness is this file's own, trimmed from `htui`'s `run_worker` fixture: the demo with its
-//! agents disabled, one scripted `acp` row ready on the demo box, a primary repo, and `RUN_2`
-//! cancelled. Sessions play one `done` turn, each after taking one permit of the harness's
+//! agents disabled, one scripted `acp` row ready on the demo box, and `RUN_2` cancelled. Only the
+//! overlap cases (criterion 26) add the project's primary repo: with it, every run of the project
+//! scopes that repo, and a live run (`running` or parked, invariant 6) holds off any other, so
+//! the cases that need two runs at once leave the scope empty. Sessions play one `done` turn, each after taking one permit of the harness's
 //! semaphore, so a case can hold walks `running` and release them. The items are ANA: an auto
 //! run walks `research` (its soft gate downgraded to `never`, D10) and parks at the hard
 //! `verdict` gate, which holds no slot (`claim_run` counts `running` only).
@@ -90,9 +92,10 @@ fn ready_on_box(agent_id: AgentId) -> AgentBox {
 }
 
 /// `htui`'s `run_worker::seeded`, over any store: every fixture agent disabled, one scripted
-/// row ready on the demo box, the htui primary repo (the scope a default run resolves to, and
-/// what makes two runs of the project overlap), and the seeded `queued` `RUN_2` cancelled.
-async fn seed<S: WriteStore>(store: &S, agents: Vec<AgentSummary>) {
+/// row ready on the demo box, with `repo` the htui primary repo (the scope a default run resolves
+/// to, and what makes two runs of the project overlap), and the seeded `queued` `RUN_2`
+/// cancelled.
+async fn seed<S: WriteStore>(store: &S, agents: Vec<AgentSummary>, repo: Repo) {
     for summary in agents {
         let mut row = summary.agent;
         row.enabled = false;
@@ -107,21 +110,32 @@ async fn seed<S: WriteStore>(store: &S, agents: Vec<AgentSummary>) {
         .upsert_agent_box(&ready_on_box(agent))
         .await
         .expect("the agent_box row lands");
-    store
-        .create_repo(NewRepo {
-            id: htui_core::model::RepoId::new(),
-            project_id: ids::PROJECT_HTUI,
-            name: "htui".to_owned(),
-            remote_url: None,
-            default_branch: "main".to_owned(),
-            is_primary: true,
-        })
-        .await
-        .expect("the demo project has no repo yet");
+    if repo == Repo::Primary {
+        store
+            .create_repo(NewRepo {
+                id: htui_core::model::RepoId::new(),
+                project_id: ids::PROJECT_HTUI,
+                name: "htui".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: true,
+            })
+            .await
+            .expect("the demo project has no repo yet");
+    }
     store
         .finish_run(ids::RUN_2, RunStatus::Cancelled, None, Utc::now())
         .await
         .expect("the seeded run is queued and cancellable");
+}
+
+/// Whether [`seed`] adds the project's primary repo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Repo {
+    /// No repo: a default run's scope is empty, so no two runs overlap.
+    None,
+    /// The primary repo: every default run of the project overlaps every other live one.
+    Primary,
 }
 
 /// A fresh `ANA` item of the htui project: `research` then `verdict` (hard).
@@ -363,9 +377,14 @@ impl Parts {
 }
 
 impl Harness {
-    /// The seeded demo; sessions hold until released.
+    /// The seeded demo without a repo; sessions hold until released.
     async fn new() -> Self {
-        Self::over(MemStore::demo()).await
+        Self::over(MemStore::demo(), Repo::None).await
+    }
+
+    /// The seeded demo with the primary repo, so any two runs overlap; sessions hold.
+    async fn overlapping() -> Self {
+        Self::over(MemStore::demo(), Repo::Primary).await
     }
 
     /// The seeded demo whose box settings are `settings`.
@@ -374,12 +393,12 @@ impl Harness {
         for row in &mut data.boxes {
             row.settings = settings.clone();
         }
-        Self::over(MemStore::from_demo(data)).await
+        Self::over(MemStore::from_demo(data), Repo::None).await
     }
 
-    async fn over(store: MemStore) -> Self {
+    async fn over(store: MemStore, repo: Repo) -> Self {
         let agents = store.agents().await.expect("the fixture's agents");
-        seed(&store, agents).await;
+        seed(&store, agents, repo).await;
         Self {
             store,
             parts: Parts::new(),
@@ -853,11 +872,11 @@ async fn a_blocked_entry_keeps_the_batch_open() {
     );
 }
 
-/// (g1) Criterion 26, manual first: an auto run that overlaps a running manual one waits
-/// `queued`, and is claimed once the manual walk rests.
+/// (g1) Criterion 26, manual first: an auto run that overlaps a live manual one waits `queued`
+/// (a parked run still holds its scope, invariant 6), and is claimed once the manual run ends.
 #[tokio::test]
 async fn a_manual_run_holds_off_an_overlapping_auto_run() {
-    let h = Harness::new().await;
+    let h = Harness::overlapping().await;
     let backend = h.backend();
     let sink = TestSink::default();
     let mut runtime = h.runtime();
@@ -891,20 +910,32 @@ async fn a_manual_run_holds_off_an_overlapping_auto_run() {
     settle(&mut runtime).await;
     let manual_run = h.only_run(manual).await;
     assert_eq!(manual_run.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        h.only_run(auto).await.status,
+        RunStatus::Queued,
+        "the parked manual run still holds the scope"
+    );
+
+    h.store
+        .finish_run(manual_run.id, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("a parked run cancels");
+    runtime.sweep_with(&backend, &sink);
+    settle(&mut runtime).await;
     let auto_run = h.only_run(auto).await;
     assert_eq!(auto_run.id, waiting.id);
     assert_eq!(
         auto_run.status,
         RunStatus::AwaitingApproval,
-        "claimed after the manual rested"
+        "claimed once the manual run ended"
     );
 }
 
 /// (g2) Criterion 26, auto first: a manual `StartRun` that overlaps a running auto run is
-/// refused `Overlaps`, and its run is claimed once the auto walk rests.
+/// refused `Overlaps`, and its run is claimed once the auto run ends.
 #[tokio::test]
 async fn an_auto_run_holds_off_an_overlapping_manual_run() {
-    let h = Harness::new().await;
+    let h = Harness::overlapping().await;
     let backend = h.backend();
     let sink = TestSink::default();
     let mut runtime = h.runtime();
@@ -931,11 +962,24 @@ async fn an_auto_run_holds_off_an_overlapping_manual_run() {
 
     h.parts.open();
     settle(&mut runtime).await;
-    assert_eq!(h.only_run(auto).await.status, RunStatus::AwaitingApproval);
+    let auto_run = h.only_run(auto).await;
+    assert_eq!(auto_run.status, RunStatus::AwaitingApproval);
+    assert_eq!(
+        h.only_run(manual).await.status,
+        RunStatus::Queued,
+        "the parked auto run still holds the scope"
+    );
+
+    h.store
+        .finish_run(auto_run.id, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("a parked run cancels");
+    runtime.sweep_with(&backend, &sink);
+    settle(&mut runtime).await;
     assert_eq!(
         h.only_run(manual).await.status,
         RunStatus::AwaitingApproval,
-        "claimed after the auto run rested"
+        "claimed once the auto run ended"
     );
 }
 
@@ -1053,6 +1097,7 @@ async fn two_runtimes_on_one_database_admit_each_item_once_pg() {
     seed(
         &db.store,
         db.store.agents().await.expect("the fixture's agents"),
+        Repo::None,
     )
     .await;
     let other = testkit::fixture_box_store(&db.url).await;
@@ -1094,6 +1139,7 @@ async fn manual_and_auto_overlap_serialise_on_postgres() {
     seed(
         &db.store,
         db.store.agents().await.expect("the fixture's agents"),
+        Repo::Primary,
     )
     .await;
     let parts = Parts::new();
@@ -1138,14 +1184,24 @@ async fn manual_and_auto_overlap_serialise_on_postgres() {
 
     parts.open();
     settle(&mut runtime).await;
+    let manual_run = pg_only_run(&db.store, manual).await;
+    assert_eq!(manual_run.status, RunStatus::AwaitingApproval);
     assert_eq!(
-        pg_only_run(&db.store, manual).await.status,
-        RunStatus::AwaitingApproval
+        pg_only_run(&db.store, auto).await.status,
+        RunStatus::Queued,
+        "the parked manual run still holds the scope"
     );
+
+    db.store
+        .finish_run(manual_run.id, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("a parked run cancels");
+    runtime.sweep_with(&db.store, &sink);
+    settle(&mut runtime).await;
     assert_eq!(
         pg_only_run(&db.store, auto).await.status,
         RunStatus::AwaitingApproval,
-        "claimed after the manual rested"
+        "claimed once the manual run ended"
     );
     match sink.reply(1).await {
         RunReply::Orch(OrchReply::Done(_)) => {}
