@@ -14377,10 +14377,9 @@ done
         }
 
         /// Blueprint §D.6, literally: a resolved `"…\n"` value echoed without its trailing newline
-        /// is masked on the chat path. Needs T1's D17 trimmed form in
-        /// `MinimalScrubber::from_resolved`, which this branch's base does not carry.
+        /// is masked on the chat path, through T1's D17 trimmed form in
+        /// `MinimalScrubber::from_resolved`.
         #[tokio::test]
-        #[ignore = "needs T1's D17 trailing-newline form in from_resolved; un-ignore once T1 is merged"]
         async fn a_newline_free_echo_of_a_newline_value_is_masked() {
             let cert = format!("{VALUE}\n");
             let (store, backend, runtime, agent_id, _slot) =
