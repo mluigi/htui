@@ -7,12 +7,17 @@
 //! same store until a row appears and then answers, cancels or supersedes it, which is all a
 //! Runs pane on another box can do (I-1: it writes no `session_event`). Waits run on a paused
 //! clock with `Relay.poll` at 10 ms, so no case sleeps for real.
+//!
+//! MOD-70 T2 (plan D6, D7; blueprint §5.4) adds the follow-up loop's cases: a client queues a
+//! follow-up while turn 0 is parked on a request (B-9's rendezvous), and two doubles reach the
+//! edges no client can time — [`CancelAtDone`] and [`Hooked`].
 
 #![cfg(feature = "test-support")]
 
 use std::collections::{BTreeMap, VecDeque};
 use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,26 +32,30 @@ use htui_agent::error::DriverError;
 use htui_agent::event::{
     DoneEvent, DriverEnvelope, DriverEvent, PermissionOption, PermissionOptionKind,
     PermissionRequestEvent, StopReason, ToolCallEvent, ToolKind, ToolResultEvent, ToolResultStatus,
+    UsageEvent,
 };
 use htui_agent::fake::FakeDriver;
 use htui_agent::permission::{PolicyStage, evaluate};
 use htui_agent::persona::narrow;
 use htui_agent::record::{
-    Control, NoRelay, RELAY_GRACE, Recorder, Relay, Signal, control_channel, drive, pump,
+    Control, NoRelay, RELAY_GRACE, Recorder, Relay, RunCap, Signal, control_channel, drive, pump,
 };
 use htui_core::fixtures::ids;
 use htui_core::model::persona::SnapshotPersona;
 use htui_core::model::{
-    AnswerOutcome, Claim, EventKind, FollowUpSettle, GraphSnapshot, Isolation, NewRun, NewRunStep,
-    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, QueuedFollowUp,
-    RelayOptionKind, RelaySessionId, RunCommandId, RunId, RunMode, SessionEvent, SettleOutcome,
-    SnapshotGraph, SnapshotSettings, StepId, StepPermission,
+    AnswerOutcome, Claim, EventKind, FOLLOW_UP_SESSION_CANCELLED, FOLLOW_UP_SESSION_ENDED,
+    FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpText, GraphSnapshot, Isolation,
+    NewFollowUp, NewRun, NewRunStep, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, QueuedFollowUp, RelayOptionKind, RelaySessionId, RunCommandId,
+    RunCommandStatus, RunId, RunMode, SessionEvent, SettleOutcome, SnapshotGraph, SnapshotSettings,
+    StepId, StepPermission, StepStatus, executor_scrub_refusal,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
     MemStore, ReadStore, Result as StoreResult, StepFence, StoreError, WriteStore,
 };
 use serde_json::{Value, json};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------------------------
@@ -2197,4 +2206,1128 @@ async fn the_relay_answers_a_cli_prompt_from_the_store() {
         position(&log, EventKind::PermissionRequest) < position(&log, EventKind::PermissionAnswer),
         "the echo follows its request"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-70 T2: follow-ups for engine steps (plan D6, D7; blueprint B-9 to B-12, B-15)
+// ---------------------------------------------------------------------------------------------
+
+/// The text every happy path queues: the executor masks [`SECRET`] when it records it (R-HIS-1).
+fn follow_up_text() -> String {
+    format!("also run {SECRET} checks")
+}
+
+/// The request a follow-up turn parks on, so a client can act while that turn is live (B-9).
+const SECOND: &str = "perm-again";
+
+/// Moves the fixture's step `pending → running`, which [`leased_at`] leaves `pending`: only a
+/// running step takes a follow-up (D3).
+async fn running(fx: &Leased) {
+    assert!(
+        fx.store
+            .transition_step(fx.step, StepStatus::Pending, StepStatus::Running, at())
+            .await
+            .expect("the step moves"),
+        "the step is running"
+    );
+}
+
+/// [`relay`] with a follow-up window (D6).
+fn relay_with_follow_ups<'a>(fx: &'a Leased, policy: &'a PermissionPolicy) -> Relay<'a, MemStore> {
+    Relay {
+        follow_ups: true,
+        ..relay(fx, policy)
+    }
+}
+
+/// The client queues `text` for `step` as the demo user from the demo box (D3).
+async fn enqueue(store: &MemStore, step: StepId, text: &str) -> FollowUpRequest {
+    store
+        .request_follow_up(NewFollowUp {
+            id: RunCommandId::new(),
+            run_step_id: step,
+            text: FollowUpText::new(text.to_owned()).expect("the client accepts the text"),
+            issued_by: ids::USER,
+            issued_box: ids::BOX,
+        })
+        .await
+        .expect("the enqueue is answered")
+}
+
+/// [`enqueue`], which must be queued; the row's id.
+async fn queued(store: &MemStore, step: StepId, text: &str) -> RunCommandId {
+    match enqueue(store, step, text).await {
+        FollowUpRequest::Queued(id) => id,
+        refused @ FollowUpRequest::Refused(_) => {
+            panic!("the follow-up was not queued: {refused:?}")
+        }
+    }
+}
+
+/// [`answered_script`]'s turn: a call parked on [`REQUEST`], finished once answered.
+fn parked_turn() -> Vec<ScriptEvent> {
+    let mut events = vec![call(&format!("run the suite with {SECRET}")), park("Allow")];
+    events.extend(finished());
+    events
+}
+
+/// A turn that parks on `request_id` and finishes once answered.
+fn parked_again(request_id: &str) -> Vec<ScriptEvent> {
+    let mut events = vec![
+        call("run the suite again"),
+        ScriptEvent::ParkPermission(permission_request(request_id, "Allow")),
+    ];
+    events.extend(finished());
+    events
+}
+
+/// A turn that ends at once.
+fn ends() -> Vec<ScriptEvent> {
+    vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+        stop_reason: StopReason::EndTurn,
+    }))]
+}
+
+/// Turn 0 parks (the client's rendezvous, B-9); `turn1` is what a follow-up would start.
+fn two_turns(turn1: Vec<ScriptEvent>) -> Script {
+    Script::turns(vec![parked_turn(), turn1])
+}
+
+/// One turn that asks nothing: a call, its result and the `done`.
+fn plain_script() -> Script {
+    let mut events = vec![call("run the suite")];
+    events.extend(finished());
+    Script::one_turn(events)
+}
+
+/// The `follow_up` rows of a log as `(turn, payload)`, in `seq` order.
+fn follow_ups_in(log: &[SessionEvent]) -> Vec<(i32, Value)> {
+    log.iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .map(|row| (row.turn, row.payload.clone()))
+        .collect()
+}
+
+/// How many `done` rows a log holds: one per turn.
+fn dones_in(log: &[SessionEvent]) -> usize {
+    log.iter().filter(|row| row.kind == EventKind::Done).count()
+}
+
+/// Follow-up `id`'s status, resolution and whether its text is still stored (B-1).
+fn the_follow_up(store: &MemStore, id: RunCommandId) -> (RunCommandStatus, Option<String>, bool) {
+    store
+        .follow_up_rows()
+        .into_iter()
+        .find(|(row, _)| row.id == id)
+        .map(|(row, text)| (row.status, row.resolution, text))
+        .expect("the follow-up row exists")
+}
+
+/// Every follow-up row's status, resolution and stored-text flag, in id order.
+fn follow_ups(store: &MemStore) -> Vec<(RunCommandStatus, Option<String>, bool)> {
+    store
+        .follow_up_rows()
+        .into_iter()
+        .map(|(row, text)| (row.status, row.resolution, text))
+        .collect()
+}
+
+/// The client's view of the pending request `request_id`, polled as [`parked_row`] polls.
+async fn parked_row_for(store: &MemStore, request_id: &str) -> Option<StepPermission> {
+    let poll = async {
+        loop {
+            let view = store
+                .relay_view(ids::HTUI_ANA_2)
+                .await
+                .expect("the relay view reads");
+            if let Some(row) = view
+                .permissions
+                .into_iter()
+                .find(|row| row.request_id == request_id)
+            {
+                return row;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(LIMIT / 2, poll).await.ok()
+}
+
+/// Takes the run's lease away from the executor: a zero-TTL refresh, then a stranger's take.
+async fn steal_lease(store: &MemStore, run: RunId, owner: Uuid) {
+    assert!(
+        store
+            .refresh_lease(run, owner, TimeDelta::zero())
+            .await
+            .expect("the refresh is answered"),
+        "the executor's lease expires now"
+    );
+    assert!(
+        store
+            .take_lease(run, ids::BOX, Uuid::new_v4(), TimeDelta::minutes(5))
+            .await
+            .expect("the take is answered"),
+        "a stranger takes the lapsed lease"
+    );
+}
+
+/// A session that signals a cancel on `sender` as it hands out each `done`: the cancel lands
+/// between the turn's end and `drive`'s look for a follow-up (D6 step 3).
+#[derive(Debug)]
+struct CancelAtDone {
+    inner: Box<dyn AgentSession>,
+    sender: watch::Sender<Signal>,
+    grace: Duration,
+}
+
+impl AgentSession for CancelAtDone {
+    fn session_ref(&self) -> Option<&AgentSessionRef> {
+        self.inner.session_ref()
+    }
+
+    fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+        Box::pin(async move {
+            let next = self.inner.next_event().await;
+            if let Ok(Some(envelope)) = &next
+                && matches!(envelope.event, DriverEvent::Done(_))
+            {
+                self.sender
+                    .send_replace(Signal::Cancel { grace: self.grace });
+            }
+            next
+        })
+    }
+
+    fn send_follow_up<'a>(&'a mut self, text: String) -> DriverFuture<'a, ()> {
+        self.inner.send_follow_up(text)
+    }
+
+    fn answer_permission<'a>(
+        &'a mut self,
+        request_id: PermissionRequestId,
+        answer: PermissionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        self.inner.answer_permission(request_id, answer)
+    }
+
+    fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
+        self.inner.cancel(grace)
+    }
+}
+
+/// [`Hooked`]'s counters, one per follow-up method.
+const OPEN: usize = 0;
+const NEXT: usize = 1;
+const SETTLE: usize = 2;
+const CLOSE: usize = 3;
+const DROPPED: usize = 4;
+
+/// What a [`Hooked`] runs inside its first `next_follow_up`, against its store.
+type Hook = Box<dyn FnOnce(MemStore) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+/// Where a [`Hook`] runs relative to the read it rides on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum When {
+    /// The hook, then the read: the caller sees what the hook wrote.
+    BeforeRead,
+    /// The read, then the hook, then the read's answer: the caller misses what the hook wrote.
+    AfterRead,
+}
+
+/// `MemStore`'s relay surface, counting the five follow-up methods, running `on_next` once inside
+/// the first `next_follow_up`, and answering `Unreachable` from `open_follow_ups` when
+/// `open_fails` (B-9).
+struct Hooked {
+    store: MemStore,
+    calls: [AtomicUsize; 5],
+    on_next: Mutex<Option<(When, Hook)>>,
+    open_fails: bool,
+}
+
+impl std::fmt::Debug for Hooked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Hooked")
+            .field("calls", &self.calls)
+            .field("open_fails", &self.open_fails)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Hooked {
+    fn new(store: MemStore) -> Self {
+        Self {
+            store,
+            calls: Default::default(),
+            on_next: Mutex::new(None),
+            open_fails: false,
+        }
+    }
+
+    fn with_hook(store: MemStore, when: When, hook: Hook) -> Self {
+        Self {
+            on_next: Mutex::new(Some((when, hook))),
+            ..Self::new(store)
+        }
+    }
+
+    fn count(&self, method: usize) {
+        self.calls[method].fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// `[open, next, settle, close, close_dropped]`.
+    fn counts(&self) -> [usize; 5] {
+        std::array::from_fn(|method| self.calls[method].load(Ordering::SeqCst))
+    }
+}
+
+impl htui_core::store::RelayStore for Hooked {
+    async fn open_permission(&self, open: OpenPermission) -> StoreResult<PermissionId> {
+        WriteStore::open_permission(&self.store, open).await
+    }
+
+    async fn permission(&self, id: PermissionId) -> StoreResult<Option<StepPermission>> {
+        htui_core::store::RelayStore::permission(&self.store, id).await
+    }
+
+    async fn apply_permission(
+        &self,
+        id: PermissionId,
+        owner: Uuid,
+    ) -> StoreResult<Option<PermissionChoice>> {
+        WriteStore::apply_permission(&self.store, id, owner).await
+    }
+
+    async fn settle_permissions(
+        &self,
+        session: RelaySessionId,
+        to: PermissionStatus,
+    ) -> StoreResult<u64> {
+        WriteStore::settle_permissions(&self.store, session, to).await
+    }
+
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> StoreResult<bool> {
+        self.count(OPEN);
+        if self.open_fails {
+            return Err(StoreError::Unreachable(
+                "the window's open is switched off".to_owned(),
+            ));
+        }
+        WriteStore::open_follow_ups(&self.store, run, step, session, owner).await
+    }
+
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> StoreResult<Option<QueuedFollowUp>> {
+        self.count(NEXT);
+        let hook = self.on_next.lock().expect("not poisoned").take();
+        match hook {
+            Some((When::BeforeRead, hook)) => {
+                hook(self.store.clone()).await;
+                WriteStore::next_follow_up(&self.store, step, session).await
+            }
+            Some((When::AfterRead, hook)) => {
+                let read = WriteStore::next_follow_up(&self.store, step, session).await;
+                hook(self.store.clone()).await;
+                read
+            }
+            None => WriteStore::next_follow_up(&self.store, step, session).await,
+        }
+    }
+
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> StoreResult<SettleOutcome> {
+        self.count(SETTLE);
+        WriteStore::settle_follow_up(&self.store, id, owner, to).await
+    }
+
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        self.count(CLOSE);
+        WriteStore::close_follow_ups(&self.store, step, session, reason).await
+    }
+
+    async fn close_dropped_follow_ups(
+        &self,
+        run: RunId,
+        owner: Uuid,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        self.count(DROPPED);
+        WriteStore::close_dropped_follow_ups(&self.store, run, owner, reason).await
+    }
+}
+
+/// D6 steps 2-7 (PRD Q1, R-HIS-1): a follow-up queued while turn 0 is parked is claimed at the
+/// turn's `done`, recorded at `turn + 1` masked by the executor's scrubber and sent; turn 1 runs,
+/// and the session ends at its `done` with the window closed.
+#[tokio::test(start_paused = true)]
+async fn a_follow_up_queued_during_the_turn_is_sent_at_its_end() {
+    let fx = leased().await;
+    running(&fx).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_turns(ends()), fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+    let mut control = Control::never();
+
+    let (out, id) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            let id = queued(&fx.store, fx.step, &follow_up_text()).await;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(id)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "turn 1's `done` ends the session"
+    );
+    let id = id.expect("the client saw the parked request");
+    let log = log(&fx.store, fx.step).await;
+    assert_eq!(
+        follow_ups_in(&log),
+        vec![(1, json!({ "text": "also run [REDACTED] checks" }))],
+        "recorded at turn 1, masked by the executor (R-HIS-1)"
+    );
+    let sent = position(&log, EventKind::FollowUp).expect("a follow_up row");
+    assert!(
+        log.len() > sent + 1 && log[sent + 1..].iter().all(|row| row.turn == 1),
+        "turn 1's rows follow it: {log:?}"
+    );
+    assert_eq!(dones_in(&log), 2, "two turns");
+    assert_eq!(
+        the_follow_up(&fx.store, id),
+        (RunCommandStatus::Applied, None, false),
+        "claimed for the next turn, its text cleared (I-5)"
+    );
+    let windows = fx.store.follow_up_windows();
+    assert_eq!(windows.len(), 1, "one window: {windows:?}");
+    assert!(windows[0].closed_at.is_some(), "the exit closed it");
+}
+
+/// PRD Q1, "repeating until none is pending": a second follow-up queued during the first
+/// follow-up's turn starts a third turn.
+#[tokio::test(start_paused = true)]
+async fn two_follow_ups_run_two_more_turns() {
+    let fx = leased().await;
+    running(&fx).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let script = Script::turns(vec![parked_turn(), parked_again(SECOND), ends()]);
+    let mut session = fake(script, fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+    let mut control = Control::never();
+
+    let (out, ids) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            let first = queued(&fx.store, fx.step, &follow_up_text()).await;
+            answer(&fx.store, &row, ALLOW).await;
+            let row = parked_row_for(&fx.store, SECOND).await?;
+            let second = queued(&fx.store, fx.step, "and the docs").await;
+            answer(&fx.store, &row, ALLOW).await;
+            Some((first, second))
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "turn 2's `done` ends the session"
+    );
+    let (first, second) = ids.expect("the client saw both parked requests");
+    let log = log(&fx.store, fx.step).await;
+    assert_eq!(
+        follow_ups_in(&log),
+        vec![
+            (1, json!({ "text": "also run [REDACTED] checks" })),
+            (2, json!({ "text": "and the docs" })),
+        ],
+        "one follow_up row per extra turn"
+    );
+    assert_eq!(dones_in(&log), 3, "three turns");
+    assert_eq!(
+        the_follow_up(&fx.store, first),
+        (RunCommandStatus::Applied, None, false)
+    );
+    assert_eq!(
+        the_follow_up(&fx.store, second),
+        (RunCommandStatus::Applied, None, false)
+    );
+}
+
+/// D6 step 3: with nothing queued the session ends at its first `done` after one look; the window
+/// writes no `session_event`, so the log is the one `follow_ups: false` writes.
+#[tokio::test(start_paused = true)]
+async fn without_a_follow_up_the_session_ends_at_its_first_done() {
+    let (run, step) = (RunId::new(), StepId::new());
+    let scrubber = scrubber();
+    let policy = PermissionPolicy::default();
+
+    let fx = leased_at(run, step).await;
+    running(&fx).await;
+    let hooked = Hooked::new(fx.store.clone());
+    let relay = Relay {
+        follow_ups: true,
+        ..relay_over(&hooked, &fx, &policy)
+    };
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(plain_script(), step).await;
+    let out = within(drive(
+        session.as_mut(),
+        &mut recorder,
+        Some(&relay),
+        &mut Control::never(),
+    ))
+    .await;
+    recorder.finish().await.expect("the recorder closes");
+
+    let bare = leased_at(run, step).await;
+    running(&bare).await;
+    let plain = self::relay(&bare, &policy);
+    let mut recorder = fenced_recorder(&bare, &scrubber);
+    let mut session = fake(plain_script(), step).await;
+    let without = within(drive(
+        session.as_mut(),
+        &mut recorder,
+        Some(&plain),
+        &mut Control::never(),
+    ))
+    .await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "the turn's own `done`"
+    );
+    assert_eq!(out, without, "the same answer as without a window");
+    assert_eq!(
+        hooked.counts(),
+        [1, 1, 0, 1, 0],
+        "one open, one look, no claim, one close"
+    );
+    let windows = fx.store.follow_up_windows();
+    assert_eq!(windows.len(), 1, "one window: {windows:?}");
+    assert!(windows[0].closed_at.is_some(), "the exit closed it");
+    let log = log(&fx.store, step).await;
+    assert_eq!(dones_in(&log), 1, "one turn");
+    assert_eq!(
+        log,
+        self::log(&bare.store, step).await,
+        "row for row the log without a window"
+    );
+}
+
+/// B-15: a follow-up that lands after the turn end's last look is not sent; the window's close
+/// refuses it `FOLLOW_UP_SESSION_ENDED`.
+#[tokio::test(start_paused = true)]
+async fn a_follow_up_queued_after_the_last_check_is_refused_by_the_close() {
+    let fx = leased().await;
+    running(&fx).await;
+    let step = fx.step;
+    let hooked = Hooked::with_hook(
+        fx.store.clone(),
+        When::AfterRead,
+        Box::new(move |store| {
+            Box::pin(async move {
+                queued(&store, step, &follow_up_text()).await;
+            })
+        }),
+    );
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(plain_script(), fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = Relay {
+        follow_ups: true,
+        ..relay_over(&hooked, &fx, &policy)
+    };
+
+    let out = within(drive(
+        session.as_mut(),
+        &mut recorder,
+        Some(&relay),
+        &mut Control::never(),
+    ))
+    .await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "the session ends at its first `done`"
+    );
+    assert_eq!(hooked.counts()[NEXT], 1, "one look, which missed the row");
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            false
+        )],
+        "the close refused it"
+    );
+    let log = log(&fx.store, fx.step).await;
+    assert!(follow_ups_in(&log).is_empty(), "nothing was sent");
+    assert_eq!(dones_in(&log), 1, "one turn");
+}
+
+/// D6 step 3, D7: a run-cap breach ends the turn `cancelled` (`enforce_breach`), and the follow-up
+/// queued while it was parked is never applied; the close refuses it.
+#[tokio::test(start_paused = true)]
+async fn a_cap_breach_applies_no_follow_up() {
+    let fx = leased().await;
+    running(&fx).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber).with_run_cap(RunCap {
+        micros: 1_000,
+        grace: Duration::ZERO,
+    });
+    let turn0 = {
+        let mut events = vec![
+            call(&format!("run the suite with {SECRET}")),
+            park("Allow"),
+            ScriptEvent::Emit(DriverEvent::Usage(UsageEvent {
+                cost_micros: Some(5_000),
+                ..UsageEvent::default()
+            })),
+        ];
+        events.extend(finished());
+        events
+    };
+    let mut session = fake(Script::turns(vec![turn0, ends()]), fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+    let mut control = Control::never();
+
+    let (out, id) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            let id = queued(&fx.store, fx.step, &follow_up_text()).await;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(id)
+        }
+    );
+    let _ = recorder.finish().await;
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::Cancelled
+        }),
+        "the breach's `done`"
+    );
+    let id = id.expect("the client saw the parked request");
+    assert_eq!(
+        the_follow_up(&fx.store, id),
+        (
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            false
+        ),
+        "the close refused it"
+    );
+    assert!(
+        follow_ups_in(&log(&fx.store, fx.step).await).is_empty(),
+        "nothing was sent"
+    );
+}
+
+/// D6 step 3: a turn whose own `done` says `cancelled` applies no follow-up.
+#[tokio::test(start_paused = true)]
+async fn a_cancelled_stop_applies_no_follow_up() {
+    let fx = leased().await;
+    running(&fx).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let turn0 = {
+        let mut events = parked_turn();
+        events.pop();
+        events.push(ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::Cancelled,
+        })));
+        events
+    };
+    let mut session = fake(Script::turns(vec![turn0, ends()]), fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+    let mut control = Control::never();
+
+    let (out, id) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            let id = queued(&fx.store, fx.step, &follow_up_text()).await;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(id)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::Cancelled
+        }),
+        "the turn's own `done`"
+    );
+    let id = id.expect("the client saw the parked request");
+    assert_eq!(
+        the_follow_up(&fx.store, id),
+        (
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            false
+        ),
+        "the close refused it"
+    );
+    let log = log(&fx.store, fx.step).await;
+    assert!(follow_ups_in(&log).is_empty(), "nothing was sent");
+    assert_eq!(dones_in(&log), 1, "one turn");
+}
+
+/// D6 step 3: a cancel signalled as the turn ends applies no follow-up and starts no turn; the
+/// session's answer is still that turn's `done`.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_signalled_at_the_turn_end_applies_no_follow_up() {
+    let fx = leased().await;
+    running(&fx).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let (sender, mut control) = control_channel();
+    let mut session = CancelAtDone {
+        inner: fake(two_turns(ends()), fx.step).await,
+        sender,
+        grace: Duration::from_secs(3),
+    };
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+
+    let (out, id) = tokio::join!(
+        within(drive(
+            &mut session,
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            let id = queued(&fx.store, fx.step, &follow_up_text()).await;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(id)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "turn 0's `done`"
+    );
+    let id = id.expect("the client saw the parked request");
+    assert_eq!(
+        the_follow_up(&fx.store, id),
+        (
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            false
+        ),
+        "the close refused it"
+    );
+    let log = log(&fx.store, fx.step).await;
+    assert!(follow_ups_in(&log).is_empty(), "nothing was sent");
+    assert_eq!(dones_in(&log), 1, "no second turn");
+}
+
+/// D6 step 8: a cancel during a follow-up turn leaves through the graceful cancel, and the close
+/// refuses what is still queued with the cancelled-session sentence.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_during_a_follow_up_turn_closes_with_the_cancelled_sentence() {
+    let fx = leased().await;
+    running(&fx).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let turn1 = vec![
+        call("run the suite again"),
+        ScriptEvent::ParkPermission(permission_request(SECOND, "Allow")),
+        ScriptEvent::ExpectCancel,
+    ];
+    let mut session = fake(two_turns(turn1), fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+    let (signal, mut control) = control_channel();
+
+    let (out, ids) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            let first = queued(&fx.store, fx.step, &follow_up_text()).await;
+            answer(&fx.store, &row, ALLOW).await;
+            parked_row_for(&fx.store, SECOND).await?;
+            let second = queued(&fx.store, fx.step, "and the docs").await;
+            signal.send_replace(Signal::Cancel {
+                grace: Duration::from_secs(3),
+            });
+            Some((first, second))
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Err(DriverError::Cancelled), "a graceful cancel");
+    let (first, second) = ids.expect("the client saw both parked requests");
+    assert_eq!(
+        the_follow_up(&fx.store, first),
+        (RunCommandStatus::Applied, None, false),
+        "the first was sent"
+    );
+    assert_eq!(
+        the_follow_up(&fx.store, second),
+        (
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_CANCELLED.to_owned()),
+            false
+        ),
+        "the close refused the second with the cancelled sentence"
+    );
+    let windows = fx.store.follow_up_windows();
+    assert_eq!(windows.len(), 1, "one window: {windows:?}");
+    assert!(
+        windows[0].closed_at.is_some(),
+        "the cancel's exit closed it"
+    );
+    assert_eq!(follow_ups_in(&log(&fx.store, fx.step).await).len(), 1);
+}
+
+/// D6 step 5, MOD-40 D1: a claim whose lease moved is the walk's fence; nothing more is written,
+/// so the row stays pending with its text and the window stays open.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_claim_ends_the_walk_and_closes_nothing() {
+    let fx = leased().await;
+    running(&fx).await;
+    let (run, step, owner) = (fx.run, fx.step, fx.owner);
+    let hooked = Hooked::with_hook(
+        fx.store.clone(),
+        When::BeforeRead,
+        Box::new(move |store| {
+            Box::pin(async move {
+                queued(&store, step, &follow_up_text()).await;
+                steal_lease(&store, run, owner).await;
+            })
+        }),
+    );
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(
+        Script::turns(vec![plain_script().turns[0].events.clone(), ends()]),
+        step,
+    )
+    .await;
+    let policy = PermissionPolicy::default();
+    let relay = Relay {
+        follow_ups: true,
+        ..relay_over(&hooked, &fx, &policy)
+    };
+
+    let out = within(drive(
+        session.as_mut(),
+        &mut recorder,
+        Some(&relay),
+        &mut Control::never(),
+    ))
+    .await;
+
+    assert_eq!(
+        out,
+        Err(DriverError::Store(StoreError::Fenced { step })),
+        "the fenced claim is the answer"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(RunCommandStatus::Pending, None, true)],
+        "a fenced writer writes nothing more: the row stays pending"
+    );
+    assert_eq!(hooked.counts()[CLOSE], 0, "no close was attempted");
+    let windows = fx.store.follow_up_windows();
+    assert_eq!(windows.len(), 1, "one window: {windows:?}");
+    assert_eq!(windows[0].closed_at, None, "the window stays open");
+    assert!(follow_ups_in(&log(&fx.store, step).await).is_empty());
+}
+
+/// I-8: `follow_ups: false` makes no follow-up call, and the log is today's.
+#[tokio::test(start_paused = true)]
+async fn drive_without_follow_ups_makes_no_follow_up_call() {
+    let (run, step) = (RunId::new(), StepId::new());
+    let scrubber = scrubber();
+    let policy = PermissionPolicy::default();
+
+    let fx = leased_at(run, step).await;
+    let hooked = Hooked::new(fx.store.clone());
+    let relay = relay_over(&hooked, &fx, &policy);
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(answered_script(), step).await;
+    let mut control = Control::never();
+    let (out, parked) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(row)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    let today = leased_at(run, step).await;
+    let plain = self::relay(&today, &policy);
+    let mut recorder = fenced_recorder(&today, &scrubber);
+    let mut session = fake(answered_script(), step).await;
+    let (by_today, _) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&plain),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&today.store).await?;
+            answer(&today.store, &row, ALLOW).await;
+            Some(row)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert!(parked.is_some(), "the request was relayed");
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        })
+    );
+    assert_eq!(out, by_today, "the same answer");
+    assert_eq!(hooked.counts(), [0; 5], "no follow-up call (I-8)");
+    assert!(fx.store.follow_up_windows().is_empty(), "no window");
+    assert_eq!(
+        log(&fx.store, step).await,
+        log(&today.store, step).await,
+        "the same rows"
+    );
+}
+
+/// D6 step 4: a text the executor's scrubber refuses is never recorded: the row is refused with
+/// the rule, no `follow_up` and no `scrub_residue` row is written, and the step is not failed.
+#[tokio::test(start_paused = true)]
+async fn an_executor_scrub_refusal_refuses_the_row_with_its_rule() {
+    let fx = leased().await;
+    running(&fx).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_turns(ends()), fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+    let mut control = Control::never();
+
+    let (out, id) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            // The client's pattern-only check passes it (no token start before `sk-ant-`); the
+            // executor masks the secret, which puts a token start right before it.
+            let id = queued(&fx.store, fx.step, &format!("{SECRET}{RESIDUE}")).await;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(id)
+        }
+    );
+    recorder
+        .finish()
+        .await
+        .expect("a refused follow-up does not fail the step");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "turn 0's `done`"
+    );
+    let id = id.expect("the client saw the parked request");
+    assert_eq!(
+        the_follow_up(&fx.store, id),
+        (
+            RunCommandStatus::Refused,
+            Some(executor_scrub_refusal("anthropic_api_key")),
+            false
+        ),
+        "refused with the executor's rule"
+    );
+    let log = log(&fx.store, fx.step).await;
+    assert!(follow_ups_in(&log).is_empty(), "nothing was sent");
+    assert!(
+        log.iter().all(|row| row.payload["code"] != "scrub_residue"),
+        "no scrub_residue row: {log:?}"
+    );
+    assert_eq!(dones_in(&log), 1, "one turn");
+}
+
+/// D6 step 1, B-10: a window that did not open (a transient error) costs the step nothing: the
+/// session runs, an enqueue is refused `NotStarted`, no turn end looks, and one close is tried.
+#[tokio::test(start_paused = true)]
+async fn a_failed_open_runs_the_session_without_a_window() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked = Hooked {
+        open_fails: true,
+        ..Hooked::new(fx.store.clone())
+    };
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_turns(ends()), fx.step).await;
+    let policy = PermissionPolicy::default();
+    let relay = Relay {
+        follow_ups: true,
+        ..relay_over(&hooked, &fx, &policy)
+    };
+    let mut control = Control::never();
+
+    let (out, refusal) = tokio::join!(
+        within(drive(
+            session.as_mut(),
+            &mut recorder,
+            Some(&relay),
+            &mut control
+        )),
+        async {
+            let row = parked_row(&fx.store).await?;
+            let refusal = enqueue(&fx.store, fx.step, &follow_up_text()).await;
+            answer(&fx.store, &row, ALLOW).await;
+            Some(refusal)
+        }
+    );
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(DoneEvent {
+            stop_reason: StopReason::EndTurn
+        }),
+        "the session ran"
+    );
+    assert_eq!(
+        refusal,
+        Some(FollowUpRequest::Refused(FollowUpRefusal::NotStarted)),
+        "no window, no follow-up"
+    );
+    assert_eq!(
+        hooked.counts(),
+        [1, 0, 0, 1, 0],
+        "one open, no look, one close attempt"
+    );
+    assert_eq!(dones_in(&log(&fx.store, fx.step).await), 1, "one turn");
+}
+
+/// D6 step 1: a window the lease no longer allows is the walk's fence, before the first pull.
+#[tokio::test(start_paused = true)]
+async fn a_fenced_open_drives_nothing() {
+    let fx = leased().await;
+    running(&fx).await;
+    steal_lease(&fx.store, fx.run, fx.owner).await;
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = Queued::new([
+        call_event("run the suite"),
+        DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        }),
+    ]);
+    let policy = PermissionPolicy::default();
+    let relay = relay_with_follow_ups(&fx, &policy);
+
+    let out = within(drive(
+        &mut session,
+        &mut recorder,
+        Some(&relay),
+        &mut Control::never(),
+    ))
+    .await;
+
+    assert_eq!(
+        out,
+        Err(DriverError::Store(StoreError::Fenced { step: fx.step })),
+        "the fenced open is the answer"
+    );
+    assert_eq!(session.queue.len(), 2, "the session was never pulled");
+    assert!(
+        log(&fx.store, fx.step).await.is_empty(),
+        "nothing was pulled or recorded"
+    );
+    assert!(fx.store.follow_up_windows().is_empty(), "no window");
 }
