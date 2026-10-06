@@ -2346,7 +2346,7 @@ mod tests {
 
     use super::{
         CHUNK_FLUSH_BYTES, ChunkMark, MarkSplit, Recorder, RecorderSummary, joined_raw_leaves,
-        seam_cut, split_marks,
+        scrubbed_text, seam_cut, split_marks,
     };
     use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, TextChunk, UsageEvent};
 
@@ -2802,6 +2802,39 @@ mod tests {
                 "the cut is the last boundary at or before len - hold_back"
             );
         }
+    }
+
+    /// The documented residual on [`seam_cut`]: `openai_api_key` is confirmed over the whole `sk-`
+    /// body, so a prose-shaped body longer than `hold_back` can be cut with both halves clean, and
+    /// a later non-prose segment makes only the concatenation refuse. The equality probe cannot see
+    /// bytes that have not arrived; this pins the behaviour so a fix has to flip it knowingly.
+    #[test]
+    fn seam_cut_can_split_a_prose_shaped_sk_body_longer_than_hold_back() {
+        let scrubber = MinimalScrubber::new(Vec::<String>::new());
+        let hold_back = scrubber.hold_back();
+        let body =
+            "learn-preprocessing-pipeline-standard-scaler-with-many-words-and-more-words-here";
+        assert!(body.len() > hold_back);
+        let text = format!("{} sk-{body}", "x".repeat(200));
+
+        let cut =
+            seam_cut(&scrubber, &text, hold_back).expect("the run is clean, so it has a seam");
+        let (head, tail) = text.split_at(cut);
+        let later = format!("{tail}-Q9Z");
+
+        assert!(head.contains(" sk-"), "the cut falls inside the sk- body");
+        assert!(
+            scrubbed_text(&scrubber, head).is_some(),
+            "the head row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &later).is_some(),
+            "the carried row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &format!("{head}{later}")).is_none(),
+            "only the concatenation refuses: a non-prose segment confirms the key"
+        );
     }
 
     /// The pure split of the open run's chunks at a cut: the chunk the cut falls in rides both
