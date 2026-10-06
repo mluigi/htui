@@ -5,6 +5,8 @@
 //!   arm ignores modifiers (Connection, Qdrant) no longer eats it, and no modal overlay swallows it.
 //! - `?` and `F1` toggle help (D12), over a modal overlay too, for a key the overlay passed (D6
 //!   step 2). A field that types `?` keeps it as text, and `F1` still reaches help.
+//! - A modal overlay swallows what it and the overlay stack passed (D6 step 3): under the switcher
+//!   a digit or `w` reaches neither the tab strip nor a second switcher.
 //! - `w`, `Ctrl+F` and `Ctrl+W` are offered by `register_all` (D5): without it they are inert and
 //!   absent from the status line and the `?` box.
 //! - The status line is byte-identical to the one the snapshots pin (D7); the `?` box follows D8.
@@ -206,6 +208,32 @@ async fn question_mark_and_f1_toggle_help_over_the_workspace_switcher() {
         harness.app().overlays.is_empty(),
         "`Esc` still closes the switcher"
     );
+}
+
+#[tokio::test]
+async fn the_modal_switcher_swallows_a_digit_and_w() {
+    let mut harness = shell(true).await;
+    let before = harness.app().tabs.active_id();
+    assert!(before.is_some(), "a tab is active");
+    harness.key("w");
+    harness.drive_to_end().await;
+    assert_eq!(top(&mut harness), Some(WorkspaceSwitcher::ID));
+
+    for key in ["2", "w"] {
+        harness.key(key);
+        harness.drive_to_end().await;
+        assert_eq!(
+            harness.app().tabs.active_id(),
+            before,
+            "`{key}` never reached the tab strip"
+        );
+        let open: Vec<OverlayId> = harness.app().overlays.iter().map(|o| o.id()).collect();
+        assert_eq!(
+            open,
+            [WorkspaceSwitcher::ID],
+            "`{key}` left only the switcher up"
+        );
+    }
 }
 
 #[tokio::test]
