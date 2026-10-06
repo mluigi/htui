@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-10-secret-provider.prd.md`
 **Selected Milestone**: 3 — Run-start injection
 **Complexity**: Large
-**Status**: CONFIRMED 2026-10-06 by the maintainer, OQ-A..D as recommended (fact-checked: 23 claims, 1 falsified — see "Verified claims")
+**Status**: COMPLETE 2026-10-06 (confirmed by the maintainer, OQ-A..D as recommended; fact-checked: 23 claims, 1 falsified; blueprint A-1..A-12, A-11 kept; implemented `7748b360`..`a4f9ab7e`; reviewed (rust-reviewer: 1 high graded medium, 9 low), all findings applied in R1)
 
 ## Summary
 
