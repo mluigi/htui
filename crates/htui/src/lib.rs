@@ -37,6 +37,7 @@ pub mod qdrant_settings_info;
 pub mod requirements;
 pub mod run_worker;
 pub(crate) mod secrets;
+pub mod secrets_settings;
 pub mod skill_import;
 pub mod skills;
 pub mod store_worker;
@@ -165,10 +166,6 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
             None
         }
     };
-    // MOD-10 D15: one secret source for the TUI's walks and chats, so they share each
-    // provider's login latch. Building it reads nothing: the keyring is read per walk and chat.
-    let secrets: Arc<dyn htui_core::secret::SecretSource> =
-        Arc::new(secrets::KeyringInfisical::new());
     // The backend moves into the worker here and is unreachable from the UI afterwards (D4).
     // MOD-7 D11: the binary, and only the binary, opts in to the registration probe.
     let worker = store_worker::spawn_hosted(
@@ -177,7 +174,9 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
         reply_tx,
         AgentRuntime::production().with_registration_probe(),
         tools,
-        Some(secrets),
+        // MOD-10 D15: one secret source for the TUI's walks and chats, so they share each
+        // provider's login latch; none under `--demo` (M4 blueprint A-5).
+        secret_source(args.demo),
     );
 
     let mut app = App::new(request_tx, Keymap::default_global());
@@ -274,9 +273,27 @@ fn init_tracing(path: Option<&Path>) -> anyhow::Result<()> {
         .map_err(|err| anyhow::anyhow!("could not install the log subscriber: {err}"))
 }
 
+/// MOD-10 D15, M4 blueprint A-5: the process's one secret source, or none under `--demo`, which
+/// never touches the keyring (D10). A demo walk, chat or check on a scoped project is refused.
+/// Building the source reads nothing: the keyring is read per walk, chat and check.
+fn secret_source(demo: bool) -> Option<Arc<dyn htui_core::secret::SecretSource>> {
+    (!demo).then(|| {
+        Arc::new(secrets::KeyringInfisical::new()) as Arc<dyn htui_core::secret::SecretSource>
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use super::session_dsn;
+    use super::{secret_source, session_dsn};
+
+    /// M4 blueprint A-5: `--demo` hands the runtimes no secret source, so nothing in a demo
+    /// session can reach the developer's keyring; a real session gets one. Building reads nothing.
+    #[test]
+    fn a_demo_session_has_no_secret_source() {
+        assert!(secret_source(true).is_none());
+        let source = secret_source(false).expect("a real session has a source");
+        assert_eq!(format!("{source:?}"), "KeyringInfisical { cached: false }");
+    }
 
     /// MOD-45 OQ-1 (a): one line, trimmed; the rest of stdin is left unread.
     #[test]

@@ -8,6 +8,7 @@
 //! one walk to the next.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use htui_core::secret::{MachineIdentity, SecretError, SecretFuture, SecretProvider, SecretSource};
 use sha2::{Digest as _, Sha256};
@@ -26,6 +27,17 @@ pub(crate) const KEYRING_SILENT: &str = "the OS keyring did not answer";
 /// enough for a human to answer an OS unlock prompt; past it the walk or chat is refused with
 /// [`KEYRING_SILENT`] and the next one asks again.
 pub(crate) const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// MOD-10 M4 (blueprint A-4): how many keyring writes `Settings > Secrets` has made in this
+/// process. A provider is reused only while this is unchanged, so entering the identity again —
+/// even the same one — gives the next walk, chat or check a fresh provider without the old
+/// one's login latch (M2 D5).
+static KEYRING_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// Called by `secrets_settings` after every successful URL or identity write or clear.
+pub(crate) fn note_keyring_write() {
+    KEYRING_WRITES.fetch_add(1, Ordering::SeqCst);
+}
 
 /// A keyring failure, as `Config`. `htui_store::secret`'s messages name slots, never values
 /// (`get_machine_identity`'s half-identity sentence included).
@@ -56,6 +68,8 @@ pub struct KeyringInfisical {
 /// The provider and what it was built from. The client secret is kept only as a SHA-256 digest
 /// to compare; the provider holds the identity itself.
 struct Cached {
+    /// [`KEYRING_WRITES`] as read before the keyring read this provider was built from.
+    generation: u64,
     url: String,
     client_id: String,
     secret_digest: [u8; 32],
@@ -64,9 +78,18 @@ struct Cached {
 
 impl Cached {
     /// Whether this provider was built from `url` and an identity with `client_id` and
-    /// `secret_digest`.
-    fn built_from(&self, url: &str, client_id: &str, secret_digest: &[u8; 32]) -> bool {
-        self.url == url && self.client_id == client_id && &self.secret_digest == secret_digest
+    /// `secret_digest`, with no Settings keyring write since (`generation`, blueprint A-4).
+    fn built_from(
+        &self,
+        generation: u64,
+        url: &str,
+        client_id: &str,
+        secret_digest: &[u8; 32],
+    ) -> bool {
+        self.generation == generation
+            && self.url == url
+            && self.client_id == client_id
+            && &self.secret_digest == secret_digest
     }
 }
 
@@ -121,6 +144,9 @@ impl KeyringInfisical {
 
     async fn current(&self) -> Result<Arc<dyn SecretProvider>, SecretError> {
         let mut cached = self.cached.lock().await;
+        // Before the read (blueprint A-4): a write that lands during it forces one more rebuild
+        // next time, never one too few.
+        let generation = KEYRING_WRITES.load(Ordering::SeqCst);
         let read = Arc::clone(&self.read);
         // R1 M2: the lock stays held across the read (two walks must not stack OS unlock
         // prompts), so the read is bounded. A blocking thread cannot be cancelled: one that
@@ -132,13 +158,14 @@ impl KeyringInfisical {
                 .map_err(|_| SecretError::Config(KEYRING_UNFINISHED.to_owned()))??;
         let digest: [u8; 32] = Sha256::digest(identity.client_secret().as_bytes()).into();
         if let Some(held) = cached.as_ref()
-            && held.built_from(&url, identity.client_id(), &digest)
+            && held.built_from(generation, &url, identity.client_id(), &digest)
         {
             return Ok(Arc::clone(&held.provider));
         }
         let client_id = identity.client_id().to_owned();
         let provider = (self.build)(&url, identity)?;
         *cached = Some(Cached {
+            generation,
             url,
             client_id,
             secret_digest: digest,
@@ -176,7 +203,7 @@ impl SecretSource for KeyringInfisical {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use htui_core::fixtures::ids;
     use htui_core::model::Project;
@@ -418,6 +445,37 @@ mod tests {
         assert_eq!(walk_1, SecretError::BadCredentials);
         assert_eq!(walk_2, SecretError::LoginRefusedEarlier);
         assert_eq!(builds.count(), 1, "one provider served both walks");
+    }
+
+    /// M4 blueprint A-4: re-entering the **same** identity after a refused login (an
+    /// `IdentityLocked`, or a fix on the server with an unchanged secret) changes none of the URL,
+    /// the client ID or the secret digest; the Settings write's generation alone gives the next
+    /// call a fresh provider without the latch.
+    #[tokio::test]
+    async fn entering_the_same_identity_again_rebuilds_a_latched_provider() {
+        let _guard = mock_keyring().await;
+        store_url(URL);
+        store_identity(CLIENT_ID, CLIENT_SECRET);
+        let (source, builds) = counting(|| {
+            FakeSecretProvider::new([
+                Err(SecretError::BadCredentials),
+                Err(SecretError::LoginRefusedEarlier),
+            ])
+        });
+        let first = source.provider().await.expect("a provider");
+
+        store_identity(CLIENT_ID, CLIENT_SECRET);
+        note_keyring_write();
+        let second = source.provider().await.expect("a provider");
+
+        assert_eq!(
+            builds.count(),
+            2,
+            "the same identity, written again, rebuilds"
+        );
+        assert!(!Arc::ptr_eq(&first, &second));
+        let third = source.provider().await.expect("a provider");
+        assert!(Arc::ptr_eq(&second, &third), "and the new one is kept");
     }
 
     /// R1 M2: a keyring read that never answers (an OS unlock prompt nobody answers) refuses
