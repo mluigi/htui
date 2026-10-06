@@ -109,6 +109,10 @@ pub(crate) const TRUNCATED: &str = "[… earlier output truncated]\n";
 /// (rounded up to a character boundary) and the drop marked with [`TRUNCATED`]. The tail is the
 /// whole output for `pass` and `fail`; an `unavailable` reason line ([`with_output`]) is kept
 /// whole, and a reason with no tail after it is returned as it is.
+///
+/// The tail was decoded lossily, so a cap that landed inside a character opens it with up to three
+/// `U+FFFD`s, each three bytes here for one byte of the original. They are dropped first and not
+/// counted, so the drop always covers at least `bytes` bytes of what the command printed.
 pub(crate) fn without_cut_head(output: &str, outcome: VerifyOutcome, bytes: usize) -> String {
     let start = match outcome {
         VerifyOutcome::Pass | VerifyOutcome::Fail => 0,
@@ -117,11 +121,16 @@ pub(crate) fn without_cut_head(output: &str, outcome: VerifyOutcome, bytes: usiz
             None => return output.to_owned(),
         },
     };
+    let start_of_tail = start;
+    let start = start + output[start..].len()
+        - output[start..]
+            .trim_start_matches(char::REPLACEMENT_CHARACTER)
+            .len();
     let mut cut = (start + bytes).min(output.len());
     while !output.is_char_boundary(cut) {
         cut += 1;
     }
-    format!("{}{TRUNCATED}{}", &output[..start], &output[cut..])
+    format!("{}{TRUNCATED}{}", &output[..start_of_tail], &output[cut..])
 }
 
 /// The boxed future every [`Verifier`] returns — [`IsolatorFuture`](crate::isolate::IsolatorFuture)'s
@@ -1380,6 +1389,16 @@ mod tests {
         assert_eq!(
             without_cut_head("abc", VerifyOutcome::Pass, 10),
             TRUNCATED.to_owned()
+        );
+        // A cap inside a 4-byte character leaves up to three `U+FFFD`s (9 decoded bytes for 3
+        // original ones): they are dropped uncounted, so the 3-byte drop still covers `abc`.
+        assert_eq!(
+            without_cut_head("\u{FFFD}\u{FFFD}\u{FFFD}abcdef", VerifyOutcome::Fail, 3),
+            format!("{TRUNCATED}def")
+        );
+        assert_eq!(
+            without_cut_head("the reason\n\u{FFFD}abcdef", VerifyOutcome::Unavailable, 3),
+            format!("the reason\n{TRUNCATED}def")
         );
     }
 }

@@ -18966,7 +18966,7 @@ mod tests {
 
         use super::Harness;
         use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
-        use crate::engine::{SessionKey, failure_text, remasked_driver};
+        use crate::engine::{SessionKey, failure_text, remasked, remasked_driver};
         use crate::fake::{FakeOrchestrator, FakeVerifier, ScriptedStep};
         use crate::status::RunFailure;
         use crate::verify::VerifyReport;
@@ -19588,6 +19588,20 @@ mod tests {
 
         /// The dual-valid M1 Anthropic fixture: refused by every scrubber's credential rules.
         const ANT_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
+
+        /// MOD-10 R1: a verify output the walk's scrubber masks keeps its text masked, and one it
+        /// refuses is stored as the verifier's own withheld sentence, never as an empty string.
+        #[test]
+        fn a_refused_verify_output_is_stored_as_the_withheld_sentence() {
+            let scrubber = htui_core::scrub::MinimalScrubber::new([VALUE.to_owned()]);
+            assert_eq!(remasked(&scrubber, format!("ok {VALUE}")), "ok [REDACTED]");
+            let refused = format!("leaked {ANT_KEY}");
+            let bytes = refused.len();
+            assert_eq!(
+                remasked(&scrubber, refused),
+                crate::verify::scrub_refused(bytes)
+            );
+        }
 
         /// MOD-10 R1 H1: a driver's error text (a CLI agent's stderr tail) is masked with the
         /// walk's scrubber, and a refused one is replaced, never emptied.

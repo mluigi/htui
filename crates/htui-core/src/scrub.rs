@@ -442,7 +442,7 @@ fn residue_rule(text: &str) -> Option<&'static str> {
 fn masked_forms(value: &str) -> Vec<String> {
     let trim = |text: &str| text.trim_end_matches(['\r', '\n']).to_owned();
     let trimmed = trim(value);
-    let mut forms = vec![value.to_owned(), trimmed.clone()];
+    let mut forms = vec![value.to_owned()];
     if trimmed.contains('\n') {
         let crlf = to_crlf(value);
         forms.push(trim(&crlf));
@@ -457,6 +457,8 @@ fn masked_forms(value: &str) -> Vec<String> {
                 .map(str::to_owned),
         );
     }
+    // Pushed last, not cloned: no unwiped copy of the value is left behind (D17).
+    forms.push(trimmed);
     forms
 }
 
