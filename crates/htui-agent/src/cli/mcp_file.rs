@@ -33,10 +33,24 @@ impl McpConfigFile {
     /// [`crate::private_dir::create`]'s, a path that is not UTF-8 (the argv is `String`s), or the
     /// file's create/write error. Every error removes what was already created.
     pub fn write(servers: &[McpServerSpec]) -> std::io::Result<Option<Self>> {
+        Self::write_in(&crate::private_dir::base(), servers)
+    }
+
+    /// [`write`](Self::write) under a `base` the caller names, through
+    /// [`crate::private_dir::create_in`]: production passes [`crate::private_dir::base`], a test
+    /// a directory it owns (MOD-79 review L1).
+    ///
+    /// # Errors
+    ///
+    /// As [`write`](Self::write).
+    pub(crate) fn write_in(
+        base: &Path,
+        servers: &[McpServerSpec],
+    ) -> std::io::Result<Option<Self>> {
         let Some(json) = super::mcp_config(servers) else {
             return Ok(None);
         };
-        let dir = crate::private_dir::create(DIR_PREFIX)?;
+        let dir = crate::private_dir::create_in(base, DIR_PREFIX)?;
         // The guard exists before anything else can fail, so every `?` below removes the
         // directory and whatever part of the file was written (blueprint H-10).
         let file = Self {

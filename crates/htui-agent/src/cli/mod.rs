@@ -470,12 +470,26 @@ impl CliDriver {
         spec: &SessionSpec,
         session_id: &str,
     ) -> Result<(ChildIo, Option<McpConfigFile>)> {
+        self.io_in(spec, session_id, None).await
+    }
+
+    /// [`io`](Self::io) with the MCP config's base named: `None` is production's
+    /// ([`crate::private_dir::base`]), `Some` a directory a test owns, so the failed-spawn arm's
+    /// cleanup is observable without racing every other test on the shared base (MOD-79 review
+    /// L1).
+    async fn io_in(
+        &self,
+        spec: &SessionSpec,
+        session_id: &str,
+        mcp_base: Option<std::path::PathBuf>,
+    ) -> Result<(ChildIo, Option<McpConfigFile>)> {
         match &self.io {
             IoSource::Spawn { .. } => {
                 let mut resolved = self.launch_for(spec).await?;
                 // MOD-79: written after the launch resolves (a failure there leaves nothing on disk)
                 // and before the spawn; a failed spawn drops it here, with this frame (H-13).
-                let config = McpConfigFile::write(&spec.mcp).map_err(|err| {
+                let base = mcp_base.unwrap_or_else(crate::private_dir::base);
+                let config = McpConfigFile::write_in(&base, &spec.mcp).map_err(|err| {
                     DriverError::Spawn(format!("cannot write the MCP config: {err}"))
                 })?;
                 resolved.args = argv(
@@ -1733,5 +1747,84 @@ fn with_stderr(message: &str, child: &Mutex<ChildGuard>) -> DriverError {
         DriverError::Transport(message.to_owned())
     } else {
         DriverError::Transport(format!("{message}\n{stderr}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use htui_core::model::{AgentId, Billing, StepId, Transport};
+
+    use super::*;
+    use crate::driver::PermissionPolicy;
+
+    /// MOD-79 review L1: `io`'s failed-spawn arm drops the config it wrote before the spawn (H-13).
+    ///
+    /// A unit test, through [`CliDriver::io_in`], because that is the seam that reaches the spawn
+    /// path with a base the test owns: the production base (`$XDG_RUNTIME_DIR` or the temp
+    /// directory) is shared with every other test in the process, so "no `htui-cli-*` left behind"
+    /// could only be asserted there by racing them. The command does not exist, so
+    /// `launch::spawn` fails at its lookup, which is after the write; the error being that lookup's
+    /// is what shows the config was reached.
+    #[tokio::test]
+    async fn a_failed_spawn_leaves_no_mcp_config_behind() {
+        let tmp = tempfile::tempdir().expect("a scratch directory");
+        let base = tmp.path().join("base");
+        std::fs::create_dir(&base).expect("the stand-in base");
+        let now = chrono::Utc::now();
+        let row = AgentRow {
+            id: AgentId::new(),
+            name: "missing-cli".to_owned(),
+            transport: Transport::Cli,
+            launch: json!({
+                "command": tmp.path().join("no-such-cli").to_string_lossy(),
+                "args": [],
+                "env": {},
+                "discovery": { "handshake": false, "tools": {} },
+            }),
+            models: Vec::new(),
+            default_model: None,
+            billing: Billing::Subscription,
+            enabled: true,
+            settings: json!({ "cli": { "stream": STREAM } }),
+            created_at: now,
+            updated_at: now,
+        };
+        let driver = CliDriver::from_row(&row, DriverCaps::default()).expect("the row parses");
+        let spec = SessionSpec {
+            agent_id: AgentId::new(),
+            step_id: StepId::new(),
+            cwd: tmp.path().to_path_buf(),
+            extra_dirs: Vec::new(),
+            env: BTreeMap::new(),
+            model: None,
+            tools: ToolExposure::default(),
+            mcp: vec![McpServerSpec {
+                name: "htui".to_owned(),
+                command: "/abs/htui".to_owned(),
+                args: vec!["mcp".to_owned()],
+                env: BTreeMap::from([("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned())]),
+            }],
+            permission: PermissionPolicy::default(),
+            retain_raw: false,
+            resume: None,
+            budget_micros: None,
+            prompt: None,
+        };
+
+        let Err(err) = driver.io_in(&spec, "session-id", Some(base.clone())).await else {
+            panic!("a command that does not exist does not spawn");
+        };
+        match &err {
+            DriverError::Spawn(message) => assert!(
+                message.contains("is not executable"),
+                "the spawn's lookup failed, after the config was written: {message}"
+            ),
+            other => panic!("expected the spawn's error, got {other:?}"),
+        }
+        let left: Vec<_> = std::fs::read_dir(&base)
+            .expect("the base is readable")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }

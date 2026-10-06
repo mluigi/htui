@@ -5,7 +5,7 @@
 //! the same base, so on Unix whatever isolation lets the relay child reach the socket also lets the
 //! CLI read its config (MOD-79 review L6: on Windows the socket is a named pipe, not a file there).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::ffi::OsString;
@@ -29,10 +29,21 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 /// The `create` error (the name exists, the base is not writable), the metadata read's, or, on Unix
 /// only, `"<dir> is not a directory"` or `"<dir> is not private (mode <octal>)"`.
 pub fn create(prefix: &str) -> std::io::Result<PathBuf> {
+    create_in(&base(), prefix)
+}
+
+/// [`create`] under a `base` the caller names: [`create`] passes [`base`], and a test passes a
+/// directory it owns, so "nothing left behind" is checkable without racing every other test that
+/// writes to the shared base (MOD-79 review L1; the split mirrors [`base_from`]'s).
+///
+/// # Errors
+///
+/// As [`create`].
+pub(crate) fn create_in(base: &Path, prefix: &str) -> std::io::Result<PathBuf> {
     // `new_v4`, not `now_v7`: a v7's leading hex is its millisecond, so one pid making two
     // directories in the same millisecond would collide (blueprint H-2).
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let dir = base().join(format!("{prefix}-{}-{}", std::process::id(), &suffix[..8]));
+    let dir = base.join(format!("{prefix}-{}-{}", std::process::id(), &suffix[..8]));
     // `channel.rs`'s body (MOD-79 D2): create with `0700`, then read the mode back, because a
     // filesystem may ignore the requested bits and the check is what the caller relies on. The
     // read no longer follows a symlink ([`ensure_private`], review L2).
@@ -56,7 +67,7 @@ pub fn create(prefix: &str) -> std::io::Result<PathBuf> {
 /// write through it into a directory it does not own. A non-directory is refused and left alone:
 /// `remove_dir` on a link fails at best, and the thing is not ours to remove at worst.
 #[cfg(unix)]
-fn ensure_private(dir: &std::path::Path) -> std::io::Result<()> {
+fn ensure_private(dir: &Path) -> std::io::Result<()> {
     let metadata = std::fs::symlink_metadata(dir)?;
     if !metadata.file_type().is_dir() {
         return Err(std::io::Error::other(format!(
@@ -76,9 +87,10 @@ fn ensure_private(dir: &std::path::Path) -> std::io::Result<()> {
 }
 
 /// `$XDG_RUNTIME_DIR` through [`base_from`]: the env read is the only part a test cannot drive
-/// (`set_var` is `unsafe`, and the workspace forbids `unsafe`; blueprint H-7).
+/// (`set_var` is `unsafe`, and the workspace forbids `unsafe`; blueprint H-7). Crate-visible so
+/// [`crate::cli::McpConfigFile`] can resolve it lazily and name it in an error (MOD-79 review L1).
 #[cfg(unix)]
-fn base() -> PathBuf {
+pub(crate) fn base() -> PathBuf {
     base_from(std::env::var_os("XDG_RUNTIME_DIR"))
 }
 
@@ -94,7 +106,7 @@ fn base_from(xdg: Option<OsString>) -> PathBuf {
 
 /// The temp directory, which on Windows is per user (MOD-79 option A).
 #[cfg(not(unix))]
-fn base() -> PathBuf {
+pub(crate) fn base() -> PathBuf {
     std::env::temp_dir()
 }
 
