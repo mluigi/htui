@@ -1362,6 +1362,27 @@ async fn an_oversized_list_error_body_is_protocol_naming_the_cap() {
     }
 }
 
+/// A declared length over the cap is refused before the body is read: each reply announces one
+/// byte over its cap but sends a tiny body and closes. Without the up-front check the read would
+/// fail part-way and the answer would be `Unreachable`, not `Protocol` naming the cap.
+#[tokio::test]
+async fn a_declared_length_over_the_cap_is_refused_before_the_read() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        Reply::text(200, "{}").truncated(SMALL_CAP + 1),
+    );
+    let err = provider(&stub).resolve(&scope()).await.must_fail("login");
+    assert_too_large(&err, LOGIN, "64 KiB", "login");
+
+    let err = list_error(Reply::text(200, "[]").truncated(LIST_CAP + 1)).await;
+    assert_too_large(&err, SECRETS, "8 MiB", "list");
+
+    let err = list_error(Reply::text(500, "{}").truncated(SMALL_CAP + 1)).await;
+    assert_too_large(&err, SECRETS, "64 KiB", "list error body");
+}
+
 /// The list cap is the larger one: a list answer above the error-body cap still resolves.
 #[tokio::test]
 async fn a_list_answer_above_the_error_cap_resolves() {
