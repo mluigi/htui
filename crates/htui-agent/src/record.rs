@@ -332,6 +332,32 @@ struct PendingRow {
     at: DateTime<Utc>,
 }
 
+/// MOD-10 D18: one chunk of the open text run: where its text ends in the run, when it was
+/// captured, and whether it pushed a `raw` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkMark {
+    end: usize,
+    at: DateTime<Utc>,
+    raw: bool,
+}
+
+/// MOD-10 D18: how a seam at a cut shares the open run's chunks ([`split_marks`]).
+///
+/// The row's raw entries are its raw-carrying chunks' wire messages, in chunk order, so both
+/// halves are index ranges of it: the head keeps `raw[..head_raw]` and the carry clones
+/// `raw[carry_raw_from..]`. The two overlap by the straddling chunk's entry, when it has one.
+#[derive(Debug, PartialEq, Eq)]
+struct MarkSplit {
+    /// How many of the row's raw entries stay on the head.
+    head_raw: usize,
+    /// The first raw entry the carry takes.
+    carry_raw_from: usize,
+    /// The carry's capture time: the `at` of the first chunk that ends after the cut.
+    carry_at: DateTime<Utc>,
+    /// The carry's chunks, their ends re-based on the cut.
+    carry: Vec<ChunkMark>,
+}
+
 /// What `docs/ANA-4.md` §4.3 makes **one row per, per step**: an `edit_proposal`'s
 /// `(tool_call_id, path)`. A proposal with no call id is a legitimate key of its own, not an absent
 /// one.
@@ -395,6 +421,9 @@ pub struct Recorder<'a, S: htui_core::store::RecorderStore> {
     buffer_kind: Option<EventKind>,
     /// The open text run's grouping key, meaningful only while `buffer_kind` is a chunk kind.
     open_message_id: Option<String>,
+    /// MOD-10 D18: the open text run's chunks, in order; empty unless `buffer_kind` is a chunk
+    /// kind. Cleared by every `flush`.
+    open_chunks: Vec<ChunkMark>,
     /// `edit_proposal` rows whose `seq` is reserved and whose write is owed (plan D77, T46).
     ///
     /// **Not cleared by a flush**, which is the fix: `docs/ANA-4.md` §4.3 asks for one row per
@@ -505,6 +534,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             buffer: Vec::new(),
             buffer_kind: None,
             open_message_id: None,
+            open_chunks: Vec::new(),
             held: BTreeMap::new(),
             unflushed: Vec::new(),
             unoffered: Vec::new(),
@@ -960,6 +990,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             DriverEvent::AssistantChunk(text) | DriverEvent::ThoughtChunk(text) => Some(text),
             _ => None,
         };
+        let is_chunk = chunk.is_some();
         let stale_group = chunk.is_some_and(|text| self.open_message_id != text.message_id);
         if self
             .buffer_kind
@@ -990,12 +1021,15 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
                 {
                     open_text.push_str(&text.text);
                 }
-                reached_bound = self
-                    .buffer
-                    .last()
-                    .and_then(|open| open.payload.get("text"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|open_text| open_text.len() >= CHUNK_FLUSH_BYTES);
+                let open_len = self.open_text().map_or(0, str::len);
+                // MOD-10 D18: where this chunk ends in the run, so a seam can split the run's
+                // `raw` and capture times along with its text.
+                self.open_chunks.push(ChunkMark {
+                    end: open_len,
+                    at: scrubbed.at,
+                    raw: false,
+                });
+                reached_bound = open_len >= CHUNK_FLUSH_BYTES;
                 RawTarget::Buffered(self.buffer.len() - 1)
             }
             (DriverEvent::EditProposal(proposal), _) => {
@@ -1088,6 +1122,9 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
                     if let Some(open) = self.buffer.get_mut(index) {
                         open.raw.push(raw);
                     }
+                    if is_chunk && let Some(mark) = self.open_chunks.last_mut() {
+                        mark.raw = true;
+                    }
                 }
                 RawTarget::Held(key) => {
                     if let Some(open) = self.held.get_mut(&key) {
@@ -1105,8 +1142,13 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             // the log had already closed.
             self.release_held(|_| true);
         }
-        if turn_ended || reached_bound {
+        if turn_ended {
             self.flush().await?;
+            self.sync_step().await?;
+        } else if reached_bound {
+            // MOD-10 D18: trigger 4 cuts at a seam and carries the tail; triggers 1, 2, 3 and 5
+            // still flush everything (a new message, a new kind, `done`, `finish`).
+            self.flush_at_seam().await?;
             self.sync_step().await?;
         }
 
@@ -1157,6 +1199,82 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         self.buffer.push(row);
     }
 
+    /// The open text run's text: the last buffered row's `text`, which is the run while
+    /// `buffer_kind` is a chunk kind (a chunk only `push`es onto an empty buffer).
+    fn open_text(&self) -> Option<&str> {
+        self.buffer
+            .last()
+            .and_then(|open| open.payload.get("text"))
+            .and_then(Value::as_str)
+    }
+
+    /// MOD-10 D18: trigger 4. Cuts the open text run at [`seam_cut`], flushes the head as one row
+    /// and re-opens the tail as the next run, with the same kind and grouping key.
+    ///
+    /// No safe cut flushes the run whole, as before MOD-10 M3, with one exception: a run no
+    /// longer than `hold_back` (a resolved secret longer than the bound) is **kept open**, so the
+    /// row grows past the bound rather than split a secret.
+    ///
+    /// The carried row's capture time is the `at` of the chunk the cut falls in, and that chunk's
+    /// `raw` rides both rows, so each row's per-pointer join ([`Recorder::withhold_split_raw`])
+    /// sees every byte of its own text. The carry is re-opened **before** a flush error is
+    /// returned, so the tail is never lost: a later flush, or `finish`, writes it.
+    async fn flush_at_seam(&mut self) -> Result<(), RecordError> {
+        let hold_back = self.scrubber.hold_back();
+        let Some(text) = self.open_text() else {
+            return self.flush().await;
+        };
+        let len = text.len();
+        let seam = seam_cut(self.scrubber, text, hold_back)
+            .and_then(|cut| split_marks(&self.open_chunks, cut).map(|split| (cut, split)))
+            // The marks describe exactly this text; anything else is a run the seam cannot share.
+            .filter(|_| self.open_chunks.last().is_some_and(|mark| mark.end == len));
+        let Some((cut, split)) = seam else {
+            if hold_back > 0 && len <= hold_back {
+                return Ok(());
+            }
+            if hold_back > 0 && scrubbed_text(self.scrubber, text).is_some() {
+                tracing::warn!(
+                    step = %self.step,
+                    bytes = len,
+                    hold_back,
+                    "no safe seam was found; the text run is flushed whole"
+                );
+            }
+            return self.flush().await;
+        };
+
+        let message_id = self.open_message_id.clone();
+        let Some(mut head) = self.buffer.pop() else {
+            return self.flush().await;
+        };
+        let tail = match head.payload.get_mut("text") {
+            Some(Value::String(text)) => text.split_off(cut),
+            _ => String::new(),
+        };
+        let carry_raw = head
+            .raw
+            .get(split.carry_raw_from..)
+            .map(<[Value]>::to_vec)
+            .unwrap_or_default();
+        head.raw.truncate(split.head_raw);
+        let carry = PendingRow {
+            kind: head.kind,
+            role: EventRole::Agent,
+            tool_call_id: None,
+            payload: json!({ "text": tail }),
+            raw: carry_raw,
+            at: split.carry_at,
+        };
+
+        self.push(head);
+        let flushed = self.flush().await;
+        self.push(carry);
+        self.open_message_id = message_id;
+        self.open_chunks = split.carry;
+        flushed
+    }
+
     /// Writes what is buffered and closes the open run.
     ///
     /// The final scrub happens here rather than at capture, because a secret split across two
@@ -1180,6 +1298,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     async fn flush(&mut self) -> Result<(), RecordError> {
         self.buffer_kind = None;
         self.open_message_id = None;
+        self.open_chunks.clear();
         if self.buffer.is_empty() && self.unflushed.is_empty() && self.unoffered.is_empty() {
             return Ok(());
         }
@@ -1798,6 +1917,107 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     }
 }
 
+/// MOD-10 D18: how many earlier seams one cut may try before it gives up and flushes whole.
+const SEAM_ATTEMPTS: usize = 4;
+
+/// MOD-10 D18: where a size-triggered flush may cut `text`, keeping at least `hold_back` bytes
+/// open. `None` is "no safe cut": the caller flushes the whole run (`hold_back == 0`, or a
+/// residue anywhere in `text`, or no attempt found a seam).
+///
+/// A cut `c` is safe when scrubbing `text[..c]` and `text[c..]` apart gives, concatenated,
+/// exactly what scrubbing `text` whole gives, and neither half is refused. That is the leak
+/// criterion itself: every complete secret and every complete credential is masked or refused
+/// identically whichever row it lands in. The first candidate is the last char boundary at least
+/// `hold_back` bytes before the end; an unsafe candidate moves back by `hold_back` more bytes.
+/// Because an occurrence of a secret is at most `hold_back + 1` bytes long, one step back always
+/// clears the occurrence that made the previous candidate unsafe; the loop re-checks in case it
+/// lands inside another.
+///
+/// A cut that *creates* a refusal (a tail starting with `AKIA…` after a letter, so `^` becomes a
+/// token start; a head ending in a truncated `sk-` body that no longer reads as prose) is unsafe
+/// too and moves back, so the seam never invents a failure the whole text did not have.
+///
+/// **Residuals.** The check sees the run as it is at the bound, not the bytes still to come, so
+/// two cases stay open, neither a regression on the cut at the bound it replaces:
+///
+/// - A credential whose matching prefix (at least its rule's minimum) is already in the run
+///   refuses `text` whole: the run is flushed whole as one `scrub_residue` row and the session
+///   fails closed, but the key's tail still arriving lands, without its prefix, in the next row.
+/// - `openai_api_key` is confirmed over its **whole** `sk-` body (`SK_PROSE`), so it is not
+///   monotonic in the body's length. A prose-shaped body (`sk-learn-preprocessing-…`) longer than
+///   `hold_back` can be cut, both halves clean, and then continue with a non-prose segment: no row
+///   refuses, while the two rows concatenated would. Random key bodies are not prose-shaped for
+///   75 bytes, so this needs a key that reads as words for its first 70-odd characters.
+fn seam_cut(scrubber: &dyn Scrubber, text: &str, hold_back: usize) -> Option<usize> {
+    if hold_back == 0 || text.len() <= hold_back {
+        return None;
+    }
+    let whole = scrubbed_text(scrubber, text)?;
+    let mut cut = text.floor_char_boundary(text.len() - hold_back);
+    for _ in 0..SEAM_ATTEMPTS {
+        if cut == 0 {
+            return None;
+        }
+        let (head, tail) = text.split_at(cut);
+        if let (Some(head), Some(tail)) =
+            (scrubbed_text(scrubber, head), scrubbed_text(scrubber, tail))
+            && whole.len() == head.len() + tail.len()
+            && whole.starts_with(&head)
+            && whole.ends_with(&tail)
+        {
+            return Some(cut);
+        }
+        cut = text.floor_char_boundary(cut.saturating_sub(hold_back));
+    }
+    None
+}
+
+/// `text` as `scrubber` masks it, or `None` when a rule refuses it.
+fn scrubbed_text(scrubber: &dyn Scrubber, text: &str) -> Option<String> {
+    let mut value = Value::String(text.to_owned());
+    scrubber.scrub(&mut value).ok()?;
+    match value {
+        Value::String(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// MOD-10 D18: shares the open run's chunks between the head and the carry of a seam at `cut`.
+///
+/// Chunk `i` spans `[start_i, end_i)`, `start_0 = 0` and `start_i = end_{i-1}`. The **carry** is
+/// every chunk with `end_i > cut`, re-based on the cut, and its capture time is the first one's.
+/// The **head** is every chunk with `start_i < cut`, plus an empty chunk sitting on the cut
+/// (`end_i <= cut`), so every chunk's raw lands on at least one row. A chunk that straddles the
+/// cut is in both. `None` when no chunk ends after `cut`, which a cut [`seam_cut`] found never is.
+fn split_marks(marks: &[ChunkMark], cut: usize) -> Option<MarkSplit> {
+    let first_carried = marks.iter().position(|mark| mark.end > cut)?;
+    let mut start = 0;
+    let mut head_raw = 0;
+    for mark in marks {
+        if (start < cut || mark.end <= cut) && mark.raw {
+            head_raw += 1;
+        }
+        start = mark.end;
+    }
+    let carry_raw_from = marks[..first_carried]
+        .iter()
+        .filter(|mark| mark.raw)
+        .count();
+    let carry = marks[first_carried..]
+        .iter()
+        .map(|mark| ChunkMark {
+            end: mark.end - cut,
+            ..*mark
+        })
+        .collect();
+    Some(MarkSplit {
+        head_raw,
+        carry_raw_from,
+        carry_at: marks[first_carried].at,
+        carry,
+    })
+}
+
 /// The refusal a fresh batch that landed short answers with (MOD-40 plan D3): some `seq` it
 /// numbered is already held on the step, which cannot happen with one writer.
 fn seq_collision(step: StepId, fresh: &[SessionEvent], written: usize) -> String {
@@ -2114,16 +2334,20 @@ pub async fn enforce_breach<S: htui_core::store::RecorderStore>(
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
+    use chrono::TimeDelta;
     use chrono::{DateTime, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
         ChatRunSpec, EventKind, EventRole, RunStep, SessionEvent, StepId, UsageTotals,
     };
-    use htui_core::scrub::MinimalScrubber;
+    use htui_core::scrub::{MinimalScrubber, Scrubber as _};
     use htui_core::store::{MemStore, ReadStore, StepFence, WriteStore};
     use serde_json::{Value, json};
 
-    use super::{Recorder, RecorderSummary, joined_raw_leaves};
+    use super::{
+        CHUNK_FLUSH_BYTES, ChunkMark, MarkSplit, Recorder, RecorderSummary, joined_raw_leaves,
+        seam_cut, split_marks,
+    };
     use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, TextChunk, UsageEvent};
 
     /// A fixed capture time, so a persisted row is a function of the script alone.
@@ -2507,5 +2731,138 @@ mod tests {
         ];
 
         assert_eq!(joined_raw_leaves(&chunks), json!(["p1p2", "q2"]));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-10 D18: the flush seam (blueprint §B.2, §D.2 item 16)
+    // -----------------------------------------------------------------------------------------
+
+    /// A resolved value 70 bytes long and not pattern-shaped, so only masking can hide it.
+    const SECRET70: &str = "zq7-resolved-value-0123456789-abcdefghijklmnopqrstuvwxyz-0123456789ABC";
+
+    /// A scrubber that keeps the default `hold_back` (0) has no seam: the caller flushes whole at
+    /// the bound, as before MOD-10 M3.
+    #[test]
+    fn seam_cut_is_none_without_hold_back() {
+        let text = "x".repeat(CHUNK_FLUSH_BYTES);
+        assert_eq!(seam_cut(&scrubber(), &text, 0), None);
+    }
+
+    /// A complete credential already in the run refuses the whole text, so no cut can hide it and
+    /// carrying would only move it: the run is flushed whole (one `scrub_residue` row, as today).
+    #[test]
+    fn seam_cut_is_none_when_the_whole_text_is_refused() {
+        let scrubber = scrubber();
+        let text = format!(
+            "{} sk-ant-api03-abcdefghijklmnopqrstuvwx {}",
+            "x".repeat(200),
+            "y".repeat(200)
+        );
+        assert_eq!(seam_cut(&scrubber, &text, scrubber.hold_back()), None);
+    }
+
+    /// The first candidate (`len - hold_back`) lands inside a complete secret, which `whole` masks
+    /// and neither half does: the cut moves back by one more `hold_back`, past the secret's start.
+    #[test]
+    fn seam_cut_moves_back_over_a_complete_secret() {
+        let scrubber = MinimalScrubber::new([SECRET70.to_owned()]);
+        let hold_back = scrubber.hold_back();
+        assert_eq!(hold_back, 75, "max(70, PATTERN_HOLD_BACK) - 1");
+        let text = format!("{}{SECRET70}{}", "x".repeat(200), "x".repeat(10));
+        assert_eq!(text.len(), 280);
+
+        let cut = seam_cut(&scrubber, &text, hold_back);
+
+        assert_eq!(
+            cut,
+            Some(280 - 2 * hold_back),
+            "205 is inside the secret at [200, 270); 130 is before it"
+        );
+    }
+
+    /// Both candidates go through `floor_char_boundary`, so a multi-byte character is never split
+    /// and `split_at` never panics.
+    #[test]
+    fn seam_cut_lands_on_a_char_boundary() {
+        let scrubber = scrubber();
+        let hold_back = scrubber.hold_back();
+        for text in [
+            "é".repeat(100),
+            format!("a{}", "𝄞".repeat(50)),
+            format!("{}{}", "𝄞".repeat(25), "é".repeat(50)),
+        ] {
+            let cut = seam_cut(&scrubber, &text, hold_back).expect("clean text has a seam");
+            assert!(text.is_char_boundary(cut), "{cut} in {} bytes", text.len());
+            assert!(
+                text.len() - cut >= hold_back,
+                "at least hold_back bytes stay open"
+            );
+            assert!(
+                text.len() - cut < hold_back + 4,
+                "the cut is the last boundary at or before len - hold_back"
+            );
+        }
+    }
+
+    /// The pure split of the open run's chunks at a cut: the chunk the cut falls in rides both
+    /// halves (its raw on both rows), a chunk wholly after the cut moves to the carry only, and the
+    /// carry takes the straddling chunk's capture time.
+    #[test]
+    fn split_marks_puts_a_straddling_chunk_in_both_halves() {
+        let t = |seconds: i64| at() + TimeDelta::seconds(seconds);
+        let mark = |end: usize, raw: bool, seconds: i64| ChunkMark {
+            end,
+            at: t(seconds),
+            raw,
+        };
+        let marks = [
+            mark(10, true, 0),
+            mark(20, false, 1),
+            mark(30, true, 2),
+            mark(40, true, 3),
+        ];
+
+        assert_eq!(
+            split_marks(&marks, 25),
+            Some(MarkSplit {
+                head_raw: 2,
+                carry_raw_from: 1,
+                carry_at: t(2),
+                carry: vec![mark(5, true, 2), mark(15, true, 3)],
+            }),
+            "chunk 2 spans [20, 30): its raw is the head's second and the carry's first"
+        );
+        assert_eq!(
+            split_marks(&marks, 20),
+            Some(MarkSplit {
+                head_raw: 1,
+                carry_raw_from: 1,
+                carry_at: t(2),
+                carry: vec![mark(10, true, 2), mark(20, true, 3)],
+            }),
+            "a cut on a chunk boundary shares nothing"
+        );
+
+        let with_empty = [
+            mark(10, true, 0),
+            mark(20, true, 1),
+            mark(20, true, 2),
+            mark(30, true, 3),
+        ];
+        assert_eq!(
+            split_marks(&with_empty, 20),
+            Some(MarkSplit {
+                head_raw: 3,
+                carry_raw_from: 3,
+                carry_at: t(3),
+                carry: vec![mark(10, true, 3)],
+            }),
+            "an empty chunk at the cut stays on the head, so its raw is never lost"
+        );
+        assert_eq!(
+            split_marks(&marks, 40),
+            None,
+            "no chunk ends after a cut at the end"
+        );
     }
 }

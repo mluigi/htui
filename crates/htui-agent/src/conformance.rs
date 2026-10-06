@@ -50,7 +50,7 @@ use htui_core::model::{
     normalize,
 };
 use htui_core::prompt::settings::SettingKey;
-use htui_core::scrub::MinimalScrubber;
+use htui_core::scrub::{MinimalScrubber, Scrubber as _};
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore, Result as StoreResult,
     SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore,
@@ -3316,9 +3316,11 @@ fn edits_surface_as_post_hoc_tool_calls(log: &[SessionEvent]) {
     );
 }
 
-/// Flush trigger 4: a coalesced run is cut at [`CHUNK_FLUSH_BYTES`] rather than buffered
-/// unboundedly, and the cut is a function of byte counts alone - no timer, so replay stays
-/// deterministic (`docs/ANA-4.md` §4.1, §11 criterion 2).
+/// Flush trigger 4: a coalesced run is cut when it reaches [`CHUNK_FLUSH_BYTES`] rather than
+/// buffered unboundedly, and the cut is a function of byte counts alone - no timer, so replay
+/// stays deterministic (`docs/ANA-4.md` §4.1, §11 criterion 2). Since MOD-10 D18 the cut is a
+/// hold-back before the bound: the scrubber's `hold_back()` trailing bytes are carried into the
+/// next row, so a secret still arriving is never split across two rows.
 async fn chunk_flush_at_16kib<H: CaseHarness, S: WriteStore + htui_core::store::RecorderStore>(
     harness: &H,
     store: &S,
@@ -3348,11 +3350,12 @@ async fn chunk_flush_at_16kib<H: CaseHarness, S: WriteStore + htui_core::store::
         .filter(|row| row.kind == EventKind::AssistantText)
         .map(|row| text_of(row).len())
         .collect();
+    let hold = scrubber.hold_back();
     assert_eq!(
         texts,
-        vec![CHUNK_FLUSH_BYTES, 1024],
-        "chunk_flush_at_16kib: 17 KiB of chunks is cut once at the bound and the remainder opens a \
-         new run"
+        vec![CHUNK_FLUSH_BYTES - hold, 1024 + hold],
+        "chunk_flush_at_16kib: 17 KiB of chunks is cut once, a hold-back before the bound, and the \
+         carried tail opens the next run"
     );
 }
 
