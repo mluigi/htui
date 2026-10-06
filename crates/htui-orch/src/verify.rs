@@ -13,12 +13,14 @@
 //! command that was asked for and could not be run, and it never fails a step (`:443`).
 //!
 //! The shell is plan D30's: `sh -c` on Unix, `cmd /C` on Windows, with the process environment
-//! unchanged, stdout and stderr merged and tail-capped at 64 KiB, masked by the engine's
-//! `Scrubber` before it is handed back, under a semaphore keyed `verify`, and with the step
-//! deadline's remainder as the timeout. The process handling is `isolate/git.rs`'s
-//! [`Cli`](crate::isolate::git::Cli) contract verb for verb — a supervised child whose whole group
-//! a kill reaches, both pipes read concurrently so neither can fill and stall it, and the cap kept
-//! at the **tail**, because the end of a build that failed is the part worth reading.
+//! unchanged (which never holds a resolved secret: MOD-10 D19), stdout and stderr merged and
+//! tail-capped at 64 KiB, masked by the engine's `Scrubber` before it is handed back (and
+//! re-masked by the engine with the walk's secrets, MOD-10 M3 blueprint A-11), under a semaphore
+//! keyed `verify`, and with the step deadline's remainder as the timeout. The process handling is
+//! `isolate/git.rs`'s [`Cli`](crate::isolate::git::Cli) contract verb for verb — a supervised
+//! child whose whole group a kill reaches, both pipes read concurrently so neither can fill and
+//! stall it, and the cap kept at the **tail**, because the end of a build that failed is the part
+//! worth reading.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -95,8 +97,40 @@ fn cannot_wait(err: &std::io::Error) -> String {
 
 /// `R-SEC-3` is fail-closed: an output the scrubber could not mask is not persistable, so the text
 /// is dropped and its size is all that is reported. The exit code is a fact and is kept.
-fn scrub_refused(bytes: usize) -> String {
+pub(crate) fn scrub_refused(bytes: usize) -> String {
     format!("<scrub refused: {bytes} bytes withheld>")
+}
+
+/// MOD-10 R1 L2: the line a verify output's tail opens with once its head was dropped (MOD-11
+/// OQ-7's `command_run` marker).
+pub(crate) const TRUNCATED: &str = "[… earlier output truncated]\n";
+
+/// MOD-10 R1 L2: a [`VerifyReport::truncated`] output with the first `bytes` of its tail dropped
+/// (rounded up to a character boundary) and the drop marked with [`TRUNCATED`]. The tail is the
+/// whole output for `pass` and `fail`; an `unavailable` reason line ([`with_output`]) is kept
+/// whole, and a reason with no tail after it is returned as it is.
+///
+/// The tail was decoded lossily, so a cap that landed inside a character opens it with up to three
+/// `U+FFFD`s, each three bytes here for one byte of the original. They are dropped first and not
+/// counted, so the drop always covers at least `bytes` bytes of what the command printed.
+pub(crate) fn without_cut_head(output: &str, outcome: VerifyOutcome, bytes: usize) -> String {
+    let start = match outcome {
+        VerifyOutcome::Pass | VerifyOutcome::Fail => 0,
+        VerifyOutcome::Unavailable => match output.find('\n') {
+            Some(newline) => newline + 1,
+            None => return output.to_owned(),
+        },
+    };
+    let start_of_tail = start;
+    let start = start + output[start..].len()
+        - output[start..]
+            .trim_start_matches(char::REPLACEMENT_CHARACTER)
+            .len();
+    let mut cut = (start + bytes).min(output.len());
+    while !output.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("{}{TRUNCATED}{}", &output[..start_of_tail], &output[cut..])
 }
 
 /// The boxed future every [`Verifier`] returns — [`IsolatorFuture`](crate::isolate::IsolatorFuture)'s
@@ -138,6 +172,10 @@ pub struct VerifyReport {
     pub started_at: DateTime<Utc>,
     /// When it ended, however it ended.
     pub finished_at: DateTime<Utc>,
+    /// MOD-10 R1 L2: the command printed more than [`CAPTURE_TAIL`] bytes and `output` holds the
+    /// kept tail (after an `unavailable` reason's line, `with_output`), whose start may be the
+    /// end of a resolved value the cap cut. `false` when the scrubber withheld the text.
+    pub truncated: bool,
 }
 
 /// Milestone 2 D6's pattern applied to the walk's other side effect: a seam now, implementations
@@ -226,44 +264,53 @@ impl ShellVerifier {
         VerifyReport {
             outcome: VerifyOutcome::Unavailable,
             exit_code: None,
-            output: self.scrubbed(reason),
+            output: self.scrubbed(reason).unwrap_or_else(|withheld| withheld),
             started_at: at,
             finished_at: at,
+            truncated: false,
         }
     }
 
-    /// One report for a command that did start, whatever became of it.
+    /// One report for a command that did start, whatever became of it. `printed` is every byte
+    /// the command wrote, so a kept tail is told from a kept whole (MOD-10 R1 L2).
     fn finished(
         &self,
         outcome: VerifyOutcome,
         exit_code: Option<i32>,
         output: String,
         started_at: DateTime<Utc>,
+        printed: usize,
     ) -> VerifyReport {
+        let (output, kept) = match self.scrubbed(output) {
+            Ok(output) => (output, true),
+            Err(withheld) => (withheld, false),
+        };
         VerifyReport {
             outcome,
             exit_code,
-            output: self.scrubbed(output),
+            output,
             started_at,
             finished_at: self.clock.now(),
+            truncated: kept && printed > CAPTURE_TAIL,
         }
     }
 
-    /// `text` masked by the engine's scrubber, or nothing at all when it refused (`R-SEC-3`).
+    /// `text` masked by the engine's scrubber, or, as the `Err`, the [`scrub_refused`] sentence
+    /// that replaces it when it refused (`R-SEC-3`).
     ///
     /// The refusal drops the text and keeps the outcome and the exit code: those are facts about
     /// the run, and neither can carry a secret.
-    fn scrubbed(&self, text: String) -> String {
+    fn scrubbed(&self, text: String) -> Result<String, String> {
         let bytes = text.len();
         let mut value = serde_json::Value::String(text);
         match self.scrubber.scrub(&mut value) {
-            Ok(()) => match value {
+            Ok(()) => Ok(match value {
                 serde_json::Value::String(text) => text,
                 other => other.to_string(),
-            },
+            }),
             Err(refusal) => {
                 tracing::warn!(%refusal, "verify output withheld: the scrubber refused it");
-                scrub_refused(bytes)
+                Err(scrub_refused(bytes))
             }
         }
     }
@@ -320,9 +367,11 @@ impl ShellVerifier {
         step: StepId,
     ) -> VerifyReport {
         let started_at = self.clock.now();
-        // The process environment is handed to the child unchanged (plan D30): ANA-2 `:493` asks
-        // for "the agent's environment minus the secrets" and the walk's `SessionSpec.env` is
-        // empty this milestone, so the agent's environment *is* this process's.
+        // The process environment is handed to the child unchanged (plan D30). ANA-2 `:493` asks
+        // for "the agent's environment minus the secrets", and that is what this is: a resolved
+        // secret reaches an agent only through `SessionSpec.env` (MOD-10 D12), never this process's
+        // own environment, which htui cannot change (`set_var` is `unsafe`, `unsafe_code` is
+        // forbidden; MOD-10 D19).
         let build = || {
             let mut shell = tokio::process::Command::new(&self.shell);
             shell
@@ -340,7 +389,7 @@ impl ShellVerifier {
             Ok(child) => child,
             Err(err) => {
                 let reason = cannot_spawn(&self.shell, &err);
-                return self.finished(VerifyOutcome::Unavailable, None, reason, started_at);
+                return self.finished(VerifyOutcome::Unavailable, None, reason, started_at, 0);
             }
         };
         tracing::debug!(%step, "verify command started");
@@ -349,12 +398,15 @@ impl ShellVerifier {
         // the interleaving the command produced still exists. Both are drained concurrently so
         // neither can fill and stall the child, exactly as `Cli::run` does.
         let captured = Arc::new(Mutex::new(TailBuffer::new(CAPTURE_TAIL)));
+        let printed = AtomicUsize::new(0);
         let stdout = child.stdout().take();
         let stderr = child.stderr().take();
         let run = async {
-            tokio::join!(drain(stdout, &captured), drain(stderr, &captured), async {
-                child.wait().await
-            })
+            tokio::join!(
+                drain_counting(stdout, &captured, &printed),
+                drain_counting(stderr, &captured, &printed),
+                async { child.wait().await }
+            )
             .2
         };
 
@@ -362,15 +414,22 @@ impl ShellVerifier {
             Some(budget) => tokio::time::timeout(budget, run).await,
             None => Ok(run.await),
         };
+        let printed = || printed.load(Ordering::SeqCst);
 
         match ended {
             Ok(Ok(status)) => {
                 let output = take_output(&captured);
                 match status.code() {
-                    Some(0) => self.finished(VerifyOutcome::Pass, Some(0), output, started_at),
-                    Some(code) => {
-                        self.finished(VerifyOutcome::Fail, Some(code), output, started_at)
+                    Some(0) => {
+                        self.finished(VerifyOutcome::Pass, Some(0), output, started_at, printed())
                     }
+                    Some(code) => self.finished(
+                        VerifyOutcome::Fail,
+                        Some(code),
+                        output,
+                        started_at,
+                        printed(),
+                    ),
                     // A signal is not an exit code, so there is nothing to compare against zero
                     // and the run is one that could not be completed (`docs/ANA-2.md:515`).
                     None => self.finished(
@@ -378,6 +437,7 @@ impl ShellVerifier {
                         None,
                         with_output(killed_by_signal(), output),
                         started_at,
+                        printed(),
                     ),
                 }
             }
@@ -388,6 +448,7 @@ impl ShellVerifier {
                     None,
                     with_output(cannot_wait(&err), output),
                     started_at,
+                    printed(),
                 )
             }
             Err(_elapsed) => {
@@ -400,6 +461,7 @@ impl ShellVerifier {
                     None,
                     with_output(deadline_elapsed(), output),
                     started_at,
+                    printed(),
                 )
             }
         }
@@ -434,26 +496,6 @@ fn take_output(captured: &Mutex<TailBuffer>) -> String {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     std::mem::replace(&mut *guard, TailBuffer::new(CAPTURE_TAIL)).into_string()
-}
-
-/// Drains `reader` into the shared tail, stopping at end of stream or at the first pipe error.
-///
-/// The lock is taken per chunk and never held across an `.await`, so the two drains interleave in
-/// the order the bytes arrived.
-async fn drain(reader: Option<impl tokio::io::AsyncRead + Unpin>, captured: &Mutex<TailBuffer>) {
-    let Some(mut reader) = reader else {
-        return;
-    };
-    let mut chunk = vec![0_u8; 8 * 1024];
-    loop {
-        match reader.read(&mut chunk).await {
-            Ok(0) | Err(_) => break,
-            Ok(read) => captured
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .push(&chunk[..read]),
-        }
-    }
 }
 
 // -- MOD-11 OQ-7 (blueprint B-15): `command_run`'s executor -------------------------------------
@@ -496,7 +538,7 @@ pub struct ShellRun {
 /// process environment unchanged, both pipes drained into one tail, until it exits, `budget`
 /// elapses, or `stop` resolves — each of the three kills the whole process group (job object on
 /// Windows), so a `cargo test`'s test binaries die with it, and a background child the shell left
-/// behind does not outlive the call (R1 M1: after an exit the pipes get [`PIPE_GRACE`], then the
+/// behind does not outlive the call (R1 M1: after an exit the pipes get `PIPE_GRACE`, then the
 /// output read so far is the answer). Infallible: a shell that cannot start is
 /// [`ShellEnd::SpawnFailed`].
 pub async fn run_shell(
@@ -631,8 +673,12 @@ impl Drop for GroupGuard {
     }
 }
 
-/// [`drain`]'s counting twin for [`run_shell`]: the same tail, plus every byte read added to
-/// `printed`, so the caller can tell a kept whole from a kept tail.
+/// Drains `reader` into the shared tail, stopping at end of stream or at the first pipe error,
+/// and adds every byte read to `printed`, so the caller can tell a kept whole from a kept tail
+/// (a verify, MOD-10 R1 L2, and [`run_shell`]).
+///
+/// The lock is taken per chunk and never held across an `.await`, so the two drains interleave in
+/// the order the bytes arrived.
 async fn drain_counting(
     reader: Option<impl tokio::io::AsyncRead + Unpin>,
     captured: &Mutex<TailBuffer>,
@@ -1266,6 +1312,93 @@ mod tests {
                 && report.output.ends_with(" bytes withheld>"),
             "unexpected output: {}",
             report.output
+        );
+    }
+
+    /// MOD-10 R1 L2: a verify that printed past the cap says its output is a cut tail.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_output_past_the_cap_is_truncated() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let long = verifier()
+            .run(request(
+                "head -c 100000 /dev/zero | tr '\\0' a; echo; echo the-end; exit 1",
+                dir.path().to_path_buf(),
+            ))
+            .await
+            .expect("a report");
+        assert_eq!(long.outcome, VerifyOutcome::Fail);
+        assert!(long.truncated, "100 kB is past the cap");
+        assert!(long.output.ends_with("the-end\n"), "the tail is kept");
+
+        let short = verifier()
+            .run(request("echo short", dir.path().to_path_buf()))
+            .await
+            .expect("a report");
+        assert!(!short.truncated, "{}", short.output);
+    }
+
+    /// MOD-10 R1 L2: an output the scrubber withheld holds no tail, so it is not `truncated`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_withheld_output_is_not_truncated() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let report = verifier()
+            .run(request(
+                "head -c 100000 /dev/zero | tr '\\0' a; echo; \
+                 echo token=sk-ant-notarealkeynotarealkey00",
+                dir.path().to_path_buf(),
+            ))
+            .await
+            .expect("a report");
+        assert!(
+            report.output.starts_with("<scrub refused: "),
+            "{}",
+            report.output
+        );
+        assert!(!report.truncated);
+    }
+
+    /// MOD-10 R1 L2: the first `bytes` of a cut tail are dropped, rounded up to a character
+    /// boundary, and the drop is marked; an `unavailable` reason line is kept whole.
+    #[test]
+    fn a_cut_head_is_dropped_and_marked() {
+        use super::{TRUNCATED, without_cut_head};
+
+        assert_eq!(
+            without_cut_head("abcdefgh", VerifyOutcome::Pass, 3),
+            format!("{TRUNCATED}defgh")
+        );
+        assert_eq!(
+            without_cut_head("abcdefgh", VerifyOutcome::Fail, 3),
+            format!("{TRUNCATED}defgh")
+        );
+        // `é` is two bytes: a drop of 2 ends inside it and is rounded up past it.
+        assert_eq!(
+            without_cut_head("aébc", VerifyOutcome::Fail, 2),
+            format!("{TRUNCATED}bc")
+        );
+        assert_eq!(
+            without_cut_head("the reason\nabcdefgh", VerifyOutcome::Unavailable, 3),
+            format!("the reason\n{TRUNCATED}defgh")
+        );
+        assert_eq!(
+            without_cut_head("the reason alone", VerifyOutcome::Unavailable, 3),
+            "the reason alone"
+        );
+        assert_eq!(
+            without_cut_head("abc", VerifyOutcome::Pass, 10),
+            TRUNCATED.to_owned()
+        );
+        // A cap inside a 4-byte character leaves up to three `U+FFFD`s (9 decoded bytes for 3
+        // original ones): they are dropped uncounted, so the 3-byte drop still covers `abc`.
+        assert_eq!(
+            without_cut_head("\u{FFFD}\u{FFFD}\u{FFFD}abcdef", VerifyOutcome::Fail, 3),
+            format!("{TRUNCATED}def")
+        );
+        assert_eq!(
+            without_cut_head("the reason\n\u{FFFD}abcdef", VerifyOutcome::Unavailable, 3),
+            format!("the reason\n{TRUNCATED}def")
         );
     }
 }

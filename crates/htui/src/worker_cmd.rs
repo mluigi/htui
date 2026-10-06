@@ -105,7 +105,9 @@ async fn serve(args: WorkerArgs) -> Result<(), WorkerExit> {
     };
     let runtime = RunRuntime::<PgStore, Unaddressed>::production()
         .with_role(Role::Worker)
-        .with_tool_host(Arc::new(tools));
+        .with_tool_host(Arc::new(tools))
+        // MOD-10 D15: this process's one secret source; the worker hosts no chats.
+        .with_secret_source(Arc::new(crate::secrets::KeyringInfisical::new()));
     tracing::info!(box_id = %pg.this_box(), pool = pool.get(), "htui worker ready");
     htui_worker::worker::run(pg, runtime, WorkerConfig::PRODUCTION, shutdown).await;
     if let Some(job) = index_job {

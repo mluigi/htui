@@ -47,6 +47,7 @@ use htui_orch::isolate::{
     ChangedPaths, FanoutSlot, GixIsolator, Isolator, IsolatorConfig, IsolatorFuture, Prepared,
     RepoCheckout, ResetReport,
 };
+use htui_orch::secrets::RunSecrets;
 use htui_orch::skip_without_git;
 use htui_orch::status::RunFailure;
 use htui_orch::verify::{ShellVerifier, VERIFY_CLASS};
@@ -75,6 +76,7 @@ macro_rules! engine_as {
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| fix.orch.driver_for_key(key);
         let scrubber = MinimalScrubber::new([]);
+        let secrets = RunSecrets::none();
         let dead_walks = DeadWalks::new();
         let app = fix
             .orch
@@ -101,6 +103,7 @@ macro_rules! engine_as {
             policy: &htui_orch::ask_policy,
             control: &htui_orch::never_cancelled,
             scrubber: &scrubber,
+            secrets: &secrets,
             app,
             box_profile,
             box_id: fix.orch.box_id(),

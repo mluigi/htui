@@ -630,6 +630,25 @@ impl MemStore {
         });
     }
 
+    /// Plants `project.secret_provider` and `project.secret_scope` without validation. **Tests
+    /// only**, like [`set_project_settings`](Self::set_project_settings): M4 owns the writer
+    /// (MOD-10 M3 blueprint A-6). A project that is not there is left alone.
+    pub fn set_project_secret_columns(
+        &self,
+        project: ProjectId,
+        provider: Option<&str>,
+        scope: Option<&str>,
+    ) {
+        let now = self.now();
+        self.write(|state| {
+            if let Some(row) = state.projects.get_mut(&project) {
+                row.secret_provider = provider.map(str::to_owned);
+                row.secret_scope = scope.map(str::to_owned);
+                row.updated_at = now;
+            }
+        });
+    }
+
     /// One `item_kind` row, or `None` when no row has that id.
     ///
     /// The prompt's `{{item}}` section names the kind, and `item` carries only `kind_id`; `§6.1`
@@ -8171,6 +8190,68 @@ mod tests {
                 .expect("MemStore never fails a read"),
             Some(settings),
             "the inherent reader sees the same blob"
+        );
+    }
+
+    /// MOD-10 M3 blueprint A-6: the tests-only setter plants both secret columns, raw, and
+    /// stamps `updated_at`; `None` clears them; an unknown project is left alone.
+    #[tokio::test]
+    async fn set_project_secret_columns_plants_both() {
+        let store = MemStore::demo();
+        async fn read(store: &MemStore) -> crate::model::Project {
+            store
+                .project(ids::PROJECT_HTUI)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("the fixture project")
+        }
+        let before = read(&store).await;
+        assert_eq!(
+            (
+                before.secret_provider.as_deref(),
+                before.secret_scope.as_deref()
+            ),
+            (None, None),
+            "the fixture project has no secret columns"
+        );
+
+        // No validation: a scope the provider would refuse is planted as is.
+        store.set_project_secret_columns(ids::PROJECT_HTUI, Some("infisical"), Some("not json"));
+        let after = read(&store).await;
+        assert_eq!(
+            (
+                after.secret_provider.as_deref(),
+                after.secret_scope.as_deref()
+            ),
+            (Some("infisical"), Some("not json"))
+        );
+        assert!(
+            after.updated_at > before.updated_at,
+            "the write stamps `updated_at`"
+        );
+        assert_eq!(
+            (after.settings, after.name),
+            (before.settings, before.name),
+            "nothing else moves"
+        );
+
+        store.set_project_secret_columns(ids::PROJECT_HTUI, None, None);
+        let cleared = read(&store).await;
+        assert_eq!(
+            (cleared.secret_provider, cleared.secret_scope),
+            (None, None),
+            "`None` clears both columns"
+        );
+
+        let unknown = ProjectId::new();
+        store.set_project_secret_columns(unknown, Some("infisical"), Some("{}"));
+        assert_eq!(
+            store
+                .project(unknown)
+                .await
+                .expect("MemStore never fails a read"),
+            None,
+            "an unknown project is a no-op, not an insert"
         );
     }
 

@@ -22,7 +22,8 @@
 //! by ANA-2 §8, remains MOD-12's and is deliberately not created, not even empty (plan D1).
 //! MOD-24 adds [`kill_point`], the crash tests' hook at three seams of a walk and the command
 //! poll; without `test-support` it compiles to nothing. MOD-11 adds [`tools`], the seam a session's
-//! MCP tool host is opened through (plan D4).
+//! MCP tool host is opened through (plan D4). MOD-10 M3 adds [`secrets`], one walk's resolved
+//! secrets as its sessions' env and its scrubber in one object (D11).
 #![warn(missing_docs)]
 
 pub mod closeout;
@@ -41,6 +42,7 @@ pub mod kill_point;
 pub mod overlap;
 pub mod promote;
 pub mod recover;
+pub mod secrets;
 pub mod select;
 pub mod status;
 pub mod tools;
@@ -68,6 +70,7 @@ pub use isolate::{
     IsolatorFuture, Prepared, PreparedTree, RepoCheckout, ResetReport, SystemClock,
 };
 pub use recover::{Heartbeat, LeaseTimes};
+pub use secrets::RunSecrets;
 pub use select::{SkipCause, Walk, walk};
 pub use status::{
     Cursor, RunFailure, cursor, latest_at, may_attempt, next_attempt, resumable_park,

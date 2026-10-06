@@ -114,6 +114,13 @@ pub enum RunFailure {
         /// The rule name `Unmasked::rule` carried, e.g. `anthropic_api_key`.
         rule: String,
     },
+    /// MOD-10 D13: the run's secrets were refused before any agent started: no identity,
+    /// unreachable, bad credentials, locked, cooling down, not found, permission, invalid or
+    /// reserved key, or a configuration fault. Transient causes fail the run too (OQ-A).
+    SecretsRefused {
+        /// The provider's or the column check's error. Value-free by construction (M2 D4).
+        cause: htui_core::secret::SecretError,
+    },
 }
 
 impl RunFailure {
@@ -164,6 +171,7 @@ impl fmt::Display for RunFailure {
             Self::ScrubRefused { phase, rule } => {
                 write!(f, "scrub refused at `{phase}`: unmasked {rule}")
             }
+            Self::SecretsRefused { cause } => f.write_str(&cause.refusal()),
         }
     }
 }
@@ -588,6 +596,69 @@ mod tests {
             "scrub refused at `implement`: unmasked anthropic_api_key",
             "MOD-10 D5: a scrub refusal names the phase and the rule, never the text or the pointer"
         );
+        assert_eq!(
+            RunFailure::SecretsRefused {
+                cause: htui_core::secret::SecretError::NoIdentity,
+            }
+            .to_string(),
+            "secrets_refused: no Infisical machine identity is stored in the OS keyring",
+            "MOD-10 D13: a refused resolution names the cause, never a value"
+        );
+    }
+
+    /// MOD-10 D13: the run's sentence is the cause's own `refusal()`, for every cause the
+    /// orchestrator can meet, so a chat, an engine error and a run read the same bytes.
+    #[test]
+    fn secrets_refused_is_the_cause_s_refusal() {
+        use htui_core::secret::SecretError;
+        let causes = [
+            SecretError::NoIdentity,
+            SecretError::Config(
+                "the project names a secret provider but has no secret_scope".into(),
+            ),
+            SecretError::Unreachable {
+                endpoint: "/api/v1/auth/universal-auth/login",
+                cause: "connection refused".into(),
+            },
+            SecretError::BadCredentials,
+            SecretError::IdentityLocked,
+            SecretError::LoginRefusedEarlier,
+            SecretError::LoginCoolingDown {
+                retry_after_secs: 30,
+            },
+            SecretError::ProjectNotFound,
+            SecretError::PathNotFound {
+                environment: "dev".into(),
+                path: "/app".into(),
+            },
+            SecretError::PermissionDenied {
+                detail: "no access".into(),
+            },
+            SecretError::RateLimited {
+                retry_after_secs: Some(5),
+            },
+            SecretError::UnsupportedServer {
+                endpoint: "/api/v4/secrets",
+            },
+            SecretError::InvalidKey { key: "1BAD".into() },
+            SecretError::InvalidValue {
+                key: "API_KEY".into(),
+            },
+            SecretError::ReservedKey {
+                key: "HTUI_LOG".into(),
+            },
+            SecretError::Protocol {
+                endpoint: "/api/v4/secrets",
+                detail: "not json".into(),
+            },
+        ];
+        for cause in causes {
+            let failure = RunFailure::SecretsRefused {
+                cause: cause.clone(),
+            };
+            assert_eq!(failure.to_string(), cause.refusal());
+            assert!(failure.to_string().starts_with("secrets_refused: "));
+        }
     }
 
     /// MOD-10 D5: the one projection of an [`htui_core::scrub::Unmasked`] keeps the rule and drops

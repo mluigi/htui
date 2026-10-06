@@ -20,14 +20,15 @@ use htui_core::model::{
     RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
 };
 use htui_core::scrub::MinimalScrubber;
+use htui_core::secret::SecretSource;
 use htui_core::store::{Result as StoreResult, StoreError};
 use htui_orch::kill_point::{KillPoint, Site};
 use htui_orch::tools::ToolHost;
 use htui_orch::{
     Adopted, Clock, Command, CommandOutcome, DeadWalks, DriverFor, Engine, EngineError,
     EngineParts, FirstCandidate, GixIsolator, Isolator, IsolatorConfig, LeaseTimes, Next,
-    OpeningPath, RepoCheckout, ResolveError, Rest, Resume, RunFence, SessionKey, ShellVerifier,
-    SystemClock, Tails, UnblockCase, Verifier, cleanup_enabled,
+    OpeningPath, RepoCheckout, ResolveError, Rest, Resume, RunFence, RunSecrets, SessionKey,
+    ShellVerifier, SystemClock, Tails, UnblockCase, Verifier, cleanup_enabled,
 };
 use htui_store::{DATABASE_UNREACHABLE, identity};
 use serde_json::Value;
@@ -195,6 +196,9 @@ struct Shared<P: ReplySink> {
     /// MOD-11 D11: htui's MCP host every engine of this runtime opens its leases on; closed by
     /// [`RunRuntime::shutdown`] (B-19).
     tools: Option<Arc<dyn ToolHost>>,
+    /// MOD-10 D15: the process's secret source, handed to every `Kit`'s `RunSecrets`; `None`
+    /// refuses provider projects (`secrets_refused`) and leaves the rest untouched.
+    secrets: Option<Arc<dyn SecretSource>>,
     owner: Uuid,
     dead_walks: Arc<DeadWalks>,
     publisher: Publisher<P>,
@@ -889,7 +893,8 @@ struct Kit<H: htui_core::store::WorkerHost> {
     verifier: Arc<dyn Verifier>,
     clock: Arc<dyn Clock>,
     sink: ProgressSink<H::Store>,
-    scrubber: MinimalScrubber,
+    /// MOD-10 D11: this task's walk's secrets: the engine's scrubber and its env, one object.
+    secrets: RunSecrets,
     app: BTreeMap<String, Value>,
     box_profile: BoxProfile,
     box_id: BoxId,
@@ -966,7 +971,9 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             isolator,
             verifier,
             clock: Arc::clone(&shared.clock),
-            scrubber: MinimalScrubber::new(std::iter::empty::<String>()),
+            // MOD-10 D11, D14: one per task, so one per walk. Building it does no I/O; it
+            // resolves at the walk's first live path, so a task that walks nothing pays nothing.
+            secrets: RunSecrets::new(shared.secrets.clone()),
             app,
             box_profile,
             box_id,
@@ -1045,7 +1052,8 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             driver,
             policy: &*self.policy,
             control: &*self.control,
-            scrubber: &self.scrubber,
+            scrubber: &self.secrets,
+            secrets: &self.secrets,
             app: self.app.clone(),
             box_profile: self.box_profile.clone(),
             box_id: self.box_id,
@@ -1155,6 +1163,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 clock: Arc::new(SystemClock),
                 author: None,
                 tools: None,
+                secrets: None,
                 owner: Uuid::now_v7(),
                 dead_walks: Arc::new(DeadWalks::new()),
                 publisher: Publisher::default(),
@@ -1371,6 +1380,17 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     #[must_use]
     pub fn with_tool_host(mut self, tools: Arc<dyn ToolHost>) -> Self {
         self.configure().tools = Some(tools);
+        self
+    }
+
+    /// MOD-10 D15: a runtime whose walks resolve provider projects' secrets through `source`
+    /// (`htui`'s `KeyringInfisical`, one per process, shared with the agent runtime).
+    ///
+    /// # Panics
+    /// When called after the runtime has served.
+    #[must_use]
+    pub fn with_secret_source(mut self, source: Arc<dyn SecretSource>) -> Self {
+        self.configure().secrets = Some(source);
         self
     }
 
@@ -3477,6 +3497,11 @@ mod role_gate {
     /// The demo with every fixture agent disabled, one scripted `acp` agent ready on the box, a
     /// primary repo every default scope resolves to, and the seeded queued `RUN_2` cancelled.
     async fn seeded(store: MemStore) -> MemStore {
+        seeded_with_primary(store, "htui").await
+    }
+
+    /// [`seeded`], its primary repo named `primary` (MOD-10: a repo slug reaches the trim record).
+    async fn seeded_with_primary(store: MemStore, primary: &str) -> MemStore {
         for summary in store.agents().await.expect("the fixture's agents") {
             let mut row = summary.agent;
             row.enabled = false;
@@ -3521,7 +3546,7 @@ mod role_gate {
             .create_repo(NewRepo {
                 id: RepoId::new(),
                 project_id: ids::PROJECT_HTUI,
-                name: "htui".to_owned(),
+                name: primary.to_owned(),
                 remote_url: None,
                 default_branch: "main".to_owned(),
                 is_primary: true,
@@ -4351,6 +4376,429 @@ mod role_gate {
             [within].into_iter().collect(),
             "the grace is twice the sweep period, not {BACKOFF_MAX:?}"
         );
+    }
+
+    /// MOD-10 M3 T5 (blueprint §D.5): the worker's `Kit` owns the walk's `RunSecrets`, lent to
+    /// the engine as its scrubber and its secrets (D11), over the runtime's source (D15).
+    mod run_secrets {
+        use std::collections::{BTreeMap, BTreeSet};
+        use std::sync::Arc;
+
+        use chrono::{TimeDelta, Utc};
+        use htui_agent::conformance::{Script, ScriptEvent};
+        use htui_agent::driver::{AgentDriver, DriverCaps};
+        use htui_agent::error::DriverError;
+        use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
+        use htui_agent::fake::{FakeDriver, SpecSlot};
+        use htui_agent::registry::{DriverFactory, TransportBuilder};
+        use htui_core::fixtures::{demo_data, ids};
+        use htui_core::model::{Agent, AgentBox, Executor, ItemPatch, Run, RunStatus, RunStep};
+        use htui_core::scrub::MinimalScrubber;
+        use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
+        use htui_core::secret::{INFISICAL, NO_SECRET_SOURCE, SecretError, SecretSource};
+        use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+        use htui_orch::fake::{FakeIsolator, FakeVerifier};
+        use htui_orch::{Isolator, ShellVerifier, SystemClock, Verifier};
+        use htui_store::Backend;
+
+        use super::{
+            OutputAuthor, PATIENCE, Role, RunRuntime, Scratch, Timed, queued, seeded,
+            seeded_with_primary, set_executor,
+        };
+
+        const SCOPE: &str = r#"{"project_id":"p1","environment":"dev","path":"/"}"#;
+        /// Long and not pattern-shaped, so a refusal can never stand in for a mask.
+        const VALUE: &str = "zq7-resolved-value-0123456789";
+        /// A key no environment of this process holds, so its absence from a printed environment
+        /// is the injection's absence.
+        const KEY: &str = "MOD10_T5_RESOLVED";
+
+        /// Every session of the scripted row: one assistant chunk of `text`, then `done`; the
+        /// spec each `start` was handed lands in `slot`.
+        #[derive(Debug)]
+        struct Echoes {
+            text: String,
+            slot: SpecSlot,
+        }
+
+        impl TransportBuilder for Echoes {
+            fn build(
+                &self,
+                agent: &Agent,
+                _on_box: Option<&AgentBox>,
+                caps: DriverCaps,
+            ) -> Result<Box<dyn AgentDriver>, DriverError> {
+                let turn = Script::one_turn(vec![
+                    ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                        text: self.text.clone(),
+                        message_id: None,
+                    })),
+                    ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                        stop_reason: StopReason::EndTurn,
+                    })),
+                ]);
+                Ok(Box::new(
+                    FakeDriver::new(agent.name.clone(), caps, turn)
+                        .with_spec_slot(self.slot.clone()),
+                ))
+            }
+        }
+
+        /// A worker-role runtime over `isolator` and `verifier` whose agent echoes `text`.
+        fn runtime_over(
+            text: &str,
+            slot: &SpecSlot,
+            isolator: Arc<dyn Isolator>,
+            verifier: Arc<dyn Verifier>,
+        ) -> RunRuntime<Backend, Timed> {
+            let mut factory = DriverFactory::new();
+            factory.register(
+                "acp",
+                Box::new(Echoes {
+                    text: text.to_owned(),
+                    slot: slot.clone(),
+                }),
+            );
+            RunRuntime::with_parts(isolator, verifier, factory)
+                .with_author(Arc::new(OutputAuthor))
+                .with_role(Role::Worker)
+        }
+
+        /// [`runtime_over`] the fake isolator and verifier.
+        fn echoing(text: &str, slot: &SpecSlot) -> RunRuntime<Backend, Timed> {
+            runtime_over(
+                text,
+                slot,
+                Arc::new(FakeIsolator::new()),
+                Arc::new(FakeVerifier::new()),
+            )
+        }
+
+        /// A source over a provider resolving `pairs`, both kept for their counters.
+        fn source(pairs: &[(&str, &str)]) -> (Arc<FakeSecretProvider>, Arc<FakeSecretSource>) {
+            let provider = Arc::new(FakeSecretProvider::resolving(pairs));
+            let source = Arc::new(FakeSecretSource::new(
+                Arc::clone(&provider) as Arc<dyn htui_core::secret::SecretProvider>
+            ));
+            (provider, source)
+        }
+
+        fn dyn_source(source: &Arc<FakeSecretSource>) -> Arc<dyn SecretSource> {
+            Arc::clone(source) as Arc<dyn SecretSource>
+        }
+
+        /// `store`, already [`seeded`], on a `worker` box; `provider` gives the demo project an
+        /// Infisical scope.
+        async fn on_a_worker_box(store: MemStore, provider: bool) -> MemStore {
+            set_executor(&store, Executor::Worker).await;
+            if provider {
+                store.set_project_secret_columns(ids::PROJECT_HTUI, Some(INFISICAL), Some(SCOPE));
+            }
+            store
+        }
+
+        /// One sweep that claims a fresh queued run of `ANA-2` and walks it; every task settled.
+        async fn walked(runtime: &mut RunRuntime<Backend, Timed>, store: &MemStore) -> Run {
+            let run = queued(store, ids::HTUI_ANA_2, Utc::now()).await;
+            runtime.sweep_with(&Backend::memory(store.clone()), &Timed::new());
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+            store.run(run).await.expect("the read").expect("the run")
+        }
+
+        /// The run's first step.
+        async fn first_step(store: &MemStore, run: &Run) -> RunStep {
+            store
+                .run_steps(run.id)
+                .await
+                .expect("the read")
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("the run walked a step: {:?}", run.failure))
+        }
+
+        /// The env the session was handed.
+        fn env_of(slot: &SpecSlot) -> BTreeMap<String, String> {
+            slot.get().expect("the session started").env
+        }
+
+        /// MOD-10 D15: a runtime built `with_secret_source` hands it to every walk's
+        /// `RunSecrets`: the claimed run's session gets the resolved map.
+        #[tokio::test]
+        async fn with_secret_source_reaches_the_engine() {
+            let store = on_a_worker_box(seeded(MemStore::demo()).await, true).await;
+            let (provider, source) = source(&[("API_KEY", VALUE)]);
+            let slot = SpecSlot::default();
+            let mut runtime = echoing("hello", &slot).with_secret_source(dyn_source(&source));
+
+            let run = walked(&mut runtime, &store).await;
+
+            assert_eq!(run.status, RunStatus::AwaitingApproval, "{:?}", run.failure);
+            assert_eq!(
+                env_of(&slot),
+                BTreeMap::from([("API_KEY".to_owned(), VALUE.to_owned())])
+            );
+            assert_eq!((source.calls(), provider.resolves()), (1, 1));
+        }
+
+        /// MOD-61 (blueprint §D.5): a walked step whose agent echoes a resolved value, whose
+        /// primary repo is named with it (the trim record) and whose item body holds it (the
+        /// prompt) stores it only as `[REDACTED]`, read back from the store.
+        #[tokio::test]
+        async fn mod61_a_walked_step_stores_a_resolved_value_only_redacted() {
+            let store = seeded_with_primary(MemStore::demo(), VALUE).await;
+            let store = on_a_worker_box(store, true).await;
+            let row = store
+                .item(ids::HTUI_ANA_2)
+                .await
+                .expect("the read")
+                .expect("the item");
+            store
+                .update_item(
+                    ids::HTUI_ANA_2,
+                    row.version,
+                    ItemPatch {
+                        body: Some(format!("the token is {VALUE}, keep it")),
+                        author_id: row.created_by,
+                        reason: "a test's edit".to_owned(),
+                        ..ItemPatch::default()
+                    },
+                )
+                .await
+                .expect("the item's version is current");
+            let (_, source) = source(&[("API_KEY", VALUE)]);
+            let slot = SpecSlot::default();
+            let mut runtime = echoing(&format!("the key is {VALUE}, see"), &slot)
+                .with_secret_source(dyn_source(&source));
+
+            let run = walked(&mut runtime, &store).await;
+
+            assert_eq!(run.status, RunStatus::AwaitingApproval, "{:?}", run.failure);
+            assert_eq!(
+                env_of(&slot).get("API_KEY").map(String::as_str),
+                Some(VALUE),
+                "the session got the value, so the masks below are not vacuous"
+            );
+            let step = first_step(&store, &run).await;
+            let trim = step
+                .trim_record
+                .as_ref()
+                .expect("the step recorded its trim record")
+                .to_string();
+            assert!(!trim.contains(VALUE), "{trim}");
+            assert!(
+                trim.contains("[REDACTED]"),
+                "the repo slug was masked: {trim}"
+            );
+            let events = store
+                .step_events(step.id)
+                .await
+                .expect("the read")
+                .expect("the step recorded its session");
+            let rows: Vec<String> = events
+                .iter()
+                .map(|event| event.payload.to_string())
+                .collect();
+            assert!(rows.iter().all(|row| !row.contains(VALUE)), "{rows:?}");
+            let prompt = events
+                .iter()
+                .find(|event| event.seq == 0)
+                .expect("seq 0 is the prompt")
+                .payload
+                .to_string();
+            assert!(
+                prompt.contains("the token is [REDACTED], keep it"),
+                "{prompt}"
+            );
+            assert!(
+                rows.iter()
+                    .any(|row| row.contains("the key is [REDACTED], see")),
+                "the echo was recorded masked: {rows:?}"
+            );
+        }
+
+        /// MOD-62 (D19): the step's verify command prints its environment through the real
+        /// `ShellVerifier`; the stored `command_run.output` shows the environment and neither the
+        /// resolved value nor its key, while the agent's session did hold both.
+        #[tokio::test]
+        async fn mod62_a_verify_command_printing_its_environment_shows_no_resolved_value() {
+            let scratch = Scratch::new();
+            let mut data = demo_data();
+            // Names only, plus whether the one variable is set: a bare `env` or `set` prints every
+            // value of the test process, and a pattern-shaped one there (an exported
+            // `ANTHROPIC_API_KEY`) makes the verifier withhold the whole output. R1 L6: `awk`'s
+            // `ENVIRON` keys, not `env | cut`, which prints the continuation lines of a
+            // multi-line value. On Windows the `for /f` options are caret-escaped rather than
+            // quoted: Rust passes a `"` to `cmd /C` as `\"`, which cmd does not unescape.
+            let print_env = if cfg!(windows) {
+                format!(
+                    "(for /f delims^=^= %v in ('set') do @echo %v) & \
+                     (if defined {KEY} (echo resolved=set) else (echo resolved=unset))"
+                )
+            } else {
+                format!(
+                    "awk 'BEGIN{{for(k in ENVIRON) print k}}'; echo \"resolved=${{{KEY}-unset}}\""
+                )
+            };
+            for phase in &mut data.phases {
+                phase.verify_command = Some(print_env.clone());
+            }
+            let store = on_a_worker_box(seeded(MemStore::from_demo(data)).await, true).await;
+            // The fake roots each tree at `<root>/<repo id>` and creates nothing: the verify
+            // command runs in the primary's, so it must exist.
+            for repo in store.repos(ids::PROJECT_HTUI).await.expect("the read") {
+                std::fs::create_dir_all(scratch.0.join(repo.id.to_string()))
+                    .expect("the primary tree's directory");
+            }
+            let isolator = FakeIsolator::new();
+            isolator.root_trees_at(&scratch.0);
+            let verifier = ShellVerifier::new(
+                &BTreeMap::new(),
+                Arc::new(MinimalScrubber::new(std::iter::empty::<String>())),
+                Arc::new(SystemClock),
+            );
+            let (_, source) = source(&[(KEY, VALUE)]);
+            let slot = SpecSlot::default();
+            let mut runtime = runtime_over("done", &slot, Arc::new(isolator), Arc::new(verifier))
+                .with_secret_source(dyn_source(&source));
+
+            let run = walked(&mut runtime, &store).await;
+
+            assert_eq!(
+                env_of(&slot).get(KEY).map(String::as_str),
+                Some(VALUE),
+                "the agent's session held the value, so the test is not vacuous"
+            );
+            let step = first_step(&store, &run).await;
+            let rows = store.command_runs(step.id).await.expect("the read");
+            assert_eq!(rows.len(), 1, "one verify run: {rows:?}");
+            let output = rows[0].output.clone().unwrap_or_default();
+            assert!(
+                output.contains("PATH"),
+                "the command printed the environment: {output}"
+            );
+            assert!(!output.contains(VALUE), "{output}");
+            assert!(
+                output.contains("resolved=unset"),
+                "the verify child does not inherit the resolved key: {output}"
+            );
+            assert!(
+                !output.contains(KEY),
+                "the verifier's child never received the resolved map: {output}"
+            );
+        }
+
+        /// MOD-10 D12: a runtime without a source walks a provider-less project as before: to
+        /// its gate, with an empty env. One with a source never touches it for that project.
+        #[tokio::test]
+        async fn a_runtime_without_a_source_walks_a_provider_less_project_as_before() {
+            let store = on_a_worker_box(seeded(MemStore::demo()).await, false).await;
+            let slot = SpecSlot::default();
+            let mut runtime = echoing("hello", &slot);
+
+            let run = walked(&mut runtime, &store).await;
+
+            assert_eq!(run.status, RunStatus::AwaitingApproval, "{:?}", run.failure);
+            assert!(env_of(&slot).is_empty());
+
+            let store = on_a_worker_box(seeded(MemStore::demo()).await, false).await;
+            let (provider, source) = source(&[("API_KEY", VALUE)]);
+            let slot = SpecSlot::default();
+            let mut runtime = echoing("hello", &slot).with_secret_source(dyn_source(&source));
+
+            let run = walked(&mut runtime, &store).await;
+
+            assert_eq!(run.status, RunStatus::AwaitingApproval, "{:?}", run.failure);
+            assert!(env_of(&slot).is_empty());
+            assert_eq!((source.calls(), provider.resolves()), (0, 0));
+        }
+
+        /// MOD-10 D13: a provider project in a runtime with no source fails the run with the
+        /// refusal before any agent starts.
+        #[tokio::test]
+        async fn a_provider_project_without_a_source_fails_secrets_refused() {
+            let store = on_a_worker_box(seeded(MemStore::demo()).await, true).await;
+            let slot = SpecSlot::default();
+            let mut runtime = echoing("hello", &slot);
+
+            let run = walked(&mut runtime, &store).await;
+
+            assert_eq!(run.status, RunStatus::Failed);
+            assert_eq!(
+                run.failure,
+                Some(SecretError::Config(NO_SECRET_SOURCE.to_owned()).refusal())
+            );
+            assert!(slot.get().is_none(), "no session started");
+        }
+
+        /// R-SEC-2: the agent's env holds the resolved keys and nothing else: no htui variable,
+        /// no DSN, no Qdrant or Infisical setting.
+        #[tokio::test]
+        async fn r_sec_2_the_agent_env_holds_only_resolved_keys() {
+            let store = on_a_worker_box(seeded(MemStore::demo()).await, true).await;
+            let pairs = [
+                ("API_KEY", VALUE),
+                ("OTHER_TOKEN", "zq7-other-value-9876543210"),
+            ];
+            let (_, source) = source(&pairs);
+            let slot = SpecSlot::default();
+            let mut runtime = echoing("hello", &slot).with_secret_source(dyn_source(&source));
+
+            let run = walked(&mut runtime, &store).await;
+
+            assert_eq!(run.status, RunStatus::AwaitingApproval, "{:?}", run.failure);
+            let env = env_of(&slot);
+            let keys: BTreeSet<&str> = env.keys().map(String::as_str).collect();
+            assert_eq!(keys, pairs.iter().map(|(key, _)| *key).collect());
+            for key in keys {
+                assert!(!key.starts_with("HTUI_"), "{key}");
+                assert!(
+                    !["DATABASE_URL", "HTUI_TEST_DATABASE_URL"].contains(&key),
+                    "{key}"
+                );
+                assert!(
+                    !key.contains("QDRANT") && !key.contains("INFISICAL"),
+                    "{key}"
+                );
+            }
+        }
+
+        /// MOD-10 D14: each task's `Kit` is its walk's `RunSecrets`, so two claimed runs resolve
+        /// twice.
+        #[tokio::test]
+        async fn each_task_resolves_in_its_own_kit() {
+            let store = on_a_worker_box(seeded(MemStore::demo()).await, true).await;
+            let (provider, source) = source(&[("API_KEY", VALUE)]);
+            let slot = SpecSlot::default();
+            let mut runtime = echoing("hello", &slot).with_secret_source(dyn_source(&source));
+            let earlier = queued(&store, ids::HTUI_ANA_2, Utc::now() - TimeDelta::minutes(2)).await;
+            let later = queued(
+                &store,
+                ids::HTUI_CLEAN_1,
+                Utc::now() - TimeDelta::minutes(1),
+            )
+            .await;
+            let backend = Backend::memory(store.clone());
+            let sink = Timed::new();
+
+            runtime.sweep_with(&backend, &sink);
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+            let row = store
+                .run(earlier)
+                .await
+                .expect("the read")
+                .expect("the run");
+            assert_eq!(row.status, RunStatus::AwaitingApproval, "{:?}", row.failure);
+            store
+                .finish_run(earlier, RunStatus::Cancelled, None, Utc::now())
+                .await
+                .expect("the parked run is cancellable");
+            runtime.sweep_with(&backend, &sink);
+            assert!(runtime.settle(PATIENCE).await.is_empty());
+            let row = store.run(later).await.expect("the read").expect("the run");
+            assert_eq!(row.status, RunStatus::AwaitingApproval, "{:?}", row.failure);
+
+            assert_eq!((source.calls(), provider.resolves()), (2, 2));
+        }
     }
 }
 

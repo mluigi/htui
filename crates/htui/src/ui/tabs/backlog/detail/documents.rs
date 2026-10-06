@@ -34,7 +34,7 @@
 //!     not (the text stays, Ctrl+S tries again); the store allocates past every version, so this
 //!     write, landed, would be at or past the expected one and at or below the checked one;
 //!   - another's past the expected version: this write may be below it, and the pane cannot tell
-//!     ([`cannot_tell`]); the text stays.
+//!     (`cannot_tell`); the text stays.
 //!
 //!   The read goes through the store's writer, as the form's does, so it is never the mirror's
 //!   (round 1): offline it fails, and a failed check says it could not check.

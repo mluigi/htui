@@ -3035,6 +3035,7 @@ dependencies = [
  "htui-core",
  "htui-mcp",
  "htui-orch",
+ "htui-secrets",
  "htui-store",
  "htui-worker",
  "insta",

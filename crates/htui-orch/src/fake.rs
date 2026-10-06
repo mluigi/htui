@@ -39,6 +39,7 @@ use htui_core::model::{
     RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
+use htui_core::secret::SecretSource;
 use htui_core::store::{MemStore, ReadStore, Result, StoreError, WriteStore};
 use tokio::sync::{Notify, watch};
 use uuid::Uuid;
@@ -828,6 +829,7 @@ impl FakeVerifier {
             output: output.to_owned(),
             started_at: epoch(),
             finished_at: epoch(),
+            truncated: false,
         }
     }
 }
@@ -1653,6 +1655,10 @@ pub struct FakeOrchestrator {
     steal_before_tool_writes: AtomicBool,
     /// Every tool write's outcome, in order.
     tool_writes: Arc<Mutex<Vec<ToolWrite>>>,
+    /// MOD-10 D15: the secret source every `*_fake` engine's `RunSecrets` resolves through, or
+    /// none (a provider project is then refused). Carried by [`restarted`](Self::restarted): a
+    /// source is the machine's, like the keyring.
+    secret_source: Mutex<Option<Arc<dyn SecretSource>>>,
 }
 
 impl FakeOrchestrator {
@@ -1695,6 +1701,7 @@ impl FakeOrchestrator {
             tool_bodies: Mutex::new(BTreeMap::new()),
             steal_before_tool_writes: AtomicBool::new(false),
             tool_writes: Arc::new(Mutex::new(Vec::new())),
+            secret_source: Mutex::new(None),
         }
     }
 
@@ -1762,7 +1769,32 @@ impl FakeOrchestrator {
             tool_bodies: Mutex::new(BTreeMap::new()),
             steal_before_tool_writes: AtomicBool::new(false),
             tool_writes: Arc::new(Mutex::new(Vec::new())),
+            secret_source: Mutex::new(self.secret_source()),
         }
+    }
+
+    /// MOD-10 D15: every engine built over this harness from now on resolves a provider
+    /// project's secrets through `source` (one fresh `RunSecrets` per `*_fake` call, D14).
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    pub fn set_secret_source(&self, source: Arc<dyn SecretSource>) {
+        *self
+            .secret_source
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock") = Some(source);
+    }
+
+    /// The secret source `*_fake` hands each walk's `RunSecrets`, or `None`.
+    ///
+    /// # Panics
+    /// When a lock is poisoned, which no case does.
+    #[must_use]
+    pub fn secret_source(&self) -> Option<Arc<dyn SecretSource>> {
+        self.secret_source
+            .lock()
+            .expect("no panic holds the fake orchestrator's lock")
+            .clone()
     }
 
     /// MOD-11 D4, B-9: every engine built over this harness opens a lease on `tools` per session.

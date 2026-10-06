@@ -11,9 +11,12 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
+
+use crate::model::Project;
 
 /// The boxed future every [`SecretProvider`] method returns: the shape of `IsolatorFuture`
 /// (`htui-orch`) and `DriverFuture` (`htui-agent`), for the same reason. A provider is held as
@@ -374,6 +377,14 @@ pub enum SecretError {
         /// The key.
         key: String,
     },
+    /// A resolved key carries htui's reserved prefix (MOD-10 D16, OQ-B). Raised by
+    /// [`check_env`], never by a provider. Key names are not secret; a provider has already
+    /// refused a key that is not a valid environment name (`InvalidKey`).
+    #[error("the secret name `{key}` is reserved for htui; rename it in Infisical")]
+    ReservedKey {
+        /// The key.
+        key: String,
+    },
     /// Anything else: a non-JSON or ill-shaped body, an unexpected status, a redirect, or a
     /// token refused right after a fresh login.
     #[error("unexpected answer from Infisical at {endpoint}: {detail}")]
@@ -385,16 +396,363 @@ pub enum SecretError {
     },
 }
 
+impl SecretError {
+    /// MOD-10 D13: the one refusal sentence a run (`RunFailure::SecretsRefused`), an engine error
+    /// (`EngineError::Secrets`) and a chat print: `secrets_refused: <Display>`. Names the cause,
+    /// never a value (M2 D4).
+    #[must_use]
+    pub fn refusal(&self) -> String {
+        format!("secrets_refused: {self}")
+    }
+}
+
 /// `"; retry after {n} s"`, or nothing.
 fn retry_hint(secs: &Option<u64>) -> String {
     secs.map(|s| format!("; retry after {s} s"))
         .unwrap_or_default()
 }
 
+/// `project.secret_provider`'s value for Infisical (the only provider of this build). Equal to
+/// `htui_secrets::InfisicalProvider::KIND`, which `htui-core` cannot name.
+pub const INFISICAL: &str = "infisical";
+
+/// MOD-10 D16: a resolved key with this prefix, in any ASCII case (R1 L7: Windows environment
+/// names are case-insensitive), is refused: htui's own variables (`HTUI_MCP_*`, `HTUI_LOG*`,
+/// `HTUI_TOOL_*`) must never be shadowed by `SessionSpec.env`, which is applied last.
+pub const RESERVED_PREFIX: &str = "HTUI_";
+
+/// [`project_scope`]'s [`SecretError::Config`] sentence for a project that names a provider and
+/// no scope.
+pub const PROVIDER_WITHOUT_SCOPE: &str =
+    "the project names a secret provider but has no secret_scope";
+
+/// [`resolve_project`]'s [`SecretError::Config`] sentence for a provider project in a process
+/// that was given no [`SecretSource`].
+pub const NO_SECRET_SOURCE: &str =
+    "this process has no secret source, so the project's secrets cannot be resolved";
+
+/// [`project_scope`]'s [`SecretError::Config`] sentence for a provider this build does not know.
+/// `{:?}`, so a control character in the column is escaped.
+fn unknown_provider(provider: &str) -> String {
+    format!(
+        "project.secret_provider {provider:?} is not a provider this build knows (expected \
+         \"{INFISICAL}\")"
+    )
+}
+
+/// [`resolve_project`]'s [`SecretError::Config`] sentence for a source whose provider is not the
+/// kind the project's column names.
+fn kind_mismatch(kind: &str, column: &str) -> String {
+    format!("the secret source answered a `{kind}` provider for a `{column}` project")
+}
+
+/// MOD-10 D15: where a process gets its one provider per identity. Production is `htui`'s
+/// keyring-backed Infisical source; tests use `fake::FakeSecretSource`.
+pub trait SecretSource: Send + Sync + core::fmt::Debug {
+    /// The provider for the identity stored now. Called once per walk and per chat; an
+    /// implementation returns the **same** `Arc` while nothing it reads has changed, so the
+    /// provider's login latch and cool-down persist across walks (M2 D5).
+    fn provider(&self) -> SecretFuture<'_, Arc<dyn SecretProvider>>;
+}
+
+/// MOD-10 D12: the project's scope, or `None` when `secret_provider` is unset (the scope column is
+/// then ignored: the provider column is the switch).
+///
+/// # Errors
+///
+/// [`SecretError::Config`]: an unknown provider (named with `{:?}`, so a control character is
+/// escaped), a provider with no scope, or a scope [`SecretScope::parse`] refuses.
+pub fn project_scope(project: &Project) -> Result<Option<SecretScope>, SecretError> {
+    let Some(provider) = project.secret_provider.as_deref() else {
+        return Ok(None);
+    };
+    if provider != INFISICAL {
+        return Err(SecretError::Config(unknown_provider(provider)));
+    }
+    let Some(column) = project.secret_scope.as_deref() else {
+        return Err(SecretError::Config(PROVIDER_WITHOUT_SCOPE.to_owned()));
+    };
+    SecretScope::parse(column).map(Some)
+}
+
+/// MOD-10 D16: refuses the first key (map order) that starts with [`RESERVED_PREFIX`], compared
+/// without regard to ASCII case (R1 L7).
+///
+/// # Errors
+///
+/// [`SecretError::ReservedKey`].
+pub fn check_env(resolved: &ResolvedSecrets) -> Result<(), SecretError> {
+    match resolved.as_map().keys().find(|key| {
+        key.get(..RESERVED_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_PREFIX))
+    }) {
+        Some(key) => Err(SecretError::ReservedKey { key: key.clone() }),
+        None => Ok(()),
+    }
+}
+
+/// MOD-10 D12, D16 (blueprint A-7): the one resolution sequence the walk (`RunSecrets`) and the
+/// chat share. `Ok(None)` for a provider-less project, **without touching `source`**. Otherwise,
+/// in this order: [`project_scope`] (a column error never reads the keyring); a missing `source`
+/// is `Config`; `source.provider()`; a provider whose `kind()` is not the column's is `Config`;
+/// `provider.resolve(&scope)`; [`check_env`] (a refused map is dropped, so zeroized).
+///
+/// # Errors
+///
+/// [`SecretError::Config`] for a column fault, no source or a provider of another kind; the
+/// source's or the provider's own error; [`SecretError::ReservedKey`].
+pub fn resolve_project<'a>(
+    source: Option<&'a dyn SecretSource>,
+    project: &'a Project,
+) -> SecretFuture<'a, Option<ResolvedSecrets>> {
+    Box::pin(async move {
+        let Some(scope) = project_scope(project)? else {
+            return Ok(None);
+        };
+        let Some(source) = source else {
+            return Err(SecretError::Config(NO_SECRET_SOURCE.to_owned()));
+        };
+        let provider = source.provider().await?;
+        // `project_scope` answered a scope, so the column is set (and is `INFISICAL`).
+        let column = project.secret_provider.as_deref().unwrap_or(INFISICAL);
+        if provider.kind() != column {
+            return Err(SecretError::Config(kind_mismatch(provider.kind(), column)));
+        }
+        let resolved = provider.resolve(&scope).await?;
+        check_env(&resolved)?;
+        Ok(Some(resolved))
+    })
+}
+
+/// Test doubles for the seam (MOD-10 M3 D16): a scripted provider and a fixed source, both
+/// counting their calls. No tokio, no keyring, no HTTP. Built for `htui-core`'s own tests and,
+/// behind `test-support`, for `htui-orch`, `htui-worker` and `htui`.
+#[cfg(any(test, feature = "test-support"))]
+pub mod fake {
+    use std::collections::{BTreeMap, VecDeque};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+
+    use zeroize::Zeroize;
+
+    use super::{
+        INFISICAL, ProviderHealth, ResolvedSecrets, SecretError, SecretFuture, SecretProvider,
+        SecretScope, SecretSource,
+    };
+
+    /// One scripted answer: a map to wrap in [`ResolvedSecrets`], or the error to fail with.
+    type Answer = Result<BTreeMap<String, String>, SecretError>;
+
+    fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn wipe(answer: &mut Answer) {
+        if let Ok(map) = answer {
+            for value in map.values_mut() {
+                value.zeroize();
+            }
+        }
+    }
+
+    /// The script and the answer it repeats once spent, under one lock.
+    struct Script {
+        queue: VecDeque<Answer>,
+        last: Option<Answer>,
+    }
+
+    impl Script {
+        /// The answer the next `resolve` gives, without spending it.
+        fn peek(&self) -> Answer {
+            self.queue
+                .front()
+                .or(self.last.as_ref())
+                .cloned()
+                .unwrap_or_else(|| Err(no_scripted_answer()))
+        }
+
+        /// The next answer; the last one repeats once the queue is spent.
+        fn next(&mut self) -> Answer {
+            match self.queue.pop_front() {
+                Some(answer) => {
+                    if let Some(mut old) = self.last.replace(answer.clone()) {
+                        wipe(&mut old);
+                    }
+                    answer
+                }
+                None => self
+                    .last
+                    .clone()
+                    .unwrap_or_else(|| Err(no_scripted_answer())),
+            }
+        }
+    }
+
+    impl Drop for Script {
+        fn drop(&mut self) {
+            self.queue.iter_mut().for_each(wipe);
+            if let Some(last) = self.last.as_mut() {
+                wipe(last);
+            }
+        }
+    }
+
+    fn no_scripted_answer() -> SecretError {
+        SecretError::Protocol {
+            endpoint: "fake",
+            detail: "no scripted answer".to_owned(),
+        }
+    }
+
+    /// A provider answering a script, one answer per `resolve`; the last answer repeats once the
+    /// script is spent; an empty script answers
+    /// `Protocol { endpoint: "fake", detail: "no scripted answer" }`. `list_keys` is the next
+    /// `resolve`'s keys (it neither spends nor counts an answer); `health` is `Ok`
+    /// (`base_url: "fake://"`, `server_ok: true`). `Debug` prints the kind and the counters, never
+    /// a value.
+    pub struct FakeSecretProvider {
+        kind: &'static str,
+        script: Mutex<Script>,
+        resolves: AtomicUsize,
+        scopes: Mutex<Vec<SecretScope>>,
+    }
+
+    impl FakeSecretProvider {
+        /// A provider of kind [`INFISICAL`] answering `script` in order.
+        pub fn new(script: impl IntoIterator<Item = Answer>) -> Self {
+            Self {
+                kind: INFISICAL,
+                script: Mutex::new(Script {
+                    queue: script.into_iter().collect(),
+                    last: None,
+                }),
+                resolves: AtomicUsize::new(0),
+                scopes: Mutex::new(Vec::new()),
+            }
+        }
+
+        /// One `Ok` answer holding `pairs` (repeated for every `resolve`).
+        pub fn resolving(pairs: &[(&str, &str)]) -> Self {
+            Self::new([Ok(pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect())])
+        }
+
+        /// One `Err` answer (repeated for every `resolve`).
+        pub fn failing(error: SecretError) -> Self {
+            Self::new([Err(error)])
+        }
+
+        /// The same provider, reporting `kind` (default [`INFISICAL`]).
+        #[must_use]
+        pub fn with_kind(mut self, kind: &'static str) -> Self {
+            self.kind = kind;
+            self
+        }
+
+        /// How many times `resolve` was called.
+        pub fn resolves(&self) -> usize {
+            self.resolves.load(Ordering::SeqCst)
+        }
+
+        /// The scopes `resolve` was called with, in call order.
+        pub fn scopes(&self) -> Vec<SecretScope> {
+            lock(&self.scopes).clone()
+        }
+    }
+
+    impl core::fmt::Debug for FakeSecretProvider {
+        /// `FakeSecretProvider { kind: "infisical", scripted: 1, resolves: 0 }`: no value.
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("FakeSecretProvider")
+                .field("kind", &self.kind)
+                .field("scripted", &lock(&self.script).queue.len())
+                .field("resolves", &self.resolves())
+                .finish()
+        }
+    }
+
+    impl SecretProvider for FakeSecretProvider {
+        fn kind(&self) -> &'static str {
+            self.kind
+        }
+
+        fn health(&self) -> SecretFuture<'_, ProviderHealth> {
+            Box::pin(async {
+                Ok(ProviderHealth {
+                    base_url: "fake://".to_owned(),
+                    server_ok: true,
+                })
+            })
+        }
+
+        fn list_keys<'a>(&'a self, _scope: &'a SecretScope) -> SecretFuture<'a, Vec<String>> {
+            let answer = lock(&self.script).peek().map(ResolvedSecrets::new);
+            Box::pin(async move { answer.map(|resolved| resolved.keys()) })
+        }
+
+        fn resolve<'a>(&'a self, scope: &'a SecretScope) -> SecretFuture<'a, ResolvedSecrets> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            lock(&self.scopes).push(scope.clone());
+            let answer = lock(&self.script).next().map(ResolvedSecrets::new);
+            Box::pin(async move { answer })
+        }
+    }
+
+    /// A source answering one fixed provider (or one fixed error) and counting its calls.
+    pub struct FakeSecretSource {
+        answer: Result<Arc<dyn SecretProvider>, SecretError>,
+        calls: AtomicUsize,
+    }
+
+    impl FakeSecretSource {
+        /// A source answering `provider` on every call.
+        pub fn new(provider: Arc<dyn SecretProvider>) -> Self {
+            Self {
+                answer: Ok(provider),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        /// A source failing every call with `error` (a keyring with no identity, say).
+        pub fn failing(error: SecretError) -> Self {
+            Self {
+                answer: Err(error),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        /// How many times `provider` was called.
+        pub fn calls(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl core::fmt::Debug for FakeSecretSource {
+        /// The provider's kind or the error's variant sentence, and the call count: no value.
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            let mut out = f.debug_struct("FakeSecretSource");
+            match &self.answer {
+                Ok(provider) => out.field("provider", &provider.kind()),
+                Err(error) => out.field("error", &error.to_string()),
+            };
+            out.field("calls", &self.calls()).finish()
+        }
+    }
+
+    impl SecretSource for FakeSecretSource {
+        fn provider(&self) -> SecretFuture<'_, Arc<dyn SecretProvider>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let answer = self.answer.clone();
+            Box::pin(async move { answer })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
-    use std::sync::Arc;
 
     use super::*;
 
@@ -743,6 +1101,7 @@ mod tests {
             SecretError::UnsupportedServer { .. } => "UnsupportedServer",
             SecretError::InvalidKey { .. } => "InvalidKey",
             SecretError::InvalidValue { .. } => "InvalidValue",
+            SecretError::ReservedKey { .. } => "ReservedKey",
             SecretError::Protocol { .. } => "Protocol",
         }
     }
@@ -784,6 +1143,9 @@ mod tests {
             SecretError::InvalidValue {
                 key: "NUL_KEY".into(),
             },
+            SecretError::ReservedKey {
+                key: "HTUI_LOG".into(),
+            },
             SecretError::Protocol {
                 endpoint: "/api/v4/secrets",
                 detail: free_text,
@@ -801,10 +1163,10 @@ mod tests {
         let names: BTreeSet<&'static str> = all.iter().map(variant).collect();
         assert_eq!(
             names.len(),
-            15,
+            16,
             "every_variant() misses or repeats a variant"
         );
-        assert_eq!(all.len(), 15, "every_variant() repeats a variant");
+        assert_eq!(all.len(), 16, "every_variant() repeats a variant");
 
         for e in &all {
             let name = variant(e);
@@ -816,7 +1178,9 @@ mod tests {
                 | SecretError::PermissionDenied { .. }
                 | SecretError::Protocol { .. } => {}
                 // Key-carrying variants print their key and nothing else of the secret.
-                SecretError::InvalidKey { key } | SecretError::InvalidValue { key } => {
+                SecretError::InvalidKey { key }
+                | SecretError::InvalidValue { key }
+                | SecretError::ReservedKey { key } => {
                     assert!(
                         display.contains(key.as_str()),
                         "{name} does not name its key"
@@ -922,5 +1286,412 @@ mod tests {
         // The futures cross threads: a provider is shared by the worker's tasks.
         fn assert_send<T: Send>(_: &T) {}
         assert_send(&provider.resolve(&scope));
+    }
+
+    // ---- MOD-10 M3 T3 (D12, D15, D16; blueprint A-7) -------------------------------------
+
+    use crate::model::{Project, ProjectId, UserId};
+    use fake::{FakeSecretProvider, FakeSecretSource};
+
+    const SCOPE_COLUMN: &str = r#"{"project_id":"p1","environment":"dev","path":"/app"}"#;
+
+    fn project(provider: Option<&str>, scope: Option<&str>) -> Project {
+        let now = chrono::Utc::now();
+        Project {
+            id: ProjectId::new(),
+            slug: "p".to_owned(),
+            name: "P".to_owned(),
+            description: String::new(),
+            secret_provider: provider.map(str::to_owned),
+            secret_scope: scope.map(str::to_owned),
+            settings: serde_json::json!({}),
+            created_by: UserId::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn infisical(scope: Option<&str>) -> Project {
+        project(Some(INFISICAL), scope)
+    }
+
+    fn the_scope() -> SecretScope {
+        SecretScope::parse(SCOPE_COLUMN).expect("the test scope parses")
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn config<T: core::fmt::Debug>(result: Result<T, SecretError>) -> String {
+        match result {
+            Err(SecretError::Config(sentence)) => sentence,
+            other => panic!("expected Config, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn project_scope_is_none_without_a_provider() {
+        for scope in [None, Some("not json at all"), Some(SCOPE_COLUMN)] {
+            assert_eq!(
+                project_scope(&project(None, scope)),
+                Ok(None),
+                "the provider column is the switch (scope {scope:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn project_scope_parses_an_infisical_scope() {
+        assert_eq!(
+            project_scope(&infisical(Some(SCOPE_COLUMN))),
+            Ok(Some(the_scope()))
+        );
+    }
+
+    #[test]
+    fn project_scope_refuses_an_unknown_provider_and_escapes_it() {
+        assert_eq!(
+            config(project_scope(&project(Some("vault"), Some(SCOPE_COLUMN)))),
+            r#"project.secret_provider "vault" is not a provider this build knows (expected "infisical")"#
+        );
+        let sentence = config(project_scope(&project(
+            Some("inf\u{1b}[31m"),
+            Some(SCOPE_COLUMN),
+        )));
+        assert_eq!(
+            sentence,
+            r#"project.secret_provider "inf\u{1b}[31m" is not a provider this build knows (expected "infisical")"#
+        );
+        assert!(
+            !sentence.chars().any(char::is_control),
+            "a raw control character reached the sentence: {sentence:?}"
+        );
+        // Case matters: the column holds the provider's `kind()` verbatim.
+        config(project_scope(&project(
+            Some("Infisical"),
+            Some(SCOPE_COLUMN),
+        )));
+    }
+
+    #[test]
+    fn project_scope_refuses_a_provider_without_a_scope() {
+        assert_eq!(
+            config(project_scope(&infisical(None))),
+            PROVIDER_WITHOUT_SCOPE
+        );
+        assert_eq!(
+            SecretError::Config(PROVIDER_WITHOUT_SCOPE.to_owned()).to_string(),
+            "secret provider configuration: the project names a secret provider but has no \
+             secret_scope"
+        );
+    }
+
+    #[test]
+    fn project_scope_refuses_an_unparsable_scope() {
+        let sentence = config(project_scope(&infisical(Some("p1/dev"))));
+        assert!(
+            sentence.starts_with("the secret scope is not valid: "),
+            "unexpected sentence: {sentence}"
+        );
+        assert_eq!(
+            config(project_scope(&infisical(Some(
+                r#"{"project_id":"p1","environment":"dev","path":"app"}"#
+            )))),
+            "the secret scope path must start with `/`"
+        );
+    }
+
+    #[test]
+    fn check_env_refuses_a_reserved_key_and_names_it() {
+        let resolved = ResolvedSecrets::new(map(&[
+            ("API_KEY", "v1"),
+            ("HTUI_MCP_TOKEN", "v2"),
+            ("HTUI_ZZZ", "v3"),
+        ]));
+        let err = check_env(&resolved).expect_err("a reserved key is refused");
+        assert_eq!(
+            err,
+            SecretError::ReservedKey {
+                key: "HTUI_MCP_TOKEN".into()
+            },
+            "the first reserved key in map order is named"
+        );
+        assert_eq!(
+            err.to_string(),
+            "the secret name `HTUI_MCP_TOKEN` is reserved for htui; rename it in Infisical"
+        );
+    }
+
+    /// MOD-10 R1 L7: Windows environment names are case-insensitive, so `htui_log` there is
+    /// `HTUI_LOG`; the prefix is matched without regard to ASCII case.
+    #[test]
+    fn check_env_is_case_insensitive() {
+        for key in ["htui_x", "Htui_Log", "hTuI_MCP_TOKEN"] {
+            let resolved = ResolvedSecrets::new(map(&[("API_KEY", "v1"), (key, "v2")]));
+            assert_eq!(
+                check_env(&resolved),
+                Err(SecretError::ReservedKey { key: key.into() }),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_env_needs_the_prefix_with_its_underscore_at_the_start() {
+        let resolved = ResolvedSecrets::new(map(&[
+            ("HTUIX", "v"),
+            ("htuix", "v"),
+            ("MY_HTUI_X", "v"),
+            ("HTUI", "v"),
+            ("htui", "v"),
+            ("ÉHTUI_X", "v"),
+        ]));
+        assert_eq!(check_env(&resolved), Ok(()));
+    }
+
+    #[test]
+    fn check_env_accepts_an_empty_map() {
+        assert_eq!(check_env(&ResolvedSecrets::new(BTreeMap::new())), Ok(()));
+    }
+
+    #[test]
+    fn secret_error_refusal_prefixes_the_display() {
+        assert_eq!(
+            SecretError::BadCredentials.refusal(),
+            "secrets_refused: Infisical refused the machine identity's login: the client ID or \
+             client secret is wrong, expired or used up"
+        );
+        for e in every_variant() {
+            assert_eq!(e.refusal(), format!("secrets_refused: {e}"));
+        }
+    }
+
+    fn source_of(provider: FakeSecretProvider) -> FakeSecretSource {
+        FakeSecretSource::new(Arc::new(provider))
+    }
+
+    #[tokio::test]
+    async fn resolve_project_never_touches_the_source_without_a_provider() {
+        let source = source_of(FakeSecretProvider::resolving(&[("A", "va")]));
+        for scope in [None, Some("garbage")] {
+            let got = resolve_project(Some(&source), &project(None, scope))
+                .await
+                .expect("a provider-less project resolves to nothing");
+            assert!(got.is_none(), "a provider-less project got a map");
+        }
+        let got = resolve_project(None, &project(None, None))
+            .await
+            .expect("no source is fine without a provider");
+        assert!(got.is_none(), "a provider-less project got a map");
+        assert_eq!(source.calls(), 0, "the source was asked for a provider");
+    }
+
+    #[tokio::test]
+    async fn resolve_project_refuses_a_column_fault_before_the_source() {
+        let source = source_of(FakeSecretProvider::resolving(&[("A", "va")]));
+        for bad in [
+            project(Some("vault"), Some(SCOPE_COLUMN)),
+            infisical(None),
+            infisical(Some("p1/dev")),
+        ] {
+            let want = config(project_scope(&bad));
+            assert_eq!(
+                config(resolve_project(Some(&source), &bad).await),
+                want,
+                "resolve_project refuses with project_scope's sentence"
+            );
+        }
+        assert_eq!(source.calls(), 0, "a column fault read the source");
+    }
+
+    #[tokio::test]
+    async fn resolve_project_refuses_without_a_source() {
+        assert_eq!(
+            config(resolve_project(None, &infisical(Some(SCOPE_COLUMN))).await),
+            NO_SECRET_SOURCE
+        );
+        assert_eq!(
+            NO_SECRET_SOURCE,
+            "this process has no secret source, so the project's secrets cannot be resolved"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_project_refuses_a_provider_of_another_kind() {
+        let provider = Arc::new(FakeSecretProvider::resolving(&[("A", "va")]).with_kind("vault"));
+        let source = FakeSecretSource::new(provider.clone());
+        assert_eq!(
+            config(resolve_project(Some(&source), &infisical(Some(SCOPE_COLUMN))).await),
+            "the secret source answered a `vault` provider for a `infisical` project"
+        );
+        assert_eq!(source.calls(), 1);
+        assert_eq!(
+            provider.resolves(),
+            0,
+            "a foreign provider was asked to resolve"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_project_passes_a_provider_error_through() {
+        let source = source_of(FakeSecretProvider::failing(SecretError::BadCredentials));
+        assert_eq!(
+            resolve_project(Some(&source), &infisical(Some(SCOPE_COLUMN)))
+                .await
+                .map(|r| r.map(|r| r.keys())),
+            Err(SecretError::BadCredentials)
+        );
+        // A source that cannot build its provider refuses the same way.
+        let broken = FakeSecretSource::failing(SecretError::NoIdentity);
+        assert_eq!(
+            resolve_project(Some(&broken), &infisical(Some(SCOPE_COLUMN)))
+                .await
+                .map(|r| r.map(|r| r.keys())),
+            Err(SecretError::NoIdentity)
+        );
+        assert_eq!(broken.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_project_refuses_a_reserved_key_from_the_provider() {
+        let source = source_of(FakeSecretProvider::resolving(&[
+            ("API_KEY", "va"),
+            ("HTUI_LOG", "vb"),
+        ]));
+        assert_eq!(
+            resolve_project(Some(&source), &infisical(Some(SCOPE_COLUMN)))
+                .await
+                .map(|r| r.map(|r| r.keys())),
+            Err(SecretError::ReservedKey {
+                key: "HTUI_LOG".into()
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_project_returns_the_map_and_the_scope_reached_the_provider() {
+        let provider = Arc::new(FakeSecretProvider::resolving(&[("A", "va"), ("B", "vb")]));
+        let source = FakeSecretSource::new(provider.clone());
+        let resolved = resolve_project(Some(&source), &infisical(Some(SCOPE_COLUMN)))
+            .await
+            .expect("the provider answers")
+            .expect("an Infisical project resolves");
+        assert!(
+            resolved.as_map() == &map(&[("A", "va"), ("B", "vb")]),
+            "the resolved map is not the provider's"
+        );
+        assert_eq!(provider.scopes(), vec![the_scope()]);
+        assert_eq!(provider.resolves(), 1);
+        assert_eq!(source.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_fakes_count_and_repeat_the_last_answer() {
+        let provider = FakeSecretProvider::new([
+            Ok(map(&[("A", "va")])),
+            Err(SecretError::RateLimited {
+                retry_after_secs: None,
+            }),
+        ]);
+        assert_eq!(provider.kind(), INFISICAL);
+        let scope = the_scope();
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            answers.push(provider.resolve(&scope).await.map(|r| r.keys()));
+        }
+        let limited = Err(SecretError::RateLimited {
+            retry_after_secs: None,
+        });
+        assert_eq!(
+            answers,
+            vec![Ok(vec!["A".to_owned()]), limited.clone(), limited]
+        );
+        assert_eq!(provider.resolves(), 3);
+        assert_eq!(provider.scopes(), vec![scope.clone(); 3]);
+        assert_eq!(
+            provider.health().await,
+            Ok(ProviderHealth {
+                base_url: "fake://".to_owned(),
+                server_ok: true,
+            })
+        );
+
+        let empty = FakeSecretProvider::new([]);
+        assert_eq!(
+            empty.resolve(&scope).await.map(|r| r.keys()),
+            Err(SecretError::Protocol {
+                endpoint: "fake",
+                detail: "no scripted answer".into(),
+            })
+        );
+
+        // `list_keys` is the next `resolve`'s keys, and neither counts nor spends it.
+        let listing = FakeSecretProvider::resolving(&[("B", "vb"), ("A", "va")]);
+        assert_eq!(
+            listing.list_keys(&scope).await,
+            Ok(vec!["A".to_owned(), "B".to_owned()])
+        );
+        assert_eq!(listing.resolves(), 0);
+
+        let source = source_of(FakeSecretProvider::resolving(&[]));
+        for _ in 0..2 {
+            let provider = source.provider().await.expect("the fixed provider");
+            assert_eq!(provider.kind(), INFISICAL);
+        }
+        assert_eq!(source.calls(), 2);
+        let failing = FakeSecretSource::failing(SecretError::NoIdentity);
+        assert_eq!(
+            failing.provider().await.map(|p| p.kind()),
+            Err(SecretError::NoIdentity)
+        );
+        assert_eq!(failing.calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_fakes_never_print_a_value() {
+        let provider = Arc::new(FakeSecretProvider::new([
+            Ok(map(&[("A", VALUE)])),
+            Ok(map(&[("B", SECRET)])),
+        ]));
+        let source = FakeSecretSource::new(provider.clone());
+        let before = format!("{provider:?} {source:?}");
+        provider
+            .resolve(&the_scope())
+            .await
+            .expect("the scripted answer");
+        let after = format!("{provider:?} {source:?}");
+        for debug in [before, after] {
+            assert!(
+                !carries_a_sentinel(&debug),
+                "a fake's Debug prints a value: {debug}"
+            );
+            assert!(
+                debug.contains(INFISICAL),
+                "a fake's Debug does not name its kind: {debug}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_is_usable_as_arc_dyn_and_send() {
+        let source: Arc<dyn SecretSource> =
+            Arc::new(source_of(FakeSecretProvider::resolving(&[("A", "va")])));
+        let project = infisical(Some(SCOPE_COLUMN));
+
+        fn assert_send<T: Send>(_: &T) {}
+        fn assert_send_sync<T: Send + Sync + ?Sized>(_: &T) {}
+        assert_send_sync(&*source);
+        let future = resolve_project(Some(source.as_ref()), &project);
+        assert_send(&future);
+        let resolved = future
+            .await
+            .expect("the provider answers")
+            .expect("an Infisical project resolves");
+        assert_eq!(resolved.keys(), vec!["A".to_owned()]);
+        assert_send(&source.provider());
     }
 }

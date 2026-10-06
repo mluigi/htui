@@ -581,8 +581,8 @@ const RESUME_TEXT: &str = "parked by an interrupted command: u resumes it";
 const INTERRUPTED_TEXT: &str = "interrupted";
 
 /// The waiting-on-you list over one candidate read (MOD-69 plan D1-D5, D9), with the engine's own
-/// guards: [`selectable_slots`] (`verdicts`' own `select` with no live chat; heads feed only
-/// approve/accept/open, plan D3) decides a slot's `select`, one [`unblock_case`] per candidate the
+/// guards: `selectable_slots` (`verdicts`' own `select` with no live chat; heads feed only
+/// approve/accept/open, plan D3) decides a slot's `select`, one `unblock_case` per candidate the
 /// item's `u`, step status a gate, and a parked run none of them lists is an Interrupted row
 /// (review H1). `permissions` is `None` offline or when the permission read failed (review L4).
 /// `active` is `Backend::active_runs` over the same scope.

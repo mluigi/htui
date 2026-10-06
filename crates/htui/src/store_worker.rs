@@ -32,6 +32,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
+use htui_core::secret::SecretSource;
 use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
     WriteStore,
@@ -2183,16 +2184,25 @@ pub fn spawn_with(
 /// [`spawn_with`] hosting htui's MCP tools (MOD-11 D11): with `tools`, the chat runtime and the
 /// run runtime open their leases on the one host, and the loop hands it the current writable
 /// backend at the top of every iteration (B-2, `host_the_backend`), so a session opened after a
-/// `SetDsn` writes to the new server. `None` is [`spawn_with`] exactly.
+/// `SetDsn` writes to the new server.
+///
+/// With `secrets` (MOD-10 D15), the chat runtime and the run runtime resolve provider projects'
+/// secrets through the one source, so a provider's login latch and cool-down are the process's,
+/// not one runtime's. `None` for both is [`spawn_with`] exactly.
 pub fn spawn_hosted(
     started: Started,
     rx: mpsc::UnboundedReceiver<RequestEnvelope>,
     tx: mpsc::UnboundedSender<ReplyEnvelope>,
     runtime: AgentRuntime,
     tools: Option<Arc<htui_mcp::McpHost<Backend>>>,
+    secrets: Option<Arc<dyn SecretSource>>,
 ) -> tokio::task::JoinHandle<()> {
     let mut runtime = runtime;
     let mut runs = crate::run_worker::production_for(&started.backend);
+    if let Some(source) = &secrets {
+        runtime = runtime.with_secret_source(Arc::clone(source));
+        runs = runs.with_secret_source(Arc::clone(source));
+    }
     if let Some(host) = &tools {
         (runtime, runs) = host_the_runtimes(runtime, runs, host);
     }
@@ -5595,6 +5605,7 @@ mod tests {
             rep_tx,
             AgentRuntime::production(),
             Some(Arc::clone(&host)),
+            None,
         );
 
         drop(req_tx);

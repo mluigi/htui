@@ -36,6 +36,7 @@ pub mod provision;
 pub mod qdrant_settings_info;
 pub mod requirements;
 pub mod run_worker;
+pub(crate) mod secrets;
 pub mod skill_import;
 pub mod skills;
 pub mod store_worker;
@@ -164,6 +165,10 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
             None
         }
     };
+    // MOD-10 D15: one secret source for the TUI's walks and chats, so they share each
+    // provider's login latch. Building it reads nothing: the keyring is read per walk and chat.
+    let secrets: Arc<dyn htui_core::secret::SecretSource> =
+        Arc::new(secrets::KeyringInfisical::new());
     // The backend moves into the worker here and is unreachable from the UI afterwards (D4).
     // MOD-7 D11: the binary, and only the binary, opts in to the registration probe.
     let worker = store_worker::spawn_hosted(
@@ -172,6 +177,7 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
         reply_tx,
         AgentRuntime::production().with_registration_probe(),
         tools,
+        Some(secrets),
     );
 
     let mut app = App::new(request_tx, Keymap::default_global());

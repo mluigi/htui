@@ -164,8 +164,21 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   fail-closed validation, https except loopback, no redirects, body caps, a cancel-safe single-flight
   login with a permanent 401 latch and a 30 s cool-down after an unanswered login). Operator page
   `docs/htui-secrets.md`. Plan `.claude/plans/mod-10-m2-infisical-provider.plan.md`; the env-gated
-  live test against the maintainer's self-hosted Infisical is still to be run. Remaining: M3 run-start
-  injection (owns the MOD-61/MOD-62 tests and the carry-overs in the PRD), M4 Settings section.
+  live test against the maintainer's self-hosted Infisical is still to be run.
+  **Phase 3 landed (`f8d26e35`..`a4f9ab7e`, 2026-10-06):** run-start injection. One per-walk
+  `htui_orch::secrets::RunSecrets` is both the walk's scrubber and its env source, so the two cannot
+  drift. It resolves lazily, once per walk, at the first live step, fan-out group or judge (and before
+  an accept's verify). The agent gets exactly the resolved map as `SessionSpec.env`; a provider-less
+  project never touches the keyring. Any failure is `secrets_refused: <cause>` and fails the run before
+  a driver starts (transient causes too, no retry). Chats resolve in their own task and leave no run
+  row on refusal. `HTUI_`-prefixed keys (any case) are refused. One `KeyringInfisical` per process
+  (TUI and `htui worker`) shares the 401 latch, with a 120 s keyring timeout. Scrubber carry-overs:
+  escaped token starts, newline-free and multi-line forms, zeroize on drop, and a hold-back seam at the
+  16 KiB flush (residuals in `docs/htui-secrets.md`). The verify output and agent error text are
+  re-masked with the walk's scrubber. MOD-61 and MOD-62 tests landed. `Engine::dispatch` arms are boxed
+  for debug-build stack headroom. Plan `.claude/plans/mod-10-m3-run-start-injection.plan.md`. Host
+  steps still owed before merge: `scripts/scrub-audit.sql` (OQ-D) and the M2 live Infisical test.
+  Remaining: M4 Settings section.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The

@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 
 use regex::{Regex, RegexSet};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 /// What every masked occurrence is replaced with.
 ///
@@ -66,12 +67,18 @@ const PATTERN_RULES: &[(&str, &str)] = &[
     ),
 ];
 
-/// An ASCII token start: the string start, or one character that is not `[A-Za-z0-9_]` (D1).
+/// A token start (MOD-10 D1, D17): the string start, one character that is not
+/// `[A-Za-z0-9_]`, or a JSON / percent escape whose last character is a letter or digit: `\n`,
+/// `\r`, `\t`, `\b`, `\f`, `\"`, `\/`, `\\`, `\uXXXX` and `%XX`. A key serialised inside an
+/// escaped string (`…\nsk-ant-…`, `%22ghp_…`) is therefore a whole token, while `subtask-…` and
+/// `x%2Fsk-learn` stay prose (the latter is too short for any rule). It widens what fails closed;
+/// `scripts/scrub-audit.sql` mirrors it (OQ-D: the host audit runs before merge).
 ///
-/// `subtask-…` is therefore not an `sk-` credential while `Bearer sk-…`, `--sk-…` and
-/// `[REDACTED]sk-…` are. A non-ASCII letter before a key (`éAKIA…`) also counts as a token start,
-/// which errs towards failing closed.
-const TOKEN_START: &str = r"(?:^|[^A-Za-z0-9_])";
+/// `Bearer sk-…`, `--sk-…` and `[REDACTED]sk-…` are token starts too. A non-ASCII letter before a
+/// key (`éAKIA…`) also counts, which errs towards failing closed. The `\"`, `\/` and `\\`
+/// alternatives are redundant with `[^A-Za-z0-9_]` (the backslash before them already is one) and
+/// are kept so the constant reads as the escape list D17 names.
+const TOKEN_START: &str = r#"(?:^|[^A-Za-z0-9_]|\\[nrtbf"/\\]|\\u[0-9A-Fa-f]{4}|%[0-9A-Fa-f]{2})"#;
 
 /// [`PATTERN_RULES`] compiled once per process, index for index.
 static PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
@@ -134,6 +141,20 @@ const PEM_RULE: &str = "private_key_pem";
 /// spells `PRIVATE KEY` in capitals in prose, which fails closed.
 const PEM_MARKER: &str = "PRIVATE KEY";
 
+/// The longest not-yet-matching prefix any pattern rule can leave at the end of a text, plus the
+/// longest token start in front of it (MOD-10 D18, blueprint A-4): `pypi_token`'s minimum match
+/// is 70 bytes (`pypi-AgEIcHlwaS5vcmc` + 50) and `\uXXXX` is 6. A text cut at least
+/// `PATTERN_HOLD_BACK - 1` bytes before its end therefore never splits a credential of a rule
+/// whose only unbounded part comes last. A rule whose minimum grows must grow this.
+///
+/// Two rules fall outside that bound. `jwt` only matches once its third segment arrives and its
+/// first two segments are unbounded, so a JWT's not-yet-matching prefix has no length limit (its
+/// 38-byte minimum match bounds nothing here). `openai_api_key` is confirmed over its whole
+/// `sk-` body, so a prose-shaped body longer than the bound is clean until a later segment
+/// confirms it. Both are residuals of the recorder's flush seam, not regressions on a cut at the
+/// bound.
+pub const PATTERN_HOLD_BACK: usize = 76;
+
 /// Masks known secrets in a payload and reports anything credential-shaped that survived.
 ///
 /// The seam MOD-10 replaces: the recorder holds a `&dyn Scrubber` and never names an
@@ -148,6 +169,14 @@ pub trait Scrubber: Send + Sync + core::fmt::Debug {
     /// the value rather than persist it: a scrubber that could not mask something never lets it
     /// reach a store (`R-SEC-3`).
     fn scrub(&self, value: &mut Value) -> Result<(), Unmasked>;
+
+    /// MOD-10 D18: how many trailing bytes of an open text run a size-triggered cut must keep
+    /// open, so that a secret or a credential still arriving is not split across two rows
+    /// (within [`PATTERN_HOLD_BACK`]'s bound: `jwt` and a prose-shaped `sk-` body can exceed it).
+    /// `0` (the default) keeps the recorder's cut at the bound exactly, as before MOD-10 M3.
+    fn hold_back(&self) -> usize {
+        0
+    }
 }
 
 /// A string leaf still matched a credential rule after masking.
@@ -180,9 +209,10 @@ pub struct Unmasked {
 ///    a PEM private-key marker; the first survivor is returned as [`Unmasked`], which blocks the
 ///    write.
 ///
-/// A pattern rule is a known prefix plus a charset plus a minimum length, and counts only at an
-/// ASCII token start (string start, or after a character that is not `[A-Za-z0-9_]`), so
-/// `subtask-list` and `sk-learn` are not credentials while `Bearer sk-ant-api03-…` is.
+/// A pattern rule is a known prefix plus a charset plus a minimum length, and counts only at a
+/// token start (string start, after a character that is not `[A-Za-z0-9_]`, or after a JSON or
+/// percent escape such as `\n` or `%22`: `TOKEN_START`), so `subtask-list` and `sk-learn` are
+/// not credentials while `Bearer sk-ant-api03-…` and `…\nsk-ant-api03-…` are.
 /// Numbers and booleans are structural and are never rewritten; strings are masked and scanned
 /// wherever they appear, as a value or as a key.
 pub struct MinimalScrubber {
@@ -194,12 +224,21 @@ impl MinimalScrubber {
     /// Builds a scrubber that masks every non-empty `secret`, longest first.
     ///
     /// Empty secrets are dropped: masking on an empty needle would match everywhere. An empty
-    /// list is legal and still fails closed on the pattern rules.
+    /// list is legal and still fails closed on the pattern rules. A duplicate is zeroized as it
+    /// is dropped, like the whole list when the scrubber goes (MOD-10 D17).
     #[must_use]
     pub fn new(secrets: impl IntoIterator<Item = String>) -> Self {
         let mut secrets: Vec<String> = secrets.into_iter().filter(|s| !s.is_empty()).collect();
         secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        secrets.dedup();
+        // `dedup_by` hands the candidate for removal first.
+        secrets.dedup_by(|dropped, kept| {
+            if dropped == kept {
+                dropped.zeroize();
+                true
+            } else {
+                false
+            }
+        });
         Self { secrets }
     }
 
@@ -210,15 +249,33 @@ impl MinimalScrubber {
     /// injected by the caller, just not masked. An empty value is below the floor and is listed.
     /// No value is ever returned or logged. An empty map is legal and still fails closed on the
     /// pattern rules.
+    ///
+    /// A value that ends in `\n` / `\r\n` (a secret stored with its line end) is masked both as
+    /// given and with its trailing line ends trimmed, so the bare token an agent echoes is masked
+    /// too (MOD-10 D17). A multi-line value (one with a line end before its trailing ones) is
+    /// also masked in the forms a tool prints it in (MOD-10 R1 L5): with bare `\n` turned into
+    /// `\r\n`, JSON-escaped (`\n` as two characters, as inside a printed JSON document), each with
+    /// and without its trailing line ends, and line by line, `\r` trimmed, skipping PEM armour
+    /// lines (`-----BEGIN …-----`, `-----END …-----`): every PEM key shares them, and a printed
+    /// one fails closed on the PEM marker anyway. A form is masked only when it is itself at the
+    /// floor; whether a key is listed as short is decided on its full value. Injection is
+    /// untouched: the caller injects `resolved` byte for byte.
     #[must_use]
     pub fn from_resolved(resolved: &BTreeMap<String, String>) -> (Self, Vec<String>) {
         let mut masked = Vec::with_capacity(resolved.len());
         let mut short = Vec::new();
         for (key, value) in resolved {
-            if value.chars().count() >= MIN_MASKED_LEN {
-                masked.push(value.clone());
-            } else {
+            if value.chars().count() < MIN_MASKED_LEN {
                 short.push(key.clone());
+                continue;
+            }
+            for mut form in masked_forms(value) {
+                if form.chars().count() >= MIN_MASKED_LEN {
+                    masked.push(form);
+                } else {
+                    // MOD-10 D17: a dropped form is wiped like a kept one.
+                    form.zeroize();
+                }
             }
         }
         (Self::new(masked), short)
@@ -339,10 +396,28 @@ impl core::fmt::Debug for MinimalScrubber {
     }
 }
 
+impl Drop for MinimalScrubber {
+    /// MOD-10 D17: the secret list is wiped when the scrubber goes (a walk's, a chat's).
+    fn drop(&mut self) {
+        for secret in &mut self.secrets {
+            secret.zeroize();
+        }
+    }
+}
+
 impl Scrubber for MinimalScrubber {
     fn scrub(&self, value: &mut Value) -> Result<(), Unmasked> {
         self.mask_value(value);
         self.find_residue(value, &mut String::new())
+    }
+
+    /// `max(longest secret in bytes, PATTERN_HOLD_BACK) - 1`: 75 with no secret.
+    fn hold_back(&self) -> usize {
+        self.secrets
+            .first() // sorted longest first by byte length (`new`)
+            .map_or(0, String::len)
+            .max(PATTERN_HOLD_BACK)
+            - 1
     }
 }
 
@@ -361,6 +436,64 @@ fn residue_rule(text: &str) -> Option<&'static str> {
         return Some(PATTERN_RULES[index].0);
     }
     text.contains(PEM_MARKER).then_some(PEM_RULE)
+}
+
+/// The forms [`MinimalScrubber::from_resolved`] masks `value` in, floor not yet applied: the
+/// value, its trailing-line-end-trimmed form, and for a multi-line value its CRLF and
+/// JSON-escaped forms (each trimmed too) and its lines (MOD-10 R1 L5). Duplicates are left to
+/// [`MinimalScrubber::new`].
+fn masked_forms(value: &str) -> Vec<String> {
+    let trim = |text: &str| text.trim_end_matches(['\r', '\n']).to_owned();
+    let trimmed = trim(value);
+    let mut forms = vec![value.to_owned()];
+    if trimmed.contains('\n') {
+        let crlf = to_crlf(value);
+        forms.push(trim(&crlf));
+        forms.push(crlf);
+        forms.push(json_escaped(value));
+        forms.push(json_escaped(&trimmed));
+        forms.extend(
+            value
+                .split('\n')
+                .map(|line| line.trim_end_matches('\r'))
+                .filter(|line| !is_pem_armour(line))
+                .map(str::to_owned),
+        );
+    }
+    // Pushed last, not cloned: no unwiped copy of the value is left behind (D17).
+    forms.push(trimmed);
+    forms
+}
+
+/// `text` with every bare `\n` (one not after a `\r`) turned into `\r\n`.
+fn to_crlf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.matches('\n').count());
+    let mut previous = None;
+    for ch in text.chars() {
+        if ch == '\n' && previous != Some('\r') {
+            out.push('\r');
+        }
+        out.push(ch);
+        previous = Some(ch);
+    }
+    out
+}
+
+/// `text` as it reads inside a JSON string literal, without the quotes.
+fn json_escaped(text: &str) -> String {
+    let mut quoted = serde_json::to_string(text).unwrap_or_default();
+    let inner = quoted
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map(str::to_owned)
+        .unwrap_or_default();
+    quoted.zeroize();
+    inner
+}
+
+/// A PEM armour line: `-----BEGIN <label>-----` or `-----END <label>-----`.
+fn is_pem_armour(line: &str) -> bool {
+    (line.starts_with("-----BEGIN ") || line.starts_with("-----END ")) && line.ends_with("-----")
 }
 
 /// Escapes one JSON pointer reference token (RFC 6901: `~` → `~0`, `/` → `~1`).
@@ -1091,6 +1224,225 @@ mod tests {
             MinimalScrubber::from_resolved(&resolved(&[("FIVE", "ééééé"), ("SIX", "éééééé")]));
         assert_eq!(short, vec!["FIVE".to_owned()]);
         assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 1 }");
+    }
+
+    /// The dual-valid M1 Anthropic fixture: refused as `anthropic_api_key` at any token start.
+    const ANT_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
+
+    #[test]
+    fn an_escaped_token_start_is_a_token_start() {
+        // The backslash is built at run time: a `\u0022` in a Rust string literal is an
+        // escape error (H-21).
+        let b = '\\';
+        let mut cases = vec![
+            (format!("x{b}n{ANT_KEY}"), "anthropic_api_key"),
+            (format!("{b}u0022AKIAIOSFODNN7EXAMPLE"), "aws_access_key_id"),
+            (
+                "%22ghp_abcdefghijklmnopqrstuvwxyz0123456789".to_owned(),
+                "github_token",
+            ),
+        ];
+        for escape in ['r', 't', 'b', 'f', '/', '\\', '"'] {
+            cases.push((format!("x{b}{escape}{ANT_KEY}"), "anthropic_api_key"));
+        }
+        let scrubber = rules_only();
+        for (text, rule) in cases {
+            let mut value = json!({ "t": text });
+            let err = scrubber
+                .scrub(&mut value)
+                .err()
+                .unwrap_or_else(|| panic!("an escaped token start must refuse: {text}"));
+            assert_eq!(err.rule, rule, "rule for {text}");
+            assert_eq!(err.path, "/t", "pointer for {text}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_start_reaches_the_openai_confirmation() {
+        let b = '\\';
+        // A LiteLLM key after a JSON `\n`: `SK_CANDIDATE` must capture its body.
+        let mut value = json!({ "t": format!("x{b}nsk-Ab3_xY9-kLmN0pQrStUvWx") });
+        let err = rules_only()
+            .scrub(&mut value)
+            .expect_err("an escaped LiteLLM key must refuse the write");
+        assert_eq!(err.rule, "openai_api_key");
+        assert_eq!(err.path, "/t");
+    }
+
+    #[test]
+    fn an_escape_lookalike_is_not_a_token_start() {
+        let b = '\\';
+        let scrubber = rules_only();
+        for text in [
+            "subtask-abcdefghijklmnopqrstuvwxyz".to_owned(),
+            "x%2Fsk-learn".to_owned(),
+            format!("n{ANT_KEY}"),
+            // One hex digit, three hex digits, no hex digits.
+            format!("%2{ANT_KEY}"),
+            format!("{b}u002{ANT_KEY}"),
+            format!("%ZZ{ANT_KEY}"),
+            "src/sk-live.rs".to_owned(),
+        ] {
+            let mut value = json!({ "t": text });
+            scrubber
+                .scrub(&mut value)
+                .unwrap_or_else(|err| panic!("{text:?} must stay clean, got {err}"));
+        }
+    }
+
+    #[test]
+    fn from_resolved_masks_a_value_and_its_newline_free_form() {
+        for raw in ["abcdefgh\n", "abcdefgh\r\n"] {
+            let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[("K", raw)]));
+            assert!(short.is_empty(), "{short:?}");
+            assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 2 }");
+            for text in [format!("x {raw} y"), "x abcdefgh y".to_owned()] {
+                let mut value = json!({ "t": text });
+                scrubber.scrub(&mut value).expect("clean");
+                assert_eq!(value["t"], json!("x [REDACTED] y"), "for {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_newline_free_form_below_the_floor_is_not_masked() {
+        let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[("K", "abcde\n")]));
+        assert!(
+            short.is_empty(),
+            "the full value is at the floor: {short:?}"
+        );
+        assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 1 }");
+        let mut value = json!({ "a": "x abcde\n y", "b": "x abcde y" });
+        scrubber.scrub(&mut value).expect("clean");
+        assert_eq!(value["a"], json!("x [REDACTED] y"));
+        assert_eq!(value["b"], json!("x abcde y"));
+    }
+
+    /// A multi-line value (a certificate, a service-account JSON, a config file).
+    const MULTI: &str = "line-one-abc\nline-two-def\n";
+
+    /// MOD-10 R1 L5: a multi-line value echoed through a Windows tool, with CRLF line ends, is
+    /// masked whole, with and without its trailing line end.
+    #[test]
+    fn from_resolved_masks_a_multi_line_value_s_crlf_form() {
+        let (scrubber, _) = MinimalScrubber::from_resolved(&resolved(&[("K", MULTI)]));
+        for text in [
+            "x line-one-abc\r\nline-two-def\r\n y",
+            "x line-one-abc\r\nline-two-def y",
+        ] {
+            let mut value = json!({ "t": text });
+            scrubber.scrub(&mut value).expect("clean");
+            assert_eq!(value["t"], json!("x [REDACTED] y"), "for {text:?}");
+        }
+    }
+
+    /// MOD-10 R1 L5: a multi-line value inside a JSON document the agent printed as text keeps
+    /// its line ends escaped (`\n` as two characters); that form is masked whole too.
+    #[test]
+    fn from_resolved_masks_a_multi_line_value_s_json_escaped_form() {
+        let (scrubber, _) = MinimalScrubber::from_resolved(&resolved(&[("K", MULTI)]));
+        let b = '\\';
+        for text in [
+            format!("{{\"k\":\"line-one-abc{b}nline-two-def{b}n\"}}"),
+            format!("{{\"k\":\"line-one-abc{b}nline-two-def\"}}"),
+        ] {
+            let mut value = json!({ "t": text });
+            scrubber.scrub(&mut value).expect("clean");
+            assert_eq!(value["t"], json!("{\"k\":\"[REDACTED]\"}"), "for {text:?}");
+        }
+    }
+
+    /// MOD-10 R1 L5: one line of a multi-line value, printed alone, is masked when it is at the
+    /// floor; a line below the floor is not (MOD-10 D3).
+    #[test]
+    fn from_resolved_masks_each_line_of_a_multi_line_value_at_the_floor() {
+        let (scrubber, short) =
+            MinimalScrubber::from_resolved(&resolved(&[("K", "abcdefgh\r\nxyz\nsecond-line")]));
+        assert!(short.is_empty(), "{short:?}");
+        let mut value = json!({ "a": "x abcdefgh y", "b": "x second-line y", "c": "x xyz y" });
+        scrubber.scrub(&mut value).expect("clean");
+        assert_eq!(
+            value,
+            json!({ "a": "x [REDACTED] y", "b": "x [REDACTED] y", "c": "x xyz y" })
+        );
+    }
+
+    /// MOD-10 R1 L5: a PEM key's armour lines are not masked as lines (every PEM key shares
+    /// them); a printed armour line still fails closed on the PEM marker, and a body line is
+    /// masked.
+    #[test]
+    fn from_resolved_skips_pem_armour_lines() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n\
+                   -----END PRIVATE KEY-----\n";
+        let (scrubber, _) = MinimalScrubber::from_resolved(&resolved(&[("PEM", pem)]));
+        let mut body = json!({ "t": "x MIIEvQIBADANBgkqhkiG9w0BAQEFAASC y" });
+        scrubber.scrub(&mut body).expect("clean");
+        assert_eq!(body["t"], json!("x [REDACTED] y"));
+        for armour in ["-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"] {
+            let mut value = json!({ "t": armour });
+            let err = scrubber
+                .scrub(&mut value)
+                .expect_err("an armour line is not masked, so the marker refuses it");
+            assert_eq!(err.rule, PEM_RULE, "for {armour}");
+        }
+    }
+
+    /// MOD-10 R1 L5: whether a key is short is still decided on its full value; a short
+    /// multi-line value adds no form at all.
+    #[test]
+    fn a_short_multi_line_value_is_listed_and_adds_no_form() {
+        let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[("K", "ab\ncd")]));
+        assert_eq!(short, vec!["K".to_owned()]);
+        assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 0 }");
+    }
+
+    #[test]
+    fn hold_back_is_zero_for_a_scrubber_that_does_not_say() {
+        #[derive(Debug)]
+        struct Plain;
+        impl Scrubber for Plain {
+            fn scrub(&self, _: &mut Value) -> Result<(), Unmasked> {
+                Ok(())
+            }
+        }
+        assert_eq!(Plain.hold_back(), 0);
+        let boxed: Box<dyn Scrubber> = Box::new(Plain);
+        assert_eq!(boxed.hold_back(), 0);
+    }
+
+    #[test]
+    fn hold_back_without_secrets_is_the_pattern_bound() {
+        assert_eq!(rules_only().hold_back(), PATTERN_HOLD_BACK - 1);
+        let (empty, _) = MinimalScrubber::from_resolved(&BTreeMap::new());
+        assert_eq!(empty.hold_back(), PATTERN_HOLD_BACK - 1);
+    }
+
+    #[test]
+    fn hold_back_covers_the_longest_secret() {
+        let long = MinimalScrubber::new(["x".repeat(120), "y".repeat(10)]);
+        assert_eq!(long.hold_back(), 119);
+        let short = MinimalScrubber::new(["y".repeat(10)]);
+        assert_eq!(short.hold_back(), PATTERN_HOLD_BACK - 1);
+        // Bytes, not characters: 60 two-byte characters are 120 bytes.
+        let wide = MinimalScrubber::new(["é".repeat(60)]);
+        assert_eq!(wide.hold_back(), 119);
+        let as_dyn: &dyn Scrubber = &wide;
+        assert_eq!(as_dyn.hold_back(), 119);
+    }
+
+    #[test]
+    fn pattern_hold_back_covers_every_rule_minimum_and_the_longest_token_start() {
+        // `\\u[0-9A-Fa-f]{4}` in `TOKEN_START`: a JSON `\uXXXX` escape, 6 bytes.
+        const LONGEST_TOKEN_START: usize = 6;
+        for (rule, short) in one_short() {
+            // One more byte reaches the rule's minimum match.
+            assert!(
+                short.len() + 1 + LONGEST_TOKEN_START <= PATTERN_HOLD_BACK,
+                "{rule}: a {}-byte minimum after a {LONGEST_TOKEN_START}-byte token start \
+                 exceeds PATTERN_HOLD_BACK = {PATTERN_HOLD_BACK}",
+                short.len() + 1
+            );
+        }
     }
 
     #[test]

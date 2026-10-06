@@ -8582,7 +8582,7 @@ mod fanout_paths {
         let driver =
             |_candidate: &htui_core::model::SnapshotCandidate,
              key: &crate::engine::SessionKey<'_>| orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
         let parts = crate::engine::fake_parts(&orch, &graphs, &driver, &scrubber)
             .await
             .expect("the fake's parts build");
@@ -8602,6 +8602,7 @@ mod fanout_paths {
             policy: parts.policy,
             control: parts.control,
             scrubber: parts.scrubber,
+            secrets: parts.secrets,
             app: parts.app,
             box_profile: parts.box_profile,
             box_id: parts.box_id,
@@ -8667,6 +8668,226 @@ mod fanout_paths {
                 ))),
                 "{key}: {notes:?}"
             );
+        }
+    }
+
+    // -- MOD-10 M3 T4 (D11-D13, blueprint A-1, A-2, H-14): the walk's secrets on the fan-out and
+    // judge paths. Never in `CASES` (blueprint H-1: `every_case_name_dispatches` sits near the
+    // stack).
+
+    /// An Infisical scope the fake provider resolves.
+    const SECRET_SCOPE: &str = r#"{"project_id":"p1","environment":"dev","path":"/"}"#;
+    /// Long and not pattern-shaped, so a refusal can never stand in for a mask.
+    const SECRET_VALUE: &str = "zq7-resolved-value-0123456789";
+
+    /// Candidate `index`'s first session at `research` attempt 1.
+    fn research_key(index: i32) -> crate::engine::SessionKey<'static> {
+        crate::engine::SessionKey {
+            phase: "research",
+            attempt: 1,
+            fanout_index: index,
+            call: 0,
+        }
+    }
+
+    /// `ANA-2`'s project.
+    async fn ana_2_project(orch: &FakeOrchestrator) -> htui_core::model::ProjectId {
+        item_of(orch, ids::HTUI_ANA_2).await.project_id
+    }
+
+    /// The source a walk of `orch` resolves through, over `provider`.
+    fn secret_source(
+        orch: &FakeOrchestrator,
+        provider: htui_core::secret::fake::FakeSecretProvider,
+    ) -> std::sync::Arc<htui_core::secret::fake::FakeSecretSource> {
+        let source = std::sync::Arc::new(htui_core::secret::fake::FakeSecretSource::new(
+            std::sync::Arc::new(provider),
+        ));
+        orch.set_secret_source(source.clone());
+        source
+    }
+
+    /// MOD-10 D11, D12 (blueprint A-1): the group's entry resolves once for all three candidates,
+    /// and each candidate's session gets the resolved map.
+    #[tokio::test]
+    async fn a_fan_out_resolves_once_and_every_candidate_gets_the_env() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        research_candidates(&orch, 1);
+        let project = ana_2_project(&orch).await;
+        orch.store().set_project_secret_columns(
+            project,
+            Some(htui_core::secret::INFISICAL),
+            Some(SECRET_SCOPE),
+        );
+        let provider = std::sync::Arc::new(htui_core::secret::fake::FakeSecretProvider::resolving(
+            &[("API_KEY", SECRET_VALUE)],
+        ));
+        orch.set_secret_source(std::sync::Arc::new(
+            htui_core::secret::fake::FakeSecretSource::new(provider.clone()),
+        ));
+
+        let _ = Box::pin(start(&orch, ids::HTUI_ANA_2)).await;
+
+        let expected =
+            std::collections::BTreeMap::from([("API_KEY".to_owned(), SECRET_VALUE.to_owned())]);
+        for index in 0..3 {
+            let spec = orch
+                .spec_for(&research_key(index))
+                .unwrap_or_else(|| panic!("candidate {index} started"));
+            assert_eq!(spec.env, expected, "candidate {index}");
+        }
+        assert_eq!(provider.resolves(), 1, "one resolution for the group");
+    }
+
+    /// MOD-10 D13 (blueprint A-2, H-13): a refusal at the group's entry fails every pending
+    /// candidate with the sentence and the run with it; no candidate starts, no attempt 2 follows,
+    /// and the item is not blocked.
+    #[tokio::test]
+    async fn a_fan_out_whose_secrets_refuse_fails_the_run_before_any_candidate_starts() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        research_candidates(&orch, 1);
+        let project = ana_2_project(&orch).await;
+        orch.store().set_project_secret_columns(
+            project,
+            Some(htui_core::secret::INFISICAL),
+            Some(SECRET_SCOPE),
+        );
+        let cause = htui_core::secret::SecretError::BadCredentials;
+        let source = secret_source(
+            &orch,
+            htui_core::secret::fake::FakeSecretProvider::failing(cause.clone()),
+        );
+
+        let (run, rest) = Box::pin(start(&orch, ids::HTUI_ANA_2)).await;
+
+        assert_eq!(
+            (rest.run, rest.position, rest.failure),
+            (
+                RunStatus::Failed,
+                Some(0),
+                Some(RunFailure::SecretsRefused {
+                    cause: cause.clone()
+                })
+            )
+        );
+        let row = run_of(&orch, run).await;
+        assert_eq!(
+            (row.status, row.failure),
+            (RunStatus::Failed, Some(cause.refusal()))
+        );
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            slot_of(&steps, 0, 1),
+            [
+                (0, StepStatus::Failed, None),
+                (1, StepStatus::Failed, None),
+                (2, StepStatus::Failed, None),
+            ]
+        );
+        assert!(
+            steps.iter().all(|step| step.attempt == 1),
+            "no retry: {steps:?}"
+        );
+        let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+        for index in 0..3 {
+            let expected = format!(
+                "fan-out candidate {index} of `research` attempt 1: {}",
+                cause.refusal()
+            );
+            assert!(notes.contains(&expected), "{expected}: {notes:?}");
+            assert!(
+                orch.spec_for(&research_key(index)).is_none(),
+                "candidate {index} never started"
+            );
+        }
+        assert_eq!(source.calls(), 1);
+        assert_ne!(
+            item_of(&orch, ids::HTUI_ANA_2).await.status,
+            Status::Blocked,
+            "`block = false`: the item mirrors `failed`"
+        );
+    }
+
+    /// MOD-10 D13 (blueprint A-2, H-14): a judge that is its walk's first resolution and is
+    /// refused fails the run with the sentence; it does not park the selection. The project is
+    /// given a provider while candidate 2 is suspended, so the candidates ran provider-less.
+    #[tokio::test]
+    async fn a_judge_whose_secrets_refuse_fails_the_run_not_the_selection() {
+        let orch = FakeOrchestrator::demo();
+        fan_research(&orch, Gate::Never, false).await;
+        set_judge(&orch, ids::HTUI_ANA_2).await;
+        research_candidates(&orch, 1);
+        let project = ana_2_project(&orch).await;
+        let cause = htui_core::secret::SecretError::BadCredentials;
+        let source = secret_source(
+            &orch,
+            htui_core::secret::fake::FakeSecretProvider::failing(cause.clone()),
+        );
+        let (stalled, wake) = orch.suspend_after_done("research", 1, Some((2, 0)));
+
+        let (walked, ()) = tokio::join!(
+            Box::pin(orch.dispatch(crate::command::Command::StartRun {
+                item: ids::HTUI_ANA_2,
+                mode: htui_core::model::RunMode::Manual,
+                repo_scope: None,
+            })),
+            async {
+                stalled.notified().await;
+                orch.store().set_project_secret_columns(
+                    project,
+                    Some(htui_core::secret::INFISICAL),
+                    Some(SECRET_SCOPE),
+                );
+                wake.notify_one();
+            }
+        );
+
+        let walked = walked.expect("the walk settles the refusal");
+        let crate::command::CommandOutcome::Started { run, rest } = walked else {
+            panic!("`StartRun` answers `Started`, not {walked:?}");
+        };
+        let steps = steps_of(&orch, run).await;
+        assert_eq!(
+            slot_of(&steps, 0, 1),
+            [
+                (0, StepStatus::Done, None),
+                (1, StepStatus::Done, None),
+                (2, StepStatus::Failed, None),
+            ],
+            "the suspended candidate wrote no document: two survivors, so the judge route"
+        );
+        assert_eq!(
+            (rest.run, rest.failure),
+            (
+                RunStatus::Failed,
+                Some(RunFailure::SecretsRefused {
+                    cause: cause.clone()
+                })
+            )
+        );
+        let row = run_of(&orch, run).await;
+        assert_eq!(
+            (row.status, row.failure),
+            (RunStatus::Failed, Some(cause.refusal()))
+        );
+        assert!(
+            orch.spec_for(&crate::engine::SessionKey {
+                phase: "research:judge",
+                attempt: 1,
+                fanout_index: -1,
+                call: 0,
+            })
+            .is_none(),
+            "the judge never started a session"
+        );
+        assert_eq!(source.calls(), 1, "the judge's entry is the one resolution");
+        for index in 0..3 {
+            let spec = orch
+                .spec_for(&research_key(index))
+                .unwrap_or_else(|| panic!("candidate {index} started"));
+            assert!(spec.env.is_empty(), "candidate {index} ran provider-less");
         }
     }
 }
