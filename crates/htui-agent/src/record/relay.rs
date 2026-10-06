@@ -1,15 +1,17 @@
-//! MOD-42 plan D6: one turn of a session, with the permission relay and the run's control.
+//! MOD-42 plan D6: one turn of a session, with the permission relay and the run's control;
+//! MOD-70 plan D6: the turns a step's queued follow-ups add to its live session.
 
 use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    FollowUpSettle, OpenPermission, PermissionChoice, PermissionId, PermissionStatus,
-    QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RunCommandId, RunId,
-    SettleOutcome, StepId, StepPermission,
+    FOLLOW_UP_SESSION_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpSettle, OpenPermission,
+    PermissionChoice, PermissionId, PermissionStatus, QueuedFollowUp, RelayOption, RelayOptionKind,
+    RelaySessionId, RunCommandId, RunId, SettleOutcome, StepId, StepPermission,
+    executor_scrub_refusal,
 };
-use htui_core::scrub::Scrubber;
+use htui_core::scrub::{Scrubber, Unmasked};
 use htui_core::store::{Result as StoreResult, StoreError};
 use serde_json::{Value, json};
 use tokio::sync::watch;
@@ -20,7 +22,7 @@ use crate::driver::{AgentSession, PermissionAnswer, PermissionPolicy, Permission
 use crate::error::DriverError;
 use crate::event::{
     DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
-    ToolCallEvent,
+    StopReason, ToolCallEvent,
 };
 
 /// D8: how often a parked request's row is read. One primary-key read per tick, only while parked.
@@ -242,11 +244,18 @@ impl htui_core::store::RelayStore for NoRelay {
 /// **A parked poll** rides out up to [`TRANSIENT_READS`] consecutive `Unreachable`/`Backend`
 /// failures of its row's read, each a `warn`; the next one is the answer.
 ///
+/// **Follow-ups (MOD-70 D6).** With `relay.follow_ups`, the step's window opens before the first
+/// pull (`false` is a fence) and, at each turn's `done` that is not a cancel or a breach, the
+/// step's pending follow-up is pre-scrubbed, claimed under the lease, recorded at `turn + 1` and
+/// sent; the next turn is driven the same way. Every exit but a fence closes the window, refusing
+/// what is still queued. Without it, `drive` makes no follow-up call (I-8).
+///
 /// # Errors
 /// [`DriverError::Cancelled`] after a graceful cancel (I-7); [`DriverError::Store`]
-/// `(Fenced { step })` when an answer can no longer be applied under the lease (D4), or a write
-/// of the cancel sequence is fenced; [`DriverError::Closed`] for a stream that ended without
-/// `done`; the recorder's failures.
+/// `(Fenced { step })` when an answer can no longer be applied under the lease (D4), a write
+/// of the cancel sequence is fenced, or the follow-up window's open or a follow-up's claim is
+/// (MOD-70 D6); [`DriverError::Closed`] for a stream that ended without `done`; the recorder's
+/// failures; a follow-up's `send_follow_up` failure.
 pub async fn drive<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
     session: &mut dyn AgentSession,
     recorder: &mut Recorder<'_, S>,
@@ -254,7 +263,13 @@ pub async fn drive<S: htui_core::store::RecorderStore, R: htui_core::store::Rela
     control: &mut Control,
 ) -> Result<DoneEvent, DriverError> {
     let mut opened = false;
-    let out = turn(session, recorder, relay, control, &mut opened).await;
+    // MOD-70 D6 step 1: before the first pull.
+    let window = match relay {
+        Some(relay) if relay.follow_ups => open_window(relay).await?,
+        _ => Window::Off,
+    };
+    // D6 steps 2-7.
+    let out = turns(session, recorder, relay, control, &mut opened, window).await;
     if let Some(relay) = relay
         && opened
         && settles_stale(&out)
@@ -267,7 +282,233 @@ pub async fn drive<S: htui_core::store::RecorderStore, R: htui_core::store::Rela
     {
         tracing::warn!(%err, "the session's leftover permission rows were not marked stale");
     }
+    // D6 step 8: every exit but a fence (MOD-40 D1), after the session ended and before
+    // `drive_once`'s `recorder.finish`, verify, capture, `finish_step` and gate (I-6). `drive`
+    // cannot tell a deadline cut from a run cancel: both close with the cancelled sentence.
+    if let Some(relay) = relay
+        && window != Window::Off
+        && !is_fenced(&out)
+    {
+        let reason = match &out {
+            Err(DriverError::Cancelled) => FOLLOW_UP_SESSION_CANCELLED,
+            _ => FOLLOW_UP_SESSION_ENDED,
+        };
+        close_window(relay, window, reason).await;
+    }
     out
+}
+
+/// MOD-70 D6, B-10: this session's follow-up window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Window {
+    /// No relay, or `follow_ups: false`: no follow-up store call at all (I-8).
+    Off,
+    /// `open_follow_ups` answered `true`: checked at every turn end, closed with retries.
+    Open,
+    /// `open_follow_ups` failed (not fenced): never checked, one close attempted (B-10).
+    Unknown,
+}
+
+/// D6 step 1: opens the step's window under the lease. `false` is the walk's fence; any other
+/// failure is a `warn`, and the session runs without a window (an enqueue is then refused
+/// `NotStarted`; the step itself is unaffected).
+async fn open_window<R: htui_core::store::RelayStore>(
+    relay: &Relay<'_, R>,
+) -> Result<Window, DriverError> {
+    match htui_core::store::RelayStore::open_follow_ups(
+        relay.store,
+        relay.run,
+        relay.step,
+        relay.session,
+        relay.owner,
+    )
+    .await
+    {
+        Ok(true) => Ok(Window::Open),
+        Ok(false) | Err(StoreError::Fenced { .. }) => {
+            Err(StoreError::Fenced { step: relay.step }.into())
+        }
+        Err(err) => {
+            tracing::warn!(
+                %err,
+                "the step's follow-up window did not open; this session takes no follow-up"
+            );
+            Ok(Window::Unknown)
+        }
+    }
+}
+
+/// The turns of one session (D6 steps 2-7): a turn, then — with an open window — the step's
+/// queued follow-up recorded and sent, and the next turn, until a turn end finds none.
+async fn turns<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, S>,
+    relay: Option<&Relay<'_, R>>,
+    control: &mut Control,
+    opened: &mut bool,
+    window: Window,
+) -> Result<DoneEvent, DriverError> {
+    loop {
+        // B-20: boxed per turn, so the loop adds no `turn`-sized slot to `drive`'s future.
+        let done = Box::pin(turn(session, recorder, relay, control, opened)).await?;
+        let Some(relay) = relay.filter(|_| window == Window::Open) else {
+            return Ok(done);
+        };
+        let Some(queued) = take_follow_up(recorder, relay, control, &done).await? else {
+            return Ok(done);
+        };
+        // D6 step 6 (PRD Q1, R-HIS-1): `turn + 1`, scrubbed by the scrubber the pre-scrub used,
+        // so `record_follow_up`'s `refuse` path is unreachable from here.
+        recorder
+            .record_follow_up(&queued.text, (relay.now)())
+            .await?;
+        // D6 step 7: a failed send ends the session as a failed turn would.
+        session.send_follow_up(queued.text).await?;
+    }
+}
+
+/// D6 steps 3-5 at one turn end: the row claimed for the next turn, or `None` to end the
+/// session. Only a fence is an error (B-11).
+async fn take_follow_up<S: htui_core::store::RecorderStore, R: htui_core::store::RelayStore>(
+    recorder: &Recorder<'_, S>,
+    relay: &Relay<'_, R>,
+    control: &mut Control,
+    done: &DoneEvent,
+) -> Result<Option<QueuedFollowUp>, DriverError> {
+    loop {
+        // D6 step 3, D7: a cancelled stop (a breach's included), a breach or a cancel applies
+        // nothing; the window's close refuses the row.
+        if done.stop_reason == StopReason::Cancelled
+            || recorder.cap_breach().is_some()
+            || control.signal().is_cancel()
+        {
+            return Ok(None);
+        }
+        let Some(queued) = next_follow_up(relay, control).await else {
+            return Ok(None);
+        };
+        // D6 step 4: the executor's scrubber over the payload `record_follow_up` scrubs.
+        let to = match prescrub(recorder.scrubber, &queued.text) {
+            // B-12: a cancel that landed during the read claims nothing.
+            Ok(()) if control.signal().is_cancel() => return Ok(None),
+            Ok(()) => FollowUpSettle::Applied,
+            Err(unmasked) => FollowUpSettle::Refused(executor_scrub_refusal(unmasked.rule)),
+        };
+        let applying = to == FollowUpSettle::Applied;
+        // D6 step 5.
+        match htui_core::store::RelayStore::settle_follow_up(
+            relay.store,
+            queued.id,
+            relay.owner,
+            to,
+        )
+        .await
+        {
+            Ok(SettleOutcome::Settled) if applying => return Ok(Some(queued)),
+            // Refused here (the executor's scrub), or by a cancel or a newer window: look again.
+            Ok(SettleOutcome::Settled | SettleOutcome::NotPending) => {}
+            Ok(SettleOutcome::Fenced) | Err(StoreError::Fenced { .. }) => {
+                return Err(StoreError::Fenced { step: relay.step }.into());
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "a follow-up was not claimed; the session ends and its window's close \
+                     refuses it"
+                );
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// B-11: the step's pending follow-up, riding out up to [`TRANSIENT_READS`] consecutive
+/// `Unreachable`/`Backend` failures at `relay.poll`, selected against the control. `None` when
+/// nothing is pending, on a cancel, on exhaustion or on any other error (each failure a `warn`).
+async fn next_follow_up<R: htui_core::store::RelayStore>(
+    relay: &Relay<'_, R>,
+    control: &mut Control,
+) -> Option<QueuedFollowUp> {
+    let mut failures = 0_u32;
+    loop {
+        match htui_core::store::RelayStore::next_follow_up(relay.store, relay.step, relay.session)
+            .await
+        {
+            Ok(next) => return next,
+            Err(err @ (StoreError::Unreachable(_) | StoreError::Backend(_)))
+                if failures + 1 < TRANSIENT_READS =>
+            {
+                failures += 1;
+                tracing::warn!(%err, failures, "the step's follow-up was not read; reading again");
+            }
+            Err(err) => {
+                tracing::warn!(%err, "the step's follow-up was not read; the session ends");
+                return None;
+            }
+        }
+        tokio::select! {
+            biased;
+            () = control.changed() => {}
+            () = tokio::time::sleep(relay.poll) => {}
+        }
+        if control.signal().is_cancel() {
+            return None;
+        }
+    }
+}
+
+/// D6 step 4: `{"text": text}` through `scrubber`, the payload `record_follow_up` scrubs. The
+/// masked copy is dropped: only the verdict matters here.
+fn prescrub(scrubber: &dyn Scrubber, text: &str) -> Result<(), Unmasked> {
+    scrubber.scrub(&mut json!({ "text": text }))
+}
+
+/// D6 step 8, B-10: `close_follow_ups` with `reason`, best-effort. An [`Window::Open`] window
+/// retries `Unreachable`/`Backend` up to [`TRANSIENT_READS`] attempts at `relay.poll`; an
+/// [`Window::Unknown`] one is tried once. A final failure is a `warn` (R-3).
+async fn close_window<R: htui_core::store::RelayStore>(
+    relay: &Relay<'_, R>,
+    window: Window,
+    reason: &str,
+) {
+    let attempts = if window == Window::Open {
+        TRANSIENT_READS
+    } else {
+        1
+    };
+    let mut failures = 0_u32;
+    loop {
+        match htui_core::store::RelayStore::close_follow_ups(
+            relay.store,
+            relay.step,
+            relay.session,
+            reason,
+        )
+        .await
+        {
+            Ok(_) => return,
+            Err(err @ (StoreError::Unreachable(_) | StoreError::Backend(_)))
+                if failures + 1 < attempts =>
+            {
+                failures += 1;
+                tracing::warn!(%err, failures, "the step's follow-up window was not closed; retrying");
+                tokio::time::sleep(relay.poll).await;
+            }
+            Err(err) => {
+                tracing::warn!(
+                    %err,
+                    "the step's follow-up window was not closed; a lease re-take or a cancel \
+                     refuses what it holds"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// `Err(Store(Fenced))`: the one exit that writes nothing more (MOD-40 D1).
+const fn is_fenced(out: &Result<DoneEvent, DriverError>) -> bool {
+    matches!(out, Err(DriverError::Store(StoreError::Fenced { .. })))
 }
 
 /// B-15: whether an exit marks the session's leftover rows `stale`. Not a cancel (it settled them
