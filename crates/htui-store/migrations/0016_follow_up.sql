@@ -34,6 +34,11 @@ CREATE UNIQUE INDEX uq_run_command_pending_cancel ON run_command (run_id)
     WHERE status = 'pending' AND kind = 'cancel';
 CREATE UNIQUE INDEX uq_run_command_pending_follow_up ON run_command (run_step_id)
     WHERE status = 'pending' AND kind = 'follow_up';
+-- Plain indexes behind the new foreign key's cascade (a step's every follow-up, not only the
+-- pending one) and behind relay_view's per-run read of follow-ups, which 0011's (run_id, kind)
+-- pending index no longer serves once it is dropped.
+CREATE INDEX idx_run_command_step ON run_command (run_step_id) WHERE run_step_id IS NOT NULL;
+CREATE INDEX idx_run_command_run ON run_command (run_id);
 
 CREATE TABLE follow_up_window (
     run_step_id UUID        PRIMARY KEY REFERENCES run_step(id) ON DELETE CASCADE,
@@ -43,4 +48,6 @@ CREATE TABLE follow_up_window (
     opened_at   TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
     closed_at   TIMESTAMPTZ
 );
-CREATE INDEX idx_follow_up_window_open ON follow_up_window (run_id) WHERE closed_at IS NULL;
+-- One plain index on run_id serves both the run cascade and the closes' and relay_view's per-run
+-- reads of open windows (a run holds a handful of windows, so the closed_at filter is cheap).
+CREATE INDEX idx_follow_up_window_run ON follow_up_window (run_id);
