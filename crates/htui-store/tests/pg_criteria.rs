@@ -7664,6 +7664,182 @@ async fn an_enqueue_behind_a_close_reads_the_window_closed() {
     db.drop_db().await;
 }
 
+/// MOD-70 review M-2 (F-18): the race of [`a_close_waits_for_an_enqueue_holding_the_window_and_refuses_it`]
+/// on a database whose `default_transaction_isolation` is `repeatable read`. The closes pin
+/// `READ COMMITTED` themselves: an inherited `REPEATABLE READ` would give the second statement the
+/// first's snapshot, taken before the enqueue committed, and leave the row pending with its text.
+/// `dropped` races [`close_dropped_follow_ups`](htui_core::store::WriteStore::close_dropped_follow_ups)
+/// instead of `close_follow_ups`.
+async fn a_close_under_a_repeatable_read_default_refuses_a_racing_enqueue(dropped: bool) {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (run, step, a, session) = follow_up_window(&db).await;
+    sqlx::raw_sql(AssertSqlSafe(format!(
+        "ALTER DATABASE \"{}\" SET default_transaction_isolation = 'repeatable read'",
+        db.name
+    )))
+    .execute(&db.pool)
+    .await
+    .expect("set the database's default isolation");
+    // A store connected after the ALTER: every connection of its pool starts at the new default.
+    let (closer, _root) = second_box(&db).await;
+    let default: String = sqlx::query_scalar("SHOW default_transaction_isolation")
+        .fetch_one(closer.pool())
+        .await
+        .expect("read the closer's default isolation");
+    assert_eq!(default, "repeatable read", "the closer inherits the default");
+
+    let mut holder = db.pool.begin().await.expect("begin the enqueue");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the holder's pid");
+    sqlx::query("SELECT 1 FROM follow_up_window WHERE run_step_id = $1 FOR SHARE")
+        .bind(step.as_uuid())
+        .fetch_one(&mut *holder)
+        .await
+        .expect("the enqueue share-locks the window row");
+    sqlx::query(
+        "INSERT INTO run_command (id, run_id, kind, run_step_id, text, issued_by, issued_box) \
+         VALUES ($1, $2, 'follow_up', $3, 'by hand', $4, $5)",
+    )
+    .bind(RunCommandId::new().as_uuid())
+    .bind(run.as_uuid())
+    .bind(step.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .bind(ids::BOX.as_uuid())
+    .execute(&mut *holder)
+    .await
+    .expect("the enqueue inserts its pending row");
+
+    let store = closer.clone();
+    let close = tokio::spawn(async move {
+        if dropped {
+            store
+                .close_dropped_follow_ups(run, a, FOLLOW_UP_SESSION_ENDED)
+                .await
+        } else {
+            store
+                .close_follow_ups(step, session, FOLLOW_UP_SESSION_ENDED)
+                .await
+        }
+    });
+    wait_until_blocked_on(&db, holder_pid, &close).await;
+    holder.commit().await.expect("the enqueue commits");
+
+    let refused = tokio::time::timeout(std::time::Duration::from_secs(10), close)
+        .await
+        .expect("the close lands once the window row is free")
+        .expect("the close task must not panic")
+        .expect("the close is answered");
+    assert_eq!(
+        refused, 1,
+        "the close reads committed rows whatever the database's default isolation"
+    );
+    assert_eq!(
+        follow_up_rows_of(&db.pool, step).await,
+        vec![(
+            "refused".to_owned(),
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            true
+        )],
+        "the row is refused and its text is gone"
+    );
+
+    closer.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-70 review M-2: `close_follow_ups` under a `repeatable read` default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_close_under_a_repeatable_read_default_still_refuses_a_racing_enqueue() {
+    a_close_under_a_repeatable_read_default_refuses_a_racing_enqueue(false).await;
+}
+
+/// MOD-70 review M-2: `close_dropped_follow_ups` under a `repeatable read` default.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_close_under_a_repeatable_read_default_still_refuses_a_racing_enqueue() {
+    a_close_under_a_repeatable_read_default_refuses_a_racing_enqueue(true).await;
+}
+
+/// MOD-70 review L-3, open first: an enqueue that arrives while a re-open holds the window row
+/// (its upsert's row lock, as `open_follow_ups` takes it) waits on its `FOR SHARE OF w`, then
+/// re-checks the committed row: open, under the lease owner, so the follow-up is admitted to the
+/// **new** window. The open's own refusal ran before the insert and does not touch it; the new
+/// session reads it at its next turn end, the old one never does.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_enqueue_behind_a_reopen_is_admitted_to_the_new_window() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (b, _root) = second_box(&db).await;
+    let (run, step, a, old) = follow_up_window(&db).await;
+    let new_session = RelaySessionId::new();
+
+    let mut holder = db.pool.begin().await.expect("begin the open");
+    let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut *holder)
+        .await
+        .expect("read the holder's pid");
+    let upserted = sqlx::query(
+        "INSERT INTO follow_up_window (run_step_id, run_id, session, owner) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (run_step_id) DO UPDATE \
+            SET session = EXCLUDED.session, owner = EXCLUDED.owner, \
+                opened_at = clock_timestamp(), closed_at = NULL",
+    )
+    .bind(step.as_uuid())
+    .bind(run.as_uuid())
+    .bind(new_session.as_uuid())
+    .bind(a)
+    .execute(&mut *holder)
+    .await
+    .expect("the open upserts the window row")
+    .rows_affected();
+    assert_eq!(upserted, 1, "the window row is held");
+
+    let new = follow_up_from(&b, step, "after the re-open");
+    let id = new.id;
+    let enqueuer = b.clone();
+    let enqueue = tokio::spawn(async move { enqueuer.request_follow_up(new).await });
+    wait_until_blocked_on(&db, holder_pid, &enqueue).await;
+    holder.commit().await.expect("the open commits");
+
+    let answer = tokio::time::timeout(std::time::Duration::from_secs(10), enqueue)
+        .await
+        .expect("the enqueue lands once the window row is free")
+        .expect("the enqueue task must not panic")
+        .expect("the enqueue is answered");
+    assert_eq!(
+        answer,
+        FollowUpRequest::Queued(id),
+        "the enqueue re-checks the committed, open window and is admitted to it"
+    );
+    assert_eq!(
+        db.store
+            .next_follow_up(step, old)
+            .await
+            .expect("the old session's read is answered"),
+        None,
+        "the superseded session never reads it"
+    );
+    assert_eq!(
+        db.store
+            .next_follow_up(step, new_session)
+            .await
+            .expect("the new session's read is answered"),
+        Some(QueuedFollowUp {
+            id,
+            text: "after the re-open".to_owned(),
+        }),
+        "the new session reads it at its next turn end"
+    );
+
+    b.pool().close().await;
+    db.drop_db().await;
+}
+
 /// MOD-70 D3 step 7, B-4: a lapsed lease, and then a lease taken by another owner while the
 /// window is still the dead walk's, both refuse an enqueue `ExecutorGone`.
 #[tokio::test(flavor = "multi_thread")]
