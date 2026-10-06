@@ -7688,7 +7688,10 @@ async fn a_close_under_a_repeatable_read_default_refuses_a_racing_enqueue(droppe
         .fetch_one(closer.pool())
         .await
         .expect("read the closer's default isolation");
-    assert_eq!(default, "repeatable read", "the closer inherits the default");
+    assert_eq!(
+        default, "repeatable read",
+        "the closer inherits the default"
+    );
 
     let mut holder = db.pool.begin().await.expect("begin the enqueue");
     let holder_pid: i32 = sqlx::query_scalar("SELECT pg_backend_pid()")
