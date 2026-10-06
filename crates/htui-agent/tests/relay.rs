@@ -10,7 +10,9 @@
 //!
 //! MOD-70 T2 (plan D6, D7; blueprint §5.4) adds the follow-up loop's cases: a client queues a
 //! follow-up while turn 0 is parked on a request (B-9's rendezvous), and two doubles reach the
-//! edges no client can time — [`CancelAtDone`] and [`Hooked`].
+//! edges no client can time — [`CancelAtDone`] and [`Hooked`]. Review M-4 gives [`Hooked`] a
+//! failure switch per follow-up method and adds [`FailingSend`], for the loop's failure and retry
+//! paths.
 
 #![cfg(feature = "test-support")]
 
@@ -642,7 +644,7 @@ impl htui_core::store::RelayStore for FailingSettles {
 #[derive(Debug)]
 struct FlakyAppends<'a> {
     store: &'a MemStore,
-    down: AtomicBool,
+    down: Arc<AtomicBool>,
 }
 
 impl htui_core::store::RecorderStore for FlakyAppends<'_> {
@@ -1885,7 +1887,7 @@ async fn a_store_blip_during_a_cancel_still_ends_it_as_a_cancel() {
     let fx = leased().await;
     let flaky = FlakyAppends {
         store: &fx.store,
-        down: AtomicBool::new(false),
+        down: Arc::new(AtomicBool::new(false)),
     };
     let mut recorder = Recorder::new(&flaky, &scrubber, fx.step, false, None)
         .with_fence(StepFence::Lease(fx.owner));
@@ -2415,6 +2417,42 @@ impl AgentSession for CancelAtDone {
     }
 }
 
+/// What [`FailingSend`]'s `send_follow_up` answers.
+const SEND_FAILED: &str = "the follow-up's send is switched off";
+
+/// A session whose `send_follow_up` fails ([`SEND_FAILED`]) and which forwards everything else:
+/// a follow-up claimed and recorded but never delivered (review M-4).
+#[derive(Debug)]
+struct FailingSend {
+    inner: Box<dyn AgentSession>,
+}
+
+impl AgentSession for FailingSend {
+    fn session_ref(&self) -> Option<&AgentSessionRef> {
+        self.inner.session_ref()
+    }
+
+    fn next_event<'a>(&'a mut self) -> DriverFuture<'a, Option<DriverEnvelope>> {
+        self.inner.next_event()
+    }
+
+    fn send_follow_up<'a>(&'a mut self, _text: String) -> DriverFuture<'a, ()> {
+        Box::pin(async { Err(DriverError::Transport(SEND_FAILED.to_owned())) })
+    }
+
+    fn answer_permission<'a>(
+        &'a mut self,
+        request_id: PermissionRequestId,
+        answer: PermissionAnswer,
+    ) -> DriverFuture<'a, ()> {
+        self.inner.answer_permission(request_id, answer)
+    }
+
+    fn cancel<'a>(&'a mut self, grace: Duration) -> DriverFuture<'a, ()> {
+        self.inner.cancel(grace)
+    }
+}
+
 /// [`Hooked`]'s counters, one per follow-up method.
 const OPEN: usize = 0;
 const NEXT: usize = 1;
@@ -2434,21 +2472,33 @@ enum When {
     AfterRead,
 }
 
+/// `record/relay.rs`'s private `TRANSIENT_READS`: how many reads of the step's follow-up, and how
+/// many closes of an open window, `drive` attempts before it gives up (B-10, B-11).
+const TRANSIENT_READS: usize = 30;
+
+/// A [`Hooked`] failure switch that never runs out.
+const ALWAYS: usize = usize::MAX;
+
 /// `MemStore`'s relay surface, counting the five follow-up methods, running `on_next` once inside
-/// the first `next_follow_up`, and answering `Unreachable` from `open_follow_ups` when
-/// `open_fails` (B-9).
+/// the first `next_follow_up` (a [`When::BeforeRead`] hook runs even when that read then fails),
+/// and failing each follow-up method `Unreachable` its switch's number of times first
+/// ([`Hooked::failing`]; [`ALWAYS`] for ever). `claimed`, when set, goes `true` once a
+/// `settle_follow_up` answers `Settled`: a recorder store watching it fails after a claim
+/// (B-9, review M-4).
 struct Hooked {
     store: MemStore,
     calls: [AtomicUsize; 5],
     on_next: Mutex<Option<(When, Hook)>>,
-    open_fails: bool,
+    /// Failures left per method; [`ALWAYS`] is for ever.
+    fails: [AtomicUsize; 5],
+    claimed: Option<Arc<AtomicBool>>,
 }
 
 impl std::fmt::Debug for Hooked {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Hooked")
             .field("calls", &self.calls)
-            .field("open_fails", &self.open_fails)
+            .field("fails", &self.fails)
             .finish_non_exhaustive()
     }
 }
@@ -2459,8 +2509,37 @@ impl Hooked {
             store,
             calls: Default::default(),
             on_next: Mutex::new(None),
-            open_fails: false,
+            fails: Default::default(),
+            claimed: None,
         }
+    }
+
+    /// `method` answers `Unreachable` its next `times` calls ([`ALWAYS`]: every call).
+    fn failing(self, method: usize, times: usize) -> Self {
+        self.fails[method].store(times, Ordering::SeqCst);
+        self
+    }
+
+    /// `claimed` goes `true` at the first `Settled` claim.
+    fn tripping(self, claimed: Arc<AtomicBool>) -> Self {
+        Self {
+            claimed: Some(claimed),
+            ..self
+        }
+    }
+
+    /// The switch of `method`: an `Unreachable` while failures are left (one spent), else `None`.
+    fn fail(&self, method: usize) -> Option<StoreError> {
+        let left = self.fails[method].load(Ordering::SeqCst);
+        if left == 0 {
+            return None;
+        }
+        if left != ALWAYS {
+            self.fails[method].store(left - 1, Ordering::SeqCst);
+        }
+        Some(StoreError::Unreachable(format!(
+            "follow-up method {method} is switched off"
+        )))
     }
 
     fn with_hook(store: MemStore, when: When, hook: Hook) -> Self {
@@ -2513,10 +2592,8 @@ impl htui_core::store::RelayStore for Hooked {
         owner: Uuid,
     ) -> StoreResult<bool> {
         self.count(OPEN);
-        if self.open_fails {
-            return Err(StoreError::Unreachable(
-                "the window's open is switched off".to_owned(),
-            ));
+        if let Some(err) = self.fail(OPEN) {
+            return Err(err);
         }
         WriteStore::open_follow_ups(&self.store, run, step, session, owner).await
     }
@@ -2528,12 +2605,20 @@ impl htui_core::store::RelayStore for Hooked {
     ) -> StoreResult<Option<QueuedFollowUp>> {
         self.count(NEXT);
         let hook = self.on_next.lock().expect("not poisoned").take();
-        match hook {
+        let hook = match hook {
             Some((When::BeforeRead, hook)) => {
                 hook(self.store.clone()).await;
-                WriteStore::next_follow_up(&self.store, step, session).await
+                None
             }
-            Some((When::AfterRead, hook)) => {
+            other => other,
+        };
+        if let Some(err) = self.fail(NEXT) {
+            // An `AfterRead` hook rides the first read that is answered.
+            *self.on_next.lock().expect("not poisoned") = hook;
+            return Err(err);
+        }
+        match hook {
+            Some((_, hook)) => {
                 let read = WriteStore::next_follow_up(&self.store, step, session).await;
                 hook(self.store.clone()).await;
                 read
@@ -2549,7 +2634,14 @@ impl htui_core::store::RelayStore for Hooked {
         to: FollowUpSettle,
     ) -> StoreResult<SettleOutcome> {
         self.count(SETTLE);
-        WriteStore::settle_follow_up(&self.store, id, owner, to).await
+        if let Some(err) = self.fail(SETTLE) {
+            return Err(err);
+        }
+        let settled = WriteStore::settle_follow_up(&self.store, id, owner, to).await;
+        if let (Ok(SettleOutcome::Settled), Some(claimed)) = (&settled, &self.claimed) {
+            claimed.store(true, Ordering::SeqCst);
+        }
+        settled
     }
 
     async fn close_follow_ups(
@@ -2559,6 +2651,9 @@ impl htui_core::store::RelayStore for Hooked {
         reason: &str,
     ) -> StoreResult<u64> {
         self.count(CLOSE);
+        if let Some(err) = self.fail(CLOSE) {
+            return Err(err);
+        }
         WriteStore::close_follow_ups(&self.store, step, session, reason).await
     }
 
@@ -2569,6 +2664,9 @@ impl htui_core::store::RelayStore for Hooked {
         reason: &str,
     ) -> StoreResult<u64> {
         self.count(DROPPED);
+        if let Some(err) = self.fail(DROPPED) {
+            return Err(err);
+        }
         WriteStore::close_dropped_follow_ups(&self.store, run, owner, reason).await
     }
 }
@@ -3244,10 +3342,7 @@ async fn an_executor_scrub_refusal_refuses_the_row_with_its_rule() {
 async fn a_failed_open_runs_the_session_without_a_window() {
     let fx = leased().await;
     running(&fx).await;
-    let hooked = Hooked {
-        open_fails: true,
-        ..Hooked::new(fx.store.clone())
-    };
+    let hooked = Hooked::new(fx.store.clone()).failing(OPEN, ALWAYS);
     let scrubber = scrubber();
     let mut recorder = fenced_recorder(&fx, &scrubber);
     let mut session = fake(two_turns(ends()), fx.step).await;
@@ -3328,6 +3423,355 @@ async fn a_fenced_open_drives_nothing() {
     assert!(
         log(&fx.store, fx.step).await.is_empty(),
         "nothing was pulled or recorded"
+    );
+    assert!(fx.store.follow_up_windows().is_empty(), "no window");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-70 review M-4: the follow-up loop's failure and retry paths, over [`Hooked`]'s switches
+// ---------------------------------------------------------------------------------------------
+
+/// A [`Hooked`] whose first look finds [`follow_up_text`] queued for `step`: the queue happens
+/// inside that look, before its read (and before its switch fails it).
+fn queues_before_the_look(store: MemStore, step: StepId) -> Hooked {
+    Hooked::with_hook(
+        store,
+        When::BeforeRead,
+        Box::new(move |store| {
+            Box::pin(async move {
+                queued(&store, step, &follow_up_text()).await;
+            })
+        }),
+    )
+}
+
+/// A [`Hooked`] whose first look misses [`follow_up_text`], queued for `step` right after that
+/// read: the row is pending when the window closes.
+fn queues_after_the_look(store: MemStore, step: StepId) -> Hooked {
+    Hooked::with_hook(
+        store,
+        When::AfterRead,
+        Box::new(move |store| {
+            Box::pin(async move {
+                queued(&store, step, &follow_up_text()).await;
+            })
+        }),
+    )
+}
+
+/// Two turns that end at once: turn 1 is what a sent follow-up starts.
+fn two_plain_turns() -> Script {
+    Script::turns(vec![ends(), ends()])
+}
+
+/// `drive` over `hooked` with a follow-up window, `session` and `recorder`, within [`LIMIT`].
+async fn drive_hooked<S: htui_core::store::RecorderStore>(
+    fx: &Leased,
+    hooked: &Hooked,
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, S>,
+) -> Result<DoneEvent, DriverError> {
+    let policy = PermissionPolicy::default();
+    let relay = Relay {
+        follow_ups: true,
+        ..relay_over(hooked, fx, &policy)
+    };
+    within(drive(
+        session,
+        recorder,
+        Some(&relay),
+        &mut Control::never(),
+    ))
+    .await
+}
+
+/// The turn's own `done`.
+const END_TURN: DoneEvent = DoneEvent {
+    stop_reason: StopReason::EndTurn,
+};
+
+/// `step`'s one window, closed or not.
+fn window_closed(store: &MemStore, step: StepId) -> bool {
+    let windows: Vec<_> = store
+        .follow_up_windows()
+        .into_iter()
+        .filter(|window| window.run_step_id == step)
+        .collect();
+    assert_eq!(windows.len(), 1, "one window for the step: {windows:?}");
+    windows[0].closed_at.is_some()
+}
+
+/// D6 steps 5-7: a send that fails after the claim and the record fails the session with the
+/// send's error. The row stays `applied` (the claim precedes the send by design), its text gone,
+/// and the follow-up is in the step's log; the window still closes, refusing nothing.
+#[tokio::test(start_paused = true)]
+async fn a_failed_send_after_the_claim_fails_the_session_and_keeps_the_row_applied() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked = queues_before_the_look(fx.store.clone(), fx.step);
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = FailingSend {
+        inner: fake(two_plain_turns(), fx.step).await,
+    };
+
+    let out = drive_hooked(&fx, &hooked, &mut session, &mut recorder).await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Err(DriverError::Transport(SEND_FAILED.to_owned())),
+        "the send's failure is the session's"
+    );
+    assert_eq!(
+        hooked.counts(),
+        [1, 1, 1, 1, 0],
+        "one open, one look, one claim, one close"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(RunCommandStatus::Applied, None, false)],
+        "claimed before the send: applied, its text gone (I-5)"
+    );
+    let log = log(&fx.store, fx.step).await;
+    assert_eq!(
+        follow_ups_in(&log),
+        vec![(1, json!({ "text": "also run [REDACTED] checks" }))],
+        "recorded before the send"
+    );
+    assert_eq!(dones_in(&log), 1, "no second turn");
+    assert!(window_closed(&fx.store, fx.step), "the exit closed it");
+}
+
+/// D6 steps 5-6: a record that fails after the claim (the log's append is down) fails the session
+/// with the store's error before anything is sent. The row stays `applied`, its text gone.
+#[tokio::test(start_paused = true)]
+async fn a_failed_record_after_the_claim_fails_the_session_and_keeps_the_row_applied() {
+    let fx = leased().await;
+    running(&fx).await;
+    let down = Arc::new(AtomicBool::new(false));
+    let hooked = queues_before_the_look(fx.store.clone(), fx.step).tripping(Arc::clone(&down));
+    let flaky = FlakyAppends {
+        store: &fx.store,
+        down: Arc::clone(&down),
+    };
+    let scrubber = scrubber();
+    let mut recorder = Recorder::new(&flaky, &scrubber, fx.step, false, None)
+        .with_fence(StepFence::Lease(fx.owner));
+    let mut session = fake(two_plain_turns(), fx.step).await;
+
+    let out = drive_hooked(&fx, &hooked, session.as_mut(), &mut recorder).await;
+    down.store(false, Ordering::SeqCst);
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Err(DriverError::Store(StoreError::Unreachable(
+            "the log is switched off".to_owned()
+        ))),
+        "the record's failure is the session's"
+    );
+    assert_eq!(
+        hooked.counts(),
+        [1, 1, 1, 1, 0],
+        "one open, one look, one claim, one close"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(RunCommandStatus::Applied, None, false)],
+        "the claim stands: applied, its text gone (I-5)"
+    );
+    assert_eq!(
+        dones_in(&log(&fx.store, fx.step).await),
+        1,
+        "nothing was sent: no second turn"
+    );
+    assert!(window_closed(&fx.store, fx.step), "the exit closed it");
+}
+
+/// B-11: a claim the store fails (not a fence) is a `warn`: the session ends at its turn's
+/// `done`, and the window's close refuses the row it could not claim.
+#[tokio::test(start_paused = true)]
+async fn a_failed_claim_ends_the_session_and_the_close_refuses_the_row() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked = queues_before_the_look(fx.store.clone(), fx.step).failing(SETTLE, ALWAYS);
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_plain_turns(), fx.step).await;
+
+    let out = drive_hooked(&fx, &hooked, session.as_mut(), &mut recorder).await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Ok(END_TURN), "turn 0's `done` ends the session");
+    assert_eq!(
+        hooked.counts(),
+        [1, 1, 1, 1, 0],
+        "one open, one look, one failed claim, one close"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            false
+        )],
+        "the close refused it, its text gone"
+    );
+    let log = log(&fx.store, fx.step).await;
+    assert!(follow_ups_in(&log).is_empty(), "nothing was sent");
+    assert_eq!(dones_in(&log), 1, "one turn");
+}
+
+/// B-11: the look rides out `TRANSIENT_READS - 1` transient failures and reads the row on the
+/// last attempt; the follow-up is sent and turn 1 runs.
+#[tokio::test(start_paused = true)]
+async fn the_look_rides_out_transient_failures() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked =
+        queues_before_the_look(fx.store.clone(), fx.step).failing(NEXT, TRANSIENT_READS - 1);
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_plain_turns(), fx.step).await;
+
+    let out = drive_hooked(&fx, &hooked, session.as_mut(), &mut recorder).await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Ok(END_TURN), "turn 1's `done` ends the session");
+    assert_eq!(
+        hooked.counts(),
+        [1, TRANSIENT_READS + 1, 1, 1, 0],
+        "turn 0's look took every attempt, turn 1's one; one claim, one close"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(RunCommandStatus::Applied, None, false)],
+        "sent, its text gone"
+    );
+    let log = log(&fx.store, fx.step).await;
+    assert_eq!(follow_ups_in(&log).len(), 1, "one follow-up recorded");
+    assert_eq!(dones_in(&log), 2, "two turns");
+}
+
+/// B-11: a look that keeps failing gives up after `TRANSIENT_READS` attempts; the session ends at
+/// turn 0's `done`, and the window's close refuses the row nobody read.
+#[tokio::test(start_paused = true)]
+async fn the_look_gives_up_after_its_transient_reads() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked = queues_before_the_look(fx.store.clone(), fx.step).failing(NEXT, ALWAYS);
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_plain_turns(), fx.step).await;
+
+    let out = drive_hooked(&fx, &hooked, session.as_mut(), &mut recorder).await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Ok(END_TURN), "turn 0's `done` ends the session");
+    assert_eq!(
+        hooked.counts(),
+        [1, TRANSIENT_READS, 0, 1, 0],
+        "every attempt failed; no claim, one close"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            false
+        )],
+        "the close refused it, its text gone"
+    );
+    assert_eq!(dones_in(&log(&fx.store, fx.step).await), 1, "one turn");
+}
+
+/// B-10: an open window's close retries transient failures and lands on its last attempt,
+/// refusing the row queued after the last look.
+#[tokio::test(start_paused = true)]
+async fn an_open_windows_close_rides_out_transient_failures() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked =
+        queues_after_the_look(fx.store.clone(), fx.step).failing(CLOSE, TRANSIENT_READS - 1);
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_plain_turns(), fx.step).await;
+
+    let out = drive_hooked(&fx, &hooked, session.as_mut(), &mut recorder).await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Ok(END_TURN), "turn 0's `done` ends the session");
+    assert_eq!(
+        hooked.counts(),
+        [1, 1, 0, TRANSIENT_READS, 0],
+        "the close took every attempt"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+            false
+        )],
+        "the last attempt refused it, its text gone"
+    );
+    assert!(window_closed(&fx.store, fx.step), "the close landed");
+}
+
+/// B-10, R-3: an open window's close that keeps failing gives up after `TRANSIENT_READS`
+/// attempts with a `warn`. The row stays pending with its text and the window open: what the
+/// engine closes when it settles the run terminal (review M-3), a cancel or the next re-take.
+#[tokio::test(start_paused = true)]
+async fn an_open_windows_close_gives_up_after_its_transient_reads() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked = queues_after_the_look(fx.store.clone(), fx.step).failing(CLOSE, ALWAYS);
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_plain_turns(), fx.step).await;
+
+    let out = drive_hooked(&fx, &hooked, session.as_mut(), &mut recorder).await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(
+        out,
+        Ok(END_TURN),
+        "a close that fails is not the session's error"
+    );
+    assert_eq!(
+        hooked.counts(),
+        [1, 1, 0, TRANSIENT_READS, 0],
+        "the close took every attempt"
+    );
+    assert_eq!(
+        follow_ups(&fx.store),
+        vec![(RunCommandStatus::Pending, None, true)],
+        "stranded: pending, its text kept"
+    );
+    assert!(!window_closed(&fx.store, fx.step), "the window stays open");
+}
+
+/// B-10: a window whose open failed gets one close attempt, whose failure is a `warn`.
+#[tokio::test(start_paused = true)]
+async fn a_window_that_never_opened_tries_one_close() {
+    let fx = leased().await;
+    running(&fx).await;
+    let hooked = Hooked::new(fx.store.clone())
+        .failing(OPEN, ALWAYS)
+        .failing(CLOSE, ALWAYS);
+    let scrubber = scrubber();
+    let mut recorder = fenced_recorder(&fx, &scrubber);
+    let mut session = fake(two_plain_turns(), fx.step).await;
+
+    let out = drive_hooked(&fx, &hooked, session.as_mut(), &mut recorder).await;
+    recorder.finish().await.expect("the recorder closes");
+
+    assert_eq!(out, Ok(END_TURN), "the session ran");
+    assert_eq!(
+        hooked.counts(),
+        [1, 0, 0, 1, 0],
+        "one failed open, no look, one failed close"
     );
     assert!(fx.store.follow_up_windows().is_empty(), "no window");
 }
