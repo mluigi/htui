@@ -580,9 +580,10 @@ async fn the_command_run_liveness_columns_exist() {
 
 /// MOD-70 plan D1 (blueprint §2.6, §4.3): `0016_follow_up.sql` splits `run_command`'s pending
 /// index in two (one pending cancel per run, one pending follow-up per step), gives the table its
-/// `run_step_id` and `text` columns, and adds `follow_up_window`. Review M-1: a plain index stands
-/// behind each foreign key it adds (`run_command.run_step_id`, `follow_up_window.run_id`) and
-/// behind `run_command.run_id`, which `relay_view` reads per run. The step's status CHECK is untouched (PRD metric "No new step state"): its definition is the one
+/// `run_step_id` and `text` columns, and adds `follow_up_window`. Review M-1: an index stands
+/// behind each foreign key it adds (`run_command.run_step_id`, partial on `run_step_id IS NOT
+/// NULL`, which the cascade's strict `=` lookup implies; `follow_up_window.run_id`) and behind
+/// `run_command.run_id`, which `relay_view` reads per run. The step's status CHECK is untouched (PRD metric "No new step state"): its definition is the one
 /// `0015_command_queue.sql` left, byte for byte.
 #[tokio::test]
 async fn migration_0016_reshapes_run_command_and_adds_the_follow_up_window() {
@@ -617,8 +618,10 @@ async fn migration_0016_reshapes_run_command_and_adds_the_follow_up_window() {
              plain), got {indexes:?}"
         );
     }
-    // MOD-70 review M-1: every foreign key 0016 adds has a plain (non-partial) index behind its
-    // cascade, and `relay_view`'s per-run read of follow-ups has one on `run_command.run_id`.
+    // MOD-70 review M-1: every foreign key 0016 adds has an index behind its cascade, and
+    // `relay_view`'s per-run read of follow-ups has one on `run_command.run_id`. The step's is
+    // partial (`run_step_id IS NOT NULL`): the cascade's `run_step_id = $1` implies it, so the
+    // planner can use it; the other two are plain.
     for (name, definition) in [
         (
             "idx_run_command_step",

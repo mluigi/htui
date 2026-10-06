@@ -34,9 +34,10 @@ CREATE UNIQUE INDEX uq_run_command_pending_cancel ON run_command (run_id)
     WHERE status = 'pending' AND kind = 'cancel';
 CREATE UNIQUE INDEX uq_run_command_pending_follow_up ON run_command (run_step_id)
     WHERE status = 'pending' AND kind = 'follow_up';
--- Plain indexes behind the new foreign key's cascade (a step's every follow-up, not only the
--- pending one) and behind relay_view's per-run read of follow-ups, which 0011's (run_id, kind)
--- pending index no longer serves once it is dropped.
+-- Indexes behind the new foreign key's cascade (a step's every follow-up, not only the pending
+-- one: partial on run_step_id IS NOT NULL, which the cascade's run_step_id = $1 implies, so the
+-- planner can use it) and behind relay_view's per-run read of follow-ups, which 0011's
+-- (run_id, kind) pending index no longer serves once it is dropped.
 CREATE INDEX idx_run_command_step ON run_command (run_step_id) WHERE run_step_id IS NOT NULL;
 CREATE INDEX idx_run_command_run ON run_command (run_id);
 
