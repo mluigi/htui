@@ -24,7 +24,7 @@ use htui_agent::fake::FakeAdapter;
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Billing, CitationKind, Claim, DocumentHead, DocumentId,
+    Agent, AgentBox, AgentId, BatchClose, Billing, CitationKind, Claim, DocumentHead, DocumentId,
     EXECUTOR_GONE, GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemPatch, NewDocument,
     NewItem, NewRun, NewRunStep, Note, OpenPermission, PermissionId, PermissionStatus, RelayOption,
     RelayOptionKind, RelaySessionId, Resolution, RunId, RunMode, RunStatus, RunStep, Scope,
@@ -3092,11 +3092,10 @@ async fn a_second_q_dequeues_it() {
     );
 }
 
-/// D2, D9: `P` on a paused box opens a batch; `P` again closes it.
+/// D2, D3, D9: `P` on a paused box opens a batch; `P` again closes it with reason `Paused`.
 ///
 /// No store read answers a closed batch (T3's surface reads only the open one), so the closed
-/// row's `paused` reason is `serve_queue`'s literal and is not read back here; that the batch
-/// closed, and that a later resume opens a new one, is.
+/// row is read back through `MemStore::batch_rows`, the test seam.
 #[tokio::test]
 async fn p_resumes_then_pauses_the_queue() {
     let store = MemStore::demo();
@@ -3118,6 +3117,13 @@ async fn p_resumes_then_pauses_the_queue() {
         None,
         "`P` closed it"
     );
+    let closed = store
+        .batch_rows()
+        .into_iter()
+        .find(|batch| batch.id == opened.id)
+        .expect("the closed row stays");
+    assert_eq!(closed.closed_reason, Some(BatchClose::Paused));
+    assert!(closed.closed_at.is_some(), "a reason comes with its stamp");
     assert_eq!(harness.app().status.as_deref(), Some("queue paused"));
 
     keys(&mut harness, &["P"]).await;
