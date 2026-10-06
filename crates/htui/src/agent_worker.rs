@@ -56,10 +56,12 @@ use htui_agent::record::{
 };
 use htui_agent::registry::{DriverFactory, caps_for};
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, ItemId, PER_TOKEN_CAP_BATCH, ProjectCaps,
-    ProjectId, QuotaSource, RunStatus, Scope, SessionEvent, StepId, StepOpening, Transport,
+    Agent, AgentBox, AgentId, BoxId, ChatRunSpec, ItemId, PER_TOKEN_CAP_BATCH, Project,
+    ProjectCaps, ProjectId, QuotaSource, RunStatus, Scope, SessionEvent, StepId, StepOpening,
+    Transport,
 };
 use htui_core::scrub::MinimalScrubber;
+use htui_core::secret::{SecretSource, project_scope, resolve_project};
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
 use htui_orch::OpeningPath;
 use htui_orch::tools::{ToolHost, ToolLease, ToolScope};
@@ -511,6 +513,10 @@ pub struct AgentRuntime {
     /// MOD-11 D11: htui's MCP host, which every chat opens one lease on (OQ-8); `None` keeps
     /// every chat's `mcp` empty.
     tools: Option<Arc<dyn ToolHost>>,
+    /// MOD-10 D15: the process's secret source, which every chat on a provider project resolves
+    /// through in its own task; `None` refuses those chats (`secrets_refused`) and leaves the rest
+    /// untouched.
+    secrets: Option<Arc<dyn SecretSource>>,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -650,6 +656,7 @@ impl AgentRuntime {
             probe_env: None,
             hardware: None,
             tools: None,
+            secrets: None,
         }
     }
 
@@ -658,6 +665,14 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_tool_host(mut self, tools: Arc<dyn ToolHost>) -> Self {
         self.tools = Some(tools);
+        self
+    }
+
+    /// MOD-10 D15: every chat this runtime starts or binds on a provider project resolves its
+    /// secrets through `source` (the TUI's `KeyringInfisical`, shared with its run runtime).
+    #[must_use]
+    pub fn with_secret_source(mut self, source: Arc<dyn SecretSource>) -> Self {
+        self.secrets = Some(source);
         self
     }
 
@@ -836,7 +851,7 @@ impl AgentRuntime {
     /// The predicate is named through a closure rather than as `Background::writes_agent_box`,
     /// because `filter` hands it `&&Background` and a method on `&self` is a `fn(&Background)`:
     /// the same path spelled as a function item is a trait-bound error, not a clippy lint.
-    /// [`claim_is_free`](Self::claim_is_free) asks the same question of the same collection and
+    /// `claim_is_free` asks the same question of the same collection and
     /// spells it `any(Background::writes_agent_box)` instead, because `any` hands it
     /// `&Background` and so takes the function item directly — `any` takes `FnMut(Self::Item)`
     /// where `filter` takes `FnMut(&Self::Item)`. Neither spelling is the other's mistake.
@@ -1036,6 +1051,16 @@ impl AgentRuntime {
             serde_json::from_value(summary.agent.settings.clone()).unwrap_or_default();
         let project_settings = backend.project_settings(project_id).await?;
         let project_caps = project_caps_for(project_id, project_settings.clone())?;
+        // MOD-10 D12: a column fault refuses here, before the log is read or a lease opened.
+        let secrets = match self.chat_secrets(backend, project_id).await? {
+            Ok(secrets) => secrets,
+            Err(refusal) => {
+                return Ok(Served::Reply(StoreReply::Failed {
+                    request: PROMOTE_STEP,
+                    message: refusal,
+                }));
+            }
+        };
         let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
         let Some(tail) = writer.step_events(step_id).await? else {
             return Ok(Served::Reply(StoreReply::Failed {
@@ -1140,10 +1165,37 @@ impl AgentRuntime {
             project_caps,
             quota_latch,
             lease,
+            secrets,
         };
         Ok(Served::Start {
             step_id,
             task: Box::pin(answering("chat", run_chat(args), Some(answer))),
+        })
+    }
+
+    /// MOD-10 D12 (blueprint B.10): `project_id`'s secret columns, checked on the serve arm. The
+    /// inner `Ok` is `None` for a provider-less project and the chat task's [`ChatSecrets`] for a
+    /// provider one; the inner `Err` is a column fault's `secrets_refused: …` sentence. No I/O
+    /// beyond the project row: the resolution itself is the chat task's (blueprint A-12, `R-NF-3`).
+    async fn chat_secrets(
+        &self,
+        backend: &Backend,
+        project_id: ProjectId,
+    ) -> Result<Result<Option<ChatSecrets>, String>, StoreError> {
+        let project = backend
+            .project(project_id)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "project",
+                id: project_id.to_string(),
+            })?;
+        Ok(match project_scope(&project) {
+            Ok(None) => Ok(None),
+            Ok(Some(_)) => Ok(Some(ChatSecrets {
+                source: self.secrets.clone(),
+                project,
+            })),
+            Err(cause) => Err(cause.refusal()),
         })
     }
 
@@ -2118,6 +2170,16 @@ impl AgentRuntime {
             );
         }
         let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
+        // MOD-10 D12: a column fault refuses here, before anything is written or opened.
+        let secrets = match self.chat_secrets(backend, project_id).await? {
+            Ok(secrets) => secrets,
+            Err(refusal) => {
+                return Ok(Served::Reply(StoreReply::Failed {
+                    request: "chat_start",
+                    message: refusal,
+                }));
+            }
+        };
 
         let chat = ChatRunSpec::mint(project_id, box_id, user, Some(agent_id), model.clone());
         // MOD-11 D11, OQ-8: a fresh chat has no item, so no item tool is advertised; opened
@@ -2143,7 +2205,12 @@ impl AgentRuntime {
             None => None,
         };
         let policy = chat_policy(settings.permission, lease.as_ref());
-        writer.start_chat_run(&chat).await?;
+        // MOD-10 D13 (blueprint A-12): a provider project's run is written by the chat task, once
+        // its secrets resolved, so a refusal leaves no run behind; any other chat's is written
+        // here, as before MOD-10.
+        if secrets.is_none() {
+            writer.start_chat_run(&chat).await?;
+        }
         #[cfg(test)]
         tests::minted(&chat);
 
@@ -2159,8 +2226,8 @@ impl AgentRuntime {
             // at all rather than a session scoped to somewhere unexpected.
             cwd,
             extra_dirs: Vec::new(),
-            // MOD-10 fills this from the secret provider; until then a session carries none, and
-            // the scrubber below therefore masks the credential prefixes only.
+            // MOD-10 D12: a provider project's chat task fills this with the resolved map
+            // (`run_chat`'s prelude); any other chat carries none.
             env: BTreeMap::new(),
             model: model.clone(),
             tools: htui_agent::driver::ToolExposure::default(),
@@ -2237,7 +2304,11 @@ impl AgentRuntime {
         // MOD-24 D4: copies of the pair and the writer, because the panicked task is dropped with
         // the originals before its answer is sent. Review L3: one closed flag between the two, so
         // a panic after the session's own close never closes the run a second time.
-        let closed = Arc::new(AtomicBool::new(false));
+        //
+        // MOD-10 (blueprint H-11): raised from the start while the run is not written yet, so
+        // neither the session's close nor the panic answer touches a run that does not exist;
+        // `run_chat` lowers it once its deferred `start_chat_run` landed.
+        let closed = Arc::new(AtomicBool::new(secrets.is_some()));
         let answer =
             frames
                 .answer(chat_failed)
@@ -2257,6 +2328,7 @@ impl AgentRuntime {
             project_caps,
             quota_latch,
             lease,
+            secrets,
         };
         Ok(Served::Start {
             step_id,
@@ -2455,6 +2527,17 @@ pub struct ChatArgs {
     /// MOD-11 D11: the chat's tool lease, held by the chat task until it returns; dropping it
     /// ends the session's token (I-6). `None` without a tool host.
     lease: Option<ToolLease>,
+    /// MOD-10 D12: `Some` only for a provider project, whose secrets the task resolves first.
+    secrets: Option<ChatSecrets>,
+}
+
+/// MOD-10 D12/D13 (blueprint A-12): what the chat task resolves before it writes or starts
+/// anything: off the store loop's arm (`R-NF-3`). Holds no value: the source and the project row.
+#[derive(Debug)]
+struct ChatSecrets {
+    /// The runtime's source; `None` refuses the chat with `resolve_project`'s own sentence.
+    source: Option<Arc<dyn SecretSource>>,
+    project: Project,
 }
 
 impl core::fmt::Debug for ChatArgs {
@@ -2465,6 +2548,7 @@ impl core::fmt::Debug for ChatArgs {
             .field("spec", &self.spec)
             .field("project_caps", &self.project_caps)
             .field("lease", &self.lease)
+            .field("secrets", &self.secrets.is_some())
             .finish()
     }
 }
@@ -4122,7 +4206,7 @@ pub async fn run_chat(args: ChatArgs) {
         driver,
         writer,
         binding,
-        spec,
+        mut spec,
         prompt,
         policy,
         caps,
@@ -4134,9 +4218,55 @@ pub async fn run_chat(args: ChatArgs) {
         quota_latch,
         // Bound, not `_`: the lease lives until this task returns (MOD-11 D11, I-6).
         lease: _lease,
+        secrets,
     } = args;
 
-    let scrubber = MinimalScrubber::new(spec.env.values().cloned());
+    // MOD-10 D12/D13 (blueprint A-12): a provider project's secrets resolve here, in the chat's
+    // own task, and a fresh chat's run is written only once they did.
+    if let Some(ChatSecrets { source, project }) = secrets {
+        match resolve_project(source.as_deref(), &project).await {
+            Ok(resolved) => {
+                // The `ResolvedSecrets` drops (zeroized) at the end of this arm; the copy in the
+                // spec is OQ-C's documented residual.
+                spec.env = resolved
+                    .as_ref()
+                    .map(|resolved| resolved.as_map().clone())
+                    .unwrap_or_default();
+            }
+            Err(cause) => {
+                // D13: the sentence a run fails with; nothing was written, nothing started. The
+                // frames are the start-failure arm's below, with no run to close.
+                let message = cause.refusal();
+                frames.to_stream(StoreReply::Failed {
+                    request: binding.request(),
+                    message: message.clone(),
+                });
+                frames.failed(message);
+                return;
+            }
+        }
+        if let ChatBinding::Fresh(chat, closed) = &binding {
+            if let Err(err) = writer.start_chat_run(chat).await {
+                let message = err.to_string();
+                frames.to_stream(StoreReply::Failed {
+                    request: binding.request(),
+                    message: message.clone(),
+                });
+                frames.failed(message);
+                return;
+            }
+            closed.store(false, Ordering::Release);
+        }
+    }
+    // MOD-10 D11 for chats: the scrubber is built from the very map the env holds.
+    let (scrubber, short) = MinimalScrubber::from_resolved(&spec.env);
+    if !short.is_empty() {
+        tracing::warn!(
+            step = %binding.step_id(),
+            keys = ?short,
+            "these secrets are shorter than the masking floor: injected, not masked"
+        );
+    }
     let step_id = binding.step_id();
     // Read before the spec moves into the driver: the tab's banner needs it (MOD-11 D18).
     let prompts = spec.prompt.is_some();
@@ -6018,6 +6148,7 @@ pub(crate) mod tests {
             .expect("the demo project's caps"),
             quota_latch: quota_latch_for(&agent, box_id, settings.quota.source),
             lease: None,
+            secrets: None,
         })
         .await;
         let mut replies = Vec::new();
@@ -13770,5 +13901,570 @@ done
         assert_eq!(snapshot.manual, map);
         assert_eq!(snapshot.status, ProbeStatus::Ready);
         assert!(on_box.enabled);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-10 M3 T6a: a chat's secrets (D12, D13, D15, blueprint A-12)
+    // -----------------------------------------------------------------------------------------
+
+    /// MOD-10 M3 (blueprint §D.6): a chat on a provider project resolves its secrets in its own
+    /// task, starts with exactly that map as its env and records through a scrubber built from
+    /// the same map; a refusal answers `secrets_refused: …`, writes no run and starts no session.
+    /// Every case uses `FakeSecretSource`, never the keyring (H-9).
+    mod chat_secrets {
+        use std::collections::BTreeMap;
+        use std::future::Future;
+        use std::sync::{Arc, PoisonError};
+        use std::time::Duration;
+
+        use htui_agent::conformance::{Script, ScriptEvent};
+        use htui_agent::driver::SessionSpec;
+        use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
+        use htui_core::fixtures::ids;
+        use htui_core::model::{EventKind, StepId};
+        use htui_core::scrub::{MinimalScrubber, Scrubber as _};
+        use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
+        use htui_core::secret::{
+            INFISICAL, SecretError, SecretFuture, SecretProvider, SecretSource, project_scope,
+        };
+        use htui_core::store::{MemStore, ReadStore as _};
+        use htui_orch::OpeningPath;
+        use htui_orch::fake::FakeToolHost;
+        use htui_store::Backend;
+        use tokio::sync::{Notify, mpsc};
+
+        use super::{
+            SpecSlot, attach_and_await, attach_and_end, envelope, fixture_with_spec_spy,
+            promote_addr, promoted, run, run_of, scope, start,
+        };
+        use crate::agent_worker::{AgentRuntime, PROMOTE_STEP, Served};
+        use crate::store_worker::{
+            ChatFrame, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest,
+        };
+
+        /// A scope `SecretScope::parse` accepts.
+        const SCOPE: &str = r#"{"project_id":"p1","environment":"dev","path":"/"}"#;
+
+        /// A resolved value long enough to be masked and shaped like no credential, so a refusal
+        /// can never stand in for a mask (blueprint §D fixture rule).
+        const VALUE: &str = "zq7-resolved-value-0123456789";
+
+        /// One turn: the agent says `text`, then ends it.
+        fn echo(text: &str) -> Script {
+            Script::one_turn(vec![
+                ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                    text: text.to_owned(),
+                    message_id: Some("m1".to_owned()),
+                })),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ])
+        }
+
+        fn map(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+                .collect()
+        }
+
+        /// A source whose provider resolves `pairs`.
+        fn resolving(pairs: &[(&str, &str)]) -> Arc<FakeSecretSource> {
+            Arc::new(FakeSecretSource::new(Arc::new(
+                FakeSecretProvider::resolving(pairs),
+            )))
+        }
+
+        /// `PROJECT_HTUI` names `provider` (with a valid scope either way).
+        fn plant(store: &MemStore, provider: Option<&str>) {
+            store.set_project_secret_columns(ids::PROJECT_HTUI, provider, Some(SCOPE));
+        }
+
+        fn spec_of(slot: &SpecSlot) -> Option<SessionSpec> {
+            slot.lock().unwrap_or_else(PoisonError::into_inner).clone()
+        }
+
+        fn handoff() -> OpeningPath {
+            OpeningPath::Handoff {
+                text: "pick up where the step stopped".to_owned(),
+                digest: "d-handoff".to_owned(),
+            }
+        }
+
+        /// Every row of `step`'s log, as `Debug` text (payload and raw included).
+        async fn rows(store: &MemStore, step: StepId) -> Vec<String> {
+            store
+                .step_events(step)
+                .await
+                .expect("the log reads")
+                .unwrap_or_default()
+                .iter()
+                .map(|row| format!("{row:?}"))
+                .collect()
+        }
+
+        /// The text of `step`'s `assistant_text` rows, joined.
+        async fn assistant_text(store: &MemStore, step: StepId) -> String {
+            store
+                .step_events(step)
+                .await
+                .expect("the log reads")
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| row.kind == EventKind::AssistantText)
+                .filter_map(|row| row.payload["text"].as_str().map(str::to_owned))
+                .collect()
+        }
+
+        /// The stream's replies (the `ChatStart`'s own address, seq 7).
+        fn stream(replies: &[ReplyEnvelope]) -> Vec<&StoreReply> {
+            replies
+                .iter()
+                .filter(|reply| reply.seq == 7)
+                .map(|reply| &reply.reply)
+                .collect()
+        }
+
+        /// Whether `replies` is exactly a refusal of `request` with `sentence`: the `Failed` that
+        /// clears the pending start, then the stream's own `Failed`, as a start failure answers.
+        fn is_refusal(replies: &[&StoreReply], request: &str, sentence: &str) -> bool {
+            matches!(
+                replies,
+                [
+                    StoreReply::Failed { request: named, message },
+                    StoreReply::Chat(ChatFrame::Failed { message: streamed }),
+                ] if *named == request && message == sentence && streamed == sentence
+            )
+        }
+
+        /// The user's `Esc Esc` on a started chat, then its task to the end: [`run`]'s tail for a
+        /// case that had to look between `serve` and the task.
+        async fn end(
+            runtime: &mut AgentRuntime,
+            backend: &Backend,
+            (tx, mut rx): (
+                mpsc::UnboundedSender<ReplyEnvelope>,
+                mpsc::UnboundedReceiver<ReplyEnvelope>,
+            ),
+            step_id: StepId,
+            task: impl Future<Output = ()>,
+        ) -> Vec<ReplyEnvelope> {
+            let cancel = runtime
+                .serve(
+                    backend,
+                    &tx,
+                    &envelope(8, StoreRequest::ChatCancel { step_id }),
+                )
+                .await;
+            assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+            task.await;
+            drop(tx);
+            let mut replies = Vec::new();
+            while let Some(reply) = rx.recv().await {
+                replies.push(reply);
+            }
+            replies
+        }
+
+        #[tokio::test]
+        async fn a_chat_on_a_provider_project_gets_the_env_and_masks_its_echo() {
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(echo(&format!("the key is {VALUE}")), None).await;
+            plant(&store, Some(INFISICAL));
+            let source = resolving(&[("API_KEY", VALUE)]);
+            let mut runtime = runtime.with_secret_source(source.clone());
+            let active = store.active_runs(&scope()).await.expect("count");
+
+            let (step_id, replies) =
+                run(&mut runtime, &backend, start(agent_id, "echo the key")).await;
+
+            assert!(
+                matches!(
+                    stream(&replies).first(),
+                    Some(StoreReply::ChatAccepted { .. })
+                ),
+                "the chat started: {replies:?}"
+            );
+            assert_eq!(source.calls(), 1, "one resolution per chat");
+            let spec = spec_of(&slot).expect("the session started");
+            assert_eq!(
+                spec.env,
+                map(&[("API_KEY", VALUE)]),
+                "the env is the resolved map, exactly (R-SEC-2)"
+            );
+            let rows = rows(&store, step_id).await;
+            assert!(
+                rows.iter().any(|row| row.contains("[REDACTED]")),
+                "the echo is stored masked: {rows:?}"
+            );
+            assert!(
+                rows.iter().all(|row| !row.contains(VALUE)),
+                "no row holds the value"
+            );
+            assert!(
+                !format!("{replies:?}").contains(VALUE),
+                "no frame the tab is sent holds it either"
+            );
+            assert!(
+                store
+                    .run(run_of(step_id))
+                    .await
+                    .expect("the read answers")
+                    .is_some(),
+                "the deferred run was written"
+            );
+            assert_eq!(
+                store.active_runs(&scope()).await.expect("count"),
+                active,
+                "and closed when the chat ended"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_chat_writes_no_run_and_answers_the_sentence() {
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(echo("never said"), None).await;
+            plant(&store, Some(INFISICAL));
+            let source = Arc::new(FakeSecretSource::failing(SecretError::NoIdentity));
+            let mut runtime = runtime.with_secret_source(source.clone());
+            let active = store.active_runs(&scope()).await.expect("count");
+
+            let (step_id, replies) = run(&mut runtime, &backend, start(agent_id, "hello")).await;
+
+            let sentence = SecretError::NoIdentity.refusal();
+            assert!(
+                is_refusal(&stream(&replies), "chat_start", &sentence),
+                "the start is refused with the run's sentence: {replies:?}"
+            );
+            assert_eq!(source.calls(), 1);
+            assert!(spec_of(&slot).is_none(), "no session was started");
+            assert!(
+                store
+                    .run(run_of(step_id))
+                    .await
+                    .expect("the read answers")
+                    .is_none(),
+                "no run row is left behind (D13)"
+            );
+            assert!(
+                rows(&store, step_id).await.is_empty(),
+                "and no log for its step"
+            );
+            assert_eq!(store.active_runs(&scope()).await.expect("count"), active);
+        }
+
+        /// Both arms, each on its own fixture: the fake factory hands out one scripted driver,
+        /// and `driver_for` runs before the column check on both.
+        #[tokio::test]
+        async fn a_column_fault_refuses_the_chat_on_the_serve_arm() {
+            for promotion in [false, true] {
+                let (store, backend, runtime, agent_id, slot) =
+                    fixture_with_spec_spy(echo("never said"), None).await;
+                plant(&store, Some("vault"));
+                let source = resolving(&[("API_KEY", VALUE)]);
+                let tools = Arc::new(FakeToolHost::default());
+                let mut runtime = runtime
+                    .with_tool_host(tools.clone())
+                    .with_secret_source(source.clone());
+                let project = store
+                    .project(ids::PROJECT_HTUI)
+                    .await
+                    .expect("the read answers")
+                    .expect("the fixture project");
+                let sentence = project_scope(&project)
+                    .expect_err("`vault` is no provider of this build")
+                    .refusal();
+                let active = store.active_runs(&scope()).await.expect("count");
+                let (tx, _rx) = mpsc::unbounded_channel();
+
+                let (served, expected) = if promotion {
+                    let served = runtime
+                        .attach_promoted(
+                            &backend,
+                            &tx,
+                            promote_addr(),
+                            promoted(agent_id, handoff()),
+                        )
+                        .await;
+                    (served, PROMOTE_STEP)
+                } else {
+                    let served = runtime
+                        .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+                        .await;
+                    (served, "chat_start")
+                };
+                match served {
+                    Served::Reply(StoreReply::Failed { request, message }) => {
+                        assert_eq!(request, expected);
+                        assert_eq!(message, sentence);
+                    }
+                    other => panic!("a column fault answers on the arm: {other:?}"),
+                }
+
+                assert_eq!(source.calls(), 0, "the source is never asked");
+                assert!(tools.opened().is_empty(), "no lease was opened");
+                assert!(runtime.live_steps().is_empty(), "no chat is live");
+                assert!(spec_of(&slot).is_none(), "no session was started");
+                assert_eq!(store.active_runs(&scope()).await.expect("count"), active);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_provider_less_chat_never_touches_the_source_and_writes_its_run_inline() {
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(echo("hello"), None).await;
+            // The provider column is the switch (D12): a scope alone means nothing.
+            store.set_project_secret_columns(ids::PROJECT_HTUI, None, Some("not a scope"));
+            let source = resolving(&[("API_KEY", VALUE)]);
+            let mut runtime = runtime.with_secret_source(source.clone());
+            let (tx, rx) = mpsc::unbounded_channel();
+
+            let Served::Start { step_id, task } = runtime
+                .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+                .await
+            else {
+                panic!("a provider-less chat starts")
+            };
+            assert!(
+                store
+                    .run(run_of(step_id))
+                    .await
+                    .expect("the read answers")
+                    .is_some(),
+                "its run is written on the serve arm, as before MOD-10"
+            );
+            let replies = end(&mut runtime, &backend, (tx, rx), step_id, task).await;
+
+            assert!(
+                matches!(
+                    stream(&replies).first(),
+                    Some(StoreReply::ChatAccepted { .. })
+                ),
+                "{replies:?}"
+            );
+            assert_eq!(source.calls(), 0, "the source is never asked");
+            assert!(
+                spec_of(&slot).expect("the session started").env.is_empty(),
+                "and the env stays empty"
+            );
+        }
+
+        /// A source that answers only once the test opens its gate.
+        #[derive(Debug)]
+        struct Gated {
+            gate: Arc<Notify>,
+            provider: Arc<dyn SecretProvider>,
+        }
+
+        impl SecretSource for Gated {
+            fn provider(&self) -> SecretFuture<'_, Arc<dyn SecretProvider>> {
+                Box::pin(async move {
+                    self.gate.notified().await;
+                    Ok(Arc::clone(&self.provider))
+                })
+            }
+        }
+
+        /// Blueprint A-12, H-10: `serve` is awaited on the store loop's arm, so it must answer
+        /// without waiting on the source; the resolution and the run's write are the task's.
+        #[tokio::test]
+        async fn chat_resolution_runs_in_the_chat_task_not_on_the_serve_arm() {
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(echo("hello"), None).await;
+            plant(&store, Some(INFISICAL));
+            let gate = Arc::new(Notify::new());
+            let provider = Arc::new(FakeSecretProvider::resolving(&[("API_KEY", VALUE)]));
+            let mut runtime = runtime.with_secret_source(Arc::new(Gated {
+                gate: Arc::clone(&gate),
+                provider: provider.clone(),
+            }));
+            let (tx, rx) = mpsc::unbounded_channel();
+            let request: RequestEnvelope = envelope(7, start(agent_id, "hello"));
+
+            let served = tokio::time::timeout(
+                Duration::from_secs(10),
+                runtime.serve(&backend, &tx, &request),
+            )
+            .await
+            .expect("serve answers without waiting on the source");
+            let Served::Start { step_id, task } = served else {
+                panic!("a provider project's chat starts its task: {served:?}")
+            };
+            assert_eq!(provider.resolves(), 0, "nothing was resolved on the arm");
+            assert!(
+                store
+                    .run(run_of(step_id))
+                    .await
+                    .expect("the read answers")
+                    .is_none(),
+                "the run is written after the resolution, by the task"
+            );
+
+            gate.notify_one();
+            let replies = end(&mut runtime, &backend, (tx, rx), step_id, task).await;
+
+            assert!(
+                matches!(
+                    stream(&replies).first(),
+                    Some(StoreReply::ChatAccepted { .. })
+                ),
+                "{replies:?}"
+            );
+            assert_eq!(provider.resolves(), 1);
+            assert!(
+                store
+                    .run(run_of(step_id))
+                    .await
+                    .expect("the read answers")
+                    .is_some(),
+                "the task wrote the run"
+            );
+            assert_eq!(
+                spec_of(&slot).expect("the session started").env,
+                map(&[("API_KEY", VALUE)])
+            );
+        }
+
+        /// D11 for chats: the scrubber is `from_resolved` over the env's own map, so a value below
+        /// the masking floor is injected and left as is, and a long one is masked.
+        ///
+        /// The agent echoes the `"…\n"` value twice: whole, and without its trailing newline (the
+        /// D17 form, blueprint §D.6). The persisted text must be exactly what
+        /// `MinimalScrubber::from_resolved` over the same map makes of the echo, so whatever forms
+        /// `from_resolved` masks, the chat masks too. This base predates T1, whose
+        /// `from_resolved` has no trimmed form yet; the literal §D.6 assertion that the
+        /// newline-free echo is masked is
+        /// `a_newline_free_echo_of_a_newline_value_is_masked`, ignored until T1 is merged.
+        #[tokio::test]
+        async fn the_chat_scrubber_is_built_from_the_resolved_map() {
+            const PIN: &str = "q7z";
+            let cert = format!("{VALUE}\n");
+            let said = format!("pin {PIN} cert {cert}end bare {VALUE}.");
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(echo(&said), None).await;
+            plant(&store, Some(INFISICAL));
+            let mut runtime =
+                runtime.with_secret_source(resolving(&[("PIN", PIN), ("CERT", &cert)]));
+
+            let (step_id, _replies) = run(&mut runtime, &backend, start(agent_id, "go")).await;
+
+            let env = map(&[("PIN", PIN), ("CERT", &cert)]);
+            assert_eq!(
+                spec_of(&slot).expect("the session started").env,
+                env,
+                "both values are injected, the short one too"
+            );
+            let mut expected = serde_json::Value::String(said);
+            MinimalScrubber::from_resolved(&env)
+                .0
+                .scrub(&mut expected)
+                .expect("the echo is credential-free");
+            let text = assistant_text(&store, step_id).await;
+            assert_eq!(
+                Some(text.as_str()),
+                expected.as_str(),
+                "the chat masks what from_resolved over the env masks"
+            );
+            assert!(
+                text.contains(&format!("pin {PIN} cert")),
+                "a value below the floor is not masked: {text:?}"
+            );
+            assert!(
+                text.contains("cert [REDACTED]end"),
+                "the long value is masked: {text:?}"
+            );
+        }
+
+        /// Blueprint §D.6, literally: a resolved `"…\n"` value echoed without its trailing newline
+        /// is masked on the chat path. Needs T1's D17 trimmed form in
+        /// `MinimalScrubber::from_resolved`, which this branch's base does not carry.
+        #[tokio::test]
+        #[ignore = "needs T1's D17 trailing-newline form in from_resolved; un-ignore once T1 is merged"]
+        async fn a_newline_free_echo_of_a_newline_value_is_masked() {
+            let cert = format!("{VALUE}\n");
+            let (store, backend, runtime, agent_id, _slot) =
+                fixture_with_spec_spy(echo(&format!("cert {VALUE}end")), None).await;
+            plant(&store, Some(INFISICAL));
+            let mut runtime = runtime.with_secret_source(resolving(&[("CERT", &cert)]));
+
+            let (step_id, _replies) = run(&mut runtime, &backend, start(agent_id, "go")).await;
+
+            let text = assistant_text(&store, step_id).await;
+            assert_eq!(text, "cert [REDACTED]end");
+            assert!(!text.contains(VALUE), "{text:?}");
+        }
+
+        #[tokio::test]
+        async fn a_promoted_chat_on_a_provider_project_gets_the_env() {
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(echo(&format!("the key is {VALUE}")), None).await;
+            plant(&store, Some(INFISICAL));
+            let source = resolving(&[("API_KEY", VALUE)]);
+            let mut runtime = runtime.with_secret_source(source.clone());
+
+            let replies = attach_and_end(
+                &mut runtime,
+                &backend,
+                promoted(agent_id, handoff()),
+                async |_| {},
+            )
+            .await;
+
+            assert!(
+                replies
+                    .iter()
+                    .any(|reply| matches!(reply.reply, StoreReply::ChatAccepted { .. })),
+                "the promoted chat started: {replies:?}"
+            );
+            assert_eq!(source.calls(), 1);
+            assert_eq!(
+                spec_of(&slot).expect("the session started").env,
+                map(&[("API_KEY", VALUE)])
+            );
+            let rows = rows(&store, ids::STEP_PLAN).await;
+            assert!(
+                rows.iter().any(|row| row.contains("[REDACTED]")),
+                "the echo is stored masked: {rows:?}"
+            );
+            assert!(rows.iter().all(|row| !row.contains(VALUE)));
+        }
+
+        #[tokio::test]
+        async fn a_refused_promotion_starts_no_session() {
+            let (store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(echo("never said"), None).await;
+            plant(&store, Some(INFISICAL));
+            let source = Arc::new(FakeSecretSource::failing(SecretError::BadCredentials));
+            let mut runtime = runtime.with_secret_source(source.clone());
+            let before = rows(&store, ids::STEP_PLAN).await;
+            let run_before = store
+                .run(ids::RUN_1)
+                .await
+                .expect("the read answers")
+                .expect("the fixture's run");
+
+            let replies =
+                attach_and_await(&mut runtime, &backend, promoted(agent_id, handoff())).await;
+
+            let sentence = SecretError::BadCredentials.refusal();
+            assert!(
+                is_refusal(&stream(&replies), PROMOTE_STEP, &sentence),
+                "the promotion is refused with the run's sentence: {replies:?}"
+            );
+            assert_eq!(source.calls(), 1);
+            assert!(spec_of(&slot).is_none(), "no session was started");
+            assert_eq!(
+                rows(&store, ids::STEP_PLAN).await,
+                before,
+                "the step's log is untouched"
+            );
+            let run_after = store
+                .run(ids::RUN_1)
+                .await
+                .expect("the read answers")
+                .expect("the fixture's run");
+            assert_eq!(run_after.status, run_before.status, "and so is its run");
+        }
     }
 }

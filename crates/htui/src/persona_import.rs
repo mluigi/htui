@@ -10,7 +10,7 @@
 //! **The row is the truth.** An import writes one `persona` row per file and stores no path: the
 //! file is never re-read, and editing it afterwards changes nothing (I-10, `R-ID-3`). Nothing here
 //! asks a model anything (`R-ID-6`): a file is read by
-//! [`parse_import`](htui_core::model::persona::parse_import), the persona file grammar with the
+//! [`parse_import`], the persona file grammar with the
 //! one import exception (an `mcp__` entry in `tools` is dropped and named, OQ-7).
 //!
 //! **The sweep is new logic, not the skill walk.** A directory contributes its depth-0 regular
