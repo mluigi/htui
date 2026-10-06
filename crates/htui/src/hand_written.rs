@@ -90,7 +90,7 @@ impl core::fmt::Debug for HandText {
 /// The answer to `StoreRequest::DocumentForm` (D1, D3): the item, and for `v` the version of the
 /// asked kind the next step reads (`resolve_inputs`, ANA-2 §4.2 as amended by MOD-73), not the
 /// latest of any producer: a fan-out loser's output is never the base (`R-ORCH-7`), and a
-/// hand-written version newer than the step-produced pick is. See [`v_base`] for the seat.
+/// hand-written version newer than the step-produced pick is. See `v_base` for the seat.
 ///
 /// `Debug` is hand-written (milestone 2 review L2): see the impl.
 #[derive(Clone, PartialEq)]

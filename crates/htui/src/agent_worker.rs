@@ -851,7 +851,7 @@ impl AgentRuntime {
     /// The predicate is named through a closure rather than as `Background::writes_agent_box`,
     /// because `filter` hands it `&&Background` and a method on `&self` is a `fn(&Background)`:
     /// the same path spelled as a function item is a trait-bound error, not a clippy lint.
-    /// [`claim_is_free`](Self::claim_is_free) asks the same question of the same collection and
+    /// `claim_is_free` asks the same question of the same collection and
     /// spells it `any(Background::writes_agent_box)` instead, because `any` hands it
     /// `&Background` and so takes the function item directly — `any` takes `FnMut(Self::Item)`
     /// where `filter` takes `FnMut(&Self::Item)`. Neither spelling is the other's mistake.

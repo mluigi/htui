@@ -2,7 +2,7 @@
 //! PRD D1; MOD-54 D3). The widget MOD-22, MOD-23 and the connection section's DSN entry consume.
 //!
 //! Width is counted in **display cells** and the cursor steps by **grapheme cluster**, both through
-//! [`crate::ui::cells`] (MOD-54 D1, D2), so a CJK or emoji line occupies the columns it is drawn
+//! `crate::ui::cells` (MOD-54 D1, D2), so a CJK or emoji line occupies the columns it is drawn
 //! in rather than one column per code point, and `Left`/`Backspace` cannot split a combining
 //! sequence. Every cell count in this file comes from that one module, so it cannot drift from
 //! `ratatui`, which is what actually draws the result.

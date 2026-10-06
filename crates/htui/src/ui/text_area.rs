@@ -16,7 +16,7 @@
 //! D59), so the text it hands back is what an editor opened on compares against.
 //!
 //! **Everything drawn is counted in display cells** (MOD-54 D9, D11), through
-//! [`crate::ui::cells`], the same module [`TextField`](crate::ui::TextField) counts by: a wide char
+//! `crate::ui::cells`, the same module [`TextField`](crate::ui::TextField) counts by: a wide char
 //! (CJK, most emoji) takes two cells and a combining mark none, and the cursor cell is sized from
 //! that measurement rather than assumed to be one. The exceptions: a `\t` draws as spaces to the
 //! next tab stop (every four columns) counted from the accumulated cell column, and any control

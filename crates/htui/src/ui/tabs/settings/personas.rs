@@ -114,8 +114,8 @@ pub const DEFAULT_IS_ASK_OR_DENY: &str = "`permission-default` is blank, ask or 
 pub const CHANGED_ELSEWHERE_SAVE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+S retries against the current row";
 
 /// What a spent token says when fields the user changed were changed elsewhere too, before their
-/// labels (copied from `agents.rs`, which stays untouched). Opens like [`CHANGED_ELSEWHERE`], so
-/// [`is_error`] draws it the same.
+/// labels (copied from `agents.rs`, which stays untouched). Opens like `CHANGED_ELSEWHERE`, so
+/// `is_error` draws it the same.
 pub const CHANGED_ON_BOTH_SIDES: &str =
     "changed elsewhere \u{2014} reloaded; Enter retries \u{b7} also changed elsewhere: ";
 
