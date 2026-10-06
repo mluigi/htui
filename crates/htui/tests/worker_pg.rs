@@ -1082,7 +1082,7 @@ async fn allow(client: &PgStore, row: &StepPermission) {
 
 /// One `run_command` row of kind `follow_up`, as the direct SQL probe reads it: PRD metric 3's
 /// `text IS NULL` has no store method, by design (OQ-6).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct FollowUpRow {
     id: RunCommandId,
     status: RunCommandStatus,
@@ -1251,7 +1251,7 @@ async fn a_cancel_from_another_box_refuses_its_pending_follow_up() {
     };
     assert_eq!(
         follow_up_rows(&stack.db.pool, parked.run_step_id).await,
-        [refused.clone()],
+        std::slice::from_ref(&refused),
         "the cancel's own transaction refused it (B-14)"
     );
     let deadline = Instant::now() + PATIENCE;
