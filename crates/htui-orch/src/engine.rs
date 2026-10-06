@@ -1533,9 +1533,11 @@ where
     /// a note says so, and the step stays promoted and parked. An `unavailable` one is not refused
     /// (plan D30: it never fails a step, and some of its causes are permanent); it is recorded and
     /// a note `accept: verify unavailable: <reason>` says the merge goes in unverified (D211).
-    /// MOD-10 (blueprint A-11): the walk's secrets are resolved after the guard and before the
-    /// lease, so the verify's output is re-masked with them; a refusal is
-    /// [`EngineError::Secrets`] and writes nothing.
+    /// MOD-10 (blueprint A-11, amended A-1, `842a4ef0`): the walk's secrets are resolved after
+    /// the guard and before the lease, unconditionally and on purpose. It is the accept's only
+    /// way to re-mask the verify's output with them, and a refusal ([`EngineError::Secrets`],
+    /// nothing written) refuses the accept while the promoted step can still be accepted again,
+    /// instead of letting the walk the accept continues `fail_hard` at its next live step.
     /// Otherwise the `AnswerGate(Approved)` tail: the step `done` with `approved`, the unpark,
     /// the merge, and the walk from `position + 1`.
     async fn accept_artifact(
@@ -1552,11 +1554,13 @@ where
         let has_output = self.output_of(item, &phase, row.id).await?.is_some();
         let steps = self.parts.store.run_steps(run.id).await?;
         crate::command::accept_enabled(&steps, &row, &phase, has_output, chat_live)?;
-        // MOD-10 (blueprint A-11): the verify below re-masks its output with this walk's
-        // scrubber, which masks resolved values only once they are resolved, so the accept
-        // resolves first (a provider-less project reads nothing). A refusal refuses the accept
-        // before the lease and the first write: the step stays promoted and parked, and the
-        // human can accept again once the project's secrets resolve. Boxed (blueprint H-1).
+        // MOD-10 (blueprint A-11, amended A-1): deliberate, whatever the phase. The verify below
+        // re-masks its output with this walk's scrubber, which masks resolved values only once
+        // they are resolved (a provider-less project reads nothing). And a refusal here refuses
+        // the accept before the lease and the first write, so the step stays promoted and
+        // parked and the human can accept again once the project's secrets resolve; resolving
+        // later would let the walk the accept continues fail the run at its next live step.
+        // Boxed (blueprint H-1).
         Box::pin(self.secrets_ready(&run))
             .await?
             .map_err(EngineError::Secrets)?;
@@ -6102,8 +6106,9 @@ where
 
     /// MOD-10 D11/D12 (blueprint A-1): this walk's secrets, ready for `run`'s project before a
     /// live path persists anything of its session (the trim record, the prompt row, the prompt's
-    /// own masking), and before `AcceptArtifact`'s verify (A-11: its output is re-masked). `Ok(Err(cause))` is a refusal the caller settles its own way; the outer
-    /// error is the project read's. Call sites box it (blueprint H-1).
+    /// own masking), and before `AcceptArtifact`'s verify (A-11: its output is re-masked).
+    /// `Ok(Err(cause))` is a refusal the caller settles its own way; the outer error is the
+    /// project read's. Call sites box it (blueprint H-1).
     async fn secrets_ready(&self, run: &Run) -> Result<Result<(), SecretError>, EngineError> {
         let project = self.project(run.project_id).await?;
         Ok(self.parts.secrets.prepare(&project).await)
