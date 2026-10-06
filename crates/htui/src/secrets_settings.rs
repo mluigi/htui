@@ -39,11 +39,12 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 /// [`StoreRequest::CheckSecretProvider`]'s name (D5).
 pub const CHECK_SECRET_PROVIDER: &str = "check_secret_provider";
 
-/// `StoreRequest::CheckSecretScope`'s name (D8).
+/// [`StoreRequest::CheckSecretScope`]'s name (D8).
 pub const CHECK_SECRET_SCOPE: &str = "check_secret_scope";
 
-/// The project scope write's name (D6). Not one of `hierarchy::REQUEST_NAMES` (blueprint A-11):
-/// its refusals are the Secrets section's, not the Hierarchy section's.
+/// [`StoreRequest::SetProjectSecretScope`]'s name (D6). Not one of
+/// [`hierarchy::REQUEST_NAMES`](crate::hierarchy::REQUEST_NAMES) (blueprint A-11): its refusals
+/// are the Secrets section's, not the Hierarchy section's.
 pub const SET_PROJECT_SECRET_SCOPE: &str = "set_project_secret_scope";
 
 /// What a keyring write is refused with on [`Backend::Memory`] (D10, blueprint A-8).
@@ -187,7 +188,7 @@ pub enum SecretCheck {
         /// The provider's health, or why there was none.
         outcome: std::result::Result<ProviderHealth, SecretError>,
     },
-    /// `StoreRequest::CheckSecretScope`'s: how many keys the project's scope shows.
+    /// [`StoreRequest::CheckSecretScope`]'s: how many keys the project's scope shows.
     Scope {
         /// The project checked.
         project: ProjectId,
@@ -391,6 +392,22 @@ mod tests {
         assert_eq!(
             StoreRequest::CheckSecretProvider.name(),
             CHECK_SECRET_PROVIDER
+        );
+        assert_eq!(
+            StoreRequest::CheckSecretScope {
+                project: ProjectId::new(),
+            }
+            .name(),
+            CHECK_SECRET_SCOPE
+        );
+        assert_eq!(
+            StoreRequest::SetProjectSecretScope {
+                id: ProjectId::new(),
+                expected: Utc::now(),
+                scope: None,
+            }
+            .name(),
+            SET_PROJECT_SECRET_SCOPE
         );
     }
 }

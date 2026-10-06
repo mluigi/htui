@@ -19,21 +19,25 @@ use std::time::Duration;
 use chrono::Utc;
 use htui::agent_worker::{AgentRuntime, Served};
 use htui::app::{Action, Handled};
+use htui::hierarchy::{self, HierarchySnapshot, ScopeWrite};
 use htui::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use htui::secrets_settings::{
-    CHECK_SECRET_PROVIDER, DEMO_SESSION, IDENTITY_INCOMPLETE, IdentityEntry, IdentityState,
-    NO_SOURCE_TO_CHECK, Redacted, SecretCheck, SecretsSnapshot, UrlState,
+    CHECK_SECRET_PROVIDER, CHECK_SECRET_SCOPE, DEMO_SESSION, IDENTITY_INCOMPLETE, IdentityEntry,
+    IdentityState, NO_PROVIDER_TO_CHECK, NO_SOURCE_TO_CHECK, Redacted, SET_PROJECT_SECRET_SCOPE,
+    SecretCheck, SecretsSnapshot, UrlState,
 };
 use htui::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::tabs::settings::QdrantSection;
 use htui_agent::registry::DriverFactory;
+use htui_core::fixtures::ids;
+use htui_core::model::{NewProject, Project, ProjectId};
 use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
 use htui_core::secret::{
-    MachineIdentity, ProviderHealth, ResolvedSecrets, SecretError, SecretFuture, SecretProvider,
-    SecretScope, SecretSource,
+    INFISICAL, MachineIdentity, ProviderHealth, ResolvedSecrets, SecretError, SecretFuture,
+    SecretProvider, SecretScope, SecretSource, project_scope,
 };
-use htui_core::store::MemStore;
+use htui_core::store::{MemStore, ReadStore, WriteStore};
 use htui_store::testkit as common;
 use htui_store::{Backend, CacheStore, PgStore, secret};
 use tokio::sync::mpsc;
@@ -155,7 +159,7 @@ struct RefusingHealth;
 
 impl SecretProvider for RefusingHealth {
     fn kind(&self) -> &'static str {
-        htui_core::secret::INFISICAL
+        INFISICAL
     }
 
     fn health(&self) -> SecretFuture<'_, ProviderHealth> {
@@ -519,5 +523,383 @@ async fn a_harness_without_an_agent_runtime_refuses_the_provider_check_by_name()
     assert_eq!(
         harness.app().status.as_deref(),
         Some("check_secret_provider: no agent runtime in this harness")
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The project scope write (D6, D7; A-1, A-11)
+// ---------------------------------------------------------------------------------------------
+
+/// A value an Infisical key holds, which no reply may carry.
+const V1: &str = "v1-secret-value-0001";
+/// Another.
+const V2: &str = "v2-secret-value-0002";
+
+/// A scope as the section would build it.
+fn a_scope() -> SecretScope {
+    SecretScope::new("p-graphics", "dev", "/app").expect("a valid scope")
+}
+
+/// The demo tree of `Graphics`, read from the store as the section's token would be.
+async fn graphics(store: &MemStore) -> HierarchySnapshot {
+    hierarchy::snapshot(store, ids::WORKSPACE_GRAPHICS, None)
+        .await
+        .expect("the store answers")
+        .expect("the demo has `Graphics`")
+}
+
+/// `project`'s row inside `tree`, or a panic.
+#[track_caller]
+fn row_in(tree: &HierarchySnapshot, project: ProjectId) -> Project {
+    tree.projects
+        .iter()
+        .find(|entry| entry.project.id == project)
+        .map(|entry| entry.project.clone())
+        .expect("the project is in the tree")
+}
+
+/// The project row as the store holds it now.
+async fn stored(store: &MemStore, project: ProjectId) -> Project {
+    store
+        .project(project)
+        .await
+        .expect("the store answers")
+        .expect("the project is there")
+}
+
+/// `SetProjectSecretScope` through `serve`.
+async fn write_scope(
+    backend: &Backend,
+    id: ProjectId,
+    expected: chrono::DateTime<Utc>,
+    scope: Option<SecretScope>,
+) -> StoreReply {
+    serve(
+        backend,
+        &StoreRequest::SetProjectSecretScope {
+            id,
+            expected,
+            scope,
+        },
+    )
+    .await
+}
+
+/// A `SecretScopeWritten` reply's `(project, tree, outcome)`, or a panic.
+#[track_caller]
+fn written(reply: StoreReply) -> (ProjectId, HierarchySnapshot, ScopeWrite) {
+    match reply {
+        StoreReply::SecretScopeWritten {
+            project,
+            tree,
+            outcome,
+        } => (project, *tree, outcome),
+        other => panic!("expected a scope write's own reply, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_project_secret_scope_writes_both_columns_and_answers_its_own_reply() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let token = row_in(&graphics(&store).await, ids::PROJECT_VULKAN).updated_at;
+
+    let (project, tree, outcome) =
+        written(write_scope(&backend, ids::PROJECT_VULKAN, token, Some(a_scope())).await);
+
+    assert_eq!(project, ids::PROJECT_VULKAN);
+    assert_eq!(outcome, ScopeWrite::Applied);
+    assert_eq!(tree.workspace.id, ids::WORKSPACE_GRAPHICS);
+    let column = Some(a_scope().to_column());
+    for row in [
+        row_in(&tree, ids::PROJECT_VULKAN),
+        stored(&store, ids::PROJECT_VULKAN).await,
+    ] {
+        assert_eq!(row.secret_provider.as_deref(), Some(INFISICAL));
+        assert_eq!(row.secret_scope, column);
+    }
+}
+
+#[tokio::test]
+async fn a_written_scope_is_what_the_next_walk_reads() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let token = row_in(&graphics(&store).await, ids::PROJECT_VULKAN).updated_at;
+    let _ = written(write_scope(&backend, ids::PROJECT_VULKAN, token, Some(a_scope())).await);
+
+    assert_eq!(
+        project_scope(&stored(&store, ids::PROJECT_VULKAN).await),
+        Ok(Some(a_scope()))
+    );
+}
+
+#[tokio::test]
+async fn clearing_a_scope_nulls_both_columns() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let token = row_in(&graphics(&store).await, ids::PROJECT_VULKAN).updated_at;
+    let (_, tree, _) =
+        written(write_scope(&backend, ids::PROJECT_VULKAN, token, Some(a_scope())).await);
+    let token = row_in(&tree, ids::PROJECT_VULKAN).updated_at;
+
+    let (_, tree, outcome) = written(write_scope(&backend, ids::PROJECT_VULKAN, token, None).await);
+
+    assert_eq!(outcome, ScopeWrite::Applied);
+    for row in [
+        row_in(&tree, ids::PROJECT_VULKAN),
+        stored(&store, ids::PROJECT_VULKAN).await,
+    ] {
+        assert_eq!(row.secret_provider, None);
+        assert_eq!(row.secret_scope, None);
+    }
+    assert_eq!(
+        project_scope(&stored(&store, ids::PROJECT_VULKAN).await),
+        Ok(None)
+    );
+}
+
+#[tokio::test]
+async fn a_spent_token_answers_stale_and_writes_nothing() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let spent = row_in(&graphics(&store).await, ids::PROJECT_VULKAN).updated_at;
+    let _ = written(write_scope(&backend, ids::PROJECT_VULKAN, spent, Some(a_scope())).await);
+    let other = SecretScope::new("p-other", "prod", "/").expect("a valid scope");
+
+    let (project, tree, outcome) =
+        written(write_scope(&backend, ids::PROJECT_VULKAN, spent, Some(other)).await);
+
+    assert_eq!(project, ids::PROJECT_VULKAN);
+    assert_eq!(outcome, ScopeWrite::Stale);
+    let now = stored(&store, ids::PROJECT_VULKAN).await;
+    assert_eq!(now.secret_scope, Some(a_scope().to_column()), "unchanged");
+    let current = match serve(&backend, &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS)).await {
+        StoreReply::Hierarchy(Some(tree)) => *tree,
+        other => panic!("expected a tree: {other:?}"),
+    };
+    assert_eq!(tree, current, "a stale write answers the tree as it is now");
+    assert_eq!(
+        row_in(&tree, ids::PROJECT_VULKAN).updated_at,
+        now.updated_at
+    );
+}
+
+/// The `tests/hierarchy.rs` shape: the workspace is resolved before the write, so an unlinked
+/// project is refused by the write's own name and nothing is written.
+#[tokio::test]
+async fn an_unlinked_project_is_refused_before_anything_is_written() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let orphan = store
+        .create_project(NewProject {
+            id: ProjectId::new(),
+            slug: "orphan".to_owned(),
+            name: "Orphan".to_owned(),
+            description: String::new(),
+            created_by: ids::USER,
+        })
+        .await
+        .expect("the store creates it");
+
+    let (request, message) =
+        failed_of(write_scope(&backend, orphan.id, orphan.updated_at, Some(a_scope())).await);
+
+    assert_eq!(request, SET_PROJECT_SECRET_SCOPE);
+    assert!(message.contains("workspace_project"), "{message}");
+    let row = stored(&store, orphan.id).await;
+    assert_eq!(row.secret_provider, None);
+    assert_eq!(row.secret_scope, None);
+}
+
+/// A-11: the Hierarchy section matches its `Failed` replies by `hierarchy::REQUEST_NAMES`, so the
+/// scope write is not one of them: its refusals are the Secrets section's.
+#[test]
+fn the_scope_write_is_not_a_hierarchy_request_name() {
+    assert!(!hierarchy::REQUEST_NAMES.contains(&SET_PROJECT_SECRET_SCOPE));
+    let request = StoreRequest::SetProjectSecretScope {
+        id: ids::PROJECT_VULKAN,
+        expected: Utc::now(),
+        scope: None,
+    };
+    assert_eq!(request.name(), SET_PROJECT_SECRET_SCOPE);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The scope check (D8)
+// ---------------------------------------------------------------------------------------------
+
+/// A runtime holding `source` (when given) and the answer to one `CheckSecretScope` of `project`
+/// over `store`: the immediate `Served`, and the deferred reply when there is one.
+async fn scope_check_through(
+    store: &MemStore,
+    source: Option<Arc<dyn SecretSource>>,
+    project: ProjectId,
+) -> (Served, Option<ReplyEnvelope>) {
+    let mut runtime = AgentRuntime::new(DriverFactory::new());
+    if let Some(source) = source {
+        runtime = runtime.with_secret_source(source);
+    }
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let served = runtime
+        .serve(
+            &Backend::memory(store.clone()),
+            &tx,
+            &envelope(9, StoreRequest::CheckSecretScope { project }),
+        )
+        .await;
+    let reply = match served {
+        Served::Deferred => Some(
+            tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the check answers within five seconds")
+                .expect("the runtime keeps the channel open"),
+        ),
+        _ => None,
+    };
+    runtime.finish_background(Duration::from_secs(5)).await;
+    (served, reply)
+}
+
+/// A scope check's `(project, outcome)` out of a reply, or a panic.
+#[track_caller]
+fn scope_outcome(reply: &StoreReply) -> (ProjectId, Result<usize, SecretError>) {
+    match reply {
+        StoreReply::SecretCheck(SecretCheck::Scope {
+            project, outcome, ..
+        }) => (*project, outcome.clone()),
+        other => panic!("expected a scope check, got {other:?}"),
+    }
+}
+
+/// The demo store with `Vulkan` on Infisical at [`a_scope`].
+fn scoped_store() -> MemStore {
+    let store = MemStore::demo();
+    store.set_project_secret_columns(
+        ids::PROJECT_VULKAN,
+        Some(INFISICAL),
+        Some(&a_scope().to_column()),
+    );
+    store
+}
+
+#[tokio::test]
+async fn check_secret_scope_answers_a_key_count_and_no_names() {
+    let store = scoped_store();
+    let provider = FakeSecretProvider::resolving(&[("API_KEY", V1), ("DB_URL", V2)]);
+    let source = Arc::new(FakeSecretSource::new(Arc::new(provider)));
+
+    let (served, reply) =
+        scope_check_through(&store, Some(source.clone()), ids::PROJECT_VULKAN).await;
+
+    assert!(matches!(served, Served::Deferred), "{served:?}");
+    let envelope = reply.expect("a deferred check answers through the channel");
+    assert_eq!(envelope.seq, 9, "the answer goes to the request's address");
+    assert_eq!(scope_outcome(&envelope.reply), (ids::PROJECT_VULKAN, Ok(2)));
+    let shown = format!("{:?}", envelope.reply);
+    for name_or_value in ["API_KEY", "DB_URL", V1, V2] {
+        assert!(!shown.contains(name_or_value), "{shown}");
+    }
+    assert_eq!(source.calls(), 1);
+}
+
+#[tokio::test]
+async fn check_secret_scope_refuses_a_provider_less_project_without_the_source() {
+    let store = MemStore::demo();
+    let source = Arc::new(FakeSecretSource::new(Arc::new(
+        FakeSecretProvider::resolving(&[]),
+    )));
+
+    let (served, reply) =
+        scope_check_through(&store, Some(source.clone()), ids::PROJECT_VULKAN).await;
+
+    assert!(reply.is_none(), "nothing deferred");
+    match served {
+        Served::Reply(reply) => assert_eq!(
+            scope_outcome(&reply),
+            (
+                ids::PROJECT_VULKAN,
+                Err(SecretError::Config(NO_PROVIDER_TO_CHECK.to_owned()))
+            )
+        ),
+        other => panic!("answered at once: {other:?}"),
+    }
+    assert_eq!(source.calls(), 0, "the source is not asked");
+}
+
+#[tokio::test]
+async fn check_secret_scope_refuses_a_column_fault_before_the_source() {
+    let store = MemStore::demo();
+    store.set_project_secret_columns(
+        ids::PROJECT_VULKAN,
+        Some("vault"),
+        Some(&a_scope().to_column()),
+    );
+    let source = Arc::new(FakeSecretSource::new(Arc::new(
+        FakeSecretProvider::resolving(&[]),
+    )));
+
+    let (served, reply) =
+        scope_check_through(&store, Some(source.clone()), ids::PROJECT_VULKAN).await;
+
+    assert!(reply.is_none(), "nothing deferred");
+    match served {
+        Served::Reply(reply) => {
+            let (project, outcome) = scope_outcome(&reply);
+            assert_eq!(project, ids::PROJECT_VULKAN);
+            assert!(
+                matches!(outcome, Err(SecretError::Config(_))),
+                "{outcome:?}"
+            );
+        }
+        other => panic!("answered at once: {other:?}"),
+    }
+    assert_eq!(source.calls(), 0, "the source is not asked");
+}
+
+#[tokio::test]
+async fn check_secret_scope_passes_a_provider_error_through() {
+    let store = scoped_store();
+    let refusal = SecretError::PermissionDenied {
+        detail: "the identity may not read /app".to_owned(),
+    };
+    let source = Arc::new(FakeSecretSource::new(Arc::new(
+        FakeSecretProvider::failing(refusal.clone()),
+    )));
+
+    let (_, reply) = scope_check_through(&store, Some(source), ids::PROJECT_VULKAN).await;
+
+    let envelope = reply.expect("a deferred check answers through the channel");
+    assert_eq!(
+        scope_outcome(&envelope.reply),
+        (ids::PROJECT_VULKAN, Err(refusal))
+    );
+}
+
+#[tokio::test]
+async fn check_secret_scope_without_a_source_is_failed_with_one_sentence() {
+    let (served, reply) = scope_check_through(&scoped_store(), None, ids::PROJECT_VULKAN).await;
+    assert!(reply.is_none(), "nothing deferred");
+    match served {
+        Served::Reply(StoreReply::Failed { request, message }) => {
+            assert_eq!(request, CHECK_SECRET_SCOPE);
+            assert_eq!(message, NO_SOURCE_TO_CHECK);
+        }
+        other => panic!("a runtime with no source refuses: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_harness_without_an_agent_runtime_refuses_the_scope_check_by_name() {
+    let mut harness = Harness::demo();
+    harness.drive().await;
+    harness
+        .app()
+        .update(Action::Store(StoreRequest::CheckSecretScope {
+            project: ids::PROJECT_VULKAN,
+        }));
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("check_secret_scope: no agent runtime in this harness")
     );
 }

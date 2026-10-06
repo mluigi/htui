@@ -1,5 +1,6 @@
 //! The hierarchy the Settings tab edits: one worker-assembled snapshot per read, thirteen served
-//! requests, identity filled here and never on the render side (MOD-15 milestone 3, D5/D6/D10).
+//! requests (plus MOD-10 M4's project scope write, which answers under its own name), identity
+//! filled here and never on the render side (MOD-15 milestone 3, D5/D6/D10).
 //!
 //! A section names a read and is handed rows (`R-NF-3`): nothing below this module is reachable
 //! from `ui/`, and the two identity columns a write needs — `workspace.created_by` and the box a
@@ -11,8 +12,9 @@ use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use htui_core::model::{
-    BoxId, NewProject, NewRepo, NewWorkspace, Project, ProjectId, ProjectRef, Repo, RepoBoxPath,
-    RepoId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    BoxId, NewProject, NewRepo, NewWorkspace, Project, ProjectId, ProjectPatch, ProjectRef, Repo,
+    RepoBoxPath, RepoId, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject,
+    WorkspaceSummary,
 };
 use htui_core::root_path::canonical_root;
 use htui_core::store::{
@@ -78,6 +80,17 @@ pub enum MirrorAfterDelete {
     NotNeeded,
     /// The rebuild failed; the delete still happened.
     Failed(String),
+}
+
+/// What a project scope write did (MOD-10 M4 D6, blueprint A-1): the `outcome` of
+/// [`StoreReply::SecretScopeWritten`], which names its own write so that neither Settings section
+/// takes another's tree for its answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeWrite {
+    /// The columns were written.
+    Applied,
+    /// The token was spent; nothing was written.
+    Stale,
 }
 
 /// What one `InferRepoPaths` did (MOD-7 milestone 4, plan D116). Carries no URL and no id of a
@@ -322,6 +335,30 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             let outcome = writer.update_project(*id, *expected, patch.clone()).await?;
             cas(&writer, ws, this_box, &outcome).await
         }
+        // MOD-10 M4 D6: `UpdateProject`'s write with only `secret` set, answered under its own
+        // name rather than as `Hierarchy`/`HierarchyStale` (blueprint A-1), and not one of
+        // `REQUEST_NAMES` (A-11).
+        StoreRequest::SetProjectSecretScope {
+            id,
+            expected,
+            scope,
+        } => {
+            // Before the write, for `UpdateProject`'s reason above.
+            let ws = workspace_of(backend, *id).await?;
+            let patch = ProjectPatch {
+                secret: Some(scope.clone()),
+                ..ProjectPatch::default()
+            };
+            let outcome = match writer.update_project(*id, *expected, patch).await? {
+                CasOutcome::Applied(_) => ScopeWrite::Applied,
+                CasOutcome::Stale(_) => ScopeWrite::Stale,
+            };
+            Ok(StoreReply::SecretScopeWritten {
+                project: *id,
+                tree: Box::new(fresh_tree(&writer, ws, this_box).await?),
+                outcome,
+            })
+        }
         StoreRequest::CreateRepo {
             project,
             name,
@@ -445,6 +482,21 @@ async fn cas<T>(
             Ok(StoreReply::HierarchyStale(Box::new(snapshot)))
         }
     }
+}
+
+/// The tree for a write, or [`StoreError::NotFound`] when the workspace vanished under it: the
+/// write was just made against it, so `None` is not an answer.
+async fn fresh_tree(
+    writer: &Writer,
+    ws: WorkspaceId,
+    this_box: Option<BoxId>,
+) -> Result<HierarchySnapshot> {
+    snapshot(writer, ws, this_box)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "workspace",
+            id: ws.to_string(),
+        })
 }
 
 /// This box's id, or the refusal a path write gets on a box with no row.

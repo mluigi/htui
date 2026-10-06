@@ -64,7 +64,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::edit_help::{self, HelpPrompt};
 use htui_core::scrub::MinimalScrubber;
-use htui_core::secret::{SecretSource, project_scope, resolve_project};
+use htui_core::secret::{SecretError, SecretSource, project_scope, resolve_project};
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
 use htui_orch::OpeningPath;
 use htui_orch::tools::{ToolHost, ToolLease, ToolScope};
@@ -76,7 +76,10 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_settings::{AgentWrite, LITERAL_LAUNCH, SET_TOOL_PATHS, parse_tool_path};
-use crate::secrets_settings::{CHECK_SECRET_PROVIDER, NO_SOURCE_TO_CHECK, SecretCheck};
+use crate::secrets_settings::{
+    CHECK_SECRET_PROVIDER, CHECK_SECRET_SCOPE, NO_PROVIDER_TO_CHECK, NO_SOURCE_TO_CHECK,
+    SecretCheck,
+};
 use crate::store_worker::{
     AuthFrame, ChatFrame, EDIT_HELP, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq,
     StoreReply, StoreRequest, UNSOLICITED,
@@ -1390,6 +1393,12 @@ impl AgentRuntime {
             ),
             StoreRequest::AuthCancel => self.auth_cancel(),
             StoreRequest::CheckSecretProvider => self.check_provider(replies, addr),
+            StoreRequest::CheckSecretScope { project } => {
+                match self.check_scope(backend, replies, addr, *project).await {
+                    Ok(served) => served,
+                    Err(err) => Served::Reply(failed(CHECK_SECRET_SCOPE, &err)),
+                }
+            }
             other => Served::Reply(StoreReply::Failed {
                 request: other.name(),
                 message: "not a chat request".to_owned(),
@@ -1807,6 +1816,84 @@ impl AgentRuntime {
         ));
         self.background.push(Background::reading(task));
         Served::Deferred
+    }
+
+    /// The [`StoreRequest::CheckSecretScope`] path (MOD-10 M4 D8): [`Self::check_provider`]'s
+    /// shape, answering a **count** of the keys `project`'s scope shows and never a name.
+    ///
+    /// In this order: no source answers `Failed` with [`NO_SOURCE_TO_CHECK`]; the project row is
+    /// read (`chat_secrets`'s read); a project with no provider, or with a column
+    /// [`project_scope`] refuses, is answered at once with [`SecretCheck::Scope`] carrying
+    /// [`NO_PROVIDER_TO_CHECK`] or the column's refusal, **without asking the source**. Otherwise
+    /// a spawned task asks the source for its provider and the provider for the scope's key list,
+    /// and answers with its length; the list is dropped inside the task. A [`Background::reading`]
+    /// like the provider check.
+    ///
+    /// # Errors
+    ///
+    /// The project read's [`StoreError`], or [`StoreError::NotFound`] when there is no such
+    /// project; the caller answers either as `check_secret_scope`'s `Failed`.
+    async fn check_scope(
+        &mut self,
+        backend: &Backend,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+        project: ProjectId,
+    ) -> Result<Served, StoreError> {
+        let Some(source) = self.secrets.clone() else {
+            return Ok(Served::Reply(StoreReply::Failed {
+                request: CHECK_SECRET_SCOPE,
+                message: NO_SOURCE_TO_CHECK.to_owned(),
+            }));
+        };
+        let row = backend
+            .project(project)
+            .await?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "project",
+                id: project.to_string(),
+            })?;
+        let refused = |outcome: SecretError| {
+            Served::Reply(StoreReply::SecretCheck(SecretCheck::Scope {
+                project,
+                at: Utc::now(),
+                outcome: Err(outcome),
+            }))
+        };
+        let scope = match project_scope(&row) {
+            Ok(Some(scope)) => scope,
+            Ok(None) => {
+                return Ok(refused(SecretError::Config(
+                    NO_PROVIDER_TO_CHECK.to_owned(),
+                )));
+            }
+            Err(err) => return Ok(refused(err)),
+        };
+        let answer = Answer::at(replies.clone(), addr.clone(), scope_check_failed);
+        let tx = replies.clone();
+        let task = tokio::spawn(answering(
+            "secret scope check",
+            async move {
+                let outcome = match source.provider().await {
+                    // Only the length leaves this block: the names are dropped here.
+                    Ok(provider) => provider.list_keys(&scope).await.map(|keys| keys.len()),
+                    Err(err) => Err(err),
+                };
+                // A UI that has gone away is not an error, as in `Frames::send`.
+                let _ = tx.send(ReplyEnvelope {
+                    seq: addr.seq,
+                    origin: addr.origin,
+                    reply: StoreReply::SecretCheck(SecretCheck::Scope {
+                        project,
+                        at: Utc::now(),
+                        outcome,
+                    }),
+                });
+            },
+            Some(answer),
+        ));
+        self.background.push(Background::reading(task));
+        Ok(Served::Deferred)
     }
 
     /// The [`StoreRequest::InstallPlan`] path (MOD-20 D13, D18).
@@ -4327,6 +4414,15 @@ fn preview_failed(message: String) -> Vec<StoreReply> {
 fn provider_check_failed(message: String) -> Vec<StoreReply> {
     vec![StoreReply::Failed {
         request: CHECK_SECRET_PROVIDER,
+        message,
+    }]
+}
+
+/// A panicked secret scope check's last word: the `check_secret_scope` failure that ends the
+/// project row's `checking` (MOD-10 M4 D8).
+fn scope_check_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Failed {
+        request: CHECK_SECRET_SCOPE,
         message,
     }]
 }

@@ -295,8 +295,9 @@ impl Harness {
                         | StoreRequest::AuthDeliver { .. }
                         | StoreRequest::AuthCancel
                         | StoreRequest::SetToolPaths { .. }
-                        // MOD-10 M4 D5 (blueprint A-2).
-                        | StoreRequest::CheckSecretProvider,
+                        // MOD-10 M4 D5, D8 (blueprint A-2).
+                        | StoreRequest::CheckSecretProvider
+                        | StoreRequest::CheckSecretScope { .. },
                         _,
                     ) => match self.runtime.as_mut() {
                         Some(runtime) => {
