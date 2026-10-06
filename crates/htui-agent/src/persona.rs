@@ -104,6 +104,8 @@ pub fn narrow(
             && own.command_run
             && !deny_kinds.contains(&ToolKind::Execute),
         deny_kinds,
+        // MOD-55 review M1: a narrowing never widens, so a tool-less base stays tool-less.
+        no_tools: base.no_tools,
     };
 
     let mut rules: Vec<PermissionRule> = persona
@@ -230,6 +232,7 @@ mod tests {
             deny: names(deny),
             command_run: true,
             deny_kinds: Vec::new(),
+            no_tools: false,
         }
     }
 

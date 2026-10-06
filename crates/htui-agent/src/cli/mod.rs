@@ -124,6 +124,11 @@ pub const UNPARSED: &str = "<unparsed>";
 ///    6½. the step's narrowing (MOD-26 D11): `--tools=<allow>` when the allow-list is not empty,
 ///    then `--disallowedTools=<deny and the names deny_kinds inverts to>` when that is not empty,
 ///    each one `=`-joined argument; `--allowedTools` is never emitted (I-1);
+///
+///    6¾. a session with no tool at all ([`ToolExposure::no_tools`], MOD-55 review M1): `--tools=`
+///    in place of the allow-list and `--strict-mcp-config`, while 3, 6¼ and 6⅓ emit nothing — no
+///    permission mode, no server (the operator's own included), no prompt tool. [`refuse_widening`]
+///    is what keeps 7 from undoing it;
 /// 7. `settings.cli.extra_args` **last**, so an operator's repeated flag is the one the CLI keeps.
 ///
 /// **The budget flag is omitted at zero, and that is a measurement, not a nicety** (plan F-10):
@@ -160,7 +165,10 @@ pub fn argv(
             args.push(flag.to_owned());
             args.push(value.to_owned());
         };
-        if !cli.permission_mode.is_empty() {
+        // MOD-55 review M1: a tool-less session has nothing a mode could approve, and the seeded
+        // row's `acceptEdits` must not make help unusable, so the row's mode is dropped rather
+        // than refused.
+        if !cli.permission_mode.is_empty() && !spec.tools.no_tools {
             push("--permission-mode", &cli.permission_mode);
         }
         match spec.resume.as_ref() {
@@ -178,12 +186,14 @@ pub fn argv(
         }
     }
 
+    let no_tools = spec.tools.no_tools;
     // MOD-11 D8: after the last pair, before the narrowing, so `extra_args` still wins.
-    if let Some(config) = mcp_config(&spec.mcp) {
+    if let Some(config) = mcp_config(&spec.mcp).filter(|_| !no_tools) {
         args.push(format!("--mcp-config={config}"));
     }
-    // MOD-11 D18: every gated call asks `htui`'s prompt tool instead of the permission mode.
-    if spec.prompt.is_some() {
+    // MOD-11 D18: every gated call asks `htui`'s prompt tool instead of the permission mode. A
+    // tool-less session has no server to serve it, and no call to gate.
+    if spec.prompt.is_some() && !no_tools {
         args.push("--permission-prompt-tool".to_owned());
         args.push(PROMPT_TOOL.to_owned());
     }
@@ -192,7 +202,13 @@ pub fn argv(
     // pairs). `--tools` restricts the built-in set and is omitted when `allow` is empty —
     // `--tools=""` would disable every tool. `--allowedTools` is never emitted: it auto-approves
     // (I-1, probed).
-    if !spec.tools.allow.is_empty() {
+    //
+    // MOD-55 review M1: `no_tools` is that empty `--tools=` on purpose, and `--strict-mcp-config`
+    // with no `--mcp-config` beside it loads no server at all. The deny list still travels.
+    if no_tools {
+        args.push("--tools=".to_owned());
+        args.push("--strict-mcp-config".to_owned());
+    } else if !spec.tools.allow.is_empty() {
         args.push(format!("--tools={}", spec.tools.allow.join(",")));
     }
     let denied = disallowed(&spec.tools);
@@ -202,6 +218,57 @@ pub fn argv(
 
     args.extend(cli.extra_args.iter().cloned());
     args
+}
+
+/// The `extra_args` flags that would widen a tool-less session back: they come last on [`argv`],
+/// so the CLI keeps them over `--tools=` and `--strict-mcp-config` (MOD-55 review M1).
+const WIDENING_FLAGS: [&str; 6] = [
+    "--allowedTools",
+    "--allowed-tools",
+    "--dangerously-skip-permissions",
+    "--allow-dangerously-skip-permissions",
+    "--tools",
+    "--mcp-config",
+];
+
+/// The `--permission-mode` values that approve without asking.
+const WIDENING_MODES: [&str; 2] = ["bypassPermissions", "acceptEdits"];
+
+/// Refuses a tool-less session ([`ToolExposure::no_tools`]) on a row whose `extra_args` would
+/// widen it back; `Ok` for every other session, which this check is no business of.
+///
+/// Refused rather than stripped (MOD-55 review M1): `extra_args` are the operator's, passed
+/// verbatim and last so their copy wins ([`argv`], 7), and silently dropping one would be a second
+/// meaning nobody configured. The row's own `permission_mode` is the exception — [`argv`] drops it
+/// — because the seeded `claude-cli` row carries `acceptEdits` and refusing it would refuse help
+/// on every default install.
+///
+/// # Errors
+/// [`DriverError::Transport`] naming the first widening flag. Never [`DriverError::Spawn`]:
+/// nothing was spawned, and the chat runtime re-probes a row whose spawn failed.
+pub fn refuse_widening(cli: &CliSettings, tools: &ToolExposure) -> Result<()> {
+    if !tools.no_tools {
+        return Ok(());
+    }
+    let mut args = cli.extra_args.iter().map(String::as_str).peekable();
+    while let Some(arg) = args.next() {
+        let (flag, joined) = arg
+            .split_once('=')
+            .map_or((arg, None), |(flag, value)| (flag, Some(value)));
+        let widens = if flag == "--permission-mode" {
+            let value = joined.or_else(|| args.peek().copied());
+            value.is_some_and(|value| WIDENING_MODES.contains(&value))
+        } else {
+            WIDENING_FLAGS.contains(&flag)
+        };
+        if widens {
+            return Err(DriverError::Transport(format!(
+                "a session with no tools refuses this row's `{arg}` extra argument: it would \
+                 widen the session back"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The `--mcp-config` JSON for `servers` (MOD-11 D8): the CLI's own
@@ -497,6 +564,8 @@ impl AgentDriver for CliDriver {
                 || Uuid::now_v7().to_string(),
                 |resume| resume.as_str().to_owned(),
             );
+            // MOD-55 review M1: before the spawn, so a refused row starts nothing.
+            refuse_widening(&self.cli_settings(), &spec.tools)?;
             let io = self.io(&spec, &session_id).await?;
             let options = SessionOptions {
                 agent_name: self.name.clone(),

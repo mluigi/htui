@@ -220,6 +220,16 @@ pub struct ToolExposure {
     /// every transport that asks and by `htui`'s own ACP `fs/*` handlers, and inverted to tool
     /// names on `claude-cli`'s argv (D11). Empty denies no kind.
     pub deny_kinds: Vec<ToolKind>,
+    /// The session may use no tool at all (MOD-55 review M1): an editor's help turn. `false` by
+    /// default, and then every field above means what it says.
+    ///
+    /// `claude-cli` puts it on the argv as `--tools=` (the empty built-in list) and
+    /// `--strict-mcp-config` with no `--mcp-config` (no server, the operator's own included), drops
+    /// the row's `--permission-mode`, and refuses a row whose `extra_args` would widen it back.
+    /// ACP needs no flag: the protocol cannot remove an agent's own tools, so what holds there is
+    /// what the spec already says — every kind in `deny_kinds`, refused by the permission relay and
+    /// by `htui`'s `fs/*` handlers, and an empty `mcp`. A narrowing never clears it.
+    pub no_tools: bool,
 }
 
 /// One MCP server handed to the agent at `session/new` (`R-MCP-1`).
