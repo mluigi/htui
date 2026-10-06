@@ -30,6 +30,9 @@ uuid       = { workspace = true, features = ["v4"] }
 # relay's stdio need both, so they are named here rather than left to feature unification.
 tokio      = { workspace = true, features = ["net", "io-util", "sync", "time", "process", "rt",
                                             "macros", "io-std"] }
+# MOD-78 D6: `sync::CancellationToken` ends a session's in-flight calls with the session; the
+# module is not behind a feature.
+tokio-util = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 # nothing yet: tokio::net::windows::named_pipe is enough

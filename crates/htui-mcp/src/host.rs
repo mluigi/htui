@@ -10,7 +10,6 @@ use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard, PoisonError, Weak};
 
 use htui_agent::driver::McpServerSpec;
@@ -23,6 +22,7 @@ use serde_json::{Value, json};
 use tokio::io::{
     AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
 };
+use tokio_util::sync::CancellationToken;
 
 use crate::channel::{Address, HandshakeLine, Listener, Lookup, Refusal, Token};
 use crate::protocol::{
@@ -58,6 +58,20 @@ struct Inner<H: htui_core::store::WorkerHost> {
     config: StdMutex<Config>,
 }
 
+/// MOD-78 D7: the last `McpHost` is gone. New calls already end through `Bound`'s `Weak`; an
+/// in-flight one holds its `Arc<Served>` and ends through the token.
+impl<H: htui_core::store::WorkerHost> Drop for Inner<H> {
+    fn drop(&mut self) {
+        let sessions = self
+            .sessions
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner);
+        for served in sessions.values() {
+            served.session.cancel.cancel();
+        }
+    }
+}
+
 /// What the `with_*` builders set.
 struct Config {
     /// D12: `None` leaves `search_concepts` unadvertised.
@@ -78,8 +92,10 @@ pub(crate) struct Session<S> {
     pub(crate) store: S,
     /// B-21: the asking end of the CLI permission bridge, for a `Transport::Cli` scope.
     pub(crate) ask: Option<PromptAsk>,
-    /// Set when the lease drops or the host closes (I-6).
-    pub(crate) ended: AtomicBool,
+    /// MOD-78 D6 (I-6): cancelled when the lease drops, the host closes, or the last `McpHost`
+    /// drops (D7). `Served::call` races every call against it, so an in-flight call ends with its
+    /// session.
+    pub(crate) cancel: CancellationToken,
     /// D12: the concept index, when the host has one.
     pub(crate) search: Option<Arc<dyn ConceptSearch>>,
     /// I-5: the host's scrubber.
@@ -95,9 +111,9 @@ pub(crate) struct Session<S> {
 }
 
 impl<S> Session<S> {
-    /// Whether the lease dropped or the host closed.
+    /// Whether the lease dropped, the host closed, or the last `McpHost` dropped.
     fn has_ended(&self) -> bool {
-        self.ended.load(Ordering::SeqCst)
+        self.cancel.is_cancelled()
     }
 
     /// The tools this session is offered, in table order (I-7).
@@ -146,16 +162,22 @@ impl<H: htui_core::store::WorkerHost> Handler for Served<H> {
                 host,
                 progress,
             };
-            Ok(match tools::dispatch(&name, ctx, arguments).await {
-                Ok(value) => CallResult {
-                    text: value.to_string(),
-                    is_error: false,
-                },
-                Err(ToolError(reason)) => CallResult {
-                    text: reason,
-                    is_error: true,
-                },
-            })
+            // MOD-78 D6: an end of the session wins over a ready answer. The dropped call undoes
+            // itself: `Enqueued` cancels its row, and `run_shell`'s `GroupGuard` kills the child.
+            tokio::select! {
+                biased;
+                () = session.cancel.cancelled() => Ok(session_ended()),
+                result = tools::dispatch(&name, ctx, arguments) => Ok(match result {
+                    Ok(value) => CallResult {
+                        text: value.to_string(),
+                        is_error: false,
+                    },
+                    Err(ToolError(reason)) => CallResult {
+                        text: reason,
+                        is_error: true,
+                    },
+                }),
+            }
         })
     }
 }
@@ -393,7 +415,7 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
                 scope,
                 store,
                 ask,
-                ended: AtomicBool::new(false),
+                cancel: CancellationToken::new(),
                 search: config.search.clone(),
                 scrubber: Arc::clone(&config.scrubber),
                 clock: Arc::clone(&config.clock),
@@ -426,8 +448,9 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
             .map(|def| def.name.to_owned())
             .collect();
         let weak: Weak<Inner<H>> = Arc::downgrade(&self.inner);
+        let cancel = session.cancel.clone();
         Ok(ToolLease::new(spec, port, move || {
-            session.ended.store(true, Ordering::SeqCst);
+            cancel.cancel();
             if let Some(inner) = weak.upgrade() {
                 lock(&inner.sessions).remove(&token);
             }
@@ -440,7 +463,7 @@ impl<H: htui_core::store::WorkerHost> ToolHost for McpHost<H> {
             listener.close();
         }
         for (_, served) in lock(&self.inner.sessions).drain() {
-            served.session.ended.store(true, Ordering::SeqCst);
+            served.session.cancel.cancel();
         }
     }
 }
@@ -714,7 +737,7 @@ pub(crate) mod tests {
         host.set_host(Backend::memory(MemStore::new()));
         let second = host.open(scope(Transport::Acp)).expect("a lease");
         let sessions = lock(&host.inner.sessions).clone();
-        let on = |lease: &htui_orch::tools::ToolLease| {
+        let on = |lease: &ToolLease| {
             let token = Token::parse(&lease.spec.env[ENV_TOKEN]).expect("a token");
             sessions[&token].session.store.clone()
         };
