@@ -76,6 +76,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::agent_settings::{AgentWrite, LITERAL_LAUNCH, SET_TOOL_PATHS, parse_tool_path};
+use crate::secrets_settings::{CHECK_SECRET_PROVIDER, NO_SOURCE_TO_CHECK, SecretCheck};
 use crate::store_worker::{
     AuthFrame, ChatFrame, EDIT_HELP, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq,
     StoreReply, StoreRequest, UNSOLICITED,
@@ -1388,6 +1389,7 @@ impl AgentRuntime {
                 },
             ),
             StoreRequest::AuthCancel => self.auth_cancel(),
+            StoreRequest::CheckSecretProvider => self.check_provider(replies, addr),
             other => Served::Reply(StoreReply::Failed {
                 request: other.name(),
                 message: "not a chat request".to_owned(),
@@ -1759,6 +1761,50 @@ impl AgentRuntime {
         if let Some(superseded) = self.previews.insert(origin, task.abort_handle()) {
             superseded.abort();
         }
+        self.background.push(Background::reading(task));
+        Served::Deferred
+    }
+
+    /// The [`StoreRequest::CheckSecretProvider`] path (MOD-10 M4 D5): the preview's shape.
+    ///
+    /// With no source (`--demo`, blueprint A-5; a runtime never given one) it answers `Failed`
+    /// with [`NO_SOURCE_TO_CHECK`] at once. Otherwise a spawned task asks the shared source for its
+    /// provider and the provider for its health — a status GET and a **fresh login**, which can
+    /// latch the shared provider exactly as a refused walk does (M2 D5) — and answers once with
+    /// [`SecretCheck::Provider`]. The task writes no `agent_box` row, so it is a
+    /// [`Background::reading`]: swept, awaited by `finish_background`, aborted by `shutdown`.
+    fn check_provider(
+        &mut self,
+        replies: &mpsc::UnboundedSender<ReplyEnvelope>,
+        addr: ReplyAddr,
+    ) -> Served {
+        let Some(source) = self.secrets.clone() else {
+            return Served::Reply(StoreReply::Failed {
+                request: CHECK_SECRET_PROVIDER,
+                message: NO_SOURCE_TO_CHECK.to_owned(),
+            });
+        };
+        let answer = Answer::at(replies.clone(), addr.clone(), provider_check_failed);
+        let tx = replies.clone();
+        let task = tokio::spawn(answering(
+            "secret provider check",
+            async move {
+                let outcome = match source.provider().await {
+                    Ok(provider) => provider.health().await,
+                    Err(err) => Err(err),
+                };
+                // A UI that has gone away is not an error, as in `Frames::send`.
+                let _ = tx.send(ReplyEnvelope {
+                    seq: addr.seq,
+                    origin: addr.origin,
+                    reply: StoreReply::SecretCheck(SecretCheck::Provider {
+                        at: Utc::now(),
+                        outcome,
+                    }),
+                });
+            },
+            Some(answer),
+        ));
         self.background.push(Background::reading(task));
         Served::Deferred
     }
@@ -4272,6 +4318,15 @@ fn registration_probe_failed(message: String) -> Vec<StoreReply> {
 fn preview_failed(message: String) -> Vec<StoreReply> {
     vec![StoreReply::Failed {
         request: crate::store_worker::PROMPT_PREVIEW,
+        message,
+    }]
+}
+
+/// A panicked secret provider check's last word: the `check_secret_provider` failure that ends
+/// the section's `checking` (MOD-10 M4 D5).
+fn provider_check_failed(message: String) -> Vec<StoreReply> {
+    vec![StoreReply::Failed {
+        request: CHECK_SECRET_PROVIDER,
         message,
     }]
 }

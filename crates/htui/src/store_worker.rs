@@ -63,6 +63,7 @@ use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
 };
 use crate::run_worker::{LiveChats, RunRuntime, RunServed, TuiRuns as _};
+use crate::secrets_settings::{self, IdentityEntry, Redacted, SecretCheck, SecretsSnapshot};
 use crate::skill_import::SkillImports;
 use crate::skills::{self, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
@@ -819,10 +820,26 @@ pub enum StoreRequest {
     QdrantInfo,
     /// Request to set the Qdrant connection string.
     SetQdrantUrl(String),
-    /// Request to set the Qdrant API key.
-    SetQdrantApiKey(zeroize::Zeroizing<String>),
+    /// The API key, redacted in `Debug` (MOD-10 M4 D9); empty clears the stored key.
+    SetQdrantApiKey(Redacted),
     /// Request to clear the Qdrant connection string.
     ClearQdrantSettings,
+    // MOD-10 milestone 4: Settings > Secrets.
+    /// The keyring rows of `Settings > Secrets` (D2). Answered with [`StoreReply::Secrets`].
+    SecretsInfo,
+    /// Store the Infisical base URL, already normalised on the UI task (D3). Not a secret: a
+    /// normalised URL has no user info, query or fragment.
+    SetInfisicalUrl(String),
+    /// Remove the stored URL.
+    ClearInfisicalUrl,
+    /// Store both halves of the machine identity (D4), redacted in `Debug`.
+    SetMachineIdentity(IdentityEntry),
+    /// Remove both halves.
+    ClearMachineIdentity,
+    /// Reachability plus a fresh login through the process's secret source (D5). Served by the
+    /// agent runtime's own task (`R-NF-3`); answered once with [`StoreReply::SecretCheck`] or
+    /// [`StoreReply::Failed`].
+    CheckSecretProvider,
     /// MOD-64 D231: a concepts search, served by `concepts_worker::ConceptsRuntime` on a task of its
     /// own (`R-NF-3`). Answered with [`StoreReply::Concepts`], never `Failed` (D232).
     SearchConcepts(SearchQuery),
@@ -1129,6 +1146,14 @@ impl StoreRequest {
             Self::SetQdrantUrl(_) => "set_qdrant_url",
             Self::SetQdrantApiKey(_) => "set_qdrant_api_key",
             Self::ClearQdrantSettings => "clear_qdrant_settings",
+            // The five of `secrets_settings::REQUEST_NAMES`, in that order, then the check
+            // (MOD-10 M4).
+            Self::SecretsInfo => "secrets_info",
+            Self::SetInfisicalUrl(_) => "set_infisical_url",
+            Self::ClearInfisicalUrl => "clear_infisical_url",
+            Self::SetMachineIdentity(_) => "set_machine_identity",
+            Self::ClearMachineIdentity => "clear_machine_identity",
+            Self::CheckSecretProvider => "check_secret_provider",
             // The two of `concepts_worker::REQUEST_NAMES`, in that order (MOD-64 D241).
             Self::SearchConcepts(_) => "search_concepts",
             Self::IndexConcepts { .. } => "index_concepts",
@@ -1502,6 +1527,10 @@ pub enum StoreReply {
         /// The version the store allocated.
         version: i32,
     },
+    /// `SecretsInfo` and every keyring write's success (D2): the section re-renders from it.
+    Secrets(SecretsSnapshot),
+    /// One check's answer, from the agent runtime's task (D5, D8).
+    SecretCheck(SecretCheck),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -1821,10 +1850,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         },
         // The six chat requests (MOD-55's help among them) need the worker loop's own state (the
         // live sessions), and the two probes, the preview, the three install requests, MOD-21's
-        // four login ones, MOD-22's delivery and MOD-66's tool-paths write need the runtime that
-        // owns their tasks, so all eighteen are served ahead of this function, exactly as
-        // `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
-        // runtime — the test harness without one — and saying so is more use than a panic.
+        // four login ones, MOD-22's delivery, MOD-66's tool-paths write and MOD-10 M4's provider
+        // check need the runtime that owns their tasks, so all nineteen are served ahead of this
+        // function, exactly as `ApplyMigrations` is. One of them that reaches here at all belongs
+        // to a caller with no runtime — the test harness without one — and saying so is more use
+        // than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
@@ -1842,7 +1872,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::AuthOpen { .. }
         | StoreRequest::AuthDeliver { .. }
         | StoreRequest::AuthCancel
-        | StoreRequest::SetToolPaths { .. } => StoreReply::Failed {
+        | StoreRequest::SetToolPaths { .. }
+        | StoreRequest::CheckSecretProvider => StoreReply::Failed {
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
@@ -1971,6 +2002,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             request: request.name(),
             message: "handled in worker loop".to_owned(),
         },
+        // The five keyring requests of `Settings > Secrets`, or-ed for the reason the arms above
+        // are (MOD-15 M3 plan F-12; MOD-10 M4 D2). They need no loop state, so the loop's
+        // `other => try_serve` serves them too: the loop, the harness and `--demo` agree.
+        StoreRequest::SecretsInfo
+        | StoreRequest::SetInfisicalUrl(_)
+        | StoreRequest::ClearInfisicalUrl
+        | StoreRequest::SetMachineIdentity(_)
+        | StoreRequest::ClearMachineIdentity => secrets_settings::serve(backend, request).await?,
         // MOD-64 D231: the loop serves both through the concepts runtime; one that reaches here
         // belongs to a caller with none (the harness default), and is answered in the overlay's
         // own reply (D232).
@@ -2635,12 +2674,14 @@ pub(crate) fn spawn_with_concepts(
                             }
                         }
                         StoreRequest::SetQdrantApiKey(key) => {
-                            let k = key.as_str().to_string();
+                            // A zeroizing clone into the closure; nothing unzeroized
+                            // (MOD-10 M4 D9).
+                            let key = key.clone();
                             let res = tokio::task::spawn_blocking(move || {
-                                if k.is_empty() {
+                                if key.expose().is_empty() {
                                     htui_store::secret::clear_qdrant_api_key()?;
                                 } else {
-                                    htui_store::secret::set_qdrant_api_key(&k)?;
+                                    htui_store::secret::set_qdrant_api_key(key.expose())?;
                                 }
                                 Ok::<(), StoreError>(())
                             })
@@ -2667,8 +2708,9 @@ pub(crate) fn spawn_with_concepts(
                             }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
-                        // the probes, the tool-paths write, the installs and the logins need the
-                        // runtime that owns their tasks, so all of them go to the runtime before
+                        // the probes, the tool-paths write, the installs, the logins and the
+                        // secret provider check (MOD-10 M4 D5) need the runtime that owns their
+                        // tasks, so all of them go to the runtime before
                         // `try_serve`, like `ApplyMigrations` above. An install reads the registry
                         // over the network and streams hundreds of megabytes, and a login waits on
                         // a human in a browser, so `Served::Deferred => continue` is the whole of
@@ -2691,7 +2733,8 @@ pub(crate) fn spawn_with_concepts(
                         | StoreRequest::AuthOpen { .. }
                         | StoreRequest::AuthDeliver { .. }
                         | StoreRequest::AuthCancel
-                        | StoreRequest::SetToolPaths { .. } => {
+                        | StoreRequest::SetToolPaths { .. }
+                        | StoreRequest::CheckSecretProvider => {
                             match runtime.serve(&backend, &tx, &envelope).await {
                                 Served::Reply(reply) => reply,
                                 // The session task answers this request itself, once.
@@ -5616,5 +5659,42 @@ mod tests {
             host.client(&lease.spec.env[htui_mcp::ENV_TOKEN]).is_err(),
             "the session ended with the host"
         );
+    }
+
+    /// MOD-10 M4 D5: the loop hands the provider check to the agent runtime, which answers it,
+    /// rather than to `try_serve`'s "no agent runtime in this build". A runtime with no source
+    /// (the `--demo` shape, blueprint A-5) answers its own one sentence.
+    #[tokio::test]
+    async fn the_loop_hands_the_provider_check_to_the_agent_runtime() {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(demo()),
+            req_rx,
+            rep_tx,
+            AgentRuntime::new(htui_agent::registry::DriverFactory::new()),
+        );
+        let reply = round_trip(&req_tx, &mut rep_rx, StoreRequest::CheckSecretProvider).await;
+        match reply {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, secrets_settings::CHECK_SECRET_PROVIDER);
+                assert_eq!(message, secrets_settings::NO_SOURCE_TO_CHECK);
+            }
+            other => panic!("the runtime answers the check: {other:?}"),
+        }
+        drop(req_tx);
+        let _ = worker.await;
+    }
+
+    /// `try_serve` has no runtime, so the check is refused by name, like every runtime request.
+    #[tokio::test]
+    async fn try_serve_refuses_the_provider_check_without_a_runtime() {
+        match serve(&demo(), &StoreRequest::CheckSecretProvider).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "check_secret_provider");
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a check with no runtime is refused, not served: {other:?}"),
+        }
     }
 }
