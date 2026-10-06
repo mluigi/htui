@@ -6,15 +6,6 @@
 //! URL entered since the last walk takes effect at the next one; the provider is rebuilt only when
 //! what it was built from changed, so its login latch and cool-down (MOD-10 M2 D5) survive from
 //! one walk to the next.
-// Nothing outside the tests builds the source until T6b hands it to `spawn_hosted` and
-// `htui worker`; the expectation then goes unfulfilled, which is the reminder to drop it.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "MOD-10 M3 T6b wires `KeyringInfisical` into the process (blueprint B.11)"
-    )
-)]
 
 use std::sync::Arc;
 
