@@ -435,6 +435,10 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// `heavy_build` item exposes nothing, a fan-out of two and a `heavy_build` item do; an exposed
 /// step's policy opens with the R-MCP-4 denials with and without a persona; a judge never gets
 /// `command_run`.
+///
+/// **Three for MOD-12 M1** (plan D10; ANA-2 criteria 23, 24): an auto run snapshots every phase
+/// whose gate is not hard `never` and walks it to `done` with no human, an auto run still parks at
+/// a hard gate, and a manual snapshot keeps every gate.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -654,6 +658,11 @@ pub const CASES: &[&str] = &[
     "a_persona_step_gets_the_denials_first_too",
     // MOD-11 D16: the judge's phase is `off`; a judge never gets `command_run`.
     "judges_never_get_command_run",
+    // MOD-12 M1 (plan D10; ANA-2 criteria 23, 24): an auto run skips soft gates, parks at hard ones,
+    // and a manual snapshot keeps every gate.
+    "auto_mode_skips_soft_gates",
+    "auto_mode_parks_at_a_hard_gate",
+    "a_manual_snapshot_keeps_its_gates",
 ];
 
 /// Run one case by name.
@@ -681,6 +690,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| hardening_case(name, harness))
         .or_else(|| input_case(name, harness))
         .or_else(|| command_queue_case(name, harness))
+        .or_else(|| auto_mode_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -1024,6 +1034,19 @@ fn command_queue_case<'a, H: CaseHarness>(
     })
 }
 
+/// MOD-12 M1's three (ANA-2 criteria 23, 24), boxed for [`case`]'s reason.
+fn auto_mode_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "auto_mode_skips_soft_gates" => Box::pin(auto_mode_skips_soft_gates(harness)),
+        "auto_mode_parks_at_a_hard_gate" => Box::pin(auto_mode_parks_at_a_hard_gate(harness)),
+        "a_manual_snapshot_keeps_its_gates" => Box::pin(a_manual_snapshot_keeps_its_gates(harness)),
+        _ => return None,
+    })
+}
+
 // -- what every case needs, written once ---------------------------------------------------------
 
 /// The run's steps in `(position, attempt, fanout_index)` order.
@@ -1298,10 +1321,18 @@ async fn primary_repo<O: Orchestrate>(orch: &O) -> RepoId {
 /// # Panics
 /// When the command is refused, which every caller of this helper expects not to be.
 async fn start<O: Orchestrate>(orch: &O, item: ItemId) -> (RunId, Rest) {
+    start_in(orch, item, RunMode::Manual).await
+}
+
+/// `StartRun` on `item` in `mode` with no requested scope, unwrapped to its run id and rest.
+///
+/// # Panics
+/// When the command is refused, which every caller of this helper expects not to be.
+async fn start_in<O: Orchestrate>(orch: &O, item: ItemId, mode: RunMode) -> (RunId, Rest) {
     let outcome = orch
         .dispatch(Command::StartRun {
             item,
-            mode: RunMode::Manual,
+            mode,
             repo_scope: None,
         })
         .await
@@ -7725,6 +7756,147 @@ async fn judges_never_get_command_run<H: CaseHarness>(harness: &H) {
     }
 }
 
+// -- MOD-12 milestone 1: the auto-mode gate downgrade (plan D10, ANA-2 §4.10) ---------------------
+
+/// ANA-2 §12 criterion 23, first half (MOD-12 D10): an auto run of a graph whose every phase gates
+/// `always` and none is hard snapshots every phase `never`, so it walks to `done` with no human and
+/// every step lands `done` with `gate_outcome = skipped`.
+async fn auto_mode_skips_soft_gates<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Always, |phase| phase.gate_hard = false).await;
+
+    let (run, rest) = start_in(&orch, ids::HTUI_FEAT_3, RunMode::Auto).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None),
+        "an auto run with no hard gate never stops for a human"
+    );
+    assert_eq!(run_of(&orch, run).await.mode, RunMode::Auto);
+
+    let snapshot = snapshot_of(&orch, run).await;
+    assert_eq!(snapshot.mode, RunMode::Auto);
+    assert_eq!(
+        snapshot
+            .phases
+            .iter()
+            .map(|phase| (phase.gate, phase.gate_effective))
+            .collect::<Vec<_>>(),
+        [(Gate::Always, Gate::Never); 4],
+        "the snapshot keeps the phase's own gate and downgrades only the effective one"
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.position, step.status, step.gate_outcome))
+            .collect::<Vec<_>>(),
+        (0..4)
+            .map(|position| (position, StepStatus::Done, Some(GateOutcome::Skipped)))
+            .collect::<Vec<_>>(),
+        "`never` passes each step `running -> done` with `gate_outcome = 'skipped'`"
+    );
+    assert_eq!(item_of(&orch, ids::HTUI_FEAT_3).await.status, Status::Done);
+}
+
+/// ANA-2 §12 criterion 23, second half (MOD-12 D10): an auto run still parks at every hard gate,
+/// and only there; its soft steps are skipped and its hard ones approved by the human.
+async fn auto_mode_parks_at_a_hard_gate<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Always, |_| {}).await;
+
+    let (run, mut rest) = start_in(&orch, ids::HTUI_FEAT_3, RunMode::Auto).await;
+    let snapshot = snapshot_of(&orch, run).await;
+    let hard: Vec<i32> = snapshot
+        .phases
+        .iter()
+        .filter(|phase| phase.gate_hard)
+        .map(|phase| phase.position)
+        .collect();
+    assert!(!hard.is_empty(), "the seeded graph keeps a hard phase");
+    for phase in &snapshot.phases {
+        let expected = if phase.gate_hard {
+            Gate::Always
+        } else {
+            Gate::Never
+        };
+        assert_eq!(
+            phase.gate_effective, expected,
+            "`{}` (gate_hard = {}) under auto mode",
+            phase.name, phase.gate_hard
+        );
+    }
+
+    let mut parked = Vec::new();
+    while rest.run == RunStatus::AwaitingApproval {
+        assert!(
+            parked.len() < snapshot.phases.len(),
+            "the walk parked more often than it has phases: {parked:?}"
+        );
+        let (step, next) = answer(&orch, run, GateAnswer::Approved).await;
+        parked.push(step.position);
+        rest = next;
+    }
+    assert_eq!(
+        parked, hard,
+        "the walk parked at the hard gates and nowhere else"
+    );
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::Done, None, None)
+    );
+
+    let steps = steps_of(&orch, run).await;
+    assert_eq!(steps.len(), 4, "one step per position, no retry");
+    for step in &steps {
+        let outcome = if hard.contains(&step.position) {
+            GateOutcome::Approved
+        } else {
+            GateOutcome::Skipped
+        };
+        assert_eq!(
+            (step.status, step.gate_outcome),
+            (StepStatus::Done, Some(outcome)),
+            "`{}` at position {}",
+            step.phase_name,
+            step.position
+        );
+    }
+}
+
+/// ANA-2 §12 criterion 24 (MOD-12 D10): a manual run of the same soft-gated graph keeps every
+/// gate — the snapshot says `always`, and the walk parks at position 0 and then at 1.
+async fn a_manual_snapshot_keeps_its_gates<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Always, |phase| phase.gate_hard = false).await;
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(0)),
+        "a manual run parks at its first `always` gate"
+    );
+    assert_eq!(run_of(&orch, run).await.mode, RunMode::Manual);
+
+    let snapshot = snapshot_of(&orch, run).await;
+    assert_eq!(snapshot.mode, RunMode::Manual);
+    for phase in &snapshot.phases {
+        assert_eq!(
+            (phase.gate_hard, phase.gate_effective),
+            (false, Gate::Always),
+            "`{}`: a manual snapshot never downgrades",
+            phase.name
+        );
+    }
+
+    let rest = approve(&orch, run, 1).await;
+    assert_eq!(
+        (rest.run, rest.position),
+        (RunStatus::AwaitingApproval, Some(1)),
+        "the next soft gate parks too: no gate was skipped"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -7749,8 +7921,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            100,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            103,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -7783,7 +7955,8 @@ mod tests {
              4's one (a promoted `shared_serialized` step's run refusing another claim, R-49), \
              and MOD-73's one (a gate edit read by the next phase, plan D2), and MOD-11 T8's six \
              (plan D16, D17: `fan_out_only` at one agent, at two and on a `heavy_build` item, \
-             the denials with and without a persona, and the judge never exposed)"
+             the denials with and without a persona, and the judge never exposed), and MOD-12 \
+             M1's three (criterion 23's two halves, criterion 24)"
         );
     }
 

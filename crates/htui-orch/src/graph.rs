@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, GraphSnapshot,
+    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, Gate, GraphSnapshot,
     Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId,
     ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding,
     SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
@@ -674,6 +674,17 @@ fn app_i32(app: &BTreeMap<String, Value>, key: &str) -> Option<i32> {
     app_positive(app, key).and_then(|n| i32::try_from(n).ok())
 }
 
+/// ANA-2 §4.10's one line (`R-ORCH-6`, `R-ORCH-2`): in auto mode a phase whose gate is not hard is
+/// snapshotted `never`, so its steps land `done` with `gate_outcome = skipped`; a hard gate, and
+/// every gate of a manual run, is kept. Applied **only** here, at snapshot time (MOD-12 D10):
+/// `run.mode` is fixed at insert, so no later edit can skip a gate a run has not reached.
+#[must_use]
+pub(crate) const fn effective_gate(mode: RunMode, gate: Gate, gate_hard: bool) -> Gate {
+    // TDD stub: the downgrade lands in the next commit.
+    let _ = (mode, gate_hard);
+    gate
+}
+
 /// One phase of the live graph, with every §4.1 chain walked (`docs/ANA-2.md:281-288`).
 #[expect(
     clippy::too_many_arguments,
@@ -921,7 +932,7 @@ mod tests {
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
         ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
         ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
-        WriteStore, override_graph, resolve,
+        WriteStore, effective_gate, override_graph, resolve,
     };
 
     /// The digest of the seeded `feature` graph, resolved against the demo fixture with one
@@ -1140,6 +1151,86 @@ question and not a test fix. Decide the version bump first, then paste the new d
             .collect();
         assert_eq!(positions, [0, 1, 2, 3]);
         assert_eq!(names, ["prd", "plan", "implement", "review"]);
+    }
+
+    /// MOD-12 D10 (ANA-2 §4.10, criterion 23): in auto mode a gate that is not hard is `never`,
+    /// whatever the phase says.
+    #[test]
+    fn auto_mode_downgrades_a_soft_gate_to_never() {
+        for &gate in Gate::ALL {
+            assert_eq!(
+                effective_gate(RunMode::Auto, gate, false),
+                Gate::Never,
+                "an auto run skips a soft `{gate}`"
+            );
+        }
+    }
+
+    /// MOD-12 D10: a hard gate is kept in auto mode.
+    #[test]
+    fn auto_mode_keeps_a_hard_gate() {
+        for &gate in Gate::ALL {
+            assert_eq!(
+                effective_gate(RunMode::Auto, gate, true),
+                gate,
+                "an auto run keeps a hard `{gate}`"
+            );
+        }
+    }
+
+    /// MOD-12 D10 (criterion 24): a manual run keeps every gate, hard or not.
+    #[test]
+    fn manual_mode_keeps_every_gate() {
+        for &gate in Gate::ALL {
+            for hard in [false, true] {
+                assert_eq!(
+                    effective_gate(RunMode::Manual, gate, hard),
+                    gate,
+                    "a manual run keeps `{gate}` (gate_hard = {hard})"
+                );
+            }
+        }
+    }
+
+    /// MOD-12 D10: an auto snapshot of the seeded `feature` graph keeps its hard phases' gates and
+    /// snapshots every other phase `never`; the mode is recorded on the snapshot.
+    #[tokio::test]
+    async fn an_auto_snapshot_downgrades_only_its_soft_phases() {
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        let snapshot = resolve(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Auto,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the seeded feature graph resolves")
+        .snapshot;
+        assert_eq!(snapshot.mode, RunMode::Auto);
+        assert!(
+            snapshot.phases.iter().any(|phase| phase.gate_hard),
+            "the seeded `feature` graph has a hard phase"
+        );
+        assert!(
+            snapshot.phases.iter().any(|phase| !phase.gate_hard),
+            "the seeded `feature` graph has a soft phase"
+        );
+        for phase in &snapshot.phases {
+            let expected = if phase.gate_hard {
+                phase.gate
+            } else {
+                Gate::Never
+            };
+            assert_eq!(
+                phase.gate_effective, expected,
+                "`{}` (gate_hard = {}) under auto mode",
+                phase.name, phase.gate_hard
+            );
+        }
     }
 
     /// One assertion per row of ANA-2 §4.1's chain table (`docs/ANA-2.md:281-288`), against the
