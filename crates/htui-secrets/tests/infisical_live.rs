@@ -53,6 +53,8 @@ fn variant(e: &SecretError) -> &'static str {
         SecretError::UnsupportedServer { .. } => "UnsupportedServer",
         SecretError::InvalidKey { .. } => "InvalidKey",
         SecretError::InvalidValue { .. } => "InvalidValue",
+        // Raised by `htui_core::secret::check_env`, never by the provider.
+        SecretError::ReservedKey { .. } => "ReservedKey",
         SecretError::Protocol { .. } => "Protocol",
     }
 }
