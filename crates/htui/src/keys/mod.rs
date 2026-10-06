@@ -49,26 +49,75 @@ impl Keys {
     /// If a default does not parse. `every_catalogue_default_parses_strictly` pins that none fails.
     #[must_use]
     pub fn defaults() -> Self {
-        todo!()
+        let rows = CATALOGUE
+            .iter()
+            .map(|spec| Row {
+                context: spec.context,
+                act: spec.act,
+                help: spec.help,
+                chords: spec
+                    .defaults
+                    .iter()
+                    .map(|written| {
+                        KeyChord::parse_strict(written).unwrap_or_else(|err| {
+                            panic!(
+                                "catalogue default {written:?} of [{}] {}: {err}",
+                                spec.context.table(),
+                                spec.name
+                            )
+                        })
+                    })
+                    .collect(),
+            })
+            .collect();
+        Self { rows }
     }
 
     /// The chords of `act` in exactly `context`, or `&[]` if there is no row or it is unbound.
     #[must_use]
     pub fn chords(&self, context: Context, act: Act) -> &[KeyChord] {
-        todo!("{context:?} {act:?}")
+        self.row(context, act).map_or(&[], |row| &row.chords)
     }
 
     /// Test-only override, the M2 merge in miniature: replaces the `(context, act)` row's chords,
     /// or appends a row if none exists (a narrower override). `specs` parse strictly.
     #[cfg(test)]
-    pub(crate) fn with_chords(self, context: Context, act: Act, specs: &[&str]) -> Self {
-        todo!("{context:?} {act:?} {specs:?}")
+    pub(crate) fn with_chords(mut self, context: Context, act: Act, specs: &[&str]) -> Self {
+        let chords = specs
+            .iter()
+            .map(|spec| KeyChord::parse_strict(spec).expect("a test override parses"))
+            .collect();
+        match self
+            .rows
+            .iter_mut()
+            .find(|row| row.context == context && row.act == act)
+        {
+            Some(row) => row.chords = chords,
+            None => self.rows.push(Row {
+                context,
+                act,
+                help: act.spec().map_or("", |spec| spec.help),
+                chords,
+            }),
+        }
+        self
+    }
+
+    /// The row of `act` in exactly `context`.
+    fn row(&self, context: Context, act: Act) -> Option<&Row> {
+        self.rows
+            .iter()
+            .find(|row| row.context == context && row.act == act)
     }
 
     /// The row of `act` as the stack sees it: in the first layer that admits `act` and has a
     /// row for it.
     fn resolve_row(&self, stack: Stack<'_>, act: Act) -> Option<&Row> {
-        todo!("{stack:?} {act:?}")
+        stack
+            .layers()
+            .iter()
+            .filter(|layer| layer.admits(act))
+            .find_map(|layer| self.row(layer.context(), act))
     }
 }
 

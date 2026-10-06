@@ -5,7 +5,17 @@
 //! all of them. Rows sharing a help label (the nine `select_tab_*`) collapse into one entry, and
 //! an unbound action drops out, except `global.quit`, which always ends with the fixed `Ctrl+c`.
 
-use super::{Act, Context, Keys, Stack};
+use crossterm::event::KeyCode;
+use unicode_width::UnicodeWidthStr;
+
+use super::{Act, CTRL_C, Context, KeyChord, Keys, Stack};
+
+/// The separator between entries: U+00B7 with a space on each side, as the status line has
+/// always written it.
+const SEP: &str = " · ";
+
+/// Where a continuation row of a packed [`HelpLine`] starts.
+const INDENT: &str = "  ";
 
 /// One element of a hint spec (ANA-26 §7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +51,7 @@ impl HelpLine {
     /// `"{heading}: {entries joined by " · "}"`.
     #[must_use]
     pub fn text(&self) -> String {
-        todo!()
+        format!("{}: {}", self.heading, self.entries.join(SEP))
     }
 
     /// The line packed into rows at most `width` cells wide (`unicode-width`), breaking only
@@ -49,7 +59,22 @@ impl HelpLine {
     /// `width` gets a row of its own (and is clipped when drawn).
     #[must_use]
     pub fn rows(&self, width: usize) -> Vec<String> {
-        todo!("{width}")
+        let mut rows = Vec::new();
+        let mut row = format!("{}: ", self.heading);
+        let mut empty = true;
+        for entry in &self.entries {
+            if empty {
+                row.push_str(entry);
+            } else if row.width() + SEP.width() + entry.width() <= width {
+                row.push_str(SEP);
+                row.push_str(entry);
+            } else {
+                rows.push(std::mem::replace(&mut row, format!("{INDENT}{entry}")));
+            }
+            empty = false;
+        }
+        rows.push(row);
+        rows
     }
 }
 
@@ -58,14 +83,32 @@ impl Keys {
     /// is unbound. Prose such as `format!("press {}", …)` uses it from M3 on.
     #[must_use]
     pub fn label(&self, stack: Stack<'_>, act: Act) -> Option<String> {
-        todo!("{stack:?} {act:?}")
+        self.resolve_row(stack, act)?
+            .chords
+            .first()
+            .map(KeyChord::label)
     }
 
     /// A view's hint row: each element through `stack`, first chord only, unbound dropped,
     /// joined by ` · ` (ANA-26 §7.6).
     #[must_use]
     pub fn hint(&self, stack: Stack<'_>, spec: HintSpec) -> String {
-        todo!("{stack:?} {spec:?}")
+        let element = |hint: &Hint| match *hint {
+            Hint::One(act, text) => self
+                .label(stack, act)
+                .map(|label| format!("{label} {text}")),
+            Hint::Pair(first, second, text) => {
+                let labels: Vec<String> = [first, second]
+                    .into_iter()
+                    .filter_map(|act| self.label(stack, act))
+                    .collect();
+                (!labels.is_empty()).then(|| format!("{} {text}", labels.join("/")))
+            }
+        };
+        spec.iter()
+            .filter_map(element)
+            .collect::<Vec<_>>()
+            .join(SEP)
     }
 
     /// The status line (D7): the `Global` rows that are `offered` and bound, in catalogue order,
@@ -73,8 +116,23 @@ impl Keys {
     /// joined by ` · `.
     #[must_use]
     pub fn status_line(&self, offered: impl Fn(Act) -> bool) -> String {
-        let _ = offered;
-        todo!()
+        let mut shown: Vec<&str> = Vec::new();
+        let mut entries = Vec::new();
+        for row in self
+            .rows
+            .iter()
+            .filter(|row| row.context == Context::Global)
+        {
+            let Some(first) = row.chords.first() else {
+                continue;
+            };
+            if !offered(row.act) || shown.contains(&row.help) {
+                continue;
+            }
+            shown.push(row.help);
+            entries.push(format!("{} {}", first.label(), row.help));
+        }
+        entries.join(SEP)
     }
 
     /// One `?` box line for `context` (D8): every offered and bound action, all its chords
@@ -82,16 +140,67 @@ impl Keys {
     /// ends with the fixed `Ctrl+c`. `None` if the context offers nothing.
     #[must_use]
     pub fn help_line(&self, context: Context, offered: impl Fn(Act) -> bool) -> Option<HelpLine> {
-        let _ = offered;
-        todo!("{context:?}")
+        let mut merged: Vec<(&str, Vec<KeyChord>)> = Vec::new();
+        for row in self.rows.iter().filter(|row| row.context == context) {
+            let quit = row.act == Act::Quit;
+            if !quit && !offered(row.act) {
+                continue;
+            }
+            let mut chords = row.chords.clone();
+            if quit && !chords.contains(&CTRL_C) {
+                chords.push(CTRL_C);
+            }
+            if chords.is_empty() {
+                continue;
+            }
+            match merged.iter_mut().find(|(help, _)| *help == row.help) {
+                Some((_, known)) => known.extend(chords),
+                None => merged.push((row.help, chords)),
+            }
+        }
+        if merged.is_empty() {
+            return None;
+        }
+        let entries = merged
+            .iter()
+            .map(|(help, chords)| format!("{} {help}", chord_list(chords)))
+            .collect();
+        Some(HelpLine::new(context.heading(), entries))
     }
 
     /// The box's last line, from `global.help`'s chords: `"?/F1 closes this box"`; `None` if
     /// help is unbound.
     #[must_use]
     pub fn help_closer(&self) -> Option<String> {
-        todo!()
+        let chords = self.chords(Context::Global, Act::Help);
+        (!chords.is_empty()).then(|| format!("{} closes this box", chord_list(chords)))
     }
+}
+
+/// One merged entry's chords: `1-9` for a run of three or more consecutive plain characters,
+/// else every label joined by `/` (`q/Ctrl+c`, `1/2/x/4`).
+fn chord_list(chords: &[KeyChord]) -> String {
+    let plain: Option<Vec<char>> = chords
+        .iter()
+        .map(|chord| match chord.code {
+            KeyCode::Char(c) if chord.mods.is_empty() => Some(c),
+            _ => None,
+        })
+        .collect();
+    if let Some(plain) = plain
+        && let [first, .., last] = plain[..]
+        && plain.len() >= 3
+        && plain
+            .windows(2)
+            .all(|pair| u32::from(pair[1]) == u32::from(pair[0]) + 1)
+    {
+        return format!("{first}-{last}");
+    }
+    chords
+        .iter()
+        .map(KeyChord::label)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]

@@ -86,7 +86,26 @@ impl Keys {
     /// accepts. [`CTRL_C`](super::CTRL_C) is never a candidate.
     #[must_use]
     pub fn actions(&self, stack: Stack<'_>, chord: KeyChord) -> Vec<Act> {
-        todo!("{stack:?} {chord:?}")
+        let mut seen: Vec<Act> = Vec::new();
+        let mut out = Vec::new();
+        for layer in stack.layers() {
+            let mut here = Vec::new();
+            let rows = self
+                .rows
+                .iter()
+                .filter(|row| row.context == layer.context && layer.admits(row.act));
+            for row in rows {
+                if seen.contains(&row.act) {
+                    continue; // shadowed by a narrower layer
+                }
+                here.push(row.act);
+                if row.chords.contains(&chord) {
+                    out.push(row.act);
+                }
+            }
+            seen.extend(here);
+        }
+        out
     }
 }
 
