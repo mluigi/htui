@@ -1220,6 +1220,13 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// MOD-10 D18: trigger 4. Cuts the open text run at [`seam_cut`], flushes the head as one row
     /// and re-opens the tail as the next run, with the same kind and grouping key.
     ///
+    /// The search is [`seam_cut`]'s: stepped candidates first, then a fine scan for the largest
+    /// safe cut within one occurrence of the first candidate, which is what finds a seam between
+    /// the occurrences of a secret echoed back to back (never one inside a complete occurrence,
+    /// nor one after the start of an occurrence still incomplete at the bound). The fine scan was chosen over
+    /// keeping the run open past the bound: it decides from the run alone, so replay stays
+    /// deterministic, and the row never holds more than the run that reached the bound.
+    ///
     /// No safe cut flushes the run whole, as before MOD-10 M3, with one exception: a run no
     /// longer than `hold_back` (a resolved secret longer than the bound) is **kept open**, so the
     /// row grows past the bound rather than split a secret.
@@ -1237,8 +1244,10 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// withhold, both rows' raw is withheld. A carry that still opens with the straddling chunk
     /// (no chunk of its own before the next cut) keeps the verdict across a later seam too. This
     /// can withhold a carry's raw for a secret wholly in the head's chunks, which is the fail-safe
-    /// direction (blueprint H-10). A secret still incomplete at the bound is not seen by the
-    /// run's join either, so the head's raw holds at most its prefix, as before the seam.
+    /// direction (H-10 of the MOD-10 M1 blueprint, `mod-10-m1-scrubber-hardening.blueprint.md`:
+    /// a raw-only finding never fails the session). A secret still incomplete at the bound is not
+    /// seen by the run's join either, so the head's raw holds at most its prefix, as before the
+    /// seam.
     async fn flush_at_seam(&mut self) -> Result<(), RecordError> {
         let hold_back = self.scrubber.hold_back();
         let Some(text) = self.open_text() else {
@@ -1961,25 +1970,54 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     }
 }
 
-/// MOD-10 D18: how many earlier seams one cut may try before it gives up and flushes whole.
+/// MOD-10 D18: how many stepped candidates (one `hold_back` apart) one cut tries before the
+/// fine scan ([`seam_cut`]).
 const SEAM_ATTEMPTS: usize = 4;
 
 /// MOD-10 D18: where a size-triggered flush may cut `text`, keeping at least `hold_back` bytes
-/// open. `None` is "no safe cut": the caller flushes the whole run (`hold_back == 0`, or a
-/// residue anywhere in `text`, or no attempt found a seam).
+/// open. `None` is "no safe cut", and the caller then does one of two things:
+///
+/// - `text` is no longer than `hold_back` (a resolved secret longer than the run): the caller
+///   **keeps the run open**, so the row grows past the bound rather than split the secret;
+/// - otherwise (`hold_back == 0`, a residue anywhere in `text`, or no candidate is safe): the
+///   caller flushes the whole run at the bound, as before MOD-10 M3.
 ///
 /// A cut `c` is safe when scrubbing `text[..c]` and `text[c..]` apart gives, concatenated,
 /// exactly what scrubbing `text` whole gives, and neither half is refused. That is the leak
 /// criterion itself: every complete secret and every complete credential is masked or refused
-/// identically whichever row it lands in. The first candidate is the last char boundary at least
-/// `hold_back` bytes before the end; an unsafe candidate moves back by `hold_back` more bytes.
-/// Because an occurrence of a secret is at most `hold_back + 1` bytes long, one step back always
-/// clears the occurrence that made the previous candidate unsafe; the loop re-checks in case it
-/// lands inside another.
+/// identically whichever row it lands in. No cut is ever later than the last char boundary at
+/// least `hold_back` bytes before the end (`first`), so a secret or credential still incomplete
+/// at the bound (at most `hold_back` bytes of it are in `text`) always lands whole in the tail.
+///
+/// **The search, in two passes.**
+///
+/// 1. **Stepped**: `first`, then one `hold_back` further back each time, [`SEAM_ATTEMPTS`]
+///    candidates. Because an occurrence of a secret is at most `hold_back + 1` bytes long, one
+///    step back clears the occurrence that made the previous candidate unsafe; the next probe
+///    re-checks in case it lands inside another. One probe in the common case.
+/// 2. **Fine scan**, only when every stepped candidate is unsafe (a secret echoed in lines so
+///    short that each step lands in the next occurrence): every char boundary below `first`, from
+///    `first - 1` down to `first - hold_back`, and the first safe one is taken, so it is the
+///    largest safe cut. For [`MinimalScrubber`](htui_core::scrub::MinimalScrubber) and a
+///    `first` inside a masked occurrence, this pass cannot come back empty: its mask is one
+///    left-to-right scan, the start `s` of the masked span `first` falls in is a position that
+///    scan visits, and scanning `text[..s]` and `text[s..]` apart masks exactly what the whole
+///    scan masks on each side. The span is at most `hold_back + 1` bytes long, so `s` is in this
+///    window. The tail then opens with `[REDACTED]`, which no pattern rule matches, and the head
+///    ends where the whole text's token ends (no rule's charset holds `[`), so neither half is
+///    refused when the whole is clean. What is left for the whole flush is a run in which a
+///    pattern rule's edge effect (below) rejects every boundary in reach of every candidate, or
+///    a scrubber whose masking is not one left-to-right scan; it is logged at `warn`.
+///
+/// **Cost.** One scrub of `text`, then two (head and tail) per probe: one probe usually, at most
+/// [`SEAM_ATTEMPTS`] + `hold_back`. Each probe is a pure function of `text` and the scrubber, so
+/// the cut, and with it replay, stays deterministic, and nothing is held beyond the run itself.
+/// The fine scan's `hold_back` probes cost the most with a long resolved secret, and only when
+/// that secret is echoed back to back across the bound.
 ///
 /// A cut that *creates* a refusal (a tail starting with `AKIA…` after a letter, so `^` becomes a
 /// token start; a head ending in a truncated `sk-` body that no longer reads as prose) is unsafe
-/// too and moves back, so the seam never invents a failure the whole text did not have.
+/// too and the search moves on, so the seam never invents a failure the whole text did not have.
 ///
 /// **Residuals.** The check sees the run as it is at the bound, not the bytes still to come, so
 /// three cases stay open, none a regression on the cut at the bound it replaces:
@@ -2002,23 +2040,32 @@ fn seam_cut(scrubber: &dyn Scrubber, text: &str, hold_back: usize) -> Option<usi
         return None;
     }
     let whole = scrubbed_text(scrubber, text)?;
-    let mut cut = text.floor_char_boundary(text.len() - hold_back);
+    let safe = |cut: usize| {
+        let (head, tail) = text.split_at(cut);
+        matches!(
+            (scrubbed_text(scrubber, head), scrubbed_text(scrubber, tail)),
+            (Some(head), Some(tail))
+                if whole.len() == head.len() + tail.len()
+                    && whole.starts_with(&head)
+                    && whole.ends_with(&tail)
+        )
+    };
+    let first = text.floor_char_boundary(text.len() - hold_back);
+    let mut cut = first;
     for _ in 0..SEAM_ATTEMPTS {
         if cut == 0 {
-            return None;
+            break;
         }
-        let (head, tail) = text.split_at(cut);
-        if let (Some(head), Some(tail)) =
-            (scrubbed_text(scrubber, head), scrubbed_text(scrubber, tail))
-            && whole.len() == head.len() + tail.len()
-            && whole.starts_with(&head)
-            && whole.ends_with(&tail)
-        {
+        if safe(cut) {
             return Some(cut);
         }
         cut = text.floor_char_boundary(cut.saturating_sub(hold_back));
     }
-    None
+    // The fine scan: the largest safe cut below `first`, within one occurrence's reach of it.
+    (first.saturating_sub(hold_back).max(1)..first)
+        .rev()
+        .filter(|&cut| text.is_char_boundary(cut))
+        .find(|&cut| safe(cut))
 }
 
 /// `text` as `scrubber` masks it, or `None` when a rule refuses it.
@@ -2826,6 +2873,35 @@ mod tests {
             cut,
             Some(280 - 2 * hold_back),
             "205 is inside the secret at [200, 270); 130 is before it"
+        );
+    }
+
+    /// A secret echoed in lines so short that every stepped candidate lands inside a complete
+    /// occurrence, with the last occurrence still incomplete at the end. Flushing whole would cut
+    /// that occurrence at the bound; the fine scan finds the start of the occurrence the first
+    /// candidate fell in, which is the largest safe cut.
+    #[test]
+    fn seam_cut_finds_an_occurrence_start_when_every_stepped_candidate_is_inside_one() {
+        let scrubber = MinimalScrubber::new([SECRET70.to_owned()]);
+        let hold_back = scrubber.hold_back();
+        assert_eq!(hold_back, 75);
+        let line = format!("{SECRET70}\n");
+        let text = format!("{}{}", line.repeat(10), &SECRET70[..30]);
+        assert_eq!(text.len(), 740);
+        for attempt in 1..=super::SEAM_ATTEMPTS {
+            let into = (text.len() - attempt * hold_back) % line.len();
+            assert!(
+                (1..SECRET70.len()).contains(&into),
+                "candidate {attempt} is {into} bytes into an occurrence"
+            );
+        }
+
+        let cut = seam_cut(&scrubber, &text, hold_back);
+
+        assert_eq!(
+            cut,
+            Some(9 * line.len()),
+            "665 is 26 bytes into the occurrence at [639, 709); 639 is its start"
         );
     }
 

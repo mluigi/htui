@@ -5435,6 +5435,109 @@ async fn a_secret_whole_at_the_bound_after_the_cut_withholds_the_head_s_raw_too(
     assert_nowhere(&log, head);
 }
 
+/// The text of every wire message in `row`'s raw, joined in order (empty when withheld).
+fn raw_text(row: &SessionEvent) -> String {
+    row.raw
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|wire| wire.pointer("/params/update/content/text"))
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// A resolved secret echoed in lines so short that every stepped candidate (`len - hold_back`,
+/// then one `hold_back` further back each time) lands inside a complete occurrence, with the last
+/// occurrence still incomplete at the bound. Before the fix the seam gave up and flushed the run
+/// whole at the bound: the head ended with the secret's first ten bytes, the carry began with the
+/// rest, and the two rows concatenated held it. The cut must land between two occurrences instead.
+#[tokio::test]
+async fn a_densely_echoed_secret_is_never_split_when_every_stepped_candidate_fails() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let hold = scrubber.hold_back();
+    assert_eq!(hold, 75, "max(40, PATTERN_HOLD_BACK) - 1");
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(10);
+    let line = format!("{SECRET40}\n");
+    // 15 KiB of filler, then 25 lines of 41 bytes and the first 10 bytes of a 26th: the run is
+    // 16395 bytes at the bound, reached by the last 20-byte piece. Each candidate `16395 - 75 * t` sits 17, 24, 31 and 38 bytes into
+    // a 40-byte occurrence (period 41).
+    let dense = format!("{}{head}", line.repeat(25));
+    let len = 15 * 1024 + dense.len();
+    assert_eq!(len, 16395);
+    for t in 1..=4 {
+        let into = (len - t * hold - 15 * 1024) % line.len();
+        assert!(
+            (1..SECRET40.len()).contains(&into),
+            "candidate {t} is strictly inside an occurrence ({into} bytes in)"
+        );
+    }
+    // Streamed 20 bytes at a time, so no chunk holds a whole occurrence and capture masks none:
+    // the run itself holds them, as a token stream would deliver them.
+    let script: Vec<DriverEnvelope> = (0..15)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain(
+            dense
+                .as_bytes()
+                .chunks(20)
+                .map(|piece| acp_chunk(core::str::from_utf8(piece).expect("ASCII"), None)),
+        )
+        .chain([acp_chunk(&format!("{tail}\nbye"), None), end_turn()])
+        .collect();
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(texts.len(), 2, "one cut, then the turn's end");
+    let masked_line = "[REDACTED]\n";
+    assert_eq!(
+        texts[0],
+        format!("{}{}", fill(15 * 1024), masked_line.repeat(23)),
+        "the cut is the start of the occurrence the first candidate (16320) fell in: 16303"
+    );
+    assert_eq!(
+        texts[1],
+        format!("{}bye", masked_line.repeat(3)),
+        "the carry holds the last two occurrences and the incomplete one, completed"
+    );
+    assert_nowhere(&log, SECRET40);
+    for pair in texts.windows(2) {
+        assert!(
+            !pair.concat().contains(SECRET40),
+            "adjacent rows' texts never rejoin the secret"
+        );
+    }
+    assert!(
+        !texts.concat().contains(head),
+        "the incomplete occurrence is carried, not left as a prefix on the head"
+    );
+    assert_eq!(
+        texts.concat().matches("[REDACTED]").count(),
+        26,
+        "every occurrence is masked whole in one row"
+    );
+    for row in &log {
+        assert!(
+            !raw_text(row).contains(SECRET40),
+            "row {}'s raw holds the secret",
+            row.seq
+        );
+    }
+    for pair in log.windows(2) {
+        let joined = format!("{}{}", raw_text(&pair[0]), raw_text(&pair[1]));
+        assert!(
+            !joined.contains(SECRET40),
+            "rows {} and {}: their raw joined holds the secret",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+}
+
 /// A scrubber that keeps the default `hold_back` (0) keeps the cut at the bound exactly, as before
 /// MOD-10 M3 (blueprint A-3).
 #[tokio::test]
