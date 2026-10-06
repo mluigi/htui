@@ -18086,7 +18086,8 @@ async fn claim_command_admits_up_to_the_limit_in_queue_order<S: WriteStore>(stor
 /// MOD-11 D14: only the claimant beats or finishes a running row. A stranger's beat and finish
 /// answer `false` and move nothing; the claimant's finish lands its status, exit code and output
 /// with a finish instant, after which its own beat is `false`; finishing to `queued` or `running`
-/// is refused before anything is read.
+/// is refused before anything is read. A claimant may end its row `cancelled` with no exit code
+/// and its output (MOD-78 D4).
 async fn beat_and_finish_need_the_claimant<S: WriteStore>(store: &S) {
     const CASE: &str = "beat_and_finish_need_the_claimant";
     let new = queued_command("build", seam_clock());
@@ -18186,6 +18187,43 @@ async fn beat_and_finish_need_the_claimant<S: WriteStore>(store: &S) {
         command_row(CASE, store, new.id).await,
         done,
         "{CASE}: the second finish moved nothing"
+    );
+
+    // MOD-78 D4: a claimant stopped on a lost lease ends its row `cancelled`, with no exit code
+    // and the output it kept.
+    let lost = queued_command("build", seam_clock() + TimeDelta::seconds(1));
+    store.enqueue_command(lost.clone()).await.expect(CASE);
+    store
+        .claim_command(lost.id, claimant, 1)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the second row is admitted"));
+    assert!(
+        store
+            .finish_command(
+                lost.id,
+                claimant,
+                CommandRunStatus::Cancelled,
+                None,
+                Some("x".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the claimant finishes its row cancelled"
+    );
+    let cancelled = command_row(CASE, store, lost.id).await;
+    assert_eq!(
+        (
+            cancelled.status,
+            cancelled.exit_code,
+            cancelled.output.as_deref()
+        ),
+        (CommandRunStatus::Cancelled, None, Some("x")),
+        "{CASE}: cancelled, no exit code, the output kept"
+    );
+    assert!(
+        cancelled.finished_at.is_some(),
+        "{CASE}: with a finish instant"
     );
 }
 
