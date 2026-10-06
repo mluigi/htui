@@ -4729,23 +4729,21 @@ async fn run_turn(
             continue;
         }
 
+        // The branches' futures are dropped before a handler runs, so the command arm may use
+        // the session the pull borrowed.
         let pulled = if listen {
             tokio::select! {
                 biased;
-                command = commands.recv() => Pull::Command(command),
-                pulled = session.next_event() => Pull::Event(pulled),
+                command = commands.recv() => {
+                    match help_command(session, recorder, ui, frames, grace, command).await {
+                        Some(end) => return Ok(end),
+                        None => continue,
+                    }
+                }
+                pulled = session.next_event() => pulled,
             }
         } else {
-            Pull::Event(session.next_event().await)
-        };
-        let pulled = match pulled {
-            Pull::Event(pulled) => pulled,
-            Pull::Command(command) => {
-                match help_command(session, recorder, ui, frames, grace, command).await {
-                    Some(end) => return Ok(end),
-                    None => continue,
-                }
-            }
+            session.next_event().await
         };
         let Some(envelope) = pulled? else {
             // The stream ended without a `done`. That is a transport that died mid-turn, not a
@@ -4803,15 +4801,6 @@ async fn run_turn(
             _ => {}
         }
     }
-}
-
-/// What a listening turn's loop got first (MOD-55 review H1): the agent's next event, or a
-/// command.
-enum Pull {
-    /// [`AgentSession::next_event`]'s answer.
-    Event(Result<Option<DriverEnvelope>, DriverError>),
-    /// The command channel's: `None` once the runtime let go of it.
-    Command(Option<ChatCommand>),
 }
 
 /// MOD-55 review H1: a command a help turn read while pulling, nothing parked. `Some` ends the
