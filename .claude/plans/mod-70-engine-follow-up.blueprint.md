@@ -37,6 +37,9 @@ follow-up text in any `Debug`, `Display`, log line, status line or `RelayView`**
 
 ## Plan deviations (take these to the maintainer before T0)
 
+**Answered: DV-1, DV-2 and DV-3 accepted as recommended (maintainer, 2026-10-06).** Every
+`[DV-n declined: …]` fallback below is void; implement the recommended text.
+
 Each is small, each has a fallback that keeps the plan's text, and this blueprint is written for the
 recommended answer. Where code differs between the two answers, §2 marks it `[DV-n declined: …]`.
 
