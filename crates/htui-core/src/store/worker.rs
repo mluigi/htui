@@ -17,7 +17,7 @@
 //! `item_by_key` (plan D13, B-4) and its five command-queue methods (plan D14); [`RelayStore`] is
 //! four (MOD-42 plan D2).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
-//! `queued_runs_on_box`.
+//! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_batch`.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -28,15 +28,16 @@ use uuid::Uuid;
 
 use crate::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use crate::model::{
-    AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CancelRequest,
-    Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead, DocumentId,
-    GateOutcome, Item, ItemId, ItemKind, NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
-    Project, ProjectId, PromptScope, PromptTemplate, RelaySessionId, Repo, RepoBoxPath, RepoId,
-    Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, Status,
-    StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
-    UserId, WorkspaceSummary,
+    AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile,
+    BoxRow, CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document,
+    DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind, ItemSummary, NewCommandRun,
+    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope, PromptTemplate,
+    QueueBatch, QueueEntry, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId,
+    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId,
+    WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -499,6 +500,37 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
         &self,
         box_id: BoxId,
     ) -> impl Future<Output = Result<Vec<(RunId, DateTime<Utc>)>>> + Send;
+
+    // -- MOD-12 M1 (plan D3, D5, D6): the queue runner's reads and its one write
+    /// `Backend::ready_items`: §7.4's ready items `box_id` can take, in queue order.
+    fn ready_items(
+        &self,
+        scope: &Scope,
+        box_id: BoxId,
+    ) -> impl Future<Output = Result<Vec<ItemSummary>>> + Send;
+    /// `Backend::running_runs_on_box`: `claim_run`'s slot count.
+    fn running_runs_on_box(&self, box_id: BoxId) -> impl Future<Output = Result<usize>> + Send;
+    /// `Backend::queue_entries`.
+    fn queue_entries(&self, box_id: BoxId) -> impl Future<Output = Result<Vec<QueueEntry>>> + Send;
+    /// `Backend::open_batch_of`.
+    fn open_batch_of(
+        &self,
+        box_id: BoxId,
+    ) -> impl Future<Output = Result<Option<QueueBatch>>> + Send;
+    /// `Backend::batch_runs`.
+    fn batch_runs(
+        &self,
+        batch: BatchId,
+    ) -> impl Future<Output = Result<Vec<(RunId, RunStatus)>>> + Send;
+    /// `Backend::prune_finished_entries`.
+    fn prune_finished_entries(&self, box_id: BoxId) -> impl Future<Output = Result<u64>> + Send;
+    /// `Backend::close_batch` (the drain, D3).
+    fn close_batch(
+        &self,
+        box_id: BoxId,
+        reason: BatchClose,
+        at: DateTime<Utc>,
+    ) -> impl Future<Output = Result<Option<QueueBatch>>> + Send;
 }
 
 impl RecorderStore for MemStore {
