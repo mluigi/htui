@@ -13,6 +13,7 @@ use std::sync::LazyLock;
 
 use regex::{Regex, RegexSet};
 use serde_json::Value;
+use zeroize::Zeroize;
 
 /// What every masked occurrence is replaced with.
 const REDACTED: &str = "[REDACTED]";
@@ -63,12 +64,18 @@ const PATTERN_RULES: &[(&str, &str)] = &[
     ),
 ];
 
-/// An ASCII token start: the string start, or one character that is not `[A-Za-z0-9_]` (D1).
+/// A token start (MOD-10 D1, D17): the string start, one character that is not
+/// `[A-Za-z0-9_]`, or a JSON / percent escape whose last character is a letter or digit: `\n`,
+/// `\r`, `\t`, `\b`, `\f`, `\"`, `\/`, `\\`, `\uXXXX` and `%XX`. A key serialised inside an
+/// escaped string (`…\nsk-ant-…`, `%22ghp_…`) is therefore a whole token, while `subtask-…` and
+/// `x%2Fsk-learn` stay prose (the latter is too short for any rule). It widens what fails closed;
+/// `scripts/scrub-audit.sql` mirrors it (OQ-D: the host audit runs before merge).
 ///
-/// `subtask-…` is therefore not an `sk-` credential while `Bearer sk-…`, `--sk-…` and
-/// `[REDACTED]sk-…` are. A non-ASCII letter before a key (`éAKIA…`) also counts as a token start,
-/// which errs towards failing closed.
-const TOKEN_START: &str = r"(?:^|[^A-Za-z0-9_])";
+/// `Bearer sk-…`, `--sk-…` and `[REDACTED]sk-…` are token starts too. A non-ASCII letter before a
+/// key (`éAKIA…`) also counts, which errs towards failing closed. The `\"`, `\/` and `\\`
+/// alternatives are redundant with `[^A-Za-z0-9_]` (the backslash before them already is one) and
+/// are kept so the constant reads as the escape list D17 names.
+const TOKEN_START: &str = r#"(?:^|[^A-Za-z0-9_]|\\[nrtbf"/\\]|\\u[0-9A-Fa-f]{4}|%[0-9A-Fa-f]{2})"#;
 
 /// [`PATTERN_RULES`] compiled once per process, index for index.
 static PATTERNS: LazyLock<RegexSet> = LazyLock::new(|| {
@@ -177,9 +184,10 @@ pub struct Unmasked {
 ///    a PEM private-key marker; the first survivor is returned as [`Unmasked`], which blocks the
 ///    write.
 ///
-/// A pattern rule is a known prefix plus a charset plus a minimum length, and counts only at an
-/// ASCII token start (string start, or after a character that is not `[A-Za-z0-9_]`), so
-/// `subtask-list` and `sk-learn` are not credentials while `Bearer sk-ant-api03-…` is.
+/// A pattern rule is a known prefix plus a charset plus a minimum length, and counts only at a
+/// token start (string start, after a character that is not `[A-Za-z0-9_]`, or after a JSON or
+/// percent escape such as `\n` or `%22`: [`TOKEN_START`]), so `subtask-list` and `sk-learn` are
+/// not credentials while `Bearer sk-ant-api03-…` and `…\nsk-ant-api03-…` are.
 /// Numbers and booleans are structural and are never rewritten; strings are masked and scanned
 /// wherever they appear, as a value or as a key.
 pub struct MinimalScrubber {
@@ -191,12 +199,21 @@ impl MinimalScrubber {
     /// Builds a scrubber that masks every non-empty `secret`, longest first.
     ///
     /// Empty secrets are dropped: masking on an empty needle would match everywhere. An empty
-    /// list is legal and still fails closed on the pattern rules.
+    /// list is legal and still fails closed on the pattern rules. A duplicate is zeroized as it
+    /// is dropped, like the whole list when the scrubber goes (MOD-10 D17).
     #[must_use]
     pub fn new(secrets: impl IntoIterator<Item = String>) -> Self {
         let mut secrets: Vec<String> = secrets.into_iter().filter(|s| !s.is_empty()).collect();
         secrets.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-        secrets.dedup();
+        // `dedup_by` hands the candidate for removal first.
+        secrets.dedup_by(|dropped, kept| {
+            if dropped == kept {
+                dropped.zeroize();
+                true
+            } else {
+                false
+            }
+        });
         Self { secrets }
     }
 
@@ -207,6 +224,12 @@ impl MinimalScrubber {
     /// injected by the caller, just not masked. An empty value is below the floor and is listed.
     /// No value is ever returned or logged. An empty map is legal and still fails closed on the
     /// pattern rules.
+    ///
+    /// A value that ends in `\n` / `\r\n` (a secret stored with its line end) is masked both as
+    /// given and with its trailing line ends trimmed, so the bare token an agent echoes is masked
+    /// too (MOD-10 D17). The trimmed form is masked only when it is itself at the floor; whether a
+    /// key is listed as short is decided on its full value. Injection is untouched: the caller
+    /// injects `resolved` byte for byte.
     #[must_use]
     pub fn from_resolved(resolved: &BTreeMap<String, String>) -> (Self, Vec<String>) {
         let mut masked = Vec::with_capacity(resolved.len());
@@ -214,6 +237,10 @@ impl MinimalScrubber {
         for (key, value) in resolved {
             if value.chars().count() >= MIN_MASKED_LEN {
                 masked.push(value.clone());
+                let trimmed = value.trim_end_matches(['\r', '\n']);
+                if trimmed.len() != value.len() && trimmed.chars().count() >= MIN_MASKED_LEN {
+                    masked.push(trimmed.to_owned());
+                }
             } else {
                 short.push(key.clone());
             }
@@ -333,6 +360,15 @@ impl core::fmt::Debug for MinimalScrubber {
         f.debug_struct("MinimalScrubber")
             .field("secrets", &self.secrets.len())
             .finish()
+    }
+}
+
+impl Drop for MinimalScrubber {
+    /// MOD-10 D17: the secret list is wiped when the scrubber goes (a walk's, a chat's).
+    fn drop(&mut self) {
+        for secret in &mut self.secrets {
+            secret.zeroize();
+        }
     }
 }
 
@@ -1088,6 +1124,98 @@ mod tests {
             MinimalScrubber::from_resolved(&resolved(&[("FIVE", "ééééé"), ("SIX", "éééééé")]));
         assert_eq!(short, vec!["FIVE".to_owned()]);
         assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 1 }");
+    }
+
+    /// The dual-valid M1 Anthropic fixture: refused as `anthropic_api_key` at any token start.
+    const ANT_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
+
+    #[test]
+    fn an_escaped_token_start_is_a_token_start() {
+        // The backslash is built at run time: a `\u0022` in a Rust string literal is an
+        // escape error (H-21).
+        let b = '\\';
+        let mut cases = vec![
+            (format!("x{b}n{ANT_KEY}"), "anthropic_api_key"),
+            (format!("{b}u0022AKIAIOSFODNN7EXAMPLE"), "aws_access_key_id"),
+            (
+                "%22ghp_abcdefghijklmnopqrstuvwxyz0123456789".to_owned(),
+                "github_token",
+            ),
+        ];
+        for escape in ['r', 't', 'b', 'f', '/', '\\', '"'] {
+            cases.push((format!("x{b}{escape}{ANT_KEY}"), "anthropic_api_key"));
+        }
+        let scrubber = rules_only();
+        for (text, rule) in cases {
+            let mut value = json!({ "t": text });
+            let err = scrubber
+                .scrub(&mut value)
+                .err()
+                .unwrap_or_else(|| panic!("an escaped token start must refuse: {text}"));
+            assert_eq!(err.rule, rule, "rule for {text}");
+            assert_eq!(err.path, "/t", "pointer for {text}");
+        }
+    }
+
+    #[test]
+    fn an_escaped_start_reaches_the_openai_confirmation() {
+        let b = '\\';
+        // A LiteLLM key after a JSON `\n`: `SK_CANDIDATE` must capture its body.
+        let mut value = json!({ "t": format!("x{b}nsk-Ab3_xY9-kLmN0pQrStUvWx") });
+        let err = rules_only()
+            .scrub(&mut value)
+            .expect_err("an escaped LiteLLM key must refuse the write");
+        assert_eq!(err.rule, "openai_api_key");
+        assert_eq!(err.path, "/t");
+    }
+
+    #[test]
+    fn an_escape_lookalike_is_not_a_token_start() {
+        let b = '\\';
+        let scrubber = rules_only();
+        for text in [
+            "subtask-abcdefghijklmnopqrstuvwxyz".to_owned(),
+            "x%2Fsk-learn".to_owned(),
+            format!("n{ANT_KEY}"),
+            // One hex digit, three hex digits, no hex digits.
+            format!("%2{ANT_KEY}"),
+            format!("{b}u002{ANT_KEY}"),
+            format!("%ZZ{ANT_KEY}"),
+            "src/sk-live.rs".to_owned(),
+        ] {
+            let mut value = json!({ "t": text });
+            scrubber
+                .scrub(&mut value)
+                .unwrap_or_else(|err| panic!("{text:?} must stay clean, got {err}"));
+        }
+    }
+
+    #[test]
+    fn from_resolved_masks_a_value_and_its_newline_free_form() {
+        for raw in ["abcdefgh\n", "abcdefgh\r\n"] {
+            let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[("K", raw)]));
+            assert!(short.is_empty(), "{short:?}");
+            assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 2 }");
+            for text in [format!("x {raw} y"), "x abcdefgh y".to_owned()] {
+                let mut value = json!({ "t": text });
+                scrubber.scrub(&mut value).expect("clean");
+                assert_eq!(value["t"], json!("x [REDACTED] y"), "for {raw:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_newline_free_form_below_the_floor_is_not_masked() {
+        let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[("K", "abcde\n")]));
+        assert!(
+            short.is_empty(),
+            "the full value is at the floor: {short:?}"
+        );
+        assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 1 }");
+        let mut value = json!({ "a": "x abcde\n y", "b": "x abcde y" });
+        scrubber.scrub(&mut value).expect("clean");
+        assert_eq!(value["a"], json!("x [REDACTED] y"));
+        assert_eq!(value["b"], json!("x abcde y"));
     }
 
     #[test]
