@@ -580,8 +580,9 @@ async fn the_command_run_liveness_columns_exist() {
 
 /// MOD-70 plan D1 (blueprint §2.6, §4.3): `0016_follow_up.sql` splits `run_command`'s pending
 /// index in two (one pending cancel per run, one pending follow-up per step), gives the table its
-/// `run_step_id` and `text` columns, and adds `follow_up_window` with its open-window index. The
-/// step's status CHECK is untouched (PRD metric "No new step state"): its definition is the one
+/// `run_step_id` and `text` columns, and adds `follow_up_window`. Review M-1: a plain index stands
+/// behind each foreign key it adds (`run_command.run_step_id`, `follow_up_window.run_id`) and
+/// behind `run_command.run_id`, which `relay_view` reads per run. The step's status CHECK is untouched (PRD metric "No new step state"): its definition is the one
 /// `0015_command_queue.sql` left, byte for byte.
 #[tokio::test]
 async fn migration_0016_reshapes_run_command_and_adds_the_follow_up_window() {
@@ -600,17 +601,48 @@ async fn migration_0016_reshapes_run_command_and_adds_the_follow_up_window() {
     for name in [
         "uq_run_command_pending_cancel",
         "uq_run_command_pending_follow_up",
-        "idx_follow_up_window_open",
+        "idx_run_command_step",
+        "idx_run_command_run",
+        "idx_follow_up_window_run",
     ] {
         assert!(
             indexes.contains(name),
             "0016 creates `{name}`, got {indexes:?}"
         );
     }
-    assert!(
-        !indexes.contains("uq_run_command_pending"),
-        "0016 drops the one pending index of 0011, got {indexes:?}"
-    );
+    for gone in ["uq_run_command_pending", "idx_follow_up_window_open"] {
+        assert!(
+            !indexes.contains(gone),
+            "0016 leaves no `{gone}` (0011's pending index is dropped; the window's run index is \
+             plain), got {indexes:?}"
+        );
+    }
+    // MOD-70 review M-1: every foreign key 0016 adds has a plain (non-partial) index behind its
+    // cascade, and `relay_view`'s per-run read of follow-ups has one on `run_command.run_id`.
+    for (name, definition) in [
+        (
+            "idx_run_command_step",
+            "CREATE INDEX idx_run_command_step ON public.run_command USING btree (run_step_id) \
+             WHERE (run_step_id IS NOT NULL)",
+        ),
+        (
+            "idx_run_command_run",
+            "CREATE INDEX idx_run_command_run ON public.run_command USING btree (run_id)",
+        ),
+        (
+            "idx_follow_up_window_run",
+            "CREATE INDEX idx_follow_up_window_run ON public.follow_up_window USING btree (run_id)",
+        ),
+    ] {
+        let actual: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(name)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or_else(|err| panic!("read `{name}`'s definition: {err}"));
+        assert_eq!(actual, definition, "0016's `{name}`");
+    }
 
     let columns = |table: &'static str| {
         let pool = db.pool.clone();
