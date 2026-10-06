@@ -4623,13 +4623,21 @@ mod role_gate {
         async fn mod62_a_verify_command_printing_its_environment_shows_no_resolved_value() {
             let scratch = Scratch::new();
             let mut data = demo_data();
-            // Names only on Unix, plus the one variable's own value: a bare `env` prints every
+            // Names only, plus whether the one variable is set: a bare `env` or `set` prints every
             // value of the test process, and a pattern-shaped one there (an exported
-            // `ANTHROPIC_API_KEY`) makes the verifier withhold the whole output.
+            // `ANTHROPIC_API_KEY`) makes the verifier withhold the whole output. R1 L6: `awk`'s
+            // `ENVIRON` keys, not `env | cut`, which prints the continuation lines of a
+            // multi-line value. On Windows the `for /f` options are caret-escaped rather than
+            // quoted: Rust passes a `"` to `cmd /C` as `\"`, which cmd does not unescape.
             let print_env = if cfg!(windows) {
-                "set".to_owned()
+                format!(
+                    "(for /f delims^=^= %v in ('set') do @echo %v) & \
+                     (if defined {KEY} (echo resolved=set) else (echo resolved=unset))"
+                )
             } else {
-                format!("env | cut -d= -f1; echo \"resolved=${{{KEY}-unset}}\"")
+                format!(
+                    "awk 'BEGIN{{for(k in ENVIRON) print k}}'; echo \"resolved=${{{KEY}-unset}}\""
+                )
             };
             for phase in &mut data.phases {
                 phase.verify_command = Some(print_env.clone());
@@ -4669,12 +4677,10 @@ mod role_gate {
                 "the command printed the environment: {output}"
             );
             assert!(!output.contains(VALUE), "{output}");
-            if !cfg!(windows) {
-                assert!(
-                    output.contains("resolved=unset"),
-                    "the verify child does not inherit the resolved key: {output}"
-                );
-            }
+            assert!(
+                output.contains("resolved=unset"),
+                "the verify child does not inherit the resolved key: {output}"
+            );
             assert!(
                 !output.contains(KEY),
                 "the verifier's child never received the resolved map: {output}"
