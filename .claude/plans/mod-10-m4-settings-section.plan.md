@@ -160,7 +160,7 @@ Routed as plan on PRD milestone 4 by `/handoff-run MOD-10` (accepted 2026-10-06,
   - There is no provider picker; `infisical` is the only kind.
   - The worker-side identity is still MOD-48's.
 
-## Open questions (maintainer)
+## Open questions (decided 2026-10-06: all four as recommended)
 
 - **OQ-1 Placement.** Put the per-project scope in the Secrets section (D1, recommended: one place
   for secrets, and the scope check sits beside the scope)? Or add three fields to the Hierarchy
