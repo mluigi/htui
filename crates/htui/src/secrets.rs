@@ -18,6 +18,15 @@ pub(crate) const NO_URL: &str = "no Infisical base URL is stored in the OS keyri
 /// The blocking keyring read panicked or was cancelled before it answered.
 pub(crate) const KEYRING_UNFINISHED: &str = "the OS keyring read did not finish";
 
+/// R1 M2: the blocking keyring read did not answer within [`KEYRING_TIMEOUT`] (an OS unlock
+/// prompt left unanswered, a keyring daemon that hangs).
+pub(crate) const KEYRING_SILENT: &str = "the OS keyring did not answer";
+
+/// R1 M2: how long one [`KeyringInfisical::provider`] call waits for the keyring read. Long
+/// enough for a human to answer an OS unlock prompt; past it the walk or chat is refused with
+/// [`KEYRING_SILENT`] and the next one asks again.
+pub(crate) const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A keyring failure, as `Config`. `htui_store::secret`'s messages name slots, never values
 /// (`get_machine_identity`'s half-identity sentence included).
 fn keyring_unreadable(err: &htui_core::store::StoreError) -> SecretError {
@@ -28,12 +37,19 @@ fn keyring_unreadable(err: &htui_core::store::StoreError) -> SecretError {
 type Build =
     dyn Fn(&str, MachineIdentity) -> Result<Arc<dyn SecretProvider>, SecretError> + Send + Sync;
 
+/// Reads the normalised URL and the identity, blocking (production:
+/// [`KeyringInfisical::read_keyring`]).
+type Read = dyn Fn() -> Result<(String, MachineIdentity), SecretError> + Send + Sync;
+
 /// MOD-10 D15: the keyring-backed Infisical [`SecretSource`]. One per process (the TUI shares
 /// its one between the run and agent runtimes; `htui worker` has its own). Building it reads
 /// nothing: the keyring is read per [`provider`](SecretSource::provider) call.
 pub struct KeyringInfisical {
     build: Box<Build>,
-    /// Held across the keyring read and the build, so two walks starting together build once.
+    /// Run on a blocking thread, under [`KEYRING_TIMEOUT`].
+    read: Arc<Read>,
+    /// Held across the keyring read and the build, so two walks starting together build once
+    /// and do not stack OS unlock prompts. [`KEYRING_TIMEOUT`] bounds how long it is held.
     cached: tokio::sync::Mutex<Option<Cached>>,
 }
 
@@ -58,24 +74,34 @@ impl KeyringInfisical {
     /// Production: `InfisicalProvider::new(InfisicalConfig::new(url), identity)`.
     #[must_use]
     pub fn new() -> Self {
-        Self::from_builder(Box::new(|url, identity| {
-            let provider = htui_secrets::InfisicalProvider::new(
-                htui_secrets::InfisicalConfig::new(url),
-                identity,
-            )?;
-            Ok(Arc::new(provider) as Arc<dyn SecretProvider>)
-        }))
+        Self::from_parts(
+            Box::new(|url, identity| {
+                let provider = htui_secrets::InfisicalProvider::new(
+                    htui_secrets::InfisicalConfig::new(url),
+                    identity,
+                )?;
+                Ok(Arc::new(provider) as Arc<dyn SecretProvider>)
+            }),
+            Arc::new(Self::read_keyring),
+        )
     }
 
-    /// Tests: any builder (a counting one returning `FakeSecretProvider`s).
+    /// Tests: any builder (a counting one returning `FakeSecretProvider`s) over the keyring.
     #[cfg(test)]
     fn with_builder(build: Box<Build>) -> Self {
-        Self::from_builder(build)
+        Self::from_parts(build, Arc::new(Self::read_keyring))
     }
 
-    fn from_builder(build: Box<Build>) -> Self {
+    /// Tests: any builder and any read (one that blocks, R1 M2).
+    #[cfg(test)]
+    fn with_parts(build: Box<Build>, read: Arc<Read>) -> Self {
+        Self::from_parts(build, read)
+    }
+
+    fn from_parts(build: Box<Build>, read: Arc<Read>) -> Self {
         Self {
             build,
+            read,
             cached: tokio::sync::Mutex::new(None),
         }
     }
@@ -95,9 +121,15 @@ impl KeyringInfisical {
 
     async fn current(&self) -> Result<Arc<dyn SecretProvider>, SecretError> {
         let mut cached = self.cached.lock().await;
-        let (url, identity) = tokio::task::spawn_blocking(Self::read_keyring)
-            .await
-            .map_err(|_| SecretError::Config(KEYRING_UNFINISHED.to_owned()))??;
+        let read = Arc::clone(&self.read);
+        // R1 M2: the lock stays held across the read (two walks must not stack OS unlock
+        // prompts), so the read is bounded. A blocking thread cannot be cancelled: one that
+        // times out outlives this call until the keyring answers, and its answer is dropped.
+        let (url, identity) =
+            tokio::time::timeout(KEYRING_TIMEOUT, tokio::task::spawn_blocking(move || read()))
+                .await
+                .map_err(|_| SecretError::Config(KEYRING_SILENT.to_owned()))?
+                .map_err(|_| SecretError::Config(KEYRING_UNFINISHED.to_owned()))??;
         let digest: [u8; 32] = Sha256::digest(identity.client_secret().as_bytes()).into();
         if let Some(held) = cached.as_ref()
             && held.built_from(&url, identity.client_id(), &digest)
@@ -386,6 +418,54 @@ mod tests {
         assert_eq!(walk_1, SecretError::BadCredentials);
         assert_eq!(walk_2, SecretError::LoginRefusedEarlier);
         assert_eq!(builds.count(), 1, "one provider served both walks");
+    }
+
+    /// R1 M2: a keyring read that never answers (an OS unlock prompt nobody answers) refuses
+    /// the walk after [`KEYRING_TIMEOUT`] and gives the lock back; the blocking read itself
+    /// cannot be cancelled and is released here only so the test does not leak its thread.
+    #[tokio::test(start_paused = true)]
+    async fn a_keyring_that_never_answers_is_refused_after_the_timeout() {
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(held);
+        let seen = Arc::clone(&started);
+        let source = Arc::new(KeyringInfisical::with_parts(
+            Box::new(|_url, _identity| Ok(Arc::new(resolving()) as Arc<dyn SecretProvider>)),
+            Arc::new(move || {
+                seen.store(true, Ordering::SeqCst);
+                let _ = held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .recv();
+                Err(SecretError::NoIdentity)
+            }),
+        ));
+        let asking = Arc::clone(&source);
+        let call = tokio::spawn(async move { asking.provider().await.map(|_| ()) });
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+
+        tokio::time::advance(KEYRING_TIMEOUT - std::time::Duration::from_secs(1)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !call.is_finished(),
+            "still waiting one second before the timeout"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(2)).await;
+        let refused = call.await.expect("the call does not panic");
+
+        assert_eq!(refused, Err(SecretError::Config(KEYRING_SILENT.to_owned())));
+        assert_eq!(
+            format!("{source:?}"),
+            "KeyringInfisical { cached: false }",
+            "the lock was given back"
+        );
+        release
+            .send(())
+            .expect("the blocking read is still waiting");
     }
 
     #[tokio::test]

@@ -168,7 +168,11 @@ masks them in everything it stores. Any other value is refused
   task, so a slow Infisical never stalls the rest of the TUI. The column checks run first and need
   no network.
 
-The keyring is read at every resolution, on a blocking thread. A process keeps one provider: the
+The keyring is read at every resolution, on a blocking thread, one read at a time per process so
+that two walks starting together never stack two OS unlock prompts. A read that has not answered
+after 120 seconds (an unlock prompt nobody answered) refuses that walk or chat as `Config`
+(`the OS keyring did not answer`); the read itself cannot be cancelled and finishes in the
+background, and the next walk reads again. A process keeps one provider: the
 TUI shares its one between its runs and its chats, and `htui worker` has its own. The provider is
 rebuilt only when the stored base URL (after [normalisation](#base-url)), client ID or client
 secret has changed, so an identity entered again takes effect at the next walk or chat, and
@@ -231,6 +235,7 @@ the cause, or wait, then run again.
 | No base URL in the keyring | `Config` (3) |
 | A stored base URL htui refuses | `Config`, naming the reason ([Base URL](#base-url)) |
 | A keyring that cannot be read, or a half-stored identity | `Config` (4) |
+| A keyring that does not answer within 120 seconds | `Config` (5) |
 | No machine identity in the keyring | `NoIdentity` |
 | Anything Infisical or the network answers | Its variant ([Errors](#errors-and-what-to-do)) |
 | A key htui refuses after the merge | [What htui refuses](#what-htui-refuses) |
@@ -243,7 +248,8 @@ The `Config` sentences, after `secret provider configuration: `:
 2. `the project names a secret provider but has no secret_scope`;
 3. `no Infisical base URL is stored in the OS keyring`;
 4. `the OS keyring could not be read: ` and the keyring's own message, which names the entry
-   (for a half-stored identity, the one that is missing), never a value.
+   (for a half-stored identity, the one that is missing), never a value;
+5. `the OS keyring did not answer`.
 
 Three more guard htui's own wiring and should never be seen: `this process has no secret source,
 so the project's secrets cannot be resolved`, ``the secret source answered a `<kind>` provider for
