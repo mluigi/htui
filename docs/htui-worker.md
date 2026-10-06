@@ -318,18 +318,24 @@ is restarted, and the step stays `running`.
   it with "the step finished its session; promote it to continue"; a session cancelled or cut by
   its deadline, with "the step's session was cancelled before the follow-up was sent". Cancelling
   the run (`c`) refuses it with "the run was cancelled".
-- **A walk that died leaves its follow-up queued.** If the worker crashes, is stopped (SIGINT and
-  SIGTERM drop its walks at once) or loses the run, a follow-up it had not sent stays `queued` in
-  the pane, and no process will send it. It is refused, "the step finished its session; promote it
-  to continue", when a process on the run's box recovers the run (the worker's next sweep, see
-  [If the worker crashes](#if-the-worker-crashes)), or "the run was cancelled" when you cancel it.
+- **Stopping the worker refuses it.** SIGINT or SIGTERM drops every walk at once; each dropped
+  walk, while it still holds the run, refuses a follow-up it had not sent with "the step finished
+  its session; promote it to continue" before it gives the run back.
+- **A walk that died leaves its follow-up queued.** If the worker crashes or loses the run, or a
+  stop cannot finish (the database is unreachable, or a walk outlasts the stop's grace window), a
+  follow-up it had not sent stays `queued` in the pane, and no process will send it. It is refused,
+  "the step finished its session; promote it to continue", when a process on the run's box
+  recovers the run (the worker's next sweep, see [If the worker crashes](#if-the-worker-crashes)),
+  or "the run was cancelled" when you cancel it.
   Meanwhile another follow-up for the step is refused as already queued; with nothing queued, one
   typed after the dead process's lease has lapsed is refused: "the process walking the step no
   longer holds the run".
 - **A database outage at the session's end can strand one.** The walking process tries for about
   30 seconds to close the session's follow-ups; if the database stays unreachable that long, a
   follow-up still queued stays pending, its text still stored, until the run is cancelled or
-  recovered after a crash. It is never sent.
+  recovered after a crash. It is never sent. If the walk instead goes on and the run finishes,
+  nothing refuses it: the row stays pending with its text stored, since `c` on a run that has
+  rested is cleanup, not a cancel.
 - **Every box upgrades together.** Follow-ups need the migration `0016_follow_up.sql`: apply it
   from a TUI first, and upgrade every TUI and worker on the database at the same time (see
   [Upgrading](#upgrading-migrate-from-a-tui-first)).
