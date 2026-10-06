@@ -1907,10 +1907,10 @@ pub trait WriteStore: ReadStore {
     /// [`StepFence::owner`], the predicate every fenced write uses ([`StepFence`]), read with no row
     /// lock (no `FOR SHARE`), so the answer may be stale by the time the caller acts on it. Owner
     /// only, never the expiry (MOD-78 D2): an expired lease nobody has taken still holds, as it still
-    /// writes. `command_run` reads it before it queues, at admission, and on every heartbeat (MOD-78
-    /// D3), because the queue's own writes take no fence. A read on `WriteStore` by the
-    /// `command_runs` precedent: `run.lease_owner` is not a [`Run`] field, so no `ReadStore` read
-    /// answers it.
+    /// writes. `command_run` reads it before it queues, while queued at most once per heartbeat, at
+    /// admission, and on every heartbeat (MOD-78 D3), because the queue's own writes take no
+    /// fence. A read on `WriteStore` by the `command_runs` precedent: `run.lease_owner` is not a
+    /// [`Run`] field, so no `ReadStore` read answers it.
     ///
     /// # Errors
     /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }` for an

@@ -85,6 +85,16 @@ impl Lease {
         htui_core::store::WorkerStore::lease_holds(store, self.run, self.fence).await
     }
 
+    /// MOD-78 D3(b)-(d), D5: whether a read bounded by [`COMMAND_HEARTBEAT`] answers that the
+    /// lease is lost. A failed read and one the store does not answer in time (a starved pool)
+    /// are not a stop: a hung read must not hold back the beat after it and get the row reaped.
+    async fn lost_now<S: htui_core::store::WorkerStore>(self, store: &S) -> bool {
+        matches!(
+            tokio::time::timeout(COMMAND_HEARTBEAT, self.holds(store)).await,
+            Ok(Ok(false))
+        )
+    }
+
     /// The answer every fenced tool gives ([`store_error`]).
     fn lost(self) -> ToolError {
         store_error(StoreError::Fenced { step: self.step })
@@ -236,7 +246,7 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     // MOD-78 D3(b): a call that waited may have lost the lease since its last read; it must not
     // spawn a child for a heartbeat on it. The armed guard cancels the running row. A failed read
     // is not a stop (D5): the heartbeat reads again.
-    if let Ok(false) = lease.holds(&store).await {
+    if lease.lost_now(&store).await {
         return Err(lease.lost());
     }
 
@@ -244,6 +254,7 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     // that is `run_shell`'s `stop`.
     let stopped = OnceLock::new();
     let beats = async {
+        // Set once: `beats` runs once.
         let _ = stopped.set(beat(&store, id, claimant, lease, progress.as_ref(), &mut ticks).await);
     };
     let ran = run_shell(&command, &dir, Duration::from_secs(timeout), beats).await;
@@ -256,20 +267,7 @@ pub(crate) async fn call<H: htui_core::store::WorkerHost>(
     };
     let output = answer_output(session.scrubber.as_ref(), &ran, timeout);
     if stopped.get() == Some(&Stopped::LeaseLost) {
-        // MOD-78 D4: the row keeps what the command printed, under the reason it was stopped.
-        let ended = htui_core::store::WorkerStore::finish_command(
-            &store,
-            id,
-            claimant,
-            CommandRunStatus::Cancelled,
-            None,
-            Some(format!("{LEASE_LOST}{output}")),
-        )
-        .await;
-        // `Ok(false)`: the queue ended the row first. `Err`: the armed guard cancels it.
-        if ended.is_ok() {
-            guard.disarm();
-        }
+        finish_lease_lost(&store, id, claimant, &output, &mut guard).await;
         return Err(lease.lost());
     }
     let finished = if stopped.get().is_some() {
@@ -392,6 +390,30 @@ async fn stored_row<S: htui_core::store::WorkerStore>(
         .ok_or_else(|| ToolError(format!("not found: command_run {id}")))
 }
 
+/// MOD-78 D4: ends a row whose lease was lost `cancelled`, keeping what the command printed
+/// under the reason it was stopped, and disarms `guard` once the store answered.
+async fn finish_lease_lost<S: htui_core::store::WorkerStore + Clone + Send + Sync + 'static>(
+    store: &S,
+    id: CommandRunId,
+    claimant: Uuid,
+    output: &str,
+    guard: &mut Enqueued<S>,
+) {
+    let ended = htui_core::store::WorkerStore::finish_command(
+        store,
+        id,
+        claimant,
+        CommandRunStatus::Cancelled,
+        None,
+        Some(format!("{LEASE_LOST}{output}")),
+    )
+    .await;
+    // `Ok(false)`: the queue ended the row first. `Err`: the armed guard cancels it.
+    if ended.is_ok() {
+        guard.disarm();
+    }
+}
+
 /// D14: asks until `id` is admitted, ticking progress while queued (B-11). Each ask is the
 /// queued row's heartbeat. MOD-78 D3(d): at most once per [`COMMAND_HEARTBEAT`] it reads the
 /// lease first, the read before the enqueue counting as the first, and a lost one answers
@@ -409,7 +431,7 @@ async fn admit<S: htui_core::store::WorkerStore>(
     loop {
         if read_at.elapsed() >= COMMAND_HEARTBEAT {
             read_at = tokio::time::Instant::now();
-            if let Ok(false) = lease.holds(store).await {
+            if lease.lost_now(store).await {
                 return Err(lease.lost());
             }
         }
@@ -442,7 +464,7 @@ async fn beat<S: htui_core::store::WorkerStore>(
         if let Ok(false) = htui_core::store::WorkerStore::beat_command(store, id, claimant).await {
             return Stopped::Taken;
         }
-        if let Ok(false) = lease.holds(store).await {
+        if lease.lost_now(store).await {
             return Stopped::LeaseLost;
         }
         tick(progress, ticks).await;
