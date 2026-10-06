@@ -747,7 +747,8 @@ impl MemStore {
 
     /// The scope's ready items this box can actually take: §7.4's store-side half, then
     /// `R-ORCH-10`'s capability half — `required_tags` must be a subset of the box's
-    /// `probed_tags ∪ declared_tags`. Ordered as [`ReadStore::items`] orders.
+    /// `probed_tags ∪ declared_tags`. In queue order: `priority DESC, created_at, id` (MOD-12 D4,
+    /// ANA-2 criterion 22).
     ///
     /// The capability half lives here rather than in [`ItemFilter`] because the filter's `tags`
     /// conjunct is the caller's own vocabulary; this one is the machine's, and MOD-4 is the first
@@ -758,7 +759,7 @@ impl MemStore {
     pub async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
         Ok(self.read(|state| {
             let capabilities = state.box_capabilities(box_id);
-            state
+            let mut rows: Vec<ItemSummary> = state
                 .item_summaries(
                     scope,
                     &ItemFilter {
@@ -772,7 +773,17 @@ impl MemStore {
                         .iter()
                         .all(|tag| capabilities.contains(tag))
                 })
-                .collect()
+                .collect();
+            // `ItemId`'s `Ord` is uuid byte order, which is Postgres' uuid order.
+            rows.sort_by_cached_key(|row| {
+                let item = state.items.get(&row.id);
+                (
+                    core::cmp::Reverse(item.map_or(row.priority, |item| item.priority)),
+                    item.map(|item| item.created_at),
+                    row.id,
+                )
+            });
+            rows
         }))
     }
 

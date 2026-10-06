@@ -2052,9 +2052,12 @@ impl PgStore {
     /// The scope's ready items this box can actually take: §7.4's readiness, then `R-ORCH-10`'s
     /// capability half - `required_tags` a subset of the box's `probed_tags ∪ declared_tags`.
     ///
-    /// The readiness conjunct and the ordering are [`items`](ReadStore::items)' own, copied rather
-    /// than shared because `ItemFilter` has no field for a box and this predicate is the machine's
-    /// vocabulary, not the caller's. The capability half is `NOT EXISTS (... t <> ALL (...))`,
+    /// The readiness conjunct is [`items`](ReadStore::items)' own, copied rather than shared
+    /// because `ItemFilter` has no field for a box and this predicate is the machine's vocabulary,
+    /// not the caller's; the ordering is the queue's (MOD-12 D4, ANA-2 criterion 22):
+    /// `priority DESC, created_at`, the id breaking a tie, and **not** the Backlog's display order.
+    /// The Backlog's "ready here" view keeps display order through `items`
+    /// (`htui::store_worker::read_items`). The capability half is `NOT EXISTS (... t <> ALL (...))`,
     /// which is `<@` spelled so that the tag list drives it.
     ///
     /// The two `COALESCE`s are the unknown-box case and are **not** decoration: the `LEFT JOIN`
@@ -2099,7 +2102,7 @@ impl PgStore {
                         SELECT 1 FROM UNNEST(i.required_tags) t
                          WHERE t <> ALL (COALESCE(b.probed_tags, '{}')
                                       || COALESCE(b.declared_tags, '{}')))
-             ORDER BY array_position($1, i.project_id), i.key_prefix, i.key_number
+             ORDER BY i.priority DESC, i.created_at, i.id
             "#,
             &projects[..],
             box_id.as_uuid(),

@@ -4339,8 +4339,8 @@ async fn ready_items_order_by_priority_then_created_at() {
     let Some(db) = common::demo_db().await else {
         return;
     };
-    let mem = htui_core::store::MemStore::demo()
-        .handle_at(Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS));
+    let mem =
+        htui_core::store::MemStore::demo().handle_at(Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS));
     let scope = htui_core::model::Scope {
         workspace_id: ids::WORKSPACE_PLATFORM,
         project_ids: vec![ids::PROJECT_HTUI],
