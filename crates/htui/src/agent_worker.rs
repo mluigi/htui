@@ -2366,9 +2366,14 @@ fn help_policy() -> PermissionPolicy {
 /// `fs/*` handlers refuse `read` and `edit`. `read` and `search` would read under the process cwd
 /// into a transcript that goes to the provider, `fetch` is egress, and `switch_mode` could leave
 /// the deny-all policy behind.
+///
+/// MOD-55 review M1: and `no_tools`, because the kinds do not reach every tool on `claude-cli`
+/// (`Task`, `TodoWrite`, the operator's MCP servers) and with no lease the deny-all policy is
+/// never asked there. The driver turns it into its own flags (`R-AGT-5`).
 fn help_exposure() -> ToolExposure {
     ToolExposure {
         deny_kinds: ToolKind::ALL.to_vec(),
+        no_tools: true,
         ..ToolExposure::default()
     }
 }
@@ -5907,6 +5912,7 @@ pub(crate) mod tests {
             }
         );
         assert_eq!(spec.tools.deny_kinds, ToolKind::ALL);
+        assert!(spec.tools.no_tools, "MOD-55 review M1: no tool at all");
         assert!(spec.tools.allow.is_empty());
         assert!(spec.tools.deny.is_empty());
         assert!(!spec.tools.command_run);
