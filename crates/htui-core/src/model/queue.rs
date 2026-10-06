@@ -78,8 +78,9 @@ pub fn admission_order(entries: &[QueueEntry], ready: &[ItemSummary]) -> Vec<Ite
     queued.into_iter().map(|(_, _, item)| item).collect()
 }
 
-/// `R-ORCH-9`'s three rungs, as `claim_run` reads them (`pg/write.rs:4375-4389`,
-/// `mem.rs:4349-4361`): the box's `settings.max_concurrent_items`, else `app_setting`'s, else
+/// `R-ORCH-9`'s three rungs, as `claim_run` reads them (`PgStore::claim_run` in
+/// `htui-store`'s `pg/write.rs`, `State::max_concurrent_items` in `store/mem.rs`): the box's
+/// `settings.max_concurrent_items`, else `app_setting`'s, else
 /// [`DEFAULT_MAX_CONCURRENT_ITEMS`]. A blob that does not decode falls through.
 #[must_use]
 pub fn admission_limit(box_settings: &Value, app: &BTreeMap<String, Value>) -> u32 {
