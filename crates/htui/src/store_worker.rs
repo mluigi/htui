@@ -1883,9 +1883,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // live sessions), and the two probes, the preview, the three install requests, MOD-21's
         // four login ones, MOD-22's delivery, MOD-66's tool-paths write and MOD-10 M4's provider
         // and scope checks need the runtime that owns their tasks, so all twenty are served ahead
-        // of this function, exactly as `ApplyMigrations` is. One of them that reaches here at all belongs
-        // to a caller with no runtime — the test harness without one — and saying so is more use
-        // than a panic.
+        // of this function, exactly as `ApplyMigrations` is. One of them that reaches here at all
+        // belongs to a caller with no runtime — the test harness without one — and saying so is
+        // more use than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
@@ -1910,11 +1910,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             message: "no agent runtime in this build".to_owned(),
         },
         // The thirteen hierarchy requests plus MOD-10 M4's scope write (D6; not one of
-        // `hierarchy::REQUEST_NAMES`, blueprint A-11), or-ed rather than guarded: this `match` has no wildcard,
-        // and an arm with a guard does not count towards exhaustivity, so `_ if …` would be an
-        // E0004 here (MOD-15 M3 plan F-12). The `?` is what keeps `spawn`'s `go_offline` working:
-        // an `Unreachable` from `hierarchy::serve` still drops an `Online` backend onto the mirror
-        // exactly as any other read does.
+        // `hierarchy::REQUEST_NAMES`, blueprint A-11), or-ed rather than guarded: this `match` has
+        // no wildcard, and an arm with a guard does not count towards exhaustivity, so `_ if …`
+        // would be an E0004 here (MOD-15 M3 plan F-12). The `?` is what keeps `spawn`'s
+        // `go_offline` working: an `Unreachable` from `hierarchy::serve` still drops an `Online`
+        // backend onto the mirror exactly as any other read does.
         StoreRequest::Hierarchy(..)
         | StoreRequest::CreateWorkspace { .. }
         | StoreRequest::UpdateWorkspace { .. }

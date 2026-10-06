@@ -37,7 +37,7 @@ use htui_core::secret::{
     INFISICAL, MachineIdentity, ProviderHealth, ResolvedSecrets, SecretError, SecretFuture,
     SecretProvider, SecretScope, SecretSource, project_scope,
 };
-use htui_core::store::{MemStore, ReadStore, WriteStore};
+use htui_core::store::{MemStore, ReadStore, StoreError, WriteStore};
 use htui_store::testkit as common;
 use htui_store::{Backend, CacheStore, PgStore, secret};
 use tokio::sync::mpsc;
@@ -873,6 +873,30 @@ async fn check_secret_scope_passes_a_provider_error_through() {
         scope_outcome(&envelope.reply),
         (ids::PROJECT_VULKAN, Err(refusal))
     );
+}
+
+#[tokio::test]
+async fn check_secret_scope_of_an_unknown_project_is_failed_by_name_without_the_source() {
+    let unknown = ProjectId::new();
+    let source = Arc::new(FakeSecretSource::new(Arc::new(
+        FakeSecretProvider::resolving(&[]),
+    )));
+
+    let (served, reply) = scope_check_through(&scoped_store(), Some(source.clone()), unknown).await;
+
+    assert!(reply.is_none(), "nothing deferred");
+    match served {
+        Served::Reply(StoreReply::Failed { request, message }) => {
+            assert_eq!(request, CHECK_SECRET_SCOPE);
+            let missing = StoreError::NotFound {
+                entity: "project",
+                id: unknown.to_string(),
+            };
+            assert_eq!(message, missing.to_string());
+        }
+        other => panic!("a missing project is failed at once: {other:?}"),
+    }
+    assert_eq!(source.calls(), 0, "the source is not asked");
 }
 
 #[tokio::test]
