@@ -631,8 +631,9 @@ impl MemStore {
     }
 
     /// Plants `project.secret_provider` and `project.secret_scope` without validation. **Tests
-    /// only**, like [`set_project_settings`](Self::set_project_settings): M4 owns the writer
-    /// (MOD-10 M3 blueprint A-6). A project that is not there is left alone.
+    /// only**, like [`set_project_settings`](Self::set_project_settings): the validated writer is
+    /// `update_project`'s `secret` (MOD-10 M4); this stays the tests' unvalidated planter. A
+    /// project that is not there is left alone.
     pub fn set_project_secret_columns(
         &self,
         project: ProjectId,
@@ -2584,6 +2585,15 @@ impl State {
         }
         if let Some(description) = patch.description {
             row.description = description;
+        }
+        if let Some(secret) = patch.secret {
+            (row.secret_provider, row.secret_scope) = match secret {
+                Some(scope) => (
+                    Some(crate::secret::INFISICAL.to_owned()),
+                    Some(scope.to_column()),
+                ),
+                None => (None, None),
+            };
         }
         row.updated_at = now;
         Ok(CasOutcome::Applied(row.clone()))
