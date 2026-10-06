@@ -50,6 +50,7 @@ use htui_core::prompt::{
     settings, withhold_unmaskable_notes,
 };
 use htui_core::scrub::Scrubber;
+use htui_core::secret::SecretError;
 use htui_core::store::{StepFence, StoreError};
 use serde_json::Value;
 use tokio::sync::watch;
@@ -3487,6 +3488,11 @@ where
         started_at: DateTime<Utc>,
     ) -> Result<Option<Rest>, EngineError> {
         let item = Self::item_of(run)?;
+        // MOD-10 D11, D13 (blueprint A-1, A-2): the walk's secrets before anything of the session
+        // is persisted; a refusal is `walk_step`'s `fail_hard`, before a tree or a driver exists.
+        Box::pin(self.secrets_ready(run))
+            .await?
+            .map_err(EngineError::Secrets)?;
         let prepared = self
             .parts
             .isolator
@@ -3752,6 +3758,14 @@ where
         let Some(report) = report else {
             return Ok(None);
         };
+        // MOD-10 (blueprint A-11): the verifier masks with the pattern rules only (D19); a
+        // command that printed a file holding a resolved value is masked here with the walk's
+        // scrubber before the output is persisted or read. A refusal drops the text, as the
+        // verifier's own `scrubbed` withholds it.
+        let report = VerifyReport {
+            output: remasked(self.parts.scrubber, report.output),
+            ..report
+        };
 
         self.parts
             .store
@@ -3914,6 +3928,21 @@ where
         let Some(first) = pending.first() else {
             return Ok(None);
         };
+        // MOD-10 D11, D13 (blueprint A-1, A-2): one resolution for the whole group, before its
+        // prompt is masked; a refusal fails the group before a token and the run with it, with no
+        // retry (the item mirrors `failed`, as on the plain path).
+        if let Err(cause) = Box::pin(self.secrets_ready(run)).await? {
+            return self
+                .fail_group_before_a_token(
+                    run,
+                    phase,
+                    &pending,
+                    RunFailure::SecretsRefused { cause },
+                    false,
+                )
+                .await
+                .map(Some);
+        }
         let base = self
             .group_base(run, &steps, phase.position, attempt)
             .await?;
@@ -4637,6 +4666,14 @@ where
         passing: Vec<StepId>,
         existing: Option<RunStep>,
     ) -> Result<Option<Rest>, EngineError> {
+        // MOD-10 D11, D13 (blueprint A-1, A-2, H-14): a judge that is its walk's first live path
+        // resolves here; a refusal fails the run, it does not park the selection.
+        if let Err(cause) = Box::pin(self.secrets_ready(run)).await? {
+            return self
+                .refuse_judge_secrets(run, phase, existing.as_ref(), cause)
+                .await
+                .map(Some);
+        }
         let steps = self.parts.store.run_steps(run.id).await?;
         let slot: Vec<RunStep> = group_at(&steps, phase.position, attempt)
             .into_iter()
@@ -5234,6 +5271,47 @@ where
         let reason = HumanReason::JudgeFailed(failure).to_string();
         self.park_selection(run, phase, attempt, slot, &reason)
             .await
+    }
+
+    /// MOD-10 D13 on the judge path (blueprint A-2): the run fails with the refusal, not the
+    /// selection. A crash's `pending` judge row (`existing`) is moved `pending -> running` and
+    /// settled by [`fail_hard`](Self::fail_hard) (`pending -> failed` is illegal); with no row, the
+    /// run is failed and cleaned up directly, as `Route::GroupFailed`'s terminal arm does.
+    async fn refuse_judge_secrets(
+        &self,
+        run: &Run,
+        phase: &SnapshotPhase,
+        existing: Option<&RunStep>,
+        cause: SecretError,
+    ) -> Result<Rest, EngineError> {
+        let failure = RunFailure::SecretsRefused { cause };
+        let reason = failure.to_string();
+        match existing {
+            Some(judge) => {
+                // Plan D144: a judge another writer moved is `StaleWrite` (D125).
+                self.move_step(
+                    run.id,
+                    judge.id,
+                    StepStatus::Pending,
+                    StepStatus::Running,
+                    self.now(),
+                )
+                .await?;
+                self.fail_hard(run, judge, &reason).await?;
+            }
+            None => {
+                self.parts
+                    .store
+                    .finish_run(run.id, RunStatus::Failed, Some(&reason), self.now())
+                    .await?;
+                self.cleanup_run(run.id).await?;
+            }
+        }
+        Ok(Rest {
+            run: RunStatus::Failed,
+            position: Some(phase.position),
+            failure: Some(failure),
+        })
     }
 
     // -- plan D25's reconcile and plan D36's cleanup -------------------------------------------
@@ -5992,6 +6070,15 @@ where
         Ok(recorder)
     }
 
+    /// MOD-10 D11/D12 (blueprint A-1): this walk's secrets, ready for `run`'s project before a
+    /// live path persists anything of its session (the trim record, the prompt row, the prompt's
+    /// own masking). `Ok(Err(cause))` is a refusal the caller settles its own way; the outer
+    /// error is the project read's. Call sites box it (blueprint H-1).
+    async fn secrets_ready(&self, run: &Run) -> Result<Result<(), SecretError>, EngineError> {
+        let project = self.project(run.project_id).await?;
+        Ok(self.parts.secrets.prepare(&project).await)
+    }
+
     /// One driver session under `recorder`: the driver for `key`, `start` with `text`, and
     /// `drive` to its `done` (MOD-42 plan D6), with the agent's own policy (D9), the permission
     /// relay and the run's control (D10).
@@ -6029,6 +6116,14 @@ where
         if control.signal().is_cancel() {
             return Err(EngineError::Cancelled { run: run.id });
         }
+        // MOD-10 D12: the walk's secrets, resolved by this live path's entry (blueprint A-1) and
+        // read from the cell here; a provider-less project's env stays empty.
+        let env = self
+            .parts
+            .secrets
+            .env_for(&project)
+            .await
+            .map_err(EngineError::Secrets)?;
         // MOD-42 D9: the agent's own policy (a judge call's is the judge agent's: `candidate_of`
         // over the judge phase).
         let policy = (self.parts.policy)(candidate.agent_id);
@@ -6102,9 +6197,9 @@ where
             // `shared_serialized` or `local` step, which lives in its own checkout somewhere else
             // on the box. An agent that cannot read it cannot work in it.
             extra_dirs,
-            // `R-SEC-2`: no secret provider exists yet; MOD-10 (secret provider, from ANA-7) owns
-            // wiring one. The walk invents none.
-            env: BTreeMap::new(),
+            // R-SEC-2, MOD-10 D12: the resolved map, exactly; never htui's own environment
+            // (spec.env is applied last, `cli/mod.rs:401-419`).
+            env,
             model: Some(candidate.model.clone()),
             tools,
             mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
@@ -6626,7 +6721,27 @@ fn failure_text(phase: &str, err: &EngineError) -> String {
         EngineError::Record(htui_agent::RecordError::Unmasked(unmasked)) => {
             RunFailure::scrub_refused(phase, unmasked).to_string()
         }
+        EngineError::Secrets(cause) => RunFailure::SecretsRefused {
+            cause: cause.clone(),
+        }
+        .to_string(),
         other => other.to_string(),
+    }
+}
+
+/// MOD-10 (blueprint A-11): `output` through `scrubber`, as a JSON string leaf; a refusal drops
+/// the text rather than persist what the scrubber would not mask.
+fn remasked(scrubber: &dyn Scrubber, output: String) -> String {
+    let mut value = Value::String(output);
+    match scrubber.scrub(&mut value) {
+        Ok(()) => match value {
+            Value::String(text) => text,
+            _ => String::new(),
+        },
+        Err(refusal) => {
+            tracing::warn!(%refusal, "verify output withheld: the walk's scrubber refused it");
+            String::new()
+        }
     }
 }
 
@@ -18744,6 +18859,491 @@ mod tests {
             let text = prompt_of(&without.orch, &step_at(&without.orch, run, 0, 0).await).await;
             assert!(!text.contains("name=\"output\""), "{text}");
             assert!(!text.contains("document_write"), "{text}");
+        }
+    }
+
+    /// MOD-10 M3 T4 (D11-D13, blueprint A-1, A-2, A-11): a walk's secrets, resolved at its first
+    /// live path's entry, injected into every session's env and masking everything it persists;
+    /// a refusal fails the run before any agent starts.
+    mod run_secrets {
+        use std::sync::Arc;
+
+        use htui_agent::conformance::{Script, ScriptEvent};
+        use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
+        use htui_core::fixtures::ids;
+        use htui_core::model::{Gate, RunId, RunMode, RunStatus, RunStep, Status, StepStatus};
+        use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
+        use htui_core::secret::{INFISICAL, NO_SECRET_SOURCE, SecretError, project_scope};
+        use htui_core::store::{ReadStore as _, WriteStore as _};
+
+        use super::Harness;
+        use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
+        use crate::engine::{SessionKey, failure_text};
+        use crate::fake::{FakeOrchestrator, FakeVerifier, ScriptedStep};
+        use crate::status::RunFailure;
+        use crate::verify::VerifyReport;
+
+        const SCOPE: &str = r#"{"project_id":"p1","environment":"dev","path":"/"}"#;
+        /// Long and not pattern-shaped, so a refusal can never stand in for a mask.
+        const VALUE: &str = "zq7-resolved-value-0123456789";
+
+        fn key(phase: &str) -> SessionKey<'_> {
+            SessionKey {
+                phase,
+                attempt: 1,
+                fanout_index: 0,
+                call: 0,
+            }
+        }
+
+        fn start_feat_3() -> Command {
+            Command::StartRun {
+                item: ids::HTUI_FEAT_3,
+                mode: RunMode::Manual,
+                repo_scope: None,
+            }
+        }
+
+        /// `FEAT-3`'s project given an Infisical scope, and a source resolving `pairs`.
+        fn provider_project(harness: &Harness, pairs: &[(&str, &str)]) -> Arc<FakeSecretProvider> {
+            columns(harness, Some(INFISICAL), Some(SCOPE));
+            let provider = Arc::new(FakeSecretProvider::resolving(pairs));
+            harness
+                .orch
+                .set_secret_source(Arc::new(FakeSecretSource::new(provider.clone())));
+            provider
+        }
+
+        fn columns(harness: &Harness, provider: Option<&str>, scope: Option<&str>) {
+            harness
+                .orch
+                .store
+                .set_project_secret_columns(ids::PROJECT_HTUI, provider, scope);
+        }
+
+        fn source(harness: &Harness, provider: FakeSecretProvider) {
+            harness
+                .orch
+                .set_secret_source(Arc::new(FakeSecretSource::new(Arc::new(provider))));
+        }
+
+        /// A column fault planted on `FEAT-3`'s project, with a resolving source, and the
+        /// refusal `project_scope` gives those columns.
+        fn column_fault(
+            harness: &Harness,
+            provider: Option<&str>,
+            scope: Option<&str>,
+        ) -> SecretError {
+            columns(harness, provider, scope);
+            source(
+                harness,
+                FakeSecretProvider::resolving(&[("API_KEY", VALUE)]),
+            );
+            let project = htui_core::fixtures::demo_data()
+                .projects
+                .into_iter()
+                .find(|project| project.id == ids::PROJECT_HTUI)
+                .map(|project| htui_core::model::Project {
+                    secret_provider: provider.map(str::to_owned),
+                    secret_scope: scope.map(str::to_owned),
+                    ..project
+                })
+                .expect("the demo fixture holds the project");
+            project_scope(&project).expect_err("the columns are a fault")
+        }
+
+        /// An Infisical project whose provider fails with `cause`.
+        fn failing(harness: &Harness, cause: SecretError) -> SecretError {
+            columns(harness, Some(INFISICAL), Some(SCOPE));
+            source(harness, FakeSecretProvider::failing(cause.clone()));
+            cause
+        }
+
+        /// `FEAT-3` freed, `prd` ungated: `prd` and `plan` walk, and the run parks at `plan`'s
+        /// gate.
+        async fn feat_3_with_prd_ungated(harness: &Harness) {
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.gate = Gate::Never;
+                    }
+                })
+                .await;
+        }
+
+        /// The `FEAT-3` run the walk started: the one that is not the seeded, cancelled `RUN_2`.
+        async fn started_run(orch: &FakeOrchestrator) -> RunId {
+            orch.store
+                .runs(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .find(|run| run.id != ids::RUN_2)
+                .expect("the walk created a run")
+                .id
+        }
+
+        async fn step_at(orch: &FakeOrchestrator, run: RunId, position: i32) -> RunStep {
+            orch.steps(run)
+                .await
+                .into_iter()
+                .find(|step| step.position == position && step.fanout_index == 0)
+                .expect("the walk created the step")
+        }
+
+        /// Every payload the step's log holds, as text.
+        async fn log_text(orch: &FakeOrchestrator, step: &RunStep) -> Vec<String> {
+            orch.store
+                .step_events(step.id)
+                .await
+                .expect("MemStore never fails a read")
+                .unwrap_or_default()
+                .iter()
+                .map(|event| event.payload.to_string())
+                .collect()
+        }
+
+        /// MOD-10 D13: a secrets refusal is typed, and its sentence is the cause's `refusal()`.
+        #[test]
+        fn failure_text_types_a_secrets_refusal() {
+            let err = EngineError::Secrets(SecretError::NoIdentity);
+            assert_eq!(
+                failure_text("prd", &err),
+                RunFailure::SecretsRefused {
+                    cause: SecretError::NoIdentity,
+                }
+                .to_string()
+            );
+            assert_eq!(err.to_string(), SecretError::NoIdentity.refusal());
+        }
+
+        /// MOD-10 D12, R-SEC-2: the session's env is the resolved map, key for key.
+        #[tokio::test]
+        async fn a_provider_project_s_session_gets_the_resolved_env() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let provider = provider_project(
+                &harness,
+                &[("API_KEY", VALUE), ("DB_URL", "postgres-not-a-secret-123")],
+            );
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at prd's gate");
+
+            let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+            assert_eq!(
+                spec.env,
+                std::collections::BTreeMap::from([
+                    ("API_KEY".to_owned(), VALUE.to_owned()),
+                    ("DB_URL".to_owned(), "postgres-not-a-secret-123".to_owned()),
+                ])
+            );
+            assert_eq!(provider.resolves(), 1);
+        }
+
+        #[tokio::test]
+        async fn a_provider_less_project_s_session_gets_no_env_and_never_touches_the_source() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let source = Arc::new(FakeSecretSource::new(Arc::new(
+                FakeSecretProvider::resolving(&[("API_KEY", VALUE)]),
+            )));
+            harness.orch.set_secret_source(source.clone());
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at prd's gate");
+
+            let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+            assert!(spec.env.is_empty(), "{:?}", spec.env.keys());
+            assert_eq!(source.calls(), 0);
+        }
+
+        /// MOD-10 D13 (blueprint A-1, A-2) on the plain path: every cause fails the run with its
+        /// own sentence before the isolator, the recorder or a driver is touched.
+        #[tokio::test]
+        async fn a_refused_resolution_fails_the_plain_run_before_any_agent_starts() {
+            type Setup = fn(&Harness) -> SecretError;
+            let cases: [(&str, Setup); 8] = [
+                ("no source", |harness| {
+                    columns(harness, Some(INFISICAL), Some(SCOPE));
+                    SecretError::Config(NO_SECRET_SOURCE.to_owned())
+                }),
+                ("unknown kind", |harness| {
+                    column_fault(harness, Some("vault"), Some(SCOPE))
+                }),
+                ("missing scope", |harness| {
+                    column_fault(harness, Some(INFISICAL), None)
+                }),
+                ("bad scope", |harness| {
+                    column_fault(harness, Some(INFISICAL), Some("{}"))
+                }),
+                ("bad credentials", |harness| {
+                    failing(harness, SecretError::BadCredentials)
+                }),
+                ("unreachable", |harness| {
+                    failing(
+                        harness,
+                        SecretError::Unreachable {
+                            endpoint: "/api/v1/auth/universal-auth/login",
+                            cause: "connection refused".to_owned(),
+                        },
+                    )
+                }),
+                ("cooling down", |harness| {
+                    failing(
+                        harness,
+                        SecretError::LoginCoolingDown {
+                            retry_after_secs: 30,
+                        },
+                    )
+                }),
+                ("reserved key", |harness| {
+                    columns(harness, Some(INFISICAL), Some(SCOPE));
+                    source(
+                        harness,
+                        FakeSecretProvider::resolving(&[
+                            ("API_KEY", VALUE),
+                            ("HTUI_LOG", "debug-everything"),
+                        ]),
+                    );
+                    SecretError::ReservedKey {
+                        key: "HTUI_LOG".to_owned(),
+                    }
+                }),
+            ];
+            for (case, setup) in cases {
+                let harness = Harness::new().await;
+                harness.free_feat_3().await;
+                let cause = setup(&harness);
+
+                let walked = Box::pin(harness.dispatch(start_feat_3())).await;
+
+                assert!(
+                    matches!(&walked, Err(EngineError::Secrets(refused)) if *refused == cause),
+                    "{case}: the walk answers the refusal: {walked:?}"
+                );
+                let run = started_run(&harness.orch).await;
+                let row = harness.orch.run(run).await;
+                assert_eq!(
+                    (row.status, row.failure),
+                    (RunStatus::Failed, Some(cause.refusal())),
+                    "{case}"
+                );
+                let prd = step_at(&harness.orch, run, 0).await;
+                assert_eq!(prd.status, StepStatus::Failed, "{case}");
+                assert_eq!(prd.trim_record, None, "{case}: no trim record");
+                assert!(
+                    log_text(&harness.orch, &prd).await.is_empty(),
+                    "{case}: no event"
+                );
+                assert!(
+                    harness.orch.spec_for(&key("prd")).is_none(),
+                    "{case}: no driver.start"
+                );
+                assert_eq!(harness.orch.isolator.prepares(), 0, "{case}: no tree");
+                assert_ne!(
+                    harness.orch.item(ids::HTUI_FEAT_3).await.status,
+                    Status::Blocked,
+                    "{case}: `fail_hard` never blocks the item"
+                );
+            }
+        }
+
+        /// MOD-61 at engine level (blueprint A-1): the trim record and the seq-0 prompt row are
+        /// written before the session, and both are masked with the resolved value.
+        #[tokio::test]
+        async fn mod61_a_trim_record_and_a_prompt_equal_to_a_resolved_value_are_stored_redacted() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            // The repo name reaches the trim record (`excerpts.roots[].repo`) but not the prompt
+            // text; the item body reaches the prompt text.
+            harness.add_primary_repo_named(VALUE).await;
+            let row = harness.orch.item(ids::HTUI_FEAT_3).await;
+            harness
+                .orch
+                .store
+                .update_item(
+                    ids::HTUI_FEAT_3,
+                    row.version,
+                    htui_core::model::ItemPatch {
+                        body: Some(format!("the token is {VALUE}, keep it")),
+                        author_id: row.created_by,
+                        reason: "a test's edit".to_owned(),
+                        ..htui_core::model::ItemPatch::default()
+                    },
+                )
+                .await
+                .expect("the item's version is current");
+            provider_project(&harness, &[("REPO_TOKEN", VALUE)]);
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at prd's gate");
+
+            let run = started_run(&harness.orch).await;
+            let failure = harness.orch.run(run).await.failure.unwrap_or_default();
+            assert!(
+                !failure.starts_with("prompt refused"),
+                "M1 H-15: the assembler refused first; the trim path was not exercised: {failure}"
+            );
+            let prd = step_at(&harness.orch, run, 0).await;
+            let trim = prd
+                .trim_record
+                .as_ref()
+                .expect("prd recorded its trim record")
+                .to_string();
+            assert!(!trim.contains(VALUE), "{trim}");
+            assert!(
+                trim.contains("[REDACTED]"),
+                "the repo slug was masked: {trim}"
+            );
+            let prompt = harness
+                .orch
+                .store
+                .step_events(prd.id)
+                .await
+                .expect("MemStore never fails a read")
+                .expect("prd recorded its session")
+                .into_iter()
+                .find(|event| event.seq == 0)
+                .expect("seq 0 is the prompt")
+                .payload
+                .to_string();
+            assert!(!prompt.contains(VALUE), "{prompt}");
+            assert!(
+                prompt.contains("the token is [REDACTED], keep it"),
+                "{prompt}"
+            );
+            let spec = harness.orch.spec_for(&key("prd")).expect("prd started");
+            assert_eq!(spec.env.get("REPO_TOKEN").map(String::as_str), Some(VALUE));
+        }
+
+        /// MOD-61: an agent that echoes a resolved value never has it stored.
+        #[tokio::test]
+        async fn mod61_an_agent_echoing_a_resolved_value_is_stored_redacted() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            provider_project(&harness, &[("API_KEY", VALUE)]);
+            harness.orch.script(
+                "prd",
+                1,
+                ScriptedStep {
+                    script: Script::one_turn(vec![
+                        ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                            text: format!("the key is {VALUE}, see"),
+                            message_id: None,
+                        })),
+                        ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                            stop_reason: StopReason::EndTurn,
+                        })),
+                    ]),
+                    output: Some("the prd".into()),
+                    spawn_failure: None,
+                },
+            );
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at prd's gate");
+
+            let run = started_run(&harness.orch).await;
+            let prd = step_at(&harness.orch, run, 0).await;
+            let log = log_text(&harness.orch, &prd).await;
+            assert!(log.iter().all(|row| !row.contains(VALUE)), "{log:?}");
+            assert!(
+                log.iter()
+                    .any(|row| row.contains("the key is [REDACTED], see")),
+                "the echo was recorded masked: {log:?}"
+            );
+        }
+
+        /// MOD-10 D11, D14: one resolution per walk, whatever the number of live steps.
+        #[tokio::test]
+        async fn a_walk_resolves_once_across_its_steps() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            let provider = provider_project(&harness, &[("API_KEY", VALUE)]);
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at plan's gate");
+
+            let run = started_run(&harness.orch).await;
+            assert_eq!(
+                step_at(&harness.orch, run, 1).await.status,
+                StepStatus::AwaitingApproval
+            );
+            assert!(
+                harness.orch.spec_for(&key("plan")).is_some(),
+                "plan's session ran"
+            );
+            assert_eq!(provider.resolves(), 1, "prd and plan share one resolution");
+        }
+
+        /// MOD-10 D14: a resumed walk is a new walk, and resolves again.
+        #[tokio::test]
+        async fn a_resumed_walk_resolves_again() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            let provider = provider_project(&harness, &[("API_KEY", VALUE)]);
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at prd's gate");
+            let run = started_run(&harness.orch).await;
+            let prd = step_at(&harness.orch, run, 0).await;
+            assert_eq!(prd.status, StepStatus::AwaitingApproval);
+            assert_eq!(provider.resolves(), 1);
+
+            let answered = Box::pin(harness.dispatch(Command::AnswerGate {
+                run,
+                step: prd.id,
+                answer: GateAnswer::Approved,
+            }))
+            .await
+            .expect("the gate is answerable");
+            assert!(
+                matches!(answered, CommandOutcome::Answered { .. }),
+                "{answered:?}"
+            );
+
+            let plan = harness.orch.spec_for(&key("plan")).expect("plan started");
+            assert_eq!(plan.env.get("API_KEY").map(String::as_str), Some(VALUE));
+            assert_eq!(
+                provider.resolves(),
+                2,
+                "the second dispatch is a second walk"
+            );
+        }
+
+        /// Blueprint A-11 (kept 2026-10-06): a verify command that printed a file holding a
+        /// resolved value is masked with the walk's scrubber before `command_run.output`.
+        #[tokio::test]
+        async fn a_verify_output_holding_a_resolved_value_is_masked() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            provider_project(&harness, &[("API_KEY", VALUE)]);
+            harness.orch.verifier.script_report(VerifyReport {
+                output: format!("leaked {VALUE}"),
+                ..FakeVerifier::pass()
+            });
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at prd's gate");
+
+            let run = started_run(&harness.orch).await;
+            let prd = step_at(&harness.orch, run, 0).await;
+            let rows = harness
+                .orch
+                .store
+                .command_runs(prd.id)
+                .await
+                .expect("MemStore never fails a read");
+            assert_eq!(rows.len(), 1, "the verify ran once");
+            assert_eq!(rows[0].output.as_deref(), Some("leaked [REDACTED]"));
         }
     }
 }

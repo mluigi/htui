@@ -13,12 +13,14 @@
 //! command that was asked for and could not be run, and it never fails a step (`:443`).
 //!
 //! The shell is plan D30's: `sh -c` on Unix, `cmd /C` on Windows, with the process environment
-//! unchanged (which never holds a resolved secret: MOD-10 D19), stdout and stderr merged and tail-capped at 64 KiB, masked by the engine's
-//! `Scrubber` before it is handed back, under a semaphore keyed `verify`, and with the step
-//! deadline's remainder as the timeout. The process handling is `isolate/git.rs`'s
-//! [`Cli`](crate::isolate::git::Cli) contract verb for verb — a supervised child whose whole group
-//! a kill reaches, both pipes read concurrently so neither can fill and stall it, and the cap kept
-//! at the **tail**, because the end of a build that failed is the part worth reading.
+//! unchanged (which never holds a resolved secret: MOD-10 D19), stdout and stderr merged and
+//! tail-capped at 64 KiB, masked by the engine's `Scrubber` before it is handed back (and
+//! re-masked by the engine with the walk's secrets, MOD-10 M3 blueprint A-11), under a semaphore
+//! keyed `verify`, and with the step deadline's remainder as the timeout. The process handling is
+//! `isolate/git.rs`'s [`Cli`](crate::isolate::git::Cli) contract verb for verb — a supervised
+//! child whose whole group a kill reaches, both pipes read concurrently so neither can fill and
+//! stall it, and the cap kept at the **tail**, because the end of a build that failed is the part
+//! worth reading.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -498,7 +500,7 @@ pub struct ShellRun {
 /// process environment unchanged, both pipes drained into one tail, until it exits, `budget`
 /// elapses, or `stop` resolves — each of the three kills the whole process group (job object on
 /// Windows), so a `cargo test`'s test binaries die with it, and a background child the shell left
-/// behind does not outlive the call (R1 M1: after an exit the pipes get [`PIPE_GRACE`], then the
+/// behind does not outlive the call (R1 M1: after an exit the pipes get `PIPE_GRACE`, then the
 /// output read so far is the answer). Infallible: a shell that cannot start is
 /// [`ShellEnd::SpawnFailed`].
 pub async fn run_shell(
