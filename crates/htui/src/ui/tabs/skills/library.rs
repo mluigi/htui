@@ -27,6 +27,7 @@ use htui_core::model::skill::validate_name;
 use htui_core::model::{
     Activation, BindingChange, BoundSkill, SkillId, SkillLevel, SkillPatch, SkillVersion,
 };
+use htui_core::prompt::edit_help::HelpTarget;
 use htui_core::prompt::{TokenEstimator, render};
 use htui_core::store::{invalid_skill_name, skill_body_refusal};
 use ratatui::Frame;
@@ -34,6 +35,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
@@ -110,7 +112,13 @@ const NAMING_HINT: &str = "Enter next  Esc cancel";
 const INFO_HINT: &str = "Tab field  Ctrl+S save  Esc cancel";
 
 /// The hint row in the editor, before the cursor's `L{line}:C{col}`.
-const EDIT_HINT: &str = "Ctrl+S save  Ctrl+E $EDITOR  Esc cancel";
+///
+/// `Ctrl+G` is MOD-55's, hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
+const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
+
+/// `Ctrl+G` with no project in the workspace (MOD-55 P7): a help turn is a chat run, and a run
+/// belongs to a project.
+const NO_PROJECT: &str = "no project in this workspace \u{2014} agent help records its run in one";
 
 /// The hint row on the import form.
 const IMPORT_HINT: &str = "Enter import  Esc cancel";
@@ -312,6 +320,9 @@ struct Editor {
     original: String,
     /// `Esc` warned about unsaved changes; the next one discards.
     esc_armed: bool,
+    /// MOD-55: the agent help, while open; the draft is locked under it. Boxed: it would
+    /// otherwise set the size of every [`Mode`].
+    help: Option<Box<AgentHelp>>,
 }
 
 impl Editor {
@@ -325,6 +336,7 @@ impl Editor {
             original: area.text().to_owned(),
             area,
             esc_armed: false,
+            help: None,
         }
     }
 
@@ -344,6 +356,7 @@ impl core::fmt::Debug for Editor {
             .field("area", &self.area)
             .field("original_len", &self.original.len())
             .field("esc_armed", &self.esc_armed)
+            .field("help", &self.help)
             .finish()
     }
 }
@@ -413,6 +426,15 @@ pub(super) enum Notice {
     Error(String),
 }
 
+impl From<Report> for Notice {
+    fn from(report: Report) -> Self {
+        match report {
+            Report::Info(text) => Self::Info(text),
+            Report::Error(text) => Self::Error(text),
+        }
+    }
+}
+
 /// One report row: its sign, its text, and whether it is something the maintainer must act on.
 ///
 /// The sign is the outcome's own verb — `+` written, `=` unchanged, `!` refused, `\u{b7}` left
@@ -476,6 +498,12 @@ impl LibraryView {
                 field.on_paste(text);
             }
             Mode::Editing(editor) => {
+                // MOD-55: an open help takes the paste (its request field, or nothing); the draft
+                // under it is locked.
+                if let Some(help) = editor.help.as_mut() {
+                    help.on_paste(text);
+                    return true;
+                }
                 editor.area.on_paste(text);
                 editor.esc_armed = false;
                 self.notice = None;
@@ -512,6 +540,17 @@ impl LibraryView {
 
     /// A reply addressed to the Skills tab (§6.4).
     pub(super) fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        // MOD-55: the open help sees every reply first (A-1: its per-state table is what makes a
+        // stray frame harmless). Its frames match none of the arms below; an editor and the
+        // attachments pane are never open together.
+        if let Mode::Editing(editor) = &mut self.mode
+            && let Some(help) = editor.help.as_mut()
+        {
+            let outcome = help.on_reply(reply, ctx);
+            if outcome != HelpOutcome::Consumed {
+                self.apply_help(outcome);
+            }
+        }
         match reply {
             StoreReply::Skills(snapshot) => {
                 if !in_scope(snapshot, ctx) {
@@ -643,8 +682,13 @@ impl LibraryView {
             }
             (_, _, Mode::Editing(editor)) => {
                 self.render_editor(frame, content, editor, ctx.theme);
-                let (line, col) = editor.area.cursor_line_col();
-                format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                match &editor.help {
+                    Some(help) => help.hint().to_owned(),
+                    None => {
+                        let (line, col) = editor.area.cursor_line_col();
+                        format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                    }
+                }
             }
             (_, _, Mode::Report { outcomes, cursor }) => {
                 self.render_report(frame, content, outcomes, *cursor, ctx);
@@ -1015,9 +1059,21 @@ impl LibraryView {
         );
     }
 
-    /// The editor: `Ctrl+S` (the area's `Submit`), `Ctrl+E` and `Esc` are the view's; `Tab` and
-    /// `Shift+Tab` pass so the shell switches tabs with the draft kept; everything else is text.
+    /// The editor: `Ctrl+S` (the area's `Submit`), `Ctrl+G`, `Ctrl+E` and `Esc` are the view's;
+    /// `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept; everything else
+    /// is text. An open agent help (MOD-55) takes every key first: the draft is locked under it,
+    /// and `Ctrl+S`/`Ctrl+E`/`Ctrl+G` are refused until it closes.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if let Mode::Editing(editor) = &mut self.mode
+            && let Some(help) = editor.help.as_mut()
+        {
+            let outcome = help.on_key(key, ctx);
+            return self.apply_help(outcome);
+        }
+        if chord(&key) && matches!(key.code, KeyCode::Char('g' | 'G')) {
+            self.open_help(ctx);
+            return Handled::Consumed;
+        }
         if chord(&key) && matches!(key.code, KeyCode::Char('e' | 'E')) {
             self.hand_off(ctx);
             return Handled::Consumed;
@@ -1108,6 +1164,63 @@ impl LibraryView {
             }
         };
         self.send(request, sent, ctx);
+    }
+
+    /// `Ctrl+G` (MOD-55 P7, P8): the agent help opens on the draft as it is (blank for a new
+    /// skill), for the active project, the scope's first, as the Chat tab picks it. Not while a
+    /// save is in flight, for `Esc`'s reason; not with no project, which a run needs.
+    fn open_help(&mut self, ctx: &Ctx<'_>) {
+        if let Some(busy) = self.busy {
+            self.notice = Some(Notice::Error(in_flight(busy)));
+            return;
+        }
+        let Some(project) = ctx.projects.first().map(|project| project.project_id) else {
+            self.notice = Some(Notice::Error(NO_PROJECT.to_owned()));
+            return;
+        };
+        let Mode::Editing(editor) = &mut self.mode else {
+            return;
+        };
+        editor.help = Some(Box::new(AgentHelp::open(
+            HelpTarget::Skill {
+                name: editor.target.name().to_owned(),
+            },
+            project,
+            editor.area.text(),
+            ctx,
+        )));
+        editor.esc_armed = false;
+        self.notice = None;
+    }
+
+    /// What the open help's key or reply did. An accepted proposal replaces the draft as the
+    /// `$EDITOR` return does (`on_external_edit`'s `Edited` arm): skills have no `parse`, so the
+    /// only check is `skill_body_refusal`'s, shown and not enforced; `Ctrl+S` stays the gate.
+    /// `original` is left alone, so `Esc` still asks first.
+    fn apply_help(&mut self, outcome: HelpOutcome) -> Handled {
+        let Mode::Editing(editor) = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match outcome {
+            HelpOutcome::Consumed => {}
+            HelpOutcome::Pass => return Handled::Pass,
+            HelpOutcome::Note(report) => self.notice = Some(report.into()),
+            HelpOutcome::Close(report) => {
+                editor.help = None;
+                editor.esc_armed = false;
+                self.notice = report.map(Notice::from);
+            }
+            HelpOutcome::Accept(text) => {
+                editor.help = None;
+                editor.area = TextArea::with_text(&text);
+                editor.esc_armed = false;
+                self.notice = Some(match skill_body_refusal(editor.area.text()) {
+                    Some(sentence) => Notice::Error(sentence),
+                    None => Notice::Info(ACCEPTED.to_owned()),
+                });
+            }
+        }
+        Handled::Consumed
     }
 
     /// `Ctrl+E`: the draft goes to `$EDITOR`, and the editor waits in the pending handoff. Not
@@ -1651,8 +1764,22 @@ impl LibraryView {
         );
     }
 
-    /// The editor over the whole content, its title carrying the draft's estimate (D82).
+    /// The editor over the whole content, its title carrying the draft's estimate (D82). An open
+    /// agent help draws in the draft's place (MOD-55 B-2): a panel under a locked draft, or the
+    /// proposal over all of it.
     fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
+        let draft = match &editor.help {
+            Some(help) => help.render(frame, area, theme),
+            None => Some(area),
+        };
+        if let Some(draft) = draft {
+            self.render_draft(frame, draft, editor, theme);
+        }
+    }
+
+    /// The draft's block: the name, the versions and the estimate, and the text with its cursor
+    /// (dim under an open help, which has the keys).
+    fn render_draft(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
         let name = editor.target.name();
         let tokens = estimate(name, editor.saves(), editor.area.text());
         let title = match (&editor.target, editor.from) {
@@ -1674,7 +1801,12 @@ impl LibraryView {
         frame.render_widget(block, area);
         self.page.set(inner.height);
         frame.render_widget(
-            Paragraph::new(editor.area.lines(inner.width, inner.height, true, theme)),
+            Paragraph::new(editor.area.lines(
+                inner.width,
+                inner.height,
+                editor.help.is_none(),
+                theme,
+            )),
             inner,
         );
     }
@@ -1709,7 +1841,7 @@ mod tests {
     use chrono::TimeDelta;
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
-    use htui_core::model::{Attachment, Scope, SkillBindingKey};
+    use htui_core::model::{Attachment, ProjectRef, Scope, SkillBindingKey, StepId};
     use htui_core::store::{BLANK_SKILL_BODY, CasOutcome, MemStore, WriteStore as _};
     use htui_store::Backend;
 
@@ -1721,6 +1853,8 @@ mod tests {
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
     use crate::ui::tabs::SkillsTab;
+    use crate::ui::tabs::skills::agent_help::fixtures as agent_fixtures;
+    use htui_agent::event::StopReason;
 
     /// MOD-60 D1: the name is fitted in cells, so a wide name never pushes the version right.
     #[test]
@@ -2126,6 +2260,8 @@ mod tests {
         theme: Theme,
         /// What the view emitted.
         emit: Emit,
+        /// The scope's projects: none, unless [`Bench::in_vulkan`] (MOD-55 P7).
+        projects: Vec<ProjectRef>,
     }
 
     impl Bench {
@@ -2136,13 +2272,28 @@ mod tests {
                 keymap: Keymap::default_global(),
                 theme: Theme::default(),
                 emit: Emit::default(),
+                projects: Vec::new(),
+            }
+        }
+
+        /// [`Bench::new`] with the scope's one project listed, as the shell lists it: the active
+        /// project agent help records its run in.
+        fn in_vulkan() -> Self {
+            Self {
+                projects: vec![ProjectRef {
+                    project_id: ids::PROJECT_VULKAN,
+                    slug: "vulkan-tutorials".to_owned(),
+                    name: "Vulkan".to_owned(),
+                    position: 0,
+                }],
+                ..Self::new()
             }
         }
 
         fn ctx(&self) -> Ctx<'_> {
             Ctx::new(
                 &self.scope,
-                &[],
+                &self.projects,
                 &self.top_bar,
                 &self.keymap,
                 &self.theme,
@@ -2851,5 +3002,281 @@ mod tests {
             }
         );
         assert!(!create.contains("secret"), "{create}");
+    }
+
+    // --- MOD-55: agent help -------------------------------------------------------------------
+
+    /// The open editor.
+    fn editor(view: &LibraryView) -> &Editor {
+        match &view.mode {
+            Mode::Editing(editor) => editor,
+            other => panic!("an editor is open: {other:?}"),
+        }
+    }
+
+    /// A fresh read, then `e` on `rust-style` (the cursor's first row): the editor over v2.
+    async fn edit_rust_style(view: &mut LibraryView, bench: &Bench, ctx: &mut Ctx<'_>) {
+        let backend = Backend::memory(MemStore::demo());
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, ctx);
+        view.on_key(key(KeyCode::Char('e')), ctx);
+        assert_eq!(
+            editor(view).target.name(),
+            "rust-style",
+            "the cursor starts on rust-style"
+        );
+    }
+
+    /// `Ctrl+G`, one enabled agent read, `request` asked. The `EditHelp` it sent.
+    fn ask_help(
+        view: &mut LibraryView,
+        bench: &Bench,
+        ctx: &mut Ctx<'_>,
+        request: &str,
+    ) -> StoreRequest {
+        assert_eq!(view.on_key(ctrl('g'), ctx), Handled::Consumed);
+        let agents = bench.one();
+        assert!(matches!(agents, StoreRequest::Agents), "{agents:?}");
+        view.on_reply(
+            &StoreReply::Agents(vec![agent_fixtures::summary("scripted", true)]),
+            ctx,
+        );
+        type_text(view, request, ctx);
+        view.on_key(key(KeyCode::Enter), ctx);
+        bench.one()
+    }
+
+    /// The help's turn: accepted, `reply` in one chunk, ended on `EndTurn`.
+    fn reply_with(view: &mut LibraryView, ctx: &mut Ctx<'_>, reply: &str) {
+        view.on_reply(&agent_fixtures::accepted(StepId::new()), ctx);
+        view.on_reply(&agent_fixtures::chunk(reply), ctx);
+        view.on_reply(&agent_fixtures::ended(StopReason::EndTurn), ctx);
+    }
+
+    /// LV-1 (P7): with no project in the workspace there is nowhere to record the run: `Ctrl+G`
+    /// is refused with a notice, no help opens and nothing is sent.
+    #[tokio::test]
+    async fn ctrl_g_without_a_project_is_refused() {
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        edit_rust_style(&mut view, &bench, &mut ctx).await;
+        let _ = bench.emit.take();
+        assert_eq!(view.on_key(ctrl('g'), &mut ctx), Handled::Consumed);
+        assert_eq!(view.notice, Some(Notice::Error(NO_PROJECT.to_owned())));
+        assert!(editor(&view).help.is_none());
+        assert!(bench.emit.take().is_empty(), "nothing is sent");
+    }
+
+    /// LV-2 (P7, A-4): the request names the active project (the scope's first) and the skill,
+    /// and carries the draft as it was when the help opened.
+    #[tokio::test]
+    async fn ctrl_g_sends_edit_help_for_the_skill_in_the_first_project() {
+        let bench = Bench::in_vulkan();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        edit_rust_style(&mut view, &bench, &mut ctx).await;
+        let _ = bench.emit.take();
+        let request = ask_help(&mut view, &bench, &mut ctx, "shorter");
+        let StoreRequest::EditHelp {
+            project_id, prompt, ..
+        } = &request
+        else {
+            panic!("an EditHelp: {request:?}");
+        };
+        assert_eq!(*project_id, ids::PROJECT_VULKAN);
+        assert_eq!(
+            prompt.target,
+            HelpTarget::Skill {
+                name: "rust-style".to_owned()
+            }
+        );
+        assert_eq!(
+            prompt.body,
+            "Prefer `expect` with a reason. One error enum per crate."
+        );
+        assert_eq!(prompt.request, "shorter");
+    }
+
+    /// The blueprint's "an empty body is allowed": a new skill's blank editor offers the help,
+    /// named after the skill `n` is creating.
+    #[tokio::test]
+    async fn ctrl_g_in_a_new_skill_s_blank_editor_asks_for_it_by_name() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::in_vulkan();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        let read = serve(&backend, &StoreRequest::Skills(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        view.on_key(key(KeyCode::Char('n')), &mut ctx);
+        type_text(&mut view, "fresh", &mut ctx);
+        view.on_key(key(KeyCode::Enter), &mut ctx);
+        view.on_key(key(KeyCode::Enter), &mut ctx);
+        assert_eq!(editor(&view).area.text(), "");
+        let request = ask_help(&mut view, &bench, &mut ctx, "write it");
+        let StoreRequest::EditHelp { prompt, .. } = &request else {
+            panic!("an EditHelp: {request:?}");
+        };
+        assert_eq!(
+            prompt.target,
+            HelpTarget::Skill {
+                name: "fresh".to_owned()
+            }
+        );
+        assert_eq!(prompt.body, "");
+    }
+
+    /// `Ctrl+G` while a save is in flight: the in-flight notice, as `Ctrl+E` and `Esc` say it.
+    #[tokio::test]
+    async fn ctrl_g_is_refused_while_a_save_is_in_flight() {
+        let bench = Bench::in_vulkan();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        edit_rust_style(&mut view, &bench, &mut ctx).await;
+        view.on_key(key(KeyCode::Char('Z')), &mut ctx);
+        view.on_key(ctrl('s'), &mut ctx);
+        assert!(matches!(bench.one(), StoreRequest::SaveSkillVersion { .. }));
+        view.on_key(ctrl('g'), &mut ctx);
+        assert_eq!(
+            view.notice,
+            Some(Notice::Error(
+                "`save_skill_version` is still in flight".to_owned()
+            ))
+        );
+        assert!(editor(&view).help.is_none());
+        assert!(bench.emit.take().is_empty());
+    }
+
+    /// While the help is open it takes every key and paste: the draft is locked, `Ctrl+S`,
+    /// `Ctrl+E` and `Ctrl+G` are refused with the help's notice, and `Esc` leaves the help (not
+    /// the editor).
+    #[tokio::test]
+    async fn an_open_help_locks_the_draft_and_refuses_ctrl_s_and_ctrl_e() {
+        let bench = Bench::in_vulkan();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        edit_rust_style(&mut view, &bench, &mut ctx).await;
+        view.on_key(ctrl('g'), &mut ctx);
+        let _ = bench.emit.take();
+        let before = editor(&view).area.text().to_owned();
+        type_text(&mut view, "zzz", &mut ctx);
+        assert!(view.on_paste("pasted"));
+        for c in ['s', 'e', 'g'] {
+            assert_eq!(view.on_key(ctrl(c), &mut ctx), Handled::Consumed);
+            assert_eq!(
+                view.notice,
+                Some(Notice::Info(
+                    "agent help is open \u{2014} Esc leaves it first".to_owned()
+                )),
+                "Ctrl+{c}"
+            );
+        }
+        assert_eq!(editor(&view).area.text(), before, "the draft is locked");
+        assert!(bench.emit.take().is_empty(), "no save, no $EDITOR, no help");
+        assert!(view.external.is_none());
+        assert!(view.captures_input());
+
+        view.on_key(key(KeyCode::Esc), &mut ctx);
+        assert!(editor(&view).help.is_none(), "Esc closes the help");
+        assert_eq!(view.notice, None);
+        view.on_key(key(KeyCode::Char('z')), &mut ctx);
+        assert_eq!(editor(&view).area.text(), format!("z{before}"));
+    }
+
+    /// An accepted proposal replaces the draft and sends nothing; `Ctrl+S` then saves it as the
+    /// next version. `original` is untouched, so `Esc` still asks first.
+    #[tokio::test]
+    async fn an_accepted_proposal_replaces_the_draft_and_ctrl_s_saves_it() {
+        let bench = Bench::in_vulkan();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        edit_rust_style(&mut view, &bench, &mut ctx).await;
+        let _ = bench.emit.take();
+        ask_help(&mut view, &bench, &mut ctx, "shorter");
+        let original = editor(&view).original.clone();
+        reply_with(&mut view, &mut ctx, "Here:\n```\nUse `expect`.\n```\n");
+        assert!(editor(&view).help.is_some(), "the proposal is shown");
+        assert_eq!(
+            view.on_key(key(KeyCode::Enter), &mut ctx),
+            Handled::Consumed
+        );
+
+        let open = editor(&view);
+        assert!(open.help.is_none(), "accepting closes the help");
+        assert_eq!(
+            open.area.text(),
+            "Use `expect`.",
+            "the sent body's ending kept"
+        );
+        assert_eq!(open.original, original, "Esc still asks first");
+        assert_eq!(view.notice, Some(Notice::Info(ACCEPTED.to_owned())));
+        assert!(bench.emit.take().is_empty(), "accepting sends nothing");
+
+        view.on_key(ctrl('s'), &mut ctx);
+        let save = bench.one();
+        assert!(
+            matches!(&save, StoreRequest::SaveSkillVersion { expected: 2, body, .. }
+                if body.as_str() == "Use `expect`."),
+            "{save:?}"
+        );
+    }
+
+    /// The save gate still runs after an accept: a proposal that says what the head says is not
+    /// saved as a duplicate version, and a blank one is refused (D77). Neither sends anything.
+    #[tokio::test]
+    async fn an_accepted_proposal_still_meets_the_save_gate() {
+        let bench = Bench::in_vulkan();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        edit_rust_style(&mut view, &bench, &mut ctx).await;
+        // The draft drifts from the head; the agent puts the head's text back.
+        view.on_key(key(KeyCode::Char('Z')), &mut ctx);
+        let _ = bench.emit.take();
+        ask_help(&mut view, &bench, &mut ctx, "undo that");
+        reply_with(
+            &mut view,
+            &mut ctx,
+            "```\nPrefer `expect` with a reason. One error enum per crate.\n```\n",
+        );
+        view.on_key(key(KeyCode::Char('y')), &mut ctx);
+        assert_eq!(view.notice, Some(Notice::Info(ACCEPTED.to_owned())));
+        view.on_key(ctrl('s'), &mut ctx);
+        assert_eq!(
+            view.notice,
+            Some(Notice::Info(
+                "v2 already says this \u{2014} nothing to save".to_owned()
+            ))
+        );
+        assert!(bench.emit.take().is_empty(), "the duplicate is not sent");
+
+        ask_help(&mut view, &bench, &mut ctx, "empty it");
+        reply_with(&mut view, &mut ctx, "```\n \n```\n");
+        view.on_key(key(KeyCode::Enter), &mut ctx);
+        assert_eq!(editor(&view).area.text(), " ");
+        assert_eq!(
+            view.notice,
+            Some(Notice::Error(BLANK_SKILL_BODY.to_owned())),
+            "the $EDITOR return's check, on accept"
+        );
+        view.on_key(ctrl('s'), &mut ctx);
+        assert_eq!(
+            view.notice,
+            Some(Notice::Error(BLANK_SKILL_BODY.to_owned()))
+        );
+        assert!(bench.emit.take().is_empty(), "the blank body is not sent");
+        assert_eq!(view.busy, None);
+    }
+
+    /// The editor's `Debug` carries the help's (lengths only): no draft text through it.
+    #[tokio::test]
+    async fn an_open_help_debugs_without_the_draft() {
+        let bench = Bench::in_vulkan();
+        let mut ctx = bench.ctx();
+        let mut view = LibraryView::default();
+        edit_rust_style(&mut view, &bench, &mut ctx).await;
+        view.on_key(ctrl('g'), &mut ctx);
+        let shown = format!("{:?}", editor(&view));
+        assert!(shown.contains("help: Some("), "{shown}");
+        assert!(!shown.contains("One error enum"), "{shown}");
     }
 }
