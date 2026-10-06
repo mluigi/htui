@@ -890,6 +890,9 @@ struct Kit<H: htui_core::store::WorkerHost> {
     clock: Arc<dyn Clock>,
     sink: ProgressSink<H::Store>,
     scrubber: MinimalScrubber,
+    /// MOD-10 M3 T4: the engine's secrets part, source-less (it resolves nothing) until T5 makes
+    /// it this task's walk's secrets and the engine's scrubber in one.
+    secrets: htui_orch::RunSecrets,
     app: BTreeMap<String, Value>,
     box_profile: BoxProfile,
     box_id: BoxId,
@@ -967,6 +970,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             verifier,
             clock: Arc::clone(&shared.clock),
             scrubber: MinimalScrubber::new(std::iter::empty::<String>()),
+            secrets: htui_orch::RunSecrets::none(),
             app,
             box_profile,
             box_id,
@@ -1046,6 +1050,7 @@ impl<H: htui_core::store::WorkerHost> Kit<H> {
             policy: &*self.policy,
             control: &*self.control,
             scrubber: &self.scrubber,
+            secrets: &self.secrets,
             app: self.app.clone(),
             box_profile: self.box_profile.clone(),
             box_id: self.box_id,

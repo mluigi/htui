@@ -71,6 +71,7 @@ use crate::isolate::{Clock, FanoutSlot, Isolator};
 use crate::kill_point::{KillPoint, Site};
 use crate::promote::{self, OpeningKind};
 use crate::recover::{self, Adjudication, Heartbeat, LeaseTimes, StepKind};
+use crate::secrets::RunSecrets;
 use crate::select::{self, SelectInput, Skipped, Walk};
 use crate::status::{
     Cursor, RunFailure, crashed_rejection, cursor, group_at, judge_at, latest_at, may_attempt,
@@ -468,6 +469,10 @@ where
     /// `R-SEC-3`'s masker, handed to both the assembler and the recorder so they cannot disagree
     /// about what two identical prompts are (blueprint H-13).
     pub scrubber: &'a dyn Scrubber,
+    /// MOD-10 D11: the walk's secrets. In production (`htui-worker`'s `Kit::engine`) the same
+    /// object is `scrubber`, so the env a session gets and the mask its log is written through are
+    /// one map. `RunSecrets::none()` resolves nothing.
+    pub secrets: &'a RunSecrets,
     /// The resolved `app_setting` map (blueprint A-2, H-11): those reads are inherent on both
     /// stores, so they are passed rather than read through a trait.
     pub app: BTreeMap<String, Value>,
@@ -505,6 +510,7 @@ where
             .field("isolator", &self.isolator)
             .field("verifier", &self.verifier)
             .field("scrubber", &self.scrubber)
+            .field("secrets", &self.secrets)
             .field("app", &self.app)
             .field("box_profile", &self.box_profile)
             .field("box_id", &self.box_id)
@@ -7014,7 +7020,7 @@ pub async fn dispatch_fake(
 ) -> Result<CommandOutcome, EngineError> {
     let graphs = orch.graphs();
     let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
-    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.dispatch(command).await
 }
@@ -7030,7 +7036,7 @@ pub async fn claim_fake(
 ) -> Result<CommandOutcome, EngineError> {
     let graphs = orch.graphs();
     let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
-    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.claim(run).await
 }
@@ -7046,7 +7052,7 @@ pub async fn resume_fake(
 ) -> Result<Resume, EngineError> {
     let graphs = orch.graphs();
     let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
-    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.resume(run).await
 }
@@ -7060,12 +7066,13 @@ pub async fn resume_fake(
 pub async fn sweep_fake(orch: &crate::fake::FakeOrchestrator) -> Result<Vec<Adopted>, EngineError> {
     let graphs = orch.graphs();
     let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
-    let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+    let scrubber = RunSecrets::new(orch.secret_source());
     let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
     engine.sweep().await
 }
 
-/// The eighteen fields, filled from the harness.
+/// The eighteen fields, filled from the harness. `secrets` is lent as both the scrubber and the
+/// secrets part, as `htui-worker`'s `Kit::engine` lends its `RunSecrets` (MOD-10 D11).
 ///
 /// `app` is read here rather than cached because `MemStore::set_app_setting` (`mem.rs:430`) is the
 /// only writer a case can reach for `step_deadline_seconds` — `SettingKey` is a closed enum of
@@ -7076,7 +7083,7 @@ pub(crate) async fn fake_parts<'a>(
     orch: &'a crate::fake::FakeOrchestrator,
     graphs: &'a crate::fake::FakeGraphSource<'a>,
     driver: DriverFor<'a>,
-    scrubber: &'a dyn Scrubber,
+    secrets: &'a RunSecrets,
 ) -> Result<
     EngineParts<
         'a,
@@ -7110,7 +7117,8 @@ pub(crate) async fn fake_parts<'a>(
         driver,
         policy: orch.policy_for(),
         control: orch.control_for(),
-        scrubber,
+        scrubber: secrets,
+        secrets,
         app,
         box_profile,
         box_id: orch.box_id(),
@@ -7460,6 +7468,7 @@ mod tests {
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
         let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let secrets = crate::secrets::RunSecrets::none();
         let selector = IndexSelector::default();
         let engine = super::Engine::new(super::EngineParts {
             store: &orch.store,
@@ -7473,6 +7482,7 @@ mod tests {
             policy: &super::ask_policy,
             control: &super::never_cancelled,
             scrubber: &scrubber,
+            secrets: &secrets,
             app: orch
                 .store
                 .app_settings()
@@ -7551,6 +7561,7 @@ mod tests {
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
         let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let secrets = crate::secrets::RunSecrets::none();
         let selector = IndexSelector::default();
         let engine = super::Engine::new(super::EngineParts {
             store: &orch.store,
@@ -7564,6 +7575,7 @@ mod tests {
             policy: &super::ask_policy,
             control: &super::never_cancelled,
             scrubber: &scrubber,
+            secrets: &secrets,
             app: orch
                 .store
                 .app_settings()
@@ -9119,7 +9131,7 @@ mod tests {
             let graphs = $orch.graphs();
             let driver =
                 |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| $orch.driver_for_key(key);
-            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let scrubber = crate::secrets::RunSecrets::new($orch.secret_source());
             let $engine = crate::engine::Engine::new(
                 crate::engine::fake_parts(&$orch, &graphs, &driver, &scrubber)
                     .await
@@ -9328,7 +9340,7 @@ mod tests {
         let graphs = harness.orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let engine = super::Engine::new(
             super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
                 .await
@@ -9419,7 +9431,7 @@ mod tests {
                 wake: Arc::clone(&wake),
             })
         };
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let engine = super::Engine::new(
             super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
                 .await
@@ -10249,7 +10261,7 @@ mod tests {
         let graphs = harness.orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
             .await
             .expect("the harness has a box");
@@ -10266,6 +10278,7 @@ mod tests {
             policy: &super::ask_policy,
             control: &super::never_cancelled,
             scrubber: parts.scrubber,
+            secrets: parts.secrets,
             app: parts.app,
             box_profile: parts.box_profile,
             box_id: parts.box_id,
@@ -10351,7 +10364,7 @@ mod tests {
         let graphs = harness.orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
             .await
             .expect("the harness has a box");
@@ -10368,6 +10381,7 @@ mod tests {
             policy: &super::ask_policy,
             control: &super::never_cancelled,
             scrubber: parts.scrubber,
+            secrets: parts.secrets,
             app: parts.app,
             box_profile: parts.box_profile,
             box_id: parts.box_id,
@@ -11539,7 +11553,7 @@ mod tests {
         let graphs = harness.orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let mut parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
             .await
             .expect("the harness has a box");
@@ -11580,7 +11594,7 @@ mod tests {
         let graphs = other.orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| other.orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(other.orch.secret_source());
         let mut parts = super::fake_parts(&other.orch, &graphs, &driver, &scrubber)
             .await
             .expect("the harness has a box");
@@ -12217,7 +12231,7 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             harness.orch.driver_for_key(key)
         };
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let engine = crate::engine::Engine::new(
             crate::engine::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
                 .await
@@ -12321,7 +12335,7 @@ mod tests {
             calls.fetch_add(1, Ordering::SeqCst);
             harness.orch.driver_for_key(key)
         };
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let engine = crate::engine::Engine::new(
             crate::engine::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
                 .await
@@ -12746,7 +12760,7 @@ mod tests {
               -> Box<dyn htui_agent::driver::AgentDriver> {
             Box::new(SpecSpy { seen: spy.clone() })
         };
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
         let engine = super::Engine::new(
             super::fake_parts(orch, &graphs, &driver, &scrubber)
                 .await
@@ -12938,7 +12952,7 @@ mod tests {
               -> Box<dyn htui_agent::driver::AgentDriver> {
             Box::new(SpecSpy { seen: spy.clone() })
         };
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
         let engine = super::Engine::new(
             super::fake_parts(orch, &graphs, &driver, &scrubber)
                 .await
@@ -13264,7 +13278,7 @@ mod tests {
         let graphs = harness.orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| harness.orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(harness.orch.secret_source());
         let parts = super::fake_parts(&harness.orch, &graphs, &driver, &scrubber)
             .await
             .expect("the harness has a box");
@@ -13280,6 +13294,7 @@ mod tests {
             policy: &super::ask_policy,
             control: &super::never_cancelled,
             scrubber: parts.scrubber,
+            secrets: parts.secrets,
             app: parts.app,
             box_profile: parts.box_profile,
             box_id: parts.box_id,
@@ -14379,7 +14394,7 @@ mod tests {
         let graphs = orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
         let parts = super::fake_parts(&orch, &graphs, &driver, &scrubber)
             .await
             .expect("the harness has a box");
@@ -14398,6 +14413,7 @@ mod tests {
             policy: &super::ask_policy,
             control: &super::never_cancelled,
             scrubber: parts.scrubber,
+            secrets: parts.secrets,
             app: parts.app,
             box_profile: parts.box_profile,
             box_id: parts.box_id,
@@ -17261,7 +17277,7 @@ mod tests {
                     inner: orch.driver_for_key(key),
                 })
             };
-            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
             let engine = Engine::new(
                 fake_parts(orch, &graphs, &driver, &scrubber)
                     .await
@@ -17958,7 +17974,7 @@ mod tests {
                 built.fetch_add(1, Ordering::SeqCst);
                 orch.driver_for_key(key)
             };
-            let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+            let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
             let engine = Engine::new(
                 fake_parts(orch, &graphs, &driver, &scrubber)
                     .await
@@ -18766,7 +18782,7 @@ mod queued_cancel {
         let graphs = orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
         let engine = super::Engine::new(
             super::fake_parts(&orch, &graphs, &driver, &scrubber)
                 .await
@@ -18863,7 +18879,7 @@ mod queued_cancel {
         let graphs = orch.graphs();
         let driver =
             |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
         let engine = super::Engine::new(
             super::fake_parts(&orch, &graphs, &driver, &scrubber)
                 .await

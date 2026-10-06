@@ -13,7 +13,7 @@
 //! command that was asked for and could not be run, and it never fails a step (`:443`).
 //!
 //! The shell is plan D30's: `sh -c` on Unix, `cmd /C` on Windows, with the process environment
-//! unchanged, stdout and stderr merged and tail-capped at 64 KiB, masked by the engine's
+//! unchanged (which never holds a resolved secret: MOD-10 D19), stdout and stderr merged and tail-capped at 64 KiB, masked by the engine's
 //! `Scrubber` before it is handed back, under a semaphore keyed `verify`, and with the step
 //! deadline's remainder as the timeout. The process handling is `isolate/git.rs`'s
 //! [`Cli`](crate::isolate::git::Cli) contract verb for verb — a supervised child whose whole group
@@ -320,9 +320,11 @@ impl ShellVerifier {
         step: StepId,
     ) -> VerifyReport {
         let started_at = self.clock.now();
-        // The process environment is handed to the child unchanged (plan D30): ANA-2 `:493` asks
-        // for "the agent's environment minus the secrets" and the walk's `SessionSpec.env` is
-        // empty this milestone, so the agent's environment *is* this process's.
+        // The process environment is handed to the child unchanged (plan D30). ANA-2 `:493` asks
+        // for "the agent's environment minus the secrets", and that is what this is: a resolved
+        // secret reaches an agent only through `SessionSpec.env` (MOD-10 D12), never this process's
+        // own environment, which htui cannot change (`set_var` is `unsafe`, `unsafe_code` is
+        // forbidden; MOD-10 D19).
         let build = || {
             let mut shell = tokio::process::Command::new(&self.shell);
             shell

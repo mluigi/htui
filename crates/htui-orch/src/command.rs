@@ -528,6 +528,10 @@ pub enum EngineError {
     /// tell them apart — the variant is `#[error(transparent)]` and both are the same rule.
     #[error(transparent)]
     Record(#[from] htui_agent::RecordError),
+    /// MOD-10 D13: the walk's secrets could not be resolved for the run's project. Its `Display`
+    /// is the run's `secrets_refused: …` sentence; it never carries a value.
+    #[error("{}", .0.refusal())]
+    Secrets(htui_core::secret::SecretError),
     /// The driver failed, or the session's stream closed before its `done`.
     #[error(transparent)]
     Driver(#[from] htui_agent::error::DriverError),

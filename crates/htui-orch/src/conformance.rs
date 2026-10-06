@@ -8582,7 +8582,7 @@ mod fanout_paths {
         let driver =
             |_candidate: &htui_core::model::SnapshotCandidate,
              key: &crate::engine::SessionKey<'_>| orch.driver_for_key(key);
-        let scrubber = htui_core::scrub::MinimalScrubber::new([]);
+        let scrubber = crate::secrets::RunSecrets::new(orch.secret_source());
         let parts = crate::engine::fake_parts(&orch, &graphs, &driver, &scrubber)
             .await
             .expect("the fake's parts build");
@@ -8602,6 +8602,7 @@ mod fanout_paths {
             policy: parts.policy,
             control: parts.control,
             scrubber: parts.scrubber,
+            secrets: parts.secrets,
             app: parts.app,
             box_profile: parts.box_profile,
             box_id: parts.box_id,
