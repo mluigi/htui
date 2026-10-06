@@ -21,11 +21,13 @@
 //! The enqueue is the one `INSERT … SELECT … FOR SHARE OF w` on the step's `follow_up_window`
 //! row, so it and a close's `UPDATE` of that row serialise (I-3): an enqueue that holds the lock
 //! commits before the close reads, one that arrives later waits and reads the window closed.
-//! `open_follow_ups` is fence, upsert, refuse in one transaction (B-6). The two closes are the only
-//! two-statement transactions, `READ COMMITTED` on purpose (F-18): their second statement takes a
-//! fresh snapshot, which sees an enqueue that committed while the first waited; under `REPEATABLE
-//! READ`, or as one CTE, it would not. `request_cancel` refuses the run's pending follow-ups in
-//! its insert's transaction (B-14). Every resolution nulls the text (I-5).
+//! MOD-70 has four multi-statement transactions: `open_follow_ups` (fence, upsert, refuse; B-6),
+//! the two closes (close the window, then refuse what is still pending), and `request_cancel`
+//! (insert the cancel, then refuse the run's pending follow-ups; B-14). Each relies on `READ
+//! COMMITTED` (F-18), so each pins it as its first statement ([`begin_read_committed`]) rather than
+//! inherit the server's default: a later statement takes a fresh snapshot, which sees an enqueue
+//! that committed while an earlier one waited; under `REPEATABLE READ`, or as one CTE, it would
+//! not. Every resolution nulls the text (I-5).
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -50,6 +52,22 @@ const CANCEL_ATTEMPTS: usize = 3;
 /// How many times [`request_follow_up`] retries when its re-read finds every guard passing (the
 /// pending row it collided with resolved in between) before it gives up (MOD-70 D3).
 const FOLLOW_UP_ATTEMPTS: usize = 3;
+
+/// MOD-70 review M-2 (F-18): a transaction pinned at `READ COMMITTED`, whatever the server's or the
+/// role's `default_transaction_isolation`. Every multi-statement transaction of this module relies
+/// on each statement taking a fresh snapshot (see the module doc); `SET TRANSACTION` must be the
+/// transaction's first statement, which is why this is a helper (`write.rs`'
+/// `begin_repeatable_read` is the same shape).
+async fn begin_read_committed(
+    pool: &sqlx::PgPool,
+) -> Result<sqlx::Transaction<'_, sqlx::Postgres>> {
+    let mut tx = pool.begin().await.map_err(map_sqlx)?;
+    sqlx::raw_sql("SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+    Ok(tx)
+}
 
 /// The step fence [`open_permission`] and [`open_follow_ups`] share: the step's run and that run's
 /// lease owner, read under `FOR KEY SHARE OF s FOR SHARE OF r`.
@@ -411,7 +429,8 @@ pub(super) async fn request_cancel(
     box_id: BoxId,
 ) -> Result<CancelRequest> {
     for _ in 0..CANCEL_ATTEMPTS {
-        let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
+        // F-18: the refusal after the insert reads a fresh snapshot.
+        let mut tx = begin_read_committed(&store.pool).await?;
         let inserted = sqlx::query_scalar!(
             r#"INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)
                VALUES ($1, $2, 'cancel', $3, $4)
@@ -881,7 +900,8 @@ pub(super) async fn open_follow_ups(
     session: RelaySessionId,
     owner: Uuid,
 ) -> Result<bool> {
-    let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
+    // F-18: the refusal after the upsert reads a fresh snapshot.
+    let mut tx = begin_read_committed(&store.pool).await?;
     let fence = lock_step_fence(&mut tx, step)
         .await?
         .ok_or_else(|| StoreError::NotFound {
@@ -1022,7 +1042,8 @@ pub(super) async fn close_follow_ups(
     session: RelaySessionId,
     reason: &str,
 ) -> Result<u64> {
-    let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
+    // F-18: the refusal reads a snapshot fresher than the close's wait.
+    let mut tx = begin_read_committed(&store.pool).await?;
     sqlx::query!(
         "UPDATE follow_up_window SET closed_at = clock_timestamp() \
           WHERE run_step_id = $1 AND session = $2 AND closed_at IS NULL",
@@ -1059,7 +1080,8 @@ pub(super) async fn close_dropped_follow_ups(
     owner: Uuid,
     reason: &str,
 ) -> Result<u64> {
-    let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
+    // F-18: the refusal reads a snapshot fresher than the close's wait.
+    let mut tx = begin_read_committed(&store.pool).await?;
     sqlx::query!(
         "UPDATE follow_up_window w SET closed_at = clock_timestamp() \
            FROM run r \
