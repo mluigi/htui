@@ -12671,6 +12671,72 @@ mod tests {
         );
     }
 
+    /// A ready, untagged FEAT in `htui` at `priority`, minted through `store`'s own clock.
+    async fn ready_feat(store: &MemStore, id: ItemId, priority: i16) -> ItemId {
+        store
+            .mint_item(NewItem {
+                id,
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: format!("queue order at priority {priority}"),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id
+    }
+
+    /// `ready_items` under `htui` alone, as ids.
+    async fn ready_htui(store: &MemStore) -> Vec<ItemId> {
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        store
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect("the read is total")
+            .into_iter()
+            .map(|row| row.id)
+            .collect()
+    }
+
+    /// MOD-12 D4, ANA-2 criterion 22: `ready_items` is queue order, `priority DESC, created_at`,
+    /// and not the Backlog's key order. `HTUI_ANA_2` is priority 0 with `created_at =
+    /// demo_at(0, 1)`, earlier than every mint; key order would put it first and the priority-1
+    /// FEAT between the two priority-0 ones.
+    #[tokio::test]
+    async fn ready_items_are_in_queue_order() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let p0a = ready_feat(&store, ItemId::new(), 0).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p1 = ready_feat(&store, ItemId::new(), 1).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p0b = ready_feat(&store, ItemId::new(), 0).await;
+
+        assert_eq!(ready_htui(&store).await, [p1, ids::HTUI_ANA_2, p0a, p0b]);
+    }
+
+    /// MOD-12 D4: two items of one priority minted at one instant come back in `ItemId` order,
+    /// which is Postgres' uuid order. The larger id is minted first, so key order disagrees.
+    #[tokio::test]
+    async fn ready_items_break_a_created_at_tie_by_id() {
+        let store = MemStore::demo().with_clock(Arc::new(TestClock::new()));
+        let high = ItemId::from_uuid(Uuid::from_u128(u128::MAX - 1));
+        let low = ItemId::from_uuid(Uuid::from_u128(1));
+        ready_feat(&store, high, 0).await;
+        ready_feat(&store, low, 0).await;
+
+        assert_eq!(ready_htui(&store).await, [ids::HTUI_ANA_2, low, high]);
+    }
+
     /// MOD-9 D89: a skill with no version (a hand-written or imported row; `create_skill` always
     /// writes v1, so no writer can make one) takes version 1 at the token `0`, and any other token
     /// is `NotFound` on the missing version, keyed `"<skill>/v<n>"`.

@@ -4326,6 +4326,87 @@ async fn inherent_orchestration_reads_answer_the_fixture() {
     db.drop_db().await;
 }
 
+/// MOD-12 D4, ANA-2 criterion 22: `ready_items` is queue order on both stores,
+/// `priority DESC, created_at, id`, and not the Backlog's key order.
+///
+/// The same three untagged FEATs (priorities 0, 1, 0) land on Postgres and on `MemStore::demo()`.
+/// `HTUI_ANA_2` is priority 0 and older than every mint. The first priority-0 mint carries the
+/// larger id, so on Postgres `created_at` alone puts it first; once the two share a `created_at`
+/// the id puts it last. `MemStore` mints all three at one frozen instant, so its tie is the same
+/// one and the two stores answer the same rows in the same order.
+#[tokio::test(flavor = "multi_thread")]
+async fn ready_items_order_by_priority_then_created_at() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mem = htui_core::store::MemStore::demo()
+        .handle_at(Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS));
+    let scope = htui_core::model::Scope {
+        workspace_id: ids::WORKSPACE_PLATFORM,
+        project_ids: vec![ids::PROJECT_HTUI],
+    };
+    let (low, high) = {
+        let (a, b) = (ItemId::new(), ItemId::new());
+        if a < b { (a, b) } else { (b, a) }
+    };
+    let feat = |id: ItemId, priority: i16| NewItem {
+        id,
+        priority,
+        ..race_item(ids::KIND_HTUI_FEAT, "queue order")
+    };
+    let p1 = ItemId::new();
+    for new in [feat(high, 0), feat(p1, 1), feat(low, 0)] {
+        db.store
+            .mint_item(new.clone())
+            .await
+            .expect("the Postgres mint lands");
+        mem.mint_item(new).await.expect("the MemStore mint lands");
+    }
+    let ready = |rows: Vec<htui_core::model::ItemSummary>| -> Vec<ItemId> {
+        rows.into_iter().map(|row| row.id).collect()
+    };
+
+    assert_eq!(
+        ready(
+            db.store
+                .ready_items(&scope, ids::BOX)
+                .await
+                .expect("ready_items must not fail")
+        ),
+        [p1, ids::HTUI_ANA_2, high, low],
+        "priority first, then `created_at`: the older priority-0 mint precedes the newer"
+    );
+
+    sqlx::query("UPDATE item SET created_at = $1 WHERE id = ANY($2)")
+        .bind(Utc::now())
+        .bind([high.as_uuid(), low.as_uuid()])
+        .execute(&db.pool)
+        .await
+        .expect("tie the two priority-0 mints");
+    let tied = ready(
+        db.store
+            .ready_items(&scope, ids::BOX)
+            .await
+            .expect("ready_items must not fail"),
+    );
+    assert_eq!(
+        tied,
+        [p1, ids::HTUI_ANA_2, low, high],
+        "a `created_at` tie breaks by id, in uuid order"
+    );
+    assert_eq!(
+        ready(
+            mem.ready_items(&scope, ids::BOX)
+                .await
+                .expect("MemStore::ready_items")
+        ),
+        tied,
+        "MemStore sorts as Postgres does"
+    );
+
+    db.drop_db().await;
+}
+
 /// `0003`'s `ck_run_graph_snapshot` is `NOT VALID`: it is checked for every new row and for no
 /// row that was already there (ANA-2 §5.1, plan D7).
 ///

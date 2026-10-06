@@ -3433,8 +3433,15 @@ mod tests {
         rows.iter().map(|row| row.id).collect()
     }
 
-    /// MOD-13 D2: `ready_here` is ANA-9 §7.4 for this box, the same rows in the same order as
-    /// `MemStore::ready_items` (which `pg_criteria.rs` pins against `PgStore`).
+    /// `rows` as a set: sorted by id, so two reads in different orders compare by membership.
+    fn by_id(mut rows: Vec<ItemSummary>) -> Vec<ItemSummary> {
+        rows.sort_by_key(|row| row.id);
+        rows
+    }
+
+    /// MOD-13 D2: `ready_here` is ANA-9 §7.4 for this box, the same rows as
+    /// `MemStore::ready_items` (which `pg_criteria.rs` pins against `PgStore`); `ready_here` keeps
+    /// the Backlog's display order, `ready_items` is queue order (MOD-12 D4).
     #[tokio::test]
     async fn ready_here_equals_ready_items_for_this_box() {
         let (store, needs_cuda) = with_cuda(MemStore::demo()).await;
@@ -3458,13 +3465,23 @@ mod tests {
 
         let ready = items_of(&backend, &scope, ItemFilter::default(), true).await;
         assert_eq!(
-            ready,
-            store
-                .ready_items(&scope, ids::BOX)
-                .await
-                .expect("the read is total")
+            by_id(ready.clone()),
+            by_id(
+                store
+                    .ready_items(&scope, ids::BOX)
+                    .await
+                    .expect("the read is total")
+            )
         );
         let ready = ids_of(&ready);
+        assert_eq!(
+            ready,
+            ids_of(&open)
+                .into_iter()
+                .filter(|id| ready.contains(id))
+                .collect::<Vec<_>>(),
+            "display order: the `items` rows, filtered"
+        );
         for id in [ids::HTUI_ANA_2, ids::AGY_FEAT_1, ids::AGY_FIX_1] {
             assert!(ready.contains(&id), "{id:?} is ready on this box");
         }
@@ -3483,13 +3500,19 @@ mod tests {
         let scope = platform_scope(&backend).await;
         let ready = items_of(&backend, &scope, ItemFilter::default(), true).await;
         assert_eq!(
-            ready,
-            store
-                .ready_items(&scope, BoxId::new())
-                .await
-                .expect("the read is total")
+            by_id(ready.clone()),
+            by_id(
+                store
+                    .ready_items(&scope, BoxId::new())
+                    .await
+                    .expect("the read is total")
+            )
         );
-        assert_eq!(ids_of(&ready), [ids::HTUI_ANA_2, ids::AGY_FIX_1]);
+        assert_eq!(
+            ids_of(&ready),
+            [ids::HTUI_ANA_2, ids::AGY_FIX_1],
+            "display order"
+        );
     }
 
     /// MOD-13 D2: readiness stays one conjunct among the others.
