@@ -622,33 +622,42 @@ where
     /// Every [`EngineError`]: the enabling guards of [`crate::command`], the store's refusals, the
     /// resolver's, the assembler's, the recorder's and the driver's.
     pub async fn dispatch(&self, command: Command) -> Result<CommandOutcome, EngineError> {
+        // Every arm boxed: debug-build stack headroom (MOD-10 M3). Inline, each verb's walk is a
+        // slot of this future, so every poll frame that builds or holds it (`htui-worker`'s
+        // `walked` and `run_request`) carried copies of the largest; with M3's secrets paths on
+        // the walk that took three `htui` walk tests past the 2 MiB test and worker stacks
+        // (~2.07 MiB). Boxed, this future holds one box and the same walks need ~1.15 MiB.
         match command {
             Command::StartRun {
                 item,
                 mode,
                 repo_scope,
-            } => self.start_run(item, mode, repo_scope).await,
-            Command::AnswerGate { run, step, answer } => self.answer_gate(run, step, answer).await,
-            Command::RetryStep { run, step } => self.retry_step(run, step).await,
-            Command::CancelRun { run } => self.cancel_run(run).await,
+            } => Box::pin(self.start_run(item, mode, repo_scope)).await,
+            Command::AnswerGate { run, step, answer } => {
+                Box::pin(self.answer_gate(run, step, answer)).await
+            }
+            Command::RetryStep { run, step } => Box::pin(self.retry_step(run, step)).await,
+            Command::CancelRun { run } => Box::pin(self.cancel_run(run)).await,
             Command::SelectFanout {
                 run,
                 position,
                 attempt,
                 winner,
-            } => self.select_fanout(run, position, attempt, winner).await,
+            } => Box::pin(self.select_fanout(run, position, attempt, winner)).await,
             Command::PromoteStep {
                 run,
                 step,
                 chat_open,
-            } => self.promote(run, step, chat_open).await,
+            } => Box::pin(self.promote(run, step, chat_open)).await,
             Command::AcceptArtifact {
                 run,
                 step,
                 chat_live,
-            } => self.accept_artifact(run, step, chat_live).await,
-            Command::Unblock { item } => self.unblock(item).await,
-            Command::CloseOut { item, resolution } => self.close_out(item, resolution).await,
+            } => Box::pin(self.accept_artifact(run, step, chat_live)).await,
+            Command::Unblock { item } => Box::pin(self.unblock(item)).await,
+            Command::CloseOut { item, resolution } => {
+                Box::pin(self.close_out(item, resolution)).await
+            }
         }
     }
 
