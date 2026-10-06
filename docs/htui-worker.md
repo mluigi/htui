@@ -339,11 +339,12 @@ is restarted, and the step stays `running`.
   30 seconds to close the session's follow-ups; if the database stays unreachable that long, a
   follow-up still queued stays pending, its text still stored. It is never sent. It is refused when
   the run is cancelled ("the run was cancelled") or recovered after a crash, and when the walking
-  process finishes the run (`done`, `failed` or `cancelled`): before it gives the run back, it
-  refuses what the run's steps still hold, "the step finished its session; promote it to continue"
-  ("the run was cancelled" for a cancel). Only if the database is unreachable then too does the row
-  stay pending with its text stored, since no process takes a finished run again and `c` on a run
-  that has rested is cleanup, not a cancel.
+  process gives the run back, having finished it (`done`, `failed` or `cancelled`) or parked it at
+  a gate: before it releases the run, it refuses what the run's steps still hold, "the step
+  finished its session; promote it to continue" ("the run was cancelled" for a cancel). Only if the
+  database is unreachable then too does the row stay pending with its text stored: on a parked run
+  until the run is next given back or cancelled, and on a finished run for good, since no process
+  takes a finished run again and `c` on a run that has rested is cleanup, not a cancel.
 - **Every box upgrades together.** Follow-ups need the migration `0016_follow_up.sql`: apply it
   from a TUI first, and upgrade every TUI and worker on the database at the same time (see
   [Upgrading](#upgrading-migrate-from-a-tui-first)).

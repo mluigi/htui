@@ -706,7 +706,7 @@ the session). Independence is decided by the file-set intersections under "Verif
 |---|---|---|
 | R-1 · A `follow_up` row reaches `cancel_run` | High without D5 | `pending_commands` kind filter; conformance case 7 |
 | R-2 · The walk-path future grows past the 2 MiB test stack | Medium | Loop inside the already-boxed `drive`; box `turn` if needed; `--no-fail-fast` + SIGABRT grep |
-| R-3 · A failed close leaves a live window on a step that moved on | Low | Bounded transient retry; D9 closes it at the next lease re-take; a cancel refuses the row; the engine, settling the run terminal, closes the run's windows under the lease before releasing it (review M-3, best-effort: a warn) |
+| R-3 · A failed close leaves a live window on a step that moved on | Low | Bounded transient retry; D9 closes it at the next lease re-take; a cancel refuses the row; the engine, when the walk gives the run back (settled terminal or parked at a gate), closes the run's windows under the lease before releasing it (review M-3, R2 P-1, best-effort: a warn) |
 | R-4 · `.sqlx` drift | Medium | Scratch-DB prepare per `hr-sandbox.md:194-210` (it compiles `htui-store` + `htui-core` only); `--check` in T1's validate |
 | R-5 · Enqueue and cancel interleave under READ COMMITTED | Low | Walk's cancelled close and D9 refuse the survivor; e2e cancel test |
 | R-6 · Plaintext in logs through `Debug` | Medium | `FollowUpText`/`QueuedFollowUp` redacting `Debug`; unit test |
