@@ -2181,7 +2181,7 @@ impl State {
             position: 0,
             attempt: 1,
             fanout_index: 0,
-            phase_name: "chat".to_owned(),
+            phase_name: chat.phase_name.clone(),
             agent_id: chat.agent_id,
             model: chat.model.clone(),
             status: StepStatus::Running,
@@ -8615,6 +8615,36 @@ mod tests {
             "run_step.status by the same name"
         );
         assert_eq!(step.finished_at, Some(at), "run_step.finished_at");
+    }
+
+    /// MOD-55 plan P5: a help turn minted through `for_edit_help` lands as the same chat pair, its
+    /// step named `edit_help` rather than `chat`.
+    #[tokio::test]
+    async fn a_help_chat_run_records_edit_help() {
+        let store = MemStore::demo();
+        let help = ChatRunSpec::mint(
+            ids::PROJECT_HTUI,
+            ids::BOX,
+            ids::USER,
+            Some(ids::AGENT_CLAUDE),
+            None,
+        )
+        .for_edit_help();
+        store.start_chat_run(&help).await.expect("the mint lands");
+
+        let (run, step) = store.read(|state| {
+            (
+                state.runs.get(&help.run_id).cloned().expect("the run row"),
+                state
+                    .steps
+                    .get(&help.step_id)
+                    .cloned()
+                    .expect("the step row"),
+            )
+        });
+        assert_eq!(step.phase_name, "edit_help", "run_step.phase_name");
+        assert_eq!(run.kind, RunKind::Chat, "run.kind");
+        assert_eq!(run.item_id, None, "run.item_id is NULL for a help turn");
     }
 
     /// `agents()` joins this box's `agent_box`, and only this box's.

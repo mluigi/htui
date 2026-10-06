@@ -284,9 +284,21 @@ pub struct RunStep {
 /// it whole, and the two backends disagree about a column neither of them changed.
 pub const TIMESTAMPTZ_DIGITS: u16 = 6;
 
+/// `run_step.phase_name` of a chat's only step (MOD-2 plan D4).
+pub const CHAT_PHASE: &str = "chat";
+
+/// `run_step.phase_name` of an editor's help turn (MOD-55 plan P5): still `run.kind = 'chat'`.
+pub const EDIT_HELP_PHASE: &str = "edit_help";
+
+/// `ChatRunSpec.phase_name`'s serde default (MOD-55 amendment A-3): a spec written before the
+/// field existed is a chat, and `#[serde(default)]` alone would read it back as `""`.
+fn chat_phase() -> String {
+    CHAT_PHASE.to_owned()
+}
+
 /// The two rows a free-standing chat needs before its first event can be recorded: one `run`
-/// (`kind = 'chat'`, `item_id NULL`) and one `run_step` (`phase_name = 'chat'`, position 0)
-/// (MOD-2 plan D4).
+/// (`kind = 'chat'`, `item_id NULL`) and one `run_step` (`phase_name` [`CHAT_PHASE`], or
+/// [`EDIT_HELP_PHASE`] for a help turn, position 0) (MOD-2 plan D4).
 ///
 /// The ids are minted client-side and both inserts of
 /// [`WriteStore::start_chat_run`](crate::store::WriteStore::start_chat_run) are
@@ -319,6 +331,10 @@ pub struct ChatRunSpec {
     /// untruncated Windows clock reading would come back from Postgres different from the one held
     /// in memory, and the two backends would disagree about a column neither of them changed.
     pub started_at: DateTime<Utc>,
+    /// `run_step.phase_name`: [`CHAT_PHASE`], or [`EDIT_HELP_PHASE`] through
+    /// [`ChatRunSpec::for_edit_help`] (MOD-55 plan P5). No CHECK constrains the column.
+    #[serde(default = "chat_phase")]
+    pub phase_name: String,
 }
 
 impl ChatRunSpec {
@@ -341,7 +357,15 @@ impl ChatRunSpec {
             agent_id,
             model,
             started_at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+            phase_name: CHAT_PHASE.to_owned(),
         }
+    }
+
+    /// MOD-55 plan P5: the same pair, marked as an editor's help turn.
+    #[must_use]
+    pub fn for_edit_help(mut self) -> Self {
+        self.phase_name = EDIT_HELP_PHASE.to_owned();
+        self
     }
 }
 
@@ -1260,6 +1284,49 @@ mod tests {
                 row(s1, "read"),
                 row(s2, "read"),
             ]
+        );
+    }
+
+    /// MOD-55 plan P5, amendment A-3: a spec written before `phase_name` existed reads back as a
+    /// chat, not as `""` (which a bare `#[serde(default)]` on a `String` would give), and
+    /// [`ChatRunSpec::for_edit_help`](super::ChatRunSpec::for_edit_help) changes nothing but the
+    /// phase.
+    #[test]
+    fn a_spec_without_phase_name_deserialises_as_chat() {
+        use super::{CHAT_PHASE, ChatRunSpec, EDIT_HELP_PHASE};
+        use crate::fixtures::ids;
+
+        let chat = ChatRunSpec::mint(
+            ids::PROJECT_HTUI,
+            ids::BOX,
+            ids::USER,
+            Some(ids::AGENT_CLAUDE),
+            Some("sonnet".to_owned()),
+        );
+        assert_eq!(chat.phase_name, CHAT_PHASE, "mint marks a chat");
+
+        let mut value = serde_json::to_value(&chat).expect("encodes");
+        let removed = value
+            .as_object_mut()
+            .expect("a spec is an object")
+            .remove("phase_name");
+        assert_eq!(removed, Some(json!("chat")), "the key is written");
+        let back: ChatRunSpec = serde_json::from_value(value).expect("old JSON decodes");
+        assert_eq!(
+            back.phase_name, "chat",
+            "the serde default is the chat phase"
+        );
+        assert_eq!(back, chat);
+
+        let help = chat.clone().for_edit_help();
+        assert_eq!(help.phase_name, EDIT_HELP_PHASE);
+        assert_eq!(
+            ChatRunSpec {
+                phase_name: CHAT_PHASE.to_owned(),
+                ..help
+            },
+            chat,
+            "for_edit_help keeps every other field"
         );
     }
 }

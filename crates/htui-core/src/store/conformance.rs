@@ -1860,6 +1860,8 @@ async fn set_step_usage_writes_usage_and_digest<S: WriteStore>(store: &S) {
 /// no-op on replay, leaves every item's run list alone, and `finish_chat_run` closes both rows
 /// (plan D4).
 async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
+    use crate::model::run::{CHAT_PHASE, EDIT_HELP_PHASE};
+
     let before = store
         .runs(ids::HTUI_FEAT_1)
         .await
@@ -1886,6 +1888,18 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
         .start_chat_run(&chat)
         .await
         .expect("start_chat_run_mints_chat_rows: the mint must land");
+    let steps = store
+        .run_steps(chat.run_id)
+        .await
+        .expect("start_chat_run_mints_chat_rows: read must not fail");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.id, step.phase_name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(chat.step_id, CHAT_PHASE)],
+        "start_chat_run_mints_chat_rows: a chat's one step carries the chat phase"
+    );
     let rows: Vec<SessionEvent> = (0..3).map(|seq| chat_event(chat.step_id, seq)).collect();
     assert_eq!(
         store
@@ -1944,6 +1958,59 @@ async fn start_chat_run_mints_chat_rows<S: WriteStore>(store: &S) {
     assert!(
         matches!(live, Err(StoreError::Constraint(_))),
         "start_chat_run_mints_chat_rows: a non-terminal finish status is refused, got {live:?}"
+    );
+
+    // MOD-55 plan P5: an editor's help turn is the same pair, marked by its step's phase name
+    // (amendment A-10 extends this case rather than adding one).
+    let help = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        None,
+    )
+    .for_edit_help();
+    store
+        .start_chat_run(&help)
+        .await
+        .expect("start_chat_run_mints_chat_rows: the help mint must land");
+    let run = store
+        .run(help.run_id)
+        .await
+        .expect("start_chat_run_mints_chat_rows: read must not fail")
+        .expect("start_chat_run_mints_chat_rows: the help run exists");
+    assert_eq!(
+        (run.kind, run.item_id),
+        (RunKind::Chat, None),
+        "start_chat_run_mints_chat_rows: a help turn is still a free-standing chat run"
+    );
+    let steps = store
+        .run_steps(help.run_id)
+        .await
+        .expect("start_chat_run_mints_chat_rows: read must not fail");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.id, step.phase_name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(help.step_id, EDIT_HELP_PHASE)],
+        "start_chat_run_mints_chat_rows: a help turn's step carries the edit_help phase"
+    );
+    store
+        .finish_chat_run(help.run_id, help.step_id, RunStatus::Done, Utc::now())
+        .await
+        .expect("start_chat_run_mints_chat_rows: the help close must land");
+    let steps = store
+        .run_steps(help.run_id)
+        .await
+        .expect("start_chat_run_mints_chat_rows: read must not fail");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.phase_name.as_str(), step.status))
+            .collect::<Vec<_>>(),
+        vec![(EDIT_HELP_PHASE, StepStatus::Done)],
+        "start_chat_run_mints_chat_rows: finish_chat_run closes a help turn like any chat"
     );
 }
 
