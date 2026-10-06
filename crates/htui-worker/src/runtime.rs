@@ -4623,9 +4623,16 @@ mod role_gate {
         async fn mod62_a_verify_command_printing_its_environment_shows_no_resolved_value() {
             let scratch = Scratch::new();
             let mut data = demo_data();
-            let print_env = if cfg!(windows) { "set" } else { "env" };
+            // Names only on Unix, plus the one variable's own value: a bare `env` prints every
+            // value of the test process, and a pattern-shaped one there (an exported
+            // `ANTHROPIC_API_KEY`) makes the verifier withhold the whole output.
+            let print_env = if cfg!(windows) {
+                "set".to_owned()
+            } else {
+                format!("env | cut -d= -f1; echo \"resolved=${{{KEY}-unset}}\"")
+            };
             for phase in &mut data.phases {
-                phase.verify_command = Some(print_env.to_owned());
+                phase.verify_command = Some(print_env.clone());
             }
             let store = on_a_worker_box(seeded(MemStore::from_demo(data)).await, true).await;
             // The fake roots each tree at `<root>/<repo id>` and creates nothing: the verify
@@ -4662,6 +4669,12 @@ mod role_gate {
                 "the command printed the environment: {output}"
             );
             assert!(!output.contains(VALUE), "{output}");
+            if !cfg!(windows) {
+                assert!(
+                    output.contains("resolved=unset"),
+                    "the verify child does not inherit the resolved key: {output}"
+                );
+            }
             assert!(
                 !output.contains(KEY),
                 "the verifier's child never received the resolved map: {output}"
