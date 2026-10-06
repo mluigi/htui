@@ -514,6 +514,9 @@ pub struct AgentRuntime {
     /// MOD-11 D11: htui's MCP host, which every chat opens one lease on (OQ-8); `None` keeps
     /// every chat's `mcp` empty.
     tools: Option<Arc<dyn ToolHost>>,
+    /// MOD-55 review M2: what [`with_session_env`](Self::with_session_env) seeded. Test-only.
+    #[cfg(test)]
+    session_env: BTreeMap<String, String>,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -653,6 +656,8 @@ impl AgentRuntime {
             probe_env: None,
             hardware: None,
             tools: None,
+            #[cfg(test)]
+            session_env: BTreeMap::new(),
         }
     }
 
@@ -812,6 +817,16 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
+        self
+    }
+
+    /// MOD-55 review M2: the environment every session this runtime starts is handed, so a test
+    /// can put a known value in the scrubber's set. Test-only: until MOD-10's secret provider a
+    /// session carries none.
+    #[cfg(test)]
+    #[must_use]
+    fn with_session_env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.session_env = env;
         self
     }
 
@@ -2084,8 +2099,11 @@ impl AgentRuntime {
         // MOD-10 fills this from the secret provider; until then a session carries none, and the
         // scrubber built over it therefore masks the credential prefixes only. Read here, ahead
         // of everything else, because a help's prompt is scrubbed with it before anything exists
-        // (MOD-55 P2).
+        // (MOD-55 P2). A test seeds it (MOD-55 review M2) to give the scrub a value to mask.
+        #[cfg(not(test))]
         let env: BTreeMap<String, String> = BTreeMap::new();
+        #[cfg(test)]
+        let env = self.session_env.clone();
         let (prompt, mode) = match opening {
             Opening::Chat(text) => (text, ChatMode::Conversation),
             Opening::Help(help) => {
@@ -6220,20 +6238,61 @@ pub(crate) mod tests {
     }
 
     /// T3-g (P2): what the driver is sent is the assembly of the scrubbed prompt, nothing else.
+    ///
+    /// MOD-55 review M2: with a known value in the session's environment (the test seam MOD-10's
+    /// secret provider will fill), so the scrub has something to mask: the driver gets
+    /// `[REDACTED]` where the body and the request held it, and neither the `prompt` row, the log
+    /// nor a frame carries it.
     #[tokio::test]
     async fn the_driver_is_sent_the_scrubbed_assembly() {
-        let (_store, backend, mut runtime, agent_id, starts) =
+        const SECRET: &str = "hunter2-secret-value";
+        let (store, backend, runtime, agent_id, starts) =
             fixture_with_failing_starts(help_script(), Vec::new()).await;
+        let mut runtime = runtime.with_session_env(BTreeMap::from([(
+            "HTUI_TEST_SECRET".to_owned(),
+            SECRET.to_owned(),
+        )]));
+        let body = format!("pw {SECRET}\n");
+        let request = format!("use {SECRET}");
 
-        run_help(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+        let (step_id, replies) =
+            run_help(&mut runtime, &backend, help(agent_id, &body, &request)).await;
 
         let starts = starts_of(&starts);
         assert_eq!(starts.len(), 1, "one start");
-        let scrubber = MinimalScrubber::new(std::iter::empty::<String>());
-        let clean = help_prompt("old\n", "new")
+        let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+        let clean = help_prompt(&body, &request)
             .scrubbed(&scrubber)
-            .expect("nothing to refuse");
+            .expect("a known value masks");
+        assert_eq!(
+            clean.body, "pw [REDACTED]\n",
+            "the mask the driver must see"
+        );
         assert_eq!(starts[0].1, edit_help::assemble(&clean));
+        assert!(!starts[0].1.contains(SECRET), "the driver saw the secret");
+
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("the help step has a log");
+        let prompt = log
+            .iter()
+            .find(|row| row.kind == EventKind::Prompt)
+            .expect("a prompt row");
+        assert_eq!(
+            prompt.payload["text"].as_str(),
+            Some(edit_help::assemble(&clean).as_str()),
+            "the row is the scrubbed assembly"
+        );
+        assert!(
+            !format!("{log:?}").contains(SECRET),
+            "no row carries the secret"
+        );
+        assert!(
+            !format!("{replies:?}").contains(SECRET),
+            "no frame carries the secret"
+        );
     }
 
     /// T3-h: a help whose spawn fails is refused as `edit_help`, not as `chat_start`, then its
