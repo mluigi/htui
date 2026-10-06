@@ -1900,8 +1900,9 @@ impl WriteStore for PgStore {
     /// The `run` / `run_step` pair of a free-standing chat, in one transaction, both
     /// `ON CONFLICT (id) DO NOTHING` (plan D4).
     ///
-    /// The pair is `kind 'chat'`, `mode 'manual'`, `item_id NULL`, `phase_name 'chat'`,
-    /// `position 0`, `attempt 1`, `fanout_index 0`, `executing_box_id` = the target box, both rows
+    /// The pair is `kind 'chat'`, `mode 'manual'`, `item_id NULL`, the spec's `phase_name`
+    /// (`'chat'`, or `'edit_help'` for a help turn, MOD-55 plan P5), `position 0`, `attempt 1`,
+    /// `fanout_index 0`, `executing_box_id` = the target box, both rows
     /// `running` with `finished_at` NULL (which [`WriteStore::finish_chat_run`] closes), `agent_id`
     /// and `model` from the spec, and every stamp `chat.started_at`. The ids are minted
     /// client-side, so a start retried after an answer that never arrived lands on the pair the
@@ -1933,10 +1934,11 @@ impl WriteStore for PgStore {
         sqlx::query!(
             "INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name, \
                                    agent_id, model, status, started_at, finished_at) \
-             VALUES ($1, $2, 0, 1, 0, 'chat', $3, $4, 'running', $5, NULL) \
+             VALUES ($1, $2, 0, 1, 0, $3, $4, $5, 'running', $6, NULL) \
              ON CONFLICT (id) DO NOTHING",
             chat.step_id.as_uuid(),
             chat.run_id.as_uuid(),
+            chat.phase_name.as_str(),
             chat.agent_id.map(AgentId::as_uuid),
             chat.model.as_deref(),
             chat.started_at,

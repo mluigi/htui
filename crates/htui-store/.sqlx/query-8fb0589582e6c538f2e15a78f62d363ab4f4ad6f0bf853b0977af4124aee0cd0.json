@@ -1,0 +1,19 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO run_step (id, run_id, position, attempt, fanout_index, phase_name, agent_id, model, status, started_at, finished_at) VALUES ($1, $2, 0, 1, 0, $3, $4, $5, 'running', $6, NULL) ON CONFLICT (id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8fb0589582e6c538f2e15a78f62d363ab4f4ad6f0bf853b0977af4124aee0cd0"
+}
