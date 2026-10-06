@@ -3,7 +3,7 @@
 **Source**: HANDOFF.md MOD-78 (from MOD-11, `docs/decisions/mod/mod-11.md` I-3 and review L5)
 **Route**: plan (C3 only, weak; maintainer accepted 2026-10-06)
 **Complexity**: Medium
-**Status**: confirmed 2026-10-06 — implementing
+**Status**: done 2026-10-07 — `docs/decisions/mod/mod-78.md`
 
 ## Summary
 
