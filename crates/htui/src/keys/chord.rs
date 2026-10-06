@@ -126,8 +126,9 @@ impl KeyChord {
     ///
     /// Parts are trimmed, the key is split off at the last `-`/`+` that is not the final
     /// character (so `ctrl--` is `ctrl` + `-`), and the only modifiers are `ctrl`, `alt` and
-    /// `shift`. `shift-` with a character is refused with the character to write instead, a
-    /// `ctrl-` capital with its lower case, and a ctrl chord the terminal delivers as another key
+    /// `shift`. `shift-` with a letter is refused with the capital to write, `shift-` with another
+    /// character is refused outright, `ctrl-` with a capital (or with `shift-` and a letter) is
+    /// refused with the lower case, and a ctrl chord the terminal delivers as another key
     /// (`ctrl-i` is `Tab`) with what arrives. `ctrl-c` is not refused here: that is the loader's
     /// rule.
     ///
@@ -449,7 +450,7 @@ mod tests {
         assert_eq!(typed, chord("?"));
     }
 
-    /// Every spelling the M1 catalogue writes, which both parsers must read alike.
+    /// Blueprint §2.5 test 4's canonical specs, which both parsers must read alike.
     const CANONICAL: [&str; 25] = [
         "q",
         "?",
@@ -590,6 +591,7 @@ mod tests {
     #[test]
     fn unknown_empty_and_repeated_parts_are_refused() {
         assert_eq!(strict(""), Err(ChordError::Empty));
+        assert_eq!(ChordError::Empty.to_string(), "an empty chord");
         assert_eq!(strict("   "), Err(ChordError::Empty));
         assert_eq!(
             strict("hyper-x"),
@@ -611,6 +613,21 @@ mod tests {
             strict("-x"),
             Err(ChordError::UnknownModifier(String::new()))
         );
+        // The messages M2 prints after `keys.toml:LINE: [context] name = "spec": `.
+        for (spec, message) in [
+            (
+                "hyper-x",
+                r#""hyper" is not a modifier: write ctrl, alt or shift"#,
+            ),
+            ("ctrl-ctrl-x", r#""ctrl" is written twice"#),
+            (
+                "ctrl-wat",
+                r#""wat" is not a key: write one character or a key name such as "enter" or "f5""#,
+            ),
+        ] {
+            let refused = strict(spec).expect_err("the spec is refused");
+            assert_eq!(refused.to_string(), message, "{spec}");
+        }
     }
 
     #[test]
@@ -620,6 +637,12 @@ mod tests {
             Err(ChordError::ShiftedCharacter {
                 written: "shift-1".to_owned()
             })
+        );
+        assert_eq!(
+            strict("shift-1")
+                .expect_err("shift-1 is refused")
+                .to_string(),
+            r#""shift-1": write the character the shifted key types instead"#
         );
     }
 
