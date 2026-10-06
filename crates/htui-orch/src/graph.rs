@@ -293,7 +293,7 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 /// agent on the box" (plan D62), so which box is a resolution input.
 ///
 /// `mode` is recorded on the snapshot and decides `gate_effective`: in auto mode every phase whose
-/// gate is not hard is snapshotted `never` ([`effective_gate`], MOD-12 D10). `resume` re-resolves
+/// gate is not hard is snapshotted `never` (`effective_gate`, MOD-12 D10). `resume` re-resolves
 /// under the run's own mode (`engine.rs:3036-3044`), so the topology an auto run is compared
 /// against is downgraded the same way (H-3).
 ///
