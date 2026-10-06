@@ -5538,6 +5538,97 @@ async fn a_densely_echoed_secret_is_never_split_when_every_stepped_candidate_fai
     }
 }
 
+/// A resolved value 10000 bytes long: lowercase letters from a fixed LCG, so it is the same on
+/// every run, no pattern rule matches it, and it has no newline. Long enough that `hold_back`
+/// (9999) is over half the bound, so an occurrence that opens the run can hold the first
+/// candidate.
+fn long_secret() -> String {
+    let mut state: u32 = 0x2545_f491;
+    (0..10_000)
+        .map(|_| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            char::from(b'a' + u8::try_from((state >> 16) % 26).expect("below 26"))
+        })
+        .collect()
+}
+
+/// A resolved secret over 8 KiB echoed twice, the run opening with the first occurrence and the
+/// second still incomplete at the bound. The first candidate (`len - hold_back`) falls in the
+/// occurrence that starts the run, so no cut above 0 keeps both occurrences whole. Before the fix
+/// the seam found no cut and flushed the run whole at the bound: the head ended with the second
+/// occurrence's first 6383 bytes, the next row began with the rest, and the two rows concatenated
+/// held the secret. The run must stay open instead, until the second occurrence is complete and
+/// its start is a seam.
+#[tokio::test]
+async fn a_long_secret_opening_the_run_keeps_it_open_rather_than_split_the_next_occurrence() {
+    let chat = chat_spec();
+    let secret = long_secret();
+    let scrubber = MinimalScrubber::new([secret.clone()]);
+    let hold = scrubber.hold_back();
+    assert_eq!(hold, 9999, "the secret's length - 1");
+    let store = open_chat(&chat).await;
+    let stream = format!("{secret}\n{secret}\nbye");
+    let bound = 16 * 1024;
+    let first = bound - hold;
+    assert!(
+        first < secret.len(),
+        "the first candidate ({first}) is inside the occurrence at [0, {})",
+        secret.len()
+    );
+    assert!(
+        bound < 2 * secret.len() + 1,
+        "the second occurrence is incomplete at the bound"
+    );
+    // 1 KiB chunks, so no chunk holds a whole occurrence and capture masks none: the run itself
+    // holds them, as a token stream would deliver them. The 16th chunk reaches the bound.
+    let script: Vec<DriverEnvelope> = stream
+        .as_bytes()
+        .chunks(1024)
+        .map(|piece| acp_chunk(core::str::from_utf8(piece).expect("ASCII"), None))
+        .chain([end_turn()])
+        .collect();
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(
+        texts,
+        ["[REDACTED]\n", "[REDACTED]\nbye"],
+        "kept open past the bound, then cut at the second occurrence's start (10001)"
+    );
+    assert_nowhere(&log, &secret);
+    let (head, tail) = secret.split_at(6383);
+    for pair in texts.windows(2) {
+        let joined = pair.concat();
+        assert!(
+            !joined.contains(&secret),
+            "adjacent rows' texts never rejoin the secret"
+        );
+        assert!(
+            !joined.contains(head) && !joined.contains(tail),
+            "neither part of the occurrence split at the bound is left on a row"
+        );
+    }
+    for row in &log {
+        assert!(
+            !raw_text(row).contains(&secret),
+            "row {}'s raw holds the secret",
+            row.seq
+        );
+    }
+    for pair in log.windows(2) {
+        let joined = format!("{}{}", raw_text(&pair[0]), raw_text(&pair[1]));
+        assert!(
+            !joined.contains(&secret),
+            "rows {} and {}: their raw joined holds the secret",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+}
+
 /// A scrubber that keeps the default `hold_back` (0) keeps the cut at the bound exactly, as before
 /// MOD-10 M3 (blueprint A-3).
 #[tokio::test]
