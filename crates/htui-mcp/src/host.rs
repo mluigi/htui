@@ -560,16 +560,24 @@ impl McpClient {
 #[cfg(test)]
 pub(crate) mod tests {
     use std::path::PathBuf;
+    use std::time::Duration;
 
+    use chrono::Utc;
     use htui_core::fixtures::ids;
-    use htui_core::model::{RunId, StepId, Transport};
+    use htui_core::model::{
+        CommandRunId, CommandRunStatus, NewCommandRun, RunId, StepId, Transport,
+    };
     use htui_core::prompt::render::HostnameLine;
-    use htui_core::store::{MemStore, StepFence};
-    use htui_orch::tools::{ToolHost, ToolHostError, ToolScope};
+    // Blueprint B-8: `WriteStore` only; with `WorkerStore` too, `MemStore`'s calls are E0034.
+    use htui_core::store::{MemStore, StepFence, WriteStore};
+    use htui_orch::tools::{ToolHost, ToolHostError, ToolLease, ToolScope};
     use htui_store::Backend;
+    use tokio::task::JoinHandle;
+    use uuid::Uuid;
 
     use super::{McpHost, lock};
     use crate::channel::{Refusal, Token};
+    use crate::protocol::CallResult;
     use crate::{ENV_ADDR, ENV_TOKEN};
 
     /// A demo-store host (blueprint B-1).
@@ -782,6 +790,162 @@ pub(crate) mod tests {
             client.tool_names().await.expect("tools/list").is_empty(),
             "an ended session offers nothing"
         );
+        drop(lease);
+    }
+
+    /// The bound every MOD-78 in-flight wait gets.
+    const IN_FLIGHT_BOUND: Duration = Duration::from_secs(5);
+
+    /// Polls `step`'s `command_run` rows until one other than `skip` has `status`, within
+    /// [`IN_FLIGHT_BOUND`]; answers its id.
+    async fn until_row(
+        store: &MemStore,
+        skip: CommandRunId,
+        status: CommandRunStatus,
+    ) -> CommandRunId {
+        tokio::time::timeout(IN_FLIGHT_BOUND, async {
+            loop {
+                let rows = store
+                    .command_runs(ids::STEP_R2_PRD)
+                    .await
+                    .expect("the step's rows");
+                if let Some(row) = rows
+                    .iter()
+                    .find(|row| row.id != skip && row.status == status)
+                {
+                    return row.id;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("no {status} row within {IN_FLIGHT_BOUND:?}"))
+    }
+
+    /// MOD-78 T2 (blueprint §3): a `command_run` in flight that can never be admitted. Another
+    /// claimant holds the box's only `build` slot, so the call waits in `admit` for ever. Answers
+    /// the store, the host, the session's lease, the spawned call, and the id of the call's
+    /// `queued` row.
+    async fn queued_call() -> (
+        MemStore,
+        McpHost<Backend>,
+        ToolLease,
+        JoinHandle<std::io::Result<CallResult>>,
+        CommandRunId,
+    ) {
+        let store = MemStore::demo();
+        let host = McpHost::new(Backend::memory(store.clone())).expect("a host");
+        let held = store
+            .enqueue_command(NewCommandRun {
+                id: CommandRunId::new(),
+                run_step_id: ids::STEP_R2_PRD,
+                box_id: ids::BOX,
+                class: "build".to_owned(),
+                command: "make".to_owned(),
+                cwd: "/srv".to_owned(),
+                status: CommandRunStatus::Queued,
+                exit_code: None,
+                output: None,
+                queued_at: Utc::now(),
+                started_at: None,
+                finished_at: None,
+            })
+            .await
+            .expect("queued");
+        assert!(
+            store
+                .claim_command(held.id, Uuid::now_v7(), 1)
+                .await
+                .expect("a claim")
+                .is_some(),
+            "another claimant holds the one build slot"
+        );
+        // Blueprint B-5: a run and step the store knows, not `scope()`'s fresh ids.
+        let lease = host
+            .open(ToolScope {
+                run_id: ids::RUN_2,
+                step_id: ids::STEP_R2_PRD,
+                command_queue: true,
+                ..scope(Transport::Acp)
+            })
+            .expect("a lease");
+        let mut client = host
+            .client(&lease.spec.env[ENV_TOKEN])
+            .expect("a live session");
+        client.initialize().await.expect("initialize");
+        let call = tokio::spawn(async move {
+            client
+                .call(
+                    "command_run",
+                    serde_json::json!({"class": "build", "command": "true"}),
+                )
+                .await
+        });
+        let ours = until_row(&store, held.id, CommandRunStatus::Queued).await;
+        (store, host, lease, call, ours)
+    }
+
+    /// Asserts `call` answers `session ended` within [`IN_FLIGHT_BOUND`], then that the dropped
+    /// call's row `ours` ends `cancelled` (`Enqueued`'s drop cancels it in a spawned task).
+    async fn ends_with_its_session(
+        store: &MemStore,
+        call: JoinHandle<std::io::Result<CallResult>>,
+        ours: CommandRunId,
+    ) {
+        let answer = tokio::time::timeout(IN_FLIGHT_BOUND, call)
+            .await
+            .expect("the in-flight call ends with its session")
+            .expect("the call task")
+            .expect("an answer");
+        assert!(answer.is_error, "{}", answer.text);
+        assert_eq!(answer.text, "session ended");
+        let cancelled = tokio::time::timeout(IN_FLIGHT_BOUND, async {
+            loop {
+                let rows = store
+                    .command_runs(ids::STEP_R2_PRD)
+                    .await
+                    .expect("the step's rows");
+                let row = rows.iter().find(|row| row.id == ours).expect("our row");
+                if row.status == CommandRunStatus::Cancelled {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        assert!(cancelled.is_ok(), "our row ends cancelled");
+    }
+
+    /// MOD-78 R3, D6: dropping the lease ends a call already in flight, not only later calls.
+    #[tokio::test]
+    async fn an_in_flight_call_ends_when_its_lease_drops() {
+        let (store, host, lease, call, ours) = queued_call().await;
+        drop(lease);
+        ends_with_its_session(&store, call, ours).await;
+        drop(host);
+    }
+
+    /// MOD-78 R3, D6: `close()` ends a call already in flight.
+    #[tokio::test]
+    async fn an_in_flight_call_ends_when_the_host_closes() {
+        let (store, host, lease, call, ours) = queued_call().await;
+        host.close();
+        ends_with_its_session(&store, call, ours).await;
+        drop(lease);
+    }
+
+    /// MOD-78 D7: dropping the last `McpHost` ends a call already in flight, which holds its
+    /// session's `Served` and so outlives the `Weak` in `Bound`.
+    #[tokio::test]
+    async fn an_in_flight_call_ends_with_the_last_host() {
+        let (store, host, lease, call, ours) = queued_call().await;
+        let inner = std::sync::Arc::downgrade(&host.inner);
+        drop(host);
+        assert!(
+            inner.upgrade().is_none(),
+            "nothing else keeps the host alive"
+        );
+        ends_with_its_session(&store, call, ours).await;
         drop(lease);
     }
 
