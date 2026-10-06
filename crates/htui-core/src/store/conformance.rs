@@ -15986,9 +15986,11 @@ async fn deleting_a_project_takes_its_relay_rows<S: WriteStore>(store: &S) {
 
 // ------------------------------------------------------------------------------------------
 // MOD-70 T0 (plan D1-D5, D9; blueprint B-3..B-5, B-13, B-14, B-19): follow-ups for engine steps.
-// Each case starts from `follow_up_step` (owner A, the fixture box, item `HTUI_ANA_2`, the step
-// `running`); the demo user and the fixture box are the sending actor. A box runs at most two
-// claimed runs at once, so no case leases more than two.
+// Every case but the first starts from `follow_up_step` (owner A, the fixture box, item
+// `HTUI_ANA_2`, the step `running`); the first, which walks the refusal order from a step still
+// `pending`, starts from `leased_step`. A second run comes from `other_follow_up_step`. The demo
+// user and the fixture box are the sending actor. A box runs at most two claimed runs at once, so
+// no case leases more than two.
 // ------------------------------------------------------------------------------------------
 
 /// MOD-70: `leased_step`, with the step moved `pending -> running`.

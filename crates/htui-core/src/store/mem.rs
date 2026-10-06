@@ -7314,7 +7314,7 @@ impl State {
     /// D5, B-13: the newest follow-up of each step of the item's non-terminal runs (the pending
     /// one if any, else the greatest `(issued_at, id)`), in `(issued_at, id)` order. No text.
     fn follow_up_views(&self, item: ItemId) -> Vec<FollowUpView> {
-        let mut newest: BTreeMap<StepId, (&RunCommand, StepId)> = BTreeMap::new();
+        let mut newest: BTreeMap<StepId, &RunCommand> = BTreeMap::new();
         for row in self.run_commands.values() {
             if row.kind != RunCommandKind::FollowUp {
                 continue;
@@ -7333,15 +7333,15 @@ impl State {
             newest
                 .entry(payload.run_step_id)
                 .and_modify(|held| {
-                    if key(row) > key(held.0) {
-                        *held = (row, payload.run_step_id);
+                    if key(row) > key(held) {
+                        *held = row;
                     }
                 })
-                .or_insert((row, payload.run_step_id));
+                .or_insert(row);
         }
         let mut views: Vec<FollowUpView> = newest
-            .into_values()
-            .map(|(row, step)| FollowUpView {
+            .into_iter()
+            .map(|(step, row)| FollowUpView {
                 id: row.id,
                 run_id: row.run_id,
                 run_step_id: step,
