@@ -1,0 +1,90 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE queue_batch\n               SET closed_at = $3, closed_reason = $2\n             WHERE box_id = $1 AND closed_at IS NULL\n            RETURNING id AS \"id: BatchId\", box_id AS \"box_id: BoxId\", opened_at,\n                      opened_by AS \"opened_by: UserId\", closed_at,\n                      closed_reason AS \"closed_reason: BatchClose\"\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: BatchId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_batch",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_batch",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "opened_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "queue_batch",
+            "name": "opened_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "opened_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_batch",
+            "name": "opened_by"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "closed_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "queue_batch",
+            "name": "closed_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "closed_reason: BatchClose",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "queue_batch",
+            "name": "closed_reason"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "64d20048752200cd79d74eeb5f0ee6226af0dc7a5319e07caca34c6b1e5bd3f3"
+}

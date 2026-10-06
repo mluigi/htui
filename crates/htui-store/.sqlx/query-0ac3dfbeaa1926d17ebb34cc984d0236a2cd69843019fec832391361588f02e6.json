@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO queue_batch (id, box_id, opened_at, opened_by)\n                VALUES ($1, $2, $3, $4)\n                ON CONFLICT (box_id) WHERE closed_at IS NULL DO NOTHING\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Timestamptz",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "0ac3dfbeaa1926d17ebb34cc984d0236a2cd69843019fec832391361588f02e6"
+}

@@ -15,19 +15,19 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    Activation, Agent, AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile,
-    BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document, DocumentHead, DocumentId,
-    Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, Persona, PersonaId, PersonaPermission,
-    PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef, PromptScope,
-    PromptTemplate, Repo, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementRevision, RequirementSpec, RequirementState,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode,
-    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillVersion,
-    Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus, ToolCallCount,
-    UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    Activation, Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId,
+    BoxInfo, BoxProfile, BoxRow, BoxTool, CitationKind, CommandQueue, CoverageRow, Document,
+    DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId,
+    ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, Persona, PersonaId,
+    PersonaPermission, PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef,
+    PromptScope, PromptTemplate, QueueBatch, QueueEntry, Repo, RepoBoxPath, RepoId, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
+    RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
+    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
+    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
+    ToolCallCount, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -2219,6 +2219,100 @@ impl PgStore {
             .into_iter()
             .map(|row| (row.id, row.queued_at))
             .collect())
+    }
+
+    /// MOD-12 D4: `box_id`'s queue entries, `position NULLS LAST, queued_at, item_id`, each with
+    /// its item's project (D5).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+        sqlx::query_as!(
+            QueueEntry,
+            r#"
+            SELECT e.item_id    AS "item_id: ItemId",
+                   i.project_id AS "project_id: ProjectId",
+                   e.box_id     AS "box_id: BoxId",
+                   e.position,
+                   e.queued_at,
+                   e.queued_by  AS "queued_by: UserId"
+              FROM queue_entry e JOIN item i ON i.id = e.item_id
+             WHERE e.box_id = $1
+             ORDER BY e.position NULLS LAST, e.queued_at, e.item_id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-12 D2: `box_id`'s open batch, if any: whether its queue runs. `uq_queue_batch_open`
+    /// keeps it at most one.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn open_batch_of(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        sqlx::query_as!(
+            QueueBatch,
+            r#"
+            SELECT id            AS "id: BatchId",
+                   box_id        AS "box_id: BoxId",
+                   opened_at,
+                   opened_by     AS "opened_by: UserId",
+                   closed_at,
+                   closed_reason AS "closed_reason: BatchClose"
+              FROM queue_batch
+             WHERE box_id = $1 AND closed_at IS NULL
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-12 D3, D9: the runs admitted under `batch`, `(id, status)` by `(queued_at, id)`.
+    /// `run.batch_id` is not a [`Run`] field (D7), so this is the one read of batch membership.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn batch_runs(&self, batch: BatchId) -> Result<Vec<(RunId, RunStatus)>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT id AS "id: RunId", status AS "status: RunStatus"
+              FROM run
+             WHERE batch_id = $1
+             ORDER BY queued_at, id
+            "#,
+            batch.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows.into_iter().map(|row| (row.id, row.status)).collect())
+    }
+
+    /// MOD-12 D6 (H-5): `claim_run`'s slot count — `running` runs executing on `box_id`, **not**
+    /// `awaiting_approval` (that is [`active_runs_on_box`](PgStore::active_runs_on_box)). The
+    /// query text is `claim_run`'s byte for byte, so it shares that `.sqlx` entry.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn running_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+        let count = sqlx::query_scalar!(
+            "SELECT COUNT(*) FROM run WHERE executing_box_id = $1 AND status = 'running'",
+            box_id.as_uuid(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .unwrap_or(0);
+        Ok(usize::try_from(count).unwrap_or(0))
     }
 
     /// Every active run whose `repo_scope` intersects `scope`, in `(queued_at, id)` order: what
