@@ -85,7 +85,9 @@ blank/NUL/unchanged check for skills.
   save path and gate (`R-SKL-3`, `R-PRM-4`).
 - The send is refused, never degraded, when the scrub refuses (`R-ID-7` fails closed).
 - The agent receives no htui credentials (`R-SEC-2`).
-- The new key is a named action in MOD-67's catalogue, never a hard-coded chord.
+- ~~The new key is a named action in MOD-67's catalogue, never a hard-coded chord.~~ **Amended at
+  planning (2026-10-06):** the catalogue does not exist yet (MOD-67 not started), so the key is a
+  hard-coded chord like the editors' `Ctrl+S`/`Ctrl+E`, and MOD-67's milestone 4 picks it up (plan P10).
 
 ## Delivery Milestones
 <!-- Business outcomes, not engineering tasks. /plan turns each into a plan. -->
@@ -93,7 +95,7 @@ blank/NUL/unchanged check for skills.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Agent help in the Skills editors | From the Templates or Library editor, the maintainer asks a registered agent for an edit, sees the scrubbed, recorded reply as a diff, and accepts it into the buffer or discards it; saving still goes through the gate | pending | — |
+| 1 | Agent help in the Skills editors | From the Templates or Library editor, the maintainer asks a registered agent for an edit, sees the scrubbed, recorded reply as a diff, and accepts it into the buffer or discards it; saving still goes through the gate | in-progress | `.claude/plans/mod-55-editor-agent-help.plan.md` |
 
 ## Open Questions
 
