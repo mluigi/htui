@@ -176,7 +176,7 @@ so it never does.
   `cancelled` with `[stopped: fenced: lease lost]` before what it printed, and the call answers
   `fenced: lease lost`. A read that fails (the database is unreachable) does not stop a command
   already queued or running; only a call not yet queued is refused, with `store unavailable: …`.
-  The check is a plain read, so a command can run for up to 10 seconds after its lease is lost.
+  The check is a plain read, so a command can run for about 10 seconds after its lease is lost.
 - **No agent moves a status** (R-ENT-8): see `item_status`.
 - **Every text an agent writes, and every command's output, is scrubbed first, and fails
   closed** (R-ID-7, R-SEC-3): note and document bodies, document titles, command lines and output
@@ -188,7 +188,9 @@ so it never does.
 - **A token outlives nothing.** It is registered for exactly the session's life and never logged.
   When the session ends (the agent exits, the step settles, the chat ends, htui quits), the token
   is unregistered, and a call on a connection still open answers `session ended`, whether it
-  arrives later or was still running: a running `command_run` is killed and its row `cancelled`.
+  arrives later or was still running. A call that arrives later writes nothing; one still running
+  may already have written. A queued or running `command_run` is killed and its row `cancelled`,
+  unless it had already finished.
 - **The token is never on a command line.** For `claude-cli`, htui writes the session's MCP server
   list, token included, to a file `mcp.json` in a new directory `htui-cli-<pid>-<8 hex>`, and starts
   the CLI with `--mcp-config=<path>`, so the process list shows only the path. On Linux and macOS the
@@ -310,7 +312,7 @@ command ran.
   chat ends, htui quits), the call answers `session ended` at once, even on a connection still
   open, the row is `cancelled` and the command is killed.
 - If the session's run is taken over by another process while the call is queued or running, the
-  call notices within 10 seconds, the row is `cancelled` and the command is killed (see
+  call notices within about 10 seconds, the row is `cancelled` and the command is killed (see
   [Scope](#scope-what-a-session-can-touch)).
 - An agent that asked for progress (`_meta.progressToken`) gets an MCP progress notification every
   second while the call waits, and every 10 seconds while the command runs.
@@ -367,7 +369,8 @@ wins. A policy whose default is not `ask` gets none of them: under a persona's o
 
 The options are **Allow** and **Reject**. An allow lets the call run with its input unchanged; a
 reject answers the CLI `denied in htui`. A cancel answers every pending prompt
-`the session was cancelled`, and a session that ends answers them `the session ended`. A denied
+`the session was cancelled`. A session that ends answers a prompt still pending with the error
+`session ended`, as any call in flight (the CLI is being stopped then). A denied
 call is recorded once, by its answer.
 
 **Gated phases.** A phase with a gate other than `never` needs an agent that can be asked inline.
@@ -454,8 +457,10 @@ the private directory or the file that hands `claude-cli` its MCP servers. Check
 `$XDG_RUNTIME_DIR` (or the temporary directory) is writable and yours.
 
 **`session ended`.** The call came after its session ended, or was still running when it ended:
-the step settled or was cancelled, the chat ended, or htui quit. Nothing was written; a
-`command_run` that was queued or running was killed and its row `cancelled`.
+the step settled or was cancelled, the chat ended, or htui quit. A call that arrived after the
+end wrote nothing. One still running may or may not have written (a note or document whose write
+had already committed stays). A `command_run` that was queued or running was killed and its row
+`cancelled`, unless it had already finished.
 
 **`fenced: lease lost`.** Another process took the run over while this session was still running
 (it had lost its lease, for example after a long database outage). Nothing was written; the run
