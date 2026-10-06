@@ -16238,10 +16238,10 @@ mod tests {
         };
         use htui_core::fixtures::ids;
         use htui_core::model::{
-            EventKind, FOLLOW_UP_SESSION_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal,
-            FollowUpRequest, FollowUpText, Gate, ItemId, NewFollowUp, PermissionStatus,
-            RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, SessionEvent,
-            SnapshotCandidate, Status, StepId, StepPermission, StepStatus,
+            EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
+            FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpText, Gate, ItemId,
+            NewFollowUp, PermissionStatus, RunCommandId, RunCommandStatus, RunId, RunMode,
+            RunStatus, SessionEvent, SnapshotCandidate, Status, StepId, StepPermission, StepStatus,
         };
         use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
         use serde_json::Value;
@@ -18556,6 +18556,67 @@ mod tests {
 
             assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
             assert_ghost_staled(&harness.orch, &ghost).await;
+        }
+
+        /// MOD-70 review M-3: [`dropped_with_a_follow_up`] leaves the rows a failed close leaves
+        /// (D6 step 8 gave up after its retries, R-3): the step's window open over a pending
+        /// follow-up, the run `running` under this owner's lease and not in [`DeadWalks`]. A walk
+        /// that then settles the run terminal closes the run's windows before it gives the lease
+        /// back, so the row is refused with its text gone rather than kept for ever.
+        #[tokio::test(start_paused = true)]
+        async fn a_stranded_follow_up_is_refused_when_its_run_finishes() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id).0,
+                RunCommandStatus::Pending,
+                "the stranded follow-up is pending, its window open"
+            );
+            harness_engine!(harness.orch, engine);
+            let (store, now) = (&harness.orch.store, harness.orch.clock.now());
+
+            engine
+                .walk_leased(ghost.run_id, engine.fresh_until(), async {
+                    store
+                        .finish_run(ghost.run_id, RunStatus::Failed, Some("it gave up"), now)
+                        .await?;
+                    Ok::<_, EngineError>(())
+                })
+                .await
+                .expect("the walk finished the run");
+
+            assert_eq!(
+                harness.orch.run(ghost.run_id).await.status,
+                RunStatus::Failed
+            );
+            assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
+        }
+
+        /// MOD-70 review M-3 at a cancel command: the run's stranded follow-up is refused with
+        /// the run-cancelled sentence before the cancel gives the lease back.
+        #[tokio::test(start_paused = true)]
+        async fn a_stranded_follow_up_is_refused_when_its_run_is_cancelled() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+
+            let cancelled = harness
+                .dispatch(Command::CancelRun { run: ghost.run_id })
+                .await;
+
+            assert!(
+                matches!(cancelled, Ok(CommandOutcome::Cancelled { .. })),
+                "the cancel lands: {cancelled:?}"
+            );
+            assert_window_closed(&harness.orch.store, ghost.run_step_id);
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id),
+                (
+                    RunCommandStatus::Refused,
+                    Some(FOLLOW_UP_RUN_CANCELLED.to_owned()),
+                    false
+                ),
+                "a cancelled run's follow-up is refused, not stranded"
+            );
         }
     }
 
