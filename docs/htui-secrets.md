@@ -4,13 +4,13 @@ htui can read a project's secrets from [Infisical](https://infisical.com), so th
 session can get them as environment variables. It logs in with an Infisical **machine identity**
 whose client ID and client secret sit in the OS keyring, reads one project scope (a project, an
 environment and a folder), merges the folder's imports, and checks that every secret can be an
-environment variable. This is MOD-10 (`docs/REQUIREMENTS.md` R-SEC-1, R-SEC-2, R-SEC-4); the code
-is the `htui-secrets` crate.
+environment variable. This is MOD-10 (`docs/REQUIREMENTS.md` R-SEC-1, R-SEC-2, R-SEC-4); the
+client is the `htui-secrets` crate.
 
-**Not yet available.** Milestone 2 ships the client only. Passing the secrets into agent sessions
-(milestone 3) and the Settings section that stores the identity and the project scope
-(milestone 4) come later. Until then, nothing in htui calls Infisical except the live test
-described [at the end](#testing-against-a-real-server).
+A project whose `secret_provider` is set gets its secrets when a run or a chat starts an agent
+session ([At run start](#at-run-start)). **Not yet available:** the Settings section that stores
+the identity and the project's scope (milestone 4). Until then htui has no command or screen that
+writes the keyring entries or the project's two secret columns.
 
 - [Create a machine identity](#create-a-machine-identity)
 - [Keyring entries](#keyring-entries)
@@ -18,6 +18,7 @@ described [at the end](#testing-against-a-real-server).
 - [Scope](#scope)
 - [Imports and precedence](#imports-and-precedence)
 - [What htui refuses](#what-htui-refuses)
+- [At run start](#at-run-start)
 - [Logins, tokens and lockout safety](#logins-tokens-and-lockout-safety)
 - [What htui never prints](#what-htui-never-prints)
 - [Errors and what to do](#errors-and-what-to-do)
@@ -138,6 +139,197 @@ problem, in this order:
 Nothing is dropped or rewritten silently. Values are kept byte for byte, spaces and newlines
 included.
 
+## At run start
+
+A project's `secret_provider` column is the switch ([Scope](#scope)). When it is unset, htui
+resolves nothing and injects nothing: it reads neither the keyring nor Infisical, and ignores
+`secret_scope` whatever it holds. When it is `infisical`, htui resolves the scope before the
+project's agents start, hands the values to each agent session as environment variables, and
+masks them in everything it stores. Any other value is refused
+([When htui refuses](#when-htui-refuses)).
+
+### When htui resolves
+
+- **Once per walk**, at the walk's first live path: the first plain step that goes live, the
+  first group of fan-out candidates, or a judge, whichever comes first. A walk is one worker task
+  driving a run (a claim, a resume, a retry, a gate answer, an adoption by the sweep). Every
+  later step, candidate and judge of the same walk gets the same values without asking Infisical
+  again.
+- **Before anything of the session is stored**: before htui prepares the step's tree, writes its
+  prompt or trim record, or starts its agent.
+- **Again on every walk.** Values are never stored, so a resumed, retried or adopted walk resolves
+  again. A value changed in Infisical reaches the next walk, never the middle of one.
+- **Before an accepted artifact's verify.** Accepting a chat's artifact resolves before the verify
+  command runs, so its output can be masked with the values
+  ([The verify command](#the-verify-command)).
+- **Not at all** for a walk that starts no agent session, such as a gate answer that only
+  settles the step, a park or a promotion.
+- **Chats** resolve each time a chat starts or a promoted step's chat binds, in the chat's own
+  task, so a slow Infisical never stalls the rest of the TUI. The column checks run first and need
+  no network.
+
+The keyring is read at every resolution, on a blocking thread. A process keeps one provider: the
+TUI shares its one between its runs and its chats, and `htui worker` has its own. The provider is
+rebuilt only when the stored base URL (after [normalisation](#base-url)), client ID or client
+secret has changed, so an identity entered again takes effect at the next walk or chat, and
+[one refused login](#logins-tokens-and-lockout-safety) holds across walks and chats: after a
+`BadCredentials`, every later walk of that process meets `LoginRefusedEarlier` until the identity
+is entered again.
+
+On a plain step, resolution runs after the step has started, so the keyring read and the time
+Infisical takes to answer (up to 5 seconds to connect and 20 per request) are spent from the
+step's deadline.
+
+### What the agent gets
+
+- **Exactly the resolved map**: every key and value of the scope after the
+  [merge](#imports-and-precedence), byte for byte. Nothing else from htui goes in (R-SEC-2).
+- **Applied last**, over the agent row's own environment, so a secret wins over a row variable of
+  the same name.
+- **Only the agent.** htui never puts a value into its own environment (it cannot: `set_var` is
+  unsafe, and htui forbids unsafe code), so no other process htui starts, the verify command
+  included, receives the values.
+
+### Reserved names
+
+A resolved key that starts with `HTUI_` (case-sensitive) is refused as `ReservedKey`:
+``the secret name `HTUI_…` is reserved for htui; rename it in Infisical``. htui's own
+variables (`HTUI_MCP_*`, `HTUI_LOG*`, `HTUI_TOOL_*`) must never be shadowed by a secret that is
+applied last. The first such key, in key order, is named. `htui_token` (lower case) is allowed.
+
+### When htui refuses
+
+A refusal is decided before any agent starts. The run's failure reason reads `secrets_refused: `
+followed by the cause's sentence, for example:
+
+```
+secrets_refused: no Infisical machine identity is stored in the OS keyring
+```
+
+- **A plain step** fails, and the run and its item fail with it.
+- **A group of fan-out candidates** fails as one: each candidate fails with an item note
+  ``fan-out candidate <i> of `<phase>` attempt <n>: secrets_refused: …``, and the run fails. There
+  is no group retry and no selection.
+- **A judge** (only when it is its walk's first live path, as in a resumed walk) fails the run;
+  the selection is not parked.
+- **An accept** is refused with the same sentence and writes nothing: the step stays promoted and
+  parked, and can be accepted again once the secrets resolve.
+- **A chat** is refused with the same sentence and starts nothing. A new chat leaves no run
+  behind.
+
+Transient causes (`Unreachable`, `RateLimited`, `LoginCoolingDown`, `IdentityLocked`) fail the run
+too. htui never retries a resolution by itself, so it never chases a cool-down or a lockout: fix
+the cause, or wait, then run again.
+
+| Cause | Error |
+|---|---|
+| `secret_provider` names a provider this build does not know | `Config` (1) |
+| A provider but no `secret_scope` | `Config` (2) |
+| A `secret_scope` that does not parse | `Config`, naming the field ([Scope](#scope)) |
+| No base URL in the keyring | `Config` (3) |
+| A stored base URL htui refuses | `Config`, naming the reason ([Base URL](#base-url)) |
+| A keyring that cannot be read, or a half-stored identity | `Config` (4) |
+| No machine identity in the keyring | `NoIdentity` |
+| Anything Infisical or the network answers | Its variant ([Errors](#errors-and-what-to-do)) |
+| A key htui refuses after the merge | [What htui refuses](#what-htui-refuses) |
+| A key starting with `HTUI_` | `ReservedKey` ([Reserved names](#reserved-names)) |
+
+The `Config` sentences, after `secret provider configuration: `:
+
+1. `project.secret_provider "<value>" is not a provider this build knows (expected
+   "infisical")`, the value escaped;
+2. `the project names a secret provider but has no secret_scope`;
+3. `no Infisical base URL is stored in the OS keyring`;
+4. `the OS keyring could not be read: ` and the keyring's own message, which names the entry
+   (for a half-stored identity, the one that is missing), never a value.
+
+Three more guard htui's own wiring and should never be seen: `this process has no secret source,
+so the project's secrets cannot be resolved`, ``the secret source answered a `<kind>` provider for
+a `<column>` project`` and `this walk's secrets were resolved for another project`.
+
+### Masking
+
+What htui stores (session events, a step's prompt and trim record, a verify command's output) is
+masked with
+the resolved values once the walk or the chat has resolved them: every occurrence of a value
+becomes `[REDACTED]`. htui's credential rules (known key formats such as `sk-ant-…`, `ghp_…` or
+`AKIA…`) apply as before: a write that still holds one is refused, and the session fails closed.
+Before its first resolution, a walk is masked by the credential rules only.
+
+#### Short values
+
+A value shorter than 6 characters is injected but **not masked**: masking a 3-character value
+would shred every transcript. htui logs the **key names** of such values at `warn`, once per walk
+and once per chat (`these secrets are shorter than the masking floor: injected, not masked`), never
+the values. Lengthen them in Infisical.
+
+#### Trailing newlines
+
+A value stored with a trailing line end (`\n` or `\r\n`) is masked both as stored and without its
+trailing line ends, so the bare token an agent echoes is masked too. The trimmed form is masked
+only when it is itself at least 6 characters long. The value is still injected byte for byte.
+
+#### Escaped token starts
+
+A credential rule counts only at a token start: the start of the text, or after a character that
+is not a letter, a digit or `_`. A token start also follows a JSON or percent escape (`\n`,
+`\r`, `\t`, `\b`, `\f`, `\"`, `\/`, `\\`, `\uXXXX`, `%XX`), so a key serialised inside an escaped
+string (`…\nsk-ant-…`, `%22ghp_…`) is refused, while `subtask-…` is still prose. This widens what
+fails closed. `scripts/scrub-audit.sql` uses the same token start: run it on the host, against the
+database htui uses, to count the stored rows the wider rule would refuse (it prints counts only).
+
+#### The row seam
+
+htui stores an agent's streamed text in rows of up to 16 KiB. When a text run reaches that bound,
+htui cuts it and carries the rest into the next row. The cut keeps the end of the run open: as
+many bytes as the longest resolved value, or 76 for the credential rules, whichever is larger,
+less one. It moves back so that no value or credential is split: one complete before the cut is
+masked whole in the first row, and one still arriving lands whole in the next, masked there (a
+resolved value) or refused there (a credential). When every cut would split an occurrence of a
+value (a value longer than the run, or a run that opens with one), the run stays open past the
+bound instead, by about twice the hold-back at most. A run with no safe cut for any other reason
+is cut at the bound as before, and htui logs `no safe seam was found` at `warn`.
+
+The cut is decided from the run as it is at the bound, not from the bytes still to come, so four
+cases stay open:
+
+- **A credential already in the run before the cut point**, at its rule's minimum length, refuses
+  the run whatever the cut: the run is replaced by one `scrub_residue` row and the session fails
+  closed. A value still arriving in the same run is cut with it, and its rest lands, without its
+  start, in the next row.
+- **An `sk-` key whose body reads as words** (`sk-learn-preprocessing-…`) for longer than the
+  hold-back can be cut with both halves clean, then continue with a key-shaped part: neither row
+  is refused, while the two together would be.
+- **A JWT** only matches once its third segment arrives. When its header and payload are longer
+  than the hold-back (every real one is, unless a long resolved value widens it), a JWT cut inside
+  its payload leaves two clean rows that together would match.
+- **A cut inside a word, right before `sk-`**, makes `sk-` a token start in the carried row. If
+  the body grows into a key shape, the carried row is refused although the whole text would not
+  be. That is a false refusal: the session fails closed.
+
+### What is wiped
+
+The resolved map and the masking list are wiped from memory when htui drops them: a walk's when
+the walk ends, a chat's map once its environment is built and its masking list when the chat
+ends, and a refused map at once. Two copies are not htui's to wipe:
+
+- the environment handed to the agent's driver (`SessionSpec.env`, a plain map, and the copies the
+  driver makes from it to start the agent);
+- the agent process's own environment block, which the operating system keeps for the life of
+  that process.
+
+### The verify command
+
+A phase's verify command runs with htui's own environment, so it never receives the resolved
+values. Its output can still hold one, for example a command that prints a file the agent wrote
+(`cat .env`, a test log). The verify runner keeps the output's last 64 KiB and masks it with the
+credential rules; htui then masks it again with the walk's resolved values before storing it in
+`command_run.output`. Output the walk's masking refuses is dropped (stored empty), and a `warn`
+log says so.
+
+One case stays open: the 64 KiB cut comes before the second masking, so a value that straddles
+the start of the kept tail leaves its end in the output, and that end no longer matches the value.
+
 ## Logins, tokens and lockout safety
 
 Universal Auth locks an identity after repeated failed logins (by default 3 failures lock it for
@@ -175,12 +367,12 @@ one.
 No secret value, client secret or access token appears in any error, log line, `Debug` output or
 test failure. Errors may contain an endpoint path, an HTTP status, a key name, the scope's
 environment and folder, and, for requests other than the login, Infisical's own error message with
-control characters removed and cut to 200 characters. A failed login's body is never quoted.
+control characters removed and cut to 200 characters. A failed login's body is never quoted. A log
+line may name a key, never its value ([Short values](#short-values)).
 
 The client ID, the client secret, the access token and the resolved values are wiped from memory
-when htui drops them. Copies made on
-the way (the HTTP request and response buffers, and, from milestone 3, the agent's environment)
-are not.
+when htui drops them. Copies made on the way (the HTTP request and response buffers, and the
+agent's environment, see [What is wiped](#what-is-wiped)) are not.
 
 ## Errors and what to do
 
