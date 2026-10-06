@@ -39,7 +39,7 @@ pub const READ_NAME: &str = REQUEST_NAMES[0];
 /// [`StoreRequest::CheckSecretProvider`]'s name (D5).
 pub const CHECK_SECRET_PROVIDER: &str = "check_secret_provider";
 
-/// [`StoreRequest::CheckSecretScope`]'s name (D8).
+/// `StoreRequest::CheckSecretScope`'s name (D8).
 pub const CHECK_SECRET_SCOPE: &str = "check_secret_scope";
 
 /// The project scope write's name (D6). Not one of `hierarchy::REQUEST_NAMES` (blueprint A-11):
@@ -187,7 +187,7 @@ pub enum SecretCheck {
         /// The provider's health, or why there was none.
         outcome: std::result::Result<ProviderHealth, SecretError>,
     },
-    /// [`StoreRequest::CheckSecretScope`]'s: how many keys the project's scope shows.
+    /// `StoreRequest::CheckSecretScope`'s: how many keys the project's scope shows.
     Scope {
         /// The project checked.
         project: ProjectId,

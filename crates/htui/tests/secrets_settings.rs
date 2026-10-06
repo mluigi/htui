@@ -2,8 +2,8 @@
 //!
 //! The **worker half** (T2a, then T2b) drives `htui::store_worker::serve` directly: the keyring
 //! read and the four keyring writes need no loop state, so `try_serve` answers them for the loop,
-//! the harness and `--demo` alike (blueprint B.4). The provider check is the agent runtime's, so its
-//! cases call `AgentRuntime::serve` over a fake source and wait on the reply channel.
+//! the harness and `--demo` alike (blueprint B.4). The provider check is the agent runtime's, so
+//! its cases call `AgentRuntime::serve` over a fake source and wait on the reply channel.
 //!
 //! **Every case that can reach a keyring takes `common::mock_keyring()` (or
 //! `mock_keyring_broken()`) as its first statement**: the guard installs a process-wide fake and

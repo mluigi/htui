@@ -478,6 +478,84 @@ mod tests {
         assert!(Arc::ptr_eq(&second, &third), "and the new one is kept");
     }
 
+    /// An offline backend over a throwaway mirror: not `Memory`, so `secrets_settings::serve`
+    /// writes the keyring rather than refusing a demo session.
+    async fn offline() -> (tempfile::TempDir, htui_store::Backend) {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "secrets-generation", 1)
+            .await
+            .expect("open a throwaway mirror");
+        (root, htui_store::Backend::Offline { cache, since: None })
+    }
+
+    /// Serves `request` through the Settings > Secrets worker arm and expects a snapshot.
+    async fn serve_write(
+        backend: &htui_store::Backend,
+        request: crate::store_worker::StoreRequest,
+    ) {
+        let reply = crate::secrets_settings::serve(backend, &request)
+            .await
+            .expect("the write is served");
+        assert!(
+            matches!(reply, crate::store_worker::StoreReply::Secrets(_)),
+            "the write lands: {reply:?}"
+        );
+    }
+
+    /// M4 blueprint A-4 end to end: the Settings writes themselves, served through
+    /// `secrets_settings::serve`, give the next `provider()` a fresh provider even when they store
+    /// the very URL and identity the latched one was built from; a refused write does not.
+    #[tokio::test]
+    async fn a_settings_keyring_write_rebuilds_a_latched_provider() {
+        use crate::secrets_settings::{IdentityEntry, Redacted};
+        use crate::store_worker::StoreRequest;
+
+        let _guard = mock_keyring().await;
+        store_url(URL);
+        store_identity(CLIENT_ID, CLIENT_SECRET);
+        let (_root, backend) = offline().await;
+        let (source, builds) = counting(|| {
+            FakeSecretProvider::new([
+                Err(SecretError::BadCredentials),
+                Err(SecretError::LoginRefusedEarlier),
+            ])
+        });
+        let first = source.provider().await.expect("a provider");
+
+        let same_identity = || {
+            IdentityEntry::new(
+                CLIENT_ID.to_owned(),
+                Redacted::new(CLIENT_SECRET.to_owned()),
+            )
+        };
+        serve_write(&backend, StoreRequest::SetMachineIdentity(same_identity())).await;
+        let second = source.provider().await.expect("a provider");
+        assert_eq!(
+            builds.count(),
+            2,
+            "the same identity, saved again, rebuilds"
+        );
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        serve_write(&backend, StoreRequest::SetInfisicalUrl(URL.to_owned())).await;
+        let third = source.provider().await.expect("a provider");
+        assert_eq!(builds.count(), 3, "the same URL, saved again, rebuilds");
+        assert!(!Arc::ptr_eq(&second, &third));
+
+        let blank = IdentityEntry::new(CLIENT_ID.to_owned(), Redacted::new(String::new()));
+        let refused =
+            crate::secrets_settings::serve(&backend, &StoreRequest::SetMachineIdentity(blank))
+                .await
+                .expect("a refusal is a reply");
+        assert!(
+            matches!(refused, crate::store_worker::StoreReply::Failed { .. }),
+            "a blank half is refused: {refused:?}"
+        );
+        let fourth = source.provider().await.expect("a provider");
+        assert_eq!(builds.count(), 3, "a refused write keeps the provider");
+        assert!(Arc::ptr_eq(&third, &fourth));
+    }
+
     /// R1 M2: a keyring read that never answers (an OS unlock prompt nobody answers) refuses
     /// the walk after [`KEYRING_TIMEOUT`] and gives the lock back; the blocking read itself
     /// cannot be cancelled and is released here only so the test does not leak its thread.
