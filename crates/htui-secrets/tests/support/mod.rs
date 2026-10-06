@@ -23,6 +23,9 @@ pub struct Reply {
     pub declared_length: Option<usize>,
     /// How long to wait, after recording the request, before answering (see [`Reply::delayed`]).
     pub delay: Option<Duration>,
+    /// No `Content-Length` at all: the body ends when the connection closes (see
+    /// [`Reply::without_length`]).
+    pub undeclared_length: bool,
 }
 
 impl Reply {
@@ -34,6 +37,7 @@ impl Reply {
             body: serde_json::to_vec(body).expect("a JSON value serialises"),
             declared_length: None,
             delay: None,
+            undeclared_length: false,
         }
     }
 
@@ -45,6 +49,7 @@ impl Reply {
             body: body.as_bytes().to_vec(),
             declared_length: None,
             delay: None,
+            undeclared_length: false,
         }
     }
 
@@ -56,6 +61,7 @@ impl Reply {
             body: Vec::new(),
             declared_length: None,
             delay: None,
+            undeclared_length: false,
         }
     }
 
@@ -63,6 +69,14 @@ impl Reply {
     #[must_use]
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.headers.push((name.to_owned(), value.to_owned()));
+        self
+    }
+
+    /// Sends no `Content-Length`: the client learns the body's size only by reading it to the
+    /// close (`Connection: close` delimits it).
+    #[must_use]
+    pub fn without_length(mut self) -> Self {
+        self.undeclared_length = true;
         self
     }
 
@@ -287,11 +301,11 @@ fn serve(stream: &TcpStream, script: &Script, seen: &Mutex<Vec<Request>>) {
     if let Some(delay) = reply.delay {
         std::thread::sleep(delay);
     }
-    let mut head = format!(
-        "HTTP/1.1 {} X\r\nContent-Length: {}\r\nConnection: close\r\n",
-        reply.status,
-        reply.declared_length.unwrap_or(reply.body.len())
-    );
+    let mut head = format!("HTTP/1.1 {} X\r\nConnection: close\r\n", reply.status);
+    if !reply.undeclared_length {
+        let length = reply.declared_length.unwrap_or(reply.body.len());
+        head.push_str(&format!("Content-Length: {length}\r\n"));
+    }
     for (name, value) in &reply.headers {
         head.push_str(&format!("{name}: {value}\r\n"));
     }

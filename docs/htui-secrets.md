@@ -196,7 +196,7 @@ Every call fails with one of these. The sentence is what htui shows; `…` is fi
 | `UnsupportedServer` | this Infisical predates v0.150 (`<endpoint>` does not exist); upgrade it | Upgrade the server, or enable Universal Auth on it when the endpoint is the login's. |
 | `InvalidKey` | the secret name `"<key>"` is not a valid environment variable name; rename it in Infisical | Rename the secret to letters, digits and `_`, not starting with a digit. |
 | `InvalidValue` | the secret `<key>` holds a NUL byte, which an environment variable cannot carry; fix its value in Infisical | Remove the NUL from the value in Infisical. |
-| `Protocol` | unexpected answer from Infisical at `<endpoint>`: … | Check the base URL points at Infisical and not at a proxy or login page (a redirect lands here); otherwise the detail names the status or what was wrong with the answer. |
+| `Protocol` | unexpected answer from Infisical at `<endpoint>`: … | Check the base URL points at Infisical and not at a proxy or login page (a redirect lands here); otherwise the detail names the status or what was wrong with the answer. An answer larger than htui reads (64 KiB for a login or an error, 8 MiB for a secrets list) lands here too, naming the limit. |
 
 ## Testing against a real server
 

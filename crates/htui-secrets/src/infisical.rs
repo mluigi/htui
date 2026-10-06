@@ -36,6 +36,24 @@ const SECRETS_PATH: &str = "/api/v4/secrets";
 /// The unauthenticated status endpoint (health only).
 const STATUS_PATH: &str = "/api/status";
 
+/// A cap on a response body, and how a sentence names it.
+#[derive(Clone, Copy)]
+struct BodyCap {
+    bytes: usize,
+    name: &'static str,
+}
+
+/// The login answer and every error body: a few hundred bytes in practice.
+const SMALL_BODY: BodyCap = BodyCap {
+    bytes: 64 * 1024,
+    name: "64 KiB",
+};
+/// A list answer: every value of a folder and its imports.
+const LIST_BODY: BodyCap = BodyCap {
+    bytes: 8 * 1024 * 1024,
+    name: "8 MiB",
+};
+
 /// Guards [`install_crypto_provider`]: the process installs one default provider, once.
 static PROVIDER: Once = Once::new();
 
@@ -289,10 +307,12 @@ impl InfisicalProvider {
             return Ok(None);
         }
         let retry_after_secs = retry_after(response.headers());
-        let body = response
-            .bytes()
-            .await
-            .map_err(|e| unreachable(SECRETS_PATH, e))?;
+        let cap = if status.is_success() {
+            LIST_BODY
+        } else {
+            SMALL_BODY
+        };
+        let body = read_body(SECRETS_PATH, response, cap).await?;
         if status.is_success() {
             return decode(SECRETS_PATH, &body).map(Some);
         }
@@ -344,13 +364,13 @@ impl Inner {
             })?;
         let status = response.status();
         let retry_after_secs = retry_after(response.headers());
-        let body = response.bytes().await;
-        // D5: a 401 refuses the identity whatever happens to its body, so a body cut short can
-        // never turn a rejected login into a retried one.
+        let body = read_body(LOGIN_PATH, response, SMALL_BODY).await;
+        // D5: a 401 refuses the identity whatever happens to its body, so a body cut short or
+        // over the cap can never turn a rejected login into a retried one.
         if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(LoginFailure::Refused(login_refusal(body.as_deref().ok())));
         }
-        let body = body.map_err(|e| LoginFailure::Other(unreachable(LOGIN_PATH, e)))?;
+        let body = body.map_err(LoginFailure::Other)?;
         if status.is_success() {
             return accept_login(&body, Instant::now()).map_err(LoginFailure::Other);
         }
@@ -621,6 +641,45 @@ const MAX_REUSE: Duration = Duration::from_secs(10 * 365 * 24 * 60 * 60);
 fn reuse_until(now: Instant, expires_in_secs: u64) -> Instant {
     now.checked_add(reuse_window(expires_in_secs).min(MAX_REUSE))
         .unwrap_or(now)
+}
+
+/// The body, read chunk by chunk up to `cap`: a declared length over it is refused before the
+/// read, an undeclared one as soon as the bytes read pass it. Over the cap is `Protocol` naming
+/// the status and the cap, never the body; a transport error is `Unreachable`.
+async fn read_body(
+    endpoint: &'static str,
+    mut response: reqwest::Response,
+    cap: BodyCap,
+) -> Result<Vec<u8>, SecretError> {
+    let too_large = |status: reqwest::StatusCode| {
+        protocol(
+            endpoint,
+            format!(
+                "status {} with a body larger than the {} limit",
+                status.as_u16(),
+                cap.name
+            ),
+        )
+    };
+    let status = response.status();
+    if response
+        .content_length()
+        .is_some_and(|declared| declared > cap.bytes as u64)
+    {
+        return Err(too_large(status));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| unreachable(endpoint, e))?
+    {
+        if chunk.len() > cap.bytes - body.len() {
+            return Err(too_large(status));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// `Unreachable` for a transport error, its URL stripped.

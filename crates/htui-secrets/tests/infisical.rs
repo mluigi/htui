@@ -1295,6 +1295,104 @@ async fn an_empty_or_unusable_login_token_is_protocol_and_never_cached() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Body caps (R1 #5)
+// ---------------------------------------------------------------------------------------------
+
+/// The login and every error body.
+const SMALL_CAP: usize = 64 * 1024;
+/// A list answer.
+const LIST_CAP: usize = 8 * 1024 * 1024;
+
+/// `status` with a body of `len` bytes made of `TOKEN` and `VALUE`, with or without a declared
+/// length. Never valid JSON; only its size matters.
+fn oversized(status: u16, len: usize, declared: bool) -> Reply {
+    let filler = format!("{TOKEN} {VALUE} ");
+    let body: String = filler.chars().cycle().take(len).collect();
+    let reply = Reply::text(status, &body);
+    if declared {
+        reply
+    } else {
+        reply.without_length()
+    }
+}
+
+/// `err` is `Protocol` at `endpoint` naming `cap`, and quotes nothing of the body.
+#[track_caller]
+fn assert_too_large(err: &SecretError, endpoint: &str, cap: &str, case: &str) {
+    assert!(
+        matches!(err, SecretError::Protocol { endpoint: e, detail }
+            if *e == endpoint && detail.contains(&format!("larger than the {cap} limit"))),
+        "{case}: not Protocol at {endpoint} naming the {cap} cap"
+    );
+    let text = format!("{err} {err:?}");
+    assert!(!text.contains(TOKEN), "{case}: the error quotes the body");
+    assert!(!text.contains(VALUE), "{case}: the error quotes the body");
+}
+
+#[tokio::test]
+async fn an_oversized_login_answer_is_protocol_naming_the_cap_and_never_latches() {
+    for declared in [true, false] {
+        let case = format!("declared length {declared}");
+        let stub = Stub::start();
+        stub.on("POST", LOGIN, oversized(200, SMALL_CAP + 1, declared));
+        let p = provider(&stub);
+        for _ in 0..2 {
+            let err = p.resolve(&scope()).await.must_fail(&case);
+            assert_too_large(&err, LOGIN, "64 KiB", &case);
+        }
+        assert_eq!(stub.count("POST", LOGIN), 2, "{case}: latched");
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_list_answer_is_protocol_naming_the_cap() {
+    for declared in [true, false] {
+        let case = format!("declared length {declared}");
+        let err = list_error(oversized(200, LIST_CAP + 1, declared)).await;
+        assert_too_large(&err, SECRETS, "8 MiB", &case);
+    }
+}
+
+#[tokio::test]
+async fn an_oversized_list_error_body_is_protocol_naming_the_cap() {
+    for declared in [true, false] {
+        let case = format!("declared length {declared}");
+        let err = list_error(oversized(500, SMALL_CAP + 1, declared)).await;
+        assert_too_large(&err, SECRETS, "64 KiB", &case);
+    }
+}
+
+/// The list cap is the larger one: a list answer above the error-body cap still resolves.
+#[tokio::test]
+async fn a_list_answer_above_the_error_cap_resolves() {
+    let big = "v".repeat(SMALL_CAP);
+    let stub = serving(json!([secret("BIG", &big)]));
+    let resolved = provider(&stub).resolve(&scope()).await.must("resolves");
+    assert_eq!(resolved.keys(), ["BIG"]);
+}
+
+/// d8f4a7ca: a 401 is decided on its status before the body, so an oversized refusal still
+/// latches; a body never read in full cannot prove the lockout, so it is `BadCredentials`.
+#[tokio::test]
+async fn an_oversized_login_401_still_latches() {
+    for declared in [true, false] {
+        let case = format!("declared length {declared}");
+        let stub = Stub::start();
+        stub.on("POST", LOGIN, oversized(401, SMALL_CAP + 1, declared));
+        let p = provider(&stub);
+        assert_err(
+            &p.resolve(&scope()).await.must_fail(&case),
+            &SecretError::BadCredentials,
+        );
+        assert_err(
+            &p.resolve(&scope()).await.must_fail(&case),
+            &SecretError::LoginRefusedEarlier,
+        );
+        assert_eq!(stub.count("POST", LOGIN), 1, "{case}: not latched");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------------------------
 
