@@ -43,7 +43,8 @@ project or a box.
    `2025-11-25`, `2025-06-18`, `2025-03-26` and `2024-11-05` (the newest when the agent asks for
    another). A message longer than 1 MiB is refused with a parse error, and the connection goes
    on.
-5. When the session ends, its token is unregistered. Any later call answers `session ended`.
+5. When the session ends, its token is unregistered. A call still running then ends, and any later
+   call answers `session ended`.
 
 Which processes host the tools:
 
@@ -168,11 +169,14 @@ so it never does.
   `document_write`, `note_add`, `item_status` and `item_link` answers `fenced: lease lost` and
   writes nothing. A chat writes without a lease, and is refused the same way once a walk holds the
   run again. A step only ever writes on its own run's item.
-- **`command_run` is not fenced.** Its queue rows take no lease, so a step that has lost its lease
-  can still queue and run a command, and record it, until its walk notices the loss (at its next
-  lease renewal) and drops the step. The agent's connection then closes, and the command is killed
-  and its row `cancelled`, as when the agent exits (see
-  [Liveness](#liveness-crashes-and-cancellation)).
+- **`command_run` checks the lease too.** Its queue rows take no lease of their own, so the call
+  reads the run's lease before it queues the command, when the queue admits it, and every 10
+  seconds while it waits or runs. A session whose run another process holds is refused with
+  `fenced: lease lost` and queues nothing. A command already running is killed, its row
+  `cancelled` with `[stopped: fenced: lease lost]` before what it printed, and the call answers
+  `fenced: lease lost`. A read that fails (the database is unreachable) does not stop a command
+  already queued or running; only a call not yet queued is refused, with `store unavailable: …`.
+  The check is a plain read, so a command can run for up to 10 seconds after its lease is lost.
 - **No agent moves a status** (R-ENT-8): see `item_status`.
 - **Every text an agent writes, and every command's output, is scrubbed first, and fails
   closed** (R-ID-7, R-SEC-3): note and document bodies, document titles, command lines and output
@@ -183,7 +187,8 @@ so it never does.
   returned as stored, unscrubbed.
 - **A token outlives nothing.** It is registered for exactly the session's life and never logged.
   When the session ends (the agent exits, the step settles, the chat ends, htui quits), the token
-  is unregistered, and a call on a connection still open answers `session ended`.
+  is unregistered, and a call on a connection still open answers `session ended`, whether it
+  arrives later or was still running: a running `command_run` is killed and its row `cancelled`.
 - **The token is never on a command line.** For `claude-cli`, htui writes the session's MCP server
   list, token included, to a file `mcp.json` in a new directory `htui-cli-<pid>-<8 hex>`, and starts
   the CLI with `--mcp-config=<path>`, so the process list shows only the path. On Linux and macOS the
@@ -301,6 +306,12 @@ command ran.
   answers the row's status with what the command printed so far.
 - If the agent cancels the call, or the agent exits (its connection closes) while the call is
   queued or running, the row is `cancelled` and the command is killed.
+- If the session ends while the call is queued or running (the step settles or is cancelled, the
+  chat ends, htui quits), the call answers `session ended` at once, even on a connection still
+  open, the row is `cancelled` and the command is killed.
+- If the session's run is taken over by another process while the call is queued or running, the
+  call notices within 10 seconds, the row is `cancelled` and the command is killed (see
+  [Scope](#scope-what-a-session-can-touch)).
 - An agent that asked for progress (`_meta.progressToken`) gets an MCP progress notification every
   second while the call waits, and every 10 seconds while the command runs.
 
@@ -442,13 +453,14 @@ directory) is writable and yours.
 the private directory or the file that hands `claude-cli` its MCP servers. Check that
 `$XDG_RUNTIME_DIR` (or the temporary directory) is writable and yours.
 
-**`session ended`.** The call came after its session ended: the step settled or was cancelled,
-the chat ended, or htui quit. Nothing was written.
+**`session ended`.** The call came after its session ended, or was still running when it ended:
+the step settled or was cancelled, the chat ended, or htui quit. Nothing was written; a
+`command_run` that was queued or running was killed and its row `cancelled`.
 
 **`fenced: lease lost`.** Another process took the run over while this session was still running
 (it had lost its lease, for example after a long database outage). Nothing was written; the run
-goes on in the process that holds it. `command_run` never answers this: a command the session
-started meanwhile is [not fenced](#scope-what-a-session-can-touch).
+goes on in the process that holds it. For `command_run`, a command still running was killed and
+its row `cancelled`, keeping what it printed ([Scope](#scope-what-a-session-can-touch)).
 
 **`version mismatch: the host is htui <x>, this relay is <y>; restart the agent`** (exit 3). The
 binary the agent started is not the build the host runs: htui was upgraded on disk while it was
