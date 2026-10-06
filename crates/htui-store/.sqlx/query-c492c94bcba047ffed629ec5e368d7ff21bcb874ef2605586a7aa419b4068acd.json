@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE project SET\n                slug        = COALESCE($3, slug),\n                name        = COALESCE($4, name),\n                description = COALESCE($5, description)\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id              AS \"id: ProjectId\",\n                      slug,\n                      name,\n                      description,\n                      secret_provider,\n                      secret_scope,\n                      settings,\n                      created_by      AS \"created_by: htui_core::model::UserId\",\n                      created_at,\n                      updated_at\n            ",
+  "query": "\n            UPDATE project SET\n                slug            = COALESCE($3, slug),\n                name            = COALESCE($4, name),\n                description     = COALESCE($5, description),\n                secret_provider = CASE WHEN $6 THEN $7 ELSE secret_provider END,\n                secret_scope    = CASE WHEN $6 THEN $8 ELSE secret_scope END\n             WHERE id = $1 AND updated_at = $2\n            RETURNING id              AS \"id: ProjectId\",\n                      slug,\n                      name,\n                      description,\n                      secret_provider,\n                      secret_scope,\n                      settings,\n                      created_by      AS \"created_by: htui_core::model::UserId\",\n                      created_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -120,6 +120,9 @@
         "Timestamptz",
         "Text",
         "Text",
+        "Text",
+        "Bool",
+        "Text",
         "Text"
       ]
     },
@@ -136,5 +139,5 @@
       false
     ]
   },
-  "hash": "11715e1015dcc19e7368790cae536658cd5ef884810c316cde12037bf80e3dbe"
+  "hash": "c492c94bcba047ffed629ec5e368d7ff21bcb874ef2605586a7aa419b4068acd"
 }
