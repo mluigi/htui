@@ -5314,8 +5314,9 @@ async fn a_straddling_chunk_s_raw_rides_both_rows() {
     );
 }
 
-/// A secret that starts in the straddling chunk and ends in the next is whole only in the
-/// carry's join: the carry's raw is withheld, and the head's raw holds at most its prefix.
+/// A secret that starts in the straddling chunk and ends in the next, which arrives after the
+/// bound, is whole only in the carry's join: the carry's raw is withheld, and the head's raw holds
+/// at most its prefix (blueprint §B.2), as the one row cut at the bound before the seam did.
 #[tokio::test]
 async fn a_secret_split_after_the_straddling_chunk_withholds_the_carry_s_raw() {
     let chat = chat_spec();
@@ -5349,6 +5350,89 @@ async fn a_secret_split_after_the_straddling_chunk_withholds_the_carry_s_raw() {
         serde_json::to_string(&log[1].raw).expect("raw serialises")
     );
     assert!(!joined.contains(tail), "row 2's raw holds no part of it");
+}
+
+/// A secret that starts in an earlier chunk and ends in the straddling chunk, before the cut: the
+/// head's join holds it whole, and so does the run's at the bound. The carry's raw starts with the
+/// straddling chunk, so it holds the secret's suffix with no prefix to complete it in its own join:
+/// the run's join decides for both rows, and both are withheld, as the one row before the seam was.
+#[tokio::test]
+async fn a_secret_ending_in_the_straddling_chunk_before_the_cut_withholds_both_raws() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(20);
+    let script: Vec<DriverEnvelope> = (0..14)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain([
+            acp_chunk(&format!("{}{head}", fill(1004)), None),
+            acp_chunk(&format!("{tail}{}", fill(1004)), None),
+            acp_chunk(&fill(10), None),
+            end_turn(),
+        ])
+        .collect();
+
+    let (outcome, withheld) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    let summary = outcome.expect("a withheld raw is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let hold = scrubber.hold_back();
+    assert_eq!(
+        texts(&log).iter().map(String::len).collect::<Vec<_>>(),
+        vec![CHUNK_FLUSH_BYTES - hold - SECRET40.len() + 10, hold + 10],
+        "the cut falls in the chunk the secret ends in, after the secret"
+    );
+    assert_eq!(log[0].raw, None, "the head's join holds the secret");
+    assert_eq!(
+        log[1].raw, None,
+        "the carry's raw starts with the secret's suffix: withheld with the run"
+    );
+    assert_eq!(withheld, 2);
+    assert_eq!(summary.raw_withheld, 2);
+    assert_nowhere(&log, SECRET40);
+    assert_nowhere(&log, tail);
+}
+
+/// A secret that starts in the straddling chunk, after the cut, and is whole by the bound: the
+/// carry's join holds it, and the head's raw holds the straddling chunk with its prefix. The run's
+/// join at the bound holds it whole, so the head's raw is withheld too, as the one row before the
+/// seam was. (A secret still incomplete at the bound is
+/// `a_secret_split_after_the_straddling_chunk_withholds_the_carry_s_raw`.)
+#[tokio::test]
+async fn a_secret_whole_at_the_bound_after_the_cut_withholds_the_head_s_raw_too() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(20);
+    let script: Vec<DriverEnvelope> = (0..15)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain([
+            acp_chunk(&format!("{}{head}", fill(1000)), None),
+            acp_chunk(&format!("{tail}xxxx"), None),
+            end_turn(),
+        ])
+        .collect();
+
+    let (outcome, withheld) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    let summary = outcome.expect("a withheld raw is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(texts.len(), 2);
+    assert_eq!(
+        texts[0],
+        fill(15 * 1024 + 1000 - (scrubber.hold_back() - SECRET40.len() - 4)),
+        "the cut falls in the straddling chunk, before the secret"
+    );
+    assert_eq!(
+        log[0].raw, None,
+        "the head's raw holds the secret's prefix: withheld with the run"
+    );
+    assert_eq!(log[1].raw, None, "the carry's join holds the secret");
+    assert_eq!(withheld, 2);
+    assert_eq!(summary.raw_withheld, 2);
+    assert_nowhere(&log, SECRET40);
+    assert_nowhere(&log, head);
 }
 
 /// A scrubber that keeps the default `hold_back` (0) keeps the cut at the bound exactly, as before

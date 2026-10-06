@@ -346,6 +346,10 @@ struct ChunkMark {
 /// The row's raw entries are its raw-carrying chunks' wire messages, in chunk order, so both
 /// halves are index ranges of it: the head keeps `raw[..head_raw]` and the carry clones
 /// `raw[carry_raw_from..]`. The two overlap by the straddling chunk's entry, when it has one.
+///
+/// That shared entry holds bytes of the *other* row's text, which that row's own join cannot
+/// complete, so [`Recorder::flush_at_seam`] lets the run's join at the cut decide for both rows
+/// ([`Recorder::open_raw_withheld`]).
 #[derive(Debug, PartialEq, Eq)]
 struct MarkSplit {
     /// How many of the row's raw entries stay on the head.
@@ -424,6 +428,10 @@ pub struct Recorder<'a, S: htui_core::store::RecorderStore> {
     /// MOD-10 D18: the open text run's chunks, in order; empty unless `buffer_kind` is a chunk
     /// kind. Cleared by every `flush`.
     open_chunks: Vec<ChunkMark>,
+    /// MOD-10 D8 at a D18 seam: the open run's `raw` is withheld at its flush whatever its own
+    /// join says, because it shares a straddling chunk with a row whose join held a secret
+    /// ([`Recorder::flush_at_seam`]). Taken by every `flush`.
+    open_raw_withheld: bool,
     /// `edit_proposal` rows whose `seq` is reserved and whose write is owed (plan D77, T46).
     ///
     /// **Not cleared by a flush**, which is the fix: `docs/ANA-4.md` §4.3 asks for one row per
@@ -535,6 +543,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             buffer_kind: None,
             open_message_id: None,
             open_chunks: Vec::new(),
+            open_raw_withheld: false,
             held: BTreeMap::new(),
             unflushed: Vec::new(),
             unoffered: Vec::new(),
@@ -1219,6 +1228,17 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// `raw` rides both rows, so each row's per-pointer join ([`Recorder::withhold_split_raw`])
     /// sees every byte of its own text. The carry is re-opened **before** a flush error is
     /// returned, so the tail is never lost: a later flush, or `finish`, writes it.
+    ///
+    /// **The straddling chunk's raw.** It also holds bytes of the other row's text, and a secret
+    /// in those bytes that crosses into a chunk the row does not hold is whole in neither row's
+    /// own join: one ending in it before the cut leaves its suffix on the carry, one starting in
+    /// it after the cut and whole by the bound leaves its prefix on the head. So the run's join
+    /// *at the cut*, which is the one row's join before MOD-10 M3, decides for both: when it would
+    /// withhold, both rows' raw is withheld. A carry that still opens with the straddling chunk
+    /// (no chunk of its own before the next cut) keeps the verdict across a later seam too. This
+    /// can withhold a carry's raw for a secret wholly in the head's chunks, which is the fail-safe
+    /// direction (blueprint H-10). A secret still incomplete at the bound is not seen by the
+    /// run's join either, so the head's raw holds at most its prefix, as before the seam.
     async fn flush_at_seam(&mut self) -> Result<(), RecordError> {
         let hold_back = self.scrubber.hold_back();
         let Some(text) = self.open_text() else {
@@ -1248,6 +1268,8 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         let Some(mut head) = self.buffer.pop() else {
             return self.flush().await;
         };
+        let run_withheld = self.raw_join_finding(&head.raw).is_some();
+        let inherited = self.open_raw_withheld;
         let tail = match head.payload.get_mut("text") {
             Some(Value::String(text)) => text.split_off(cut),
             _ => String::new(),
@@ -1268,10 +1290,14 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         };
 
         self.push(head);
+        self.open_raw_withheld = inherited || run_withheld;
         let flushed = self.flush().await;
         self.push(carry);
         self.open_message_id = message_id;
         self.open_chunks = split.carry;
+        // The inherited verdict lives in the run's first raw entry, the previous seam's straddling
+        // chunk: it rides on only while the carry still opens with that entry.
+        self.open_raw_withheld = run_withheld || (inherited && split.carry_raw_from == 0);
         flushed
     }
 
@@ -1299,6 +1325,9 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         self.buffer_kind = None;
         self.open_message_id = None;
         self.open_chunks.clear();
+        // Only the open run sets it, and the run is the buffer's one row (a chunk only `push`es
+        // onto an empty buffer).
+        let seam_withheld = core::mem::take(&mut self.open_raw_withheld);
         if self.buffer.is_empty() && self.unflushed.is_empty() && self.unoffered.is_empty() {
             return Ok(());
         }
@@ -1311,7 +1340,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             let row = match outcome {
                 Ok(()) => {
                     // `next_seq` is the number this row is given just below.
-                    self.withhold_split_raw(&mut row, self.next_seq);
+                    self.withhold_split_raw(&mut row, self.next_seq, seam_withheld);
                     row
                 }
                 Err(unmasked) => {
@@ -1402,7 +1431,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
                 // Re-announcements accumulate raw on the held row (plan D77), so a split can live
                 // here just as in a coalesced run.
                 Ok(()) => {
-                    self.withhold_split_raw(&mut row, seq);
+                    self.withhold_split_raw(&mut row, seq, false);
                     row
                 }
                 Err(unmasked) => {
@@ -1820,18 +1849,17 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// A single chunk needs nothing: it was scrubbed whole at capture ([`Recorder::scrub_envelope`]).
     /// Already-masked chunks register no change, because re-masking `[REDACTED]` is idempotent.
     ///
+    /// `seam` is a D18 seam's verdict on the row ([`Recorder::open_raw_withheld`]): its raw is
+    /// withheld, even a single chunk's, whatever its own join says (cause `seam`).
+    ///
     /// The log carries the step, the `seq`, the chunk count, the cause and the rule name - never
     /// the joined text, a pointer or a key.
-    fn withhold_split_raw(&mut self, row: &mut PendingRow, seq: i32) {
-        if row.raw.len() < 2 {
+    fn withhold_split_raw(&mut self, row: &mut PendingRow, seq: i32, seam: bool) {
+        let Some((cause, rule)) = self
+            .raw_join_finding(&row.raw)
+            .or_else(|| (seam && !row.raw.is_empty()).then_some(("seam", None)))
+        else {
             return;
-        }
-        let joined = joined_raw_leaves(&row.raw);
-        let mut probe = joined.clone();
-        let (cause, rule) = match self.scrubber.scrub(&mut probe) {
-            Err(unmasked) => ("residue", Some(unmasked.rule)),
-            Ok(()) if probe != joined => ("masked", None),
-            Ok(()) => return,
         };
         let chunks = row.raw.len();
         row.raw.clear();
@@ -1844,6 +1872,22 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             rule = rule.unwrap_or("none"),
             "a coalesced row's raw was withheld: its chunks joined hold what no chunk held alone"
         );
+    }
+
+    /// What a row's per-pointer raw join ([`joined_raw_leaves`]) holds that no chunk held alone:
+    /// `("residue", rule)` when a rule still trips, `("masked", None)` when masking changes it,
+    /// `None` when it is clean or there is a single chunk.
+    fn raw_join_finding(&self, raw: &[Value]) -> Option<(&'static str, Option<&'static str>)> {
+        if raw.len() < 2 {
+            return None;
+        }
+        let joined = joined_raw_leaves(raw);
+        let mut probe = joined.clone();
+        match self.scrubber.scrub(&mut probe) {
+            Err(unmasked) => Some(("residue", Some(unmasked.rule))),
+            Ok(()) if probe != joined => Some(("masked", None)),
+            Ok(()) => None,
+        }
     }
 
     /// Keeps the first residue of the session; the rest are already visible as their own rows.
