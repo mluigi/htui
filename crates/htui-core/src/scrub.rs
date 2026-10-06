@@ -138,6 +138,13 @@ const PEM_RULE: &str = "private_key_pem";
 /// spells `PRIVATE KEY` in capitals in prose, which fails closed.
 const PEM_MARKER: &str = "PRIVATE KEY";
 
+/// The longest not-yet-matching prefix any pattern rule can leave at the end of a text, plus the
+/// longest token start in front of it (MOD-10 D18, blueprint A-4): `pypi_token`'s minimum match
+/// is 70 bytes (`pypi-AgEIcHlwaS5vcmc` + 50) and `\uXXXX` is 6. A text cut at least
+/// `PATTERN_HOLD_BACK - 1` bytes before its end therefore never splits a credential the rules
+/// would have caught whole. A rule whose minimum grows must grow this.
+pub const PATTERN_HOLD_BACK: usize = 76;
+
 /// Masks known secrets in a payload and reports anything credential-shaped that survived.
 ///
 /// The seam MOD-10 replaces: the recorder holds a `&dyn Scrubber` and never names an
@@ -152,6 +159,13 @@ pub trait Scrubber: Send + Sync + core::fmt::Debug {
     /// the value rather than persist it: a scrubber that could not mask something never lets it
     /// reach a store (`R-SEC-3`).
     fn scrub(&self, value: &mut Value) -> Result<(), Unmasked>;
+
+    /// MOD-10 D18: how many trailing bytes of an open text run a size-triggered cut must keep
+    /// open, so that a secret or a credential still arriving is never split across two rows.
+    /// `0` (the default) keeps the recorder's cut at the bound exactly, as before MOD-10 M3.
+    fn hold_back(&self) -> usize {
+        0
+    }
 }
 
 /// A string leaf still matched a credential rule after masking.
@@ -376,6 +390,15 @@ impl Scrubber for MinimalScrubber {
     fn scrub(&self, value: &mut Value) -> Result<(), Unmasked> {
         self.mask_value(value);
         self.find_residue(value, &mut String::new())
+    }
+
+    /// `max(longest secret in bytes, PATTERN_HOLD_BACK) - 1`: 75 with no secret.
+    fn hold_back(&self) -> usize {
+        self.secrets
+            .first() // sorted longest first by byte length (`new`)
+            .map_or(0, String::len)
+            .max(PATTERN_HOLD_BACK)
+            - 1
     }
 }
 
@@ -1216,6 +1239,55 @@ mod tests {
         scrubber.scrub(&mut value).expect("clean");
         assert_eq!(value["a"], json!("x [REDACTED] y"));
         assert_eq!(value["b"], json!("x abcde y"));
+    }
+
+    #[test]
+    fn hold_back_is_zero_for_a_scrubber_that_does_not_say() {
+        #[derive(Debug)]
+        struct Plain;
+        impl Scrubber for Plain {
+            fn scrub(&self, _: &mut Value) -> Result<(), Unmasked> {
+                Ok(())
+            }
+        }
+        assert_eq!(Plain.hold_back(), 0);
+        let boxed: Box<dyn Scrubber> = Box::new(Plain);
+        assert_eq!(boxed.hold_back(), 0);
+    }
+
+    #[test]
+    fn hold_back_without_secrets_is_the_pattern_bound() {
+        assert_eq!(rules_only().hold_back(), PATTERN_HOLD_BACK - 1);
+        let (empty, _) = MinimalScrubber::from_resolved(&BTreeMap::new());
+        assert_eq!(empty.hold_back(), PATTERN_HOLD_BACK - 1);
+    }
+
+    #[test]
+    fn hold_back_covers_the_longest_secret() {
+        let long = MinimalScrubber::new(["x".repeat(120), "y".repeat(10)]);
+        assert_eq!(long.hold_back(), 119);
+        let short = MinimalScrubber::new(["y".repeat(10)]);
+        assert_eq!(short.hold_back(), PATTERN_HOLD_BACK - 1);
+        // Bytes, not characters: 60 two-byte characters are 120 bytes.
+        let wide = MinimalScrubber::new(["é".repeat(60)]);
+        assert_eq!(wide.hold_back(), 119);
+        let as_dyn: &dyn Scrubber = &wide;
+        assert_eq!(as_dyn.hold_back(), 119);
+    }
+
+    #[test]
+    fn pattern_hold_back_covers_every_rule_minimum_and_the_longest_token_start() {
+        // `\\u[0-9A-Fa-f]{4}` in `TOKEN_START`: a JSON `\uXXXX` escape, 6 bytes.
+        const LONGEST_TOKEN_START: usize = 6;
+        for (rule, short) in one_short() {
+            // One more byte reaches the rule's minimum match.
+            assert!(
+                short.len() + 1 + LONGEST_TOKEN_START <= PATTERN_HOLD_BACK,
+                "{rule}: a {}-byte minimum after a {LONGEST_TOKEN_START}-byte token start \
+                 exceeds PATTERN_HOLD_BACK = {PATTERN_HOLD_BACK}",
+                short.len() + 1
+            );
+        }
     }
 
     #[test]
