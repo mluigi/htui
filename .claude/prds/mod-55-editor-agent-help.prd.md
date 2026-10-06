@@ -44,7 +44,7 @@ saved past a failing gate, and no body leaves the machine with a secret unscrubb
 
 | Metric | Target | How measured |
 |---|---|---|
-| Proposals accepted into the buffer | > 50% of the first 10 uses | Recorded help runs (D2), accept vs discard |
+| Proposals accepted into the buffer | > 50% of the first 10 uses | Help runs counted by `phase_name = 'edit_help'`; accept vs discard by the maintainer's self-report (not recorded: plan M-1) |
 | Proposals saved past a failing gate | 0 | Save path: the gate is the only way to persist (tests) |
 | Bodies sent with a known secret value or a key-pattern hit | 0 | Scrub-before-send refusal (D3), covered by tests |
 | Edits that still needed the copy-into-chat workaround | TBD — needs validation by the maintainer's self-report after the 10 uses | Maintainer note in the close-out write-up |

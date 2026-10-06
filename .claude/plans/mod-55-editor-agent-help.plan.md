@@ -150,6 +150,31 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | A global `Action::Error` fires on every `Failed`, double-reporting a scrub refusal | Low | Accept the status-line line as the one report; the component shows the same sentence |
 | Snapshot churn from hint-line changes | High | Full `cargo insta test` run, every changed snapshot reviewed |
 
+## Amendments after the blueprint (accepted by the maintainer 2026-10-06)
+
+The blueprint (`.claude/plans/mod-55-editor-agent-help.blueprint.md`) is authoritative where it
+differs from the sections above. Accepted: **A-1** to **A-11** as written there, including:
+
+- **A-1:** frames are told apart by `App::is_fresh` and one help per tab, not by `step_id`/seq.
+- **A-2 (M-3):** an `Esc` before `ChatAccepted` defers the cancel; a help that is cancelling cannot be abandoned.
+- **A-3:** the `serde` default is `"chat"`.
+- **A-4:** `HelpTarget::{Template { name }, Skill { name }}`.
+- **A-5:** the component is `agent_help.rs`/`AgentHelp`.
+- **A-6 (M-2):** all ten `ToolKind`s are denied.
+- **A-7:** `Failed` comes before `Ended` when the recorder refuses, and only `Ended { EndTurn }` proposes.
+- **A-8:** `testkit.rs` and the `tests/templates.rs` hint assertion are added to the file list.
+- **A-9:** a scrub refusal is a `Served::Reply(Failed)`.
+- **A-10:** `start_chat_run_mints_chat_rows` is extended instead of adding a case.
+- **A-11:** `scrub::REDACTED` becomes public.
+
+- **M-1:** accept/discard is **not recorded**. Help runs are counted by `phase_name = 'edit_help'`;
+  the accept rate comes from the maintainer's self-report in the close-out write-up (PRD metric
+  amended).
+- **H-6 (known limit, accepted):** on `claude-cli` with no lease the deny-all policy is not
+  consulted. Only `--disallowedTools` binds, so `Task`, `TodoWrite`, user-configured MCP servers and
+  an ACP agent's non-asking tools stay reachable. This is recorded in the write-up and not filed as
+  an item.
+
 ## Verified claims
 
 | Claim | Verdict | Evidence |
