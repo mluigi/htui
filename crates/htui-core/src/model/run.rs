@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{
-    AgentId, BoxId, CommandRunId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId, UserId,
+    AgentId, BatchId, BoxId, CommandRunId, ItemId, ProjectId, RepoId, RunId, StepGraphId, StepId,
+    UserId,
 };
 use crate::model::kind::{CommandQueue, Gate, Isolation};
 
@@ -373,6 +374,11 @@ pub struct NewRun {
     pub repo_scope: Vec<RepoId>,
     /// `run.queued_at`; the caller's clock, microsecond-truncated like [`ChatRunSpec::started_at`].
     pub queued_at: DateTime<Utc>,
+    /// `run.batch_id` (MOD-12 D7): the queue batch an auto run was admitted under; `None` for a
+    /// manual run. Not a [`Run`] field: only the runner and milestone 2's spend sum read it, through
+    /// `batch_runs`.
+    #[serde(default)]
+    pub batch_id: Option<BatchId>,
 }
 
 /// Arguments of [`crate::store::WriteStore::create_step`]: a `run_step` inserted at `pending`

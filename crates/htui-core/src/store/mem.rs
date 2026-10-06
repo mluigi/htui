@@ -24,28 +24,29 @@ use crate::clock::TestClock;
 use crate::model::link::{ProposeLink, WithdrawLink};
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
-    BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile,
-    BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, DocumentHead, DocumentId, EventKind, Executor, GateOutcome, Item, ItemCitation,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount,
-    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    BOX_PROBE_SPEC_KEY, BatchClose, BatchId, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo,
+    BoxProbe, BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
+    CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentHead, DocumentId, EventKind, Executor,
+    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind,
+    LinkNode, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewPersona, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate,
+    PromptTemplateId, QueueBatch, QueueEntry, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId,
+    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate,
+    WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary,
+    scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -56,19 +57,20 @@ use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
     EXECUTOR_MUST_BE_KNOWN, ParkOutcome, ReadStore, SettingRung, StepFence, StoredSetting,
-    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
-    close_out_needs_a_summary, command_finish_status, command_not_claimable, command_not_queued,
-    document_needs_a_step, expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
-    link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
-    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
-    persona_is_bound, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
-    reaped_note, references_no_row, requirement_withdrawn, reserved_phase_name,
-    resolution_not_closable, row_names_another_phase, row_names_another_step, run_is_terminal,
-    self_link, skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
-    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    UpdateOutcome, WriteStore, already_exists, batch_is_closed, chat_step_status, check_attachment,
+    citation_key, close_out_needs_a_summary, command_finish_status, command_not_claimable,
+    command_not_queued, document_needs_a_step, expected_on_row, failure_disagrees_with_status,
+    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run, link_outside_project,
+    new_persona_refusal, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    note_needs_a_step, persona_is_bound, persona_patch_refusal, prompt_template_key,
+    prompt_template_refusal, reaped_note, references_no_row, requirement_withdrawn,
+    reserved_phase_name, resolution_not_closable, row_names_another_phase, row_names_another_step,
+    run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal, skill_version_key,
+    step_document_refusal, step_is_not_promotable, step_note_refusal, step_slot_is_taken,
+    step_writes_own_item, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -269,6 +271,13 @@ struct State {
     permissions: BTreeMap<PermissionId, PermissionRow>,
     /// `run_command` (MOD-42 plan D1), by id.
     run_commands: BTreeMap<RunCommandId, RunCommand>,
+    /// `queue_entry` (MOD-12 D1), by item: an item is queued on at most one box. The entry keeps
+    /// its item's project, which never moves.
+    queue_entries: BTreeMap<ItemId, QueueEntry>,
+    /// `queue_batch` (MOD-12 D2), by id.
+    queue_batches: BTreeMap<BatchId, QueueBatch>,
+    /// `run.batch_id` (MOD-12 D7), beside `runs` as `lease_owners` is: not a `Run` field.
+    run_batches: HashMap<RunId, BatchId>,
     /// `session_event`.
     events: Vec<SessionEvent>,
     /// `requirement_spec` (ANA-11 §4.4), keyed by its primary key, the project (MOD-38).
@@ -374,6 +383,9 @@ impl MemStore {
             openings: HashMap::new(),
             permissions: BTreeMap::new(),
             run_commands: BTreeMap::new(),
+            queue_entries: BTreeMap::new(),
+            queue_batches: BTreeMap::new(),
+            run_batches: HashMap::new(),
             events: data.events,
             requirement_specs: data
                 .requirement_specs
@@ -842,6 +854,197 @@ impl MemStore {
                 .collect();
             rows.sort_by_key(|(id, at)| (*at, *id));
             rows
+        }))
+    }
+
+    // ---- MOD-12 M1: the queue (plan D1-D9). Neither table is mirrored, so these are inherent,
+    // dispatched by `Backend`; `PgStore` carries the same nine.
+
+    /// MOD-12 D1: queue `item` on `box_id`. Idempotent: an item already queued (on any box)
+    /// answers its stored entry unchanged. `at` is microsecond-truncated.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
+    /// [`StoreError::Constraint`] for an unknown box or user.
+    pub async fn queue_item(
+        &self,
+        item: ItemId,
+        box_id: BoxId,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<QueueEntry> {
+        self.write(|state| {
+            let project_id = state.require_item(item)?.project_id;
+            if let Some(stored) = state.queue_entries.get(&item) {
+                return Ok(stored.clone());
+            }
+            if !state.boxes.contains_key(&box_id) {
+                return Err(StoreError::Constraint(references_no_row(
+                    "queue_entry.box_id",
+                    box_id,
+                    "box",
+                )));
+            }
+            state.require_user(by, "queue_entry.queued_by")?;
+            let entry = QueueEntry {
+                item_id: item,
+                project_id,
+                box_id,
+                position: None,
+                queued_at: at.trunc_subsecs(TIMESTAMPTZ_DIGITS),
+                queued_by: by,
+            };
+            state.queue_entries.insert(item, entry.clone());
+            Ok(entry)
+        })
+    }
+
+    /// MOD-12 D9: `item` leaves whatever queue holds it; `false` when none did. Never touches a
+    /// run.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn dequeue_item(&self, item: ItemId) -> Result<bool> {
+        Ok(self.write(|state| state.queue_entries.remove(&item).is_some()))
+    }
+
+    /// MOD-12 D4: `box_id`'s entries, `position NULLS LAST, queued_at, item_id`. `ItemId`'s `Ord`
+    /// is uuid byte order, which is Postgres' uuid order.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+        Ok(self.read(|state| {
+            let mut rows: Vec<QueueEntry> = state
+                .queue_entries
+                .values()
+                .filter(|entry| entry.box_id == box_id)
+                .cloned()
+                .collect();
+            rows.sort_by_key(|entry| {
+                (
+                    entry.position.is_none(),
+                    entry.position,
+                    entry.queued_at,
+                    entry.item_id,
+                )
+            });
+            rows
+        }))
+    }
+
+    /// MOD-12 D2: resume — the open batch of `box_id`, opened now under a fresh `BatchId` unless
+    /// one is already open (idempotent; two racing resumes answer the same row).
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`] for an unknown box or user.
+    pub async fn open_batch(
+        &self,
+        box_id: BoxId,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<QueueBatch> {
+        self.write(|state| {
+            if let Some(open) = state.open_batch_of(box_id) {
+                return Ok(open.clone());
+            }
+            if !state.boxes.contains_key(&box_id) {
+                return Err(StoreError::Constraint(references_no_row(
+                    "queue_batch.box_id",
+                    box_id,
+                    "box",
+                )));
+            }
+            state.require_user(by, "queue_batch.opened_by")?;
+            let batch = QueueBatch {
+                id: BatchId::new(),
+                box_id,
+                opened_at: at.trunc_subsecs(TIMESTAMPTZ_DIGITS),
+                opened_by: by,
+                closed_at: None,
+                closed_reason: None,
+            };
+            state.queue_batches.insert(batch.id, batch.clone());
+            Ok(batch)
+        })
+    }
+
+    /// MOD-12 D2: `box_id`'s open batch, if any: whether its queue runs.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn open_batch_of(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        Ok(self.read(|state| state.open_batch_of(box_id).cloned()))
+    }
+
+    /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn close_batch(
+        &self,
+        box_id: BoxId,
+        reason: BatchClose,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        Ok(self.write(|state| {
+            let id = state.open_batch_of(box_id)?.id;
+            let batch = state.queue_batches.get_mut(&id)?;
+            batch.closed_at = Some(at.trunc_subsecs(TIMESTAMPTZ_DIGITS));
+            batch.closed_reason = Some(reason);
+            Some(batch.clone())
+        }))
+    }
+
+    /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
+        Ok(self.write(|state| {
+            let items = &state.items;
+            let before = state.queue_entries.len();
+            state.queue_entries.retain(|item, entry| {
+                entry.box_id != box_id
+                    || !items
+                        .get(item)
+                        .is_some_and(|row| matches!(row.status, Status::Done | Status::Closed))
+            });
+            rows(before - state.queue_entries.len())
+        }))
+    }
+
+    /// MOD-12 D3, D9: the runs admitted under `batch`, `(id, status)` by `(queued_at, id)`.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn batch_runs(&self, batch: BatchId) -> Result<Vec<(RunId, RunStatus)>> {
+        Ok(self.read(|state| {
+            let mut runs: Vec<&Run> = state
+                .run_batches
+                .iter()
+                .filter(|(_, of)| **of == batch)
+                .filter_map(|(run, _)| state.runs.get(run))
+                .collect();
+            runs.sort_by_key(|row| (row.queued_at, row.id));
+            runs.into_iter().map(|row| (row.id, row.status)).collect()
+        }))
+    }
+
+    /// MOD-12 D6: `claim_run`'s slot count — `running` runs executing on `box_id`, **not**
+    /// `awaiting_approval` (that is [`MemStore::active_runs_on_box`]).
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn running_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+        Ok(self.read(|state| {
+            state
+                .runs
+                .values()
+                .filter(|row| {
+                    row.executing_box_id == Some(box_id) && row.status == RunStatus::Running
+                })
+                .count()
         }))
     }
 
@@ -4219,6 +4422,11 @@ impl State {
             .retain(|_, p| !gone.runs.contains(&p.row.run_id));
         self.run_commands
             .retain(|_, c| !gone.runs.contains(&c.run_id));
+        // MOD-12 D1, D7: an entry goes with its item (`ON DELETE CASCADE`), and `run.batch_id`
+        // with its run.
+        self.queue_entries
+            .retain(|item, _| !gone.items.contains(item));
+        self.run_batches.retain(|run, _| !gone.runs.contains(run));
         self.documents
             .retain(|row| !gone.items.contains(&row.item_id));
         self.notes.retain(|row| !gone.items.contains(&row.item_id));
@@ -4301,6 +4509,13 @@ impl State {
             entity: "run_step",
             id: id.to_string(),
         })
+    }
+
+    /// MOD-12 D2: `box_id`'s open `queue_batch`; `uq_queue_batch_open` keeps it at most one.
+    fn open_batch_of(&self, box_id: BoxId) -> Option<&QueueBatch> {
+        self.queue_batches
+            .values()
+            .find(|batch| batch.box_id == box_id && batch.closed_at.is_none())
     }
 
     /// [`State::require_run`] for an `item`.
@@ -4524,6 +4739,21 @@ impl State {
                 )));
             }
         }
+        // MOD-12 D7, H-6: `PgStore`'s `FOR SHARE` read of the batch, in the same place.
+        if let Some(batch) = new.batch_id {
+            let open = self
+                .queue_batches
+                .get(&batch)
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "queue_batch",
+                    id: batch.to_string(),
+                })?
+                .closed_at
+                .is_none();
+            if !open {
+                return Err(StoreError::Constraint(batch_is_closed(batch)));
+            }
+        }
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
         })?;
@@ -4551,6 +4781,9 @@ impl State {
             updated_at: now,
         };
         self.runs.insert(row.id, row.clone());
+        if let Some(batch) = new.batch_id {
+            self.run_batches.insert(row.id, batch);
+        }
         self.transition(new.item_id, status, Status::Queued, now)?;
         Ok(row)
     }
@@ -7991,7 +8224,7 @@ mod tests {
     use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
     use crate::model::{
-        AgentBox, AgentId, AnswerOutcome, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
+        AgentBox, AgentId, AnswerOutcome, BatchClose, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
         CitationKind, Claim, CommandRunId, CommandRunStatus, DocumentId, GateOutcome,
         GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewCommandRun, NewDocument, NewItem,
         NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
@@ -10634,6 +10867,7 @@ mod tests {
             graph_snapshot: test_snapshot(),
             repo_scope: scope,
             queued_at: Utc::now(),
+            batch_id: None,
         }
     }
 
@@ -12931,6 +13165,325 @@ mod tests {
             "persona `architect` is bound to 7 phases (`htui/feature/a`, `htui/feature/b`, \
              `htui/feature/c`, `htui/feature/d`, `htui/feature/e` and 2 more); clear them in \
              Settings \u{203a} Kinds first"
+        );
+    }
+
+    // ---- MOD-12 M1: the queue store surface (blueprint §C.3) ---------------------------------
+
+    /// A graph run of `item` admitted under `batch`.
+    fn batch_run(item: ItemId, batch: Option<crate::model::BatchId>) -> NewRun {
+        NewRun {
+            batch_id: batch,
+            ..graph_run(item, ids::PROJECT_HTUI, Vec::new())
+        }
+    }
+
+    /// MOD-12 D1, D9: `queue_item` is idempotent (the stored entry answers a repeat unchanged),
+    /// `dequeue_item` reports membership, and an unknown item is `NotFound`.
+    #[tokio::test]
+    async fn queue_item_is_idempotent_and_dequeue_reports_membership() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let entry = store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("an open item queues");
+        assert_eq!(entry.item_id, ids::HTUI_ANA_2);
+        assert_eq!(
+            entry.project_id,
+            ids::PROJECT_HTUI,
+            "the item's project, joined"
+        );
+        assert_eq!(entry.box_id, ids::BOX);
+        assert_eq!(entry.position, None, "milestone 1 writes no position");
+        assert_eq!(entry.queued_at, at.trunc_subsecs(TIMESTAMPTZ_DIGITS));
+        assert_eq!(entry.queued_by, ids::USER);
+
+        let again = store
+            .queue_item(
+                ids::HTUI_ANA_2,
+                ids::BOX,
+                ids::USER,
+                at + TimeDelta::minutes(1),
+            )
+            .await
+            .expect("a repeat is answered");
+        assert_eq!(again, entry, "a repeat answers the stored entry unchanged");
+        assert_eq!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("the read is total"),
+            vec![entry],
+        );
+
+        assert!(store.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
+        assert!(
+            !store.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"),
+            "nothing held it the second time"
+        );
+        assert!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("the read is total")
+                .is_empty()
+        );
+
+        assert!(matches!(
+            store
+                .queue_item(ItemId::new(), ids::BOX, ids::USER, at)
+                .await,
+            Err(StoreError::NotFound { entity: "item", .. })
+        ));
+        assert!(matches!(
+            store
+                .queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, at)
+                .await,
+            Err(StoreError::Constraint(_))
+        ));
+        assert!(matches!(
+            store
+                .queue_item(ids::HTUI_ANA_2, ids::BOX, UserId::new(), at)
+                .await,
+            Err(StoreError::Constraint(_))
+        ));
+    }
+
+    /// MOD-12 D2: a second resume answers the open batch; `open_batch_of` sees it until the close.
+    #[tokio::test]
+    async fn open_batch_answers_the_open_one() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        assert_eq!(store.open_batch_of(ids::BOX).await.expect("read"), None);
+        let first = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        assert_eq!(first.box_id, ids::BOX);
+        assert_eq!(first.opened_at, at.trunc_subsecs(TIMESTAMPTZ_DIGITS));
+        assert_eq!(first.opened_by, ids::USER);
+        assert_eq!((first.closed_at, first.closed_reason), (None, None));
+        let second = store
+            .open_batch(ids::BOX, ids::USER, at + TimeDelta::minutes(1))
+            .await
+            .expect("a repeat is answered");
+        assert_eq!(second, first, "one open batch per box");
+        assert_eq!(
+            store.open_batch_of(ids::BOX).await.expect("read"),
+            Some(first.clone())
+        );
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close is answered")
+            .expect("one was open");
+        assert_eq!(store.open_batch_of(ids::BOX).await.expect("read"), None);
+        let third = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("a resume after a pause opens a new batch");
+        assert_ne!(third.id, first.id);
+        assert!(matches!(
+            store.open_batch(BoxId::new(), ids::USER, at).await,
+            Err(StoreError::Constraint(_))
+        ));
+    }
+
+    /// MOD-12 D2, D3: the close stamps its reason and instant once; a second close finds none.
+    #[tokio::test]
+    async fn close_batch_records_its_reason_once() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let open = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        let closed = store
+            .close_batch(ids::BOX, BatchClose::Paused, at + TimeDelta::seconds(1))
+            .await
+            .expect("the close is answered")
+            .expect("one was open");
+        assert_eq!(closed.id, open.id);
+        assert_eq!(closed.closed_reason, Some(BatchClose::Paused));
+        assert_eq!(
+            closed.closed_at,
+            Some((at + TimeDelta::seconds(1)).trunc_subsecs(TIMESTAMPTZ_DIGITS))
+        );
+        assert_eq!(
+            store
+                .close_batch(ids::BOX, BatchClose::Drained, at)
+                .await
+                .expect("the close is answered"),
+            None,
+            "nothing is open any more"
+        );
+    }
+
+    /// MOD-12 D3: only `done` and `closed` items leave the queue.
+    #[tokio::test]
+    async fn prune_finished_entries_drops_done_and_closed_items_only() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        for item in [ids::HTUI_ANA_1, ids::HTUI_ANA_2] {
+            store
+                .queue_item(item, ids::BOX, ids::USER, at)
+                .await
+                .expect("the item queues");
+        }
+        assert_eq!(
+            store
+                .prune_finished_entries(ids::BOX)
+                .await
+                .expect("the prune is answered"),
+            1,
+            "ANA-1 is done"
+        );
+        let left: Vec<ItemId> = store
+            .queue_entries(ids::BOX)
+            .await
+            .expect("the read is total")
+            .into_iter()
+            .map(|entry| entry.item_id)
+            .collect();
+        assert_eq!(left, [ids::HTUI_ANA_2]);
+        assert_eq!(
+            store
+                .prune_finished_entries(ids::BOX)
+                .await
+                .expect("the prune is answered"),
+            0
+        );
+    }
+
+    /// MOD-12 D7, H-6: a run records its batch, and a closed or unknown batch refuses the run with
+    /// nothing written.
+    #[tokio::test]
+    async fn create_run_records_its_batch_and_refuses_a_closed_one() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        let run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(batch.id)))
+            .await
+            .expect("an open batch admits");
+        assert_eq!(
+            store.batch_runs(batch.id).await.expect("read"),
+            [(run.id, RunStatus::Queued)]
+        );
+
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close is answered");
+        let status = |store: &MemStore| {
+            store.read(|state| state.items.get(&ids::HTUI_CLEAN_1).map(|item| item.status))
+        };
+        let before = status(&store);
+        let refused = batch_run(ids::HTUI_CLEAN_1, Some(batch.id));
+        let refused_id = refused.id;
+        assert!(matches!(
+            store.create_run(refused).await,
+            Err(StoreError::Constraint(message)) if message.contains("is closed")
+        ));
+        let unknown = batch_run(ids::HTUI_CLEAN_1, Some(crate::model::BatchId::new()));
+        let unknown_id = unknown.id;
+        assert!(matches!(
+            store.create_run(unknown).await,
+            Err(StoreError::NotFound {
+                entity: "queue_batch",
+                ..
+            })
+        ));
+        for id in [refused_id, unknown_id] {
+            assert_eq!(store.run(id).await.expect("read"), None, "nothing written");
+        }
+        assert_eq!(status(&store), before, "the item did not move");
+        assert_eq!(
+            store.batch_runs(batch.id).await.expect("read").len(),
+            1,
+            "the batch kept its one run"
+        );
+    }
+
+    /// MOD-12 D1, D7: `delete_project` takes the project's entries and its runs' batch pairs, as
+    /// Postgres' cascades do.
+    #[tokio::test]
+    async fn delete_project_takes_queue_entries_and_run_batches() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(batch.id)))
+            .await
+            .expect("an open batch admits");
+        store
+            .delete_project(ids::PROJECT_HTUI)
+            .await
+            .expect("the project goes");
+        assert!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("read")
+                .is_empty()
+        );
+        assert!(store.batch_runs(batch.id).await.expect("read").is_empty());
+        store.read(|state| {
+            assert!(state.queue_entries.is_empty(), "no entry remains");
+            assert!(state.run_batches.is_empty(), "no run-batch pair remains");
+        });
+    }
+
+    /// MOD-12 D6 (H-5): the runner's slot count is `claim_run`'s, `running` alone; a parked run
+    /// holds no slot, while `active_runs_on_box` still counts it.
+    #[tokio::test]
+    async fn running_runs_on_box_counts_running_only() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let run = store
+            .create_run(graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new()))
+            .await
+            .expect("the run is queued")
+            .id;
+        let base = store.running_runs_on_box(ids::BOX).await.expect("read");
+        assert_eq!(
+            store
+                .claim_run(run, ids::BOX, Uuid::now_v7(), at, TimeDelta::minutes(5))
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted
+        );
+        assert_eq!(
+            store.running_runs_on_box(ids::BOX).await.expect("read"),
+            base + 1
+        );
+        let active = store.active_runs_on_box(ids::BOX).await.expect("read");
+        assert!(
+            store
+                .transition_run(run, RunStatus::Running, RunStatus::AwaitingApproval, at)
+                .await
+                .expect("the park is answered")
+        );
+        assert_eq!(
+            store.running_runs_on_box(ids::BOX).await.expect("read"),
+            base,
+            "a parked run holds no slot"
+        );
+        assert_eq!(
+            store.active_runs_on_box(ids::BOX).await.expect("read"),
+            active,
+            "active_runs_on_box still counts it"
         );
     }
 }

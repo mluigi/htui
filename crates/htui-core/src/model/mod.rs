@@ -93,6 +93,7 @@ pub mod link;
 pub mod note;
 pub mod overlap;
 pub mod persona;
+pub mod queue;
 pub mod quota;
 pub mod relay;
 pub mod requirement;
@@ -120,9 +121,10 @@ pub use hierarchy::{
     RepoPatch, Workspace, WorkspaceBoxPath, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
 };
 pub use ids::{
-    AgentId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PermissionId, PersonaId,
-    PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId, RequirementId,
-    RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId, WorkspaceId,
+    AgentId, BatchId, BoxId, CommandRunId, DocumentId, ItemId, ItemKindId, NoteId, PermissionId,
+    PersonaId, PhaseId, ProjectId, PromptTemplateId, RelaySessionId, RepoId, RequirementAreaId,
+    RequirementId, RunCommandId, RunId, SkillBindingId, SkillId, StepGraphId, StepId, UserId,
+    WorkspaceId,
 };
 pub use item::{
     Item, ItemFilter, ItemPatch, ItemRevision, ItemSummary, NewItem, Resolution, Status,
@@ -144,6 +146,7 @@ pub use persona::{
     PersonaMatch, PersonaNotInSnapshot, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
     RuleLineError, SnapshotPersona,
 };
+pub use queue::{BatchClose, QueueBatch, QueueEntry, admission_limit, admission_order, free_slots};
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
     QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
@@ -466,6 +469,7 @@ mod tests {
         check_id(RunCommandId::from_uuid(u), u);
         check_id(RelaySessionId::from_uuid(u), u);
         check_id(PersonaId::from_uuid(u), u);
+        check_id(BatchId::from_uuid(u), u);
     }
 
     #[test]

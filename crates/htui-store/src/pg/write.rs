@@ -21,35 +21,36 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use htui_core::model::{
-    Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BindingChange,
-    BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, Executor, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
-    Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
-    RequirementUpdate, Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, UserId, VerifyOutcome, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
-    missing_tags_failure, overlaps, scope_of,
+    Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
+    BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
+    CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, GateOutcome, Isolation, Item, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
+    NewDocument, NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PersonaPermission, PersonaTools,
+    PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
+    PromptTemplateId, QueueBatch, QueueEntry, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps,
+    scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, command_finish_status, command_not_claimable,
-    command_not_queued, document_needs_a_step, link_key, link_not_proposed_by_run,
-    link_outside_project, note_needs_a_step, reaped_note, self_link, step_document_refusal,
-    step_note_refusal, step_writes_own_item,
+    COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
+    command_not_claimable, command_not_queued, document_needs_a_step, link_key,
+    link_not_proposed_by_run, link_outside_project, note_needs_a_step, reaped_note, self_link,
+    step_document_refusal, step_note_refusal, step_writes_own_item,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore as _, Result,
@@ -4104,7 +4105,8 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] when the item cannot reach `queued`, when the item is not in
     /// `new.project_id`, when the id is taken, or on any of the keys above. Nothing is written on
-    /// any of them.
+    /// any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for an unknown or closed
+    /// `new.batch_id` (MOD-12 D7).
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
@@ -4169,12 +4171,34 @@ impl WriteStore for PgStore {
             )));
         }
 
+        // MOD-12 D7, H-6: a run joins only an open batch. `FOR SHARE` conflicts with
+        // `close_batch`'s UPDATE, so a pause and an admission serialise on the batch row and a run
+        // never joins a batch that has already closed. The lock order is item, then batch;
+        // `close_batch` takes no item lock, so the two never cycle.
+        if let Some(batch) = new.batch_id {
+            let open = sqlx::query_scalar!(
+                r#"SELECT closed_at IS NULL AS "open!" FROM queue_batch WHERE id = $1 FOR SHARE"#,
+                batch.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "queue_batch",
+                id: batch.to_string(),
+            })?;
+            if !open {
+                return Err(StoreError::Constraint(batch_is_closed(batch)));
+            }
+        }
+
         let run = sqlx::query_as!(
             Run,
             r#"
             INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,
-                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope)
-            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[])
+                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,
+                             batch_id)
+            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10)
             RETURNING id               AS "id: RunId",
                       project_id       AS "project_id: ProjectId",
                       item_id          AS "item_id: ItemId",
@@ -4203,6 +4227,7 @@ impl WriteStore for PgStore {
             new.started_by.as_uuid(),
             new.queued_at,
             &scope,
+            new.batch_id.map(BatchId::as_uuid),
         )
         .fetch_one(&mut *tx)
         .await
@@ -7396,5 +7421,177 @@ impl PgStore {
             entity: "item_revision",
             id: format!("{id}@{version}"),
         })
+    }
+}
+
+/// MOD-12 M1: the queue's writes (plan D1-D3, D9). Neither `queue_entry` nor `queue_batch` is
+/// mirrored, so these are inherent and `Backend` dispatches them; `MemStore` carries the same.
+impl PgStore {
+    /// MOD-12 D1: queue `item` on `box_id`. Idempotent: an item already queued (on any box)
+    /// answers its stored entry unchanged (`ON CONFLICT (item_id) DO NOTHING`, then the read).
+    /// `at` is microsecond-truncated by the driver.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
+    /// [`StoreError::Constraint`] for an unknown box or user (23503, through [`map_sqlx`]).
+    pub async fn queue_item(
+        &self,
+        item: ItemId,
+        box_id: BoxId,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<QueueEntry> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM item WHERE id = $1"#,
+            item.as_uuid()
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "item",
+            id: item.to_string(),
+        })?;
+        sqlx::query!(
+            r#"
+            INSERT INTO queue_entry (item_id, box_id, position, queued_at, queued_by)
+            VALUES ($1, $2, NULL, $3, $4)
+            ON CONFLICT (item_id) DO NOTHING
+            "#,
+            item.as_uuid(),
+            box_id.as_uuid(),
+            at,
+            by.as_uuid(),
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let entry = sqlx::query_as!(
+            QueueEntry,
+            r#"
+            SELECT e.item_id    AS "item_id: ItemId",
+                   i.project_id AS "project_id: ProjectId",
+                   e.box_id     AS "box_id: BoxId",
+                   e.position,
+                   e.queued_at,
+                   e.queued_by  AS "queued_by: UserId"
+              FROM queue_entry e JOIN item i ON i.id = e.item_id
+             WHERE e.item_id = $1
+            "#,
+            item.as_uuid(),
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(entry)
+    }
+
+    /// MOD-12 D9: `item` leaves whatever queue holds it; `false` when none did. Never touches a
+    /// run.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn dequeue_item(&self, item: ItemId) -> Result<bool> {
+        let gone = sqlx::query!("DELETE FROM queue_entry WHERE item_id = $1", item.as_uuid())
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?
+            .rows_affected();
+        Ok(gone == 1)
+    }
+
+    /// MOD-12 D2: resume — the open batch of `box_id`, opened now under a fresh [`BatchId`]
+    /// unless one is already open. Idempotent: `uq_queue_batch_open` turns the second of two
+    /// racing inserts into a no-op, and both answer the row that won. A close that slips between
+    /// the insert and the read is retried once.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::Constraint`] for an unknown box or user (23503, through [`map_sqlx`]);
+    /// [`StoreError::Backend`] when no batch is open after the retry.
+    pub async fn open_batch(
+        &self,
+        box_id: BoxId,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<QueueBatch> {
+        for _ in 0..2 {
+            sqlx::query!(
+                r#"
+                INSERT INTO queue_batch (id, box_id, opened_at, opened_by)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (box_id) WHERE closed_at IS NULL DO NOTHING
+                "#,
+                BatchId::new().as_uuid(),
+                box_id.as_uuid(),
+                at,
+                by.as_uuid(),
+            )
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx)?;
+            if let Some(open) = self.open_batch_of(box_id).await? {
+                return Ok(open);
+            }
+        }
+        Err(StoreError::Backend(
+            "queue_batch: no open batch after open".to_owned(),
+        ))
+    }
+
+    /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open. The
+    /// UPDATE conflicts with `create_run`'s `FOR SHARE` on the row, so a pause and an admission
+    /// serialise (H-6).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn close_batch(
+        &self,
+        box_id: BoxId,
+        reason: BatchClose,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        sqlx::query_as!(
+            QueueBatch,
+            r#"
+            UPDATE queue_batch
+               SET closed_at = $3, closed_reason = $2
+             WHERE box_id = $1 AND closed_at IS NULL
+            RETURNING id AS "id: BatchId", box_id AS "box_id: BoxId", opened_at,
+                      opened_by AS "opened_by: UserId", closed_at,
+                      closed_reason AS "closed_reason: BatchClose"
+            "#,
+            box_id.as_uuid(),
+            reason.as_str(),
+            at,
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
+        Ok(sqlx::query!(
+            r#"
+            DELETE FROM queue_entry e
+             USING item i
+             WHERE e.item_id = i.id AND e.box_id = $1 AND i.status IN ('done', 'closed')
+            "#,
+            box_id.as_uuid(),
+        )
+        .execute(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .rows_affected())
     }
 }

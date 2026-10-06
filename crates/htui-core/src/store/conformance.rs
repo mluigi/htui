@@ -4614,6 +4614,7 @@ fn new_run(project: ProjectId, item: ItemId, scope: Vec<RepoId>) -> NewRun {
         graph_snapshot: run_snapshot(),
         repo_scope: scope,
         queued_at: seam_clock(),
+        batch_id: None,
     }
 }
 

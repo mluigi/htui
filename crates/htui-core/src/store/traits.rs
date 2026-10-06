@@ -1182,7 +1182,8 @@ pub trait WriteStore: ReadStore {
     /// cannot move to `queued` (only `open` and `failed` can), when the item is not in
     /// `new.project_id` ([`item_not_in_project`] — the run is filed under that id and
     /// [`delete_project`](WriteStore::delete_project) counts by it), when `id` already exists, or
-    /// on any foreign key.
+    /// on any foreign key. For `new.batch_id` (MOD-12 D7): `NotFound { entity: "queue_batch" }`
+    /// for an unknown batch, `Constraint` ([`batch_is_closed`]) for a closed one.
     async fn create_run(&self, new: NewRun) -> Result<Run>;
 
     /// ANA-2 §4.7's admission, one transaction, answered as a [`Claim`] (plan D83).
@@ -2441,6 +2442,13 @@ pub fn lease_ttl_micros(ttl: TimeDelta) -> Result<i64> {
 #[must_use]
 pub fn references_no_row(column: &str, id: impl std::fmt::Display, table: &str) -> String {
     format!("{column} `{id}` references no {table}")
+}
+
+/// MOD-12 D2, D7 (H-6): `create_run` refuses to admit a run under a batch that has closed, in
+/// the sentence both stores give it.
+#[must_use]
+pub fn batch_is_closed(batch: crate::model::BatchId) -> String {
+    format!("queue_batch `{batch}` is closed: no run joins it")
 }
 
 /// A client-minted id that is already stored: Postgres's duplicate key, in words.

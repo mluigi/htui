@@ -12,15 +12,15 @@ use std::collections::BTreeMap;
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
-    AgentBox, AgentId, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CancelRequest,
-    Claim, CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item, ItemId, ItemKind,
-    NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId,
-    PromptScope, PromptTemplate, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
-    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
-    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, Status, StepGraphId,
-    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId,
-    WorkspaceSummary,
+    AgentBox, AgentId, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile,
+    BoxRow, CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, GateOutcome,
+    Item, ItemId, ItemKind, ItemSummary, NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
+    Project, ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry, RelaySessionId, Repo,
+    RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission,
+    StepStatus, UpstreamEntry, UserId, WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -782,6 +782,33 @@ impl htui_core::store::WorkerHost for PgStore {
     async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
         PgStore::queued_runs_on_box(self, box_id).await
     }
+
+    async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
+        PgStore::ready_items(self, scope, box_id).await
+    }
+    async fn running_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+        PgStore::running_runs_on_box(self, box_id).await
+    }
+    async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+        PgStore::queue_entries(self, box_id).await
+    }
+    async fn open_batch_of(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        PgStore::open_batch_of(self, box_id).await
+    }
+    async fn batch_runs(&self, batch: BatchId) -> Result<Vec<(RunId, RunStatus)>> {
+        PgStore::batch_runs(self, batch).await
+    }
+    async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
+        PgStore::prune_finished_entries(self, box_id).await
+    }
+    async fn close_batch(
+        &self,
+        box_id: BoxId,
+        reason: BatchClose,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        PgStore::close_batch(self, box_id, reason, at).await
+    }
 }
 
 impl htui_core::store::WorkerHost for Backend {
@@ -861,6 +888,33 @@ impl htui_core::store::WorkerHost for Backend {
     }
     async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
         Backend::queued_runs_on_box(self, box_id).await
+    }
+
+    async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
+        Backend::ready_items(self, scope, box_id).await
+    }
+    async fn running_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+        Backend::running_runs_on_box(self, box_id).await
+    }
+    async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+        Backend::queue_entries(self, box_id).await
+    }
+    async fn open_batch_of(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        Backend::open_batch_of(self, box_id).await
+    }
+    async fn batch_runs(&self, batch: BatchId) -> Result<Vec<(RunId, RunStatus)>> {
+        Backend::batch_runs(self, batch).await
+    }
+    async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
+        Backend::prune_finished_entries(self, box_id).await
+    }
+    async fn close_batch(
+        &self,
+        box_id: BoxId,
+        reason: BatchClose,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        Backend::close_batch(self, box_id, reason, at).await
     }
 }
 

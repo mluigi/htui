@@ -1107,6 +1107,7 @@ fn race_run(item: ItemId) -> NewRun {
         },
         repo_scope: Vec::new(),
         queued_at: Utc::now(),
+        batch_id: None,
     }
 }
 
@@ -7482,6 +7483,405 @@ async fn an_orphaned_queued_row_is_reaped_by_the_next_claim() {
         ),
         "the reaped row is no longer claimable"
     );
+
+    db.drop_db().await;
+}
+
+// ---- MOD-12 M1: the queue store surface (blueprint §C.3) -------------------------------------
+
+/// [`race_run`] admitted under `batch`.
+fn batch_run(item: ItemId, batch: Option<htui_core::model::BatchId>) -> NewRun {
+    NewRun {
+        batch_id: batch,
+        ..race_run(item)
+    }
+}
+
+/// The shape of a batch both stores agree on: each mints its own id.
+fn batch_shape(
+    batch: &htui_core::model::QueueBatch,
+) -> (
+    BoxId,
+    DateTime<Utc>,
+    UserId,
+    Option<DateTime<Utc>>,
+    Option<htui_core::model::BatchClose>,
+) {
+    (
+        batch.box_id,
+        batch.opened_at,
+        batch.opened_by,
+        batch.closed_at,
+        batch.closed_reason,
+    )
+}
+
+/// MOD-12 D1-D6: the same calls with the same `at` answer alike on Postgres and on
+/// `MemStore::demo()`: entries, membership, prunes, the slot count, the batch's shape and the
+/// error variants for an unknown item and an unknown box.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_surface_answers_alike_on_both_stores() {
+    use htui_core::model::BatchClose;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    // Sub-microsecond digits on purpose: both stores keep the microsecond.
+    let at = Utc::now();
+    let later = at + TimeDelta::seconds(1);
+
+    for (item, when) in [
+        (ids::HTUI_ANA_2, at),
+        (ids::HTUI_ANA_1, later),
+        (ids::HTUI_FIX_1, later),
+    ] {
+        let on_pg = pg
+            .queue_item(item, ids::BOX, ids::USER, when)
+            .await
+            .expect("the Postgres queue_item lands");
+        let on_mem = mem
+            .queue_item(item, ids::BOX, ids::USER, when)
+            .await
+            .expect("the MemStore queue_item lands");
+        assert_eq!(on_pg, on_mem, "one entry, both stores");
+        assert_eq!(on_pg.queued_at, when.trunc_subsecs(TIMESTAMPTZ_DIGITS));
+    }
+    let repeat = pg
+        .queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, later)
+        .await
+        .expect("a repeat on Postgres answers the stored entry");
+    assert_eq!(
+        repeat,
+        mem.queue_item(ids::HTUI_ANA_2, BoxId::new(), ids::USER, later)
+            .await
+            .expect("a repeat on MemStore answers the stored entry"),
+    );
+    assert_eq!(
+        (repeat.box_id, repeat.queued_at),
+        (ids::BOX, at.trunc_subsecs(TIMESTAMPTZ_DIGITS))
+    );
+    let entries = pg.queue_entries(ids::BOX).await.expect("queue_entries");
+    assert_eq!(
+        entries,
+        mem.queue_entries(ids::BOX).await.expect("queue_entries"),
+        "same entries, same order"
+    );
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].item_id, ids::HTUI_ANA_2, "queued_at first");
+
+    assert!(matches!(
+        pg.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
+        Err(htui_core::store::StoreError::NotFound { entity: "item", .. })
+    ));
+    assert!(matches!(
+        mem.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
+        Err(htui_core::store::StoreError::NotFound { entity: "item", .. })
+    ));
+    assert!(matches!(
+        pg.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), ids::USER, at)
+            .await,
+        Err(htui_core::store::StoreError::Constraint(_))
+    ));
+    assert!(matches!(
+        mem.queue_item(ids::HTUI_CLEAN_1, BoxId::new(), ids::USER, at)
+            .await,
+        Err(htui_core::store::StoreError::Constraint(_))
+    ));
+
+    assert_eq!(
+        pg.prune_finished_entries(ids::BOX).await.expect("prune"),
+        mem.prune_finished_entries(ids::BOX).await.expect("prune"),
+    );
+    assert_eq!(
+        pg.queue_entries(ids::BOX).await.expect("queue_entries"),
+        mem.queue_entries(ids::BOX).await.expect("queue_entries"),
+        "ANA-1 (done) and FIX-1 (closed) went on both"
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            pg.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"),
+            mem.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"),
+        );
+    }
+    assert!(pg.queue_entries(ids::BOX).await.expect("read").is_empty());
+
+    assert_eq!(
+        pg.open_batch_of(ids::BOX).await.expect("read"),
+        mem.open_batch_of(ids::BOX).await.expect("read"),
+        "no batch is open in the fixture"
+    );
+    let (pg_batch, mem_batch) = (
+        pg.open_batch(ids::BOX, ids::USER, at).await.expect("open"),
+        mem.open_batch(ids::BOX, ids::USER, at).await.expect("open"),
+    );
+    assert_eq!(batch_shape(&pg_batch), batch_shape(&mem_batch));
+    let (pg_closed, mem_closed) = (
+        pg.close_batch(ids::BOX, BatchClose::Drained, later)
+            .await
+            .expect("close")
+            .expect("one was open"),
+        mem.close_batch(ids::BOX, BatchClose::Drained, later)
+            .await
+            .expect("close")
+            .expect("one was open"),
+    );
+    assert_eq!(pg_closed.id, pg_batch.id);
+    assert_eq!(batch_shape(&pg_closed), batch_shape(&mem_closed));
+    assert_eq!(pg_closed.closed_reason, Some(BatchClose::Drained));
+    assert_eq!(
+        pg.close_batch(ids::BOX, BatchClose::Paused, later)
+            .await
+            .expect("close"),
+        None
+    );
+    assert_eq!(
+        mem.close_batch(ids::BOX, BatchClose::Paused, later)
+            .await
+            .expect("close"),
+        None
+    );
+
+    let base = pg.running_runs_on_box(ids::BOX).await.expect("read");
+    assert_eq!(base, mem.running_runs_on_box(ids::BOX).await.expect("read"));
+    let run = race_run(ids::HTUI_ANA_2);
+    let (owner, ttl) = (uuid::Uuid::now_v7(), TimeDelta::minutes(5));
+    pg.create_run(run.clone()).await.expect("create_run");
+    mem.create_run(run.clone()).await.expect("create_run");
+    assert_eq!(
+        pg.claim_run(run.id, ids::BOX, owner, at, ttl)
+            .await
+            .expect("claim"),
+        mem.claim_run(run.id, ids::BOX, owner, at, ttl)
+            .await
+            .expect("claim"),
+    );
+    assert_eq!(
+        pg.running_runs_on_box(ids::BOX).await.expect("read"),
+        mem.running_runs_on_box(ids::BOX).await.expect("read"),
+    );
+    assert!(
+        pg.transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect("park")
+    );
+    assert!(
+        mem.transition_run(run.id, RunStatus::Running, RunStatus::AwaitingApproval, at)
+            .await
+            .expect("park")
+    );
+    let parked = pg.running_runs_on_box(ids::BOX).await.expect("read");
+    assert_eq!(
+        parked,
+        mem.running_runs_on_box(ids::BOX).await.expect("read")
+    );
+    assert_eq!(parked, base, "a parked run holds no slot (H-5)");
+    assert_eq!(
+        pg.active_runs_on_box(ids::BOX).await.expect("read"),
+        mem.active_runs_on_box(ids::BOX).await.expect("read"),
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 D7, H-6: on both stores a run records its batch (`batch_runs`), a closed batch refuses
+/// the run with `Constraint` and an unknown one with `NotFound { entity: "queue_batch" }`.
+#[tokio::test(flavor = "multi_thread")]
+async fn create_run_round_trips_its_batch() {
+    use htui_core::model::BatchClose;
+    use htui_core::store::StoreError;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now();
+
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let pg_run = pg
+        .create_run(batch_run(ids::HTUI_ANA_2, Some(pg_batch.id)))
+        .await
+        .expect("an open batch admits on Postgres");
+    let mem_run = mem
+        .create_run(batch_run(ids::HTUI_ANA_2, Some(mem_batch.id)))
+        .await
+        .expect("an open batch admits on MemStore");
+    assert_eq!(
+        pg.batch_runs(pg_batch.id).await.expect("read"),
+        [(pg_run.id, RunStatus::Queued)]
+    );
+    assert_eq!(
+        mem.batch_runs(mem_batch.id).await.expect("read"),
+        [(mem_run.id, RunStatus::Queued)]
+    );
+    let column: Option<uuid::Uuid> = sqlx::query_scalar("SELECT batch_id FROM run WHERE id = $1")
+        .bind(pg_run.id.as_uuid())
+        .fetch_one(&db.pool)
+        .await
+        .expect("read run.batch_id");
+    assert_eq!(column, Some(pg_batch.id.as_uuid()), "the column is written");
+
+    pg.close_batch(ids::BOX, BatchClose::Paused, at)
+        .await
+        .expect("close");
+    mem.close_batch(ids::BOX, BatchClose::Paused, at)
+        .await
+        .expect("close");
+    let runs_before = common::count(&db.pool, "run").await;
+    let closed = |batch| batch_run(ids::HTUI_CLEAN_1, Some(batch));
+    for answer in [
+        pg.create_run(closed(pg_batch.id)).await,
+        mem.create_run(closed(mem_batch.id)).await,
+    ] {
+        assert!(
+            matches!(&answer, Err(StoreError::Constraint(message)) if message.contains("is closed")),
+            "a closed batch refuses: {answer:?}"
+        );
+    }
+    let unknown = htui_core::model::BatchId::new();
+    for answer in [
+        pg.create_run(closed(unknown)).await,
+        mem.create_run(closed(unknown)).await,
+    ] {
+        assert!(
+            matches!(
+                &answer,
+                Err(StoreError::NotFound {
+                    entity: "queue_batch",
+                    ..
+                })
+            ),
+            "an unknown batch is NotFound: {answer:?}"
+        );
+    }
+    assert_eq!(
+        common::count(&db.pool, "run").await,
+        runs_before,
+        "no refusal wrote a run"
+    );
+    assert_eq!(pg.batch_runs(pg_batch.id).await.expect("read").len(), 1);
+    assert_eq!(mem.batch_runs(mem_batch.id).await.expect("read").len(), 1);
+
+    db.drop_db().await;
+}
+
+/// MOD-12 D2: two racing resumes on two handles open one batch, and both answer it.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_resumes_open_one_batch() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let other = common::fixture_box_store(&db.url).await;
+    let at = Utc::now();
+    let (left, right) = tokio::join!(
+        db.store.open_batch(ids::BOX, ids::USER, at),
+        other.open_batch(ids::BOX, ids::USER, at),
+    );
+    let (left, right) = (left.expect("open"), right.expect("open"));
+    assert_eq!(left.id, right.id, "both resumes answer the one open batch");
+    let open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM queue_batch WHERE box_id = $1 AND closed_at IS NULL",
+    )
+    .bind(ids::BOX.as_uuid())
+    .fetch_one(&db.pool)
+    .await
+    .expect("count open batches");
+    assert_eq!(open, 1);
+
+    db.drop_db().await;
+}
+
+/// Waits until `n` backends of this database wait on a lock, or panics after five seconds.
+async fn lock_waiters(pool: &PgPool, n: i64) {
+    for _ in 0..500 {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_stat_activity \
+              WHERE datname = current_database() AND wait_event_type = 'Lock'",
+        )
+        .fetch_one(pool)
+        .await
+        .expect("read pg_stat_activity");
+        if waiting >= n {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("{n} backends never waited on a lock");
+}
+
+/// MOD-12 H-6 (Postgres only): a pause and an admission serialise on the batch row.
+///
+/// Admission first: `create_run` is held mid-transaction (after its `FOR SHARE` on the batch,
+/// blocked on the box row's foreign-key lock a third transaction holds), and a `close_batch`
+/// issued then waits for it, so the run lands in the batch and the close commits after it. Close
+/// first: the admission reads a closed batch and refuses with `Constraint`. A run never joins a
+/// batch that had closed when the run was inserted.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pause_and_an_admission_serialise_on_the_batch_row() {
+    use htui_core::model::BatchClose;
+    use htui_core::store::StoreError;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let at = Utc::now();
+    let batch = db
+        .store
+        .open_batch(ids::BOX, ids::USER, at)
+        .await
+        .expect("open");
+
+    let mut holder = db.pool.begin().await.expect("begin the box holder");
+    sqlx::query("SELECT 1 FROM box WHERE id = $1 FOR UPDATE")
+        .bind(ids::BOX.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("lock the box row");
+    let admit = tokio::spawn({
+        let store = db.store.clone();
+        let run = batch_run(ids::HTUI_ANA_2, Some(batch.id));
+        async move { store.create_run(run).await }
+    });
+    lock_waiters(&db.pool, 1).await;
+    let close = tokio::spawn({
+        let store = db.store.clone();
+        async move { store.close_batch(ids::BOX, BatchClose::Paused, at).await }
+    });
+    lock_waiters(&db.pool, 2).await;
+    assert!(
+        !close.is_finished(),
+        "the close waits on the admission's FOR SHARE"
+    );
+    holder.rollback().await.expect("release the box row");
+
+    let run = admit
+        .await
+        .expect("the admission task")
+        .expect("the batch was open when the run was inserted");
+    let closed = close
+        .await
+        .expect("the close task")
+        .expect("close")
+        .expect("the batch was open");
+    assert_eq!(closed.id, batch.id);
+    assert_eq!(
+        db.store.batch_runs(batch.id).await.expect("read"),
+        [(run.id, RunStatus::Queued)],
+        "the run joined before the close committed"
+    );
+
+    let late = db
+        .store
+        .create_run(batch_run(ids::HTUI_CLEAN_1, Some(batch.id)))
+        .await;
+    assert!(
+        matches!(&late, Err(StoreError::Constraint(message)) if message.contains("is closed")),
+        "an admission after the close is refused: {late:?}"
+    );
+    assert_eq!(db.store.batch_runs(batch.id).await.expect("read").len(), 1);
 
     db.drop_db().await;
 }

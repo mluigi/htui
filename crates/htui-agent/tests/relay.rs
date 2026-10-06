@@ -127,6 +127,7 @@ async fn leased_at(run: RunId, step: StepId) -> Leased {
             graph_snapshot: snapshot(),
             repo_scope: Vec::new(),
             queued_at: at(),
+            batch_id: None,
         })
         .await
         .expect("the run is created");
