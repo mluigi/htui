@@ -14,7 +14,7 @@
 use std::collections::BTreeMap;
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, GraphSnapshot,
+    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, Gate, GraphSnapshot,
     Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId,
     ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding,
     SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
@@ -292,9 +292,10 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 /// `box_id` is the box the run will target: rung 3 of the candidate chain is "the single enabled
 /// agent on the box" (plan D62), so which box is a resolution input.
 ///
-/// `mode` is recorded on the snapshot so it is self-contained. It does **not** move
-/// `gate_effective`: §4.10's auto-mode gate downgrade (`R-ORCH-6`) is a later milestone's, and
-/// until it exists `gate_effective` equals `gate` for every phase in either mode.
+/// `mode` is recorded on the snapshot and decides `gate_effective`: in auto mode every phase whose
+/// gate is not hard is snapshotted `never` (`effective_gate`, MOD-12 D10). `resume` re-resolves
+/// under the run's own mode (`engine.rs:3036-3044`), so the topology an auto run is compared
+/// against is downgraded the same way (H-3).
 ///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
@@ -345,6 +346,7 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
             &settings,
             app,
             box_id,
+            mode,
         )
         .await?;
         phase.persona = frozen_persona(row, &mut personas)?;
@@ -674,6 +676,19 @@ fn app_i32(app: &BTreeMap<String, Value>, key: &str) -> Option<i32> {
     app_positive(app, key).and_then(|n| i32::try_from(n).ok())
 }
 
+/// ANA-2 §4.10's one line (`R-ORCH-6`, `R-ORCH-2`): in auto mode a phase whose gate is not hard is
+/// snapshotted `never`, so its steps land `done` with `gate_outcome = skipped`; a hard gate, and
+/// every gate of a manual run, is kept. Applied **only** here, at snapshot time (MOD-12 D10):
+/// `run.mode` is fixed at insert, so no later edit can skip a gate a run has not reached.
+#[must_use]
+pub(crate) const fn effective_gate(mode: RunMode, gate: Gate, gate_hard: bool) -> Gate {
+    if matches!(mode, RunMode::Auto) && !gate_hard {
+        Gate::Never
+    } else {
+        gate
+    }
+}
+
 /// One phase of the live graph, with every §4.1 chain walked (`docs/ANA-2.md:281-288`).
 #[expect(
     clippy::too_many_arguments,
@@ -689,6 +704,7 @@ async fn snapshot_phase<G: GraphSource>(
     settings: &ProjectSettings,
     app: &BTreeMap<String, Value>,
     box_id: BoxId,
+    mode: RunMode,
 ) -> std::result::Result<SnapshotPhase, ResolveError> {
     let isolation = phase.isolation.unwrap_or(settings.default_isolation);
     if isolation == Isolation::Local && phase.fan_out > 1 {
@@ -724,9 +740,7 @@ async fn snapshot_phase<G: GraphSource>(
         name: phase.name.clone(),
         fan_out: phase.fan_out,
         gate: phase.gate,
-        // `R-ORCH-6`'s auto-mode downgrade is §4.10's and is not implemented here, so nothing has
-        // downgraded this gate and the two agree by construction.
-        gate_effective: phase.gate,
+        gate_effective: effective_gate(mode, phase.gate, phase.gate_hard),
         gate_hard: phase.gate_hard,
         retry_limit: phase.retry_limit,
         input_kinds: phase.input_kinds.clone(),
@@ -921,7 +935,7 @@ mod tests {
         Agent, AgentBox, AgentId, BTreeMap, BoundSkill, BoxId, GraphSource, Isolation, Item,
         ItemId, PhaseAgent, PhaseId, ProjectId, PromptTemplate, ResolveError, Resolved,
         ResolvedGraph, Result, RunMode, SnapshotTemplate, StepGraphId, StepGraphPhase, Value,
-        WriteStore, override_graph, resolve,
+        WriteStore, effective_gate, override_graph, resolve,
     };
 
     /// The digest of the seeded `feature` graph, resolved against the demo fixture with one
@@ -1142,6 +1156,86 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_eq!(names, ["prd", "plan", "implement", "review"]);
     }
 
+    /// MOD-12 D10 (ANA-2 §4.10, criterion 23): in auto mode a gate that is not hard is `never`,
+    /// whatever the phase says.
+    #[test]
+    fn auto_mode_downgrades_a_soft_gate_to_never() {
+        for &gate in Gate::ALL {
+            assert_eq!(
+                effective_gate(RunMode::Auto, gate, false),
+                Gate::Never,
+                "an auto run skips a soft `{gate}`"
+            );
+        }
+    }
+
+    /// MOD-12 D10: a hard gate is kept in auto mode.
+    #[test]
+    fn auto_mode_keeps_a_hard_gate() {
+        for &gate in Gate::ALL {
+            assert_eq!(
+                effective_gate(RunMode::Auto, gate, true),
+                gate,
+                "an auto run keeps a hard `{gate}`"
+            );
+        }
+    }
+
+    /// MOD-12 D10 (criterion 24): a manual run keeps every gate, hard or not.
+    #[test]
+    fn manual_mode_keeps_every_gate() {
+        for &gate in Gate::ALL {
+            for hard in [false, true] {
+                assert_eq!(
+                    effective_gate(RunMode::Manual, gate, hard),
+                    gate,
+                    "a manual run keeps `{gate}` (gate_hard = {hard})"
+                );
+            }
+        }
+    }
+
+    /// MOD-12 D10: an auto snapshot of the seeded `feature` graph keeps its hard phases' gates and
+    /// snapshots every other phase `never`; the mode is recorded on the snapshot.
+    #[tokio::test]
+    async fn an_auto_snapshot_downgrades_only_its_soft_phases() {
+        let store = MemStore::demo();
+        let item = feat_1(&store).await;
+        let snapshot = resolve(
+            &store,
+            &TestSource::claude(&store),
+            &item,
+            RunMode::Auto,
+            &BTreeMap::new(),
+            None,
+            ids::BOX,
+        )
+        .await
+        .expect("the seeded feature graph resolves")
+        .snapshot;
+        assert_eq!(snapshot.mode, RunMode::Auto);
+        assert!(
+            snapshot.phases.iter().any(|phase| phase.gate_hard),
+            "the seeded `feature` graph has a hard phase"
+        );
+        assert!(
+            snapshot.phases.iter().any(|phase| !phase.gate_hard),
+            "the seeded `feature` graph has a soft phase"
+        );
+        for phase in &snapshot.phases {
+            let expected = if phase.gate_hard {
+                phase.gate
+            } else {
+                Gate::Never
+            };
+            assert_eq!(
+                phase.gate_effective, expected,
+                "`{}` (gate_hard = {}) under auto mode",
+                phase.name, phase.gate_hard
+            );
+        }
+    }
+
     /// One assertion per row of ANA-2 §4.1's chain table (`docs/ANA-2.md:281-288`), against the
     /// fixture's own values.
     #[tokio::test]
@@ -1166,7 +1260,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
         assert!(!implement.gate_hard);
 
-        // `gate_effective`: nothing downgrades a gate this milestone.
+        // `gate_effective`: a manual snapshot never downgrades.
         assert_eq!(prd.gate, Gate::Always);
         assert_eq!(prd.gate_effective, prd.gate);
 
