@@ -35,6 +35,7 @@ pub mod provision;
 pub mod qdrant_settings_info;
 pub mod requirements;
 pub mod run_worker;
+pub(crate) mod secrets;
 pub mod skill_import;
 pub mod skills;
 pub mod store_worker;

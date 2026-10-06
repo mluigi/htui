@@ -33,6 +33,9 @@ htui-worker        = { workspace = true }
 # MOD-11 D6: `htui mcp`, the stdio relay an agent starts as its htui MCP server.
 htui-mcp           = { workspace = true }
 htui-core          = { workspace = true, features = ["demo"] }
+# MOD-10 D15: `secrets::KeyringInfisical` builds the process's one `InfisicalProvider` from the
+# keyring's URL and identity. A workspace member already in the lock; nothing new is compiled.
+htui-secrets       = { workspace = true }
 chrono             = { workspace = true }
 serde_json         = { workspace = true }
 # MOD-66 review N5: `AgentLaunch::deserialize(&launch)` reads a stored launch without cloning the
