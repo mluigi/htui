@@ -346,8 +346,8 @@ where
 /// The host closing the stream ends the relay at once. On Unix the agent closing stdin half-closes
 /// the socket, and the relay then waits for the host to finish answering. A Windows named pipe
 /// cannot half-close (tokio's `poll_shutdown` only flushes; the host never reads EOF), so there the
-/// relay waits at most [`DRAIN_WITHOUT_HALF_CLOSE`] for answers already on their way, then ends;
-/// dropping the pipe is the host's EOF.
+/// relay waits at most `DRAIN_WITHOUT_HALF_CLOSE` (1 s) for answers already on their way, then
+/// ends; dropping the pipe is the host's EOF.
 ///
 /// # Errors
 ///
