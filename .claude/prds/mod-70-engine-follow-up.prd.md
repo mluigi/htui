@@ -120,10 +120,14 @@ Decisions taken at the PRD gate (maintainer, 2026-10-06, recommended answers):
 
 ## Open Questions
 
-- [ ] Q7 — A follow-up queued while the step's permission request is parked waits for the turn's
-  end; should the relay view say "queued until the turn ends" explicitly?
-- [ ] Q8 — Does a follow-up turn count toward any step budget or timeout (if one exists), or is it
-  outside them?
+- [x] Q7 — A follow-up queued while the step's permission request is parked waits for the turn's
+  end; should the relay view say "queued until the turn ends" explicitly? **Yes** (maintainer,
+  2026-10-06): a queued follow-up always reads "queued — sent when the current turn ends", parked or
+  not, since a parked turn cannot reach `Done` until its request is answered.
+- [x] Q8 — Does a follow-up turn count toward any step budget or timeout? **Moot, closed**
+  (maintainer, 2026-10-06): no step timeout or usage cap exists; `token_budget` is the prompt
+  assembly budget (`docs/ANA-2.md:284` chain, `crates/htui-orch/src/graph.rs:750`). A follow-up
+  turn's usage is recorded like any turn's and nothing limits it.
 
 ## Risks
 
