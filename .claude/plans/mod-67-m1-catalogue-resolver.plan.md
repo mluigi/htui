@@ -1,0 +1,252 @@
+# Plan: MOD-67 M1 — key catalogue and resolver
+
+**Source**: `HANDOFF.md` MOD-67; spec `docs/ANA-26.md` §6 (verdict), §7.1–§7.3, §7.6, §8 (M1 row)
+**Routing**: routed as **plan** by maintainer override (2026-10-06): the rule gave PRD (C2 + C4),
+but ANA-26 §6–§9 already is the requirements document. Ultracode accepted for implement and
+review-finding verification; `rust-reviewer` stays the gate.
+**Selected milestone**: M1 only (maintainer, 2026-10-06). M2–M6 are later runs.
+**Complexity**: Medium (~10 files, one new module, no snapshot churn intended)
+**Status**: approved (maintainer CONFIRM 2026-10-06) — implementing
+
+## Summary
+
+Add the `keys/` module: `KeyChord` (moved) with a strict parser, the compiled-in action
+catalogue for the `global`, `overlay` and shared (`list`, `pane`, `confirm`, `form`, `common`)
+contexts, and a `Keys` resolver that returns ordered candidates for a context stack and generates
+hints and help. `App::on_key` checks `ctrl-c` first and dispatches its global and overlay layers
+through the resolver. The status line and the `?` box are generated from the stack. No view file
+(M3–M5's) is touched, and no default changes except `f1` for help and `ctrl-c` winning everywhere.
+
+## Decisions (proposed; confirmed at the CONFIRM gate)
+
+- **D1 — Module layout.** `crates/htui/src/keys/{mod,chord,catalogue,stack,hint}.rs`, `pub mod
+  keys` in `lib.rs`. `mod.rs` holds `Keys` and the re-exports.
+- **D2 — `keymap.rs` shrinks but stays until M5/M6.** `KeyChord` (+ `key_code`) moves to
+  `keys/chord.rs`; `keymap.rs` re-exports it (`pub use crate::keys::KeyChord;`) so every
+  `crate::keymap::KeyChord` / `htui::keymap::…` path still compiles. `Keymap`, `Binding`,
+  `KeyScope` stay: they still carry the six Backlog tab rows `register_all` adds (Enter miss,
+  `m`, `f`, `F`, `N`, `e`), which four integration tests read through
+  `app.keymap.help_line(&KeyScope::Tab(BacklogTab::ID))` (`tests/backlog.rs` ×3,
+  `tests/replay.rs` ×1). Those rows move to the `backlog` context in M5; the types are deleted in
+  M6 (ANA §8). `Keymap::default_global()` keeps its name (its bench call sites live in M4 files)
+  but returns an empty table: its global and overlay rows are now catalogue entries. Its doc
+  says so.
+- **D3 — The `keymap.rs` tests move.** The three chord tests move to `keys/chord.rs`; the global
+  table, `ctrl-c` and help-line tests are rewritten against the catalogue/resolver/hint in
+  `keys/`; the three tests of `Keymap` mechanics (scope fallback, newest wins, foreign scope) stay
+  with `Keymap` while it exists.
+- **D4 — Catalogue scope in M1.** Contexts `Global`, `Overlay`, `List`, `Pane`, `Confirm`, `Form`,
+  `Common`, per ANA §7.2. Global: `quit` (`q`), `next_tab` (`Tab`), `prev_tab` (`BackTab`),
+  `select_tab_1`..`_9` (`1`..`9`), `help` (`?`, `f1`), `workspaces` (`w`), `find` (`ctrl-f`),
+  `waiting` (`ctrl-w`, MOD-69 D7, added after ANA-26 was written). Overlay: `close` (`Esc`).
+  Shared-context defaults are taken from today's match arms, each entry citing the arm it mirrors
+  (`code-architect` produces the table; the fact-check of the blueprint checks the citations).
+  View contexts (`settings.*`, `skills.*`, `backlog*`, `chat`, `requirements`, `concepts`,
+  `switcher`, `migration`) are **not** added in M1: each is appended by the milestone that
+  converts its view (M3–M5), in its own block of `catalogue.rs`.
+- **D5 — Offered globals.** Global actions that open a named overlay (`workspaces`, `find`,
+  `waiting`) are only *offered* once `register_all` registers them, through a new
+  `App::offer(Act, Action)`. The shell maps the fixed ones (`quit`, tabs, `help`) itself. An
+  action that is not offered is neither dispatched nor shown. This keeps both of today's status
+  lines byte-identical — 72 snapshots from harnesses without `register_all`
+  (`q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help`) and 34 with it
+  (`… · ? help · w workspaces · Ctrl+f find`, cut at the terminal width) — and keeps `w` inert in
+  a bare harness, as it is today.
+- **D6 — `App::on_key` order.**
+  0. `ctrl-c` → `Action::Quit`, before any overlay or view (ANA §6.4, C3). This fixes the `ctrl-c`
+     half of ANA §2.6 defect 1 (Settings > Connection and Qdrant browse eat it) by construction.
+     MOD-57's pane exception is not built here: MOD-57 adds the focus check and its leave action.
+  1. The top overlay's `on_key` (unchanged).
+  2. The resolver over the overlay stack `[overlay, global∩{help}]`: `Esc` closes, `?`/`f1` toggle
+     help — so help opens over the modal switcher (ANA §6.5), but only for a key the overlay
+     itself passed (typed `?` in a field stays text).
+  3. The modal swallow (unchanged).
+  4. The active tab's `on_key` (unchanged).
+  5. The legacy `Keymap` tab rows (unchanged; the Backlog Enter miss still fires here).
+  6. The resolver over `[global]`: the first candidate that maps to an action wins.
+- **D7 — Status line.** Generated by `Keys` from the global layer of the base stack: offered and
+  bound actions in catalogue order, the first chord of each, actions sharing a help label
+  collapsed to the first (the digits), joined by ` · `. Byte-identical to today (D5).
+  **Deferred to M3:** the overlay-aware and capture-filtered status line of ANA §6.5. M1 has no
+  capture signal (the `Tab` trait has none; it comes with the view stacks of M3–M5), and making
+  it overlay-aware re-baselines the overlay snapshots that M3 re-baselines anyway.
+- **D8 — `?` box.** Re-rendered from the live stack every frame (it already renders per frame;
+  now its content is computed from the stack, not from fixed scopes). One line per layer, top to
+  bottom: the overlay context (if one is up), the legacy tab rows (`Keymap::help_line`, unchanged
+  text), the global context. Each line has the layer's heading and every chord of every
+  bound action, joined by `/`. `quit` lists the fixed `Ctrl+c` after its bound chords, and the
+  digit group renders as `1-9 select tab`. The literal `"? closes this box"` becomes the
+  generated `"?/F1 closes this box"` from `global.help`'s chords. No snapshot pins the box.
+- **D9 — `Ctx`.** Gains a private `keys: &'a Keys` and `pub fn keys(&self) -> &Keys`.
+  `Ctx::new` keeps its signature and fills the compiled defaults (`Keys::compiled()`, a
+  `&'static Keys` behind a `LazyLock`); `Ctx::with_keys(self, &'a Keys) -> Self` is how the
+  `App` sites hand theirs over. No view reads it in M1.
+- **D10 — `App`.** Gains `pub keys: Keys` (compiled defaults; M2 replaces it from the file) and
+  the offered-action table. `App::new`'s signature is unchanged (5 call sites).
+- **D11 — Strict chord parser.** `KeyChord::parse_strict(&str) -> Result<KeyChord, ChordError>`
+  per ANA §7.1. Parts are trimmed and modifiers are `ctrl`/`alt`/`shift`. `"shift-a"` is an error
+  suggesting `"A"`, and `"ctrl-C"` one suggesting `"ctrl-c"`. `shift-tab` is `BackTab`, and
+  `ctrl--` is writable (split at the last separator). The reject list rests on crossterm 0.29's
+  Unix parser (`event/sys/unix/parse.rs:92-116`): `ctrl-i` is `Tab`, `ctrl-m` is `Enter`,
+  `ctrl-[` is `Esc`, and `ctrl-\`/`ctrl-]`/`ctrl-^`/`ctrl-_` arrive as `ctrl-4`..`ctrl-7`, so all
+  of these are errors naming what arrives. `ctrl-h` and `ctrl-j` stay accepted, since in raw mode
+  they arrive as themselves (`0x08`/`0x0A` → `Char+CONTROL`; Backspace is `0x7F`). The lenient
+  `parse` is unchanged for the harness.
+- **D12 — Defaults.** Unchanged except `global.help` gains `f1` (ANA §6.5) and `ctrl-c` is checked
+  first. The `Down`/`Up` list aliases exist in the `list` context but no view consumes `list`
+  until M3, so they change nothing yet.
+
+## Patterns to Mirror
+
+| Category | Source | Pattern |
+|---|---|---|
+| Naming / module docs | `crates/htui/src/keymap.rs:1-6` | `//!` header citing the plan decision; one type per concern |
+| Static tables | `crates/htui/src/keymap.rs:205-253` | defaults built from spec strings, help label per row |
+| Error type | `crates/htui/src/keymap.rs:55-82` (`parse` never panics) | strict variant returns a reason enum with `Display`, not `anyhow` |
+| Default + opt-in builder | `crates/htui/src/ui/tabs/registry.rs:68-118` | trait/ctor defaults so no other file changes; doc says "defaulted so …" |
+| Registration seam | `crates/htui/src/app/mod.rs:57-170` | only `register_all` names concrete views; `App` holds ids, not views |
+| Unit tests | `crates/htui/src/keymap.rs:296-497` | `#[cfg(test)] mod tests` in the module, `chord("…")` helper, sentence-named tests |
+| Integration tests | `crates/htui/src/testkit.rs:123-147` (`Harness`), `tests/backlog.rs:1186-1192` | spec-string `.key("…")`, assert on `harness.app()` state and screen text |
+
+## Files to Change
+
+| File | Action | Why | Task |
+|---|---|---|---|
+| `crates/htui/src/keys/mod.rs` | CREATE | `Keys`, `Keys::compiled()`, re-exports, module docs | T0 (stub), T3 |
+| `crates/htui/src/keys/chord.rs` | CREATE | `KeyChord` moved, `parse_strict`, `ChordError`, moved chord tests | T1 |
+| `crates/htui/src/keys/catalogue.rs` | CREATE | `Act`, `Context`, `ActionSpec`, the static table | T2 |
+| `crates/htui/src/keys/stack.rs` | CREATE | `Stack`, `Keys::actions(stack, chord)` ordered candidates | T3 |
+| `crates/htui/src/keys/hint.rs` | CREATE | `Hint`/`HintSpec`, `label`, `hint`, status-line and help-box lines | T3 |
+| `crates/htui/src/keymap.rs` | UPDATE | drop `KeyChord`/`key_code` (re-export), empty `default_global`, tests per D3 | T1 |
+| `crates/htui/src/lib.rs` | UPDATE | `pub mod keys;` | T0 |
+| `crates/htui/src/app/state.rs` | UPDATE | `App.keys`, offered table, `on_key` order, generated status/help, `Ctx.keys`/`with_keys` | T4 |
+| `crates/htui/src/app/update.rs` | UPDATE | `Ctx::new(..)` sites gain `.with_keys(keys)`; test benches unchanged | T4 |
+| `crates/htui/src/app/mod.rs` | UPDATE | `w`/`ctrl-f`/`ctrl-w` rows → `app.offer(Act::…, …)`; Backlog rows unchanged | T4 |
+| `crates/htui/tests/keys.rs` | CREATE | App-level behaviour tests (T4, written first) | T4 |
+
+`testkit.rs` imports `crate::keymap::{KeyChord, Keymap}`; it compiles through the D2 re-export and
+is not edited. No file under `crates/htui/src/ui/` is touched.
+
+## Tasks
+
+### T0 — Scaffold (main thread, before fan-out)
+- **Action**: `lib.rs` `pub mod keys;`; `keys/mod.rs` declaring `pub mod chord; pub mod catalogue;
+  pub mod stack; pub mod hint;` with empty files, so T1 and T2 compile apart. Commit.
+- **Validate**: `cargo check -p htui`
+
+### T1 — Chord and strict parser (parallel with T2)
+- **Action**: tests first: the moved chord tests, then `parse_strict` cases (D11, every reject with
+  its message, trimming, `ctrl--`, `shift-tab`). Move `KeyChord`/`key_code` into `keys/chord.rs`.
+  Re-export from `keymap.rs`. Rework `keymap.rs` per D2/D3.
+- **Files**: `keys/chord.rs`, `keymap.rs`
+- **Validate**: `cargo test -p htui --lib keys::chord keymap`
+
+### T2 — Catalogue (parallel with T1)
+- **Action**: `Act`, `Context` (with its TOML table name), `ActionSpec { act, context, name,
+  defaults: &[&str], help, in_capture }`, and `CATALOGUE: &[ActionSpec]` for D4's contexts,
+  each shared-context default citing its source arm in a comment. Unit tests that need no parser:
+  names unique per context, help non-empty, `overlay.close` non-empty, `global.help ==
+  ["?", "f1"]`, no `ctrl-c` spelled anywhere.
+- **Files**: `keys/catalogue.rs`
+- **Validate**: `cargo test -p htui --lib keys::catalogue`
+
+### T3 — `Keys`, stacks, hints (after T1 + T2)
+- **Action**: tests first. These cover:
+  - every catalogue default parses strictly;
+  - no two actions in one context share a default chord;
+  - no `in_capture` action has a printable chord;
+  - `actions(stack, chord)` returns the candidates narrowest first;
+  - an unbound action drops out of a hint;
+  - the status line from the default global layer equals today's string in both offered
+    variants;
+  - the help-box lines follow D8.
+
+  Then implement `Keys` (a per-(context, act) chord table built from the catalogue;
+  `#[cfg(test)]` constructor for an override, since the file merge is M2), `Stack`, `label`,
+  `hint`, `status_line`, `help_lines`.
+- **Files**: `keys/mod.rs`, `keys/stack.rs`, `keys/hint.rs`
+- **Validate**: `cargo test -p htui --lib keys`
+
+### T4 — Shell integration (after T3)
+- **Action**: tests first in `tests/keys.rs` (Harness, spec strings). They cover:
+  - `ctrl-c` quits from Settings > Connection browse with a stored DSN, where today it opens the
+    clear confirm;
+  - the same from Qdrant browse;
+  - `ctrl-c` quits over each modal overlay;
+  - `f1` opens and closes help on Backlog and over the workspace switcher;
+  - `?` still toggles;
+  - typed `?` in the concepts search stays text;
+  - `w` is inert without `register_all` and opens the switcher with it;
+  - the help box shows `Ctrl+w waiting` only with `register_all`.
+
+  Then D5–D10 in `app/state.rs`, `app/update.rs`, `app/mod.rs`.
+- **Files**: `app/state.rs`, `app/update.rs`, `app/mod.rs`, `tests/keys.rs`
+- **Validate**: `cargo test -p htui --all-features -- --test-threads=1`, and no `.snap.new` appears
+
+### Independence (file-set intersection)
+
+| Pair | T1 files | T2 files | Intersection |
+|---|---|---|---|
+| T1 ∥ T2 | `keys/chord.rs`, `keymap.rs` | `keys/catalogue.rs` | ∅ → parallel |
+
+T3 depends on T1's `KeyChord::parse_strict` and T2's types; T4 depends on T3. `keys/mod.rs` is
+created by T0 and edited only by T3. Ultracode shape (accepted): one Workflow, `T1 ∥ T2` then
+`T3` then `T4`, each implement stage followed by an adversarial-verify stage; `rust-reviewer`
+runs on the whole change afterwards.
+
+## Validation
+
+```bash
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace -- -D warnings            # featureless: catches test-support-only code
+cargo test -p htui --all-features -- --test-threads=1
+cargo test --workspace --all-features --no-fail-fast
+find crates -name '*.snap.new' | wc -l             # must be 0: M1 re-baselines nothing
+bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
+```
+
+## Risks
+
+| Risk | Likelihood | Mitigation |
+|---|---|---|
+| A generated status line drifts by one character and fails ~106 snapshots | Medium | T3 asserts both strings verbatim before T4 wires it; the gate checks for zero `.snap.new` |
+| `ctrl-c`-first quits where a view relied on receiving it | Low | ANA §2.6 found no consumer; the fact-check re-greps; T4 pins the intended quits |
+| M3–M5 all append to `catalogue.rs` (and `Act`) and conflict | Medium | Per-context blocks appended at distinct anchors; the conflicts are textual; the serial merge re-runs the catalogue tests |
+| Shared-context defaults guessed wrong before their views convert | Medium | Each default cites the arm it mirrors; M3–M5 may amend; no view consumes them in M1 |
+| `f1` swallowed by Settings capturing editors (they eat non-CONTROL keys) | Certain, accepted | Fixed when M3 gives sections stacks; M1 promises `f1` wherever the view passes it |
+| Suite flakes from the process-wide keyring fake | Known | Gate with `--test-threads=1` |
+
+## Acceptance
+
+- [ ] T0–T4 complete, tests written before code
+- [ ] Validation passes; zero snapshot changes
+- [ ] `ctrl-c` quits from Connection/Qdrant browse and every overlay (pinned)
+- [ ] `?`/`f1` open help over the switcher; status line byte-identical
+- [ ] No file under `crates/htui/src/ui/` changed
+- [ ] HANDOFF MOD-67 phase note (P1); plan status updated
+
+## Verified claims (plan fact-check, 2026-10-06)
+
+| # | claim | verdict | evidence |
+|---|---|---|---|
+| 1 | `keymap.rs` has 9 unit tests (3 chord, 6 table/scope) | ✓ | `keymap.rs:296-497`: parse_reads…, shift_tab…, a_shifted…, the_global_table…, ctrl_c_quits…, an_unknown_chord…, every_overlay_inherits…, the_newest_binding…, the_help_line… |
+| 2 | Snapshots pin two status lines, 72 × bare and 34 × with `register_all`; the second is cut before `Ctrl+w waiting` | ✓ | count of `q quit…` lines across `tests/snapshots` + `src/snapshots`; `concepts_search__searching.snap:34` is 99 columns + newline at the 100-column harness |
+| 3 | No snapshot pins the `?` box | ✓ | no `closes this box` / `─ Keys ─` in any `.snap`; the three `Keys` hits are requirement prose |
+| 4 | `App::new` has 5 call sites; signature can stay | ✓ | `lib.rs:176`, `testkit.rs:128`, `app/update.rs:581,1460,1488` |
+| 5 | `testkit.rs` reaches `KeyChord` through `crate::keymap` (re-export keeps it compiling) | ✓ | `testkit.rs:27` `use crate::keymap::{KeyChord, Keymap};` |
+| 6 | Four integration tests read `app.keymap.help_line(&KeyScope::Tab(BacklogTab::ID))` | ✓ | `tests/backlog.rs:273,1813,2237`; `tests/replay.rs:222-223` |
+| 7 | `Tab` has no capture signal, so a capture-filtered status line has no input in M1 | ✓ | `ui/tabs/registry.rs:39-118` (no `captures_input` on `Tab`; it exists only on `SettingsSection`) |
+| 8 | All four real overlays are modal | ✓ | `is_modal → true`: `concepts_search.rs:282`, `migration_prompt.rs:80`, `waiting_list.rs:257`, `workspace_switcher.rs:152` |
+| 9 | No view consumes `ctrl-c` on purpose; Connection/Qdrant browse eat it through a modifier-blind `'c'` arm | ✓ | `Char('c')` sweep: every `CONTROL`+`c` hit is a pass-through test; `connection.rs:785`, `qdrant.rs:388` are `KeyCode::Char('c')` arms without a modifier check |
+| 10 | Settings capturing editors swallow `f1` (non-CONTROL pass → `Consumed`) | ✓ | `connection.rs:427-428` `FieldOutcome::Pass if CONTROL => Pass`, else `Consumed` |
+| 11 | crossterm 0.29 Unix legacy decoding: `0x09`→Tab, `0x0D`→Enter, `0x1B`→Esc, `0x1C-0x1F`→`ctrl-4..7`, `0x08`/`0x0A` (raw mode)→`Char+CONTROL` | ✓ | `crossterm-0.29.0/src/event/sys/unix/parse.rs:92-116`; `Cargo.lock` crossterm 0.29.0 |
+| 12 | `LazyLock` is available | ✓ | `rust-version = "1.98"`, edition 2024 (`Cargo.toml:7-8`); stable since 1.80 |
+| 13 | A harness can set up a stored DSN for the `ctrl-c` test | ✓ | `tests/connection.rs:489` `clear_dsn_empties_the_keyring_and_keeps_the_backend` |
+| 14 | The `w`/`ctrl-f`/`ctrl-w` rows are added only by `register_all` | ✓ | `app/mod.rs:79-108`; `default_global` binds none of them (`keymap.rs:205-253`) |
+| 15 | T1 ∥ T2 file sets are disjoint | ✓ | {`keys/chord.rs`, `keymap.rs`} ∩ {`keys/catalogue.rs`} = ∅; T2 uses spec strings, not `KeyChord` |
+| 16 | `crates/htui` lacks `serde` (ANA §2.7) | ✗ (no M1 impact) | `crates/htui/Cargo.toml:40` already has `serde`; M2 adds only `toml` |
+
+Sandbox note for implementers: the Gortex PreToolUse hook blocks shell reads of indexed source;
+read with Gortex `read`, and if `Read`/`Edit` is blocked use an anchored scripted replace (each
+anchor asserted to match once), then `cargo fmt`.
