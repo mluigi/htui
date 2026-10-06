@@ -7767,10 +7767,12 @@ async fn a_dropped_close_under_a_repeatable_read_default_still_refuses_a_racing_
 }
 
 /// MOD-70 review L-3, open first: an enqueue that arrives while a re-open holds the window row
-/// (its upsert's row lock, as `open_follow_ups` takes it) waits on its `FOR SHARE OF w`, then
-/// re-checks the committed row: open, under the lease owner, so the follow-up is admitted to the
-/// **new** window. The open's own refusal ran before the insert and does not touch it; the new
-/// session reads it at its next turn end, the old one never does.
+/// (its upsert's row lock, as `open_follow_ups` takes it) **over a window still open** waits on
+/// its `FOR SHARE OF w`, then re-checks the committed row: open, under the lease owner, so the
+/// follow-up is admitted to the **new** window. The open's own refusal ran before the insert and
+/// does not touch it; the new session reads it at its next turn end, the old one never does. A
+/// re-open over a window already closed does not make the enqueue wait:
+/// [`an_enqueue_during_a_reopen_of_a_closed_window_is_refused_session_ended`].
 #[tokio::test(flavor = "multi_thread")]
 async fn an_enqueue_behind_a_reopen_is_admitted_to_the_new_window() {
     let Some(db) = common::demo_db().await else {
@@ -7835,6 +7837,90 @@ async fn an_enqueue_behind_a_reopen_is_admitted_to_the_new_window() {
         Some(QueuedFollowUp {
             id,
             text: "after the re-open".to_owned(),
+        }),
+        "the new session reads it at its next turn end"
+    );
+
+    b.pool().close().await;
+    db.drop_db().await;
+}
+
+/// MOD-70 review R2 P-3, closed first: the old window is closed (its session ended) when a
+/// re-open holds the window row. The enqueue's `INSERT .. SELECT` reads the committed version,
+/// which `w.closed_at IS NULL` filters out before `FOR SHARE OF w` would lock it, so it does
+/// **not** wait on the upsert: it inserts nothing, its re-read sees the committed closed window,
+/// and it is refused `SessionEnded` while the re-open is still uncommitted. Nothing is written;
+/// once the re-open commits, the same text is admitted to the new window.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_enqueue_during_a_reopen_of_a_closed_window_is_refused_session_ended() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let (b, _root) = second_box(&db).await;
+    let (run, step, a, old) = follow_up_window(&db).await;
+    let new_session = RelaySessionId::new();
+    assert_eq!(
+        db.store
+            .close_follow_ups(step, old, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect("the old session's close is answered"),
+        0,
+        "the old window closes over nothing"
+    );
+
+    let mut holder = db.pool.begin().await.expect("begin the open");
+    let upserted = sqlx::query(
+        "INSERT INTO follow_up_window (run_step_id, run_id, session, owner) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (run_step_id) DO UPDATE \
+            SET session = EXCLUDED.session, owner = EXCLUDED.owner, \
+                opened_at = clock_timestamp(), closed_at = NULL",
+    )
+    .bind(step.as_uuid())
+    .bind(run.as_uuid())
+    .bind(new_session.as_uuid())
+    .bind(a)
+    .execute(&mut *holder)
+    .await
+    .expect("the open upserts the window row")
+    .rows_affected();
+    assert_eq!(upserted, 1, "the window row is held");
+
+    let during = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        b.request_follow_up(follow_up_from(&b, step, "during the re-open")),
+    )
+    .await
+    .expect("the enqueue does not wait on the held window row")
+    .expect("the enqueue is answered");
+    assert_eq!(
+        during,
+        FollowUpRequest::Refused(FollowUpRefusal::SessionEnded),
+        "the enqueue reads the committed, closed window"
+    );
+    assert!(
+        follow_up_rows_of(&db.pool, step).await.is_empty(),
+        "the refused enqueue wrote nothing"
+    );
+
+    holder.commit().await.expect("the open commits");
+    let after = follow_up_from(&b, step, "during the re-open");
+    let id = after.id;
+    assert_eq!(
+        b.request_follow_up(after)
+            .await
+            .expect("the retry is answered"),
+        FollowUpRequest::Queued(id),
+        "once the re-open commits, the retry is admitted to the new window"
+    );
+    assert_eq!(
+        db.store
+            .next_follow_up(step, new_session)
+            .await
+            .expect("the new session's read is answered"),
+        Some(QueuedFollowUp {
+            id,
+            text: "during the re-open".to_owned(),
         }),
         "the new session reads it at its next turn end"
     );
