@@ -15,6 +15,11 @@
 //! ends a live worker walk through the worker loop's own command poll. Their worker sessions play
 //! [`ParksOnce`] through [`Parts::runtime_with`]; the relay polls at its production interval.
 //!
+//! MOD-70 T4 (blueprint §8) adds three follow-up cases to the same relay setup: the parking
+//! session has follow-up turns ([`ParksOnce::then`]), box B queues a follow-up while it is parked
+//! and then answers or cancels, and each case reads the transcript's `follow_up` row and probes
+//! `run_command` directly for `text IS NULL` (PRD metric 3), which no store method returns.
+//!
 //! Case 4 is the headless connect's refusal, and cases 5 to 8 spawn the `htui` binary with a
 //! cleared environment whose `HOME` and `XDG_CONFIG_HOME` are a temporary directory, so nothing
 //! reaches the developer's `~/.config/htui` (blueprint F-22). No case walks a run with production
@@ -35,16 +40,17 @@ use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::driver::{AgentDriver, DriverCaps, PermissionRequestId};
 use htui_agent::event::{
     DoneEvent, DriverEvent, PermissionOption, PermissionOptionKind, PermissionRequestEvent,
-    StopReason, ToolCallEvent, ToolKind,
+    StopReason, TextChunk, ToolCallEvent, ToolKind,
 };
 use htui_agent::fake::FakeDriver;
 use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, Billing, BoxEdit, BoxId, DocumentId, EventKind,
-    Executor, ItemId, NewDocument, NewRepo, PermissionStatus, RepoId, RunCommandStatus, RunId,
-    RunMode, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepPermission, StepStatus,
-    Transport,
+    Executor, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
+    FollowUpText, ItemId, NewDocument, NewFollowUp, NewRepo, PermissionStatus, RepoId,
+    RunCommandId, RunCommandStatus, RunId, RunMode, RunStatus, RunStep, SnapshotPhase, Status,
+    StepId, StepPermission, StepStatus, Transport,
 };
 use htui_core::store::{CasOutcome, ReadStore as _, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -130,8 +136,37 @@ impl TransportBuilder for Walks {
 /// MOD-42 T6: the first session a runtime builds plays a gated `execute` call and parks on its
 /// permission request (one allow and one reject option), then ends its turn once answered; every
 /// later session plays [`Walks`]'s one turn, so an ungated walk reaches `done` after the answer.
+///
+/// MOD-70 T4: [`ParksOnce::then`] gives that first session `follow_ups` more turns, each one
+/// [`a_follow_up_turn`], which only a follow-up starts (B-9: the park is the rendezvous).
 #[derive(Debug, Default)]
-struct ParksOnce(AtomicBool);
+struct ParksOnce {
+    built: AtomicBool,
+    follow_ups: usize,
+}
+
+impl ParksOnce {
+    /// The parking session, with `follow_ups` turns after the parked one.
+    fn then(follow_ups: usize) -> Self {
+        Self {
+            built: AtomicBool::new(false),
+            follow_ups,
+        }
+    }
+}
+
+/// MOD-70 T4: the turn a follow-up starts: a line of text, then the end of the turn.
+fn a_follow_up_turn() -> Vec<ScriptEvent> {
+    vec![
+        ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+            text: "the edge cases are covered".to_owned(),
+            message_id: None,
+        })),
+        ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })),
+    ]
+}
 
 impl TransportBuilder for ParksOnce {
     fn build(
@@ -140,42 +175,49 @@ impl TransportBuilder for ParksOnce {
         on_box: Option<&AgentBox>,
         caps: DriverCaps,
     ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
-        if self.0.swap(true, Ordering::SeqCst) {
+        if self.built.swap(true, Ordering::SeqCst) {
             return Walks.build(agent, on_box, caps);
         }
+        let mut turns = vec![parked_turn()];
+        turns.extend((0..self.follow_ups).map(|_| a_follow_up_turn()));
         Ok(Box::new(FakeDriver::new(
             agent.name.clone(),
             caps,
-            Script::one_turn(vec![
-                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
-                    tool_call_id: "call-1".to_owned(),
-                    title: "run the suite".to_owned(),
-                    tool_kind: ToolKind::Execute,
-                    input: json!({ "command": "cargo test" }),
-                    locations: Vec::new(),
-                })),
-                ScriptEvent::ParkPermission(PermissionRequestEvent {
-                    request_id: PermissionRequestId::new("request-1"),
-                    tool_call_id: Some("call-1".to_owned()),
-                    options: vec![
-                        PermissionOption {
-                            id: "allow-once".to_owned(),
-                            label: "Allow".to_owned(),
-                            kind: PermissionOptionKind::AllowOnce,
-                        },
-                        PermissionOption {
-                            id: "reject-once".to_owned(),
-                            label: "Reject".to_owned(),
-                            kind: PermissionOptionKind::RejectOnce,
-                        },
-                    ],
-                }),
-                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
-                    stop_reason: StopReason::EndTurn,
-                })),
-            ]),
+            Script::turns(turns),
         )))
     }
+}
+
+/// [`ParksOnce`]'s first turn: a gated `execute` call, its parked request, the end of the turn.
+fn parked_turn() -> Vec<ScriptEvent> {
+    vec![
+        ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "run the suite".to_owned(),
+            tool_kind: ToolKind::Execute,
+            input: json!({ "command": "cargo test" }),
+            locations: Vec::new(),
+        })),
+        ScriptEvent::ParkPermission(PermissionRequestEvent {
+            request_id: PermissionRequestId::new("request-1"),
+            tool_call_id: Some("call-1".to_owned()),
+            options: vec![
+                PermissionOption {
+                    id: "allow-once".to_owned(),
+                    label: "Allow".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    id: "reject-once".to_owned(),
+                    label: "Reject".to_owned(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        }),
+        ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })),
+    ]
 }
 
 /// The fake isolator and verifier one box's processes share.
@@ -993,6 +1035,362 @@ async fn a_cancel_from_another_box_ends_a_live_worker_walk() {
         view.permissions.is_empty() && view.cancels.is_empty(),
         "{view:?}"
     );
+    worker.stop().await;
+    stack.finish().await;
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-70 T4: follow-ups across boxes
+// ---------------------------------------------------------------------------------------------
+
+/// The follow-up box B types. Nothing a pattern-only scrubber refuses (D2), so the scrubbed
+/// `follow_up` row the executor records carries it as typed.
+const FOLLOW_UP: &str = "also cover the edge cases";
+
+/// Box B queues `text` for `step` as its own user from its own box (D3).
+async fn request_follow_up(client: &PgStore, step: StepId, text: &str) -> FollowUpRequest {
+    client
+        .request_follow_up(NewFollowUp {
+            id: RunCommandId::new(),
+            run_step_id: step,
+            text: FollowUpText::new(text.to_owned()).expect("the client accepts the text"),
+            issued_by: client.this_user(),
+            issued_box: client.this_box(),
+        })
+        .await
+        .expect("the enqueue is answered")
+}
+
+/// [`request_follow_up`], which must be queued; the row's id.
+async fn queued(client: &PgStore, step: StepId, text: &str) -> RunCommandId {
+    match request_follow_up(client, step, text).await {
+        FollowUpRequest::Queued(id) => id,
+        refused @ FollowUpRequest::Refused(_) => {
+            panic!("the follow-up was not queued: {refused:?}")
+        }
+    }
+}
+
+/// Box B answers `row` with its allow option.
+async fn allow(client: &PgStore, row: &StepPermission) {
+    let answered = client
+        .answer_permission(row.id, "allow-once", client.this_user(), client.this_box())
+        .await
+        .expect("the answer is written");
+    assert_eq!(answered, AnswerOutcome::Answered);
+}
+
+/// One `run_command` row of kind `follow_up`, as the direct SQL probe reads it: PRD metric 3's
+/// `text IS NULL` has no store method, by design (OQ-6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FollowUpRow {
+    id: RunCommandId,
+    status: RunCommandStatus,
+    text_is_null: bool,
+    resolution: Option<String>,
+    issued_box: BoxId,
+}
+
+/// Every follow-up row of `step`, in issue order.
+async fn follow_up_rows(pool: &sqlx::PgPool, step: StepId) -> Vec<FollowUpRow> {
+    sqlx::query_as::<_, (uuid::Uuid, String, bool, Option<String>, uuid::Uuid)>(
+        "SELECT id, status, text IS NULL, resolution, issued_box FROM run_command \
+         WHERE kind = 'follow_up' AND run_step_id = $1 ORDER BY issued_at, id",
+    )
+    .bind(step.as_uuid())
+    .fetch_all(pool)
+    .await
+    .expect("read the follow-up rows")
+    .into_iter()
+    .map(
+        |(id, status, text_is_null, resolution, issued_box)| FollowUpRow {
+            id: RunCommandId::from_uuid(id),
+            status: status.parse().expect("a known command status"),
+            text_is_null,
+            resolution,
+            issued_box: BoxId::from_uuid(issued_box),
+        },
+    )
+    .collect()
+}
+
+/// `(windows, open windows)` of `step`'s `follow_up_window` rows: no store method lists them.
+async fn follow_up_windows(pool: &sqlx::PgPool, step: StepId) -> (i64, i64) {
+    sqlx::query_as::<_, (i64, i64)>(
+        "SELECT COUNT(*), COUNT(*) FILTER (WHERE closed_at IS NULL) FROM follow_up_window \
+         WHERE run_step_id = $1",
+    )
+    .bind(step.as_uuid())
+    .fetch_one(pool)
+    .await
+    .expect("read follow_up_window")
+}
+
+/// The `follow_up` rows of `step`'s log: `(turn, payload)`, in `seq` order.
+async fn follow_up_events(store: &PgStore, step: StepId) -> Vec<(i32, serde_json::Value)> {
+    store
+        .step_events(step)
+        .await
+        .expect("the log reads")
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|row| row.kind == EventKind::FollowUp)
+        .map(|row| (row.turn, row.payload))
+        .collect()
+}
+
+/// How many `done` rows `step`'s log holds: one per turn.
+async fn dones(store: &PgStore, step: StepId) -> usize {
+    store
+        .step_events(step)
+        .await
+        .expect("the log reads")
+        .unwrap_or_default()
+        .iter()
+        .filter(|row| row.kind == EventKind::Done)
+        .count()
+}
+
+/// MOD-70 PRD metrics "applied across executors" (other-box worker) and "no unscrubbed
+/// persistence": the worker on box A walks a step whose session parks; box B queues a follow-up
+/// while it is parked, then answers. The worker sends the follow-up when the parked turn ends: the
+/// step's log holds the scrubbed `follow_up` at `turn = 1` and a second `done`, the step completes
+/// `done`, and the row is `applied` with its text gone, issued from B.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_walked_step_takes_a_follow_up_from_another_box() {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    stack.ungate_feat().await;
+    stack.set_executor(Executor::Worker).await;
+    let (run, rest) = stack.start(ids::HTUI_FEAT_3).await;
+    assert_eq!(rest.run, RunStatus::Queued, "the TUI only queues");
+    let worker = stack.spawn_worker_with(CONFIG, Box::new(ParksOnce::then(1)));
+    let (client, _client_root) = another_box(&stack.db).await;
+
+    let parked = pending_request(&client, ids::HTUI_FEAT_3).await;
+    assert_eq!(parked.run_id, run);
+    let id = queued(&client, parked.run_step_id, FOLLOW_UP).await;
+    let view = client
+        .relay_view(ids::HTUI_FEAT_3)
+        .await
+        .expect("the view reads");
+    assert_eq!(
+        view.follow_ups
+            .iter()
+            .map(|row| (row.id, row.status))
+            .collect::<Vec<_>>(),
+        [(id, RunCommandStatus::Pending)],
+        "B's pane shows its follow-up queued"
+    );
+    allow(&client, &parked).await;
+    step_reaches(&stack, run, parked.run_step_id, StepStatus::Done).await;
+
+    assert_eq!(
+        follow_up_events(&stack.db.store, parked.run_step_id).await,
+        [(1, json!({ "text": FOLLOW_UP }))],
+        "the executor recorded the scrubbed follow-up once, as turn 1"
+    );
+    assert_eq!(
+        dones(&stack.db.store, parked.run_step_id).await,
+        2,
+        "two turns, two `done`s"
+    );
+    assert_eq!(
+        follow_up_rows(&stack.db.pool, parked.run_step_id).await,
+        [FollowUpRow {
+            id,
+            status: RunCommandStatus::Applied,
+            text_is_null: true,
+            resolution: None,
+            issued_box: client.this_box(),
+        }],
+        "applied by the worker, issued from B, its text gone (PRD metric 3)"
+    );
+    assert_eq!(
+        follow_up_windows(&stack.db.pool, parked.run_step_id).await,
+        (1, 0),
+        "one window, closed at the session's exit"
+    );
+    assert_eq!(stack.rested(run).await.status, RunStatus::Done);
+    stack.released(run).await;
+    worker.stop().await;
+    stack.finish().await;
+}
+
+/// MOD-70 D5, B-14: a cancel box B requests while its follow-up is pending refuses that
+/// follow-up in the cancel's own transaction (`FOLLOW_UP_RUN_CANCELLED`, text gone); the worker
+/// ends the walk, the run is `cancelled`, and no `follow_up` was ever recorded.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_from_another_box_refuses_its_pending_follow_up() {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    stack.ungate_feat().await;
+    stack.set_executor(Executor::Worker).await;
+    let (run, _) = stack.start(ids::HTUI_FEAT_3).await;
+    let worker = stack.spawn_worker_with(CONFIG, Box::new(ParksOnce::then(1)));
+    let (client, _client_root) = another_box(&stack.db).await;
+    let parked = pending_request(&client, ids::HTUI_FEAT_3).await;
+    let id = queued(&client, parked.run_step_id, FOLLOW_UP).await;
+
+    let requested = client
+        .request_cancel(run, client.this_user(), client.this_box())
+        .await
+        .expect("the cancel is written");
+    assert!(
+        matches!(requested, htui_core::model::CancelRequest::Inserted(_)),
+        "{requested:?}"
+    );
+    let refused = FollowUpRow {
+        id,
+        status: RunCommandStatus::Refused,
+        text_is_null: true,
+        resolution: Some(FOLLOW_UP_RUN_CANCELLED.to_owned()),
+        issued_box: client.this_box(),
+    };
+    assert_eq!(
+        follow_up_rows(&stack.db.pool, parked.run_step_id).await,
+        [refused.clone()],
+        "the cancel's own transaction refused it (B-14)"
+    );
+    let deadline = Instant::now() + PATIENCE;
+    while stack.run_row(run).await.status != RunStatus::Cancelled {
+        assert!(Instant::now() < deadline, "the run was never cancelled");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    step_reaches(&stack, run, parked.run_step_id, StepStatus::Cancelled).await;
+    stack.released(run).await;
+
+    assert_eq!(
+        follow_up_rows(&stack.db.pool, parked.run_step_id).await,
+        [refused],
+        "the walk's own close changed nothing"
+    );
+    assert!(
+        follow_up_events(&stack.db.store, parked.run_step_id)
+            .await
+            .is_empty(),
+        "no follow-up was sent"
+    );
+    assert_eq!(
+        follow_up_windows(&stack.db.pool, parked.run_step_id)
+            .await
+            .1,
+        0,
+        "no window is left open"
+    );
+    let view = client
+        .relay_view(ids::HTUI_FEAT_3)
+        .await
+        .expect("the view reads");
+    assert!(
+        view.permissions.is_empty() && view.cancels.is_empty() && view.follow_ups.is_empty(),
+        "{view:?}"
+    );
+    worker.stop().await;
+    stack.finish().await;
+}
+
+/// How many follow-ups [`no_follow_up_is_left_pending_after_the_step_ends`]' client queues at
+/// most; the parking session has a turn for each.
+const MAX_QUEUED: usize = 3;
+
+/// MOD-70 B-15, PRD "none pending after its step ends": box B queues a follow-up while the step
+/// is parked, answers, and then keeps queueing as fast as Postgres answers until the step's
+/// session refuses it, racing the walk's last turn-end check and its close however they
+/// interleave. Whatever the race decided, once the step is `done` no follow-up of it is pending,
+/// every one is resolved with its text gone (each applied one recorded as its own turn, each
+/// refused one `FOLLOW_UP_SESSION_ENDED`), its window is closed, and a further enqueue is refused
+/// `NotRunning`.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_follow_up_is_left_pending_after_the_step_ends() {
+    let Some(mut stack) = Stack::new().await else {
+        return;
+    };
+    stack.ungate_feat().await;
+    stack.set_executor(Executor::Worker).await;
+    let (run, _) = stack.start(ids::HTUI_FEAT_3).await;
+    let worker = stack.spawn_worker_with(CONFIG, Box::new(ParksOnce::then(MAX_QUEUED)));
+    let (client, _client_root) = another_box(&stack.db).await;
+    let parked = pending_request(&client, ids::HTUI_FEAT_3).await;
+    let step = parked.run_step_id;
+    queued(&client, step, FOLLOW_UP).await;
+    allow(&client, &parked).await;
+
+    let mut queued_rows = 1;
+    let deadline = Instant::now() + PATIENCE;
+    let ended = loop {
+        assert!(Instant::now() < deadline, "the session never ended");
+        match request_follow_up(&client, step, FOLLOW_UP).await {
+            FollowUpRequest::Queued(_) => {
+                queued_rows += 1;
+                if queued_rows == MAX_QUEUED {
+                    break None;
+                }
+            }
+            FollowUpRequest::Refused(FollowUpRefusal::AlreadyQueued) => {}
+            FollowUpRequest::Refused(
+                refusal @ (FollowUpRefusal::SessionEnded | FollowUpRefusal::NotRunning),
+            ) => break Some(refusal),
+            refused @ FollowUpRequest::Refused(_) => {
+                panic!("a live session's enqueue was refused otherwise: {refused:?}")
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    step_reaches(&stack, run, step, StepStatus::Done).await;
+
+    let rows = follow_up_rows(&stack.db.pool, step).await;
+    assert_eq!(
+        rows.len(),
+        queued_rows,
+        "one row per queued follow-up: {rows:?} ({ended:?})"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row.status != RunCommandStatus::Pending && row.text_is_null),
+        "every follow-up resolved, its text gone: {rows:?}"
+    );
+    let applied = rows
+        .iter()
+        .filter(|row| row.status == RunCommandStatus::Applied)
+        .count();
+    assert!(
+        applied >= 1,
+        "the one queued while parked was sent: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .filter(|row| row.status == RunCommandStatus::Refused)
+            .all(|row| row.resolution.as_deref() == Some(FOLLOW_UP_SESSION_ENDED)),
+        "a follow-up the session missed is refused `SessionEnded`: {rows:?}"
+    );
+    let sent = follow_up_events(&stack.db.store, step).await;
+    assert_eq!(
+        sent.iter().map(|(turn, _)| *turn).collect::<Vec<_>>(),
+        (1..=i32::try_from(applied).expect("a few turns")).collect::<Vec<_>>(),
+        "each applied follow-up opened its own turn: {rows:?}"
+    );
+    assert_eq!(
+        follow_up_windows(&stack.db.pool, step).await,
+        (1, 0),
+        "the step's one window is closed"
+    );
+    assert_eq!(
+        request_follow_up(&client, step, FOLLOW_UP).await,
+        FollowUpRequest::Refused(FollowUpRefusal::NotRunning),
+        "a `done` step takes no follow-up"
+    );
+    assert!(
+        follow_up_rows(&stack.db.pool, step)
+            .await
+            .iter()
+            .all(|row| row.status != RunCommandStatus::Pending),
+        "the refusal wrote nothing"
+    );
+    assert_eq!(stack.rested(run).await.status, RunStatus::Done);
+    stack.released(run).await;
     worker.stop().await;
     stack.finish().await;
 }
