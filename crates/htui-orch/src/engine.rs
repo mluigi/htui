@@ -1524,6 +1524,9 @@ where
     /// a note says so, and the step stays promoted and parked. An `unavailable` one is not refused
     /// (plan D30: it never fails a step, and some of its causes are permanent); it is recorded and
     /// a note `accept: verify unavailable: <reason>` says the merge goes in unverified (D211).
+    /// MOD-10 (blueprint A-11): the walk's secrets are resolved after the guard and before the
+    /// lease, so the verify's output is re-masked with them; a refusal is
+    /// [`EngineError::Secrets`] and writes nothing.
     /// Otherwise the `AnswerGate(Approved)` tail: the step `done` with `approved`, the unpark,
     /// the merge, and the walk from `position + 1`.
     async fn accept_artifact(
@@ -1540,6 +1543,14 @@ where
         let has_output = self.output_of(item, &phase, row.id).await?.is_some();
         let steps = self.parts.store.run_steps(run.id).await?;
         crate::command::accept_enabled(&steps, &row, &phase, has_output, chat_live)?;
+        // MOD-10 (blueprint A-11): the verify below re-masks its output with this walk's
+        // scrubber, which masks resolved values only once they are resolved, so the accept
+        // resolves first (a provider-less project reads nothing). A refusal refuses the accept
+        // before the lease and the first write: the step stays promoted and parked, and the
+        // human can accept again once the project's secrets resolve. Boxed (blueprint H-1).
+        Box::pin(self.secrets_ready(&run))
+            .await?
+            .map_err(EngineError::Secrets)?;
 
         // Plan D108's order: after the pure guard and before the first write.
         let until = self.take_lease(run.id).await?;
@@ -6072,7 +6083,7 @@ where
 
     /// MOD-10 D11/D12 (blueprint A-1): this walk's secrets, ready for `run`'s project before a
     /// live path persists anything of its session (the trim record, the prompt row, the prompt's
-    /// own masking). `Ok(Err(cause))` is a refusal the caller settles its own way; the outer
+    /// own masking), and before `AcceptArtifact`'s verify (A-11: its output is re-masked). `Ok(Err(cause))` is a refusal the caller settles its own way; the outer
     /// error is the project read's. Call sites box it (blueprint H-1).
     async fn secrets_ready(&self, run: &Run) -> Result<Result<(), SecretError>, EngineError> {
         let project = self.project(run.project_id).await?;
@@ -19344,6 +19355,119 @@ mod tests {
                 .expect("MemStore never fails a read");
             assert_eq!(rows.len(), 1, "the verify ran once");
             assert_eq!(rows[0].output.as_deref(), Some("leaked [REDACTED]"));
+        }
+
+        /// `FEAT-3` started over a primary repo, parked at `prd`, and `prd` promoted: the run and
+        /// the promoted step, ready for an `AcceptArtifact`.
+        async fn promoted_prd(harness: &Harness) -> (RunId, htui_core::model::StepId) {
+            harness.add_primary_repo().await;
+            let (run, prd) = super::started(harness).await;
+            Box::pin(harness.dispatch(Command::PromoteStep {
+                run,
+                step: prd,
+                chat_open: false,
+            }))
+            .await
+            .expect("a parked step is promotable");
+            (run, prd)
+        }
+
+        fn accept(run: RunId, step: htui_core::model::StepId) -> Command {
+            Command::AcceptArtifact {
+                run,
+                step,
+                chat_live: false,
+            }
+        }
+
+        /// Blueprint A-11 on `AcceptArtifact`: the accept's dispatch is a walk of its own, and
+        /// its verify re-masks with that walk's secrets, resolved before the verify runs.
+        #[tokio::test]
+        async fn an_accept_verify_output_holding_a_resolved_value_is_masked() {
+            let harness = Harness::new().await;
+            let (run, prd) = promoted_prd(&harness).await;
+            let provider = provider_project(&harness, &[("API_KEY", VALUE)]);
+            harness.orch.verifier.script_report(VerifyReport {
+                output: format!("leaked {VALUE}"),
+                ..FakeVerifier::pass()
+            });
+
+            let accepted = Box::pin(harness.dispatch(accept(run, prd)))
+                .await
+                .expect("a promoted step with its document");
+            assert!(
+                matches!(accepted, CommandOutcome::Accepted { .. }),
+                "{accepted:?}"
+            );
+
+            let rows = harness
+                .orch
+                .store
+                .command_runs(prd)
+                .await
+                .expect("MemStore never fails a read");
+            assert!(
+                rows.iter()
+                    .all(|row| !row.output.as_deref().unwrap_or_default().contains(VALUE)),
+                "{rows:?}"
+            );
+            assert_eq!(
+                rows.last().and_then(|row| row.output.as_deref()),
+                Some("leaked [REDACTED]"),
+                "the accept's verify was recorded masked"
+            );
+            assert_eq!(
+                provider.resolves(),
+                1,
+                "the accept and the walk it resumes share one resolution"
+            );
+        }
+
+        /// Blueprint A-11 on `AcceptArtifact`: a refused resolution refuses the accept before
+        /// its lease, its verify and its first write; the step stays promoted and parked.
+        #[tokio::test]
+        async fn a_refused_resolution_refuses_the_accept_and_writes_nothing() {
+            let harness = Harness::new().await;
+            let (run, prd) = promoted_prd(&harness).await;
+            let cause = failing(
+                &harness,
+                SecretError::Unreachable {
+                    endpoint: "/api/v1/auth/universal-auth/login",
+                    cause: "connection refused".to_owned(),
+                },
+            );
+            let steps = harness.orch.steps(run).await;
+            let rows = harness
+                .orch
+                .store
+                .command_runs(prd)
+                .await
+                .expect("MemStore never fails a read");
+            let verifies = harness.orch.verifier.runs();
+
+            let refused = Box::pin(harness.dispatch(accept(run, prd)))
+                .await
+                .expect_err("the walk's secrets were refused");
+            assert!(
+                matches!(&refused, EngineError::Secrets(refusal) if *refusal == cause),
+                "{refused}"
+            );
+            assert_eq!(harness.orch.verifier.runs(), verifies, "no verify ran");
+            assert_eq!(harness.orch.steps(run).await, steps, "nothing was written");
+            assert_eq!(
+                harness
+                    .orch
+                    .store
+                    .command_runs(prd)
+                    .await
+                    .expect("MemStore never fails a read"),
+                rows
+            );
+            assert_eq!(
+                harness.orch.run(run).await.status,
+                RunStatus::AwaitingApproval,
+                "the run stays parked at the promoted step"
+            );
         }
     }
 }

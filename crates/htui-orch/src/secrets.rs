@@ -18,7 +18,8 @@ pub const FOREIGN_PROJECT: &str = "this walk's secrets were resolved for another
 /// the engine as both `EngineParts.scrubber` and `EngineParts.secrets`.
 ///
 /// Resolves at most once (`tokio::sync::OnceCell`), for the first project it is asked about, on
-/// the first live path of the walk (MOD-10 M3 blueprint A-1). Until then, after a refusal, and
+/// the first live path of the walk (MOD-10 M3 blueprint A-1) or before `AcceptArtifact`'s verify
+/// (A-11). Until then, after a refusal, and
 /// for a provider-less project it scrubs with the pattern rules only, exactly as the empty
 /// `MinimalScrubber` it replaces. Dropping it zeroizes the resolved map and the scrubber's list.
 pub struct RunSecrets {
