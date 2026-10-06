@@ -896,7 +896,7 @@ pub(crate) mod tests {
             .client(&lease.spec.env[ENV_TOKEN])
             .expect("a live session");
         client.initialize().await.expect("initialize");
-        let call = tokio::spawn(async move {
+        let call = htui_agent::contained::spawn(async move {
             client
                 .call(
                     "command_run",
