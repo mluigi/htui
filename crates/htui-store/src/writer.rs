@@ -1201,6 +1201,13 @@ impl WriteStore for Writer {
         }
     }
 
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.lease_holds(run, fence).await,
+            Self::Online(pg) => pg.lease_holds(run, fence).await,
+        }
+    }
+
     // ---- MOD-11 M4 (plan D14): the command queue ----
 
     async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {

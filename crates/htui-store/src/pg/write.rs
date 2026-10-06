@@ -6872,6 +6872,28 @@ impl WriteStore for PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-78 D1: one plain read on the pool. There is no `FOR SHARE`: the answer is a snapshot
+    /// either way, and a lock would queue behind `claim_run`'s and the fenced writes' row locks.
+    /// The predicate is the fenced writes' `IS NOT DISTINCT FROM`.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound { entity: "run" }` when no row matches; the backend's own failures.
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
+        sqlx::query_scalar!(
+            r#"SELECT lease_owner IS NOT DISTINCT FROM $2 AS "holds!" FROM run WHERE id = $1"#,
+            run.as_uuid(),
+            fence.owner(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        })
+    }
+
     /// D14, B-16: the shape refusal, then [`WriteStore::record_command_run`]'s check and insert
     /// with the heartbeat stamped `clock_timestamp()` in the same statement (R-3: a waiter that
     /// dies before its first claim is reaped like one that dies later). Like

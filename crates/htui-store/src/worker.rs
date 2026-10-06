@@ -334,6 +334,9 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await
     }
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
+        WriteStore::lease_holds(self, run, fence).await
+    }
     async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::enqueue_command(self, new).await
     }
@@ -670,6 +673,9 @@ impl htui_core::store::WorkerStore for Writer {
     }
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await
+    }
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
+        WriteStore::lease_holds(self, run, fence).await
     }
     async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::enqueue_command(self, new).await
