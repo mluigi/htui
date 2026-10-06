@@ -1211,7 +1211,7 @@ packing (B9), which no snapshot pins.
 |---|---|---|
 | `crates/htui/src/keys/chord.rs` | `KeyChord` moved; `parse_strict`, `ChordError`, `CTRL_C`, `spec`, `is_printable`; 17 tests | T1 |
 | `crates/htui/src/keymap.rs` | T1: drop moved code, re-export, prune `KeyEvent`, drop 3 chord tests. T4: empty `default_global`, doc, prune imports, test swap (§5.6) | T1, T4 |
-| `crates/htui/src/keys/catalogue.rs` | `Context`, `Act`, `ActionSpec`, `CATALOGUE`, `STATE_GUARDED`; 11 tests | T2 |
+| `crates/htui/src/keys/catalogue.rs` | `Context`, `Act`, `ActionSpec`, `CATALOGUE`, `STATE_GUARDED`; 12 tests (11 + review M3) | T2 |
 | `crates/htui/src/keys/mod.rs` | re-exports, `Keys`, `Row`, `COMPILED`; 5 tests | T3 |
 | `crates/htui/src/keys/stack.rs` | `Layer`, `Stack`, `Keys::actions`; 6 tests | T3 |
 | `crates/htui/src/keys/hint.rs` | `Hint`, `HintSpec`, `HelpLine`, `label`, `hint`, `status_line`, `help_line`, `help_closer`; 9 tests | T3 |

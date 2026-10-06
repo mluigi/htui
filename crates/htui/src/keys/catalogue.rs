@@ -178,7 +178,7 @@ impl Act {
     }
 
     /// This action's catalogue row. `None` only if a variant was added without a row, which
-    /// `every_act_has_exactly_one_row` forbids.
+    /// the test `every_act_is_listed_and_has_a_row` forbids.
     #[must_use]
     pub fn spec(self) -> Option<&'static ActionSpec> {
         CATALOGUE.iter().find(|row| row.act == self)
@@ -439,6 +439,112 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{Act, CATALOGUE, Context, STATE_GUARDED};
+
+    /// Every [`Act`], in declaration order. [`position`] keeps it complete.
+    const ALL: &[Act] = &[
+        Act::Quit,
+        Act::NextTab,
+        Act::PrevTab,
+        Act::SelectTab1,
+        Act::SelectTab2,
+        Act::SelectTab3,
+        Act::SelectTab4,
+        Act::SelectTab5,
+        Act::SelectTab6,
+        Act::SelectTab7,
+        Act::SelectTab8,
+        Act::SelectTab9,
+        Act::Help,
+        Act::Workspaces,
+        Act::Find,
+        Act::Waiting,
+        Act::OverlayClose,
+        Act::ListDown,
+        Act::ListUp,
+        Act::ListTop,
+        Act::ListBottom,
+        Act::ListFold,
+        Act::PaneScrollDown,
+        Act::PaneScrollUp,
+        Act::PanePageDown,
+        Act::PanePageUp,
+        Act::PaneNextSubtab,
+        Act::PanePrevSubtab,
+        Act::ConfirmYes,
+        Act::ConfirmNo,
+        Act::FormNextField,
+        Act::FormPrevField,
+        Act::FormSave,
+        Act::FormExternalEditor,
+        Act::Edit,
+        Act::New,
+        Act::Delete,
+        Act::Clear,
+        Act::Reload,
+        Act::Back,
+        Act::Dismiss,
+    ];
+
+    /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
+    /// listed, and then in [`ALL`] too, or `every_act_is_listed_and_has_a_row` fails.
+    const fn position(act: Act) -> usize {
+        match act {
+            Act::Quit => 0,
+            Act::NextTab => 1,
+            Act::PrevTab => 2,
+            Act::SelectTab1 => 3,
+            Act::SelectTab2 => 4,
+            Act::SelectTab3 => 5,
+            Act::SelectTab4 => 6,
+            Act::SelectTab5 => 7,
+            Act::SelectTab6 => 8,
+            Act::SelectTab7 => 9,
+            Act::SelectTab8 => 10,
+            Act::SelectTab9 => 11,
+            Act::Help => 12,
+            Act::Workspaces => 13,
+            Act::Find => 14,
+            Act::Waiting => 15,
+            Act::OverlayClose => 16,
+            Act::ListDown => 17,
+            Act::ListUp => 18,
+            Act::ListTop => 19,
+            Act::ListBottom => 20,
+            Act::ListFold => 21,
+            Act::PaneScrollDown => 22,
+            Act::PaneScrollUp => 23,
+            Act::PanePageDown => 24,
+            Act::PanePageUp => 25,
+            Act::PaneNextSubtab => 26,
+            Act::PanePrevSubtab => 27,
+            Act::ConfirmYes => 28,
+            Act::ConfirmNo => 29,
+            Act::FormNextField => 30,
+            Act::FormPrevField => 31,
+            Act::FormSave => 32,
+            Act::FormExternalEditor => 33,
+            Act::Edit => 34,
+            Act::New => 35,
+            Act::Delete => 36,
+            Act::Clear => 37,
+            Act::Reload => 38,
+            Act::Back => 39,
+            Act::Dismiss => 40,
+        }
+    }
+
+    #[test]
+    fn every_act_is_listed_and_has_a_row() {
+        for (index, act) in ALL.iter().enumerate() {
+            assert_eq!(position(*act), index, "{act:?} is out of place in ALL");
+            assert!(act.spec().is_some(), "{act:?} has no catalogue row");
+        }
+        assert_eq!(
+            ALL.len(),
+            CATALOGUE.len(),
+            "a row's act is missing from ALL"
+        );
+    }
 
     #[test]
     fn global_help_is_question_mark_and_f1() {
