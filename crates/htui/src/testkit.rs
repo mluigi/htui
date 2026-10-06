@@ -283,6 +283,7 @@ impl Harness {
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }
                         | StoreRequest::ChatFollow { .. }
+                        | StoreRequest::EditHelp { .. }
                         | StoreRequest::ProbeAgents
                         | StoreRequest::ProbeBox
                         | StoreRequest::InstallPlan { .. }
