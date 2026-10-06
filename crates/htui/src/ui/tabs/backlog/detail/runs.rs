@@ -26,13 +26,16 @@
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
 //! | `C` | item | close-out: the counts, a picked resolution, a `y`, the key typed back (D167) |
 //! | `1`-`9` | step with a pending request | `AnswerPermission` with that option (MOD-42 D14) |
+//! | `i` | running engine step | a typed follow-up (`FollowUp`, MOD-70 D14) |
 //! | `v` | pane | the list or the flow view of the cursor's run (MOD-28 D1, D8) |
 //! | `+` / `-` / `=` | flow | zoom in, zoom out, fit the run (MOD-28 D8) |
 //!
 //! MOD-42 plan D14: every `Runs` reply also asks for the item's `RelayView`. A step whose session
 //! parked a stage-3 permission request takes two more lines, the scrubbed summary and the strip,
 //! and while the cursor is on it every digit is the pane's; anywhere else a digit passes on to the
-//! global tab select. A run with a pending cancel says `cancel requested` under its grid.
+//! global tab select. A run with a pending cancel says `cancel requested` under its grid. A step's
+//! newest follow-up takes one line (queued, sent) or up to three (refused: the label and its
+//! reason), from column 2 (MOD-70 D14, blueprint B-7).
 //!
 //! MOD-28: `v` draws the run under the cursor as a flow (`execution_graph.rs`). The flow's selected
 //! node *is* the cursor, so every key above acts the same in both views (ANA-12 invariant 2).
@@ -552,6 +555,42 @@ impl RunsTab {
             .find(|pending| pending.run_step_id == step)
     }
 
+    /// MOD-70 plan D5, D14: `step`'s newest follow-up, as the last `RelayView` had it.
+    fn follow_up_on(&self, step: StepId) -> Option<&FollowUpView> {
+        self.relay
+            .as_ref()?
+            .follow_ups
+            .iter()
+            .find(|view| view.run_step_id == step)
+    }
+
+    /// MOD-70 D14: `i` opens the follow-up input on a running main step of a graph run; anywhere
+    /// else it says why (D12) and sends nothing. The store re-checks every guard (D3).
+    fn open_follow_up(&mut self, ctx: &Ctx<'_>) {
+        let refusal = match self.entry_step() {
+            None => Err(NO_STEP),
+            Some(_)
+                if self
+                    .entry_run()
+                    .is_some_and(|run| run.kind == RunKind::Chat) =>
+            {
+                Err(FOLLOW_UP_CHAT_RUN)
+            }
+            Some((_, step)) if step.fanout_index < 0 => Err(FOLLOW_UP_JUDGE),
+            Some((_, step)) if step.status != StepStatus::Running => Err(FOLLOW_UP_NOT_RUNNING),
+            Some((_, step)) => Ok(step.id),
+        };
+        match refusal {
+            Ok(step) => {
+                self.mode = Mode::FollowUp {
+                    step,
+                    field: TextField::new(),
+                };
+            }
+            Err(sentence) => ctx.emit(Action::Error(sentence.to_owned())),
+        }
+    }
+
     /// The pending request on the step under the cursor, which the digits answer.
     fn pending_under_cursor(&self) -> Option<&StepPermission> {
         self.pending_on(self.selected_step()?)
@@ -664,6 +703,11 @@ impl RunsTab {
         let Some(item) = self.item else {
             return Handled::Pass;
         };
+        // MOD-70 D14: a follow-up has no `RunActions` verdict, so it waits on none.
+        if key == 'i' {
+            self.open_follow_up(ctx);
+            return Handled::Consumed;
+        }
         let Some(actions) = &self.actions else {
             ctx.emit(Action::Error(NOT_LOADED.to_owned()));
             return Handled::Consumed;
@@ -1330,9 +1374,31 @@ fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 
 }
 
 /// MOD-70 D14, blueprint B-7: the lines under a step with a follow-up, each exactly [`PANE`] wide
-/// from [`FOLLOW_UP_INDENT`].
-fn follow_up_lines(_view: &FollowUpView, _theme: &Theme) -> Vec<Line<'static>> {
-    Vec::new()
+/// from [`FOLLOW_UP_INDENT`]: queued (a warning: it waits on the turn), sent, or refused and its
+/// reason wrapped to at most two lines. Never the text (OQ-6): the view has none.
+fn follow_up_lines(view: &FollowUpView, theme: &Theme) -> Vec<Line<'static>> {
+    let line = |text: &str, style: Style| {
+        Line::from(vec![
+            Span::raw(blank(FOLLOW_UP_INDENT)),
+            Span::styled(cells::fit(text, PANE - FOLLOW_UP_INDENT), style),
+        ])
+    };
+    match view.status {
+        RunCommandStatus::Pending => vec![line(FOLLOW_UP_QUEUED, theme.warning)],
+        RunCommandStatus::Applied => vec![line(FOLLOW_UP_SENT, theme.dim)],
+        RunCommandStatus::Refused => {
+            let mut lines = vec![line(FOLLOW_UP_REFUSED, theme.dim)];
+            if let Some(reason) = &view.resolution {
+                lines.extend(
+                    cells::wrap(reason, PANE - FOLLOW_UP_INDENT)
+                        .iter()
+                        .take(2)
+                        .map(|row| line(row, theme.dim)),
+                );
+            }
+            lines
+        }
+    }
 }
 
 /// D170's usage cell: dollars when the usage document carries a cost, else tokens, else `—`. At
@@ -1512,7 +1578,7 @@ impl DetailTab for RunsTab {
             // MOD-28 D8: the list's page keys do nothing in the flow, and leave its scroll alone.
             KeyCode::PageUp | KeyCode::PageDown if self.view == View::Flow => {}
             KeyCode::Char(
-                key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
+                key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'i' | 'A' | 'R' | 'C' | 'T'),
             ) => {
                 let handled = self.action(key, ctx);
                 // MOD-71 D11, MOD-74 D4: a mode that captures input ends a live gesture
@@ -1531,8 +1597,9 @@ impl DetailTab for RunsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
-    /// MOD-22 review M-1: a bracketed paste into the rejection note or the typed-back key. The
-    /// `y`/`n` questions are not fields: a paste there is dropped, so its `y` confirms nothing.
+    /// MOD-22 review M-1: a bracketed paste into the rejection note, the follow-up (MOD-70 D14) or
+    /// the typed-back key. The `y`/`n` questions are not fields: a paste there is dropped, so its
+    /// `y` confirms nothing.
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
         match &mut self.mode {
             Mode::RejectNote { field, .. }
@@ -1691,6 +1758,10 @@ impl DetailTab for RunsTab {
                 self.answering = None;
                 self.re_read(ctx);
             }
+            // MOD-70 D13: a follow-up, queued or refused (its sentence is on the status line
+            // already), re-reads the runs, and the re-read brings the relay view that draws it.
+            StoreReply::FollowUpQueued { .. } => self.re_read(ctx),
+            StoreReply::Failed { request, .. } if *request == FOLLOW_UP => self.re_read(ctx),
             _ => {}
         }
     }
@@ -1790,6 +1861,9 @@ impl RunsTab {
             if let Some(pending) = self.pending_on(step.id) {
                 lines.extend(permission_lines(pending, theme));
             }
+            if let Some(view) = self.follow_up_on(step.id) {
+                lines.extend(follow_up_lines(view, theme));
+            }
         }
         lines
     }
@@ -1825,6 +1899,10 @@ impl RunsTab {
                 // counts them and the scroll keeps them in view.
                 if let Some(pending) = self.pending_on(step.id) {
                     lines.extend(permission_lines(pending, theme));
+                }
+                // MOD-70 D14: so do the follow-up's.
+                if let Some(view) = self.follow_up_on(step.id) {
+                    lines.extend(follow_up_lines(view, theme));
                 }
                 if on_cursor {
                     cursor_end = lines.len();
