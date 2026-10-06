@@ -16072,11 +16072,6 @@ async fn other_follow_up_step<S: WriteStore>(
     (item, run, step)
 }
 
-/// `step`'s row in the relay view of `HTUI_ANA_2`, if it lists one.
-async fn view_of<S: WriteStore>(case: &str, store: &S, step: StepId) -> Option<FollowUpView> {
-    view_in(case, store, ids::HTUI_ANA_2, step).await
-}
-
 /// `step`'s row in the relay view of `item`, if it lists one.
 async fn view_in<S: WriteStore>(
     case: &str,
@@ -16622,8 +16617,9 @@ async fn opening_a_window_refuses_an_older_windows_follow_up<S: WriteStore>(stor
         "run_step",
         "opening an unknown step's window",
     );
+    let elsewhere = minted(CASE, store, "another run").await;
     let other = store
-        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .create_run(new_run(ids::PROJECT_HTUI, elsewhere, Vec::new()))
         .await
         .expect(CASE)
         .id;

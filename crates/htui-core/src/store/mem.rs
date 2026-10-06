@@ -27,26 +27,27 @@ use crate::model::{
     BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile,
     BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim,
     CommandRun, CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, DocumentHead, DocumentId, EventKind, Executor, FollowUpRequest, FollowUpSettle,
-    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind,
-    LinkNode, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote, NewPersona,
-    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
-    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate,
-    PromptTemplateId, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
-    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps,
-    prompt_summary, scope_of,
+    Document, DocumentHead, DocumentId, EventKind, Executor, FOLLOW_UP_RUN_CANCELLED,
+    FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpView,
+    FollowUpWindow, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
+    ItemKindPatch, ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge,
+    LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind,
+    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
+    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef,
+    PromptScope, PromptTemplate, PromptTemplateId, QueuedFollowUp, RelaySessionId, RelayView, Repo,
+    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
+    Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
+    RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -139,6 +140,26 @@ struct PermissionRow {
     row: StepPermission,
     /// `step_permission.owner`: the executor's lease owner at park time (I-2).
     owner: Uuid,
+}
+
+/// `run_command`'s MOD-70 columns of a `follow_up` row (blueprint B-2), beside the row as
+/// [`PermissionRow::owner`] sits beside its row: [`RunCommand`] is unchanged (plan D5).
+#[derive(Clone)]
+struct FollowUpPayload {
+    /// `run_command.run_step_id`.
+    run_step_id: StepId,
+    /// `run_command.text`: as typed while the row is `pending`, `None` once it resolves (I-5).
+    text: Option<String>,
+}
+
+impl core::fmt::Debug for FollowUpPayload {
+    /// The step and the text's length, never the text (I-5).
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FollowUpPayload")
+            .field("run_step_id", &self.run_step_id)
+            .field("len", &self.text.as_ref().map(String::len))
+            .finish()
+    }
 }
 
 /// `command_run.claimed_by` and `heartbeat_at` (MOD-11 `0015`, B-16): the queue's liveness,
@@ -270,6 +291,11 @@ struct State {
     permissions: BTreeMap<PermissionId, PermissionRow>,
     /// `run_command` (MOD-42 plan D1), by id.
     run_commands: BTreeMap<RunCommandId, RunCommand>,
+    /// `run_command`'s MOD-70 columns for `follow_up` rows, by id (B-2): `run_step_id` and the
+    /// text, `None` once the row resolves. The row itself is in `run_commands`.
+    follow_up_payloads: BTreeMap<RunCommandId, FollowUpPayload>,
+    /// `follow_up_window` (MOD-70 D1), by step.
+    follow_up_windows: BTreeMap<StepId, FollowUpWindow>,
     /// `session_event`.
     events: Vec<SessionEvent>,
     /// `requirement_spec` (ANA-11 §4.4), keyed by its primary key, the project (MOD-38).
@@ -375,6 +401,8 @@ impl MemStore {
             openings: HashMap::new(),
             permissions: BTreeMap::new(),
             run_commands: BTreeMap::new(),
+            follow_up_payloads: BTreeMap::new(),
+            follow_up_windows: BTreeMap::new(),
             events: data.events,
             requirement_specs: data
                 .requirement_specs
@@ -918,6 +946,41 @@ impl MemStore {
     #[must_use]
     pub fn command_rows(&self) -> Vec<RunCommand> {
         self.read(|state| state.run_commands.values().cloned().collect())
+    }
+
+    /// Every `follow_up` row as the Runs pane would see it, with whether its text is still stored
+    /// (MOD-70 blueprint B-1): `true` exactly while it is pending (I-5). In id order.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn follow_up_rows(&self) -> Vec<(FollowUpView, bool)> {
+        self.read(|state| {
+            state
+                .run_commands
+                .values()
+                .filter_map(|row| {
+                    let payload = state.follow_up_payloads.get(&row.id)?;
+                    Some((
+                        FollowUpView {
+                            id: row.id,
+                            run_id: row.run_id,
+                            run_step_id: payload.run_step_id,
+                            status: row.status,
+                            resolution: row.resolution.clone(),
+                            issued_at: row.issued_at,
+                            resolved_at: row.resolved_at,
+                        },
+                        payload.text.is_some(),
+                    ))
+                })
+                .collect()
+        })
+    }
+
+    /// Every `follow_up_window` row, in step-id order (MOD-70 blueprint B-1).
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn follow_up_windows(&self) -> Vec<FollowUpWindow> {
+        self.read(|state| state.follow_up_windows.values().cloned().collect())
     }
 
     /// MOD-76 D4 (R-55): sets `settings[key]` on box `id`'s row, on this store and every clone
@@ -4209,6 +4272,12 @@ impl State {
             .retain(|_, p| !gone.runs.contains(&p.row.run_id));
         self.run_commands
             .retain(|_, c| !gone.runs.contains(&c.run_id));
+        // MOD-70 plan D1: a window and a follow-up's columns go with their run too.
+        self.follow_up_windows
+            .retain(|_, w| !gone.runs.contains(&w.run_id));
+        let run_commands = &self.run_commands;
+        self.follow_up_payloads
+            .retain(|id, _| run_commands.contains_key(id));
         self.documents
             .retain(|row| !gone.items.contains(&row.item_id));
         self.notes.retain(|row| !gone.items.contains(&row.item_id));
@@ -6832,7 +6901,7 @@ impl State {
         RelayView {
             permissions,
             cancels: cancels.into_iter().collect(),
-            follow_ups: Vec::new(),
+            follow_ups: self.follow_up_views(item),
         }
     }
 
@@ -6889,13 +6958,21 @@ impl State {
     ) -> Result<CancelRequest> {
         self.require_run(run)?;
         self.require_actor(user, box_id, "run_command", "issued")?;
-        if let Some(pending) = self.run_commands.values().find(|c| {
-            c.run_id == run
-                && c.kind == RunCommandKind::Cancel
-                && c.status == RunCommandStatus::Pending
-        }) {
-            return Ok(CancelRequest::AlreadyPending(pending.id));
+        // MOD-70 D5, B-14: both answers refuse the run's pending follow-ups, idempotently.
+        if let Some(pending) = self
+            .run_commands
+            .values()
+            .find(|c| {
+                c.run_id == run
+                    && c.kind == RunCommandKind::Cancel
+                    && c.status == RunCommandStatus::Pending
+            })
+            .map(|c| c.id)
+        {
+            self.refuse_follow_ups(|row, _| row.run_id == run, FOLLOW_UP_RUN_CANCELLED, now);
+            return Ok(CancelRequest::AlreadyPending(pending));
         }
+        self.refuse_follow_ups(|row, _| row.run_id == run, FOLLOW_UP_RUN_CANCELLED, now);
         let id = RunCommandId::new();
         self.run_commands.insert(
             id,
@@ -6931,7 +7008,12 @@ impl State {
         let mut rows: Vec<RunCommand> = self
             .run_commands
             .values()
-            .filter(|c| c.status == RunCommandStatus::Pending && applies(c.run_id))
+            // MOD-70 D5, I-9: cancels only; a follow-up is the walk's own, never a command.
+            .filter(|c| {
+                c.kind == RunCommandKind::Cancel
+                    && c.status == RunCommandStatus::Pending
+                    && applies(c.run_id)
+            })
             .cloned()
             .collect();
         rows.sort_unstable_by_key(|row| (row.issued_at, row.id));
@@ -6962,7 +7044,315 @@ impl State {
         row.status = to;
         row.resolution = resolution;
         row.resolved_at = Some(now);
+        // MOD-70 D5: a resolved row never keeps a follow-up's text.
+        if let Some(payload) = self.follow_up_payloads.get_mut(&id) {
+            payload.text = None;
+        }
         Ok(true)
+    }
+}
+
+/// MOD-70 (plan D1-D5, D9; blueprint §2.8): follow-ups for engine steps. Every time is the
+/// handle's clock (I-4); every method is one closure under the write lock, so the Postgres races
+/// collapse to "first one in".
+impl State {
+    /// Every `pending` follow-up `pick` selects moves to `refused` with `reason`, its text dropped
+    /// (I-5). Answers how many moved.
+    fn refuse_follow_ups(
+        &mut self,
+        pick: impl Fn(&RunCommand, &FollowUpPayload) -> bool,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> u64 {
+        let mut moved = 0;
+        for (id, row) in &mut self.run_commands {
+            if row.kind != RunCommandKind::FollowUp || row.status != RunCommandStatus::Pending {
+                continue;
+            }
+            let Some(payload) = self.follow_up_payloads.get_mut(id) else {
+                continue;
+            };
+            if !pick(row, payload) {
+                continue;
+            }
+            row.status = RunCommandStatus::Refused;
+            row.resolution = Some(reason.to_owned());
+            row.resolved_at = Some(now);
+            payload.text = None;
+            moved += 1;
+        }
+        moved
+    }
+
+    /// The step's `pending` follow-up, if any (D1: at most one).
+    fn pending_follow_up(&self, step: StepId) -> Option<RunCommandId> {
+        self.run_commands
+            .values()
+            .find(|c| {
+                c.kind == RunCommandKind::FollowUp
+                    && c.status == RunCommandStatus::Pending
+                    && self
+                        .follow_up_payloads
+                        .get(&c.id)
+                        .is_some_and(|p| p.run_step_id == step)
+            })
+            .map(|c| c.id)
+    }
+
+    fn request_follow_up(
+        &mut self,
+        new: NewFollowUp,
+        now: DateTime<Utc>,
+    ) -> Result<FollowUpRequest> {
+        let step = self
+            .steps
+            .get(&new.run_step_id)
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "run_step",
+                id: new.run_step_id.to_string(),
+            })?;
+        let (run, fanout_index, status) = (step.run_id, step.fanout_index, step.status);
+        self.require_actor(new.issued_by, new.issued_box, "run_command", "issued")?;
+        let refusal = if self
+            .runs
+            .get(&run)
+            .is_some_and(|row| row.kind == RunKind::Chat)
+        {
+            Some(FollowUpRefusal::ChatRun)
+        } else if fanout_index < 0 {
+            Some(FollowUpRefusal::Judge)
+        } else if status != StepStatus::Running {
+            Some(FollowUpRefusal::NotRunning)
+        } else if self.run_commands.values().any(|c| {
+            c.run_id == run
+                && c.kind == RunCommandKind::Cancel
+                && c.status == RunCommandStatus::Pending
+        }) {
+            Some(FollowUpRefusal::Cancelling)
+        } else if self.pending_follow_up(new.run_step_id).is_some() {
+            Some(FollowUpRefusal::AlreadyQueued)
+        } else {
+            let window = self.follow_up_windows.get(&new.run_step_id);
+            let live = self.live_owner(run, now);
+            // B-4: the lease must be live under the window's owner; with no window, under anyone.
+            let gone = match window {
+                Some(w) => live != Some(w.owner),
+                None => live.is_none(),
+            };
+            if gone {
+                Some(FollowUpRefusal::ExecutorGone)
+            } else {
+                match window {
+                    None => Some(FollowUpRefusal::NotStarted),
+                    Some(w) if w.closed_at.is_some() => Some(FollowUpRefusal::SessionEnded),
+                    Some(_) => None,
+                }
+            }
+        };
+        if let Some(refusal) = refusal {
+            return Ok(FollowUpRequest::Refused(refusal));
+        }
+        if self.run_commands.contains_key(&new.id) {
+            return Err(StoreError::Constraint(already_exists(
+                "run_command",
+                new.id,
+            )));
+        }
+        self.run_commands.insert(
+            new.id,
+            RunCommand {
+                id: new.id,
+                run_id: run,
+                kind: RunCommandKind::FollowUp,
+                issued_by: new.issued_by,
+                issued_box: new.issued_box,
+                status: RunCommandStatus::Pending,
+                resolution: None,
+                issued_at: now,
+                resolved_at: None,
+            },
+        );
+        self.follow_up_payloads.insert(
+            new.id,
+            FollowUpPayload {
+                run_step_id: new.run_step_id,
+                text: Some(new.text.into_string()),
+            },
+        );
+        Ok(FollowUpRequest::Queued(new.id))
+    }
+
+    fn open_follow_ups(
+        &mut self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<bool> {
+        let row = self.steps.get(&step).ok_or_else(|| StoreError::NotFound {
+            entity: "run_step",
+            id: step.to_string(),
+        })?;
+        if row.run_id != run {
+            return Err(StoreError::Constraint(format!(
+                "follow_up_window.run_step_id `{step}` is not a step of run `{run}`"
+            )));
+        }
+        // B-3: the owner alone, as every other executor-side write.
+        if self.lease_owners.get(&run) != Some(&owner) {
+            return Ok(false);
+        }
+        self.follow_up_windows.insert(
+            step,
+            FollowUpWindow {
+                run_step_id: step,
+                run_id: run,
+                session,
+                owner,
+                opened_at: now,
+                closed_at: None,
+            },
+        );
+        self.refuse_follow_ups(
+            |_, payload| payload.run_step_id == step,
+            FOLLOW_UP_SESSION_ENDED,
+            now,
+        );
+        Ok(true)
+    }
+
+    fn next_follow_up(&self, step: StepId, session: RelaySessionId) -> Option<QueuedFollowUp> {
+        let window = self.follow_up_windows.get(&step)?;
+        if window.session != session || window.closed_at.is_some() {
+            return None;
+        }
+        let id = self.pending_follow_up(step)?;
+        let text = self.follow_up_payloads.get(&id)?.text.clone()?;
+        Some(QueuedFollowUp { id, text })
+    }
+
+    fn settle_follow_up(
+        &mut self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+        now: DateTime<Utc>,
+    ) -> Result<SettleOutcome> {
+        // B-19: unknown, then not a follow-up, then not pending, then fenced.
+        let Some(row) = self.run_commands.get(&id) else {
+            return Err(StoreError::NotFound {
+                entity: "run_command",
+                id: id.to_string(),
+            });
+        };
+        if row.kind != RunCommandKind::FollowUp {
+            return Err(StoreError::Constraint(format!(
+                "run_command `{id}` is a `{}`, not a `follow_up`",
+                row.kind
+            )));
+        }
+        if row.status != RunCommandStatus::Pending {
+            return Ok(SettleOutcome::NotPending);
+        }
+        // B-3: the owner alone.
+        if self.lease_owners.get(&row.run_id) != Some(&owner) {
+            return Ok(SettleOutcome::Fenced);
+        }
+        let (status, resolution) = match to {
+            FollowUpSettle::Applied => (RunCommandStatus::Applied, None),
+            FollowUpSettle::Refused(sentence) => (RunCommandStatus::Refused, Some(sentence)),
+        };
+        if let Some(row) = self.run_commands.get_mut(&id) {
+            row.status = status;
+            row.resolution = resolution;
+            row.resolved_at = Some(now);
+        }
+        if let Some(payload) = self.follow_up_payloads.get_mut(&id) {
+            payload.text = None;
+        }
+        Ok(SettleOutcome::Settled)
+    }
+
+    fn close_follow_ups(
+        &mut self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> u64 {
+        // B-5: only while the step's window is this session's.
+        let Some(window) = self.follow_up_windows.get_mut(&step) else {
+            return 0;
+        };
+        if window.session != session {
+            return 0;
+        }
+        window.closed_at = window.closed_at.or(Some(now));
+        self.refuse_follow_ups(|_, payload| payload.run_step_id == step, reason, now)
+    }
+
+    fn close_dropped_follow_ups(
+        &mut self,
+        run: RunId,
+        owner: Uuid,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> u64 {
+        // B-3, F-22: the owner alone; otherwise nothing is written.
+        if self.lease_owners.get(&run) != Some(&owner) {
+            return 0;
+        }
+        for window in self.follow_up_windows.values_mut() {
+            if window.run_id == run && window.closed_at.is_none() {
+                window.closed_at = Some(now);
+            }
+        }
+        self.refuse_follow_ups(|row, _| row.run_id == run, reason, now)
+    }
+
+    /// D5, B-13: the newest follow-up of each step of the item's non-terminal runs (the pending
+    /// one if any, else the greatest `(issued_at, id)`), in `(issued_at, id)` order. No text.
+    fn follow_up_views(&self, item: ItemId) -> Vec<FollowUpView> {
+        let mut newest: BTreeMap<StepId, (&RunCommand, StepId)> = BTreeMap::new();
+        for row in self.run_commands.values() {
+            if row.kind != RunCommandKind::FollowUp {
+                continue;
+            }
+            let live = self
+                .runs
+                .get(&row.run_id)
+                .is_some_and(|run| run.item_id == Some(item) && !run.status.is_terminal());
+            let Some(payload) = self.follow_up_payloads.get(&row.id) else {
+                continue;
+            };
+            if !live {
+                continue;
+            }
+            let key = |c: &RunCommand| (c.status == RunCommandStatus::Pending, c.issued_at, c.id);
+            newest
+                .entry(payload.run_step_id)
+                .and_modify(|held| {
+                    if key(row) > key(held.0) {
+                        *held = (row, payload.run_step_id);
+                    }
+                })
+                .or_insert((row, payload.run_step_id));
+        }
+        let mut views: Vec<FollowUpView> = newest
+            .into_values()
+            .map(|(row, step)| FollowUpView {
+                id: row.id,
+                run_id: row.run_id,
+                run_step_id: step,
+                status: row.status,
+                resolution: row.resolution.clone(),
+                issued_at: row.issued_at,
+                resolved_at: row.resolved_at,
+            })
+            .collect();
+        views.sort_unstable_by_key(|row| (row.issued_at, row.id));
+        views
     }
 }
 
@@ -7975,53 +8365,53 @@ impl WriteStore for MemStore {
 
     // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)
 
-    async fn request_follow_up(&self, _new: NewFollowUp) -> Result<FollowUpRequest> {
-        Err(StoreError::Backend("MOD-70 T0: red".into()))
+    async fn request_follow_up(&self, new: NewFollowUp) -> Result<FollowUpRequest> {
+        let now = self.now();
+        self.write(|state| state.request_follow_up(new, now))
     }
 
     async fn open_follow_ups(
         &self,
-        _run: RunId,
-        _step: StepId,
-        _session: RelaySessionId,
-        _owner: Uuid,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
     ) -> Result<bool> {
-        Err(StoreError::Backend("MOD-70 T0: red".into()))
+        let now = self.now();
+        self.write(|state| state.open_follow_ups(run, step, session, owner, now))
     }
 
     async fn next_follow_up(
         &self,
-        _step: StepId,
-        _session: RelaySessionId,
+        step: StepId,
+        session: RelaySessionId,
     ) -> Result<Option<QueuedFollowUp>> {
-        Err(StoreError::Backend("MOD-70 T0: red".into()))
+        Ok(self.read(|state| state.next_follow_up(step, session)))
     }
 
     async fn settle_follow_up(
         &self,
-        _id: RunCommandId,
-        _owner: Uuid,
-        _to: FollowUpSettle,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
     ) -> Result<SettleOutcome> {
-        Err(StoreError::Backend("MOD-70 T0: red".into()))
+        let now = self.now();
+        self.write(|state| state.settle_follow_up(id, owner, to, now))
     }
 
     async fn close_follow_ups(
         &self,
-        _step: StepId,
-        _session: RelaySessionId,
-        _reason: &str,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
     ) -> Result<u64> {
-        Err(StoreError::Backend("MOD-70 T0: red".into()))
+        let now = self.now();
+        Ok(self.write(|state| state.close_follow_ups(step, session, reason, now)))
     }
 
-    async fn close_dropped_follow_ups(
-        &self,
-        _run: RunId,
-        _owner: Uuid,
-        _reason: &str,
-    ) -> Result<u64> {
-        Err(StoreError::Backend("MOD-70 T0: red".into()))
+    async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
+        let now = self.now();
+        Ok(self.write(|state| state.close_dropped_follow_ups(run, owner, reason, now)))
     }
 }
 
@@ -8029,20 +8419,22 @@ impl WriteStore for MemStore {
 mod tests {
     use std::sync::Arc;
 
-    use super::MemStore;
+    use super::{FollowUpPayload, MemStore};
     use crate::clock::{Clock as _, TestClock};
     use crate::fixtures::ids;
     use crate::model::{
         AgentBox, AgentId, AnswerOutcome, BoxId, BoxProbe, CancelRequest, ChatRunSpec,
-        CitationKind, Claim, CommandRunId, CommandRunStatus, DocumentId, GateOutcome,
-        GraphSnapshot, Isolation, ItemId, ItemKindPatch, NewCommandRun, NewDocument, NewItem,
+        CitationKind, Claim, CommandRunId, CommandRunStatus, DocumentId, FOLLOW_UP_SESSION_ENDED,
+        FollowUpRequest, FollowUpSettle, FollowUpText, FollowUpWindow, GateOutcome, GraphSnapshot,
+        Isolation, ItemId, ItemKindPatch, NewCommandRun, NewDocument, NewFollowUp, NewItem,
         NewNote, NewProject, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
         NoteId, OpenPermission, OverlapRule, PermissionId, PhaseAgent, Priority, ProbedTool,
         ProjectId, ProjectPatch, RelayOption, RelayOptionKind, RelaySessionId, RepoId,
         RequirementAreaId, RequirementId, RequirementPatch, RequirementUpdate, Resolution,
-        RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStepCommit, RunStepTree, Scope,
-        SnapshotGraph, SnapshotSettings, Status, StepId, StepOutcome, StepStatus,
-        TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+        RunCommand, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus,
+        RunStepCommit, RunStepTree, Scope, SettleOutcome, SnapshotGraph, SnapshotSettings, Status,
+        StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, UserId, VerifyOutcome,
+        executor_scrub_refusal,
     };
     use crate::prompt::settings::SettingKey;
     use crate::prompt::{DEFAULT_TEMPLATES, body_of};
@@ -9764,6 +10156,67 @@ mod tests {
             "resolved_at is the handle's clock"
         );
 
+        // MOD-70 I-4: the window's and the follow-up's times are the handle's clock too.
+        assert!(
+            store
+                .transition_step(step, StepStatus::Pending, StepStatus::Running, t)
+                .await
+                .expect("the step runs")
+        );
+        let session = RelaySessionId::new();
+        assert!(
+            store
+                .open_follow_ups(run, step, session, owner)
+                .await
+                .expect("the window opens")
+        );
+        let follow_up = NewFollowUp {
+            id: crate::model::RunCommandId::new(),
+            run_step_id: step,
+            text: FollowUpText::new("use the smaller fixture".to_owned()).expect("prose"),
+            issued_by: ids::USER,
+            issued_box: ids::BOX,
+        };
+        let queued = follow_up.id;
+        assert_eq!(
+            store
+                .request_follow_up(follow_up)
+                .await
+                .expect("the follow-up is written"),
+            FollowUpRequest::Queued(queued)
+        );
+        assert_eq!(
+            store
+                .settle_follow_up(queued, owner, FollowUpSettle::Applied)
+                .await
+                .expect("the settle lands"),
+            SettleOutcome::Settled
+        );
+        assert_eq!(
+            store
+                .close_follow_ups(step, session, FOLLOW_UP_SESSION_ENDED)
+                .await
+                .expect("the close lands"),
+            0
+        );
+        let windows = store.follow_up_windows();
+        assert_eq!(
+            windows
+                .iter()
+                .map(|w| (w.opened_at, w.closed_at))
+                .collect::<Vec<_>>(),
+            vec![(t, Some(t))],
+            "opened_at and closed_at are the handle's clock"
+        );
+        let rows = store.follow_up_rows();
+        assert_eq!(
+            rows.iter()
+                .map(|(row, _)| (row.issued_at, row.resolved_at))
+                .collect::<Vec<_>>(),
+            vec![(t, Some(t))],
+            "a follow-up's issued_at and resolved_at are the handle's clock"
+        );
+
         assert!(matches!(
             store
                 .request_cancel(run, ids::USER, ids::BOX)
@@ -9809,6 +10262,183 @@ mod tests {
             ),
             "the resolution is stored, and resolved_at is the handle's clock"
         );
+    }
+
+    /// MOD-70 I-5, blueprint B-1: a follow-up's text is stored exactly while the row is pending.
+    /// One row is resolved by each path that resolves one — the executor's two settles, a close,
+    /// a superseding open, a cancel, a dropped walk's close and `resolve_command` — and every one
+    /// of them drops the text; the row left pending keeps it.
+    #[tokio::test]
+    async fn a_follow_ups_text_is_cleared_on_every_resolution() {
+        let store = MemStore::demo();
+        let owner = Uuid::now_v7();
+        let at = Utc::now();
+        let leased = |item: ItemId| {
+            let store = &store;
+            async move {
+                let run = store
+                    .create_run(graph_run(item, ids::PROJECT_HTUI, Vec::new()))
+                    .await
+                    .expect("the run is created")
+                    .id;
+                assert_eq!(
+                    store
+                        .claim_run(run, ids::BOX, owner, at, TimeDelta::minutes(5))
+                        .await
+                        .expect("the claim lands"),
+                    Claim::Admitted
+                );
+                run
+            }
+        };
+        let running = |run: RunId, position: i32| {
+            let store = &store;
+            async move {
+                let step = store
+                    .create_step(new_step(run, position, 1, 0))
+                    .await
+                    .expect("the step is created")
+                    .id;
+                assert!(
+                    store
+                        .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+                        .await
+                        .expect("the step runs")
+                );
+                let session = RelaySessionId::new();
+                assert!(
+                    store
+                        .open_follow_ups(run, step, session, owner)
+                        .await
+                        .expect("the window opens")
+                );
+                (step, session)
+            }
+        };
+        let queue = |step: StepId| {
+            let store = &store;
+            async move {
+                let new = NewFollowUp {
+                    id: crate::model::RunCommandId::new(),
+                    run_step_id: step,
+                    text: FollowUpText::new("use the smaller fixture".to_owned()).expect("prose"),
+                    issued_by: ids::USER,
+                    issued_box: ids::BOX,
+                };
+                let id = new.id;
+                assert_eq!(
+                    store.request_follow_up(new).await.expect("the enqueue"),
+                    FollowUpRequest::Queued(id)
+                );
+                id
+            }
+        };
+        let other = store
+            .mint_item(NewItem {
+                id: ItemId::new(),
+                project_id: ids::PROJECT_HTUI,
+                kind_id: ids::KIND_HTUI_FEAT,
+                title: "follow-up".to_owned(),
+                body: String::new(),
+                required_tags: Vec::new(),
+                touched_paths: Vec::new(),
+                priority: 0,
+                step_graph_id: None,
+                created_by: ids::USER,
+                box_id: Some(ids::BOX),
+            })
+            .await
+            .expect("the mint lands")
+            .id;
+        let run_a = leased(ids::HTUI_ANA_2).await;
+        let run_b = leased(other).await;
+
+        let (s1, _) = running(run_a, 0).await;
+        let applied = queue(s1).await;
+        assert_eq!(
+            store
+                .settle_follow_up(applied, owner, FollowUpSettle::Applied)
+                .await
+                .expect("settle"),
+            SettleOutcome::Settled
+        );
+        let (s2, _) = running(run_a, 1).await;
+        let refused = queue(s2).await;
+        assert_eq!(
+            store
+                .settle_follow_up(
+                    refused,
+                    owner,
+                    FollowUpSettle::Refused(executor_scrub_refusal("anthropic_api_key"))
+                )
+                .await
+                .expect("settle"),
+            SettleOutcome::Settled
+        );
+        let (s3, w3) = running(run_a, 2).await;
+        queue(s3).await;
+        assert_eq!(
+            store
+                .close_follow_ups(s3, w3, FOLLOW_UP_SESSION_ENDED)
+                .await
+                .expect("close"),
+            1
+        );
+        let (s4, _) = running(run_a, 3).await;
+        queue(s4).await;
+        assert!(
+            store
+                .open_follow_ups(run_a, s4, RelaySessionId::new(), owner)
+                .await
+                .expect("the superseding open")
+        );
+        let (s5, _) = running(run_a, 4).await;
+        let resolved = queue(s5).await;
+        assert!(
+            store
+                .resolve_command(
+                    resolved,
+                    RunCommandStatus::Refused,
+                    Some("by hand".to_owned())
+                )
+                .await
+                .expect("resolve")
+        );
+        let (s6, _) = running(run_a, 5).await;
+        queue(s6).await;
+        assert!(matches!(
+            store
+                .request_cancel(run_a, ids::USER, ids::BOX)
+                .await
+                .expect("the cancel"),
+            CancelRequest::Inserted(_)
+        ));
+        let (b1, _) = running(run_b, 0).await;
+        queue(b1).await;
+        assert_eq!(
+            store
+                .close_dropped_follow_ups(run_b, owner, FOLLOW_UP_SESSION_ENDED)
+                .await
+                .expect("the dropped walk's close"),
+            1
+        );
+        let (b2, _) = running(run_b, 1).await;
+        let pending = queue(b2).await;
+
+        let rows = store.follow_up_rows();
+        assert_eq!(rows.len(), 8, "one row per path and the pending one");
+        for (row, stored) in rows {
+            assert_eq!(
+                stored,
+                row.id == pending,
+                "the text is stored exactly while the row is pending, got {row:?}"
+            );
+            assert_eq!(
+                row.status == RunCommandStatus::Pending,
+                row.id == pending,
+                "only the last row is pending, got {row:?}"
+            );
+        }
     }
 
     /// MOD-11 OQ-3: a `running` row whose claimant stopped beating holds its slot until the next
@@ -10071,6 +10701,50 @@ mod tests {
             (1, 1),
             "precondition: one relay row of each table"
         );
+        // MOD-70 plan D1: a window and a pending follow-up on the same `htui` step, staged.
+        let follow_up = crate::model::RunCommandId::new();
+        store.write(|state| {
+            state.follow_up_windows.insert(
+                ids::STEP_IMPL,
+                FollowUpWindow {
+                    run_step_id: ids::STEP_IMPL,
+                    run_id: ids::RUN_1,
+                    session: RelaySessionId::new(),
+                    owner,
+                    opened_at: Utc::now(),
+                    closed_at: None,
+                },
+            );
+            state.run_commands.insert(
+                follow_up,
+                RunCommand {
+                    id: follow_up,
+                    run_id: ids::RUN_1,
+                    kind: RunCommandKind::FollowUp,
+                    issued_by: ids::USER,
+                    issued_box: ids::BOX,
+                    status: RunCommandStatus::Pending,
+                    resolution: None,
+                    issued_at: Utc::now(),
+                    resolved_at: None,
+                },
+            );
+            state.follow_up_payloads.insert(
+                follow_up,
+                FollowUpPayload {
+                    run_step_id: ids::STEP_IMPL,
+                    text: Some("use the smaller fixture".to_owned()),
+                },
+            );
+        });
+        assert_eq!(
+            (
+                store.follow_up_windows().len(),
+                store.follow_up_rows().len()
+            ),
+            (1, 1),
+            "precondition: one window and one follow-up"
+        );
         // MOD-11 H-21: a claimed `command_run` row on an `htui` step, so the claim map has an
         // entry the cascade must take.
         let queued = NewCommandRun {
@@ -10120,6 +10794,10 @@ mod tests {
                     .all(|c| state.runs.contains_key(&c.run_id))
                     && state.run_commands.is_empty(),
                 "run_command goes with its run (MOD-42 plan D1)"
+            );
+            assert!(
+                state.follow_up_windows.is_empty() && state.follow_up_payloads.is_empty(),
+                "follow_up_window and a follow-up's payload go with the run (MOD-70 plan D1)"
             );
             assert!(
                 state
