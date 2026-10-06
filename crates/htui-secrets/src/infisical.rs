@@ -230,11 +230,31 @@ impl InfisicalProvider {
             Ok(result) => result,
             Err(e) => match e.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
-                // Only a runtime shutting down cancels the task; its outcome is unknown.
-                Err(_) => Err(protocol(
-                    LOGIN_PATH,
-                    "the login was cancelled before it answered".to_owned(),
-                )),
+                // Only a runtime shutting down cancels the task, dropping its guard unrecorded.
+                // The login may have reached the server, so its outcome is unknown: cool down as
+                // for an unanswered one, unless another caller recorded an outcome meanwhile.
+                Err(_) => {
+                    let cancelled = protocol(
+                        LOGIN_PATH,
+                        "the login was cancelled before it answered".to_owned(),
+                    );
+                    let mut state = self.state.lock().await;
+                    let now = Instant::now();
+                    // The cancelled task left the state as it found it: Empty, or an expired token
+                    // or cool-down. A live token, a running cool-down or a refusal is a newer
+                    // outcome another caller recorded, and stays.
+                    let recorded_since = no_login(&state, now).is_some()
+                        || matches!(&*state, TokenState::Valid { reuse_until, .. } if now < *reuse_until);
+                    if !recorded_since {
+                        record(
+                            &mut state,
+                            Err(LoginFailure::Unanswered(cancelled)),
+                            self.inner.login_cool_down,
+                        )
+                    } else {
+                        Err(cancelled)
+                    }
+                }
             },
         }
     }

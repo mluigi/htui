@@ -708,6 +708,51 @@ async fn cancelled_callers_around_a_slow_refusal_cost_one_login() {
     );
 }
 
+/// A runtime shut down while its login task waits on the server cancels the task, and the login's
+/// answer is lost: the outcome is unknown, so the provider cools down instead of logging in again
+/// on the next call (R1 verify).
+#[test]
+fn a_login_cancelled_by_a_runtime_shutdown_cools_down() {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login_ok(TOKEN, 2_592_000).delayed(SLOW))
+        .on("POST", LOGIN, login_ok(TOKEN_2, 2_592_000));
+    let p = provider(&stub);
+    let doomed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("the runtime the login task runs on");
+    let caller = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the caller's runtime");
+    let handle = doomed.handle().clone();
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(IMPATIENT);
+        doomed.shutdown_background();
+    });
+    let first = caller.block_on(async {
+        // The login task is spawned on `doomed`; the caller keeps running on `caller`.
+        let _on_doomed = handle.enter();
+        p.resolve(&scope()).await
+    });
+    killer.join().expect("the shutdown thread");
+    assert!(
+        matches!(first, Err(SecretError::Protocol { endpoint, .. }) if endpoint == LOGIN),
+        "a cancelled login is not Protocol at the login"
+    );
+    let second = caller.block_on(p.resolve(&scope()));
+    assert!(
+        matches!(second, Err(SecretError::LoginCoolingDown { .. })),
+        "the call after a cancelled login did not cool down"
+    );
+    assert_eq!(
+        stub.count("POST", LOGIN),
+        1,
+        "the call after a cancelled login logged in again"
+    );
+}
+
 /// A caller that gives up during a good login does not waste it: the token is cached.
 #[tokio::test]
 async fn a_cancelled_caller_s_login_still_caches_the_token() {
