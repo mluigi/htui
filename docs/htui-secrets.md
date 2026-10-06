@@ -302,7 +302,9 @@ less one. It moves back so that no value or credential is split: one complete be
 masked whole in the first row, and one still arriving lands whole in the next, masked there (a
 resolved value) or refused there (a credential). When every cut would split an occurrence of a
 value (a value longer than the run, or a run that opens with one), the run stays open past the
-bound instead, by about twice the hold-back at most. A run with no safe cut for any other reason
+bound instead: until the run is about twice the hold-back long, plus one streamed chunk, or about
+three times the hold-back plus one chunk when the run is refused at the bound because a value or
+credential is still arriving. A run with no safe cut for any other reason
 is cut at the bound as before, and htui logs `no safe seam was found` at `warn`.
 
 The cut is decided from the run as it is at the bound, not from the bytes still to come, so four

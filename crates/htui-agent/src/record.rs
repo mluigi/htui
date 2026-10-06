@@ -1231,12 +1231,15 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// past the bound rather than split a secret: a run no longer than `hold_back` (a resolved
     /// secret longer than the bound), or a run that opens with the occurrence the first candidate
     /// falls in (a resolved secret over half the bound). Either ends by about `2 * hold_back`
-    /// bytes plus one chunk. Any other run with no safe cut is flushed whole, as before MOD-10 M3.
+    /// bytes plus one chunk, or about `3 * hold_back` plus one chunk when the run is refused at
+    /// the bound (the reference [`seam_reach`] checks against can then end up to `hold_back`
+    /// bytes short of the run). Any other run with no safe cut is flushed whole, as before
+    /// MOD-10 M3.
     ///
     /// A run refused at the bound is not, by itself, a run with no safe cut: the refusal can be a
     /// value still incomplete there (a pattern-shaped resolved secret, or a credential, with its
-    /// rule's minimum in the run). `seam_cut` then checks its cut against the longest prefix of
-    /// the run that is not refused ([`seam_reach`]), so the value is carried whole and completes
+    /// rule's minimum in the run). `seam_cut` then checks its cut against a prefix of the run
+    /// that is not refused ([`seam_reach`]), so the value is carried whole and completes
     /// in the next row, masked there or refused there whole. That was chosen over keeping a
     /// refused run open up to a ceiling: a stream can keep the end of the run refused at every
     /// chunk (a pattern-shaped secret echoed in chunks that each end inside an occurrence), so the
@@ -1985,6 +1988,9 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     }
 }
 
+/// MOD-10 R1 M1: how many strided ends below `text.len()` [`seam_reach`] tries before it bisects.
+const SEAM_REACH_STRIDES: usize = 8;
+
 /// MOD-10 D18: how many stepped candidates (one `hold_back` apart) one cut tries before the
 /// descent ([`seam_cut`]).
 const SEAM_ATTEMPTS: usize = 4;
@@ -2011,17 +2017,18 @@ const SEAM_ATTEMPTS: usize = 4;
 /// **The reference ([`seam_reach`]).** "Scrubbing `text` whole" needs a clean scrub, and `text`
 /// can be refused at the bound merely because a value is not complete yet: a resolved secret that
 /// is itself pattern-shaped (`sk-ant-…`, `ghp_…`, as injected keys are), or a credential, with at
-/// least its rule's minimum already in the run. So the reference is the longest prefix
-/// `text[..end]`, `end` from `text.len()` down to `first`, that scrubs clean, and the search
+/// least its rule's minimum already in the run. So the reference is a prefix `text[..end]`,
+/// `first <= end <= text.len()`, that scrubs clean (the longest one when the refusal is monotonic
+/// in `end`; [`seam_reach`] strides and bisects rather than try every end, R1 M1), and the search
 /// below runs on it, keeping `hold_back` bytes of *it* open. Any such `end` is sound: an
 /// occurrence still incomplete at the bound starts at or after `first`, hence after every cut;
 /// an occurrence straddling a cut `c <= end - hold_back` is at most `hold_back + 1` bytes long,
 /// so it ends by `end` and the reference masks it whole, which the probe compares against. The
 /// value then completes in the carried row, where it is masked (a resolved secret) or refused
 /// whole as one `scrub_residue` row (a credential), never split. `end` is `text.len()` whenever
-/// `text` is clean. When every prefix down to `first` is refused, the refusal is complete before
-/// `first` (a credential): the session fails closed whatever the cut, and the run is flushed
-/// whole.
+/// `text` is clean. When every prefix tried down to `first` is refused, the refusal is (for a
+/// monotonic one) complete before `first` (a credential): the session fails closed whatever the
+/// cut, and the run is flushed whole.
 ///
 /// **The search, in two passes**, over the reference (called `text` below).
 ///
@@ -2050,9 +2057,11 @@ const SEAM_ATTEMPTS: usize = 4;
 ///    carry after a seam at an occurrence start), every cut from 1 to `first` is inside it. The
 ///    descent reaches 0 and answers `Some(0)`: the run is kept open until the stream moves
 ///    `first` past that occurrence. That is bounded: an occurrence starting at 0 ends by
-///    `hold_back + 1`, and once `first` is past `hold_back` (a run of about `2 * hold_back`
-///    bytes, plus the chunk that crosses it) 0 is out of reach and the descent finds the next
-///    occurrence's start instead.
+///    `hold_back + 1`, and once the reference's own `first` is past `hold_back` 0 is out of
+///    reach and the descent finds the next occurrence's start instead. That is a run of about
+///    `2 * hold_back` bytes, plus the chunk that crosses it, when the run is clean at the bound;
+///    when it is refused there the reference can end up to `hold_back` bytes short of the run,
+///    so about `3 * hold_back` bytes plus one chunk.
 ///
 ///    What is left for the whole flush is a run in which a pattern rule's edge effect (below)
 ///    rejects every boundary in reach, or a scrubber whose masking is not one left-to-right scan;
@@ -2062,10 +2071,12 @@ const SEAM_ATTEMPTS: usize = 4;
 /// until a safe cut appears would split no occurrence either, but it has no bound of its own: a
 /// stream that keeps the bound unsafe keeps the row growing until it hits a ceiling, which then
 /// needs its own fallback. The descent decides from the run alone, keeps the run open only when
-/// no cut can exist (`Some(0)` above), and that case ends within about `2 * hold_back` bytes.
+/// no cut can exist (`Some(0)` above), and that case ends within about `2 * hold_back` bytes
+/// (`3 * hold_back` when the run is refused at the bound), plus one chunk.
 ///
-/// **Cost.** One scrub of `text` (one per prefix tried, at most `hold_back + 1`, when `text` is
-/// refused at the bound), then two (head and tail) per probe: one probe usually, two
+/// **Cost.** One scrub of `text` (when `text` is refused at the bound, one per end
+/// [`seam_reach`] tries: at most [`SEAM_REACH_STRIDES`] + 1 plus a bisection of one stride, R1
+/// M1), then two (head and tail) per probe: one probe usually, two
 /// when the stepped pass fails and the jump lands on an occurrence's start (none when it lands
 /// on 0), at most [`SEAM_ATTEMPTS`] + `hold_back` when a pattern edge effect makes the descent
 /// step one char at a time. A run kept open pays this on every chunk until it is cut, and that
@@ -2073,12 +2084,16 @@ const SEAM_ATTEMPTS: usize = 4;
 /// scrubber, so the cut, and with it replay, stays deterministic, and nothing is held beyond the
 /// run itself.
 ///
-/// A cut that *creates* a refusal (a tail starting with `AKIA…` after a letter, so `^` becomes a
-/// token start; a head ending in a truncated `sk-` body that no longer reads as prose) is unsafe
-/// too and the search moves on, so the seam never invents a failure the whole text did not have.
+/// A cut that *creates* a refusal in the run as it is (a tail starting with `AKIA…` after a
+/// letter, so `^` becomes a token start; a head ending in a truncated `sk-` body that no longer
+/// reads as prose) is unsafe too and the search moves on. The check sees only the run, though:
+/// a cut inside a word right before `sk-` or `eyJ` makes that a token start of the carried row,
+/// and when the bytes still to come grow it into a key shape, the carried row is refused while
+/// the whole text would not be. That is a false refusal, in the fail-closed direction (the
+/// session fails), and listed with the residuals below.
 ///
 /// **Residuals.** The check sees the run as it is at the bound, not the bytes still to come, so
-/// three cases stay open, none a regression on the cut at the bound it replaces:
+/// four cases stay open, none a regression on the cut at the bound it replaces:
 ///
 /// - A complete credential before `first` refuses every reference, so the run is flushed whole
 ///   as one `scrub_residue` row and the session fails closed; a value still incomplete at the
@@ -2094,6 +2109,9 @@ const SEAM_ATTEMPTS: usize = 4;
 ///   counts the rule's 38-byte minimum, not that prefix. Every real header plus payload is well
 ///   over `hold_back`, so a JWT cut inside its payload leaves a clean head and a clean carried
 ///   row (`<payload end>.<signature>`), while the two rows concatenated would match.
+/// - A cut inside a word right before `sk-` or `eyJ` (above): the carried row can be refused once
+///   the rest of the key arrives, where the whole text would not be. A false refusal: the session
+///   fails closed.
 fn seam_cut(scrubber: &dyn Scrubber, text: &str, hold_back: usize) -> Option<usize> {
     if hold_back == 0 {
         return None;
@@ -2109,21 +2127,59 @@ fn seam_cut(scrubber: &dyn Scrubber, text: &str, hold_back: usize) -> Option<usi
     seam_search(scrubber, reach, &whole, hold_back)
 }
 
-/// MOD-10 D18: the reference a seam is checked against ([`seam_cut`]): the longest prefix
-/// `text[..end]`, `end` from `text.len()` down to `first`, that scrubs clean, with its scrub.
-/// `text` itself in the common case (one scrub); `None` when every such prefix is refused.
+/// MOD-10 D18: the reference a seam is checked against ([`seam_cut`]): a prefix `text[..end]`,
+/// `first <= end <= text.len()`, that scrubs clean, with its scrub. `text` itself in the common
+/// case (one scrub); `None` when no end tried is clean.
+///
+/// R1 M1: when `text` is refused, the ends tried are [`SEAM_REACH_STRIDES`] strides of
+/// `(text.len() - first) / SEAM_REACH_STRIDES` bytes down to `first`, snapped to char
+/// boundaries, then a bisection between the first clean stride and the refused one above it.
+/// Any clean `end` in `[first, text.len()]` is a sound reference, so a refusal that is not
+/// monotonic in `end` can only make the reference shorter than the longest clean prefix, never
+/// unsound. For a refusal that is monotonic (an incomplete pattern-shaped value, the case this
+/// exists for) the bisection lands on the longest clean prefix. One scrub per char boundary
+/// instead cost up to `hold_back + 1` scrubs of the run (seconds in a debug build for a 2 KB
+/// secret); this is at most `SEAM_REACH_STRIDES + 1` plus the bisection's `log2` of one stride.
 fn seam_reach<'t>(
     scrubber: &dyn Scrubber,
     text: &'t str,
     first: usize,
 ) -> Option<(&'t str, String)> {
-    (first..=text.len())
-        .rev()
-        .filter(|&end| text.is_char_boundary(end))
-        .find_map(|end| {
-            let reach = &text[..end];
-            scrubbed_text(scrubber, reach).map(|whole| (reach, whole))
-        })
+    if let Some(whole) = scrubbed_text(scrubber, text) {
+        return Some((text, whole));
+    }
+    let stride = (text.len() - first).div_ceil(SEAM_REACH_STRIDES).max(1);
+    // `refused` is the lowest end found refused; `clean` the first clean end below it.
+    let (mut refused, mut end) = (text.len(), text.len());
+    let mut clean = None;
+    while end > first {
+        // `first` is a char boundary, so the floor of any end at or above it stays at or above it.
+        end = text.floor_char_boundary(end.saturating_sub(stride).max(first));
+        match scrubbed_text(scrubber, &text[..end]) {
+            Some(whole) => {
+                clean = Some((end, whole));
+                break;
+            }
+            None => refused = end,
+        }
+    }
+    let (mut low, mut whole) = clean?;
+    loop {
+        let mid = text.floor_char_boundary(low + (refused - low) / 2);
+        let mid = if mid > low {
+            mid
+        } else {
+            text.ceil_char_boundary(low + 1)
+        };
+        if mid >= refused {
+            break;
+        }
+        match scrubbed_text(scrubber, &text[..mid]) {
+            Some(scrub) => (low, whole) = (mid, scrub),
+            None => refused = mid,
+        }
+    }
+    Some((&text[..low], whole))
 }
 
 /// MOD-10 D18: the stepped pass and the descent of [`seam_cut`] over `text`, whose clean scrub is
@@ -3020,8 +3076,9 @@ mod tests {
         assert_eq!(cut, Some(327 - hold_back), "the reach is text[..327]");
         assert_eq!(
             scrubber.scrubs() - before,
-            (327..=341).count() + 2,
-            "one scrub per prefix tried, then the first candidate's head and tail"
+            1 + 2 + 4 + 2,
+            "341, the strides 329 and 317 (12 bytes: 92 / 8), the bisection 323, 326, 327 and 328, \
+             then the first candidate's head and tail (R1 M1)"
         );
         let (head, tail) = text.split_at(235);
         assert!(
@@ -3029,6 +3086,43 @@ mod tests {
             "the occurrence is wholly in the tail"
         );
         assert!(tail.ends_with(&secret[..40]));
+    }
+
+    /// MOD-10 R1 M1: a long pattern-shaped resolved secret (2313 bytes, so `hold_back` is 2312),
+    /// still incomplete at the bound with 1000 bytes in the run: every end from `len` down to 26
+    /// bytes into the occurrence is refused. One scrub per char boundary would be about 970
+    /// scrubs; the strided search and its bisection find the same reference in a bounded few.
+    #[test]
+    fn seam_reach_finds_the_reference_in_a_bounded_number_of_scrubs() {
+        let secret = format!("sk-ant-api03-{}", &long_secret()[..2300]);
+        let scrubber = Counting::new(&secret);
+        let hold_back = scrubber.hold_back();
+        assert_eq!(hold_back, 2312);
+        let text = format!("{} {}", "x".repeat(3000), &secret[..1000]);
+        let first = text.floor_char_boundary(text.len() - hold_back);
+        // One scrub per char boundary, as before R1: the longest clean prefix.
+        let longest = (first..=text.len())
+            .rev()
+            .find(|&end| scrubbed_text(&scrubber.inner, &text[..end]).is_some())
+            .expect("the text before the occurrence is clean");
+        assert_eq!(
+            longest, 3027,
+            "26 bytes into the occurrence, under the rule's 27"
+        );
+        let before = scrubber.scrubs();
+
+        let (reach, whole) = super::seam_reach(&scrubber, &text, first).expect("a clean prefix");
+
+        assert_eq!(reach.len(), longest);
+        assert_eq!(
+            scrubbed_text(&scrubber.inner, reach).as_deref(),
+            Some(whole.as_str())
+        );
+        let scrubs = scrubber.scrubs() - before;
+        assert!(
+            scrubs <= super::SEAM_REACH_STRIDES + 12,
+            "{scrubs} scrubs: `len`, the strides and a bisection of one stride"
+        );
     }
 
     /// The first candidate (`len - hold_back`) lands inside a complete secret, which `whole` masks
