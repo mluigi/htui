@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
+**Current status (2026-10-06):** **MOD-55 is done** (`docs/decisions/mod/mod-55.md`): `Ctrl+G` in
+the Skills tab's Templates and Library editors asks a registry agent for an edit. The body, the request and (for
+templates) the placeholder table go out as one help turn (`StoreRequest::EditHelp`): scrubbed before sending, fail
+closed; no tools and every permission denied (`ToolExposure::no_tools`, `--tools=` on `claude-cli`); closed after
+one turn; recorded as a chat run with step `edit_help`. The reply's last fenced block is shown as a diff and
+accepted into the buffer or discarded; saving is still the editor's own gate. No migration; one `.sqlx` entry
+replaced. It filed **MOD-86** (chat prompts scrubbed only before persisting) and **MOD-87** (chat cancel
+answered late or dropped).
+Before it, **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
 pane reflows an item's hard-wrapped Markdown before wrapping it. Soft-wrapped lines of a paragraph or list item
 join, list items hang under their text, blank lines, fences, headings, tables and quotes stay as written, and inline
 code is drawn in the accent style without its backticks (`ui::markdown`, `cells::wrap_spans`). The scroll counts
@@ -26,27 +34,6 @@ degraded store label, the waiting count) and diff-added (green) have their own `
 the terminal foreground plus bold, `dim` is `Indexed(244)`, and active tabs are bold and underlined.
 `NO_COLOR` selects `Theme::monochrome()`, which marks everything with modifiers alone. Style only, no
 text or snapshot change. The remaining non-focus cyan is **MOD-85**.
-Before it, **MOD-77 is done** (`docs/decisions/mod/mod-77.md`): every fenced
-Postgres step writer locks the step before the run, `park_step`'s order, so none can deadlock (`40P01`)
-against a park. Step updaters take `FOR NO KEY UPDATE OF s FOR SHARE OF r` up front; reader-inserters
-(`append_events`, `record_commits`, the relay's `open_permission`) take `FOR KEY SHARE OF s FOR SHARE OF
-r`; `finish_chat_run` locks its step first. Fifteen deterministic lock-order tests. No migration; `.sqlx`
-regenerated.
-Before it, **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
-waiting-on-you list. `Ctrl+W` opens, from every screen, an overlay listing every run in the active
-workspace that waits on a person, one row per reason (gate, selection, judge failed, unblock,
-interrupted, open permission with its tool); `Enter` opens the item's Runs tab on that step. The top
-bar reads `N working · M waiting`. It is derived each tick by `StoreRequest::Waiting` (replacing
-`ActiveRuns`) from `ReadStore::waiting_candidates` + `WriteStore::open_permissions` and the pure
-`htui_worker::waiting`, which reuses the Runs pane's guards; the list keeps no state. `R-TUI-11`
-added, `R-TUI-1` amended. No migration, no new crate, four new `.sqlx` entries. It spawned **MOD-75**
-(agent question tool, blocked on MOD-11).
-Before it, **MOD-76 is done** (`docs/decisions/mod/mod-76.md`): MOD-37's four
-carried risks. R-32 and R-53 closed as accepted with no code. The Runs pane shortens `agent/model`
-before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
-`claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
-the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
-with no run walking, never under a live walk. No migration.
 Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
 `heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
 MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
@@ -264,6 +251,9 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   a drag pan and a wheel zoom, then an `$EDITOR` handoff before the flow view was ever opened (MOD-71
   review H1's path). `cargo check` the `#[cfg(windows)]` half of `EnableButtonMouseCapture`
   (`crates/htui/src/terminal.rs`, MOD-74 D5), which no Linux build compiles.
+  **From MOD-55 (review L1, `docs/decisions/mod/mod-55.md`):** `edit_help::holds_mask` compares `[REDACTED]` counts
+  in the sent body and the proposal. Once this item masks real values, the help runtime should report how many masks
+  it applied, so a body's literal `[REDACTED]` cannot hide a masked value from the double-accept.
 
 - [ ] **MOD-70 - Follow-up command rows for engine steps** (from MOD-42, PRD Q9;
   `docs/decisions/mod/mod-42.md`). `R-AGT-1`, `R-HIS-1`. MOD-42's `run_command` table carries only
@@ -347,15 +337,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   worker-side cache; worker self-update. Targeted per-run secrets, never agent credentials
   (`R-AGT-9` unchanged). **Open question for the maintainer:** `R-SEC-2` amendment only if the server,
   not the worker, resolves project secrets. Blocked on MOD-47, MOD-10.
-
-- [ ] **MOD-55 - Ask an agent for help while editing a template or skill** (from MOD-9, PRD gate
-  2026-09-25; `docs/decisions/mod/mod-9.md`). `R-SKL-3`, `R-PRM-4`. MOD-9's editor (Skills tab, `TextArea` and `$EDITOR`,
-  `.claude/prds/mod-9-skill-library-templates.prd.md` D2) gains an action that sends the body being
-  edited, the role's placeholder table and the maintainer's request to a configured agent and offers
-  the reply as a proposed edit, shown as a diff and saved only through the same `parse` gate. Open:
-  which agent and model answer (the chat driver or a one-shot CLI call), whether the exchange is
-  recorded, and how secrets in a body are scrubbed before they leave. Not blocked: MOD-9 is done (`docs/decisions/mod/mod-9.md`); the editor this extends landed with
-  its milestone 1 and the Skills view with milestone 3.
 
 - [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, `docs/decisions/mod/mod-9.md`;
   merge of MOD-7 milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
@@ -450,6 +431,25 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   parked question holds its session and compute slot (like a permission request) or releases them
   and resumes later is this item's design call. Not blocked: MOD-11 is done (`docs/decisions/mod/mod-11.md`), so the MCP
   server exists.
+  **From MOD-55 (`docs/decisions/mod/mod-55.md`):** milestone 4 (Skills) also takes the editors' `Ctrl+G` (ask an
+  agent, `ui/tabs/skills/agent_help.rs`) and the `AgentHelp` panel's keys (`Enter`/`y` accept, `Esc`/`n` discard),
+  hard-coded today like `Ctrl+S`/`Ctrl+E`.
+
+- [ ] **MOD-86 - Scrub chat prompts before they are sent** (from MOD-55, `docs/decisions/mod/mod-55.md`).
+  `R-ID-7`, `R-SEC-3`. The Chat tab's `run_chat` sends the opening prompt and every follow-up to the driver
+  unscrubbed: the scrubber runs only on the recorded row (`record_prompt`, `record_follow_up`), and a refusal there
+  is only logged. `R-ID-7` requires scrubbing before anything is persisted **or transmitted**, failing closed.
+  MOD-55's help mode already does this (`prompt::scrub_section`, refused before the run is minted); a chat should
+  scrub its first prompt the same way and refuse a follow-up whose scrub refuses. Open: what the Chat tab shows for
+  a refused follow-up in a live session. Not blocked; it gets stronger as MOD-10 fills in `SessionSpec.env`.
+
+- [ ] **MOD-87 - Chat cancel answered late or dropped during an unparked turn** (from MOD-55,
+  `docs/decisions/mod/mod-55.md`). `R-TUI-6`. In `run_chat`, `run_turn` reads `commands` only while a permission
+  request is parked. So a `ChatCancel` sent while a chat streams is answered only after the turn's `Done`, and the
+  agent spends the whole turn. A second cancel queued behind a cancelled turn is dropped unanswered, which breaks
+  `ChatCommand`'s answered-exactly-once contract. MOD-55 fixed this for help turns only (a `select` on commands while
+  pulling events, and the queue drained and answered at the end). Apply the same to `ChatMode::Conversation`,
+  keeping promotions' behaviour. Not blocked.
 
 ### Deferred backlog
 
@@ -471,6 +471,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

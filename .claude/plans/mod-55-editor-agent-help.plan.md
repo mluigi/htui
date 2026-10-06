@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-55-editor-agent-help.prd.md`
 **Selected Milestone**: 1 — Agent help in the Skills editors
 **Complexity**: Medium (about 13 files across `htui-core`, `htui-store`, `htui`)
-**Status**: DRAFT — awaiting CONFIRM
+**Status**: DONE (2026-10-06) — confirmed 2026-10-06; write-up `docs/decisions/mod/mod-55.md`
 
 ## Summary
 

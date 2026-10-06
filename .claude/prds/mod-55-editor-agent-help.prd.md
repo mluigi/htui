@@ -95,7 +95,7 @@ blank/NUL/unchanged check for skills.
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Agent help in the Skills editors | From the Templates or Library editor, the maintainer asks a registered agent for an edit, sees the scrubbed, recorded reply as a diff, and accepts it into the buffer or discards it; saving still goes through the gate | in-progress | `.claude/plans/mod-55-editor-agent-help.plan.md` |
+| 1 | Agent help in the Skills editors | From the Templates or Library editor, the maintainer asks a registered agent for an edit, sees the scrubbed, recorded reply as a diff, and accepts it into the buffer or discards it; saving still goes through the gate | complete | `.claude/plans/mod-55-editor-agent-help.plan.md` |
 
 ## Open Questions
 
@@ -122,4 +122,4 @@ Resolved by the maintainer after the PRD gate (2026-10-06); `/plan` adopts these
 | Skills get little safety from their gate (blank/NUL/unchanged only) | Medium | Low | Out of scope to strengthen here; the diff and the maintainer's accept are the check |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: milestone 1 complete (2026-10-06, `docs/decisions/mod/mod-55.md`). The hypothesis is validated by the maintainer's tally over the next 10 uses.*

@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-55](docs/decisions/mod/mod-55.md)** - Ask an agent for help while editing a template or skill (done, 2026-10-06)
 - **[MOD-84](docs/decisions/mod/mod-84.md)** - Reflow item bodies before wrapping (done, 2026-10-04)
 - **[MOD-80](docs/decisions/mod/mod-80.md)** - Theme and colour meaning (done, 2026-10-04)
 - **[MOD-77](docs/decisions/mod/mod-77.md)** - Pg step writers lock the step before the run (done, 2026-10-04)
