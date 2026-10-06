@@ -13,10 +13,13 @@ use crate::ui::tabs::TabId;
 /// and `htui::keymap::KeyChord` path keeps compiling until M6.
 pub use crate::keys::chord::KeyChord;
 
-/// Where a binding applies. The propagation chain asks the scopes in order.
+/// Where a binding applies.
+///
+/// Since MOD-67 M1 `App` reads only [`KeyScope::Tab`] rows: `App::on_key` step 5 and the `?` box.
+/// `Global` and `Overlay` remain only for this module's mechanics tests, until M6 deletes it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum KeyScope {
-    /// Always live, checked last.
+    /// Always live.
     Global,
     /// Live while this tab is active.
     Tab(TabId),
@@ -69,8 +72,7 @@ impl Keymap {
 
     /// The action bound to this chord in this scope, or `None`.
     ///
-    /// A [`KeyScope::Overlay`] falls back to [`OverlayId::ANY`], which is how `Esc` closes an
-    /// overlay that never registered a binding of its own.
+    /// A [`KeyScope::Overlay`] with no exact binding falls back to [`OverlayId::ANY`].
     #[must_use]
     pub fn resolve(&self, scope: &KeyScope, chord: KeyChord) -> Option<&Action> {
         if let Some(action) = self.lookup(scope, chord) {
@@ -108,7 +110,9 @@ impl Keymap {
         out
     }
 
-    /// The status-line summary of a scope: `q quit · Tab next tab · ? help`.
+    /// The help-line summary of a scope: `key help · key help`. Since MOD-67 M1 only the `?` box
+    /// reads it, for the Backlog rows it lists under the tab's title; the status line is
+    /// `Keys::status_line`'s.
     ///
     /// Bindings that share a help text (the nine `1`..`9` rows) are collapsed to their first row,
     /// so the line stays one line.

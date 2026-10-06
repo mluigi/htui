@@ -81,7 +81,8 @@ pub struct Ctx<'a> {
     pub projects: &'a [ProjectRef],
     /// What the top bar currently shows.
     pub top_bar: &'a TopBarState,
-    /// The key table, for help lines.
+    /// The legacy Backlog tab rows (MOD-67 D2). No view reads it; the named-action keys are
+    /// [`keys()`](Self::keys).
     pub keymap: &'a Keymap,
     /// The palette.
     pub theme: &'a Theme,
