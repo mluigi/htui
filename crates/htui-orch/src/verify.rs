@@ -173,7 +173,7 @@ pub struct VerifyReport {
     /// When it ended, however it ended.
     pub finished_at: DateTime<Utc>,
     /// MOD-10 R1 L2: the command printed more than [`CAPTURE_TAIL`] bytes and `output` holds the
-    /// kept tail (after an `unavailable` reason's line, [`with_output`]), whose start may be the
+    /// kept tail (after an `unavailable` reason's line, `with_output`), whose start may be the
     /// end of a resolved value the cap cut. `false` when the scrubber withheld the text.
     pub truncated: bool,
 }
