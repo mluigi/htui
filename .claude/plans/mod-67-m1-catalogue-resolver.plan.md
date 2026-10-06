@@ -226,6 +226,19 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] No file under `crates/htui/src/ui/` changed
 - [ ] HANDOFF MOD-67 phase note (P1); plan status updated
 
+## Blueprint amendments (2026-10-06)
+
+`mod-67-m1-catalogue-resolver.blueprint.md` §0/§9 amends this plan without reopening a decision:
+- **PD-1**: `common.back`/`common.dismiss` share `Esc` today; `catalogue.rs` starts ANA §7.4's
+  state-guarded allow-list with that pair, and the uniqueness tests exempt it.
+- **PD-2**: T1 only moves `KeyChord` and adds `parse_strict`; `default_global()` is emptied in **T4**,
+  in the commit that wires the resolver (otherwise T1-T3 leave the tree red). T4 adds `keymap.rs`.
+- **PD-3**: the `keymap.rs` re-export names `crate::keys::chord::KeyChord` (`keys/mod.rs` is T3's).
+- **PD-4**: T1's gate is `cargo test -p htui --lib -- keys::chord keymap`.
+- **Execution**: T1 and T2 run **serially**, not in parallel. Their file sets are disjoint, but both
+  compile the one crate in the one tree, so each would see the other's half-written file; a
+  worktree per task costs a full target build for two small tasks.
+
 ## Verified claims (plan fact-check, 2026-10-06)
 
 | # | claim | verdict | evidence |
