@@ -97,7 +97,7 @@ fn cannot_wait(err: &std::io::Error) -> String {
 
 /// `R-SEC-3` is fail-closed: an output the scrubber could not mask is not persistable, so the text
 /// is dropped and its size is all that is reported. The exit code is a fact and is kept.
-fn scrub_refused(bytes: usize) -> String {
+pub(crate) fn scrub_refused(bytes: usize) -> String {
     format!("<scrub refused: {bytes} bytes withheld>")
 }
 

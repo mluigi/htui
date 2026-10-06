@@ -6231,8 +6231,12 @@ where
         };
         // MOD-37 M4 (review L3): `deadline` was fixed before the start, so the start counts
         // against it; the start itself is not under it - a hung start is bounded by the driver's
-        // own handshake timeout.
-        let mut session = driver.start(spec, text.to_owned()).await?;
+        // own handshake timeout. MOD-10 R1 H1: a start error's text (an agent's stderr tail) is
+        // masked with the walk's scrubber before any caller writes it.
+        let mut session = driver
+            .start(spec, text.to_owned())
+            .await
+            .map_err(|err| remasked_driver(self.parts.scrubber, err))?;
         let now = || self.now();
         let relay = Relay {
             store: self.parts.store,
@@ -6296,7 +6300,12 @@ where
             Err(fenced @ DriverError::Store(StoreError::Fenced { .. })) => {
                 Err(EngineError::Driver(fenced))
             }
-            result => Ok(Driven { result, cut: false }),
+            // MOD-10 R1 H1: settle, a candidate's note and a judge's failure all read this
+            // error's text; it is masked here, once, for every one of them.
+            result => Ok(Driven {
+                result: result.map_err(|err| remasked_driver(self.parts.scrubber, err)),
+                cut: false,
+            }),
         }
     }
 
@@ -6749,19 +6758,62 @@ fn failure_text(phase: &str, err: &EngineError) -> String {
     }
 }
 
-/// MOD-10 (blueprint A-11): `output` through `scrubber`, as a JSON string leaf; a refusal drops
-/// the text rather than persist what the scrubber would not mask.
+/// MOD-10 (blueprint A-11): a verify's `output` through `scrubber`, as a JSON string leaf; a
+/// refusal replaces the text with the verifier's own `<scrub refused: N bytes withheld>` sentence
+/// (R1) rather than persist what the scrubber would not mask.
 fn remasked(scrubber: &dyn Scrubber, output: String) -> String {
-    let mut value = Value::String(output);
+    let bytes = output.len();
+    remasked_or(scrubber, output, "verify output", || {
+        crate::verify::scrub_refused(bytes)
+    })
+}
+
+/// `text` through `scrubber`, as a JSON string leaf, or `withheld()` when it refused (MOD-10:
+/// fail-closed, and never an empty string, MOD-9 D132). `what` names the text in the warning.
+fn remasked_or(
+    scrubber: &dyn Scrubber,
+    text: String,
+    what: &str,
+    withheld: impl FnOnce() -> String,
+) -> String {
+    let mut value = Value::String(text);
     match scrubber.scrub(&mut value) {
         Ok(()) => match value {
             Value::String(text) => text,
-            _ => String::new(),
+            _ => withheld(),
         },
         Err(refusal) => {
-            tracing::warn!(%refusal, "verify output withheld: the walk's scrubber refused it");
-            String::new()
+            tracing::warn!(%refusal, "{what} withheld: the walk's scrubber refused it");
+            withheld()
         }
+    }
+}
+
+/// MOD-10 R1 H1: what replaces a transport error's text (a CLI or ACP agent's stderr tail) that
+/// the walk's scrubber refused.
+const STDERR_WITHHELD: &str = "stderr withheld: the walk's scrubber refused it";
+
+/// MOD-10 R1 H1: what replaces any other driver error's text that the walk's scrubber refused.
+const CAUSE_WITHHELD: &str = "cause withheld: the walk's scrubber refused it";
+
+/// MOD-10 R1 H1: `err`'s text through the walk's `scrubber`. A transport error carries the agent's
+/// stderr tail (`cli/mod.rs` `with_stderr`, the ACP handshake), which reaches `run.failure`
+/// (`fail_hard` via [`failure_text`]), a candidate's or a judge's note and settle's
+/// `StepFailure::Driver`; [`Engine::drive_once`] passes both its start error and its session's
+/// result through here, so every one of those is masked. A refusal keeps the variant and replaces
+/// the text with a fixed sentence. Variants without text are returned as they are.
+fn remasked_driver(scrubber: &dyn Scrubber, err: DriverError) -> DriverError {
+    let masked = |text: String, withheld: &'static str| {
+        remasked_or(scrubber, text, "a driver error", || withheld.to_owned())
+    };
+    match err {
+        DriverError::Transport(text) => DriverError::Transport(masked(text, STDERR_WITHHELD)),
+        DriverError::Spawn(text) => DriverError::Spawn(masked(text, CAUSE_WITHHELD)),
+        DriverError::Unresolved(text) => DriverError::Unresolved(masked(text, CAUSE_WITHHELD)),
+        DriverError::UnknownAdapter(text) => {
+            DriverError::UnknownAdapter(masked(text, CAUSE_WITHHELD))
+        }
+        other => other,
     }
 }
 
@@ -18889,6 +18941,7 @@ mod tests {
         use std::sync::Arc;
 
         use htui_agent::conformance::{Script, ScriptEvent};
+        use htui_agent::error::DriverError;
         use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
         use htui_core::fixtures::ids;
         use htui_core::model::{Gate, RunId, RunMode, RunStatus, RunStep, Status, StepStatus};
@@ -18898,7 +18951,7 @@ mod tests {
 
         use super::Harness;
         use crate::command::{Command, CommandOutcome, EngineError, GateAnswer};
-        use crate::engine::{SessionKey, failure_text};
+        use crate::engine::{SessionKey, failure_text, remasked_driver};
         use crate::fake::{FakeOrchestrator, FakeVerifier, ScriptedStep};
         use crate::status::RunFailure;
         use crate::verify::VerifyReport;
@@ -19476,6 +19529,143 @@ mod tests {
                 harness.orch.run(run).await.status,
                 RunStatus::AwaitingApproval,
                 "the run stays parked at the promoted step"
+            );
+        }
+
+        /// The dual-valid M1 Anthropic fixture: refused by every scrubber's credential rules.
+        const ANT_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
+
+        /// MOD-10 R1 H1: a driver's error text (a CLI agent's stderr tail) is masked with the
+        /// walk's scrubber, and a refused one is replaced, never emptied.
+        #[test]
+        fn a_driver_error_s_text_is_remasked_or_withheld() {
+            let scrubber = htui_core::scrub::MinimalScrubber::new([VALUE.to_owned()]);
+            let masked = remasked_driver(
+                &scrubber,
+                DriverError::Transport(format!("stderr: {VALUE} then exit 1")),
+            );
+            assert!(
+                matches!(&masked, DriverError::Transport(text) if text == "stderr: [REDACTED] then exit 1"),
+                "{masked:?}"
+            );
+            let refused = remasked_driver(
+                &scrubber,
+                DriverError::Transport(format!("stderr: {ANT_KEY}")),
+            );
+            assert_eq!(
+                refused.to_string(),
+                "agent transport error: stderr withheld: the walk's scrubber refused it"
+            );
+            let spawn =
+                remasked_driver(&scrubber, DriverError::Spawn(format!("{ANT_KEY} {VALUE}")));
+            assert!(!spawn.to_string().contains(VALUE), "{spawn}");
+            assert!(!spawn.to_string().contains(ANT_KEY), "{spawn}");
+            assert!(
+                spawn.to_string().starts_with("agent spawn failed: "),
+                "{spawn}"
+            );
+            assert!(
+                matches!(
+                    remasked_driver(&scrubber, DriverError::Cancelled),
+                    DriverError::Cancelled
+                ),
+                "a variant without text is kept"
+            );
+        }
+
+        /// MOD-10 R1 H1 on the plain path: a driver that refuses to start with a resolved value
+        /// in its error fails the run with the value masked in `run.failure`.
+        #[tokio::test]
+        async fn a_driver_error_holding_a_resolved_value_fails_the_run_masked() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            provider_project(&harness, &[("API_KEY", VALUE)]);
+            harness.orch.script(
+                "prd",
+                1,
+                ScriptedStep::refusing_to_start(&format!("the agent printed {VALUE} and exited")),
+            );
+
+            let refused = Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect_err("the driver refused to start");
+            assert!(!refused.to_string().contains(VALUE), "{refused}");
+
+            let run = started_run(&harness.orch).await;
+            let row = harness.orch.run(run).await;
+            assert_eq!(
+                (row.status, row.failure.as_deref()),
+                (
+                    RunStatus::Failed,
+                    Some("agent spawn failed: the agent printed [REDACTED] and exited")
+                )
+            );
+        }
+
+        /// MOD-10 R1 H1: a driver error the scrubber refuses fails the run with a fixed sentence,
+        /// not with an empty failure.
+        #[tokio::test]
+        async fn a_driver_error_the_scrubber_refuses_fails_the_run_with_a_sentence() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            provider_project(&harness, &[("API_KEY", VALUE)]);
+            harness.orch.script(
+                "prd",
+                1,
+                ScriptedStep::refusing_to_start(&format!("the agent printed {ANT_KEY}")),
+            );
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect_err("the driver refused to start");
+
+            let run = started_run(&harness.orch).await;
+            assert_eq!(
+                harness.orch.run(run).await.failure.as_deref(),
+                Some("agent spawn failed: cause withheld: the walk's scrubber refused it")
+            );
+        }
+
+        /// MOD-10 R1 H1 on the candidate path: the candidate's note carries the masked error.
+        #[tokio::test]
+        async fn a_candidate_driver_error_holding_a_resolved_value_is_noted_masked() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| {
+                    if phase.name == "prd" {
+                        phase.fan_out = 2;
+                    }
+                })
+                .await;
+            provider_project(&harness, &[("API_KEY", VALUE)]);
+            harness.orch.script_candidate(
+                "prd",
+                1,
+                1,
+                0,
+                ScriptedStep::refusing_to_start(&format!("the agent printed {VALUE} and exited")),
+            );
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("a group with one survivor parks for a human");
+
+            let notes: Vec<String> = harness
+                .orch
+                .store
+                .notes(ids::HTUI_FEAT_3)
+                .await
+                .expect("MemStore never fails a read")
+                .into_iter()
+                .map(|note| note.body)
+                .collect();
+            assert!(notes.iter().all(|body| !body.contains(VALUE)), "{notes:?}");
+            assert!(
+                notes.iter().any(|body| body
+                    == "fan-out candidate 1 of `prd` attempt 1: agent spawn failed: the agent \
+                        printed [REDACTED] and exited"),
+                "{notes:?}"
             );
         }
     }

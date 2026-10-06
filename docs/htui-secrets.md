@@ -251,10 +251,13 @@ a `<column>` project`` and `this walk's secrets were resolved for another projec
 
 ### Masking
 
-What htui stores (session events, a step's prompt and trim record, a verify command's output) is
-masked with
+What htui stores (session events, a step's prompt and trim record, a verify command's output,
+and an agent's error text, such as the stderr tail of an agent that failed, wherever it is kept:
+a run's failure, a step's failure, and a fan-out candidate's or a judge's note) is masked with
 the resolved values once the walk or the chat has resolved them: every occurrence of a value
-becomes `[REDACTED]`. htui's credential rules (known key formats such as `sk-ant-…`, `ghp_…` or
+becomes `[REDACTED]`. When the credential rules refuse an agent's error text, htui keeps
+`stderr withheld: the walk's scrubber refused it` (or `cause withheld: …`) in its place, and a
+refused verify output is kept as `<scrub refused: N bytes withheld>`. htui's credential rules (known key formats such as `sk-ant-…`, `ghp_…` or
 `AKIA…`) apply as before: a write that still holds one is refused, and the session fails closed.
 Before its first resolution, a walk is masked by the credential rules only.
 
