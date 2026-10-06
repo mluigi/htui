@@ -97,17 +97,17 @@ blank/NUL/unchanged check for skills.
 
 ## Open Questions
 
-- [ ] Which project a help run belongs to. Chat runs carry a project, but templates and skills are
-  not project-scoped. TBD — needs validation in `/plan` against the run schema (a project selector,
-  the active project, or a project-less run).
-- [ ] What instruction frames the request (the "help" prompt itself). `R-ID-5` says htui owns every
-  prompt. TBD in `/plan`: a fixed instruction in code for the MVP, or a new versioned template role.
-- [ ] How a reply becomes a proposed body: a whole replacement body, or a body extracted from a
-  delimited block. A reply with no usable body is shown as text with nothing to accept. TBD in `/plan`.
-- [ ] Behaviour while waiting: whether the request can be cancelled, and whether the editor stays
-  editable (a proposal diffed against a buffer that changed in the meantime). TBD in `/plan`.
-- [ ] Recording (D2) needs the database. The chat path refuses when it is unreachable, so help is
-  unavailable offline. Accept or revisit in `/plan`.
+Resolved by the maintainer after the PRD gate (2026-10-06); `/plan` adopts these:
+
+- [x] Which project a help run belongs to: **the active project**; the action is refused when none is
+  selected. `/plan` checks this against the run schema.
+- [x] What instruction frames the request: **a fixed instruction in code for the MVP**, not a new
+  versioned template role (`R-ID-5` holds, as the instruction is htui's own text).
+- [x] How a reply becomes a proposed body: **the agent is asked for the whole body in one fenced
+  block**; a reply without one is shown as text with nothing to accept.
+- [x] Behaviour while waiting: **the request can be cancelled, and the buffer is locked until the
+  reply arrives**, so the diff is always against what was sent.
+- [x] Database unreachable: **help is unavailable**, as chat is.
 
 ## Risks
 
