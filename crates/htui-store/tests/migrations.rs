@@ -728,8 +728,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // fifty-eight contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11 and
-    // MOD-12 wrote and no half-finished fifty-ninth.
+    // sixty contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11 and MOD-12
+    // wrote and no half-finished sixty-first.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -771,7 +771,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the fifty-eight commented columns, and no others"
+        "exactly the sixty commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -2671,6 +2671,53 @@ async fn a_queue_entry_goes_with_its_item() {
         0,
         "the entry went with its item"
     );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 plan D1: an item is queued on at most one box. `queue_entry.item_id` is the whole primary
+/// key, so a second entry for the same item is refused on another box as well as on the same one.
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn an_item_is_queued_on_at_most_one_box() {
+    use htui_core::fixtures::ids;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let other_box = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, $2, 'elsewhere', 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(other_box)
+    .bind(ids::USER.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("register a second box");
+    let queue_on = |box_id: uuid::Uuid| {
+        sqlx::query(
+            "INSERT INTO queue_entry (item_id, box_id, queued_at, queued_by) \
+             VALUES ($1, $2, now(), $3)",
+        )
+        .bind(ids::HTUI_ANA_2.as_uuid())
+        .bind(box_id)
+        .bind(ids::USER.as_uuid())
+        .execute(&db.pool)
+    };
+
+    queue_on(ids::BOX.as_uuid())
+        .await
+        .expect("queue HTUI ANA-2 on the fixture box");
+    let err = queue_on(other_box)
+        .await
+        .expect_err("the same item on a second box is refused");
+    assert_refused_by(err, "queue_entry_pkey", "the same item on a second box");
+    let err = queue_on(ids::BOX.as_uuid())
+        .await
+        .expect_err("the same item twice on one box is refused");
+    assert_refused_by(err, "queue_entry_pkey", "the same item twice on one box");
+    assert_eq!(common::count(&db.pool, "queue_entry").await, 1);
 
     db.drop_db().await;
 }
