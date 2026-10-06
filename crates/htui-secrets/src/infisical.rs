@@ -13,7 +13,7 @@ use htui_core::secret::{
     MachineIdentity, ProviderHealth, ResolvedSecrets, SecretError, SecretFuture, SecretProvider,
     SecretScope,
 };
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use url::{Host, Position, Url};
 use zeroize::Zeroizing;
 
@@ -222,39 +222,26 @@ impl InfisicalProvider {
         }
         let inner = Arc::clone(&self.inner);
         let login = tokio::spawn(async move {
-            let mut state = state;
+            // Built on the task's first poll: a task cancelled before it ran sent nothing, and
+            // its plain guard leaves the state as it was.
+            let mut login = LoginGuard {
+                state,
+                cool_down: inner.login_cool_down,
+                recorded: false,
+            };
             let outcome = inner.login().await;
-            record(&mut state, outcome, inner.login_cool_down)
+            login.record(outcome)
         });
         match login.await {
             Ok(result) => result,
             Err(e) => match e.try_into_panic() {
                 Ok(panic) => std::panic::resume_unwind(panic),
-                // Only a runtime shutting down cancels the task, dropping its guard unrecorded.
-                // The login may have reached the server, so its outcome is unknown: cool down as
-                // for an unanswered one, unless another caller recorded an outcome meanwhile.
-                Err(_) => {
-                    let cancelled = protocol(
-                        LOGIN_PATH,
-                        "the login was cancelled before it answered".to_owned(),
-                    );
-                    let mut state = self.state.lock().await;
-                    let now = Instant::now();
-                    // The cancelled task left the state as it found it: Empty, or an expired token
-                    // or cool-down. A live token, a running cool-down or a refusal is a newer
-                    // outcome another caller recorded, and stays.
-                    let recorded_since = no_login(&state, now).is_some()
-                        || matches!(&*state, TokenState::Valid { reuse_until, .. } if now < *reuse_until);
-                    if !recorded_since {
-                        record(
-                            &mut state,
-                            Err(LoginFailure::Unanswered(cancelled)),
-                            self.inner.login_cool_down,
-                        )
-                    } else {
-                        Err(cancelled)
-                    }
-                }
+                // Only a runtime shutting down cancels the task; its `LoginGuard` has already
+                // recorded the cool-down an unanswered login gets.
+                Err(_) => Err(protocol(
+                    LOGIN_PATH,
+                    "the login was cancelled before it answered".to_owned(),
+                )),
             },
         }
     }
@@ -423,6 +410,43 @@ fn no_login(state: &TokenState, now: Instant) -> Option<SecretError> {
     }
 }
 
+/// The login task's hold on the token state (D5). A task dropped before it records an outcome (a
+/// runtime shutting down cancels it, or the login panics) may have reached the server, so its
+/// `Drop` records the cool-down an unanswered login gets. It writes before the guard releases the
+/// lock, so no caller queued on the lock ever sees the state the login started from.
+struct LoginGuard {
+    state: OwnedMutexGuard<TokenState>,
+    cool_down: Duration,
+    recorded: bool,
+}
+
+impl LoginGuard {
+    /// Records the login's outcome (see [`record`]) and returns it.
+    fn record(
+        &mut self,
+        outcome: Result<(Zeroizing<String>, Instant), LoginFailure>,
+    ) -> Result<Zeroizing<String>, SecretError> {
+        self.recorded = true;
+        record(&mut self.state, outcome, self.cool_down)
+    }
+}
+
+impl Drop for LoginGuard {
+    fn drop(&mut self) {
+        if !self.recorded {
+            *self.state = TokenState::CoolingDown {
+                until: cool_down_until(Instant::now(), self.cool_down),
+            };
+        }
+    }
+}
+
+/// The end of a cool-down starting at `now`. Never panics: a cool-down past `Instant`'s range is
+/// capped like a reuse window.
+fn cool_down_until(now: Instant, cool_down: Duration) -> Instant {
+    now.checked_add(cool_down.min(MAX_REUSE)).unwrap_or(now)
+}
+
 /// Records a login's outcome in `state` (§B.4.3) and returns it to the caller.
 fn record(
     state: &mut TokenState,
@@ -440,9 +464,7 @@ fn record(
         Err(LoginFailure::Refused(e)) => (TokenState::Refused, Err(e)),
         Err(LoginFailure::Other(e)) => (TokenState::Empty, Err(e)),
         Err(LoginFailure::Unanswered(e)) => {
-            let now = Instant::now();
-            // Never panics: a cool-down past `Instant`'s range is capped like a reuse window.
-            let until = now.checked_add(cool_down.min(MAX_REUSE)).unwrap_or(now);
+            let until = cool_down_until(Instant::now(), cool_down);
             (TokenState::CoolingDown { until }, Err(e))
         }
     };

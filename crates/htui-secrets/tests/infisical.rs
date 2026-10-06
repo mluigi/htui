@@ -753,6 +753,118 @@ fn a_login_cancelled_by_a_runtime_shutdown_cools_down() {
     );
 }
 
+/// Two runtimes for the shutdown tests: `doomed`, which the login task is spawned on and which a
+/// helper thread shuts down after `IMPATIENT`, and `caller`, which the calls run on. Returns the
+/// caller's runtime, a handle to enter `doomed` with, and the shutdown thread.
+fn doomed_runtime() -> (
+    tokio::runtime::Runtime,
+    tokio::runtime::Handle,
+    std::thread::JoinHandle<()>,
+) {
+    let doomed = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("the runtime the login task runs on");
+    let caller = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the caller's runtime");
+    let handle = doomed.handle().clone();
+    let killer = std::thread::spawn(move || {
+        std::thread::sleep(IMPATIENT);
+        doomed.shutdown_background();
+    });
+    (caller, handle, killer)
+}
+
+/// A health check logs in fresh while a live token is cached; cancelled by a runtime shutdown,
+/// that login's outcome is still unknown, so the next call cools down instead of logging in again
+/// (R1 verify).
+#[test]
+fn a_fresh_login_cancelled_over_a_live_token_cools_down() {
+    let stub = Stub::start();
+    stub.on("POST", LOGIN, login_ok(TOKEN, 2_592_000))
+        .on("POST", LOGIN, login_ok(TOKEN_2, 2_592_000).delayed(SLOW))
+        .on("POST", LOGIN, login_ok(TOKEN_2, 2_592_000))
+        .on("GET", STATUS, Reply::json(200, &json!({})));
+    let p = provider(&stub);
+    let (caller, handle, killer) = doomed_runtime();
+    caller
+        .block_on(p.health())
+        .must("the first health check logs in");
+    let cancelled = caller.block_on(async {
+        let _on_doomed = handle.enter();
+        p.health().await
+    });
+    killer.join().expect("the shutdown thread");
+    assert!(
+        matches!(cancelled, Err(SecretError::Protocol { endpoint, .. }) if endpoint == LOGIN),
+        "a cancelled login is not Protocol at the login"
+    );
+    assert!(
+        matches!(
+            caller.block_on(p.health()),
+            Err(SecretError::LoginCoolingDown { .. })
+        ),
+        "the health check after a cancelled login did not cool down"
+    );
+    assert_eq!(
+        stub.count("POST", LOGIN),
+        2,
+        "the call after a cancelled login logged in again"
+    );
+}
+
+/// A caller already queued on the token lock when a runtime shutdown cancels the login task must
+/// see the cool-down, never the old state, so it does not log in again (R1 verify, D5).
+#[test]
+fn a_caller_queued_behind_a_cancelled_login_sees_the_cool_down() {
+    let stub = Stub::start();
+    stub.on(
+        "POST",
+        LOGIN,
+        error(401, "UnauthorizedError", "Invalid credentials").delayed(SLOW),
+    )
+    .on(
+        "POST",
+        LOGIN,
+        error(401, "UnauthorizedError", "Invalid credentials"),
+    );
+    let p = std::sync::Arc::new(provider(&stub));
+    let (caller, handle, killer) = doomed_runtime();
+    let queued = {
+        let p = std::sync::Arc::clone(&p);
+        std::thread::spawn(move || {
+            std::thread::sleep(IMPATIENT / 2);
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the queued caller's runtime")
+                .block_on(p.resolve(&scope()))
+        })
+    };
+    let cancelled = caller.block_on(async {
+        let _on_doomed = handle.enter();
+        p.resolve(&scope()).await
+    });
+    killer.join().expect("the shutdown thread");
+    let queued = queued.join().expect("the queued caller's thread");
+    assert!(
+        matches!(cancelled, Err(SecretError::Protocol { endpoint, .. }) if endpoint == LOGIN),
+        "a cancelled login is not Protocol at the login"
+    );
+    assert!(
+        matches!(queued, Err(SecretError::LoginCoolingDown { .. })),
+        "the queued caller did not see the cool-down"
+    );
+    assert_eq!(
+        stub.count("POST", LOGIN),
+        1,
+        "the queued caller logged in again"
+    );
+}
+
 /// A caller that gives up during a good login does not waste it: the token is cached.
 #[tokio::test]
 async fn a_cancelled_caller_s_login_still_caches_the_token() {
