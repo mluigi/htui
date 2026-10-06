@@ -152,10 +152,16 @@ provider **one** refused login:
   refused login (`BadCredentials`): only a body read in full can show the lockout text.
 - To try again, enter the identity again. htui builds a new provider for the new identity, and
   the new provider starts with a clean slate.
-- Concurrent calls wait for a single login, so a wrong secret costs exactly one failed attempt,
-  however many calls were waiting.
-- Failures that are not refusals (the server unreachable, a 429, a 5xx, an unexpected answer) are
-  not remembered: the next call logs in again.
+- A login runs to its end even when the call that started it gives up (a timeout, a cancelled
+  task), and concurrent calls wait for that one login. So a provider spends at most one refused
+  login, however many calls were waiting or gave up.
+- A login that was sent but got no answer (the 20-second timeout, a dropped connection) may have
+  been counted by Infisical as a failed attempt. The call that sent it fails with `Unreachable`;
+  for the next 30 seconds (Infisical's default window for forgetting failed attempts) every call,
+  health checks included, answers `LoginCoolingDown` at once and sends nothing. After that, one
+  new login is tried.
+- Other failures that are not refusals (the server not reachable at all, so nothing was sent; a
+  429; a 5xx; an unexpected answer) are not remembered: the next call logs in again.
 
 htui keeps the access token in memory only and reuses it until shortly before it expires (it
 stops a minute early, or a tenth of the token's lifetime early when that is longer). If

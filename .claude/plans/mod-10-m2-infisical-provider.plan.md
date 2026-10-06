@@ -230,7 +230,13 @@ Rules for every variant:
 - **A rejected login is never retried.** A 401 from the login endpoint latches the provider into
   `TokenState::Refused`. Every later call returns `LoginRefusedEarlier` **without a request** until a
   new provider is built with a new identity, which M4's identity entry does. One provider therefore
-  costs at most one failed attempt, far below the default threshold of 3.
+  costs at most one refused login, far below the default threshold of 3. The login is cancel-safe:
+  it runs on its own task, so a caller that gives up mid-login never loses the outcome and never
+  causes a second login. A login that was sent but got no answer (a timeout or a reset after the
+  send) may have counted as a failed attempt: the provider then cools down for 30 s (Infisical's
+  default lockout counter-reset window), answering `LoginCoolingDown` without a request, before
+  one new attempt. A connect error sent nothing and stays retryable. *(Amended in the R1 review
+  round.)*
 - If a data request answers 401, or 403 `TokenError`, the cached token is dropped and the provider
   logs in **once** more. That is a token refresh, not a retried rejected login: if the second
   login is refused, it latches as above.

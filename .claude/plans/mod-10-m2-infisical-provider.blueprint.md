@@ -937,15 +937,22 @@ runs first.
 | Entry | State on lock | Action | New state | Returns |
 |---|---|---|---|---|
 | `token()` | `Refused` | none (no request) | `Refused` | `Err(LoginRefusedEarlier)` |
+| `token()` | `CoolingDown{until}`, `now < until` | none (no request) | same | `Err(LoginCoolingDown { retry_after_secs })`, the seconds left rounded up |
 | `token()` | `Valid`, `now < reuse_until` | none | same | a `Zeroizing` clone of the token |
-| `token()` | `Empty`, or `Valid` expired | `login()` with the lock held | ok → `Valid{…}` | the token |
+| `token()` | `Empty`, `Valid` expired, or `CoolingDown` over | `login()` on a spawned task that owns the lock guard (R1 #1) | ok → `Valid{…}` | the token |
 | | | | `LoginFailure::Refused(e)` → `Refused` | `Err(e)` (`BadCredentials`/`IdentityLocked`) |
-| | | | `LoginFailure::Other(e)` → `Empty` | `Err(e)` |
-| `refresh(used)` | `Refused` | none | `Refused` | `Err(LoginRefusedEarlier)` |
+| | | | `LoginFailure::Other(e)` → `Empty` (nothing sent: connect error; or a non-refusal answer) | `Err(e)` |
+| | | | `LoginFailure::Unanswered(e)` → `CoolingDown { until: now + login_cool_down }` (30 s default; any send error but a connect error) | `Err(e)` (`Unreachable`) |
+| `refresh(used)` | `Refused` / `CoolingDown` running | none | same | as `token()` |
 | `refresh(used)` | `Valid{token}`, `token != used`, not expired | none (another caller refreshed) | same | that token |
-| `refresh(used)` | otherwise | `login()` with the lock held | as `token()` | as `token()` |
-| `fresh_login()` (health) | `Refused` | none | `Refused` | `Err(LoginRefusedEarlier)` |
-| `fresh_login()` | anything else | `login()` with the lock held | as `token()` | as `token()` |
+| `refresh(used)` | otherwise | `login()` as `token()` | as `token()` | as `token()` |
+| `fresh_login()` (health) | `Refused` / `CoolingDown` running | none | same | as `token()` |
+| `fresh_login()` | anything else | `login()` as `token()` | as `token()` | as `token()` |
+
+*(R1 #1, amended.)* The login task records its outcome before it releases the guard, so a caller
+dropped mid-login (a timeout, a `select!`) loses nothing and the callers queued on the lock see
+that outcome: still one login. `health_inner` peeks `Refused` and a running `CoolingDown` before
+the status request.
 
 `resolve_inner(scope)`:
 1. `let token = self.token().await?;`
