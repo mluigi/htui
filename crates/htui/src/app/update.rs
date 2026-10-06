@@ -149,6 +149,7 @@ impl App {
                 projects,
                 top_bar,
                 keymap,
+                keys,
                 theme,
                 emit,
                 tabs,
@@ -165,7 +166,8 @@ impl App {
                 theme,
                 origin.clone(),
                 emit,
-            );
+            )
+            .with_keys(keys);
             view.on_refresh(&mut ctx);
         }
         self.drain(&origin);
@@ -251,6 +253,7 @@ impl App {
                 projects,
                 top_bar,
                 keymap,
+                keys,
                 theme,
                 emit,
                 tabs,
@@ -267,7 +270,8 @@ impl App {
                 theme,
                 origin.clone(),
                 emit,
-            );
+            )
+            .with_keys(keys);
             if !view.reveal(target, &mut ctx) {
                 tracing::debug!(%tab, "the tab does not reveal this target");
             }
@@ -298,6 +302,7 @@ impl App {
                         projects,
                         top_bar,
                         keymap,
+                        keys,
                         theme,
                         emit,
                         tabs,
@@ -312,7 +317,8 @@ impl App {
                             theme,
                             origin.clone(),
                             emit,
-                        );
+                        )
+                        .with_keys(keys);
                         tab.on_reply(&reply, &mut ctx);
                     }
                 }
@@ -326,6 +332,7 @@ impl App {
                         projects,
                         top_bar,
                         keymap,
+                        keys,
                         theme,
                         emit,
                         overlays,
@@ -341,7 +348,8 @@ impl App {
                             theme,
                             origin.clone(),
                             emit,
-                        );
+                        )
+                        .with_keys(keys);
                         overlay.on_reply(&reply, &mut ctx);
                     }
                 }

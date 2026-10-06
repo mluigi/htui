@@ -1,14 +1,11 @@
-//! Key bindings as data (plan D5).
+//! Legacy key rows (MOD-1 plan D5), shrinking.
 //!
-//! A binding is a `(scope, chord) -> Action` row in a table, so MOD-13's `n`/`e` and MOD-4's
-//! approve/reject are `Keymap::bind` calls rather than `match` arms in the event loop. Resolution
-//! is scoped: the overlay on top wins over the active tab, which wins over the global table
-//! (blueprint C.4, C.6). `KeyChord` lives in `crate::keys::chord` since MOD-67 M1 and is
-//! re-exported here.
+//! Since MOD-67 M1 the global and overlay keys are named actions in `crate::keys`. What remains
+//! are the six Backlog tab rows `register_all` binds: the help box's half of five arms, and the
+//! `Enter` miss. M5 moves them to the `backlog` context; M6 deletes this module. `KeyChord` lives
+//! in `crate::keys::chord` since MOD-67 M1 and is re-exported here.
 
-use crossterm::event::{KeyCode, KeyModifiers};
-
-use crate::app::action::{Action, OverlayAction, TabAction};
+use crate::app::action::Action;
 use crate::ui::overlay::OverlayId;
 use crate::ui::tabs::TabId;
 
@@ -54,66 +51,15 @@ impl Keymap {
         Self::default()
     }
 
-    /// The MOD-1 table: `q`, `Tab`, `Shift+Tab`, `1`..`9`, `?`, and `Esc` for every overlay, plus
-    /// `ctrl-c`, which quits from anywhere (MOD-52).
+    /// An empty table (MOD-67 M1, plan D2).
     ///
-    /// Raw mode clears `ISIG`, so `ctrl-c` raises no `SIGINT` and arrives as a key like any other.
-    /// It is bound twice: globally, and on the overlay wildcard so a modal overlay (the startup
-    /// switcher, the migration prompt) does not swallow it. Every capturing section and text field
-    /// passes `CONTROL` chords on, so it quits from inside a half-typed field too, where `q` is a
-    /// letter.
-    ///
-    /// T6 adds global `w` (open the workspace switcher) once T5's overlay exists.
+    /// It held the global and overlay rows until MOD-67. `q`, `Tab`, `Shift+Tab`, `1`..`9`, `?`,
+    /// `Esc` and `ctrl-c` are now catalogue actions (`crate::keys::catalogue`), dispatched by
+    /// `App::on_key` through the resolver, and `ctrl-c` is checked before anything else. The name
+    /// stays because the test benches of M3-M5's files call it; M6 deletes it with `Keymap`.
     #[must_use]
     pub fn default_global() -> Self {
-        let mut map = Self::new();
-        map.bind(Binding {
-            scope: KeyScope::Global,
-            key: KeyChord::new(KeyCode::Char('q'), KeyModifiers::NONE),
-            action: Action::Quit,
-            help: "quit",
-        });
-        map.bind(Binding {
-            scope: KeyScope::Global,
-            key: KeyChord::new(KeyCode::Tab, KeyModifiers::NONE),
-            action: Action::Tab(TabAction::Next),
-            help: "next tab",
-        });
-        map.bind(Binding {
-            scope: KeyScope::Global,
-            key: KeyChord::new(KeyCode::BackTab, KeyModifiers::NONE),
-            action: Action::Tab(TabAction::Prev),
-            help: "previous tab",
-        });
-        for (index, digit) in ('1'..='9').enumerate() {
-            map.bind(Binding {
-                scope: KeyScope::Global,
-                key: KeyChord::new(KeyCode::Char(digit), KeyModifiers::NONE),
-                action: Action::Tab(TabAction::Select(index)),
-                help: "select tab",
-            });
-        }
-        map.bind(Binding {
-            scope: KeyScope::Global,
-            key: KeyChord::new(KeyCode::Char('?'), KeyModifiers::NONE),
-            action: Action::ToggleHelp,
-            help: "help",
-        });
-        map.bind(Binding {
-            scope: KeyScope::Overlay(OverlayId::ANY),
-            key: KeyChord::new(KeyCode::Esc, KeyModifiers::NONE),
-            action: Action::Overlay(OverlayAction::Close),
-            help: "close",
-        });
-        for scope in [KeyScope::Global, KeyScope::Overlay(OverlayId::ANY)] {
-            map.bind(Binding {
-                scope,
-                key: KeyChord::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-                action: Action::Quit,
-                help: "quit",
-            });
-        }
-        map
+        Self::new()
     }
 
     /// Adds a binding. It shadows any earlier binding of the same scope and chord.
@@ -184,64 +130,28 @@ impl Keymap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::action::OverlayAction;
 
     fn chord(spec: &str) -> KeyChord {
         KeyChord::parse(spec).expect("test specs parse")
     }
 
     #[test]
-    fn the_global_table_binds_quit_tabs_digits_and_help() {
+    fn the_default_table_is_empty_since_the_catalogue_owns_those_keys() {
         let map = Keymap::default_global();
-        assert!(matches!(
-            map.resolve(&KeyScope::Global, chord("q")),
-            Some(Action::Quit)
-        ));
-        assert!(matches!(
-            map.resolve(&KeyScope::Global, chord("tab")),
-            Some(Action::Tab(TabAction::Next))
-        ));
-        assert!(matches!(
-            map.resolve(&KeyScope::Global, chord("shift-tab")),
-            Some(Action::Tab(TabAction::Prev))
-        ));
-        assert!(matches!(
-            map.resolve(&KeyScope::Global, chord("3")),
-            Some(Action::Tab(TabAction::Select(2)))
-        ));
-        assert!(matches!(
-            map.resolve(&KeyScope::Global, chord("?")),
-            Some(Action::ToggleHelp)
-        ));
-    }
-
-    /// MOD-52: `ctrl-c` quits globally and from every overlay, while `q` stays global only.
-    #[test]
-    fn ctrl_c_quits_globally_and_from_any_overlay() {
-        let map = Keymap::default_global();
-        assert!(matches!(
-            map.resolve(&KeyScope::Global, chord("ctrl-c")),
-            Some(Action::Quit)
-        ));
-        assert!(matches!(
-            map.resolve(
-                &KeyScope::Overlay(OverlayId("workspace_switcher")),
-                chord("ctrl-c")
-            ),
-            Some(Action::Quit)
-        ));
-        assert!(
-            map.resolve(
-                &KeyScope::Overlay(OverlayId("workspace_switcher")),
-                chord("q")
-            )
-            .is_none(),
-            "`q` is still not an overlay key"
-        );
+        assert!(map.help_line(&KeyScope::Global).is_empty());
+        assert!(map.help_line(&KeyScope::Overlay(OverlayId::ANY)).is_empty());
     }
 
     #[test]
     fn an_unknown_chord_and_a_foreign_scope_resolve_to_none() {
-        let map = Keymap::default_global();
+        let mut map = Keymap::new();
+        map.bind(Binding {
+            scope: KeyScope::Global,
+            key: chord("q"),
+            action: Action::Quit,
+            help: "quit",
+        });
         assert!(map.resolve(&KeyScope::Global, chord("z")).is_none());
         assert!(map.resolve(&KeyScope::Global, chord("esc")).is_none());
         assert!(
@@ -254,7 +164,13 @@ mod tests {
     #[test]
     fn every_overlay_inherits_esc_and_can_shadow_it() {
         let switcher = OverlayId("workspace_switcher");
-        let mut map = Keymap::default_global();
+        let mut map = Keymap::new();
+        map.bind(Binding {
+            scope: KeyScope::Overlay(OverlayId::ANY),
+            key: chord("esc"),
+            action: Action::Overlay(OverlayAction::Close),
+            help: "close",
+        });
         assert!(matches!(
             map.resolve(&KeyScope::Overlay(switcher), chord("esc")),
             Some(Action::Overlay(OverlayAction::Close))
@@ -283,7 +199,13 @@ mod tests {
 
     #[test]
     fn the_newest_binding_of_a_scope_wins() {
-        let mut map = Keymap::default_global();
+        let mut map = Keymap::new();
+        map.bind(Binding {
+            scope: KeyScope::Global,
+            key: chord("q"),
+            action: Action::Quit,
+            help: "quit",
+        });
         map.bind(Binding {
             scope: KeyScope::Global,
             key: chord("q"),
@@ -294,14 +216,5 @@ mod tests {
             map.resolve(&KeyScope::Global, chord("q")),
             Some(Action::ToggleHelp)
         ));
-    }
-
-    #[test]
-    fn the_help_line_collapses_the_digit_rows() {
-        let line = Keymap::default_global().help_line(&KeyScope::Global);
-        assert_eq!(
-            line,
-            "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help"
-        );
     }
 }
