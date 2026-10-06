@@ -100,6 +100,8 @@ Decisions taken at the PRD gate (maintainer, 2026-10-06, recommended answers):
   step `pending`.
 - **Q6 — TUI.** `f` on a `running` step in the Runs tab opens a one-line input; the relay view shows
   the queued follow-up and its resolution. No chat-view entry point.
+  *Amended at plan CONFIRM (plan OQ-1, maintainer 2026-10-06):* the key is **`i`** ("instruct"):
+  `f` is the Backlog tab's filter key and the Runs pane lives inside that tab.
 
 **Out of scope**
 - Mid-turn interrupt / steering (cancel the turn, then send) — riskier; revisit if the
@@ -128,6 +130,10 @@ Decisions taken at the PRD gate (maintainer, 2026-10-06, recommended answers):
   (maintainer, 2026-10-06): no step timeout or usage cap exists; `token_budget` is the prompt
   assembly budget (`docs/ANA-2.md:284` chain, `crates/htui-orch/src/graph.rs:750`). A follow-up
   turn's usage is recorded like any turn's and nothing limits it.
+  *Corrected at plan CONFIRM (plan OQ-3, maintainer 2026-10-06):* the premise was wrong. The step
+  deadline (`deadline_seconds`, default 7200 s, `crates/htui-orch/src/graph.rs:29-30`) wraps the
+  whole driven session and the per-run token cap (`per_token_cap_run`) applies to it; a follow-up
+  turn counts toward both like any turn, and after a cut or a breach no follow-up is applied.
 
 ## Risks
 

@@ -1,7 +1,9 @@
 # Plan: MOD-70 — Follow-up command rows for engine steps
 
-**Status: DRAFT, fact-checked (step 3.5: 141 claims, 123 true, 13 partial, 5 false (4 distinct); all amended in place,
-see "Verified claims"); awaiting the maintainer's CONFIRM.**
+**Status: CONFIRMED by the maintainer 2026-10-06, OQ-1…OQ-6 as recommended (`i` key, `follow_up_window`
+table, follow-up turns count toward the step deadline and the run cap, refuse before the session
+starts, a dead walk's row waits for recovery or cancel, text never echoed). Fact-checked at step 3.5
+(141 claims, 123 true, 13 partial, 5 false (4 distinct); all amended in place, see "Verified claims").**
 
 **Source PRD**: `.claude/prds/mod-70-engine-follow-up.prd.md`, both milestones (M1 follow-up row and
 engine verb; M2 Runs-tab follow-up), with its gate decisions (maintainer, 2026-10-06, Q1-Q6 as
