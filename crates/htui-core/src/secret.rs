@@ -300,6 +300,17 @@ pub enum SecretError {
          the identity is entered again"
     )]
     LoginRefusedEarlier,
+    /// An earlier login was sent but got no answer (a timeout or a reset after the request went
+    /// out), so Infisical may have counted it as a failed attempt. For a short window no login is
+    /// tried and no request is made (D5); then exactly one new attempt is allowed.
+    #[error(
+        "an earlier login with this machine identity got no answer and may have counted as a \
+         failed attempt; no new login is tried for another {retry_after_secs} s"
+    )]
+    LoginCoolingDown {
+        /// Whole seconds (rounded up) until the next login may be tried.
+        retry_after_secs: u64,
+    },
     /// The list endpoint answered 404 `NotFound`.
     #[error("Infisical has no project with the configured project ID")]
     ProjectNotFound,
@@ -604,6 +615,14 @@ mod tests {
              the identity is entered again"
         );
         assert_eq!(
+            SecretError::LoginCoolingDown {
+                retry_after_secs: 30
+            }
+            .to_string(),
+            "an earlier login with this machine identity got no answer and may have counted as a \
+             failed attempt; no new login is tried for another 30 s"
+        );
+        assert_eq!(
             SecretError::ProjectNotFound.to_string(),
             "Infisical has no project with the configured project ID"
         );
@@ -681,6 +700,7 @@ mod tests {
             SecretError::BadCredentials => "BadCredentials",
             SecretError::IdentityLocked => "IdentityLocked",
             SecretError::LoginRefusedEarlier => "LoginRefusedEarlier",
+            SecretError::LoginCoolingDown { .. } => "LoginCoolingDown",
             SecretError::ProjectNotFound => "ProjectNotFound",
             SecretError::PathNotFound { .. } => "PathNotFound",
             SecretError::PermissionDenied { .. } => "PermissionDenied",
@@ -706,6 +726,9 @@ mod tests {
             SecretError::BadCredentials,
             SecretError::IdentityLocked,
             SecretError::LoginRefusedEarlier,
+            SecretError::LoginCoolingDown {
+                retry_after_secs: 30,
+            },
             SecretError::ProjectNotFound,
             SecretError::PathNotFound {
                 environment: "dev".into(),
@@ -743,10 +766,10 @@ mod tests {
         let names: BTreeSet<&'static str> = all.iter().map(variant).collect();
         assert_eq!(
             names.len(),
-            14,
+            15,
             "every_variant() misses or repeats a variant"
         );
-        assert_eq!(all.len(), 14, "every_variant() repeats a variant");
+        assert_eq!(all.len(), 15, "every_variant() repeats a variant");
 
         for e in &all {
             let name = variant(e);
@@ -776,6 +799,7 @@ mod tests {
                 | SecretError::BadCredentials
                 | SecretError::IdentityLocked
                 | SecretError::LoginRefusedEarlier
+                | SecretError::LoginCoolingDown { .. }
                 | SecretError::ProjectNotFound
                 | SecretError::PathNotFound { .. }
                 | SecretError::RateLimited { .. }

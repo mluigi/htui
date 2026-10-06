@@ -45,6 +45,7 @@ fn variant(e: &SecretError) -> &'static str {
         SecretError::BadCredentials => "BadCredentials",
         SecretError::IdentityLocked => "IdentityLocked",
         SecretError::LoginRefusedEarlier => "LoginRefusedEarlier",
+        SecretError::LoginCoolingDown { .. } => "LoginCoolingDown",
         SecretError::ProjectNotFound => "ProjectNotFound",
         SecretError::PathNotFound { .. } => "PathNotFound",
         SecretError::PermissionDenied { .. } => "PermissionDenied",
