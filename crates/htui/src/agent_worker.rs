@@ -13922,6 +13922,7 @@ done
         use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
         use htui_core::fixtures::ids;
         use htui_core::model::{EventKind, StepId};
+        use htui_core::scrub::{MinimalScrubber, Scrubber as _};
         use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
         use htui_core::secret::{
             INFISICAL, SecretError, SecretFuture, SecretProvider, SecretSource, project_scope,
@@ -14327,24 +14328,44 @@ done
 
         /// D11 for chats: the scrubber is `from_resolved` over the env's own map, so a value below
         /// the masking floor is injected and left as is, and a long one is masked.
+        ///
+        /// The agent echoes the `"…\n"` value twice: whole, and without its trailing newline (the
+        /// D17 form, blueprint §D.6). The persisted text must be exactly what
+        /// `MinimalScrubber::from_resolved` over the same map makes of the echo, so whatever forms
+        /// `from_resolved` masks, the chat masks too. This base predates T1, whose
+        /// `from_resolved` has no trimmed form yet; the literal §D.6 assertion that the
+        /// newline-free echo is masked is
+        /// `a_newline_free_echo_of_a_newline_value_is_masked`, ignored until T1 is merged.
         #[tokio::test]
         async fn the_chat_scrubber_is_built_from_the_resolved_map() {
             const PIN: &str = "q7z";
             let cert = format!("{VALUE}\n");
+            let said = format!("pin {PIN} cert {cert}end bare {VALUE}.");
             let (store, backend, runtime, agent_id, slot) =
-                fixture_with_spec_spy(echo(&format!("pin {PIN} cert {cert}end")), None).await;
+                fixture_with_spec_spy(echo(&said), None).await;
             plant(&store, Some(INFISICAL));
             let mut runtime =
                 runtime.with_secret_source(resolving(&[("PIN", PIN), ("CERT", &cert)]));
 
             let (step_id, _replies) = run(&mut runtime, &backend, start(agent_id, "go")).await;
 
+            let env = map(&[("PIN", PIN), ("CERT", &cert)]);
             assert_eq!(
                 spec_of(&slot).expect("the session started").env,
-                map(&[("PIN", PIN), ("CERT", &cert)]),
+                env,
                 "both values are injected, the short one too"
             );
+            let mut expected = serde_json::Value::String(said);
+            MinimalScrubber::from_resolved(&env)
+                .0
+                .scrub(&mut expected)
+                .expect("the echo is credential-free");
             let text = assistant_text(&store, step_id).await;
+            assert_eq!(
+                Some(text.as_str()),
+                expected.as_str(),
+                "the chat masks what from_resolved over the env masks"
+            );
             assert!(
                 text.contains(&format!("pin {PIN} cert")),
                 "a value below the floor is not masked: {text:?}"
@@ -14353,6 +14374,24 @@ done
                 text.contains("cert [REDACTED]end"),
                 "the long value is masked: {text:?}"
             );
+        }
+
+        /// Blueprint §D.6, literally: a resolved `"…\n"` value echoed without its trailing newline
+        /// is masked on the chat path. Needs T1's D17 trimmed form in
+        /// `MinimalScrubber::from_resolved`, which this branch's base does not carry.
+        #[tokio::test]
+        #[ignore = "needs T1's D17 trailing-newline form in from_resolved; un-ignore once T1 is merged"]
+        async fn a_newline_free_echo_of_a_newline_value_is_masked() {
+            let cert = format!("{VALUE}\n");
+            let (store, backend, runtime, agent_id, _slot) =
+                fixture_with_spec_spy(echo(&format!("cert {VALUE}end")), None).await;
+            plant(&store, Some(INFISICAL));
+            let mut runtime = runtime.with_secret_source(resolving(&[("CERT", &cert)]));
+
+            let (step_id, _replies) = run(&mut runtime, &backend, start(agent_id, "go")).await;
+
+            let text = assistant_text(&store, step_id).await;
+            assert_eq!(text, "cert [REDACTED]end");
             assert!(!text.contains(VALUE), "{text:?}");
         }
 
