@@ -24,9 +24,9 @@ use crate::clock::TestClock;
 use crate::model::link::{ProposeLink, WithdrawLink};
 use crate::model::{
     Agent, AgentBox, AgentId, AgentSummary, AnswerOutcome, AnswerRefusal, AppUser,
-    BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile,
-    BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim,
-    CommandRun, CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
+    BOX_PROBE_SPEC_KEY, BatchId, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe,
+    BoxProfile, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind,
+    Claim, CommandRun, CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
     Document, DocumentHead, DocumentId, EventKind, Executor, GateOutcome, Item, ItemCitation,
     ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
     ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
@@ -34,18 +34,18 @@ use crate::model::{
     NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount,
-    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch,
+    QueueEntry, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution,
+    ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind,
+    RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary,
+    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    canonical_declared_tags, missing_tags_failure, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -56,19 +56,20 @@ use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
     EXECUTOR_MUST_BE_KNOWN, ParkOutcome, ReadStore, SettingRung, StepFence, StoredSetting,
-    UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment, citation_key,
-    close_out_needs_a_summary, command_finish_status, command_not_claimable, command_not_queued,
-    document_needs_a_step, expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
-    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
-    link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
-    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
-    persona_is_bound, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
-    reaped_note, references_no_row, requirement_withdrawn, reserved_phase_name,
-    resolution_not_closable, row_names_another_phase, row_names_another_step, run_is_terminal,
-    self_link, skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
-    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    UpdateOutcome, WriteStore, already_exists, batch_is_closed, chat_step_status, check_attachment,
+    citation_key, close_out_needs_a_summary, command_finish_status, command_not_claimable,
+    command_not_queued, document_needs_a_step, expected_on_row, failure_disagrees_with_status,
+    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run, link_outside_project,
+    new_persona_refusal, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
+    note_needs_a_step, persona_is_bound, persona_patch_refusal, prompt_template_key,
+    prompt_template_refusal, reaped_note, references_no_row, requirement_withdrawn,
+    reserved_phase_name, resolution_not_closable, row_names_another_phase, row_names_another_step,
+    run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal, skill_version_key,
+    step_document_refusal, step_is_not_promotable, step_note_refusal, step_slot_is_taken,
+    step_writes_own_item, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -269,6 +270,13 @@ struct State {
     permissions: BTreeMap<PermissionId, PermissionRow>,
     /// `run_command` (MOD-42 plan D1), by id.
     run_commands: BTreeMap<RunCommandId, RunCommand>,
+    /// `queue_entry` (MOD-12 D1), by item: an item is queued on at most one box. The entry keeps
+    /// its item's project, which never moves.
+    queue_entries: BTreeMap<ItemId, QueueEntry>,
+    /// `queue_batch` (MOD-12 D2), by id.
+    queue_batches: BTreeMap<BatchId, QueueBatch>,
+    /// `run.batch_id` (MOD-12 D7), beside `runs` as `lease_owners` is: not a `Run` field.
+    run_batches: HashMap<RunId, BatchId>,
     /// `session_event`.
     events: Vec<SessionEvent>,
     /// `requirement_spec` (ANA-11 §4.4), keyed by its primary key, the project (MOD-38).
@@ -374,6 +382,9 @@ impl MemStore {
             openings: HashMap::new(),
             permissions: BTreeMap::new(),
             run_commands: BTreeMap::new(),
+            queue_entries: BTreeMap::new(),
+            queue_batches: BTreeMap::new(),
+            run_batches: HashMap::new(),
             events: data.events,
             requirement_specs: data
                 .requirement_specs
@@ -4219,6 +4230,11 @@ impl State {
             .retain(|_, p| !gone.runs.contains(&p.row.run_id));
         self.run_commands
             .retain(|_, c| !gone.runs.contains(&c.run_id));
+        // MOD-12 D1, D7: an entry goes with its item (`ON DELETE CASCADE`), and `run.batch_id`
+        // with its run.
+        self.queue_entries
+            .retain(|item, _| !gone.items.contains(item));
+        self.run_batches.retain(|run, _| !gone.runs.contains(run));
         self.documents
             .retain(|row| !gone.items.contains(&row.item_id));
         self.notes.retain(|row| !gone.items.contains(&row.item_id));
@@ -4524,6 +4540,21 @@ impl State {
                 )));
             }
         }
+        // MOD-12 D7, H-6: `PgStore`'s `FOR SHARE` read of the batch, in the same place.
+        if let Some(batch) = new.batch_id {
+            let open = self
+                .queue_batches
+                .get(&batch)
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "queue_batch",
+                    id: batch.to_string(),
+                })?
+                .closed_at
+                .is_none();
+            if !open {
+                return Err(StoreError::Constraint(batch_is_closed(batch)));
+            }
+        }
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
         })?;
@@ -4551,6 +4582,9 @@ impl State {
             updated_at: now,
         };
         self.runs.insert(row.id, row.clone());
+        if let Some(batch) = new.batch_id {
+            self.run_batches.insert(row.id, batch);
+        }
         self.transition(new.item_id, status, Status::Queued, now)?;
         Ok(row)
     }
@@ -10634,6 +10668,7 @@ mod tests {
             graph_snapshot: test_snapshot(),
             repo_scope: scope,
             queued_at: Utc::now(),
+            batch_id: None,
         }
     }
 

@@ -713,6 +713,7 @@ where
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: now,
+                batch_id: None,
             })
             .await?;
         Ok(id)
@@ -8937,6 +8938,7 @@ mod tests {
                 graph_snapshot: snapshot,
                 repo_scope: Vec::new(),
                 queued_at: now,
+                batch_id: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -12207,6 +12209,7 @@ mod tests {
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
+                batch_id: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -12311,6 +12314,7 @@ mod tests {
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
+                batch_id: None,
             })
             .await
             .expect("MemStore creates the run");

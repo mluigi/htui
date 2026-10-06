@@ -1107,6 +1107,7 @@ fn race_run(item: ItemId) -> NewRun {
         },
         repo_scope: Vec::new(),
         queued_at: Utc::now(),
+        batch_id: None,
     }
 }
 

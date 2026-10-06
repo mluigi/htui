@@ -3609,6 +3609,7 @@ mod role_gate {
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at,
+                batch_id: None,
             })
             .await
             .expect("the run lands");

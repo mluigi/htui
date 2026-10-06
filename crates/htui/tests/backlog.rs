@@ -986,6 +986,7 @@ async fn a_run_with_no_steps_says_so_in_the_flow() {
             graph_snapshot: bare_snapshot(),
             repo_scope: Vec::new(),
             queued_at: demo_at(2, 8),
+            batch_id: None,
         })
         .await
         .expect("the run is queued");

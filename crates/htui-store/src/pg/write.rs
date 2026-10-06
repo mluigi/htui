@@ -21,35 +21,35 @@
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use htui_core::model::{
-    Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BindingChange,
-    BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec,
-    CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, Executor, GateOutcome, Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch,
-    ItemPatch, ItemRequirement, ItemRevision, NewCommandRun, NewDocument, NewItem, NewItemKind,
-    NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
-    Project, ProjectId, ProjectPatch, PromptTemplate, PromptTemplateId, RelaySessionId, RelayView,
-    Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementSpec, RequirementState,
-    RequirementUpdate, Resolution, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, UserId, VerifyOutcome, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
-    missing_tags_failure, overlaps, scope_of,
+    Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchId,
+    BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
+    CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, GateOutcome, Isolation, Item, ItemId,
+    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
+    NewDocument, NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
+    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
+    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
+    PermissionStatus, Persona, PersonaId, PersonaPatch, PersonaPermission, PersonaTools,
+    PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
+    PromptTemplateId, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
+    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey,
+    SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, UserId,
+    VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
 use htui_core::seed;
 use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
-    COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, command_finish_status, command_not_claimable,
-    command_not_queued, document_needs_a_step, link_key, link_not_proposed_by_run,
-    link_outside_project, note_needs_a_step, reaped_note, self_link, step_document_refusal,
-    step_note_refusal, step_writes_own_item,
+    COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
+    command_not_claimable, command_not_queued, document_needs_a_step, link_key,
+    link_not_proposed_by_run, link_outside_project, note_needs_a_step, reaped_note, self_link,
+    step_document_refusal, step_note_refusal, step_writes_own_item,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore as _, Result,
@@ -4104,7 +4104,8 @@ impl WriteStore for PgStore {
     /// [`StoreError::NotFound`] `{ entity: "item" }` for an unknown item;
     /// [`StoreError::Constraint`] when the item cannot reach `queued`, when the item is not in
     /// `new.project_id`, when the id is taken, or on any of the keys above. Nothing is written on
-    /// any of them.
+    /// any of them. `NotFound { entity: "queue_batch" }` / `Constraint` for an unknown or closed
+    /// `new.batch_id` (MOD-12 D7).
     async fn create_run(&self, new: NewRun) -> Result<Run> {
         let snapshot = serde_json::to_value(&new.graph_snapshot).map_err(|error| {
             StoreError::Constraint(format!("run.graph_snapshot does not serialise: {error}"))
@@ -4169,12 +4170,34 @@ impl WriteStore for PgStore {
             )));
         }
 
+        // MOD-12 D7, H-6: a run joins only an open batch. `FOR SHARE` conflicts with
+        // `close_batch`'s UPDATE, so a pause and an admission serialise on the batch row and a run
+        // never joins a batch that has already closed. The lock order is item, then batch;
+        // `close_batch` takes no item lock, so the two never cycle.
+        if let Some(batch) = new.batch_id {
+            let open = sqlx::query_scalar!(
+                r#"SELECT closed_at IS NULL AS "open!" FROM queue_batch WHERE id = $1 FOR SHARE"#,
+                batch.as_uuid(),
+            )
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(map_sqlx)?
+            .ok_or_else(|| StoreError::NotFound {
+                entity: "queue_batch",
+                id: batch.to_string(),
+            })?;
+            if !open {
+                return Err(StoreError::Constraint(batch_is_closed(batch)));
+            }
+        }
+
         let run = sqlx::query_as!(
             Run,
             r#"
             INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,
-                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope)
-            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[])
+                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,
+                             batch_id)
+            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10)
             RETURNING id               AS "id: RunId",
                       project_id       AS "project_id: ProjectId",
                       item_id          AS "item_id: ItemId",
@@ -4203,6 +4226,7 @@ impl WriteStore for PgStore {
             new.started_by.as_uuid(),
             new.queued_at,
             &scope,
+            new.batch_id.map(BatchId::as_uuid),
         )
         .fetch_one(&mut *tx)
         .await

@@ -1625,6 +1625,7 @@ pub(crate) mod tests {
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: past,
+                batch_id: None,
             })
             .await
             .expect("the run lands");
@@ -1666,6 +1667,7 @@ pub(crate) mod tests {
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: Utc::now() - TimeDelta::minutes(5),
+                batch_id: None,
             })
             .await
             .expect("the run lands");
