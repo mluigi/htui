@@ -16,8 +16,9 @@ use htui_agent::error::DriverError;
 use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, RepoId, Run,
-    RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
+    AgentId, AgentSummary, BatchClose, BoxId, BoxProfile, CancelRequest, Executor, ItemId,
+    ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus,
+    SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order, free_slots,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -1914,7 +1915,8 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
 /// holding a slot on this box), then the claim scan, always unless the runtime was built
 /// [`RunRuntime::without_claim_scan`] (blueprint B-8: `queued` rows hold no slot, so the
-/// adoption's short-circuit must not skip them).
+/// adoption's short-circuit must not skip them). Between the adoption and the claim scan, the
+/// queue runner admits this box's queued ready items (MOD-12 D6, [`admit`]).
 async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>) {
     let host = &ctx.host;
     if !ctx.shared.sweep_fixed
@@ -1927,14 +1929,15 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     let Ok(box_id) = registered_box(host).await else {
         return;
     };
-    let executor = match host.box_row(box_id).await {
-        Ok(Some(row)) => Executor::of(&row.settings),
+    let settings = match host.box_row(box_id).await {
+        Ok(Some(row)) => row.settings,
         Ok(None) => return,
         Err(err) => {
             tracing::debug!(%err, "the sweep could not read this box's executor");
             return;
         }
     };
+    let executor = Executor::of(&settings);
     ctx.shared.note_executor(&executor);
     if !ctx.shared.role.executes(&executor) {
         return;
@@ -1965,7 +1968,152 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
         adopt(&ctx).await;
     }
     if claims {
+        // MOD-12 D6: admission first, under the same guard, so the claim scan below claims and
+        // walks what it created; there is no second admission path.
+        Box::pin(admit(&ctx, box_id, &settings)).await;
         claim_scan(&ctx, box_id).await;
+    }
+}
+
+/// MOD-12 D3, D5, D6: the queue runner, once per sweep of the box's executing process (I-1 is
+/// `sweep_once`'s early return). Nothing without an open batch (D2). First the D3 prune: entries
+/// whose item is `done` or `closed` go, and a batch left with no entry and no live run of its own
+/// closes `drained`. Then `ready_items` over the entries' projects (D5; the scope's
+/// `workspace_id` is a placeholder neither store reads, blueprint H-4), kept to the queued ones in
+/// queue order (D4, [`admission_order`]), and up to [`free_slots`] of them enqueued `auto` under
+/// the batch (D7). Every refusal is logged at `debug` and the next entry tried; one that writes a
+/// note on its item (rung 4, missing tags) is visible there. A `Constraint` re-reads the open
+/// batch and stops when it is no longer this one (a pause won the race, H-6). The `Kit` is read
+/// only when something is to be admitted.
+async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: &TaskCtx<H, P>,
+    box_id: BoxId,
+    box_settings: &Value,
+) {
+    let host = &ctx.host;
+    let batch = match host.open_batch_of(box_id).await {
+        Ok(Some(batch)) => batch,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read this box's batch");
+            return;
+        }
+    };
+    if let Err(err) = host.prune_finished_entries(box_id).await {
+        tracing::debug!(%err, "the queue runner could not prune its finished entries");
+        return;
+    }
+    let entries = match host.queue_entries(box_id).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read its entries");
+            return;
+        }
+    };
+    if entries.is_empty() {
+        drain(ctx, box_id, &batch).await;
+        return;
+    }
+    let mut project_ids: Vec<ProjectId> = Vec::new();
+    for entry in &entries {
+        if !project_ids.contains(&entry.project_id) {
+            project_ids.push(entry.project_id);
+        }
+    }
+    let scope = htui_core::model::Scope {
+        workspace_id: WorkspaceId::default(),
+        project_ids,
+    };
+    let ready = match host.ready_items(&scope, box_id).await {
+        Ok(ready) => ready,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read the ready items");
+            return;
+        }
+    };
+    let order = admission_order(&entries, &ready);
+    if order.is_empty() {
+        return;
+    }
+    let slots = async {
+        let running = host.running_runs_on_box(box_id).await?;
+        let queued = host.queued_runs_on_box(box_id).await?.len();
+        let app = host.app_settings().await?;
+        StoreResult::Ok(free_slots(
+            admission_limit(box_settings, &app),
+            running,
+            queued,
+        ))
+    };
+    let free = match slots.await {
+        Ok(free) => free,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not count this box's free slots");
+            return;
+        }
+    };
+    if free == 0 {
+        return;
+    }
+    let kit = match Kit::read(&ctx.shared, host, false).await {
+        Ok(kit) => kit,
+        Err(message) => {
+            tracing::warn!(%message, "the queue runner could not build its engine");
+            return;
+        }
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    let mut admitted = 0;
+    for item in order {
+        if admitted >= free || ctx.shared.walks.closed() {
+            break;
+        }
+        match engine.enqueue_in_batch(item, batch.id).await {
+            Ok(run) => {
+                admitted += 1;
+                ctx.shared.publisher.publish(&RunFrame {
+                    item,
+                    run: Some(run),
+                    kind: FrameKind::Started,
+                });
+                tracing::info!(%run, %item, batch = %batch.id, "the queue admitted a run");
+            }
+            // H-6: a pause (or a racing runner) may have closed the batch under this admission.
+            Err(EngineError::Store(StoreError::Constraint(message))) => {
+                tracing::debug!(%item, %message, "the queue's enqueue was refused");
+                match host.open_batch_of(box_id).await {
+                    Ok(Some(open)) if open.id == batch.id => {}
+                    _ => return,
+                }
+            }
+            Err(err) => tracing::debug!(%item, %err, "the queue skipped an entry"),
+        }
+    }
+}
+
+/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live.
+async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: &TaskCtx<H, P>,
+    box_id: BoxId,
+    batch: &htui_core::model::QueueBatch,
+) {
+    let host = &ctx.host;
+    match host.batch_runs(batch.id).await {
+        Ok(runs) if runs.iter().all(|(_, status)| status.is_terminal()) => {}
+        Ok(_) => return,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read its batch's runs");
+            return;
+        }
+    }
+    match host
+        .close_batch(box_id, BatchClose::Drained, ctx.shared.clock.now())
+        .await
+    {
+        Ok(Some(_)) => tracing::info!(batch = %batch.id, "the queue drained"),
+        Ok(None) => {}
+        Err(err) => tracing::debug!(%err, "the queue runner could not close its drained batch"),
     }
 }
 
