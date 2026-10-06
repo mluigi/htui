@@ -3046,3 +3046,163 @@ async fn the_document_form_renders_in_the_docs_pane() {
     let frame = harness.render();
     insta::assert_snapshot!("document_form", frame);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The queue keys (MOD-12 milestone 1, plan D9, blueprint §B.5).
+// ---------------------------------------------------------------------------------------------
+
+/// This box's queue, as item ids in queue order.
+async fn queued(store: &MemStore) -> Vec<ItemId> {
+    store
+        .queue_entries(ids::BOX)
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .map(|entry| entry.item_id)
+        .collect()
+}
+
+/// D9: `Q` on `ANA-2` queues it on this box, and the status line says so. The demo box has no
+/// open batch, so the queue is paused (D2): queueing never starts spending by itself.
+#[tokio::test]
+async fn q_queues_the_cursor_item_and_says_so() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    down(&mut harness, TO_ANA_2).await;
+    keys(&mut harness, &["Q"]).await;
+    assert_eq!(queued(&store).await, vec![ids::HTUI_ANA_2]);
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("queued ANA-2 (1 in queue, paused)")
+    );
+}
+
+/// D9: `Q` toggles: a second `Q` on a queued item takes it out again.
+#[tokio::test]
+async fn a_second_q_dequeues_it() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    down(&mut harness, TO_ANA_2).await;
+    keys(&mut harness, &["Q"]).await;
+    keys(&mut harness, &["Q"]).await;
+    assert_eq!(queued(&store).await, Vec::<ItemId>::new());
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("dequeued ANA-2 (0 in queue)")
+    );
+}
+
+/// D2, D9: `P` on a paused box opens a batch; `P` again closes it.
+///
+/// No store read answers a closed batch (T3's surface reads only the open one), so the closed
+/// row's `paused` reason is `serve_queue`'s literal and is not read back here; that the batch
+/// closed, and that a later resume opens a new one, is.
+#[tokio::test]
+async fn p_resumes_then_pauses_the_queue() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["P"]).await;
+    let opened = store
+        .open_batch_of(ids::BOX)
+        .await
+        .expect("the memory store never fails")
+        .expect("`P` opened a batch");
+    assert_eq!(harness.app().status.as_deref(), Some("queue resumed"));
+
+    keys(&mut harness, &["P"]).await;
+    assert_eq!(
+        store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("the memory store never fails"),
+        None,
+        "`P` closed it"
+    );
+    assert_eq!(harness.app().status.as_deref(), Some("queue paused"));
+
+    keys(&mut harness, &["P"]).await;
+    let reopened = store
+        .open_batch_of(ids::BOX)
+        .await
+        .expect("the memory store never fails")
+        .expect("`P` opened another");
+    assert_ne!(reopened.id, opened.id, "a resume opens a new batch (D2)");
+}
+
+/// D9: a pause names the batch's runs it leaves running.
+#[tokio::test]
+async fn pausing_names_the_runs_still_running() {
+    let store = MemStore::demo();
+    let batch = store
+        .open_batch(ids::BOX, ids::USER, demo_at(2, 8))
+        .await
+        .expect("the batch opens");
+    store
+        .create_run(NewRun {
+            id: RunId::new(),
+            project_id: ids::PROJECT_HTUI,
+            item_id: ids::HTUI_ANA_2,
+            mode: RunMode::Auto,
+            target_box_id: ids::BOX,
+            started_by: ids::USER,
+            graph_snapshot: GraphSnapshot {
+                mode: RunMode::Auto,
+                ..bare_snapshot()
+            },
+            repo_scope: Vec::new(),
+            queued_at: demo_at(2, 8),
+            batch_id: Some(batch.id),
+        })
+        .await
+        .expect("the run is admitted under the batch");
+    // No run runtime: nothing claims the run, so it stays `queued`, which is live.
+    let mut harness = backlog_over(store.clone()).await;
+    keys(&mut harness, &["P"]).await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("queue paused \u{2014} 1 run still running")
+    );
+}
+
+/// D9: a finished item is not queued, and nothing is sent for it.
+#[tokio::test]
+async fn q_on_a_done_item_queues_nothing() {
+    let store = MemStore::demo();
+    let mut harness = backlog_over(store.clone()).await;
+    assert!(
+        harness.render().contains("┌ ANA-1"),
+        "the cursor arrives on the done ANA-1"
+    );
+    keys(&mut harness, &["Q"]).await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("ANA-1 is done: nothing to queue")
+    );
+    assert_eq!(queued(&store).await, Vec::<ItemId>::new());
+}
+
+/// D9, blueprint deviation 6: offline the queue is refused with the database sentence.
+#[tokio::test]
+async fn offline_q_is_refused_with_the_database_sentence() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let (mut harness, _cache) = offline_backlog(root.path()).await;
+    down(&mut harness, TO_ANA_2).await;
+    harness.app().status = None;
+    keys(&mut harness, &["Q"]).await;
+    let status = harness.app().status.clone().unwrap_or_default();
+    assert!(status.contains(DATABASE_UNREACHABLE), "{status}");
+}
+
+/// D9: `Q` and `P` are on the Backlog's help line.
+#[tokio::test]
+async fn q_and_p_are_on_the_backlog_help_line() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    let help = harness
+        .app()
+        .keymap
+        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    assert!(help.contains("Q queue / dequeue"), "{help}");
+    assert!(help.contains("P pause / resume queue"), "{help}");
+}
