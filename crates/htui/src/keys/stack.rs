@@ -83,7 +83,8 @@ impl Keys {
     /// the first layer that has one binds `chord`, narrowest layer first, catalogue order within
     /// a layer. A row in a narrower layer **shadows** the same act in every wider layer, even
     /// when it is unbound or binds other chords. The caller handles the first candidate it
-    /// accepts. [`CTRL_C`](super::CTRL_C) is never a candidate.
+    /// accepts. [`CTRL_C`](super::CTRL_C) is never a candidate: no catalogue default binds it and
+    /// M2's loader refuses it, and `App::on_key` checks it before any stack regardless.
     #[must_use]
     pub fn actions(&self, stack: Stack<'_>, chord: KeyChord) -> Vec<Act> {
         let mut seen: Vec<Act> = Vec::new();

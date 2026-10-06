@@ -126,9 +126,10 @@ impl<'a> Ctx<'a> {
         self
     }
 
-    /// The keys in force, for hint rows and labels (M3-M5).
+    /// The keys in force, for hint rows and labels (M3-M5). The borrow lives as long as the
+    /// context's data (`'a`), not as long as this `Ctx`.
     #[must_use]
-    pub fn keys(&self) -> &Keys {
+    pub fn keys(&self) -> &'a Keys {
         self.keys
     }
 
@@ -328,9 +329,15 @@ impl App {
     /// Offers a global action that names a view (MOD-67 D5), replacing an earlier offer of `act`.
     /// Only `register_all` calls it: the shell itself never names a concrete overlay.
     pub fn offer(&mut self, act: Act, action: Action) {
-        debug_assert!(act.spec().is_some_and(|s| s.context == Context::Global));
+        debug_assert!(Self::is_offerable(act), "{act:?} is not offerable");
         self.offered.retain(|(known, _)| *known != act);
         self.offered.push((act, action));
+    }
+
+    /// The global actions [`offer`](Self::offer) takes: those that open a named view. Every other
+    /// global action is [`action_for`](Self::action_for)'s fixed mapping.
+    const fn is_offerable(act: Act) -> bool {
+        matches!(act, Act::Workspaces | Act::Find | Act::Waiting)
     }
 
     /// What the shell does for `act`: the fixed mapping, then the offered table. `None` for
@@ -751,6 +758,8 @@ impl App {
                 return;
             }
             // `Esc` closes; `?`/`F1` toggle help over any overlay, for a key the overlay passed.
+            // Before the modal swallow: under a future non-modal overlay, help pre-empts the active
+            // tab for a key the overlay passed (D6). The first non-modal overlay revisits this.
             if self.apply_keys(Stack::OVERLAY, chord) {
                 return;
             }
@@ -908,5 +917,35 @@ impl App {
                 .block(Block::new().borders(Borders::ALL).title(" Keys ")),
             box_area,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use super::App;
+    use crate::keymap::Keymap;
+    use crate::keys::{CATALOGUE, Context};
+
+    /// MOD-67 review L1: `action_for`'s wildcard arm is only safe while every global act is
+    /// either fixed-mapped by the shell or offerable (and so dispatched once `register_all`
+    /// offers it). A new global act that is neither would be silently inert.
+    #[test]
+    fn every_global_act_is_fixed_mapped_or_offerable() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = App::new(tx, Keymap::new());
+        for row in CATALOGUE
+            .iter()
+            .filter(|row| row.context == Context::Global)
+        {
+            let fixed = app.action_for(row.act).is_some();
+            assert!(
+                fixed != App::is_offerable(row.act),
+                "{:?}: fixed-mapped {fixed}, offerable {}",
+                row.act,
+                App::is_offerable(row.act)
+            );
+        }
     }
 }
