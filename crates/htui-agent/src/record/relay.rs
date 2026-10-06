@@ -465,7 +465,9 @@ fn prescrub(scrubber: &dyn Scrubber, text: &str) -> Result<(), Unmasked> {
 
 /// D6 step 8, B-10: `close_follow_ups` with `reason`, best-effort. An [`Window::Open`] window
 /// retries `Unreachable`/`Backend` up to [`TRANSIENT_READS`] attempts at `relay.poll`; an
-/// [`Window::Unknown`] one is tried once. A final failure is a `warn` (R-3).
+/// [`Window::Unknown`] one is tried once. A final failure is a `warn` (R-3): the window stays open
+/// over what it holds until the engine settles the run terminal (review M-3), a cancel refuses it,
+/// or a lease re-take closes it (D9).
 async fn close_window<R: htui_core::store::RelayStore>(
     relay: &Relay<'_, R>,
     window: Window,
@@ -497,8 +499,8 @@ async fn close_window<R: htui_core::store::RelayStore>(
             Err(err) => {
                 tracing::warn!(
                     %err,
-                    "the step's follow-up window was not closed; a lease re-take or a cancel \
-                     refuses what it holds"
+                    "the step's follow-up window was not closed; the run's end, a cancel or a \
+                     lease re-take refuses what it holds"
                 );
                 return;
             }
