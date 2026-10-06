@@ -17,11 +17,11 @@ use std::time::{Duration, Instant};
 
 use htui_agent::DriverError;
 use htui_agent::launch::{
-    AgentLaunch, AgentSettings, Discovery, Install, InstallSource, QuotaSource, ToolMap, ToolProbe,
-    resolve,
+    AgentLaunch, AgentSettings, Discovery, Install, InstallSource, QuotaSource, ResolvedLaunch,
+    ToolMap, ToolProbe, resolve,
 };
 #[cfg(unix)]
-use htui_agent::launch::{ResolvedLaunch, Spawned, StopSignal};
+use htui_agent::launch::{Spawned, StopSignal};
 #[cfg(unix)]
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -436,6 +436,79 @@ fn debug_never_prints_an_environment_value() {
         );
         assert!(rendered.contains("[REDACTED]"), "{rendered}");
     }
+}
+
+/// A `ResolvedLaunch` with `args` and nothing else, built literally: the redaction is a property of
+/// `Debug` alone, so these cases need neither `resolve` nor a platform.
+fn claude_with_args(args: &[&str]) -> ResolvedLaunch {
+    ResolvedLaunch {
+        command: "claude".to_owned(),
+        args: args.iter().map(|&arg| arg.to_owned()).collect(),
+        env: BTreeMap::new(),
+    }
+}
+
+/// MOD-79 (review L2): a joined `--mcp-config=<value>` prints as `--mcp-config=[REDACTED]`, whether
+/// the value is an operator's inline JSON carrying a token or the session's config file path. The
+/// arguments around it stay visible, so a log still says how the CLI was started.
+#[test]
+fn debug_redacts_a_joined_mcp_config_value() {
+    let inline =
+        r#"--mcp-config={"mcpServers":{"htui":{"env":{"HTUI_MCP_TOKEN":"s3cr3t-token"}}}}"#;
+    let path = "--mcp-config=/run/htui-cli-1-abcd/mcp.json";
+
+    for joined in [inline, path] {
+        let rendered = format!(
+            "{:?}",
+            claude_with_args(&["-p", joined, "--model", "sonnet"])
+        );
+        for kept in [
+            r#""--mcp-config=[REDACTED]""#,
+            r#""-p""#,
+            r#""--model""#,
+            r#""sonnet""#,
+        ] {
+            assert!(rendered.contains(kept), "{kept} is missing: {rendered}");
+        }
+        for leaked in ["s3cr3t-token", "mcpServers", "/run/htui-cli-1-abcd"] {
+            assert!(
+                !rendered.contains(leaked),
+                "an --mcp-config value reached Debug ({leaked}): {rendered}"
+            );
+        }
+    }
+}
+
+/// MOD-79 (review L2): the CLI's `--mcp-config` is variadic, so after a bare flag every following
+/// argument up to the next `-`-prefixed one is a value, and each prints as `[REDACTED]`. The next
+/// flag and its own value print unchanged. Exact, so a redaction that eats `--model` fails here.
+#[test]
+fn debug_redacts_every_value_of_a_split_mcp_config() {
+    let launch = claude_with_args(&[
+        "--mcp-config",
+        "a.json",
+        r#"{"t":"s3cr3t"}"#,
+        "--model",
+        "x",
+    ]);
+
+    assert_eq!(
+        format!("{launch:?}"),
+        r#"ResolvedLaunch { command: "claude", args: ["--mcp-config", "[REDACTED]", "[REDACTED]", "--model", "x"], env: {} }"#
+    );
+}
+
+/// MOD-79: arguments without an `--mcp-config` print exactly as `Vec<String>`'s own `Debug` would,
+/// including a flag that merely shares the prefix (`--mcp-config-x`) and the value after it.
+#[test]
+fn debug_prints_arguments_without_mcp_config_unchanged() {
+    let args = ["--model", "x", "--add-dir", "/a", "--mcp-config-x", "y"];
+    let launch = claude_with_args(&args);
+
+    assert_eq!(
+        format!("{launch:?}"),
+        format!(r#"ResolvedLaunch {{ command: "claude", args: {args:?}, env: {{}} }}"#)
+    );
 }
 
 #[test]
