@@ -416,9 +416,9 @@ fn retry_hint(secs: &Option<u64>) -> String {
 /// `htui_secrets::InfisicalProvider::KIND`, which `htui-core` cannot name.
 pub const INFISICAL: &str = "infisical";
 
-/// MOD-10 D16: a resolved key with this prefix (case-sensitive) is refused: htui's own variables
-/// (`HTUI_MCP_*`, `HTUI_LOG*`, `HTUI_TOOL_*`) must never be shadowed by `SessionSpec.env`, which
-/// is applied last.
+/// MOD-10 D16: a resolved key with this prefix, in any ASCII case (R1 L7: Windows environment
+/// names are case-insensitive), is refused: htui's own variables (`HTUI_MCP_*`, `HTUI_LOG*`,
+/// `HTUI_TOOL_*`) must never be shadowed by `SessionSpec.env`, which is applied last.
 pub const RESERVED_PREFIX: &str = "HTUI_";
 
 /// [`project_scope`]'s [`SecretError::Config`] sentence for a project that names a provider and
@@ -475,17 +475,17 @@ pub fn project_scope(project: &Project) -> Result<Option<SecretScope>, SecretErr
     SecretScope::parse(column).map(Some)
 }
 
-/// MOD-10 D16: refuses the first key (map order) that starts with [`RESERVED_PREFIX`].
+/// MOD-10 D16: refuses the first key (map order) that starts with [`RESERVED_PREFIX`], compared
+/// without regard to ASCII case (R1 L7).
 ///
 /// # Errors
 ///
 /// [`SecretError::ReservedKey`].
 pub fn check_env(resolved: &ResolvedSecrets) -> Result<(), SecretError> {
-    match resolved
-        .as_map()
-        .keys()
-        .find(|key| key.starts_with(RESERVED_PREFIX))
-    {
+    match resolved.as_map().keys().find(|key| {
+        key.get(..RESERVED_PREFIX.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(RESERVED_PREFIX))
+    }) {
         Some(key) => Err(SecretError::ReservedKey { key: key.clone() }),
         None => Ok(()),
     }
@@ -1426,13 +1426,29 @@ mod tests {
         );
     }
 
+    /// MOD-10 R1 L7: Windows environment names are case-insensitive, so `htui_log` there is
+    /// `HTUI_LOG`; the prefix is matched without regard to ASCII case.
     #[test]
-    fn check_env_is_case_sensitive_and_needs_the_underscore() {
+    fn check_env_is_case_insensitive() {
+        for key in ["htui_x", "Htui_Log", "hTuI_MCP_TOKEN"] {
+            let resolved = ResolvedSecrets::new(map(&[("API_KEY", "v1"), (key, "v2")]));
+            assert_eq!(
+                check_env(&resolved),
+                Err(SecretError::ReservedKey { key: key.into() }),
+                "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn check_env_needs_the_prefix_with_its_underscore_at_the_start() {
         let resolved = ResolvedSecrets::new(map(&[
-            ("htui_x", "v"),
             ("HTUIX", "v"),
+            ("htuix", "v"),
             ("MY_HTUI_X", "v"),
             ("HTUI", "v"),
+            ("htui", "v"),
+            ("ÉHTUI_X", "v"),
         ]));
         assert_eq!(check_env(&resolved), Ok(()));
     }

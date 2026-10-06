@@ -192,10 +192,12 @@ step's deadline.
 
 ### Reserved names
 
-A resolved key that starts with `HTUI_` (case-sensitive) is refused as `ReservedKey`:
+A resolved key that starts with `HTUI_`, in any letter case (`htui_token` and `Htui_Log`
+included, since Windows environment names are case-insensitive), is refused as `ReservedKey`:
 ``the secret name `HTUI_…` is reserved for htui; rename it in Infisical``. htui's own
 variables (`HTUI_MCP_*`, `HTUI_LOG*`, `HTUI_TOOL_*`) must never be shadowed by a secret that is
-applied last. The first such key, in key order, is named. `htui_token` (lower case) is allowed.
+applied last. The first such key, in key order, is named. `HTUIX`, `HTUI` and `MY_HTUI_X` are
+allowed.
 
 ### When htui refuses
 
@@ -232,7 +234,7 @@ the cause, or wait, then run again.
 | No machine identity in the keyring | `NoIdentity` |
 | Anything Infisical or the network answers | Its variant ([Errors](#errors-and-what-to-do)) |
 | A key htui refuses after the merge | [What htui refuses](#what-htui-refuses) |
-| A key starting with `HTUI_` | `ReservedKey` ([Reserved names](#reserved-names)) |
+| A key starting with `HTUI_`, in any case | `ReservedKey` ([Reserved names](#reserved-names)) |
 
 The `Config` sentences, after `secret provider configuration: `:
 

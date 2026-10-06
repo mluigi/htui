@@ -173,7 +173,8 @@ PRD's "resolve-once vs per-step" question: per walk.
 **D16 — Pure resolution helpers in `htui-core::secret`.**
 - `project_scope(&Project) -> Result<Option<SecretScope>, SecretError>` covers D12's column rules.
 - `check_env(&ResolvedSecrets) -> Result<(), SecretError>` refuses **reserved names**: any key
-  with the `HTUI_` prefix (case-sensitive). This adds the new variant
+  with the `HTUI_` prefix (case-insensitive, R1 2026-10-06, Windows env names are
+  case-insensitive; was case-sensitive). This adds the new variant
   `SecretError::ReservedKey { key }`: "the secret name `X` is reserved for htui; rename it in
   Infisical". htui's own variables (`HTUI_MCP_*`, `HTUI_LOG*`, `HTUI_TOOL_*`) must never be
   shadowed by a project secret that `spec.env` would apply last.
