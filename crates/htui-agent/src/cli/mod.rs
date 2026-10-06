@@ -24,6 +24,11 @@
 //! [`DriverEvent`]: crate::event::DriverEvent
 
 pub mod claude;
+mod mcp_file;
+
+// MOD-79 (blueprint G-2): `open_session` is `pub` and takes one, so the type must be nameable
+// outside the private module.
+pub use mcp_file::McpConfigFile;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};

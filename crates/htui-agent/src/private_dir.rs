@@ -1,9 +1,9 @@
 //! Private per-process directories, for a file another local account must not read (MOD-79 D2).
 //!
 //! One helper, two callers: `htui-mcp`'s socket directory (`htui-mcp-<pid>-<8 hex>`) and the CLI
-//! driver's MCP config (`htui-cli-<pid>-<8 hex>`, `cli::McpConfigFile`). Both live under the same
-//! base, so whatever isolation lets the relay child reach the socket also lets the CLI read its
-//! config.
+//! driver's MCP config (`htui-cli-<pid>-<8 hex>`, [`crate::cli::McpConfigFile`]). Both live under
+//! the same base, so whatever isolation lets the relay child reach the socket also lets the CLI read
+//! its config.
 
 use std::path::PathBuf;
 
