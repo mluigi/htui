@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use chrono::{TimeDelta, Utc};
 use htui_core::clock::TestClock;
 use htui_core::fixtures::ids;
-use htui_core::model::{CommandRun, CommandRunId, CommandRunStatus, NewCommandRun, Transport};
+use htui_core::model::{
+    Claim, CommandRun, CommandRunId, CommandRunStatus, NewCommandRun, Transport,
+};
 use htui_core::prompt::render::HostnameLine;
 use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
 use htui_core::store::{MemStore, StepFence, WriteStore};
@@ -51,6 +53,51 @@ fn scope(cwd: &Path, exposed: bool) -> ToolScope {
         cwd: cwd.to_path_buf(),
         transport: Transport::Acp,
     }
+}
+
+/// [`scope`] with `command_run` exposed, fenced on `owner`'s lease of the fixture's `RUN_2`.
+fn fenced(cwd: &Path, owner: Uuid) -> ToolScope {
+    ToolScope {
+        fence: StepFence::Lease(owner),
+        ..scope(cwd, true)
+    }
+}
+
+/// `owner` claims the fixture's `RUN_2`, as the walk whose session calls `command_run` does.
+async fn claim(store: &MemStore, owner: Uuid) {
+    assert_eq!(
+        store
+            .claim_run(
+                ids::RUN_2,
+                ids::BOX,
+                owner,
+                Utc::now(),
+                TimeDelta::minutes(5)
+            )
+            .await
+            .expect("the claim is answered"),
+        Claim::Admitted,
+        "the walk claims the run"
+    );
+}
+
+/// Another process takes `RUN_2`'s lease from `owner`; the stranger that holds it now.
+async fn take_away(store: &MemStore, owner: Uuid) -> Uuid {
+    assert!(
+        store
+            .release_lease(ids::RUN_2, owner)
+            .await
+            .expect("release")
+    );
+    let stranger = Uuid::now_v7();
+    assert!(
+        store
+            .take_lease(ids::RUN_2, ids::BOX, stranger, TimeDelta::minutes(5))
+            .await
+            .expect("take"),
+        "the stranger holds the lease now"
+    );
+    stranger
 }
 
 /// A host over `store`.
@@ -120,6 +167,18 @@ fn alive(pattern: &str) -> bool {
         .output()
         .map(|out| out.status.success())
         .unwrap_or(false)
+}
+
+/// Polls until a process matches `pattern`, or fails after five seconds.
+async fn until_alive(pattern: &str) {
+    let started = Instant::now();
+    while !alive(pattern) {
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "`{pattern}` never started"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Polls until no process matches `pattern`, or fails after five seconds.
@@ -810,4 +869,135 @@ async fn command_run_is_not_advertised_when_exposure_is_off() {
         on.tool_names().await.expect("tools/list"),
         ["box_profile", "command_run"]
     );
+}
+
+/// MOD-78 R1: a session whose walk lost the lease is refused before anything is queued, with the
+/// answer every fenced tool gives. The control: the session of the walk that holds it runs.
+#[tokio::test]
+async fn a_lost_lease_refuses_the_call_and_queues_nothing() {
+    let dir = tempfile::tempdir().expect("a scratch cwd");
+    let store = MemStore::demo();
+    let host = host(&store);
+    let owner = Uuid::now_v7();
+    claim(&store, owner).await;
+    let stranger = take_away(&store, owner).await;
+
+    let (_lost, mut lost) = open(&host, fenced(dir.path(), owner)).await;
+    let answer = lost
+        .call(
+            "command_run",
+            json!({"class": "build", "command": "echo never"}),
+        )
+        .await
+        .expect("the call");
+    assert_eq!(refused(&answer), "fenced: lease lost");
+    assert!(rows(&store).await.is_empty(), "nothing was queued");
+
+    let (_held, mut held) = open(&host, fenced(dir.path(), stranger)).await;
+    let answer = ok(&held
+        .call(
+            "command_run",
+            json!({"class": "build", "command": "echo ok"}),
+        )
+        .await
+        .expect("the call"));
+    assert_eq!(answer["output"], json!("ok\n"), "the holder's session runs");
+}
+
+/// MOD-78 R2, D4: a lease lost while the command runs is read on the next heartbeat; the child's
+/// process group is killed, the row ends `cancelled` with the reason over what the command
+/// printed, and the call answers `fenced: lease lost`.
+#[tokio::test]
+async fn a_lease_lost_while_running_kills_the_child() {
+    const PATTERN: &str = "sleep 30.4220";
+    let dir = tempfile::tempdir().expect("a scratch cwd");
+    let store = MemStore::demo();
+    let host = host(&store);
+    let owner = Uuid::now_v7();
+    claim(&store, owner).await;
+    let (_lease, mut client) = open(&host, fenced(dir.path(), owner)).await;
+
+    let call = client.call(
+        "command_run",
+        json!({"class": "build", "command": format!("echo started; {PATTERN}")}),
+    );
+    let take = async {
+        until_status(&store, CommandRunStatus::Running).await;
+        until_alive(PATTERN).await;
+        take_away(&store, owner).await;
+        Instant::now()
+    };
+    let (answer, taken_at) = tokio::join!(call, take);
+    assert_eq!(refused(&answer.expect("the call")), "fenced: lease lost");
+    assert!(
+        taken_at.elapsed() < Duration::from_secs(20),
+        "the next heartbeat stopped the child: {:?}",
+        taken_at.elapsed()
+    );
+    until_gone(PATTERN).await;
+
+    let stored = until_status(&store, CommandRunStatus::Cancelled).await;
+    assert_eq!(stored.exit_code, None);
+    assert!(stored.finished_at.is_some());
+    let output = stored.output.as_deref().unwrap_or_default();
+    assert!(
+        output.starts_with("[stopped: fenced: lease lost]\n"),
+        "{output}"
+    );
+    assert!(
+        output.contains("started\n"),
+        "the row keeps the tail: {output}"
+    );
+}
+
+/// MOD-78 D3(d): a lease lost while the call waits for a slot is read in the queue; the call
+/// answers `fenced: lease lost` and its row is cancelled, never run.
+#[tokio::test]
+async fn a_lease_lost_while_queued_cancels_the_row() {
+    let dir = tempfile::tempdir().expect("a scratch cwd");
+    let store = MemStore::demo();
+    let host = host(&store);
+    let held = store
+        .enqueue_command(queued("build"))
+        .await
+        .expect("queued");
+    assert!(
+        store
+            .claim_command(held.id, Uuid::now_v7(), 1)
+            .await
+            .expect("a claim")
+            .is_some(),
+        "another session holds the one build slot"
+    );
+    let owner = Uuid::now_v7();
+    claim(&store, owner).await;
+    let (_lease, mut client) = open(&host, fenced(dir.path(), owner)).await;
+
+    let call = client.call(
+        "command_run",
+        json!({"class": "build", "command": "echo never"}),
+    );
+    let take = async {
+        let started = Instant::now();
+        while !rows(&store)
+            .await
+            .iter()
+            .any(|row| row.id != held.id && row.status == CommandRunStatus::Queued)
+        {
+            assert!(started.elapsed() < PATIENCE, "the call never queued");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        take_away(&store, owner).await;
+        Instant::now()
+    };
+    let (answer, taken_at) = tokio::join!(call, take);
+    assert_eq!(refused(&answer.expect("the call")), "fenced: lease lost");
+    assert!(
+        taken_at.elapsed() < Duration::from_secs(25),
+        "a read in the queue stopped the wait: {:?}",
+        taken_at.elapsed()
+    );
+    let ours = until_status(&store, CommandRunStatus::Cancelled).await;
+    assert_ne!(ours.id, held.id);
+    assert_eq!((ours.started_at, ours.output), (None, None), "it never ran");
 }

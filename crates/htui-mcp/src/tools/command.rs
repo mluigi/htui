@@ -391,15 +391,16 @@ mod tests {
 
     use std::time::Duration;
 
+    use chrono::{TimeDelta, Utc};
     use htui_core::fixtures::ids;
-    use htui_core::model::{BoxId, CommandRunId, CommandRunStatus, NewCommandRun};
-    use htui_core::store::MemStore;
-    use htui_core::store::WorkerStore;
+    use htui_core::model::{BoxId, Claim, CommandRunId, CommandRunStatus, NewCommandRun};
+    use htui_core::store::mem::MemFault;
     use htui_core::store::traits::COMMAND_HEARTBEAT;
+    use htui_core::store::{MemStore, StepFence, WorkerStore};
     use serde_json::json;
     use uuid::Uuid;
 
-    use super::{COMMAND_ADMIT_POLL, class_limits};
+    use super::{COMMAND_ADMIT_POLL, Lease, Stopped, class_limits};
 
     /// Counts the `WARN` events emitted while it is the default subscriber.
     struct Warnings(Arc<AtomicUsize>);
@@ -524,10 +525,155 @@ mod tests {
             status: CommandRunStatus::Queued,
             exit_code: None,
             output: None,
-            queued_at: chrono::Utc::now(),
+            queued_at: Utc::now(),
             started_at: None,
             finished_at: None,
         }
+    }
+
+    /// The demo's `RUN_2`, on which no lease is held: what every scope before MOD-78 ran on.
+    fn unleased() -> Lease {
+        Lease {
+            run: ids::RUN_2,
+            fence: StepFence::Unleased,
+            step: ids::STEP_R2_PRD,
+        }
+    }
+
+    /// `RUN_2` claimed by `owner`, and the lease a session of its walk is fenced on.
+    async fn leased(store: &MemStore, owner: Uuid) -> Lease {
+        assert_eq!(
+            store
+                .claim_run(
+                    ids::RUN_2,
+                    ids::BOX,
+                    owner,
+                    Utc::now(),
+                    TimeDelta::minutes(5)
+                )
+                .await
+                .expect("the claim is answered"),
+            Claim::Admitted,
+            "the walk claims the run"
+        );
+        Lease {
+            run: ids::RUN_2,
+            fence: StepFence::Lease(owner),
+            step: ids::STEP_R2_PRD,
+        }
+    }
+
+    /// Another process takes `RUN_2`'s lease from `owner`.
+    async fn take_away(store: &MemStore, owner: Uuid) {
+        assert!(
+            store
+                .release_lease(ids::RUN_2, owner)
+                .await
+                .expect("release")
+        );
+        assert!(
+            store
+                .take_lease(ids::RUN_2, ids::BOX, Uuid::now_v7(), TimeDelta::minutes(5))
+                .await
+                .expect("take"),
+            "a stranger holds the lease now"
+        );
+    }
+
+    /// A `running` row on the session's step, claimed by the returned claimant.
+    async fn running(store: &MemStore) -> (CommandRunId, Uuid) {
+        let row = store.enqueue_command(queued()).await.expect("enqueue");
+        let claimant = Uuid::now_v7();
+        assert!(
+            store
+                .claim_command(row.id, claimant, 1)
+                .await
+                .expect("claim")
+                .is_some()
+        );
+        (row.id, claimant)
+    }
+
+    /// MOD-78 D3(d): a queued call whose walk lost its lease leaves the queue within two
+    /// heartbeats, with the answer every fenced tool gives; the reads in the queue are
+    /// rate-limited to one per heartbeat, so it does not stop before the first heartbeat.
+    #[tokio::test(start_paused = true)]
+    async fn a_waiter_on_a_lost_lease_stops_within_two_heartbeats() {
+        let store = MemStore::demo();
+        let owner = Uuid::now_v7();
+        let lease = leased(&store, owner).await;
+        let _ahead = running(&store).await;
+        let waiter = store.enqueue_command(queued()).await.expect("enqueue");
+        take_away(&store, owner).await;
+
+        let mut ticks = 0;
+        let admit = super::admit(
+            &store,
+            waiter.id,
+            Uuid::now_v7(),
+            1,
+            lease,
+            None,
+            &mut ticks,
+        );
+        tokio::pin!(admit);
+        assert!(
+            tokio::time::timeout(COMMAND_HEARTBEAT - Duration::from_millis(1), &mut admit)
+                .await
+                .is_err(),
+            "no lease read in the queue before a heartbeat has passed"
+        );
+        let refused = tokio::time::timeout(COMMAND_HEARTBEAT * 2, admit)
+            .await
+            .expect("the waiter stops within two heartbeats")
+            .expect_err("a lost lease is not admitted");
+        assert_eq!(refused.0, "fenced: lease lost");
+    }
+
+    /// MOD-78 D3(c): the heartbeat of a running command reads the lease, and a lost one stops it.
+    #[tokio::test(start_paused = true)]
+    async fn a_beat_on_a_lost_lease_answers_lease_lost() {
+        let store = MemStore::demo();
+        let owner = Uuid::now_v7();
+        let lease = leased(&store, owner).await;
+        let (id, claimant) = running(&store).await;
+        take_away(&store, owner).await;
+
+        let mut ticks = 0;
+        let stopped = tokio::time::timeout(
+            COMMAND_HEARTBEAT * 2,
+            super::beat(&store, id, claimant, lease, None, &mut ticks),
+        )
+        .await
+        .expect("the next beat reads the lost lease");
+        assert_eq!(stopped, Stopped::LeaseLost);
+    }
+
+    /// MOD-78 D5: a lease read the store fails is not a stop, even on a lease that is in fact
+    /// lost; the first read that answers stops the beat.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_lease_read_does_not_stop_the_beat() {
+        let store = MemStore::demo();
+        let owner = Uuid::now_v7();
+        let lease = leased(&store, owner).await;
+        let (id, claimant) = running(&store).await;
+        take_away(&store, owner).await;
+        store.set_fault(MemFault::LeaseHolds, true);
+
+        let mut ticks = 0;
+        let beat = super::beat(&store, id, claimant, lease, None, &mut ticks);
+        tokio::pin!(beat);
+        assert!(
+            tokio::time::timeout(COMMAND_HEARTBEAT * 5, &mut beat)
+                .await
+                .is_err(),
+            "a failed read does not stop the command"
+        );
+        store.set_fault(MemFault::LeaseHolds, false);
+        let stopped = tokio::time::timeout(COMMAND_HEARTBEAT * 2, beat)
+            .await
+            .expect("the first read that answers stops it");
+        assert_eq!(stopped, Stopped::LeaseLost);
     }
 
     /// ADV-1: a client that holds the connection open without reading does not stop the beats.
@@ -548,12 +694,20 @@ mod tests {
         );
         assert!(store.cancel_command(row.id).await.expect("cancel"));
         let mut ticks = 0;
-        tokio::time::timeout(
+        let stopped = tokio::time::timeout(
             COMMAND_HEARTBEAT * 6,
-            super::beat(&store, row.id, claimant, Some(&progress), &mut ticks),
+            super::beat(
+                &store,
+                row.id,
+                claimant,
+                unleased(),
+                Some(&progress),
+                &mut ticks,
+            ),
         )
         .await
         .expect("the beat is reached and answers false");
+        assert_eq!(stopped, Stopped::Taken, "the queue took the row");
     }
 
     /// ADV-1: a client that holds the connection open without reading does not stop a queued
@@ -578,6 +732,7 @@ mod tests {
             waiter.id,
             Uuid::now_v7(),
             1,
+            unleased(),
             Some(&progress),
             &mut ticks,
         );
