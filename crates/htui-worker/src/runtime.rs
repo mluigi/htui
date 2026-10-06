@@ -3933,6 +3933,65 @@ mod role_gate {
         assert!(runtime.settle(PATIENCE).await.is_empty());
     }
 
+    /// MOD-12 D8 (blueprint H-8): a sweep asked for while one runs is not dropped. The first
+    /// sweep is held in its claim scan, behind the lock the case holds on `first`; `second` is
+    /// queued after that scan listed the box's queued runs, and a second `sweep_with` lands while
+    /// the first still runs. Only the held sweep going round once more claims `second`: no batch
+    /// is open (so no rested walk wakes a sweep), the claim queue is empty (so no retry claims
+    /// it), and nothing else sweeps. The two scopes are disjoint, so neither claim is refused.
+    #[tokio::test]
+    async fn a_sweep_asked_for_during_a_sweep_goes_round_again() {
+        let store = seeded(MemStore::demo()).await;
+        let beta = RepoId::new();
+        store
+            .create_repo(NewRepo {
+                id: beta,
+                project_id: ids::PROJECT_HTUI,
+                name: "beta".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the name is fresh");
+        let first = queued(&store, ids::HTUI_ANA_2, Utc::now() - TimeDelta::minutes(1)).await;
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(OneTurn));
+        let mut runtime: RunRuntime<Backend, Timed> = RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            factory,
+        )
+        .with_author(Arc::new(OutputAuthor));
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        let held = runtime
+            .shared
+            .locks
+            .try_lock(first)
+            .expect("no task holds the run's lock yet");
+
+        runtime.sweep_with(&backend, &sink);
+        tokio::time::timeout(PATIENCE, async {
+            while !runtime.shared.walks.is_live(first) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sweep's claim of `first` waits on the case's lock");
+        let second = queued_over(&store, ids::HTUI_CLEAN_1, Utc::now(), Some(&[beta])).await;
+        runtime.sweep_with(&backend, &sink);
+        drop(held);
+
+        rests_at(&store, first, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_ne!(
+            status_of(&store, second).await,
+            RunStatus::Queued,
+            "the sweep asked for during the first went round once more and claimed `second`"
+        );
+    }
+
     /// MOD-11 D11: a runtime built `with_tool_host` hands the host to every engine it builds:
     /// the claimed run's first session opened a lease scoped to its step, under the runtime's
     /// own fence, and gave it back when the session ended.
