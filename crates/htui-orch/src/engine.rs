@@ -2000,16 +2000,16 @@ where
     /// The re-read only decides that, so its failure is warned and the release is tried anyway;
     /// the walk's answer stands either way.
     ///
-    /// MOD-70 review M-3: a run the walk settled terminal has its follow-up windows closed first,
-    /// under the lease still held ([`Self::close_finished_follow_ups`]).
+    /// MOD-70 review M-3, R2 P-1: a run the walk gives back (settled terminal, or parked at a
+    /// gate) has its follow-up windows closed first, under the lease still held
+    /// ([`Self::close_finished_follow_ups`]). A failed re-read closes nothing: the run's status
+    /// is unknown, and nothing else is written.
     async fn release_after_walk(&self, run: RunId, reread: Result<Run, EngineError>) {
         match reread {
             Ok(row) if row.status == RunStatus::Running => {}
-            Ok(row) => {
-                if row.status.is_terminal() {
-                    self.close_finished_follow_ups(run, FOLLOW_UP_SESSION_ENDED)
-                        .await;
-                }
+            Ok(_) => {
+                self.close_finished_follow_ups(run, FOLLOW_UP_SESSION_ENDED)
+                    .await;
                 self.release_lease(run).await;
             }
             Err(err) => {
@@ -2019,12 +2019,14 @@ where
         }
     }
 
-    /// MOD-70 review M-3: every follow-up window of `run` closes and every follow-up still pending
-    /// on it is refused with `reason`, its text nulled. Called where this process settled the run
-    /// terminal and still holds its lease, before giving it back: a follow-up whose window close
-    /// gave up (D6 step 8, R-3) would otherwise keep its text for ever, since no lease is re-taken
-    /// on a finished run (D9) and `relay_view` lists no terminal run. The store fences it on this
-    /// owner's lease, and it is idempotent.
+    /// MOD-70 review M-3, R2 P-1: every follow-up window of `run` closes and every follow-up
+    /// still pending on it is refused with `reason`, its text nulled. Called where this process
+    /// gives the run back with no session live on it (it settled the run terminal, cancelled it,
+    /// or its walk parked it at a gate) and still holds its lease, before releasing it: a
+    /// follow-up whose window close gave up (D6 step 8, R-3) would otherwise keep its text, for
+    /// ever on a finished run (no lease is re-taken on it, D9, and `relay_view` lists no terminal
+    /// run) and for as long as a parked run waits (its next take runs D9 only for `DeadWalks`).
+    /// The store fences it on this owner's lease, and it is idempotent.
     ///
     /// Best-effort: a failure is a `warn`, and the rows stay as they were. Boxed: it is awaited on
     /// the walk's path (the 2 MiB stack).
