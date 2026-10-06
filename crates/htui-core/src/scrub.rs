@@ -15,7 +15,10 @@ use regex::{Regex, RegexSet};
 use serde_json::Value;
 
 /// What every masked occurrence is replaced with.
-const REDACTED: &str = "[REDACTED]";
+///
+/// Public for MOD-55 P9: a proposal that brings the marker back is flagged before it can replace a
+/// real value.
+pub const REDACTED: &str = "[REDACTED]";
 
 /// ANA-7 §3.4's floor: a resolved value shorter than this many characters is injected but not
 /// masked, because masking a 3-character value would shred every transcript (MOD-10 D3).

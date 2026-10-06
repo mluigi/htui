@@ -25,10 +25,12 @@
 //! [`withhold_unmaskable_notes`] (P-2), and MOD-9 milestone 5 adds [`drop_unmaskable_files`]
 //! (MOD-9 D116), which the shared pass `htui_agent::excerpt::step_pass` uses. It is the one pass
 //! both the engine's phase prompt and the Backlog preview run, and a caller with no readable root
-//! gets the empty audit from it.
+//! gets the empty audit from it. MOD-55 adds [`edit_help`], the fixed prompt and reply parser of
+//! the editors' agent help, and [`scrub_section`].
 
 pub mod defaults;
 pub mod digest;
+pub mod edit_help;
 pub mod estimate;
 pub mod excerpt;
 pub mod render;
@@ -1278,20 +1280,55 @@ fn scrub_text(
     content: &str,
     section: &str,
 ) -> Result<String, AssembleError> {
+    scrub_string(scrubber, content).map_err(|unmasked| AssembleError::Unmasked {
+        section: section.to_owned(),
+        rule: unmasked.rule,
+        path: unmasked.path,
+    })
+}
+
+/// One string, wrapped, scrubbed and unwrapped (plan D100's two lines); the scrubber's own refusal.
+///
+/// The one wrap/scrub/unwrap: [`scrub_text`] and [`scrub_section`] differ only in how they name a
+/// refusal.
+fn scrub_string(scrubber: &dyn Scrubber, content: &str) -> Result<String, crate::scrub::Unmasked> {
     let mut value = Value::String(content.to_owned());
-    scrubber
-        .scrub(&mut value)
-        .map_err(|unmasked| AssembleError::Unmasked {
-            section: section.to_owned(),
-            rule: unmasked.rule,
-            path: unmasked.path,
-        })?;
+    scrubber.scrub(&mut value)?;
     Ok(match value {
         Value::String(masked) => masked,
         // `mask_value` rewrites a string leaf in place and cannot change its type; this arm exists
         // so a future scrubber that did would lose the content loudly rather than silently.
         other => other.to_string(),
     })
+}
+
+/// MOD-55 P2: `content` masked for **sending**, under `section`'s name, or the refusal naming the
+/// section and the rule and never the text (`R-ID-7`, `R-SEC-3`). The one public string scrub.
+///
+/// # Errors
+///
+/// [`SectionRefused`] when something credential-shaped survives masking.
+pub fn scrub_section(
+    scrubber: &dyn Scrubber,
+    content: &str,
+    section: &'static str,
+) -> Result<String, SectionRefused> {
+    scrub_string(scrubber, content).map_err(|unmasked| SectionRefused {
+        section,
+        rule: unmasked.rule,
+    })
+}
+
+/// MOD-55 P2: a section that still matched a credential rule after masking. Its `Display` and
+/// `Debug` are part of the security contract: a section name and a rule name, never the text,
+/// never the pointer (a lone string's pointer is always `""`).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("the {section} matches the {rule} rule")]
+pub struct SectionRefused {
+    /// `"name"`, `"body"` or `"request"` for a help prompt.
+    pub section: &'static str,
+    /// The scrubber's rule name, e.g. `"github_token"`.
+    pub rule: &'static str,
 }
 
 /// §4.5's audit with `files[]` **rebuilt** from what survived the trim (§5.1 `:1536-1538`).
@@ -1763,5 +1800,59 @@ mod residual_tests {
             assert!(!note.contains("hunter2hunter2"), "{note}");
             assert!(!note.contains("sk-"), "{note}");
         }
+    }
+
+    /// MOD-55 P2: a refusal carries the section and the rule; its `Debug` and `Display` spell
+    /// neither the key nor a pointer.
+    #[test]
+    fn scrub_section_names_the_section_never_the_text() {
+        let key = format!("ghp_{}", "A1b2".repeat(9));
+        let refused = scrub_section(
+            &MinimalScrubber::new([]),
+            &format!("use {key} here"),
+            "body",
+        )
+        .expect_err("a GitHub token pattern is refused");
+        assert_eq!(
+            refused,
+            SectionRefused {
+                section: "body",
+                rule: "github_token",
+            }
+        );
+        for rendered in [format!("{refused:?}"), refused.to_string()] {
+            assert!(!rendered.contains(&key), "{rendered}");
+            assert!(!rendered.contains("ghp_"), "{rendered}");
+            assert!(!rendered.contains("path"), "{rendered}");
+        }
+        assert_eq!(
+            refused.to_string(),
+            "the body matches the github_token rule"
+        );
+    }
+
+    /// MOD-55 T1: `scrub_text` over the shared core still reports `AssembleError::Unmasked` with
+    /// the lone string's pointer.
+    #[test]
+    fn scrub_text_still_reports_the_pointer() {
+        let key = format!("ghp_{}", "A1b2".repeat(9));
+        let refused = scrub_text(&MinimalScrubber::new([]), &key, "item")
+            .expect_err("a GitHub token pattern is refused");
+        assert_eq!(
+            refused,
+            AssembleError::Unmasked {
+                section: "item".to_owned(),
+                rule: "github_token",
+                path: String::new(),
+            }
+        );
+        assert_eq!(
+            scrub_text(
+                &MinimalScrubber::new(["hunter2-secret".to_owned()]),
+                "pw hunter2-secret",
+                "item",
+            ),
+            Ok("pw [REDACTED]".to_owned())
+        );
     }
 }
