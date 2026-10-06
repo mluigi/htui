@@ -130,8 +130,8 @@ impl KeyChord {
     /// character is refused outright, `ctrl-` with a capital (or with `shift-` and a letter) is
     /// refused with the lower case, and a ctrl chord the terminal delivers as another key
     /// (`ctrl-i` is `Tab`) with what arrives; that last refusal also covers `ctrl-I`,
-    /// `ctrl-shift-i` and their `m` twins, ahead of the capital one. `ctrl-c` is not refused here: that is the loader's
-    /// rule.
+    /// `ctrl-shift-i` and their `m` twins, ahead of the capital one. `ctrl-c` is not refused
+    /// here: that is the loader's rule.
     ///
     /// # Errors
     ///
