@@ -979,6 +979,7 @@ impl HierarchySection {
                         slug: Some(editor.text(0)),
                         name: Some(editor.text(1)),
                         description: Some(editor.text(2)),
+                        secret: None,
                     },
                 }
             }
