@@ -2,8 +2,8 @@
 //!
 //! One helper, two callers: `htui-mcp`'s socket directory (`htui-mcp-<pid>-<8 hex>`) and the CLI
 //! driver's MCP config (`htui-cli-<pid>-<8 hex>`, [`crate::cli::McpConfigFile`]). Both live under
-//! the same base, so whatever isolation lets the relay child reach the socket also lets the CLI read
-//! its config.
+//! the same base, so on Unix whatever isolation lets the relay child reach the socket also lets the
+//! CLI read its config (MOD-79 review L6: on Windows the socket is a named pipe, not a file there).
 
 use std::path::PathBuf;
 
@@ -16,8 +16,9 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 /// removes it; after a success this function never does.
 ///
 /// On Unix, `<base>` is `$XDG_RUNTIME_DIR` when that is set to an existing absolute directory, else
-/// [`std::env::temp_dir`]. The directory is created with mode `0700` and its mode is read back. A
-/// directory that grants anything to group or others is removed and refused.
+/// [`std::env::temp_dir`]. The directory is created with mode `0700` and its mode is read back,
+/// without following a symlink. A directory that grants anything to group or others is removed and
+/// refused; a symlink (or anything else not a directory) in its place is refused and left alone.
 ///
 /// Elsewhere (Windows), `<base>` is [`std::env::temp_dir`] (`%LOCALAPPDATA%\Temp` for a user), and
 /// the directory inherits that directory's ACL: the account, SYSTEM and Administrators (MOD-79,
@@ -26,31 +27,52 @@ use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
 /// # Errors
 ///
 /// The `create` error (the name exists, the base is not writable), the metadata read's, or, on Unix
-/// only, `"<dir> is not private (mode <octal>)"`.
+/// only, `"<dir> is not a directory"` or `"<dir> is not private (mode <octal>)"`.
 pub fn create(prefix: &str) -> std::io::Result<PathBuf> {
     // `new_v4`, not `now_v7`: a v7's leading hex is its millisecond, so one pid making two
     // directories in the same millisecond would collide (blueprint H-2).
     let suffix = uuid::Uuid::new_v4().simple().to_string();
     let dir = base().join(format!("{prefix}-{}-{}", std::process::id(), &suffix[..8]));
-    // `channel.rs`'s body, moved verbatim (MOD-79 D2): create with `0700`, then read the mode back,
-    // because a filesystem may ignore the requested bits and the check is what the caller relies on.
+    // `channel.rs`'s body (MOD-79 D2): create with `0700`, then read the mode back, because a
+    // filesystem may ignore the requested bits and the check is what the caller relies on. The
+    // read no longer follows a symlink ([`ensure_private`], review L2).
     #[cfg(unix)]
     {
         std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-        let mode = std::fs::metadata(&dir)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            let _ = std::fs::remove_dir(&dir);
-            return Err(std::io::Error::other(format!(
-                "{} is not private (mode {mode:o})",
-                dir.display()
-            )));
-        }
+        ensure_private(&dir)?;
     }
     // Option A: the per-user temp directory's inherited ACL is the whole of the privacy, and no
     // `unsafe` DACL call is reachable under the workspace's `forbid` (MOD-79 plan).
     #[cfg(not(unix))]
     std::fs::create_dir(&dir)?;
     Ok(dir)
+}
+
+/// Refuses `dir` unless it is a directory itself, not a symlink to one, granting nothing to group
+/// or others; a directory that grants something is removed.
+///
+/// `symlink_metadata`, not `metadata` (MOD-79 review L2): `metadata` follows a link, so a symlink
+/// swapped in after the `create` would be judged by its target's mode, and the caller would then
+/// write through it into a directory it does not own. A non-directory is refused and left alone:
+/// `remove_dir` on a link fails at best, and the thing is not ours to remove at worst.
+#[cfg(unix)]
+fn ensure_private(dir: &std::path::Path) -> std::io::Result<()> {
+    let metadata = std::fs::symlink_metadata(dir)?;
+    if !metadata.file_type().is_dir() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        let _ = std::fs::remove_dir(dir);
+        return Err(std::io::Error::other(format!(
+            "{} is not private (mode {mode:o})",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// `$XDG_RUNTIME_DIR` through [`base_from`]: the env read is the only part a test cannot drive
@@ -128,6 +150,31 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o700, "{mode:o}");
+    }
+
+    /// MOD-79 review L2: a symlink where the directory should be is refused even when what it
+    /// points at is a `0700` directory, and neither the link nor its target is removed.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_in_place_of_the_dir_is_refused_and_left_alone() {
+        let tmp = tempfile::tempdir().expect("a scratch directory");
+        let target = tmp.path().join("target");
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&target)
+            .expect("a private target");
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).expect("the symlink");
+
+        let err = ensure_private(&link).expect_err("a symlink is not a private directory");
+        assert!(err.to_string().contains("is not a directory"), "{err}");
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .expect("the link is still there")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(target.is_dir(), "the target is untouched");
     }
 
     #[cfg(unix)]
