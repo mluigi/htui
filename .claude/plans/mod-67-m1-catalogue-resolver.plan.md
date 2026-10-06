@@ -239,6 +239,23 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
   compile the one crate in the one tree, so each would see the other's half-written file; a
   worktree per task costs a full target build for two small tasks.
 
+## Review gate (2026-10-06)
+
+- **Applied**: M2 (`KeyScope`, `resolve`, `help_line` and `Ctx.keymap` docs say M1 reads only
+  `Tab` rows), M3 (test-only `ALL` plus a no-wildcard `match`, so a new `Act` must get a row),
+  L2 (`ctrl-I`/`ctrl-shift-i` and `ctrl-M`/`ctrl-shift-m` are refused as `Tab`/`Enter`, not
+  with a `ctrl-i`/`ctrl-m` suggestion), L4 (`Ctx::keys` returns `&'a Keys`), and the hardening
+  L1 (`App::offer` asserts `is_offerable`; a test pins every global act as fixed or offerable),
+  L3 (`Keys::actions` says why `CTRL_C` is never a candidate), L5 (overlay-stack-before-swallow
+  note in `App::on_key`), L6 (`tests/keys.rs`: the modal switcher swallows `2` and `w`).
+- **Deferred to M2**: the strict parser's reject list grows with the Unix legacy collisions
+  whose arrival is known: `ctrl-2`/`ctrl-@` → `Ctrl+Space`, `ctrl-3` → `Esc`, `ctrl-8`/`ctrl-?`
+  → `Backspace`, `ctrl-/` → `ctrl-7` (crossterm 0.29 `event/sys/unix/parse.rs`). M2 decides
+  between a `cfg(unix)`-gated error and a warning for the other CONTROL non-letters and for
+  ctrl/shift on `Enter`/`Tab`; not a blanket allow-list, since Windows delivers some of them.
+- **Not acted on**: L7 (per-frame clones and `Vec` allocations) and L8 (the `?` box's
+  inherited sizing).
+
 ## Verified claims (plan fact-check, 2026-10-06)
 
 | # | claim | verdict | evidence |
