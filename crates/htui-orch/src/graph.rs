@@ -292,9 +292,10 @@ pub fn topology(phases: &[SnapshotPhase]) -> std::result::Result<String, Resolve
 /// `box_id` is the box the run will target: rung 3 of the candidate chain is "the single enabled
 /// agent on the box" (plan D62), so which box is a resolution input.
 ///
-/// `mode` is recorded on the snapshot so it is self-contained. It does **not** move
-/// `gate_effective`: §4.10's auto-mode gate downgrade (`R-ORCH-6`) is a later milestone's, and
-/// until it exists `gate_effective` equals `gate` for every phase in either mode.
+/// `mode` is recorded on the snapshot and decides `gate_effective`: in auto mode every phase whose
+/// gate is not hard is snapshotted `never` ([`effective_gate`], MOD-12 D10). `resume` re-resolves
+/// under the run's own mode (`engine.rs:3036-3044`), so the topology an auto run is compared
+/// against is downgraded the same way (H-3).
 ///
 /// # Errors
 /// Any [`ResolveError`]; a missing `project` row is [`StoreError::NotFound`].
@@ -345,6 +346,7 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
             &settings,
             app,
             box_id,
+            mode,
         )
         .await?;
         phase.persona = frozen_persona(row, &mut personas)?;
@@ -680,9 +682,11 @@ fn app_i32(app: &BTreeMap<String, Value>, key: &str) -> Option<i32> {
 /// `run.mode` is fixed at insert, so no later edit can skip a gate a run has not reached.
 #[must_use]
 pub(crate) const fn effective_gate(mode: RunMode, gate: Gate, gate_hard: bool) -> Gate {
-    // TDD stub: the downgrade lands in the next commit.
-    let _ = (mode, gate_hard);
-    gate
+    if matches!(mode, RunMode::Auto) && !gate_hard {
+        Gate::Never
+    } else {
+        gate
+    }
 }
 
 /// One phase of the live graph, with every §4.1 chain walked (`docs/ANA-2.md:281-288`).
@@ -700,6 +704,7 @@ async fn snapshot_phase<G: GraphSource>(
     settings: &ProjectSettings,
     app: &BTreeMap<String, Value>,
     box_id: BoxId,
+    mode: RunMode,
 ) -> std::result::Result<SnapshotPhase, ResolveError> {
     let isolation = phase.isolation.unwrap_or(settings.default_isolation);
     if isolation == Isolation::Local && phase.fan_out > 1 {
@@ -735,9 +740,7 @@ async fn snapshot_phase<G: GraphSource>(
         name: phase.name.clone(),
         fan_out: phase.fan_out,
         gate: phase.gate,
-        // `R-ORCH-6`'s auto-mode downgrade is §4.10's and is not implemented here, so nothing has
-        // downgraded this gate and the two agree by construction.
-        gate_effective: phase.gate,
+        gate_effective: effective_gate(mode, phase.gate, phase.gate_hard),
         gate_hard: phase.gate_hard,
         retry_limit: phase.retry_limit,
         input_kinds: phase.input_kinds.clone(),
@@ -1257,7 +1260,7 @@ question and not a test fix. Decide the version bump first, then paste the new d
         );
         assert!(!implement.gate_hard);
 
-        // `gate_effective`: nothing downgrades a gate this milestone.
+        // `gate_effective`: a manual snapshot never downgrades.
         assert_eq!(prd.gate, Gate::Always);
         assert_eq!(prd.gate_effective, prd.gate);
 
