@@ -5879,7 +5879,9 @@ mod tests {
     /// whether or not the run actions have loaded: a follow-up has no verdict to wait on.
     #[tokio::test]
     async fn i_says_why_on_a_judge_a_parked_or_a_done_step() {
-        let cases: [(&str, fn(&mut RunSummary), &str); 4] = [
+        /// What a case does to the run before `i`.
+        type Edit = fn(&mut RunSummary);
+        let cases: [(&str, Edit, &str); 4] = [
             (
                 "a judge",
                 |run| run.steps[0].fanout_index = -1,
