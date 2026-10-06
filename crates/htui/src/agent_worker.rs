@@ -14332,10 +14332,8 @@ done
         /// The agent echoes the `"…\n"` value twice: whole, and without its trailing newline (the
         /// D17 form, blueprint §D.6). The persisted text must be exactly what
         /// `MinimalScrubber::from_resolved` over the same map makes of the echo, so whatever forms
-        /// `from_resolved` masks, the chat masks too. This base predates T1, whose
-        /// `from_resolved` has no trimmed form yet; the literal §D.6 assertion that the
-        /// newline-free echo is masked is
-        /// `a_newline_free_echo_of_a_newline_value_is_masked`, ignored until T1 is merged.
+        /// `from_resolved` masks, the chat masks too. The literal §D.6 assertion that the
+        /// newline-free echo is masked is `a_newline_free_echo_of_a_newline_value_is_masked`.
         #[tokio::test]
         async fn the_chat_scrubber_is_built_from_the_resolved_map() {
             const PIN: &str = "q7z";
