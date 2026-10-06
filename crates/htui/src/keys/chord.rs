@@ -129,7 +129,8 @@ impl KeyChord {
     /// `shift`. `shift-` with a letter is refused with the capital to write, `shift-` with another
     /// character is refused outright, `ctrl-` with a capital (or with `shift-` and a letter) is
     /// refused with the lower case, and a ctrl chord the terminal delivers as another key
-    /// (`ctrl-i` is `Tab`) with what arrives. `ctrl-c` is not refused here: that is the loader's
+    /// (`ctrl-i` is `Tab`) with what arrives; that last refusal also covers `ctrl-I`,
+    /// `ctrl-shift-i` and their `m` twins, ahead of the capital one. `ctrl-c` is not refused here: that is the loader's
     /// rule.
     ///
     /// # Errors
@@ -224,6 +225,10 @@ impl KeyChord {
 
 /// `parse_strict`'s refusals for a character key, in D11's order: a shift, a ctrl capital, then a
 /// ctrl chord the legacy encoding delivers as another key.
+///
+/// One exception runs first: `ctrl-I`, `ctrl-shift-i`, `ctrl-M` and `ctrl-shift-m` are refused
+/// by what arrives (`Tab`, `Enter`), since suggesting `ctrl-i` or `ctrl-m` would name a chord
+/// this function refuses too.
 fn refuse_char(written: &str, c: char, mods: KeyModifiers) -> Result<(), ChordError> {
     let spelled = |mods: KeyModifiers, c: char| {
         KeyChord {
@@ -233,6 +238,16 @@ fn refuse_char(written: &str, c: char, mods: KeyModifiers) -> Result<(), ChordEr
         .spec()
     };
     let ctrl = mods.contains(KeyModifiers::CONTROL);
+    let lowered = c.to_ascii_lowercase();
+    if ctrl
+        && matches!(lowered, 'i' | 'm')
+        && let Some(arrives_as) = legacy_arrival(lowered, mods.difference(KeyModifiers::SHIFT))
+    {
+        return Err(ChordError::Indistinguishable {
+            written: written.to_owned(),
+            arrives_as,
+        });
+    }
     if mods.contains(KeyModifiers::SHIFT) {
         let unshifted = mods.difference(KeyModifiers::SHIFT);
         return Err(if ctrl && c.is_ascii_alphabetic() {
@@ -257,10 +272,23 @@ fn refuse_char(written: &str, c: char, mods: KeyModifiers) -> Result<(), ChordEr
             suggestion: spelled(mods, c.to_ascii_lowercase()),
         });
     }
-    // crossterm 0.29 `event/sys/unix/parse.rs:92-116`: the legacy encoding of these chords is
-    // another key's byte. `ctrl-h` and `ctrl-j` arrive as themselves in raw mode (D11).
+    match legacy_arrival(c, mods) {
+        Some(arrives_as) => Err(ChordError::Indistinguishable {
+            written: written.to_owned(),
+            arrives_as,
+        }),
+        None => Ok(()),
+    }
+}
+
+/// What a ctrl chord of `c` arrives as when its legacy encoding is another key's byte, or `None`
+/// when it arrives as itself. `mods` holds CONTROL and no SHIFT.
+///
+/// crossterm 0.29 `event/sys/unix/parse.rs:92-116`. `ctrl-h` and `ctrl-j` arrive as themselves
+/// in raw mode (D11).
+fn legacy_arrival(c: char, mods: KeyModifiers) -> Option<KeyChord> {
     let without_ctrl = mods.difference(KeyModifiers::CONTROL);
-    let arrives_as = match c {
+    Some(match c {
         'i' => KeyChord::new(KeyCode::Tab, without_ctrl),
         'm' => KeyChord::new(KeyCode::Enter, without_ctrl),
         '[' => KeyChord::new(KeyCode::Esc, without_ctrl),
@@ -268,11 +296,7 @@ fn refuse_char(written: &str, c: char, mods: KeyModifiers) -> Result<(), ChordEr
         ']' => KeyChord::new(KeyCode::Char('5'), mods),
         '^' => KeyChord::new(KeyCode::Char('6'), mods),
         '_' => KeyChord::new(KeyCode::Char('7'), mods),
-        _ => return Ok(()),
-    };
-    Err(ChordError::Indistinguishable {
-        written: written.to_owned(),
-        arrives_as,
+        _ => return None,
     })
 }
 
@@ -576,6 +600,33 @@ mod tests {
             strict("ctrl-i").expect_err("ctrl-i is refused").to_string(),
             r#""ctrl-i" arrives as Tab: a terminal cannot tell the two apart"#
         );
+    }
+
+    #[test]
+    fn a_capital_or_shifted_ctrl_i_or_m_is_refused_by_what_arrives() {
+        for (spec, label) in [
+            ("ctrl-I", "Tab"),
+            ("ctrl-shift-i", "Tab"),
+            ("ctrl-M", "Enter"),
+            ("ctrl-shift-m", "Enter"),
+        ] {
+            let refused = strict(spec).expect_err("the spec is refused");
+            assert_eq!(
+                refused.to_string(),
+                format!(r#""{spec}" arrives as {label}: a terminal cannot tell the two apart"#),
+                "{spec}"
+            );
+            match refused {
+                ChordError::Indistinguishable {
+                    written,
+                    arrives_as,
+                } => {
+                    assert_eq!(written, spec);
+                    assert_eq!(arrives_as.label(), label, "{spec}");
+                }
+                other => panic!("{spec}: expected Indistinguishable, got {other:?}"),
+            }
+        }
     }
 
     #[test]
