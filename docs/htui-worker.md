@@ -15,6 +15,7 @@ htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
 - [Permission requests on worker steps](#permission-requests-on-worker-steps)
 - [htui's MCP tools on worker steps](#htuis-mcp-tools-on-worker-steps)
 - [Cancelling a run the worker walks](#cancelling-a-run-the-worker-walks)
+- [Follow-ups on worker steps](#follow-ups-on-worker-steps)
 - [Upgrading: migrate from a TUI first](#upgrading-migrate-from-a-tui-first)
 - [Where the DSN comes from](#where-the-dsn-comes-from)
 - [Pool size](#pool-size)
@@ -299,8 +300,10 @@ is restarted, and the step stays `running`.
   "the run is being cancelled" (a cancel is pending), "a follow-up is already queued", "the
   process walking the step no longer holds the run", "the step's session has not started yet" (the
   step is still preparing its tree or its prompt) or "the step finished its session; promote it to
-  continue" (its last turn has ended, and the walk has moved on to verifying, the gate or the next
-  step).
+  continue" (its last turn has ended, and the walk is still finishing the step: verifying it or
+  reaching its gate). Once the walk has moved the step on, it is no longer `running`, and the
+  refusal is "only a running step takes a follow-up; p promotes a parked or failed step to a
+  chat".
 - **The walking box scrubs it again before sending.** A text its own scrubber refuses is not sent:
   the line becomes `follow-up refused`, with "the executing box's scrubber refused the text (…)"
   under it.
@@ -310,6 +313,8 @@ is restarted, and the step stays `running`.
   is never shown back.** It leaves the database only for the process that sends it, and it is erased from its row as soon as that
   process takes it or it is refused. What stays is the step's log: the follow-up is recorded
   there, scrubbed like the rest, before it is sent, and the step's replay (`Enter`) shows it.
+  `follow-up sent` means the walking process took the follow-up, not that the agent received it:
+  the step's log, not the label, is the evidence of delivery, and a send that fails fails the step.
 - **It counts toward the step's limits.** A follow-up turn runs inside the step's deadline
   (`step_deadline_seconds`, 7200 seconds unless the project or the app setting says otherwise) and
   under the run's spending cap (`per_token_cap_run`), like any other turn. Once the deadline cuts
@@ -332,10 +337,13 @@ is restarted, and the step stays `running`.
   longer holds the run".
 - **A database outage at the session's end can strand one.** The walking process tries for about
   30 seconds to close the session's follow-ups; if the database stays unreachable that long, a
-  follow-up still queued stays pending, its text still stored, until the run is cancelled or
-  recovered after a crash. It is never sent. If the walk instead goes on and the run finishes,
-  nothing refuses it: the row stays pending with its text stored, since `c` on a run that has
-  rested is cleanup, not a cancel.
+  follow-up still queued stays pending, its text still stored. It is never sent. It is refused when
+  the run is cancelled ("the run was cancelled") or recovered after a crash, and when the walking
+  process finishes the run (`done`, `failed` or `cancelled`): before it gives the run back, it
+  refuses what the run's steps still hold, "the step finished its session; promote it to continue"
+  ("the run was cancelled" for a cancel). Only if the database is unreachable then too does the row
+  stay pending with its text stored, since no process takes a finished run again and `c` on a run
+  that has rested is cleanup, not a cancel.
 - **Every box upgrades together.** Follow-ups need the migration `0016_follow_up.sql`: apply it
   from a TUI first, and upgrade every TUI and worker on the database at the same time (see
   [Upgrading](#upgrading-migrate-from-a-tui-first)).
@@ -362,8 +370,9 @@ version has applied it.
 
 The [follow-ups](#follow-ups-on-worker-steps) need `0016_follow_up.sql`, and it asks for more:
 **upgrade every box together**. Once it is applied, a TUI or worker still running an older `htui`
-can no longer request a cancel, and its cancel poll fails while a follow-up is queued on a run it
-walks. Stop every TUI and worker that uses the database, on every box, upgrade them all, start one
+can no longer request a cancel, and its cancel poll fails while a follow-up is pending on a run it
+walks, or on any run of its box that has finished or whose lease has lapsed: a follow-up a dead
+walk left queued, or one a database outage stranded, breaks it too. Stop every TUI and worker that uses the database, on every box, upgrade them all, start one
 TUI to apply the migration, then start the workers. An older binary started after the migration
 refuses the database anyway ("schema is newer than this htui").
 

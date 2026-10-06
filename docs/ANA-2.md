@@ -1292,9 +1292,11 @@ nothing respawns, and nothing steers a turn already under way. The main step's s
 fan-out candidate's take follow-ups; a judge call never does, and a chat run takes them in its own
 view. A follow-up turn runs inside the step's deadline and under the run's cap like any turn, and
 none is sent after a cut, a breach or a cancel. When the session ends, its `follow_up_window` row
-closes and a follow-up still queued is refused ("the step finished its session; promote it to
-continue"), so promotion stays the way to continue a step whose session has ended. A follow-up
-queued for a walk that died stays pending until the run is recovered or cancelled. The state table
+closes and a follow-up still queued is refused: "the step finished its session; promote it to
+continue" when the session ended, "the step's session was cancelled before the follow-up was sent"
+when a cancel or the deadline cut it. Promotion stays the way to continue a step whose session has
+ended. A follow-up queued for a walk that died stays pending until the run is recovered or
+cancelled. The state table
 is unchanged: the step stays `running` throughout, no state is added, and the second and third
 paths are untouched.
 
