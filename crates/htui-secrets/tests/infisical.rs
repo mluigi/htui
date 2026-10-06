@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use htui_core::secret::{MachineIdentity, SecretError, SecretProvider, SecretScope};
 use htui_secrets::{InfisicalConfig, InfisicalProvider};
 use serde_json::{Value, json};
-use support::{Reply, Stub, closed_port_base};
+use support::{ClosedPort, Reply, Stub};
 
 const CLIENT_ID: &str = "cid-sentinel-1";
 const CLIENT_SECRET: &str = "csecret-sentinel-1";
@@ -836,7 +836,8 @@ async fn a_login_429_is_rate_limited_and_does_not_latch() {
 
 #[tokio::test]
 async fn a_login_network_failure_is_unreachable_and_does_not_latch() {
-    let p = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
+    let closed = ClosedPort::new();
+    let p = InfisicalProvider::new(InfisicalConfig::new(closed.base()), identity())
         .must("a provider on a closed port");
     for _ in 0..2 {
         match p.resolve(&scope()).await {
@@ -1198,7 +1199,8 @@ async fn health_always_logs_in_afresh() {
 
 #[tokio::test]
 async fn health_on_an_unreachable_server_names_the_status_endpoint() {
-    let p = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
+    let closed = ClosedPort::new();
+    let p = InfisicalProvider::new(InfisicalConfig::new(closed.base()), identity())
         .must("a provider on a closed port");
     assert!(
         matches!(
@@ -1260,10 +1262,11 @@ async fn no_error_or_debug_carries_a_value_the_client_secret_or_the_token() {
         InfisicalProvider::new(InfisicalConfig::new("http://192.168.1.10"), identity())
             .must_fail("a LAN http URL is refused"),
     );
-    let closed = InfisicalProvider::new(InfisicalConfig::new(closed_port_base()), identity())
+    let closed = ClosedPort::new();
+    let unreachable = InfisicalProvider::new(InfisicalConfig::new(closed.base()), identity())
         .must("a provider on a closed port");
     errors.push(
-        closed
+        unreachable
             .resolve(&scope())
             .await
             .must_fail("a closed port fails"),

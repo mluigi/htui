@@ -170,13 +170,36 @@ impl Stub {
     }
 }
 
-/// A loopback base URL nothing listens on (bind port 0, read it, drop the listener), for the
-/// `Unreachable` cases.
-pub fn closed_port_base() -> String {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
-    let addr = listener.local_addr().expect("the port's address");
-    drop(listener);
-    format!("http://{addr}")
+/// A loopback base URL whose connect is refused at once, for the `Unreachable` cases. Keep it
+/// alive for as long as the URL is used.
+///
+/// Race-free: the port is **held** on `127.0.0.1` for the guard's lifetime, so no stub (they all
+/// bind `127.0.0.1:0`) can be handed it, and no wildcard listener can take it either. The URL
+/// names `127.0.0.2`, another loopback address (Linux routes all of `127.0.0.0/8` to `lo`) on
+/// which nothing listens on that port: the kernel answers the SYN with a reset, a connect error.
+/// Pointing at the held listener itself would not do: an unaccepted connection still completes
+/// its handshake through the backlog, and the request would time out instead of being refused.
+#[derive(Debug)]
+pub struct ClosedPort {
+    _held: TcpListener,
+    base: String,
+}
+
+impl ClosedPort {
+    /// Reserves the port.
+    pub fn new() -> Self {
+        let held = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+        let port = held.local_addr().expect("the port's address").port();
+        Self {
+            _held: held,
+            base: format!("http://127.0.0.2:{port}"),
+        }
+    }
+
+    /// `http://127.0.0.2:<port>`.
+    pub fn base(&self) -> &str {
+        &self.base
+    }
 }
 
 /// One request on one connection, recorded, then answered with `Connection: close`.
