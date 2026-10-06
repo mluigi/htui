@@ -1,0 +1,127 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT r.kind                AS \"run_kind: RunKind\",\n                      s.fanout_index,\n                      s.status              AS \"step_status: StepStatus\",\n                      EXISTS (SELECT 1 FROM app_user WHERE id = $2) AS \"user_known!\",\n                      EXISTS (SELECT 1 FROM box WHERE id = $3)      AS \"box_known!\",\n                      EXISTS (SELECT 1 FROM run_command c\n                               WHERE c.run_id = s.run_id AND c.kind = 'cancel'\n                                 AND c.status = 'pending')          AS \"cancelling!\",\n                      EXISTS (SELECT 1 FROM run_command c\n                               WHERE c.run_step_id = s.id AND c.kind = 'follow_up'\n                                 AND c.status = 'pending')          AS \"queued!\",\n                      w.run_step_id IS NOT NULL                     AS \"window!\",\n                      w.closed_at IS NOT NULL                       AS \"window_closed!\",\n                      w.owner                                       AS \"window_owner?\",\n                      r.lease_owner                                 AS \"lease_owner?\",\n                      (r.lease_expires_at IS NOT NULL\n                       AND r.lease_expires_at > clock_timestamp())  AS \"lease_live!\"\n                 FROM run_step s\n                 JOIN run r ON r.id = s.run_id\n                 LEFT JOIN follow_up_window w ON w.run_step_id = s.id\n                WHERE s.id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "run_kind: RunKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "fanout_index",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "fanout_index"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "step_status: StepStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_step",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "user_known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "box_known!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 5,
+        "name": "cancelling!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 6,
+        "name": "queued!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 7,
+        "name": "window!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "window_closed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 9,
+        "name": "window_owner?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "follow_up_window",
+            "name": "owner"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "lease_owner?",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "lease_owner"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "lease_live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null,
+      null,
+      null,
+      null,
+      null,
+      null,
+      true,
+      true,
+      null
+    ]
+  },
+  "hash": "21250c4741739d14c75b4c9efeb55c15ab1514bc8403aee6b97afbb573ebd400"
+}

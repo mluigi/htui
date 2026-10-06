@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE run_command c SET status = $3, resolution = $4, text = NULL, resolved_at = clock_timestamp() FROM run r WHERE c.id = $1 AND c.kind = 'follow_up' AND c.status = 'pending' AND r.id = c.run_id AND r.lease_owner = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f2623057c2dba4c0cda09f5d4739bdb8f66a80acdca0ef4a2fbd642d4300d9ca"
+}

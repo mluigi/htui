@@ -1,11 +1,11 @@
 //! The permission and control relay on Postgres (MOD-42 plan D1-D5, D12-D14; blueprint §2.10;
 //! `0011_permission_relay.sql`).
 //!
-//! `impl WriteStore for PgStore` (`write.rs`) delegates its nine relay methods here. Every status
+//! `impl WriteStore for PgStore` (`write.rs`) delegates its relay methods here. Every status
 //! move is one compare-and-set statement (I-3): under `READ COMMITTED` the loser of a race blocks
 //! on the row lock, re-evaluates its `status` predicate against the committed row and matches
 //! nothing. Every miss is told apart by one re-read, the `take_lease` shape. Every instant is
-//! `clock_timestamp()`, never a box clock (I-4). The only transaction is `open_permission`'s,
+//! `clock_timestamp()`, never a box clock (I-4). MOD-42's only transaction is `open_permission`'s,
 //! which key-share-locks the step and then share-locks its run (`FOR KEY SHARE OF s FOR SHARE OF
 //! r`, MOD-77 plan D4, review L1: `park_step`'s order, and `KEY SHARE` is the lock the insert's
 //! foreign key takes anyway) so an adoption cannot commit between its fence and its insert
@@ -16,14 +16,25 @@
 //! status, so the re-read of a miss checks it first too: an unknown user or box is a
 //! [`StoreError::Constraint`] whether or not the compare-and-set would have matched, never
 //! `Refused(Answered)` or `AlreadyPending`.
+//!
+//! MOD-70 (plan D1-D5, D9; blueprint §2.7; `0016_follow_up.sql`) adds follow-ups for engine steps.
+//! The enqueue is the one `INSERT … SELECT … FOR SHARE OF w` on the step's `follow_up_window`
+//! row, so it and a close's `UPDATE` of that row serialise (I-3): an enqueue that holds the lock
+//! commits before the close reads, one that arrives later waits and reads the window closed.
+//! `open_follow_ups` is fence, upsert, refuse in one transaction (B-6). The two closes are the only
+//! two-statement transactions, `READ COMMITTED` on purpose (F-18): their second statement takes a
+//! fresh snapshot, which sees an enqueue that committed while the first waited; under `REPEATABLE
+//! READ`, or as one CTE, it would not. `request_cancel` refuses the run's pending follow-ups in
+//! its insert's transaction (B-14). Every resolution nulls the text (I-5).
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AnswerOutcome, AnswerRefusal, BoxId, CancelRequest, FollowUpRequest, FollowUpSettle, ItemId,
-    NewFollowUp, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, ProjectId,
-    QueuedFollowUp, RelayOption, RelaySessionId, RelayView, RunCommand, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, Scope, SettleOutcome, StepId, StepPermission, UserId,
-    WaitingPermission,
+    AnswerOutcome, AnswerRefusal, BoxId, CancelRequest, FOLLOW_UP_RUN_CANCELLED,
+    FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpSettle, FollowUpView,
+    ItemId, NewFollowUp, OpenPermission, PermissionChoice, PermissionId, PermissionStatus,
+    ProjectId, QueuedFollowUp, RelayOption, RelaySessionId, RelayView, RunCommand, RunCommandId,
+    RunCommandKind, RunCommandStatus, RunId, RunKind, Scope, SettleOutcome, StepId, StepPermission,
+    StepStatus, UserId, WaitingPermission,
 };
 use htui_core::store::{Result, StoreError, references_no_row};
 use sqlx::types::Json;
@@ -35,6 +46,41 @@ use crate::pg::PgStore;
 /// How many times [`request_cancel`] retries a pending row that was resolved between its insert
 /// and its re-read before it gives up.
 const CANCEL_ATTEMPTS: usize = 3;
+
+/// How many times [`request_follow_up`] retries when its re-read finds every guard passing (the
+/// pending row it collided with resolved in between) before it gives up (MOD-70 D3).
+const FOLLOW_UP_ATTEMPTS: usize = 3;
+
+/// The step fence [`open_permission`] and [`open_follow_ups`] share: the step's run and that run's
+/// lease owner, read under `FOR KEY SHARE OF s FOR SHARE OF r`.
+#[derive(Debug)]
+struct StepFenceRow {
+    /// `run_step.run_id`.
+    run_id: Uuid,
+    /// `run.lease_owner`.
+    lease_owner: Option<Uuid>,
+}
+
+/// MOD-77 plan D4, review L1: the step is key-share-locked (the insert's foreign-key lock) and
+/// then its run share-locked, `park_step`'s order, so an adoption cannot commit between the
+/// caller's check and its write, and a park holding the step cannot deadlock against it. One query
+/// text for both callers, so `.sqlx` keeps one entry (MOD-70 blueprint §2.7).
+async fn lock_step_fence(
+    tx: &mut sqlx::PgConnection,
+    step: StepId,
+) -> Result<Option<StepFenceRow>> {
+    sqlx::query_as!(
+        StepFenceRow,
+        r#"SELECT s.run_id, r.lease_owner AS "lease_owner?"
+             FROM run_step s JOIN run r ON r.id = s.run_id
+            WHERE s.id = $1
+              FOR KEY SHARE OF s FOR SHARE OF r"#,
+        step.as_uuid(),
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_sqlx)
+}
 
 /// One `step_permission` row as the two readers select it: [`StepPermission`] with its options
 /// still in their JSON wrapper.
@@ -129,23 +175,13 @@ pub(super) async fn open_permission(store: &PgStore, open: OpenPermission) -> Re
     })?;
     let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
 
-    // MOD-77 plan D4, review L1: the step is key-share-locked (the insert's foreign-key lock) and
-    // then its run share-locked, `park_step`'s order, so an adoption cannot commit between this
-    // check and the insert, and a park holding the step cannot deadlock against the insert.
-    let fence = sqlx::query!(
-        r#"SELECT s.run_id, r.lease_owner AS "lease_owner?"
-             FROM run_step s JOIN run r ON r.id = s.run_id
-            WHERE s.id = $1
-              FOR KEY SHARE OF s FOR SHARE OF r"#,
-        open.run_step_id.as_uuid(),
-    )
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(map_sqlx)?
-    .ok_or_else(|| StoreError::NotFound {
-        entity: "run_step",
-        id: open.run_step_id.to_string(),
-    })?;
+    // MOD-77 plan D4, review L1: the fence locks the step, then its run (`lock_step_fence`).
+    let fence = lock_step_fence(&mut tx, open.run_step_id)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run_step",
+            id: open.run_step_id.to_string(),
+        })?;
     if fence.run_id != open.run_id.as_uuid() {
         return Err(StoreError::Constraint(format!(
             "step_permission.run_step_id `{}` is not a step of run `{}`",
@@ -364,6 +400,10 @@ pub(super) async fn answer_permission(
 /// partial unique index admits once per run, then on a miss one re-read deciding, in `MemStore`'s
 /// order: `NotFound { run }`, the actor (`Constraint`), `AlreadyPending`. A pending row resolved
 /// between the two statements is retried, [`CANCEL_ATTEMPTS`] times in all.
+///
+/// MOD-70 D5, B-14: an `Inserted` cancel refuses the run's pending follow-ups with
+/// [`FOLLOW_UP_RUN_CANCELLED`] in its insert's transaction; an `AlreadyPending` one refuses them
+/// too (a follow-up that slipped in between a first cancel's two statements, R-5). Idempotent.
 pub(super) async fn request_cancel(
     store: &PgStore,
     run: RunId,
@@ -371,25 +411,32 @@ pub(super) async fn request_cancel(
     box_id: BoxId,
 ) -> Result<CancelRequest> {
     for _ in 0..CANCEL_ATTEMPTS {
+        let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
         let inserted = sqlx::query_scalar!(
             r#"INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)
                VALUES ($1, $2, 'cancel', $3, $4)
-               ON CONFLICT (run_id, kind) WHERE status = 'pending' DO NOTHING
+               ON CONFLICT (run_id) WHERE status = 'pending' AND kind = 'cancel' DO NOTHING
                RETURNING id AS "id: RunCommandId""#,
             RunCommandId::new().as_uuid(),
             run.as_uuid(),
             user.as_uuid(),
             box_id.as_uuid(),
         )
-        .fetch_optional(&store.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(map_sqlx);
         let refused = match inserted {
-            Ok(Some(id)) => return Ok(CancelRequest::Inserted(id)),
+            Ok(Some(id)) => {
+                refuse_run_follow_ups(&mut *tx, run).await?;
+                tx.commit().await.map_err(map_sqlx)?;
+                return Ok(CancelRequest::Inserted(id));
+            }
             Ok(None) => None,
             Err(err @ StoreError::Constraint(_)) => Some(err),
             Err(err) => return Err(err),
         };
+        // Nothing was written; the re-read runs on the pool.
+        tx.rollback().await.map_err(map_sqlx)?;
 
         let state = sqlx::query!(
             r#"SELECT EXISTS (SELECT 1 FROM run WHERE id = $1) AS "run_known!",
@@ -422,6 +469,7 @@ pub(super) async fn request_cancel(
             return Err(err);
         }
         if let Some(pending) = state.pending {
+            refuse_run_follow_ups(&store.pool, run).await?;
             return Ok(CancelRequest::AlreadyPending(pending));
         }
     }
@@ -431,7 +479,28 @@ pub(super) async fn request_cancel(
     )))
 }
 
-/// [`WriteStore::pending_commands`](htui_core::store::WriteStore::pending_commands) (B-4).
+/// MOD-70 D5, B-14: every `pending` follow-up of `run` moves to `refused` with
+/// [`FOLLOW_UP_RUN_CANCELLED`], its text nulled. Answers how many moved.
+async fn refuse_run_follow_ups<'e, E>(executor: E, run: RunId) -> Result<u64>
+where
+    E: sqlx::PgExecutor<'e>,
+{
+    let moved = sqlx::query!(
+        "UPDATE run_command \
+            SET status = 'refused', resolution = $2, text = NULL, resolved_at = clock_timestamp() \
+          WHERE run_id = $1 AND kind = 'follow_up' AND status = 'pending'",
+        run.as_uuid(),
+        FOLLOW_UP_RUN_CANCELLED,
+    )
+    .execute(executor)
+    .await
+    .map_err(map_sqlx)?
+    .rows_affected();
+    Ok(moved)
+}
+
+/// [`WriteStore::pending_commands`](htui_core::store::WriteStore::pending_commands) (B-4):
+/// **cancels only** (MOD-70 D5, I-9); a follow-up is read by the walk that owns its step.
 pub(super) async fn pending_commands(
     store: &PgStore,
     owner: Uuid,
@@ -449,7 +518,7 @@ pub(super) async fn pending_commands(
                   c.issued_at,
                   c.resolved_at
              FROM run_command c JOIN run r ON r.id = c.run_id
-            WHERE c.status = 'pending'
+            WHERE c.status = 'pending' AND c.kind = 'cancel'
               AND (r.lease_owner = $1
                    OR (r.executing_box_id = $2
                        AND (r.status IN ('done', 'failed', 'cancelled')
@@ -465,7 +534,8 @@ pub(super) async fn pending_commands(
     .map_err(map_sqlx)
 }
 
-/// [`WriteStore::resolve_command`](htui_core::store::WriteStore::resolve_command).
+/// [`WriteStore::resolve_command`](htui_core::store::WriteStore::resolve_command): always clears
+/// `text` (MOD-70 D5, I-5).
 pub(super) async fn resolve_command(
     store: &PgStore,
     id: RunCommandId,
@@ -478,7 +548,8 @@ pub(super) async fn resolve_command(
         )));
     }
     let moved = sqlx::query!(
-        "UPDATE run_command SET status = $2, resolution = $3, resolved_at = clock_timestamp() \
+        "UPDATE run_command \
+            SET status = $2, resolution = $3, text = NULL, resolved_at = clock_timestamp() \
           WHERE id = $1 AND status = 'pending'",
         id.as_uuid(),
         to.as_str(),
@@ -502,8 +573,10 @@ pub(super) async fn resolve_command(
     Ok(false)
 }
 
-/// [`WriteStore::relay_view`](htui_core::store::WriteStore::relay_view): two reads; a display
-/// read, so two snapshots are harmless.
+/// [`WriteStore::relay_view`](htui_core::store::WriteStore::relay_view): three reads; a display
+/// read, so three snapshots are harmless. MOD-70 D5, B-13: `follow_ups` is the newest follow-up
+/// of each step of the item's non-terminal runs (the pending one, else the greatest
+/// `(issued_at, id)`), in `(issued_at, id)` order, never its text (OQ-6).
 pub(super) async fn relay_view(store: &PgStore, item: ItemId) -> Result<RelayView> {
     let permissions = sqlx::query_as!(
         PermissionRecord,
@@ -544,10 +617,31 @@ pub(super) async fn relay_view(store: &PgStore, item: ItemId) -> Result<RelayVie
     .await
     .map_err(map_sqlx)?;
 
+    // The `!` overrides: sqlx cannot infer non-null through the subquery.
+    let follow_ups = sqlx::query_as!(
+        FollowUpView,
+        r#"SELECT n.id AS "id!: RunCommandId", n.run_id AS "run_id!: RunId",
+                  n.run_step_id AS "run_step_id!: StepId", n.status AS "status!: RunCommandStatus",
+                  n.resolution, n.issued_at AS "issued_at!", n.resolved_at
+             FROM (SELECT DISTINCT ON (c.run_step_id)
+                          c.id, c.run_id, c.run_step_id, c.status, c.resolution, c.issued_at,
+                          c.resolved_at
+                     FROM run_command c JOIN run r ON r.id = c.run_id
+                    WHERE r.item_id = $1 AND c.kind = 'follow_up'
+                      AND r.status NOT IN ('done', 'failed', 'cancelled')
+                    ORDER BY c.run_step_id, (c.status = 'pending') DESC, c.issued_at DESC,
+                             c.id DESC) n
+            ORDER BY n.issued_at, n.id"#,
+        item.as_uuid(),
+    )
+    .fetch_all(&store.pool)
+    .await
+    .map_err(map_sqlx)?;
+
     Ok(RelayView {
         permissions: permissions.into_iter().map(StepPermission::from).collect(),
         cancels,
-        follow_ups: Vec::new(),
+        follow_ups,
     })
 }
 
@@ -644,62 +738,352 @@ pub(super) async fn open_permissions(
     Ok(out)
 }
 
-// ---- MOD-70 (plan D1-D5, D9): follow-ups. T1 writes the bodies against `0016_follow_up.sql`. ----
+// ---- MOD-70 (plan D1-D5, D9; blueprint §2.7): follow-ups for engine steps. -----------------------
 
-/// [`WriteStore::request_follow_up`](htui_core::store::WriteStore::request_follow_up).
+/// [`WriteStore::request_follow_up`](htui_core::store::WriteStore::request_follow_up): D3's one
+/// `INSERT … SELECT … FOR SHARE OF w`, then on a miss one re-read deciding, in `MemStore`'s order:
+/// `NotFound { run_step }`, the actor (`Constraint`), `ChatRun`, `Judge`, `NotRunning`,
+/// `Cancelling`, `AlreadyQueued`, `ExecutorGone` (B-4), `NotStarted`, `SessionEnded`. An insert's
+/// own `Constraint` (an unknown actor, a repeated id) is held until the re-read has checked the
+/// actor and the guards. When every guard passes on the re-read the colliding row resolved in
+/// between: retried, [`FOLLOW_UP_ATTEMPTS`] times in all.
 pub(super) async fn request_follow_up(
-    _store: &PgStore,
-    _new: NewFollowUp,
+    store: &PgStore,
+    new: NewFollowUp,
 ) -> Result<FollowUpRequest> {
-    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+    let step = new.run_step_id;
+    let text = new.text.into_string();
+    for _ in 0..FOLLOW_UP_ATTEMPTS {
+        // The casts: the parameters sit in a SELECT list, where Postgres cannot infer their type
+        // from the INSERT's columns.
+        let inserted = sqlx::query_scalar!(
+            r#"INSERT INTO run_command (id, run_id, kind, run_step_id, text, issued_by, issued_box)
+               SELECT $1::uuid, s.run_id, 'follow_up', s.id, $3::text, $4::uuid, $5::uuid
+                 FROM follow_up_window w
+                 JOIN run_step s ON s.id = w.run_step_id
+                 JOIN run r      ON r.id = s.run_id
+                WHERE w.run_step_id = $2
+                  AND w.closed_at IS NULL
+                  AND r.kind = 'graph'
+                  AND s.fanout_index >= 0
+                  AND s.status = 'running'
+                  AND r.lease_owner = w.owner
+                  AND r.lease_expires_at > clock_timestamp()
+                  AND NOT EXISTS (SELECT 1 FROM run_command c
+                                   WHERE c.run_id = s.run_id AND c.kind = 'cancel'
+                                     AND c.status = 'pending')
+                  FOR SHARE OF w
+               ON CONFLICT (run_step_id) WHERE status = 'pending' AND kind = 'follow_up' DO NOTHING
+               RETURNING id AS "id: RunCommandId""#,
+            new.id.as_uuid(),
+            step.as_uuid(),
+            text,
+            new.issued_by.as_uuid(),
+            new.issued_box.as_uuid(),
+        )
+        .fetch_optional(&store.pool)
+        .await
+        .map_err(map_sqlx);
+        let held = match inserted {
+            Ok(Some(id)) => return Ok(FollowUpRequest::Queued(id)),
+            Ok(None) => None,
+            Err(err @ StoreError::Constraint(_)) => Some(err),
+            Err(err) => return Err(err),
+        };
+
+        let state = sqlx::query!(
+            r#"SELECT r.kind                AS "run_kind: RunKind",
+                      s.fanout_index,
+                      s.status              AS "step_status: StepStatus",
+                      EXISTS (SELECT 1 FROM app_user WHERE id = $2) AS "user_known!",
+                      EXISTS (SELECT 1 FROM box WHERE id = $3)      AS "box_known!",
+                      EXISTS (SELECT 1 FROM run_command c
+                               WHERE c.run_id = s.run_id AND c.kind = 'cancel'
+                                 AND c.status = 'pending')          AS "cancelling!",
+                      EXISTS (SELECT 1 FROM run_command c
+                               WHERE c.run_step_id = s.id AND c.kind = 'follow_up'
+                                 AND c.status = 'pending')          AS "queued!",
+                      w.run_step_id IS NOT NULL                     AS "window!",
+                      w.closed_at IS NOT NULL                       AS "window_closed!",
+                      w.owner                                       AS "window_owner?",
+                      r.lease_owner                                 AS "lease_owner?",
+                      (r.lease_expires_at IS NOT NULL
+                       AND r.lease_expires_at > clock_timestamp())  AS "lease_live!"
+                 FROM run_step s
+                 JOIN run r ON r.id = s.run_id
+                 LEFT JOIN follow_up_window w ON w.run_step_id = s.id
+                WHERE s.id = $1"#,
+            step.as_uuid(),
+            new.issued_by.as_uuid(),
+            new.issued_box.as_uuid(),
+        )
+        .fetch_optional(&store.pool)
+        .await
+        .map_err(map_sqlx)?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run_step",
+            id: step.to_string(),
+        })?;
+        require_actor(
+            (state.user_known, state.box_known),
+            new.issued_by,
+            new.issued_box,
+            "run_command",
+            "issued",
+        )?;
+        // B-4: the lease must be live under the window's owner; with no window, under anyone.
+        let executor_live = state.lease_live
+            && state.lease_owner.is_some()
+            && (state.window_owner.is_none() || state.lease_owner == state.window_owner);
+        let refusal = if state.run_kind == RunKind::Chat {
+            Some(FollowUpRefusal::ChatRun)
+        } else if state.fanout_index < 0 {
+            Some(FollowUpRefusal::Judge)
+        } else if state.step_status != StepStatus::Running {
+            Some(FollowUpRefusal::NotRunning)
+        } else if state.cancelling {
+            Some(FollowUpRefusal::Cancelling)
+        } else if state.queued {
+            Some(FollowUpRefusal::AlreadyQueued)
+        } else if !executor_live {
+            Some(FollowUpRefusal::ExecutorGone)
+        } else if !state.window {
+            Some(FollowUpRefusal::NotStarted)
+        } else if state.window_closed {
+            Some(FollowUpRefusal::SessionEnded)
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return Ok(FollowUpRequest::Refused(refusal));
+        }
+        // Every guard passes now: a held insert error is a repeated id (MemStore checks the id
+        // last too); otherwise the colliding row resolved, or a close was rolled back: retry.
+        if let Some(err) = held {
+            return Err(err);
+        }
+    }
+    Err(StoreError::Constraint(format!(
+        "run_command: step `{step}`'s follow-up guards changed between the insert and the \
+         re-read {FOLLOW_UP_ATTEMPTS} times; nothing was written"
+    )))
 }
 
-/// [`WriteStore::open_follow_ups`](htui_core::store::WriteStore::open_follow_ups).
+/// [`WriteStore::open_follow_ups`](htui_core::store::WriteStore::open_follow_ups) (D4, B-3, B-6):
+/// one transaction, in this order: the fence ([`lock_step_fence`], owner only), the window's
+/// upsert (which takes its row lock: an enqueue already holding `FOR SHARE` commits first, a later
+/// one waits and re-checks), then the refusal of every follow-up still pending on the step, whose
+/// fresh snapshot sees every row committed before the lock.
 pub(super) async fn open_follow_ups(
-    _store: &PgStore,
-    _run: RunId,
-    _step: StepId,
-    _session: RelaySessionId,
-    _owner: Uuid,
+    store: &PgStore,
+    run: RunId,
+    step: StepId,
+    session: RelaySessionId,
+    owner: Uuid,
 ) -> Result<bool> {
-    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+    let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
+    let fence = lock_step_fence(&mut tx, step)
+        .await?
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "run_step",
+            id: step.to_string(),
+        })?;
+    if fence.run_id != run.as_uuid() {
+        return Err(StoreError::Constraint(format!(
+            "follow_up_window.run_step_id `{step}` is not a step of run `{run}`"
+        )));
+    }
+    // B-3: the owner alone, as every other executor-side write; nothing is written.
+    if fence.lease_owner != Some(owner) {
+        tx.rollback().await.map_err(map_sqlx)?;
+        return Ok(false);
+    }
+
+    sqlx::query!(
+        "INSERT INTO follow_up_window (run_step_id, run_id, session, owner) \
+         VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (run_step_id) DO UPDATE \
+            SET session = EXCLUDED.session, owner = EXCLUDED.owner, \
+                opened_at = clock_timestamp(), closed_at = NULL",
+        step.as_uuid(),
+        run.as_uuid(),
+        session.as_uuid(),
+        owner,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
+
+    sqlx::query!(
+        "UPDATE run_command \
+            SET status = 'refused', resolution = $2, text = NULL, resolved_at = clock_timestamp() \
+          WHERE run_step_id = $1 AND kind = 'follow_up' AND status = 'pending'",
+        step.as_uuid(),
+        FOLLOW_UP_SESSION_ENDED,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
+
+    tx.commit().await.map_err(map_sqlx)?;
+    Ok(true)
 }
 
-/// [`WriteStore::next_follow_up`](htui_core::store::WriteStore::next_follow_up).
+/// [`WriteStore::next_follow_up`](htui_core::store::WriteStore::next_follow_up): the step's
+/// pending follow-up while its window is `session`'s and open. A read: never fenced.
 pub(super) async fn next_follow_up(
-    _store: &PgStore,
-    _step: StepId,
-    _session: RelaySessionId,
+    store: &PgStore,
+    step: StepId,
+    session: RelaySessionId,
 ) -> Result<Option<QueuedFollowUp>> {
-    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+    let row = sqlx::query!(
+        r#"SELECT c.id AS "id: RunCommandId", c.text AS "text!"
+             FROM run_command c
+             JOIN follow_up_window w ON w.run_step_id = c.run_step_id
+            WHERE c.run_step_id = $1 AND c.kind = 'follow_up' AND c.status = 'pending'
+              AND w.session = $2 AND w.closed_at IS NULL"#,
+        step.as_uuid(),
+        session.as_uuid(),
+    )
+    .fetch_optional(&store.pool)
+    .await
+    .map_err(map_sqlx)?;
+    Ok(row.map(|row| QueuedFollowUp {
+        id: row.id,
+        text: row.text,
+    }))
 }
 
-/// [`WriteStore::settle_follow_up`](htui_core::store::WriteStore::settle_follow_up).
+/// [`WriteStore::settle_follow_up`](htui_core::store::WriteStore::settle_follow_up) (D4, B-3,
+/// B-19): one compare-and-set fenced on the owner only, the text always nulled; a miss is told
+/// apart by one re-read: `NotFound` → `Constraint` (a cancel) → `NotPending` → `Fenced`.
 pub(super) async fn settle_follow_up(
-    _store: &PgStore,
-    _id: RunCommandId,
-    _owner: Uuid,
-    _to: FollowUpSettle,
+    store: &PgStore,
+    id: RunCommandId,
+    owner: Uuid,
+    to: FollowUpSettle,
 ) -> Result<SettleOutcome> {
-    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+    let (status, resolution) = match to {
+        FollowUpSettle::Applied => (RunCommandStatus::Applied, None),
+        FollowUpSettle::Refused(sentence) => (RunCommandStatus::Refused, Some(sentence)),
+    };
+    let moved = sqlx::query!(
+        "UPDATE run_command c \
+            SET status = $3, resolution = $4, text = NULL, resolved_at = clock_timestamp() \
+           FROM run r \
+          WHERE c.id = $1 AND c.kind = 'follow_up' AND c.status = 'pending' \
+            AND r.id = c.run_id AND r.lease_owner = $2",
+        id.as_uuid(),
+        owner,
+        status.as_str(),
+        resolution,
+    )
+    .execute(&store.pool)
+    .await
+    .map_err(map_sqlx)?
+    .rows_affected();
+    if moved == 1 {
+        return Ok(SettleOutcome::Settled);
+    }
+
+    let row = sqlx::query!(
+        r#"SELECT kind AS "kind: RunCommandKind", status AS "status: RunCommandStatus"
+             FROM run_command WHERE id = $1"#,
+        id.as_uuid(),
+    )
+    .fetch_optional(&store.pool)
+    .await
+    .map_err(map_sqlx)?
+    .ok_or_else(|| StoreError::NotFound {
+        entity: "run_command",
+        id: id.to_string(),
+    })?;
+    if row.kind != RunCommandKind::FollowUp {
+        return Err(StoreError::Constraint(format!(
+            "run_command `{id}` is a `{}`, not a `follow_up`",
+            row.kind
+        )));
+    }
+    if row.status != RunCommandStatus::Pending {
+        return Ok(SettleOutcome::NotPending);
+    }
+    Ok(SettleOutcome::Fenced)
 }
 
-/// [`WriteStore::close_follow_ups`](htui_core::store::WriteStore::close_follow_ups).
+/// [`WriteStore::close_follow_ups`](htui_core::store::WriteStore::close_follow_ups) (D4, D6 step
+/// 8, B-5): two statements in one `READ COMMITTED` transaction, never one CTE (F-18). The first
+/// closes the window if it is `session`'s, waiting on an enqueue that holds its row; the second,
+/// on a fresh snapshot that sees that enqueue, refuses the step's pending follow-ups, but only
+/// while the window is this session's (a superseded walk's close refuses nothing). Answers the
+/// second's count.
 pub(super) async fn close_follow_ups(
-    _store: &PgStore,
-    _step: StepId,
-    _session: RelaySessionId,
-    _reason: &str,
+    store: &PgStore,
+    step: StepId,
+    session: RelaySessionId,
+    reason: &str,
 ) -> Result<u64> {
-    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+    let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
+    sqlx::query!(
+        "UPDATE follow_up_window SET closed_at = clock_timestamp() \
+          WHERE run_step_id = $1 AND session = $2 AND closed_at IS NULL",
+        step.as_uuid(),
+        session.as_uuid(),
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
+    let refused = sqlx::query!(
+        "UPDATE run_command c \
+            SET status = 'refused', resolution = $3, text = NULL, resolved_at = clock_timestamp() \
+          WHERE c.run_step_id = $1 AND c.kind = 'follow_up' AND c.status = 'pending' \
+            AND EXISTS (SELECT 1 FROM follow_up_window w \
+                         WHERE w.run_step_id = $1 AND w.session = $2)",
+        step.as_uuid(),
+        session.as_uuid(),
+        reason,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?
+    .rows_affected();
+    tx.commit().await.map_err(map_sqlx)?;
+    Ok(refused)
 }
 
-/// [`WriteStore::close_dropped_follow_ups`](htui_core::store::WriteStore::close_dropped_follow_ups).
+/// [`WriteStore::close_dropped_follow_ups`](htui_core::store::WriteStore::close_dropped_follow_ups)
+/// (D9, B-3, F-22): [`close_follow_ups`]' transaction shape over the whole run, both statements
+/// fenced on `owner` being the run's lease owner; otherwise nothing matches and it answers 0.
 pub(super) async fn close_dropped_follow_ups(
-    _store: &PgStore,
-    _run: RunId,
-    _owner: Uuid,
-    _reason: &str,
+    store: &PgStore,
+    run: RunId,
+    owner: Uuid,
+    reason: &str,
 ) -> Result<u64> {
-    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+    let mut tx = store.pool.begin().await.map_err(map_sqlx)?;
+    sqlx::query!(
+        "UPDATE follow_up_window w SET closed_at = clock_timestamp() \
+           FROM run r \
+          WHERE w.run_id = $1 AND w.closed_at IS NULL AND r.id = w.run_id AND r.lease_owner = $2",
+        run.as_uuid(),
+        owner,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?;
+    let refused = sqlx::query!(
+        "UPDATE run_command c \
+            SET status = 'refused', resolution = $3, text = NULL, resolved_at = clock_timestamp() \
+           FROM run r \
+          WHERE c.run_id = $1 AND c.kind = 'follow_up' AND c.status = 'pending' \
+            AND r.id = c.run_id AND r.lease_owner = $2",
+        run.as_uuid(),
+        owner,
+        reason,
+    )
+    .execute(&mut *tx)
+    .await
+    .map_err(map_sqlx)?
+    .rows_affected();
+    tx.commit().await.map_err(map_sqlx)?;
+    Ok(refused)
 }

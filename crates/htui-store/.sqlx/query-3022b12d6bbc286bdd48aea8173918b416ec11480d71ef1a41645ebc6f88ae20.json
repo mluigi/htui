@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE follow_up_window SET closed_at = clock_timestamp() WHERE run_step_id = $1 AND session = $2 AND closed_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3022b12d6bbc286bdd48aea8173918b416ec11480d71ef1a41645ebc6f88ae20"
+}
