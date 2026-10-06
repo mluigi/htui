@@ -107,8 +107,8 @@ A project reads one scope, kept in the project's `secret_scope` column as JSON, 
 
 Unknown fields are refused, as are an empty project ID or environment, a path without a
 leading `/`, and a control character (a newline, a tab, an escape) in any of the three; the
-refusal names the field, not its value. Only the folder itself is read, not its subfolders. Secret references
-(`${OTHER_KEY}`) are expanded by Infisical before htui sees the values.
+refusal names the field, not its value. Only the folder itself is read, not its subfolders.
+Secret references (`${OTHER_KEY}`) are expanded by Infisical before htui sees the values.
 
 ## Imports and precedence
 
