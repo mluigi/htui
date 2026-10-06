@@ -3,7 +3,7 @@
 **Source PRD**: `.claude/prds/mod-10-secret-provider.prd.md`
 **Selected Milestone**: 2 — Infisical provider
 **Complexity**: Medium
-**Status**: DRAFT — fact-checked (46 claims: 32 verified, 9 amended, 5 falsified; all folded in); CONFIRMED by the maintainer 2026-10-04
+**Status**: COMPLETE 2026-10-06 (confirmed by the maintainer 2026-10-04; fact-checked: 46 claims, 9 amended, 5 falsified; implemented `b2a4cfb8`..`5d93d748`; reviewed and fixed)
 
 ## Summary
 
@@ -430,10 +430,10 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 ## Acceptance
 
-- [ ] All tasks complete; every new test written before its implementation
-- [ ] Validation passes, featureless clippy included
-- [ ] Patterns mirrored, not reinvented
-- [ ] No secret value, client secret or token in any `Debug`, `Display` or error (leak test green)
+- [x] All tasks complete; every new test written before its implementation
+- [x] Validation passes, featureless clippy included
+- [x] Patterns mirrored, not reinvented
+- [x] No secret value, client secret or token in any `Debug`, `Display` or error (leak test green)
 - [ ] Live test run once by the maintainer against the self-hosted Infisical, result in the phase note
 
 ## Verified claims
@@ -492,3 +492,24 @@ sections above.)*
 | T2 needs nothing outside its files | verified | `Fake`/`FakeSlots` touched only in secret.rs, testkit.rs |
 | T2 "broken second write" via `Fake::Broken` | amended | Broken fails the first write too; a new `refuse_store` hook |
 | T1 then T3 Cargo.lock edits are serial and non-overlapping | verified | probe: T1 adds one line; T3 adds a new package block |
+
+## Review (2026-10-04 → 2026-10-06)
+
+Configured reviewer `rust-reviewer` over `44f9d176..0064a5d2`: **request-changes**, one high.
+Every finding was decided by the maintainer and fixed in round R1, verified after every repair.
+
+| # | Severity | Finding | Outcome |
+|---|---|---|---|
+| 1 | high | A cancelled caller or a post-send transport error left the token state `Empty`, so the next call logged in again (reproduced: 3 failed logins on one provider) | Fixed: the login runs on its own task that records its outcome; a send with an unknown outcome cools down 30 s (`SecretError::LoginCoolingDown`), then allows one attempt; connect errors stay retryable (`ba9cd525`, `a1dab14c`). Verify found a runtime shutdown still lost the outcome: the task's `LoginGuard` now writes the cool-down in `Drop` before the lock is released (`dc4cd30f`, `b177252b`) |
+| 2 | low | Docs/D5 promised "exactly one failed attempt" | Fixed (`68615b3f`, `28a015b8`) |
+| 3 | low | `thiserror` declared but unused (A-2) | Dropped (`2c3a5794`) |
+| 4 | low | Skipped personal entries dropped unwiped | Values are `Zeroizing` from decode (`83260570`) |
+| 5 | low | Unbounded response bodies | 64 KiB login/error, 8 MiB list caps (`604339f0`, `c83f4c2f`) |
+| 6 | low | Control characters in scope fields reached `PathNotFound` | Refused in `SecretScope` (`7d71e38c`); serde's parse message escaped (`d633542b`) |
+| 7 | nit | Closed-port test helper raced on the freed port | `ClosedPort` holds the port (`313460c3`) |
+| 8 | nit | `login()`/`list()` too long | `map_login_status`/`map_list_status` (`dabd058d`) |
+| 9 | nit | No proxy test | Child-process test: loopback never goes through `HTTP_PROXY` (`bdc4b872`); non-loopback half not tested |
+
+Deferred, accepted: commit groups differ from blueprint §F (no history rewrite); the live test
+against the self-hosted Infisical is the maintainer's (Acceptance).
+

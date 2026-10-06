@@ -154,6 +154,24 @@ document version newer than a step's output is what the next step reads (ANA-2 Â
   The verifier's scrubber (`crates/htui-worker/src/runtime.rs:437`) stays pattern-only: handing it the map would put
   the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
   secret is stored as `[REDACTED]` belongs to this item.
+  PRD `.claude/prds/mod-10-secret-provider.prd.md` (4 milestones; maintainer decisions: identity from
+  the executing box's keyring, typed run failure, per-project whole-run scope, self-hosted Infisical).
+  **Phase 1 landed (`857be690`..`7b2bfd0e`, 2026-10-04):** scrubber hardening. Whole-token pattern
+  rules (15, `regex` in `htui-core`; `openai_api_key` gate + prose filter; Stripe live keys only),
+  `MinimalScrubber::from_resolved` with a 6-char floor, one typed `RunFailure::ScrubRefused` sentence
+  on the plain-step, candidate, judge and chat paths, the opt-in `raw` re-checked per JSON pointer at
+  the flush, `R-SEC-3` amended. Plan `.claude/plans/mod-10-m1-scrubber-hardening.plan.md`; host audit
+  (T0) skipped. *(Note restored 2026-10-06: a later merge on main had dropped it.)*
+  **Phase 2 landed (`b2a4cfb8`..`5d93d748`, 2026-10-06):** Infisical provider. The
+  `htui_core::secret` seam (`SecretProvider`, `SecretScope`, `ResolvedSecrets`, `MachineIdentity`,
+  typed `SecretError` with 15 non-leaking variants); three keyring slots in `htui-store::secret`
+  (`infisical-url`, `infisical-client-id`, `infisical-client-secret`); the new `htui-secrets` crate
+  (Universal Auth, `GET /api/v4/secrets` with both imports spellings, folder-over-imports merge,
+  fail-closed validation, https except loopback, no redirects, body caps, a cancel-safe single-flight
+  login with a permanent 401 latch and a 30 s cool-down after an unanswered login). Operator page
+  `docs/htui-secrets.md`. Plan `.claude/plans/mod-10-m2-infisical-provider.plan.md`; the env-gated
+  live test against the maintainer's self-hosted Infisical is still to be run. Remaining: M3 run-start
+  injection (owns the MOD-61/MOD-62 tests and the carry-overs in the PRD), M4 Settings section.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The

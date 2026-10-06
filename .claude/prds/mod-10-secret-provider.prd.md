@@ -138,7 +138,7 @@ completes a run whose tests need a secret, and no resolved value appears in any 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Scrubber hardening | Exact-match masking from a resolved map and a broader pattern rule set guard every persisted byte; a fail-closed scrub fails the run with a typed, visible reason | complete | `.claude/plans/mod-10-m1-scrubber-hardening.plan.md` |
-| 2 | Infisical provider | A box with a machine identity in its keyring can authenticate to the configured Infisical, list and resolve a project scope's secrets, and report health; every failure is a typed, non-leaking error | in-progress | `.claude/plans/mod-10-m2-infisical-provider.plan.md` |
+| 2 | Infisical provider | A box with a machine identity in its keyring can authenticate to the configured Infisical, list and resolve a project scope's secrets, and report health; every failure is a typed, non-leaking error | complete | `.claude/plans/mod-10-m2-infisical-provider.plan.md` |
 | 3 | Run-start injection | Graph runs and chat on a configured project receive its secrets in the agent environment only, with the scrubber built from the same map; failures refuse the run; the verifier never sees them | pending | — |
 | 4 | Settings section | The maintainer enters the machine identity and base URL, sees provider health, and sets each project's scope, without leaving the TUI | pending | — |
 
@@ -152,6 +152,24 @@ completes a run whose tests need a secret, and no resolved value appears in any 
 - **`(?-u:\b)` anchor** (review N1): equivalent; adopt only with a benchmark.
 - **`from_resolved` normalisation**: a provider value with a trailing newline must mask its trimmed
   occurrence too.
+
+## Carried into M3 and M4 from M2 (2026-10-06)
+
+- **One provider per process and identity** (M3): the 401 latch and the cool-down live in one
+  `InfisicalProvider`. Building a provider per run would give each run its own failed login and
+  three runs could lock the identity. Rebuild it only when M4 stores a new identity or base URL.
+- **Unzeroized copies** (M3): `ResolvedSecrets` wipes its own values on drop, but
+  `MinimalScrubber::from_resolved` and `SessionSpec.env` take plain `String` copies.
+- **Trailing-newline normalisation** stays M3's (M1 carry-over above); values pass through byte for
+  byte.
+- **A key that is not a valid environment name refuses the run** (`InvalidKey` names it); the fix is
+  a rename in Infisical. Surface it in M3's refusal text.
+- **`list_keys` needs read-value permission too** (blueprint A-6), so M4's health/scope check fails
+  the same way `resolve` does.
+- **Proxy on non-loopback hosts** is the system proxy and is untested (needs DNS tricks); loopback
+  bypass is tested.
+- **Live check**: run `crates/htui-secrets/tests/infisical_live.rs` once against the self-hosted
+  instance (`HTUI_TEST_INFISICAL_*`, see `docs/htui-secrets.md`) and record it in the next phase note.
 
 ## Open Questions
 
