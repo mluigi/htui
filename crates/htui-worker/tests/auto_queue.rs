@@ -821,6 +821,7 @@ async fn a_drained_batch_closes_drained() {
         "the batch closed"
     );
     // Nothing else closes a batch here: a pause now finds none open, and the batch kept its run.
+    // No `MemStore` read returns a closed batch; (pg-f) reads its `drained` reason.
     assert_eq!(
         h.store
             .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
@@ -831,6 +832,52 @@ async fn a_drained_batch_closes_drained() {
     assert_eq!(
         h.store.batch_runs(batch).await.expect("the read answers"),
         vec![(run.id, RunStatus::Cancelled)]
+    );
+}
+
+/// (f3) D3: a batch with no entry left stays open while a run of its own is live (parked at
+/// `verdict`), and closes once that run is finished.
+#[tokio::test]
+async fn a_live_batch_run_keeps_the_drained_batch_open() {
+    let h = Harness::open().await;
+    let item = mint_ana(&h.store, "parks", 0).await;
+    h.queue(item).await;
+    let batch = h.resume().await;
+    let mut runtime = h.runtime();
+    runtime.sweep_with(&h.backend(), &TestSink::default());
+    settle(&mut runtime).await;
+    let run = h.only_run(item).await;
+    assert_eq!(run.status, RunStatus::AwaitingApproval, "parked at verdict");
+
+    assert!(
+        h.store.dequeue_item(item).await.expect("the write answers"),
+        "the entry leaves the queue; its run is untouched (D9)"
+    );
+    runtime.sweep_with(&h.backend(), &TestSink::default());
+    settle(&mut runtime).await;
+    assert_eq!(
+        h.store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("the read answers")
+            .map(|open| open.id),
+        Some(batch),
+        "no entry is left, but the parked run is the batch's and live"
+    );
+
+    h.store
+        .finish_run(run.id, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("a parked run cancels");
+    runtime.sweep_with(&h.backend(), &TestSink::default());
+    settle(&mut runtime).await;
+    assert_eq!(
+        h.store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("the read answers"),
+        None,
+        "the batch's last run finished, so it drained"
     );
 }
 
@@ -1126,6 +1173,73 @@ async fn two_runtimes_on_one_database_admit_each_item_once_pg() {
     for item in [x, y] {
         assert_eq!(pg_only_run(&db.store, item).await.mode, RunMode::Auto);
     }
+    db.drop_db().await;
+}
+
+/// (pg-f) (f) over Postgres, reading the closed row: the batch closes with reason `drained`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_drained_batch_closes_drained_pg() {
+    let Some(db) = testkit::demo_db().await else {
+        eprintln!("{}", testkit::SKIP);
+        return;
+    };
+    seed(
+        &db.store,
+        db.store.agents().await.expect("the fixture's agents"),
+        Repo::None,
+    )
+    .await;
+    let parts = Parts::new();
+    parts.open();
+    let item = mint_ana(&db.store, "drains", 0).await;
+    db.store
+        .queue_item(item, ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the item queues");
+    let batch = db
+        .store
+        .open_batch(ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the batch opens")
+        .id;
+    let mut runtime: RunRuntime<PgStore, TestSink> = parts.runtime();
+    runtime.sweep_with(&db.store, &TestSink::default());
+    settle(&mut runtime).await;
+    let run = pg_only_run(&db.store, item).await;
+    assert_eq!(run.status, RunStatus::AwaitingApproval, "parked at verdict");
+
+    db.store
+        .finish_run(run.id, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("a parked run cancels");
+    db.store
+        .close_out(
+            item,
+            Resolution::Withdrawn,
+            NewDocument {
+                id: DocumentId::new(),
+                item_id: item,
+                kind: "summary".to_owned(),
+                title: "withdrawn".to_owned(),
+                body: "withdrawn".to_owned(),
+                produced_by_step_id: None,
+                created_by: ids::USER,
+                created_at: Utc::now(),
+            },
+            &[],
+        )
+        .await
+        .expect("an open item closes withdrawn");
+    runtime.sweep_with(&db.store, &TestSink::default());
+    settle(&mut runtime).await;
+
+    let reason: Option<String> =
+        sqlx::query_scalar("SELECT closed_reason FROM queue_batch WHERE id = $1")
+            .bind(batch.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("the batch row is read");
+    assert_eq!(reason.as_deref(), Some("drained"));
     db.drop_db().await;
 }
 
