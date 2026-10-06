@@ -22,10 +22,10 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 42 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 44 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
-/// (MOD-26 plan D1).
+/// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -73,6 +73,9 @@ const TABLES: &[&str] = &[
     "run_command",
     // 0012_persona.sql (MOD-26)
     "persona",
+    // 0016_auto_queue.sql (MOD-12)
+    "queue_batch",
+    "queue_entry",
 ];
 
 #[tokio::test]
@@ -93,15 +96,15 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
          milestone 2's 0007_skill_attachments.sql, MOD-9 milestone 5's 0008_trim_record_v3.sql, \
          MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
-         0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql and \
-         MOD-11's 0015_command_queue.sql, in ordinal order"
+         0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
+         MOD-11's 0015_command_queue.sql and MOD-12's 0016_auto_queue.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -119,18 +122,20 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        42,
+        44,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
-         MOD-42's 0011_permission_relay.sql adds step_permission and run_command and MOD-26's \
-         0012_persona.sql adds persona"
+         MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
+         0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and \
+         queue_entry"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 42 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
-         MOD-42's 0011_permission_relay.sql and MOD-26's 0012_persona.sql and nothing else, \
+        "the migrations create the 44 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's \
+         0016_auto_queue.sql (which adds queue_batch and queue_entry) and nothing else, \
          got {present:?}"
     );
 
@@ -523,6 +528,64 @@ const MOD11_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
     ),
 ];
 
+/// The twelve `COMMENT ON COLUMN` texts of `0016_auto_queue.sql` (MOD-12 plan D1, D2, D3, D4, D7),
+/// verbatim and in migration order, for [`ANA_COLUMN_COMMENTS`]'s reason. `run` is among that
+/// set's tables, so `run.batch_id`'s comment would otherwise read as an unlisted extra.
+const MOD12_COLUMN_COMMENTS: &[(&str, &str, &str)] = &[
+    (
+        "queue_batch",
+        "id",
+        "MOD-12 D1: client-minted UUIDv7; what run.batch_id references.",
+    ),
+    (
+        "queue_batch",
+        "box_id",
+        "MOD-12 D2: the box whose queue this activation is; at most one open batch per box.",
+    ),
+    (
+        "queue_batch",
+        "opened_at",
+        "MOD-12 D2: when the queue was resumed.",
+    ),
+    ("queue_batch", "opened_by", "MOD-12 D2: who resumed it."),
+    (
+        "queue_batch",
+        "closed_at",
+        "MOD-12 D2, D3: when the batch closed; NULL while the queue runs.",
+    ),
+    (
+        "queue_batch",
+        "closed_reason",
+        "MOD-12 D2, D3: paused, or drained (no entry left and no live auto run); NULL while open.",
+    ),
+    (
+        "queue_entry",
+        "item_id",
+        "MOD-12 D1: the queued item; queued on at most one box, and gone with the item.",
+    ),
+    (
+        "queue_entry",
+        "box_id",
+        "MOD-12 D1: the box whose queue holds the item; the local box at queue time (R-ORCH-12).",
+    ),
+    (
+        "queue_entry",
+        "position",
+        "MOD-12 D4: an explicit queue position (milestone 3 reorder); NULL sorts last.",
+    ),
+    (
+        "queue_entry",
+        "queued_at",
+        "MOD-12 D1: when the item was queued.",
+    ),
+    ("queue_entry", "queued_by", "MOD-12 D1: who queued it."),
+    (
+        "run",
+        "batch_id",
+        "MOD-12 D7: the queue_batch an auto run was admitted under; NULL for manual and chat runs.",
+    ),
+];
+
 /// MOD-11 plan D14 (OQ-3): `0015_command_queue.sql` gives `command_run` its two liveness columns,
 /// both nullable (every row written before the migration, and every verify row, has neither) and
 /// both commented.
@@ -625,6 +688,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD33_COLUMN_COMMENTS)
         .chain(MOD26_COLUMN_COMMENTS)
         .chain(MOD11_COLUMN_COMMENTS)
+        .chain(MOD12_COLUMN_COMMENTS)
     {
         let actual: Option<String> = sqlx::query_scalar(
             "SELECT pg_catalog.col_description(c.oid, a.attnum) \
@@ -641,8 +705,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         assert_eq!(
             actual.as_deref(),
             Some(*expected),
-            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26 or \
-             MOD-11) text byte for byte"
+            "{table}.{column}'s comment is the ANA (or MOD-7, MOD-9, MOD-23, MOD-33, MOD-26, \
+             MOD-11 or MOD-12) text byte for byte"
         );
     }
 
@@ -664,8 +728,8 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
     );
 
     // And nothing else in those tables carries one, so a reader of `\d+` sees exactly the
-    // forty-six contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26 and MOD-11 wrote and
-    // no half-finished forty-seventh.
+    // fifty-eight contracts the three ANAs, MOD-7, ANA-22, MOD-23, MOD-33, MOD-26, MOD-11 and
+    // MOD-12 wrote and no half-finished fifty-ninth.
     let commented: Vec<(String, String)> = sqlx::query_as(
         "SELECT c.relname::text, a.attname::text FROM pg_class c \
          JOIN pg_attribute a ON a.attrelid = c.oid \
@@ -683,6 +747,7 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
             .chain(MOD33_COLUMN_COMMENTS)
             .chain(MOD26_COLUMN_COMMENTS)
             .chain(MOD11_COLUMN_COMMENTS)
+            .chain(MOD12_COLUMN_COMMENTS)
             .map(|(table, _, _)| (*table).to_owned())
             .collect::<BTreeSet<String>>()
             .into_iter()
@@ -700,12 +765,13 @@ async fn the_ana_column_comments_are_present_and_verbatim() {
         .chain(MOD33_COLUMN_COMMENTS)
         .chain(MOD26_COLUMN_COMMENTS)
         .chain(MOD11_COLUMN_COMMENTS)
+        .chain(MOD12_COLUMN_COMMENTS)
         .map(|(table, column, _)| ((*table).to_owned(), (*column).to_owned()))
         .collect();
     expected.sort();
     assert_eq!(
         commented, expected,
-        "exactly the forty-six commented columns, and no others"
+        "exactly the fifty-eight commented columns, and no others"
     );
 
     db.drop_db().await;
@@ -1085,8 +1151,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(15),
-        "fifteen embedded migrations, none applied (through MOD-11's 0015_command_queue.sql)"
+        MigrationState::Pending(16),
+        "sixteen embedded migrations, none applied (through MOD-12's 0016_auto_queue.sql)"
     );
 
     db.drop_db().await;
@@ -1186,8 +1252,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(15),
-        "fifteen embedded migrations, through MOD-11's 0015_command_queue.sql"
+        MigrationState::Pending(16),
+        "sixteen embedded migrations, through MOD-12's 0016_auto_queue.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -1195,8 +1261,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(15),
-        "every one of the fifteen, through MOD-11's 0015_command_queue.sql, is pending"
+        HeadlessError::MigrationsPending(16),
+        "every one of the sixteen, through MOD-12's 0016_auto_queue.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -1218,8 +1284,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(15),
-        "every one of the fifteen, through MOD-11's 0015_command_queue.sql, is pending"
+        HeadlessError::MigrationsPending(16),
+        "every one of the sixteen, through MOD-12's 0016_auto_queue.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -1370,9 +1436,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        15,
-        "the later applies migrate nothing: the fifteen embedded migrations (through MOD-11's \
-         0015_command_queue.sql) are applied once"
+        16,
+        "the later applies migrate nothing: the sixteen embedded migrations (through MOD-12's \
+         0016_auto_queue.sql) are applied once"
     );
 
     db.drop_db().await;
@@ -2354,4 +2420,287 @@ async fn connect_writes_no_files_of_its_own() {
     let root = db.config_root.clone();
     db.drop_db().await;
     assert!(!root.exists(), "drop_db removes the throwaway config root");
+}
+
+/// The constraint a refused statement tripped, read through `htui_store::map_sqlx` the way every
+/// store write reports it: a [`StoreError::Constraint`] whose text starts `"<name>: "`.
+fn refused_by(err: sqlx::Error) -> String {
+    match htui_store::map_sqlx(err) {
+        StoreError::Constraint(text) => text,
+        other => panic!("expected StoreError::Constraint, got {other:?}"),
+    }
+}
+
+/// Asserts `err` is a [`StoreError::Constraint`] naming exactly `constraint`.
+fn assert_refused_by(err: sqlx::Error, constraint: &str, what: &str) {
+    let text = refused_by(err);
+    assert!(
+        text.starts_with(&format!("{constraint}: ")),
+        "{what} is refused by {constraint}, got {text:?}"
+    );
+}
+
+/// Inserts an open `queue_batch` for `box_id`, opened by `user`, and answers its id.
+async fn open_batch_row(
+    pool: &sqlx::PgPool,
+    box_id: uuid::Uuid,
+    user: uuid::Uuid,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let id = uuid::Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO queue_batch (id, box_id, opened_at, opened_by) VALUES ($1, $2, now(), $3)",
+    )
+    .bind(id)
+    .bind(box_id)
+    .bind(user)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// MOD-12 plan D1, D2, D7: `0016_auto_queue.sql` creates `queue_batch` and `queue_entry` with
+/// exactly blueprint B.0's columns, adds the nullable `run.batch_id`, and builds its three
+/// indexes. `pg_indexes` prints the definitions Postgres normalised.
+#[tokio::test]
+async fn the_auto_queue_tables_and_column_exist() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let columns: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name::text, column_name::text, data_type::text, is_nullable::text \
+         FROM information_schema.columns \
+         WHERE table_schema = 'public' \
+           AND (table_name IN ('queue_batch', 'queue_entry') \
+                OR (table_name = 'run' AND column_name = 'batch_id')) \
+         ORDER BY table_name, ordinal_position",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read the auto-queue columns");
+    let expected: Vec<(String, String, String, String)> = [
+        ("queue_batch", "id", "uuid", "NO"),
+        ("queue_batch", "box_id", "uuid", "NO"),
+        ("queue_batch", "opened_at", "timestamp with time zone", "NO"),
+        ("queue_batch", "opened_by", "uuid", "NO"),
+        (
+            "queue_batch",
+            "closed_at",
+            "timestamp with time zone",
+            "YES",
+        ),
+        ("queue_batch", "closed_reason", "text", "YES"),
+        ("queue_entry", "item_id", "uuid", "NO"),
+        ("queue_entry", "box_id", "uuid", "NO"),
+        ("queue_entry", "position", "integer", "YES"),
+        ("queue_entry", "queued_at", "timestamp with time zone", "NO"),
+        ("queue_entry", "queued_by", "uuid", "NO"),
+        ("run", "batch_id", "uuid", "YES"),
+    ]
+    .into_iter()
+    .map(|(t, c, ty, null)| (t.to_owned(), c.to_owned(), ty.to_owned(), null.to_owned()))
+    .collect();
+    assert_eq!(
+        columns, expected,
+        "0016 creates queue_batch and queue_entry as blueprint B.0 lists them and adds the \
+         nullable run.batch_id"
+    );
+
+    let indexes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT indexname::text, indexdef FROM pg_indexes WHERE schemaname = 'public' \
+         AND indexname IN ('uq_queue_batch_open', 'idx_queue_entry_box', 'idx_run_batch') \
+         ORDER BY indexname",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read pg_indexes");
+    let expected: Vec<(String, String)> = [
+        (
+            "idx_queue_entry_box",
+            "CREATE INDEX idx_queue_entry_box ON public.queue_entry USING btree (box_id)",
+        ),
+        (
+            "idx_run_batch",
+            "CREATE INDEX idx_run_batch ON public.run USING btree (batch_id) \
+             WHERE (batch_id IS NOT NULL)",
+        ),
+        (
+            "uq_queue_batch_open",
+            "CREATE UNIQUE INDEX uq_queue_batch_open ON public.queue_batch USING btree (box_id) \
+             WHERE (closed_at IS NULL)",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, def)| (name.to_owned(), def.to_owned()))
+    .collect();
+    assert_eq!(
+        indexes, expected,
+        "0016's partial unique open-batch index, the entry box index and the partial run batch index"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 plan D2: at most one open batch per box. `uq_queue_batch_open` refuses a second, and
+/// once the first is closed the second lands; closed batches coexist without limit.
+#[tokio::test]
+async fn a_second_open_batch_on_one_box_is_refused() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let box_id = db.store.this_box().as_uuid();
+    let user = db.store.this_user().as_uuid();
+
+    let first = open_batch_row(&db.pool, box_id, user)
+        .await
+        .expect("the first open batch on the box lands");
+    let err = open_batch_row(&db.pool, box_id, user)
+        .await
+        .expect_err("a second open batch on the same box is refused");
+    assert_refused_by(err, "uq_queue_batch_open", "a second open batch");
+
+    sqlx::query("UPDATE queue_batch SET closed_at = now(), closed_reason = 'paused' WHERE id = $1")
+        .bind(first)
+        .execute(&db.pool)
+        .await
+        .expect("pause closes the first batch");
+    let second = open_batch_row(&db.pool, box_id, user)
+        .await
+        .expect("with the first closed, a new open batch lands");
+    sqlx::query(
+        "UPDATE queue_batch SET closed_at = now(), closed_reason = 'drained' WHERE id = $1",
+    )
+    .bind(second)
+    .execute(&db.pool)
+    .await
+    .expect("drain closes the second batch");
+    let closed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM queue_batch WHERE box_id = $1 AND closed_at IS NOT NULL",
+    )
+    .bind(box_id)
+    .fetch_one(&db.pool)
+    .await
+    .expect("count the closed batches");
+    assert_eq!(closed, 2, "two closed batches coexist on one box");
+
+    db.drop_db().await;
+}
+
+/// MOD-12 plan D2, D3: a batch is open (neither `closed_at` nor `closed_reason`) or closed (both),
+/// never half-closed, and it closes only as `paused` or `drained`.
+#[tokio::test]
+async fn a_batch_closes_with_its_reason_and_only_with_it() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let batch = open_batch_row(
+        &db.pool,
+        db.store.this_box().as_uuid(),
+        db.store.this_user().as_uuid(),
+    )
+    .await
+    .expect("an open batch lands");
+    let close = |closed_at: bool, reason: Option<&'static str>| {
+        sqlx::query(
+            "UPDATE queue_batch \
+             SET closed_at = CASE WHEN $2 THEN now() END, closed_reason = $3 WHERE id = $1",
+        )
+        .bind(batch)
+        .bind(closed_at)
+        .bind(reason)
+        .execute(&db.pool)
+    };
+
+    let err = close(true, None)
+        .await
+        .expect_err("closed_at without a reason is refused");
+    assert_refused_by(err, "chk_queue_batch_closed", "closed_at without a reason");
+    let err = close(false, Some("paused"))
+        .await
+        .expect_err("a reason without closed_at is refused");
+    assert_refused_by(err, "chk_queue_batch_closed", "a reason without closed_at");
+    let err = close(true, Some("cancelled"))
+        .await
+        .expect_err("a reason outside paused and drained is refused");
+    assert_refused_by(
+        err,
+        "chk_queue_batch_closed_reason",
+        "closed_reason = 'cancelled'",
+    );
+
+    for reason in ["paused", "drained"] {
+        let done = close(true, Some(reason))
+            .await
+            .unwrap_or_else(|err| panic!("closing as `{reason}` is admitted: {err}"));
+        assert_eq!(done.rows_affected(), 1, "the batch closes as `{reason}`");
+    }
+    close(false, None)
+        .await
+        .expect("an open batch carries neither column");
+
+    db.drop_db().await;
+}
+
+/// MOD-12 plan D1: a `queue_entry` goes with its item (`ON DELETE CASCADE`), which is what lets
+/// `delete_project` remove a project whose items are queued.
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn a_queue_entry_goes_with_its_item() {
+    use htui_core::fixtures::ids;
+    use htui_core::store::WriteStore;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    sqlx::query(
+        "INSERT INTO queue_entry (item_id, box_id, queued_at, queued_by) \
+         VALUES ($1, $2, now(), $3)",
+    )
+    .bind(ids::HTUI_ANA_2.as_uuid())
+    .bind(ids::BOX.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .execute(&db.pool)
+    .await
+    .expect("queue HTUI ANA-2 on the fixture box");
+    assert_eq!(common::count(&db.pool, "queue_entry").await, 1);
+
+    WriteStore::delete_project(&db.store, ids::PROJECT_HTUI)
+        .await
+        .expect("a project whose item is queued deletes");
+    assert_eq!(
+        common::count(&db.pool, "queue_entry").await,
+        0,
+        "the entry went with its item"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 plan D7: `run.batch_id` names an existing `queue_batch` or nothing (`fk_run_batch`).
+#[cfg(feature = "demo")]
+#[tokio::test]
+async fn a_run_names_only_an_existing_batch() {
+    use htui_core::fixtures::ids;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let set = |batch: uuid::Uuid| {
+        sqlx::query("UPDATE run SET batch_id = $2 WHERE id = $1")
+            .bind(ids::RUN_2.as_uuid())
+            .bind(batch)
+            .execute(&db.pool)
+    };
+
+    let err = set(uuid::Uuid::now_v7())
+        .await
+        .expect_err("a batch id no queue_batch carries is refused");
+    assert_refused_by(err, "fk_run_batch", "an unknown batch id");
+
+    let batch = open_batch_row(&db.pool, ids::BOX.as_uuid(), ids::USER.as_uuid())
+        .await
+        .expect("open a batch on the fixture box");
+    let done = set(batch).await.expect("an existing batch id is admitted");
+    assert_eq!(done.rows_affected(), 1, "RUN_2 records the batch");
+
+    db.drop_db().await;
 }
