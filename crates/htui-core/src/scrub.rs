@@ -200,7 +200,7 @@ pub struct Unmasked {
 ///
 /// A pattern rule is a known prefix plus a charset plus a minimum length, and counts only at a
 /// token start (string start, after a character that is not `[A-Za-z0-9_]`, or after a JSON or
-/// percent escape such as `\n` or `%22`: [`TOKEN_START`]), so `subtask-list` and `sk-learn` are
+/// percent escape such as `\n` or `%22`: `TOKEN_START`), so `subtask-list` and `sk-learn` are
 /// not credentials while `Bearer sk-ant-api03-…` and `…\nsk-ant-api03-…` are.
 /// Numbers and booleans are structural and are never rewritten; strings are masked and scanned
 /// wherever they appear, as a value or as a key.
