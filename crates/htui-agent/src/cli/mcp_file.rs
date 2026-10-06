@@ -18,6 +18,10 @@ const FILE_NAME: &str = "mcp.json";
 /// session task, so every exit drops it, the abort of a session that never sent `system/init`
 /// included. `Drop` removes the file and then the directory, best effort. `Debug` prints the
 /// path, never the contents. Move-only on purpose: a copy would outlive the session.
+///
+/// `#[must_use]` (MOD-79 review L7): a guard dropped on the spot deletes the file the argv was
+/// about to name, and the CLI would start with a `--mcp-config` that does not exist.
+#[must_use = "dropping it deletes the file; keep it for the session's life"]
 pub struct McpConfigFile {
     /// `<dir>/mcp.json`: what `--mcp-config=` names.
     path: PathBuf,
@@ -31,7 +35,8 @@ impl McpConfigFile {
     /// # Errors
     ///
     /// [`crate::private_dir::create`]'s, a path that is not UTF-8 (the argv is `String`s), or the
-    /// file's create/write error. Every error removes what was already created.
+    /// file's create/write error. Every error removes what was already created, and names the base
+    /// or the file it tried (MOD-79 review L5).
     pub fn write(servers: &[McpServerSpec]) -> std::io::Result<Option<Self>> {
         Self::write_in(&crate::private_dir::base(), servers)
     }
@@ -50,7 +55,18 @@ impl McpConfigFile {
         let Some(json) = super::mcp_config(servers) else {
             return Ok(None);
         };
-        let dir = crate::private_dir::create_in(base, DIR_PREFIX)?;
+        // Named here because neither `create_dir`'s error nor the caller's message says where
+        // (review L5); `private_dir`'s own "not private" error names the directory again, which
+        // is redundant but harmless.
+        let dir = crate::private_dir::create_in(base, DIR_PREFIX).map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!(
+                    "cannot create a private directory in {}: {err}",
+                    base.display()
+                ),
+            )
+        })?;
         // The guard exists before anything else can fail, so every `?` below removes the
         // directory and whatever part of the file was written (blueprint H-10).
         let file = Self {
@@ -60,11 +76,15 @@ impl McpConfigFile {
         // `channel.rs`'s socket-path check: `argv` is `String`s, and a lossy path would name a
         // file that does not exist.
         if file.path.to_str().is_none() {
-            return Err(std::io::Error::other("the MCP config path is not UTF-8"));
+            return Err(std::io::Error::other(format!(
+                "the MCP config path is not UTF-8: {}",
+                file.path.display()
+            )));
         }
         // `create_new`: a fresh directory holds no file, so one already there is never ours to
-        // reuse. Synchronous `std::fs`, as `channel.rs`'s `bind`: a few hundred bytes, and `Drop`
-        // is synchronous anyway (blueprint G-4).
+        // reuse. Synchronous `std::fs`, called off the runtime: `CliDriver::io` runs this whole
+        // function under `spawn_blocking` (MOD-79 review L3, superseding blueprint G-4's "a few
+        // hundred bytes" on a worker). `Drop` stays synchronous; two unlinks.
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create_new(true);
         #[cfg(unix)]
@@ -72,7 +92,12 @@ impl McpConfigFile {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        options.open(&file.path)?.write_all(json.as_bytes())?;
+        options
+            .open(&file.path)
+            .and_then(|mut handle| handle.write_all(json.as_bytes()))
+            .map_err(|err| {
+                std::io::Error::new(err.kind(), format!("{}: {err}", file.path.display()))
+            })?;
         Ok(Some(file))
     }
 
@@ -181,6 +206,21 @@ mod tests {
         drop(file);
         assert!(!path.exists(), "{}", path.display());
         assert!(!dir.exists(), "{}", dir.display());
+    }
+
+    /// MOD-79 review L5: the error names where it tried, so the troubleshooting entry's "check that
+    /// the base is writable" has a path to check.
+    #[test]
+    fn a_failed_write_names_the_base_it_tried() {
+        let tmp = tempfile::tempdir().expect("a scratch directory");
+        let base = tmp.path().join("missing");
+        let err = McpConfigFile::write_in(&base, &[server()])
+            .expect_err("a base that does not exist holds no directory");
+        assert!(
+            err.to_string().contains(&base.display().to_string()),
+            "{err}"
+        );
+        assert!(!base.exists(), "{}", base.display());
     }
 
     #[test]

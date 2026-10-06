@@ -488,10 +488,20 @@ impl CliDriver {
                 let mut resolved = self.launch_for(spec).await?;
                 // MOD-79: written after the launch resolves (a failure there leaves nothing on disk)
                 // and before the spawn; a failed spawn drops it here, with this frame (H-13).
-                let base = mcp_base.unwrap_or_else(crate::private_dir::base);
-                let config = McpConfigFile::write_in(&base, &spec.mcp).map_err(|err| {
-                    DriverError::Spawn(format!("cannot write the MCP config: {err}"))
-                })?;
+                // On a blocking thread (review L3): the base's `is_dir`, the directory's create and
+                // mode read-back and the file's write are all synchronous `std::fs`, which a
+                // runtime worker must not wait on. A cancelled `io` still drops the guard: the task
+                // runs to its end, and tokio drops an output nobody joins, which removes the file
+                // and its directory. A `JoinError` is `launch::spawn`'s lookup's mapping.
+                let servers = spec.mcp.clone();
+                let config = crate::contained::spawn_blocking(move || {
+                    let base = mcp_base.unwrap_or_else(crate::private_dir::base);
+                    McpConfigFile::write_in(&base, &servers)
+                })
+                .await
+                .map_err(|err| DriverError::Transport(format!("writing the MCP config: {err}")))?
+                // The io error names the directory or file it tried (review L5).
+                .map_err(|err| DriverError::Spawn(format!("cannot write the MCP config: {err}")))?;
                 resolved.args = argv(
                     &resolved.args,
                     &self.cli_settings(),
