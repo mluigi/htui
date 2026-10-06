@@ -18,7 +18,14 @@
 //! consult `FAKE` first, so a test can round-trip a DSN without touching the developer's OS
 //! store. Nothing installs it but `crate::testkit::mock_keyring`; with it uninstalled the
 //! production path below is what runs, unchanged (blueprint flag L, ruling §0.3).
+//!
+//! The module also holds the Infisical base URL and machine identity (MOD-10 D7): three entries
+//! under [`SERVICE`], [`INFISICAL_URL_USER`] (`infisical-url`), [`INFISICAL_CLIENT_ID_USER`]
+//! (`infisical-client-id`) and [`INFISICAL_CLIENT_SECRET_USER`] (`infisical-client-secret`). A
+//! half-stored identity is an error, not `None`, and [`set_machine_identity`] never leaves one
+//! behind. The `test-support` fake honours its `refuse_store` switch for these entries only.
 
+use htui_core::secret::MachineIdentity;
 use htui_core::store::{Result, StoreError};
 use keyring::{Entry, Error as KeyringError};
 use zeroize::Zeroizing;
@@ -34,6 +41,12 @@ pub const USER: &str = "postgres-dsn";
 pub const QDRANT_URL_USER: &str = "qdrant-url";
 /// The OS keyring username used to store the Qdrant API key.
 pub const QDRANT_KEY_USER: &str = "qdrant-key";
+/// Keyring user name of the Infisical base URL (MOD-10 D7).
+pub const INFISICAL_URL_USER: &str = "infisical-url";
+/// Keyring user name of the Infisical machine identity's client ID (MOD-10 D7, ANA-7 §3.3).
+pub const INFISICAL_CLIENT_ID_USER: &str = "infisical-client-id";
+/// Keyring user name of the Infisical machine identity's client secret (MOD-10 D7, ANA-7 §3.3).
+pub const INFISICAL_CLIENT_SECRET_USER: &str = "infisical-client-secret";
 
 /// What an installed stand-in answers with (D18, flag L).
 ///
@@ -47,6 +60,13 @@ pub(crate) struct FakeSlots {
     pub pg: Option<String>,
     pub qdrant_url: Option<String>,
     pub qdrant_key: Option<String>,
+    pub infisical_url: Option<String>,
+    pub infisical_client_id: Option<String>,
+    pub infisical_client_secret: Option<String>,
+    /// MOD-10 T2: the user name whose **store** fails, as `Fake::Broken` would fail it. Every
+    /// other call still answers. Honoured by the Infisical slots only. `Fake::Broken` cannot test
+    /// "the second write fails" because it fails the first one too.
+    pub refuse_store: Option<&'static str>,
 }
 
 #[cfg(feature = "test-support")]
@@ -356,6 +376,151 @@ pub fn clear_qdrant_api_key() -> Result<()> {
         };
     }
     Slot::open(SERVICE, QDRANT_KEY_USER)?.clear()
+}
+
+/// The fake field for one of the Infisical users.
+#[cfg(feature = "test-support")]
+fn infisical_field<'a>(slots: &'a mut FakeSlots, user: &str) -> &'a mut Option<String> {
+    match user {
+        INFISICAL_URL_USER => &mut slots.infisical_url,
+        INFISICAL_CLIENT_ID_USER => &mut slots.infisical_client_id,
+        INFISICAL_CLIENT_SECRET_USER => &mut slots.infisical_client_secret,
+        other => unreachable!("not an Infisical keyring user: {other}"),
+    }
+}
+
+/// Reads one Infisical entry; blank reads as `None` (as [`Slot::get`]).
+fn read_slot(user: &'static str) -> Result<Option<String>> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => Ok(infisical_field(slots, user)
+                .clone()
+                .filter(|value| !value.trim().is_empty())),
+            Fake::Broken(why) => Err(fake_failure("read", user, why)),
+        };
+    }
+    Slot::open(SERVICE, user)?.get()
+}
+
+/// Writes one Infisical entry. Under the fake, `refuse_store == Some(user)` fails the write the way
+/// `Fake::Broken` would, and changes nothing.
+fn write_slot(user: &'static str, value: &str) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) if slots.refuse_store == Some(user) => {
+                Err(fake_failure("store", user, "refused by the test"))
+            }
+            Fake::Slot(slots) => {
+                *infisical_field(slots, user) = Some(value.to_owned());
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("store", user, why)),
+        };
+    }
+    Slot::open(SERVICE, user)?.set(value)
+}
+
+/// Removes one Infisical entry; a missing entry is `Ok(())`.
+fn remove_slot(user: &'static str) -> Result<()> {
+    #[cfg(feature = "test-support")]
+    if let Some(fake) = &mut *fake() {
+        return match fake {
+            Fake::Slot(slots) => {
+                *infisical_field(slots, user) = None;
+                Ok(())
+            }
+            Fake::Broken(why) => Err(fake_failure("remove", user, why)),
+        };
+    }
+    Slot::open(SERVICE, user)?.clear()
+}
+
+/// The stored Infisical base URL, if any (D7; the Qdrant URL's shape).
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] for any keyring failure other than a missing entry.
+pub fn get_infisical_url() -> Result<Option<String>> {
+    read_slot(INFISICAL_URL_USER)
+}
+
+/// Stores the Infisical base URL. Not validated here: `htui-secrets` normalises it, and M4 calls
+/// that before storing.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when the keyring refuses the write.
+pub fn set_infisical_url(url: &str) -> Result<()> {
+    write_slot(INFISICAL_URL_USER, url)
+}
+
+/// Removes the Infisical base URL. A missing entry is `Ok(())`.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when the keyring refuses the delete.
+pub fn clear_infisical_url() -> Result<()> {
+    remove_slot(INFISICAL_URL_USER)
+}
+
+/// The error for an identity with one half stored and the other, `missing`, absent.
+fn half_identity(missing: &str) -> StoreError {
+    StoreError::Backend(format!(
+        "the Infisical machine identity is half stored: {SERVICE}/{missing} is missing; enter \
+         the identity again"
+    ))
+}
+
+/// The stored machine identity (D7): both halves → `Some`, neither → `None`.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] for a keyring failure, **and** for a half-stored identity, naming the
+/// missing half. A half identity is not "no identity". The message never carries a value.
+pub fn get_machine_identity() -> Result<Option<MachineIdentity>> {
+    let id = read_slot(INFISICAL_CLIENT_ID_USER)?;
+    let secret = read_slot(INFISICAL_CLIENT_SECRET_USER)?.map(Zeroizing::new);
+    match (id, secret) {
+        // `take` moves the allocation into the identity: no copy, and the emptied wrapper drops
+        // harmlessly.
+        (Some(id), Some(mut secret)) => {
+            Ok(Some(MachineIdentity::new(id, std::mem::take(&mut *secret))))
+        }
+        (None, None) => Ok(None),
+        (Some(_), None) => Err(half_identity(INFISICAL_CLIENT_SECRET_USER)),
+        (None, Some(_)) => Err(half_identity(INFISICAL_CLIENT_ID_USER)),
+    }
+}
+
+/// Writes both halves: client ID first, then client secret. If the secret write fails, both
+/// entries are removed (A-1: an old secret must not outlive a new client ID), and the write error
+/// is returned.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when either write fails.
+pub fn set_machine_identity(identity: &MachineIdentity) -> Result<()> {
+    write_slot(INFISICAL_CLIENT_ID_USER, identity.client_id())?;
+    if let Err(err) = write_slot(INFISICAL_CLIENT_SECRET_USER, identity.client_secret()) {
+        // Best effort, both attempted: the write error is the one worth reporting.
+        let _ = remove_slot(INFISICAL_CLIENT_ID_USER);
+        let _ = remove_slot(INFISICAL_CLIENT_SECRET_USER);
+        return Err(err);
+    }
+    Ok(())
+}
+
+/// Removes both halves. Both removals are attempted; the first error is returned.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when either removal fails.
+pub fn clear_machine_identity() -> Result<()> {
+    let id = remove_slot(INFISICAL_CLIENT_ID_USER);
+    let secret = remove_slot(INFISICAL_CLIENT_SECRET_USER);
+    id.and(secret)
 }
 
 /// One keyring entry, plus the `service/user` pair its error messages quote.
@@ -692,6 +857,225 @@ mod headless_dsn_tests {
         assert!(
             matches!(err, DsnSourceError::NoSource { .. }),
             "got {err:?}"
+        );
+    }
+}
+
+/// The Infisical base URL and machine identity slots (MOD-10 D7), over the process-wide fake
+/// keyring: never the developer's. Every case takes its guard as its first statement (H-15), and no
+/// assertion message ever prints a secret or an error text that could carry one (H-8).
+#[cfg(test)]
+mod machine_identity_tests {
+    use super::{
+        INFISICAL_CLIENT_ID_USER, INFISICAL_CLIENT_SECRET_USER, INFISICAL_URL_USER, SERVICE,
+        clear_infisical_url, clear_machine_identity, get_infisical_url, get_machine_identity,
+        set_infisical_url, set_machine_identity,
+    };
+    use crate::testkit::{
+        BROKEN_KEYRING, fake_machine_identity, mock_keyring, mock_keyring_broken, refuse_fake_store,
+    };
+    use htui_core::secret::MachineIdentity;
+
+    /// What the fake holds for `(client_id, client_secret)`, owned, for comparing against
+    /// [`fake_machine_identity`] without ever printing it.
+    fn held(id: &str, secret: &str) -> (Option<String>, Option<String>) {
+        (Some(id.to_owned()), Some(secret.to_owned()))
+    }
+
+    #[tokio::test]
+    async fn the_infisical_entries_are_named_exactly_as_the_plan_says() {
+        let _guard = mock_keyring().await;
+        assert_eq!(SERVICE, "htui");
+        assert_eq!(INFISICAL_URL_USER, "infisical-url");
+        assert_eq!(INFISICAL_CLIENT_ID_USER, "infisical-client-id");
+        assert_eq!(INFISICAL_CLIENT_SECRET_USER, "infisical-client-secret");
+    }
+
+    #[tokio::test]
+    async fn the_infisical_url_round_trips_and_blank_reads_as_none() {
+        let _guard = mock_keyring().await;
+        assert_eq!(
+            get_infisical_url().expect("an empty fake reads"),
+            None,
+            "nothing stored yet"
+        );
+        set_infisical_url("https://infisical.example").expect("the fake keyring stores");
+        assert_eq!(
+            get_infisical_url().expect("read"),
+            Some("https://infisical.example".to_owned())
+        );
+        set_infisical_url("  ").expect("the fake keyring stores");
+        assert_eq!(
+            get_infisical_url().expect("read"),
+            None,
+            "a blank URL is no URL"
+        );
+        set_infisical_url("https://infisical.example").expect("the fake keyring stores");
+        clear_infisical_url().expect("clear");
+        assert_eq!(get_infisical_url().expect("read"), None);
+        clear_infisical_url().expect("clearing twice is not an error");
+    }
+
+    #[tokio::test]
+    async fn a_machine_identity_round_trips() {
+        let _guard = mock_keyring().await;
+        set_machine_identity(&MachineIdentity::new("cid-1", "csecret-1"))
+            .expect("the fake keyring stores both halves");
+        let identity = get_machine_identity()
+            .expect("the fake keyring reads")
+            .expect("both halves are stored");
+        assert_eq!(identity.client_id(), "cid-1");
+        assert!(
+            identity.client_secret() == "csecret-1",
+            "the client secret round-trips"
+        );
+        assert!(
+            fake_machine_identity() == held("cid-1", "csecret-1"),
+            "the fake holds both halves under their own users"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_identity_reads_as_none() {
+        let _guard = mock_keyring().await;
+        assert!(
+            matches!(get_machine_identity(), Ok(None)),
+            "an empty keyring holds no identity, and that is not an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lone_client_id_is_an_error_naming_the_secret() {
+        let _guard = mock_keyring().await;
+        super::write_slot(INFISICAL_CLIENT_ID_USER, "cid-1").expect("the fake keyring stores");
+        let text = get_machine_identity()
+            .expect_err("a half identity is an error, not `None`")
+            .to_string();
+        assert!(
+            text.contains("infisical-client-secret"),
+            "the error names the missing half"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lone_client_secret_is_an_error_naming_the_client_id_and_never_the_secret() {
+        let _guard = mock_keyring().await;
+        super::write_slot(INFISICAL_CLIENT_SECRET_USER, "csecret-1")
+            .expect("the fake keyring stores");
+        let text = get_machine_identity()
+            .expect_err("a half identity is an error, not `None`")
+            .to_string();
+        assert!(
+            text.contains("infisical-client-id"),
+            "the error names the missing half"
+        );
+        assert!(
+            !text.contains("csecret-1"),
+            "the error never carries the stored secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_half_reads_as_absent() {
+        let _guard = mock_keyring().await;
+        super::write_slot(INFISICAL_CLIENT_ID_USER, "cid-1").expect("the fake keyring stores");
+        super::write_slot(INFISICAL_CLIENT_SECRET_USER, "   ").expect("the fake keyring stores");
+        let text = get_machine_identity()
+            .expect_err("a blank half is a missing half")
+            .to_string();
+        assert!(
+            text.contains("infisical-client-secret"),
+            "the blank half is the one named as missing"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_secret_write_leaves_nothing() {
+        let _guard = mock_keyring().await;
+        refuse_fake_store(INFISICAL_CLIENT_SECRET_USER);
+        assert!(
+            set_machine_identity(&MachineIdentity::new("cid-1", "csecret-1")).is_err(),
+            "a refused secret write fails the whole set"
+        );
+        assert!(
+            fake_machine_identity() == (None, None),
+            "no half identity is left behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_secret_write_over_an_old_identity_leaves_nothing() {
+        let _guard = mock_keyring().await;
+        set_machine_identity(&MachineIdentity::new("old-id", "old-secret"))
+            .expect("the fake keyring stores both halves");
+        refuse_fake_store(INFISICAL_CLIENT_SECRET_USER);
+        assert!(
+            set_machine_identity(&MachineIdentity::new("new-id", "new-secret")).is_err(),
+            "a refused secret write fails the whole set"
+        );
+        assert!(
+            fake_machine_identity() == (None, None),
+            "neither the new client ID nor the old secret survives (A-1)"
+        );
+        assert!(
+            matches!(get_machine_identity(), Ok(None)),
+            "what is left reads as no identity, never a half one"
+        );
+    }
+
+    #[tokio::test]
+    async fn clear_removes_both_halves() {
+        let _guard = mock_keyring().await;
+        set_machine_identity(&MachineIdentity::new("cid-1", "csecret-1"))
+            .expect("the fake keyring stores both halves");
+        clear_machine_identity().expect("clear");
+        assert!(
+            fake_machine_identity() == (None, None),
+            "both halves are removed"
+        );
+        clear_machine_identity().expect("clearing twice is not an error");
+    }
+
+    #[tokio::test]
+    async fn a_broken_keyring_is_an_error_never_none() {
+        let _broken = mock_keyring_broken().await;
+        let identity = MachineIdentity::new("cid-1", "csecret-1");
+        let results = [
+            ("get_machine_identity", get_machine_identity().map(|_| ())),
+            ("set_machine_identity", set_machine_identity(&identity)),
+            ("clear_machine_identity", clear_machine_identity()),
+            ("get_infisical_url", get_infisical_url().map(|_| ())),
+            (
+                "set_infisical_url",
+                set_infisical_url("https://infisical.example"),
+            ),
+            ("clear_infisical_url", clear_infisical_url()),
+        ];
+        for (call, result) in results {
+            let text = result
+                .err()
+                .unwrap_or_else(|| panic!("{call} answers a broken keyring with an error"))
+                .to_string();
+            assert!(
+                text.contains(BROKEN_KEYRING),
+                "{call} reports the keyring's own failure"
+            );
+            assert!(
+                !text.contains("csecret-1"),
+                "{call} never carries the client secret"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn refuse_store_touches_only_the_named_user() {
+        let _guard = mock_keyring().await;
+        refuse_fake_store(INFISICAL_CLIENT_SECRET_USER);
+        set_infisical_url("https://infisical.example")
+            .expect("only the client secret's store is refused");
+        assert_eq!(
+            get_infisical_url().expect("read"),
+            Some("https://infisical.example".to_owned())
         );
     }
 }

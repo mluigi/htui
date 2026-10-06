@@ -13,6 +13,7 @@ pub mod model;
 pub mod prompt;
 pub mod root_path;
 pub mod scrub;
+pub mod secret;
 pub mod seed;
 pub mod store;
 

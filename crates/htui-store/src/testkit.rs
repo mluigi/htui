@@ -395,6 +395,43 @@ pub fn fake_dsn() -> Option<String> {
     }
 }
 
+/// What the fake keyring holds for the Infisical identity, `(client_id, client_secret)`, for
+/// assertions.
+///
+/// # Panics
+///
+/// Outside a [`mock_keyring`] guard, and under a [`mock_keyring_broken`] one (as
+/// [`fake_qdrant_dsn`]).
+pub fn fake_machine_identity() -> (Option<String>, Option<String>) {
+    match crate::secret::fake()
+        .clone()
+        .expect("fake keyring not installed; take a `mock_keyring()` guard first")
+    {
+        crate::secret::Fake::Slot(slots) => {
+            (slots.infisical_client_id, slots.infisical_client_secret)
+        }
+        crate::secret::Fake::Broken(_) => {
+            panic!("the fake keyring is broken; it holds no identity to read")
+        }
+    }
+}
+
+/// Makes the installed fake refuse every **store** to `user` (one of the `INFISICAL_*_USER`
+/// constants) until the guard drops. Used to prove `set_machine_identity` leaves no half.
+///
+/// # Panics
+///
+/// Outside a [`mock_keyring`] guard, and under a [`mock_keyring_broken`] one.
+pub fn refuse_fake_store(user: &'static str) {
+    match &mut *crate::secret::fake() {
+        Some(crate::secret::Fake::Slot(slots)) => slots.refuse_store = Some(user),
+        Some(crate::secret::Fake::Broken(_)) => {
+            panic!("the fake keyring is broken; it already refuses every store")
+        }
+        None => panic!("fake keyring not installed; take a `mock_keyring()` guard first"),
+    }
+}
+
 /// Writes the six unscoped tables of a [`DemoData`] straight into a mirror, with no server.
 ///
 /// The refresher is the only *production* writer of `cache.sqlite` and it needs a `PgPool`; a test

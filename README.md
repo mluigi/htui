@@ -481,6 +481,12 @@ HTUI_TEST_DATABASE_URL=postgres://postgres:htui@localhost:5439/postgres cargo te
 The Qdrant tests read `HTUI_TEST_QDRANT_URL` the same way (`http://localhost:6334` with the
 included `compose.yaml`).
 
+The Infisical live test reads `HTUI_TEST_INFISICAL_URL`, `HTUI_TEST_INFISICAL_CLIENT_ID`,
+`HTUI_TEST_INFISICAL_CLIENT_SECRET`, `HTUI_TEST_INFISICAL_PROJECT_ID` and
+`HTUI_TEST_INFISICAL_ENVIRONMENT` (`cargo test -p htui-secrets --test infisical_live`); without the
+URL it prints `skipped: HTUI_TEST_INFISICAL_URL not set` and passes. Use a throwaway identity with
+read access to one test environment.
+
 The test suite never touches your real configuration directory or keyring entry. A test run that is
 killed halfway can leave `htui_test_…` databases behind; drop them by hand.
 
@@ -540,3 +546,4 @@ arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 - [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md): the full requirements.
 - [`docs/personas.md`](docs/personas.md): agent personas and how they narrow a step.
 - [`docs/htui-mcp.md`](docs/htui-mcp.md): htui's MCP server, the tools every agent session gets.
+- [`docs/htui-secrets.md`](docs/htui-secrets.md): the Infisical secret provider — machine identity, base URL, errors.

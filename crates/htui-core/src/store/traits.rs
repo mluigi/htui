@@ -1481,7 +1481,7 @@ pub trait WriteStore: ReadStore {
     ///
     /// A read on [`WriteStore`] rather than [`ReadStore`], by milestone 1's precedent for
     /// [`repos`](WriteStore::repos) and [`phases`](WriteStore::phases): `command_run` is not a
-    /// mirrored table — [`MIRRORED_TABLES`](crate::store::MIRRORED_TABLES) does not list it — so a
+    /// mirrored table — htui-store's `MIRRORED_TABLES` does not list it — so a
     /// `ReadStore` placement would put it where the conformance suite, which is written against
     /// `WriteStore` alone, could never reach it.
     ///
