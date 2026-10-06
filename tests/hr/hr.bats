@@ -1178,7 +1178,7 @@ EOF
 @test "40b. compose: the dev container shares the host's clock zone, read-only" {
     local cfg f
     cfg="$(compose_config)"
-    for f in /etc/localtime /etc/timezone; do
+    for f in /etc/localtime; do
         [[ "$(jq -c --arg t "$f" '.services.dev.volumes[] | select(.target == $t) | [.type, .source, .read_only]' <<<"$cfg")" \
             == "[\"bind\",\"$f\",true]" ]]
     done

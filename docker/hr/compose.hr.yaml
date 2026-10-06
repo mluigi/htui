@@ -86,8 +86,8 @@ services:
       - {type: bind, source: "${HR_CLAUDE_JSON:?}",          target: /hr-seed/claude.json, read_only: true, bind: {create_host_path: false}}
       # The host's clock zone: the image has no tzdata, so TZ= alone would fall back to UTC. Docker
       # follows the /etc/localtime symlink, so the container gets the zone file itself.
+      # /etc/timezone is not mounted: Ubuntu 26.04 no longer ships it, and a missing bind source fails `up`.
       - {type: bind, source: /etc/localtime, target: /etc/localtime, read_only: true, bind: {create_host_path: false}}
-      - {type: bind, source: /etc/timezone,  target: /etc/timezone,  read_only: true, bind: {create_host_path: false}}
       # Only the tool dirs of ~/.local, read-only (review C1): the rest of it holds secrets (nvim undo
       # histories of credential files, keyrings, uv/gh credentials). claude = mise installs; gortex,
       # uv/uvx (stale, shadowed) = ~/.local/bin; python3 -> uv/python; graphify, headroom -> uv/tools

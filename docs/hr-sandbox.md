@@ -436,7 +436,7 @@ runs rather than letting them pile up.
 | the run's clone | `~/projects/htui` | read-write |
 | this repo | `/host/htui` | read-only, the clone's `origin` |
 | `~/.local/bin`, `~/.local/share/mise/installs`, `~/.local/share/uv/python`, `~/.local/share/uv/tools` (claude, gortex, graphify, headroom, uv) | same paths | read-only; nothing else of `~/.local` |
-| `/etc/localtime`, `/etc/timezone` | same paths | read-only; the run shows the host's local time (the image has no `tzdata`, so `TZ` alone would mean UTC). A run already up picks it up after `down` + `up` |
+| `/etc/localtime` | same path | read-only; the run shows the host's local time (the image has no `tzdata`, so `TZ` alone would mean UTC). A run already up picks it up after `down` + `up` |
 | `~/.claude` (login, settings, plugins, skills, agents, commands) | same path | read-write, shared by all runs, except what the next rows mask |
 | `~/.claude/projects/-home-mluigi-projects-htui` (this project's auto-memory and sessions) | same path | read-write, shared |
 | the rest of `~/.claude/projects`, and `file-history`, `paste-cache`, `shell-snapshots`, `session-env`, `session-data`, `sessions`, `daemon`, `jobs`, `backups`, `metrics`, `.remember` in `~/.claude` | an empty `tmpfs` each (256 MB for `projects`, 128 MB `file-history`, 64 MB `paste-cache`, 16 MB the rest) | per container, gone when it stops |
