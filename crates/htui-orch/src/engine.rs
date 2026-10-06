@@ -18626,6 +18626,51 @@ mod tests {
             assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
         }
 
+        /// MOD-70 review R2 P-1: [`dropped_with_a_follow_up`]'s stranded follow-up (the window
+        /// close gave up, R-3) on a run the walk then parks at a gate. The walk gives the lease
+        /// back with no live session, and no later re-take of a parked run closes anything (D9
+        /// runs only for `DeadWalks`), so the run's windows close before the lease goes back,
+        /// as for a run that finished.
+        #[tokio::test(start_paused = true)]
+        async fn a_stranded_follow_up_is_refused_when_its_run_parks() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id).0,
+                RunCommandStatus::Pending,
+                "the stranded follow-up is pending, its window open"
+            );
+            harness_engine!(harness.orch, engine);
+            let (store, now) = (&harness.orch.store, harness.orch.clock.now());
+
+            engine
+                .walk_leased(ghost.run_id, engine.fresh_until(), async {
+                    assert!(
+                        store
+                            .transition_run(
+                                ghost.run_id,
+                                RunStatus::Running,
+                                RunStatus::AwaitingApproval,
+                                now,
+                            )
+                            .await?,
+                        "the walk parked the run"
+                    );
+                    Ok::<_, EngineError>(())
+                })
+                .await
+                .expect("the walk parked the run");
+
+            let row = harness.orch.run(ghost.run_id).await;
+            assert_eq!(row.status, RunStatus::AwaitingApproval);
+            assert_eq!(
+                row.lease_expires_at,
+                Some(now),
+                "the parked run's lease went back"
+            );
+            assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
+        }
+
         /// MOD-70 review M-3 at a cancel command: the run's stranded follow-up is refused with
         /// the run-cancelled sentence before the cancel gives the lease back.
         #[tokio::test(start_paused = true)]
