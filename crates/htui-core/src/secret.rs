@@ -110,9 +110,23 @@ impl SecretScope {
     ///
     /// [`SecretError::Config`]: not JSON of this shape, or a [`Self::new`] refusal.
     pub fn parse(column: &str) -> Result<Self, SecretError> {
-        // The column holds no secret, so serde's message may be quoted here.
-        let parsed: ScopeColumn = serde_json::from_str(column)
-            .map_err(|err| SecretError::Config(format!("the secret scope is not valid: {err}")))?;
+        // The column holds no secret, so serde's message may be quoted here. serde prints an
+        // unknown key with `Display`, so control characters are escaped before the sentence
+        // can reach a terminal.
+        let parsed: ScopeColumn = serde_json::from_str(column).map_err(|err| {
+            let detail: String = err
+                .to_string()
+                .chars()
+                .map(|c| {
+                    if c.is_control() {
+                        c.escape_debug().to_string()
+                    } else {
+                        c.to_string()
+                    }
+                })
+                .collect();
+            SecretError::Config(format!("the secret scope is not valid: {detail}"))
+        })?;
         Self::new(parsed.project_id, parsed.environment, parsed.path)
     }
 
@@ -500,6 +514,27 @@ mod tests {
         );
         // Printable non-ASCII is not a control character.
         SecretScope::new("p1", "dév", "/é/✓").expect("printable Unicode is accepted");
+    }
+
+    /// serde quotes an unknown key with `Display`: a control character in it must reach the
+    /// `Config` sentence escaped, never raw.
+    #[test]
+    fn scope_parse_escapes_control_characters_in_serde_messages() {
+        let sentence = config_sentence(SecretScope::parse(
+            r#"{"project_id":"p1","environment":"dev","x\u001b[2J\u0007":1}"#,
+        ));
+        assert!(
+            sentence.starts_with("the secret scope is not valid: "),
+            "unexpected sentence: {sentence:?}"
+        );
+        assert!(
+            !sentence.chars().any(char::is_control),
+            "a raw control character reached the sentence: {sentence:?}"
+        );
+        assert!(
+            sentence.contains(r"x\u{1b}[2J\u{7}"),
+            "the key is not shown escaped: {sentence:?}"
+        );
     }
 
     #[test]
