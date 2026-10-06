@@ -40,6 +40,10 @@
 //! through a data spec ([`box_probe::spec`]) that [`probe`]'s resolver walks. It never writes; the
 //! [`BoxProbe`](htui_core::model::BoxProbe) it returns is what the store records.
 //!
+//! [`private_dir`] is MOD-79's answer to "and where does a file another account must not read
+//! go": one `0700` per-process directory helper (on Windows, the per-user temp directory) that
+//! `htui-mcp`'s socket and the CLI driver's MCP config both live in.
+//!
 //! [`contained`] is MOD-65's answer to "and what if a thread it starts panics": every blocking
 //! thread and task this crate starts runs inside [`excerpt::contain`]'s window, so a panic tokio
 //! catches and hands back as a `JoinError` is one `htui`'s panic hook leaves the terminal alone
@@ -116,6 +120,7 @@ pub mod install;
 pub mod launch;
 pub mod permission;
 pub mod persona;
+pub mod private_dir;
 pub mod probe;
 pub mod prompt_bridge;
 pub mod record;

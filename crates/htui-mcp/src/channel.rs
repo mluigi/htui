@@ -473,7 +473,6 @@ async fn connect_next<P: PipeInstance>(
 
 #[cfg(unix)]
 mod platform {
-    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -485,37 +484,14 @@ mod platform {
     /// The socket's file name inside the private directory: short, for `sun_path` (H-12).
     pub(super) const SOCKET_NAME: &str = "s";
 
-    /// `$XDG_RUNTIME_DIR` when set, absolute and a directory, else the temp directory.
-    fn base() -> PathBuf {
-        std::env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|dir| dir.is_absolute() && dir.is_dir())
-            .unwrap_or_else(std::env::temp_dir)
-    }
-
-    /// Creates `<base>/htui-mcp-<pid>-<8 hex>` with mode `0700` and checks it is private.
-    fn private_dir() -> std::io::Result<PathBuf> {
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let name = format!("htui-mcp-{}-{}", std::process::id(), &suffix[..8]);
-        let dir = base().join(name);
-        std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-        let mode = std::fs::metadata(&dir)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            let _ = std::fs::remove_dir(&dir);
-            return Err(std::io::Error::other(format!(
-                "{} is not private (mode {mode:o})",
-                dir.display()
-            )));
-        }
-        Ok(dir)
-    }
-
     pub(super) fn bind(
         lookup: Lookup,
         budget: Duration,
         stopped: watch::Receiver<bool>,
     ) -> std::io::Result<(Address, Option<PathBuf>)> {
-        let dir = private_dir()?;
+        // `<base>/htui-mcp-<pid>-<8 hex>`, `0700` and checked: the helper the CLI driver's MCP
+        // config shares, so both sit under one base (MOD-79 D2).
+        let dir = htui_agent::private_dir::create("htui-mcp")?;
         let socket = dir.join(SOCKET_NAME);
         let listener = match UnixListener::bind(&socket) {
             Ok(listener) => listener,
