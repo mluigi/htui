@@ -4,7 +4,7 @@
 **Requirements**: `R-MCP-1`, `R-NF-1`
 **Routed**: plan path (0 criteria fired), accepted by the maintainer 2026-10-06
 **Complexity**: Small
-**Status**: confirmed 2026-10-06 (Windows ACL: option A)
+**Status**: done 2026-10-06 (`docs/decisions/mod/mod-79.md`; Windows ACL: option A)
 
 ## Summary
 
@@ -175,18 +175,19 @@ no token.
 | `claude` accepts `--mcp-config=<path>` (`=`-joined, one argv element) and spawns the file's servers with the file's `env` | ✓ verified | Probe, claude 2.1.289: `--mcp-config=/tmp/mcpprobe/c.json` (mode 0600), and the stdio server logged `T=from-file` |
 | The CLI help lists `--mcp-config <configs...>` as "JSON files or strings" | ✓ | `claude --help` line 132 |
 | The token is put in argv today by `cli::argv` via `mcp_config(&spec.mcp)` | ✓ | `crates/htui-agent/src/cli/mod.rs:182-184`, `:213-232`; token minted into `env` at `crates/htui-mcp/src/host.rs:414-422` |
-| `ResolvedLaunch`'s `Debug` prints `args` unredacted (L2) | ✓ | `crates/htui-agent/src/launch.rs:452-461` |
+| `ResolvedLaunch`'s `Debug` prints `args` unredacted (L2) | ✓ (`RedactedEnv` itself lives in `driver.rs:325`, so T4 also touches `driver.rs`) | `crates/htui-agent/src/launch.rs:452-461` |
 | No current `Debug` path logs the token (L2 refuted) | ✓ (recorded) | `docs/decisions/mod/mod-11.md:244`; the change is hardening |
 | `unsafe_code = "forbid"` workspace-wide; `htui-agent` inherits it | ✓ | `Cargo.toml:182`; `crates/htui-agent/Cargo.toml:83-84` |
 | `htui-mcp` depends on `htui-agent` (it can host the shared helper) | ✓ | `crates/htui-mcp/Cargo.toml:17`; `channel.rs` calls `htui_agent::contained::spawn` |
 | The private-dir pattern exists only in `channel.rs` | ✓ | text search: `private_dir` only at `channel.rs:497,518` |
-| `argv` has 1 production and 8 test call sites | ✓ | `cli/mod.rs:453`; `tests/cli_driver.rs:171,207,249,472,473,543,582,590` |
+| `argv` has 1 production and 8 test call sites | ✗ corrected by the blueprint: 13 test call sites | `cli/mod.rs:453`; `tests/cli_driver.rs:171,207,249,472,473,543,582,590` |
 | `SessionOptions` is built literally at 2 sites | ✓ | `cli/mod.rs:501`; `tests/cli_driver.rs:1447` |
 | `open_session`'s timeout arm aborts the task, so task-owned state is dropped | ✓ | `cli/mod.rs:842-853` |
 | The ACP path never puts the spec on argv | ✓ | `docs/htui-mcp.md:190-191`; `tests/acp_driver.rs:2008` (`session_new_carries_the_mcp_server_as_stdio`) |
 | `tempfile` is a dev-dependency only (the product code must not need it) | ✓ | `crates/htui-agent/Cargo.toml:78` under `[dev-dependencies]` |
 | The Windows GNU target is not installed in this sandbox | ✓ | `rustup target list --installed` → linux only; validation adds it |
 | Task independence: T4 `{launch.rs, tests/launch.rs}` ∩ T5 `{docs/htui-mcp.md}` ∩ T1–T3 `{private_dir.rs, lib.rs, channel.rs, cli/mcp_file.rs, cli/mod.rs, tests/cli_driver.rs}` = ∅ | ✓ | File table above; T1–T3 share `cli/mod.rs`, hence serial |
+| `htui-agent` builds alone with `Uuid::new_v4` | ✗ found by the blueprint: needs `uuid` feature `v4` (it compiled only through `htui-mcp`); added in T1 | `crates/htui-agent/Cargo.toml` |
 
 ## Acceptance
 

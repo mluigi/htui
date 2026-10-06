@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
+**Current status (2026-10-06):** **MOD-79 is done** (`docs/decisions/mod/mod-79.md`): the MCP
+token is off claude's argv. `claude-cli` gets `--mcp-config=<path>` to a `0600` `mcp.json` in a per-session `0700`
+directory (`htui-cli-<pid>-<8 hex>`, same base as the socket; on Windows under the per-user temp dir, inheriting
+its DACL). The session task owns the file, so every exit removes it. `ResolvedLaunch`'s `Debug` redacts
+`--mcp-config` values. `htui_agent::private_dir` is now the one private-directory helper (`channel.rs` uses it).
+No migration, no new crate.
+Before it, **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
 pane reflows an item's hard-wrapped Markdown before wrapping it. Soft-wrapped lines of a paragraph or list item
 join, list items hang under their text, blank lines, fences, headings, tables and quotes stay as written, and inline
 code is drawn in the accent style without its backticks (`ui::markdown`, `cells::wrap_spans`). The scroll counts
@@ -26,27 +32,6 @@ degraded store label, the waiting count) and diff-added (green) have their own `
 the terminal foreground plus bold, `dim` is `Indexed(244)`, and active tabs are bold and underlined.
 `NO_COLOR` selects `Theme::monochrome()`, which marks everything with modifiers alone. Style only, no
 text or snapshot change. The remaining non-focus cyan is **MOD-85**.
-Before it, **MOD-77 is done** (`docs/decisions/mod/mod-77.md`): every fenced
-Postgres step writer locks the step before the run, `park_step`'s order, so none can deadlock (`40P01`)
-against a park. Step updaters take `FOR NO KEY UPDATE OF s FOR SHARE OF r` up front; reader-inserters
-(`append_events`, `record_commits`, the relay's `open_permission`) take `FOR KEY SHARE OF s FOR SHARE OF
-r`; `finish_chat_run` locks its step first. Fifteen deterministic lock-order tests. No migration; `.sqlx`
-regenerated.
-Before it, **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
-waiting-on-you list. `Ctrl+W` opens, from every screen, an overlay listing every run in the active
-workspace that waits on a person, one row per reason (gate, selection, judge failed, unblock,
-interrupted, open permission with its tool); `Enter` opens the item's Runs tab on that step. The top
-bar reads `N working · M waiting`. It is derived each tick by `StoreRequest::Waiting` (replacing
-`ActiveRuns`) from `ReadStore::waiting_candidates` + `WriteStore::open_permissions` and the pure
-`htui_worker::waiting`, which reuses the Runs pane's guards; the list keeps no state. `R-TUI-11`
-added, `R-TUI-1` amended. No migration, no new crate, four new `.sqlx` entries. It spawned **MOD-75**
-(agent question tool, blocked on MOD-11).
-Before it, **MOD-76 is done** (`docs/decisions/mod/mod-76.md`): MOD-37's four
-carried risks. R-32 and R-53 closed as accepted with no code. The Runs pane shortens `agent/model`
-before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
-`claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
-the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
-with no run walking, never under a live walk. No migration.
 Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
 `heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
 MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
@@ -280,13 +265,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   the lease only sets the session's `ended`. Add a cancellation signal on `Session` (a `watch` or a
   `CancellationToken`) that `Served::call` selects against, so an in-flight call ends with its
   session. Not blocked.
-- [ ] **MOD-79 - MCP token off claude's argv** (from MOD-11, `docs/decisions/mod/mod-11.md`,
-  blueprint E-1 and review L2). `R-MCP-1`, `R-NF-1`. `claude-cli` gets the per-session
-  `HTUI_MCP_TOKEN` inline in `--mcp-config=<json>`, so any local user can read it from
-  `/proc/<pid>/cmdline`. It is useless without the `0700` socket directory, but it should not be
-  there. Pass a `0600` config file in the session's private directory instead (the CLI accepts a
-  path), and redact `--mcp-config` arguments in `ResolvedLaunch`'s `Debug`. A Windows equivalent for
-  the file's ACL is part of the item. Not blocked.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
@@ -471,6 +449,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 23 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
