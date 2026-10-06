@@ -70,6 +70,14 @@ cargo build --release
 
 The binary is `target/release/htui` (`target/release/htui.exe` on Windows).
 
+To install it onto your `PATH` (`~/.cargo/bin`) instead, use `cargo install`. htui is not published
+to crates.io, so install from git or from a checkout:
+
+```
+cargo install --git https://git.mluigi.it/htui.git htui --locked
+cargo install --path crates/htui --locked
+```
+
 ### Toolchain
 
 `workspace.package.rust-version` in `Cargo.toml` and `clippy.toml` both say `1.98`, matching the

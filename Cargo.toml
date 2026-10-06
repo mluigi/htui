@@ -7,6 +7,9 @@ resolver = "3"
 edition      = "2024"
 rust-version = "1.98"          # MSRV = the exact toolchain pin (T7/X9); see README "Toolchain"
 license      = "MIT"
+repository   = "https://git.mluigi.it/htui.git"
+# Install from git or a checkout, not crates.io: `cargo install --git <repository> htui --locked`
+# or `cargo install --path crates/htui --locked`. Neither consults `publish`.
 publish      = false
 
 # Debug info is what made `target/` reach 161 GB and each of a dozen concurrent `rust-lld`
