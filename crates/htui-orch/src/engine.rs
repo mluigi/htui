@@ -6123,6 +6123,8 @@ where
             poll: RELAY_POLL,
             grace: RELAY_GRACE,
             now: &now,
+            // MOD-70 D8: T3 sets it for main and candidate sessions.
+            follow_ups: false,
         };
         // MOD-37 M4 D1: under a deadline `drive` runs against a step-local control, which
         // `forward_or_cut` feeds from the run's; without one, against the run's own, and no

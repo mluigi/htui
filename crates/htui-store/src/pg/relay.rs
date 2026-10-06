@@ -19,9 +19,10 @@
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AnswerOutcome, AnswerRefusal, BoxId, CancelRequest, ItemId, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, ProjectId, RelayOption, RelaySessionId, RelayView, RunCommand,
-    RunCommandId, RunCommandKind, RunCommandStatus, RunId, Scope, StepId, StepPermission, UserId,
+    AnswerOutcome, AnswerRefusal, BoxId, CancelRequest, FollowUpRequest, FollowUpSettle, ItemId,
+    NewFollowUp, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, ProjectId,
+    QueuedFollowUp, RelayOption, RelaySessionId, RelayView, RunCommand, RunCommandId,
+    RunCommandKind, RunCommandStatus, RunId, Scope, SettleOutcome, StepId, StepPermission, UserId,
     WaitingPermission,
 };
 use htui_core::store::{Result, StoreError, references_no_row};
@@ -546,6 +547,7 @@ pub(super) async fn relay_view(store: &PgStore, item: ItemId) -> Result<RelayVie
     Ok(RelayView {
         permissions: permissions.into_iter().map(StepPermission::from).collect(),
         cancels,
+        follow_ups: Vec::new(),
     })
 }
 
@@ -640,4 +642,64 @@ pub(super) async fn open_permissions(
         .collect();
     WaitingPermission::sort_canonical(&mut out);
     Ok(out)
+}
+
+// ---- MOD-70 (plan D1-D5, D9): follow-ups. T1 writes the bodies against `0016_follow_up.sql`. ----
+
+/// [`WriteStore::request_follow_up`](htui_core::store::WriteStore::request_follow_up).
+pub(super) async fn request_follow_up(
+    _store: &PgStore,
+    _new: NewFollowUp,
+) -> Result<FollowUpRequest> {
+    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+}
+
+/// [`WriteStore::open_follow_ups`](htui_core::store::WriteStore::open_follow_ups).
+pub(super) async fn open_follow_ups(
+    _store: &PgStore,
+    _run: RunId,
+    _step: StepId,
+    _session: RelaySessionId,
+    _owner: Uuid,
+) -> Result<bool> {
+    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+}
+
+/// [`WriteStore::next_follow_up`](htui_core::store::WriteStore::next_follow_up).
+pub(super) async fn next_follow_up(
+    _store: &PgStore,
+    _step: StepId,
+    _session: RelaySessionId,
+) -> Result<Option<QueuedFollowUp>> {
+    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+}
+
+/// [`WriteStore::settle_follow_up`](htui_core::store::WriteStore::settle_follow_up).
+pub(super) async fn settle_follow_up(
+    _store: &PgStore,
+    _id: RunCommandId,
+    _owner: Uuid,
+    _to: FollowUpSettle,
+) -> Result<SettleOutcome> {
+    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+}
+
+/// [`WriteStore::close_follow_ups`](htui_core::store::WriteStore::close_follow_ups).
+pub(super) async fn close_follow_ups(
+    _store: &PgStore,
+    _step: StepId,
+    _session: RelaySessionId,
+    _reason: &str,
+) -> Result<u64> {
+    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
+}
+
+/// [`WriteStore::close_dropped_follow_ups`](htui_core::store::WriteStore::close_dropped_follow_ups).
+pub(super) async fn close_dropped_follow_ups(
+    _store: &PgStore,
+    _run: RunId,
+    _owner: Uuid,
+    _reason: &str,
+) -> Result<u64> {
+    Err(StoreError::Backend("MOD-70 T1: not yet implemented".into()))
 }

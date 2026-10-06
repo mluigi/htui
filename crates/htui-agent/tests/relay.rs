@@ -37,9 +37,10 @@ use htui_agent::record::{
 use htui_core::fixtures::ids;
 use htui_core::model::persona::SnapshotPersona;
 use htui_core::model::{
-    AnswerOutcome, Claim, EventKind, GraphSnapshot, Isolation, NewRun, NewRunStep, OpenPermission,
-    PermissionChoice, PermissionId, PermissionStatus, RelayOptionKind, RelaySessionId, RunId,
-    RunMode, SessionEvent, SnapshotGraph, SnapshotSettings, StepId, StepPermission,
+    AnswerOutcome, Claim, EventKind, FollowUpSettle, GraphSnapshot, Isolation, NewRun, NewRunStep,
+    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, QueuedFollowUp,
+    RelayOptionKind, RelaySessionId, RunCommandId, RunId, RunMode, SessionEvent, SettleOutcome,
+    SnapshotGraph, SnapshotSettings, StepId, StepPermission,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{
@@ -184,6 +185,7 @@ fn relay_over<'a, R: htui_core::store::RelayStore>(
         poll: POLL,
         grace: RELAY_GRACE,
         now: &at,
+        follow_ups: false,
     }
 }
 
@@ -501,6 +503,51 @@ impl htui_core::store::RelayStore for FailingReads {
     ) -> StoreResult<u64> {
         WriteStore::settle_permissions(&self.store, session, to).await
     }
+
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> StoreResult<bool> {
+        WriteStore::open_follow_ups(&self.store, run, step, session, owner).await
+    }
+
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> StoreResult<Option<QueuedFollowUp>> {
+        WriteStore::next_follow_up(&self.store, step, session).await
+    }
+
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> StoreResult<SettleOutcome> {
+        WriteStore::settle_follow_up(&self.store, id, owner, to).await
+    }
+
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        WriteStore::close_follow_ups(&self.store, step, session, reason).await
+    }
+
+    async fn close_dropped_follow_ups(
+        &self,
+        run: RunId,
+        owner: Uuid,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        WriteStore::close_dropped_follow_ups(&self.store, run, owner, reason).await
+    }
 }
 
 /// `MemStore`'s relay surface, except that `settle_permissions` answers `Unreachable`.
@@ -532,6 +579,51 @@ impl htui_core::store::RelayStore for FailingSettles {
         Err(StoreError::Unreachable(
             "the settle is switched off".to_owned(),
         ))
+    }
+
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> StoreResult<bool> {
+        WriteStore::open_follow_ups(&self.0, run, step, session, owner).await
+    }
+
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> StoreResult<Option<QueuedFollowUp>> {
+        WriteStore::next_follow_up(&self.0, step, session).await
+    }
+
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> StoreResult<SettleOutcome> {
+        WriteStore::settle_follow_up(&self.0, id, owner, to).await
+    }
+
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        WriteStore::close_follow_ups(&self.0, step, session, reason).await
+    }
+
+    async fn close_dropped_follow_ups(
+        &self,
+        run: RunId,
+        owner: Uuid,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        WriteStore::close_dropped_follow_ups(&self.0, run, owner, reason).await
     }
 }
 
@@ -1459,6 +1551,7 @@ async fn a_session_that_fails_while_parked_leaves_no_pending_row() {
         poll: POLL,
         grace: RELAY_GRACE,
         now: &at,
+        follow_ups: false,
     };
 
     let out = within(drive(

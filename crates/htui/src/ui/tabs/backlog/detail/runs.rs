@@ -5238,6 +5238,7 @@ mod tests {
             view: Box::new(RelayView {
                 permissions,
                 cancels,
+                follow_ups: Vec::new(),
             }),
         }
     }

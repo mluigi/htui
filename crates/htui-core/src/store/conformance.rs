@@ -19,24 +19,26 @@ use crate::model::{
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRow, CancelRequest, ChatRunSpec, CitationKind,
     Claim, CommandQueue, CommandRun, CommandRunId, CommandRunStatus, CoverageRow,
     DEFAULT_MAX_CONCURRENT_ITEMS, Document, DocumentId, EditReason, EventKind, EventRole, Executor,
-    Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemCitation, ItemFilter, ItemId,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule, PermissionChoice,
-    PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId, PersonaMatch, PersonaPatch,
-    PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority,
-    ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate, PromptTemplateId,
-    RelayOption, RelayOptionKind, RelaySessionId, RelayView, RepoBoxPath, RepoId, RepoPatch,
-    RepoScope, Requirement, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementState, RequirementUpdate, Resolution, Run, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunScope, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry, UserId, VerifyOutcome,
-    WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, missing_tags_failure,
+    FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
+    FollowUpSettle, FollowUpText, FollowUpView, Gate, GateOutcome, GraphSnapshot, Isolation, Item,
+    ItemCitation, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemPatch, ItemSummary, LinkKind,
+    NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote, NewPersona, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, NoteId, OpenPermission, OverlapRule,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId,
+    PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId,
+    PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
+    PromptTemplateId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RelayView,
+    RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter,
+    RequirementId, RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate,
+    Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
+    RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome,
+    Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings,
+    Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry,
+    UserId, VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, canonical_declared_tags, executor_scrub_refusal,
+    missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -203,6 +205,15 @@ pub const CASES: &[&str] = &[
     "cancel_command_ends_a_queued_or_running_row",
     "waiting_candidates_hold_every_park_and_nothing_else",
     "open_permissions_list_live_pending_item_requests",
+    "a_follow_up_is_refused_in_the_documented_order",
+    "a_step_has_at_most_one_pending_follow_up",
+    "settling_a_follow_up_is_a_fenced_compare_and_set",
+    "closing_the_window_refuses_what_is_still_queued",
+    "opening_a_window_refuses_an_older_windows_follow_up",
+    "a_cancel_refuses_the_runs_pending_follow_ups",
+    "pending_commands_list_cancels_only",
+    "relay_view_lists_the_newest_follow_up_per_step_without_text",
+    "closing_a_dropped_walks_windows_needs_the_lease",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -527,6 +538,33 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "open_permissions_list_live_pending_item_requests" => {
             open_permissions_list_live_pending_item_requests(store).await;
+        }
+        "a_follow_up_is_refused_in_the_documented_order" => {
+            a_follow_up_is_refused_in_the_documented_order(store).await;
+        }
+        "a_step_has_at_most_one_pending_follow_up" => {
+            a_step_has_at_most_one_pending_follow_up(store).await;
+        }
+        "settling_a_follow_up_is_a_fenced_compare_and_set" => {
+            settling_a_follow_up_is_a_fenced_compare_and_set(store).await;
+        }
+        "closing_the_window_refuses_what_is_still_queued" => {
+            closing_the_window_refuses_what_is_still_queued(store).await;
+        }
+        "opening_a_window_refuses_an_older_windows_follow_up" => {
+            opening_a_window_refuses_an_older_windows_follow_up(store).await;
+        }
+        "a_cancel_refuses_the_runs_pending_follow_ups" => {
+            a_cancel_refuses_the_runs_pending_follow_ups(store).await;
+        }
+        "pending_commands_list_cancels_only" => {
+            pending_commands_list_cancels_only(store).await;
+        }
+        "relay_view_lists_the_newest_follow_up_per_step_without_text" => {
+            relay_view_lists_the_newest_follow_up_per_step_without_text(store).await;
+        }
+        "closing_a_dropped_walks_windows_needs_the_lease" => {
+            closing_a_dropped_walks_windows_needs_the_lease(store).await;
         }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
@@ -15881,17 +15919,29 @@ async fn open_permissions_list_live_pending_item_requests<S: WriteStore>(store: 
     );
 }
 
-/// MOD-42 plan D1: both relay tables go with their run, so deleting the project takes its rows.
+/// MOD-42 plan D1: both relay tables go with their run, so deleting the project takes its rows;
+/// MOD-70 plan D1: so do the step's follow-up window and its follow-ups.
 async fn deleting_a_project_takes_its_relay_rows<S: WriteStore>(store: &S) {
     const CASE: &str = "deleting_a_project_takes_its_relay_rows";
     let a = Uuid::now_v7();
-    let (run, step) = leased_step(CASE, store, a, seam_clock()).await;
+    let (run, step) = follow_up_step(CASE, store, a, seam_clock()).await;
     let id = parked(
         CASE,
         store,
         open_request(run, step, RelaySessionId::new(), "req-1", a),
     )
     .await;
+    let session = window_of(CASE, store, run, step, a).await;
+    let f = queued(CASE, store, follow_up(step, "use the smaller fixture")).await;
+    assert_eq!(
+        store
+            .next_follow_up(step, session)
+            .await
+            .expect(CASE)
+            .map(|q| q.id),
+        Some(f),
+        "{CASE}: precondition: the follow-up is pending"
+    );
     let CancelRequest::Inserted(x) = cancel_of(CASE, store, run).await else {
         panic!("{CASE}: the first request writes a row");
     };
@@ -15921,6 +15971,964 @@ async fn deleting_a_project_takes_its_relay_rows<S: WriteStore>(store: &S) {
         "run_command",
         "resolving the cancel of a deleted run",
     );
+    assert_eq!(
+        store.next_follow_up(step, session).await.expect(CASE),
+        None,
+        "{CASE}: the window went with its run"
+    );
+    not_found_on(
+        CASE,
+        store.settle_follow_up(f, a, FollowUpSettle::Applied).await,
+        "run_command",
+        "settling the follow-up of a deleted run",
+    );
+}
+
+// ------------------------------------------------------------------------------------------
+// MOD-70 T0 (plan D1-D5, D9; blueprint B-3..B-5, B-13, B-14, B-19): follow-ups for engine steps.
+// Each case starts from `follow_up_step` (owner A, the fixture box, item `HTUI_ANA_2`, the step
+// `running`); the demo user and the fixture box are the sending actor. A box runs at most two
+// claimed runs at once, so no case leases more than two.
+// ------------------------------------------------------------------------------------------
+
+/// MOD-70: `leased_step`, with the step moved `pending -> running`.
+async fn follow_up_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    a: Uuid,
+    at: DateTime<Utc>,
+) -> (RunId, StepId) {
+    let (run, step) = leased_step(case, store, a, at).await;
+    assert!(
+        store
+            .transition_step(step, StepStatus::Pending, StepStatus::Running, at)
+            .await
+            .expect(case),
+        "{case}: pending -> running is a sanctioned move"
+    );
+    (run, step)
+}
+
+/// Opens `step`'s follow-up window for a fresh session under `owner`, and answers the session.
+async fn window_of<S: WriteStore>(
+    case: &str,
+    store: &S,
+    run: RunId,
+    step: StepId,
+    owner: Uuid,
+) -> RelaySessionId {
+    let session = RelaySessionId::new();
+    assert!(
+        store
+            .open_follow_ups(run, step, session, owner)
+            .await
+            .expect(case),
+        "{case}: the lease owner opens the step's window"
+    );
+    session
+}
+
+/// A follow-up of `step` with a fresh id, sent by the demo user from the fixture box.
+fn follow_up(step: StepId, text: &str) -> NewFollowUp {
+    NewFollowUp {
+        id: RunCommandId::new(),
+        run_step_id: step,
+        text: FollowUpText::new(text.to_owned()).expect("a follow-up fixture is prose"),
+        issued_by: ids::USER,
+        issued_box: ids::BOX,
+    }
+}
+
+/// Enqueues `new` and answers its id, or a panic naming the case.
+async fn queued<S: WriteStore>(case: &str, store: &S, new: NewFollowUp) -> RunCommandId {
+    let id = new.id;
+    assert_eq!(
+        store.request_follow_up(new).await.expect(case),
+        FollowUpRequest::Queued(id),
+        "{case}: the follow-up is queued under its own id"
+    );
+    id
+}
+
+/// What an enqueue of a fresh follow-up on `step` answers.
+async fn enqueue<S: WriteStore>(case: &str, store: &S, step: StepId) -> FollowUpRequest {
+    store
+        .request_follow_up(follow_up(step, "and run the linter too"))
+        .await
+        .expect(case)
+}
+
+/// MOD-70: a second run, of a fresh item (an item walks one run at a time), claimed by `owner`,
+/// with a running step at `(0, 1, 0)`.
+async fn other_follow_up_step<S: WriteStore>(
+    case: &str,
+    store: &S,
+    owner: Uuid,
+    at: DateTime<Utc>,
+) -> (ItemId, RunId, StepId) {
+    let item = minted(case, store, "follow-up").await;
+    let run = claimed(case, store, item, owner, at).await;
+    let step = running_step(case, store, run, (0, 1, 0), at).await;
+    (item, run, step)
+}
+
+/// `step`'s row in the relay view of `HTUI_ANA_2`, if it lists one.
+async fn view_of<S: WriteStore>(case: &str, store: &S, step: StepId) -> Option<FollowUpView> {
+    view_in(case, store, ids::HTUI_ANA_2, step).await
+}
+
+/// `step`'s row in the relay view of `item`, if it lists one.
+async fn view_in<S: WriteStore>(
+    case: &str,
+    store: &S,
+    item: ItemId,
+    step: StepId,
+) -> Option<FollowUpView> {
+    follow_ups_in(case, store, item)
+        .await
+        .into_iter()
+        .find(|row| row.run_step_id == step)
+}
+
+/// The relay view's follow-ups of `HTUI_ANA_2`.
+async fn follow_ups_of<S: WriteStore>(case: &str, store: &S) -> Vec<FollowUpView> {
+    follow_ups_in(case, store, ids::HTUI_ANA_2).await
+}
+
+/// The relay view's follow-ups of `item`.
+async fn follow_ups_in<S: WriteStore>(case: &str, store: &S, item: ItemId) -> Vec<FollowUpView> {
+    store.relay_view(item).await.expect(case).follow_ups
+}
+
+/// `step`'s listed row (item `HTUI_ANA_2`) has `id`, `status` and `resolution`, or a panic naming
+/// the case.
+async fn assert_follow_up<S: WriteStore>(
+    case: &str,
+    store: &S,
+    step: StepId,
+    id: RunCommandId,
+    status: RunCommandStatus,
+    resolution: Option<&str>,
+    what: &str,
+) {
+    assert_follow_up_in(
+        case,
+        store,
+        (ids::HTUI_ANA_2, step),
+        id,
+        status,
+        resolution,
+        what,
+    )
+    .await;
+}
+
+/// `assert_follow_up` for a step of another item.
+async fn assert_follow_up_in<S: WriteStore>(
+    case: &str,
+    store: &S,
+    (item, step): (ItemId, StepId),
+    id: RunCommandId,
+    status: RunCommandStatus,
+    resolution: Option<&str>,
+    what: &str,
+) {
+    let row = view_in(case, store, item, step)
+        .await
+        .unwrap_or_else(|| panic!("{case}: {what}: the step lists a follow-up"));
+    assert_eq!(
+        (row.id, row.status, row.resolution.as_deref()),
+        (id, status, resolution),
+        "{case}: {what}"
+    );
+    assert_eq!(
+        row.resolved_at.is_some(),
+        status != RunCommandStatus::Pending,
+        "{case}: {what}: resolved_at is set exactly when the row resolved"
+    );
+}
+
+/// MOD-70 plan D3: an enqueue that writes nothing is refused for the first guard it fails, in
+/// the documented order: the step, the actor, a chat run, a judge, a step not running, a
+/// pending cancel, a pending follow-up, no live executor under the window's owner (B-4), no
+/// window, a closed window. Nothing a refusal answered was written.
+async fn a_follow_up_is_refused_in_the_documented_order<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_follow_up_is_refused_in_the_documented_order";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run_a, pending) = leased_step(CASE, store, a, at).await;
+    let judge = running_step(CASE, store, run_a, (0, 1, -1), at).await;
+    let nowin = running_step(CASE, store, run_a, (1, 1, 0), at).await;
+    let main = running_step(CASE, store, run_a, (2, 1, 0), at).await;
+    let closed = running_step(CASE, store, run_a, (3, 1, 0), at).await;
+    window_of(CASE, store, run_a, main, a).await;
+    let closed_session = window_of(CASE, store, run_a, closed, a).await;
+    assert_eq!(
+        store
+            .close_follow_ups(closed, closed_session, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: closing an empty window refuses nothing"
+    );
+
+    not_found_on(
+        CASE,
+        store
+            .request_follow_up(follow_up(StepId::new(), "unknown"))
+            .await,
+        "run_step",
+        "a follow-up of an unknown step",
+    );
+    let mut stranger = follow_up(pending, "who sent this");
+    stranger.issued_by = UserId::new();
+    constraint_with(
+        CASE,
+        store.request_follow_up(stranger).await,
+        "",
+        "an unknown user is refused before the step's status is read",
+    );
+    let mut elsewhere = follow_up(main, "from where");
+    elsewhere.issued_box = BoxId::new();
+    constraint_with(
+        CASE,
+        store.request_follow_up(elsewhere).await,
+        "",
+        "an unknown box is refused",
+    );
+    let checks = [
+        (pending, FollowUpRefusal::NotRunning, "a pending step"),
+        (judge, FollowUpRefusal::Judge, "a judge"),
+        (
+            nowin,
+            FollowUpRefusal::NotStarted,
+            "a running step without a window",
+        ),
+        (closed, FollowUpRefusal::SessionEnded, "a closed window"),
+    ];
+    for (step, refusal, what) in checks {
+        assert_eq!(
+            enqueue(CASE, store, step).await,
+            FollowUpRequest::Refused(refusal),
+            "{CASE}: {what}"
+        );
+    }
+    assert!(
+        follow_ups_of(CASE, store).await.is_empty(),
+        "{CASE}: no refusal wrote a row"
+    );
+    let x = queued(CASE, store, follow_up(main, "use the smaller fixture")).await;
+    let listed = follow_ups_of(CASE, store).await;
+    assert_eq!(
+        listed.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![x],
+        "{CASE}: the open window admits one"
+    );
+    assert_eq!(
+        enqueue(CASE, store, main).await,
+        FollowUpRequest::Refused(FollowUpRefusal::AlreadyQueued),
+        "{CASE}: a second one while the first is pending"
+    );
+    assert_eq!(
+        follow_ups_of(CASE, store).await,
+        listed,
+        "{CASE}: the second enqueue wrote nothing"
+    );
+
+    assert!(
+        matches!(
+            cancel_of(CASE, store, run_a).await,
+            CancelRequest::Inserted(_)
+        ),
+        "{CASE}: a pending cancel of run A"
+    );
+    let cancelled = follow_ups_of(CASE, store).await;
+    assert_eq!(
+        enqueue(CASE, store, judge).await,
+        FollowUpRequest::Refused(FollowUpRefusal::Judge),
+        "{CASE}: a judge before a pending cancel (3 before 5)"
+    );
+    assert_eq!(
+        enqueue(CASE, store, nowin).await,
+        FollowUpRequest::Refused(FollowUpRefusal::Cancelling),
+        "{CASE}: a pending cancel before the window (5 before 7 and 8)"
+    );
+
+    let (item_b, run_b, windowed) = other_follow_up_step(CASE, store, a, at).await;
+    let sibling = running_step(CASE, store, run_b, (1, 1, 0), at).await;
+    window_of(CASE, store, run_b, windowed, a).await;
+    assert!(
+        store
+            .refresh_lease(run_b, a, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: A's lease on run B lapses"
+    );
+    assert_eq!(
+        enqueue(CASE, store, sibling).await,
+        FollowUpRequest::Refused(FollowUpRefusal::ExecutorGone),
+        "{CASE}: no live executor before no window (7 before 8)"
+    );
+    assert_eq!(
+        enqueue(CASE, store, windowed).await,
+        FollowUpRequest::Refused(FollowUpRefusal::ExecutorGone),
+        "{CASE}: a lapsed lease under an open window"
+    );
+    assert!(
+        store
+            .take_lease(run_b, ids::BOX, b, TimeDelta::minutes(14))
+            .await
+            .expect(CASE),
+        "{CASE}: B takes A's lapsed lease"
+    );
+    assert_eq!(
+        enqueue(CASE, store, windowed).await,
+        FollowUpRequest::Refused(FollowUpRefusal::ExecutorGone),
+        "{CASE}: a live lease of another owner is no executor of A's window (B-4)"
+    );
+    assert_eq!(
+        enqueue(CASE, store, sibling).await,
+        FollowUpRequest::Refused(FollowUpRefusal::NotStarted),
+        "{CASE}: with a live lease and no window, the step has not started"
+    );
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    assert_eq!(
+        enqueue(CASE, store, chat.step_id).await,
+        FollowUpRequest::Refused(FollowUpRefusal::ChatRun),
+        "{CASE}: a chat's step"
+    );
+    assert_eq!(
+        follow_ups_of(CASE, store).await,
+        cancelled,
+        "{CASE}: nothing a refusal answered was written"
+    );
+    assert!(
+        follow_ups_in(CASE, store, item_b).await.is_empty(),
+        "{CASE}: nor on run B"
+    );
+}
+
+/// MOD-70 plan D1, D3: a step holds at most one pending follow-up; a second is refused and the
+/// first stands. The limit is per step, not per run; once the first is settled, a new one is
+/// admitted. Cancels stay one per run.
+async fn a_step_has_at_most_one_pending_follow_up<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_step_has_at_most_one_pending_follow_up";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run, s1) = follow_up_step(CASE, store, a, at).await;
+    let s2 = running_step(CASE, store, run, (1, 1, 0), at).await;
+    let w1 = window_of(CASE, store, run, s1, a).await;
+    window_of(CASE, store, run, s2, a).await;
+
+    let x = queued(CASE, store, follow_up(s1, "use the smaller fixture")).await;
+    let second = follow_up(s1, "and run the linter too");
+    assert_eq!(
+        store.request_follow_up(second).await.expect(CASE),
+        FollowUpRequest::Refused(FollowUpRefusal::AlreadyQueued),
+        "{CASE}: a second follow-up of the step"
+    );
+    assert_eq!(
+        store.next_follow_up(s1, w1).await.expect(CASE),
+        Some(QueuedFollowUp {
+            id: x,
+            text: "use the smaller fixture".to_owned(),
+        }),
+        "{CASE}: the first stands, with its text"
+    );
+    queued(CASE, store, follow_up(s2, "check the other crate")).await;
+    assert_eq!(
+        store
+            .settle_follow_up(x, a, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::Settled,
+        "{CASE}: the executor takes the first"
+    );
+    let y = queued(CASE, store, follow_up(s1, "now the docs")).await;
+    assert_ne!(y, x, "{CASE}: a new row, not the settled one");
+
+    let CancelRequest::Inserted(c) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the first cancel writes a row");
+    };
+    assert_eq!(
+        cancel_of(CASE, store, run).await,
+        CancelRequest::AlreadyPending(c),
+        "{CASE}: cancels stay one per run beside follow-ups"
+    );
+}
+
+/// MOD-70 plan D4, blueprint B-3, B-19: settling is a compare-and-set `pending -> applied |
+/// refused` fenced on the run's lease owner alone. Another owner is `Fenced` and moves nothing;
+/// a settled row is `NotPending`; an unknown id is `NotFound`, a cancel's id a `Constraint`. A
+/// lapsed lease nobody took still lets its owner settle.
+async fn settling_a_follow_up_is_a_fenced_compare_and_set<S: WriteStore>(store: &S) {
+    const CASE: &str = "settling_a_follow_up_is_a_fenced_compare_and_set";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, step) = follow_up_step(CASE, store, a, seam_clock()).await;
+    let session = window_of(CASE, store, run, step, a).await;
+
+    let x = queued(CASE, store, follow_up(step, "use the smaller fixture")).await;
+    assert_eq!(
+        store
+            .settle_follow_up(x, b, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::Fenced,
+        "{CASE}: B does not hold the run"
+    );
+    assert_eq!(
+        store
+            .next_follow_up(step, session)
+            .await
+            .expect(CASE)
+            .map(|q| q.id),
+        Some(x),
+        "{CASE}: the fenced settle moved nothing"
+    );
+    assert_eq!(
+        store
+            .settle_follow_up(x, a, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::Settled,
+        "{CASE}: A applies it"
+    );
+    assert_follow_up(
+        CASE,
+        store,
+        step,
+        x,
+        RunCommandStatus::Applied,
+        None,
+        "applied, no resolution",
+    )
+    .await;
+    assert_eq!(
+        store.next_follow_up(step, session).await.expect(CASE),
+        None,
+        "{CASE}: nothing pending any more"
+    );
+    assert_eq!(
+        store
+            .settle_follow_up(x, a, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::NotPending,
+        "{CASE}: a second settle"
+    );
+    not_found_on(
+        CASE,
+        store
+            .settle_follow_up(RunCommandId::new(), a, FollowUpSettle::Applied)
+            .await,
+        "run_command",
+        "settling an unknown row",
+    );
+
+    let y = queued(CASE, store, follow_up(step, "and run the linter too")).await;
+    let refusal = executor_scrub_refusal("anthropic_api_key");
+    assert_eq!(
+        store
+            .settle_follow_up(y, a, FollowUpSettle::Refused(refusal.clone()))
+            .await
+            .expect(CASE),
+        SettleOutcome::Settled,
+        "{CASE}: A refuses it"
+    );
+    assert_follow_up(
+        CASE,
+        store,
+        step,
+        y,
+        RunCommandStatus::Refused,
+        Some(&refusal),
+        "refused with the executor's sentence",
+    )
+    .await;
+
+    let z = queued(CASE, store, follow_up(step, "now the docs")).await;
+    assert!(
+        store
+            .refresh_lease(run, a, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: A's lease lapses; nobody takes it"
+    );
+    assert_eq!(
+        store
+            .settle_follow_up(z, a, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::Settled,
+        "{CASE}: the owner fence is the owner alone (B-3)"
+    );
+
+    let CancelRequest::Inserted(c) = cancel_of(CASE, store, run).await else {
+        panic!("{CASE}: the first cancel writes a row");
+    };
+    constraint_with(
+        CASE,
+        store.settle_follow_up(c, a, FollowUpSettle::Applied).await,
+        "",
+        "settling a cancel",
+    );
+}
+
+/// MOD-70 plan D4, D6, blueprint B-5: closing a step's window refuses what is still queued on it
+/// and stops admitting; a second close refuses nothing. A close by a superseded session changes
+/// nothing; the current session's close does.
+async fn closing_the_window_refuses_what_is_still_queued<S: WriteStore>(store: &S) {
+    const CASE: &str = "closing_the_window_refuses_what_is_still_queued";
+    let a = Uuid::now_v7();
+    let (run, step) = follow_up_step(CASE, store, a, seam_clock()).await;
+    let s1 = window_of(CASE, store, run, step, a).await;
+    let x = queued(CASE, store, follow_up(step, "use the smaller fixture")).await;
+    assert_eq!(
+        store
+            .close_follow_ups(step, s1, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: the close refuses the queued row"
+    );
+    assert_follow_up(
+        CASE,
+        store,
+        step,
+        x,
+        RunCommandStatus::Refused,
+        Some(FOLLOW_UP_SESSION_ENDED),
+        "refused with the close's reason",
+    )
+    .await;
+    assert_eq!(
+        enqueue(CASE, store, step).await,
+        FollowUpRequest::Refused(FollowUpRefusal::SessionEnded),
+        "{CASE}: a closed window admits nothing"
+    );
+    assert_eq!(
+        store
+            .close_follow_ups(step, s1, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: a second close refuses nothing"
+    );
+
+    let s2 = window_of(CASE, store, run, step, a).await;
+    let y = queued(CASE, store, follow_up(step, "and run the linter too")).await;
+    assert_eq!(
+        store
+            .close_follow_ups(step, s1, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: the superseded session's close changes nothing (B-5)"
+    );
+    assert_follow_up(
+        CASE,
+        store,
+        step,
+        y,
+        RunCommandStatus::Pending,
+        None,
+        "the new session's row is still pending",
+    )
+    .await;
+    assert_eq!(
+        store
+            .next_follow_up(step, s2)
+            .await
+            .expect(CASE)
+            .map(|q| q.id),
+        Some(y),
+        "{CASE}: and the new session still reads it"
+    );
+    assert_eq!(
+        store
+            .close_follow_ups(step, s2, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: the current session's close refuses it"
+    );
+}
+
+/// MOD-70 plan D4, blueprint B-3, B-6: opening a window for a new session refuses what an older
+/// window left queued; an open by an owner that does not hold the run writes nothing. An unknown
+/// step is `NotFound`, a step of another run a `Constraint`.
+async fn opening_a_window_refuses_an_older_windows_follow_up<S: WriteStore>(store: &S) {
+    const CASE: &str = "opening_a_window_refuses_an_older_windows_follow_up";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, step) = follow_up_step(CASE, store, a, seam_clock()).await;
+    let s1 = window_of(CASE, store, run, step, a).await;
+    let x = queued(CASE, store, follow_up(step, "use the smaller fixture")).await;
+    let s2 = window_of(CASE, store, run, step, a).await;
+    assert_follow_up(
+        CASE,
+        store,
+        step,
+        x,
+        RunCommandStatus::Refused,
+        Some(FOLLOW_UP_SESSION_ENDED),
+        "the older window's row is refused",
+    )
+    .await;
+    assert_eq!(
+        store.next_follow_up(step, s1).await.expect(CASE),
+        None,
+        "{CASE}: the older session reads nothing"
+    );
+    let y = queued(CASE, store, follow_up(step, "and run the linter too")).await;
+    assert!(
+        !store
+            .open_follow_ups(run, step, RelaySessionId::new(), b)
+            .await
+            .expect(CASE),
+        "{CASE}: B does not hold the run"
+    );
+    assert_follow_up(
+        CASE,
+        store,
+        step,
+        y,
+        RunCommandStatus::Pending,
+        None,
+        "the fenced open refused nothing",
+    )
+    .await;
+    assert_eq!(
+        store
+            .next_follow_up(step, s2)
+            .await
+            .expect(CASE)
+            .map(|q| q.id),
+        Some(y),
+        "{CASE}: and left the window s2's"
+    );
+    not_found_on(
+        CASE,
+        store
+            .open_follow_ups(run, StepId::new(), RelaySessionId::new(), a)
+            .await,
+        "run_step",
+        "opening an unknown step's window",
+    );
+    let other = store
+        .create_run(new_run(ids::PROJECT_HTUI, ids::HTUI_ANA_2, Vec::new()))
+        .await
+        .expect(CASE)
+        .id;
+    let foreign = store
+        .create_step(new_run_step(other, 0, 1, 0))
+        .await
+        .expect(CASE)
+        .id;
+    constraint_with(
+        CASE,
+        store
+            .open_follow_ups(run, foreign, RelaySessionId::new(), a)
+            .await,
+        "",
+        "opening a window on another run's step",
+    );
+}
+
+/// MOD-70 plan D5, blueprint B-14: a cancel refuses every pending follow-up of its run, and only
+/// of its run; the run then admits none.
+async fn a_cancel_refuses_the_runs_pending_follow_ups<S: WriteStore>(store: &S) {
+    const CASE: &str = "a_cancel_refuses_the_runs_pending_follow_ups";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run_a, a1) = follow_up_step(CASE, store, a, at).await;
+    let a2 = running_step(CASE, store, run_a, (1, 1, 0), at).await;
+    let (item_b, run_b, b1) = other_follow_up_step(CASE, store, a, at).await;
+    window_of(CASE, store, run_a, a1, a).await;
+    window_of(CASE, store, run_a, a2, a).await;
+    window_of(CASE, store, run_b, b1, a).await;
+    let x1 = queued(CASE, store, follow_up(a1, "use the smaller fixture")).await;
+    let x2 = queued(CASE, store, follow_up(a2, "and run the linter too")).await;
+    let y = queued(CASE, store, follow_up(b1, "now the docs")).await;
+
+    assert!(
+        matches!(
+            cancel_of(CASE, store, run_a).await,
+            CancelRequest::Inserted(_)
+        ),
+        "{CASE}: run A's cancel"
+    );
+    for (step, id) in [(a1, x1), (a2, x2)] {
+        assert_follow_up(
+            CASE,
+            store,
+            step,
+            id,
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_RUN_CANCELLED),
+            "run A's row is refused with the cancel",
+        )
+        .await;
+    }
+    assert_follow_up_in(
+        CASE,
+        store,
+        (item_b, b1),
+        y,
+        RunCommandStatus::Pending,
+        None,
+        "run B's row is untouched",
+    )
+    .await;
+    assert_eq!(
+        enqueue(CASE, store, a1).await,
+        FollowUpRequest::Refused(FollowUpRefusal::Cancelling),
+        "{CASE}: a cancelling run admits none"
+    );
+}
+
+/// MOD-70 plan D5, I-9: `pending_commands` lists cancels only; a pending follow-up is never a
+/// command a process applies.
+async fn pending_commands_list_cancels_only<S: WriteStore>(store: &S) {
+    const CASE: &str = "pending_commands_list_cancels_only";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run_a, step_a) = follow_up_step(CASE, store, a, at).await;
+    window_of(CASE, store, run_a, step_a, a).await;
+    queued(CASE, store, follow_up(step_a, "use the smaller fixture")).await;
+    assert!(
+        pending_ids(CASE, store, a, ids::BOX).await.is_empty(),
+        "{CASE}: a pending follow-up is not listed"
+    );
+    let CancelRequest::Inserted(c) = cancel_of(CASE, store, run_a).await else {
+        panic!("{CASE}: the first cancel writes a row");
+    };
+    assert_eq!(
+        pending_ids(CASE, store, a, ids::BOX).await,
+        vec![c],
+        "{CASE}: only the cancel is listed"
+    );
+
+    let (item_b, run_b, step_b) = other_follow_up_step(CASE, store, b, at).await;
+    window_of(CASE, store, run_b, step_b, b).await;
+    let y = queued(CASE, store, follow_up(step_b, "and run the linter too")).await;
+    assert!(
+        pending_ids(CASE, store, b, ids::BOX).await.is_empty(),
+        "{CASE}: run B's pending follow-up is not listed under B's owner (I-9)"
+    );
+    assert_follow_up_in(
+        CASE,
+        store,
+        (item_b, step_b),
+        y,
+        RunCommandStatus::Pending,
+        None,
+        "and is still pending",
+    )
+    .await;
+}
+
+/// MOD-70 plan D5, blueprint B-13: the relay view lists the newest follow-up of each step of the
+/// item's non-terminal runs, the pending one first, in `(issued_at, id)` order; a terminal run's
+/// are absent, and another item's are its own. `FollowUpView` has no text field: the text never
+/// reaches a reader.
+async fn relay_view_lists_the_newest_follow_up_per_step_without_text<S: WriteStore>(store: &S) {
+    const CASE: &str = "relay_view_lists_the_newest_follow_up_per_step_without_text";
+    let a = Uuid::now_v7();
+    let at = seam_clock();
+    let (run_a, step1) = follow_up_step(CASE, store, a, at).await;
+    let step2 = running_step(CASE, store, run_a, (1, 1, 0), at).await;
+    let s1 = window_of(CASE, store, run_a, step1, a).await;
+    window_of(CASE, store, run_a, step2, a).await;
+    let x = queued(CASE, store, follow_up(step1, "use the smaller fixture")).await;
+    assert_eq!(
+        store
+            .close_follow_ups(step1, s1, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        1,
+        "{CASE}: x is refused by the close"
+    );
+    let z = queued(CASE, store, follow_up(step2, "and run the linter too")).await;
+    assert_eq!(
+        store
+            .settle_follow_up(z, a, FollowUpSettle::Applied)
+            .await
+            .expect(CASE),
+        SettleOutcome::Settled,
+        "{CASE}: z is applied"
+    );
+    window_of(CASE, store, run_a, step1, a).await;
+    let y = queued(CASE, store, follow_up(step1, "now the docs")).await;
+
+    let (item_b, run_b, step_b) = other_follow_up_step(CASE, store, a, at).await;
+    window_of(CASE, store, run_b, step_b, a).await;
+    let w = queued(CASE, store, follow_up(step_b, "check the other crate")).await;
+
+    let listed = follow_ups_of(CASE, store).await;
+    assert_eq!(
+        listed.iter().map(|row| row.id).collect::<Vec<_>>(),
+        vec![z, y],
+        "{CASE}: one row per step, the pending one over the refused x, (issued_at, id) order"
+    );
+    assert!(
+        !listed.iter().any(|row| row.id == x),
+        "{CASE}: x is not the newest of its step"
+    );
+    let applied = &listed[0];
+    assert_eq!(
+        (
+            applied.run_id,
+            applied.run_step_id,
+            applied.status,
+            applied.resolution.as_deref(),
+            applied.resolved_at.is_some(),
+        ),
+        (run_a, step2, RunCommandStatus::Applied, None, true),
+        "{CASE}: the applied row reads back"
+    );
+    let pending = &listed[1];
+    assert_eq!(
+        (
+            pending.run_id,
+            pending.run_step_id,
+            pending.status,
+            pending.resolution.as_deref(),
+            pending.resolved_at,
+        ),
+        (run_a, step1, RunCommandStatus::Pending, None, None),
+        "{CASE}: the pending row reads back"
+    );
+    assert!(
+        listed
+            .windows(2)
+            .all(|pair| { (pair[0].issued_at, pair[0].id) <= (pair[1].issued_at, pair[1].id) }),
+        "{CASE}: (issued_at, id) order, got {listed:?}"
+    );
+
+    assert_eq!(
+        follow_ups_in(CASE, store, item_b)
+            .await
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![w],
+        "{CASE}: run B's item lists run B's row, and only it"
+    );
+    store
+        .finish_run(run_b, RunStatus::Done, None, at)
+        .await
+        .expect(CASE);
+    assert!(
+        follow_ups_in(CASE, store, item_b).await.is_empty(),
+        "{CASE}: a terminal run's follow-ups are not listed"
+    );
+    assert_eq!(
+        follow_ups_of(CASE, store).await,
+        listed,
+        "{CASE}: run A's rows are unchanged"
+    );
+    assert!(
+        store
+            .relay_view(ids::HTUI_FEAT_1)
+            .await
+            .expect(CASE)
+            .follow_ups
+            .is_empty(),
+        "{CASE}: an item without runs lists none"
+    );
+}
+
+/// MOD-70 plan D9, blueprint B-3, F-22: closing a dropped walk's windows needs the run's lease
+/// owner; another owner closes and refuses nothing. The owner's call closes every window of the
+/// run and refuses every pending follow-up of it, and only of it; a second call refuses nothing.
+async fn closing_a_dropped_walks_windows_needs_the_lease<S: WriteStore>(store: &S) {
+    const CASE: &str = "closing_a_dropped_walks_windows_needs_the_lease";
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let at = seam_clock();
+    let (run_a, a1) = follow_up_step(CASE, store, a, at).await;
+    let a2 = running_step(CASE, store, run_a, (1, 1, 0), at).await;
+    let a3 = running_step(CASE, store, run_a, (2, 1, 0), at).await;
+    let (item_b, run_b, b1) = other_follow_up_step(CASE, store, a, at).await;
+    for (run, step) in [(run_a, a1), (run_a, a2), (run_a, a3), (run_b, b1)] {
+        window_of(CASE, store, run, step, a).await;
+    }
+    let x1 = queued(CASE, store, follow_up(a1, "use the smaller fixture")).await;
+    let x2 = queued(CASE, store, follow_up(a2, "and run the linter too")).await;
+    let y = queued(CASE, store, follow_up(b1, "now the docs")).await;
+
+    assert_eq!(
+        store
+            .close_dropped_follow_ups(run_a, b, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: B does not hold run A"
+    );
+    for (step, id) in [(a1, x1), (a2, x2)] {
+        assert_follow_up(
+            CASE,
+            store,
+            step,
+            id,
+            RunCommandStatus::Pending,
+            None,
+            "the fenced call refused nothing",
+        )
+        .await;
+    }
+    let x3 = queued(CASE, store, follow_up(a3, "check the other crate")).await;
+
+    assert_eq!(
+        store
+            .close_dropped_follow_ups(run_a, a, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        3,
+        "{CASE}: A's call refuses run A's three rows"
+    );
+    for (step, id) in [(a1, x1), (a2, x2), (a3, x3)] {
+        assert_follow_up(
+            CASE,
+            store,
+            step,
+            id,
+            RunCommandStatus::Refused,
+            Some(FOLLOW_UP_SESSION_ENDED),
+            "refused with the call's reason",
+        )
+        .await;
+        assert_eq!(
+            enqueue(CASE, store, step).await,
+            FollowUpRequest::Refused(FollowUpRefusal::SessionEnded),
+            "{CASE}: every window of run A is closed"
+        );
+    }
+    assert_eq!(
+        store
+            .close_dropped_follow_ups(run_a, a, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect(CASE),
+        0,
+        "{CASE}: a second call refuses nothing"
+    );
+    assert_follow_up_in(
+        CASE,
+        store,
+        (item_b, b1),
+        y,
+        RunCommandStatus::Pending,
+        None,
+        "run B's row is untouched",
+    )
+    .await;
 }
 
 // ------------------------------------------------------------------------------------------------

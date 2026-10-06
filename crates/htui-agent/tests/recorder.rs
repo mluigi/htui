@@ -32,17 +32,18 @@ use htui_core::fixtures::ids;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, Billing, BindingChange, BoxEdit, BoxId, BoxProbe,
     BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow,
-    Document, DocumentHead, DocumentId, EventKind, EventRole, GateOutcome, Item, ItemCitation,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
-    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem, NewItemKind, NewNote, NewProject,
-    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
-    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
-    PermissionId, PermissionStatus, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId,
-    ProjectPatch, PromptScope, PromptTemplate, Quota, QuotaSource, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
+    Document, DocumentHead, DocumentId, EventKind, EventRole, FollowUpRequest, FollowUpSettle,
+    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewFollowUp,
+    NewItem, NewItemKind, NewNote, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
+    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
+    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp,
+    Quota, QuotaSource, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
     SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
     StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
     StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
@@ -1192,6 +1193,57 @@ impl WriteStore for SpyStore {
 
     async fn open_permissions(&self, scope: &Scope) -> StoreResult<Vec<WaitingPermission>> {
         self.inner.open_permissions(scope).await
+    }
+
+    async fn request_follow_up(&self, new: NewFollowUp) -> StoreResult<FollowUpRequest> {
+        self.inner.request_follow_up(new).await
+    }
+
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> StoreResult<bool> {
+        self.inner.open_follow_ups(run, step, session, owner).await
+    }
+
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> StoreResult<Option<QueuedFollowUp>> {
+        self.inner.next_follow_up(step, session).await
+    }
+
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> StoreResult<SettleOutcome> {
+        self.inner.settle_follow_up(id, owner, to).await
+    }
+
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        self.inner.close_follow_ups(step, session, reason).await
+    }
+
+    async fn close_dropped_follow_ups(
+        &self,
+        run: RunId,
+        owner: Uuid,
+        reason: &str,
+    ) -> StoreResult<u64> {
+        self.inner
+            .close_dropped_follow_ups(run, owner, reason)
+            .await
     }
 }
 

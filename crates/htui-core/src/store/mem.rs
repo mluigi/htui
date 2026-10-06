@@ -27,25 +27,26 @@ use crate::model::{
     BOX_PROBE_SPEC_KEY, BindingChange, BoundSkill, BoxEdit, BoxId, BoxInfo, BoxProbe, BoxProfile,
     BoxRecord, BoxRow, BoxSettings, BoxTool, CancelRequest, ChatRunSpec, CitationKind, Claim,
     CommandRun, CommandRunId, CommandRunStatus, CoverageRow, DEFAULT_MAX_CONCURRENT_ITEMS,
-    Document, DocumentHead, DocumentId, EventKind, Executor, GateOutcome, Item, ItemCitation,
-    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemLink, ItemPatch, ItemRequirement,
-    ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind, LinkNode, NewCommandRun, NewDocument,
-    NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
-    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
-    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
-    SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount,
-    UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath,
-    WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary, canonical_declared_tags,
-    missing_tags_failure, overlaps, prompt_summary, scope_of,
+    Document, DocumentHead, DocumentId, EventKind, Executor, FollowUpRequest, FollowUpSettle,
+    GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch,
+    ItemLink, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkEdge, LinkGraph, LinkKind,
+    LinkNode, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote, NewPersona,
+    NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep,
+    NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate,
+    PromptTemplateId, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
+    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId,
+    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
+    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
+    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
+    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
+    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps,
+    prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -6831,6 +6832,7 @@ impl State {
         RelayView {
             permissions,
             cancels: cancels.into_iter().collect(),
+            follow_ups: Vec::new(),
         }
     }
 
@@ -7969,6 +7971,57 @@ impl WriteStore for MemStore {
     async fn open_permissions(&self, scope: &Scope) -> Result<Vec<WaitingPermission>> {
         let now = self.now();
         Ok(self.read(|state| state.open_permissions(scope, now)))
+    }
+
+    // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)
+
+    async fn request_follow_up(&self, _new: NewFollowUp) -> Result<FollowUpRequest> {
+        Err(StoreError::Backend("MOD-70 T0: red".into()))
+    }
+
+    async fn open_follow_ups(
+        &self,
+        _run: RunId,
+        _step: StepId,
+        _session: RelaySessionId,
+        _owner: Uuid,
+    ) -> Result<bool> {
+        Err(StoreError::Backend("MOD-70 T0: red".into()))
+    }
+
+    async fn next_follow_up(
+        &self,
+        _step: StepId,
+        _session: RelaySessionId,
+    ) -> Result<Option<QueuedFollowUp>> {
+        Err(StoreError::Backend("MOD-70 T0: red".into()))
+    }
+
+    async fn settle_follow_up(
+        &self,
+        _id: RunCommandId,
+        _owner: Uuid,
+        _to: FollowUpSettle,
+    ) -> Result<SettleOutcome> {
+        Err(StoreError::Backend("MOD-70 T0: red".into()))
+    }
+
+    async fn close_follow_ups(
+        &self,
+        _step: StepId,
+        _session: RelaySessionId,
+        _reason: &str,
+    ) -> Result<u64> {
+        Err(StoreError::Backend("MOD-70 T0: red".into()))
+    }
+
+    async fn close_dropped_follow_ups(
+        &self,
+        _run: RunId,
+        _owner: Uuid,
+        _reason: &str,
+    ) -> Result<u64> {
+        Err(StoreError::Backend("MOD-70 T0: red".into()))
     }
 }
 

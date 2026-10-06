@@ -5,8 +5,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, RelayOption, RelayOptionKind,
-    RelaySessionId, RunId, StepId, StepPermission,
+    FollowUpSettle, OpenPermission, PermissionChoice, PermissionId, PermissionStatus,
+    QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RunCommandId, RunId,
+    SettleOutcome, StepId, StepPermission,
 };
 use htui_core::scrub::Scrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -117,6 +118,9 @@ pub struct Relay<'a, R: htui_core::store::RelayStore> {
     pub grace: Duration,
     /// The instant source for the rows `htui` authors (`record_permission_answer`'s `at`).
     pub now: &'a (dyn Fn() -> DateTime<Utc> + Sync),
+    /// MOD-70 D6: whether this session opens a follow-up window; `drive_once` sets it for main
+    /// and candidate sessions (D8).
+    pub follow_ups: bool,
 }
 
 impl<R: htui_core::store::RelayStore> core::fmt::Debug for Relay<'_, R> {
@@ -130,6 +134,7 @@ impl<R: htui_core::store::RelayStore> core::fmt::Debug for Relay<'_, R> {
             .field("session", &self.session)
             .field("poll", &self.poll)
             .field("grace", &self.grace)
+            .field("follow_ups", &self.follow_ups)
             .finish_non_exhaustive()
     }
 }
@@ -160,6 +165,51 @@ impl htui_core::store::RelayStore for NoRelay {
         &self,
         _session: RelaySessionId,
         _to: PermissionStatus,
+    ) -> StoreResult<u64> {
+        match *self {}
+    }
+
+    async fn open_follow_ups(
+        &self,
+        _run: RunId,
+        _step: StepId,
+        _session: RelaySessionId,
+        _owner: Uuid,
+    ) -> StoreResult<bool> {
+        match *self {}
+    }
+
+    async fn next_follow_up(
+        &self,
+        _step: StepId,
+        _session: RelaySessionId,
+    ) -> StoreResult<Option<QueuedFollowUp>> {
+        match *self {}
+    }
+
+    async fn settle_follow_up(
+        &self,
+        _id: RunCommandId,
+        _owner: Uuid,
+        _to: FollowUpSettle,
+    ) -> StoreResult<SettleOutcome> {
+        match *self {}
+    }
+
+    async fn close_follow_ups(
+        &self,
+        _step: StepId,
+        _session: RelaySessionId,
+        _reason: &str,
+    ) -> StoreResult<u64> {
+        match *self {}
+    }
+
+    async fn close_dropped_follow_ups(
+        &self,
+        _run: RunId,
+        _owner: Uuid,
+        _reason: &str,
     ) -> StoreResult<u64> {
         match *self {}
     }
