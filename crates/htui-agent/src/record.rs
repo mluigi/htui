@@ -1982,7 +1982,7 @@ const SEAM_ATTEMPTS: usize = 4;
 /// too and moves back, so the seam never invents a failure the whole text did not have.
 ///
 /// **Residuals.** The check sees the run as it is at the bound, not the bytes still to come, so
-/// two cases stay open, neither a regression on the cut at the bound it replaces:
+/// three cases stay open, none a regression on the cut at the bound it replaces:
 ///
 /// - A credential whose matching prefix (at least its rule's minimum) is already in the run
 ///   refuses `text` whole: the run is flushed whole as one `scrub_residue` row and the session
@@ -1992,6 +1992,11 @@ const SEAM_ATTEMPTS: usize = 4;
 ///   `hold_back` can be cut, both halves clean, and then continue with a non-prose segment: no row
 ///   refuses, while the two rows concatenated would. Random key bodies are not prose-shaped for
 ///   75 bytes, so this needs a key that reads as words for its first 70-odd characters.
+/// - `jwt` only matches once its third segment arrives, and its first two segments have no upper
+///   bound, so the prefix of a JWT that does not match yet is unbounded: `PATTERN_HOLD_BACK`
+///   counts the rule's 38-byte minimum, not that prefix. Every real header plus payload is well
+///   over `hold_back`, so a JWT cut inside its payload leaves a clean head and a clean carried
+///   row (`<payload end>.<signature>`), while the two rows concatenated would match.
 fn seam_cut(scrubber: &dyn Scrubber, text: &str, hold_back: usize) -> Option<usize> {
     if hold_back == 0 || text.len() <= hold_back {
         return None;
@@ -2878,6 +2883,48 @@ mod tests {
         assert!(
             scrubbed_text(&scrubber, &format!("{head}{later}")).is_none(),
             "only the concatenation refuses: a non-prose segment confirms the key"
+        );
+    }
+
+    /// The third documented residual on [`seam_cut`]: `jwt` only matches once its third segment
+    /// arrives, and its first two segments have no upper bound, so the not-yet-matching prefix of
+    /// a JWT is unbounded and a real header plus payload is well over `hold_back`. The run at the
+    /// bound is clean, the cut falls inside the payload, the head (header and payload start) and
+    /// the carried row (payload end and signature) are each clean, and only the concatenation
+    /// matches. This pins the behaviour so a fix has to flip it knowingly.
+    #[test]
+    fn seam_cut_can_split_a_jwt_whose_header_and_payload_exceed_hold_back() {
+        let scrubber = MinimalScrubber::new(Vec::<String>::new());
+        let hold_back = scrubber.hold_back();
+        let header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+        let payload_so_far = format!("eyJ{}", "a".repeat(100));
+        let text = format!("{} {header}.{payload_so_far}", "x".repeat(200));
+        assert!(
+            scrubbed_text(&scrubber, &text).is_some(),
+            "no third segment yet: the run at the bound is clean"
+        );
+
+        let cut =
+            seam_cut(&scrubber, &text, hold_back).expect("the run is clean, so it has a seam");
+        let (head, tail) = text.split_at(cut);
+        let later = format!("{tail}{}.{}", "b".repeat(16), "c".repeat(43));
+
+        assert_eq!(cut, text.len() - hold_back, "the first candidate is taken");
+        assert!(
+            head.contains(&format!("{header}.eyJ")),
+            "the cut falls inside the payload"
+        );
+        assert!(
+            scrubbed_text(&scrubber, head).is_some(),
+            "the head row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &later).is_some(),
+            "the carried row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &format!("{head}{later}")).is_none(),
+            "only the concatenation matches jwt"
         );
     }
 

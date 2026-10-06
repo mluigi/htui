@@ -3320,7 +3320,9 @@ fn edits_surface_as_post_hoc_tool_calls(log: &[SessionEvent]) {
 /// buffered unboundedly, and the cut is a function of byte counts alone - no timer, so replay
 /// stays deterministic (`docs/ANA-4.md` §4.1, §11 criterion 2). Since MOD-10 D18 the cut is a
 /// hold-back before the bound: the scrubber's `hold_back()` trailing bytes are carried into the
-/// next row, so a secret still arriving is never split across two rows.
+/// next row, so a known secret still arriving is not split across two rows, nor is a credential
+/// whose not-yet-matching prefix fits in the hold-back (`jwt` and a prose-shaped `sk-` body do
+/// not; the residuals are documented on the recorder's seam).
 async fn chunk_flush_at_16kib<H: CaseHarness, S: WriteStore + htui_core::store::RecorderStore>(
     harness: &H,
     store: &S,
