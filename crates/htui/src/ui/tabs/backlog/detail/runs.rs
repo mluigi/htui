@@ -1848,8 +1848,9 @@ impl RunsTab {
 
     /// MOD-28 review L3, H1: the flow's head, the lines the list draws for `run` and the cursor's
     /// step that a node has no room for: the run header (failure, pending cancel, a queued
-    /// command), the step's parked reason, and the pending request the digits answer, so a digit
-    /// in the flow never answers a request the pane does not show.
+    /// command), the step's parked reason, how its chat opened, the pending request the digits
+    /// answer, so a digit in the flow never answers a request the pane does not show, and its
+    /// follow-up's lines (MOD-70 D14: queued, sent or refused with its reason).
     fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
         if self.waiting.contains(&run.id) {

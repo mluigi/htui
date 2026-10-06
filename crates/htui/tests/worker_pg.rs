@@ -1372,6 +1372,11 @@ async fn no_follow_up_is_left_pending_after_the_step_ends() {
         (1..=i32::try_from(applied).expect("a few turns")).collect::<Vec<_>>(),
         "each applied follow-up opened its own turn: {rows:?}"
     );
+    assert!(
+        sent.iter()
+            .all(|(_, payload)| *payload == json!({ "text": FOLLOW_UP })),
+        "each sent follow-up carries the text the client queued: {sent:?}"
+    );
     assert_eq!(
         follow_up_windows(&stack.db.pool, step).await,
         (1, 0),
