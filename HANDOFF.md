@@ -487,6 +487,16 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   pulling events, and the queue drained and answered at the end). Apply the same to `ChatMode::Conversation`,
   keeping promotions' behaviour. Not blocked.
 
+- [ ] **MOD-88 - Flow-graph mode for the Backlog item graph (rataflow)** (from MOD-14 and MOD-28,
+  `docs/decisions/mod/mod-14.md`, `docs/decisions/mod/mod-28.md`). `R-TUI-1`. The Backlog detail's Graph
+  sub-tab (`ui/tabs/backlog/detail/graph.rs`, MOD-14) shows an item's link neighbourhood only as a
+  `cargo tree`-style tree. Add a second mode that draws the same `LinkGraph` as a `rataflow` node-and-edge
+  graph: one node per item, one edge per link (depends, origin, blocked-on), the arrow direction read the way the
+  tree reads it. It reuses MOD-28's `ExecutionGraph` plumbing (pan, zoom, mouse, fit through `ui::cells`), with a
+  key toggle like the Runs pane's `v`. Open in the plan: node content and size, layout of cycles and items with
+  several parents, re-rooting from a node (the tree's `Enter` emits `Action::Reveal`), and how the hop depth
+  (`+`/`-`) sits beside the flow's zoom. Not blocked. After MOD-67, which owns the key catalogue.
+
 ### Deferred backlog
 
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
@@ -507,6 +517,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |
