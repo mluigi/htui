@@ -249,22 +249,30 @@ impl MinimalScrubber {
     ///
     /// A value that ends in `\n` / `\r\n` (a secret stored with its line end) is masked both as
     /// given and with its trailing line ends trimmed, so the bare token an agent echoes is masked
-    /// too (MOD-10 D17). The trimmed form is masked only when it is itself at the floor; whether a
-    /// key is listed as short is decided on its full value. Injection is untouched: the caller
-    /// injects `resolved` byte for byte.
+    /// too (MOD-10 D17). A multi-line value (one with a line end before its trailing ones) is
+    /// also masked in the forms a tool prints it in (MOD-10 R1 L5): with bare `\n` turned into
+    /// `\r\n`, JSON-escaped (`\n` as two characters, as inside a printed JSON document), each with
+    /// and without its trailing line ends, and line by line, `\r` trimmed, skipping PEM armour
+    /// lines (`-----BEGIN …-----`, `-----END …-----`): every PEM key shares them, and a printed
+    /// one fails closed on the PEM marker anyway. A form is masked only when it is itself at the
+    /// floor; whether a key is listed as short is decided on its full value. Injection is
+    /// untouched: the caller injects `resolved` byte for byte.
     #[must_use]
     pub fn from_resolved(resolved: &BTreeMap<String, String>) -> (Self, Vec<String>) {
         let mut masked = Vec::with_capacity(resolved.len());
         let mut short = Vec::new();
         for (key, value) in resolved {
-            if value.chars().count() >= MIN_MASKED_LEN {
-                masked.push(value.clone());
-                let trimmed = value.trim_end_matches(['\r', '\n']);
-                if trimmed.len() != value.len() && trimmed.chars().count() >= MIN_MASKED_LEN {
-                    masked.push(trimmed.to_owned());
-                }
-            } else {
+            if value.chars().count() < MIN_MASKED_LEN {
                 short.push(key.clone());
+                continue;
+            }
+            for mut form in masked_forms(value) {
+                if form.chars().count() >= MIN_MASKED_LEN {
+                    masked.push(form);
+                } else {
+                    // MOD-10 D17: a dropped form is wiped like a kept one.
+                    form.zeroize();
+                }
             }
         }
         (Self::new(masked), short)
@@ -425,6 +433,62 @@ fn residue_rule(text: &str) -> Option<&'static str> {
         return Some(PATTERN_RULES[index].0);
     }
     text.contains(PEM_MARKER).then_some(PEM_RULE)
+}
+
+/// The forms [`MinimalScrubber::from_resolved`] masks `value` in, floor not yet applied: the
+/// value, its trailing-line-end-trimmed form, and for a multi-line value its CRLF and
+/// JSON-escaped forms (each trimmed too) and its lines (MOD-10 R1 L5). Duplicates are left to
+/// [`MinimalScrubber::new`].
+fn masked_forms(value: &str) -> Vec<String> {
+    let trim = |text: &str| text.trim_end_matches(['\r', '\n']).to_owned();
+    let trimmed = trim(value);
+    let mut forms = vec![value.to_owned(), trimmed.clone()];
+    if trimmed.contains('\n') {
+        let crlf = to_crlf(value);
+        forms.push(trim(&crlf));
+        forms.push(crlf);
+        forms.push(json_escaped(value));
+        forms.push(json_escaped(&trimmed));
+        forms.extend(
+            value
+                .split('\n')
+                .map(|line| line.trim_end_matches('\r'))
+                .filter(|line| !is_pem_armour(line))
+                .map(str::to_owned),
+        );
+    }
+    forms
+}
+
+/// `text` with every bare `\n` (one not after a `\r`) turned into `\r\n`.
+fn to_crlf(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + text.matches('\n').count());
+    let mut previous = None;
+    for ch in text.chars() {
+        if ch == '\n' && previous != Some('\r') {
+            out.push('\r');
+        }
+        out.push(ch);
+        previous = Some(ch);
+    }
+    out
+}
+
+/// `text` as it reads inside a JSON string literal, without the quotes.
+fn json_escaped(text: &str) -> String {
+    let mut quoted = serde_json::to_string(text).unwrap_or_default();
+    let inner = quoted
+        .strip_prefix('"')
+        .and_then(|inner| inner.strip_suffix('"'))
+        .map(str::to_owned)
+        .unwrap_or_default();
+    quoted.zeroize();
+    inner
+}
+
+/// A PEM armour line: `-----BEGIN <label>-----` or `-----END <label>-----`.
+fn is_pem_armour(line: &str) -> bool {
+    (line.starts_with("-----BEGIN ") || line.starts_with("-----END ")) && line.ends_with("-----")
 }
 
 /// Escapes one JSON pointer reference token (RFC 6901: `~` → `~0`, `/` → `~1`).
@@ -1247,6 +1311,84 @@ mod tests {
         scrubber.scrub(&mut value).expect("clean");
         assert_eq!(value["a"], json!("x [REDACTED] y"));
         assert_eq!(value["b"], json!("x abcde y"));
+    }
+
+    /// A multi-line value (a certificate, a service-account JSON, a config file).
+    const MULTI: &str = "line-one-abc\nline-two-def\n";
+
+    /// MOD-10 R1 L5: a multi-line value echoed through a Windows tool, with CRLF line ends, is
+    /// masked whole, with and without its trailing line end.
+    #[test]
+    fn from_resolved_masks_a_multi_line_value_s_crlf_form() {
+        let (scrubber, _) = MinimalScrubber::from_resolved(&resolved(&[("K", MULTI)]));
+        for text in [
+            "x line-one-abc\r\nline-two-def\r\n y",
+            "x line-one-abc\r\nline-two-def y",
+        ] {
+            let mut value = json!({ "t": text });
+            scrubber.scrub(&mut value).expect("clean");
+            assert_eq!(value["t"], json!("x [REDACTED] y"), "for {text:?}");
+        }
+    }
+
+    /// MOD-10 R1 L5: a multi-line value inside a JSON document the agent printed as text keeps
+    /// its line ends escaped (`\n` as two characters); that form is masked whole too.
+    #[test]
+    fn from_resolved_masks_a_multi_line_value_s_json_escaped_form() {
+        let (scrubber, _) = MinimalScrubber::from_resolved(&resolved(&[("K", MULTI)]));
+        let b = '\\';
+        for text in [
+            format!("{{\"k\":\"line-one-abc{b}nline-two-def{b}n\"}}"),
+            format!("{{\"k\":\"line-one-abc{b}nline-two-def\"}}"),
+        ] {
+            let mut value = json!({ "t": text });
+            scrubber.scrub(&mut value).expect("clean");
+            assert_eq!(value["t"], json!("{\"k\":\"[REDACTED]\"}"), "for {text:?}");
+        }
+    }
+
+    /// MOD-10 R1 L5: one line of a multi-line value, printed alone, is masked when it is at the
+    /// floor; a line below the floor is not (MOD-10 D3).
+    #[test]
+    fn from_resolved_masks_each_line_of_a_multi_line_value_at_the_floor() {
+        let (scrubber, short) =
+            MinimalScrubber::from_resolved(&resolved(&[("K", "abcdefgh\r\nxyz\nsecond-line")]));
+        assert!(short.is_empty(), "{short:?}");
+        let mut value = json!({ "a": "x abcdefgh y", "b": "x second-line y", "c": "x xyz y" });
+        scrubber.scrub(&mut value).expect("clean");
+        assert_eq!(
+            value,
+            json!({ "a": "x [REDACTED] y", "b": "x [REDACTED] y", "c": "x xyz y" })
+        );
+    }
+
+    /// MOD-10 R1 L5: a PEM key's armour lines are not masked as lines (every PEM key shares
+    /// them); a printed armour line still fails closed on the PEM marker, and a body line is
+    /// masked.
+    #[test]
+    fn from_resolved_skips_pem_armour_lines() {
+        let pem = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n\
+                   -----END PRIVATE KEY-----\n";
+        let (scrubber, _) = MinimalScrubber::from_resolved(&resolved(&[("PEM", pem)]));
+        let mut body = json!({ "t": "x MIIEvQIBADANBgkqhkiG9w0BAQEFAASC y" });
+        scrubber.scrub(&mut body).expect("clean");
+        assert_eq!(body["t"], json!("x [REDACTED] y"));
+        for armour in ["-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----"] {
+            let mut value = json!({ "t": armour });
+            let err = scrubber
+                .scrub(&mut value)
+                .expect_err("an armour line is not masked, so the marker refuses it");
+            assert_eq!(err.rule, PEM_RULE, "for {armour}");
+        }
+    }
+
+    /// MOD-10 R1 L5: whether a key is short is still decided on its full value; a short
+    /// multi-line value adds no form at all.
+    #[test]
+    fn a_short_multi_line_value_is_listed_and_adds_no_form() {
+        let (scrubber, short) = MinimalScrubber::from_resolved(&resolved(&[("K", "ab\ncd")]));
+        assert_eq!(short, vec!["K".to_owned()]);
+        assert_eq!(format!("{scrubber:?}"), "MinimalScrubber { secrets: 0 }");
     }
 
     #[test]

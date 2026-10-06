@@ -263,11 +263,21 @@ would shred every transcript. htui logs the **key names** of such values at `war
 and once per chat (`these secrets are shorter than the masking floor: injected, not masked`), never
 the values. Lengthen them in Infisical.
 
-#### Trailing newlines
+#### Trailing newlines and multi-line values
 
 A value stored with a trailing line end (`\n` or `\r\n`) is masked both as stored and without its
-trailing line ends, so the bare token an agent echoes is masked too. The trimmed form is masked
-only when it is itself at least 6 characters long. The value is still injected byte for byte.
+trailing line ends, so the bare token an agent echoes is masked too.
+
+A multi-line value (a certificate, a service-account file) is also masked in the forms a tool
+prints it in: with its `\n` line ends turned into `\r\n`, JSON-escaped (`\n` written as two
+characters, as inside a printed JSON document), each with and without its trailing line ends,
+and line by line, so one line printed alone is masked too. PEM armour lines
+(`-----BEGIN PRIVATE KEY-----`, `-----END …-----`) are not masked as lines, since every key shares
+them; a printed private-key armour line is refused by the credential rules anyway.
+
+Every extra form is masked only when it is itself at least 6 characters long; whether a value is
+[short](#short-values) is decided on the value as stored. The value is still injected byte for
+byte.
 
 #### Escaped token starts
 
