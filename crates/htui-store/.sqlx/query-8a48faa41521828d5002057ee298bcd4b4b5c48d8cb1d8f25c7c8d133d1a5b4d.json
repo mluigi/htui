@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            SELECT i.id            AS \"id: ItemId\",\n                   i.project_id    AS \"project_id: ProjectId\",\n                   i.kind_id       AS \"kind_id: htui_core::model::ItemKindId\",\n                   i.key           AS \"key!\",\n                   i.key_prefix,\n                   i.key_number,\n                   i.title,\n                   i.status        AS \"status: htui_core::model::Status\",\n                   i.priority,\n                   i.required_tags,\n                   i.updated_at,\n                   i.touched_paths\n              FROM item i LEFT JOIN box b ON b.id = $2\n             WHERE i.project_id = ANY($1)\n               AND i.status = 'open'\n               AND NOT EXISTS (\n                        SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id\n                         WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'\n                           AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed'))\n               AND NOT EXISTS (\n                        SELECT 1 FROM UNNEST(i.required_tags) t\n                         WHERE t <> ALL (COALESCE(b.probed_tags, '{}')\n                                      || COALESCE(b.declared_tags, '{}')))\n             ORDER BY array_position($1, i.project_id), i.key_prefix, i.key_number\n            ",
+  "query": "\n            SELECT i.id            AS \"id: ItemId\",\n                   i.project_id    AS \"project_id: ProjectId\",\n                   i.kind_id       AS \"kind_id: htui_core::model::ItemKindId\",\n                   i.key           AS \"key!\",\n                   i.key_prefix,\n                   i.key_number,\n                   i.title,\n                   i.status        AS \"status: htui_core::model::Status\",\n                   i.priority,\n                   i.required_tags,\n                   i.updated_at,\n                   i.touched_paths\n              FROM item i LEFT JOIN box b ON b.id = $2\n             WHERE i.project_id = ANY($1)\n               AND i.status = 'open'\n               AND NOT EXISTS (\n                        SELECT 1 FROM item_link l JOIN item t ON t.id = l.to_item_id\n                         WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'\n                           AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed'))\n               AND NOT EXISTS (\n                        SELECT 1 FROM UNNEST(i.required_tags) t\n                         WHERE t <> ALL (COALESCE(b.probed_tags, '{}')\n                                      || COALESCE(b.declared_tags, '{}')))\n             ORDER BY i.priority DESC, i.created_at, i.id\n            ",
   "describe": {
     "columns": [
       {
@@ -157,5 +157,5 @@
       false
     ]
   },
-  "hash": "a22310d83599424233ef569d5d082dde7e1db6b07ee7f8220bb1962e87fb6c31"
+  "hash": "8a48faa41521828d5002057ee298bcd4b4b5c48d8cb1d8f25c7c8d133d1a5b4d"
 }
