@@ -7,8 +7,8 @@
 --
 -- What it walks, matching the scrubber (crates/htui-core/src/scrub.rs): every string value AND
 -- every object key, at any depth, of session_event.payload, session_event.raw and
--- run_step.trim_record. Matching `payload::text` instead would undercount: a JSON escape such as
--- `\n` puts a letter right before the token, so the token-start anchor would miss it.
+-- run_step.trim_record. JSON escapes such as `\n` are token starts (MOD-10 D17), and matching the
+-- decoded string values (not `payload::text`) keeps one level of escaping out of the haystack.
 --
 -- Rules are the plan's D2 table (.claude/plans/mod-10-m1-scrubber-hardening.plan.md), each
 -- anchored at a token start as in D1. Plain '...' literals only (standard_conforming_strings);
@@ -75,10 +75,12 @@ CREATE TEMP VIEW scrub_audit_hits (rule, src, row_key) AS
     SELECT r.rule, s.src, s.row_key
       FROM scrub_audit_rules r
       JOIN scrub_audit_strings s
-        ON s.s ~ ('(^|[^A-Za-z0-9_])' || r.re)
+        ON s.s ~ ('(^|[^A-Za-z0-9_]|\\[nrtbf"/\\]|\\u[0-9A-Fa-f]{4}|%[0-9A-Fa-f]{2})' || r.re)
         OR (r.rule = 'openai_api_key' AND EXISTS (
                SELECT 1
-                 FROM regexp_matches(s.s, '(?:^|[^A-Za-z0-9_])sk-([A-Za-z0-9_-]{20,})', 'g') AS m
+                 FROM regexp_matches(s.s,
+                      '(?:^|[^A-Za-z0-9_]|\\[nrtbf"/\\]|\\u[0-9A-Fa-f]{4}|%[0-9A-Fa-f]{2})sk-([A-Za-z0-9_-]{20,})',
+                      'g') AS m
                 WHERE m[1] !~ '^ant-'
                   AND m[1] !~ '^(?:(?:[A-Z]?[a-z]+)+[0-9]*|[0-9]+)(?:[-_](?:(?:[A-Z]?[a-z]+)+[0-9]*|[0-9]+))*$'));
 
