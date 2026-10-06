@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-06):** **MOD-55 is done** (`docs/decisions/mod/mod-55.md`): `Ctrl+G` in
+**Current status (2026-10-06):** **MOD-79 is done** (`docs/decisions/mod/mod-79.md`): the MCP
+token is off claude's argv. `claude-cli` gets `--mcp-config=<path>` to a `0600` `mcp.json` in a per-session `0700`
+directory (`htui-cli-<pid>-<8 hex>`, same base as the socket; on Windows under the per-user temp dir, inheriting
+its DACL). The session task owns the file, so every exit removes it. `ResolvedLaunch`'s `Debug` redacts
+`--mcp-config` values. `htui_agent::private_dir` is now the one private-directory helper (`channel.rs` uses it).
+No migration, no new crate.
+Before it, **MOD-55 is done** (`docs/decisions/mod/mod-55.md`): `Ctrl+G` in
 the Skills tab's Templates and Library editors asks a registry agent for an edit. The body, the request and (for
 templates) the placeholder table go out as one help turn (`StoreRequest::EditHelp`): scrubbed before sending, fail
 closed; no tools and every permission denied (`ToolExposure::no_tools`, `--tools=` on `claude-cli`); closed after
@@ -288,13 +294,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   the lease only sets the session's `ended`. Add a cancellation signal on `Session` (a `watch` or a
   `CancellationToken`) that `Served::call` selects against, so an in-flight call ends with its
   session. Not blocked.
-- [ ] **MOD-79 - MCP token off claude's argv** (from MOD-11, `docs/decisions/mod/mod-11.md`,
-  blueprint E-1 and review L2). `R-MCP-1`, `R-NF-1`. `claude-cli` gets the per-session
-  `HTUI_MCP_TOKEN` inline in `--mcp-config=<json>`, so any local user can read it from
-  `/proc/<pid>/cmdline`. It is useless without the `0700` socket directory, but it should not be
-  there. Pass a `0600` config file in the session's private directory instead (the CLI accepts a
-  path), and redact `--mcp-config` arguments in `ResolvedLaunch`'s `Debug`. A Windows equivalent for
-  the file's ACL is part of the item. Not blocked.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
@@ -495,6 +494,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

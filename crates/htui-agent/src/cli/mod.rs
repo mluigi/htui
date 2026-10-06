@@ -24,8 +24,14 @@
 //! [`DriverEvent`]: crate::event::DriverEvent
 
 pub mod claude;
+mod mcp_file;
+
+// MOD-79 (blueprint G-2): `open_session` is `pub` and takes one, so the type must be nameable
+// outside the private module.
+pub use mcp_file::McpConfigFile;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -100,6 +106,9 @@ pub const UNPARSED: &str = "<unparsed>";
 /// The argv of `docs/ANA-4.md` §4.4, assembled from the row and the spec. Pure, and unit-tested as
 /// a list rather than through a process.
 ///
+/// `mcp_config` is the path of the [`McpConfigFile`] the caller wrote for `spec.mcp`; `argv` does not
+/// read `spec.mcp` itself, so the code that owns the file is the code that decides the flag.
+///
 /// Order, and every position in it is a decision:
 ///
 /// 1. the row's own resolved `args` first, so a registry row that wraps the CLI in something (`npx`,
@@ -113,10 +122,12 @@ pub const UNPARSED: &str = "<unparsed>";
 /// 5. the spec's model and extra directories;
 /// 6. the budget, **only above zero** — see below;
 ///
-///    6¼. `htui`'s own MCP servers (MOD-11 D8): one `--mcp-config=<json>` argument
-///    ([`mcp_config`]) when `spec.mcp` is not empty, `=`-joined so the CLI's variadic parse cannot
-///    swallow the token after it. No `--strict-mcp-config` — the operator's own servers stay — and
-///    `--tools` is left as it is, because it never filters MCP tools;
+///    6¼. `htui`'s own MCP servers (MOD-11 D8, MOD-79): one `--mcp-config=<path>` argument when
+///    `mcp_config` is `Some`, `=`-joined so the CLI's variadic parse cannot swallow the argument after
+///    it. The path names the `0600` file [`McpConfigFile`] wrote [`mcp_config`]'s JSON into; the JSON
+///    itself never reaches the argv, because its `env` carries `HTUI_MCP_TOKEN` and an argv is readable
+///    by every account on the box (blueprint P-2's reason). No `--strict-mcp-config` — the operator's
+///    own servers stay — and `--tools` is left as it is, because it never filters MCP tools;
 ///
 ///    6⅓. the pair `--permission-prompt-tool` [`PROMPT_TOOL`] when the spec carries a prompt port
 ///    (MOD-11 D18). A pair is safe here: the flag takes exactly one value;
@@ -140,6 +151,7 @@ pub fn argv(
     cli: &CliSettings,
     spec: &SessionSpec,
     session_id: &str,
+    mcp_config: Option<&Path>,
 ) -> Vec<String> {
     let mut args: Vec<String> = row_args.to_vec();
     // `--verbose` is what makes `stream-json` emit every envelope rather than the terminal
@@ -187,9 +199,11 @@ pub fn argv(
     }
 
     let no_tools = spec.tools.no_tools;
-    // MOD-11 D8: after the last pair, before the narrowing, so `extra_args` still wins.
-    if let Some(config) = mcp_config(&spec.mcp).filter(|_| !no_tools) {
-        args.push(format!("--mcp-config={config}"));
+    // MOD-11 D8: after the last pair, before the narrowing, so `extra_args` still wins. MOD-79: the
+    // file's path, never the JSON. Lossy as `--add-dir` above, and exact here: `McpConfigFile::write`
+    // refuses a path that is not UTF-8.
+    if let Some(config) = mcp_config.filter(|_| !no_tools) {
+        args.push(format!("--mcp-config={}", config.to_string_lossy()));
     }
     // MOD-11 D18: every gated call asks `htui`'s prompt tool instead of the permission mode. A
     // tool-less session has no server to serve it, and no call to gate.
@@ -271,9 +285,12 @@ pub fn refuse_widening(cli: &CliSettings, tools: &ToolExposure) -> Result<()> {
     Ok(())
 }
 
-/// The `--mcp-config` JSON for `servers` (MOD-11 D8): the CLI's own
+/// The MCP config JSON for `servers` (MOD-11 D8): the CLI's own
 /// `{"mcpServers":{<name>:{"type":"stdio","command","args","env"}}}`, serialised compactly.
 /// `None` for an empty slice, which is what keeps a session with no server on today's argv.
+///
+/// It is written to a file ([`McpConfigFile`], MOD-79) and never put on the argv: `env` carries the
+/// session's `HTUI_MCP_TOKEN`.
 ///
 /// Both maps are `BTreeMap`s, so the bytes are stable: servers by name, `env` by key.
 #[must_use]
@@ -512,14 +529,55 @@ impl CliDriver {
         }
     }
 
-    /// The streams this session runs over, with the child started if there is one to start.
-    async fn io(&self, spec: &SessionSpec, session_id: &str) -> Result<ChildIo> {
+    /// The streams this session runs over, with the child started if there is one to start, and
+    /// the MCP config file its argv names, which the caller must keep for the session's life
+    /// (MOD-79 D3).
+    async fn io(
+        &self,
+        spec: &SessionSpec,
+        session_id: &str,
+    ) -> Result<(ChildIo, Option<McpConfigFile>)> {
+        self.io_in(spec, session_id, None).await
+    }
+
+    /// [`io`](Self::io) with the MCP config's base named: `None` is production's
+    /// ([`crate::private_dir::base`]), `Some` a directory a test owns, so the failed-spawn arm's
+    /// cleanup is observable without racing every other test on the shared base (MOD-79 review
+    /// L1).
+    async fn io_in(
+        &self,
+        spec: &SessionSpec,
+        session_id: &str,
+        mcp_base: Option<std::path::PathBuf>,
+    ) -> Result<(ChildIo, Option<McpConfigFile>)> {
         match &self.io {
             IoSource::Spawn { .. } => {
                 let mut resolved = self.launch_for(spec).await?;
-                resolved.args = argv(&resolved.args, &self.cli_settings(), spec, session_id);
+                // MOD-79: written after the launch resolves (a failure there leaves nothing on disk)
+                // and before the spawn; a failed spawn drops it here, with this frame (H-13).
+                // On a blocking thread (review L3): the base's `is_dir`, the directory's create and
+                // mode read-back and the file's write are all synchronous `std::fs`, which a
+                // runtime worker must not wait on. A cancelled `io` still drops the guard: the task
+                // runs to its end, and tokio drops an output nobody joins, which removes the file
+                // and its directory. A `JoinError` is `launch::spawn`'s lookup's mapping.
+                let servers = spec.mcp.clone();
+                let config = crate::contained::spawn_blocking(move || {
+                    let base = mcp_base.unwrap_or_else(crate::private_dir::base);
+                    McpConfigFile::write_in(&base, &servers)
+                })
+                .await
+                .map_err(|err| DriverError::Transport(format!("writing the MCP config: {err}")))?
+                // The io error names the directory or file it tried (review L5).
+                .map_err(|err| DriverError::Spawn(format!("cannot write the MCP config: {err}")))?;
+                resolved.args = argv(
+                    &resolved.args,
+                    &self.cli_settings(),
+                    spec,
+                    session_id,
+                    config.as_ref().map(McpConfigFile::path),
+                );
                 let spawned = crate::launch::spawn(&resolved, &spec.cwd).await?;
-                ChildIo::from_spawned(spawned)
+                Ok((ChildIo::from_spawned(spawned)?, config))
             }
             #[cfg(feature = "test-support")]
             IoSource::Prepared(slot) => slot
@@ -528,7 +586,7 @@ impl CliDriver {
                     DriverError::Transport("the prepared transport is poisoned".to_owned())
                 })?
                 .take()
-                .map(|io| *io)
+                .map(|io| (*io, None))
                 .ok_or_else(|| {
                     DriverError::Transport("this driver's transport was already used".to_owned())
                 }),
@@ -566,7 +624,7 @@ impl AgentDriver for CliDriver {
             );
             // MOD-55 review M1: before the spawn, so a refused row starts nothing.
             refuse_widening(&self.cli_settings(), &spec.tools)?;
-            let io = self.io(&spec, &session_id).await?;
+            let (io, mcp_config) = self.io(&spec, &session_id).await?;
             let options = SessionOptions {
                 agent_name: self.name.clone(),
                 models: self.models.clone(),
@@ -576,7 +634,7 @@ impl AgentDriver for CliDriver {
                 box_version: self.box_version.clone(),
                 session_id,
             };
-            let session = open_session(io, spec, prompt, options).await?;
+            let session = open_session(io, spec, prompt, options, mcp_config).await?;
             Ok(Box::new(session) as Box<dyn AgentSession>)
         })
     }
@@ -880,11 +938,15 @@ pub struct SessionOptions {
 ///    stderr and exits, which is EOF. Composed on the task's own timeline with the stderr tail
 ///    attached, so the tree is killed *and* reaped before this returns.
 /// 3. **Nobody answered at all**, the sender dropped with the task. Awaited exactly as (2) is.
+///
+/// `mcp_config` is the file the argv names (MOD-79). It moves into the task and is removed when the
+/// task ends, on all three failing exits as on the session's own end.
 pub async fn open_session(
     io: ChildIo,
     spec: SessionSpec,
     prompt: String,
     options: SessionOptions,
+    mcp_config: Option<McpConfigFile>,
 ) -> Result<CliSession> {
     let (events_tx, events_rx) = mpsc::channel(EVENTS_CAPACITY);
     let (commands_tx, commands_rx) = mpsc::unbounded_channel();
@@ -897,23 +959,23 @@ pub async fn open_session(
     // is a `warn!` there rather than a value here (blueprint H-17).
     let session_ref = AgentSessionRef::new(options.session_id.clone());
     let prompts = spec.prompt.is_some();
-    let task = crate::contained::spawn(run_session(
-        io,
-        spec,
-        prompt,
-        options,
-        ready_tx,
-        events_tx,
-        commands_rx,
-    ));
+    // MOD-79 D3: the config file is the task's, beside the `ChildGuard` `run_session` makes: every
+    // exit drops it, the abort in exit (1) included, and a normal end drops it only after
+    // `run_session`'s final kill. Captured here rather than passed in, so `run_session` keeps its
+    // seven arguments (blueprint G-1, H-12); dropped by name, because `let _ =` would drop it at
+    // once (H-11).
+    let task = crate::contained::spawn(async move {
+        run_session(io, spec, prompt, options, ready_tx, events_tx, commands_rx).await;
+        drop(mcp_config);
+    });
 
     match tokio::time::timeout(timeout, ready_rx).await {
         Err(_) => {
-            // Exit (1). The aborted task drops its `ChildGuard`, whose `Drop` signals the kill;
-            // awaiting the cancelled handle resolves as soon as the runtime has dropped the future
-            // and is what makes this `Err` mean "the kill has been sent" rather than "the kill will
-            // be sent shortly". The reap is tokio's orphan queue's, as `acp::open_session` explains
-            // at length.
+            // Exit (1). The aborted task drops its `ChildGuard`, whose `Drop` signals the kill, and
+            // its MCP config file (MOD-79); awaiting the cancelled handle resolves as soon as the
+            // runtime has dropped the future and is what makes this `Err` mean "the kill has been
+            // sent" rather than "the kill will be sent shortly". The reap is tokio's orphan queue's,
+            // as `acp::open_session` explains at length.
             task.abort();
             let _ = task.await;
             Err(DriverError::Transport(format!(
@@ -1764,5 +1826,84 @@ fn with_stderr(message: &str, child: &Mutex<ChildGuard>) -> DriverError {
         DriverError::Transport(message.to_owned())
     } else {
         DriverError::Transport(format!("{message}\n{stderr}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use htui_core::model::{AgentId, Billing, StepId, Transport};
+
+    use super::*;
+    use crate::driver::PermissionPolicy;
+
+    /// MOD-79 review L1: `io`'s failed-spawn arm drops the config it wrote before the spawn (H-13).
+    ///
+    /// A unit test, through [`CliDriver::io_in`], because that is the seam that reaches the spawn
+    /// path with a base the test owns: the production base (`$XDG_RUNTIME_DIR` or the temp
+    /// directory) is shared with every other test in the process, so "no `htui-cli-*` left behind"
+    /// could only be asserted there by racing them. The command does not exist, so
+    /// `launch::spawn` fails at its lookup, which is after the write; the error being that lookup's
+    /// is what shows the config was reached.
+    #[tokio::test]
+    async fn a_failed_spawn_leaves_no_mcp_config_behind() {
+        let tmp = tempfile::tempdir().expect("a scratch directory");
+        let base = tmp.path().join("base");
+        std::fs::create_dir(&base).expect("the stand-in base");
+        let now = chrono::Utc::now();
+        let row = AgentRow {
+            id: AgentId::new(),
+            name: "missing-cli".to_owned(),
+            transport: Transport::Cli,
+            launch: json!({
+                "command": tmp.path().join("no-such-cli").to_string_lossy(),
+                "args": [],
+                "env": {},
+                "discovery": { "handshake": false, "tools": {} },
+            }),
+            models: Vec::new(),
+            default_model: None,
+            billing: Billing::Subscription,
+            enabled: true,
+            settings: json!({ "cli": { "stream": STREAM } }),
+            created_at: now,
+            updated_at: now,
+        };
+        let driver = CliDriver::from_row(&row, DriverCaps::default()).expect("the row parses");
+        let spec = SessionSpec {
+            agent_id: AgentId::new(),
+            step_id: StepId::new(),
+            cwd: tmp.path().to_path_buf(),
+            extra_dirs: Vec::new(),
+            env: BTreeMap::new(),
+            model: None,
+            tools: ToolExposure::default(),
+            mcp: vec![McpServerSpec {
+                name: "htui".to_owned(),
+                command: "/abs/htui".to_owned(),
+                args: vec!["mcp".to_owned()],
+                env: BTreeMap::from([("HTUI_MCP_TOKEN".to_owned(), "token-value".to_owned())]),
+            }],
+            permission: PermissionPolicy::default(),
+            retain_raw: false,
+            resume: None,
+            budget_micros: None,
+            prompt: None,
+        };
+
+        let Err(err) = driver.io_in(&spec, "session-id", Some(base.clone())).await else {
+            panic!("a command that does not exist does not spawn");
+        };
+        match &err {
+            DriverError::Spawn(message) => assert!(
+                message.contains("is not executable"),
+                "the spawn's lookup failed, after the config was written: {message}"
+            ),
+            other => panic!("expected the spawn's error, got {other:?}"),
+        }
+        let left: Vec<_> = std::fs::read_dir(&base)
+            .expect("the base is readable")
+            .map(|entry| entry.expect("an entry").file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 }

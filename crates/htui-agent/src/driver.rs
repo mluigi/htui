@@ -26,7 +26,11 @@ use crate::error::DriverError;
 use crate::event::{DriverEnvelope, PermissionOptionKind, ToolKind};
 
 /// What a hand-written `Debug` prints in place of an environment value (ANA-4 §4.1, invariant 4).
-const REDACTED: &str = "[REDACTED]";
+///
+/// `pub(crate)` so [`crate::launch`]'s `RedactedArgs` prints an `--mcp-config` value as the same
+/// literal (MOD-79): one spelling of the marker for every wrapper, as [`RedactedEnv`] is one
+/// implementation for every environment map.
+pub(crate) const REDACTED: &str = "[REDACTED]";
 
 /// ANA-4 §4.1's return type, spelled once.
 ///

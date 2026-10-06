@@ -15,9 +15,7 @@
 //! `scripted-cli` precisely so that a supervisor that had started reading names would fail.
 
 use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -26,7 +24,7 @@ use chrono::Utc;
 #[cfg(unix)]
 use htui_agent::cli::ClaudeStreamAdapter;
 #[cfg(unix)]
-use htui_agent::cli::{SessionOptions, open_session};
+use htui_agent::cli::{McpConfigFile, SessionOptions, open_session};
 use htui_agent::cli::{argv, refuse_widening, usd};
 #[cfg(unix)]
 use htui_agent::driver::{AgentSession, PermissionAnswer, PermissionRequestId};
@@ -102,6 +100,7 @@ fn argv_is_the_ana4_line_in_order() {
         &cli_settings("acceptEdits", &["--x"]),
         &spec,
         "minted-id",
+        None,
     );
 
     assert_eq!(
@@ -149,6 +148,7 @@ fn the_prompt_has_no_place_on_the_command_line() {
         &cli_settings("", &[]),
         &spec(PathBuf::from("/scratch")),
         "minted-id",
+        None,
     );
     let after_p = args
         .iter()
@@ -168,7 +168,7 @@ fn a_resuming_session_names_the_old_id_and_mints_nothing() {
     let mut spec = spec(PathBuf::from("/scratch"));
     spec.resume = Some(AgentSessionRef::new("older-session"));
 
-    let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id");
+    let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None);
 
     assert!(
         args.windows(2)
@@ -190,6 +190,7 @@ fn an_empty_permission_mode_passes_no_flag() {
         &cli_settings("", &[]),
         &spec(PathBuf::from("/scratch")),
         "minted-id",
+        None,
     );
     assert!(!args.contains(&"--permission-mode".to_owned()), "{args:?}");
 }
@@ -204,7 +205,7 @@ fn a_budget_that_is_absent_or_zero_or_negative_passes_no_flag() {
     for budget in [None, Some(0), Some(-1)] {
         let mut spec = spec(PathBuf::from("/scratch"));
         spec.budget_micros = budget;
-        let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id");
+        let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id", None);
         assert!(
             !args.contains(&"--max-budget-usd".to_owned()),
             "budget {budget:?} must not reach the command line: {args:?}"
@@ -247,7 +248,7 @@ fn exposure(allow: &[&str], deny: &[&str], deny_kinds: &[ToolKind]) -> ToolExpos
 fn narrowed_argv(tools: ToolExposure, extra_args: &[&str]) -> Vec<String> {
     let mut spec = spec(PathBuf::from("/scratch"));
     spec.tools = tools;
-    argv(&[], &cli_settings("", extra_args), &spec, "minted-id")
+    argv(&[], &cli_settings("", extra_args), &spec, "minted-id", None)
 }
 
 /// D11's position: both flags come right after the last pair and before the operator's
@@ -393,6 +394,9 @@ fn a_default_exposure_adds_no_flag() {
 // ---------------------------------------------------------------------------------------------
 
 /// The server `htui` registers for a session: the binary, `mcp`, the address and the token.
+/// MOD-79: a stand-in for the path [`McpConfigFile`] writes, for the pure `argv` cases.
+const CONFIG_PATH: &str = "/run/htui-cli-1-abcd/mcp.json";
+
 fn htui_server() -> McpServerSpec {
     McpServerSpec {
         name: "htui".to_owned(),
@@ -433,6 +437,7 @@ fn argv_without_mcp_is_unchanged() {
         &cli_settings("acceptEdits", &["--x"]),
         &full_spec(),
         "minted-id",
+        None,
     );
     assert_eq!(
         args,
@@ -470,12 +475,23 @@ fn argv_without_mcp_is_unchanged() {
 fn argv_with_mcp_has_one_joined_config_before_tools() {
     let mut with = full_spec();
     with.mcp = vec![htui_server()];
-    let args = argv(&[], &cli_settings("", &[]), &with, "minted-id");
-    let without = argv(&[], &cli_settings("", &[]), &full_spec(), "minted-id");
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &with,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+    );
+    let without = argv(&[], &cli_settings("", &[]), &full_spec(), "minted-id", None);
 
     let configs = mcp_configs(&args);
     assert_eq!(configs.len(), 1, "{args:?}");
     assert!(configs[0].starts_with("--mcp-config="), "{args:?}");
+    assert_eq!(
+        configs[0],
+        &format!("--mcp-config={CONFIG_PATH}"),
+        "the path, joined"
+    );
     let config_at = args
         .iter()
         .position(|arg| arg.starts_with("--mcp-config="))
@@ -509,7 +525,8 @@ fn argv_with_mcp_has_one_joined_config_before_tools() {
 }
 
 /// D8: the JSON is the CLI's own `mcpServers` shape — keyed by name, `type: "stdio"`, `env` an
-/// object — and serialises compactly in key order.
+/// object — and serialises compactly in key order, and the argv carries only the file's path
+/// (MOD-79): the JSON's `env` holds the session's `HTUI_MCP_TOKEN`.
 #[test]
 fn the_mcp_config_is_the_clis_stdio_shape() {
     let config = htui_agent::cli::mcp_config(&[htui_server()]).expect("one server, one config");
@@ -541,12 +558,24 @@ fn the_mcp_config_is_the_clis_stdio_shape() {
 
     let mut spec = spec(PathBuf::from("/scratch"));
     spec.mcp = vec![htui_server()];
-    let args = argv(&[], &cli_settings("", &[]), &spec, "minted-id");
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &spec,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+    );
     assert_eq!(
         mcp_configs(&args),
-        [&format!("--mcp-config={config}")],
-        "argv carries exactly that JSON"
+        [&format!("--mcp-config={CONFIG_PATH}")],
+        "argv carries the file's path, never that JSON (MOD-79)"
     );
+    for secret in ["token-value", "/run/htui-mcp-1-abcd/s", "mcpServers"] {
+        assert!(
+            !args.iter().any(|arg| arg.contains(secret)),
+            "{secret} stays off the argv: {args:?}"
+        );
+    }
 }
 
 /// D8: the operator's `extra_args` still come last, so a repeated flag is theirs.
@@ -559,6 +588,7 @@ fn extra_args_stay_last_with_mcp() {
         &cli_settings("", &["--mcp-config=operator.json", "--y"]),
         &spec,
         "minted-id",
+        Some(Path::new(CONFIG_PATH)),
     );
     assert_eq!(
         args[args.len() - 2..],
@@ -580,7 +610,13 @@ fn extra_args_stay_last_with_mcp() {
 fn argv_names_the_prompt_tool_only_with_a_port() {
     let mut with = full_spec();
     with.mcp = vec![htui_server()];
-    let without = argv(&[], &cli_settings("", &["--y"]), &with, "minted-id");
+    let without = argv(
+        &[],
+        &cli_settings("", &["--y"]),
+        &with,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+    );
     assert!(
         !without.contains(&"--permission-prompt-tool".to_owned()),
         "no port, no prompt tool: {without:?}"
@@ -588,7 +624,13 @@ fn argv_names_the_prompt_tool_only_with_a_port() {
 
     let (port, _ask) = bridge();
     with.prompt = Some(port);
-    let args = argv(&[], &cli_settings("", &["--y"]), &with, "minted-id");
+    let args = argv(
+        &[],
+        &cli_settings("", &["--y"]),
+        &with,
+        "minted-id",
+        Some(Path::new(CONFIG_PATH)),
+    );
     let config_at = args
         .iter()
         .position(|arg| arg.starts_with("--mcp-config="))
@@ -645,6 +687,7 @@ fn no_tools_disables_every_tool_and_every_mcp_server() {
         &cli_settings("acceptEdits", &["--x"]),
         &spec,
         "minted-id",
+        Some(Path::new(CONFIG_PATH)),
     );
 
     assert_eq!(
@@ -684,7 +727,13 @@ fn no_tools_off_adds_neither_flag() {
         let mut spec = full_spec();
         spec.tools = tools.clone();
         spec.mcp = vec![htui_server()];
-        let args = argv(&[], &cli_settings("acceptEdits", &[]), &spec, "minted-id");
+        let args = argv(
+            &[],
+            &cli_settings("acceptEdits", &[]),
+            &spec,
+            "minted-id",
+            Some(Path::new(CONFIG_PATH)),
+        );
         assert!(
             !args.contains(&"--strict-mcp-config".to_owned()),
             "{tools:?} → {args:?}"
@@ -883,6 +932,16 @@ async fn start(row: &AgentRow, cwd: &Path) -> Box<dyn AgentSession> {
 /// [`start`] with a spec the case built (MOD-11 D18: one carrying a prompt port).
 #[cfg(unix)]
 async fn start_with(row: &AgentRow, spec: SessionSpec) -> Box<dyn AgentSession> {
+    driver(row)
+        .start(spec, "hello".to_owned())
+        .await
+        .expect("the scripted agent sends its `system/init`")
+}
+
+/// The driver for `row`, through the factory, with §4.3's capability triple checked: what
+/// [`start_with`] starts from, and what a case that expects `start` to **fail** calls directly.
+#[cfg(unix)]
+fn driver(row: &AgentRow) -> Box<dyn htui_agent::driver::AgentDriver> {
     let mut factory = DriverFactory::new();
     factory.register(
         htui_agent::cli::ADAPTER_ID,
@@ -897,9 +956,6 @@ async fn start_with(row: &AgentRow, spec: SessionSpec) -> Box<dyn AgentSession> 
         driver.caps()
     );
     driver
-        .start(spec, "hello".to_owned())
-        .await
-        .expect("the scripted agent sends its `system/init`")
 }
 
 /// The next event, or a named failure rather than a hung suite.
@@ -983,6 +1039,7 @@ const RECORD: &str = concat!(
 fn script(template: &str) -> String {
     template
         .replace("<RECORD>", RECORD)
+        .replace("<COPY_CONFIG>", COPY_CONFIG)
         .replace("<INIT>", INIT)
         .replace("<RESULT>", RESULT)
         .replace("<REPLY>", REPLY)
@@ -1544,6 +1601,22 @@ async fn noise_and_a_carriage_return_do_not_end_the_stream() {
     );
 }
 
+/// Options for a session whose agent never says `system/init`.
+#[cfg(unix)]
+fn short_init_options() -> SessionOptions {
+    SessionOptions {
+        agent_name: "scripted-cli".to_owned(),
+        models: Vec::new(),
+        settings: AgentSettings::default(),
+        stamp: Stamp::Wall,
+        // Short enough that this is a test rather than a coffee break: the production minute is
+        // what `SessionOptions` carries the window as a *field* for.
+        init_timeout: Duration::from_millis(300),
+        box_version: None,
+        session_id: "minted-id".to_owned(),
+    }
+}
+
 /// An agent that opens its streams and never says `system/init` must not hold the tab that asked
 /// for the chat — and must not be left running when the wait gives up.
 ///
@@ -1578,18 +1651,14 @@ async fn a_stream_with_no_init_times_out_and_kills_its_child() {
         child: Some(child),
     };
 
-    let options = SessionOptions {
-        agent_name: "scripted-cli".to_owned(),
-        models: Vec::new(),
-        settings: AgentSettings::default(),
-        stamp: Stamp::Wall,
-        // Short enough that this is a test rather than a coffee break: the production minute is
-        // what `SessionOptions` carries the window as a *field* for.
-        init_timeout: Duration::from_millis(300),
-        box_version: None,
-        session_id: "minted-id".to_owned(),
-    };
-    let opened = open_session(io, spec(tmp.path().to_path_buf()), "hi".to_owned(), options).await;
+    let opened = open_session(
+        io,
+        spec(tmp.path().to_path_buf()),
+        "hi".to_owned(),
+        short_init_options(),
+        None,
+    )
+    .await;
 
     match &opened {
         Err(DriverError::Transport(message)) => assert!(
@@ -2078,4 +2147,190 @@ async fn a_tool_less_start_with_widening_extra_args_is_refused_before_the_spawn(
             if message.contains("--dangerously-skip-permissions")),
         "{refused:?}"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-79: the MCP config travels as a file
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-79: copies the file `--mcp-config=` names to `$HTUI_GO_FILE.config`, proving the CLI can
+/// read it while it runs.
+#[cfg(unix)]
+const COPY_CONFIG: &str = concat!(
+    "for arg in \"$@\"; do\n",
+    "  case \"$arg\" in\n",
+    "    --mcp-config=*) cat \"${arg#--mcp-config=}\" > \"$HTUI_GO_FILE.config\" ;;\n",
+    "  esac\n",
+    "done\n",
+);
+
+/// [`TURN_SCRIPT`], after copying its MCP config.
+#[cfg(unix)]
+const CONFIG_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+<COPY_CONFIG>
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// Copies its MCP config, then exits before `system/init`, as an unauthenticated CLI does.
+#[cfg(unix)]
+const CONFIG_THEN_EXIT_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+<COPY_CONFIG>
+printf '%s\n' 'not logged in' >&2
+exit 1
+"#;
+
+/// The one `--mcp-config=` path a script recorded, and the whole argv text it recorded it in.
+///
+/// One argument per line (`RECORD`), and a config path holds no newline, so the split is exact
+/// (blueprint H-17).
+#[cfg(unix)]
+fn recorded_config(argv: &Path) -> (PathBuf, String) {
+    let text = std::fs::read_to_string(argv).expect("the script recorded its argv");
+    let configs: Vec<&str> = text
+        .lines()
+        .filter(|arg| arg.starts_with("--mcp-config"))
+        .collect();
+    assert_eq!(configs.len(), 1, "one config argument: {text}");
+    let path = configs[0]
+        .strip_prefix("--mcp-config=")
+        .expect("the `=`-joined form");
+    (PathBuf::from(path), text)
+}
+
+/// The directory around a config file.
+#[cfg(unix)]
+fn config_dir(config: &Path) -> PathBuf {
+    config
+        .parent()
+        .expect("the config file has a directory")
+        .to_path_buf()
+}
+
+/// The CLI gets a path and can read the token through it; the argv shows neither the token nor any
+/// other `env` value. The file lives while the session does and is gone once `cancel` has joined
+/// the task (blueprint H-18: a natural end would race the drop).
+#[tokio::test]
+#[cfg(unix)]
+async fn the_cli_reads_its_mcp_config_from_a_private_file_and_never_from_its_argv() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), CONFIG_SCRIPT);
+    let mut spec = spec(tmp.path().to_path_buf());
+    spec.mcp = vec![htui_server()];
+    let mut session = start_with(&scripted.row, spec).await;
+    // The script records and copies before it prints `init`, so both files exist by now.
+    let _ = next(&mut session, "the banner").await;
+
+    let (config, text) = recorded_config(&scripted.argv);
+    for value in htui_server().env.values() {
+        assert!(
+            !text.contains(value.as_str()),
+            "{value} stays off the argv: {text}"
+        );
+    }
+    assert!(!text.contains("mcpServers"), "no JSON on the argv: {text}");
+    assert_eq!(config.file_name(), Some("mcp.json".as_ref()), "{config:?}");
+    let dir = config_dir(&config);
+    let name = dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a UTF-8 directory name");
+    assert!(
+        name.starts_with(&format!("htui-cli-{}-", std::process::id())),
+        "{name}"
+    );
+    assert!(dir.is_dir(), "the file outlives `system/init` (D3)");
+
+    let copied = std::fs::read_to_string(tmp.path().join("go.config"))
+        .expect("the script copied its config");
+    assert_eq!(
+        Some(copied.as_str()),
+        htui_agent::cli::mcp_config(&[htui_server()]).as_deref(),
+        "the file is `mcp_config`'s JSON, byte for byte"
+    );
+    assert!(copied.contains("token-value"), "the CLI can read the token");
+
+    session.cancel(Duration::ZERO).await.expect("cancel");
+    assert!(!config.exists(), "{config:?}");
+    assert!(!dir.exists(), "{dir:?}");
+}
+
+/// `open_session`'s exit (2): a CLI that read its config and then exited before `system/init`
+/// fails `start`, and the awaited task has dropped the file by the time it does.
+#[tokio::test]
+#[cfg(unix)]
+async fn a_cli_that_exits_before_init_leaves_no_mcp_config_behind() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let scripted = scripted(tmp.path(), CONFIG_THEN_EXIT_SCRIPT);
+    let mut spec = spec(tmp.path().to_path_buf());
+    spec.mcp = vec![htui_server()];
+    // `let … else`, not `expect_err`: `Box<dyn AgentSession>` has no `Debug`.
+    let Err(err) = driver(&scripted.row).start(spec, "hello".to_owned()).await else {
+        panic!("a CLI that exits before `system/init` opens no session");
+    };
+    match &err {
+        DriverError::Transport(message) => assert!(
+            message.contains("system/init"),
+            "the error names what never arrived: {message}"
+        ),
+        other => panic!("expected a transport error, got {other:?}"),
+    }
+
+    let copied = std::fs::read_to_string(tmp.path().join("go.config"))
+        .expect("the script copied its config");
+    assert!(
+        copied.contains("token-value"),
+        "the file existed while the CLI ran"
+    );
+    let (config, _) = recorded_config(&scripted.argv);
+    assert!(!config.exists(), "{config:?}");
+    assert!(!config_dir(&config).exists(), "{config:?}");
+}
+
+/// `open_session`'s exit (1), the abort: the config moved into the task is dropped with the
+/// aborted future. No child is needed to show that, so the streams are a duplex nobody writes to,
+/// as in [`a_stream_with_no_init_times_out_and_kills_its_child`]; the production minute cannot be
+/// reached through `start`, which is why this builds the guard itself.
+#[tokio::test]
+#[cfg(unix)]
+async fn an_open_session_that_times_out_drops_its_mcp_config() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let config = McpConfigFile::write(&[htui_server()])
+        .expect("the config is written")
+        .expect("one server writes a file");
+    let dir = config_dir(config.path());
+    assert!(dir.is_dir());
+
+    // Held for the test's life: dropping the agent end is an EOF, which is exit (2), not this one.
+    let (client_end, _agent_end) = tokio::io::duplex(64 * 1024);
+    let (reader, writer) = tokio::io::split(client_end);
+    let io = ChildIo {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        child: None,
+    };
+    let opened = open_session(
+        io,
+        spec(tmp.path().to_path_buf()),
+        "hi".to_owned(),
+        short_init_options(),
+        Some(config),
+    )
+    .await;
+
+    match &opened {
+        Err(DriverError::Transport(message)) => assert!(
+            message.contains("system/init"),
+            "the error names what never arrived: {message}"
+        ),
+        Err(other) => panic!("expected a transport error, got {other:?}"),
+        Ok(_) => panic!("a silent agent does not open a session"),
+    }
+    assert!(!dir.exists(), "{dir:?}");
 }

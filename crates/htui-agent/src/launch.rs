@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 use tracing::warn;
 
-use crate::driver::{PermissionPolicy, RedactedEnv};
+use crate::driver::{PermissionPolicy, REDACTED, RedactedEnv};
 use crate::error::{DriverError, Result};
 
 /// How many stderr lines a [`Spawned`] keeps. Enough to explain a failed handshake, bounded so a
@@ -442,7 +442,7 @@ fn default_true() -> bool {
 pub struct ResolvedLaunch {
     /// The executable, as a concrete path or a name `which` can find.
     pub command: String,
-    /// Arguments, fully substituted.
+    /// Arguments, fully substituted. `Debug` redacts every `--mcp-config` value (MOD-79).
     pub args: Vec<String>,
     /// Environment for the child, fully substituted. Redacted by `Debug`.
     pub env: BTreeMap<String, String>,
@@ -452,9 +452,45 @@ impl core::fmt::Debug for ResolvedLaunch {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("ResolvedLaunch")
             .field("command", &self.command)
-            .field("args", &self.args)
+            .field("args", &RedactedArgs(&self.args))
             .field("env", &RedactedEnv(&self.env))
             .finish()
+    }
+}
+
+/// `ResolvedLaunch::args` for `Debug` (MOD-79, review L2): every `--mcp-config` value prints as
+/// `[REDACTED]`, so neither a session's config path nor an operator's inline JSON reaches a log line.
+///
+/// Hardening rather than a fix: no `Debug` path logs a token today (`docs/decisions/mod/mod-11.md`),
+/// but `args` is the one field of this type an operator's `extra_args` reach verbatim, and an inline
+/// `--mcp-config=<json>` there carries whatever secret the JSON does.
+///
+/// `--mcp-config=<v>` prints as `--mcp-config=[REDACTED]`. After a bare `--mcp-config`, every
+/// following argument up to the next `-`-prefixed one prints as `[REDACTED]`; that is how the CLI's
+/// variadic flag consumes them. Every other argument prints unchanged, including flags that merely
+/// share the prefix (`--mcp-config-x`). The marker is [`REDACTED`], the literal [`RedactedEnv`]
+/// prints, so a log has one spelling to grep for.
+struct RedactedArgs<'a>(&'a [String]);
+
+impl core::fmt::Debug for RedactedArgs<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let mut list = f.debug_list();
+        let mut values = false; // inside a bare `--mcp-config`'s values
+        for arg in self.0 {
+            if arg == "--mcp-config" {
+                values = true;
+                list.entry(arg);
+            } else if arg.starts_with("--mcp-config=") {
+                values = false;
+                list.entry(&format!("--mcp-config={REDACTED}"));
+            } else if values && !arg.starts_with('-') {
+                list.entry(&REDACTED);
+            } else {
+                values = false;
+                list.entry(arg);
+            }
+        }
+        list.finish()
     }
 }
 

@@ -59,9 +59,11 @@ flate2                = { workspace = true }
 fs4                   = { workspace = true }
 # MOD-2 milestone 8 (T50, plan D84): the CLI supervisor mints its own session id and passes it as
 # `claude --session-id`, so a later step can `--resume` it. `Uuid::now_v7()`, the same call
-# `htui_core::model::ids` makes; the workspace pins `v7` + `serde` and this crate needs no other
-# feature.
-uuid                  = { workspace = true }
+# `htui_core::model::ids` makes; the workspace pins `v7` + `serde`. MOD-79 (blueprint PC-3, H-1):
+# `v4` for `private_dir::create`'s random suffix. `now_v7()`'s leading hex is the millisecond, so
+# two directories made in one millisecond would collide (H-2). Declared here, not borrowed from
+# `htui-mcp`'s feature unification, so `cargo check -p htui-agent` compiles on its own.
+uuid                  = { workspace = true, features = ["v4"] }
 # MOD-7 D6: the box probe's OS version, CPU brand and total RAM on all three platforms (`system`
 # only, set at the workspace).
 sysinfo               = { workspace = true }
