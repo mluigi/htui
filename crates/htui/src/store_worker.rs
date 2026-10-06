@@ -1821,9 +1821,9 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // The six chat requests (MOD-55's help among them) need the worker loop's own state (the
         // live sessions), and the two probes, the preview, the three install requests, MOD-21's
         // four login ones, MOD-22's delivery and MOD-66's tool-paths write need the runtime that
-        // owns their tasks, so all eighteen are served ahead of this function, exactly as `ApplyMigrations` is. One
-        // of them that reaches here at all belongs to a caller with no runtime — the test harness
-        // without one — and saying so is more use than a panic.
+        // owns their tasks, so all eighteen are served ahead of this function, exactly as
+        // `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
+        // runtime — the test harness without one — and saying so is more use than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
