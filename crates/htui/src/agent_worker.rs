@@ -4466,6 +4466,7 @@ pub async fn run_chat(args: ChatArgs) {
             &mut calls,
             &frames,
             grace,
+            mode.is_help(),
         )
         .await
         {
@@ -4504,10 +4505,12 @@ pub async fn run_chat(args: ChatArgs) {
 
         // MOD-55 P4: a help session is one turn, ended exactly as a cancel between turns ends a
         // chat: nothing was cut, so the run closes `done` with the turn's own stop reason, and the
-        // `Ended` below is the stream's last frame. No `ChatCommand` is read: a `ChatCancel` that
-        // raced the turn's end is dropped with the receiver and the tab ends on this `Ended`.
+        // `Ended` below is the stream's last frame. A `ChatCancel` that raced the turn's end is
+        // answered after the loop (MOD-55 review H1).
         if mode.is_help() {
-            let _ = session.cancel(grace).await;
+            if let Err(err) = session.cancel(grace).await {
+                tracing::debug!(%err, "the help session did not close gracefully");
+            }
             drain(session.as_mut(), &mut recorder, &mut ui_rx, &frames).await;
             break;
         }
@@ -4578,6 +4581,12 @@ pub async fn run_chat(args: ChatArgs) {
         }
     }
 
+    // MOD-55 review H1: every command is answered exactly once, so a help answers what is still
+    // queued as it ends rather than dropping it with the receiver. A chat keeps its behaviour.
+    if mode.is_help() {
+        answer_after_help(&mut commands, &frames, last_stop).await;
+    }
+
     if let Err(err) = recorder.finish().await {
         tracing::error!(%err, "the recorder did not close cleanly");
         status = RunStatus::Failed;
@@ -4603,6 +4612,11 @@ pub async fn run_chat(args: ChatArgs) {
 /// `pump` cannot cross a parked permission request — `next_event` refuses while one is
 /// outstanding, on every transport — so the pull and the command channel have to be served by the
 /// same loop.
+///
+/// `listen` (MOD-55 review H1, a help turn): commands are served **while pulling** too, ahead of
+/// the pull, so an `Esc` mid-reply cancels the session at once rather than after the agent's
+/// `Done`. A chat passes `false` and reads commands between turns, as it always has. Both
+/// transports' `next_event` is cancel-safe (an mpsc `recv`), so a command that wins drops no event.
 #[expect(
     clippy::too_many_arguments,
     reason = "one turn's collaborators; a struct would rename the arity without reducing it"
@@ -4616,6 +4630,7 @@ async fn run_turn(
     calls: &mut HashMap<String, ToolCallEvent>,
     frames: &Frames,
     grace: Duration,
+    listen: bool,
 ) -> Result<TurnEnd, DriverError> {
     let mut parked: Option<PermissionRequestId> = None;
 
@@ -4696,7 +4711,25 @@ async fn run_turn(
             continue;
         }
 
-        let Some(envelope) = session.next_event().await? else {
+        let pulled = if listen {
+            tokio::select! {
+                biased;
+                command = commands.recv() => Pull::Command(command),
+                pulled = session.next_event() => Pull::Event(pulled),
+            }
+        } else {
+            Pull::Event(session.next_event().await)
+        };
+        let pulled = match pulled {
+            Pull::Event(pulled) => pulled,
+            Pull::Command(command) => {
+                match help_command(session, recorder, ui, frames, grace, command).await {
+                    Some(end) => return Ok(end),
+                    None => continue,
+                }
+            }
+        };
+        let Some(envelope) = pulled? else {
             // The stream ended without a `done`. That is a transport that died mid-turn, not a
             // turn that finished: reporting it as `EndTurn` would close the run `done`, leave no
             // `done` row in the log, and tell the tab nothing.
@@ -4751,6 +4784,110 @@ async fn run_turn(
             DriverEvent::Done(done) => return Ok(TurnEnd::Done(done.stop_reason)),
             _ => {}
         }
+    }
+}
+
+/// What a listening turn's loop got first (MOD-55 review H1): the agent's next event, or a
+/// command.
+enum Pull {
+    /// [`AgentSession::next_event`]'s answer.
+    Event(Result<Option<DriverEnvelope>, DriverError>),
+    /// The command channel's: `None` once the runtime let go of it.
+    Command(Option<ChatCommand>),
+}
+
+/// MOD-55 review H1: a command a help turn read while pulling, nothing parked. `Some` ends the
+/// turn; every command is answered at its own address, once.
+///
+/// A cancel ends the session now, as the parked path's does: the run closes `cancelled` and the
+/// cancel is answered `Ended{Cancelled}`. A runtime that let go of the channel ends it the same
+/// way, with nobody to answer. A help has no follow-up and nothing parked to answer, so `Send`
+/// and `Answer` are refused and the turn goes on.
+async fn help_command(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, Writer>,
+    ui: &mut mpsc::Receiver<DriverEnvelope>,
+    frames: &Frames,
+    grace: Duration,
+    command: Option<ChatCommand>,
+) -> Option<TurnEnd> {
+    let reply = match command {
+        Some(ChatCommand::Cancel { reply }) => reply,
+        None => None,
+        Some(ChatCommand::Send { reply, .. }) => {
+            frames.reply(
+                &reply,
+                StoreReply::Failed {
+                    request: "chat_send",
+                    message: "a help turn takes no follow-up".to_owned(),
+                },
+            );
+            return None;
+        }
+        Some(ChatCommand::Answer {
+            request_id, reply, ..
+        }) => {
+            frames.reply(
+                &reply,
+                StoreReply::Failed {
+                    request: "chat_answer",
+                    message: format!("no permission request `{request_id}` is waiting"),
+                },
+            );
+            return None;
+        }
+    };
+    // Logged and not returned: the kill that follows a failed graceful cancel still ends the
+    // session, and the cancel is owed its answer either way.
+    if let Err(err) = session.cancel(grace).await {
+        tracing::debug!(%err, "the help session did not cancel gracefully");
+    }
+    drain(session, recorder, ui, frames).await;
+    if let Some(reply) = reply {
+        frames.reply(
+            &reply,
+            StoreReply::Chat(ChatFrame::Ended {
+                stop_reason: StopReason::Cancelled,
+            }),
+        );
+    }
+    Some(TurnEnd::Cancelled)
+}
+
+/// MOD-55 review H1: what is still queued when a help ends, each answered once at its own address.
+///
+/// The receiver is closed first, so a command sent from now on is refused by the runtime as "this
+/// chat has ended" and none can slip in behind this drain. A cancel is answered as a chat answers
+/// a cancel between turns — `Ended` with the help's last stop reason, which is the stream's own
+/// closing frame too, so the tab's `Cancelling` closes on either; a send or an answer has nothing
+/// left to reach and is refused with the runtime's sentence.
+async fn answer_after_help(
+    commands: &mut mpsc::UnboundedReceiver<ChatCommand>,
+    frames: &Frames,
+    last_stop: StopReason,
+) {
+    commands.close();
+    while let Some(command) = commands.recv().await {
+        let (reply, answer) = match command {
+            ChatCommand::Cancel { reply: None } => continue,
+            ChatCommand::Cancel { reply: Some(reply) } => (
+                reply,
+                StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: last_stop,
+                }),
+            ),
+            ChatCommand::Send { reply, .. } => (reply, ended("chat_send")),
+            ChatCommand::Answer { reply, .. } => (reply, ended("chat_answer")),
+        };
+        frames.reply(&reply, answer);
+    }
+}
+
+/// The runtime's "this chat has ended" refusal, as `request`.
+fn ended(request: &'static str) -> StoreReply {
+    StoreReply::Failed {
+        request,
+        message: "this chat has ended".to_owned(),
     }
 }
 
@@ -6133,8 +6270,9 @@ pub(crate) mod tests {
     }
 
     /// T3-i: a cancel mid-turn ends the help `cancelled`, answered at the cancel's own seq. The
-    /// turn stalls on a permission request the deny-all policy cannot answer (no reject option is
-    /// offered, H-5), which is where `run_turn` reads the cancel.
+    /// turn would stall on a permission request the deny-all policy cannot answer (no reject option
+    /// is offered, H-5); since MOD-55 review H1 the queued cancel is read ahead of the first pull,
+    /// and the parked path is the one a later cancel takes.
     #[tokio::test]
     async fn a_cancel_mid_turn_closes_the_help_cancelled() {
         let script = Script::one_turn(vec![
@@ -6203,6 +6341,362 @@ pub(crate) mod tests {
             .expect("the read answers")
             .expect("the help's run");
         assert_eq!(run.status, RunStatus::Cancelled);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-55 review H1: a help's cancel with nothing parked
+    // -----------------------------------------------------------------------------------------
+
+    /// Where [`StallSession`] stops and waits for the case.
+    #[derive(Debug, Clone, Copy)]
+    enum StallAt {
+        /// The pull after the first reply chunk never resolves until the session is cancelled:
+        /// an agent mid-reply, with no permission request parked.
+        AfterChunk,
+        /// `cancel` waits for [`StallProbe::release`]: the turn's `Done` is in, and the help is
+        /// ending itself.
+        InCancel,
+    }
+
+    /// What a [`StallSession`] shares with its case.
+    #[derive(Debug, Default)]
+    struct StallProbe {
+        /// Set once the session's `cancel` ran.
+        cancelled: AtomicBool,
+        /// Notified when the session reaches its [`StallAt`].
+        reached: tokio::sync::Notify,
+        /// What an [`StallAt::InCancel`] session waits for.
+        release: tokio::sync::Notify,
+    }
+
+    /// The fake driver whose sessions stall at `at`.
+    #[derive(Debug)]
+    struct StallDriver {
+        inner: Box<dyn AgentDriver>,
+        probe: Arc<StallProbe>,
+        at: StallAt,
+    }
+
+    impl AgentDriver for StallDriver {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
+            Box::pin(async move {
+                let inner = self.inner.start(spec, prompt).await?;
+                Ok(Box::new(StallSession {
+                    inner,
+                    probe: Arc::clone(&self.probe),
+                    at: self.at,
+                    chunk_seen: false,
+                    cancelled: false,
+                }) as Box<dyn AgentSession>)
+            })
+        }
+    }
+
+    /// The fake session, stalled at `at`.
+    #[derive(Debug)]
+    struct StallSession {
+        inner: Box<dyn AgentSession>,
+        probe: Arc<StallProbe>,
+        at: StallAt,
+        chunk_seen: bool,
+        cancelled: bool,
+    }
+
+    impl AgentSession for StallSession {
+        fn session_ref(&self) -> Option<&AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+        ) -> htui_agent::driver::DriverFuture<'a, Option<DriverEnvelope>> {
+            Box::pin(async move {
+                if matches!(self.at, StallAt::AfterChunk) && self.chunk_seen && !self.cancelled {
+                    self.probe.reached.notify_one();
+                    // Cancel-safe: dropping a pending future drops nothing.
+                    std::future::pending::<()>().await;
+                }
+                let pulled = self.inner.next_event().await?;
+                if pulled.as_ref().is_some_and(|envelope| {
+                    matches!(envelope.event, DriverEvent::AssistantChunk(_))
+                }) {
+                    self.chunk_seen = true;
+                }
+                Ok(pulled)
+            })
+        }
+
+        fn send_follow_up<'a>(
+            &'a mut self,
+            text: String,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: PermissionRequestId,
+            answer: PermissionAnswer,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(&'a mut self, grace: Duration) -> htui_agent::driver::DriverFuture<'a, ()> {
+            Box::pin(async move {
+                self.cancelled = true;
+                self.probe.cancelled.store(true, Ordering::SeqCst);
+                if matches!(self.at, StallAt::InCancel) {
+                    self.probe.reached.notify_one();
+                    self.probe.release.notified().await;
+                }
+                self.inner.cancel(grace).await
+            })
+        }
+    }
+
+    /// [`StallDriver`]'s builder over one shared fake.
+    #[derive(Debug)]
+    struct StallBuilder {
+        adapter: Arc<FakeAdapter>,
+        probe: Arc<StallProbe>,
+        at: StallAt,
+    }
+
+    impl htui_agent::registry::TransportBuilder for StallBuilder {
+        fn build(
+            &self,
+            agent: &Agent,
+            on_box: Option<&AgentBox>,
+            caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            Ok(Box::new(StallDriver {
+                inner: self.adapter.build(agent, on_box, caps)?,
+                probe: Arc::clone(&self.probe),
+                at: self.at,
+            }))
+        }
+    }
+
+    /// [`fixture`] over [`StallDriver`].
+    async fn fixture_with_stall(
+        script: Script,
+        at: StallAt,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId, Arc<StallProbe>) {
+        let store = MemStore::from_demo(htui_core::fixtures::demo_data());
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&fake_row(agent_id), None)
+            .await
+            .expect("the fake row lands");
+        let adapter = Arc::new(FakeAdapter::new());
+        adapter.load(script);
+        let probe = Arc::new(StallProbe::default());
+        let mut factory = DriverFactory::new();
+        factory.register(
+            "cli/fake",
+            Box::new(StallBuilder {
+                adapter,
+                probe: Arc::clone(&probe),
+                at,
+            }),
+        );
+        let backend = Backend::memory(store.clone());
+        let runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
+        (store, backend, runtime, agent_id, probe)
+    }
+
+    /// Starts a help over `runtime`, waits for its session to reach the stall, serves a
+    /// `ChatCancel` at seq 8, releases the stall, and drives the help to its end.
+    async fn cancel_at_stall(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        agent_id: AgentId,
+        probe: &StallProbe,
+    ) -> (StepId, Vec<ReplyEnvelope>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .serve(backend, &tx, &envelope(7, help(agent_id, "old\n", "new")))
+            .await
+        else {
+            panic!("a help turn opens a session")
+        };
+        let task = tokio::spawn(task);
+        tokio::time::timeout(Duration::from_secs(30), probe.reached.notified())
+            .await
+            .expect("the session reaches its stall");
+        let cancel = runtime
+            .serve(
+                backend,
+                &tx,
+                &envelope(8, StoreRequest::ChatCancel { step_id }),
+            )
+            .await;
+        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+        probe.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the help ends once cancelled, without its agent finishing the turn")
+            .expect("the help task does not panic");
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+        (step_id, replies)
+    }
+
+    /// The replies at `seq`.
+    fn at_seq(replies: &[ReplyEnvelope], seq: Seq) -> Vec<&StoreReply> {
+        replies
+            .iter()
+            .filter(|reply| reply.seq == seq)
+            .map(|reply| &reply.reply)
+            .collect()
+    }
+
+    /// MOD-55 review H1: `Esc` while the agent is mid-reply, with **no** permission request
+    /// parked, cancels the session at once: the cancel is answered once, `Ended{Cancelled}`, the
+    /// run closes `cancelled` and the stream ends `cancelled`. Before the fix the turn read no
+    /// command until its `Done`, so the agent finished its reply first.
+    #[tokio::test]
+    async fn a_cancel_mid_stream_with_nothing_parked_cancels_the_help() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                text: "partial".to_owned(),
+                message_id: Some("m1".to_owned()),
+            })),
+            ScriptEvent::ExpectCancel,
+        ]);
+        let (store, backend, mut runtime, agent_id, probe) =
+            fixture_with_stall(script, StallAt::AfterChunk).await;
+
+        let (step_id, replies) = cancel_at_stall(&mut runtime, &backend, agent_id, &probe).await;
+
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                })]
+            ),
+            "the cancel is answered exactly once: {replies:?}"
+        );
+        assert!(
+            probe.cancelled.load(Ordering::SeqCst),
+            "the driver session was cancelled"
+        );
+        assert!(
+            matches!(
+                replies.last(),
+                Some(ReplyEnvelope {
+                    seq: 7,
+                    reply: StoreReply::Chat(ChatFrame::Ended {
+                        stop_reason: StopReason::Cancelled
+                    }),
+                    ..
+                })
+            ),
+            "the stream ends cancelled: {replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Cancelled);
+    }
+
+    /// MOD-55 review H1, A-2: a cancel already queued when the session is accepted (an `Esc`
+    /// deferred until `ChatAccepted`) is read before the first pull: the agent's turn, which only
+    /// a cancel ends, is cancelled rather than pulled into.
+    #[tokio::test]
+    async fn a_cancel_queued_at_the_acceptance_cancels_the_help() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                text: "partial".to_owned(),
+                message_id: Some("m1".to_owned()),
+            })),
+            ScriptEvent::ExpectCancel,
+        ]);
+        let (store, backend, mut runtime, agent_id) = fixture(script).await;
+
+        let (step_id, replies) = run(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                })]
+            ),
+            "the cancel is answered exactly once: {replies:?}"
+        );
+        assert!(
+            !replies.iter().any(|reply| matches!(
+                reply.reply,
+                StoreReply::Failed { .. } | StoreReply::Chat(ChatFrame::Failed { .. })
+            )),
+            "nothing failed: {replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Cancelled);
+    }
+
+    /// MOD-55 review H1: a cancel that reaches the session while the help is ending itself (its
+    /// `Done` in, the session closing) is answered once, as a chat answers a cancel between turns:
+    /// `Ended` with the turn's own stop reason, the run `done`. It used to be dropped with the
+    /// receiver, unanswered.
+    #[tokio::test]
+    async fn a_cancel_queued_as_the_help_turn_ends_is_answered_once() {
+        let (store, backend, mut runtime, agent_id, probe) =
+            fixture_with_stall(help_script(), StallAt::InCancel).await;
+
+        let (step_id, replies) = cancel_at_stall(&mut runtime, &backend, agent_id, &probe).await;
+
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::EndTurn
+                })]
+            ),
+            "the cancel is answered exactly once: {replies:?}"
+        );
+        assert!(
+            matches!(
+                replies.last(),
+                Some(ReplyEnvelope {
+                    seq: 7,
+                    reply: StoreReply::Chat(ChatFrame::Ended {
+                        stop_reason: StopReason::EndTurn
+                    }),
+                    ..
+                })
+            ),
+            "the stream ends with the turn's reason: {replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Done, "nothing was cut");
     }
 
     // -----------------------------------------------------------------------------------------
