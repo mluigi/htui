@@ -447,7 +447,7 @@ fn kind_mismatch(kind: &str, column: &str) -> String {
 }
 
 /// MOD-10 D15: where a process gets its one provider per identity. Production is `htui`'s
-/// keyring-backed Infisical source; tests use [`fake::FakeSecretSource`].
+/// keyring-backed Infisical source; tests use `fake::FakeSecretSource`.
 pub trait SecretSource: Send + Sync + core::fmt::Debug {
     /// The provider for the identity stored now. Called once per walk and per chat; an
     /// implementation returns the **same** `Arc` while nothing it reads has changed, so the
