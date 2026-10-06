@@ -33,12 +33,12 @@ use htui_agent::record::{
 };
 use htui_core::model::{
     AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
-    DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
-    NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
-    PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotPersona,
-    SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, missing_tags_failure,
+    DocumentId, EventKind, FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, Isolation,
+    Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId,
+    ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate,
+    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
+    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -2147,8 +2147,23 @@ where
     /// `open_permission` staling only reaches it if a new session parks on the same step, and
     /// recovery opens none.
     ///
+    /// MOD-70 D9: the dropped walk's follow-up windows close first, under the same lease, and
+    /// every follow-up still pending on the run is refused with
+    /// [`FOLLOW_UP_SESSION_ENDED`]: no session will ever send it (OQ-5). The sweep can reach
+    /// this twice for one run (its `renew_lease`, then its recovery); the close is idempotent.
+    ///
     /// Best-effort: a failure is a `warn`, and the row stays the ghost it was.
     async fn stale_dropped_requests(&self, run: RunId, item: ItemId) {
+        // MOD-70 D9: the dropped walk's follow-up windows close first, under the same lease: a
+        // follow-up queued for a session nobody drives is refused, not stranded (OQ-5).
+        if let Err(err) = self
+            .parts
+            .store
+            .close_dropped_follow_ups(run, self.parts.owner, FOLLOW_UP_SESSION_ENDED)
+            .await
+        {
+            tracing::warn!(%run, %err, "closing a dropped walk's follow-up windows failed; a cancel or the next re-take refuses what they hold");
+        }
         let view = match self.parts.store.relay_view(item).await {
             Ok(view) => view,
             Err(err) => {
@@ -6132,8 +6147,9 @@ where
             poll: RELAY_POLL,
             grace: RELAY_GRACE,
             now: &now,
-            // MOD-70 D8: T3 sets it for main and candidate sessions.
-            follow_ups: false,
+            // MOD-70 D8: the main step's and each candidate's session take follow-ups; a judge
+            // call (`fanout_index = -1`, `judge_calls`) never opens a window (PRD Q2).
+            follow_ups: step.fanout_index >= 0,
         };
         // MOD-37 M4 D1: under a deadline `drive` runs against a step-local control, which
         // `forward_or_cut` feeds from the run's; without one, against the run's own, and no
@@ -18117,6 +18133,12 @@ mod tests {
                 .collect()
         }
 
+        /// Whether a log's `follow_up` rows include the one [`FOLLOW_UP`] sent.
+        fn carries_the_follow_up(log: &[SessionEvent]) -> bool {
+            log.iter()
+                .any(|row| row.kind == EventKind::FollowUp && row.payload["text"] == FOLLOW_UP)
+        }
+
         /// How many `done` rows a log holds: one per turn.
         fn dones_in(log: &[SessionEvent]) -> usize {
             log.iter().filter(|row| row.kind == EventKind::Done).count()
@@ -18226,11 +18248,18 @@ mod tests {
                 [1],
                 "the follow-up is candidate 0's turn 1"
             );
-            assert!(follow_up_turns(&log(&harness.orch.store, second.id).await).is_empty());
-            assert!(follow_up_turns(&log(&harness.orch.store, judge.id).await).is_empty());
+            // The judge's own `follow_up` row is its reversed call's prompt (call 1), not ours.
+            for (step, sent) in [(first.id, true), (second.id, false), (judge.id, false)] {
+                assert_eq!(
+                    carries_the_follow_up(&log(&harness.orch.store, step).await),
+                    sent,
+                    "the follow-up lands on candidate 0's log only"
+                );
+            }
             assert_eq!(
                 (first.status, second.status, judge.status),
-                (StepStatus::Done, StepStatus::Done, StepStatus::Done)
+                (StepStatus::Done, StepStatus::Superseded, StepStatus::Done),
+                "candidate 0 won, its sibling lost, the judge decided"
             );
             assert_eq!(
                 (first.selected, second.selected),
@@ -18298,9 +18327,29 @@ mod tests {
             assert!(harness.orch.store.follow_up_rows().is_empty());
         }
 
+        /// A follow-up turn that hangs: a second call parks on a request nobody answers, and the
+        /// turn ends only by a cancel. (A bare `ExpectCancel` fails the turn at once: the fake
+        /// session answers an uncancelled marker with a transport error.)
+        fn hangs_on_a_second_request() -> Vec<ScriptEvent> {
+            let mut second = request();
+            second.request_id = PermissionRequestId::new("req-2");
+            second.tool_call_id = Some("call-2".to_owned());
+            vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(htui_agent::event::ToolCallEvent {
+                    tool_call_id: "call-2".to_owned(),
+                    title: "run the suite again".to_owned(),
+                    tool_kind: htui_agent::event::ToolKind::Execute,
+                    input: serde_json::json!({ "command": "cargo test" }),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(second),
+                ScriptEvent::ExpectCancel,
+            ]
+        }
+
         /// A client that queues [`FOLLOW_UP`] for `item`'s parked step and answers, waits until
-        /// the walk took it for turn 1, then queues a second one while turn 1 is live. Answers
-        /// the parked row and both ids.
+        /// the walk took it for turn 1 and turn 1 parked ([`hangs_on_a_second_request`]), then
+        /// queues a second one. Answers the first parked row and both ids.
         async fn queues_into_turn_1(
             store: &MemStore,
             item: ItemId,
@@ -18309,6 +18358,7 @@ mod tests {
             let first = queued(store, row.run_step_id, FOLLOW_UP).await;
             answer(store, &row).await;
             applied(store, first).await?;
+            pending_row(store).await?;
             let second = queued(store, row.run_step_id, "and the docs").await;
             Some((row, first, second))
         }
@@ -18321,11 +18371,9 @@ mod tests {
             let harness = Harness::new().await;
             harness.free_feat_3().await;
             step_deadline(&harness, 5);
-            harness.orch.script(
-                "prd",
-                1,
-                parks_then(vec![ScriptEvent::ExpectCancel], "the prd"),
-            );
+            harness
+                .orch
+                .script("prd", 1, parks_then(hangs_on_a_second_request(), "the prd"));
             let store = harness.orch.store.clone();
 
             let (walked, client) = tokio::join!(
@@ -18375,11 +18423,9 @@ mod tests {
         async fn a_cancel_during_a_follow_up_turn_finishes_no_step() {
             let harness = Harness::new().await;
             feat_3_with_prd_ungated(&harness).await;
-            harness.orch.script(
-                "prd",
-                1,
-                parks_then(vec![ScriptEvent::ExpectCancel], "the prd"),
-            );
+            harness
+                .orch
+                .script("prd", 1, parks_then(hangs_on_a_second_request(), "the prd"));
             let orch = &harness.orch;
 
             let (walked, client) =
