@@ -33,12 +33,13 @@ use htui_agent::record::{
 };
 use htui_core::model::{
     AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
-    DocumentId, EventKind, FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome, GraphSnapshot, Isolation,
-    Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId,
-    ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate,
-    SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome,
-    StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, missing_tags_failure,
+    DocumentId, EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, Gate, GateOutcome,
+    GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun, NewRunStep, NoteId,
+    Project, ProjectId, ProjectSettings, PromptScope, RelaySessionId, Repo, RepoId, Resolution,
+    Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, SessionEvent,
+    SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId,
+    StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome,
+    missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -1872,6 +1873,9 @@ where
             self.cleanup_run(run).await
         };
         self.leased_window(run, window).await?;
+        // MOD-70 review M-3: under the lease still held, before it goes back.
+        self.close_finished_follow_ups(run, FOLLOW_UP_RUN_CANCELLED)
+            .await;
         self.release_lease(run).await;
         Ok(CommandOutcome::Cancelled {
             rest: Rest {
@@ -1995,14 +1999,44 @@ where
     /// decides the release: a run still `running` keeps its lease, any other status gives it back.
     /// The re-read only decides that, so its failure is warned and the release is tried anyway;
     /// the walk's answer stands either way.
+    ///
+    /// MOD-70 review M-3: a run the walk settled terminal has its follow-up windows closed first,
+    /// under the lease still held ([`Self::close_finished_follow_ups`]).
     async fn release_after_walk(&self, run: RunId, reread: Result<Run, EngineError>) {
         match reread {
             Ok(row) if row.status == RunStatus::Running => {}
-            Ok(_) => self.release_lease(run).await,
+            Ok(row) => {
+                if row.status.is_terminal() {
+                    self.close_finished_follow_ups(run, FOLLOW_UP_SESSION_ENDED)
+                        .await;
+                }
+                self.release_lease(run).await;
+            }
             Err(err) => {
                 tracing::warn!(%run, %err, "re-reading the run after its walk failed");
                 self.release_lease(run).await;
             }
+        }
+    }
+
+    /// MOD-70 review M-3: every follow-up window of `run` closes and every follow-up still pending
+    /// on it is refused with `reason`, its text nulled. Called where this process settled the run
+    /// terminal and still holds its lease, before giving it back: a follow-up whose window close
+    /// gave up (D6 step 8, R-3) would otherwise keep its text for ever, since no lease is re-taken
+    /// on a finished run (D9) and `relay_view` lists no terminal run. The store fences it on this
+    /// owner's lease, and it is idempotent.
+    ///
+    /// Best-effort: a failure is a `warn`, and the rows stay as they were. Boxed: it is awaited on
+    /// the walk's path (the 2 MiB stack).
+    async fn close_finished_follow_ups(&self, run: RunId, reason: &str) {
+        let closed = Box::pin(self.parts.store.close_dropped_follow_ups(
+            run,
+            self.parts.owner,
+            reason,
+        ))
+        .await;
+        if let Err(err) = closed {
+            tracing::warn!(%run, %err, "closing a finished run's follow-up windows failed; what they hold stays pending");
         }
     }
 
@@ -18560,7 +18594,7 @@ mod tests {
 
         /// MOD-70 review M-3: [`dropped_with_a_follow_up`] leaves the rows a failed close leaves
         /// (D6 step 8 gave up after its retries, R-3): the step's window open over a pending
-        /// follow-up, the run `running` under this owner's lease and not in [`DeadWalks`]. A walk
+        /// follow-up, the run `running` under this owner's lease and not in `DeadWalks`. A walk
         /// that then settles the run terminal closes the run's windows before it gives the lease
         /// back, so the row is refused with its text gone rather than kept for ever.
         #[tokio::test(start_paused = true)]
