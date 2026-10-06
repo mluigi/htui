@@ -1393,6 +1393,91 @@ async fn an_oversized_login_401_still_latches() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Proxy (D9, H-5, R1 #9)
+// ---------------------------------------------------------------------------------------------
+
+/// Set only in the child process of [`a_loopback_base_never_goes_through_the_proxy`]: the base
+/// URL of the parent's Infisical stub.
+const PROXY_CHILD_BASE: &str = "HTUI_SECRETS_TEST_PROXY_CHILD_BASE";
+
+/// D9 / H-5: on a loopback base the provider ignores the environment's proxy. A test cannot set
+/// `HTTP_PROXY` in its own process (`set_var` is `unsafe`), so this test re-runs its own binary,
+/// filtered to itself, with the proxy variables pointing at a recording stub. In the child the
+/// provider resolves against the Infisical stub; then a control client that keeps the system
+/// proxy sends one request, which proves the variables reached reqwest. The parent asserts the
+/// proxy saw that control request only, and the Infisical stub saw the login and the list.
+///
+/// Not proven here: that a non-loopback base keeps the system proxy. It would need a resolvable
+/// non-loopback name served by a stub (DNS tricks); `parse_base` decides the split and its unit
+/// tests pin which hosts are loopback.
+#[tokio::test]
+async fn a_loopback_base_never_goes_through_the_proxy() {
+    if let Ok(base) = std::env::var(PROXY_CHILD_BASE) {
+        let p = InfisicalProvider::new(InfisicalConfig::new(base.as_str()), identity())
+            .must("a provider in the child");
+        p.resolve(&scope())
+            .await
+            .must("the child resolves on loopback");
+        let control = reqwest::Client::builder()
+            .build()
+            .expect("the control client builds");
+        let _ = control.get(format!("{base}{STATUS}")).send().await;
+        return;
+    }
+    let proxy = Stub::start();
+    let stub = serving(json!([secret("A", VALUE)]));
+    let exe = std::env::current_exe().expect("the test binary's path");
+    let mut child = std::process::Command::new(exe);
+    child
+        .args([
+            "a_loopback_base_never_goes_through_the_proxy",
+            "--exact",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(PROXY_CHILD_BASE, stub.base())
+        .env_remove("NO_PROXY")
+        .env_remove("no_proxy")
+        // hyper-util ignores `HTTP_PROXY` in a CGI process.
+        .env_remove("REQUEST_METHOD");
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        child.env(name, proxy.base());
+    }
+    let output = child.output().expect("the child test runs");
+    assert!(
+        output.status.success(),
+        "the child test failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        routes(&stub),
+        [
+            ("POST".to_owned(), LOGIN.to_owned()),
+            ("GET".to_owned(), SECRETS.to_owned())
+        ],
+        "the Infisical stub did not see exactly the provider's login and list"
+    );
+    let through_proxy = proxy.requests();
+    assert_eq!(
+        through_proxy.len(),
+        1,
+        "the proxy saw a provider request, or the control never reached it"
+    );
+    assert!(
+        through_proxy[0].path == format!("{}{STATUS}", stub.base()),
+        "the proxy's one request is not the control's"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // Health
 // ---------------------------------------------------------------------------------------------
 
