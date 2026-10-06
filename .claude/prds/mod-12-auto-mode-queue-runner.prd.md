@@ -129,9 +129,9 @@ reorder (M3).
 
 - [ ] Unattended outcome quality for `FIX` / `CLEAN` / `TOOL` graphs — validated by the prototype
   batch after M1; a poor result narrows which kinds the maintainer queues, not the mechanism.
-- [ ] Does pausing end the batch (so resume opens a new one with a fresh cap), or does a batch
-  span pauses until the queue drains? D2's reading is "pause ends it"; `/plan` for M2 confirms
-  against the overlay wording before the migration is written.
+- [x] Does pausing end the batch? **Yes (maintainer, 2026-10-06):** pause closes the batch and
+  resume opens a new one with a fresh cap. Accepted consequence: pause/resume resets the batch cap;
+  the per-run cap and `min_budget_for_new_attempt` still bound each run.
 
 ## Risks
 
