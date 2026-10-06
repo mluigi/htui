@@ -35,6 +35,10 @@ use crate::ui::{TextField, Theme, diff};
 /// reached it) is a cancelling help's end (H-1).
 const CHAT_CANCEL: &str = "chat_cancel";
 
+/// `StoreRequest::Agents`'s request name: its `Failed` before the list arrived ends the help
+/// (MOD-55 review L3).
+const AGENTS: &str = "agents";
+
 /// The editor's own chords while the help is open.
 const HELP_OPEN: &str = "agent help is open \u{2014} Esc leaves it first";
 
@@ -150,6 +154,9 @@ enum State {
         masked: bool,
         /// The first accept of a masked proposal was refused.
         armed: bool,
+        /// The reply's closed fenced blocks (MOD-55 review L2): above one, the title says the
+        /// last was proposed, which may be a trailing example rather than the body.
+        blocks: usize,
     },
     /// A reply with nothing to accept: no block, or the body as sent.
     Answered {
@@ -189,6 +196,7 @@ impl core::fmt::Debug for State {
                 unified,
                 masked,
                 armed,
+                blocks,
             } => f
                 .debug_struct("Proposal")
                 .field("agent", agent)
@@ -196,6 +204,7 @@ impl core::fmt::Debug for State {
                 .field("unified_len", &unified.len())
                 .field("masked", masked)
                 .field("armed", armed)
+                .field("blocks", blocks)
                 .finish(),
             Self::Answered { agent, text, same } => f
                 .debug_struct("Answered")
@@ -385,6 +394,18 @@ impl AgentHelp {
                 self.agents = Some(enabled);
                 (State::Asking, HelpOutcome::Consumed)
             }
+            // MOD-55 review L3: without the list nothing can be asked, and "reading the agents…"
+            // would never end; once read, another view's failed read is not this help's.
+            (State::Asking, StoreReply::Failed { request, message })
+                if *request == AGENTS && self.agents.is_none() =>
+            {
+                (
+                    State::Asking,
+                    HelpOutcome::Close(Some(Report::Error(format!(
+                        "could not read the agents \u{2014} {message}"
+                    )))),
+                )
+            }
             (State::Starting { agent, cancel }, StoreReply::ChatAccepted { step_id, .. }) => {
                 if cancel {
                     ctx.request(StoreRequest::ChatCancel { step_id: *step_id });
@@ -490,6 +511,7 @@ impl AgentHelp {
             unified: diff::unified(&self.sent, &proposed, "sent", "proposed"),
             masked: edit_help::holds_mask(&self.sent, &proposed),
             armed: false,
+            blocks: edit_help::closed_blocks(&reply),
             agent,
             proposed,
         }
@@ -514,11 +536,22 @@ impl AgentHelp {
                 agent,
                 unified,
                 masked,
+                blocks,
                 ..
             } => {
-                let title = format!(" proposal from {agent} \u{b7} sent \u{2192} proposed ");
+                let mut title = format!(" proposal from {agent} \u{b7} sent \u{2192} proposed ");
+                if *masked {
+                    title.push_str("\u{b7} holds [REDACTED] ");
+                }
+                // MOD-55 review L2: the last block is proposed; with several, it may be a
+                // trailing example rather than the body.
+                if *blocks > 1 {
+                    title.push_str(&format!("\u{b7} last of {blocks} blocks "));
+                }
                 let title = if *masked {
-                    Line::styled(format!("{title}\u{b7} holds [REDACTED] "), theme.error)
+                    Line::styled(title, theme.error)
+                } else if *blocks > 1 {
+                    Line::styled(title, theme.warning)
                 } else {
                     Line::from(title)
                 };
@@ -932,10 +965,12 @@ mod tests {
             unified,
             masked,
             armed,
+            blocks,
         } = &help.state
         else {
             panic!("a proposal: {help:?}");
         };
+        assert_eq!(*blocks, 1);
         assert_eq!(agent, "c");
         assert_eq!(proposed, "new\n");
         assert!(unified.contains("-old"), "{unified}");
@@ -1330,6 +1365,70 @@ mod tests {
         );
         assert!(text.contains("holds [REDACTED]"), "{text}");
         assert!(text.contains("+key: [REDACTED]"), "{text}");
+    }
+
+    /// MOD-55 review L3: a failed `Agents` read closes the help with the store's sentence rather
+    /// than leaving it on "reading the agents…"; once the agents are read, a stray one changes
+    /// nothing.
+    #[test]
+    fn a_failed_agents_read_closes_the_help() {
+        let bench = Bench::new();
+        let ctx = bench.ctx();
+        let failed = StoreReply::Failed {
+            request: "agents",
+            message: "the store is unavailable".to_owned(),
+        };
+        let mut help = AgentHelp::open(target(), ids::PROJECT_VULKAN, "body", &ctx);
+        assert_eq!(
+            help.on_reply(&failed, &ctx),
+            HelpOutcome::Close(Some(Report::Error(
+                "could not read the agents \u{2014} the store is unavailable".to_owned()
+            )))
+        );
+
+        let mut help = asking(&bench, "body");
+        assert_eq!(help.on_reply(&failed, &ctx), HelpOutcome::Consumed);
+        assert!(matches!(help.state, State::Asking));
+        assert_eq!(help.agents.as_ref().map(Vec::len), Some(2));
+    }
+
+    /// MOD-55 review L2: a reply with more than one closed block still proposes the last, and
+    /// the proposal's title says how many there were; a one-block reply's title does not.
+    #[test]
+    fn a_reply_with_several_blocks_flags_the_last_one_proposed() {
+        let bench = Bench::new();
+        let help = answered(
+            &bench,
+            "old\n",
+            "```\nnew\n```\nRun it:\n```sh\ncargo test\n```\n",
+        );
+        assert!(
+            matches!(&help.state, State::Proposal { proposed, blocks: 2, .. } if proposed == "cargo test\n"),
+            "{help:?}"
+        );
+        assert!(format!("{help:?}").contains("blocks: 2"), "{help:?}");
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                help.render(frame, frame.area(), &bench.theme);
+            })
+            .expect("draws");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(text.contains("\u{b7} last of 2 blocks"), "{text}");
+
+        let help = answered(&bench, "old\n", "```\nnew\n```");
+        assert!(
+            matches!(help.state, State::Proposal { blocks: 1, .. }),
+            "{help:?}"
+        );
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).expect("a test terminal");
+        terminal
+            .draw(|frame| {
+                help.render(frame, frame.area(), &bench.theme);
+            })
+            .expect("draws");
+        let text = buffer_text(terminal.backend().buffer());
+        assert!(!text.contains("blocks"), "{text}");
     }
 
     /// The buffer's symbols, one line per row.
