@@ -332,6 +332,36 @@ struct PendingRow {
     at: DateTime<Utc>,
 }
 
+/// MOD-10 D18: one chunk of the open text run: where its text ends in the run, when it was
+/// captured, and whether it pushed a `raw` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChunkMark {
+    end: usize,
+    at: DateTime<Utc>,
+    raw: bool,
+}
+
+/// MOD-10 D18: how a seam at a cut shares the open run's chunks ([`split_marks`]).
+///
+/// The row's raw entries are its raw-carrying chunks' wire messages, in chunk order, so both
+/// halves are index ranges of it: the head keeps `raw[..head_raw]` and the carry clones
+/// `raw[carry_raw_from..]`. The two overlap by the straddling chunk's entry, when it has one.
+///
+/// That shared entry holds bytes of the *other* row's text, which that row's own join cannot
+/// complete, so [`Recorder::flush_at_seam`] lets the run's join at the cut decide for both rows
+/// ([`Recorder::open_raw_withheld`]).
+#[derive(Debug, PartialEq, Eq)]
+struct MarkSplit {
+    /// How many of the row's raw entries stay on the head.
+    head_raw: usize,
+    /// The first raw entry the carry takes.
+    carry_raw_from: usize,
+    /// The carry's capture time: the `at` of the first chunk that ends after the cut.
+    carry_at: DateTime<Utc>,
+    /// The carry's chunks, their ends re-based on the cut.
+    carry: Vec<ChunkMark>,
+}
+
 /// What `docs/ANA-4.md` §4.3 makes **one row per, per step**: an `edit_proposal`'s
 /// `(tool_call_id, path)`. A proposal with no call id is a legitimate key of its own, not an absent
 /// one.
@@ -395,6 +425,13 @@ pub struct Recorder<'a, S: htui_core::store::RecorderStore> {
     buffer_kind: Option<EventKind>,
     /// The open text run's grouping key, meaningful only while `buffer_kind` is a chunk kind.
     open_message_id: Option<String>,
+    /// MOD-10 D18: the open text run's chunks, in order; empty unless `buffer_kind` is a chunk
+    /// kind. Cleared by every `flush`.
+    open_chunks: Vec<ChunkMark>,
+    /// MOD-10 D8 at a D18 seam: the open run's `raw` is withheld at its flush whatever its own
+    /// join says, because it shares a straddling chunk with a row whose join held a secret
+    /// ([`Recorder::flush_at_seam`]). Taken by every `flush`.
+    open_raw_withheld: bool,
     /// `edit_proposal` rows whose `seq` is reserved and whose write is owed (plan D77, T46).
     ///
     /// **Not cleared by a flush**, which is the fix: `docs/ANA-4.md` §4.3 asks for one row per
@@ -505,6 +542,8 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             buffer: Vec::new(),
             buffer_kind: None,
             open_message_id: None,
+            open_chunks: Vec::new(),
+            open_raw_withheld: false,
             held: BTreeMap::new(),
             unflushed: Vec::new(),
             unoffered: Vec::new(),
@@ -960,6 +999,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             DriverEvent::AssistantChunk(text) | DriverEvent::ThoughtChunk(text) => Some(text),
             _ => None,
         };
+        let is_chunk = chunk.is_some();
         let stale_group = chunk.is_some_and(|text| self.open_message_id != text.message_id);
         if self
             .buffer_kind
@@ -990,12 +1030,15 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
                 {
                     open_text.push_str(&text.text);
                 }
-                reached_bound = self
-                    .buffer
-                    .last()
-                    .and_then(|open| open.payload.get("text"))
-                    .and_then(Value::as_str)
-                    .is_some_and(|open_text| open_text.len() >= CHUNK_FLUSH_BYTES);
+                let open_len = self.open_text().map_or(0, str::len);
+                // MOD-10 D18: where this chunk ends in the run, so a seam can split the run's
+                // `raw` and capture times along with its text.
+                self.open_chunks.push(ChunkMark {
+                    end: open_len,
+                    at: scrubbed.at,
+                    raw: false,
+                });
+                reached_bound = open_len >= CHUNK_FLUSH_BYTES;
                 RawTarget::Buffered(self.buffer.len() - 1)
             }
             (DriverEvent::EditProposal(proposal), _) => {
@@ -1088,6 +1131,9 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
                     if let Some(open) = self.buffer.get_mut(index) {
                         open.raw.push(raw);
                     }
+                    if is_chunk && let Some(mark) = self.open_chunks.last_mut() {
+                        mark.raw = true;
+                    }
                 }
                 RawTarget::Held(key) => {
                     if let Some(open) = self.held.get_mut(&key) {
@@ -1105,8 +1151,13 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             // the log had already closed.
             self.release_held(|_| true);
         }
-        if turn_ended || reached_bound {
+        if turn_ended {
             self.flush().await?;
+            self.sync_step().await?;
+        } else if reached_bound {
+            // MOD-10 D18: trigger 4 cuts at a seam and carries the tail; triggers 1, 2, 3 and 5
+            // still flush everything (a new message, a new kind, `done`, `finish`).
+            self.flush_at_seam().await?;
             self.sync_step().await?;
         }
 
@@ -1157,6 +1208,123 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         self.buffer.push(row);
     }
 
+    /// The open text run's text: the last buffered row's `text`, which is the run while
+    /// `buffer_kind` is a chunk kind (a chunk only `push`es onto an empty buffer).
+    fn open_text(&self) -> Option<&str> {
+        self.buffer
+            .last()
+            .and_then(|open| open.payload.get("text"))
+            .and_then(Value::as_str)
+    }
+
+    /// MOD-10 D18: trigger 4. Cuts the open text run at [`seam_cut`], flushes the head as one row
+    /// and re-opens the tail as the next run, with the same kind and grouping key.
+    ///
+    /// The search is [`seam_cut`]'s: stepped candidates first, then a descent to the largest safe
+    /// cut within one occurrence of the first candidate, which is what finds a seam between the
+    /// occurrences of a secret echoed back to back (never one inside a complete occurrence, nor
+    /// one after the start of an occurrence still incomplete at the bound). The descent was chosen
+    /// over keeping every unsafe run open past the bound: it decides from the run alone, so replay
+    /// stays deterministic, and it lets a row grow past the bound only when no cut can exist.
+    ///
+    /// That is when `seam_cut` answers `0`, and the run is then **kept open**, so the row grows
+    /// past the bound rather than split a secret: a run no longer than `hold_back` (a resolved
+    /// secret longer than the bound), or a run that opens with the occurrence the first candidate
+    /// falls in (a resolved secret over half the bound). Either ends by about `2 * hold_back`
+    /// bytes plus one chunk. Any other run with no safe cut is flushed whole, as before MOD-10 M3.
+    ///
+    /// A run refused at the bound is not, by itself, a run with no safe cut: the refusal can be a
+    /// value still incomplete there (a pattern-shaped resolved secret, or a credential, with its
+    /// rule's minimum in the run). `seam_cut` then checks its cut against the longest prefix of
+    /// the run that is not refused ([`seam_reach`]), so the value is carried whole and completes
+    /// in the next row, masked there or refused there whole. That was chosen over keeping a
+    /// refused run open up to a ceiling: a stream can keep the end of the run refused at every
+    /// chunk (a pattern-shaped secret echoed in chunks that each end inside an occurrence), so the
+    /// ceiling would need this search anyway, while the reference decides at the bound from the
+    /// run alone. Only a run refused down to its first candidate (a complete credential before
+    /// it) is flushed whole; the session fails closed on that credential either way.
+    ///
+    /// The carried row's capture time is the `at` of the chunk the cut falls in, and that chunk's
+    /// `raw` rides both rows, so each row's per-pointer join ([`Recorder::withhold_split_raw`])
+    /// sees every byte of its own text. The carry is re-opened **before** a flush error is
+    /// returned, so the tail is never lost: a later flush, or `finish`, writes it.
+    ///
+    /// **The straddling chunk's raw.** It also holds bytes of the other row's text, and a secret
+    /// in those bytes that crosses into a chunk the row does not hold is whole in neither row's
+    /// own join: one ending in it before the cut leaves its suffix on the carry, one starting in
+    /// it after the cut and whole by the bound leaves its prefix on the head. So the run's join
+    /// *at the cut*, which is the one row's join before MOD-10 M3, decides for both: when it would
+    /// withhold, both rows' raw is withheld. A carry that still opens with the straddling chunk
+    /// (no chunk of its own before the next cut) keeps the verdict across a later seam too. This
+    /// can withhold a carry's raw for a secret wholly in the head's chunks, which is the fail-safe
+    /// direction (H-10 of the MOD-10 M1 blueprint, `mod-10-m1-scrubber-hardening.blueprint.md`:
+    /// a raw-only finding never fails the session). A secret still incomplete at the bound is not
+    /// seen by the run's join either, so the head's raw holds at most its prefix, as before the
+    /// seam.
+    async fn flush_at_seam(&mut self) -> Result<(), RecordError> {
+        let hold_back = self.scrubber.hold_back();
+        let Some(text) = self.open_text() else {
+            return self.flush().await;
+        };
+        let len = text.len();
+        let found = seam_cut(self.scrubber, text, hold_back);
+        if found == Some(0) {
+            // Every cut above 0 would split a secret: the run stays open past the bound.
+            return Ok(());
+        }
+        let seam = found
+            .and_then(|cut| split_marks(&self.open_chunks, cut).map(|split| (cut, split)))
+            // The marks describe exactly this text; anything else is a run the seam cannot share.
+            .filter(|_| self.open_chunks.last().is_some_and(|mark| mark.end == len));
+        let Some((cut, split)) = seam else {
+            if hold_back > 0 && scrubbed_text(self.scrubber, text).is_some() {
+                tracing::warn!(
+                    step = %self.step,
+                    bytes = len,
+                    hold_back,
+                    "no safe seam was found; the text run is flushed whole"
+                );
+            }
+            return self.flush().await;
+        };
+
+        let message_id = self.open_message_id.clone();
+        let Some(mut head) = self.buffer.pop() else {
+            return self.flush().await;
+        };
+        let run_withheld = self.raw_join_finding(&head.raw).is_some();
+        let inherited = self.open_raw_withheld;
+        let tail = match head.payload.get_mut("text") {
+            Some(Value::String(text)) => text.split_off(cut),
+            _ => String::new(),
+        };
+        let carry_raw = head
+            .raw
+            .get(split.carry_raw_from..)
+            .map(<[Value]>::to_vec)
+            .unwrap_or_default();
+        head.raw.truncate(split.head_raw);
+        let carry = PendingRow {
+            kind: head.kind,
+            role: EventRole::Agent,
+            tool_call_id: None,
+            payload: json!({ "text": tail }),
+            raw: carry_raw,
+            at: split.carry_at,
+        };
+
+        self.push(head);
+        self.open_raw_withheld = inherited || run_withheld;
+        let flushed = self.flush().await;
+        self.push(carry);
+        self.open_message_id = message_id;
+        self.open_chunks = split.carry;
+        // The inherited verdict lives in the run's first raw entry, the previous seam's straddling
+        // chunk: it rides on only while the carry still opens with that entry.
+        self.open_raw_withheld = run_withheld || (inherited && split.carry_raw_from == 0);
+        flushed
+    }
+
     /// Writes what is buffered and closes the open run.
     ///
     /// The final scrub happens here rather than at capture, because a secret split across two
@@ -1180,6 +1348,10 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     async fn flush(&mut self) -> Result<(), RecordError> {
         self.buffer_kind = None;
         self.open_message_id = None;
+        self.open_chunks.clear();
+        // Only the open run sets it, and the run is the buffer's one row (a chunk only `push`es
+        // onto an empty buffer).
+        let seam_withheld = core::mem::take(&mut self.open_raw_withheld);
         if self.buffer.is_empty() && self.unflushed.is_empty() && self.unoffered.is_empty() {
             return Ok(());
         }
@@ -1192,7 +1364,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             let row = match outcome {
                 Ok(()) => {
                     // `next_seq` is the number this row is given just below.
-                    self.withhold_split_raw(&mut row, self.next_seq);
+                    self.withhold_split_raw(&mut row, self.next_seq, seam_withheld);
                     row
                 }
                 Err(unmasked) => {
@@ -1283,7 +1455,7 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
                 // Re-announcements accumulate raw on the held row (plan D77), so a split can live
                 // here just as in a coalesced run.
                 Ok(()) => {
-                    self.withhold_split_raw(&mut row, seq);
+                    self.withhold_split_raw(&mut row, seq, false);
                     row
                 }
                 Err(unmasked) => {
@@ -1701,18 +1873,17 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
     /// A single chunk needs nothing: it was scrubbed whole at capture ([`Recorder::scrub_envelope`]).
     /// Already-masked chunks register no change, because re-masking `[REDACTED]` is idempotent.
     ///
+    /// `seam` is a D18 seam's verdict on the row ([`Recorder::open_raw_withheld`]): its raw is
+    /// withheld, even a single chunk's, whatever its own join says (cause `seam`).
+    ///
     /// The log carries the step, the `seq`, the chunk count, the cause and the rule name - never
     /// the joined text, a pointer or a key.
-    fn withhold_split_raw(&mut self, row: &mut PendingRow, seq: i32) {
-        if row.raw.len() < 2 {
+    fn withhold_split_raw(&mut self, row: &mut PendingRow, seq: i32, seam: bool) {
+        let Some((cause, rule)) = self
+            .raw_join_finding(&row.raw)
+            .or_else(|| (seam && !row.raw.is_empty()).then_some(("seam", None)))
+        else {
             return;
-        }
-        let joined = joined_raw_leaves(&row.raw);
-        let mut probe = joined.clone();
-        let (cause, rule) = match self.scrubber.scrub(&mut probe) {
-            Err(unmasked) => ("residue", Some(unmasked.rule)),
-            Ok(()) if probe != joined => ("masked", None),
-            Ok(()) => return,
         };
         let chunks = row.raw.len();
         row.raw.clear();
@@ -1725,6 +1896,22 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             rule = rule.unwrap_or("none"),
             "a coalesced row's raw was withheld: its chunks joined hold what no chunk held alone"
         );
+    }
+
+    /// What a row's per-pointer raw join ([`joined_raw_leaves`]) holds that no chunk held alone:
+    /// `("residue", rule)` when a rule still trips, `("masked", None)` when masking changes it,
+    /// `None` when it is clean or there is a single chunk.
+    fn raw_join_finding(&self, raw: &[Value]) -> Option<(&'static str, Option<&'static str>)> {
+        if raw.len() < 2 {
+            return None;
+        }
+        let joined = joined_raw_leaves(raw);
+        let mut probe = joined.clone();
+        match self.scrubber.scrub(&mut probe) {
+            Err(unmasked) => Some(("residue", Some(unmasked.rule))),
+            Ok(()) if probe != joined => Some(("masked", None)),
+            Ok(()) => None,
+        }
     }
 
     /// Keeps the first residue of the session; the rest are already visible as their own rows.
@@ -1796,6 +1983,274 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             }
         }
     }
+}
+
+/// MOD-10 D18: how many stepped candidates (one `hold_back` apart) one cut tries before the
+/// descent ([`seam_cut`]).
+const SEAM_ATTEMPTS: usize = 4;
+
+/// MOD-10 D18: where a size-triggered flush may cut `text`, keeping at least `hold_back` bytes
+/// open. The caller acts on the answer:
+///
+/// - `Some(0)`: no cut above 0 is safe, so the caller **keeps the run open** and the row grows
+///   past the bound rather than split a secret. Either `text` is no longer than `hold_back` (a
+///   resolved secret longer than the run), or the occurrence the first candidate falls in starts
+///   the run (the descent, below), or the same of the reference when `text` is refused (below);
+/// - `Some(cut)`: the caller flushes `text[..cut]` and carries the rest;
+/// - `None` (`hold_back == 0`, every prefix of `text` reaching `first` refused, which is a
+///   complete credential before `first`, or no safe cut in reach): the caller flushes the whole
+///   run at the bound, as before MOD-10 M3.
+///
+/// A cut `c` is safe when scrubbing `text[..c]` and `text[c..]` apart gives, concatenated,
+/// exactly what scrubbing `text` whole gives, and neither half is refused. That is the leak
+/// criterion itself: every complete secret and every complete credential is masked or refused
+/// identically whichever row it lands in. No cut is ever later than the last char boundary at
+/// least `hold_back` bytes before the end (`first`), so a secret or credential still incomplete
+/// at the bound (at most `hold_back` bytes of it are in `text`) always lands whole in the tail.
+///
+/// **The reference ([`seam_reach`]).** "Scrubbing `text` whole" needs a clean scrub, and `text`
+/// can be refused at the bound merely because a value is not complete yet: a resolved secret that
+/// is itself pattern-shaped (`sk-ant-…`, `ghp_…`, as injected keys are), or a credential, with at
+/// least its rule's minimum already in the run. So the reference is the longest prefix
+/// `text[..end]`, `end` from `text.len()` down to `first`, that scrubs clean, and the search
+/// below runs on it, keeping `hold_back` bytes of *it* open. Any such `end` is sound: an
+/// occurrence still incomplete at the bound starts at or after `first`, hence after every cut;
+/// an occurrence straddling a cut `c <= end - hold_back` is at most `hold_back + 1` bytes long,
+/// so it ends by `end` and the reference masks it whole, which the probe compares against. The
+/// value then completes in the carried row, where it is masked (a resolved secret) or refused
+/// whole as one `scrub_residue` row (a credential), never split. `end` is `text.len()` whenever
+/// `text` is clean. When every prefix down to `first` is refused, the refusal is complete before
+/// `first` (a credential): the session fails closed whatever the cut, and the run is flushed
+/// whole.
+///
+/// **The search, in two passes**, over the reference (called `text` below).
+///
+/// 1. **Stepped**: `first`, then one `hold_back` further back each time, [`SEAM_ATTEMPTS`]
+///    candidates. Because an occurrence of a secret is at most `hold_back + 1` bytes long, one
+///    step back clears the occurrence that made the previous candidate unsafe; the next probe
+///    re-checks in case it lands inside another. One probe in the common case.
+/// 2. **Descent**, only when every stepped candidate is unsafe (a secret echoed in lines so
+///    short that each step lands in the next occurrence): from `first` down to
+///    `first - hold_back`, one occurrence's reach, taking the first safe cut, so it is the
+///    largest safe cut in reach. Each unsafe probe names the next candidate ([`seam_jump`]): where
+///    the head's scrub stops agreeing with the whole one, mapped back onto `text`, when the head's
+///    scrub is `text` verbatim from there on; otherwise the char boundary just below. For
+///    [`MinimalScrubber`](htui_core::scrub::MinimalScrubber) and a probe inside a masked
+///    occurrence, that point is the occurrence's start `s` (or a little after it, when the
+///    secret opens like the `[REDACTED]` marker), and every cut between `s` and the probe is
+///    inside the occurrence, so the jump skips no safe cut. `s` itself is safe when `s > 0`: the
+///    mask is one left-to-right scan, `s` is a position that scan visits, and scanning
+///    `text[..s]` and `text[s..]` apart masks exactly what the whole scan masks on each side.
+///    The tail then opens with `[REDACTED]`, which no pattern rule matches, and the head ends
+///    where the whole text's token ends (no rule's charset holds `[`), so neither half is refused
+///    when the whole is clean.
+///
+///    **`s == 0`.** When the occurrence the first candidate falls in starts the run (a resolved
+///    secret over half the bound, and a run opening with it: a message that starts with it, or a
+///    carry after a seam at an occurrence start), every cut from 1 to `first` is inside it. The
+///    descent reaches 0 and answers `Some(0)`: the run is kept open until the stream moves
+///    `first` past that occurrence. That is bounded: an occurrence starting at 0 ends by
+///    `hold_back + 1`, and once `first` is past `hold_back` (a run of about `2 * hold_back`
+///    bytes, plus the chunk that crosses it) 0 is out of reach and the descent finds the next
+///    occurrence's start instead.
+///
+///    What is left for the whole flush is a run in which a pattern rule's edge effect (below)
+///    rejects every boundary in reach, or a scrubber whose masking is not one left-to-right scan;
+///    it is logged at `warn`.
+///
+/// **Why the descent, and not a run kept open past the bound.** Keeping every unsafe run open
+/// until a safe cut appears would split no occurrence either, but it has no bound of its own: a
+/// stream that keeps the bound unsafe keeps the row growing until it hits a ceiling, which then
+/// needs its own fallback. The descent decides from the run alone, keeps the run open only when
+/// no cut can exist (`Some(0)` above), and that case ends within about `2 * hold_back` bytes.
+///
+/// **Cost.** One scrub of `text` (one per prefix tried, at most `hold_back + 1`, when `text` is
+/// refused at the bound), then two (head and tail) per probe: one probe usually, two
+/// when the stepped pass fails and the jump lands on an occurrence's start (none when it lands
+/// on 0), at most [`SEAM_ATTEMPTS`] + `hold_back` when a pattern edge effect makes the descent
+/// step one char at a time. A run kept open pays this on every chunk until it is cut, and that
+/// is at most about `hold_back` bytes of chunks. Each probe is a pure function of `text` and the
+/// scrubber, so the cut, and with it replay, stays deterministic, and nothing is held beyond the
+/// run itself.
+///
+/// A cut that *creates* a refusal (a tail starting with `AKIA…` after a letter, so `^` becomes a
+/// token start; a head ending in a truncated `sk-` body that no longer reads as prose) is unsafe
+/// too and the search moves on, so the seam never invents a failure the whole text did not have.
+///
+/// **Residuals.** The check sees the run as it is at the bound, not the bytes still to come, so
+/// three cases stay open, none a regression on the cut at the bound it replaces:
+///
+/// - A complete credential before `first` refuses every reference, so the run is flushed whole
+///   as one `scrub_residue` row and the session fails closed; a value still incomplete at the
+///   bound in the same run is cut with it, and its rest lands, without its prefix, in the next
+///   row. The session has already failed on the first credential.
+/// - `openai_api_key` is confirmed over its **whole** `sk-` body (`SK_PROSE`), so it is not
+///   monotonic in the body's length. A prose-shaped body (`sk-learn-preprocessing-…`) longer than
+///   `hold_back` can be cut, both halves clean, and then continue with a non-prose segment: no row
+///   refuses, while the two rows concatenated would. Random key bodies are not prose-shaped for
+///   75 bytes, so this needs a key that reads as words for its first 70-odd characters.
+/// - `jwt` only matches once its third segment arrives, and its first two segments have no upper
+///   bound, so the prefix of a JWT that does not match yet is unbounded: `PATTERN_HOLD_BACK`
+///   counts the rule's 38-byte minimum, not that prefix. Every real header plus payload is well
+///   over `hold_back`, so a JWT cut inside its payload leaves a clean head and a clean carried
+///   row (`<payload end>.<signature>`), while the two rows concatenated would match.
+fn seam_cut(scrubber: &dyn Scrubber, text: &str, hold_back: usize) -> Option<usize> {
+    if hold_back == 0 {
+        return None;
+    }
+    if text.len() <= hold_back {
+        return Some(0);
+    }
+    let first = text.floor_char_boundary(text.len() - hold_back);
+    if first == 0 {
+        return Some(0);
+    }
+    let (reach, whole) = seam_reach(scrubber, text, first)?;
+    seam_search(scrubber, reach, &whole, hold_back)
+}
+
+/// MOD-10 D18: the reference a seam is checked against ([`seam_cut`]): the longest prefix
+/// `text[..end]`, `end` from `text.len()` down to `first`, that scrubs clean, with its scrub.
+/// `text` itself in the common case (one scrub); `None` when every such prefix is refused.
+fn seam_reach<'t>(
+    scrubber: &dyn Scrubber,
+    text: &'t str,
+    first: usize,
+) -> Option<(&'t str, String)> {
+    (first..=text.len())
+        .rev()
+        .filter(|&end| text.is_char_boundary(end))
+        .find_map(|end| {
+            let reach = &text[..end];
+            scrubbed_text(scrubber, reach).map(|whole| (reach, whole))
+        })
+}
+
+/// MOD-10 D18: the stepped pass and the descent of [`seam_cut`] over `text`, whose clean scrub is
+/// `whole`, keeping at least `hold_back` bytes of `text` open.
+fn seam_search(
+    scrubber: &dyn Scrubber,
+    text: &str,
+    whole: &str,
+    hold_back: usize,
+) -> Option<usize> {
+    if text.len() <= hold_back {
+        return Some(0);
+    }
+    let first = text.floor_char_boundary(text.len() - hold_back);
+    if first == 0 {
+        return Some(0);
+    }
+    // `Ok` when `cut` is safe; otherwise the head's scrub (`None`: refused), for the descent.
+    let probe = |cut: usize| -> Result<(), Option<String>> {
+        let (head, tail) = text.split_at(cut);
+        match (scrubbed_text(scrubber, head), scrubbed_text(scrubber, tail)) {
+            (Some(head), Some(tail))
+                if whole.len() == head.len() + tail.len()
+                    && whole.starts_with(&head)
+                    && whole.ends_with(&tail) =>
+            {
+                Ok(())
+            }
+            (head, _) => Err(head),
+        }
+    };
+    let mut first_head = None;
+    let mut cut = first;
+    for attempt in 0..SEAM_ATTEMPTS {
+        if cut == 0 {
+            break;
+        }
+        match probe(cut) {
+            Ok(()) => return Some(cut),
+            Err(head) if attempt == 0 => first_head = head,
+            Err(_) => {}
+        }
+        cut = text.floor_char_boundary(cut.saturating_sub(hold_back));
+    }
+    // The descent: the largest safe cut within one occurrence's reach of `first`.
+    let floor = first.saturating_sub(hold_back);
+    let (mut cut, mut head) = (first, first_head);
+    while cut > floor {
+        let next = head
+            .as_deref()
+            .and_then(|head| seam_jump(text, whole, head, cut))
+            .filter(|&next| next < cut && next >= floor)
+            .unwrap_or_else(|| text.floor_char_boundary(cut - 1));
+        if next < floor {
+            return None;
+        }
+        if next == 0 {
+            return Some(0);
+        }
+        match probe(next) {
+            Ok(()) => return Some(next),
+            Err(next_head) => head = next_head,
+        }
+        cut = next;
+    }
+    None
+}
+
+/// MOD-10 D18: the descent's next candidate after an unsafe probe at `cut` ([`seam_cut`]): where
+/// `head`, the scrub of `text[..cut]`, stops agreeing with `whole`, mapped back onto `text`.
+/// `None` unless `head` is `text` verbatim from that point to `cut`, the one case in which the
+/// mapping is exact; the descent then steps one char back instead.
+fn seam_jump(text: &str, whole: &str, head: &str, cut: usize) -> Option<usize> {
+    let agree = head
+        .bytes()
+        .zip(whole.bytes())
+        .take_while(|(head, whole)| head == whole)
+        .count();
+    let verbatim = &head[head.floor_char_boundary(agree)..];
+    let at = cut.checked_sub(verbatim.len())?;
+    (text.get(at..cut) == Some(verbatim)).then_some(at)
+}
+
+/// `text` as `scrubber` masks it, or `None` when a rule refuses it.
+fn scrubbed_text(scrubber: &dyn Scrubber, text: &str) -> Option<String> {
+    let mut value = Value::String(text.to_owned());
+    scrubber.scrub(&mut value).ok()?;
+    match value {
+        Value::String(text) => Some(text),
+        _ => None,
+    }
+}
+
+/// MOD-10 D18: shares the open run's chunks between the head and the carry of a seam at `cut`.
+///
+/// Chunk `i` spans `[start_i, end_i)`, `start_0 = 0` and `start_i = end_{i-1}`. The **carry** is
+/// every chunk with `end_i > cut`, re-based on the cut, and its capture time is the first one's.
+/// The **head** is every chunk with `start_i < cut`, plus an empty chunk sitting on the cut
+/// (`end_i <= cut`), so every chunk's raw lands on at least one row. A chunk that straddles the
+/// cut is in both. `None` when no chunk ends after `cut`, which a cut [`seam_cut`] found never is.
+fn split_marks(marks: &[ChunkMark], cut: usize) -> Option<MarkSplit> {
+    let first_carried = marks.iter().position(|mark| mark.end > cut)?;
+    let mut start = 0;
+    let mut head_raw = 0;
+    for mark in marks {
+        if (start < cut || mark.end <= cut) && mark.raw {
+            head_raw += 1;
+        }
+        start = mark.end;
+    }
+    let carry_raw_from = marks[..first_carried]
+        .iter()
+        .filter(|mark| mark.raw)
+        .count();
+    let carry = marks[first_carried..]
+        .iter()
+        .map(|mark| ChunkMark {
+            end: mark.end - cut,
+            ..*mark
+        })
+        .collect();
+    Some(MarkSplit {
+        head_raw,
+        carry_raw_from,
+        carry_at: marks[first_carried].at,
+        carry,
+    })
 }
 
 /// The refusal a fresh batch that landed short answers with (MOD-40 plan D3): some `seq` it
@@ -2114,16 +2569,22 @@ pub async fn enforce_breach<S: htui_core::store::RecorderStore>(
 
 #[cfg(all(test, feature = "test-support"))]
 mod tests {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    use chrono::TimeDelta;
     use chrono::{DateTime, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
         ChatRunSpec, EventKind, EventRole, RunStep, SessionEvent, StepId, UsageTotals,
     };
-    use htui_core::scrub::MinimalScrubber;
+    use htui_core::scrub::{MinimalScrubber, Scrubber, Unmasked};
     use htui_core::store::{MemStore, ReadStore, StepFence, WriteStore};
     use serde_json::{Value, json};
 
-    use super::{Recorder, RecorderSummary, joined_raw_leaves};
+    use super::{
+        CHUNK_FLUSH_BYTES, ChunkMark, MarkSplit, Recorder, RecorderSummary, joined_raw_leaves,
+        scrubbed_text, seam_cut, split_marks,
+    };
     use crate::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, TextChunk, UsageEvent};
 
     /// A fixed capture time, so a persisted row is a function of the script alone.
@@ -2507,5 +2968,388 @@ mod tests {
         ];
 
         assert_eq!(joined_raw_leaves(&chunks), json!(["p1p2", "q2"]));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-10 D18: the flush seam (blueprint §B.2, §D.2 item 16)
+    // -----------------------------------------------------------------------------------------
+
+    /// A resolved value 70 bytes long and not pattern-shaped, so only masking can hide it.
+    const SECRET70: &str = "zq7-resolved-value-0123456789-abcdefghijklmnopqrstuvwxyz-0123456789ABC";
+
+    /// A scrubber that keeps the default `hold_back` (0) has no seam: the caller flushes whole at
+    /// the bound, as before MOD-10 M3.
+    #[test]
+    fn seam_cut_is_none_without_hold_back() {
+        let text = "x".repeat(CHUNK_FLUSH_BYTES);
+        assert_eq!(seam_cut(&scrubber(), &text, 0), None);
+    }
+
+    /// A complete credential already in the run refuses every prefix that reaches `first`, so no
+    /// cut can hide it and carrying would only move it: the run is flushed whole (one
+    /// `scrub_residue` row, as before MOD-10 M3).
+    #[test]
+    fn seam_cut_is_none_when_every_prefix_reaching_first_is_refused() {
+        let scrubber = scrubber();
+        let text = format!(
+            "{} sk-ant-api03-abcdefghijklmnopqrstuvwx {}",
+            "x".repeat(200),
+            "y".repeat(200)
+        );
+        assert_eq!(seam_cut(&scrubber, &text, scrubber.hold_back()), None);
+    }
+
+    /// A resolved secret that is itself pattern-shaped, still incomplete at the end with 40 bytes
+    /// (over `anthropic_api_key`'s minimum of 27) in the text: the text is refused whole only
+    /// because the value is not complete yet. The reference is the longest prefix not refused
+    /// (it ends 26 bytes into the occurrence), and the cut keeps `hold_back` bytes of that open,
+    /// so the occurrence lands whole in the tail.
+    #[test]
+    fn seam_cut_checks_against_the_longest_clean_prefix_when_the_end_is_refused() {
+        let secret = format!("sk-ant-api03-{}", "Q7w9".repeat(20));
+        let scrubber = Counting::new(&secret);
+        let hold_back = scrubber.hold_back();
+        assert_eq!(hold_back, 92);
+        let text = format!("{} {}", "x".repeat(300), &secret[..40]);
+        assert_eq!(text.len(), 341);
+        assert_eq!(scrubbed_text(&scrubber, &text), None, "refused whole");
+        let before = scrubber.scrubs();
+
+        let cut = seam_cut(&scrubber, &text, hold_back);
+
+        assert_eq!(cut, Some(327 - hold_back), "the reach is text[..327]");
+        assert_eq!(
+            scrubber.scrubs() - before,
+            (327..=341).count() + 2,
+            "one scrub per prefix tried, then the first candidate's head and tail"
+        );
+        let (head, tail) = text.split_at(235);
+        assert!(
+            !head.contains("sk-"),
+            "the occurrence is wholly in the tail"
+        );
+        assert!(tail.ends_with(&secret[..40]));
+    }
+
+    /// The first candidate (`len - hold_back`) lands inside a complete secret, which `whole` masks
+    /// and neither half does: the cut moves back by one more `hold_back`, past the secret's start.
+    #[test]
+    fn seam_cut_moves_back_over_a_complete_secret() {
+        let scrubber = MinimalScrubber::new([SECRET70.to_owned()]);
+        let hold_back = scrubber.hold_back();
+        assert_eq!(hold_back, 75, "max(70, PATTERN_HOLD_BACK) - 1");
+        let text = format!("{}{SECRET70}{}", "x".repeat(200), "x".repeat(10));
+        assert_eq!(text.len(), 280);
+
+        let cut = seam_cut(&scrubber, &text, hold_back);
+
+        assert_eq!(
+            cut,
+            Some(280 - 2 * hold_back),
+            "205 is inside the secret at [200, 270); 130 is before it"
+        );
+    }
+
+    /// A secret echoed in lines so short that every stepped candidate lands inside a complete
+    /// occurrence, with the last occurrence still incomplete at the end. Flushing whole would cut
+    /// that occurrence at the bound; the descent finds the start of the occurrence the first
+    /// candidate fell in, which is the largest safe cut.
+    #[test]
+    fn seam_cut_finds_an_occurrence_start_when_every_stepped_candidate_is_inside_one() {
+        let scrubber = MinimalScrubber::new([SECRET70.to_owned()]);
+        let hold_back = scrubber.hold_back();
+        assert_eq!(hold_back, 75);
+        let line = format!("{SECRET70}\n");
+        let text = format!("{}{}", line.repeat(10), &SECRET70[..30]);
+        assert_eq!(text.len(), 740);
+        for attempt in 1..=super::SEAM_ATTEMPTS {
+            let into = (text.len() - attempt * hold_back) % line.len();
+            assert!(
+                (1..SECRET70.len()).contains(&into),
+                "candidate {attempt} is {into} bytes into an occurrence"
+            );
+        }
+
+        let cut = seam_cut(&scrubber, &text, hold_back);
+
+        assert_eq!(
+            cut,
+            Some(9 * line.len()),
+            "665 is 26 bytes into the occurrence at [639, 709); 639 is its start"
+        );
+    }
+
+    /// A resolved value 10000 bytes long: lowercase letters from a fixed LCG, so no pattern rule
+    /// matches it and it has no newline. `hold_back` (9999) is over half the bound, so an
+    /// occurrence that opens the run can hold the first candidate.
+    fn long_secret() -> String {
+        let mut state: u32 = 0x2545_f491;
+        (0..10_000)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                char::from(b'a' + u8::try_from((state >> 16) % 26).expect("below 26"))
+            })
+            .collect()
+    }
+
+    /// A [`MinimalScrubber`] that counts its scrubs, so a test can pin what one cut costs.
+    #[derive(Debug)]
+    struct Counting {
+        inner: MinimalScrubber,
+        scrubs: AtomicUsize,
+    }
+
+    impl Counting {
+        fn new(secret: &str) -> Self {
+            Self {
+                inner: MinimalScrubber::new([secret.to_owned()]),
+                scrubs: AtomicUsize::new(0),
+            }
+        }
+
+        fn scrubs(&self) -> usize {
+            self.scrubs.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Scrubber for Counting {
+        fn scrub(&self, value: &mut Value) -> Result<(), Unmasked> {
+            self.scrubs.fetch_add(1, Ordering::Relaxed);
+            self.inner.scrub(value)
+        }
+
+        fn hold_back(&self) -> usize {
+            self.inner.hold_back()
+        }
+    }
+
+    /// A run no longer than `hold_back` (a resolved secret longer than the run) has no cut that
+    /// keeps `hold_back` bytes open but 0: the caller keeps it open.
+    #[test]
+    fn seam_cut_is_zero_for_a_run_no_longer_than_hold_back() {
+        let secret = long_secret();
+        let scrubber = MinimalScrubber::new([secret.clone()]);
+        let hold_back = scrubber.hold_back();
+
+        assert_eq!(
+            seam_cut(&scrubber, &secret[..hold_back], hold_back),
+            Some(0)
+        );
+        assert_eq!(seam_cut(&scrubber, &secret[..100], hold_back), Some(0));
+    }
+
+    /// The occurrence the first candidate falls in starts the run, and the next one is still
+    /// incomplete at the end: every cut above 0 that keeps `hold_back` bytes open is inside the
+    /// first occurrence, and flushing whole would split the second. The answer is 0 (keep open),
+    /// and once the second occurrence is complete its start is the cut.
+    #[test]
+    fn seam_cut_keeps_the_run_open_when_the_first_candidate_is_in_an_occurrence_at_its_start() {
+        let secret = long_secret();
+        let scrubber = Counting::new(&secret);
+        let hold_back = scrubber.hold_back();
+        assert_eq!(hold_back, 9999);
+        let bound = CHUNK_FLUSH_BYTES;
+
+        for text in [
+            format!("{secret}{}", &secret[..bound - secret.len()]),
+            format!("{secret}\n{}", &secret[..bound - secret.len() - 1]),
+        ] {
+            assert_eq!(text.len(), bound);
+            assert!(
+                text.len() - hold_back < secret.len(),
+                "first is in [0, 10000)"
+            );
+            let before = scrubber.scrubs();
+
+            assert_eq!(seam_cut(&scrubber, &text, hold_back), Some(0), "kept open");
+            assert_eq!(
+                scrubber.scrubs() - before,
+                3,
+                "the whole, and the first candidate's head and tail: the jump lands on 0"
+            );
+        }
+
+        let text = format!("{secret}{secret}");
+        assert_eq!(seam_cut(&scrubber, &text, hold_back), Some(10_000));
+        let text = format!("{secret}\n{secret}");
+        assert_eq!(seam_cut(&scrubber, &text, hold_back), Some(10_001));
+    }
+
+    /// The descent jumps to where the first candidate's head stops agreeing with the whole scrub,
+    /// so a dense echo costs one probe past the stepped ones, not one per byte of reach.
+    #[test]
+    fn the_descent_jumps_to_the_occurrence_start_in_one_probe() {
+        let scrubber = Counting::new(SECRET70);
+        let hold_back = scrubber.hold_back();
+        let line = format!("{SECRET70}\n");
+        let text = format!("{}{}", line.repeat(10), &SECRET70[..30]);
+
+        assert_eq!(seam_cut(&scrubber, &text, hold_back), Some(9 * line.len()));
+        assert_eq!(
+            scrubber.scrubs(),
+            1 + 2 * (super::SEAM_ATTEMPTS + 1),
+            "the whole, four stepped probes and one descent probe, two scrubs each"
+        );
+    }
+
+    /// Both candidates go through `floor_char_boundary`, so a multi-byte character is never split
+    /// and `split_at` never panics.
+    #[test]
+    fn seam_cut_lands_on_a_char_boundary() {
+        let scrubber = scrubber();
+        let hold_back = scrubber.hold_back();
+        for text in [
+            "é".repeat(100),
+            format!("a{}", "𝄞".repeat(50)),
+            format!("{}{}", "𝄞".repeat(25), "é".repeat(50)),
+        ] {
+            let cut = seam_cut(&scrubber, &text, hold_back).expect("clean text has a seam");
+            assert!(text.is_char_boundary(cut), "{cut} in {} bytes", text.len());
+            assert!(
+                text.len() - cut >= hold_back,
+                "at least hold_back bytes stay open"
+            );
+            assert!(
+                text.len() - cut < hold_back + 4,
+                "the cut is the last boundary at or before len - hold_back"
+            );
+        }
+    }
+
+    /// The documented residual on [`seam_cut`]: `openai_api_key` is confirmed over the whole `sk-`
+    /// body, so a prose-shaped body longer than `hold_back` can be cut with both halves clean, and
+    /// a later non-prose segment makes only the concatenation refuse. The equality probe cannot see
+    /// bytes that have not arrived; this pins the behaviour so a fix has to flip it knowingly.
+    #[test]
+    fn seam_cut_can_split_a_prose_shaped_sk_body_longer_than_hold_back() {
+        let scrubber = MinimalScrubber::new(Vec::<String>::new());
+        let hold_back = scrubber.hold_back();
+        let body =
+            "learn-preprocessing-pipeline-standard-scaler-with-many-words-and-more-words-here";
+        assert!(body.len() > hold_back);
+        let text = format!("{} sk-{body}", "x".repeat(200));
+
+        let cut =
+            seam_cut(&scrubber, &text, hold_back).expect("the run is clean, so it has a seam");
+        let (head, tail) = text.split_at(cut);
+        let later = format!("{tail}-Q9Z");
+
+        assert!(head.contains(" sk-"), "the cut falls inside the sk- body");
+        assert!(
+            scrubbed_text(&scrubber, head).is_some(),
+            "the head row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &later).is_some(),
+            "the carried row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &format!("{head}{later}")).is_none(),
+            "only the concatenation refuses: a non-prose segment confirms the key"
+        );
+    }
+
+    /// The third documented residual on [`seam_cut`]: `jwt` only matches once its third segment
+    /// arrives, and its first two segments have no upper bound, so the not-yet-matching prefix of
+    /// a JWT is unbounded and a real header plus payload is well over `hold_back`. The run at the
+    /// bound is clean, the cut falls inside the payload, the head (header and payload start) and
+    /// the carried row (payload end and signature) are each clean, and only the concatenation
+    /// matches. This pins the behaviour so a fix has to flip it knowingly.
+    #[test]
+    fn seam_cut_can_split_a_jwt_whose_header_and_payload_exceed_hold_back() {
+        let scrubber = MinimalScrubber::new(Vec::<String>::new());
+        let hold_back = scrubber.hold_back();
+        let header = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+        let payload_so_far = format!("eyJ{}", "a".repeat(100));
+        let text = format!("{} {header}.{payload_so_far}", "x".repeat(200));
+        assert!(
+            scrubbed_text(&scrubber, &text).is_some(),
+            "no third segment yet: the run at the bound is clean"
+        );
+
+        let cut =
+            seam_cut(&scrubber, &text, hold_back).expect("the run is clean, so it has a seam");
+        let (head, tail) = text.split_at(cut);
+        let later = format!("{tail}{}.{}", "b".repeat(16), "c".repeat(43));
+
+        assert_eq!(cut, text.len() - hold_back, "the first candidate is taken");
+        assert!(
+            head.contains(&format!("{header}.eyJ")),
+            "the cut falls inside the payload"
+        );
+        assert!(
+            scrubbed_text(&scrubber, head).is_some(),
+            "the head row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &later).is_some(),
+            "the carried row is clean"
+        );
+        assert!(
+            scrubbed_text(&scrubber, &format!("{head}{later}")).is_none(),
+            "only the concatenation matches jwt"
+        );
+    }
+
+    /// The pure split of the open run's chunks at a cut: the chunk the cut falls in rides both
+    /// halves (its raw on both rows), a chunk wholly after the cut moves to the carry only, and the
+    /// carry takes the straddling chunk's capture time.
+    #[test]
+    fn split_marks_puts_a_straddling_chunk_in_both_halves() {
+        let t = |seconds: i64| at() + TimeDelta::seconds(seconds);
+        let mark = |end: usize, raw: bool, seconds: i64| ChunkMark {
+            end,
+            at: t(seconds),
+            raw,
+        };
+        let marks = [
+            mark(10, true, 0),
+            mark(20, false, 1),
+            mark(30, true, 2),
+            mark(40, true, 3),
+        ];
+
+        assert_eq!(
+            split_marks(&marks, 25),
+            Some(MarkSplit {
+                head_raw: 2,
+                carry_raw_from: 1,
+                carry_at: t(2),
+                carry: vec![mark(5, true, 2), mark(15, true, 3)],
+            }),
+            "chunk 2 spans [20, 30): its raw is the head's second and the carry's first"
+        );
+        assert_eq!(
+            split_marks(&marks, 20),
+            Some(MarkSplit {
+                head_raw: 1,
+                carry_raw_from: 1,
+                carry_at: t(2),
+                carry: vec![mark(10, true, 2), mark(20, true, 3)],
+            }),
+            "a cut on a chunk boundary shares nothing"
+        );
+
+        let with_empty = [
+            mark(10, true, 0),
+            mark(20, true, 1),
+            mark(20, true, 2),
+            mark(30, true, 3),
+        ];
+        assert_eq!(
+            split_marks(&with_empty, 20),
+            Some(MarkSplit {
+                head_raw: 3,
+                carry_raw_from: 3,
+                carry_at: t(3),
+                carry: vec![mark(10, true, 3)],
+            }),
+            "an empty chunk at the cut stays on the head, so its raw is never lost"
+        );
+        assert_eq!(
+            split_marks(&marks, 40),
+            None,
+            "no chunk ends after a cut at the end"
+        );
     }
 }

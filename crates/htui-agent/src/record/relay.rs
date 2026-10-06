@@ -189,7 +189,7 @@ impl htui_core::store::RelayStore for NoRelay {
 /// it. Every store write of the sequence is best-effort (I-6): a failure is a `warn` and the
 /// answer stays `Cancelled`, unless it is a fence.
 ///
-/// **A parked poll** rides out up to [`TRANSIENT_READS`] consecutive `Unreachable`/`Backend`
+/// **A parked poll** rides out up to `TRANSIENT_READS` (30) consecutive `Unreachable`/`Backend`
 /// failures of its row's read, each a `warn`; the next one is the answer.
 ///
 /// # Errors

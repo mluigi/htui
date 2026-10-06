@@ -141,8 +141,15 @@ const PEM_MARKER: &str = "PRIVATE KEY";
 /// The longest not-yet-matching prefix any pattern rule can leave at the end of a text, plus the
 /// longest token start in front of it (MOD-10 D18, blueprint A-4): `pypi_token`'s minimum match
 /// is 70 bytes (`pypi-AgEIcHlwaS5vcmc` + 50) and `\uXXXX` is 6. A text cut at least
-/// `PATTERN_HOLD_BACK - 1` bytes before its end therefore never splits a credential the rules
-/// would have caught whole. A rule whose minimum grows must grow this.
+/// `PATTERN_HOLD_BACK - 1` bytes before its end therefore never splits a credential of a rule
+/// whose only unbounded part comes last. A rule whose minimum grows must grow this.
+///
+/// Two rules fall outside that bound. `jwt` only matches once its third segment arrives and its
+/// first two segments are unbounded, so a JWT's not-yet-matching prefix has no length limit (its
+/// 38-byte minimum match bounds nothing here). `openai_api_key` is confirmed over its whole
+/// `sk-` body, so a prose-shaped body longer than the bound is clean until a later segment
+/// confirms it. Both are residuals of the recorder's flush seam, not regressions on a cut at the
+/// bound.
 pub const PATTERN_HOLD_BACK: usize = 76;
 
 /// Masks known secrets in a payload and reports anything credential-shaped that survived.
@@ -161,7 +168,8 @@ pub trait Scrubber: Send + Sync + core::fmt::Debug {
     fn scrub(&self, value: &mut Value) -> Result<(), Unmasked>;
 
     /// MOD-10 D18: how many trailing bytes of an open text run a size-triggered cut must keep
-    /// open, so that a secret or a credential still arriving is never split across two rows.
+    /// open, so that a secret or a credential still arriving is not split across two rows
+    /// (within [`PATTERN_HOLD_BACK`]'s bound: `jwt` and a prose-shaped `sk-` body can exceed it).
     /// `0` (the default) keeps the recorder's cut at the bound exactly, as before MOD-10 M3.
     fn hold_back(&self) -> usize {
         0

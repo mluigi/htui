@@ -49,7 +49,7 @@ use htui_core::model::{
     Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, normalize,
 };
 use htui_core::prompt::settings::SettingKey;
-use htui_core::scrub::MinimalScrubber;
+use htui_core::scrub::{MinimalScrubber, Scrubber as _};
 use htui_core::store::{
     CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, ReadStore, Result as StoreResult,
     SettingRung, StepFence, StoreError, StoredSetting, UpdateOutcome, WriteStore,
@@ -1822,8 +1822,10 @@ async fn raw_is_null_unless_retained() {
 // The remaining D6 obligations
 // ---------------------------------------------------------------------------------------------
 
-/// Trigger 4: a run longer than the 16 KiB bound is cut at the bound rather than buffered
-/// unboundedly, and the cut is a function of byte counts alone (no timer, `docs/ANA-4.md` §4.1).
+/// Trigger 4: a run that reaches the 16 KiB bound is cut rather than buffered unboundedly, and
+/// the cut is a function of byte counts alone (no timer, `docs/ANA-4.md` §4.1). Since MOD-10 D18
+/// it cuts a hold-back before the bound: the scrubber's `hold_back()` trailing bytes are carried
+/// into the next row.
 #[tokio::test]
 async fn chunks_flush_at_the_16_kib_bound() {
     let chat = chat_spec();
@@ -1841,16 +1843,17 @@ async fn chunks_flush_at_the_16_kib_bound() {
     recorder.finish().await.expect("close");
 
     let log = rows(&store, chat.step_id).await;
+    let hold = scrubber.hold_back();
     assert_eq!(log.len(), 2, "17 KiB of chunks is cut once at the bound");
     assert_eq!(
         text_of(&log[0]).len(),
-        CHUNK_FLUSH_BYTES,
-        "the open run is flushed as soon as it reaches 16 KiB"
+        CHUNK_FLUSH_BYTES - hold,
+        "the open run is cut a hold-back before the bound as soon as it reaches 16 KiB"
     );
     assert_eq!(
         text_of(&log[1]).len(),
-        1024,
-        "the remainder opens a new run"
+        1024 + hold,
+        "the carried tail and the remainder open a new run"
     );
     assert_eq!(log[0].seq, 0);
     assert_eq!(log[1].seq, 1);
@@ -4877,5 +4880,937 @@ async fn a_notice_is_htuis_other_row_in_the_current_turn() {
         (follow_up.seq, follow_up.turn),
         (6, 1),
         "the next follow-up opens the next turn"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-10 D18 (blueprint §B.2, §D.2): the flush seam
+// ---------------------------------------------------------------------------------------------
+
+/// A resolved value 40 bytes long and not pattern-shaped, so only masking can hide it.
+const SECRET40: &str = "zq7-resolved-value-0123456789-abcdefghij";
+/// The anthropic key the seam cases split: refused whole by `anthropic_api_key`.
+const SEAM_KEY: &str = "sk-ant-api03-abcdefghijklmnopqrstuvwx";
+
+/// `n` bytes of `x`: filler that no rule and no secret matches.
+fn fill(n: usize) -> String {
+    "x".repeat(n)
+}
+
+/// The `assistant_text` rows' text, in `seq` order.
+fn texts(log: &[SessionEvent]) -> Vec<String> {
+    log.iter()
+        .filter(|row| row.kind == EventKind::AssistantText)
+        .map(|row| text_of(row).to_owned())
+        .collect()
+}
+
+/// Fifteen 1 KiB chunks of filler: one more KiB reaches the bound.
+fn fifteen_kib() -> Vec<DriverEnvelope> {
+    (0..15).map(|_| chunk(&fill(1024), "m1")).collect()
+}
+
+/// Records `script` into a fresh recorder over `store` and closes it.
+async fn record_all(
+    store: &SpyStore,
+    scrubber: &MinimalScrubber,
+    step: StepId,
+    retain_raw: bool,
+    script: Vec<DriverEnvelope>,
+) -> (
+    Result<htui_agent::record::RecorderSummary, RecordError>,
+    usize,
+) {
+    let mut recorder = Recorder::new(store, scrubber, step, retain_raw, None);
+    for envelope in script {
+        recorder
+            .record(envelope)
+            .await
+            .expect("recording must land");
+    }
+    let withheld = recorder.raw_withheld();
+    (recorder.finish().await, withheld)
+}
+
+/// Asserts the leak criterion: `needle` is in no row's payload or raw, and not in the rows'
+/// texts concatenated.
+fn assert_nowhere(log: &[SessionEvent], needle: &str) {
+    for row in log {
+        let rendered = serde_json::to_string(row).expect("a row serialises");
+        assert!(
+            !rendered.contains(needle),
+            "row {} holds {needle:?}",
+            row.seq
+        );
+    }
+    assert!(
+        !texts(log).concat().contains(needle),
+        "the rows' texts concatenated hold {needle:?}"
+    );
+}
+
+/// D18's acceptance for a resolved secret: split by chunking across the bound, it is carried into
+/// the next row whole, so no row and no concatenation of rows holds it or either half.
+#[tokio::test]
+async fn a_resolved_secret_split_at_the_seam_is_never_split_across_rows() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(20);
+    let mut script = fifteen_kib();
+    script.push(chunk(&format!("{}{head}", fill(1004)), "m1"));
+    script.push(chunk(&format!("{tail} tail"), "m1"));
+    script.push(end_turn());
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(texts(&log).len(), 2, "one cut");
+    for needle in [SECRET40, head, tail] {
+        assert_nowhere(&log, needle);
+    }
+    assert_eq!(
+        texts(&log).concat().matches("[REDACTED]").count(),
+        1,
+        "the carried row masks the secret once"
+    );
+}
+
+/// D18's acceptance for a pattern key split after its first byte: before the seam the two rows
+/// were `… s` and `k-ant-…`, neither refused. Now the carried row holds the key whole and is
+/// refused as one `scrub_residue` row.
+#[tokio::test]
+async fn a_pattern_key_split_at_the_seam_is_refused_whole() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new(Vec::<String>::new());
+    let store = open_chat(&chat).await;
+    let (head, tail) = SEAM_KEY.split_at(1);
+    let mut script = fifteen_kib();
+    script.push(chunk(&format!("{} {head}", fill(1022)), "m1"));
+    script.push(chunk(&format!("{tail} ok"), "m1"));
+    script.push(end_turn());
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    assert!(
+        matches!(&outcome, Err(RecordError::Unmasked(unmasked)) if unmasked.rule == "anthropic_api_key"),
+        "the carried row is refused, got {outcome:?}"
+    );
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::AssistantText, EventKind::Error, EventKind::Done],
+        "the head is kept and the carried row becomes one scrub_residue row"
+    );
+    assert_eq!(
+        log[1].payload.get("code").and_then(Value::as_str),
+        Some("scrub_residue")
+    );
+    assert_nowhere(&log, SEAM_KEY);
+    assert_nowhere(&log, tail);
+}
+
+/// A key whose matching prefix is already in the run at the bound refuses the run whole. Before
+/// the fix that left no cut, so the run was flushed whole at the bound as one `scrub_residue` row
+/// and the key's tail still arriving landed, without its prefix, in the next row (the residual
+/// blueprint §B.2 accepted). The seam now checks its cut against the longest prefix of the run
+/// that is not refused, which ends before the key's 27th byte, so the cut falls before the key and
+/// the carried row holds it whole: one `scrub_residue` row, the session fails closed, and no row
+/// holds any part of the key.
+#[tokio::test]
+async fn a_pattern_key_already_matching_at_the_bound_is_carried_whole() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new(Vec::<String>::new());
+    let store = open_chat(&chat).await;
+    // `api03-abcdefghijklmn` is 20 characters: the rule's minimum is met by the chunk that reaches
+    // the bound. The prefix arrives in two chunks, so neither is refused at capture and the
+    // refusal is the assembled run's.
+    let (head, tail) = SEAM_KEY.split_at("sk-ant-api03-abcdefghijklmn".len());
+    let (early, late) = head.split_at("sk-ant-api03-abcdef".len());
+    let mut script = fifteen_kib();
+    script.push(chunk(
+        &format!("{} {early}", fill(1024 - 1 - head.len())),
+        "m1",
+    ));
+    script.push(chunk(late, "m1"));
+    script.push(chunk(tail, "m1"));
+    script.push(end_turn());
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    assert!(
+        matches!(&outcome, Err(RecordError::Unmasked(unmasked)) if unmasked.rule == "anthropic_api_key"),
+        "the session fails closed, got {outcome:?}"
+    );
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![EventKind::AssistantText, EventKind::Error, EventKind::Done],
+        "the head is kept and the carried row, holding the key whole, is one scrub_residue row"
+    );
+    assert_eq!(
+        log[1].payload.get("code").and_then(Value::as_str),
+        Some("scrub_residue")
+    );
+    let hold = scrubber.hold_back();
+    assert_eq!(
+        texts(&log),
+        vec![fill(CHUNK_FLUSH_BYTES - 1 - hold)],
+        "the reach ends one byte short of the bound (26 bytes of the key), the cut a hold_back \
+         before that"
+    );
+    assert_nowhere(&log, SEAM_KEY);
+    assert_nowhere(&log, head);
+    assert_nowhere(&log, tail);
+}
+
+/// A secret wholly inside the last `hold_back` bytes at the bound is carried whole: the first row
+/// holds no part of it and the second masks it. The secret arrives in two chunks, so it is the
+/// assembled run, not one chunk at capture, that holds it.
+#[tokio::test]
+async fn a_secret_entirely_within_hold_back_of_the_bound_is_carried_whole() {
+    let secret30 = &SECRET40[..30];
+    let (head, tail) = secret30.split_at(15);
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([secret30.to_owned()]);
+    let store = open_chat(&chat).await;
+    let mut script = fifteen_kib();
+    // 15 KiB + 1015 bytes stays under the bound; the next 25 bytes reach it at 16400, with the
+    // secret at [16360, 16390), ending 10 bytes before the end.
+    script.push(chunk(&format!("{}{head}", fill(1000)), "m1"));
+    script.push(chunk(&format!("{tail}{}", fill(10)), "m1"));
+    script.push(end_turn());
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(texts.len(), 2);
+    assert_eq!(texts[0], fill(16_400 - scrubber.hold_back()));
+    assert!(
+        !texts[0].contains("[REDACTED]"),
+        "row 1 holds no part of it"
+    );
+    assert_eq!(
+        texts[1],
+        format!("{}[REDACTED]{}", fill(scrubber.hold_back() - 40), fill(10)),
+        "row 2 masks it"
+    );
+    assert_nowhere(&log, secret30);
+}
+
+/// A complete secret the first candidate would cut through: the whole run masks it, the two halves
+/// would not, so the cut moves back past the secret's start.
+#[tokio::test]
+async fn a_complete_secret_straddling_the_first_candidate_moves_the_cut_back() {
+    let secret70 = format!("{SECRET40}-{}", &SECRET40[..29]);
+    assert_eq!(secret70.len(), 70);
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([secret70.clone()]);
+    let hold = scrubber.hold_back();
+    let store = open_chat(&chat).await;
+    let (head, tail) = secret70.split_at(35);
+    let mut script = fifteen_kib();
+    // 15 KiB + 1000 bytes stays under the bound; the next 45 reach it at 16405, with the secret at
+    // [16325, 16395): the first candidate, 16405 - 75 = 16330, is inside it.
+    script.push(chunk(&format!("{}{head}", fill(965)), "m1"));
+    script.push(chunk(&format!("{tail}{}", fill(10)), "m1"));
+    script.push(end_turn());
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(texts.len(), 2);
+    assert!(
+        texts[0].len() < CHUNK_FLUSH_BYTES - hold,
+        "the cut moved back: row 1 is {} bytes",
+        texts[0].len()
+    );
+    assert_eq!(texts[0].len(), 16_405 - 2 * hold, "one step back clears it");
+    assert!(!texts[0].contains("[REDACTED]"), "row 1 is filler only");
+    assert_eq!(texts.concat().matches("[REDACTED]").count(), 1);
+    assert_nowhere(&log, &secret70);
+    assert_nowhere(&log, &secret70[..35]);
+    assert_nowhere(&log, &secret70[35..]);
+}
+
+/// A cut lands on a char boundary: 2-byte `é` and 4-byte `𝄞` runs around it, in both orders. Every
+/// row is a `String`, so a split character could not even be stored; the concatenation is the
+/// input byte for byte.
+#[tokio::test]
+async fn a_seam_cut_never_splits_a_character() {
+    for last in [
+        format!("{}{}", "é".repeat(256), "𝄞".repeat(128)),
+        format!("{}{}", "𝄞".repeat(128), "é".repeat(256)),
+    ] {
+        assert_eq!(last.len(), 1024);
+        let chat = chat_spec();
+        let scrubber = scrubber();
+        let store = open_chat(&chat).await;
+        let mut script = fifteen_kib();
+        script.push(chunk(&last, "m1"));
+        script.push(end_turn());
+
+        let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+        outcome.expect("clean text closes cleanly");
+        let log = rows(&store, chat.step_id).await;
+        let texts = texts(&log);
+        assert_eq!(texts.len(), 2);
+        assert!(
+            texts[0].len() <= CHUNK_FLUSH_BYTES - scrubber.hold_back(),
+            "at least hold_back bytes were carried"
+        );
+        assert_eq!(texts.concat(), format!("{}{last}", fill(15 * 1024)));
+    }
+}
+
+/// Replay determinism (`docs/ANA-4.md` §11 criterion 2): the cut is a pure function of the chunks
+/// and the scrubber, so the same stream into two fresh stores gives identical rows.
+#[tokio::test]
+async fn the_seam_is_deterministic() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let script: Vec<DriverEnvelope> = (0..17)
+        .map(|i| {
+            let mut envelope = chunk(&fill(1024), "m1");
+            envelope.at = at() + TimeDelta::seconds(i);
+            envelope
+        })
+        .chain(std::iter::once(end_turn()))
+        .collect();
+
+    let mut runs = Vec::new();
+    for _ in 0..2 {
+        let store = open_chat(&chat).await;
+        let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script.clone()).await;
+        outcome.expect("clean text closes cleanly");
+        let log = rows(&store, chat.step_id).await;
+        runs.push(
+            log.iter()
+                .filter(|row| row.kind == EventKind::AssistantText)
+                .map(|row| (row.seq, text_of(row).to_owned(), row.at))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    assert_eq!(runs[0], runs[1], "the same stream gives the same rows");
+    assert_eq!(runs[0].len(), 2);
+    assert_eq!(runs[0][0].1.len(), CHUNK_FLUSH_BYTES - scrubber.hold_back());
+}
+
+/// The carried row's `at` is a captured chunk's own: the one the cut fell in, not the clock and
+/// not the next chunk's.
+#[tokio::test]
+async fn the_carried_row_takes_its_first_chunk_s_capture_time() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let script: Vec<DriverEnvelope> = (0..17)
+        .map(|i| {
+            let mut envelope = chunk(&fill(1024), "m1");
+            envelope.at = at() + TimeDelta::seconds(i);
+            envelope
+        })
+        .collect();
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    outcome.expect("clean text closes cleanly");
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(log.len(), 2);
+    assert_eq!(log[0].at, at(), "the head keeps its first chunk's time");
+    assert_eq!(
+        log[1].at,
+        at() + TimeDelta::seconds(15),
+        "the cut fell in chunk 15, so the carry takes its time"
+    );
+}
+
+/// After a seam, `done` (trigger 3) writes the carried tail as its own row.
+#[tokio::test]
+async fn a_turn_end_writes_the_carried_tail() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut script = fifteen_kib();
+    script.push(chunk(&fill(1024), "m1"));
+    script.push(end_turn());
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    outcome.expect("clean text closes cleanly");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(texts.len(), 2, "the head at the bound, the carry at `done`");
+    assert_eq!(texts[1].len(), scrubber.hold_back());
+    assert_eq!(texts.concat().len(), CHUNK_FLUSH_BYTES, "no byte is lost");
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![
+            EventKind::AssistantText,
+            EventKind::AssistantText,
+            EventKind::Done
+        ]
+    );
+}
+
+/// After a seam, a chunk of another message (trigger 2) flushes the carried tail first.
+#[tokio::test]
+async fn a_new_message_id_writes_the_carried_tail() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let mut script = fifteen_kib();
+    script.push(chunk(&fill(1024), "m1"));
+    script.push(chunk("next message", "m2"));
+    script.push(end_turn());
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, false, script).await;
+
+    outcome.expect("clean text closes cleanly");
+    let log = rows(&store, chat.step_id).await;
+    let hold = scrubber.hold_back();
+    assert_eq!(
+        texts(&log),
+        vec![
+            fill(CHUNK_FLUSH_BYTES - hold),
+            fill(hold),
+            "next message".to_owned()
+        ]
+    );
+    assert_eq!(
+        log.iter().map(|row| row.seq).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3]
+    );
+}
+
+/// MOD-10 D8 at the seam: the chunk the cut falls in rides both rows, so each row's raw holds
+/// every wire message behind its own text.
+#[tokio::test]
+async fn a_straddling_chunk_s_raw_rides_both_rows() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let pieces: Vec<String> = (0..17u8)
+        .map(|i| char::from(b'a' + i).to_string().repeat(1024))
+        .collect();
+    let script: Vec<DriverEnvelope> = pieces
+        .iter()
+        .map(|piece| acp_chunk(piece, None))
+        .chain(std::iter::once(end_turn()))
+        .collect();
+
+    let (outcome, withheld) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    outcome.expect("clean text closes cleanly");
+    assert_eq!(withheld, 0, "nothing new appears on either join");
+    let log = rows(&store, chat.step_id).await;
+    let head_raw: Vec<Value> = pieces[..16].iter().map(|p| acp_wire(p, None)).collect();
+    let carry_raw: Vec<Value> = pieces[15..].iter().map(|p| acp_wire(p, None)).collect();
+    assert_eq!(
+        log[0].raw,
+        Some(Value::Array(head_raw)),
+        "row 1 carries chunks 0..=15, the straddling chunk last"
+    );
+    assert_eq!(
+        log[1].raw,
+        Some(Value::Array(carry_raw)),
+        "row 2 starts with the straddling chunk"
+    );
+}
+
+/// A secret that starts in the straddling chunk and ends in the next, which arrives after the
+/// bound, is whole only in the carry's join: the carry's raw is withheld, and the head's raw holds
+/// at most its prefix (blueprint §B.2), as the one row cut at the bound before the seam did.
+#[tokio::test]
+async fn a_secret_split_after_the_straddling_chunk_withholds_the_carry_s_raw() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(20);
+    let script: Vec<DriverEnvelope> = (0..15)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain([
+            acp_chunk(&format!("{}{head}", fill(1004)), None),
+            acp_chunk(&format!("{tail} tail"), None),
+            end_turn(),
+        ])
+        .collect();
+
+    let (outcome, withheld) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    let summary = outcome.expect("a withheld raw is not a refusal");
+    assert_eq!(withheld, 1);
+    assert_eq!(summary.raw_withheld, 1);
+    let log = rows(&store, chat.step_id).await;
+    assert!(log[0].raw.is_some(), "the head's join holds only a prefix");
+    assert_eq!(
+        log[1].raw, None,
+        "the carry's join holds the secret: withheld"
+    );
+    assert_nowhere(&log, SECRET40);
+    let joined = format!(
+        "{}{}",
+        serde_json::to_string(&log[0].raw).expect("raw serialises"),
+        serde_json::to_string(&log[1].raw).expect("raw serialises")
+    );
+    assert!(!joined.contains(tail), "row 2's raw holds no part of it");
+}
+
+/// A secret that starts in an earlier chunk and ends in the straddling chunk, before the cut: the
+/// head's join holds it whole, and so does the run's at the bound. The carry's raw starts with the
+/// straddling chunk, so it holds the secret's suffix with no prefix to complete it in its own join:
+/// the run's join decides for both rows, and both are withheld, as the one row before the seam was.
+#[tokio::test]
+async fn a_secret_ending_in_the_straddling_chunk_before_the_cut_withholds_both_raws() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(20);
+    let script: Vec<DriverEnvelope> = (0..14)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain([
+            acp_chunk(&format!("{}{head}", fill(1004)), None),
+            acp_chunk(&format!("{tail}{}", fill(1004)), None),
+            acp_chunk(&fill(10), None),
+            end_turn(),
+        ])
+        .collect();
+
+    let (outcome, withheld) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    let summary = outcome.expect("a withheld raw is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let hold = scrubber.hold_back();
+    assert_eq!(
+        texts(&log).iter().map(String::len).collect::<Vec<_>>(),
+        vec![CHUNK_FLUSH_BYTES - hold - SECRET40.len() + 10, hold + 10],
+        "the cut falls in the chunk the secret ends in, after the secret"
+    );
+    assert_eq!(log[0].raw, None, "the head's join holds the secret");
+    assert_eq!(
+        log[1].raw, None,
+        "the carry's raw starts with the secret's suffix: withheld with the run"
+    );
+    assert_eq!(withheld, 2);
+    assert_eq!(summary.raw_withheld, 2);
+    assert_nowhere(&log, SECRET40);
+    assert_nowhere(&log, tail);
+}
+
+/// A secret that starts in the straddling chunk, after the cut, and is whole by the bound: the
+/// carry's join holds it, and the head's raw holds the straddling chunk with its prefix. The run's
+/// join at the bound holds it whole, so the head's raw is withheld too, as the one row before the
+/// seam was. (A secret still incomplete at the bound is
+/// `a_secret_split_after_the_straddling_chunk_withholds_the_carry_s_raw`.)
+#[tokio::test]
+async fn a_secret_whole_at_the_bound_after_the_cut_withholds_the_head_s_raw_too() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(20);
+    let script: Vec<DriverEnvelope> = (0..15)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain([
+            acp_chunk(&format!("{}{head}", fill(1000)), None),
+            acp_chunk(&format!("{tail}xxxx"), None),
+            end_turn(),
+        ])
+        .collect();
+
+    let (outcome, withheld) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    let summary = outcome.expect("a withheld raw is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(texts.len(), 2);
+    assert_eq!(
+        texts[0],
+        fill(15 * 1024 + 1000 - (scrubber.hold_back() - SECRET40.len() - 4)),
+        "the cut falls in the straddling chunk, before the secret"
+    );
+    assert_eq!(
+        log[0].raw, None,
+        "the head's raw holds the secret's prefix: withheld with the run"
+    );
+    assert_eq!(log[1].raw, None, "the carry's join holds the secret");
+    assert_eq!(withheld, 2);
+    assert_eq!(summary.raw_withheld, 2);
+    assert_nowhere(&log, SECRET40);
+    assert_nowhere(&log, head);
+}
+
+/// The text of every wire message in `row`'s raw, joined in order (empty when withheld).
+fn raw_text(row: &SessionEvent) -> String {
+    row.raw
+        .as_ref()
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|wire| wire.pointer("/params/update/content/text"))
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// A resolved secret echoed in lines so short that every stepped candidate (`len - hold_back`,
+/// then one `hold_back` further back each time) lands inside a complete occurrence, with the last
+/// occurrence still incomplete at the bound. Before the fix the seam gave up and flushed the run
+/// whole at the bound: the head ended with the secret's first ten bytes, the carry began with the
+/// rest, and the two rows concatenated held it. The cut must land between two occurrences instead.
+#[tokio::test]
+async fn a_densely_echoed_secret_is_never_split_when_every_stepped_candidate_fails() {
+    let chat = chat_spec();
+    let scrubber = MinimalScrubber::new([SECRET40.to_owned()]);
+    let hold = scrubber.hold_back();
+    assert_eq!(hold, 75, "max(40, PATTERN_HOLD_BACK) - 1");
+    let store = open_chat(&chat).await;
+    let (head, tail) = SECRET40.split_at(10);
+    let line = format!("{SECRET40}\n");
+    // 15 KiB of filler, then 25 lines of 41 bytes and the first 10 bytes of a 26th: the run is
+    // 16395 bytes at the bound, reached by the last 20-byte piece. Each candidate `16395 - 75 * t` sits 17, 24, 31 and 38 bytes into
+    // a 40-byte occurrence (period 41).
+    let dense = format!("{}{head}", line.repeat(25));
+    let len = 15 * 1024 + dense.len();
+    assert_eq!(len, 16395);
+    for t in 1..=4 {
+        let into = (len - t * hold - 15 * 1024) % line.len();
+        assert!(
+            (1..SECRET40.len()).contains(&into),
+            "candidate {t} is strictly inside an occurrence ({into} bytes in)"
+        );
+    }
+    // Streamed 20 bytes at a time, so no chunk holds a whole occurrence and capture masks none:
+    // the run itself holds them, as a token stream would deliver them.
+    let script: Vec<DriverEnvelope> = (0..15)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain(
+            dense
+                .as_bytes()
+                .chunks(20)
+                .map(|piece| acp_chunk(core::str::from_utf8(piece).expect("ASCII"), None)),
+        )
+        .chain([acp_chunk(&format!("{tail}\nbye"), None), end_turn()])
+        .collect();
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(texts.len(), 2, "one cut, then the turn's end");
+    let masked_line = "[REDACTED]\n";
+    assert_eq!(
+        texts[0],
+        format!("{}{}", fill(15 * 1024), masked_line.repeat(23)),
+        "the cut is the start of the occurrence the first candidate (16320) fell in: 16303"
+    );
+    assert_eq!(
+        texts[1],
+        format!("{}bye", masked_line.repeat(3)),
+        "the carry holds the last two occurrences and the incomplete one, completed"
+    );
+    assert_nowhere(&log, SECRET40);
+    for pair in texts.windows(2) {
+        assert!(
+            !pair.concat().contains(SECRET40),
+            "adjacent rows' texts never rejoin the secret"
+        );
+    }
+    assert!(
+        !texts.concat().contains(head),
+        "the incomplete occurrence is carried, not left as a prefix on the head"
+    );
+    assert_eq!(
+        texts.concat().matches("[REDACTED]").count(),
+        26,
+        "every occurrence is masked whole in one row"
+    );
+    for row in &log {
+        assert!(
+            !raw_text(row).contains(SECRET40),
+            "row {}'s raw holds the secret",
+            row.seq
+        );
+    }
+    for pair in log.windows(2) {
+        let joined = format!("{}{}", raw_text(&pair[0]), raw_text(&pair[1]));
+        assert!(
+            !joined.contains(SECRET40),
+            "rows {} and {}: their raw joined holds the secret",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+}
+
+/// A resolved value 10000 bytes long: lowercase letters from a fixed LCG, so it is the same on
+/// every run, no pattern rule matches it, and it has no newline. Long enough that `hold_back`
+/// (9999) is over half the bound, so an occurrence that opens the run can hold the first
+/// candidate.
+fn long_secret() -> String {
+    let mut state: u32 = 0x2545_f491;
+    (0..10_000)
+        .map(|_| {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            char::from(b'a' + u8::try_from((state >> 16) % 26).expect("below 26"))
+        })
+        .collect()
+}
+
+/// A resolved secret over 8 KiB echoed twice, the run opening with the first occurrence and the
+/// second still incomplete at the bound. The first candidate (`len - hold_back`) falls in the
+/// occurrence that starts the run, so no cut above 0 keeps both occurrences whole. Before the fix
+/// the seam found no cut and flushed the run whole at the bound: the head ended with the second
+/// occurrence's first 6383 bytes, the next row began with the rest, and the two rows concatenated
+/// held the secret. The run must stay open instead, until the second occurrence is complete and
+/// its start is a seam.
+#[tokio::test]
+async fn a_long_secret_opening_the_run_keeps_it_open_rather_than_split_the_next_occurrence() {
+    let chat = chat_spec();
+    let secret = long_secret();
+    let scrubber = MinimalScrubber::new([secret.clone()]);
+    let hold = scrubber.hold_back();
+    assert_eq!(hold, 9999, "the secret's length - 1");
+    let store = open_chat(&chat).await;
+    let stream = format!("{secret}\n{secret}\nbye");
+    let bound = 16 * 1024;
+    let first = bound - hold;
+    assert!(
+        first < secret.len(),
+        "the first candidate ({first}) is inside the occurrence at [0, {})",
+        secret.len()
+    );
+    assert!(
+        bound < 2 * secret.len() + 1,
+        "the second occurrence is incomplete at the bound"
+    );
+    // 1 KiB chunks, so no chunk holds a whole occurrence and capture masks none: the run itself
+    // holds them, as a token stream would deliver them. The 16th chunk reaches the bound.
+    let script: Vec<DriverEnvelope> = stream
+        .as_bytes()
+        .chunks(1024)
+        .map(|piece| acp_chunk(core::str::from_utf8(piece).expect("ASCII"), None))
+        .chain([end_turn()])
+        .collect();
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    assert_eq!(
+        texts,
+        ["[REDACTED]\n", "[REDACTED]\nbye"],
+        "kept open past the bound, then cut at the second occurrence's start (10001)"
+    );
+    assert_nowhere(&log, &secret);
+    let (head, tail) = secret.split_at(6383);
+    for pair in texts.windows(2) {
+        let joined = pair.concat();
+        assert!(
+            !joined.contains(&secret),
+            "adjacent rows' texts never rejoin the secret"
+        );
+        assert!(
+            !joined.contains(head) && !joined.contains(tail),
+            "neither part of the occurrence split at the bound is left on a row"
+        );
+    }
+    for row in &log {
+        assert!(
+            !raw_text(row).contains(&secret),
+            "row {}'s raw holds the secret",
+            row.seq
+        );
+    }
+    for pair in log.windows(2) {
+        let joined = format!("{}{}", raw_text(&pair[0]), raw_text(&pair[1]));
+        assert!(
+            !joined.contains(&secret),
+            "rows {} and {}: their raw joined holds the secret",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+}
+
+/// A resolved value shaped like an anthropic key, as an injected `ANTHROPIC_API_KEY` is: 93 bytes,
+/// so `hold_back` is 92, and refused by `anthropic_api_key` once 27 of its bytes are in a text
+/// without the rest (masking needs the whole value).
+fn pattern_shaped_secret() -> String {
+    format!("sk-ant-api03-{}", "Q7w9".repeat(20))
+}
+
+/// Asserts that neither row, nor any two adjacent rows' texts joined, nor any row's raw, nor any
+/// two adjacent rows' raw joined, holds `secret`.
+fn assert_never_rejoined(log: &[SessionEvent], secret: &str) {
+    assert_nowhere(log, secret);
+    let texts = texts(log);
+    for pair in texts.windows(2) {
+        assert!(
+            !pair.concat().contains(secret),
+            "adjacent rows' texts rejoin the secret"
+        );
+    }
+    for row in log {
+        assert!(
+            !raw_text(row).contains(secret),
+            "row {}'s raw holds the secret",
+            row.seq
+        );
+    }
+    for pair in log.windows(2) {
+        let joined = format!("{}{}", raw_text(&pair[0]), raw_text(&pair[1]));
+        assert!(
+            !joined.contains(secret),
+            "rows {} and {}: their raw joined holds the secret",
+            pair[0].seq,
+            pair[1].seq
+        );
+    }
+}
+
+/// A resolved secret that is itself pattern-shaped, still incomplete at the bound with more than
+/// its rule's minimum already in the run: the run is refused whole at the bound only because the
+/// value is not complete yet. Before the fix the seam answered "no cut", the run was flushed whole
+/// as one `scrub_residue` row, the session failed with `Unmasked`, and the secret's last 58 bytes
+/// landed in plaintext in the next row. The cut must fall before the occurrence instead, so it
+/// completes in the carry and is masked there, with no refusal.
+#[tokio::test]
+async fn a_pattern_shaped_resolved_secret_incomplete_at_the_bound_is_carried_and_masked() {
+    let chat = chat_spec();
+    let secret = pattern_shaped_secret();
+    let scrubber = MinimalScrubber::new([secret.clone()]);
+    let hold = scrubber.hold_back();
+    assert_eq!(hold, 92, "the secret's length - 1");
+    let store = open_chat(&chat).await;
+    // 15 KiB + 1009 bytes stays under the bound; the next 15 reach it at 16384 exactly, with the
+    // secret's first 35 bytes at the end: `sk-ant-` and 28 body bytes, over the rule's 20.
+    let script: Vec<DriverEnvelope> = (0..15)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain([
+            acp_chunk(&format!("{} {}", fill(1024 - 1 - 35), &secret[..20]), None),
+            acp_chunk(&secret[20..35], None),
+            acp_chunk(&format!("{} ok", &secret[35..]), None),
+            end_turn(),
+        ])
+        .collect();
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        log.iter().map(|row| row.kind).collect::<Vec<_>>(),
+        vec![
+            EventKind::AssistantText,
+            EventKind::AssistantText,
+            EventKind::Done
+        ],
+        "one cut, no scrub_residue row"
+    );
+    let texts = texts(&log);
+    assert!(!texts[0].contains("sk-"), "row 1 is filler only");
+    assert!(
+        texts[1].ends_with(" [REDACTED] ok"),
+        "the carry masks the completed secret"
+    );
+    assert_never_rejoined(&log, &secret);
+    assert_nowhere(&log, &secret[..35]);
+    assert_nowhere(&log, &secret[35..]);
+}
+
+/// The same pattern-shaped secret echoed in 94-byte lines, the last still incomplete at the bound
+/// (84 bytes in). The occurrence before it straddles `len - hold_back`, so the run up to there is
+/// refused too (its first 86 bytes), and every stepped candidate lands inside a complete
+/// occurrence. Before the fix the run was flushed whole at the bound as one `scrub_residue` row
+/// and the last occurrence's rest landed in plaintext in the next row. The cut must land between
+/// two occurrences, so every one is masked whole in one row and the session is not failed.
+#[tokio::test]
+async fn a_densely_echoed_pattern_shaped_secret_is_never_split_when_the_run_is_refused_at_the_bound()
+ {
+    let chat = chat_spec();
+    let secret = pattern_shaped_secret();
+    let scrubber = MinimalScrubber::new([secret.clone()]);
+    let hold = scrubber.hold_back();
+    assert_eq!(hold, 92);
+    let store = open_chat(&chat).await;
+    let line = format!("{secret}\n");
+    assert_eq!(line.len(), 94);
+    let dense = format!("{}{}", line.repeat(10), &secret[..84]);
+    assert_eq!(
+        15 * 1024 + dense.len(),
+        CHUNK_FLUSH_BYTES,
+        "the last piece reaches the bound"
+    );
+    // Streamed 20 bytes at a time, so no chunk holds 27 bytes of the secret and capture refuses
+    // none: the assembled run holds every occurrence, as a token stream would deliver them.
+    let script: Vec<DriverEnvelope> = (0..15)
+        .map(|_| acp_chunk(&fill(1024), None))
+        .chain(
+            dense
+                .as_bytes()
+                .chunks(20)
+                .map(|piece| acp_chunk(core::str::from_utf8(piece).expect("ASCII"), None)),
+        )
+        .chain([
+            acp_chunk(&format!("{}\nbye", &secret[84..]), None),
+            end_turn(),
+        ])
+        .collect();
+
+    let (outcome, _) = record_all(&store, &scrubber, chat.step_id, true, script).await;
+
+    outcome.expect("a masked secret is not a refusal");
+    let log = rows(&store, chat.step_id).await;
+    let texts = texts(&log);
+    let masked_line = "[REDACTED]\n";
+    assert_eq!(
+        texts,
+        [
+            format!("{}{}", fill(15 * 1024), masked_line.repeat(9)),
+            format!("{}bye", masked_line.repeat(2)),
+        ],
+        "the cut is the start of the occurrence that straddles the reach's first candidate"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|row| row.kind == EventKind::Error)
+            .count(),
+        0,
+        "no scrub_residue row"
+    );
+    assert_never_rejoined(&log, &secret);
+    assert!(
+        !texts.concat().contains(&secret[..27]),
+        "no occurrence is left as a refusable prefix on a row"
+    );
+}
+
+/// A scrubber that keeps the default `hold_back` (0) keeps the cut at the bound exactly, as before
+/// MOD-10 M3 (blueprint A-3).
+#[tokio::test]
+async fn a_scrubber_without_hold_back_cuts_at_the_bound_as_before() {
+    let chat = chat_spec();
+    let scrubber = MaskKey("unused");
+    let store = open_chat(&chat).await;
+    let mut recorder = Recorder::new(&store, &scrubber, chat.step_id, false, None);
+    for _ in 0..17 {
+        recorder
+            .record(chunk(&fill(1024), "m1"))
+            .await
+            .expect("recording must land");
+    }
+    recorder.finish().await.expect("close");
+
+    let log = rows(&store, chat.step_id).await;
+    assert_eq!(
+        texts(&log).iter().map(String::len).collect::<Vec<_>>(),
+        vec![CHUNK_FLUSH_BYTES, 1024]
     );
 }
