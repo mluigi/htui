@@ -219,6 +219,8 @@ struct Shared<P: ReplySink> {
     sweep_fixed: bool,
     /// D190: one sweep at a time.
     sweeping: AtomicBool,
+    /// MOD-12 D8: a sweep asked for while one ran; the running one sweeps once more before it ends.
+    sweep_again: AtomicBool,
     /// I-1: the executor the last sweep read, so a change is logged once.
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
@@ -1171,6 +1173,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweep_every: AtomicU64::new(millis(lease_period(&BTreeMap::new()))),
                 sweep_fixed: false,
                 sweeping: AtomicBool::new(false),
+                sweep_again: AtomicBool::new(false),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
@@ -1211,40 +1214,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// MOD-41 blueprint B-3: named `sweep_with`, so it never shadows the TUI's `TuiRuns::sweep`.
     pub fn sweep_with(&mut self, host: &H, sink: &P) {
         self.shared.prune();
-        if host.writer().is_none() || self.shared.walks.closed() {
-            return;
-        }
-        if self
-            .shared
-            .sweeping
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        self.shared.publisher.wire(sink);
-        let ctx = TaskCtx {
-            shared: Arc::clone(&self.shared),
-            host: host.clone(),
-            sink: sink.clone(),
-            addr: None,
-            name: "sweep",
-            tag: Arc::default(),
-        };
-        let shared = Arc::clone(&self.shared);
-        let tag = Arc::clone(&ctx.tag);
-        let handle = tokio::spawn(async move {
-            /// Frees the one-sweep-at-a-time claim however the sweep ends.
-            struct Swept<P: ReplySink>(Arc<Shared<P>>);
-            impl<P: ReplySink> Drop for Swept<P> {
-                fn drop(&mut self) {
-                    self.0.sweeping.store(false, Ordering::SeqCst);
-                }
-            }
-            let _swept = Swept(Arc::clone(&ctx.shared));
-            sweep_once(ctx).await;
-        });
-        shared.track(tag, handle);
+        spawn_sweep(&self.shared, host, sink);
     }
 
     /// MOD-42 plan D13 (B-1, B-10): one command poll, the `sweep_with` shape: sync, one tracked
@@ -1781,9 +1751,91 @@ fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
         // Before the queue is looked at, so a claim refused meanwhile sees the count move.
         ctx.shared.ended.fetch_add(1, Ordering::SeqCst);
+        // MOD-12 D8: before the retry, so the queue's next admission and this process's refused
+        // claims meet in one sweep when they can.
+        wake_on_rest(&ctx).await;
         retry_claims(&ctx).await;
     });
     shared.track(tag, handle);
+}
+
+/// D190's one-sweep-at-a-time task (MOD-12 D8: callable from a task's tail). A sweep asked for
+/// while one runs is not dropped: `sweep_again` makes the running one go round once more. A wake
+/// landing between the loop's last look at `sweep_again` and the guard's drop is still lost; the
+/// next tick covers it (blueprint H-8).
+fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
+    shared: &Arc<Shared<P>>,
+    host: &H,
+    sink: &P,
+) {
+    if host.writer().is_none() || shared.walks.closed() {
+        return;
+    }
+    if shared
+        .sweeping
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        shared.sweep_again.store(true, Ordering::SeqCst);
+        return;
+    }
+    shared.publisher.wire(sink);
+    let ctx = TaskCtx {
+        shared: Arc::clone(shared),
+        host: host.clone(),
+        sink: sink.clone(),
+        addr: None,
+        name: "sweep",
+        tag: Arc::default(),
+    };
+    let tag = Arc::clone(&ctx.tag);
+    let handle = tokio::spawn(async move {
+        /// Frees the one-sweep-at-a-time claim however the sweep ends.
+        struct Swept<P: ReplySink>(Arc<Shared<P>>);
+        impl<P: ReplySink> Drop for Swept<P> {
+            fn drop(&mut self) {
+                self.0.sweeping.store(false, Ordering::SeqCst);
+            }
+        }
+        let _swept = Swept(Arc::clone(&ctx.shared));
+        loop {
+            Box::pin(sweep_once(ctx.clone())).await;
+            if !ctx.shared.sweep_again.swap(false, Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+    shared.track(tag, handle);
+}
+
+/// MOD-12 D8: a walk of this process that rested may have freed a slot. When this box's queue
+/// runs, a sweep is asked for now rather than at the next tick (the lease period, 120 s, on a
+/// TUI box). Only a task whose run is read to be at rest (not `queued`, not `running`) asks, so
+/// a refused claim, which leaves its run `queued`, never loops; nothing without the claim scan.
+async fn wake_on_rest<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
+    if !ctx.shared.claim_scan {
+        return;
+    }
+    let Some(run) = ctx.tag.run.get().copied() else {
+        return;
+    };
+    match ctx.host.run(run).await {
+        Ok(
+            Some(Run {
+                status: RunStatus::Running | RunStatus::Queued,
+                ..
+            })
+            | None,
+        )
+        | Err(_) => return,
+        Ok(Some(_)) => {}
+    }
+    let Ok(box_id) = registered_box(&ctx.host).await else {
+        return;
+    };
+    if let Ok(Some(_)) = ctx.host.open_batch_of(box_id).await {
+        spawn_sweep(&ctx.shared, &ctx.host, &ctx.sink);
+    }
 }
 
 /// M5 D84: once a task's run no longer walks — parked, finished, or gone — every run a refused
