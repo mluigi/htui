@@ -829,6 +829,7 @@ impl FakeVerifier {
             output: output.to_owned(),
             started_at: epoch(),
             finished_at: epoch(),
+            truncated: false,
         }
     }
 }

@@ -3781,9 +3781,19 @@ where
         // MOD-10 (blueprint A-11): the verifier masks with the pattern rules only (D19); a
         // command that printed a file holding a resolved value is masked here with the walk's
         // scrubber before the output is persisted or read. A refusal drops the text, as the
-        // verifier's own `scrubbed` withholds it.
+        // verifier's own `scrubbed` withholds it. R1 L2: a tail the 64 KiB cap cut can open with
+        // the end of a value, which no mask matches; its first hold-back bytes are dropped first.
+        let output = if report.truncated {
+            crate::verify::without_cut_head(
+                &report.output,
+                report.outcome,
+                self.parts.scrubber.hold_back(),
+            )
+        } else {
+            report.output
+        };
         let report = VerifyReport {
-            output: remasked(self.parts.scrubber, report.output),
+            output: remasked(self.parts.scrubber, output),
             ..report
         };
 
@@ -19417,6 +19427,45 @@ mod tests {
                 .expect("MemStore never fails a read");
             assert_eq!(rows.len(), 1, "the verify ran once");
             assert_eq!(rows[0].output.as_deref(), Some("leaked [REDACTED]"));
+        }
+
+        /// MOD-10 R1 L2: a verify output past the 64 KiB cap is a tail, and a resolved value the
+        /// cap cut leaves its suffix at the tail's start, which no mask can match. The re-mask
+        /// drops the tail's first hold-back bytes and marks the drop.
+        #[tokio::test]
+        async fn a_cut_verify_tail_keeps_no_suffix_of_a_resolved_value() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            provider_project(&harness, &[("API_KEY", VALUE)]);
+            let rest = "the build went on. ".repeat(10);
+            harness.orch.verifier.script_report(VerifyReport {
+                // The cap kept the value from its fifth byte on.
+                output: format!("{}{rest}", &VALUE[4..]),
+                truncated: true,
+                ..FakeVerifier::pass()
+            });
+
+            Box::pin(harness.dispatch(start_feat_3()))
+                .await
+                .expect("the walk parks at prd's gate");
+
+            let run = started_run(&harness.orch).await;
+            let prd = step_at(&harness.orch, run, 0).await;
+            let rows = harness
+                .orch
+                .store
+                .command_runs(prd.id)
+                .await
+                .expect("MemStore never fails a read");
+            let stored = rows[0].output.clone().unwrap_or_default();
+            for start in 0..=VALUE.len() - htui_core::scrub::MIN_MASKED_LEN {
+                assert!(!stored.contains(&VALUE[start..]), "{stored}");
+            }
+            assert!(stored.starts_with(crate::verify::TRUNCATED), "{stored}");
+            assert!(
+                stored.ends_with(&rest[100..]),
+                "the rest of the tail is kept: {stored}"
+            );
         }
 
         /// `FEAT-3` started over a primary repo, parked at `prd`, and `prd` promoted: the run and

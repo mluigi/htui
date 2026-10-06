@@ -339,11 +339,15 @@ A phase's verify command runs with htui's own environment, so it never receives 
 values. Its output can still hold one, for example a command that prints a file the agent wrote
 (`cat .env`, a test log). The verify runner keeps the output's last 64 KiB and masks it with the
 credential rules; htui then masks it again with the walk's resolved values before storing it in
-`command_run.output`. Output the walk's masking refuses is dropped (stored empty), and a `warn`
-log says so.
+`command_run.output`. Output the walk's masking refuses is dropped and stored as
+`<scrub refused: N bytes withheld>`, and a `warn` log says so.
 
-One case stays open: the 64 KiB cut comes before the second masking, so a value that straddles
-the start of the kept tail leaves its end in the output, and that end no longer matches the value.
+The 64 KiB cut comes before the second masking, so a value that straddles the start of the kept
+tail would leave its end in the output, where it no longer matches the value. When the output
+was cut, htui therefore drops the tail's first bytes before masking it again, as many as the
+longest resolved value (or 76 for the credential rules, whichever is larger), less one, and opens
+the stored tail with `[… earlier output truncated]`. An `unavailable` verify keeps its reason line
+whole above the tail.
 
 ## Logins, tokens and lockout safety
 
