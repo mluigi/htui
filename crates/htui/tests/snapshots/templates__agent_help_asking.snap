@@ -5,8 +5,8 @@ expression: frame
 Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
  1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
  Skills │ Templates
-┌ implement · editing from v1, saves v3 ─────────────────────┐┌ phase placeholders ────────────────┐
-│DRAFT You are running the `implement` phase for {{item_key}}││{{item_key}} scalar                 │
+┌ implement · editing from v1, saves v2 ─────────────────────┐┌ phase placeholders ────────────────┐
+│You are running the `implement` phase for {{item_key}}, atte││{{item_key}} scalar                 │
 │                                                            ││{{item_title}} scalar               │
 │{{item}}                                                    ││{{item_kind}} scalar                │
 │{{documents}}                                               ││{{phase}} scalar                    │
@@ -24,11 +24,11 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │you verified it, one section per file group.                ││                                    │
 │                                                            ││                                    │
 │                                                            ││                                    │
-│                                                            ││                                    │
-│                                                            ││                                    │
-│                                                            ││                                    │
+└────────────────────────────────────────────────────────────┘│                                    │
+┌ ask an agent ──────────────────────────────────────────────┐│                                    │
+│ask: shorter                                                ││                                    │
+│agent: scripted                                             ││                                    │
 └────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
- saved elsewhere since you opened it — v2 is now the latest; your draft is kept and Ctrl+S saves it
- as v3
- Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel  L1:C7
+
+ Enter ask  Up/Down agent  Esc back
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

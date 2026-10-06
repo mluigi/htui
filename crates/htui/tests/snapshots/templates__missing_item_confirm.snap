@@ -30,5 +30,5 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                            ││                                    │
 └────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
  this phase template never places {{item}} — Ctrl+S again saves anyway
- Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C20
+ Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel  L1:C20
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

@@ -1,0 +1,34 @@
+---
+source: crates/htui/tests/templates.rs
+expression: frame
+---
+Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
+ 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat
+ Skills │ Templates
+┌ proposal from scripted · sent → proposed ──────────────────┐┌ phase placeholders ────────────────┐
+│--- sent                                                    ││{{item_key}} scalar                 │
+│+++ proposed                                                ││{{item_title}} scalar               │
+│@@ -1,16 +1,3 @@                                            ││{{item_kind}} scalar                │
+│-You are running the `implement` phase for {{item_key}},    ││{{phase}} scalar                    │
+│attempt {{attempt}}.                                        ││{{output_kind}} scalar              │
+│-                                                           ││{{attempt}} scalar                  │
+│ {{item}}                                                   ││{{item}} section                    │
+│-{{documents}}                                              ││{{documents}} section               │
+│-{{verify_failure}}                                         ││{{upstream}} section                │
+│-{{previous_diff}}                                          ││{{box}} section                     │
+│-{{upstream}}                                               ││{{skills}} section                  │
+│-{{box}}                                                    ││{{excerpts}} section                │
+│-{{skills}}                                                 ││{{verify_failure}} section          │
+│-{{excerpts}}                                               ││{{previous_diff}} section           │
+│-{{command_queue}}                                          ││{{command_queue}} section           │
+│                                                            ││                                    │
+│-Make the change the plan describes, in this working tree.  ││                                    │
+│Keep the diff to what the plan asks for.                    ││                                    │
+│-When a prior attempt is shown above, read its diff and its ││                                    │
+│verification output first and fix the                       ││                                    │
+│-cause rather than the symptom. Write a `{{output_kind}}`   ││                                    │
+│document describing what changed and how                    ││                                    │
+└────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
+
+ Enter accept  Esc discard  J/K PgUp/PgDn scroll
+q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

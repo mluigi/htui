@@ -18,13 +18,15 @@
 use core::cell::Cell;
 
 use htui_core::model::{ProjectId, PromptTemplate};
-use htui_core::prompt::{Placeholder, TemplateError, TemplateRole, body_of, parse};
+use htui_core::prompt::edit_help::{self, HelpTarget};
+use htui_core::prompt::{TemplateError, TemplateRole, body_of, parse};
 use htui_core::store::invalid_template_name;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
+use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -82,8 +84,9 @@ const SCROLL_HINT: &str = " J/K PgUp/PgDn scroll ";
 /// The hint row while naming a new template.
 const NAMING_HINT: &str = "Enter create  Esc cancel";
 
-/// The hint row in the editor, before the cursor's `L{line}:C{col}` (D20).
-const EDIT_HINT: &str = "Ctrl+S save  Ctrl+E $EDITOR  Esc cancel";
+/// The hint row in the editor, before the cursor's `L{line}:C{col}` (D20). `Ctrl+G` is MOD-55's,
+/// hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
+const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
 
 /// The review phase's wire contract, the one a reviewer's output is parsed by (ANA-5 `:1323-1331`).
 const REVIEW_WIRE: &str = "wire: first 3 lines `---` / `verdict: approve|request-changes` / `---`";
@@ -223,6 +226,9 @@ struct Editor {
     /// The body the save in flight carries: what tells a draft typed on since from the one that
     /// was saved.
     sent: Option<String>,
+    /// MOD-55: the agent help, while open; the draft is locked under it. Boxed: it would
+    /// otherwise set the size of every [`Mode`].
+    help: Option<Box<AgentHelp>>,
 }
 
 impl Editor {
@@ -245,6 +251,7 @@ impl Editor {
             confirm_item: false,
             esc_armed: false,
             sent: None,
+            help: None,
         }
     }
 }
@@ -263,6 +270,7 @@ impl core::fmt::Debug for Editor {
             .field("confirm_item", &self.confirm_item)
             .field("esc_armed", &self.esc_armed)
             .field("sent_len", &self.sent.as_ref().map(String::len))
+            .field("help", &self.help)
             .finish()
     }
 }
@@ -286,6 +294,15 @@ enum Notice {
     Info(String),
     /// `theme.error`: something the user has to act on.
     Error(String),
+}
+
+impl From<Report> for Notice {
+    fn from(report: Report) -> Self {
+        match report {
+            Report::Info(text) => Self::Info(text),
+            Report::Error(text) => Self::Error(text),
+        }
+    }
 }
 
 /// Where a `parse` error points: the opening `{{` for the three that have one, and `None` for
@@ -314,6 +331,12 @@ impl TemplatesView {
                 field.on_paste(text);
             }
             Mode::Editing(editor) => {
+                // MOD-55: an open help takes the paste (its request field, or nothing); the draft
+                // under it is locked.
+                if let Some(help) = editor.help.as_mut() {
+                    help.on_paste(text);
+                    return true;
+                }
                 editor.area.on_paste(text);
                 editor.confirm_item = false;
                 editor.esc_armed = false;
@@ -350,6 +373,16 @@ impl TemplatesView {
 
     /// A reply addressed to the Skills tab.
     pub(super) fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        // MOD-55: the open help sees every reply first (A-1: its per-state table is what makes a
+        // stray frame harmless). Its frames match none of the arms below.
+        if let Mode::Editing(editor) = &mut self.mode
+            && let Some(help) = editor.help.as_mut()
+        {
+            let outcome = help.on_reply(reply, ctx);
+            if outcome != HelpOutcome::Consumed {
+                self.apply_help(outcome);
+            }
+        }
         match reply {
             StoreReply::Templates(snapshot) => {
                 if !in_scope(snapshot, ctx) {
@@ -482,8 +515,13 @@ impl TemplatesView {
         let hint = match &self.mode {
             Mode::Editing(editor) => {
                 self.render_editor(frame, content, editor, ctx.theme);
-                let (line, col) = editor.area.cursor_line_col();
-                format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                match &editor.help {
+                    Some(help) => help.hint().to_owned(),
+                    None => {
+                        let (line, col) = editor.area.cursor_line_col();
+                        format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                    }
+                }
             }
             Mode::Naming { .. } => {
                 self.render_browse(frame, content, ctx);
@@ -681,11 +719,22 @@ impl TemplatesView {
         self.mode = Mode::Editing(Editor::new(project, name, None, None, body));
     }
 
-    /// The editor (plan D11, D13): `Ctrl+S` (the area's `Submit`), `Ctrl+E` and `Esc` are the
-    /// view's, `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept,
-    /// everything else is text.
+    /// The editor (plan D11, D13): `Ctrl+S` (the area's `Submit`), `Ctrl+G`, `Ctrl+E` and `Esc`
+    /// are the view's, `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept,
+    /// everything else is text. An open agent help (MOD-55) takes every key first: the draft is
+    /// locked under it, and `Ctrl+S`/`Ctrl+E`/`Ctrl+G` are refused until it closes.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        if let Mode::Editing(editor) = &mut self.mode
+            && let Some(help) = editor.help.as_mut()
+        {
+            let outcome = help.on_key(key, ctx);
+            return self.apply_help(outcome);
+        }
         let chord = key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL;
+        if chord && matches!(key.code, KeyCode::Char('g' | 'G')) {
+            self.open_help(ctx);
+            return Handled::Consumed;
+        }
         if chord && matches!(key.code, KeyCode::Char('e' | 'E')) {
             self.hand_off(ctx);
             return Handled::Consumed;
@@ -786,6 +835,62 @@ impl TemplatesView {
             editor,
             resume: true,
         });
+    }
+
+    /// `Ctrl+G` (MOD-55 P7, P8): the agent help opens on the draft as it is, for the template's
+    /// own project. Not while a save is in flight, for `Esc`'s reason.
+    fn open_help(&mut self, ctx: &Ctx<'_>) {
+        if let Some(busy) = self.busy {
+            self.notice = Some(Notice::Error(format!("`{busy}` is still in flight")));
+            return;
+        }
+        let Mode::Editing(editor) = &mut self.mode else {
+            return;
+        };
+        editor.help = Some(Box::new(AgentHelp::open(
+            HelpTarget::Template {
+                name: editor.name.clone(),
+            },
+            editor.project,
+            editor.area.text(),
+            ctx,
+        )));
+        editor.esc_armed = false;
+        self.notice = None;
+    }
+
+    /// What the open help's key or reply did. An accepted proposal replaces the draft through the
+    /// `$EDITOR` return's gate (`on_external_edit`'s `Edited` arm): `parse` runs, the cursor goes
+    /// to its error, and nothing is sent. `original` is left alone, so `Esc` still asks first.
+    fn apply_help(&mut self, outcome: HelpOutcome) -> Handled {
+        let Mode::Editing(editor) = &mut self.mode else {
+            return Handled::Pass;
+        };
+        match outcome {
+            HelpOutcome::Consumed => {}
+            HelpOutcome::Pass => return Handled::Pass,
+            HelpOutcome::Note(report) => self.notice = Some(report.into()),
+            HelpOutcome::Close(report) => {
+                editor.help = None;
+                editor.esc_armed = false;
+                self.notice = report.map(Notice::from);
+            }
+            HelpOutcome::Accept(text) => {
+                editor.help = None;
+                editor.area = TextArea::with_text(&text);
+                let text = editor.area.text().to_owned();
+                editor.confirm_item = false;
+                editor.esc_armed = false;
+                self.notice = Some(match parse(TemplateRole::of_name(&editor.name), &text) {
+                    Err(err) => {
+                        editor.area.set_cursor(error_at(&err).unwrap_or(text.len()));
+                        Notice::Error(err.to_string())
+                    }
+                    Ok(_) => Notice::Info(ACCEPTED.to_owned()),
+                });
+            }
+        }
+        Handled::Consumed
     }
 
     // --- state ---------------------------------------------------------------------------------
@@ -1048,10 +1153,25 @@ impl TemplatesView {
         )
     }
 
-    /// The editor: the draft on the left, the role's placeholders on the right (plan D14).
+    /// The editor: the draft on the left, the role's placeholders on the right (plan D14). An
+    /// open agent help draws in the draft's place (MOD-55 B-2): a panel under a locked draft, or
+    /// the proposal over all of it; the placeholder column stays, to check a proposal against.
     fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
         let [left, right] =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(HELP_WIDTH)]).areas(area);
+        let draft = match &editor.help {
+            Some(help) => help.render(frame, left, theme),
+            None => Some(left),
+        };
+        if let Some(draft) = draft {
+            self.render_draft(frame, draft, editor, theme);
+        }
+        self.render_placeholders(frame, right, editor, theme);
+    }
+
+    /// The draft's block: the name, the versions, and the text with its cursor (dim under an
+    /// open help, which has the keys).
+    fn render_draft(&self, frame: &mut Frame<'_>, left: Rect, editor: &Editor, theme: &Theme) {
         let title = match (editor.token, editor.from) {
             (Some(token), from) => format!(
                 " {} \u{b7} editing from v{}, saves v{} ",
@@ -1066,31 +1186,29 @@ impl TemplatesView {
         frame.render_widget(block, left);
         self.page.set(inner.height);
         frame.render_widget(
-            Paragraph::new(editor.area.lines(inner.width, inner.height, true, theme)),
+            Paragraph::new(editor.area.lines(
+                inner.width,
+                inner.height,
+                editor.help.is_none(),
+                theme,
+            )),
             inner,
         );
+    }
 
+    /// The role's placeholders and, for the judge and `review`, the wire contract.
+    fn render_placeholders(
+        &self,
+        frame: &mut Frame<'_>,
+        right: Rect,
+        editor: &Editor,
+        theme: &Theme,
+    ) {
+        // One table for the column and the help prompt (MOD-55 §1.3).
         let role = TemplateRole::of_name(&editor.name);
-        let required = Placeholder::required_by(role);
-        let mut lines: Vec<Line<'static>> = Placeholder::ALL
-            .iter()
-            .filter(|placeholder| placeholder.allowed_in(role))
-            .map(|placeholder| {
-                let kind = if placeholder.is_section() {
-                    "section"
-                } else {
-                    "scalar"
-                };
-                let need = if required.contains(placeholder) {
-                    " required"
-                } else {
-                    ""
-                };
-                Line::styled(
-                    format!("{{{{{}}}}} {kind}{need}", placeholder.token()),
-                    theme.base,
-                )
-            })
+        let mut lines: Vec<Line<'static>> = edit_help::placeholder_table(role)
+            .into_iter()
+            .map(|line| Line::styled(line, theme.base))
             .collect();
         let wire = match (role, editor.name.as_str()) {
             (TemplateRole::Judge, _) => Some(JUDGE_WIRE),
@@ -1153,7 +1271,10 @@ mod tests {
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
     use crate::ui::tabs::SkillsTab;
+    use crate::ui::tabs::skills::agent_help::fixtures as agent_fixtures;
     use crossterm::event::{KeyCode, KeyModifiers};
+    use htui_agent::event::StopReason;
+    use htui_core::model::StepId;
 
     /// MOD-60 D1: the name is fitted in cells, so a wide name never pushes the head or the role
     /// right.
@@ -1664,5 +1785,196 @@ mod tests {
             view.selected_template(),
             Some((ids::PROJECT_VULKAN, "implement".to_owned()))
         );
+    }
+
+    // --- MOD-55: agent help -------------------------------------------------------------------
+
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    fn enter() -> KeyEvent {
+        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+    }
+
+    /// The open editor.
+    fn editor(view: &TemplatesView) -> &Editor {
+        match &view.mode {
+            Mode::Editing(editor) => editor,
+            other => panic!("an editor is open: {other:?}"),
+        }
+    }
+
+    /// From a fresh read: `implement` opened (three `j`s, `e`), then `Ctrl+G`. The one request
+    /// it sent, drained.
+    fn open_help(view: &mut TemplatesView, bench: &Bench, ctx: &mut Ctx<'_>) -> StoreRequest {
+        for _ in 0..3 {
+            view.on_key(key('j'), ctx);
+        }
+        view.on_key(key('e'), ctx);
+        assert_eq!(view.on_key(ctrl('g'), ctx), Handled::Consumed);
+        bench.one()
+    }
+
+    /// [`open_help`], one enabled agent read, `shorter` asked. The `EditHelp` it sent.
+    fn ask_help(view: &mut TemplatesView, bench: &Bench, ctx: &mut Ctx<'_>) -> StoreRequest {
+        open_help(view, bench, ctx);
+        view.on_reply(
+            &StoreReply::Agents(vec![agent_fixtures::summary("scripted", true)]),
+            ctx,
+        );
+        for c in "shorter".chars() {
+            view.on_key(key(c), ctx);
+        }
+        view.on_key(enter(), ctx);
+        bench.one()
+    }
+
+    /// TV-1 (B-1): `Ctrl+G` in the editor opens the help, which reads the agents.
+    #[tokio::test]
+    async fn ctrl_g_opens_help_and_asks_for_agents() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        let request = open_help(&mut view, &bench, &mut ctx);
+        assert!(matches!(request, StoreRequest::Agents), "{request:?}");
+        assert!(editor(&view).help.is_some());
+        assert!(view.captures_input(), "the editor still owns every key");
+    }
+
+    /// TV-2 (P7): the request names the editor's project and the template, and carries the
+    /// draft as it was when the help opened.
+    #[tokio::test]
+    async fn the_help_request_carries_the_editor_s_project_and_name() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        let request = ask_help(&mut view, &bench, &mut ctx);
+        let StoreRequest::EditHelp {
+            project_id, prompt, ..
+        } = &request
+        else {
+            panic!("an EditHelp: {request:?}");
+        };
+        assert_eq!(*project_id, ids::PROJECT_VULKAN);
+        assert_eq!(
+            prompt.target,
+            HelpTarget::Template {
+                name: "implement".to_owned()
+            }
+        );
+        assert_eq!(prompt.body, editor(&view).area.text());
+        assert_eq!(prompt.request, "shorter");
+    }
+
+    /// TV-3: a save in flight refuses `Ctrl+G` with the in-flight notice; no help opens.
+    #[tokio::test]
+    async fn ctrl_g_is_refused_while_a_save_is_in_flight() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        save_implement(&mut view, &bench, &mut ctx);
+        view.on_key(ctrl('g'), &mut ctx);
+        assert_eq!(
+            view.notice,
+            Some(Notice::Error(
+                "`save_template` is still in flight".to_owned()
+            ))
+        );
+        assert!(editor(&view).help.is_none());
+        assert!(sent(&bench.emit).is_empty());
+    }
+
+    /// TV-4: an accepted proposal replaces the draft through the `$EDITOR` return's gate: `parse`
+    /// runs, the cursor goes to the error, and nothing is sent. A body `parse` accepts says so,
+    /// and `Ctrl+S` saves it.
+    #[tokio::test]
+    async fn an_accepted_proposal_replaces_the_draft_through_parse() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        ask_help(&mut view, &bench, &mut ctx);
+        let original = editor(&view).original.clone();
+        view.on_reply(&agent_fixtures::accepted(StepId::new()), &mut ctx);
+        view.on_reply(
+            &agent_fixtures::chunk("Here:\n```\nx {{itme}}\n```\n"),
+            &mut ctx,
+        );
+        view.on_reply(&agent_fixtures::ended(StopReason::EndTurn), &mut ctx);
+        assert!(editor(&view).help.is_some(), "the proposal is shown");
+        assert_eq!(view.on_key(enter(), &mut ctx), Handled::Consumed);
+
+        let open = editor(&view);
+        assert!(open.help.is_none(), "accepting closes the help");
+        assert_eq!(open.area.text(), "x {{itme}}\n");
+        assert_eq!(open.area.cursor_line_col(), (0, 2), "on the braces");
+        assert_eq!(open.original, original, "Esc still asks first");
+        assert!(
+            matches!(&view.notice, Some(Notice::Error(text)) if text.starts_with("unknown prompt placeholder")),
+            "{:?}",
+            view.notice
+        );
+        assert!(sent(&bench.emit).is_empty(), "accepting sends nothing");
+
+        view.on_key(ctrl('g'), &mut ctx);
+        assert!(matches!(bench.one(), StoreRequest::Agents));
+        view.on_reply(
+            &StoreReply::Agents(vec![agent_fixtures::summary("scripted", true)]),
+            &mut ctx,
+        );
+        view.on_key(key('x'), &mut ctx);
+        view.on_key(enter(), &mut ctx);
+        bench.one();
+        view.on_reply(&agent_fixtures::accepted(StepId::new()), &mut ctx);
+        view.on_reply(&agent_fixtures::chunk("```\nDo {{item}}.\n```\n"), &mut ctx);
+        view.on_reply(&agent_fixtures::ended(StopReason::EndTurn), &mut ctx);
+        view.on_key(key('y'), &mut ctx);
+        assert_eq!(view.notice, Some(Notice::Info(ACCEPTED.to_owned())));
+        view.on_key(ctrl('s'), &mut ctx);
+        let save = bench.one();
+        assert!(
+            matches!(&save, StoreRequest::SaveTemplate { body, .. } if body.as_str() == "Do {{item}}.\n"),
+            "{save:?}"
+        );
+    }
+
+    /// TV-5: while the help is open, keys and pastes go to it: the draft under it is locked.
+    #[tokio::test]
+    async fn typing_under_an_open_help_leaves_the_draft_alone() {
+        let backend = Backend::memory(MemStore::demo());
+        let bench = Bench::new();
+        let mut ctx = bench.ctx();
+        let mut view = TemplatesView::default();
+        let read = serve(&backend, StoreRequest::Templates(bench.scope.clone())).await;
+        view.on_reply(&read, &mut ctx);
+        open_help(&mut view, &bench, &mut ctx);
+        let before = editor(&view).area.text().to_owned();
+        for c in "zzz".chars() {
+            view.on_key(key(c), &mut ctx);
+        }
+        assert!(view.on_paste("pasted"));
+        view.on_key(ctrl('e'), &mut ctx);
+        assert_eq!(editor(&view).area.text(), before, "the draft is locked");
+        assert!(
+            bench.emit.take().is_empty(),
+            "Ctrl+E is refused while the help is open"
+        );
+        // `Esc` closes the asking help; the draft is back, editable.
+        view.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut ctx);
+        assert!(editor(&view).help.is_none());
+        view.on_key(key('z'), &mut ctx);
+        assert_eq!(editor(&view).area.text(), format!("z{before}"));
     }
 }

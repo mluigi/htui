@@ -7,6 +7,7 @@
 //! and an editor that saves through `parse`. The tab reads both on activation whichever view is
 //! shown (blueprint D34, plan D84), so switching views needs no request.
 
+mod agent_help;
 mod attach;
 mod library;
 mod templates;
