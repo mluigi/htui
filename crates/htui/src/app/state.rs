@@ -8,13 +8,14 @@ use htui_worker::WaitingView;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use std::cell::RefCell;
 use tokio::sync::mpsc;
 
-use crate::app::action::{Action, Handled, RevealKind};
+use crate::app::action::{Action, Handled, OverlayAction, RevealKind, TabAction};
 use crate::editor::{ExternalEdit, ExternalEditOutcome};
-use crate::keymap::{KeyChord, KeyScope, Keymap};
+use crate::keymap::{KeyScope, Keymap};
+use crate::keys::{Act, CTRL_C, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
@@ -80,10 +81,14 @@ pub struct Ctx<'a> {
     pub projects: &'a [ProjectRef],
     /// What the top bar currently shows.
     pub top_bar: &'a TopBarState,
-    /// The key table, for help lines.
+    /// The legacy Backlog tab rows (MOD-67 D2). No view reads it; the named-action keys are
+    /// [`keys()`](Self::keys).
     pub keymap: &'a Keymap,
     /// The palette.
     pub theme: &'a Theme,
+    /// The keys in force (MOD-67 D9): `App`'s own at the shell's sites, else the compiled
+    /// defaults. No view reads it in M1.
+    keys: &'a Keys,
     /// Who the shell is talking to; replies to this view's requests come back addressed to it.
     origin: Origin,
     /// The action sink.
@@ -108,9 +113,24 @@ impl<'a> Ctx<'a> {
             top_bar,
             keymap,
             theme,
+            keys: Keys::compiled(),
             origin,
             emit,
         }
+    }
+
+    /// Hands the view these keys instead of the compiled defaults: how `App` passes its own.
+    #[must_use]
+    pub fn with_keys(mut self, keys: &'a Keys) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// The keys in force, for hint rows and labels (M3-M5). The borrow lives as long as the
+    /// context's data (`'a`), not as long as this `Ctx`.
+    #[must_use]
+    pub fn keys(&self) -> &'a Keys {
+        self.keys
     }
 
     /// Asks the store. The reply comes back to this view through `on_reply`, unless a newer
@@ -146,8 +166,15 @@ pub struct App {
     pub overlays: OverlayStack,
     /// How an [`OverlayId`](crate::ui::overlay::OverlayId) becomes an overlay.
     pub overlay_factories: OverlayRegistry,
-    /// The key table.
+    /// The legacy tab rows: the six Backlog rows `register_all` binds (MOD-67 D2). Global and
+    /// overlay keys are `keys`' since MOD-67.
     pub keymap: Keymap,
+    /// The named-action keys in force (MOD-67 D10): the compiled defaults; M2 builds them from
+    /// `keys.toml`.
+    pub keys: Keys,
+    /// Global actions that open a named view, offered by `register_all` (D5). An action not offered
+    /// is neither dispatched nor shown.
+    pub(super) offered: Vec<(Act, Action)>,
     /// The palette: `Theme::default()` until `run` applies `NO_COLOR` (MOD-80 D4).
     pub theme: Theme,
     /// Whether the help box is up.
@@ -235,6 +262,8 @@ impl App {
             overlays: OverlayStack::new(),
             overlay_factories: OverlayRegistry::new(),
             keymap,
+            keys: Keys::compiled().clone(),
+            offered: Vec::new(),
             theme: Theme::default(),
             help_visible: false,
             status: None,
@@ -295,6 +324,58 @@ impl App {
             self.dispatch(Origin::Overlay(id), request);
         }
         self.dirty = true;
+    }
+
+    /// Offers a global action that names a view (MOD-67 D5), replacing an earlier offer of `act`.
+    /// Only `register_all` calls it: the shell itself never names a concrete overlay.
+    pub fn offer(&mut self, act: Act, action: Action) {
+        debug_assert!(Self::is_offerable(act), "{act:?} is not offerable");
+        self.offered.retain(|(known, _)| *known != act);
+        self.offered.push((act, action));
+    }
+
+    /// The global actions [`offer`](Self::offer) takes: those that open a named view. Every other
+    /// global action is [`action_for`](Self::action_for)'s fixed mapping.
+    const fn is_offerable(act: Act) -> bool {
+        matches!(act, Act::Workspaces | Act::Find | Act::Waiting)
+    }
+
+    /// What the shell does for `act`: the fixed mapping, then the offered table. `None` for
+    /// everything a view must handle (every shared context) and for an offerable act nobody
+    /// offered.
+    fn action_for(&self, act: Act) -> Option<Action> {
+        match act {
+            Act::Quit => Some(Action::Quit),
+            Act::NextTab => Some(Action::Tab(TabAction::Next)),
+            Act::PrevTab => Some(Action::Tab(TabAction::Prev)),
+            Act::Help => Some(Action::ToggleHelp),
+            Act::OverlayClose => Some(Action::Overlay(OverlayAction::Close)),
+            other => other
+                .tab_index()
+                .map(|index| Action::Tab(TabAction::Select(index)))
+                .or_else(|| {
+                    self.offered
+                        .iter()
+                        .find(|(known, _)| *known == other)
+                        .map(|(_, action)| action.clone())
+                }),
+        }
+    }
+
+    /// D6 steps 2 and 6: the first candidate the shell maps to an action wins. `true` if one did.
+    fn apply_keys(&mut self, stack: Stack<'_>, chord: KeyChord) -> bool {
+        let action = self
+            .keys
+            .actions(stack, chord)
+            .into_iter()
+            .find_map(|act| self.action_for(act));
+        match action {
+            Some(action) => {
+                self.update(action);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Issues the active tab's `wants_requests`: called on activation and after a scope change.
@@ -399,6 +480,7 @@ impl App {
                 projects,
                 top_bar,
                 keymap,
+                keys,
                 theme,
                 emit,
                 tabs,
@@ -416,7 +498,8 @@ impl App {
                 theme,
                 origin.clone(),
                 emit,
-            );
+            )
+            .with_keys(keys);
             view.on_external_edit(outcome, &mut ctx);
         }
         self.drain(&origin);
@@ -457,6 +540,7 @@ impl App {
                     projects,
                     top_bar,
                     keymap,
+                    keys,
                     theme,
                     emit,
                     overlays,
@@ -472,7 +556,8 @@ impl App {
                             theme,
                             origin.clone(),
                             emit,
-                        );
+                        )
+                        .with_keys(keys);
                         top.on_paste(text, &mut ctx)
                     }
                     None => Handled::Pass,
@@ -492,6 +577,7 @@ impl App {
                     projects,
                     top_bar,
                     keymap,
+                    keys,
                     theme,
                     emit,
                     tabs,
@@ -506,7 +592,8 @@ impl App {
                         theme,
                         origin.clone(),
                         emit,
-                    );
+                    )
+                    .with_keys(keys);
                     // `Pass` is the drop: there is no keymap for a paste to fall through to.
                     let _ = tab.on_paste(text, &mut ctx);
                 }
@@ -584,6 +671,7 @@ impl App {
                 projects,
                 top_bar,
                 keymap,
+                keys,
                 theme,
                 emit,
                 tabs,
@@ -599,7 +687,8 @@ impl App {
                         theme,
                         origin.clone(),
                         emit,
-                    );
+                    )
+                    .with_keys(keys);
                     tab.on_mouse(mouse, &mut ctx)
                 }
                 None => Handled::Pass,
@@ -613,13 +702,25 @@ impl App {
         }
     }
 
-    /// The propagation chain of blueprint C.4, stopping at the first `Handled::Consumed`.
+    /// The propagation chain (blueprint C.4, MOD-67 D6), stopping at the first consumer: `ctrl-c`,
+    /// the top overlay, the overlay stack, the modal swallow, the active tab, its legacy rows, the
+    /// base stack.
+    ///
+    /// `ctrl-c` is checked here only: a bracketed paste has no key table
+    /// ([`on_paste`](Self::on_paste)), so a pasted `U+0003` never quits.
     pub fn on_key(&mut self, key: KeyEvent) {
         self.dirty = true;
         // An error survives until the user does something, then the help line comes back. Cleared
         // before the key is dispatched, so a failure this key causes still lands.
         self.status = None;
         let chord = KeyChord::from_event(key);
+
+        // `ctrl-c` quits before any overlay or view sees it (ANA-26 §6.4, MOD-67 D6). MOD-57 adds
+        // the one exception (a focused child-process pane) and its leave action.
+        if chord == CTRL_C {
+            self.update(Action::Quit);
+            return;
+        }
 
         if let Some(id) = self.overlays.top().map(Overlay::id) {
             let origin = Origin::Overlay(id);
@@ -629,6 +730,7 @@ impl App {
                     projects,
                     top_bar,
                     keymap,
+                    keys,
                     theme,
                     emit,
                     overlays,
@@ -644,7 +746,8 @@ impl App {
                             theme,
                             origin.clone(),
                             emit,
-                        );
+                        )
+                        .with_keys(keys);
                         top.on_key(key, &mut ctx)
                     }
                     None => Handled::Pass,
@@ -654,8 +757,10 @@ impl App {
             if handled == Handled::Consumed {
                 return;
             }
-            if let Some(action) = self.keymap.resolve(&KeyScope::Overlay(id), chord).cloned() {
-                self.update(action);
+            // `Esc` closes; `?`/`F1` toggle help over any overlay, for a key the overlay passed.
+            // Before the modal swallow: under a future non-modal overlay, help pre-empts the active
+            // tab for a key the overlay passed (D6). The first non-modal overlay revisits this.
+            if self.apply_keys(Stack::OVERLAY, chord) {
                 return;
             }
             // A modal overlay swallows what it did not handle: the tab below never sees it.
@@ -672,6 +777,7 @@ impl App {
                     projects,
                     top_bar,
                     keymap,
+                    keys,
                     theme,
                     emit,
                     tabs,
@@ -687,7 +793,8 @@ impl App {
                             theme,
                             origin.clone(),
                             emit,
-                        );
+                        )
+                        .with_keys(keys);
                         tab.on_key(key, &mut ctx)
                     }
                     None => Handled::Pass,
@@ -703,9 +810,8 @@ impl App {
             }
         }
 
-        if let Some(action) = self.keymap.resolve(&KeyScope::Global, chord).cloned() {
-            self.update(action);
-        }
+        // The base stack.
+        self.apply_keys(Stack::BASE, chord);
     }
 
     /// The context of one view.
@@ -720,6 +826,7 @@ impl App {
             origin,
             &self.emit,
         )
+        .with_keys(&self.keys)
     }
 
     /// Draws one frame: top bar, tab strip, the active tab, the status line, then the overlays
@@ -751,7 +858,10 @@ impl App {
 
         let (status, style) = match &self.status {
             Some(message) => (message.clone(), self.theme.error),
-            None => (self.keymap.help_line(&KeyScope::Global), self.theme.dim),
+            None => (
+                self.keys.status_line(|act| self.action_for(act).is_some()),
+                self.theme.dim,
+            ),
         };
         frame.render_widget(Paragraph::new(Line::styled(status, style)), chrome.status);
 
@@ -765,29 +875,77 @@ impl App {
         }
     }
 
-    /// The `?` box: the bindings of the global scope and of the active tab.
+    /// The `?` box (MOD-67 D8), rebuilt from the live state every frame: the overlay context (if
+    /// one is up), the active tab's legacy rows, the global context, then the closing line.
+    ///
+    /// Each logical line is packed into rows that fit the box ([`HelpLine::rows`]), so the box is
+    /// exactly as tall as what it shows and no row is clipped.
     fn render_help(&self, frame: &mut Frame<'_>, area: Rect) {
-        let mut lines = vec![Line::styled(
-            self.keymap.help_line(&KeyScope::Global),
-            self.theme.base,
-        )];
-        if let Some(id) = self.tabs.active_id() {
-            let tab_help = self.keymap.help_line(&KeyScope::Tab(id));
-            if !tab_help.is_empty() {
-                lines.push(Line::styled(tab_help, self.theme.base));
+        let box_width = area.width.saturating_sub(10).max(20);
+        let inner = usize::from(box_width.saturating_sub(2));
+        let offered = |act| self.action_for(act).is_some();
+        let mut lines: Vec<HelpLine> = Vec::new();
+        if !self.overlays.is_empty() {
+            lines.extend(self.keys.help_line(Context::Overlay, offered));
+        }
+        if let Some(tab) = self.tabs.active() {
+            let legacy = self.keymap.help_line(&KeyScope::Tab(tab.id()));
+            if !legacy.is_empty() {
+                lines.push(HelpLine::new(
+                    tab.title(),
+                    legacy.split(" · ").map(str::to_owned).collect(),
+                ));
             }
         }
-        lines.push(Line::styled("? closes this box", self.theme.dim));
-        let height = u16::try_from(lines.len())
+        lines.extend(self.keys.help_line(Context::Global, offered));
+        let mut rows: Vec<Line<'_>> = lines
+            .iter()
+            .flat_map(|line| line.rows(inner))
+            .map(|row| Line::styled(row, self.theme.base))
+            .collect();
+        if let Some(closer) = self.keys.help_closer() {
+            rows.push(Line::styled(closer, self.theme.dim));
+        }
+        let height = u16::try_from(rows.len())
             .unwrap_or(u16::MAX)
-            .saturating_add(2);
-        let box_area = layout::centered(area, area.width.saturating_sub(10).max(20), height);
+            .saturating_add(2)
+            .min(area.height);
+        let box_area = layout::centered(area, box_width, height);
         frame.render_widget(Clear, box_area);
         frame.render_widget(
-            Paragraph::new(Text::from(lines))
-                .wrap(Wrap { trim: true })
+            Paragraph::new(Text::from(rows))
                 .block(Block::new().borders(Borders::ALL).title(" Keys ")),
             box_area,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::sync::mpsc;
+
+    use super::App;
+    use crate::keymap::Keymap;
+    use crate::keys::{CATALOGUE, Context};
+
+    /// MOD-67 review L1: `action_for`'s wildcard arm is only safe while every global act is
+    /// either fixed-mapped by the shell or offerable (and so dispatched once `register_all`
+    /// offers it). A new global act that is neither would be silently inert.
+    #[test]
+    fn every_global_act_is_fixed_mapped_or_offerable() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let app = App::new(tx, Keymap::new());
+        for row in CATALOGUE
+            .iter()
+            .filter(|row| row.context == Context::Global)
+        {
+            let fixed = app.action_for(row.act).is_some();
+            assert!(
+                fixed != App::is_offerable(row.act),
+                "{:?}: fixed-mapped {fixed}, offerable {}",
+                row.act,
+                App::is_offerable(row.act)
+            );
+        }
     }
 }

@@ -10,6 +10,7 @@ pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::keymap::{Binding, KeyChord, KeyScope};
+use crate::keys::Act;
 use crate::ui::overlay::{ConceptsSearch, MigrationPrompt, WaitingList, WorkspaceSwitcher};
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
@@ -29,9 +30,9 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    order and `1`..`9` order, so Backlog first is what makes it the tab a user lands on.
 ///    Requirements sits before Settings, `R-TUI-1`'s order (MOD-39 PRD D2).
 /// 2. The switcher's factory goes in under its own [`OverlayId`](crate::ui::overlay::OverlayId)
-///    and global `w` is bound to opening it. The binding is added here rather than in
-///    [`Keymap::default_global`](crate::keymap::Keymap::default_global) because it names an
-///    overlay, and the key table must not know which views exist.
+///    and global `w` is **offered** ([`App::offer`] with [`Act::Workspaces`], MOD-67 D5) rather
+///    than mapped by the shell, because it names an overlay, and the shell must not know which
+///    views exist.
 /// 3. The switcher is named as the startup overlay. Nothing opens here: the first frame is the
 ///    bare shell, and the first workspace list either picks a startup scope (`--demo`) or is
 ///    empty, in which case `App::on_app_reply` opens the switcher reading "no workspaces"
@@ -44,16 +45,16 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///    belong here for the same reason the `w` binding does.
 /// 6. The Backlog and Requirements tabs are named as the tabs that reveal items and requirements
 ///    (MOD-64 D235).
-/// 7. The concepts search's factory goes in and global `Ctrl+F` is bound to opening it (MOD-64
-///    D236), a chord so no tab's letters and no text field's input can take it.
+/// 7. The concepts search's factory goes in and global `Ctrl+F` is offered as [`Act::Find`] to
+///    open it (MOD-64 D236), a chord so no tab's letters and no text field's input can take it.
 /// 8. The Backlog tab's `m` is bound to its `open graph` help text (MOD-14 D8). The tab's own
 ///    arm selects the Graph sub-tab; the binding only puts `m open graph` on the help line.
 /// 9. The Backlog tab's `f` and `F` are bound to their `filter` and `clear filter` help texts
 ///    (MOD-13 D1), for the same reason: the tab's own arms open and clear the filter.
 /// 10. The Backlog tab's `N` and `e` are bound to their `new item` and `edit item` help texts
 ///     (MOD-13 milestone 2 D7), for the same reason: the tab's own arms read the item form.
-/// 11. The waiting list's factory goes in and global `Ctrl+W` is bound to opening it (MOD-69 D7),
-///     a chord for `Ctrl+F`'s reason.
+/// 11. The waiting list's factory goes in and global `Ctrl+W` is offered as [`Act::Waiting`] to
+///     open it (MOD-69 D7), a chord for `Ctrl+F`'s reason.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -79,34 +80,27 @@ pub fn register_all(app: &mut App) {
 
     app.overlay_factories
         .register(WorkspaceSwitcher::ID, || Box::new(WorkspaceSwitcher::new()));
-    app.keymap.bind(Binding {
-        scope: KeyScope::Global,
-        key: KeyChord::new(KeyCode::Char('w'), KeyModifiers::NONE),
-        action: Action::Overlay(OverlayAction::Open(WorkspaceSwitcher::ID)),
-        help: "workspaces",
-    });
+    app.offer(
+        Act::Workspaces,
+        Action::Overlay(OverlayAction::Open(WorkspaceSwitcher::ID)),
+    );
 
     // MOD-64 D236: the concepts search, global `Ctrl+F`. A chord, so no tab's letters and no text
     // field's input can take it (every text widget passes chords, blueprint F7).
     app.overlay_factories
         .register(ConceptsSearch::ID, || Box::new(ConceptsSearch::new()));
-    app.keymap.bind(Binding {
-        scope: KeyScope::Global,
-        key: KeyChord::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
-        action: Action::Overlay(OverlayAction::Open(ConceptsSearch::ID)),
-        help: "find",
-    });
+    app.offer(
+        Act::Find,
+        Action::Overlay(OverlayAction::Open(ConceptsSearch::ID)),
+    );
 
-    // MOD-69 D7: the waiting-on-you list, global `Ctrl+W`. A chord, for `Ctrl+F`'s reason; MOD-67
-    // makes it a named action.
+    // MOD-69 D7: the waiting-on-you list, global `Ctrl+W`. A chord, for `Ctrl+F`'s reason.
     app.overlay_factories
         .register(WaitingList::ID, || Box::new(WaitingList::new()));
-    app.keymap.bind(Binding {
-        scope: KeyScope::Global,
-        key: KeyChord::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
-        action: Action::Overlay(OverlayAction::Open(WaitingList::ID)),
-        help: "waiting",
-    });
+    app.offer(
+        Act::Waiting,
+        Action::Overlay(OverlayAction::Open(WaitingList::ID)),
+    );
 
     app.startup_overlay = Some(WorkspaceSwitcher::ID);
 

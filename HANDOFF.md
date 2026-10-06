@@ -394,6 +394,12 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   in four places and spell one action four ways (`j/k move`/`select`/`rows`, `J/K move`, `Up/Dn
   move`), and Backlog has no hint row; generated hints go in one fixed row for every tab. MOD-81
   and MOD-82 come after this item.
+  **Phase M1 landed (`c3b3f7bd`..`add7fb39`, 2026-10-06):** the `keys/` module: `KeyChord` with a
+  strict parser, the 41-action catalogue (`global`, `overlay`, shared contexts), the `Keys`
+  resolver over context stacks, and generated status line and `?` box. `ctrl-c` quits first from
+  every screen (fixes Connection/Qdrant browse), and `?`/`f1` open help over overlays. No snapshot
+  changed. Deferred: the overlay-aware and capture-filtered status line to M3, and the Unix
+  ctrl-collision rejects to M2 (`.claude/plans/mod-67-m1-catalogue-resolver.plan.md`, "Review gate").
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,
