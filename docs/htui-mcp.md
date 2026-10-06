@@ -184,11 +184,15 @@ so it never does.
 - **A token outlives nothing.** It is registered for exactly the session's life and never logged.
   When the session ends (the agent exits, the step settles, the chat ends, htui quits), the token
   is unregistered, and a call on a connection still open answers `session ended`.
-- **The token is visible in `claude-cli`'s command line.** `--mcp-config=<json>` carries
-  `HTUI_MCP_TOKEN`, so another local user can read it from the process list (`/proc/<pid>/cmdline`).
-  It grants nothing on its own: the socket lives in a directory only your user can enter (`0700`),
-  so nobody else can connect to present it, and it dies with the session. An ACP agent receives it
-  over its stdin instead.
+- **The token is never on a command line.** For `claude-cli`, htui writes the session's MCP server
+  list, token included, to a file `mcp.json` in a new directory `htui-cli-<pid>-<8 hex>`, and starts
+  the CLI with `--mcp-config=<path>`, so the process list shows only the path. On Linux and macOS the
+  file has mode `0600` and the directory `0700` (htui refuses a directory that is not private), under
+  the same base directory as [the socket](#the-socket). On Windows the directory is under your
+  temporary directory (usually `%LOCALAPPDATA%\Temp`) and inherits its permissions: your account,
+  SYSTEM and Administrators. This path is compiled but not yet exercised on Windows (MOD-16). htui
+  removes the file and its directory when the session ends. An ACP agent receives the token over its
+  stdin instead.
 
 ## The output instruction in the prompt
 
@@ -385,12 +389,13 @@ local listener, at its first session, and the token gates every connection.
   your account and refusing remote clients. This path is compiled but not yet exercised on Windows
   (MOD-16).
 
-The socket and its directory are removed when the htui process exits normally. A crash (`kill -9`,
-a power cut) leaves the directory behind; nothing sweeps it. It is safe to delete once no htui
-process with that pid runs:
+The socket and its directory are removed when the htui process exits normally, and a `claude-cli`
+session's `htui-cli-*` directory when the session ends. A crash (`kill -9`, a power cut) leaves them
+behind; nothing sweeps them. A token left in an `htui-cli-*` directory is dead once its htui process
+has exited. Both are safe to delete once no htui process with that pid runs:
 
 ```
-ls -d "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"/htui-mcp-*
+ls -d "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"/htui-mcp-* "${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}"/htui-cli-*
 ```
 
 A connection must send its token within 5 seconds, or it is closed.
@@ -432,6 +437,10 @@ no database connection when the session started. Reconnect, then retry.
 **A step fails with `agent spawn failed: htui's MCP listener could not start: …`.** The socket
 directory could not be created or is not private: check that `$XDG_RUNTIME_DIR` (or the temporary
 directory) is writable and yours.
+
+**A step fails with `agent spawn failed: cannot write the MCP config: …`.** htui could not create
+the private directory or the file that hands `claude-cli` its MCP servers. Check that
+`$XDG_RUNTIME_DIR` (or the temporary directory) is writable and yours.
 
 **`session ended`.** The call came after its session ended: the step settled or was cancelled,
 the chat ended, or htui quit. Nothing was written.
