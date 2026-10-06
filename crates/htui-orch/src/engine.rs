@@ -32,8 +32,8 @@ use htui_agent::record::{
     Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, Signal, control_channel, drive,
 };
 use htui_core::model::{
-    AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
-    DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
+    AgentId, BatchId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus,
+    Document, DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
     NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
     RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotPersona,
@@ -663,6 +663,30 @@ where
         mode: htui_core::model::RunMode,
         repo_scope: Option<Vec<RepoId>>,
     ) -> Result<RunId, EngineError> {
+        Box::pin(self.enqueue_with(item, mode, repo_scope, None)).await
+    }
+
+    /// MOD-12 D6, D7: [`Self::enqueue`] for the queue runner — an `auto` run over the item's
+    /// default scope, recorded under `batch`. `create_run` refuses a closed or unknown batch.
+    ///
+    /// # Errors
+    /// [`Self::enqueue`]'s.
+    pub async fn enqueue_in_batch(
+        &self,
+        item: ItemId,
+        batch: BatchId,
+    ) -> Result<RunId, EngineError> {
+        Box::pin(self.enqueue_with(item, htui_core::model::RunMode::Auto, None, Some(batch))).await
+    }
+
+    /// The body `enqueue` had, with `batch_id` threaded into `NewRun` (MOD-12 D7).
+    async fn enqueue_with(
+        &self,
+        item: ItemId,
+        mode: htui_core::model::RunMode,
+        repo_scope: Option<Vec<RepoId>>,
+        batch: Option<BatchId>,
+    ) -> Result<RunId, EngineError> {
         let item = self.item(item).await?;
         // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
         // lacks tags *and* has no candidate is refused for the tags, the cheaper box-level fact.
@@ -713,7 +737,7 @@ where
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: now,
-                batch_id: None,
+                batch_id: batch,
             })
             .await?;
         Ok(id)

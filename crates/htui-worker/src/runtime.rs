@@ -16,8 +16,9 @@ use htui_agent::error::DriverError;
 use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, RepoId, Run,
-    RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
+    AgentId, AgentSummary, BatchClose, BoxId, BoxProfile, CancelRequest, Executor, ItemId,
+    ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus,
+    SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order, free_slots,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -218,6 +219,8 @@ struct Shared<P: ReplySink> {
     sweep_fixed: bool,
     /// D190: one sweep at a time.
     sweeping: AtomicBool,
+    /// MOD-12 D8: a sweep asked for while one ran; the running one sweeps once more before it ends.
+    sweep_again: AtomicBool,
     /// I-1: the executor the last sweep read, so a change is logged once.
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
@@ -1170,6 +1173,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweep_every: AtomicU64::new(millis(lease_period(&BTreeMap::new()))),
                 sweep_fixed: false,
                 sweeping: AtomicBool::new(false),
+                sweep_again: AtomicBool::new(false),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
@@ -1210,40 +1214,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
     /// MOD-41 blueprint B-3: named `sweep_with`, so it never shadows the TUI's `TuiRuns::sweep`.
     pub fn sweep_with(&mut self, host: &H, sink: &P) {
         self.shared.prune();
-        if host.writer().is_none() || self.shared.walks.closed() {
-            return;
-        }
-        if self
-            .shared
-            .sweeping
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
-            return;
-        }
-        self.shared.publisher.wire(sink);
-        let ctx = TaskCtx {
-            shared: Arc::clone(&self.shared),
-            host: host.clone(),
-            sink: sink.clone(),
-            addr: None,
-            name: "sweep",
-            tag: Arc::default(),
-        };
-        let shared = Arc::clone(&self.shared);
-        let tag = Arc::clone(&ctx.tag);
-        let handle = tokio::spawn(async move {
-            /// Frees the one-sweep-at-a-time claim however the sweep ends.
-            struct Swept<P: ReplySink>(Arc<Shared<P>>);
-            impl<P: ReplySink> Drop for Swept<P> {
-                fn drop(&mut self) {
-                    self.0.sweeping.store(false, Ordering::SeqCst);
-                }
-            }
-            let _swept = Swept(Arc::clone(&ctx.shared));
-            sweep_once(ctx).await;
-        });
-        shared.track(tag, handle);
+        spawn_sweep(&self.shared, host, sink);
     }
 
     /// MOD-42 plan D13 (B-1, B-10): one command poll, the `sweep_with` shape: sync, one tracked
@@ -1780,9 +1751,91 @@ fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
         // Before the queue is looked at, so a claim refused meanwhile sees the count move.
         ctx.shared.ended.fetch_add(1, Ordering::SeqCst);
+        // MOD-12 D8: before the retry, so the queue's next admission and this process's refused
+        // claims meet in one sweep when they can.
+        wake_on_rest(&ctx).await;
         retry_claims(&ctx).await;
     });
     shared.track(tag, handle);
+}
+
+/// D190's one-sweep-at-a-time task (MOD-12 D8: callable from a task's tail). A sweep asked for
+/// while one runs is not dropped: `sweep_again` makes the running one go round once more. A wake
+/// landing between the loop's last look at `sweep_again` and the guard's drop is still lost; the
+/// next tick covers it (blueprint H-8).
+fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
+    shared: &Arc<Shared<P>>,
+    host: &H,
+    sink: &P,
+) {
+    if host.writer().is_none() || shared.walks.closed() {
+        return;
+    }
+    if shared
+        .sweeping
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        shared.sweep_again.store(true, Ordering::SeqCst);
+        return;
+    }
+    shared.publisher.wire(sink);
+    let ctx = TaskCtx {
+        shared: Arc::clone(shared),
+        host: host.clone(),
+        sink: sink.clone(),
+        addr: None,
+        name: "sweep",
+        tag: Arc::default(),
+    };
+    let tag = Arc::clone(&ctx.tag);
+    let handle = tokio::spawn(async move {
+        /// Frees the one-sweep-at-a-time claim however the sweep ends.
+        struct Swept<P: ReplySink>(Arc<Shared<P>>);
+        impl<P: ReplySink> Drop for Swept<P> {
+            fn drop(&mut self) {
+                self.0.sweeping.store(false, Ordering::SeqCst);
+            }
+        }
+        let _swept = Swept(Arc::clone(&ctx.shared));
+        loop {
+            Box::pin(sweep_once(ctx.clone())).await;
+            if !ctx.shared.sweep_again.swap(false, Ordering::SeqCst) {
+                break;
+            }
+        }
+    });
+    shared.track(tag, handle);
+}
+
+/// MOD-12 D8: a walk of this process that rested may have freed a slot. When this box's queue
+/// runs, a sweep is asked for now rather than at the next tick (the lease period, 120 s, on a
+/// TUI box). Only a task whose run is read to be at rest (not `queued`, not `running`) asks, so
+/// a refused claim, which leaves its run `queued`, never loops; nothing without the claim scan.
+async fn wake_on_rest<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: &TaskCtx<H, P>) {
+    if !ctx.shared.claim_scan {
+        return;
+    }
+    let Some(run) = ctx.tag.run.get().copied() else {
+        return;
+    };
+    match ctx.host.run(run).await {
+        Ok(
+            Some(Run {
+                status: RunStatus::Running | RunStatus::Queued,
+                ..
+            })
+            | None,
+        )
+        | Err(_) => return,
+        Ok(Some(_)) => {}
+    }
+    let Ok(box_id) = registered_box(&ctx.host).await else {
+        return;
+    };
+    if let Ok(Some(_)) = ctx.host.open_batch_of(box_id).await {
+        spawn_sweep(&ctx.shared, &ctx.host, &ctx.sink);
+    }
 }
 
 /// M5 D84: once a task's run no longer walks — parked, finished, or gone — every run a refused
@@ -1914,7 +1967,8 @@ async fn reclaim<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// (nothing is built when there is nothing to adopt: no dead walk of this process and no run
 /// holding a slot on this box), then the claim scan, always unless the runtime was built
 /// [`RunRuntime::without_claim_scan`] (blueprint B-8: `queued` rows hold no slot, so the
-/// adoption's short-circuit must not skip them).
+/// adoption's short-circuit must not skip them). Between the adoption and the claim scan, the
+/// queue runner admits this box's queued ready items (MOD-12 D6, [`admit`]).
 async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<H, P>) {
     let host = &ctx.host;
     if !ctx.shared.sweep_fixed
@@ -1927,14 +1981,15 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
     let Ok(box_id) = registered_box(host).await else {
         return;
     };
-    let executor = match host.box_row(box_id).await {
-        Ok(Some(row)) => Executor::of(&row.settings),
+    let settings = match host.box_row(box_id).await {
+        Ok(Some(row)) => row.settings,
         Ok(None) => return,
         Err(err) => {
             tracing::debug!(%err, "the sweep could not read this box's executor");
             return;
         }
     };
+    let executor = Executor::of(&settings);
     ctx.shared.note_executor(&executor);
     if !ctx.shared.role.executes(&executor) {
         return;
@@ -1965,7 +2020,152 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
         adopt(&ctx).await;
     }
     if claims {
+        // MOD-12 D6: admission first, under the same guard, so the claim scan below claims and
+        // walks what it created; there is no second admission path.
+        Box::pin(admit(&ctx, box_id, &settings)).await;
         claim_scan(&ctx, box_id).await;
+    }
+}
+
+/// MOD-12 D3, D5, D6: the queue runner, once per sweep of the box's executing process (I-1 is
+/// `sweep_once`'s early return). Nothing without an open batch (D2). First the D3 prune: entries
+/// whose item is `done` or `closed` go, and a batch left with no entry and no live run of its own
+/// closes `drained`. Then `ready_items` over the entries' projects (D5; the scope's
+/// `workspace_id` is a placeholder neither store reads, blueprint H-4), kept to the queued ones in
+/// queue order (D4, [`admission_order`]), and up to [`free_slots`] of them enqueued `auto` under
+/// the batch (D7). Every refusal is logged at `debug` and the next entry tried; one that writes a
+/// note on its item (rung 4, missing tags) is visible there. A `Constraint` re-reads the open
+/// batch and stops when it is no longer this one (a pause won the race, H-6). The `Kit` is read
+/// only when something is to be admitted.
+async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: &TaskCtx<H, P>,
+    box_id: BoxId,
+    box_settings: &Value,
+) {
+    let host = &ctx.host;
+    let batch = match host.open_batch_of(box_id).await {
+        Ok(Some(batch)) => batch,
+        Ok(None) => return,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read this box's batch");
+            return;
+        }
+    };
+    if let Err(err) = host.prune_finished_entries(box_id).await {
+        tracing::debug!(%err, "the queue runner could not prune its finished entries");
+        return;
+    }
+    let entries = match host.queue_entries(box_id).await {
+        Ok(entries) => entries,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read its entries");
+            return;
+        }
+    };
+    if entries.is_empty() {
+        drain(ctx, box_id, &batch).await;
+        return;
+    }
+    let mut project_ids: Vec<ProjectId> = Vec::new();
+    for entry in &entries {
+        if !project_ids.contains(&entry.project_id) {
+            project_ids.push(entry.project_id);
+        }
+    }
+    let scope = htui_core::model::Scope {
+        workspace_id: WorkspaceId::default(),
+        project_ids,
+    };
+    let ready = match host.ready_items(&scope, box_id).await {
+        Ok(ready) => ready,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read the ready items");
+            return;
+        }
+    };
+    let order = admission_order(&entries, &ready);
+    if order.is_empty() {
+        return;
+    }
+    let slots = async {
+        let running = host.running_runs_on_box(box_id).await?;
+        let queued = host.queued_runs_on_box(box_id).await?.len();
+        let app = host.app_settings().await?;
+        StoreResult::Ok(free_slots(
+            admission_limit(box_settings, &app),
+            running,
+            queued,
+        ))
+    };
+    let free = match slots.await {
+        Ok(free) => free,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not count this box's free slots");
+            return;
+        }
+    };
+    if free == 0 {
+        return;
+    }
+    let kit = match Kit::read(&ctx.shared, host, false).await {
+        Ok(kit) => kit,
+        Err(message) => {
+            tracing::warn!(%message, "the queue runner could not build its engine");
+            return;
+        }
+    };
+    let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
+    let engine = kit.engine(&driver);
+    let mut admitted = 0;
+    for item in order {
+        if admitted >= free || ctx.shared.walks.closed() {
+            break;
+        }
+        match engine.enqueue_in_batch(item, batch.id).await {
+            Ok(run) => {
+                admitted += 1;
+                ctx.shared.publisher.publish(&RunFrame {
+                    item,
+                    run: Some(run),
+                    kind: FrameKind::Started,
+                });
+                tracing::info!(%run, %item, batch = %batch.id, "the queue admitted a run");
+            }
+            // H-6: a pause (or a racing runner) may have closed the batch under this admission.
+            Err(EngineError::Store(StoreError::Constraint(message))) => {
+                tracing::debug!(%item, %message, "the queue's enqueue was refused");
+                match host.open_batch_of(box_id).await {
+                    Ok(Some(open)) if open.id == batch.id => {}
+                    _ => return,
+                }
+            }
+            Err(err) => tracing::debug!(%item, %err, "the queue skipped an entry"),
+        }
+    }
+}
+
+/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live.
+async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
+    ctx: &TaskCtx<H, P>,
+    box_id: BoxId,
+    batch: &htui_core::model::QueueBatch,
+) {
+    let host = &ctx.host;
+    match host.batch_runs(batch.id).await {
+        Ok(runs) if runs.iter().all(|(_, status)| status.is_terminal()) => {}
+        Ok(_) => return,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read its batch's runs");
+            return;
+        }
+    }
+    match host
+        .close_batch(box_id, BatchClose::Drained, ctx.shared.clock.now())
+        .await
+    {
+        Ok(Some(_)) => tracing::info!(batch = %batch.id, "the queue drained"),
+        Ok(None) => {}
+        Err(err) => tracing::debug!(%err, "the queue runner could not close its drained batch"),
     }
 }
 
@@ -3731,6 +3931,65 @@ mod role_gate {
         runtime.sweep_with(&backend, &sink);
         rests_at(&store, later, RunStatus::AwaitingApproval).await;
         assert!(runtime.settle(PATIENCE).await.is_empty());
+    }
+
+    /// MOD-12 D8 (blueprint H-8): a sweep asked for while one runs is not dropped. The first
+    /// sweep is held in its claim scan, behind the lock the case holds on `first`; `second` is
+    /// queued after that scan listed the box's queued runs, and a second `sweep_with` lands while
+    /// the first still runs. Only the held sweep going round once more claims `second`: no batch
+    /// is open (so no rested walk wakes a sweep), the claim queue is empty (so no retry claims
+    /// it), and nothing else sweeps. The two scopes are disjoint, so neither claim is refused.
+    #[tokio::test]
+    async fn a_sweep_asked_for_during_a_sweep_goes_round_again() {
+        let store = seeded(MemStore::demo()).await;
+        let beta = RepoId::new();
+        store
+            .create_repo(NewRepo {
+                id: beta,
+                project_id: ids::PROJECT_HTUI,
+                name: "beta".to_owned(),
+                remote_url: None,
+                default_branch: "main".to_owned(),
+                is_primary: false,
+            })
+            .await
+            .expect("the name is fresh");
+        let first = queued(&store, ids::HTUI_ANA_2, Utc::now() - TimeDelta::minutes(1)).await;
+        let mut factory = DriverFactory::new();
+        factory.register("acp", Box::new(OneTurn));
+        let mut runtime: RunRuntime<Backend, Timed> = RunRuntime::with_parts(
+            Arc::new(FakeIsolator::new()) as Arc<dyn Isolator>,
+            Arc::new(FakeVerifier::new()),
+            factory,
+        )
+        .with_author(Arc::new(OutputAuthor));
+        let backend = Backend::memory(store.clone());
+        let sink = Timed::new();
+        let held = runtime
+            .shared
+            .locks
+            .try_lock(first)
+            .expect("no task holds the run's lock yet");
+
+        runtime.sweep_with(&backend, &sink);
+        tokio::time::timeout(PATIENCE, async {
+            while !runtime.shared.walks.is_live(first) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the sweep's claim of `first` waits on the case's lock");
+        let second = queued_over(&store, ids::HTUI_CLEAN_1, Utc::now(), Some(&[beta])).await;
+        runtime.sweep_with(&backend, &sink);
+        drop(held);
+
+        rests_at(&store, first, RunStatus::AwaitingApproval).await;
+        assert!(runtime.settle(PATIENCE).await.is_empty());
+        assert_ne!(
+            status_of(&store, second).await,
+            RunStatus::Queued,
+            "the sweep asked for during the first went round once more and claimed `second`"
+        );
     }
 
     /// MOD-11 D11: a runtime built `with_tool_host` hands the host to every engine it builds:
