@@ -36,11 +36,13 @@ use htui_agent::auth::{
 use htui_agent::box_probe;
 use htui_agent::box_probe::hardware::{HardwareSource, SystemHardware};
 use htui_agent::driver::{
-    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, PermissionAnswer, PermissionPolicy,
-    PermissionRequestId, SessionSpec,
+    AgentDriver, AgentSession, AgentSessionRef, DriverCaps, PermissionAnswer, PermissionDefault,
+    PermissionPolicy, PermissionRequestId, SessionSpec, ToolExposure,
 };
 use htui_agent::error::DriverError;
-use htui_agent::event::{DriverEnvelope, DriverEvent, OtherEvent, StopReason, ToolCallEvent};
+use htui_agent::event::{
+    DriverEnvelope, DriverEvent, OtherEvent, StopReason, ToolCallEvent, ToolKind,
+};
 use htui_agent::install::{
     InstallConfig, InstallError, InstallJob, InstallOutcome, InstallPlan, InstallProgress,
     Installer, PlanError, install, plan as plan_install,
@@ -59,6 +61,7 @@ use htui_core::model::{
     Agent, AgentBox, AgentId, BoxId, ChatRunSpec, ItemId, PER_TOKEN_CAP_BATCH, ProjectCaps,
     ProjectId, QuotaSource, RunStatus, Scope, SessionEvent, StepId, StepOpening, Transport,
 };
+use htui_core::prompt::edit_help::{self, HelpPrompt};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
 use htui_orch::OpeningPath;
@@ -72,8 +75,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::agent_settings::{AgentWrite, LITERAL_LAUNCH, SET_TOOL_PATHS, parse_tool_path};
 use crate::store_worker::{
-    AuthFrame, ChatFrame, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq, StoreReply,
-    StoreRequest, UNSOLICITED,
+    AuthFrame, ChatFrame, EDIT_HELP, InstallFrame, Origin, ReplyEnvelope, RequestEnvelope, Seq,
+    StoreReply, StoreRequest, UNSOLICITED,
 };
 
 /// How long a cancelled session may take the graceful path before its tree is killed.
@@ -511,6 +514,9 @@ pub struct AgentRuntime {
     /// MOD-11 D11: htui's MCP host, which every chat opens one lease on (OQ-8); `None` keeps
     /// every chat's `mcp` empty.
     tools: Option<Arc<dyn ToolHost>>,
+    /// MOD-55 review M2: what [`with_session_env`](Self::with_session_env) seeded. Test-only.
+    #[cfg(test)]
+    session_env: BTreeMap<String, String>,
 }
 
 impl core::fmt::Debug for AgentRuntime {
@@ -650,6 +656,8 @@ impl AgentRuntime {
             probe_env: None,
             hardware: None,
             tools: None,
+            #[cfg(test)]
+            session_env: BTreeMap::new(),
         }
     }
 
@@ -809,6 +817,16 @@ impl AgentRuntime {
     #[must_use]
     pub fn with_grace(mut self, grace: Duration) -> Self {
         self.grace = grace;
+        self
+    }
+
+    /// MOD-55 review M2: the environment every session this runtime starts is handed, so a test
+    /// can put a known value in the scrubber's set. Test-only: until MOD-10's secret provider a
+    /// session carries none.
+    #[cfg(test)]
+    #[must_use]
+    fn with_session_env(mut self, env: BTreeMap<String, String>) -> Self {
+        self.session_env = env;
         self
     }
 
@@ -1095,7 +1113,7 @@ impl AgentRuntime {
             model: opening
                 .model
                 .or_else(|| summary.agent.default_model.clone()),
-            tools: htui_agent::driver::ToolExposure::default(),
+            tools: ToolExposure::default(),
             mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
             permission: policy.clone(),
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
@@ -1140,6 +1158,7 @@ impl AgentRuntime {
             project_caps,
             quota_latch,
             lease,
+            mode: ChatMode::Conversation,
         };
         Ok(Served::Start {
             step_id,
@@ -1182,12 +1201,35 @@ impl AgentRuntime {
                         *project_id,
                         *agent_id,
                         model.clone(),
-                        prompt.clone(),
+                        Opening::Chat(prompt.clone()),
                     )
                     .await
                 {
                     Ok(started) => started,
                     Err(err) => Served::Reply(failed("chat_start", &err)),
+                }
+            }
+            // MOD-55 P1: a help turn is a chat `start` in help mode, with the row's default model
+            // (PRD D1). Every refusal a chat has is a help's too, answered under its own name.
+            StoreRequest::EditHelp {
+                project_id,
+                agent_id,
+                prompt,
+            } => {
+                match self
+                    .start(
+                        backend,
+                        replies,
+                        addr,
+                        *project_id,
+                        *agent_id,
+                        None,
+                        Opening::Help(prompt.clone()),
+                    )
+                    .await
+                {
+                    Ok(started) => started,
+                    Err(err) => Served::Reply(failed(EDIT_HELP, &err)),
                 }
             }
             StoreRequest::ChatSend { step_id, text } => self.command(
@@ -2028,6 +2070,8 @@ impl AgentRuntime {
     }
 
     /// The `ChatStart` path: identity, registry row, driver, the two rows, the session future.
+    /// MOD-55: `EditHelp` takes it too, as [`Opening::Help`]; where help differs is spelled at
+    /// each point (plan P2-P4).
     #[expect(
         clippy::too_many_arguments,
         reason = "the request's own fields plus the three the worker supplies; a struct would \
@@ -2041,7 +2085,7 @@ impl AgentRuntime {
         project_id: ProjectId,
         agent_id: AgentId,
         model: Option<String>,
-        prompt: String,
+        opening: Opening,
     ) -> Result<Served, StoreError> {
         // `htui` is online-only since MOD-25: an offline backend hands out no writer, and a chat
         // it cannot record is refused here. This is the one place the unreachable-database
@@ -2052,6 +2096,38 @@ impl AgentRuntime {
         let writer = backend
             .writer()
             .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
+        // MOD-10 fills this from the secret provider; until then a session carries none, and the
+        // scrubber built over it therefore masks the credential prefixes only. Read here, ahead
+        // of everything else, because a help's prompt is scrubbed with it before anything exists
+        // (MOD-55 P2). A test seeds it (MOD-55 review M2) to give the scrub a value to mask.
+        #[cfg(not(test))]
+        let env: BTreeMap<String, String> = BTreeMap::new();
+        #[cfg(test)]
+        let env = self.session_env.clone();
+        let (prompt, mode) = match opening {
+            Opening::Chat(text) => (text, ChatMode::Conversation),
+            Opening::Help(help) => {
+                // MOD-55 P2: the session's own scrubber, before the box, the registry row, the
+                // lease or the run: a refusal leaves nothing behind and reaches no driver. It is a
+                // reply, not a `StoreError` (A-9): every error's `Display` carries a prefix that
+                // would misdescribe it. The refusal names the section and the rule, never the text.
+                let scrubber = MinimalScrubber::new(env.values().cloned());
+                match help.scrubbed(&scrubber) {
+                    Ok(clean) => (
+                        edit_help::assemble(&clean),
+                        ChatMode::Help {
+                            sections: edit_help::sections(&clean.target),
+                        },
+                    ),
+                    Err(refused) => {
+                        return Ok(Served::Reply(StoreReply::Failed {
+                            request: EDIT_HELP,
+                            message: format!("not sent: {refused}"),
+                        }));
+                    }
+                }
+            }
+        };
         let box_id = backend
             .box_info()
             .await?
@@ -2120,9 +2196,17 @@ impl AgentRuntime {
         let quota_latch = quota_latch_for(&summary.agent, box_id, settings.quota.source);
 
         let chat = ChatRunSpec::mint(project_id, box_id, user, Some(agent_id), model.clone());
+        // MOD-55 P5: a help run is still `kind = 'chat'`; its step says what it was for.
+        let chat = if mode.is_help() {
+            chat.for_edit_help()
+        } else {
+            chat
+        };
         // MOD-11 D11, OQ-8: a fresh chat has no item, so no item tool is advertised; opened
-        // before the run is written, so a host that refuses leaves no run behind.
+        // before the run is written, so a host that refuses leaves no run behind. MOD-55 P3: a
+        // help turn proposes text and never acts, so it opens none: no server, no prompt port.
         let lease = match &self.tools {
+            Some(_) if mode.is_help() => None,
             Some(tools) => Some(open_chat_lease(
                 tools.as_ref(),
                 ToolScope {
@@ -2142,7 +2226,13 @@ impl AgentRuntime {
             )?),
             None => None,
         };
-        let policy = chat_policy(settings.permission, lease.as_ref());
+        // MOD-55 P3: the row's own policy defaults to `ask`, which would park a request on a user
+        // who is looking at an editor, not at a permission prompt.
+        let policy = if mode.is_help() {
+            help_policy()
+        } else {
+            chat_policy(settings.permission, lease.as_ref())
+        };
         writer.start_chat_run(&chat).await?;
         #[cfg(test)]
         tests::minted(&chat);
@@ -2159,11 +2249,15 @@ impl AgentRuntime {
             // at all rather than a session scoped to somewhere unexpected.
             cwd,
             extra_dirs: Vec::new(),
-            // MOD-10 fills this from the secret provider; until then a session carries none, and
-            // the scrubber below therefore masks the credential prefixes only.
-            env: BTreeMap::new(),
+            // Read above, before the help's scrub (MOD-55 P2).
+            env,
             model: model.clone(),
-            tools: htui_agent::driver::ToolExposure::default(),
+            // MOD-55 P3, A-6: a help turn uses no tool at all.
+            tools: if mode.is_help() {
+                help_exposure()
+            } else {
+                ToolExposure::default()
+            },
             mcp: lease.iter().map(|lease| lease.spec.clone()).collect(),
             permission: policy.clone(),
             retain_raw: std::env::var(KEEP_RAW_ENV).is_ok_and(|value| value == "1"),
@@ -2257,10 +2351,11 @@ impl AgentRuntime {
             project_caps,
             quota_latch,
             lease,
+            mode,
         };
         Ok(Served::Start {
             step_id,
-            task: Box::pin(answering("chat", run_chat(args), Some(answer))),
+            task: Box::pin(answering(mode.label(), run_chat(args), Some(answer))),
         })
     }
 }
@@ -2273,6 +2368,43 @@ fn chat_policy(mut policy: PermissionPolicy, lease: Option<&ToolLease>) -> Permi
         htui_orch::tools::pre_approve(&mut policy, lease);
     }
     policy
+}
+
+/// MOD-55 P3: a help session answers every permission request "no" by policy (stage 3 is
+/// never reached, so nothing parks on a user who is not looking at a permission prompt).
+fn help_policy() -> PermissionPolicy {
+    PermissionPolicy {
+        default: PermissionDefault::Deny,
+        rules: Vec::new(),
+        remembered: Vec::new(),
+    }
+}
+
+/// MOD-55 P3, A-6: every tool kind denied. `claude-cli` inverts it to `--disallowedTools`; the ACP
+/// `fs/*` handlers refuse `read` and `edit`. `read` and `search` would read under the process cwd
+/// into a transcript that goes to the provider, `fetch` is egress, and `switch_mode` could leave
+/// the deny-all policy behind.
+///
+/// MOD-55 review M1: and `no_tools`, because the kinds do not reach every tool on `claude-cli`
+/// (`Task`, `TodoWrite`, the operator's MCP servers) and with no lease the deny-all policy is
+/// never asked there. The driver turns it into its own flags (`R-AGT-5`).
+fn help_exposure() -> ToolExposure {
+    ToolExposure {
+        deny_kinds: ToolKind::ALL.to_vec(),
+        no_tools: true,
+        ..ToolExposure::default()
+    }
+}
+
+/// The `sections[]` of a help turn's `prompt` row: [`prompt_sections`]' shape, one entry per name
+/// (MOD-55 P6).
+fn help_sections(names: &[&str]) -> Value {
+    Value::Array(
+        names
+            .iter()
+            .map(|name| json!({ "name": name, "tokens": Value::Null, "trimmed": false }))
+            .collect(),
+    )
 }
 
 /// MOD-11 D11: `scope`'s lease on `tools`. A host that cannot serve refuses the chat, as the
@@ -2420,6 +2552,50 @@ impl ChatBinding {
     }
 }
 
+/// MOD-55 P1: what `start` sends first.
+#[derive(Debug)]
+enum Opening {
+    /// `ChatStart`'s text, sent as typed (the chat path's own `R-ID-7` gap, out of scope here).
+    Chat(String),
+    /// `EditHelp`'s prompt: assembled and scrubbed before anything is minted (P2).
+    Help(HelpPrompt),
+}
+
+/// MOD-55 P1: what a session `start` opened is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChatMode {
+    /// MOD-2's chat: turns until the user ends it.
+    Conversation,
+    /// An editor's help turn: one turn, then the session ends itself (P4).
+    Help {
+        /// The `prompt` row's section names ([`edit_help::sections`]).
+        sections: &'static [&'static str],
+    },
+}
+
+impl ChatMode {
+    /// Whether this is a help turn.
+    const fn is_help(self) -> bool {
+        matches!(self, Self::Help { .. })
+    }
+
+    /// The request a failed start is answered as: [`EDIT_HELP`] for help, else the binding's.
+    const fn request(self, binding: &ChatBinding) -> &'static str {
+        match self {
+            Self::Help { .. } => EDIT_HELP,
+            Self::Conversation => binding.request(),
+        }
+    }
+
+    /// [`answering`]'s label: `"edit_help"` or `"chat"`.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Help { .. } => EDIT_HELP,
+            Self::Conversation => "chat",
+        }
+    }
+}
+
 /// [`StoreRequest::name`] of a promotion (blueprint D209): what a promoted chat's refusals are
 /// answered as, since the promotion is the request that opened it.
 const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
@@ -2455,6 +2631,8 @@ pub struct ChatArgs {
     /// MOD-11 D11: the chat's tool lease, held by the chat task until it returns; dropping it
     /// ends the session's token (I-6). `None` without a tool host.
     lease: Option<ToolLease>,
+    /// MOD-55 P1: a chat, or a help turn.
+    mode: ChatMode,
 }
 
 impl core::fmt::Debug for ChatArgs {
@@ -2465,6 +2643,7 @@ impl core::fmt::Debug for ChatArgs {
             .field("spec", &self.spec)
             .field("project_caps", &self.project_caps)
             .field("lease", &self.lease)
+            .field("mode", &self.mode)
             .finish()
     }
 }
@@ -4134,6 +4313,7 @@ pub async fn run_chat(args: ChatArgs) {
         quota_latch,
         // Bound, not `_`: the lease lives until this task returns (MOD-11 D11, I-6).
         lease: _lease,
+        mode,
     } = args;
 
     let scrubber = MinimalScrubber::new(spec.env.values().cloned());
@@ -4226,7 +4406,7 @@ pub async fn run_chat(args: ChatArgs) {
             }
             let message = err.to_string();
             frames.to_stream(StoreReply::Failed {
-                request: binding.request(),
+                request: mode.request(&binding),
                 message: message.clone(),
             });
             binding.close(&writer, RunStatus::Failed).await;
@@ -4269,10 +4449,11 @@ pub async fn run_chat(args: ChatArgs) {
     let now = Utc::now();
     match &binding {
         ChatBinding::Fresh(..) => {
-            if let Err(err) = recorder
-                .record_prompt(&opening_text, prompt_sections(), now)
-                .await
-            {
+            let sections = match mode {
+                ChatMode::Help { sections } => help_sections(sections),
+                ChatMode::Conversation => prompt_sections(),
+            };
+            if let Err(err) = recorder.record_prompt(&opening_text, sections, now).await {
                 tracing::error!(%err, "the prompt row could not be written");
             }
             frames.local("prompt", json!({ "text": opening_text }), now);
@@ -4303,6 +4484,7 @@ pub async fn run_chat(args: ChatArgs) {
             &mut calls,
             &frames,
             grace,
+            mode.is_help(),
         )
         .await
         {
@@ -4337,6 +4519,18 @@ pub async fn run_chat(args: ChatArgs) {
                 frames.failed(err.to_string());
                 break;
             }
+        }
+
+        // MOD-55 P4: a help session is one turn, ended exactly as a cancel between turns ends a
+        // chat: nothing was cut, so the run closes `done` with the turn's own stop reason, and the
+        // `Ended` below is the stream's last frame. A `ChatCancel` that raced the turn's end is
+        // answered after the loop (MOD-55 review H1).
+        if mode.is_help() {
+            if let Err(err) = session.cancel(grace).await {
+                tracing::debug!(%err, "the help session did not close gracefully");
+            }
+            drain(session.as_mut(), &mut recorder, &mut ui_rx, &frames).await;
+            break;
         }
 
         // Between turns the session idles on the user, not on the wire: a closed transport is
@@ -4405,11 +4599,25 @@ pub async fn run_chat(args: ChatArgs) {
         }
     }
 
+    // MOD-55 review H1: every command is answered exactly once, so a help answers what is still
+    // queued as it ends rather than dropping it with the receiver. A chat keeps its behaviour.
+    if mode.is_help() {
+        answer_after_help(&mut commands, &frames, last_stop).await;
+    }
+
     if let Err(err) = recorder.finish().await {
         tracing::error!(%err, "the recorder did not close cleanly");
         status = RunStatus::Failed;
-        if let Some(failure) = chat_failure(&err) {
-            binding.record_failure(&writer, &failure).await;
+        let failure = chat_failure(&err);
+        if let Some(failure) = &failure {
+            binding.record_failure(&writer, failure).await;
+        }
+        // MOD-55 A-7: a refused row reached the tab as no frame (`Recorder::refuse` tells the UI
+        // nothing), so a help's reply as the tab assembled it may be missing text. Saying so
+        // before the `Ended` is what keeps a partial reply from being offered as a proposal. A
+        // chat keeps its behaviour: its transcript shows the `scrub_residue` row on replay.
+        if mode.is_help() {
+            frames.failed(failure.unwrap_or_else(|| "the reply could not be recorded".to_owned()));
         }
     }
     binding.close(&writer, status).await;
@@ -4422,6 +4630,11 @@ pub async fn run_chat(args: ChatArgs) {
 /// `pump` cannot cross a parked permission request — `next_event` refuses while one is
 /// outstanding, on every transport — so the pull and the command channel have to be served by the
 /// same loop.
+///
+/// `listen` (MOD-55 review H1, a help turn): commands are served **while pulling** too, ahead of
+/// the pull, so an `Esc` mid-reply cancels the session at once rather than after the agent's
+/// `Done`. A chat passes `false` and reads commands between turns, as it always has. Both
+/// transports' `next_event` is cancel-safe (an mpsc `recv`), so a command that wins drops no event.
 #[expect(
     clippy::too_many_arguments,
     reason = "one turn's collaborators; a struct would rename the arity without reducing it"
@@ -4435,6 +4648,7 @@ async fn run_turn(
     calls: &mut HashMap<String, ToolCallEvent>,
     frames: &Frames,
     grace: Duration,
+    listen: bool,
 ) -> Result<TurnEnd, DriverError> {
     let mut parked: Option<PermissionRequestId> = None;
 
@@ -4515,7 +4729,23 @@ async fn run_turn(
             continue;
         }
 
-        let Some(envelope) = session.next_event().await? else {
+        // The branches' futures are dropped before a handler runs, so the command arm may use
+        // the session the pull borrowed.
+        let pulled = if listen {
+            tokio::select! {
+                biased;
+                command = commands.recv() => {
+                    match help_command(session, recorder, ui, frames, grace, command).await {
+                        Some(end) => return Ok(end),
+                        None => continue,
+                    }
+                }
+                pulled = session.next_event() => pulled,
+            }
+        } else {
+            session.next_event().await
+        };
+        let Some(envelope) = pulled? else {
             // The stream ended without a `done`. That is a transport that died mid-turn, not a
             // turn that finished: reporting it as `EndTurn` would close the run `done`, leave no
             // `done` row in the log, and tell the tab nothing.
@@ -4570,6 +4800,101 @@ async fn run_turn(
             DriverEvent::Done(done) => return Ok(TurnEnd::Done(done.stop_reason)),
             _ => {}
         }
+    }
+}
+
+/// MOD-55 review H1: a command a help turn read while pulling, nothing parked. `Some` ends the
+/// turn; every command is answered at its own address, once.
+///
+/// A cancel ends the session now, as the parked path's does: the run closes `cancelled` and the
+/// cancel is answered `Ended{Cancelled}`. A runtime that let go of the channel ends it the same
+/// way, with nobody to answer. A help has no follow-up and nothing parked to answer, so `Send`
+/// and `Answer` are refused and the turn goes on.
+async fn help_command(
+    session: &mut dyn AgentSession,
+    recorder: &mut Recorder<'_, Writer>,
+    ui: &mut mpsc::Receiver<DriverEnvelope>,
+    frames: &Frames,
+    grace: Duration,
+    command: Option<ChatCommand>,
+) -> Option<TurnEnd> {
+    let reply = match command {
+        Some(ChatCommand::Cancel { reply }) => reply,
+        None => None,
+        Some(ChatCommand::Send { reply, .. }) => {
+            frames.reply(
+                &reply,
+                StoreReply::Failed {
+                    request: "chat_send",
+                    message: "a help turn takes no follow-up".to_owned(),
+                },
+            );
+            return None;
+        }
+        Some(ChatCommand::Answer {
+            request_id, reply, ..
+        }) => {
+            frames.reply(
+                &reply,
+                StoreReply::Failed {
+                    request: "chat_answer",
+                    message: format!("no permission request `{request_id}` is waiting"),
+                },
+            );
+            return None;
+        }
+    };
+    // Logged and not returned: the kill that follows a failed graceful cancel still ends the
+    // session, and the cancel is owed its answer either way.
+    if let Err(err) = session.cancel(grace).await {
+        tracing::debug!(%err, "the help session did not cancel gracefully");
+    }
+    drain(session, recorder, ui, frames).await;
+    if let Some(reply) = reply {
+        frames.reply(
+            &reply,
+            StoreReply::Chat(ChatFrame::Ended {
+                stop_reason: StopReason::Cancelled,
+            }),
+        );
+    }
+    Some(TurnEnd::Cancelled)
+}
+
+/// MOD-55 review H1: what is still queued when a help ends, each answered once at its own address.
+///
+/// The receiver is closed first, so a command sent from now on is refused by the runtime as "this
+/// chat has ended" and none can slip in behind this drain. A cancel is answered as a chat answers
+/// a cancel between turns — `Ended` with the help's last stop reason, which is the stream's own
+/// closing frame too, so the tab's `Cancelling` closes on either; a send or an answer has nothing
+/// left to reach and is refused with the runtime's sentence.
+async fn answer_after_help(
+    commands: &mut mpsc::UnboundedReceiver<ChatCommand>,
+    frames: &Frames,
+    last_stop: StopReason,
+) {
+    commands.close();
+    while let Some(command) = commands.recv().await {
+        let (reply, answer) = match command {
+            ChatCommand::Cancel { reply: None } => continue,
+            ChatCommand::Cancel { reply: Some(reply) } => (
+                reply,
+                StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: last_stop,
+                }),
+            ),
+            ChatCommand::Send { reply, .. } => (reply, ended("chat_send")),
+            ChatCommand::Answer { reply, .. } => (reply, ended("chat_answer")),
+        };
+        frames.reply(&reply, answer);
+    }
+}
+
+/// The runtime's "this chat has ended" refusal, as `request`.
+fn ended(request: &'static str) -> StoreReply {
+    StoreReply::Failed {
+        request,
+        message: "this chat has ended".to_owned(),
     }
 }
 
@@ -4809,6 +5134,7 @@ pub(crate) mod tests {
     use htui_core::model::{
         Agent, AgentId, EventKind, EventRole, RunId, Scope, StepStatus, Transport,
     };
+    use htui_core::prompt::edit_help::HelpTarget;
     use htui_core::store::MemStore;
     use std::sync::Arc;
 
@@ -5500,6 +5826,928 @@ pub(crate) mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
+    // MOD-55: an editor's help turn (plan P1-P4, P11; blueprint §3.8)
+    // -----------------------------------------------------------------------------------------
+
+    /// MOD-55: what the cases below ask about: a skill's body and the user's request.
+    fn help_prompt(body: &str, request: &str) -> HelpPrompt {
+        HelpPrompt {
+            target: HelpTarget::Skill {
+                name: "rust-style".to_owned(),
+            },
+            body: body.to_owned(),
+            request: request.to_owned(),
+        }
+    }
+
+    /// MOD-55: an `EditHelp` on `PROJECT_HTUI` for the fake row.
+    fn help(agent_id: AgentId, body: &str, request: &str) -> StoreRequest {
+        StoreRequest::EditHelp {
+            project_id: ids::PROJECT_HTUI,
+            agent_id,
+            prompt: help_prompt(body, request),
+        }
+    }
+
+    /// MOD-55: the agent's one turn: a reply holding a fenced proposal, then `end_turn`.
+    fn help_script() -> Script {
+        Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                text: "Here:\n```\nnew\n```\n".to_owned(),
+                message_id: Some("m1".to_owned()),
+            })),
+            ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                stop_reason: StopReason::EndTurn,
+            })),
+        ])
+    }
+
+    /// Drives an `EditHelp` to its end with **no** cancel queued: the session ends itself (P4).
+    /// Bounded, because a help that waited on the user, as a chat does, would never return.
+    async fn run_help(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        request: StoreRequest,
+    ) -> (StepId, Vec<ReplyEnvelope>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } =
+            runtime.serve(backend, &tx, &envelope(7, request)).await
+        else {
+            panic!("a help turn opens a session")
+        };
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("a help session ends itself after its turn");
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+        (step_id, replies)
+    }
+
+    /// T3-a (P4): no `ChatCancel` is sent, yet the task returns: one turn, then the session closes
+    /// its run `done` and ends its stream with the turn's own stop reason. The `prompt` row is the
+    /// assembled prompt with the help's own section names.
+    #[tokio::test]
+    async fn a_help_turn_ends_itself_after_one_turn_and_closes_done() {
+        let (store, backend, mut runtime, agent_id) = fixture(help_script()).await;
+        let before = store.active_runs(&scope()).await.expect("count");
+
+        let (step_id, replies) = run_help(
+            &mut runtime,
+            &backend,
+            help(agent_id, "old\n", "make it new"),
+        )
+        .await;
+
+        assert!(
+            matches!(replies[0].reply, StoreReply::ChatAccepted { .. }),
+            "the first reply is the acceptance: {:?}",
+            replies[0].reply
+        );
+        assert!(
+            replies.iter().all(|reply| reply.seq == 7),
+            "every frame answers the EditHelp: {replies:?}"
+        );
+        let ended: Vec<&StoreReply> = replies
+            .iter()
+            .map(|reply| &reply.reply)
+            .filter(|reply| matches!(reply, StoreReply::Chat(ChatFrame::Ended { .. })))
+            .collect();
+        assert_eq!(ended.len(), 1, "one end: {replies:?}");
+        assert!(
+            matches!(
+                replies.last().map(|reply| &reply.reply),
+                Some(StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::EndTurn
+                }))
+            ),
+            "the last reply ends the stream with the turn's reason: {:?}",
+            replies.last()
+        );
+        assert!(
+            !replies.iter().any(|reply| matches!(
+                reply.reply,
+                StoreReply::Failed { .. } | StoreReply::Chat(ChatFrame::Failed { .. })
+            )),
+            "nothing failed: {replies:?}"
+        );
+        assert!(
+            stream_events(&replies).iter().any(|event| matches!(
+                event,
+                DriverEvent::AssistantChunk(chunk) if chunk.text.contains("```\nnew\n```")
+            )),
+            "the reply reaches the stream: {replies:?}"
+        );
+
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Done, "one turn, nothing cut");
+        assert_eq!(
+            store.active_runs(&scope()).await.expect("count"),
+            before,
+            "a finished help stops counting as an active run"
+        );
+
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("the help step has a log");
+        let prompt = log
+            .iter()
+            .find(|row| row.kind == EventKind::Prompt)
+            .expect("a prompt row");
+        let names: Vec<&str> = prompt.payload["sections"]
+            .as_array()
+            .expect("sections[]")
+            .iter()
+            .filter_map(|section| section["name"].as_str())
+            .collect();
+        assert_eq!(names, ["instruction", "body", "request"]);
+        assert_eq!(
+            prompt.payload["text"].as_str(),
+            Some(edit_help::assemble(&help_prompt("old\n", "make it new")).as_str()),
+            "the row is the assembled prompt"
+        );
+        assert!(
+            log.iter().any(|row| row.kind == EventKind::AssistantText),
+            "the reply is recorded: {log:?}"
+        );
+    }
+
+    /// T3-b (P2, A-9): a credential in the body or the request refuses the help before anything
+    /// exists: no step, no run, no driver start, and a `Failed` naming the section and the rule
+    /// that never carries the text.
+    #[tokio::test]
+    async fn a_body_with_a_key_pattern_is_refused_before_anything_is_minted() {
+        let key = format!("ghp_{}", "A1b2".repeat(9));
+        for (body, request, section) in [
+            (format!("token = {key}\n"), "tidy it".to_owned(), "body"),
+            ("body\n".to_owned(), format!("use {key}"), "request"),
+        ] {
+            let (store, backend, mut runtime, agent_id, slot) =
+                fixture_with_spec_spy(help_script(), None).await;
+            let before = store.active_runs(&scope()).await.expect("count");
+            let (tx, mut rx) = mpsc::unbounded_channel();
+
+            let served = runtime
+                .serve(&backend, &tx, &envelope(7, help(agent_id, &body, &request)))
+                .await;
+
+            match served {
+                Served::Reply(StoreReply::Failed { request, message }) => {
+                    assert_eq!(request, "edit_help");
+                    assert_eq!(
+                        message,
+                        format!("not sent: the {section} matches the github_token rule")
+                    );
+                    assert!(!message.contains("ghp_"), "the key leaked: {message}");
+                }
+                other => panic!("{section}: a key is refused before the start: {other:?}"),
+            }
+            assert!(
+                runtime.steps().is_empty(),
+                "{section}: no step: {:?}",
+                runtime.steps()
+            );
+            assert_eq!(
+                store.active_runs(&scope()).await.expect("count"),
+                before,
+                "{section}: no run was minted"
+            );
+            assert!(
+                slot.lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_none(),
+                "{section}: no driver was started"
+            );
+            drop(tx);
+            assert!(rx.recv().await.is_none(), "{section}: nothing else is sent");
+        }
+    }
+
+    /// T3-c (P3, A-6): a help session is handed no MCP server, no prompt port, every tool kind
+    /// denied and a policy that answers every request "no".
+    #[tokio::test]
+    async fn a_help_session_has_no_tools_no_lease_and_denies_every_permission() {
+        let (_store, backend, mut runtime, agent_id, slot) =
+            fixture_with_spec_spy(help_script(), None).await;
+
+        run_help(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+
+        let spec = slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            .expect("the driver was started");
+        assert!(spec.mcp.is_empty(), "no server: {:?}", spec.mcp);
+        assert!(spec.prompt.is_none(), "no prompt port");
+        assert_eq!(
+            spec.permission,
+            PermissionPolicy {
+                default: PermissionDefault::Deny,
+                rules: Vec::new(),
+                remembered: Vec::new(),
+            }
+        );
+        assert_eq!(spec.tools.deny_kinds, ToolKind::ALL);
+        assert!(spec.tools.no_tools, "MOD-55 review M1: no tool at all");
+        assert!(spec.tools.allow.is_empty());
+        assert!(spec.tools.deny.is_empty());
+        assert!(!spec.tools.command_run);
+        assert_eq!(spec.model, fake_row(agent_id).default_model);
+    }
+
+    /// P3: a permission request in a help turn is answered by the deny-all policy, never parked on
+    /// a user who is looking at an editor, and the turn goes on to its end.
+    #[tokio::test]
+    async fn a_help_turn_answers_a_permission_request_no_by_policy() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+                tool_call_id: "call-1".to_owned(),
+                title: "Edit".to_owned(),
+                tool_kind: ToolKind::Edit,
+                input: json!({ "path": "SKILL.md" }),
+                locations: Vec::new(),
+            })),
+            ScriptEvent::ParkPermission(PermissionRequestEvent {
+                request_id: PermissionRequestId::new("req-1"),
+                tool_call_id: Some("call-1".to_owned()),
+                options: vec![
+                    PermissionOption {
+                        id: "allow".to_owned(),
+                        label: "Allow".to_owned(),
+                        kind: PermissionOptionKind::AllowOnce,
+                    },
+                    PermissionOption {
+                        id: "reject".to_owned(),
+                        label: "Reject".to_owned(),
+                        kind: PermissionOptionKind::RejectOnce,
+                    },
+                ],
+            }),
+            ends(StopReason::EndTurn),
+        ]);
+        let (store, backend, mut runtime, agent_id) = fixture(script).await;
+
+        let (step_id, replies) =
+            run_help(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        let answer = log
+            .iter()
+            .find(|row| row.kind == EventKind::PermissionAnswer)
+            .expect("the policy answered the request");
+        assert_eq!(answer.payload["by"], "policy");
+        assert_eq!(answer.payload["option_id"], "reject");
+        assert!(
+            matches!(
+                replies.last().map(|reply| &reply.reply),
+                Some(StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::EndTurn
+                }))
+            ),
+            "{replies:?}"
+        );
+    }
+
+    /// T3-d (P5): the help's step is `edit_help`; a chat's stays `chat`. Both runs are `chat`.
+    #[tokio::test]
+    async fn a_help_step_is_phase_edit_help_and_a_chat_step_stays_chat() {
+        for (helping, phase) in [
+            (true, htui_core::model::run::EDIT_HELP_PHASE),
+            (false, htui_core::model::run::CHAT_PHASE),
+        ] {
+            let (store, backend, mut runtime, agent_id) = fixture(help_script()).await;
+            let (step_id, _) = if helping {
+                run_help(&mut runtime, &backend, help(agent_id, "old\n", "new")).await
+            } else {
+                run(&mut runtime, &backend, start(agent_id, "hello")).await
+            };
+            let run_id = run_of(step_id);
+            let steps = store.run_steps(run_id).await.expect("the steps read");
+            assert_eq!(
+                steps
+                    .iter()
+                    .map(|step| (step.id, step.phase_name.as_str()))
+                    .collect::<Vec<_>>(),
+                [(step_id, phase)]
+            );
+            let run = store
+                .run(run_id)
+                .await
+                .expect("the read answers")
+                .expect("the run");
+            assert_eq!(run.kind, htui_core::model::RunKind::Chat, "{phase}");
+        }
+    }
+
+    /// T3-e (P11): offline, help is refused exactly as a chat is, with the same sentence, under
+    /// its own request name, and nothing is started.
+    #[tokio::test]
+    async fn an_offline_backend_refuses_help_with_the_unreachable_sentence() {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "help-test", 1)
+            .await
+            .expect("mirror");
+        let backend = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+
+        let mut runtime = AgentRuntime::new(DriverFactory::new());
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(1, help(AgentId::new(), "old\n", "new")),
+            )
+            .await;
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "edit_help");
+                assert_eq!(
+                    message,
+                    format!("store unreachable: {}", htui_store::DATABASE_UNREACHABLE)
+                );
+            }
+            other => panic!("an offline help must be refused: {other:?}"),
+        }
+        assert!(runtime.steps().is_empty(), "{:?}", runtime.steps());
+        cache.close().await;
+    }
+
+    /// T3-f (A-7): a reply chunk the recorder refuses reaches the tab as no frame, so the help
+    /// says so with a `Failed` **before** its `Ended`, and the run fails. A proposal assembled
+    /// from the frames would otherwise be missing text.
+    #[tokio::test]
+    async fn a_refused_reply_row_fails_the_help_before_it_ends() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                text: "sk-ant-api03-abcdefghijklmnopqrstuvwx".to_owned(),
+                message_id: Some("m1".to_owned()),
+            })),
+            ends(StopReason::EndTurn),
+        ]);
+        let (store, backend, mut runtime, agent_id) = fixture(script).await;
+
+        let (step_id, replies) =
+            run_help(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+
+        let failed = replies
+            .iter()
+            .position(|reply| matches!(reply.reply, StoreReply::Chat(ChatFrame::Failed { .. })))
+            .unwrap_or_else(|| panic!("a Failed frame: {replies:?}"));
+        let ended = replies
+            .iter()
+            .position(|reply| matches!(reply.reply, StoreReply::Chat(ChatFrame::Ended { .. })))
+            .unwrap_or_else(|| panic!("an Ended frame: {replies:?}"));
+        assert!(failed < ended, "Failed comes first: {replies:?}");
+        assert_eq!(ended, replies.len() - 1, "Ended is last: {replies:?}");
+        let StoreReply::Chat(ChatFrame::Failed { message }) = &replies[failed].reply else {
+            unreachable!()
+        };
+        assert!(!message.contains("sk-ant-"), "the key leaked: {message}");
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Failed);
+    }
+
+    /// T3-g (P2): what the driver is sent is the assembly of the scrubbed prompt, nothing else.
+    ///
+    /// MOD-55 review M2: with a known value in the session's environment (the test seam MOD-10's
+    /// secret provider will fill), so the scrub has something to mask: the driver gets
+    /// `[REDACTED]` where the body and the request held it, and neither the `prompt` row, the log
+    /// nor a frame carries it.
+    #[tokio::test]
+    async fn the_driver_is_sent_the_scrubbed_assembly() {
+        const SECRET: &str = "hunter2-secret-value";
+        let (store, backend, runtime, agent_id, starts) =
+            fixture_with_failing_starts(help_script(), Vec::new()).await;
+        let mut runtime = runtime.with_session_env(BTreeMap::from([(
+            "HTUI_TEST_SECRET".to_owned(),
+            SECRET.to_owned(),
+        )]));
+        let body = format!("pw {SECRET}\n");
+        let request = format!("use {SECRET}");
+
+        let (step_id, replies) =
+            run_help(&mut runtime, &backend, help(agent_id, &body, &request)).await;
+
+        let starts = starts_of(&starts);
+        assert_eq!(starts.len(), 1, "one start");
+        let scrubber = MinimalScrubber::new([SECRET.to_owned()]);
+        let clean = help_prompt(&body, &request)
+            .scrubbed(&scrubber)
+            .expect("a known value masks");
+        assert_eq!(
+            clean.body, "pw [REDACTED]\n",
+            "the mask the driver must see"
+        );
+        assert_eq!(starts[0].1, edit_help::assemble(&clean));
+        assert!(!starts[0].1.contains(SECRET), "the driver saw the secret");
+
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("the help step has a log");
+        let prompt = log
+            .iter()
+            .find(|row| row.kind == EventKind::Prompt)
+            .expect("a prompt row");
+        assert_eq!(
+            prompt.payload["text"].as_str(),
+            Some(edit_help::assemble(&clean).as_str()),
+            "the row is the scrubbed assembly"
+        );
+        assert!(
+            !format!("{log:?}").contains(SECRET),
+            "no row carries the secret"
+        );
+        assert!(
+            !format!("{replies:?}").contains(SECRET),
+            "no frame carries the secret"
+        );
+    }
+
+    /// T3-h: a help whose spawn fails is refused as `edit_help`, not as `chat_start`, then its
+    /// stream fails, exactly as a chat's does.
+    #[tokio::test]
+    async fn a_help_whose_spawn_fails_is_answered_as_edit_help() {
+        let (store, backend, mut runtime, agent_id, _starts) =
+            fixture_with_failing_starts(help_script(), vec![DriverError::Spawn("gone".to_owned())])
+                .await;
+
+        let (step_id, replies) =
+            run_help(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+
+        let kinds: Vec<&StoreReply> = replies.iter().map(|reply| &reply.reply).collect();
+        assert!(
+            matches!(
+                kinds.as_slice(),
+                [
+                    StoreReply::Failed {
+                        request: "edit_help",
+                        ..
+                    },
+                    StoreReply::Chat(ChatFrame::Failed { .. })
+                ]
+            ),
+            "{replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Failed);
+    }
+
+    /// T3-i: a cancel mid-turn ends the help `cancelled`, answered at the cancel's own seq. The
+    /// turn would stall on a permission request the deny-all policy cannot answer (no reject option
+    /// is offered, H-5); since MOD-55 review H1 the queued cancel is read ahead of the first pull,
+    /// and the parked path is the one a later cancel takes.
+    #[tokio::test]
+    async fn a_cancel_mid_turn_closes_the_help_cancelled() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::ParkPermission(PermissionRequestEvent {
+                request_id: PermissionRequestId::new("req-1"),
+                tool_call_id: None,
+                options: vec![PermissionOption {
+                    id: "allow".to_owned(),
+                    label: "Allow".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                }],
+            }),
+            ends(StopReason::EndTurn),
+        ]);
+        let (store, backend, mut runtime, agent_id) = fixture(script).await;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .serve(&backend, &tx, &envelope(7, help(agent_id, "old\n", "new")))
+            .await
+        else {
+            panic!("a help turn opens a session")
+        };
+        let cancel = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(8, StoreRequest::ChatCancel { step_id }),
+            )
+            .await;
+        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+        tokio::time::timeout(Duration::from_secs(30), task)
+            .await
+            .expect("the cancelled help ends");
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+
+        assert!(
+            replies.iter().any(|reply| reply.seq == 8
+                && matches!(
+                    reply.reply,
+                    StoreReply::Chat(ChatFrame::Ended {
+                        stop_reason: StopReason::Cancelled
+                    })
+                )),
+            "the cancel is answered at its own seq: {replies:?}"
+        );
+        assert!(
+            matches!(
+                replies.last(),
+                Some(ReplyEnvelope {
+                    seq: 7,
+                    reply: StoreReply::Chat(ChatFrame::Ended {
+                        stop_reason: StopReason::Cancelled
+                    }),
+                    ..
+                })
+            ),
+            "the stream ends cancelled: {replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Cancelled);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-55 review H1: a help's cancel with nothing parked
+    // -----------------------------------------------------------------------------------------
+
+    /// Where [`StallSession`] stops and waits for the case.
+    #[derive(Debug, Clone, Copy)]
+    enum StallAt {
+        /// The pull after the first reply chunk never resolves until the session is cancelled:
+        /// an agent mid-reply, with no permission request parked.
+        AfterChunk,
+        /// `cancel` waits for [`StallProbe::release`]: the turn's `Done` is in, and the help is
+        /// ending itself.
+        InCancel,
+    }
+
+    /// What a [`StallSession`] shares with its case.
+    #[derive(Debug, Default)]
+    struct StallProbe {
+        /// Set once the session's `cancel` ran.
+        cancelled: AtomicBool,
+        /// Notified when the session reaches its [`StallAt`].
+        reached: tokio::sync::Notify,
+        /// What an [`StallAt::InCancel`] session waits for.
+        release: tokio::sync::Notify,
+    }
+
+    /// The fake driver whose sessions stall at `at`.
+    #[derive(Debug)]
+    struct StallDriver {
+        inner: Box<dyn AgentDriver>,
+        probe: Arc<StallProbe>,
+        at: StallAt,
+    }
+
+    impl AgentDriver for StallDriver {
+        fn name(&self) -> &str {
+            self.inner.name()
+        }
+
+        fn caps(&self) -> DriverCaps {
+            self.inner.caps()
+        }
+
+        fn start<'a>(
+            &'a self,
+            spec: SessionSpec,
+            prompt: String,
+        ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
+            Box::pin(async move {
+                let inner = self.inner.start(spec, prompt).await?;
+                Ok(Box::new(StallSession {
+                    inner,
+                    probe: Arc::clone(&self.probe),
+                    at: self.at,
+                    chunk_seen: false,
+                    cancelled: false,
+                }) as Box<dyn AgentSession>)
+            })
+        }
+    }
+
+    /// The fake session, stalled at `at`.
+    #[derive(Debug)]
+    struct StallSession {
+        inner: Box<dyn AgentSession>,
+        probe: Arc<StallProbe>,
+        at: StallAt,
+        chunk_seen: bool,
+        cancelled: bool,
+    }
+
+    impl AgentSession for StallSession {
+        fn session_ref(&self) -> Option<&AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+        ) -> htui_agent::driver::DriverFuture<'a, Option<DriverEnvelope>> {
+            Box::pin(async move {
+                if matches!(self.at, StallAt::AfterChunk) && self.chunk_seen && !self.cancelled {
+                    self.probe.reached.notify_one();
+                    // Cancel-safe: dropping a pending future drops nothing.
+                    std::future::pending::<()>().await;
+                }
+                let pulled = self.inner.next_event().await?;
+                if pulled.as_ref().is_some_and(|envelope| {
+                    matches!(envelope.event, DriverEvent::AssistantChunk(_))
+                }) {
+                    self.chunk_seen = true;
+                }
+                Ok(pulled)
+            })
+        }
+
+        fn send_follow_up<'a>(
+            &'a mut self,
+            text: String,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: PermissionRequestId,
+            answer: PermissionAnswer,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(&'a mut self, grace: Duration) -> htui_agent::driver::DriverFuture<'a, ()> {
+            Box::pin(async move {
+                self.cancelled = true;
+                self.probe.cancelled.store(true, Ordering::SeqCst);
+                if matches!(self.at, StallAt::InCancel) {
+                    self.probe.reached.notify_one();
+                    self.probe.release.notified().await;
+                }
+                self.inner.cancel(grace).await
+            })
+        }
+    }
+
+    /// [`StallDriver`]'s builder over one shared fake.
+    #[derive(Debug)]
+    struct StallBuilder {
+        adapter: Arc<FakeAdapter>,
+        probe: Arc<StallProbe>,
+        at: StallAt,
+    }
+
+    impl htui_agent::registry::TransportBuilder for StallBuilder {
+        fn build(
+            &self,
+            agent: &Agent,
+            on_box: Option<&AgentBox>,
+            caps: DriverCaps,
+        ) -> Result<Box<dyn AgentDriver>, DriverError> {
+            Ok(Box::new(StallDriver {
+                inner: self.adapter.build(agent, on_box, caps)?,
+                probe: Arc::clone(&self.probe),
+                at: self.at,
+            }))
+        }
+    }
+
+    /// [`fixture`] over [`StallDriver`].
+    async fn fixture_with_stall(
+        script: Script,
+        at: StallAt,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId, Arc<StallProbe>) {
+        let store = MemStore::from_demo(htui_core::fixtures::demo_data());
+        let agent_id = AgentId::new();
+        store
+            .upsert_agent(&fake_row(agent_id), None)
+            .await
+            .expect("the fake row lands");
+        let adapter = Arc::new(FakeAdapter::new());
+        adapter.load(script);
+        let probe = Arc::new(StallProbe::default());
+        let mut factory = DriverFactory::new();
+        factory.register(
+            "cli/fake",
+            Box::new(StallBuilder {
+                adapter,
+                probe: Arc::clone(&probe),
+                at,
+            }),
+        );
+        let backend = Backend::memory(store.clone());
+        let runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
+        (store, backend, runtime, agent_id, probe)
+    }
+
+    /// Starts a help over `runtime`, waits for its session to reach the stall, serves a
+    /// `ChatCancel` at seq 8, releases the stall, and drives the help to its end.
+    async fn cancel_at_stall(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        agent_id: AgentId,
+        probe: &StallProbe,
+    ) -> (StepId, Vec<ReplyEnvelope>) {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .serve(backend, &tx, &envelope(7, help(agent_id, "old\n", "new")))
+            .await
+        else {
+            panic!("a help turn opens a session")
+        };
+        let task = tokio::spawn(task);
+        tokio::time::timeout(Duration::from_secs(30), probe.reached.notified())
+            .await
+            .expect("the session reaches its stall");
+        let cancel = runtime
+            .serve(
+                backend,
+                &tx,
+                &envelope(8, StoreRequest::ChatCancel { step_id }),
+            )
+            .await;
+        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
+        probe.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the help ends once cancelled, without its agent finishing the turn")
+            .expect("the help task does not panic");
+        drop(tx);
+        let mut replies = Vec::new();
+        while let Some(reply) = rx.recv().await {
+            replies.push(reply);
+        }
+        (step_id, replies)
+    }
+
+    /// The replies at `seq`.
+    fn at_seq(replies: &[ReplyEnvelope], seq: Seq) -> Vec<&StoreReply> {
+        replies
+            .iter()
+            .filter(|reply| reply.seq == seq)
+            .map(|reply| &reply.reply)
+            .collect()
+    }
+
+    /// MOD-55 review H1: `Esc` while the agent is mid-reply, with **no** permission request
+    /// parked, cancels the session at once: the cancel is answered once, `Ended{Cancelled}`, the
+    /// run closes `cancelled` and the stream ends `cancelled`. Before the fix the turn read no
+    /// command until its `Done`, so the agent finished its reply first.
+    #[tokio::test]
+    async fn a_cancel_mid_stream_with_nothing_parked_cancels_the_help() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                text: "partial".to_owned(),
+                message_id: Some("m1".to_owned()),
+            })),
+            ScriptEvent::ExpectCancel,
+        ]);
+        let (store, backend, mut runtime, agent_id, probe) =
+            fixture_with_stall(script, StallAt::AfterChunk).await;
+
+        let (step_id, replies) = cancel_at_stall(&mut runtime, &backend, agent_id, &probe).await;
+
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                })]
+            ),
+            "the cancel is answered exactly once: {replies:?}"
+        );
+        assert!(
+            probe.cancelled.load(Ordering::SeqCst),
+            "the driver session was cancelled"
+        );
+        assert!(
+            matches!(
+                replies.last(),
+                Some(ReplyEnvelope {
+                    seq: 7,
+                    reply: StoreReply::Chat(ChatFrame::Ended {
+                        stop_reason: StopReason::Cancelled
+                    }),
+                    ..
+                })
+            ),
+            "the stream ends cancelled: {replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Cancelled);
+    }
+
+    /// MOD-55 review H1, A-2: a cancel already queued when the session is accepted (an `Esc`
+    /// deferred until `ChatAccepted`) is read before the first pull: the agent's turn, which only
+    /// a cancel ends, is cancelled rather than pulled into.
+    #[tokio::test]
+    async fn a_cancel_queued_at_the_acceptance_cancels_the_help() {
+        let script = Script::one_turn(vec![
+            ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                text: "partial".to_owned(),
+                message_id: Some("m1".to_owned()),
+            })),
+            ScriptEvent::ExpectCancel,
+        ]);
+        let (store, backend, mut runtime, agent_id) = fixture(script).await;
+
+        let (step_id, replies) = run(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                })]
+            ),
+            "the cancel is answered exactly once: {replies:?}"
+        );
+        assert!(
+            !replies.iter().any(|reply| matches!(
+                reply.reply,
+                StoreReply::Failed { .. } | StoreReply::Chat(ChatFrame::Failed { .. })
+            )),
+            "nothing failed: {replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Cancelled);
+    }
+
+    /// MOD-55 review H1: a cancel that reaches the session while the help is ending itself (its
+    /// `Done` in, the session closing) is answered once, as a chat answers a cancel between turns:
+    /// `Ended` with the turn's own stop reason, the run `done`. It used to be dropped with the
+    /// receiver, unanswered.
+    #[tokio::test]
+    async fn a_cancel_queued_as_the_help_turn_ends_is_answered_once() {
+        let (store, backend, mut runtime, agent_id, probe) =
+            fixture_with_stall(help_script(), StallAt::InCancel).await;
+
+        let (step_id, replies) = cancel_at_stall(&mut runtime, &backend, agent_id, &probe).await;
+
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::EndTurn
+                })]
+            ),
+            "the cancel is answered exactly once: {replies:?}"
+        );
+        assert!(
+            matches!(
+                replies.last(),
+                Some(ReplyEnvelope {
+                    seq: 7,
+                    reply: StoreReply::Chat(ChatFrame::Ended {
+                        stop_reason: StopReason::EndTurn
+                    }),
+                    ..
+                })
+            ),
+            "the stream ends with the turn's reason: {replies:?}"
+        );
+        let run = store
+            .run(run_of(step_id))
+            .await
+            .expect("the read answers")
+            .expect("the help's run");
+        assert_eq!(run.status, RunStatus::Done, "nothing was cut");
+    }
+
+    // -----------------------------------------------------------------------------------------
     // A promoted graph step (MOD-4 plan D164, D165, blueprint D205, D206)
     // -----------------------------------------------------------------------------------------
 
@@ -5978,7 +7226,7 @@ pub(crate) mod tests {
             extra_dirs: Vec::new(),
             env: BTreeMap::from([("API_TOKEN".to_owned(), SECRET.to_owned())]),
             model: None,
-            tools: htui_agent::driver::ToolExposure::default(),
+            tools: ToolExposure::default(),
             mcp: Vec::new(),
             permission: settings.permission.clone(),
             retain_raw: false,
@@ -6018,6 +7266,7 @@ pub(crate) mod tests {
             .expect("the demo project's caps"),
             quota_latch: quota_latch_for(&agent, box_id, settings.quota.source),
             lease: None,
+            mode: ChatMode::Conversation,
         })
         .await;
         let mut replies = Vec::new();
@@ -6459,8 +7708,8 @@ pub(crate) mod tests {
         use tokio::sync::mpsc;
 
         use super::{
-            SpecSlot, ends, envelope, fixture_over, fixture_with_spec_spy, promote_addr, promoted,
-            start,
+            SpecSlot, ends, envelope, fixture_over, fixture_with_spec_spy, help, promote_addr,
+            promoted, start,
         };
         use crate::agent_worker::{AgentRuntime, Served};
         use crate::store_worker::{ReplyEnvelope, StoreReply, StoreRequest};
@@ -6591,6 +7840,44 @@ pub(crate) mod tests {
                 .expect("the call is answered");
             assert!(!profile.is_error, "{}", profile.text);
             assert_eq!(live.spec.step_id, live.step_id);
+            end(&mut runtime, &backend, &mut live).await;
+        }
+
+        /// MOD-55 T3-c2 (P3): a help on a runtime that hosts tools opens no lease: no server, no
+        /// prompt port. A chat on the same runtime gets its server, which is the control.
+        #[tokio::test]
+        async fn a_help_session_opens_no_tool_lease_on_a_hosted_runtime() {
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, _host) = hosted(runtime, &backend);
+
+            let (tx, _rx) = mpsc::unbounded_channel();
+            let served = runtime
+                .serve(&backend, &tx, &envelope(7, help(agent_id, "old\n", "new")))
+                .await;
+            let Served::Start { task, .. } = served else {
+                panic!("a help turn opens a session: {served:?}")
+            };
+            tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .expect("a help ends itself");
+            let spec = slot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+                .expect("the help's driver started");
+            assert!(spec.mcp.is_empty(), "no server: {:?}", spec.mcp);
+            assert!(spec.prompt.is_none(), "no prompt port");
+
+            // The control, on a hosted runtime of its own (the fake plays one script per load):
+            // `live` asserts the one `htui` server.
+            let (_store, backend, runtime, agent_id, slot) =
+                fixture_with_spec_spy(one_turn(), None).await;
+            let (mut runtime, host) = hosted(runtime, &backend);
+            let served = runtime
+                .serve(&backend, &tx, &envelope(9, start(agent_id, "hello")))
+                .await;
+            let mut live = live(served, tx, &host, &slot).await;
             end(&mut runtime, &backend, &mut live).await;
         }
 

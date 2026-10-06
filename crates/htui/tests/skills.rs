@@ -15,17 +15,28 @@
 //! The demo estimates (blueprint F-I): `rust-style` v2 is ~42 tokens, v1 ~31, `tests` v1 ~32.
 #![cfg(feature = "testkit")]
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
+use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
 use htui::editor::{ExternalEdit, ExternalEditOutcome};
 use htui::testkit::Harness;
 use htui::ui::tabs::SkillsTab;
-use htui_core::fixtures::ids;
+use htui_agent::conformance::{Script, ScriptEvent};
+use htui_agent::driver::{AgentDriver, DriverCaps};
+use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
+use htui_agent::fake::FakeAdapter;
+use htui_agent::registry::DriverFactory;
+use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
     Activation, Attachment, BindingChange, NewRepo, NewSkillVersion, RepoBoxPath, RepoId,
     SkillBinding, SkillBindingKey, SkillVersion,
 };
-use htui_core::store::{CasOutcome, MemStore, WriteStore};
+use htui_core::model::{Agent, AgentBox, AgentId, Billing, EventKind, Scope, Transport};
+use htui_core::store::{BLANK_SKILL_BODY, CasOutcome, MemStore, ReadStore as _, WriteStore};
+use serde_json::json;
 
 /// The shell over `store`, every view registered, on the Skills tab's Skills view (the tab opens
 /// there, D34).
@@ -1470,5 +1481,200 @@ async fn the_prefilled_fields_are_what_the_save_writes() {
             "**/Cargo.toml".to_owned()
         ],
         "typed first, then the language's globs"
+    );
+}
+
+// --- MOD-55: agent help over a scripted agent ---------------------------------------------------
+
+/// A registry row the factory reaches by row data alone: `cli` with stream `fake` (`tests/chat.rs`
+/// `scripted_row`).
+fn scripted_row() -> Agent {
+    Agent {
+        id: AgentId::new(),
+        name: "scripted".to_owned(),
+        transport: Transport::Cli,
+        billing: Billing::Subscription,
+        models: Vec::new(),
+        default_model: Some("sonnet".to_owned()),
+        launch: json!({ "command": "unused", "args": [] }),
+        settings: json!({ "cli": { "stream": "fake", "permission_mode": "ask",
+                                   "extra_args": [] } }),
+        enabled: true,
+        created_at: htui_core::fixtures::demo_at(0, 0),
+        updated_at: htui_core::fixtures::demo_at(0, 0),
+    }
+}
+
+/// Lets the test keep the adapter it loaded a script into.
+#[derive(Debug)]
+struct SharedAdapter(Arc<FakeAdapter>);
+
+impl htui_agent::registry::TransportBuilder for SharedAdapter {
+    fn build(
+        &self,
+        agent: &Agent,
+        on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
+        self.0.build(agent, on_box, caps)
+    }
+}
+
+/// The Skills view over the demo world with an agent runtime whose one enabled agent,
+/// `scripted`, plays `script`. The fixture's own agents are disabled, as `tests/chat.rs` does.
+async fn open_with_agent(script: Script) -> (Harness, MemStore) {
+    let store = MemStore::demo();
+    for summary in store.agents().await.expect("the fixture's agents") {
+        let mut row = summary.agent;
+        row.enabled = false;
+        edit_agent(&store, &row).await.expect("the row is disabled");
+    }
+    store
+        .upsert_agent(&scripted_row(), None)
+        .await
+        .expect("the scripted row lands");
+    let adapter = Arc::new(FakeAdapter::new());
+    adapter.load(script);
+    let mut factory = DriverFactory::new();
+    factory.register("cli/fake", Box::new(SharedAdapter(Arc::clone(&adapter))));
+    let mut harness = Harness::over(store.clone())
+        .with_agent_runtime(AgentRuntime::new(factory).with_grace(Duration::from_millis(0)));
+    register_all(harness.app());
+    harness.drive().await;
+    harness.key("2");
+    harness.drive().await;
+    (harness, store)
+}
+
+/// One turn whose reply is `text`, ended on `EndTurn`.
+fn reply_script(text: &str) -> Script {
+    Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+            text: text.to_owned(),
+            message_id: Some("m1".to_owned()),
+        })),
+        ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })),
+    ])
+}
+
+/// The Harness's startup scope.
+fn vulkan() -> Scope {
+    Scope {
+        workspace_id: ids::WORKSPACE_GRAPHICS,
+        project_ids: vec![ids::PROJECT_VULKAN],
+    }
+}
+
+/// `rust-style` in the editor, `Ctrl+G`, `request` asked, the turn driven.
+async fn ask_on_rust_style(harness: &mut Harness, request: &str) {
+    select(harness, "rust-style");
+    harness.key("e");
+    harness.key("ctrl-g");
+    harness.drive().await;
+    type_text(harness, request);
+    harness.key("enter");
+    harness.drive().await;
+}
+
+/// LI-1: `Ctrl+G` in the Library editor, a request, one turn in the active project: the proposal
+/// is drawn as a diff against the body sent; accepting it and `Ctrl+S` saves it as the next
+/// version. The turn was one chat run, recorded as a skill help (no placeholder section) and
+/// closed.
+#[tokio::test]
+async fn a_proposal_accepted_saves_as_the_next_version() {
+    let (mut harness, store) = open_with_agent(reply_script(
+        "Shorter:\n```\nPrefer `expect`. One error enum per crate.\n```\n",
+    ))
+    .await;
+    let active = store.active_runs(&vulkan()).await.expect("count");
+    ask_on_rust_style(&mut harness, "shorter").await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" proposal from scripted \u{b7} sent \u{2192} proposed "),
+        "{frame}"
+    );
+    assert!(frame.contains("--- sent"), "the diff's header: {frame}");
+    assert!(
+        frame.contains("-Prefer `expect` with a reason."),
+        "the removed line: {frame}"
+    );
+    assert!(
+        frame.contains("+Prefer `expect`. One error enum per crate."),
+        "the added line: {frame}"
+    );
+    assert!(
+        hint(&frame).ends_with("Enter accept  Esc discard  J/K PgUp/PgDn scroll"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("agent_help_proposal", frame);
+
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("proposal accepted \u{2014} Ctrl+S saves it"),
+        "{frame}"
+    );
+    assert!(
+        hint(&frame).contains("Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel"),
+        "the editor is back: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.drive().await;
+    let row = head(&store, "rust-style").await.expect("a head");
+    assert_eq!(
+        (row.version, row.body.as_str()),
+        (3, "Prefer `expect`. One error enum per crate.")
+    );
+
+    let steps = harness.chat_steps();
+    let [step] = steps.as_slice() else {
+        panic!("one help turn: {steps:?}");
+    };
+    let log = store
+        .step_events(*step)
+        .await
+        .expect("the log reads")
+        .expect("the help step has a log");
+    let prompt = log
+        .iter()
+        .find(|row| row.kind == EventKind::Prompt)
+        .expect("a prompt row");
+    let sections: Vec<&str> = prompt.payload["sections"]
+        .as_array()
+        .expect("sections[]")
+        .iter()
+        .filter_map(|section| section["name"].as_str())
+        .collect();
+    assert_eq!(sections, ["instruction", "body", "request"]);
+    assert_eq!(
+        store.active_runs(&vulkan()).await.expect("count"),
+        active,
+        "the help's run is closed"
+    );
+}
+
+/// LI-2: an accepted blank proposal still meets the save gate: `Ctrl+S` is refused with the
+/// blank-body sentence and no version is written.
+#[tokio::test]
+async fn a_blank_proposal_still_meets_the_save_gate() {
+    let (mut harness, store) = open_with_agent(reply_script("```\n \n```")).await;
+    ask_on_rust_style(&mut harness, "empty").await;
+    let frame = harness.render();
+    assert!(frame.contains(" proposal from scripted "), "{frame}");
+    harness.key("enter");
+    harness.key("ctrl-s");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(notice(&frame).contains(BLANK_SKILL_BODY), "{frame}");
+    assert!(
+        hint(&frame).contains("Ctrl+S save"),
+        "the editor stays: {frame}"
+    );
+    assert_eq!(
+        versions(&store, "rust-style").await.len(),
+        2,
+        "nothing saved"
     );
 }

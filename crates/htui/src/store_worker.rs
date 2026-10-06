@@ -102,6 +102,9 @@ pub const NO_RUN_RUNTIME: &str = "no run runtime in this build";
 /// holds both.
 pub const PROMOTION_NEEDS_CHAT: &str = "promotion needs the chat runtime";
 
+/// MOD-55: the help request's name, shared by the runtime and the editors.
+pub const EDIT_HELP: &str = "edit_help";
+
 /// Who asked, and therefore who the reply is addressed to.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Origin {
@@ -237,6 +240,20 @@ pub enum StoreRequest {
     ChatFollow {
         /// The step the chat records against.
         step_id: StepId,
+    },
+    /// MOD-55: one agent help turn for a Skills editor (P1-P4). The runtime assembles and scrubs
+    /// the prompt **before** anything is minted (a refusal is a `Failed` naming the section and the
+    /// rule, and leaves no run), mints a `chat` run whose step is `edit_help`, and opens a session
+    /// with no tool lease, every tool kind denied and a deny-all policy. The session ends itself
+    /// after its first turn. Answered as [`StoreRequest::ChatStart`] is: `ChatAccepted`, `Chat`
+    /// frames, `Ended`. `ChatCancel` ends it early.
+    EditHelp {
+        /// The run's project: the template's own, or the scope's first for a skill (P7).
+        project_id: ProjectId,
+        /// Which registry row answers, with its default model (PRD D1).
+        agent_id: AgentId,
+        /// What is edited, the body and the request. Its `Debug` is lengths only (H-11).
+        prompt: htui_core::prompt::edit_help::HelpPrompt,
     },
     /// Probe every enabled registry row on this box and write `agent_box` (MOD-2 D53, `R-AGT-6`).
     ///
@@ -1031,6 +1048,7 @@ impl StoreRequest {
             Self::ChatAnswer { .. } => "chat_answer",
             Self::ChatCancel { .. } => "chat_cancel",
             Self::ChatFollow { .. } => "chat_follow",
+            Self::EditHelp { .. } => EDIT_HELP,
             Self::ProbeAgents => "probe_agents",
             Self::ProbeBox => "probe_box",
             // The three of `box_settings::REQUEST_NAMES`, in that order (MOD-7 milestone 2, D46;
@@ -1800,18 +1818,19 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             step_id: *step,
             events: backend.step_events(*step).await?,
         },
-        // The five chat requests need the worker loop's own state (the live sessions), and the
-        // two probes, the preview, the three install requests, MOD-21's four login ones,
-        // MOD-22's delivery and MOD-66's tool-paths write need the runtime that owns their tasks,
-        // so all seventeen are served ahead of this function, exactly as `ApplyMigrations` is. One
-        // of them that reaches here at all belongs to a caller with no runtime — the test harness
-        // without one — and saying so is more use than a panic.
+        // The six chat requests (MOD-55's help among them) need the worker loop's own state (the
+        // live sessions), and the two probes, the preview, the three install requests, MOD-21's
+        // four login ones, MOD-22's delivery and MOD-66's tool-paths write need the runtime that
+        // owns their tasks, so all eighteen are served ahead of this function, exactly as
+        // `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
+        // runtime — the test harness without one — and saying so is more use than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
         | StoreRequest::ChatAnswer { .. }
         | StoreRequest::ChatCancel { .. }
         | StoreRequest::ChatFollow { .. }
+        | StoreRequest::EditHelp { .. }
         | StoreRequest::ProbeAgents
         | StoreRequest::ProbeBox
         | StoreRequest::InstallPlan { .. }
@@ -2651,6 +2670,7 @@ pub(crate) fn spawn_with_concepts(
                         | StoreRequest::ChatAnswer { .. }
                         | StoreRequest::ChatCancel { .. }
                         | StoreRequest::ChatFollow { .. }
+                        | StoreRequest::EditHelp { .. }
                         | StoreRequest::ProbeAgents
                         | StoreRequest::ProbeBox
                         | StoreRequest::InstallPlan { .. }
@@ -4860,6 +4880,65 @@ mod tests {
             assert!(shown.contains("RedirectUrl(<redacted>)"), "{shown}");
             assert!(!shown.contains("CODE-SENTINEL-4f1c"), "the code leaked");
             assert!(!shown.contains("STATE-SENTINEL-9a2e"), "the state leaked");
+        }
+    }
+
+    /// MOD-55: a help request whose body and request are sentinels.
+    fn edit_help_request() -> StoreRequest {
+        StoreRequest::EditHelp {
+            project_id: ids::PROJECT_HTUI,
+            agent_id: AgentId::new(),
+            prompt: htui_core::prompt::edit_help::HelpPrompt {
+                target: htui_core::prompt::edit_help::HelpTarget::Skill {
+                    name: "rust-style".to_owned(),
+                },
+                body: "BODY-SENTINEL-7d3e".to_owned(),
+                request: "REQUEST-SENTINEL-2b9a".to_owned(),
+            },
+        }
+    }
+
+    /// MOD-55 W-1: the help request's name is the shared constant the editors match on.
+    #[test]
+    fn an_edit_help_request_is_named_edit_help() {
+        assert_eq!(EDIT_HELP, "edit_help");
+        assert_eq!(edit_help_request().name(), EDIT_HELP);
+    }
+
+    /// MOD-55 W-2 (H-11): the body and the request may hold a secret, so neither the request's
+    /// `Debug` nor its envelope's prints them.
+    #[test]
+    fn an_edit_help_request_debugs_without_its_body() {
+        let request = edit_help_request();
+        let envelope = RequestEnvelope {
+            seq: 7,
+            origin: Origin::App,
+            request: request.clone(),
+        };
+        for shown in [
+            format!("{request:?}"),
+            format!("{request:#?}"),
+            format!("{envelope:?}"),
+            format!("{envelope:#?}"),
+        ] {
+            assert!(shown.contains("rust-style"), "{shown}");
+            assert!(!shown.contains("BODY-SENTINEL"), "the body leaked: {shown}");
+            assert!(
+                !shown.contains("REQUEST-SENTINEL"),
+                "the request leaked: {shown}"
+            );
+        }
+    }
+
+    /// MOD-55 W-3: a build with no agent runtime refuses a help by name, exactly once.
+    #[tokio::test]
+    async fn edit_help_without_a_runtime_is_refused_by_name() {
+        match serve(&demo(), &edit_help_request()).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, EDIT_HELP);
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a help with no runtime is refused, not served: {other:?}"),
         }
     }
 

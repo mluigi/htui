@@ -13,14 +13,27 @@
 //! fixtures here.
 #![cfg(feature = "testkit")]
 
+use std::sync::Arc;
+use std::time::Duration;
+
+use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
 use htui::editor::{ExternalEdit, ExternalEditOutcome};
 use htui::testkit::Harness;
 use htui::ui::tabs::SkillsTab;
-use htui_core::fixtures::ids;
-use htui_core::model::{NewPromptTemplate, PromptTemplate, PromptTemplateId};
+use htui_agent::conformance::{Script, ScriptEvent};
+use htui_agent::driver::{AgentDriver, DriverCaps};
+use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
+use htui_agent::fake::FakeAdapter;
+use htui_agent::registry::DriverFactory;
+use htui_core::fixtures::{edit_agent, ids};
+use htui_core::model::{
+    Agent, AgentBox, AgentId, Billing, EventKind, NewPromptTemplate, PromptTemplate,
+    PromptTemplateId, Scope, Transport,
+};
 use htui_core::prompt::body_of;
-use htui_core::store::{CasOutcome, MemStore, WriteStore};
+use htui_core::store::{CasOutcome, MemStore, ReadStore as _, WriteStore};
+use serde_json::json;
 
 /// The shell over `store`, every view registered, on the Skills tab's Templates view.
 async fn open_over(store: MemStore) -> Harness {
@@ -396,7 +409,7 @@ async fn a_refused_save_sends_no_request() {
         "no `Failed` reply landed: {frame}"
     );
     assert!(
-        hint(&frame).ends_with("Ctrl+S save  Ctrl+E $EDITOR  Esc cancel  L1:C1"),
+        hint(&frame).ends_with("Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel  L1:C1"),
         "the editor is still open, the cursor on the `{{`: {frame}"
     );
 }
@@ -911,4 +924,220 @@ async fn the_strip_text_is_unchanged() {
         frame.contains(" 1 Backlog  2 Skills  3 Requirements  4 Settings  5 Chat"),
         "{frame}"
     );
+}
+
+// --- MOD-55: agent help over a scripted agent ---------------------------------------------------
+
+/// A registry row the factory reaches by row data alone: `cli` with stream `fake` (`tests/chat.rs`
+/// `scripted_row`).
+fn scripted_row() -> Agent {
+    Agent {
+        id: AgentId::new(),
+        name: "scripted".to_owned(),
+        transport: Transport::Cli,
+        billing: Billing::Subscription,
+        models: Vec::new(),
+        default_model: Some("sonnet".to_owned()),
+        launch: json!({ "command": "unused", "args": [] }),
+        settings: json!({ "cli": { "stream": "fake", "permission_mode": "ask",
+                                   "extra_args": [] } }),
+        enabled: true,
+        created_at: htui_core::fixtures::demo_at(0, 0),
+        updated_at: htui_core::fixtures::demo_at(0, 0),
+    }
+}
+
+/// Lets the test keep the adapter it loaded a script into.
+#[derive(Debug)]
+struct SharedAdapter(Arc<FakeAdapter>);
+
+impl htui_agent::registry::TransportBuilder for SharedAdapter {
+    fn build(
+        &self,
+        agent: &Agent,
+        on_box: Option<&AgentBox>,
+        caps: DriverCaps,
+    ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
+        self.0.build(agent, on_box, caps)
+    }
+}
+
+/// The Templates view over the demo world with an agent runtime whose one enabled agent,
+/// `scripted`, plays `script`. The fixture's own agents are disabled, as `tests/chat.rs` does.
+async fn open_with_agent(script: Script) -> (Harness, MemStore) {
+    let store = MemStore::demo();
+    for summary in store.agents().await.expect("the fixture's agents") {
+        let mut row = summary.agent;
+        row.enabled = false;
+        edit_agent(&store, &row).await.expect("the row is disabled");
+    }
+    store
+        .upsert_agent(&scripted_row(), None)
+        .await
+        .expect("the scripted row lands");
+    let adapter = Arc::new(FakeAdapter::new());
+    adapter.load(script);
+    let mut factory = DriverFactory::new();
+    factory.register("cli/fake", Box::new(SharedAdapter(Arc::clone(&adapter))));
+    let mut harness = Harness::over(store.clone())
+        .with_agent_runtime(AgentRuntime::new(factory).with_grace(Duration::from_millis(0)));
+    register_all(harness.app());
+    harness.drive().await;
+    harness.key("2");
+    harness.key("l");
+    harness.drive().await;
+    (harness, store)
+}
+
+/// The script of TI-1: a short reply whose block is a phase body `parse` accepts.
+fn shorter_script() -> Script {
+    Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+            text: "Shorter:\n```\n{{item}}\n\nDo the item.\n```\n".to_owned(),
+            message_id: Some("m1".to_owned()),
+        })),
+        ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::EndTurn,
+        })),
+    ])
+}
+
+/// The Harness's startup scope.
+fn vulkan() -> Scope {
+    Scope {
+        workspace_id: ids::WORKSPACE_GRAPHICS,
+        project_ids: vec![ids::PROJECT_VULKAN],
+    }
+}
+
+/// TI-1: `Ctrl+G`, a request, one turn: the proposal is drawn as a diff against the body sent;
+/// accepting it and `Ctrl+S` saves it through `parse` as the next version. The turn was one chat
+/// run, recorded as a help (its prompt row carries the template help's sections) and closed.
+#[tokio::test]
+async fn ctrl_g_proposal_accept_and_save() {
+    let (mut harness, store) = open_with_agent(shorter_script()).await;
+    let active = store.active_runs(&vulkan()).await.expect("count");
+    select(&mut harness, "implement");
+    harness.key("e");
+    harness.key("ctrl-g");
+    harness.drive().await;
+    type_text(&mut harness, "shorter");
+    harness.key("enter");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" proposal from scripted \u{b7} sent \u{2192} proposed "),
+        "{frame}"
+    );
+    assert!(frame.contains("--- sent"), "the diff's header: {frame}");
+    assert!(
+        frame.contains("-You are running"),
+        "a removed line: {frame}"
+    );
+    assert!(
+        hint(&frame).ends_with("Enter accept  Esc discard  J/K PgUp/PgDn scroll"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("agent_help_proposal", frame);
+    // The added line is below the fold: the pane scrolls.
+    harness.key("pagedown");
+    let scrolled = harness.render();
+    assert!(
+        scrolled.contains("+Do the item."),
+        "the added line: {scrolled}"
+    );
+    assert!(!scrolled.contains("--- sent"), "the header scrolled off");
+
+    harness.key("enter");
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("proposal accepted \u{2014} Ctrl+S saves it"),
+        "{frame}"
+    );
+    assert!(
+        frame.contains("{{item}}"),
+        "the draft is the proposal: {frame}"
+    );
+    harness.key("ctrl-s");
+    harness.drive().await;
+    let row = head(&store, "implement").await.expect("a head");
+    assert_eq!(
+        (row.version, row.body.as_str()),
+        (2, "{{item}}\n\nDo the item.\n")
+    );
+
+    let steps = harness.chat_steps();
+    let [step] = steps.as_slice() else {
+        panic!("one help turn: {steps:?}");
+    };
+    let log = store
+        .step_events(*step)
+        .await
+        .expect("the log reads")
+        .expect("the help step has a log");
+    let prompt = log
+        .iter()
+        .find(|row| row.kind == EventKind::Prompt)
+        .expect("a prompt row");
+    let sections: Vec<&str> = prompt.payload["sections"]
+        .as_array()
+        .expect("sections[]")
+        .iter()
+        .filter_map(|section| section["name"].as_str())
+        .collect();
+    assert_eq!(sections, ["instruction", "placeholders", "body", "request"]);
+    assert_eq!(
+        store.active_runs(&vulkan()).await.expect("count"),
+        active,
+        "the help's run is closed"
+    );
+}
+
+/// TI-2: the asking panel sits under the locked draft, the placeholder column beside it.
+#[tokio::test]
+async fn the_asking_panel() {
+    let (mut harness, _) = open_with_agent(Script::default()).await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    harness.key("ctrl-g");
+    harness.drive().await;
+    type_text(&mut harness, "shorter");
+    let frame = harness.render();
+    assert!(frame.contains(" ask an agent "), "{frame}");
+    assert!(frame.contains("ask: shorter"), "{frame}");
+    assert!(frame.contains("agent: scripted"), "{frame}");
+    assert!(frame.contains(" phase placeholders "), "{frame}");
+    assert!(
+        hint(&frame).ends_with("Enter ask  Up/Down agent  Esc back"),
+        "{frame}"
+    );
+    insta::assert_snapshot!("agent_help_asking", frame);
+}
+
+/// TI-3 (P2): a body holding a credential is refused before anything is sent: the notice names
+/// the section and the rule, the help is closed, and no chat run exists.
+#[tokio::test]
+async fn a_body_holding_a_key_is_not_sent() {
+    let (mut harness, store) = open_with_agent(shorter_script()).await;
+    let active = store.active_runs(&vulkan()).await.expect("count");
+    select(&mut harness, "implement");
+    harness.key("e");
+    type_text(&mut harness, &format!("ghp_{} ", "A1b2".repeat(9)));
+    harness.key("ctrl-g");
+    harness.drive().await;
+    type_text(&mut harness, "tidy");
+    harness.key("enter");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("not sent: the body matches the github_token rule"),
+        "{frame}"
+    );
+    assert!(
+        !frame.contains(" ask an agent "),
+        "the help closed: {frame}"
+    );
+    assert!(hint(&frame).contains("Ctrl+S save"), "{frame}");
+    assert!(harness.chat_steps().is_empty(), "no session started");
+    assert_eq!(store.active_runs(&vulkan()).await.expect("count"), active);
 }

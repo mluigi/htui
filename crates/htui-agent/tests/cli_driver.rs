@@ -27,7 +27,7 @@ use chrono::Utc;
 use htui_agent::cli::ClaudeStreamAdapter;
 #[cfg(unix)]
 use htui_agent::cli::{SessionOptions, open_session};
-use htui_agent::cli::{argv, usd};
+use htui_agent::cli::{argv, refuse_widening, usd};
 #[cfg(unix)]
 use htui_agent::driver::{AgentSession, PermissionAnswer, PermissionRequestId};
 use htui_agent::driver::{
@@ -239,6 +239,7 @@ fn exposure(allow: &[&str], deny: &[&str], deny_kinds: &[ToolKind]) -> ToolExpos
         deny: tool_names(deny),
         command_run: false,
         deny_kinds: deny_kinds.to_vec(),
+        no_tools: false,
     }
 }
 
@@ -612,6 +613,139 @@ fn argv_names_the_prompt_tool_only_with_a_port() {
         Some("--y"),
         "extra_args last"
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-55 review M1: a session with no tool at all
+// ---------------------------------------------------------------------------------------------
+
+/// A `no_tools` exposure, every kind denied besides: what a help turn hands the driver.
+fn tool_less() -> ToolExposure {
+    ToolExposure {
+        deny_kinds: ToolKind::ALL.to_vec(),
+        no_tools: true,
+        ..ToolExposure::default()
+    }
+}
+
+/// `no_tools` disables every built-in tool (`--tools=`, the empty list), loads no MCP server at
+/// all (`--strict-mcp-config` with no `--mcp-config`, so the operator's own servers go too), and
+/// drops the row's `--permission-mode` and the prompt-tool pair: with nothing to call there is
+/// nothing a mode or a prompt could approve.
+#[test]
+fn no_tools_disables_every_tool_and_every_mcp_server() {
+    let mut spec = full_spec();
+    spec.tools = tool_less();
+    spec.mcp = vec![htui_server()];
+    let (port, _ask) = bridge();
+    spec.prompt = Some(port);
+
+    let args = argv(
+        &[],
+        &cli_settings("acceptEdits", &["--x"]),
+        &spec,
+        "minted-id",
+    );
+
+    assert_eq!(
+        args.iter()
+            .filter(|arg| arg.starts_with("--tools"))
+            .collect::<Vec<_>>(),
+        ["--tools="],
+        "one empty tool list, the allow-list ignored: {args:?}"
+    );
+    assert!(args.contains(&"--strict-mcp-config".to_owned()), "{args:?}");
+    assert!(mcp_configs(&args).is_empty(), "no server: {args:?}");
+    assert!(
+        !args.contains(&"--permission-mode".to_owned()),
+        "the row's mode is dropped: {args:?}"
+    );
+    assert!(
+        !args.contains(&"--permission-prompt-tool".to_owned()),
+        "no prompt tool: {args:?}"
+    );
+    assert!(
+        args.iter().any(|arg| arg.starts_with("--disallowedTools=")),
+        "the deny list still travels: {args:?}"
+    );
+    assert_eq!(args.last().map(String::as_str), Some("--x"), "{args:?}");
+}
+
+/// With `no_tools` off nothing above appears, whatever else the exposure says: the flag-off argv
+/// is pinned flag for flag by `argv_is_the_ana4_line_in_order` and `argv_without_mcp_is_unchanged`.
+#[test]
+fn no_tools_off_adds_neither_flag() {
+    let grid = [
+        ToolExposure::default(),
+        exposure(&["Read"], &[], &[]),
+        exposure(&["Read", "Grep"], &["mcp__x__y"], ToolKind::ALL),
+    ];
+    for tools in grid {
+        let mut spec = full_spec();
+        spec.tools = tools.clone();
+        spec.mcp = vec![htui_server()];
+        let args = argv(&[], &cli_settings("acceptEdits", &[]), &spec, "minted-id");
+        assert!(
+            !args.contains(&"--strict-mcp-config".to_owned()),
+            "{tools:?} → {args:?}"
+        );
+        assert!(
+            !args.contains(&"--tools=".to_owned()),
+            "{tools:?} → {args:?}"
+        );
+        assert_eq!(mcp_configs(&args).len(), 1, "{tools:?} → {args:?}");
+    }
+}
+
+/// A row whose `extra_args` would widen a tool-less session back is refused, naming the flag:
+/// they come last on the argv, so the CLI would keep them over `--tools=`.
+#[test]
+fn no_tools_refuses_extra_args_that_widen() {
+    for extra in [
+        &["--allowedTools", "Bash"][..],
+        &["--allowedTools=Bash"],
+        &["--allowed-tools", "Bash"],
+        &["--dangerously-skip-permissions"],
+        &["--allow-dangerously-skip-permissions"],
+        &["--permission-mode", "bypassPermissions"],
+        &["--permission-mode=acceptEdits"],
+        &["--tools", "Bash"],
+        &["--tools=Bash"],
+        &["--mcp-config", "operator.json"],
+        &["--mcp-config=operator.json"],
+    ] {
+        let cli = cli_settings("", extra);
+        let refused =
+            refuse_widening(&cli, &tool_less()).expect_err(&format!("{extra:?} must be refused"));
+        assert!(
+            refused.to_string().starts_with("agent transport error: "),
+            "a transport refusal, never a spawn failure: {refused:?}"
+        );
+        let flag = extra[0].split('=').next().expect("a flag");
+        assert!(
+            refused.to_string().contains(flag),
+            "{extra:?}: the refusal names the flag: {refused}"
+        );
+    }
+}
+
+/// What does not widen passes, and with `no_tools` off nothing is checked at all.
+#[test]
+fn no_tools_passes_extra_args_that_do_not_widen() {
+    for extra in [
+        &[][..],
+        &["--x"],
+        &["--permission-mode", "plan"],
+        &["--disallowedTools=Bash"],
+    ] {
+        refuse_widening(&cli_settings("acceptEdits", extra), &tool_less())
+            .unwrap_or_else(|err| panic!("{extra:?} widens nothing: {err}"));
+    }
+    refuse_widening(
+        &cli_settings("bypassPermissions", &["--dangerously-skip-permissions"]),
+        &ToolExposure::default(),
+    )
+    .expect("a session with tools is not this check's business");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1914,5 +2048,34 @@ async fn a_prompt_ahead_of_its_tool_use_line_still_follows_its_call() {
         matches!(rest.last(), Some(DriverEvent::Done(done)) if done.stop_reason == StopReason::EndTurn),
         "{:?}",
         rest.last()
+    );
+}
+
+/// MOD-55 review M1: the refusal comes before the spawn. The row names a command that does not
+/// exist, so a driver that spawned first would answer `Spawn` instead of naming the flag.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tool_less_start_with_widening_extra_args_is_refused_before_the_spawn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut row = scripted_row(&dir.path().join("absent"), serde_json::Map::new());
+    row.settings["cli"]["extra_args"] = json!(["--dangerously-skip-permissions"]);
+    let mut factory = DriverFactory::new();
+    factory.register(
+        htui_agent::cli::ADAPTER_ID,
+        Box::new(ClaudeStreamAdapter) as Box<dyn htui_agent::registry::TransportBuilder>,
+    );
+    let driver = factory.driver_for(&row, None).expect("the row builds");
+    let mut with = spec(dir.path().to_path_buf());
+    with.tools = tool_less();
+
+    let refused = driver
+        .start(with, "hello".to_owned())
+        .await
+        .expect_err("a tool-less session refuses the row");
+
+    assert!(
+        matches!(&refused, DriverError::Transport(message)
+            if message.contains("--dangerously-skip-permissions")),
+        "{refused:?}"
     );
 }
