@@ -15,20 +15,21 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, SubsecRound as _, Utc};
 use htui_agent::auth::loopback::{ListenerReply, RedirectUrl};
 use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
-    AgentId, AgentSummary, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxInfo, CitationKind,
-    Document, DocumentHead, DocumentId, EditReason, Item, ItemFilter, ItemId, ItemKindId,
-    ItemKindPatch, ItemSpec, ItemSummary, LinkGraph, NewPersona, Note, PermissionId, Persona,
-    PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView,
-    RepoId, RepoPatch, RequirementAreaId, RequirementId, RunSummary, Scope, SessionEvent,
-    SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch, StepId,
-    ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
+    BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, Item, ItemFilter,
+    ItemId, ItemKindId, ItemKindPatch, ItemSpec, ItemSummary, LinkGraph, NewPersona, Note,
+    PermissionId, Persona, PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId,
+    ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunStatus,
+    RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
+    StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission,
+    WorkspaceId, WorkspacePatch, WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -84,6 +85,16 @@ pub const PROMPT_PREVIEW: &str = "prompt_preview";
 /// `hierarchy::REQUEST_NAMES`: a listing reads this box's filesystem and no store, so it is not one
 /// of the thirteen offline refusals, and the Hierarchy section matches its `Failed` by this name.
 pub const LIST_DIR: &str = "list_dir";
+
+/// [`StoreRequest::name`] of the five queue requests (MOD-12 D9), in variant order: the Backlog
+/// matches a queue request's `Failed` by these.
+pub const QUEUE_REQUEST_NAMES: [&str; 5] = [
+    "queue_state",
+    "queue_item",
+    "dequeue_item",
+    "resume_queue",
+    "pause_queue",
+];
 
 /// The most entries one [`StoreReply::DirListing`] carries; the rest is its `more` (MOD-49 P4).
 pub const LIST_CAP: usize = 1000;
@@ -330,6 +341,23 @@ pub enum StoreRequest {
         /// `discovery.tools` declares. Paths, not secrets (`R-SEC-2`).
         paths: BTreeMap<String, String>,
     },
+    /// MOD-12 D9: this box's queue — its entries and whether it runs. Answered with
+    /// [`StoreReply::Queue`]. Offline: `DATABASE_UNREACHABLE`.
+    QueueState,
+    /// MOD-12 D9: queue `item` on this box (idempotent). Answered with [`StoreReply::QueueWritten`].
+    QueueItem {
+        /// The item.
+        item: ItemId,
+    },
+    /// MOD-12 D9: take `item` out of the queue; never cancels a run. [`StoreReply::QueueWritten`].
+    DequeueItem {
+        /// The item.
+        item: ItemId,
+    },
+    /// MOD-12 D2, D9: resume — open a batch on this box (idempotent); the loop sweeps at once (D8).
+    ResumeQueue,
+    /// MOD-12 D2, D9: pause — close this box's open batch `paused`; running runs continue.
+    PauseQueue,
     /// The persona registry by name (MOD-26 M2 D21). Served by [`persona_settings::serve`]
     /// through the writer: personas are not mirrored, so offline it is refused with
     /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::Personas`].
@@ -1044,6 +1072,12 @@ impl StoreRequest {
             Self::SetAgentOnBox { .. } => "set_agent_on_box",
             // Served by the agent runtime, not `agent_settings::serve` (MOD-66 D7).
             Self::SetToolPaths { .. } => agent_settings::SET_TOOL_PATHS,
+            // The five of `QUEUE_REQUEST_NAMES`, in that order (MOD-12 D9).
+            Self::QueueState => "queue_state",
+            Self::QueueItem { .. } => "queue_item",
+            Self::DequeueItem { .. } => "dequeue_item",
+            Self::ResumeQueue => "resume_queue",
+            Self::PauseQueue => "pause_queue",
             // The five of `persona_settings::REQUEST_NAMES`, in that order (MOD-26 M2 D21).
             Self::Personas => "personas",
             Self::CreatePersona { .. } => "create_persona",
@@ -1426,6 +1460,15 @@ pub enum StoreReply {
         /// What the write did.
         outcome: PersonaWrite,
     },
+    /// Answer to [`StoreRequest::QueueState`].
+    Queue(QueueView),
+    /// Answer to the four queue writes: what was done, and the queue after it.
+    QueueWritten {
+        /// The write.
+        write: QueueWrite,
+        /// The queue after it.
+        view: QueueView,
+    },
     /// The registry after an import, and what happened to every file (D20). Boxed: the report
     /// can be long.
     PersonaImports(Box<PersonaImports>),
@@ -1489,6 +1532,45 @@ pub enum StoreReply {
         request: &'static str,
         /// The `StoreError`, rendered through `Display`.
         message: String,
+    },
+}
+
+/// MOD-12 D9: this box's queue as the Backlog needs it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueView {
+    /// The queued items, `position NULLS LAST, queued_at, item_id`.
+    pub entries: Vec<ItemId>,
+    /// The open batch; `None` = paused (D2).
+    pub open_batch: Option<BatchId>,
+}
+
+/// MOD-12 D9: what one queue write did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueWrite {
+    /// `item` is queued.
+    Queued {
+        /// The item.
+        item: ItemId,
+    },
+    /// `item` left the queue; `was_queued` is `false` when it was not in it.
+    Dequeued {
+        /// The item.
+        item: ItemId,
+        /// Whether it was in a queue at all.
+        was_queued: bool,
+    },
+    /// A batch is open; `already` when one was.
+    Resumed {
+        /// Whether a batch was open before this write.
+        already: bool,
+    },
+    /// The batch closed `paused` with `live` of its runs `queued` or `running`; `already` when
+    /// none was open.
+    Paused {
+        /// The closed batch's runs still `queued` or `running`.
+        live: usize,
+        /// Whether no batch was open, so nothing closed.
+        already: bool,
     },
 }
 
@@ -2013,12 +2095,102 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 },
             }
         }
+        // The five queue requests, or-ed for the reason the arms above are: a guard does not
+        // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-12 D9).
+        StoreRequest::QueueState
+        | StoreRequest::QueueItem { .. }
+        | StoreRequest::DequeueItem { .. }
+        | StoreRequest::ResumeQueue
+        | StoreRequest::PauseQueue => serve_queue(backend, request).await?,
         // A command needs the runtime that owns its task, and the loop serves every one of them
         // ahead of this function; one that reaches here belongs to a caller with no runtime.
         StoreRequest::Orch(_) => StoreReply::Failed {
             request: request.name(),
             message: NO_RUN_RUNTIME.to_owned(),
         },
+    })
+}
+
+/// MOD-12 D9: the five queue requests over `backend`'s inherent queue methods. This box is
+/// `box_info()`'s, the author `this_user()`, every time `Utc::now()` truncated to the microsecond.
+///
+/// Memory serves them (blueprint deviation 6: `--demo` writes the rows, and its runtime never
+/// admits); offline every queue method answers `DATABASE_UNREACHABLE`. The box is read first, so
+/// an unregistered box costs no queue read.
+async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<StoreReply> {
+    let box_id = backend
+        .box_info()
+        .await?
+        .map(|info| info.box_id)
+        .ok_or_else(|| StoreError::NotFound {
+            entity: "box",
+            id: "this box".to_owned(),
+        })?;
+    let now = || Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let write = match request {
+        StoreRequest::QueueState => {
+            return Ok(StoreReply::Queue(queue_view(backend, box_id).await?));
+        }
+        StoreRequest::QueueItem { item } => {
+            let user = backend.this_user().await?;
+            backend.queue_item(*item, box_id, user, now()).await?;
+            QueueWrite::Queued { item: *item }
+        }
+        StoreRequest::DequeueItem { item } => QueueWrite::Dequeued {
+            item: *item,
+            was_queued: backend.dequeue_item(*item).await?,
+        },
+        StoreRequest::ResumeQueue => {
+            let already = backend.open_batch_of(box_id).await?.is_some();
+            let user = backend.this_user().await?;
+            backend.open_batch(box_id, user, now()).await?;
+            QueueWrite::Resumed { already }
+        }
+        StoreRequest::PauseQueue => {
+            match backend
+                .close_batch(box_id, BatchClose::Paused, now())
+                .await?
+            {
+                Some(closed) => QueueWrite::Paused {
+                    live: backend
+                        .batch_runs(closed.id)
+                        .await?
+                        .iter()
+                        .filter(|(_, status)| {
+                            matches!(status, RunStatus::Queued | RunStatus::Running)
+                        })
+                        .count(),
+                    already: false,
+                },
+                None => QueueWrite::Paused {
+                    live: 0,
+                    already: true,
+                },
+            }
+        }
+        other => {
+            return Ok(StoreReply::Failed {
+                request: other.name(),
+                message: "not a queue request".to_owned(),
+            });
+        }
+    };
+    Ok(StoreReply::QueueWritten {
+        write,
+        view: queue_view(backend, box_id).await?,
+    })
+}
+
+/// MOD-12 D9: `box_id`'s queue: its entries in queue order and its open batch.
+async fn queue_view(backend: &Backend, box_id: BoxId) -> StoreResult<QueueView> {
+    Ok(QueueView {
+        entries: backend
+            .queue_entries(box_id)
+            .await?
+            .into_iter()
+            .map(|entry| entry.item_id)
+            .collect(),
+        open_batch: backend.open_batch_of(box_id).await?.map(|batch| batch.id),
     })
 }
 
@@ -2717,6 +2889,11 @@ pub(crate) fn spawn_with_concepts(
                         }
                         other => {
                             let served = try_serve(&backend, other).await;
+                            if matches!(other, StoreRequest::ResumeQueue) && served.is_ok() {
+                                // MOD-12 D8: a resumed queue is admitted at the next sweep, which
+                                // is now.
+                                runs.sweep(&backend, &tx);
+                            }
                             // This read is what noticed the server had gone. The asking view
                             // still hears back exactly once; the next read finds the mirror.
                             // MOD-37 M4 D3 (R-46), review M1: this swap does **not** preempt.
@@ -4748,6 +4925,74 @@ mod tests {
             ],
             agent_settings::REQUEST_NAMES
         );
+    }
+
+    /// The five queue requests are named exactly as `QUEUE_REQUEST_NAMES` lists them, so the
+    /// Backlog's `Failed` match and the worker cannot drift apart (MOD-12 D9).
+    #[test]
+    fn queue_requests_are_named_as_queue_request_names_lists_them() {
+        assert_eq!(
+            [
+                StoreRequest::QueueState.name(),
+                StoreRequest::QueueItem {
+                    item: ids::HTUI_ANA_2,
+                }
+                .name(),
+                StoreRequest::DequeueItem {
+                    item: ids::HTUI_ANA_2,
+                }
+                .name(),
+                StoreRequest::ResumeQueue.name(),
+                StoreRequest::PauseQueue.name(),
+            ],
+            QUEUE_REQUEST_NAMES
+        );
+    }
+
+    /// MOD-12 D9: `QueueState` answers this box's entries and whether its queue runs. The demo
+    /// box has no entry and no open batch, so it is paused (D2); a queued item is listed.
+    #[tokio::test]
+    async fn queue_state_answers_the_box_queue() {
+        let store = MemStore::demo();
+        let backend = Backend::memory(store.clone());
+        let StoreReply::Queue(view) = serve(&backend, &StoreRequest::QueueState).await else {
+            panic!("`QueueState` answers `Queue`");
+        };
+        assert_eq!(
+            view,
+            QueueView {
+                entries: Vec::new(),
+                open_batch: None,
+            }
+        );
+
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the item is queued");
+        let StoreReply::Queue(view) = serve(&backend, &StoreRequest::QueueState).await else {
+            panic!("`QueueState` answers `Queue`");
+        };
+        assert_eq!(view.entries, vec![ids::HTUI_ANA_2]);
+        assert_eq!(view.open_batch, None, "queueing never resumes (D2)");
+    }
+
+    /// MOD-12 D9: a pause with no open batch writes nothing and says so.
+    #[tokio::test]
+    async fn pause_on_a_paused_box_says_already() {
+        match serve(&demo(), &StoreRequest::PauseQueue).await {
+            StoreReply::QueueWritten { write, view } => {
+                assert_eq!(
+                    write,
+                    QueueWrite::Paused {
+                        live: 0,
+                        already: true,
+                    }
+                );
+                assert_eq!(view.open_batch, None);
+            }
+            other => panic!("a pause answers `QueueWritten`: {other:?}"),
+        }
     }
 
     /// MOD-66 D7, blueprint B12: the tool-paths write is named by its own const, outside

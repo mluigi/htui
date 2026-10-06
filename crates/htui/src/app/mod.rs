@@ -162,4 +162,14 @@ pub fn register_all(app: &mut App) {
             help,
         });
     }
+    // MOD-12 D9: `Q` toggles the cursor item's queue membership and `P` this box's queue, in the
+    // Backlog's own arms, which always consume the key; these rows are the help box's half.
+    for (key, help) in [('Q', "queue / dequeue"), ('P', "pause / resume queue")] {
+        app.keymap.bind(Binding {
+            scope: KeyScope::Tab(BacklogTab::ID),
+            key: KeyChord::new(KeyCode::Char(key), KeyModifiers::NONE),
+            action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
+            help,
+        });
+    }
 }

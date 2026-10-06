@@ -1133,6 +1133,14 @@ impl MemStore {
         self.read(|state| state.run_commands.values().cloned().collect())
     }
 
+    /// Every `queue_batch` row, open or closed, in id order (MOD-12 blueprint C.5): no store
+    /// method reads a closed batch back, so a test that checks a close's reason reads it here.
+    #[cfg(feature = "test-support")]
+    #[must_use]
+    pub fn batch_rows(&self) -> Vec<QueueBatch> {
+        self.read(|state| state.queue_batches.values().cloned().collect())
+    }
+
     /// MOD-76 D4 (R-55): sets `settings[key]` on box `id`'s row, on this store and every clone
     /// of it, as no `BoxEdit` field writes it (`command_limits`). `edit_version` does not move.
     /// Whether the row exists.

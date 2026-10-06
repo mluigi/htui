@@ -208,7 +208,8 @@ pub(crate) mod tests {
     };
     use crate::agent_worker::AgentRuntime;
     use crate::store_worker::{
-        self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, spawn_with_runtimes,
+        self, Origin, QueueWrite, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest,
+        spawn_with_runtimes,
     };
     use crate::ui::tabs::TabId;
     use htui_mcp::McpHost;
@@ -1770,6 +1771,88 @@ pub(crate) mod tests {
             "the panicked task's request is answered"
         );
         let run = only_run(&fixture.store, ids::HTUI_ANA_2).await;
+        rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
+    }
+
+    /// The sweep an hour away: whatever a case sees swept after the startup sweep was a wake.
+    const AN_HOUR: Duration = Duration::from_secs(3600);
+
+    /// MOD-12 D8, resume half (blueprint §C.5, deviation 8): with the sweep an hour away, the
+    /// queued ANA-2 is admitted under the batch `ResumeQueue` opened, at once: the loop sweeps
+    /// after serving the resume, and the sweep admits (T4's `sweep_once`).
+    #[tokio::test]
+    #[ignore = "MOD-12 T4: needs sweep_once's queue admission (D6); un-ignore when T4 lands"]
+    async fn resuming_the_queue_sweeps_at_once() {
+        let fixture = Fixture::new().await;
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime().with_sweep_every(AN_HOUR));
+        fixture
+            .store
+            .queue_item(
+                ids::HTUI_ANA_2,
+                ids::BOX,
+                ids::USER,
+                Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+            )
+            .await
+            .expect("the item is queued");
+
+        let resume = worker.send(Origin::App, StoreRequest::ResumeQueue);
+        let batch = match worker.reply(resume).await {
+            StoreReply::QueueWritten {
+                write: QueueWrite::Resumed { already: false },
+                view,
+            } => view.open_batch.expect("the resume opened a batch"),
+            other => panic!("a resume of a paused box answers `Resumed`: {other:?}"),
+        };
+        within("ANA-2's auto run admitted under the batch", async {
+            loop {
+                let admitted = fixture.store.batch_runs(batch).await.expect("the read");
+                let runs = fixture.store.runs(ids::HTUI_ANA_2).await.expect("the read");
+                if runs.iter().any(|run| {
+                    run.mode == RunMode::Auto && admitted.iter().any(|(id, _)| *id == run.id)
+                }) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    /// MOD-12 D8, the wake itself, which holds before the runner admits anything: with the sweep
+    /// an hour away, the only sweep that can adopt a run whose lease lapses after the startup
+    /// sweep is the one a served `ResumeQueue` asks for.
+    #[tokio::test]
+    async fn a_resume_wakes_the_sweep() {
+        let fixture = Fixture::new().await;
+        let lease = TimeDelta::milliseconds(300);
+        let run = queued_by_another(&fixture, ids::HTUI_ANA_2).await;
+        let claim = fixture
+            .store
+            .claim_run(run, ids::BOX, Uuid::now_v7(), Utc::now(), lease)
+            .await
+            .expect("the claim answers");
+        assert!(claim.is_admitted(), "{claim}");
+        let mut worker = Worker::spawn(&fixture.store, fixture.runtime().with_sweep_every(AN_HOUR));
+
+        // Past the lease, and past the startup sweep, which found it held.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            fixture.run(run).await.status,
+            RunStatus::Running,
+            "nothing adopted it while it was leased"
+        );
+        let resume = worker.send(Origin::App, StoreRequest::ResumeQueue);
+        assert!(
+            matches!(
+                worker.reply(resume).await,
+                StoreReply::QueueWritten {
+                    write: QueueWrite::Resumed { already: false },
+                    ..
+                }
+            ),
+            "the resume is answered"
+        );
         rests_at(&fixture, run, RunStatus::AwaitingApproval).await;
     }
 
