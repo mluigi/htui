@@ -40,6 +40,38 @@ const FALLBACK: &str = "vi";
 #[cfg(windows)]
 const FALLBACK: &str = "notepad";
 
+/// The variable that chooses the in-pane editor (MOD-57 plan P3), read next to `$VISUAL`/`$EDITOR`.
+pub const PANE_VAR: &str = "HTUI_EDITOR_PANE";
+
+/// The answer to a second edit while an in-pane editor is alive (MOD-57 P6, PD-8).
+pub const EDITOR_BUSY: &str = "an editor is already open: return to it or abort it first";
+
+/// The answer to `editor.abort` (MOD-57 P8): the editor is killed and nothing is read back.
+pub const EDITOR_ABORTED: &str = "the editor was aborted; nothing was changed";
+
+/// How `E`/`Ctrl+E` run the editor (MOD-57 P3, PRD D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorMode {
+    /// Today's handoff: the TUI is suspended while the editor runs. The default.
+    Suspend,
+    /// The editor runs on a pseudo-terminal drawn inside htui.
+    Pane,
+}
+
+impl EditorMode {
+    /// [`PANE_VAR`] through `lookup`: `1`, `true` or `yes` (trimmed, ASCII case-insensitive) is
+    /// `Pane`; anything else, unset or blank included, is `Suspend`.
+    pub fn resolve(lookup: impl Fn(&str) -> Option<String>) -> Self {
+        let on = lookup(PANE_VAR).is_some_and(|value| {
+            let value = value.trim();
+            ["1", "true", "yes"]
+                .into_iter()
+                .any(|on| value.eq_ignore_ascii_case(on))
+        });
+        if on { Self::Pane } else { Self::Suspend }
+    }
+}
+
 /// A resolved editor command (D8). `value` is handed to the platform shell verbatim.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EditorCommand {
@@ -113,6 +145,56 @@ impl EditorCommand {
             use std::os::windows::process::CommandExt as _;
             let mut command = std::process::Command::new("cmd");
             command.raw_arg(format!("/S /C \"{} \"{}\"\"", self.value, file.display()));
+            command
+        }
+    }
+
+    /// The same process as [`command`](Self::command), on a pseudo-terminal (MOD-57 P9, PD-6).
+    ///
+    /// Unix: the same `sh -c "exec <value> \"$1\"" htui-editor <file>` argv, for the same
+    /// reasons (see [`command`](Self::command)). The child is a session leader on its own PTY
+    /// (portable-pty `setsid` + `TIOCSCTTY`), so `ctrl-c` reaches only it; no `Interrupts` are
+    /// needed. `TERM` is `xterm-256color`, what the pane's VT parser speaks. The cwd is htui's
+    /// own, as the suspended handoff inherits it (portable-pty would default to `$HOME`), and
+    /// `LINES`/`COLUMNS` are removed so a stale value cannot override the PTY's size.
+    ///
+    /// Windows: `cmd /S /C "<value> <file name>"` with the cwd set to the file's directory.
+    /// portable-pty quotes every argument and has no `raw_arg`, so the file is named bare; the
+    /// temp file's name holds no space and no quote, and `/S` strips the one pair of quotes
+    /// around the last argument. A `value` holding `"` is MOD-16's to verify.
+    ///
+    /// The builder carries the whole environment: never `Debug` or log it.
+    #[must_use]
+    pub fn pty_command(&self, file: &Path) -> portable_pty::CommandBuilder {
+        #[cfg(not(windows))]
+        {
+            let mut command = portable_pty::CommandBuilder::new("sh");
+            command.arg("-c");
+            command.arg(format!("exec {} \"$1\"", self.value));
+            command.arg("htui-editor");
+            command.arg(file);
+            command.env("TERM", "xterm-256color");
+            command.env_remove("LINES");
+            command.env_remove("COLUMNS");
+            if let Ok(dir) = std::env::current_dir() {
+                command.cwd(dir);
+            }
+            command
+        }
+        #[cfg(windows)]
+        {
+            let mut command = portable_pty::CommandBuilder::new("cmd");
+            command.arg("/S");
+            command.arg("/C");
+            let name = file
+                .file_name()
+                .map(|name| name.to_string_lossy())
+                .unwrap_or_default();
+            command.arg(format!("{} {name}", self.value));
+            if let Some(dir) = file.parent() {
+                command.cwd(dir);
+            }
+            command.env("TERM", "xterm-256color");
             command
         }
     }
@@ -898,6 +980,101 @@ mod tests {
         assert!(!shown.contains("secret"), "{shown}");
         assert!(shown.contains("text_len: 11"), "{shown}");
         assert!(shown.contains("htui-implement-"), "{shown}");
+    }
+
+    #[test]
+    fn editor_mode_reads_htui_editor_pane() {
+        assert_eq!(EditorMode::resolve(|_| None), EditorMode::Suspend);
+        for (value, mode) in [
+            ("", EditorMode::Suspend),
+            (" ", EditorMode::Suspend),
+            ("0", EditorMode::Suspend),
+            ("no", EditorMode::Suspend),
+            ("false", EditorMode::Suspend),
+            ("on", EditorMode::Suspend),
+            ("1", EditorMode::Pane),
+            ("true", EditorMode::Pane),
+            ("TRUE", EditorMode::Pane),
+            (" yes ", EditorMode::Pane),
+        ] {
+            let lookup = |key: &str| (key == "HTUI_EDITOR_PANE").then(|| value.to_owned());
+            assert_eq!(EditorMode::resolve(lookup), mode, "{value:?}");
+        }
+        // Only `HTUI_EDITOR_PANE` is read.
+        assert_eq!(PANE_VAR, "HTUI_EDITOR_PANE");
+        assert_eq!(
+            EditorMode::resolve(vars(&[("EDITOR", "1")])),
+            EditorMode::Suspend
+        );
+    }
+
+    #[test]
+    fn the_pane_sentences_are_pinned() {
+        assert_eq!(
+            EDITOR_BUSY,
+            "an editor is already open: return to it or abort it first"
+        );
+        assert_eq!(
+            EDITOR_ABORTED,
+            "the editor was aborted; nothing was changed"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pty_command_matches_command_s_argv() {
+        let cmd = EditorCommand {
+            value: "code --wait".to_owned(),
+            fallback: false,
+        };
+        let file = Path::new("/tmp/htui-implement-x.md");
+        let command = cmd.pty_command(file);
+        assert_eq!(
+            *command.get_argv(),
+            [
+                "sh",
+                "-c",
+                "exec code --wait \"$1\"",
+                "htui-editor",
+                "/tmp/htui-implement-x.md"
+            ]
+        );
+        // The same argv as the suspended handoff's.
+        let suspended = cmd.command(file);
+        assert_eq!(command.get_argv()[0], suspended.get_program());
+        assert!(command.get_argv()[1..].iter().eq(suspended.get_args()));
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
+        assert_eq!(command.get_env("LINES"), None);
+        assert_eq!(command.get_env("COLUMNS"), None);
+        assert_eq!(
+            command.get_cwd().map(std::ffi::OsString::as_os_str),
+            Some(std::env::current_dir().unwrap().as_os_str())
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn pty_command_names_the_file_in_its_directory() {
+        let cmd = EditorCommand {
+            value: "code --wait".to_owned(),
+            fallback: false,
+        };
+        let command = cmd.pty_command(Path::new(r"C:\Temp\htui-implement-x.md"));
+        assert_eq!(
+            *command.get_argv(),
+            ["cmd", "/S", "/C", "code --wait htui-implement-x.md"]
+        );
+        assert_eq!(
+            command.get_cwd().map(std::ffi::OsString::as_os_str),
+            Some(std::ffi::OsStr::new(r"C:\Temp"))
+        );
+        assert_eq!(
+            command.get_env("TERM"),
+            Some(std::ffi::OsStr::new("xterm-256color"))
+        );
     }
 
     /// Fake editors: `#!/bin/sh` scripts in a temp dir. No test launches a real editor.
