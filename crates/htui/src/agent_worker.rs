@@ -6015,11 +6015,125 @@ pub(crate) mod tests {
 
     /// Drives a `ChatStart` to completion inline and returns every reply it produced.
     ///
-    /// The cancel is queued **before** the future is polled, because a chat does not end by
-    /// itself: after its turn it waits on the user, exactly as it does in the running binary. The
-    /// command channel is unbounded, so the session plays its whole turn and then finds the
-    /// waiting `Cancel` — which is the same sequence as a user pressing `Esc Esc`.
+    /// A chat does not end by itself: after its turn it waits on the user, exactly as it does in
+    /// the running binary. So the user's `Esc Esc` is served once the first turn's `Done` frame
+    /// reaches the stream ([`end_after_turn`]), the sequence `tests/chat_live.rs` drives. Since
+    /// MOD-87 D1 a chat reads commands while it pulls, so a cancel queued before the future is
+    /// polled would cut the turn rather than end the chat after it.
     async fn run(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        request: StoreRequest,
+    ) -> (StepId, Vec<ReplyEnvelope>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } =
+            runtime.serve(backend, &tx, &envelope(7, request)).await
+        else {
+            panic!("a chat start opens a session")
+        };
+        let replies = end_after_turn(runtime, backend, (tx, rx), step_id, task).await;
+        (step_id, replies)
+    }
+
+    /// Whether `reply` is a turn's `done` as the stream carries it.
+    fn is_done_frame(reply: &ReplyEnvelope) -> bool {
+        matches!(
+            &reply.reply,
+            StoreReply::Chat(ChatFrame::Event(frame)) if matches!(frame.event, DriverEvent::Done(_))
+        )
+    }
+
+    /// Whether the stream (seq 7: [`run`]'s `ChatStart`, [`promote_addr`]) has sent its `Ended`.
+    fn stream_ended(replies: &[ReplyEnvelope]) -> bool {
+        replies.iter().any(|reply| {
+            reply.seq == 7 && matches!(reply.reply, StoreReply::Chat(ChatFrame::Ended { .. }))
+        })
+    }
+
+    /// Drives `task` **inline** and collects every reply. After the k-th `Done` frame it serves
+    /// `batches[k]` (each asserted `Served::Deferred`) unless the stream has already ended:
+    /// `tests/chat_live.rs`'s shape. Since MOD-87 D1 a chat reads commands while it pulls, so a
+    /// command queued before the first poll would land mid-turn.
+    ///
+    /// Inline rather than spawned: a case may install a thread-local `tracing` default around it,
+    /// and `run_chat`'s D60 arm relies on being awaited inline by the harness. A spawned task is
+    /// passed as `async move { handle.await.expect(..) }`.
+    async fn converse(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        (tx, mut rx): (
+            mpsc::UnboundedSender<ReplyEnvelope>,
+            mpsc::UnboundedReceiver<ReplyEnvelope>,
+        ),
+        task: impl Future<Output = ()>,
+        batches: Vec<Vec<RequestEnvelope>>,
+    ) -> Vec<ReplyEnvelope> {
+        tokio::time::timeout(Duration::from_secs(30), async move {
+            let mut task = std::pin::pin!(task);
+            let mut batches = batches.into_iter();
+            let mut replies = Vec::new();
+            loop {
+                tokio::select! {
+                    biased;
+                    Some(reply) = rx.recv() => {
+                        let done = is_done_frame(&reply);
+                        replies.push(reply);
+                        if done {
+                            // Everything the task sent before it yielded, so a stream that
+                            // already ended is seen.
+                            while let Ok(more) = rx.try_recv() {
+                                replies.push(more);
+                            }
+                            if let Some(batch) = batches.next()
+                                && !stream_ended(&replies)
+                            {
+                                for request in batch {
+                                    let served = runtime.serve(backend, &tx, &request).await;
+                                    assert!(matches!(served, Served::Deferred), "{served:?}");
+                                }
+                            }
+                        }
+                    }
+                    () = &mut task => break,
+                }
+            }
+            drop(tx);
+            while let Some(reply) = rx.recv().await {
+                replies.push(reply);
+            }
+            replies
+        })
+        .await
+        .expect("the chat ends")
+    }
+
+    /// The user's `Esc Esc` once the first turn is done: [`converse`] with one batch, a
+    /// `ChatCancel` at seq 8. A chat that ends by itself before a `Done` (a refused or failed
+    /// start) is sent none.
+    async fn end_after_turn(
+        runtime: &mut AgentRuntime,
+        backend: &Backend,
+        channel: (
+            mpsc::UnboundedSender<ReplyEnvelope>,
+            mpsc::UnboundedReceiver<ReplyEnvelope>,
+        ),
+        step_id: StepId,
+        task: impl Future<Output = ()>,
+    ) -> Vec<ReplyEnvelope> {
+        converse(
+            runtime,
+            backend,
+            channel,
+            task,
+            vec![vec![envelope(8, StoreRequest::ChatCancel { step_id })]],
+        )
+        .await
+    }
+
+    /// [`run`] as it was before MOD-87: the cancel is queued **before** the future is polled. It
+    /// pins a cancel read before the first pull (MOD-55 A-2), which a help's script that only a
+    /// cancel ends needs.
+    async fn run_with_cancel_queued(
         runtime: &mut AgentRuntime,
         backend: &Backend,
         request: StoreRequest,
@@ -6971,7 +7085,8 @@ pub(crate) mod tests {
         ]);
         let (store, backend, mut runtime, agent_id) = fixture(script).await;
 
-        let (step_id, replies) = run(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
+        let (step_id, replies) =
+            run_with_cancel_queued(&mut runtime, &backend, help(agent_id, "old\n", "new")).await;
 
         assert!(
             matches!(
@@ -7069,15 +7184,15 @@ pub(crate) mod tests {
         }
     }
 
-    /// Attaches `promoted`, queues the user's `Esc Esc` before the session is polled, and drives
-    /// it to its end: [`run`]'s shape for a promotion.
+    /// Attaches `promoted`, runs `between` before the session is polled, and ends it with the
+    /// user's `Esc Esc` after its first turn: [`run`]'s shape for a promotion.
     async fn attach_and_end(
         runtime: &mut AgentRuntime,
         backend: &Backend,
         promoted: crate::run_worker::Promoted,
         between: impl AsyncFnOnce(StepId),
     ) -> Vec<ReplyEnvelope> {
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         let Served::Start { step_id, task } = runtime
             .attach_promoted(backend, &tx, promote_addr(), promoted)
             .await
@@ -7085,21 +7200,7 @@ pub(crate) mod tests {
             panic!("a promotion over a registered row opens a session")
         };
         between(step_id).await;
-        let cancel = runtime
-            .serve(
-                backend,
-                &tx,
-                &envelope(8, StoreRequest::ChatCancel { step_id }),
-            )
-            .await;
-        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
-        task.await;
-        drop(tx);
-        let mut replies = Vec::new();
-        while let Some(reply) = rx.recv().await {
-            replies.push(reply);
-        }
-        replies
+        end_after_turn(runtime, backend, (tx, rx), step_id, task).await
     }
 
     /// Blueprint D192, R-48: a CLI step with a `session_started` banner is resumed — the spec the
@@ -7946,7 +8047,7 @@ pub(crate) mod tests {
     async fn live_steps_drops_an_ended_chat() {
         let (_store, backend, mut runtime, agent_id) =
             fixture(Script::one_turn(vec![ends(StopReason::EndTurn)])).await;
-        let (tx, _rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::unbounded_channel();
         let Served::Start { step_id, task } = runtime
             .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
             .await
@@ -7959,15 +8060,7 @@ pub(crate) mod tests {
             "a started chat is live"
         );
 
-        let cancel = runtime
-            .serve(
-                &backend,
-                &tx,
-                &envelope(8, StoreRequest::ChatCancel { step_id }),
-            )
-            .await;
-        assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
-        task.await;
+        end_after_turn(&mut runtime, &backend, (tx, rx), step_id, task).await;
 
         assert!(
             runtime.caps(step_id).is_some(),
@@ -7993,6 +8086,8 @@ pub(crate) mod tests {
         use htui_agent::conformance::Script;
         use htui_agent::event::StopReason;
         use htui_core::fixtures::ids;
+        use htui_core::model::EventKind;
+        use htui_core::store::ReadStore as _;
         use htui_mcp::{McpClient, McpHost};
         use htui_orch::OpeningPath;
         use htui_store::Backend;
@@ -8014,12 +8109,29 @@ pub(crate) mod tests {
             tools: Vec<String>,
             spec: htui_agent::driver::SessionSpec,
             replies: mpsc::UnboundedSender<ReplyEnvelope>,
+            /// The step's log length before the task was spawned: 0 for a fresh chat, the tail
+            /// for a promoted step. [`end`] waits for a `done` row past it.
+            rows_before: usize,
         }
 
         fn hosted(runtime: AgentRuntime, backend: &Backend) -> (AgentRuntime, McpHost<Backend>) {
             let host = McpHost::new(backend.clone()).expect("an absolute binary path");
             let runtime = runtime.with_tool_host(Arc::new(host.clone()));
             (runtime, host)
+        }
+
+        /// The number of rows in `step`'s log, as `backend`'s writer reads it.
+        async fn rows_of(backend: &Backend, step: htui_core::model::StepId) -> Vec<EventKind> {
+            backend
+                .writer()
+                .expect("an online backend")
+                .step_events(step)
+                .await
+                .expect("the log reads")
+                .unwrap_or_default()
+                .iter()
+                .map(|row| row.kind)
+                .collect()
         }
 
         /// Runs `served`'s task on its own, waits for the driver's start, and lists the tools
@@ -8029,10 +8141,12 @@ pub(crate) mod tests {
             replies: mpsc::UnboundedSender<ReplyEnvelope>,
             host: &McpHost<Backend>,
             slot: &SpecSlot,
+            backend: &Backend,
         ) -> Live {
             let Served::Start { step_id, task } = served else {
                 panic!("the chat opens a session: {served:?}")
             };
+            let rows_before = rows_of(backend, step_id).await.len();
             let task = tokio::spawn(task);
             let spec = tokio::time::timeout(Duration::from_secs(20), async {
                 loop {
@@ -8062,11 +8176,25 @@ pub(crate) mod tests {
                 tools,
                 spec,
                 replies,
+                rows_before,
             }
         }
 
-        /// The user's `Esc Esc`, then the task's end.
+        /// The user's `Esc Esc` once the first turn's `done` row is stored, then the task's end.
+        /// The case owns the reply receiver, so the turn's end is read off the log: once its
+        /// `done` row is in, the `Done` was pulled and the turn reads no more commands (MOD-87 D1).
         async fn end(runtime: &mut AgentRuntime, backend: &Backend, live: &mut Live) {
+            tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    let rows = rows_of(backend, live.step_id).await;
+                    if rows.len() > live.rows_before && rows.last() == Some(&EventKind::Done) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the first turn ends");
             let cancel = runtime
                 .serve(
                     backend,
@@ -8106,7 +8234,7 @@ pub(crate) mod tests {
             let served = runtime
                 .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
                 .await;
-            let mut live = live(served, tx, &host, &slot).await;
+            let mut live = live(served, tx, &host, &slot, &backend).await;
 
             assert_eq!(live.tools, ["box_profile", "permission_prompt"]);
             assert!(
@@ -8169,7 +8297,7 @@ pub(crate) mod tests {
             let served = runtime
                 .serve(&backend, &tx, &envelope(9, start(agent_id, "hello")))
                 .await;
-            let mut live = live(served, tx, &host, &slot).await;
+            let mut live = live(served, tx, &host, &slot, &backend).await;
             end(&mut runtime, &backend, &mut live).await;
         }
 
@@ -8235,7 +8363,7 @@ pub(crate) mod tests {
             let served = runtime
                 .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
                 .await;
-            let mut fresh = live(served, tx, &host, &slot).await;
+            let mut fresh = live(served, tx, &host, &slot, &backend).await;
             assert_eq!(allowed(&fresh.spec), ["mcp__htui__box_profile"]);
             end(&mut runtime, &backend, &mut fresh).await;
 
@@ -8246,7 +8374,7 @@ pub(crate) mod tests {
             let served = runtime
                 .attach_promoted(&backend, &tx, promote_addr(), promoted(agent_id, handoff()))
                 .await;
-            let mut attached = live(served, tx, &host, &slot).await;
+            let mut attached = live(served, tx, &host, &slot, &backend).await;
             assert_eq!(
                 allowed(&attached.spec),
                 [
@@ -8339,7 +8467,7 @@ pub(crate) mod tests {
             let served = runtime
                 .attach_promoted(&backend, &tx, promote_addr(), promoted(agent_id, handoff()))
                 .await;
-            let mut live = live(served, tx, &host, &slot).await;
+            let mut live = live(served, tx, &host, &slot, &backend).await;
 
             for tool in [
                 "box_profile",
@@ -8393,7 +8521,7 @@ pub(crate) mod tests {
             let served = runtime
                 .attach_promoted(&backend, &tx, promote_addr(), promoted(agent_id, handoff()))
                 .await;
-            let mut live = live(served, tx, &host, &slot).await;
+            let mut live = live(served, tx, &host, &slot, &backend).await;
 
             assert!(
                 !live.tools.iter().any(|name| name == "document_write"),
@@ -8418,7 +8546,7 @@ pub(crate) mod tests {
             let served = runtime
                 .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
                 .await;
-            let mut live = live(served, tx, &host, &slot).await;
+            let mut live = live(served, tx, &host, &slot, &backend).await;
             end(&mut runtime, &backend, &mut live).await;
 
             let after = live
@@ -15361,7 +15489,6 @@ done
     /// Every case uses `FakeSecretSource`, never the keyring (H-9).
     mod chat_secrets {
         use std::collections::BTreeMap;
-        use std::future::Future;
         use std::sync::{Arc, PoisonError};
         use std::time::Duration;
 
@@ -15378,17 +15505,14 @@ done
         use htui_core::store::{MemStore, ReadStore as _};
         use htui_orch::OpeningPath;
         use htui_orch::fake::FakeToolHost;
-        use htui_store::Backend;
         use tokio::sync::{Notify, mpsc};
 
         use super::{
-            SpecSlot, attach_and_await, attach_and_end, envelope, fixture_with_spec_spy,
-            promote_addr, promoted, run, run_of, scope, start,
+            SpecSlot, attach_and_await, attach_and_end, end_after_turn as end, envelope,
+            fixture_with_spec_spy, promote_addr, promoted, run, run_of, scope, start,
         };
-        use crate::agent_worker::{AgentRuntime, PROMOTE_STEP, Served};
-        use crate::store_worker::{
-            ChatFrame, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest,
-        };
+        use crate::agent_worker::{PROMOTE_STEP, Served};
+        use crate::store_worker::{ChatFrame, ReplyEnvelope, RequestEnvelope, StoreReply};
 
         /// A scope `SecretScope::parse` accepts.
         const SCOPE: &str = r#"{"project_id":"p1","environment":"dev","path":"/"}"#;
@@ -15484,35 +15608,6 @@ done
                     StoreReply::Chat(ChatFrame::Failed { message: streamed }),
                 ] if *named == request && message == sentence && streamed == sentence
             )
-        }
-
-        /// The user's `Esc Esc` on a started chat, then its task to the end: [`run`]'s tail for a
-        /// case that had to look between `serve` and the task.
-        async fn end(
-            runtime: &mut AgentRuntime,
-            backend: &Backend,
-            (tx, mut rx): (
-                mpsc::UnboundedSender<ReplyEnvelope>,
-                mpsc::UnboundedReceiver<ReplyEnvelope>,
-            ),
-            step_id: StepId,
-            task: impl Future<Output = ()>,
-        ) -> Vec<ReplyEnvelope> {
-            let cancel = runtime
-                .serve(
-                    backend,
-                    &tx,
-                    &envelope(8, StoreRequest::ChatCancel { step_id }),
-                )
-                .await;
-            assert!(matches!(cancel, Served::Deferred), "{cancel:?}");
-            task.await;
-            drop(tx);
-            let mut replies = Vec::new();
-            while let Some(reply) = rx.recv().await {
-                replies.push(reply);
-            }
-            replies
         }
 
         #[tokio::test]
