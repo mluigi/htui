@@ -1,10 +1,12 @@
 //! The shell: state, actions, the update function and the view registrations.
 
 pub mod action;
+mod pane;
 pub mod state;
 pub mod update;
 
 pub use action::{Action, Handled, OverlayAction, RevealKind, RevealTarget, TabAction};
+pub use pane::{EDITOR_LOCKED, MIN_PANE};
 pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 
 use crossterm::event::{KeyCode, KeyModifiers};
