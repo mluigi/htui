@@ -112,8 +112,10 @@ pub const MIN_BUDGET_FOR_NEW_ATTEMPT: &str = "min_budget_for_new_attempt";
 /// runner (MOD-12 M2 D4) and the walk agree on one number.
 #[must_use]
 pub fn min_budget_micros(app: &BTreeMap<String, Value>) -> i64 {
-    let _ = app;
-    0
+    app.get(MIN_BUDGET_FOR_NEW_ATTEMPT)
+        .and_then(Value::as_i64)
+        .filter(|micros| *micros > 0)
+        .unwrap_or(0)
 }
 
 /// Why [`batch_budget`] admits no new attempt in a batch (MOD-12 M2 D3).
@@ -137,7 +139,14 @@ pub enum BatchStop {
 
 impl core::fmt::Display for BatchStop {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::CapReached { spent, cap } => {
+                write!(f, "batch cap reached ({spent} of {cap} micros)")
+            }
+            Self::Budget { remaining, min } => {
+                write!(f, "batch budget: {remaining} micros left, {min} required")
+            }
+        }
     }
 }
 
@@ -154,8 +163,17 @@ pub fn batch_budget(
     cap: Option<i64>,
     min: i64,
 ) -> Result<Option<i64>, BatchStop> {
-    let _ = (spent, cap, min);
-    Ok(None)
+    let (Some(spent), Some(cap)) = (spent, cap) else {
+        return Ok(None);
+    };
+    if spent >= cap {
+        return Err(BatchStop::CapReached { spent, cap });
+    }
+    let remaining = cap.saturating_sub(spent);
+    if remaining < min {
+        return Err(BatchStop::Budget { remaining, min });
+    }
+    Ok(Some(remaining))
 }
 
 #[cfg(test)]
