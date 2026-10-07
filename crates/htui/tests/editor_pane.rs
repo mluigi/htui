@@ -169,10 +169,11 @@ async fn gone(pid: &str) {
     }
 }
 
-/// PRD metric, plan T7: `E` in Templates opens the editor in the pane, the keys typed reach it,
-/// and its exit reads the file back into the view through the same outcome as the suspend mode.
+/// PRD metric, plan T7: browse `E` in Templates opens the editor in the pane (over the whole tab
+/// body: browse has no draft to claim, F-12), the keys typed reach it, and its exit reads the
+/// file back into the view through the same outcome as the suspend mode.
 #[tokio::test]
-async fn ctrl_e_in_templates_edits_in_the_pane_end_to_end() {
+async fn e_in_templates_edits_in_the_pane_end_to_end() {
     let dir = TempDir::new().expect("a temp dir");
     let cmd = script(
         &dir,
@@ -203,6 +204,8 @@ async fn ctrl_e_in_templates_edits_in_the_pane_end_to_end() {
     })
     .await;
     harness.settle().await;
+    // Before any key: `App::on_key` clears the status line.
+    assert_eq!(harness.app().status, None, "the exit set no status");
 
     let frame = harness.render();
     assert!(
@@ -222,7 +225,95 @@ async fn ctrl_e_in_templates_edits_in_the_pane_end_to_end() {
     );
     assert!(!frame.contains(READY), "the pane is gone: {frame}");
     assert!(!file.exists(), "the temp file is removed");
-    assert_eq!(harness.app().status, None);
+}
+
+/// Plan T7: `Ctrl+E` on a draft hands it to the pane, which goes over the draft's claimed text
+/// rect (inside the draft's block, its title still drawn above), not over the whole tab body; the
+/// editor's exit puts the edited file back into the draft.
+#[tokio::test]
+async fn ctrl_e_on_a_draft_edits_over_its_claimed_rect() {
+    let dir = TempDir::new().expect("a temp dir");
+    let cmd = script(
+        &dir,
+        &format!("printf '{READY}\\n'; IFS= read -r line; printf '%s\\n' \"$line\" >> \"$1\""),
+    );
+    let mut harness = open().await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    for key in ["D", "R", "A", "F", "T", "space"] {
+        harness.key(key);
+    }
+    harness.key("ctrl-e");
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let file = open_editor(&mut harness, cmd, &tx);
+    assert!(
+        std::fs::read_to_string(&file)
+            .expect("the temp file")
+            .starts_with("DRAFT You are running"),
+        "the editor gets the draft"
+    );
+
+    pump(
+        &mut harness,
+        &mut rx,
+        "ready editor with the keys",
+        |harness| {
+            let frame = harness.render();
+            frame.contains(READY) && frame.contains("Ctrl+4 to htui")
+        },
+    )
+    .await;
+    let frame = harness.render();
+    let lines: Vec<&str> = frame.lines().collect();
+    let title = lines
+        .iter()
+        .position(|line| line.contains("implement \u{b7} editing from v"))
+        .unwrap_or_else(|| panic!("the draft's title stays drawn beside the pane:\n{frame}"));
+    let rule = lines
+        .iter()
+        .position(|line| line.contains("Ctrl+4 to htui"))
+        .expect("the pane's rule");
+    assert_eq!(
+        rule,
+        title + 1,
+        "the pane starts on the draft's first text row:\n{frame}"
+    );
+    assert!(
+        lines[rule].starts_with('\u{2502}') && lines[rule + 1].starts_with('\u{2502}'),
+        "the pane is inside the draft's block, not over the tab body:\n{frame}"
+    );
+    assert!(
+        lines[rule + 1].contains(READY),
+        "the editor's first row is under the rule:\n{frame}"
+    );
+
+    for key in ["x", "y", "z", "enter"] {
+        harness.key(key);
+    }
+    pump(&mut harness, &mut rx, "editor exit", |harness| {
+        !harness.app().editor_open()
+    })
+    .await;
+    harness.settle().await;
+    assert_eq!(harness.app().status, None, "the exit set no status");
+
+    let frame = harness.render();
+    assert!(
+        hint(&frame).contains("Ctrl+S save"),
+        "the draft is back in the view's editor: {frame}"
+    );
+    assert!(
+        frame.contains("DRAFT You are running"),
+        "the draft's own text came back: {frame}"
+    );
+    harness.key("ctrl-end");
+    let frame = harness.render();
+    assert!(
+        frame.contains("xyz"),
+        "the typed line is in the draft: {frame}"
+    );
+    assert!(!frame.contains(READY), "the pane is gone: {frame}");
+    assert!(!file.exists(), "the temp file is removed");
 }
 
 /// P5: a focused editor gets `ctrl-c` (the line discipline turns it into its own SIGINT, htui

@@ -303,15 +303,17 @@ frames were read as text from the `TestBackend`.
 | Keys | `gg`, `O`, `MANUAL`, `Esc`, `:wq`, `Enter` | `MANUAL`, `Enter`, `Ctrl+X` (exit; not htui's abort while focused), `y`, `Enter` at the file-name prompt |
 | Exit and read-back | `Edited`: the Templates draft opened with `MANUAL` as line 1, notice `edited in $EDITOR — Ctrl+S saves`; temp file removed | same |
 | Small pane (terminal 42x12, tab body 42x9: 8x42 grid) | the file message wrapped to two rows, so vim opened on `Press ENTER or type command to continue` (its hit-enter prompt; `Enter` continues) | usable: title, 3 text rows, status, both help rows (labels truncated) |
+| Smallest pane (2026-10-08, terminal 40x11, tab body 40x8: 7x40 grid, the grid of a 40x8 claim, the least `MIN_PANE` admits) | spawned at 7x40; the hit-enter prompt again, then 6 text rows and the command line; `gg`, `O`, `MANUAL`, `Esc`, `:wq`, `Enter` read back as `Edited` | spawned at 7x40; title bar, 3 text rows (no soft wrap: line 1 ends in `>`), the message row and both help rows; the save prompt and the file-name prompt each fit; `MANUAL` read back as `Edited` |
 | Abort (`Ctrl+4`, `Ctrl+x`) | notice `the editor was aborted; nothing was changed`; **left `/tmp/.htui-verdict-*.md.swp`** (vim's swap, preserved on SIGHUP) | same notice; **left `/tmp/htui-verdict-*.md.save`** (blueprint H-4) |
 
 Both recovery files are documented in `docs/htui-editor.md` (Limits) and were removed by hand. No
 editor process outlived its pane (`ps` after the runs). Neither editor stalled at start: each drew
 its first screen while the harness was still pumping its first events.
 
-**`MIN_PANE` verdict (PRD Q3).** Keep 40x8. At 8 rows nano is usable (3 text rows) and vim works
-after one hit-enter prompt when its open message is longer than the width (the temp path is long);
-smaller would not be worth drawing. Below it the pane takes the whole tab body, which is the right
+**`MIN_PANE` verdict (PRD Q3).** Keep 40x8. A 40x8 claim leaves a 7x40 grid (the title rule takes
+a row), and at 7x40 both editors still did a full edit: nano keeps 3 text rows, vim 6 after one
+hit-enter prompt when its open message is longer than the width (the temp path is long). Smaller
+would not be worth drawing. Below it the pane takes the whole tab body, which is the right
 fallback. The nvim run in the Notes compose box (the PRD's case for this verdict) is still owed.
 
 **Owed by the maintainer, on the host (the sandbox has no nvim, blueprint H-18).** With
