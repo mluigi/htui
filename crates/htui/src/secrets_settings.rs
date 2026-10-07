@@ -224,7 +224,7 @@ pub async fn snapshot(backend: &Backend) -> Result<SecretsSnapshot> {
         let _io = crate::secrets::keyring_io();
         SecretsSnapshot {
             url: url_state(secret::get_infisical_url()),
-            identity: identity_state(secret::get_machine_identity()),
+            identity: identity_state(secret::read_machine_identity()),
         }
     })
     .await
@@ -247,13 +247,14 @@ fn url_state(read: Result<Option<String>>) -> UrlState {
     }
 }
 
-/// The identity row from what the keyring answered. The identity itself is dropped here.
-fn identity_state(read: Result<Option<MachineIdentity>>) -> IdentityState {
+/// The identity row from what the keyring answered. The identity itself is dropped here. A half
+/// identity is told from the typed read, never from an error's wording (CLEAN-8 #7).
+fn identity_state(read: Result<secret::IdentityRead>) -> IdentityState {
     match read {
-        Ok(Some(_)) => IdentityState::Stored,
-        Ok(None) => IdentityState::NotStored,
-        Err(StoreError::Backend(message)) if message.starts_with(secret::HALF_STORED_IDENTITY) => {
-            IdentityState::HalfStored(message)
+        Ok(secret::IdentityRead::Stored(_)) => IdentityState::Stored,
+        Ok(secret::IdentityRead::NotStored) => IdentityState::NotStored,
+        Ok(secret::IdentityRead::HalfStored { missing }) => {
+            IdentityState::HalfStored(secret::half_identity_sentence(missing))
         }
         Err(err) => IdentityState::Unreadable(seam_sentence(&err)),
     }
@@ -399,6 +400,29 @@ mod tests {
         let identity = entry.to_identity();
         assert_eq!(identity.client_id(), CLIENT_ID);
         assert_eq!(identity.client_secret(), SECRET);
+    }
+
+    /// CLEAN-8 #7: the half-stored row comes from the typed read, never from an error's wording.
+    #[test]
+    fn an_error_worded_like_a_half_identity_is_still_unreadable() {
+        let message = format!(
+            "{}: htui/infisical-client-id is missing",
+            secret::HALF_STORED_IDENTITY
+        );
+        assert_eq!(
+            identity_state(Err(StoreError::Backend(message.clone()))),
+            IdentityState::Unreadable(message)
+        );
+        assert_eq!(
+            identity_state(Ok(secret::IdentityRead::HalfStored {
+                missing: secret::INFISICAL_CLIENT_ID_USER,
+            })),
+            IdentityState::HalfStored(
+                "the Infisical machine identity is half stored: htui/infisical-client-id is \
+                 missing; enter the identity again"
+                    .to_owned()
+            )
+        );
     }
 
     #[test]

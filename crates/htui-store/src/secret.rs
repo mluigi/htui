@@ -497,11 +497,57 @@ pub fn set_infisical_write_mark(mark: &str) -> Result<()> {
 /// [`StoreError::Backend`]; only the message differs. No value is in either message.
 pub const HALF_STORED_IDENTITY: &str = "the Infisical machine identity is half stored";
 
+/// What the keyring holds of the machine identity (CLEAN-8 #7).
+#[derive(Debug)]
+pub enum IdentityRead {
+    /// Both halves.
+    Stored(MachineIdentity),
+    /// Neither half.
+    NotStored,
+    /// One half; `missing` is the absent half's user ([`INFISICAL_CLIENT_ID_USER`] or
+    /// [`INFISICAL_CLIENT_SECRET_USER`]).
+    HalfStored {
+        /// The absent half's keyring user name.
+        missing: &'static str,
+    },
+}
+
+/// The half-identity sentence, byte for byte what [`get_machine_identity`]'s error carries
+/// (CLEAN-8 #7: built here only). Names the missing slot, never a value.
+#[must_use]
+pub fn half_identity_sentence(missing: &str) -> String {
+    format!("{HALF_STORED_IDENTITY}: {SERVICE}/{missing} is missing; enter the identity again")
+}
+
 /// The error for an identity with one half stored and the other, `missing`, absent.
 fn half_identity(missing: &str) -> StoreError {
-    StoreError::Backend(format!(
-        "{HALF_STORED_IDENTITY}: {SERVICE}/{missing} is missing; enter the identity again"
-    ))
+    StoreError::Backend(half_identity_sentence(missing))
+}
+
+/// The stored machine identity, typed (D7, CLEAN-8 #7): both halves, neither, or which half is
+/// missing.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] for a keyring failure only. The message never carries a value.
+pub fn read_machine_identity() -> Result<IdentityRead> {
+    let id = read_slot(INFISICAL_CLIENT_ID_USER)?;
+    let secret = read_slot(INFISICAL_CLIENT_SECRET_USER)?.map(Zeroizing::new);
+    match (id, secret) {
+        // `take` moves the allocation into the identity: no copy, and the emptied wrapper drops
+        // harmlessly.
+        (Some(id), Some(mut secret)) => Ok(IdentityRead::Stored(MachineIdentity::new(
+            id,
+            std::mem::take(&mut *secret),
+        ))),
+        (None, None) => Ok(IdentityRead::NotStored),
+        (Some(_), None) => Ok(IdentityRead::HalfStored {
+            missing: INFISICAL_CLIENT_SECRET_USER,
+        }),
+        (None, Some(_)) => Ok(IdentityRead::HalfStored {
+            missing: INFISICAL_CLIENT_ID_USER,
+        }),
+    }
 }
 
 /// The stored machine identity (D7): both halves → `Some`, neither → `None`.
@@ -509,19 +555,13 @@ fn half_identity(missing: &str) -> StoreError {
 /// # Errors
 ///
 /// [`StoreError::Backend`] for a keyring failure, **and** for a half-stored identity, naming the
-/// missing half. A half identity is not "no identity". The message never carries a value.
+/// missing half ([`half_identity_sentence`]). A half identity is not "no identity". The message
+/// never carries a value.
 pub fn get_machine_identity() -> Result<Option<MachineIdentity>> {
-    let id = read_slot(INFISICAL_CLIENT_ID_USER)?;
-    let secret = read_slot(INFISICAL_CLIENT_SECRET_USER)?.map(Zeroizing::new);
-    match (id, secret) {
-        // `take` moves the allocation into the identity: no copy, and the emptied wrapper drops
-        // harmlessly.
-        (Some(id), Some(mut secret)) => {
-            Ok(Some(MachineIdentity::new(id, std::mem::take(&mut *secret))))
-        }
-        (None, None) => Ok(None),
-        (Some(_), None) => Err(half_identity(INFISICAL_CLIENT_SECRET_USER)),
-        (None, Some(_)) => Err(half_identity(INFISICAL_CLIENT_ID_USER)),
+    match read_machine_identity()? {
+        IdentityRead::Stored(identity) => Ok(Some(identity)),
+        IdentityRead::NotStored => Ok(None),
+        IdentityRead::HalfStored { missing } => Err(half_identity(missing)),
     }
 }
 
@@ -899,13 +939,15 @@ mod headless_dsn_tests {
 mod machine_identity_tests {
     use super::{
         INFISICAL_CLIENT_ID_USER, INFISICAL_CLIENT_SECRET_USER, INFISICAL_URL_USER,
-        INFISICAL_WRITE_MARK_USER, SERVICE, clear_infisical_url, clear_machine_identity,
-        get_infisical_url, get_machine_identity, set_infisical_url, set_machine_identity,
+        INFISICAL_WRITE_MARK_USER, IdentityRead, SERVICE, clear_infisical_url,
+        clear_machine_identity, get_infisical_url, get_machine_identity, read_machine_identity,
+        set_infisical_url, set_machine_identity,
     };
     use crate::testkit::{
         BROKEN_KEYRING, fake_machine_identity, mock_keyring, mock_keyring_broken, refuse_fake_store,
     };
     use htui_core::secret::MachineIdentity;
+    use htui_core::store::StoreError;
 
     /// What the fake holds for `(client_id, client_secret)`, owned, for comparing against
     /// [`fake_machine_identity`] without ever printing it.
@@ -1005,6 +1047,54 @@ mod machine_identity_tests {
             !text.contains("csecret-1"),
             "the error never carries the stored secret"
         );
+    }
+
+    /// CLEAN-8 #7: the typed read names the missing half; the wrapper's sentence is unchanged.
+    #[tokio::test]
+    async fn read_machine_identity_reports_the_missing_half_typed() {
+        let _guard = mock_keyring().await;
+        assert!(
+            matches!(read_machine_identity(), Ok(IdentityRead::NotStored)),
+            "an empty keyring holds no identity"
+        );
+
+        super::write_slot(INFISICAL_CLIENT_ID_USER, "cid-1").expect("the fake keyring stores");
+        assert!(
+            matches!(
+                read_machine_identity(),
+                Ok(IdentityRead::HalfStored {
+                    missing: INFISICAL_CLIENT_SECRET_USER
+                })
+            ),
+            "a lone client ID is missing its secret"
+        );
+        match get_machine_identity() {
+            Err(StoreError::Backend(message)) => assert_eq!(
+                message,
+                "the Infisical machine identity is half stored: htui/infisical-client-secret is \
+                 missing; enter the identity again"
+            ),
+            other => panic!("expected the half-identity error, got {:?}", other.is_ok()),
+        }
+
+        clear_machine_identity().expect("clear");
+        super::write_slot(INFISICAL_CLIENT_SECRET_USER, "csecret-1")
+            .expect("the fake keyring stores");
+        assert!(
+            matches!(
+                read_machine_identity(),
+                Ok(IdentityRead::HalfStored {
+                    missing: INFISICAL_CLIENT_ID_USER
+                })
+            ),
+            "a lone client secret is missing its client ID"
+        );
+
+        super::write_slot(INFISICAL_CLIENT_ID_USER, "cid-1").expect("the fake keyring stores");
+        match read_machine_identity() {
+            Ok(IdentityRead::Stored(identity)) => assert_eq!(identity.client_id(), "cid-1"),
+            other => panic!("expected both halves, got {:?}", other.is_ok()),
+        }
     }
 
     #[tokio::test]
