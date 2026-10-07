@@ -42,6 +42,9 @@ serde_json         = { workspace = true }
 # MOD-66 review N5: `AgentLaunch::deserialize(&launch)` reads a stored launch without cloning the
 # document. Already in htui's graph through every workspace crate, so nothing new is compiled.
 serde              = { workspace = true }
+# MOD-67 M2 D1: keys.toml is parsed with spans (`toml::de::DeTable`). 1.1.5 is already in the
+# lock through htui-store, so nothing new is compiled.
+toml               = { workspace = true }
 htui-store         = { workspace = true, features = ["demo", "local-embed"] }
 anyhow             = { workspace = true }
 clap               = { workspace = true }

@@ -2,7 +2,8 @@
 //!
 //! `KeyChord` moved here from `keymap.rs` (MOD-67 M1, plan D2); `crate::keymap::KeyChord`
 //! re-exports it until M6. `parse` is the harness's lenient reader and is unchanged.
-//! `parse_strict` is the key file's reader (ANA-26 §7.1).
+//! `parse_strict` is the key file's reader (ANA-26 §7.1); on Unix it also refuses the chords a
+//! terminal in the legacy encoding never delivers as themselves (MOD-67 M2 D6).
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -130,8 +131,9 @@ impl KeyChord {
     /// character is refused outright, `ctrl-` with a capital (or with `shift-` and a letter) is
     /// refused with the lower case, and a ctrl chord the terminal delivers as another key
     /// (`ctrl-i` is `Tab`) with what arrives; that last refusal also covers `ctrl-I`,
-    /// `ctrl-shift-i` and their `m` twins, ahead of the capital one. `ctrl-c` is not refused
-    /// here: that is the loader's rule.
+    /// `ctrl-shift-i` and their `m` twins, ahead of the capital one. Last, on Unix only, a chord
+    /// the terminal never delivers as itself is refused (MOD-67 M2 D6; see `unix_drops`).
+    /// `ctrl-c` is not refused here: that is the loader's rule.
     ///
     /// # Errors
     ///
@@ -168,7 +170,14 @@ impl KeyChord {
         if let KeyCode::Char(c) = code {
             refuse_char(written, c, mods)?;
         }
-        Ok(Self::new(code, mods))
+        let chord = Self::new(code, mods);
+        // `cfg!`, not `#[cfg]`: `unix_drops` stays used (and tested) on every target.
+        if cfg!(unix) && unix_drops(chord) {
+            return Err(ChordError::NotDelivered {
+                written: written.to_owned(),
+            });
+        }
+        Ok(chord)
     }
 
     /// The canonical spelling `parse_strict` reads back: modifiers in the order `ctrl-`, `alt-`,
@@ -284,8 +293,10 @@ fn refuse_char(written: &str, c: char, mods: KeyModifiers) -> Result<(), ChordEr
 /// What a ctrl chord of `c` arrives as when its legacy encoding is another key's byte, or `None`
 /// when it arrives as itself. `mods` holds CONTROL and no SHIFT.
 ///
-/// crossterm 0.29 `event/sys/unix/parse.rs:92-116`. `ctrl-h` and `ctrl-j` arrive as themselves
-/// in raw mode (D11).
+/// crossterm 0.29 `event/sys/unix/parse.rs:92-118`: `0x00` is ctrl-space (so `ctrl-2` and
+/// `ctrl-@`), `0x1B` is Esc (`ctrl-3`, `ctrl-[`), `0x1C..=0x1F` are ctrl-4..7 (`ctrl-\`,
+/// `ctrl-]`, `ctrl-^`, `ctrl-_`, `ctrl-/`) and `0x7F` is Backspace (`ctrl-8`, `ctrl-?`).
+/// `ctrl-h` and `ctrl-j` arrive as themselves in raw mode (D11).
 fn legacy_arrival(c: char, mods: KeyModifiers) -> Option<KeyChord> {
     let without_ctrl = mods.difference(KeyModifiers::CONTROL);
     Some(match c {
@@ -296,12 +307,36 @@ fn legacy_arrival(c: char, mods: KeyModifiers) -> Option<KeyChord> {
         ']' => KeyChord::new(KeyCode::Char('5'), mods),
         '^' => KeyChord::new(KeyCode::Char('6'), mods),
         '_' => KeyChord::new(KeyCode::Char('7'), mods),
+        '2' | '@' => KeyChord::new(KeyCode::Char(' '), mods),
+        '3' => KeyChord::new(KeyCode::Esc, without_ctrl),
+        '8' | '?' => KeyChord::new(KeyCode::Backspace, without_ctrl),
+        '/' => KeyChord::new(KeyCode::Char('7'), mods),
         _ => return None,
     })
 }
 
-/// Why a spec is not a chord a terminal can deliver (ANA-26 §7.1, §7.5). Every message is the
-/// tail of a `keys.toml:LINE: [context] name = "spec": …` line.
+/// Whether a Unix terminal in the legacy encoding never delivers `chord` as itself (MOD-67 M2
+/// D6): ctrl with a character other than `a`-`z`, space and `4`-`7` arrives as another key or
+/// not at all, and ctrl/shift on `Enter`, `Tab`, `Backspace` or `Esc` arrive without that
+/// modifier (`shift-tab` is `BackTab` and stays deliverable; ctrl-backtab is not). htui never
+/// pushes keyboard-enhancement flags, so nothing restores them. Windows delivers all of these.
+fn unix_drops(chord: KeyChord) -> bool {
+    let ctrl = chord.mods.contains(KeyModifiers::CONTROL);
+    match chord.code {
+        KeyCode::Char(c) => {
+            ctrl && !(c.is_ascii_lowercase() || c == ' ' || ('4'..='7').contains(&c))
+        }
+        KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Esc => chord
+            .mods
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+        KeyCode::BackTab => ctrl,
+        _ => false,
+    }
+}
+
+/// Why a spec is not a chord a terminal can deliver (ANA-26 §7.1, §7.5; `NotDelivered`, MOD-67
+/// M2 D6, only on Unix). Every message is the tail of a `keys.toml:LINE: [context] name =
+/// "spec": …` line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChordError {
     /// Nothing but whitespace.
@@ -336,6 +371,13 @@ pub enum ChordError {
         written: String,
         /// What actually arrives.
         arrives_as: KeyChord,
+    },
+    /// A chord a Unix terminal in the legacy encoding never delivers as itself (MOD-67 M2 D6):
+    /// ctrl with a character other than `a`-`z`, space and `4`-`7`, or ctrl/shift on `Enter`,
+    /// `Tab`, `Backspace` or `Esc`. Produced only on Unix; Windows delivers these chords.
+    NotDelivered {
+        /// The spec as written (trimmed).
+        written: String,
     },
 }
 
@@ -372,6 +414,10 @@ impl std::fmt::Display for ChordError {
                     r#""{written}" arrives as {label}: a terminal cannot tell the two apart"#
                 )
             }
+            Self::NotDelivered { written } => write!(
+                f,
+                r#""{written}" never reaches htui: a Unix terminal sends it as another key or not at all"#
+            ),
         }
     }
 }
@@ -517,18 +563,26 @@ mod tests {
         }
     }
 
+    /// The grammar reads `ctrl--`, `ctrl++` and `ctrl-+`: the key is split off at the last
+    /// separator that is not the final character. A Unix terminal never sends ctrl with `-` or
+    /// `+` (MOD-67 M2 D6), so there they reach `NotDelivered`, which proves the parse got past
+    /// the grammar; elsewhere they are the ctrl chords.
     #[test]
     fn ctrl_minus_and_ctrl_plus_are_writable() {
-        assert_eq!(
-            strict("ctrl--"),
-            Ok(KeyChord::new(KeyCode::Char('-'), KeyModifiers::CONTROL))
-        );
-        for spec in ["ctrl++", "ctrl-+"] {
-            assert_eq!(
-                strict(spec),
-                Ok(KeyChord::new(KeyCode::Char('+'), KeyModifiers::CONTROL)),
-                "{spec}"
-            );
+        for (spec, written, c) in [
+            ("ctrl--", "ctrl--", '-'),
+            ("ctrl++", "ctrl++", '+'),
+            ("ctrl-+", "ctrl-+", '+'),
+            (" ctrl-+ ", "ctrl-+", '+'),
+        ] {
+            let expected = if cfg!(unix) {
+                Err(ChordError::NotDelivered {
+                    written: written.to_owned(),
+                })
+            } else {
+                Ok(KeyChord::new(KeyCode::Char(c), KeyModifiers::CONTROL))
+            };
+            assert_eq!(strict(spec), expected, "{spec:?}");
         }
         assert_eq!(
             strict("-"),
@@ -600,6 +654,166 @@ mod tests {
             strict("ctrl-i").expect_err("ctrl-i is refused").to_string(),
             r#""ctrl-i" arrives as Tab: a terminal cannot tell the two apart"#
         );
+    }
+
+    #[test]
+    fn digits_and_symbols_with_a_legacy_byte_are_refused_by_what_arrives() {
+        let table = [
+            ("ctrl-2", "Ctrl+Space"),
+            ("ctrl-@", "Ctrl+Space"),
+            ("ctrl-3", "Esc"),
+            ("ctrl-8", "Backspace"),
+            ("ctrl-?", "Backspace"),
+            ("ctrl-/", "Ctrl+7"),
+        ];
+        for (spec, label) in table {
+            match strict(spec) {
+                Err(ChordError::Indistinguishable {
+                    written,
+                    arrives_as,
+                }) => {
+                    assert_eq!(written, spec);
+                    assert_eq!(arrives_as.label(), label, "{spec}");
+                }
+                other => panic!("{spec}: expected Indistinguishable, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            strict("ctrl-2").expect_err("ctrl-2 is refused").to_string(),
+            r#""ctrl-2" arrives as Ctrl+Space: a terminal cannot tell the two apart"#
+        );
+    }
+
+    #[test]
+    fn unix_drops_ctrl_characters_outside_letters_space_and_4_to_7() {
+        let ctrl = KeyModifiers::CONTROL;
+        let ctrl_alt = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        let dropped = ['1', '0', '9', '.', ',', ';', '\'', '=', '-', '+', '\u{e9}']
+            .map(|c| (c, ctrl))
+            .into_iter()
+            .chain([('1', ctrl_alt)]);
+        for (c, mods) in dropped {
+            let chord = KeyChord::new(KeyCode::Char(c), mods);
+            assert!(unix_drops(chord), "{chord:?}");
+        }
+        let delivered = ['a', 'z', 'h', 'j', ' ', '4', '5', '6', '7']
+            .map(|c| (c, ctrl))
+            .into_iter()
+            .chain([
+                ('x', ctrl_alt),
+                ('1', KeyModifiers::ALT),
+                ('1', KeyModifiers::NONE),
+                ('q', KeyModifiers::NONE),
+            ]);
+        for (c, mods) in delivered {
+            let chord = KeyChord::new(KeyCode::Char(c), mods);
+            assert!(!unix_drops(chord), "{chord:?}");
+        }
+    }
+
+    #[test]
+    fn unix_drops_ctrl_and_shift_on_enter_tab_backspace_and_esc() {
+        let ctrl = KeyModifiers::CONTROL;
+        let shift = KeyModifiers::SHIFT;
+        let alt = KeyModifiers::ALT;
+        for (code, mods) in [
+            (KeyCode::Enter, ctrl),
+            (KeyCode::Enter, shift),
+            (KeyCode::Enter, alt | shift),
+            (KeyCode::Tab, ctrl),
+            // ctrl-backtab
+            (KeyCode::Tab, ctrl | shift),
+            (KeyCode::Backspace, ctrl),
+            (KeyCode::Backspace, shift),
+            (KeyCode::Esc, ctrl),
+            (KeyCode::Esc, shift),
+        ] {
+            let chord = KeyChord::new(code, mods);
+            assert!(unix_drops(chord), "{chord:?}");
+        }
+        for (code, mods) in [
+            (KeyCode::Enter, KeyModifiers::NONE),
+            (KeyCode::Tab, KeyModifiers::NONE),
+            (KeyCode::Backspace, KeyModifiers::NONE),
+            (KeyCode::Esc, KeyModifiers::NONE),
+            // backtab
+            (KeyCode::Tab, shift),
+            (KeyCode::Enter, alt),
+            (KeyCode::Backspace, alt),
+            (KeyCode::Up, shift),
+            (KeyCode::Up, ctrl),
+            (KeyCode::F(5), shift),
+            (KeyCode::Delete, ctrl),
+        ] {
+            let chord = KeyChord::new(code, mods);
+            assert!(!unix_drops(chord), "{chord:?}");
+        }
+    }
+
+    /// The specs a Unix terminal never sends as themselves, with the trimmed spec each reports.
+    const NOT_DELIVERED: [(&str, &str); 7] = [
+        ("ctrl-1", "ctrl-1"),
+        ("shift-enter", "shift-enter"),
+        ("ctrl-tab", "ctrl-tab"),
+        ("ctrl-shift-tab", "ctrl-shift-tab"),
+        ("ctrl-backspace", "ctrl-backspace"),
+        ("shift-esc", "shift-esc"),
+        (" ctrl - . ", "ctrl - ."),
+    ];
+
+    #[cfg(unix)]
+    #[test]
+    fn a_chord_a_unix_terminal_never_sends_is_refused_there() {
+        for (spec, written) in NOT_DELIVERED {
+            assert_eq!(
+                strict(spec),
+                Err(ChordError::NotDelivered {
+                    written: written.to_owned()
+                }),
+                "{spec:?}"
+            );
+        }
+        assert_eq!(
+            strict("ctrl-1").expect_err("ctrl-1 is refused").to_string(),
+            r#""ctrl-1" never reaches htui: a Unix terminal sends it as another key or not at all"#
+        );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_chord_a_unix_terminal_never_sends_parses_elsewhere() {
+        for (spec, _) in NOT_DELIVERED {
+            assert!(strict(spec).is_ok(), "{spec:?}");
+        }
+        assert_eq!(
+            strict("shift-enter"),
+            Ok(KeyChord::new(KeyCode::Enter, KeyModifiers::SHIFT))
+        );
+    }
+
+    #[test]
+    fn the_older_refusals_still_win_over_the_unix_rule() {
+        assert_eq!(
+            strict("ctrl-A"),
+            Err(ChordError::CtrlCapital {
+                suggestion: "ctrl-a".to_owned()
+            })
+        );
+        for spec in ["shift-1", "ctrl-shift-1"] {
+            assert_eq!(
+                strict(spec),
+                Err(ChordError::ShiftedCharacter {
+                    written: spec.to_owned()
+                }),
+                "{spec}"
+            );
+        }
+        match strict("ctrl-i") {
+            Err(ChordError::Indistinguishable { arrives_as, .. }) => {
+                assert_eq!(arrives_as.label(), "Tab");
+            }
+            other => panic!("ctrl-i: expected Indistinguishable, got {other:?}"),
+        }
     }
 
     #[test]

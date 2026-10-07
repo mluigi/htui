@@ -38,7 +38,24 @@ struct BoxToml {
     hostname: String,
 }
 
-/// `<dirs::config_dir()>/htui`, created if missing.
+/// `<dirs::config_dir()>/htui`, **without** creating it (MOD-67 M2 D3): `htui` looks for
+/// `keys.toml` here before anything is allowed to write. [`config_root`] is this plus
+/// `create_dir_all`.
+///
+/// `%APPDATA%\htui` on Windows, `~/.config/htui` on Linux, `~/Library/Application Support/htui` on
+/// macOS.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] (`this platform has no config directory`) when `dirs` has none.
+pub fn config_root_path() -> Result<PathBuf> {
+    let base = dirs::config_dir()
+        .ok_or_else(|| StoreError::Backend("this platform has no config directory".to_owned()))?;
+    Ok(base.join("htui"))
+}
+
+/// `<dirs::config_dir()>/htui`, created if missing; [`config_root_path`] is the same path without
+/// the create.
 ///
 /// `%APPDATA%\htui` on Windows, `~/.config/htui` on Linux, `~/Library/Application Support/htui` on
 /// macOS.
@@ -48,9 +65,7 @@ struct BoxToml {
 /// [`StoreError::Backend`] when the platform has no config directory or the directory cannot be
 /// created.
 pub fn config_root() -> Result<PathBuf> {
-    let base = dirs::config_dir()
-        .ok_or_else(|| StoreError::Backend("this platform has no config directory".to_owned()))?;
-    let root = base.join("htui");
+    let root = config_root_path()?;
     std::fs::create_dir_all(&root)
         .map_err(|e| StoreError::Backend(format!("cannot create {}: {e}", root.display())))?;
     Ok(root)
@@ -360,8 +375,8 @@ fn hostname() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        BOX_FILE, Fingerprint, Identity, db_fingerprint, ioreg_platform_uuid, load_or_mint,
-        machine_id_under, parse_box_toml, store,
+        BOX_FILE, Fingerprint, Identity, config_root_path, db_fingerprint, ioreg_platform_uuid,
+        load_or_mint, machine_id_under, parse_box_toml, store,
     };
     use htui_core::model::BoxId;
 
@@ -372,6 +387,17 @@ mod tests {
     /// this crate (Python's `hmac`), so the test pins the construction and not just itself.
     const SYNTHETIC_FINGERPRINT: &str =
         "a2e8a0ed177cf8b655e4a8c2d16f745209325966a8339fd26e7c6437dae364df";
+
+    /// `config_root_path` is the config directory joined with `htui`, computed without creating
+    /// it. `config_root` is deliberately not called here: it would create the developer's real
+    /// `~/.config/htui`.
+    #[test]
+    fn config_root_path_is_the_config_dir_joined_with_htui() {
+        assert_eq!(
+            config_root_path().ok(),
+            dirs::config_dir().map(|dir| dir.join("htui")),
+        );
+    }
 
     #[test]
     fn the_fingerprint_is_hmac_sha256_known_answer() {

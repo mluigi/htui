@@ -1,0 +1,4 @@
+# MOD-67 M2 fixture: a TOML syntax error stops every other check.
+[global]
+quit = "x"
+quit = ["shift-a"]

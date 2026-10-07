@@ -1,6 +1,7 @@
 //! Named key actions (MOD-67, `docs/ANA-26.md` §7): the compiled-in catalogue, the strict chord
 //! parser, context stacks and the resolver that turns a chord into ordered candidate actions, and
-//! the hints and help generated from them.
+//! the hints and help generated from them. M2 adds the key file: [`load`] reads `keys.toml` over
+//! the catalogue.
 //!
 //! D6's dispatch order lives in `App::on_key`. This module only answers "which actions does this
 //! chord name in this stack" and "how is this action labelled".
@@ -8,15 +9,22 @@
 pub mod catalogue;
 pub mod chord;
 pub mod hint;
+pub mod load;
+pub mod print;
 pub mod stack;
+pub mod validate;
 
 pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, STATE_GUARDED};
 pub use chord::{CTRL_C, ChordError, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
-pub use stack::{Layer, Stack};
+pub use load::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
+pub use print::print;
+pub use stack::{DECLARED, Layer, Stack};
+pub use validate::validate;
 
 /// The keys in force: every catalogue action's chords per context (MOD-67 D9, D10). Built once
-/// from the compiled defaults ([`Keys::compiled`]); M2 builds one from `keys.toml` instead.
+/// from the compiled defaults ([`Keys::compiled`]); M2 builds one from `keys.toml` instead
+/// ([`load_str`]). Equality compares bindings only, not the file lines that set them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Keys {
     /// One row per `(context, act)`, in catalogue order. A row with no chords is an unbound
@@ -24,14 +32,30 @@ pub struct Keys {
     rows: Vec<Row>,
 }
 
-/// One binding row (private: no `pub` doc may link it).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// One binding row (private: no `pub` doc may link it). Equality ignores `line` (MOD-67 M2
+/// PA-3): two tables with the same bindings are equal whatever file set them, so a provenance
+/// check goes through [`Keys::line`] or `--print-keys`.
+#[derive(Debug, Clone)]
 struct Row {
     context: Context,
     act: Act,
     help: &'static str,
     chords: Vec<KeyChord>,
+    /// The `keys.toml` line of the entry that set `chords`, or `None` while they equal the
+    /// catalogue default (PA-3). Validation reports on it; `--print-keys` marks it `(changed)`.
+    line: Option<usize>,
 }
+
+impl PartialEq for Row {
+    fn eq(&self, other: &Self) -> bool {
+        self.context == other.context
+            && self.act == other.act
+            && self.help == other.help
+            && self.chords == other.chords
+    }
+}
+
+impl Eq for Row {}
 
 static COMPILED: std::sync::LazyLock<Keys> = std::sync::LazyLock::new(Keys::defaults);
 
@@ -68,6 +92,7 @@ impl Keys {
                         })
                     })
                     .collect(),
+                line: None,
             })
             .collect();
         Self { rows }
@@ -98,9 +123,32 @@ impl Keys {
                 act,
                 help: act.spec().map_or("", |spec| spec.help),
                 chords,
+                line: None,
             }),
         }
         self
+    }
+
+    /// The `keys.toml` line that set `act`'s chords in exactly `context`, or `None` while they
+    /// are the catalogue default (MOD-67 M2 D7). `--print-keys` marks such a row `(changed)`.
+    #[must_use]
+    pub fn line(&self, context: Context, act: Act) -> Option<usize> {
+        self.row(context, act).and_then(|row| row.line)
+    }
+
+    /// The loader's merge (MOD-67 M2 D7): replaces the `(context, act)` row's chords and keeps
+    /// `line` only when they differ from [`Keys::compiled`]'s for that row (PA-3). A missing row
+    /// is a no-op: the loader resolves names through `CATALOGUE`, so it never happens.
+    fn set(&mut self, context: Context, act: Act, chords: Vec<KeyChord>, line: usize) {
+        let changed = chords != Self::compiled().chords(context, act);
+        if let Some(row) = self
+            .rows
+            .iter_mut()
+            .find(|row| row.context == context && row.act == act)
+        {
+            row.chords = chords;
+            row.line = changed.then_some(line);
+        }
     }
 
     /// The row of `act` in exactly `context`.
@@ -119,6 +167,34 @@ impl Keys {
             .filter(|layer| layer.admits(act))
             .find_map(|layer| self.row(layer.context(), act))
     }
+}
+
+/// Every context in catalogue order, once each: the key file's tables (MOD-67 M2).
+fn contexts() -> Vec<Context> {
+    let mut out: Vec<Context> = Vec::new();
+    for spec in CATALOGUE {
+        if !out.contains(&spec.context) {
+            out.push(spec.context);
+        }
+    }
+    out
+}
+
+/// `text` as a TOML basic string: wrapped in `"`, with `\` and `"` escaped and every control
+/// character as `\uXXXX`. The error report and `--print-keys` both spell chords with it.
+fn quote(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 #[cfg(test)]

@@ -352,6 +352,14 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   every screen (fixes Connection/Qdrant browse), and `?`/`f1` open help over overlays. No snapshot
   changed. Deferred: the overlay-aware and capture-filtered status line to M3, and the Unix
   ctrl-collision rejects to M2 (`.claude/plans/mod-67-m1-catalogue-resolver.plan.md`, "Review gate").
+  **Phase M2 landed (`d4be4861`..`97cad2aa`, 2026-10-07):** `<config_root>/keys.toml` (or
+  `--keys PATH`) is loaded with line spans, checked per context and per declared stack, and either
+  installed or refused with every error as `keys.toml:LINE:`, exit status 2, outside Sentry;
+  `--default-keys`, `--print-keys` (round-trips). The Unix legacy ctrl rejects landed (some
+  `cfg(unix)` only). Global and overlay keys are configurable end to end; a key a view or overlay
+  still matches itself wins until M3-M5 (README "Changing keys"). The narrower-context override of a
+  shared verb and the shadowing allow-list kind land with M3's first view context
+  (`.claude/plans/mod-67-m2-keys-file.plan.md`, "Review gate").
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,

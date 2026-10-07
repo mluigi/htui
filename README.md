@@ -93,6 +93,9 @@ checkable is the one everybody actually builds with. Keep all three in step when
 | `--set-dsn` | Read a Postgres connection string from standard input, save it in the OS keyring and exit. |
 | `--clear-dsn` | Remove the saved connection string from the OS keyring and exit. |
 | `--dsn-stdin` | Read the connection string for this session from standard input; it is never stored. For a TUI over `ssh -t` on a machine with no keyring. |
+| `--keys <PATH>` | Read key bindings from this file instead of `keys.toml`. See [Changing keys](#changing-keys). |
+| `--default-keys` | Ignore `keys.toml` for this run and use the default keys. |
+| `--print-keys` | Print every key binding in force as a commented `keys.toml` and exit. With an invalid file, print its errors and exit with status 2. |
 | `--index-items` | Update the search index from the database, then exit. See [Search](#search). |
 | `--search-items <QUERY>` | Search items, their documents and requirements, print the results and exit. |
 | `--project <SLUG>` | With `--index-items` or `--search-items`: only this project. |
@@ -195,6 +198,33 @@ yet, create one in **Settings › Hierarchy** with `N`.
 
 Most lists use `j` / `k` (or the arrow keys) to move, and `h` / `l` (or `[` / `]`) to switch
 between sub-tabs or sections.
+
+### Changing keys
+
+htui reads your key bindings from `keys.toml` in its configuration directory (see
+[Where htui keeps its files](#where-htui-keeps-its-files)); `--keys <PATH>` reads another file
+instead. The file is optional. List only what you change: a list replaces that action's keys, and
+`[]` unbinds it. `htui --print-keys` prints every action with its keys as a commented `keys.toml`:
+start from it, and run it again to check your file.
+
+```toml
+version = 1
+
+[global]
+quit = ["ctrl-q"]
+
+[overlay]
+close = ["esc", "f2"]
+```
+
+htui refuses to start on an invalid file and names every bad line, as in
+`keys.toml:5: [global] quit = "ctrl-c": ctrl-c always quits and cannot be bound`;
+`htui --default-keys` starts with the default keys anyway. `ctrl-c` always quits and cannot be
+bound.
+
+Until every screen reads its keys from this file, a key a screen or pop-up handles itself wins
+there: with `[global] quit = ["e"]`, `e` still edits in Settings instead of quitting, and a pop-up
+that handles `Esc` itself still closes on it after `[overlay] close = ["f2"]`.
 
 ### Backlog
 
@@ -437,6 +467,7 @@ Everything local lives in your user configuration directory: `~/.config/htui` on
 | Path | What it is |
 |---|---|
 | `box.toml` | This machine's identity. It survives a hostname change. |
+| `keys.toml` | Your key bindings, if you change any. htui only reads it. See [Changing keys](#changing-keys). |
 | `cache/<id>/cache.sqlite` | The local copy of one database. Each server gets its own folder, and the name never contains your credentials. |
 
 Deleting `cache/` is safe: it is refilled from the server. You can also rebuild it from

@@ -8,9 +8,10 @@ use std::time::Duration;
 /// Parses the command line and runs the shell, or `htui worker`.
 ///
 /// Exit codes: 0 on success; 2 for `htui worker`'s startup refusals, `htui provision`'s
-/// refusals (MOD-45 D292), `htui mcp` without its environment and clap's usage errors; 3 for an
-/// `htui mcp` the host refused (MOD-11 D6); 1 for every other failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the terminal, so a failure is
-/// readable instead of being drawn over the last frame.
+/// refusals (MOD-45 D292), `htui mcp` without its environment, a key file htui refuses (MOD-67)
+/// and clap's usage errors; 3 for an `htui mcp` the host refused (MOD-11 D6); 1 for every other
+/// failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the
+/// terminal, so a failure is readable instead of being drawn over the last frame.
 ///
 /// MOD-41 review R-4: the runtime is built by hand, not by `#[tokio::main]`, so its teardown is
 /// bounded by [`htui::SHUTDOWN`], whether the body returns or panics: a blocking task that never
@@ -96,7 +97,8 @@ async fn body(args: htui::cli::Args) -> ExitCode {
 
 /// The exit code `error` ends `body` with: a [`WorkerExit`](htui::worker_cmd::WorkerExit)'s, a
 /// [`ProvisionExit`](htui::provision::ProvisionExit)'s or an [`McpExit`](htui::mcp_cmd::McpExit)'s
-/// own code (MOD-11 B-13: 2, 3 or 1), else 1.
+/// own code (MOD-11 B-13: 2, 3 or 1), a [`KeysError`](htui::keys::KeysError)'s (MOD-67 M2 D9:
+/// 2), else 1.
 fn exit_code(error: &anyhow::Error) -> u8 {
     error
         .downcast_ref::<htui::worker_cmd::WorkerExit>()
@@ -111,6 +113,11 @@ fn exit_code(error: &anyhow::Error) -> u8 {
                 .downcast_ref::<htui::mcp_cmd::McpExit>()
                 .map(htui::mcp_cmd::McpExit::code)
         })
+        .or_else(|| {
+            error
+                .downcast_ref::<htui::keys::KeysError>()
+                .map(htui::keys::KeysError::code)
+        })
         .unwrap_or(1)
 }
 
@@ -120,13 +127,15 @@ fn exit_code(error: &anyhow::Error) -> u8 {
 /// log, not a crash report. MOD-45 review finding 1: no `htui provision` end is either, whatever
 /// its code: its sentences carry `user@host`, remote paths and the host's journal and log lines,
 /// and each describes that host's state. MOD-11 B-13: no `htui mcp` end is either; an agent's
-/// relay ending is the session's state, not a crash.
+/// relay ending is the session's state, not a crash. MOD-67 M2 D9: no key-file refusal either,
+/// whatever its code: the report carries the user's home path.
 fn reports_to_sentry(error: &anyhow::Error, code: u8) -> bool {
     code != 2
         && error
             .downcast_ref::<htui::provision::ProvisionExit>()
             .is_none()
         && error.downcast_ref::<htui::mcp_cmd::McpExit>().is_none()
+        && error.downcast_ref::<htui::keys::KeysError>().is_none()
 }
 
 #[cfg(test)]
@@ -136,6 +145,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{reports_to_sentry, run_bounded, teardown_grace};
+    use htui::keys::{KeyFileError, KeysError};
     use htui::mcp_cmd::McpExit;
     use htui::provision::ProvisionExit;
     use htui::worker_cmd::WorkerExit;
@@ -170,6 +180,36 @@ mod tests {
         assert!(!reports_to_sentry(&refused, 3), "a refused relay");
         let failed = anyhow::Error::from(McpExit::Failed("cannot reach the host".into()));
         assert!(!reports_to_sentry(&failed, 1), "a failed relay");
+    }
+
+    /// MOD-67 M2 D9: a key file htui refuses exits 2 and never reaches Sentry, by its type and
+    /// not only by its code (the report carries the user's home path), wrapped or not.
+    #[test]
+    fn a_key_file_refusal_exits_2_and_never_reaches_sentry() {
+        let refusals = || {
+            [
+                KeysError::Invalid {
+                    path: "/home/u/.config/htui/keys.toml".into(),
+                    errors: vec![KeyFileError {
+                        line: 3,
+                        message: "[global] quit = \"ctrl-c\": ctrl-c always quits".to_owned(),
+                    }],
+                },
+                KeysError::Unreadable {
+                    path: "/home/u/k.toml".into(),
+                    source: std::io::ErrorKind::NotFound.into(),
+                },
+            ]
+        };
+        for refusal in refusals() {
+            let error = anyhow::Error::from(refusal);
+            assert_eq!(super::exit_code(&error), 2, "{error}");
+            assert!(!reports_to_sentry(&error, 2), "{error}");
+            assert!(!reports_to_sentry(&error, 1), "refused by type: {error}");
+            let wrapped = error.context("while starting");
+            assert_eq!(super::exit_code(&wrapped), 2, "{wrapped:#}");
+            assert!(!reports_to_sentry(&wrapped, 1), "{wrapped:#}");
+        }
     }
 
     /// MOD-11 D6, B-13: `htui mcp` exits 2 without its environment, 3 when the host refuses it, 1

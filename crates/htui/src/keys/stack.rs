@@ -4,6 +4,7 @@
 //! [`Stack::BASE`] (the global layer) and [`Stack::OVERLAY`] (the overlay layer, then only
 //! `global.help`). A row for an act in a narrower layer shadows that act in every wider layer,
 //! bound or not (blueprint B6): that is how M2's narrower overrides and `reject = []` work.
+//! [`DECLARED`] lists every stack the key file's validator walks (MOD-67 M2 D8 step 5).
 
 use super::{Act, Context, KeyChord, Keys};
 
@@ -78,6 +79,13 @@ impl Stack<'static> {
     ]);
 }
 
+/// Every stack the validator walks (ANA-26 §7.3, MOD-67 M2 D8 step 5), each with the phrase its
+/// collision errors end with. M3-M5 append each view mode's stack.
+pub static DECLARED: &[(&str, Stack<'static>)] = &[
+    ("on every screen", Stack::BASE),
+    ("over an overlay", Stack::OVERLAY),
+];
+
 impl Keys {
     /// The **ordered candidates** for `chord` in `stack` (ANA-26 §7.3): every action whose row in
     /// the first layer that has one binds `chord`, narrowest layer first, catalogue order within
@@ -112,7 +120,7 @@ impl Keys {
 
 #[cfg(test)]
 mod tests {
-    use super::{Layer, Stack};
+    use super::{DECLARED, Layer, Stack};
     use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys};
 
     fn chord(spec: &str) -> KeyChord {
@@ -141,6 +149,17 @@ mod tests {
         assert_eq!(base(keys, "ctrl-w"), [Act::Waiting]);
         assert_eq!(base(keys, "z"), []);
         assert_eq!(base(keys, "esc"), []);
+    }
+
+    #[test]
+    fn declared_walks_every_screen_then_over_an_overlay() {
+        assert_eq!(
+            DECLARED,
+            [
+                ("on every screen", Stack::BASE),
+                ("over an overlay", Stack::OVERLAY)
+            ]
+        );
     }
 
     #[test]
