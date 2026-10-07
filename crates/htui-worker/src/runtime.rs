@@ -1792,7 +1792,10 @@ fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
 /// landing between the loop's last look at `sweep_again` and the claim's release is not lost
 /// either (review L2, closing blueprint H-8's gap): the guard looks again after it releases the
 /// claim and asks for one more sweep here, whose own claim and close checks keep it to one sweep
-/// at a time and none after shutdown.
+/// at a time and none after shutdown. Nor is a wake whose claim fails just before that release
+/// but whose `sweep_again` lands after the guard's look (review G2): having published the flag,
+/// the loser tries the claim once more, so either the holder had not yet released it (and its
+/// guard's look, ordered after that try, sees the flag) or this call takes it and sweeps.
 fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
     shared: &Arc<Shared<P>>,
     host: &H,
@@ -1807,7 +1810,16 @@ fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
         .is_err()
     {
         shared.sweep_again.store(true, Ordering::SeqCst);
-        return;
+        // Review G2: a holder that released between the failed claim and the store above has
+        // already looked at `sweep_again`; this second try takes its claim, and the sweep it
+        // starts spends the flag on its loop's first look.
+        if shared
+            .sweeping
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
     }
     shared.publisher.wire(sink);
     let ctx = TaskCtx {
