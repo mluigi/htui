@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO follow_up_window (run_step_id, run_id, session, owner) VALUES ($1, $2, $3, $4) ON CONFLICT (run_step_id) DO UPDATE SET session = EXCLUDED.session, owner = EXCLUDED.owner, opened_at = clock_timestamp(), closed_at = NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3c4c200a70b4a2aa4a23553323d588dd5bd86abbd7ef67cd2046b05f77fbfb4d"
+}

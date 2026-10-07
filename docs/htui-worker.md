@@ -15,6 +15,7 @@ htui worker [--pool-size N] [--dsn-stdin] [--log PATH]
 - [Permission requests on worker steps](#permission-requests-on-worker-steps)
 - [htui's MCP tools on worker steps](#htuis-mcp-tools-on-worker-steps)
 - [Cancelling a run the worker walks](#cancelling-a-run-the-worker-walks)
+- [Follow-ups on worker steps](#follow-ups-on-worker-steps)
 - [Upgrading: migrate from a TUI first](#upgrading-migrate-from-a-tui-first)
 - [Where the DSN comes from](#where-the-dsn-comes-from)
 - [Pool size](#pool-size)
@@ -60,6 +61,8 @@ What it does:
   [Permission requests](#permission-requests-on-worker-steps)).
 - Applies a cancel requested from any TUI: it reads requests every second and stops the walk
   gracefully (see [Cancelling](#cancelling-a-run-the-worker-walks)).
+- Sends a step's agent a follow-up queued from any TUI, when its current turn ends (see
+  [Follow-ups](#follow-ups-on-worker-steps)).
 - Stops on SIGINT or SIGTERM (Ctrl-C, Ctrl-Break, closing the console or a system shutdown on
   Windows): it drops its walks at once, waits a short grace period for their tasks to end and
   gives their leases back, then exits 0. A step it interrupted is reset and retried by the next sweep on the box. This stop is a hard
@@ -128,6 +131,7 @@ finishes it exactly as it would finish a run whose process crashed at that point
 | `p` promote | Unchanged. A parked step promotes and its chat runs in the TUI. A step the worker is walking is refused: "the worker on this box is walking run …; a live step is promoted only by the process that walks it". A live session cannot move between processes. | Keeps walking. |
 | `c` cancel | A `queued` run, or one nobody holds, cancels at once as before. A run the worker is walking gets a **cancel request**: the status line says "cancel requested: the run's executor applies it", the Runs pane shows `cancel requested` under the run, and a second `c` says "a cancel is already requested". | Applies it within about a second, gracefully (see [Cancelling](#cancelling-a-run-the-worker-walks)). |
 | `1` … `9` | On a step whose session asks for a permission: answers it with that option (see [Permission requests](#permission-requests-on-worker-steps)). | Applies the answer within about a second and the step goes on. |
+| `i` follow-up | On a running step: asks for a follow-up for the step's agent, and `Enter` queues it. The Runs pane shows `queued — sent when the current turn ends` under the step. | Sends it to the agent when the current turn ends (see [Follow-ups](#follow-ups-on-worker-steps)). |
 | `C`, `T`, `o` | Unchanged. | — |
 
 **Cleanup is not serialised with the worker.** The TUI's cleanup (`c` on a run that has rested,
@@ -267,6 +271,84 @@ applies it:
 
 A `c` on a run the TUI itself walks takes the same graceful path, at once, in the TUI.
 
+## Follow-ups on worker steps
+
+While a step's agent works, you can add to what it was asked. Put the cursor on a `running` step
+in the **Runs** pane of any TUI connected to the same database, on this box or another, and press
+`i`. The footer asks "follow-up for the running step:"; type the text and press `Enter` (`Esc`
+drops it). The TUI writes the follow-up to Postgres for that step, and the pane shows
+`queued — sent when the current turn ends` under it. The process walking the step, the worker or
+a TUI, sends it to the agent in the same session, as its next turn, and the step goes on. Nothing
+is restarted, and the step stays `running`.
+
+- **It is sent when the current turn ends, never during one.** The walking process looks for a
+  follow-up only when the agent finishes a turn; nothing steers a turn already under way. A long
+  turn keeps the follow-up queued until it ends, and so does a turn parked on a
+  [permission request](#permission-requests-on-worker-steps): answer it, and the follow-up goes
+  when that turn ends. The pane reads the step again every 5 seconds while the item has a run
+  going, so the line changes to `follow-up sent` within about 5 seconds of the turn end.
+- **One at a time per step.** While one is queued, another is refused: "a follow-up is already
+  queued". Once it is sent, the next can be queued, and it goes when the turn the first one started
+  ends.
+- **The TUI checks first.** On a step that cannot take one, `i` says why on the status line and
+  sends nothing: "only a running step takes a follow-up; p promotes a parked or failed step to a
+  chat", "a judge session takes no follow-up" or "a chat takes follow-ups in its own view". An
+  empty text says "a follow-up needs text", and a text that looks like a secret says "not sent: the
+  text looks like it holds a credential (…)", naming the rule; both leave the line open, so you can
+  edit it.
+- **Postgres checks again**, and a refusal there writes nothing and is said on the status line:
+  "the run is being cancelled" (a cancel is pending), "a follow-up is already queued", "the
+  process walking the step no longer holds the run", "the step's session has not started yet" (the
+  step is still preparing its tree or its prompt) or "the step finished its session; promote it to
+  continue" (its last turn has ended, and the walk is still finishing the step: verifying it or
+  reaching its gate). Once the walk has moved the step on, it is no longer `running`, and the
+  refusal is "only a running step takes a follow-up; p promotes a parked or failed step to a
+  chat".
+- **The walking box scrubs it again before sending.** A text its own scrubber refuses is not sent:
+  the line becomes `follow-up refused`, with "the executing box's scrubber refused the text (…)"
+  under it.
+- **What the pane shows** is the step's latest follow-up:
+  `queued — sent when the current turn ends` while it waits, `follow-up sent` once the walking
+  process has taken it, or `follow-up refused` and the reason, on up to two more lines. **The text
+  is never shown back.** It leaves the database only for the process that sends it, and it is erased from its row as soon as that
+  process takes it or it is refused. What stays is the step's log: the follow-up is recorded
+  there, scrubbed like the rest, before it is sent, and the step's replay (`Enter`) shows it.
+  `follow-up sent` means the walking process took the follow-up, not that the agent received it:
+  the step's log, not the label, is the evidence of delivery, and a send that fails fails the step.
+- **It counts toward the step's limits.** A follow-up turn runs inside the step's deadline
+  (`step_deadline_seconds`, 7200 seconds unless the project or the app setting says otherwise) and
+  under the run's spending cap (`per_token_cap_run`), like any other turn. Once the deadline cuts
+  the session or the cap stops it, no follow-up is sent.
+- **When the session ends, a queued follow-up is refused, not kept.** A session that ended refuses
+  it with "the step finished its session; promote it to continue"; a session cancelled or cut by
+  its deadline, with "the step's session was cancelled before the follow-up was sent". Cancelling
+  the run (`c`) refuses it with "the run was cancelled".
+- **Stopping the worker refuses it.** SIGINT or SIGTERM drops every walk at once; each dropped
+  walk, while it still holds the run, refuses a follow-up it had not sent with "the step finished
+  its session; promote it to continue" before it gives the run back.
+- **A walk that died leaves its follow-up queued.** If the worker crashes or loses the run, or a
+  stop cannot finish (the database is unreachable, or a walk outlasts the stop's grace window), a
+  follow-up it had not sent stays `queued` in the pane, and no process will send it. It is refused,
+  "the step finished its session; promote it to continue", when a process on the run's box
+  recovers the run (the worker's next sweep, see [If the worker crashes](#if-the-worker-crashes)),
+  or "the run was cancelled" when you cancel it.
+  Meanwhile another follow-up for the step is refused as already queued; with nothing queued, one
+  typed after the dead process's lease has lapsed is refused: "the process walking the step no
+  longer holds the run".
+- **A database outage at the session's end can strand one.** The walking process tries for about
+  30 seconds to close the session's follow-ups; if the database stays unreachable that long, a
+  follow-up still queued stays pending, its text still stored. It is never sent. It is refused when
+  the run is cancelled ("the run was cancelled") or recovered after a crash, and when the walking
+  process gives the run back, having finished it (`done`, `failed` or `cancelled`) or parked it at
+  a gate: before it releases the run, it refuses what the run's steps still hold, "the step
+  finished its session; promote it to continue" ("the run was cancelled" for a cancel). Only if the
+  database is unreachable then too does the row stay pending with its text stored: on a parked run
+  until the run is next given back or cancelled, and on a finished run for good, since no process
+  takes a finished run again and `c` on a run that has rested is cleanup, not a cancel.
+- **Every box upgrades together.** Follow-ups need the migration `0017_follow_up.sql`: apply it
+  from a TUI first, and upgrade every TUI and worker on the database at the same time (see
+  [Upgrading](#upgrading-migrate-from-a-tui-first)).
+
 ## Upgrading: migrate from a TUI first
 
 The worker never changes the database schema (it has no one to ask). So when a new `htui` brings a
@@ -286,6 +368,14 @@ newer than this htui") with the same exit 2.
 For example, the permission and cancel relay above needs the migration
 `0011_permission_relay.sql`: a worker built with it waits, refusing, until a TUI of the same
 version has applied it.
+
+The [follow-ups](#follow-ups-on-worker-steps) need `0017_follow_up.sql`, and it asks for more:
+**upgrade every box together**. Once it is applied, a TUI or worker still running an older `htui`
+can no longer request a cancel, and its cancel poll fails while a follow-up is pending on a run it
+walks, or on any run of its box that has finished or whose lease has lapsed: a follow-up a dead
+walk left queued, or one a database outage stranded, breaks it too. Stop every TUI and worker that uses the database, on every box, upgrade them all, start one
+TUI to apply the migration, then start the workers. An older binary started after the migration
+refuses the database anyway ("schema is newer than this htui").
 
 ## Where the DSN comes from
 

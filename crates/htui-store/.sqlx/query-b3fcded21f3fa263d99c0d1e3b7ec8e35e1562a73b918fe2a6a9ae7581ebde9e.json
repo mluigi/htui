@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)\n               VALUES ($1, $2, 'cancel', $3, $4)\n               ON CONFLICT (run_id, kind) WHERE status = 'pending' DO NOTHING\n               RETURNING id AS \"id: RunCommandId\"",
+  "query": "INSERT INTO run_command (id, run_id, kind, issued_by, issued_box)\n               VALUES ($1, $2, 'cancel', $3, $4)\n               ON CONFLICT (run_id) WHERE status = 'pending' AND kind = 'cancel' DO NOTHING\n               RETURNING id AS \"id: RunCommandId\"",
   "describe": {
     "columns": [
       {
@@ -27,5 +27,5 @@
       false
     ]
   },
-  "hash": "2d96f4b7b71a2e668561b7e7f64e9e64855a6107b5d4bef7961a5c25d3621581"
+  "hash": "b3fcded21f3fa263d99c0d1e3b7ec8e35e1562a73b918fe2a6a9ae7581ebde9e"
 }

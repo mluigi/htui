@@ -22,10 +22,11 @@ use sqlx::Row as _;
 /// The `connect_timeout` every headless connect here passes.
 const HEADLESS_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// The 44 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
+/// The 45 tables, in creation order: blueprint B.1's 32, then the one `0003_orchestration.sql`
 /// adds (`run_step_tree`, ANA-2 §9), then the six of `0006_requirements.sql` (ANA-11 §5), then
 /// the two of `0011_permission_relay.sql` (MOD-42 plan D1), then the one of `0012_persona.sql`
-/// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2).
+/// (MOD-26 plan D1), then the two of `0016_auto_queue.sql` (MOD-12 plan D1, D2), then the one of
+/// `0017_follow_up.sql` (MOD-70 plan D1).
 const TABLES: &[&str] = &[
     "app_user",
     "capability_tag",
@@ -76,6 +77,8 @@ const TABLES: &[&str] = &[
     // 0016_auto_queue.sql (MOD-12)
     "queue_batch",
     "queue_entry",
+    // 0017_follow_up.sql (MOD-70)
+    "follow_up_window",
 ];
 
 #[tokio::test]
@@ -104,7 +107,7 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
-         MOD-11's 0015_command_queue.sql and MOD-12's 0016_auto_queue.sql, in ordinal order"
+         MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql and MOD-70's 0017_follow_up.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -122,20 +125,19 @@ async fn migrations_apply_on_a_clean_database() {
     }
     assert_eq!(
         TABLES.len(),
-        44,
+        45,
         "blueprint B.1 lists 32 tables (ANA-9 §3's prose count of 30 is wrong, H.1), \
          0003_orchestration.sql adds run_step_tree, 0006_requirements.sql adds ANA-11 §5's six, \
          MOD-42's 0011_permission_relay.sql adds step_permission and run_command, MOD-26's \
-         0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and \
-         queue_entry"
+         0012_persona.sql adds persona and MOD-12's 0016_auto_queue.sql adds queue_batch and queue_entry and MOD-70's 0017_follow_up.sql adds follow_up_window"
     );
     // `_sqlx_migrations` is the only extra table sqlx adds.
     assert_eq!(
         present.len(),
         TABLES.len() + 1,
-        "the migrations create the 44 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
-         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's \
-         0016_auto_queue.sql (which adds queue_batch and queue_entry) and nothing else, \
+        "the migrations create the 45 tables of B.1 as amended by ANA-2 §9, ANA-11 §5, \
+         MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql and MOD-12's 0016_auto_queue.sql (queue_batch, queue_entry) and MOD-70's \
+         0017_follow_up.sql and nothing else, \
          got {present:?}"
     );
 
@@ -634,6 +636,131 @@ async fn the_command_run_liveness_columns_exist() {
             "{table}.{column}'s comment is 0014's text byte for byte"
         );
     }
+
+    db.drop_db().await;
+}
+
+/// MOD-70 plan D1 (blueprint §2.6, §4.3): `0017_follow_up.sql` splits `run_command`'s pending
+/// index in two (one pending cancel per run, one pending follow-up per step), gives the table its
+/// `run_step_id` and `text` columns, and adds `follow_up_window`. Review M-1: an index stands
+/// behind each foreign key it adds (`run_command.run_step_id`, partial on `run_step_id IS NOT
+/// NULL`, which the cascade's strict `=` lookup implies; `follow_up_window.run_id`) and behind
+/// `run_command.run_id`, which `relay_view` reads per run. The step's status CHECK is untouched (PRD metric "No new step state"): its definition is the one
+/// `0015_command_queue.sql` left, byte for byte.
+#[tokio::test]
+async fn migration_0016_reshapes_run_command_and_adds_the_follow_up_window() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let indexes: BTreeSet<String> = sqlx::query_scalar(
+        "SELECT indexname::text FROM pg_indexes WHERE schemaname = 'public' \
+         AND tablename IN ('run_command', 'follow_up_window')",
+    )
+    .fetch_all(&db.pool)
+    .await
+    .expect("read pg_indexes")
+    .into_iter()
+    .collect();
+    for name in [
+        "uq_run_command_pending_cancel",
+        "uq_run_command_pending_follow_up",
+        "idx_run_command_step",
+        "idx_run_command_run",
+        "idx_follow_up_window_run",
+    ] {
+        assert!(
+            indexes.contains(name),
+            "0016 creates `{name}`, got {indexes:?}"
+        );
+    }
+    for gone in ["uq_run_command_pending", "idx_follow_up_window_open"] {
+        assert!(
+            !indexes.contains(gone),
+            "0016 leaves no `{gone}` (0011's pending index is dropped; the window's run index is \
+             plain), got {indexes:?}"
+        );
+    }
+    // MOD-70 review M-1: every foreign key 0016 adds has an index behind its cascade, and
+    // `relay_view`'s per-run read of follow-ups has one on `run_command.run_id`. The step's is
+    // partial (`run_step_id IS NOT NULL`): the cascade's `run_step_id = $1` implies it, so the
+    // planner can use it; the other two are plain.
+    for (name, definition) in [
+        (
+            "idx_run_command_step",
+            "CREATE INDEX idx_run_command_step ON public.run_command USING btree (run_step_id) \
+             WHERE (run_step_id IS NOT NULL)",
+        ),
+        (
+            "idx_run_command_run",
+            "CREATE INDEX idx_run_command_run ON public.run_command USING btree (run_id)",
+        ),
+        (
+            "idx_follow_up_window_run",
+            "CREATE INDEX idx_follow_up_window_run ON public.follow_up_window USING btree (run_id)",
+        ),
+    ] {
+        let actual: String = sqlx::query_scalar(
+            "SELECT indexdef FROM pg_indexes WHERE schemaname = 'public' AND indexname = $1",
+        )
+        .bind(name)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap_or_else(|err| panic!("read `{name}`'s definition: {err}"));
+        assert_eq!(actual, definition, "0016's `{name}`");
+    }
+
+    let columns = |table: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            sqlx::query_as::<_, (String, String, String)>(
+                "SELECT column_name::text, data_type::text, is_nullable::text \
+                 FROM information_schema.columns \
+                 WHERE table_schema = 'public' AND table_name = $1 ORDER BY ordinal_position",
+            )
+            .bind(table)
+            .fetch_all(&pool)
+            .await
+            .unwrap_or_else(|err| panic!("read {table}'s columns: {err}"))
+        }
+    };
+    let owned = |rows: &[(&str, &str, &str)]| -> Vec<(String, String, String)> {
+        rows.iter()
+            .map(|(a, b, c)| ((*a).to_owned(), (*b).to_owned(), (*c).to_owned()))
+            .collect()
+    };
+    let command = columns("run_command").await;
+    assert_eq!(
+        command[command.len() - 2..],
+        owned(&[("run_step_id", "uuid", "YES"), ("text", "text", "YES")])[..],
+        "0016 appends run_step_id UUID and text TEXT to run_command, both nullable"
+    );
+    assert_eq!(
+        columns("follow_up_window").await,
+        owned(&[
+            ("run_step_id", "uuid", "NO"),
+            ("run_id", "uuid", "NO"),
+            ("session", "uuid", "NO"),
+            ("owner", "uuid", "NO"),
+            ("opened_at", "timestamp with time zone", "NO"),
+            ("closed_at", "timestamp with time zone", "YES"),
+        ]),
+        "follow_up_window has its six columns (MOD-70 D1, blueprint B-4's owner)"
+    );
+
+    let status: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint \
+          WHERE conrelid = 'run_step'::regclass AND conname = 'run_step_status_check'",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("read run_step's status CHECK");
+    assert_eq!(
+        status,
+        "CHECK ((status = ANY (ARRAY['pending'::text, 'running'::text, \
+         'awaiting_approval'::text, 'done'::text, 'failed'::text, 'cancelled'::text, \
+         'superseded'::text])))",
+        "no new step state: run_step's status CHECK is 0015's, byte for byte"
+    );
 
     db.drop_db().await;
 }
@@ -1152,7 +1279,7 @@ async fn connect_reports_pending_on_a_bare_database() {
     assert_eq!(
         db.migrations_at_connect,
         MigrationState::Pending(16),
-        "sixteen embedded migrations, none applied (through MOD-12's 0016_auto_queue.sql)"
+        "seventeen embedded migrations, none applied (through MOD-70's 0017_follow_up.sql)"
     );
 
     db.drop_db().await;
@@ -1253,7 +1380,7 @@ async fn a_headless_connect_never_migrates() {
     assert_eq!(
         db.migrations_at_connect,
         MigrationState::Pending(16),
-        "sixteen embedded migrations, through MOD-12's 0016_auto_queue.sql"
+        "seventeen embedded migrations, through MOD-70's 0017_follow_up.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -1262,7 +1389,7 @@ async fn a_headless_connect_never_migrates() {
     assert_eq!(
         refused,
         HeadlessError::MigrationsPending(16),
-        "every one of the sixteen, through MOD-12's 0016_auto_queue.sql, is pending"
+        "every one of the seventeen, through MOD-70's 0017_follow_up.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -1285,7 +1412,7 @@ async fn a_headless_connect_never_migrates() {
     assert_eq!(
         refused,
         HeadlessError::MigrationsPending(16),
-        "every one of the sixteen, through MOD-12's 0016_auto_queue.sql, is pending"
+        "every one of the seventeen, through MOD-70's 0017_follow_up.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -1437,8 +1564,8 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
         16,
-        "the later applies migrate nothing: the sixteen embedded migrations (through MOD-12's \
-         0016_auto_queue.sql) are applied once"
+        "the later applies migrate nothing: the seventeen embedded migrations (through MOD-70's \
+         0017_follow_up.sql) are applied once"
     );
 
     db.drop_db().await;

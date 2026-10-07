@@ -1,0 +1,41 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.id AS \"id: RunCommandId\", c.text AS \"text!\"\n             FROM run_command c\n             JOIN follow_up_window w ON w.run_step_id = c.run_step_id\n            WHERE c.run_step_id = $1 AND c.kind = 'follow_up' AND c.status = 'pending'\n              AND w.session = $2 AND w.closed_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RunCommandId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run_command",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "text!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_command",
+            "name": "text"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "a2cad4b1bb74900a63f87f85bc833b1d9bc53d34bfd7e5b339404d0ba5fea174"
+}

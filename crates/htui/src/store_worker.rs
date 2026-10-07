@@ -23,13 +23,14 @@ use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
-    BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, Item, ItemFilter,
-    ItemId, ItemKindId, ItemKindPatch, ItemSpec, ItemSummary, LinkGraph, NewPersona, Note,
-    PermissionId, Persona, PersonaId, PersonaPatch, PhaseId, PhasePatch, Priority, ProjectId,
-    ProjectPatch, RelayView, RepoId, RepoPatch, RequirementAreaId, RequirementId, RunStatus,
-    RunSummary, Scope, SessionEvent, SkillBindingKey, SkillId, SkillPatch, SpecChanges,
-    StepGraphId, StepGraphPatch, StepId, TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission,
-    WorkspaceId, WorkspacePatch, WorkspaceSummary,
+    BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
+    FollowUpText, Item, ItemFilter, ItemId, ItemKindId, ItemKindPatch, ItemSpec, ItemSummary,
+    LinkGraph, NewFollowUp, NewPersona, Note, PermissionId, Persona, PersonaId, PersonaPatch,
+    PhaseId, PhasePatch, Priority, ProjectId, ProjectPatch, RelayView, RepoId, RepoPatch,
+    RequirementAreaId, RequirementId, RunCommandId, RunStatus, RunSummary, Scope, SessionEvent,
+    SkillBindingKey, SkillId, SkillPatch, SpecChanges, StepGraphId, StepGraphPatch, StepId,
+    TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch,
+    WorkspaceSummary,
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
@@ -893,6 +894,14 @@ pub enum StoreRequest {
         /// The chosen option's id.
         option_id: String,
     },
+    /// MOD-70 plan D13: one follow-up for a running engine step (D3). Refused offline with
+    /// `DATABASE_UNREACHABLE`. `text`'s `Debug` prints its length only (I-5).
+    FollowUp {
+        /// The step whose session takes it.
+        step: StepId,
+        /// Checked at construction (D2): the typing box refused a residue already.
+        text: FollowUpText,
+    },
     /// MOD-39 plan P2: the scope's specs, areas and requirements, answered with
     /// [`StoreReply::Requirements`].
     Requirements(Scope),
@@ -1174,6 +1183,8 @@ impl StoreRequest {
             // MOD-42 plan D14.
             Self::RelayView { .. } => "relay_view",
             Self::AnswerPermission { .. } => "answer_permission",
+            // MOD-70 plan D13.
+            Self::FollowUp { .. } => "follow_up",
             // MOD-72 plan D4.
             Self::ToolCalls { .. } => "tool_calls",
             // The ten of `requirements::REQUEST_NAMES`, in that order (MOD-39 plan P2).
@@ -1447,6 +1458,12 @@ pub enum StoreReply {
     PermissionAnswered {
         /// The answered request.
         permission: PermissionId,
+    },
+    /// [`StoreRequest::FollowUp`] queued its row; a refusal is [`StoreReply::Failed`] with the
+    /// refusal's sentence (MOD-70 D13).
+    FollowUpQueued {
+        /// The step it was queued for.
+        step: StepId,
     },
     /// What one box probe did (MOD-7 D13): one per box probe, at the requester's address or
     /// [`UNSOLICITED`].
@@ -2126,6 +2143,35 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::DequeueItem { .. }
         | StoreRequest::ResumeQueue
         | StoreRequest::PauseQueue => serve_queue(backend, request).await?,
+        // MOD-70 D3, D13: refused offline before anything is sent; a refusal is its sentence.
+        StoreRequest::FollowUp { step, text } => {
+            let writer = backend
+                .writer()
+                .ok_or_else(|| StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()))?;
+            let user = backend.this_user().await?;
+            let box_id = backend
+                .box_info()
+                .await?
+                .map(|info| info.box_id)
+                .ok_or_else(|| StoreError::NotFound {
+                    entity: "box",
+                    id: "this box".to_owned(),
+                })?;
+            let new = NewFollowUp {
+                id: RunCommandId::new(),
+                run_step_id: *step,
+                text: text.clone(),
+                issued_by: user,
+                issued_box: box_id,
+            };
+            match WriteStore::request_follow_up(&writer, new).await? {
+                FollowUpRequest::Queued(_) => StoreReply::FollowUpQueued { step: *step },
+                FollowUpRequest::Refused(why) => StoreReply::Failed {
+                    request: request.name(),
+                    message: why.to_string(),
+                },
+            }
+        }
         // A command needs the runtime that owns its task, and the loop serves every one of them
         // ahead of this function; one that reaches here belongs to a caller with no runtime.
         StoreRequest::Orch(_) => StoreReply::Failed {
@@ -5559,8 +5605,8 @@ mod tests {
     }
 
     /// MOD-42 plan D14, OQ-4: offline the Runs pane's relay read is an **empty** view, never a
-    /// `Failed` (the status line) or an `Unreachable` (`go_offline`), and an answer is refused with
-    /// `DATABASE_UNREACHABLE` before anything is sent.
+    /// `Failed` (the status line) or an `Unreachable` (`go_offline`), and an answer (or a MOD-70
+    /// follow-up) is refused with `DATABASE_UNREACHABLE` before anything is sent.
     #[tokio::test]
     async fn relay_reads_are_empty_offline_and_answers_are_refused() {
         // A non-`Memory` backend: nothing here may reach the developer's own OS keyring.
@@ -5592,6 +5638,18 @@ mod tests {
         match try_serve(&backend, &answer).await {
             Err(StoreError::Unreachable(message)) => assert_eq!(message, DATABASE_UNREACHABLE),
             other => panic!("an offline answer is refused before anything is sent: {other:?}"),
+        }
+
+        // MOD-70 D13: a follow-up, the other relay write, is refused the same way.
+        let follow_up = StoreRequest::FollowUp {
+            step: ids::STEP_R2_PRD,
+            text: FollowUpText::new("use the smaller fixture".to_owned())
+                .expect("plain prose is a follow-up"),
+        };
+        assert_eq!(follow_up.name(), "follow_up");
+        match try_serve(&backend, &follow_up).await {
+            Err(StoreError::Unreachable(message)) => assert_eq!(message, DATABASE_UNREACHABLE),
+            other => panic!("an offline follow-up is refused before anything is sent: {other:?}"),
         }
 
         cache.close().await;

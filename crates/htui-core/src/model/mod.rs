@@ -153,9 +153,14 @@ pub use quota::{
 };
 pub use relay::{
     ALREADY_ANSWERED, ALREADY_APPLIED, AnswerOutcome, AnswerRefusal, CancelRequest, EXECUTOR_GONE,
-    NOT_OFFERED, OpenPermission, PermissionChoice, PermissionStatus, REQUEST_CANCELLED,
-    REQUEST_STALE, RelayOption, RelayOptionKind, RelayView, RunCommand, RunCommandKind,
-    RunCommandStatus, StepPermission,
+    FOLLOW_UP_ALREADY_QUEUED, FOLLOW_UP_CANCELLING, FOLLOW_UP_CHAT_RUN, FOLLOW_UP_EMPTY,
+    FOLLOW_UP_EXECUTOR_GONE, FOLLOW_UP_JUDGE, FOLLOW_UP_NOT_RUNNING, FOLLOW_UP_NOT_STARTED,
+    FOLLOW_UP_QUEUED, FOLLOW_UP_REFUSED, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SENT,
+    FOLLOW_UP_SESSION_CANCELLED, FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest,
+    FollowUpSettle, FollowUpText, FollowUpTextError, FollowUpView, FollowUpWindow, NOT_OFFERED,
+    NewFollowUp, OpenPermission, PermissionChoice, PermissionStatus, QueuedFollowUp,
+    REQUEST_CANCELLED, REQUEST_STALE, RelayOption, RelayOptionKind, RelayView, RunCommand,
+    RunCommandKind, RunCommandStatus, SettleOutcome, StepPermission, executor_scrub_refusal,
 };
 pub use requirement::{
     CitationKind, CoverageRow, ItemCitation, ItemRequirement, NewRequirement, NewRequirementArea,
@@ -372,10 +377,10 @@ mod tests {
         check_enum(RunCommandStatus::ALL, &["pending", "applied", "refused"]);
     }
 
-    /// `0011_permission_relay.sql`'s `chk_run_command_kind` (MOD-42 plan D1).
+    /// `0017_follow_up.sql`'s `chk_run_command_kind` (MOD-42 plan D1, MOD-70 plan D1).
     #[test]
     fn run_command_kind_matches_check_list() {
-        check_enum(RunCommandKind::ALL, &["cancel"]);
+        check_enum(RunCommandKind::ALL, &["cancel", "follow_up"]);
     }
 
     /// `step_permission.options[].kind` (MOD-42 plan D6-ids): the agent's four option kinds.

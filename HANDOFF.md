@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-06):** **MOD-79 is done** (`docs/decisions/mod/mod-79.md`): the MCP
+**Current status (2026-10-07):** **MOD-70 is done** (`docs/decisions/mod/mod-70.md`): a follow-up
+typed in any TUI reaches a step an engine walks, in process or on a worker, on any box. `i` on a running
+engine step queues a `follow_up` `run_command` row (the typing box refuses a credential-shaped text); the
+walking process claims it at the turn's `done` with a fenced compare-and-set that nulls the text, records
+it scrubbed at `turn + 1`, sends it and drives on, then closes the step's `follow_up_window`. Judges, chat
+and `pump` are unchanged; follow-up turns count toward the step deadline and the run cap. Migration `0017`;
+every box upgrades together (an older binary cannot cancel once it is applied).
+Before it, **MOD-79 is done** (`docs/decisions/mod/mod-79.md`): the MCP
 token is off claude's argv. `claude-cli` gets `--mcp-config=<path>` to a `0600` `mcp.json` in a per-session `0700`
 directory (`htui-cli-<pid>-<8 hex>`, same base as the socket; on Windows under the per-user temp dir, inheriting
 its DACL). The session task owns the file, so every exit removes it. `ResolvedLaunch`'s `Debug` redacts
@@ -40,11 +47,12 @@ degraded store label, the waiting count) and diff-added (green) have their own `
 the terminal foreground plus bold, `dim` is `Indexed(244)`, and active tabs are bold and underlined.
 `NO_COLOR` selects `Theme::monochrome()`, which marks everything with modifiers alone. Style only, no
 text or snapshot change. The remaining non-focus cyan is **MOD-85**.
-Live coordinates after MOD-12 M1: migrations run through `0016_auto_queue` (`queue_entry`, `queue_batch`,
-`run.batch_id`), so **the next migration is `0017`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
-MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
-conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES` 15, `htui-orch` `CASES` 103.
-
+Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
+`text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
+migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
+`0014`; MOD-11's was renumbered at the merge, and MOD-70's `0016` became `0017` at the merge with MOD-12. Pins: store
+conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from the merged tree), `READ_CASES` 15,
+`htui-orch` `CASES` re-pin from the merged tree; Postgres tables 45.
 ---
 
 ## Open items
@@ -305,13 +313,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   in the sent body and the proposal. Once this item masks real values, the help runtime should report how many masks
   it applied, so a body's literal `[REDACTED]` cannot hide a masked value from the double-accept.
 
-- [ ] **MOD-70 - Follow-up command rows for engine steps** (from MOD-42, PRD Q9;
-  `docs/decisions/mod/mod-42.md`). `R-AGT-1`, `R-HIS-1`. MOD-42's `run_command` table carries only
-  `kind = 'cancel'`; a follow-up typed in any TUI for a step an engine walks (in process or on a
-  worker, on any box) would be a second kind, applied by the lease holder like a cancel. Open first:
-  the engine has no follow-up verb and ANA-2 no state that accepts one (a walk's session ends at
-  `done` before the step parks, `docs/ANA-2.md:1235-1238`), and the text is typed on one box but must
-  be scrubbed on the executing box (`R-SEC-3`, `R-ID-7`). Not blocked.
 - [ ] **MOD-78 - `command_run` lifecycle: lease check and cancel on session end** (from MOD-11,
   `docs/decisions/mod/mod-11.md`). `R-MCP-1`, `R-MCP-3`. `command_run` is not fenced (MOD-11's I-3
   reads "every item write"). A session whose walk lost its lease can queue and run commands until the
@@ -530,6 +531,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 25 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

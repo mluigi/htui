@@ -28,6 +28,10 @@
 //! runtime walks a session that parks on a permission request, and a second `PgStore` client
 //! registered as another box answers it from its own relay view.
 //!
+//! MOD-70 T4 (blueprint §8) adds a follow-up the same client queues while that session is parked:
+//! the TUI sends it when the parked turn ends, and the case probes `run_command` directly for the
+//! row's `text IS NULL` (PRD metric 3).
+//!
 //! Each case prints `testkit::SKIP` and returns with `HTUI_TEST_DATABASE_URL` unset, and panics
 //! instead when `CI` is set (plan D13), like every other Postgres-backed suite.
 #![cfg(feature = "testkit")]
@@ -55,9 +59,10 @@ use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::{edit_agent, ids};
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, Billing, BoxEdit, DocumentHead, DocumentId, EventKind,
-    EventRole, Item, ItemId, ItemPatch, NewDocument, NewRepo, PermissionStatus, RepoId, Resolution,
-    Run, RunId, RunMode, RunStatus, RunStep, RunStepCommit, SessionEvent, SnapshotPhase, Status,
-    StepId, StepPermission, StepStatus, Transport, UsageTotals,
+    EventRole, FollowUpRequest, FollowUpText, Item, ItemId, ItemPatch, NewDocument, NewFollowUp,
+    NewRepo, PermissionStatus, RepoId, Resolution, Run, RunCommandId, RunId, RunMode, RunStatus,
+    RunStep, RunStepCommit, SessionEvent, SnapshotPhase, Status, StepId, StepPermission,
+    StepStatus, Transport, UsageTotals,
 };
 use htui_core::store::{CasOutcome, ReadStore as _, StepFence, StoreError, WriteStore as _};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
@@ -230,8 +235,24 @@ impl AgentDriver for ToolWriting {
 /// MOD-42 T6: the first session plays a gated `execute` call and parks on its permission request
 /// (one allow and one reject option), then ends its turn once answered; every later session plays
 /// [`Walks`].
+///
+/// MOD-70 T4: [`ParksOnce::then`] gives that first session `follow_ups` more turns, each one
+/// [`chat_turn`], which only a follow-up starts (B-9: the park is the rendezvous).
 #[derive(Debug, Default)]
-struct ParksOnce(AtomicBool);
+struct ParksOnce {
+    built: AtomicBool,
+    follow_ups: usize,
+}
+
+impl ParksOnce {
+    /// The parking session, with `follow_ups` turns after the parked one.
+    fn then(follow_ups: usize) -> Self {
+        Self {
+            built: AtomicBool::new(false),
+            follow_ups,
+        }
+    }
+}
 
 impl TransportBuilder for ParksOnce {
     fn build(
@@ -240,40 +261,47 @@ impl TransportBuilder for ParksOnce {
         on_box: Option<&AgentBox>,
         caps: DriverCaps,
     ) -> Result<Box<dyn AgentDriver>, htui_agent::error::DriverError> {
-        if self.0.swap(true, Ordering::SeqCst) {
+        if self.built.swap(true, Ordering::SeqCst) {
             return Walks.build(agent, on_box, caps);
         }
+        let mut turns = vec![parked_turn()];
+        turns.extend((0..self.follow_ups).map(|_| chat_turn("the edge cases are covered")));
         Ok(Box::new(FakeDriver::new(
             agent.name.clone(),
             caps,
-            Script::one_turn(vec![
-                ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
-                    tool_call_id: "call-1".to_owned(),
-                    title: "run the suite".to_owned(),
-                    tool_kind: ToolKind::Execute,
-                    input: json!({ "command": "cargo test" }),
-                    locations: Vec::new(),
-                })),
-                ScriptEvent::ParkPermission(PermissionRequestEvent {
-                    request_id: PermissionRequestId::new("request-1"),
-                    tool_call_id: Some("call-1".to_owned()),
-                    options: vec![
-                        PermissionOption {
-                            id: "allow-once".to_owned(),
-                            label: "Allow".to_owned(),
-                            kind: PermissionOptionKind::AllowOnce,
-                        },
-                        PermissionOption {
-                            id: "reject-once".to_owned(),
-                            label: "Reject".to_owned(),
-                            kind: PermissionOptionKind::RejectOnce,
-                        },
-                    ],
-                }),
-                done(),
-            ]),
+            Script::turns(turns),
         )))
     }
+}
+
+/// [`ParksOnce`]'s first turn: a gated `execute` call, its parked request, the end of the turn.
+fn parked_turn() -> Vec<ScriptEvent> {
+    vec![
+        ScriptEvent::Emit(DriverEvent::ToolCall(ToolCallEvent {
+            tool_call_id: "call-1".to_owned(),
+            title: "run the suite".to_owned(),
+            tool_kind: ToolKind::Execute,
+            input: json!({ "command": "cargo test" }),
+            locations: Vec::new(),
+        })),
+        ScriptEvent::ParkPermission(PermissionRequestEvent {
+            request_id: PermissionRequestId::new("request-1"),
+            tool_call_id: Some("call-1".to_owned()),
+            options: vec![
+                PermissionOption {
+                    id: "allow-once".to_owned(),
+                    label: "Allow".to_owned(),
+                    kind: PermissionOptionKind::AllowOnce,
+                },
+                PermissionOption {
+                    id: "reject-once".to_owned(),
+                    label: "Reject".to_owned(),
+                    kind: PermissionOptionKind::RejectOnce,
+                },
+            ],
+        }),
+        done(),
+    ]
 }
 
 /// Lets the chat runtime reach the adapter a case loaded its script into.
@@ -1667,6 +1695,137 @@ async fn an_in_process_walk_resumes_on_an_answer_from_another_box() {
     assert!(
         view.permissions.is_empty() && view.cancels.is_empty(),
         "the TUI's own relay view is empty afterwards: {view:?}"
+    );
+
+    stack.finish().await;
+}
+
+/// MOD-70 PRD metric "applied across executors" for an in-process walk (executor `tui`), plan T4:
+/// the TUI's runtime walks a session that parks; box B queues a follow-up for the parked step
+/// **then** answers (B-9), while the shell waits on the walk. The TUI sends the follow-up when the
+/// parked turn ends: the step's log holds the scrubbed `follow_up` at `turn = 1` and a second
+/// `done`, the step reaches its gate, and the direct SQL probe reads the row `applied` with its
+/// text gone (PRD metric 3), issued from B.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_in_process_walk_takes_a_follow_up_from_another_box() {
+    const FOLLOW_UP: &str = "also cover the edge cases";
+    let Some(mut stack) = Stack::over(None, Box::new(ParksOnce::then(1))).await else {
+        return;
+    };
+    let item = ids::HTUI_ANA_2;
+    let (client, _client_root) = another_box(&stack.db).await;
+    // The shell's drive awaits the walk to its rest, which the answer releases: queue, then
+    // answer, meanwhile.
+    let follower = tokio::spawn(async move {
+        let parked = pending_request(&client, item).await;
+        let queued = client
+            .request_follow_up(NewFollowUp {
+                id: RunCommandId::new(),
+                run_step_id: parked.run_step_id,
+                text: FollowUpText::new(FOLLOW_UP.to_owned()).expect("the client accepts it"),
+                issued_by: client.this_user(),
+                issued_box: client.this_box(),
+            })
+            .await
+            .expect("the enqueue is answered");
+        let answered = client
+            .answer_permission(
+                parked.id,
+                "allow-once",
+                client.this_user(),
+                client.this_box(),
+            )
+            .await
+            .expect("the answer is written");
+        (client, parked, queued, answered)
+    });
+
+    let run = stack.start(item).await;
+    let (client, parked, queued, answered) = tokio::time::timeout(PATIENCE, follower)
+        .await
+        .expect("the follower ends within the patience window")
+        .expect("the follower did not panic");
+    let FollowUpRequest::Queued(id) = queued else {
+        panic!("the follow-up was not queued: {queued:?}");
+    };
+    assert_eq!(answered, AnswerOutcome::Answered);
+    assert_eq!(parked.run_id, run);
+    let step = stack.step_at(run, 0).await;
+    assert_eq!(
+        (step.id, step.status),
+        (parked.run_step_id, StepStatus::AwaitingApproval),
+        "the follow-up turn ended and the step reached its gate"
+    );
+    let log = stack.log(step.id).await;
+    let sent: Vec<(i32, Value)> = log
+        .iter()
+        .filter(|event| event.kind == EventKind::FollowUp)
+        .map(|event| (event.turn, event.payload.clone()))
+        .collect();
+    assert_eq!(
+        sent,
+        [(1, json!({ "text": FOLLOW_UP }))],
+        "the TUI recorded the scrubbed follow-up once, as turn 1"
+    );
+    assert_eq!(
+        log.iter()
+            .filter(|event| event.kind == EventKind::Done)
+            .count(),
+        2,
+        "two turns, two `done`s"
+    );
+    let rows = sqlx::query(
+        "SELECT id, status, text IS NULL AS text_is_null, resolution, issued_box \
+         FROM run_command WHERE kind = 'follow_up' AND run_step_id = $1",
+    )
+    .bind(step.id.as_uuid())
+    .fetch_all(&stack.db.pool)
+    .await
+    .expect("read the follow-up rows");
+    let rows: Vec<_> = rows
+        .iter()
+        .map(|row| {
+            (
+                RunCommandId::from_uuid(row.get("id")),
+                row.get::<String, _>("status"),
+                row.get::<bool, _>("text_is_null"),
+                row.get::<Option<String>, _>("resolution"),
+                row.get::<uuid::Uuid, _>("issued_box"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        [(
+            id,
+            "applied".to_owned(),
+            true,
+            None,
+            client.this_box().as_uuid()
+        )],
+        "applied by the TUI, issued from B, its text gone (PRD metric 3)"
+    );
+    let open: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM follow_up_window WHERE run_step_id = $1 AND closed_at IS NULL",
+    )
+    .bind(step.id.as_uuid())
+    .fetch_one(&stack.db.pool)
+    .await
+    .expect("read follow_up_window");
+    assert_eq!(open, 0, "the session's exit closed its window");
+    let view = stack
+        .db
+        .store
+        .relay_view(item)
+        .await
+        .expect("the view reads");
+    assert_eq!(
+        view.follow_ups
+            .iter()
+            .map(|row| (row.id, row.status))
+            .collect::<Vec<_>>(),
+        [(id, htui_core::model::RunCommandStatus::Applied)],
+        "the TUI's own pane shows it sent, never its text"
     );
 
     stack.finish().await;

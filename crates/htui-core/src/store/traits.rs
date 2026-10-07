@@ -36,6 +36,11 @@
 //! and `run_command`: the permission and control relay. Neither table is mirrored (plan OQ-4), so
 //! all nine are online and writer-only, by the `command_runs` precedent; `RelayStore` and
 //! `WorkerStore` forward seven of them, and `relay_view` / `answer_permission` stay here alone.
+//!
+//! **MOD-70** (plan D1-D5, D9) adds six writer methods for follow-ups to a running engine step's
+//! live session, over `run_command` (a second kind) and `follow_up_window`; neither is mirrored
+//! (plan D1). `RelayStore` forwards five of them; `request_follow_up`, the answer side, stays here
+//! alone, as `answer_permission` does.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use serde_json::Value;
@@ -48,22 +53,23 @@ use crate::model::skill_language;
 use crate::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, Attachment, BindingChange, BoxEdit, BoxId,
     BoxProbe, BoxRecord, BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun,
-    CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId, GateOutcome,
-    Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch,
-    ItemRequirement, ItemRevision, ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewItem,
-    NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement,
-    NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace,
-    Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId,
-    PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope,
-    PromptTemplate, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingKey, SkillId,
-    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
-    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, ToolCallCount, UpstreamEntry,
-    UserId, WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject,
+    CommandRunId, CommandRunStatus, CoverageRow, Document, DocumentHead, DocumentId,
+    FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
+    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, ItemSummary, LinkGraph,
+    NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote, NewPersona, NewProject,
+    NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
+    NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
+    PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
+    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
+    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, ToolCallCount, UpstreamEntry, UserId,
+    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -1792,7 +1798,10 @@ pub trait WriteStore: ReadStore {
     ) -> Result<u64>;
 
     /// D12: one `pending` cancel per run. Writes `(id, run, 'cancel', user, box_id)` unless a
-    /// pending cancel exists. Never reads the run's status: the caller decides (B-20).
+    /// pending cancel exists. Never reads the run's status: the caller decides (B-20). And, in the
+    /// same transaction, refuses every `pending` follow-up of the run with
+    /// [`FOLLOW_UP_RUN_CANCELLED`](crate::model::FOLLOW_UP_RUN_CANCELLED) (MOD-70 D5, B-14; on
+    /// `AlreadyPending` too).
     ///
     /// # Errors
     /// `NotFound { entity: "run" }`; `Constraint` for an unknown user or box (B-7).
@@ -1803,7 +1812,8 @@ pub trait WriteStore: ReadStore {
         box_id: BoxId,
     ) -> Result<CancelRequest>;
 
-    /// D13, B-4: the `pending` commands this process applies, `(issued_at, id)` order: runs whose
+    /// D13, B-4: the `pending` commands this process applies, **cancels only** (MOD-70 D5, I-9),
+    /// `(issued_at, id)` order: runs whose
     /// `lease_owner = owner`; runs executing on `box_id` whose lease is free or expired by the
     /// store's clock and whose status is `running` or `awaiting_approval`; and runs executing on
     /// `box_id` that are already terminal (the caller refuses those with their status).
@@ -1813,7 +1823,8 @@ pub trait WriteStore: ReadStore {
     async fn pending_commands(&self, owner: Uuid, box_id: BoxId) -> Result<Vec<RunCommand>>;
 
     /// D12, D13: compare-and-set `pending → to` (`Applied` or `Refused`), with `resolution`,
-    /// `resolved_at` the store's clock. `Ok(false)` = not pending any more (I-3).
+    /// `resolved_at` the store's clock. `Ok(false)` = not pending any more (I-3). Always clears
+    /// `text` (MOD-70 D5).
     ///
     /// # Errors
     /// `Constraint` for `to = Pending`, before anything is read; `NotFound { entity:
@@ -1826,8 +1837,9 @@ pub trait WriteStore: ReadStore {
     ) -> Result<bool>;
 
     /// D14: the item's `pending` requests whose owner holds the run's lease live by the store's
-    /// clock, and its non-terminal runs with a `pending` cancel. A read on `WriteStore` by the
-    /// `command_runs` precedent: neither table is mirrored (OQ-4).
+    /// clock, its non-terminal runs with a `pending` cancel, and (MOD-70 D5, B-13) `follow_ups`,
+    /// the newest follow-up of each step of its non-terminal runs, without text. A read on
+    /// `WriteStore` by the `command_runs` precedent: none of the tables is mirrored (OQ-4).
     ///
     /// # Errors
     /// The backend's own failures only.
@@ -1848,6 +1860,82 @@ pub trait WriteStore: ReadStore {
         user: UserId,
         box_id: BoxId,
     ) -> Result<AnswerOutcome>;
+
+    // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)
+
+    /// D3: one pending follow-up per step, admitted only while the step's window is open, under a
+    /// `FOR SHARE OF w` on that window row (`READ COMMITTED`; I-3). On a miss one re-read decides,
+    /// in this order: `NotFound { entity: "run_step" }`; the actor (`Constraint`, MOD-42 A-1);
+    /// `ChatRun`; `Judge` (`fanout_index < 0`); `NotRunning`; `Cancelling`; `AlreadyQueued`;
+    /// `ExecutorGone` (the run's lease is not live under the window's owner, B-4); `NotStarted`
+    /// (no window); `SessionEnded` (window closed). Never touches `run`, the lease or
+    /// `session_event` (I-1). `issued_at` is the store's clock (I-4).
+    ///
+    /// # Errors
+    /// The two above; `Constraint` for a repeated id; `Constraint` after three re-reads that each
+    /// found every guard passing (the pending row it collided with resolved in between).
+    async fn request_follow_up(&self, new: NewFollowUp) -> Result<FollowUpRequest>;
+
+    /// D4, B-6: opens (or re-opens for a new session) the step's window under `owner`, then
+    /// refuses with [`FOLLOW_UP_SESSION_ENDED`](crate::model::FOLLOW_UP_SESSION_ENDED) every
+    /// follow-up still pending on the step (an older window's). `Ok(false)` = `run.lease_owner`
+    /// is not `owner` (B-3, owner only); nothing written.
+    ///
+    /// # Errors
+    /// `NotFound { entity: "run_step" }`; `Constraint` when the step is not `run`'s.
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> Result<bool>;
+
+    /// D4: the step's pending follow-up while its window is `session`'s and open; else `None`
+    /// (also for an unknown step). A read: never fenced.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> Result<Option<QueuedFollowUp>>;
+
+    /// D4, B-3, B-19: compare-and-set `pending → applied | refused` while `run.lease_owner =
+    /// owner`; always `text = NULL`, `resolved_at` the store's clock. A miss is told apart by one
+    /// re-read.
+    ///
+    /// # Errors
+    /// `NotFound { entity: "run_command" }`; `Constraint` for a `cancel` row.
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> Result<SettleOutcome>;
+
+    /// D4, D6 step 8, B-5: closes the step's window if it is `session`'s, then — only while it
+    /// is — refuses the step's pending follow-ups with `reason`. Two statements in one `READ
+    /// COMMITTED` transaction on Postgres (never one CTE). Idempotent. Answers how many rows it
+    /// refused.
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> Result<u64>;
+
+    /// D9, B-3, F-22: while `owner` is the run's lease owner, closes every open window of `run`
+    /// and refuses every pending follow-up of `run` with `reason`; otherwise `Ok(0)`, nothing
+    /// written. Idempotent (the sweep reaches it twice).
+    ///
+    /// # Errors
+    /// The backend's own failures only.
+    async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64>;
 
     // -- MOD-11: agent writes (plan D13, B-4..B-6) ------------------------------------------
 

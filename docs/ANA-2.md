@@ -1282,6 +1282,24 @@ second path now serves both transports. An ACP step resumes through `session/res
 (`resumed` | `handoff` | `resume_failed`) records which way the chat opened, and the Runs pane says
 "context not carried; handoff prompt only" for the latter two.
 
+*Amended by MOD-70, 2026-10-06 (plan D6-D8, D12, D16, OQ-3, OQ-5,
+`.claude/plans/mod-70-engine-follow-up.plan.md`):* as built, the first path is reachable for a
+walk's own session, between its turns and before the step parks. Any TUI's Runs pane queues a
+follow-up for a `running` step (`i`): a `pending` `run_command` row of kind `follow_up`
+(`0017_follow_up.sql`). The process walking the step reads it only at a turn's `done`, records the
+scrubbed text as the `follow_up` event at the next `turn` and sends it into the same session;
+nothing respawns, and nothing steers a turn already under way. The main step's session and each
+fan-out candidate's take follow-ups; a judge call never does, and a chat run takes them in its own
+view. A follow-up turn runs inside the step's deadline and under the run's cap like any turn, and
+none is sent after a cut, a breach or a cancel. When the session ends, its `follow_up_window` row
+closes and a follow-up still queued is refused: "the step finished its session; promote it to
+continue" when the session ended, "the step's session was cancelled before the follow-up was sent"
+when a cancel or the deadline cut it. Promotion stays the way to continue a step whose session has
+ended. A follow-up queued for a walk that died stays pending until the run is recovered or
+cancelled. The state table
+is unchanged: the step stays `running` throughout, no state is added, and the second and third
+paths are untouched.
+
 The third path is what makes `R-ORCH-5` true for every agent rather than only for resumable ones.
 Claude Code's Explore and Plan agents "return no agent ID, so Claude can't resume them"
 (https://code.claude.com/docs/en/sub-agents), and an ACP agent may advertise neither `loadSession`

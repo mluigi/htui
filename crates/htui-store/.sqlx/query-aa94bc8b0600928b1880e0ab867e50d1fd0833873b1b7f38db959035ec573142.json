@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT c.id         AS \"id: RunCommandId\",\n                  c.run_id     AS \"run_id: RunId\",\n                  c.kind       AS \"kind: RunCommandKind\",\n                  c.issued_by  AS \"issued_by: UserId\",\n                  c.issued_box AS \"issued_box: BoxId\",\n                  c.status     AS \"status: RunCommandStatus\",\n                  c.resolution,\n                  c.issued_at,\n                  c.resolved_at\n             FROM run_command c JOIN run r ON r.id = c.run_id\n            WHERE c.status = 'pending'\n              AND (r.lease_owner = $1\n                   OR (r.executing_box_id = $2\n                       AND (r.status IN ('done', 'failed', 'cancelled')\n                            OR (r.status IN ('running', 'awaiting_approval')\n                                AND (r.lease_owner IS NULL OR r.lease_expires_at IS NULL\n                                     OR r.lease_expires_at <= clock_timestamp())))))\n            ORDER BY c.issued_at, c.id",
+  "query": "SELECT c.id         AS \"id: RunCommandId\",\n                  c.run_id     AS \"run_id: RunId\",\n                  c.kind       AS \"kind: RunCommandKind\",\n                  c.issued_by  AS \"issued_by: UserId\",\n                  c.issued_box AS \"issued_box: BoxId\",\n                  c.status     AS \"status: RunCommandStatus\",\n                  c.resolution,\n                  c.issued_at,\n                  c.resolved_at\n             FROM run_command c JOIN run r ON r.id = c.run_id\n            WHERE c.status = 'pending' AND c.kind = 'cancel'\n              AND (r.lease_owner = $1\n                   OR (r.executing_box_id = $2\n                       AND (r.status IN ('done', 'failed', 'cancelled')\n                            OR (r.status IN ('running', 'awaiting_approval')\n                                AND (r.lease_owner IS NULL OR r.lease_expires_at IS NULL\n                                     OR r.lease_expires_at <= clock_timestamp())))))\n            ORDER BY c.issued_at, c.id",
   "describe": {
     "columns": [
       {
@@ -121,5 +121,5 @@
       true
     ]
   },
-  "hash": "bcb182773e6bfa55a91930be3701b3e66cad21b538d82cb6f9ba14c0f6473d63"
+  "hash": "aa94bc8b0600928b1880e0ab867e50d1fd0833873b1b7f38db959035ec573142"
 }

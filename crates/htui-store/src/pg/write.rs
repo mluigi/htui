@@ -24,23 +24,23 @@ use htui_core::model::{
     Activation, Agent, AgentBox, AgentId, AnswerOutcome, BOX_PROBE_SPEC_KEY, BatchClose, BatchId,
     BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord, BoxRow, BoxSettings, BoxTool,
     CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CommandRunId, CommandRunStatus,
-    DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, GateOutcome, Isolation, Item, ItemId,
-    ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemRevision, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, Persona, PersonaId, PersonaPatch, PersonaPermission, PersonaTools,
-    PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId, ProjectPatch, PromptTemplate,
-    PromptTemplateId, QueueBatch, QueueEntry, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps,
-    scope_of,
+    DEFAULT_MAX_CONCURRENT_ITEMS, Document, Executor, FollowUpRequest, FollowUpSettle, GateOutcome,
+    Isolation, Item, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
+    ItemRevision, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote,
+    NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
+    PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
+    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueuedFollowUp,
+    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
+    RequirementState, RequirementUpdate, Resolution, Run, RunCommand, RunCommandId,
+    RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
+    Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey,
+    SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
+    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, UserId,
+    VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
+    WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -6667,6 +6667,52 @@ impl WriteStore for PgStore {
         box_id: BoxId,
     ) -> Result<AnswerOutcome> {
         super::relay::answer_permission(self, id, option_id, user, box_id).await
+    }
+
+    // ---- MOD-70 (plan D1-D5, D9): follow-ups, in `relay.rs` ----
+
+    async fn request_follow_up(&self, new: NewFollowUp) -> Result<FollowUpRequest> {
+        super::relay::request_follow_up(self, new).await
+    }
+
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> Result<bool> {
+        super::relay::open_follow_ups(self, run, step, session, owner).await
+    }
+
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> Result<Option<QueuedFollowUp>> {
+        super::relay::next_follow_up(self, step, session).await
+    }
+
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> Result<SettleOutcome> {
+        super::relay::settle_follow_up(self, id, owner, to).await
+    }
+
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> Result<u64> {
+        super::relay::close_follow_ups(self, step, session, reason).await
+    }
+
+    async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
+        super::relay::close_dropped_follow_ups(self, run, owner, reason).await
     }
 
     // ---- MOD-11 (D13) ----

@@ -13,14 +13,15 @@ use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
-    CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, GateOutcome, Item,
-    ItemId, ItemKind, ItemSummary, NewCommandRun, NewDocument, NewNote, NewRun, NewRunStep, Note,
-    OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent, PhaseId, Project,
-    ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry, RelaySessionId, Repo,
-    RepoBoxPath, RepoId, Resolution, ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission,
-    StepStatus, UpstreamEntry, UserId, WorkspaceSummary,
+    CancelRequest, Claim, CommandRun, Document, DocumentHead, DocumentId, FollowUpSettle,
+    GateOutcome, Item, ItemId, ItemKind, ItemSummary, NewCommandRun, NewDocument, NewNote, NewRun,
+    NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId, PermissionStatus, PhaseAgent,
+    PhaseId, Project, ProjectId, PromptScope, PromptTemplate, QueueBatch, QueueEntry,
+    QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Status,
+    StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry,
+    UserId, WorkspaceSummary,
 };
 use htui_core::store::{ParkOutcome, ReadStore, Result, StepFence, WriteStore};
 use serde_json::Value;
@@ -74,6 +75,41 @@ impl htui_core::store::RelayStore for PgStore {
         to: PermissionStatus,
     ) -> Result<u64> {
         WriteStore::settle_permissions(self, session, to).await
+    }
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> Result<bool> {
+        WriteStore::open_follow_ups(self, run, step, session, owner).await
+    }
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> Result<Option<QueuedFollowUp>> {
+        WriteStore::next_follow_up(self, step, session).await
+    }
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> Result<SettleOutcome> {
+        WriteStore::settle_follow_up(self, id, owner, to).await
+    }
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> Result<u64> {
+        WriteStore::close_follow_ups(self, step, session, reason).await
+    }
+    async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
+        WriteStore::close_dropped_follow_ups(self, run, owner, reason).await
     }
 }
 
@@ -411,6 +447,41 @@ impl htui_core::store::RelayStore for Writer {
         to: PermissionStatus,
     ) -> Result<u64> {
         WriteStore::settle_permissions(self, session, to).await
+    }
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> Result<bool> {
+        WriteStore::open_follow_ups(self, run, step, session, owner).await
+    }
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> Result<Option<QueuedFollowUp>> {
+        WriteStore::next_follow_up(self, step, session).await
+    }
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> Result<SettleOutcome> {
+        WriteStore::settle_follow_up(self, id, owner, to).await
+    }
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> Result<u64> {
+        WriteStore::close_follow_ups(self, step, session, reason).await
+    }
+    async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
+        WriteStore::close_dropped_follow_ups(self, run, owner, reason).await
     }
 }
 

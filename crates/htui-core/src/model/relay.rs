@@ -1,11 +1,14 @@
 //! The permission and control relay's rows and outcomes (MOD-42 plan D1-D5, D12, D13;
-//! `0011_permission_relay.sql`). Neither table is mirrored (plan OQ-4).
+//! `0011_permission_relay.sql`) and MOD-70's follow-ups (plan D1-D5, D12;
+//! `0017_follow_up.sql`). None of the three tables is mirrored (MOD-42 OQ-4, MOD-70 D1).
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use uuid::Uuid;
 
 use crate::model::ids::{BoxId, PermissionId, RelaySessionId, RunCommandId, RunId, StepId, UserId};
+use crate::scrub::{MinimalScrubber, Scrubber, Unmasked};
 
 str_enum!(
     /// `step_permission.status` (MOD-42 plan D1), in `CHECK` order.
@@ -24,10 +27,12 @@ str_enum!(
 );
 
 str_enum!(
-    /// `run_command.kind` (MOD-42 plan D1). A follow-up command adds a kind later (PRD Q9).
+    /// `run_command.kind` (MOD-42 plan D1; MOD-70 plan D1).
     RunCommandKind {
-        /// Cancel the run (D12).
+        /// Cancel the run (MOD-42 D12).
         Cancel => "cancel",
+        /// One user follow-up for a running engine step's live session (MOD-70).
+        FollowUp => "follow_up",
     }
 );
 
@@ -223,4 +228,290 @@ pub struct RelayView {
     pub permissions: Vec<StepPermission>,
     /// Non-terminal runs of the item with a `pending` cancel, ascending.
     pub cancels: Vec<RunId>,
+    /// MOD-70 D5: the newest follow-up of each step of the item's non-terminal runs (B-13),
+    /// `(issued_at, id)` order. Never the text (OQ-6).
+    pub follow_ups: Vec<FollowUpView>,
+}
+
+// -- MOD-70: follow-ups for engine steps (plan D1-D5, D12) -------------------------------------
+
+/// MOD-70 D2: a follow-up's text, checked when built: not empty after trimming, and nothing a
+/// pattern-only scrubber refuses. Stored and sent as typed (PRD Q3). `Debug` prints the length
+/// only; there is no `Display` and no serde (I-5).
+#[derive(Clone, PartialEq, Eq)]
+pub struct FollowUpText(String);
+
+impl FollowUpText {
+    /// Checks `text` and keeps it as typed.
+    ///
+    /// # Errors
+    /// [`FollowUpTextError::Empty`] for an empty or whitespace-only text;
+    /// [`FollowUpTextError::Residue`] when `MinimalScrubber::new(Vec::<String>::new())` refuses
+    /// `{"text": text}` (the payload shape `record_follow_up` scrubs).
+    pub fn new(text: String) -> Result<Self, FollowUpTextError> {
+        if text.trim().is_empty() {
+            return Err(FollowUpTextError::Empty);
+        }
+        let mut payload = json!({ "text": text });
+        MinimalScrubber::new(Vec::<String>::new())
+            .scrub(&mut payload)
+            .map_err(FollowUpTextError::Residue)?;
+        Ok(Self(text))
+    }
+
+    /// The text as typed.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The text as typed, moved out.
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl core::fmt::Debug for FollowUpText {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("FollowUpText")
+            .field("len", &self.0.len())
+            .finish()
+    }
+}
+
+/// Why a typed follow-up was not sent (D2, D12; nothing was written).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum FollowUpTextError {
+    /// Empty or whitespace-only.
+    #[error("{}", FOLLOW_UP_EMPTY)]
+    Empty,
+    /// A pattern-only scrubber refused the text. Carries the pointer and the rule, never the text
+    /// (`scrub.rs`'s [`Unmasked`]).
+    #[error("not sent: the text looks like it holds a credential ({})", .0.rule)]
+    Residue(Unmasked),
+}
+
+/// Arguments of `WriteStore::request_follow_up` (D3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewFollowUp {
+    /// Minted by the sender (`RunCommandId::new()`).
+    pub id: RunCommandId,
+    /// The running engine step whose live session takes it.
+    pub run_step_id: StepId,
+    /// The checked text.
+    pub text: FollowUpText,
+    /// The sending user.
+    pub issued_by: UserId,
+    /// The sending box.
+    pub issued_box: BoxId,
+}
+
+/// `WriteStore::request_follow_up`'s outcome (D3; a refusal writes nothing, MOD-42 OQ-1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FollowUpRequest {
+    /// A new `pending` row.
+    Queued(RunCommandId),
+    /// Nothing was written; why.
+    Refused(FollowUpRefusal),
+}
+
+/// Why an enqueue wrote nothing, in D3's classification order. `Display` is D12's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum FollowUpRefusal {
+    /// The step is a chat run's.
+    #[error("{}", FOLLOW_UP_CHAT_RUN)]
+    ChatRun,
+    /// The step is a judge (`fanout_index < 0`).
+    #[error("{}", FOLLOW_UP_JUDGE)]
+    Judge,
+    /// The step is not `running`.
+    #[error("{}", FOLLOW_UP_NOT_RUNNING)]
+    NotRunning,
+    /// The run has a pending cancel.
+    #[error("{}", FOLLOW_UP_CANCELLING)]
+    Cancelling,
+    /// The step already has a pending follow-up.
+    #[error("{}", FOLLOW_UP_ALREADY_QUEUED)]
+    AlreadyQueued,
+    /// The run's lease is not live under the window's owner (B-4).
+    #[error("{}", FOLLOW_UP_EXECUTOR_GONE)]
+    ExecutorGone,
+    /// The step has no window yet.
+    #[error("{}", FOLLOW_UP_NOT_STARTED)]
+    NotStarted,
+    /// The step's window is closed.
+    #[error("{}", FOLLOW_UP_SESSION_ENDED)]
+    SessionEnded,
+}
+
+/// The step's pending follow-up, as the executor reads it (`next_follow_up`, D4). `Debug` prints
+/// the id and the text's length only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct QueuedFollowUp {
+    /// `run_command.id`.
+    pub id: RunCommandId,
+    /// `run_command.text`, as typed.
+    pub text: String,
+}
+
+impl core::fmt::Debug for QueuedFollowUp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("QueuedFollowUp")
+            .field("id", &self.id)
+            .field("len", &self.text.len())
+            .finish()
+    }
+}
+
+/// What `settle_follow_up` moves a pending row to (D4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FollowUpSettle {
+    /// Taken for the next turn: `applied`, `resolution` NULL.
+    Applied,
+    /// `refused`, with this sentence as `resolution` (`executor_scrub_refusal`).
+    Refused(String),
+}
+
+/// `settle_follow_up`'s outcome (D4, B-19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettleOutcome {
+    /// This call moved it; `text` is now NULL.
+    Settled,
+    /// Not pending any more (a cancel, a newer window or a close refused it).
+    NotPending,
+    /// Pending, but `owner` is not the run's lease owner.
+    Fenced,
+}
+
+/// What the Runs pane shows for one step's newest follow-up (D5, D14). No text (OQ-6).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FollowUpView {
+    /// `run_command.id`.
+    pub id: RunCommandId,
+    /// `run_command.run_id`.
+    pub run_id: RunId,
+    /// `run_command.run_step_id`.
+    pub run_step_id: StepId,
+    /// `run_command.status`.
+    pub status: RunCommandStatus,
+    /// `run_command.resolution`: the refusal's sentence, or `None`.
+    pub resolution: Option<String>,
+    /// `run_command.issued_at`, the store's clock.
+    pub issued_at: DateTime<Utc>,
+    /// `run_command.resolved_at`.
+    pub resolved_at: Option<DateTime<Utc>>,
+}
+
+/// A row of `follow_up_window` (D1, OQ-2): one per step whose engine session takes follow-ups.
+/// MemStore's state and its test-support reader (B-1); no trait method returns it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUpWindow {
+    /// `follow_up_window.run_step_id` (the key).
+    pub run_step_id: StepId,
+    /// `follow_up_window.run_id`.
+    pub run_id: RunId,
+    /// `follow_up_window.session`: the session that opened it.
+    pub session: RelaySessionId,
+    /// `follow_up_window.owner`: the lease owner that opened it (B-4).
+    pub owner: Uuid,
+    /// `follow_up_window.opened_at`, the store's clock.
+    pub opened_at: DateTime<Utc>,
+    /// `follow_up_window.closed_at`: set when the session ends.
+    pub closed_at: Option<DateTime<Utc>>,
+}
+
+/// [`FollowUpRefusal::NotRunning`].
+pub const FOLLOW_UP_NOT_RUNNING: &str =
+    "only a running step takes a follow-up; p promotes a parked or failed step to a chat";
+/// [`FollowUpRefusal::Judge`].
+pub const FOLLOW_UP_JUDGE: &str = "a judge session takes no follow-up";
+/// [`FollowUpRefusal::ChatRun`].
+pub const FOLLOW_UP_CHAT_RUN: &str = "a chat takes follow-ups in its own view";
+/// [`FollowUpRefusal::AlreadyQueued`].
+pub const FOLLOW_UP_ALREADY_QUEUED: &str = "a follow-up is already queued";
+/// [`FollowUpRefusal::SessionEnded`], and the resolution of a row its window's close (or a newer
+/// window) refused.
+pub const FOLLOW_UP_SESSION_ENDED: &str = "the step finished its session; promote it to continue";
+/// [`FollowUpRefusal::NotStarted`].
+pub const FOLLOW_UP_NOT_STARTED: &str = "the step's session has not started yet";
+/// [`FollowUpRefusal::Cancelling`].
+pub const FOLLOW_UP_CANCELLING: &str = "the run is being cancelled";
+/// The resolution of a pending follow-up a run's cancel refused (D5, B-14).
+pub const FOLLOW_UP_RUN_CANCELLED: &str = "the run was cancelled";
+/// [`FollowUpRefusal::ExecutorGone`].
+pub const FOLLOW_UP_EXECUTOR_GONE: &str = "the process walking the step no longer holds the run";
+/// The resolution of a pending follow-up whose session was cancelled before it was sent (D6).
+pub const FOLLOW_UP_SESSION_CANCELLED: &str =
+    "the step's session was cancelled before the follow-up was sent";
+/// [`FollowUpTextError::Empty`].
+pub const FOLLOW_UP_EMPTY: &str = "a follow-up needs text";
+/// The Runs pane's label for a pending follow-up (PRD Q7, D12, B-21).
+pub const FOLLOW_UP_QUEUED: &str = "queued \u{2014} sent when the current turn ends";
+/// The Runs pane's label for an applied follow-up (D12, B-21).
+pub const FOLLOW_UP_SENT: &str = "follow-up sent";
+/// The Runs pane's label for a refused follow-up (D12, B-21).
+pub const FOLLOW_UP_REFUSED: &str = "follow-up refused";
+
+/// D12: the executor's scrubber refused the text (D6 step 4).
+#[must_use]
+pub fn executor_scrub_refusal(rule: &str) -> String {
+    format!("the executing box's scrubber refused the text ({rule})")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn follow_up_text_refuses_empty_and_whitespace_only_text() {
+        for text in ["", " ", "\t\n  "] {
+            let err = FollowUpText::new(text.to_owned()).expect_err("empty");
+            assert_eq!(err, FollowUpTextError::Empty);
+            assert_eq!(err.to_string(), FOLLOW_UP_EMPTY);
+        }
+    }
+
+    #[test]
+    fn follow_up_text_refuses_a_credential_and_names_only_its_rule() {
+        let err = FollowUpText::new("use sk-ant-api03-aaaaaaaaaaaaaaaaaaaa now".to_owned())
+            .expect_err("a credential");
+        assert!(
+            matches!(err, FollowUpTextError::Residue(ref u) if u.rule == "anthropic_api_key"),
+            "{err:?}"
+        );
+        let display = err.to_string();
+        let debug = format!("{err:?}");
+        assert!(display.contains("anthropic_api_key"), "{display}");
+        assert!(!display.contains("sk-ant"), "{display}");
+        assert!(!debug.contains("sk-ant"), "{debug}");
+    }
+
+    #[test]
+    fn follow_up_text_keeps_prose_as_typed() {
+        let typed = "  use the smaller fixture\t";
+        let text = FollowUpText::new(typed.to_owned()).expect("prose");
+        assert_eq!(text.as_str(), typed);
+        assert_eq!(text.into_string().as_bytes(), typed.as_bytes());
+    }
+
+    #[test]
+    fn follow_up_texts_debug_prints_its_length_only() {
+        let text = FollowUpText::new("rename the helper".to_owned()).expect("prose");
+        let debug = format!("{text:?}");
+        assert_eq!(debug, "FollowUpText { len: 17 }");
+        assert!(!debug.contains("rename"), "{debug}");
+    }
+
+    #[test]
+    fn a_queued_follow_ups_debug_prints_its_length_only() {
+        let id = RunCommandId::new();
+        let queued = QueuedFollowUp {
+            id,
+            text: "rename the helper".to_owned(),
+        };
+        let debug = format!("{queued:?}");
+        assert_eq!(debug, format!("QueuedFollowUp {{ id: {id:?}, len: 17 }}"));
+        assert!(!debug.contains("rename"), "{debug}");
+    }
 }

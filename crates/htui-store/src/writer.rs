@@ -25,21 +25,22 @@ use htui_core::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use htui_core::model::{
     Agent, AgentBox, AgentId, AnswerOutcome, BindingChange, BoxEdit, BoxId, BoxProbe, BoxRecord,
     BoxRow, CancelRequest, ChatRunSpec, CitationKind, Claim, CommandRun, CoverageRow, Document,
-    DocumentHead, DocumentId, GateOutcome, Item, ItemCitation, ItemFilter, ItemId, ItemKind,
-    ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement, ItemSummary, LinkGraph, NewCommandRun,
-    NewDocument, NewItem, NewItemKind, NewNote, NewPersona, NewProject, NewPromptTemplate, NewRepo,
-    NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill, NewSkillVersion,
-    NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
-    PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
-    ProjectId, ProjectPatch, PromptScope, PromptTemplate, RelaySessionId, RelayView, Repo,
-    RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea, RequirementAreaId,
-    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus,
-    RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Skill,
-    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
-    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
-    StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
-    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    DocumentHead, DocumentId, FollowUpRequest, FollowUpSettle, GateOutcome, Item, ItemCitation,
+    ItemFilter, ItemId, ItemKind, ItemKindId, ItemKindPatch, ItemPatch, ItemRequirement,
+    ItemSummary, LinkGraph, NewCommandRun, NewDocument, NewFollowUp, NewItem, NewItemKind, NewNote,
+    NewPersona, NewProject, NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun,
+    NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
+    PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
+    PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
@@ -1468,6 +1469,70 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.open_permissions(scope).await,
             Self::Online(pg) => pg.open_permissions(scope).await,
+        }
+    }
+
+    // -- MOD-70: follow-ups for engine steps (plan D1-D5, D9)
+
+    async fn request_follow_up(&self, new: NewFollowUp) -> Result<FollowUpRequest> {
+        match self {
+            Self::Memory(store) => store.request_follow_up(new).await,
+            Self::Online(pg) => pg.request_follow_up(new).await,
+        }
+    }
+
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.open_follow_ups(run, step, session, owner).await,
+            Self::Online(pg) => pg.open_follow_ups(run, step, session, owner).await,
+        }
+    }
+
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> Result<Option<QueuedFollowUp>> {
+        match self {
+            Self::Memory(store) => store.next_follow_up(step, session).await,
+            Self::Online(pg) => pg.next_follow_up(step, session).await,
+        }
+    }
+
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> Result<SettleOutcome> {
+        match self {
+            Self::Memory(store) => store.settle_follow_up(id, owner, to).await,
+            Self::Online(pg) => pg.settle_follow_up(id, owner, to).await,
+        }
+    }
+
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> Result<u64> {
+        match self {
+            Self::Memory(store) => store.close_follow_ups(step, session, reason).await,
+            Self::Online(pg) => pg.close_follow_ups(step, session, reason).await,
+        }
+    }
+
+    async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
+        match self {
+            Self::Memory(store) => store.close_dropped_follow_ups(run, owner, reason).await,
+            Self::Online(pg) => pg.close_dropped_follow_ups(run, owner, reason).await,
         }
     }
 }

@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT kind AS \"kind: RunCommandKind\", status AS \"status: RunCommandStatus\"\n             FROM run_command WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "kind: RunCommandKind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_command",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "status: RunCommandStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run_command",
+            "name": "status"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "85c365fbb3f5a8b016c1ba385106a115c54490c4c5dbcfdbd63cce5762d369c4"
+}

@@ -15,7 +15,7 @@
 //! `WorkerStore` is 58 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
 //! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
 //! `item_by_key` (plan D13, B-4) and its five command-queue methods (plan D14); [`RelayStore`] is
-//! four (MOD-42 plan D2).
+//! nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
 //! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`.
 
@@ -30,14 +30,14 @@ use crate::model::link::{ItemLink, ProposeLink, WithdrawLink};
 use crate::model::{
     AgentBox, AgentId, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CancelRequest, Claim, CommandRun, CommandRunId, CommandRunStatus, Document, DocumentHead,
-    DocumentId, GateOutcome, Item, ItemId, ItemKind, ItemSummary, NewCommandRun, NewDocument,
-    NewNote, NewRun, NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId,
+    DocumentId, FollowUpSettle, GateOutcome, Item, ItemId, ItemKind, ItemSummary, NewCommandRun,
+    NewDocument, NewNote, NewRun, NewRunStep, Note, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, PhaseAgent, PhaseId, Project, ProjectId, PromptScope, PromptTemplate,
-    QueueBatch, QueueEntry, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution, ResolvedGraph,
-    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, Status, StepGraphId,
-    StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus, UpstreamEntry, UserId,
-    WorkspaceSummary,
+    QueueBatch, QueueEntry, QueuedFollowUp, RelaySessionId, Repo, RepoBoxPath, RepoId, Resolution,
+    ResolvedGraph, ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId,
+    RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome,
+    Status, StepGraphId, StepGraphPhase, StepId, StepOutcome, StepPermission, StepStatus,
+    UpstreamEntry, UserId, WorkspaceSummary,
 };
 use crate::store::error::Result;
 use crate::store::mem::MemStore;
@@ -70,8 +70,9 @@ pub trait RecorderStore: Send + Sync {
 }
 
 /// What `htui_agent::record::drive` writes and reads while a request is parked (MOD-42 plan D2,
-/// D6). Separate from [`RecorderStore`] so `drive` can take a recorder store and a relay store as
-/// two type parameters: the spies implement only the first (plan probe A1b).
+/// D6), and its follow-up window (MOD-70 D4). Separate from [`RecorderStore`] so `drive` can take
+/// a recorder store and a relay store as two type parameters: the spies implement only the first
+/// (plan probe A1b).
 pub trait RelayStore: Send + Sync {
     /// [`WriteStore::open_permission`].
     fn open_permission(
@@ -94,6 +95,41 @@ pub trait RelayStore: Send + Sync {
         &self,
         session: RelaySessionId,
         to: PermissionStatus,
+    ) -> impl Future<Output = Result<u64>> + Send;
+    /// [`WriteStore::open_follow_ups`].
+    fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> impl Future<Output = Result<bool>> + Send;
+    /// [`WriteStore::next_follow_up`].
+    fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> impl Future<Output = Result<Option<QueuedFollowUp>>> + Send;
+    /// [`WriteStore::settle_follow_up`].
+    fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> impl Future<Output = Result<SettleOutcome>> + Send;
+    /// [`WriteStore::close_follow_ups`].
+    fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> impl Future<Output = Result<u64>> + Send;
+    /// [`WriteStore::close_dropped_follow_ups`].
+    fn close_dropped_follow_ups(
+        &self,
+        run: RunId,
+        owner: Uuid,
+        reason: &str,
     ) -> impl Future<Output = Result<u64>> + Send;
 }
 
@@ -576,6 +612,41 @@ impl RelayStore for MemStore {
         to: PermissionStatus,
     ) -> Result<u64> {
         WriteStore::settle_permissions(self, session, to).await
+    }
+    async fn open_follow_ups(
+        &self,
+        run: RunId,
+        step: StepId,
+        session: RelaySessionId,
+        owner: Uuid,
+    ) -> Result<bool> {
+        WriteStore::open_follow_ups(self, run, step, session, owner).await
+    }
+    async fn next_follow_up(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+    ) -> Result<Option<QueuedFollowUp>> {
+        WriteStore::next_follow_up(self, step, session).await
+    }
+    async fn settle_follow_up(
+        &self,
+        id: RunCommandId,
+        owner: Uuid,
+        to: FollowUpSettle,
+    ) -> Result<SettleOutcome> {
+        WriteStore::settle_follow_up(self, id, owner, to).await
+    }
+    async fn close_follow_ups(
+        &self,
+        step: StepId,
+        session: RelaySessionId,
+        reason: &str,
+    ) -> Result<u64> {
+        WriteStore::close_follow_ups(self, step, session, reason).await
+    }
+    async fn close_dropped_follow_ups(&self, run: RunId, owner: Uuid, reason: &str) -> Result<u64> {
+        WriteStore::close_dropped_follow_ups(self, run, owner, reason).await
     }
 }
 

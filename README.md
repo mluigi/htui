@@ -221,6 +221,7 @@ If an action isn't allowed right now, the status line says why and nothing happe
 | `A` | Accept the step's output |
 | `o` | Read the step's output document |
 | `p` | Continue the step as a chat |
+| `i` | Send a running step's agent a follow-up; it is sent when the current turn ends |
 | `Enter` | Replay the step's conversation in the Chat tab |
 | `c` | Cancel the run |
 | `T` | Retry the run's cleanup |

@@ -26,13 +26,16 @@
 //! | `u` / `R` | item | `Unblock` / `StartRun` |
 //! | `C` | item | close-out: the counts, a picked resolution, a `y`, the key typed back (D167) |
 //! | `1`-`9` | step with a pending request | `AnswerPermission` with that option (MOD-42 D14) |
+//! | `i` | running engine step | a typed follow-up (`FollowUp`, MOD-70 D14) |
 //! | `v` | pane | the list or the flow view of the cursor's run (MOD-28 D1, D8) |
 //! | `+` / `-` / `=` | flow | zoom in, zoom out, fit the run (MOD-28 D8) |
 //!
 //! MOD-42 plan D14: every `Runs` reply also asks for the item's `RelayView`. A step whose session
 //! parked a stage-3 permission request takes two more lines, the scrubbed summary and the strip,
 //! and while the cursor is on it every digit is the pane's; anywhere else a digit passes on to the
-//! global tab select. A run with a pending cancel says `cancel requested` under its grid.
+//! global tab select. A run with a pending cancel says `cancel requested` under its grid. A step's
+//! newest follow-up takes one line (queued, sent) or up to three (refused: the label and its
+//! reason), from column 2 (MOD-70 D14, blueprint B-7).
 //!
 //! MOD-28: `v` draws the run under the cursor as a flow (`execution_graph.rs`). The flow's selected
 //! node *is* the cursor, so every key above acts the same in both views (ANA-12 invariant 2).
@@ -57,8 +60,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use htui_agent::event::{PermissionOption, PermissionOptionKind};
 use htui_core::model::{
-    Document, DocumentId, ItemId, PermissionId, RelayOption, RelayOptionKind, RelayView,
-    Resolution, RunId, RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId, StepOpening,
+    Document, DocumentId, FOLLOW_UP_CHAT_RUN, FOLLOW_UP_JUDGE, FOLLOW_UP_NOT_RUNNING,
+    FOLLOW_UP_QUEUED, FOLLOW_UP_REFUSED, FOLLOW_UP_SENT, FollowUpText, FollowUpView, ItemId,
+    PermissionId, RelayOption, RelayOptionKind, RelayView, Resolution, RunCommandStatus, RunId,
+    RunKind, RunMode, RunStatus, RunStepSummary, RunSummary, Status, StepId, StepOpening,
     StepPermission, StepStatus, ToolCallCount, UsageTotals,
 };
 use htui_orch::closeout::Preview;
@@ -112,6 +117,9 @@ const DOCUMENT: &str = "document";
 /// blueprint B-13).
 const ANSWER_PERMISSION: &str = "answer_permission";
 
+/// `StoreRequest::FollowUp`'s name, which a refused follow-up is answered under (MOD-70 plan D13).
+const FOLLOW_UP: &str = "follow_up";
+
 /// The line under a run with a pending cancel (MOD-42 plan D14). The pane's own label: the
 /// runtime's sentence is longer than the pane is wide.
 const CANCEL_REQUESTED_LINE: &str = "cancel requested";
@@ -152,6 +160,10 @@ const INDENT: usize = 8;
 const GATE_WIDTH: usize = 10;
 /// See [`INDENT`].
 const TAIL_WIDTH: usize = 24;
+
+/// MOD-70 blueprint B-7: where a step's follow-up lines start. Two columns, not [`INDENT`]: PRD
+/// Q7's pending label is 40 columns and has to be read whole, so each line keeps 41 for its text.
+const FOLLOW_UP_INDENT: usize = 2;
 
 /// What replaces a timestamp a run has not reached yet, and any figure a step does not have.
 const PENDING: &str = "\u{2014}";
@@ -280,6 +292,14 @@ enum Mode {
         /// The parked step.
         step: StepId,
         /// The note.
+        field: TextField,
+    },
+    /// `i`: the follow-up typed for a running step's session (MOD-70 D14). No run: the request
+    /// names the step alone (blueprint B-8).
+    FollowUp {
+        /// The running step.
+        step: StepId,
+        /// The follow-up.
         field: TextField,
     },
     /// `c`: `y` cancels the run, `n` or `Esc` does not.
@@ -535,6 +555,42 @@ impl RunsTab {
             .find(|pending| pending.run_step_id == step)
     }
 
+    /// MOD-70 plan D5, D14: `step`'s newest follow-up, as the last `RelayView` had it.
+    fn follow_up_on(&self, step: StepId) -> Option<&FollowUpView> {
+        self.relay
+            .as_ref()?
+            .follow_ups
+            .iter()
+            .find(|view| view.run_step_id == step)
+    }
+
+    /// MOD-70 D14: `i` opens the follow-up input on a running main step of a graph run; anywhere
+    /// else it says why (D12) and sends nothing. The store re-checks every guard (D3).
+    fn open_follow_up(&mut self, ctx: &Ctx<'_>) {
+        let refusal = match self.entry_step() {
+            None => Err(NO_STEP),
+            Some(_)
+                if self
+                    .entry_run()
+                    .is_some_and(|run| run.kind == RunKind::Chat) =>
+            {
+                Err(FOLLOW_UP_CHAT_RUN)
+            }
+            Some((_, step)) if step.fanout_index < 0 => Err(FOLLOW_UP_JUDGE),
+            Some((_, step)) if step.status != StepStatus::Running => Err(FOLLOW_UP_NOT_RUNNING),
+            Some((_, step)) => Ok(step.id),
+        };
+        match refusal {
+            Ok(step) => {
+                self.mode = Mode::FollowUp {
+                    step,
+                    field: TextField::new(),
+                };
+            }
+            Err(sentence) => ctx.emit(Action::Error(sentence.to_owned())),
+        }
+    }
+
     /// The pending request on the step under the cursor, which the digits answer.
     fn pending_under_cursor(&self) -> Option<&StepPermission> {
         self.pending_on(self.selected_step()?)
@@ -579,6 +635,7 @@ impl RunsTab {
         self.mode = match core::mem::take(&mut self.mode) {
             Mode::Browse => Mode::Browse,
             Mode::RejectNote { run, step, field } => reject_key(run, step, field, key, ctx),
+            Mode::FollowUp { step, field } => follow_up_key(step, field, key, ctx),
             Mode::ConfirmCancel { run } => match key.code {
                 KeyCode::Char('y') => {
                     ctx.request(command(Command::CancelRun { run }));
@@ -646,6 +703,11 @@ impl RunsTab {
         let Some(item) = self.item else {
             return Handled::Pass;
         };
+        // MOD-70 D14: a follow-up has no `RunActions` verdict, so it waits on none.
+        if key == 'i' {
+            self.open_follow_up(ctx);
+            return Handled::Consumed;
+        }
         let Some(actions) = &self.actions else {
             ctx.emit(Action::Error(NOT_LOADED.to_owned()));
             return Handled::Consumed;
@@ -859,6 +921,28 @@ fn reject_key(
         }
         FieldOutcome::Cancel => Mode::Browse,
         FieldOutcome::Consumed | FieldOutcome::Pass => Mode::RejectNote { run, step, field },
+    }
+}
+
+/// A key in [`Mode::FollowUp`] (MOD-70 D14): `Enter` sends the text when it is a follow-up, and
+/// otherwise says why and stays, so the text can be edited (an empty text and a credential-shaped
+/// one alike, D2); `Esc` goes back to the list and everything else is typed.
+fn follow_up_key(step: StepId, mut field: TextField, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
+    match field.on_key(key) {
+        FieldOutcome::Submit => {
+            match FollowUpText::new(field.text().unwrap_or_default().to_owned()) {
+                Ok(text) => {
+                    ctx.request(StoreRequest::FollowUp { step, text });
+                    Mode::Browse
+                }
+                Err(why) => {
+                    ctx.emit(Action::Error(why.to_string()));
+                    Mode::FollowUp { step, field }
+                }
+            }
+        }
+        FieldOutcome::Cancel => Mode::Browse,
+        FieldOutcome::Consumed | FieldOutcome::Pass => Mode::FollowUp { step, field },
     }
 }
 
@@ -1289,6 +1373,34 @@ fn permission_lines(pending: &StepPermission, theme: &Theme) -> [Line<'static>; 
     [asks, Line::from(spans)]
 }
 
+/// MOD-70 D14, blueprint B-7: the lines under a step with a follow-up, each exactly [`PANE`] wide
+/// from [`FOLLOW_UP_INDENT`]: queued (a warning: it waits on the turn), sent, or refused and its
+/// reason wrapped to at most two lines. Never the text (OQ-6): the view has none.
+fn follow_up_lines(view: &FollowUpView, theme: &Theme) -> Vec<Line<'static>> {
+    let line = |text: &str, style: Style| {
+        Line::from(vec![
+            Span::raw(blank(FOLLOW_UP_INDENT)),
+            Span::styled(cells::fit(text, PANE - FOLLOW_UP_INDENT), style),
+        ])
+    };
+    match view.status {
+        RunCommandStatus::Pending => vec![line(FOLLOW_UP_QUEUED, theme.warning)],
+        RunCommandStatus::Applied => vec![line(FOLLOW_UP_SENT, theme.dim)],
+        RunCommandStatus::Refused => {
+            let mut lines = vec![line(FOLLOW_UP_REFUSED, theme.dim)];
+            if let Some(reason) = &view.resolution {
+                lines.extend(
+                    cells::wrap(reason, PANE - FOLLOW_UP_INDENT)
+                        .iter()
+                        .take(2)
+                        .map(|row| line(row, theme.dim)),
+                );
+            }
+            lines
+        }
+    }
+}
+
 /// D170's usage cell: dollars when the usage document carries a cost, else tokens, else `—`. At
 /// most [`USAGE_WIDTH`] characters over the whole of `i64`.
 ///
@@ -1466,7 +1578,7 @@ impl DetailTab for RunsTab {
             // MOD-28 D8: the list's page keys do nothing in the flow, and leave its scroll alone.
             KeyCode::PageUp | KeyCode::PageDown if self.view == View::Flow => {}
             KeyCode::Char(
-                key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'A' | 'R' | 'C' | 'T'),
+                key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'i' | 'A' | 'R' | 'C' | 'T'),
             ) => {
                 let handled = self.action(key, ctx);
                 // MOD-71 D11, MOD-74 D4: a mode that captures input ends a live gesture
@@ -1485,11 +1597,14 @@ impl DetailTab for RunsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
-    /// MOD-22 review M-1: a bracketed paste into the rejection note or the typed-back key. The
-    /// `y`/`n` questions are not fields: a paste there is dropped, so its `y` confirms nothing.
+    /// MOD-22 review M-1: a bracketed paste into the rejection note, the follow-up (MOD-70 D14) or
+    /// the typed-back key. The `y`/`n` questions are not fields: a paste there is dropped, so its
+    /// `y` confirms nothing.
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
         match &mut self.mode {
-            Mode::RejectNote { field, .. } | Mode::CloseOut(CloseOutStage::Typed { field, .. }) => {
+            Mode::RejectNote { field, .. }
+            | Mode::FollowUp { field, .. }
+            | Mode::CloseOut(CloseOutStage::Typed { field, .. }) => {
                 field.on_paste(text);
                 Handled::Consumed
             }
@@ -1643,6 +1758,10 @@ impl DetailTab for RunsTab {
                 self.answering = None;
                 self.re_read(ctx);
             }
+            // MOD-70 D13: a follow-up, queued or refused (its sentence is on the status line
+            // already), re-reads the runs, and the re-read brings the relay view that draws it.
+            StoreReply::FollowUpQueued { .. } => self.re_read(ctx),
+            StoreReply::Failed { request, .. } if *request == FOLLOW_UP => self.re_read(ctx),
             _ => {}
         }
     }
@@ -1729,8 +1848,9 @@ impl RunsTab {
 
     /// MOD-28 review L3, H1: the flow's head, the lines the list draws for `run` and the cursor's
     /// step that a node has no room for: the run header (failure, pending cancel, a queued
-    /// command), the step's parked reason, and the pending request the digits answer, so a digit
-    /// in the flow never answers a request the pane does not show.
+    /// command), the step's parked reason, how its chat opened, the pending request the digits
+    /// answer, so a digit in the flow never answers a request the pane does not show, and its
+    /// follow-up's lines (MOD-70 D14: queued, sent or refused with its reason).
     fn flow_head(&self, run: &RunSummary, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = run_lines(run, self.cancel_requested(run.id), theme);
         if self.waiting.contains(&run.id) {
@@ -1741,6 +1861,9 @@ impl RunsTab {
             lines.extend(opening_lines(step, theme));
             if let Some(pending) = self.pending_on(step.id) {
                 lines.extend(permission_lines(pending, theme));
+            }
+            if let Some(view) = self.follow_up_on(step.id) {
+                lines.extend(follow_up_lines(view, theme));
             }
         }
         lines
@@ -1778,6 +1901,10 @@ impl RunsTab {
                 if let Some(pending) = self.pending_on(step.id) {
                     lines.extend(permission_lines(pending, theme));
                 }
+                // MOD-70 D14: so do the follow-up's.
+                if let Some(view) = self.follow_up_on(step.id) {
+                    lines.extend(follow_up_lines(view, theme));
+                }
                 if on_cursor {
                     cursor_end = lines.len();
                 }
@@ -1795,6 +1922,11 @@ impl RunsTab {
                 Line::styled("reject with a note:", theme.title),
                 field.line(width, true, theme),
                 hint("Enter reject · Esc cancel"),
+            ],
+            Mode::FollowUp { field, .. } => vec![
+                Line::styled("follow-up for the running step:", theme.title),
+                field.line(width, true, theme),
+                hint("Enter send · Esc cancel"),
             ],
             Mode::ConfirmCancel { .. } => vec![
                 Line::styled("cancel this run?", theme.title),
@@ -1841,7 +1973,9 @@ mod tests {
     use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use htui_core::fixtures::{demo_at, ids};
     use htui_core::model::{
-        GateOutcome, PermissionStatus, ProjectRef, RelaySessionId, Scope, WorkspaceId,
+        FOLLOW_UP_EMPTY, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
+        FOLLOW_UP_SESSION_ENDED, GateOutcome, PermissionStatus, ProjectRef, RelaySessionId,
+        RunCommandId, Scope, WorkspaceId, executor_scrub_refusal,
     };
     use htui_core::store::{MemStore, ReadStore};
     use htui_orch::Rest;
@@ -5238,6 +5372,7 @@ mod tests {
             view: Box::new(RelayView {
                 permissions,
                 cancels,
+                follow_ups: Vec::new(),
             }),
         }
     }
@@ -5669,6 +5804,372 @@ mod tests {
             &requests(shell.emit.take()),
             ids::HTUI_FEAT_1
         ));
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-70 plan D13, D14: a typed follow-up for a running engine step.
+    // -----------------------------------------------------------------------------------------
+
+    /// The `FEAT-1` pane with its cursor step, `prd`, running on the main slot, after `edit` had
+    /// its say over the run; with every verdict allowed when `actions`, else with none loaded.
+    async fn following(shell: &Shell, actions: bool, edit: fn(&mut RunSummary)) -> RunsTab {
+        let mut runs = feat_1_runs().await;
+        runs[0].steps[0].status = StepStatus::Running;
+        runs[0].steps[0].fanout_index = 0;
+        edit(&mut runs[0]);
+        let mut pane = RunsTab::new();
+        pane.on_item_change(Some(ids::HTUI_FEAT_1));
+        pane.on_reply(&StoreReply::Runs(runs), &mut shell.ctx());
+        if actions {
+            let actions = verdicts(ids::HTUI_FEAT_1, &pane.runs, true, DocumentId::new());
+            pane.on_reply(&StoreReply::RunActions(Box::new(actions)), &mut shell.ctx());
+        }
+        let _ = shell.emit.take();
+        assert_eq!(pane.selected_step(), Some(ids::STEP_PRD));
+        pane
+    }
+
+    /// The newest follow-up of `step`, as the relay view carries it.
+    fn follow_up(step: StepId, status: RunCommandStatus, resolution: Option<&str>) -> FollowUpView {
+        FollowUpView {
+            id: RunCommandId::new(),
+            run_id: ids::RUN_1,
+            run_step_id: step,
+            status,
+            resolution: resolution.map(str::to_owned),
+            issued_at: demo_at(1, 9),
+            resolved_at: None,
+        }
+    }
+
+    /// A `RelayView` reply for `item` carrying `follow_ups` and nothing else.
+    fn relay_with(item: ItemId, follow_ups: Vec<FollowUpView>) -> StoreReply {
+        StoreReply::RelayView {
+            item,
+            view: Box::new(RelayView {
+                permissions: Vec::new(),
+                cancels: Vec::new(),
+                follow_ups,
+            }),
+        }
+    }
+
+    /// D14: `i` on a running main step opens the input, for that step, and sends nothing yet.
+    #[tokio::test]
+    async fn i_on_a_running_main_step_opens_the_follow_up_input() {
+        let shell = Shell::new();
+        let mut pane = following(&shell, true, |_| {}).await;
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('i')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(
+            matches!(pane.mode, Mode::FollowUp { step, .. } if step == ids::STEP_PRD),
+            "the input is the cursor step's: {:?}",
+            pane.mode
+        );
+        assert!(pane.captures_input());
+        assert!(shell.emit.is_empty(), "`i` only opens the input");
+        let footer = footer(&pane);
+        assert_eq!(footer.len(), 3, "{footer:?}");
+        assert_eq!(footer[0], "follow-up for the running step:");
+        assert_eq!(footer[2], "Enter send · Esc cancel");
+    }
+
+    /// D12, D14: `i` anywhere but a running main step of a graph run says why and sends nothing,
+    /// whether or not the run actions have loaded: a follow-up has no verdict to wait on.
+    #[tokio::test]
+    async fn i_says_why_on_a_judge_a_parked_or_a_done_step() {
+        /// What a case does to the run before `i`.
+        type Edit = fn(&mut RunSummary);
+        let cases: [(&str, Edit, &str); 4] = [
+            (
+                "a judge",
+                |run| run.steps[0].fanout_index = -1,
+                FOLLOW_UP_JUDGE,
+            ),
+            (
+                "a parked step",
+                |run| run.steps[0].status = StepStatus::AwaitingApproval,
+                FOLLOW_UP_NOT_RUNNING,
+            ),
+            (
+                "a done step",
+                |run| run.steps[0].status = StepStatus::Done,
+                FOLLOW_UP_NOT_RUNNING,
+            ),
+            ("a chat", |run| run.kind = RunKind::Chat, FOLLOW_UP_CHAT_RUN),
+        ];
+        for actions in [true, false] {
+            for (name, edit, sentence) in cases {
+                let shell = Shell::new();
+                let mut pane = following(&shell, actions, edit).await;
+                assert_eq!(
+                    pane.on_key(key(KeyCode::Char('i')), &mut shell.ctx()),
+                    Handled::Consumed,
+                    "{name}"
+                );
+                let emitted = shell.emit.take();
+                assert!(
+                    matches!(emitted.as_slice(), [Action::Error(said)] if said == sentence),
+                    "{name} (actions loaded: {actions}) says `{sentence}` and sends nothing: \
+                     {emitted:?}"
+                );
+                assert!(!pane.captures_input(), "{name} opens nothing");
+            }
+        }
+    }
+
+    /// D13, D14: `Enter` sends the text as typed, for the step, and goes back to the list.
+    #[tokio::test]
+    async fn enter_sends_a_follow_up_and_returns_to_browse() {
+        let shell = Shell::new();
+        let mut pane = following(&shell, true, |_| {}).await;
+        pane.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "use the smaller fixture");
+        assert_eq!(footer(&pane)[1], "use the smaller fixture", "on screen");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::FollowUp { step, text }]
+                if *step == ids::STEP_PRD && text.as_str() == "use the smaller fixture"),
+            "one follow-up, the text as typed: {sent:?}"
+        );
+        assert!(!pane.captures_input(), "and back to the list");
+        assert!(matches!(pane.mode, Mode::Browse));
+    }
+
+    /// D2, D12: an empty or blank follow-up says it needs text and stays open.
+    #[tokio::test]
+    async fn an_empty_follow_up_stays_open_with_its_sentence() {
+        let shell = Shell::new();
+        let mut pane = following(&shell, true, |_| {}).await;
+        pane.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "   ");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(said)] if said == FOLLOW_UP_EMPTY),
+            "{emitted:?}"
+        );
+        assert!(
+            matches!(pane.mode, Mode::FollowUp { step, .. } if step == ids::STEP_PRD),
+            "the input stays open: {:?}",
+            pane.mode
+        );
+    }
+
+    /// D2, I-5: a credential-shaped follow-up is refused on the typing box, by the rule's name and
+    /// never by the key, and the input stays open so the text can be edited.
+    #[tokio::test]
+    async fn a_credential_shaped_follow_up_stays_open_and_sends_nothing() {
+        let key_text = format!("sk-ant-api03-{}", "a".repeat(30));
+        let shell = Shell::new();
+        let mut pane = following(&shell, true, |_| {}).await;
+        pane.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        assert_eq!(
+            pane.on_paste(&format!("try {key_text}"), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let emitted = shell.emit.take();
+        assert!(
+            matches!(emitted.as_slice(), [Action::Error(said)]
+                if said.contains("anthropic_api_key") && !said.contains("sk-ant")),
+            "the rule, not the key, and nothing sent: {emitted:?}"
+        );
+        assert!(matches!(pane.mode, Mode::FollowUp { .. }), "still open");
+    }
+
+    /// D14: `Esc` leaves the input and sends nothing, as the rejection note's does.
+    #[tokio::test]
+    async fn esc_leaves_the_follow_up_input() {
+        let shell = Shell::new();
+        let mut pane = following(&shell, true, |_| {}).await;
+        pane.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        type_text(&mut pane, &shell, "never mind");
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(
+            pane.on_key(ctrl_c, &mut shell.ctx()),
+            Handled::Pass,
+            "the input lets `ctrl-c` through"
+        );
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        assert!(!pane.captures_input(), "`Esc` drops the follow-up");
+        assert!(shell.emit.is_empty(), "and sends nothing");
+    }
+
+    /// MOD-22 review M-1's rule for the new field: a bracketed paste is typed into it.
+    #[tokio::test]
+    async fn a_paste_reaches_the_follow_up_field() {
+        let shell = Shell::new();
+        let mut pane = following(&shell, true, |_| {}).await;
+        pane.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        assert_eq!(
+            pane.on_paste("use the smaller fixture", &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert_eq!(footer(&pane)[1], "use the smaller fixture");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        let sent = requests(shell.emit.take());
+        assert!(
+            matches!(sent.as_slice(), [StoreRequest::FollowUp { text, .. }]
+                if text.as_str() == "use the smaller fixture"),
+            "{sent:?}"
+        );
+    }
+
+    /// D13: a follow-up, queued or refused, re-reads the runs (and so the relay view); the
+    /// refusal's sentence is on the status line already.
+    #[tokio::test]
+    async fn a_follow_up_reply_re_reads_the_runs() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_reply(
+            &StoreReply::FollowUpQueued {
+                step: ids::STEP_PRD,
+            },
+            &mut shell.ctx(),
+        );
+        assert!(is_one_re_read(
+            &requests(shell.emit.take()),
+            ids::HTUI_FEAT_1
+        ));
+
+        pane.on_reply(
+            &StoreReply::Failed {
+                request: "follow_up",
+                message: FOLLOW_UP_SESSION_ENDED.to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+        assert!(is_one_re_read(
+            &requests(shell.emit.take()),
+            ids::HTUI_FEAT_1
+        ));
+    }
+
+    /// D14, blueprint B-7: a step's newest follow-up is one more line (queued, sent) or three
+    /// (refused: the label and its reason, wrapped), each exactly the pane's 43 columns from
+    /// column 2, and PRD Q7's pending label is read whole.
+    #[tokio::test]
+    async fn a_step_with_a_follow_up_takes_its_lines_each_forty_three_wide() {
+        let theme = Theme::default();
+        for (status, resolution, expected) in [
+            (RunCommandStatus::Pending, None, 1),
+            (RunCommandStatus::Applied, None, 1),
+            (RunCommandStatus::Refused, Some(FOLLOW_UP_SESSION_ENDED), 3),
+        ] {
+            let view = follow_up(ids::STEP_PRD, status, resolution);
+            let drawn = follow_up_lines(&view, &theme);
+            assert_eq!(drawn.len(), expected, "{status:?}: {drawn:?}");
+            for line in &drawn {
+                assert_eq!(line.width(), PANE, "{:?} is not {PANE} wide", text(line));
+                assert!(
+                    text(line).starts_with(&blank(FOLLOW_UP_INDENT)),
+                    "{:?} starts at column {FOLLOW_UP_INDENT}",
+                    text(line)
+                );
+            }
+            let first = text(&drawn[0]);
+            let label = match status {
+                RunCommandStatus::Pending => FOLLOW_UP_QUEUED,
+                RunCommandStatus::Applied => FOLLOW_UP_SENT,
+                _ => FOLLOW_UP_REFUSED,
+            };
+            assert_eq!(first.trim(), label, "the label, whole");
+            if let Some(resolution) = resolution {
+                let reason: Vec<String> = drawn[1..]
+                    .iter()
+                    .map(|line| text(line).trim().to_owned())
+                    .collect();
+                assert_eq!(reason.join(" "), resolution, "the reason, whole");
+            }
+        }
+
+        let shell = Shell::new();
+        let mut pane = pane(&shell).await;
+        pane.on_reply(
+            &relay_with(
+                ids::HTUI_FEAT_1,
+                vec![follow_up(ids::STEP_PRD, RunCommandStatus::Pending, None)],
+            ),
+            &mut shell.ctx(),
+        );
+        let drawn = lines(&pane, &shell);
+        let at = drawn
+            .iter()
+            .position(|line| line.contains("prd"))
+            .expect("the `prd` step is listed");
+        assert_eq!(
+            drawn[at + 2],
+            format!("{}{FOLLOW_UP_QUEUED}", blank(FOLLOW_UP_INDENT)),
+            "the pending line is right under the step's second line: {drawn:#?}"
+        );
+        assert!(
+            drawn[at + 3].contains("plan"),
+            "the next step follows: {drawn:#?}"
+        );
+        assert_eq!(
+            drawn.iter().filter(|line| !line.is_empty()).count(),
+            2 + 2 + 4 * 2 + 1,
+            "only the step with the follow-up grew: {drawn:#?}"
+        );
+
+        pane.on_reply(
+            &relay_with(
+                ids::HTUI_FEAT_1,
+                vec![follow_up(
+                    ids::STEP_PRD,
+                    RunCommandStatus::Refused,
+                    Some(FOLLOW_UP_SESSION_ENDED),
+                )],
+            ),
+            &mut shell.ctx(),
+        );
+        let drawn = lines(&pane, &shell);
+        assert!(drawn[at + 2].contains(FOLLOW_UP_REFUSED), "{drawn:#?}");
+        assert!(
+            drawn[at + 5].contains("plan"),
+            "three lines, then the next step: {drawn:#?}"
+        );
+    }
+
+    /// Blueprint B-7: every reason D12 refuses a queued follow-up with fits two lines of the 41
+    /// columns a follow-up line has, the scrubber's with the longest rule name in `scrub.rs`.
+    #[test]
+    fn every_follow_up_resolution_fits_two_lines() {
+        let theme = Theme::default();
+        let scrubbed: Vec<String> = [
+            "anthropic_api_key",
+            "aws_access_key_id",
+            "stripe_secret_key",
+        ]
+        .into_iter()
+        .map(executor_scrub_refusal)
+        .collect();
+        let mut reasons = vec![
+            FOLLOW_UP_SESSION_ENDED,
+            FOLLOW_UP_SESSION_CANCELLED,
+            FOLLOW_UP_RUN_CANCELLED,
+        ];
+        reasons.extend(scrubbed.iter().map(String::as_str));
+        for reason in reasons {
+            let rows = cells::wrap(reason, PANE - FOLLOW_UP_INDENT);
+            assert!(
+                rows.len() <= 2,
+                "{reason:?} takes {} lines: {rows:?}",
+                rows.len()
+            );
+            let view = follow_up(ids::STEP_PRD, RunCommandStatus::Refused, Some(reason));
+            let drawn = follow_up_lines(&view, &theme);
+            let shown: Vec<String> = drawn
+                .iter()
+                .skip(1)
+                .map(|line| text(line).trim().to_owned())
+                .collect();
+            assert_eq!(shown.join(" "), reason, "nothing of {reason:?} is cut");
+        }
     }
 
     // -----------------------------------------------------------------------------------------

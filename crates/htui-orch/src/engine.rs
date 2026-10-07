@@ -33,12 +33,13 @@ use htui_agent::record::{
 };
 use htui_core::model::{
     AgentId, BatchId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus,
-    Document, DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
-    NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
-    PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
-    RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotPersona,
-    SnapshotPhase, SnapshotTemplate, Status, StepFiles, StepId, StepOutcome, StepStatus,
-    TIMESTAMPTZ_DIGITS, Transport, UserId, VerifyOutcome, missing_tags_failure,
+    Document, DocumentId, EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_ENDED, Gate,
+    GateOutcome, GraphSnapshot, Isolation, Item, ItemId, NewCommandRun, NewNote, NewRun,
+    NewRunStep, NoteId, Project, ProjectId, ProjectSettings, PromptScope, RelaySessionId, Repo,
+    RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
+    SessionEvent, SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status,
+    StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
+    VerifyOutcome, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -1919,6 +1920,9 @@ where
             self.cleanup_run(run).await
         };
         self.leased_window(run, window).await?;
+        // MOD-70 review M-3: under the lease still held, before it goes back.
+        self.close_finished_follow_ups(run, FOLLOW_UP_RUN_CANCELLED)
+            .await;
         self.release_lease(run).await;
         Ok(CommandOutcome::Cancelled {
             rest: Rest {
@@ -2042,14 +2046,46 @@ where
     /// decides the release: a run still `running` keeps its lease, any other status gives it back.
     /// The re-read only decides that, so its failure is warned and the release is tried anyway;
     /// the walk's answer stands either way.
+    ///
+    /// MOD-70 review M-3, R2 P-1: a run the walk gives back (settled terminal, or parked at a
+    /// gate) has its follow-up windows closed first, under the lease still held
+    /// ([`Self::close_finished_follow_ups`]). A failed re-read closes nothing: the run's status
+    /// is unknown, and nothing else is written.
     async fn release_after_walk(&self, run: RunId, reread: Result<Run, EngineError>) {
         match reread {
             Ok(row) if row.status == RunStatus::Running => {}
-            Ok(_) => self.release_lease(run).await,
+            Ok(_) => {
+                self.close_finished_follow_ups(run, FOLLOW_UP_SESSION_ENDED)
+                    .await;
+                self.release_lease(run).await;
+            }
             Err(err) => {
                 tracing::warn!(%run, %err, "re-reading the run after its walk failed");
                 self.release_lease(run).await;
             }
+        }
+    }
+
+    /// MOD-70 review M-3, R2 P-1: every follow-up window of `run` closes and every follow-up
+    /// still pending on it is refused with `reason`, its text nulled. Called where this process
+    /// gives the run back with no session live on it (it settled the run terminal, cancelled it,
+    /// or its walk parked it at a gate) and still holds its lease, before releasing it: a
+    /// follow-up whose window close gave up (D6 step 8, R-3) would otherwise keep its text, for
+    /// ever on a finished run (no lease is re-taken on it, D9, and `relay_view` lists no terminal
+    /// run) and for as long as a parked run waits (its next take runs D9 only for `DeadWalks`).
+    /// The store fences it on this owner's lease, and it is idempotent.
+    ///
+    /// Best-effort: a failure is a `warn`, and the rows stay as they were. Boxed: it is awaited on
+    /// the walk's path (the 2 MiB stack).
+    async fn close_finished_follow_ups(&self, run: RunId, reason: &str) {
+        let closed = Box::pin(self.parts.store.close_dropped_follow_ups(
+            run,
+            self.parts.owner,
+            reason,
+        ))
+        .await;
+        if let Err(err) = closed {
+            tracing::warn!(%run, %err, "closing the follow-up windows of a run given back failed; what they hold stays pending");
         }
     }
 
@@ -2194,8 +2230,23 @@ where
     /// `open_permission` staling only reaches it if a new session parks on the same step, and
     /// recovery opens none.
     ///
+    /// MOD-70 D9: the dropped walk's follow-up windows close first, under the same lease, and
+    /// every follow-up still pending on the run is refused with
+    /// [`FOLLOW_UP_SESSION_ENDED`]: no session will ever send it (OQ-5). The sweep can reach
+    /// this twice for one run (its `renew_lease`, then its recovery); the close is idempotent.
+    ///
     /// Best-effort: a failure is a `warn`, and the row stays the ghost it was.
     async fn stale_dropped_requests(&self, run: RunId, item: ItemId) {
+        // MOD-70 D9: the dropped walk's follow-up windows close first, under the same lease: a
+        // follow-up queued for a session nobody drives is refused, not stranded (OQ-5).
+        if let Err(err) = self
+            .parts
+            .store
+            .close_dropped_follow_ups(run, self.parts.owner, FOLLOW_UP_SESSION_ENDED)
+            .await
+        {
+            tracing::warn!(%run, %err, "closing a dropped walk's follow-up windows failed; a cancel or the next re-take refuses what they hold");
+        }
         let view = match self.parts.store.relay_view(item).await {
             Ok(view) => view,
             Err(err) => {
@@ -6288,6 +6339,9 @@ where
             poll: RELAY_POLL,
             grace: RELAY_GRACE,
             now: &now,
+            // MOD-70 D8: the main step's and each candidate's session take follow-ups; a judge
+            // call (`fanout_index = -1`, `judge_calls`) never opens a window (PRD Q2).
+            follow_ups: step.fanout_index >= 0,
         };
         // MOD-37 M4 D1: under a deadline `drive` runs against a step-local control, which
         // `forward_or_cut` feeds from the run's; without one, against the run's own, and no
@@ -16516,8 +16570,10 @@ mod tests {
         };
         use htui_core::fixtures::ids;
         use htui_core::model::{
-            EventKind, Gate, ItemId, PermissionStatus, RunId, RunMode, RunStatus, SessionEvent,
-            SnapshotCandidate, Status, StepId, StepPermission, StepStatus,
+            EventKind, FOLLOW_UP_RUN_CANCELLED, FOLLOW_UP_SESSION_CANCELLED,
+            FOLLOW_UP_SESSION_ENDED, FollowUpRefusal, FollowUpRequest, FollowUpText, Gate, ItemId,
+            NewFollowUp, PermissionStatus, RunCommandId, RunCommandStatus, RunId, RunMode,
+            RunStatus, SessionEvent, SnapshotCandidate, Status, StepId, StepPermission, StepStatus,
         };
         use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
         use serde_json::Value;
@@ -18287,6 +18343,657 @@ mod tests {
                 "no driver was built or started"
             );
             assert!(orch.store.relay_rows().is_empty());
+        }
+
+        // -- MOD-70 T3: follow-ups for engine steps (plan D8, D9; blueprint §7.4) ------------
+
+        /// The text every case's client queues first.
+        const FOLLOW_UP: &str = "also cover the edge cases";
+
+        /// The second turn a follow-up starts: a line of text, then `Done { EndTurn }`.
+        fn a_second_turn() -> Vec<ScriptEvent> {
+            vec![
+                ScriptEvent::Emit(DriverEvent::AssistantChunk(TextChunk {
+                    text: "the edge cases are covered".into(),
+                    message_id: None,
+                })),
+                ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+                    stop_reason: StopReason::EndTurn,
+                })),
+            ]
+        }
+
+        /// MOD-70 B-9: turn 0 is [`parks`]' (the client's rendezvous, finished once answered);
+        /// turn 1 is `turn1`, what a follow-up starts. A document with `body`.
+        fn parks_then(turn1: Vec<ScriptEvent>, body: &str) -> ScriptedStep {
+            let mut step = parks(body);
+            step.script = Script::turns(vec![step.script.turns[0].events.clone(), turn1]);
+            step
+        }
+
+        /// A judge call that parks on [`request`] and, once answered, writes a verdict naming
+        /// candidate `winner`.
+        fn judge_parks(winner: i32) -> ScriptedStep {
+            ScriptedStep {
+                output: ScriptedStep::judge(winner, &[]).output,
+                ..parks("")
+            }
+        }
+
+        /// The client queues `text` for `step` as the demo user from the demo box (D3).
+        async fn request_follow_up(store: &MemStore, step: StepId, text: &str) -> FollowUpRequest {
+            store
+                .request_follow_up(NewFollowUp {
+                    id: RunCommandId::new(),
+                    run_step_id: step,
+                    text: FollowUpText::new(text.to_owned()).expect("the client accepts the text"),
+                    issued_by: ids::USER,
+                    issued_box: ids::BOX,
+                })
+                .await
+                .expect("the enqueue is answered")
+        }
+
+        /// [`request_follow_up`], which must be queued; the row's id.
+        async fn queued(store: &MemStore, step: StepId, text: &str) -> RunCommandId {
+            match request_follow_up(store, step, text).await {
+                FollowUpRequest::Queued(id) => id,
+                refused @ FollowUpRequest::Refused(_) => {
+                    panic!("the follow-up was not queued: {refused:?}")
+                }
+            }
+        }
+
+        /// The client answers `row` with its first (allow) option.
+        async fn answer(store: &MemStore, row: &StepPermission) {
+            let answered = store
+                .answer_permission(row.id, &row.options[0].id, ids::USER, ids::BOX)
+                .await
+                .expect("the answer is read");
+            assert_eq!(
+                answered,
+                htui_core::model::AnswerOutcome::Answered,
+                "the client's answer wins"
+            );
+        }
+
+        /// B-9: [`answering_client`] that queues a follow-up for the parked row's step **before**
+        /// it answers, so the row is pending at the turn's `done`. Answers the parked row and the
+        /// follow-up's id.
+        fn following_client(
+            store: MemStore,
+            item: ItemId,
+            text: &'static str,
+        ) -> tokio::task::JoinHandle<Option<(StepPermission, RunCommandId)>> {
+            tokio::spawn(async move {
+                let row = parked_row(&store, item).await?;
+                let id = queued(&store, row.run_step_id, text).await;
+                answer(&store, &row).await;
+                Some((row, id))
+            })
+        }
+
+        /// Follow-up `id`'s status, resolution and whether its text is still stored (B-1).
+        fn the_follow_up(
+            store: &MemStore,
+            id: RunCommandId,
+        ) -> (RunCommandStatus, Option<String>, bool) {
+            store
+                .follow_up_rows()
+                .into_iter()
+                .find(|(row, _)| row.id == id)
+                .map(|(row, text)| (row.status, row.resolution, text))
+                .expect("the follow-up row exists")
+        }
+
+        /// Polls every 100 ms until follow-up `id` was taken for a turn; `None` after
+        /// [`CLIENT_LIMIT`].
+        async fn applied(store: &MemStore, id: RunCommandId) -> Option<()> {
+            let poll = async {
+                while the_follow_up(store, id).0 != RunCommandStatus::Applied {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            };
+            tokio::time::timeout(CLIENT_LIMIT, poll).await.ok()
+        }
+
+        /// The turns of a log's `follow_up` rows, in `seq` order.
+        fn follow_up_turns(log: &[SessionEvent]) -> Vec<i32> {
+            log.iter()
+                .filter(|row| row.kind == EventKind::FollowUp)
+                .map(|row| row.turn)
+                .collect()
+        }
+
+        /// Whether a log's `follow_up` rows include the one [`FOLLOW_UP`] sent.
+        fn carries_the_follow_up(log: &[SessionEvent]) -> bool {
+            log.iter()
+                .any(|row| row.kind == EventKind::FollowUp && row.payload["text"] == FOLLOW_UP)
+        }
+
+        /// How many `done` rows a log holds: one per turn.
+        fn dones_in(log: &[SessionEvent]) -> usize {
+            log.iter().filter(|row| row.kind == EventKind::Done).count()
+        }
+
+        /// `step` has exactly one follow-up window, and it is closed.
+        fn assert_window_closed(store: &MemStore, step: StepId) {
+            let windows: Vec<_> = store
+                .follow_up_windows()
+                .into_iter()
+                .filter(|window| window.run_step_id == step)
+                .collect();
+            assert_eq!(windows.len(), 1, "one window for the step: {windows:?}");
+            assert!(
+                windows[0].closed_at.is_some(),
+                "the session's exit closed it: {windows:?}"
+            );
+        }
+
+        /// `ANA-2` as [`ana_2_judged_with_a_parked_call`] sets it up, with candidate 0's session
+        /// and judge call 0 replaced, and judge call 1 agreeing on candidate 0.
+        async fn ana_2_judged_with(
+            harness: &Harness,
+            candidate: ScriptedStep,
+            judge: ScriptedStep,
+        ) {
+            ana_2_judged_with_a_parked_call(harness).await;
+            harness
+                .orch
+                .script_candidate("research", 1, 0, 0, candidate);
+            harness
+                .orch
+                .script_candidate("research:judge", 1, -1, 0, judge);
+            harness
+                .orch
+                .script_candidate("research:judge", 1, -1, 1, ScriptedStep::judge(0, &[]));
+        }
+
+        /// MOD-70 D8 end to end: a follow-up queued while `prd`'s main session is parked is sent
+        /// when that turn ends and runs a second turn; the step settles `done` and the walk rests
+        /// at `plan`'s gate.
+        #[tokio::test(start_paused = true)]
+        async fn a_follow_up_queued_while_parked_runs_a_second_turn_before_the_gate() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .script("prd", 1, parks_then(a_second_turn(), "the prd"));
+            let client = following_client(harness.orch.store.clone(), ids::HTUI_FEAT_3, FOLLOW_UP);
+
+            let walked = walked(Box::pin(harness.dispatch(start_feat_3()))).await;
+            let (parked, id) = client
+                .await
+                .expect("the client task ends")
+                .expect("the client saw the parked request");
+
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the walk resumed and started: {walked:?}");
+            };
+            assert_eq!(
+                (rest.run, rest.position),
+                (RunStatus::AwaitingApproval, Some(1)),
+                "the claim walked on to `plan`'s gate"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.id, parked.run_step_id, "the client queued for `prd`");
+            assert_eq!(prd.status, StepStatus::Done, "the step settled `done`");
+            let log = log(&harness.orch.store, prd.id).await;
+            assert_eq!(follow_up_turns(&log), [1], "one follow-up, sent as turn 1");
+            assert_eq!(dones_in(&log), 2, "two turns, two `done`s");
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id),
+                (RunCommandStatus::Applied, None, false),
+                "applied, its text gone (I-5)"
+            );
+            assert_window_closed(&harness.orch.store, prd.id);
+        }
+
+        /// MOD-70 D8: a fan-out candidate's session takes a follow-up; it lands on that
+        /// candidate's log only, and the judge still picks a winner.
+        #[tokio::test(start_paused = true)]
+        async fn a_fan_out_candidate_takes_a_follow_up() {
+            let harness = Harness::new().await;
+            ana_2_judged_with(
+                &harness,
+                parks_then(a_second_turn(), "research by candidate 0"),
+                ScriptedStep::judge(0, &[(0, "it covered the edge cases")]),
+            )
+            .await;
+            let client = following_client(harness.orch.store.clone(), ids::HTUI_ANA_2, FOLLOW_UP);
+
+            let walked = walked(Box::pin(harness.dispatch(start_ana_2()))).await;
+            let (parked, id) = client
+                .await
+                .expect("the client task ends")
+                .expect("the client saw the parked request");
+
+            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+                panic!("the walk resumed and started: {walked:?}");
+            };
+            let first = step_at(&harness.orch, run, 0, 0).await;
+            let second = step_at(&harness.orch, run, 0, 1).await;
+            let judge = step_at(&harness.orch, run, 0, -1).await;
+            assert_eq!(first.id, parked.run_step_id, "candidate 0 parked");
+            assert_eq!(
+                follow_up_turns(&log(&harness.orch.store, first.id).await),
+                [1],
+                "the follow-up is candidate 0's turn 1"
+            );
+            // The judge's own `follow_up` row is its reversed call's prompt (call 1), not ours.
+            for (step, sent) in [(first.id, true), (second.id, false), (judge.id, false)] {
+                assert_eq!(
+                    carries_the_follow_up(&log(&harness.orch.store, step).await),
+                    sent,
+                    "the follow-up lands on candidate 0's log only"
+                );
+            }
+            assert_eq!(
+                (first.status, second.status, judge.status),
+                (StepStatus::Done, StepStatus::Superseded, StepStatus::Done),
+                "candidate 0 won, its sibling lost, the judge decided"
+            );
+            assert_eq!(
+                (first.selected, second.selected),
+                (Some(true), Some(false)),
+                "the judge picked candidate 0"
+            );
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id),
+                (RunCommandStatus::Applied, None, false)
+            );
+            assert_window_closed(&harness.orch.store, first.id);
+            assert_window_closed(&harness.orch.store, second.id);
+        }
+
+        /// MOD-70 D8, PRD Q2: a judge call opens no window; a follow-up for the judge step is
+        /// refused `Judge` while the call is live.
+        #[tokio::test(start_paused = true)]
+        async fn a_judge_step_opens_no_window() {
+            let harness = Harness::new().await;
+            ana_2_judged_with(
+                &harness,
+                ScriptedStep::done_with_output("research by candidate 0"),
+                judge_parks(0),
+            )
+            .await;
+            let store = harness.orch.store.clone();
+            let client = tokio::spawn(async move {
+                let row = parked_row(&store, ids::HTUI_ANA_2).await?;
+                let refused = request_follow_up(&store, row.run_step_id, FOLLOW_UP).await;
+                answer(&store, &row).await;
+                Some((row, refused))
+            });
+
+            let walked = walked(Box::pin(harness.dispatch(start_ana_2()))).await;
+            let (parked, refused) = client
+                .await
+                .expect("the client task ends")
+                .expect("the judge's request was relayed");
+
+            let Ok(CommandOutcome::Started { run, .. }) = walked else {
+                panic!("the walk resumed and started: {walked:?}");
+            };
+            let judge = step_at(&harness.orch, run, 0, -1).await;
+            assert_eq!(judge.id, parked.run_step_id, "the judge call parked");
+            assert_eq!(
+                refused,
+                FollowUpRequest::Refused(FollowUpRefusal::Judge),
+                "a judge session takes no follow-up"
+            );
+            assert_eq!(
+                judge.status,
+                StepStatus::Done,
+                "the judge decided: {:?}",
+                judge.gate_note
+            );
+            let windows = harness.orch.store.follow_up_windows();
+            assert!(
+                windows.iter().all(|window| window.run_step_id != judge.id),
+                "no window for the judge step: {windows:?}"
+            );
+            assert_window_closed(
+                &harness.orch.store,
+                step_at(&harness.orch, run, 0, 0).await.id,
+            );
+            assert!(harness.orch.store.follow_up_rows().is_empty());
+        }
+
+        /// A follow-up turn that hangs: a second call parks on a request nobody answers, and the
+        /// turn ends only by a cancel. (A bare `ExpectCancel` fails the turn at once: the fake
+        /// session answers an uncancelled marker with a transport error.)
+        fn hangs_on_a_second_request() -> Vec<ScriptEvent> {
+            let mut second = request();
+            second.request_id = PermissionRequestId::new("req-2");
+            second.tool_call_id = Some("call-2".to_owned());
+            vec![
+                ScriptEvent::Emit(DriverEvent::ToolCall(htui_agent::event::ToolCallEvent {
+                    tool_call_id: "call-2".to_owned(),
+                    title: "run the suite again".to_owned(),
+                    tool_kind: htui_agent::event::ToolKind::Execute,
+                    input: serde_json::json!({ "command": "cargo test" }),
+                    locations: Vec::new(),
+                })),
+                ScriptEvent::ParkPermission(second),
+                ScriptEvent::ExpectCancel,
+            ]
+        }
+
+        /// A client that queues [`FOLLOW_UP`] for `item`'s parked step and answers, waits until
+        /// the walk took it for turn 1 and turn 1 parked ([`hangs_on_a_second_request`]), then
+        /// queues a second one. Answers the first parked row and both ids.
+        async fn queues_into_turn_1(
+            store: &MemStore,
+            item: ItemId,
+        ) -> Option<(StepPermission, RunCommandId, RunCommandId)> {
+            let row = parked_row(store, item).await?;
+            let first = queued(store, row.run_step_id, FOLLOW_UP).await;
+            answer(store, &row).await;
+            applied(store, first).await?;
+            pending_row(store).await?;
+            let second = queued(store, row.run_step_id, "and the docs").await;
+            Some((row, first, second))
+        }
+
+        /// MOD-70 D8 with MOD-37's step deadline (OQ-3): the deadline covers the follow-up turn.
+        /// The cut settles the step `DeadlineElapsed` after turn 1 ran, and the cut's close
+        /// refuses a row queued during turn 1 with the cancelled sentence (D6 step 8).
+        #[tokio::test(start_paused = true)]
+        async fn a_follow_up_turn_cut_by_the_deadline_settles_deadline_elapsed() {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            step_deadline(&harness, 5);
+            harness
+                .orch
+                .script("prd", 1, parks_then(hangs_on_a_second_request(), "the prd"));
+            let store = harness.orch.store.clone();
+
+            let (walked, client) = tokio::join!(
+                walked(Box::pin(harness.dispatch(start_feat_3()))),
+                queues_into_turn_1(&store, ids::HTUI_FEAT_3)
+            );
+
+            let (parked, first, second) = client.expect("the client saw turn 1 start");
+            let Ok(CommandOutcome::Started { run, rest }) = walked else {
+                panic!("the cut walk answers `Started`, not `Cancelled`: {walked:?}");
+            };
+            assert_eq!(
+                rest.run,
+                RunStatus::AwaitingApproval,
+                "`always` parks the failure"
+            );
+            let prd = step_at(&harness.orch, run, 0, 0).await;
+            assert_eq!(prd.id, parked.run_step_id);
+            assert_eq!(prd.status, StepStatus::AwaitingApproval);
+            let notes = deadline_notes(&harness.orch, ids::HTUI_FEAT_3).await;
+            assert!(!notes.is_empty(), "the settle's reason is the deadline");
+            assert_eq!(
+                follow_up_turns(&log(&store, prd.id).await),
+                [1],
+                "turn 1 ran before the cut"
+            );
+            assert_eq!(
+                the_follow_up(&store, first),
+                (RunCommandStatus::Applied, None, false),
+                "the first was sent"
+            );
+            assert_eq!(
+                the_follow_up(&store, second),
+                (
+                    RunCommandStatus::Refused,
+                    Some(FOLLOW_UP_SESSION_CANCELLED.to_owned()),
+                    false
+                ),
+                "the cut's close refused the second with the cancelled sentence"
+            );
+            assert_window_closed(&store, prd.id);
+        }
+
+        /// MOD-70 D8, I-6: a run cancel during a follow-up turn ends the walk `Cancelled` and
+        /// finishes no step; the close refuses a row queued during that turn.
+        #[tokio::test(start_paused = true)]
+        async fn a_cancel_during_a_follow_up_turn_finishes_no_step() {
+            let harness = Harness::new().await;
+            feat_3_with_prd_ungated(&harness).await;
+            harness
+                .orch
+                .script("prd", 1, parks_then(hangs_on_a_second_request(), "the prd"));
+            let orch = &harness.orch;
+
+            let (walked, client) =
+                tokio::join!(walked(Box::pin(harness.dispatch(start_feat_3()))), async {
+                    let queued = queues_into_turn_1(&orch.store, ids::HTUI_FEAT_3).await;
+                    orch.cancel_walks(GRACE);
+                    queued
+                });
+
+            let (parked, first, second) = client.expect("the client saw turn 1 start");
+            let run = parked.run_id;
+            assert!(
+                matches!(walked, Err(EngineError::Cancelled { run: stopped }) if stopped == run),
+                "the walk answers `Cancelled`: {walked:?}"
+            );
+            let prd = step_at(orch, run, 0, 0).await;
+            assert_eq!(
+                (prd.status, prd.finished_at),
+                (StepStatus::Running, None),
+                "a cancel settles nothing"
+            );
+            assert_eq!(
+                the_follow_up(&orch.store, first),
+                (RunCommandStatus::Applied, None, false)
+            );
+            assert_eq!(
+                the_follow_up(&orch.store, second),
+                (
+                    RunCommandStatus::Refused,
+                    Some(FOLLOW_UP_SESSION_CANCELLED.to_owned()),
+                    false
+                ),
+                "the cancel's close refused the second"
+            );
+            assert_window_closed(&orch.store, prd.id);
+        }
+
+        /// MOD-70 B-18: [`dropped_while_parked`] with a follow-up queued before the drop, so the
+        /// dropped walk leaves its window open over a pending row. Answers the parked row and
+        /// the follow-up's id.
+        async fn dropped_with_a_follow_up(harness: &Harness) -> (StepPermission, RunCommandId) {
+            feat_3_with_prd_ungated(harness).await;
+            harness
+                .orch
+                .script("prd", 1, parks_then(a_second_turn(), "the prd"));
+            let walk = harness.dispatch(start_feat_3());
+            let parked = pending_row(&harness.orch.store);
+            match futures::future::select(Box::pin(walk), Box::pin(parked)).await {
+                futures::future::Either::Left((outcome, _)) => {
+                    panic!("the walk ended instead of parking: {outcome:?}")
+                }
+                futures::future::Either::Right((row, walk)) => {
+                    let row = row.expect("the request was relayed");
+                    let id = queued(&harness.orch.store, row.run_step_id, FOLLOW_UP).await;
+                    drop(walk);
+                    (row, id)
+                }
+            }
+        }
+
+        /// MOD-70 D9: the dropped walk's window is closed and its pending follow-up refused with
+        /// the session-ended sentence, its text gone.
+        fn assert_dropped_follow_up_refused(
+            orch: &FakeOrchestrator,
+            ghost: &StepPermission,
+            id: RunCommandId,
+        ) {
+            assert_window_closed(&orch.store, ghost.run_step_id);
+            assert_eq!(
+                the_follow_up(&orch.store, id),
+                (
+                    RunCommandStatus::Refused,
+                    Some(FOLLOW_UP_SESSION_ENDED.to_owned()),
+                    false
+                ),
+                "a follow-up for a session nobody drives is refused, not stranded"
+            );
+        }
+
+        /// MOD-70 D9 at the sweep: the same owner's re-adoption closes the dropped walk's window.
+        #[tokio::test(start_paused = true)]
+        async fn a_dead_walks_follow_up_is_refused_when_its_sweep_readopts_the_run() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+            harness.orch.dead_walks.mark(ghost.run_id);
+            harness_engine!(harness.orch, engine);
+
+            let swept = engine.sweep().await.expect("the sweep runs");
+
+            assert_eq!(
+                swept.iter().map(|adopted| adopted.run).collect::<Vec<_>>(),
+                [ghost.run_id],
+                "the same owner re-adopted the run"
+            );
+            assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
+            assert_ghost_staled(&harness.orch, &ghost).await;
+        }
+
+        /// MOD-70 D9 at a command's take of a dead walk's run.
+        #[tokio::test(start_paused = true)]
+        async fn a_dead_walks_follow_up_is_refused_when_a_command_retakes_the_lease() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+            harness.orch.dead_walks.mark(ghost.run_id);
+            harness_engine!(harness.orch, engine);
+
+            engine
+                .take_lease(ghost.run_id)
+                .await
+                .expect("this owner's lease renews");
+
+            assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
+            assert_ghost_staled(&harness.orch, &ghost).await;
+        }
+
+        /// MOD-70 D9 at `abandoned`: the window closes before the lease goes back.
+        #[tokio::test(start_paused = true)]
+        async fn an_abandoned_walks_follow_up_is_refused_before_the_lease_goes_back() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+            harness_engine!(harness.orch, engine);
+
+            engine.abandoned(ghost.run_id).await;
+            engine
+                .take_lease(ghost.run_id)
+                .await
+                .expect("the released lease is takeable");
+
+            assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
+            assert_ghost_staled(&harness.orch, &ghost).await;
+        }
+
+        /// MOD-70 review M-3: [`dropped_with_a_follow_up`] leaves the rows a failed close leaves
+        /// (D6 step 8 gave up after its retries, R-3): the step's window open over a pending
+        /// follow-up, the run `running` under this owner's lease and not in `DeadWalks`. A walk
+        /// that then settles the run terminal closes the run's windows before it gives the lease
+        /// back, so the row is refused with its text gone rather than kept for ever.
+        #[tokio::test(start_paused = true)]
+        async fn a_stranded_follow_up_is_refused_when_its_run_finishes() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id).0,
+                RunCommandStatus::Pending,
+                "the stranded follow-up is pending, its window open"
+            );
+            harness_engine!(harness.orch, engine);
+            let (store, now) = (&harness.orch.store, harness.orch.clock.now());
+
+            engine
+                .walk_leased(ghost.run_id, engine.fresh_until(), async {
+                    store
+                        .finish_run(ghost.run_id, RunStatus::Failed, Some("it gave up"), now)
+                        .await?;
+                    Ok::<_, EngineError>(())
+                })
+                .await
+                .expect("the walk finished the run");
+
+            assert_eq!(
+                harness.orch.run(ghost.run_id).await.status,
+                RunStatus::Failed
+            );
+            assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
+        }
+
+        /// MOD-70 review R2 P-1: [`dropped_with_a_follow_up`]'s stranded follow-up (the window
+        /// close gave up, R-3) on a run the walk then parks at a gate. The walk gives the lease
+        /// back with no live session, and no later re-take of a parked run closes anything (D9
+        /// runs only for `DeadWalks`), so the run's windows close before the lease goes back,
+        /// as for a run that finished.
+        #[tokio::test(start_paused = true)]
+        async fn a_stranded_follow_up_is_refused_when_its_run_parks() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id).0,
+                RunCommandStatus::Pending,
+                "the stranded follow-up is pending, its window open"
+            );
+            harness_engine!(harness.orch, engine);
+            let (store, now) = (&harness.orch.store, harness.orch.clock.now());
+
+            engine
+                .walk_leased(ghost.run_id, engine.fresh_until(), async {
+                    assert!(
+                        store
+                            .transition_run(
+                                ghost.run_id,
+                                RunStatus::Running,
+                                RunStatus::AwaitingApproval,
+                                now,
+                            )
+                            .await?,
+                        "the walk parked the run"
+                    );
+                    Ok::<_, EngineError>(())
+                })
+                .await
+                .expect("the walk parked the run");
+
+            let row = harness.orch.run(ghost.run_id).await;
+            assert_eq!(row.status, RunStatus::AwaitingApproval);
+            assert_eq!(
+                row.lease_expires_at,
+                Some(now),
+                "the parked run's lease went back"
+            );
+            assert_dropped_follow_up_refused(&harness.orch, &ghost, id);
+        }
+
+        /// MOD-70 review M-3 at a cancel command: the run's stranded follow-up is refused with
+        /// the run-cancelled sentence before the cancel gives the lease back.
+        #[tokio::test(start_paused = true)]
+        async fn a_stranded_follow_up_is_refused_when_its_run_is_cancelled() {
+            let harness = Harness::new().await;
+            let (ghost, id) = dropped_with_a_follow_up(&harness).await;
+
+            let cancelled = harness
+                .dispatch(Command::CancelRun { run: ghost.run_id })
+                .await;
+
+            assert!(
+                matches!(cancelled, Ok(CommandOutcome::Cancelled { .. })),
+                "the cancel lands: {cancelled:?}"
+            );
+            assert_window_closed(&harness.orch.store, ghost.run_step_id);
+            assert_eq!(
+                the_follow_up(&harness.orch.store, id),
+                (
+                    RunCommandStatus::Refused,
+                    Some(FOLLOW_UP_RUN_CANCELLED.to_owned()),
+                    false
+                ),
+                "a cancelled run's follow-up is refused, not stranded"
+            );
         }
     }
 

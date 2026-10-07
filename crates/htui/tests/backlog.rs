@@ -25,11 +25,12 @@ use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::{demo_at, edit_agent, ids};
 use htui_core::model::{
     Agent, AgentBox, AgentId, BatchClose, Billing, CitationKind, Claim, DocumentHead, DocumentId,
-    EXECUTOR_GONE, GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemPatch, NewDocument,
+    EXECUTOR_GONE, FOLLOW_UP_QUEUED, FOLLOW_UP_SESSION_ENDED, FollowUpRequest, FollowUpText,
+    GraphSnapshot, Isolation, Item, ItemFilter, ItemId, ItemPatch, NewDocument, NewFollowUp,
     NewItem, NewRun, NewRunStep, Note, OpenPermission, PermissionId, PermissionStatus, RelayOption,
-    RelayOptionKind, RelaySessionId, Resolution, RunId, RunMode, RunStatus, RunStep, Scope,
-    SnapshotGraph, SnapshotPhase, SnapshotSettings, Status, StepId, StepStatus, Transport,
-    WorkspaceSummary,
+    RelayOptionKind, RelaySessionId, Resolution, RunCommandId, RunCommandStatus, RunId, RunMode,
+    RunStatus, RunStep, Scope, SnapshotGraph, SnapshotPhase, SnapshotSettings, Status, StepId,
+    StepStatus, Transport, WorkspaceSummary,
 };
 use htui_core::store::{MAX_LEASE_TTL, MemStore, ReadStore as _, UpdateOutcome, WriteStore as _};
 use htui_orch::Clock;
@@ -2030,6 +2031,164 @@ async fn offline_the_runs_pane_asks_for_no_error() {
         status.starts_with("answer_permission: ") && status.ends_with(DATABASE_UNREACHABLE),
         "an answer offline is refused before anything is sent: {status:?}"
     );
+
+    // MOD-70 D13: so is a follow-up, the other relay write.
+    harness.app().update(Action::Store(StoreRequest::FollowUp {
+        step: ids::STEP_R2_PRD,
+        text: FollowUpText::new(FOLLOW_UP.to_owned()).expect("plain prose is a follow-up"),
+    }));
+    harness.drive().await;
+    let status = harness.app().status.clone().unwrap_or_default();
+    assert!(
+        status.starts_with("follow_up: ") && status.ends_with(DATABASE_UNREACHABLE),
+        "a follow-up offline is refused before anything is sent: {status:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-70 plan D13, D14: a typed follow-up for a running engine step, from the Runs pane.
+// ---------------------------------------------------------------------------------------------
+
+/// The follow-up every case below types.
+const FOLLOW_UP: &str = "use the smaller fixture";
+
+/// The demo with `FEAT-3`'s queued run claimed on the demo box by `owner` for
+/// [`MAX_LEASE_TTL`], its `prd` step running and that step's follow-up window open under a fresh
+/// session, as a walk on another process would have opened it. Answers the session.
+async fn following_store(owner: uuid::Uuid) -> (MemStore, RelaySessionId) {
+    let store = MemStore::demo();
+    assert_eq!(
+        store
+            .claim_run(ids::RUN_2, ids::BOX, owner, demo_at(2, 9), MAX_LEASE_TTL)
+            .await
+            .expect("the claim reads"),
+        Claim::Admitted,
+        "`RUN_2` was queued on the demo box"
+    );
+    assert!(
+        store
+            .transition_step(
+                ids::STEP_R2_PRD,
+                StepStatus::Pending,
+                StepStatus::Running,
+                demo_at(2, 9),
+            )
+            .await
+            .expect("the step exists"),
+        "`prd` starts"
+    );
+    let session = RelaySessionId::new();
+    assert!(
+        store
+            .open_follow_ups(ids::RUN_2, ids::STEP_R2_PRD, session, owner)
+            .await
+            .expect("the step is the run's"),
+        "the owner opens the window"
+    );
+    (store, session)
+}
+
+/// D13, D14: `i`, the text and `Enter` queue a follow-up through the store; the re-read draws it.
+#[tokio::test]
+async fn i_on_the_runs_pane_queues_a_follow_up_through_the_store() {
+    let (store, _) = following_store(uuid::Uuid::new_v4()).await;
+    let mut harness = on_feat_3_runs(store.clone()).await;
+
+    harness.key("i");
+    harness.paste(FOLLOW_UP);
+    harness.key("Enter");
+    harness.drive().await;
+    let rows = store.follow_up_rows();
+    assert_eq!(rows.len(), 1, "one row: {rows:?}");
+    let (view, text_stored) = &rows[0];
+    assert_eq!(view.run_id, ids::RUN_2);
+    assert_eq!(view.run_step_id, ids::STEP_R2_PRD);
+    assert_eq!(view.status, RunCommandStatus::Pending);
+    assert!(
+        *text_stored,
+        "a pending row keeps its text until it is taken"
+    );
+    assert_eq!(harness.app().status, None, "nothing failed");
+    let frame = harness.render();
+    assert!(
+        detail_pane(&frame).contains(FOLLOW_UP_QUEUED),
+        "the re-read draws the queued line whole:\n{frame}"
+    );
+}
+
+/// D3, D13: a follow-up the store refuses puts the refusal's sentence on the status line, under
+/// the request's name, and writes nothing.
+#[tokio::test]
+async fn a_refused_follow_up_lands_on_the_status_line() {
+    let (store, session) = following_store(uuid::Uuid::new_v4()).await;
+    let mut harness = on_feat_3_runs(store.clone()).await;
+
+    harness.key("i");
+    harness.paste(FOLLOW_UP);
+    assert_eq!(
+        store
+            .close_follow_ups(ids::STEP_R2_PRD, session, FOLLOW_UP_SESSION_ENDED)
+            .await
+            .expect("the close writes"),
+        0,
+        "the session ends with nothing queued"
+    );
+    harness.key("Enter");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status,
+        Some(format!("follow_up: {FOLLOW_UP_SESSION_ENDED}")),
+        "the refusal's own sentence, under the request's name"
+    );
+    assert!(store.follow_up_rows().is_empty(), "nothing was written");
+}
+
+/// D14: the input under the list, its title, the text and the hint.
+#[tokio::test]
+async fn the_follow_up_input_renders_under_the_running_step() {
+    let (store, _) = following_store(uuid::Uuid::new_v4()).await;
+    let mut harness = on_feat_3_runs(store).await;
+    harness.key("i");
+    harness.paste(FOLLOW_UP);
+    harness.drive().await;
+    let frame = harness.render();
+    let pane = detail_pane(&frame);
+    assert!(
+        pane.contains("follow-up for the running step:") && pane.contains(FOLLOW_UP),
+        "the input is up:\n{frame}"
+    );
+    insta::assert_snapshot!("runs_follow_up_input", frame);
+}
+
+/// D14, B-7: a follow-up queued before the pane read the runs is drawn under its step.
+#[tokio::test]
+async fn a_queued_follow_up_renders_under_its_step() {
+    let (store, _) = following_store(uuid::Uuid::new_v4()).await;
+    let id = RunCommandId::new();
+    assert_eq!(
+        store
+            .request_follow_up(NewFollowUp {
+                id,
+                run_step_id: ids::STEP_R2_PRD,
+                text: FollowUpText::new(FOLLOW_UP.to_owned()).expect("plain prose"),
+                issued_by: ids::USER,
+                issued_box: ids::BOX,
+            })
+            .await
+            .expect("the enqueue reads"),
+        FollowUpRequest::Queued(id),
+    );
+    let mut harness = on_feat_3_runs(store).await;
+    let frame = harness.render();
+    assert!(
+        detail_pane(&frame).contains(FOLLOW_UP_QUEUED),
+        "the queued line:\n{frame}"
+    );
+    assert!(
+        !frame.contains(FOLLOW_UP),
+        "never the text (OQ-6):\n{frame}"
+    );
+    insta::assert_snapshot!("runs_follow_up_queued", frame);
 }
 
 // ---------------------------------------------------------------------------------------------
