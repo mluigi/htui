@@ -1332,7 +1332,9 @@ mod tests {
     }
 
     /// MOD-12 M2 D6: a breach whose binding term was the batch's remainder settles `CapBreached`
-    /// naming the batch, and that sentence is what `run.failure` and `gate_note` carry.
+    /// naming the batch. That sentence lands in the item note `note_step` writes
+    /// (``step `<phase>` attempt N: cap breached (batch <id>)``), and in `run.failure` when the
+    /// failure ends the run; `run_step.gate_note` is not written on a failed settle.
     #[test]
     fn a_batch_bound_breach_names_the_batch() {
         let ended = done(StopReason::EndTurn);
