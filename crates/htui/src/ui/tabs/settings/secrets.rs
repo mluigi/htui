@@ -354,7 +354,7 @@ pub struct SecretsSection {
     unavailable: Option<String>,
     /// The scope's workspace tree: the project rows and their tokens.
     tree: Option<HierarchySnapshot>,
-    /// Index into [`rows`](SecretsSection::rows).
+    /// Index into the rows, in [`row_at`](SecretsSection::row_at)'s order.
     cursor: usize,
     /// Browsing, typing, or being asked a question.
     mode: Mode,
@@ -402,24 +402,27 @@ impl SecretsSection {
         Self::default()
     }
 
-    /// Every row, in cursor order.
-    fn rows(&self) -> Vec<Row> {
-        let projects = self.tree.as_ref().map_or(0, |tree| tree.projects.len());
-        Row::FIXED
-            .into_iter()
-            .chain((0..projects).map(Row::Project))
-            .collect()
+    /// How many rows: the four fixed, then one per project of the tree.
+    fn row_count(&self) -> usize {
+        Row::FIXED.len() + self.tree.as_ref().map_or(0, |tree| tree.projects.len())
+    }
+
+    /// Row `index` in cursor order; `index < row_count()`.
+    fn row_at(&self, index: usize) -> Row {
+        match Row::FIXED.get(index) {
+            Some(row) => *row,
+            None => Row::Project(index - Row::FIXED.len()),
+        }
     }
 
     /// The row under the cursor.
     fn row(&self) -> Row {
-        let rows = self.rows();
-        rows[self.cursor.min(rows.len() - 1)]
+        self.row_at(self.cursor.min(self.row_count() - 1))
     }
 
     /// Moves the cursor one row; no wrap.
     fn move_cursor(&mut self, down: bool) {
-        let last = self.rows().len() - 1;
+        let last = self.row_count() - 1;
         self.cursor = if down {
             self.cursor.saturating_add(1).min(last)
         } else {
@@ -429,7 +432,7 @@ impl SecretsSection {
 
     /// Puts the cursor back inside the rows after the tree changed.
     fn clamp_cursor(&mut self) {
-        self.cursor = self.cursor.min(self.rows().len() - 1);
+        self.cursor = self.cursor.min(self.row_count() - 1);
     }
 
     /// A project of the tree, by row index.
@@ -1596,6 +1599,45 @@ mod tests {
             !printed.contains("cid-typed-1") && printed.contains("len: 11"),
             "{printed}"
         );
+    }
+
+    /// CLEAN-8 #5: the rows, indexed without a `Vec`, are the four fixed ones, then one per
+    /// project of the tree; with no tree, the four alone.
+    #[tokio::test]
+    async fn row_at_walks_the_fixed_rows_then_the_projects() {
+        let tree = crate::hierarchy::snapshot(
+            &htui_core::store::MemStore::demo(),
+            htui_core::fixtures::ids::WORKSPACE_GRAPHICS,
+            None,
+        )
+        .await
+        .expect("the demo store reads")
+        .expect("the demo store has the graphics workspace");
+        let n = tree.projects.len();
+        assert!(n > 0, "the graphics workspace has projects");
+        let walk = |section: &SecretsSection| {
+            (0..section.row_count())
+                .map(|index| section.row_at(index))
+                .collect::<Vec<_>>()
+        };
+
+        let section = SecretsSection {
+            tree: Some(tree.clone()),
+            ..SecretsSection::new()
+        };
+        assert_eq!(
+            walk(&section),
+            Row::FIXED
+                .into_iter()
+                .chain((0..n).map(Row::Project))
+                .collect::<Vec<_>>()
+        );
+
+        let section = SecretsSection {
+            tree: None,
+            ..SecretsSection::new()
+        };
+        assert_eq!(walk(&section), Row::FIXED);
     }
 
     /// The `busy` names are the request names, so a refused write is matched by its own name.
