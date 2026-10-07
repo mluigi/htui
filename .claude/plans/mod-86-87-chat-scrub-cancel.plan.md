@@ -3,7 +3,7 @@
 **Source:** HANDOFF.md items MOD-86 and MOD-87 (both from MOD-55, `docs/decisions/mod/mod-55.md`).
 **Routing:** plan path for both, run together in sandbox `hr/MOD-86` (maintainer, 2026-10-07).
 **Complexity:** Medium. One runtime file carries almost all of it; the test-helper fallout from MOD-87 is the bulk.
-**Status:** CONFIRMED 2026-10-07 (D5 as recommended: no UI change, composer text not restored). Implementation in progress.
+**Status:** DONE 2026-10-07 (D5 as recommended: no UI change, composer text not restored; blueprint amendments A-1..A-6 accepted). Commits 0e59d640, 9589e34d, bd6bc7ce, db319529.
 
 ## Open question for the maintainer (read first)
 
