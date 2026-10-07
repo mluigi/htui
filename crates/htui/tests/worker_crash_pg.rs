@@ -1269,21 +1269,31 @@ async fn a_worker_killed_after_a_flush_keeps_its_rows_and_retries() {
         let steps = case.steps().await;
         if let Some(step) = prd(&steps, 1) {
             let events = case.events(step.id).await;
-            if events.iter().any(|(_, kind)| *kind != EventKind::Prompt) {
+            if events.iter().any(|(_, kind)| *kind == EventKind::ToolCall) {
                 break step.clone();
             }
         }
-        first.alive("a flushed event");
+        first.alive("a flushed tool call");
         assert!(
             Instant::now() < deadline,
-            "no event beyond the prompt within {PATIENCE:?}; the child's log:\n{}",
+            "no tool call within {PATIENCE:?}; the child's log:\n{}",
             first.log()
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     first.killed();
 
-    let at_kill = case.events(killed.id).await;
+    // A statement the child sent before the SIGKILL may still commit server-side after the reap, so
+    // the rows it "flushed" are those the log settles on, not the first read after the kill.
+    let mut at_kill = case.events(killed.id).await;
+    loop {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let again = case.events(killed.id).await;
+        if again == at_kill {
+            break;
+        }
+        at_kill = again;
+    }
     assert!(
         at_kill.iter().any(|(_, kind)| *kind == EventKind::ToolCall),
         "the tool call was flushed: {at_kill:?}"
