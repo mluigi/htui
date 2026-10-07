@@ -1,0 +1,13 @@
+# MOD-67 M2 fixture: one of each entry error, out of order on purpose.
+version = 2
+
+[list]
+down = 5
+up = ["k", 7]
+
+[globl]
+help = "f1"
+
+[global]
+quitt = "q"
+quit = ["x", "shift-a"]

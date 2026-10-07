@@ -1,0 +1,4 @@
+# MOD-67 M2 fixture: ctrl-c, however it is spelled.
+[global]
+quit = ["q", "ctrl-c"]
+find = "ctrl-C"

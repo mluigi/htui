@@ -1,0 +1,3 @@
+# MOD-67 M2 fixture: the overlay close unbound.
+[overlay]
+close = []
