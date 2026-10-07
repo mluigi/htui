@@ -62,7 +62,8 @@ anywhere. The editor is drawn only in its own view, the status line shows that a
 and a second `E`/`Ctrl+E` is refused while one editor is alive. htui offers an **abort** for a
 stuck editor. Pane resizes reach the editor. When the editor exits, the file is read back through
 the same outcome path and `parse` gate as today, so the view sees the same result either way.
-Quitting htui with a live editor asks for confirmation first, then kills the editor. Linux and
+The `quit` action with a live editor asks for confirmation, then kills the editor; `ctrl-c` with
+focus in htui still quits at once (ANA-26 C3). Linux and
 macOS are built and tested here; Windows (ConPTY) compiles and passes the cross-check.
 
 **Out of scope**
@@ -85,7 +86,7 @@ macOS are built and tested here; Windows (ConPTY) compiles and passes the cross-
 | D2 | How in-pane is chosen over suspend | **One per-machine preference** (default: suspend) that `E`/`Ctrl+E` follow everywhere. No new edit key. |
 | D3 | What the reserved leave action does | **Unfocus, editor stays alive.** The same action refocuses it. The edit ends when the editor exits. htui has its own abort action for a stuck editor. |
 | D4 | What is allowed while unfocused | **Anything, one editor at a time.** Tabs can be switched; the editor is drawn only in its own view; the status line shows the open edit; a second edit request is refused. |
-| D5 | Quit with a live editor | **Confirm, then kill the editor and quit.** See open question Q5 for how this squares with ANA-26 C3 on `ctrl-c`. |
+| D5 | Quit with a live editor | **The `quit` action confirms, then kills the editor and quits. `ctrl-c` keeps ANA-26 C3** (with focus in htui it quits at once and kills the editor; only the focused pane forwards it). Settled at the gate as Q5. |
 | D6 | Windows coverage before done | **Cross-check now, real verification under MOD-16.** |
 
 ## Delivery Milestones
@@ -108,10 +109,8 @@ macOS are built and tested here; Windows (ConPTY) compiles and passes the cross-
       manual run with nvim in the smallest editing area (Notes compose).
 - [ ] **Q4 Key encoding.** How htui's crossterm key events are encoded back to bytes for the child
       (Alt, function keys, `ctrl-` chords), and which `TERM` the child sees.
-- [ ] **Q5 `ctrl-c` with focus in htui while an editor is alive.** ANA-26 C3 makes `ctrl-c`
-      quit at once before any overlay. D5 asks for a confirm. Either the `quit` action confirms and
-      `ctrl-c` keeps C3 (kill and quit at once), or C3 gains a second exception. Leaning: keep C3,
-      confirm on `quit`. Maintainer to settle at plan CONFIRM.
+- [x] **Q5 `ctrl-c` with focus in htui while an editor is alive.** Settled (D5): keep C3, only
+      `quit` confirms.
 - [ ] **Q6 MOD-67 coupling.** The leave and abort actions, a forwarding context in which nothing but
       leave resolves, and a validator rule that keeps leave bound all land in `keys/` while MOD-67
       M2-M5 are still in flight. The plan names the merge order and the shared files.
