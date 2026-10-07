@@ -221,6 +221,9 @@ struct Shared<P: ReplySink> {
     sweeping: AtomicBool,
     /// MOD-12 D8: a sweep asked for while one ran; the running one sweeps once more before it ends.
     sweep_again: AtomicBool,
+    /// MOD-12 review M2: the queue runner's last sweep failed at a store call
+    /// ([`Shared::queue_read_failed`]).
+    queue_failing: AtomicBool,
     /// I-1: the executor the last sweep read, so a change is logged once.
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
@@ -275,6 +278,30 @@ impl<P: ReplySink> Shared<P> {
                 tracing::debug!(%executor, executes, "this box's executor; the TUI executes only on `tui`");
             }
         }
+    }
+
+    /// MOD-12 review M2: a store call of the queue runner (`admit`'s reads and prune, `drain`'s
+    /// close) failed at `step`, so the sweep admits nothing. Warned on the first failure of a
+    /// streak, at `debug` after it, so an outage neither hides at the default `info` filter nor
+    /// warns every sweep. True when this failure started the streak.
+    fn queue_read_failed(&self, step: &'static str, err: &StoreError) -> bool {
+        let first = !self.queue_failing.swap(true, Ordering::SeqCst);
+        if first {
+            tracing::warn!(step, %err, "the queue runner's store call failed; the queue admits nothing until it succeeds");
+        } else {
+            tracing::debug!(step, %err, "the queue runner's store call failed again");
+        }
+        first
+    }
+
+    /// MOD-12 review M2: a sweep got past every store call of the queue runner; said once, at
+    /// `info`, when it ends a streak of [`Shared::queue_read_failed`]. True when it did.
+    fn queue_reads_ok(&self) -> bool {
+        let ended = self.queue_failing.swap(false, Ordering::SeqCst);
+        if ended {
+            tracing::info!("the queue runner reads its store again");
+        }
+        ended
     }
 
     /// OQ-6: `run`'s resume failed again; its next one waits, 5 s doubling to 5 min. Warned once
@@ -1174,6 +1201,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweep_fixed: false,
                 sweeping: AtomicBool::new(false),
                 sweep_again: AtomicBool::new(false),
+                queue_failing: AtomicBool::new(false),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
@@ -2050,29 +2078,34 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// the batch (D7). Every refusal is logged at `debug` and the next entry tried; one that writes a
 /// note on its item (rung 4, missing tags) is visible there. A `Constraint` re-reads the open
 /// batch and stops when it is no longer this one (a pause won the race, H-6). The `Kit` is read
-/// only when something is to be admitted.
+/// only when something is to be admitted. A failed store read stops the sweep's admission and is
+/// warned once per streak (review M2, [`Shared::queue_read_failed`]).
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
     box_settings: &Value,
 ) {
     let host = &ctx.host;
+    let shared = &ctx.shared;
     let batch = match host.open_batch_of(box_id).await {
         Ok(Some(batch)) => batch,
-        Ok(None) => return,
+        Ok(None) => {
+            shared.queue_reads_ok();
+            return;
+        }
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read this box's batch");
+            shared.queue_read_failed("reading this box's open batch", &err);
             return;
         }
     };
     if let Err(err) = host.prune_finished_entries(box_id).await {
-        tracing::debug!(%err, "the queue runner could not prune its finished entries");
+        shared.queue_read_failed("pruning its finished entries", &err);
         return;
     }
     let entries = match host.queue_entries(box_id).await {
         Ok(entries) => entries,
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read its entries");
+            shared.queue_read_failed("reading its entries", &err);
             return;
         }
     };
@@ -2093,7 +2126,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     let ready = match host.ready_items(&scope, box_id).await {
         Ok(ready) => ready,
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read the ready items");
+            shared.queue_read_failed("reading the ready items", &err);
             return;
         }
     };
@@ -2103,7 +2136,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     let cancelled = match host.batch_cancelled_items(batch.id).await {
         Ok(cancelled) => cancelled,
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read its batch's cancelled items");
+            shared.queue_read_failed("reading its batch's cancelled items", &err);
             return;
         }
     };
@@ -2113,6 +2146,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .collect();
     let order = admission_order(&entries, &ready);
     if order.is_empty() {
+        shared.queue_reads_ok();
         return;
     }
     let slots = async {
@@ -2128,10 +2162,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     let free = match slots.await {
         Ok(free) => free,
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not count this box's free slots");
+            shared.queue_read_failed("counting this box's free slots", &err);
             return;
         }
     };
+    shared.queue_reads_ok();
     if free == 0 {
         return;
     }
@@ -2184,9 +2219,16 @@ async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
         .close_drained_batch(batch.id, ctx.shared.clock.now())
         .await
     {
-        Ok(Some(_)) => tracing::info!(batch = %batch.id, "the queue drained"),
-        Ok(None) => {}
-        Err(err) => tracing::debug!(%err, "the queue runner could not close its drained batch"),
+        Ok(closed) => {
+            ctx.shared.queue_reads_ok();
+            if closed.is_some() {
+                tracing::info!(batch = %batch.id, "the queue drained");
+            }
+        }
+        Err(err) => {
+            ctx.shared
+                .queue_read_failed("closing its drained batch", &err);
+        }
     }
 }
 
@@ -3331,7 +3373,7 @@ mod tests {
     use htui_agent::registry::DriverFactory;
     use htui_core::fixtures::ids;
     use htui_core::model::ItemId;
-    use htui_core::store::MemStore;
+    use htui_core::store::{MemStore, StoreError};
     use htui_store::Backend;
 
     use super::RunRuntime;
@@ -3410,6 +3452,30 @@ mod tests {
             run: None,
             kind: FrameKind::Changed,
         }
+    }
+
+    /// MOD-12 review M2: a queue read that keeps failing is warned about once per streak, not once
+    /// per sweep, and the sweep that reads past it again says so once.
+    #[test]
+    fn a_failing_queue_read_warns_once_per_streak() {
+        let runtime = runtime();
+        let shared = &runtime.shared;
+        let err = StoreError::ReadOnly("a test");
+        assert!(!shared.queue_reads_ok(), "no streak to end yet");
+        assert!(
+            shared.queue_read_failed("its entries", &err),
+            "the first failure warns"
+        );
+        assert!(
+            !shared.queue_read_failed("the ready items", &err),
+            "the next one, at any step, does not"
+        );
+        assert!(shared.queue_reads_ok(), "the streak's end is noted");
+        assert!(!shared.queue_reads_ok(), "once");
+        assert!(
+            shared.queue_read_failed("its entries", &err),
+            "a new streak warns again"
+        );
     }
 
     /// Plan D172, MOD-41 plan D7: a frame reaches every subscriber of its item, each at its own
