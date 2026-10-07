@@ -1781,7 +1781,6 @@ pub(crate) mod tests {
     /// queued ANA-2 is admitted under the batch `ResumeQueue` opened, at once: the loop sweeps
     /// after serving the resume, and the sweep admits (T4's `sweep_once`).
     #[tokio::test]
-    #[ignore = "MOD-12 T4: needs sweep_once's queue admission (D6); un-ignore when T4 lands"]
     async fn resuming_the_queue_sweeps_at_once() {
         let fixture = Fixture::new().await;
         let mut worker = Worker::spawn(&fixture.store, fixture.runtime().with_sweep_every(AN_HOUR));
