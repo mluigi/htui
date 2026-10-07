@@ -29,7 +29,8 @@ const WIDE: NonZeroU16 = NonZeroU16::new(2).unwrap();
 
 /// Draws an in-pane editor over `area`: a top rule titled `title` (focused: `theme.title`, else
 /// `theme.dim`), then the VT screen cell by cell in the rest. When `focused` and the child shows
-/// its cursor, the terminal's real cursor is placed on it (`Frame::set_cursor_position`).
+/// its cursor, the terminal's real cursor is placed on it (`Frame::set_cursor_position`), on the
+/// grid's last column while a wrap is pending.
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -50,7 +51,9 @@ pub fn render(
     frame.render_widget(block, area);
     draw_screen(frame.buffer_mut(), inner, screen);
     if focused && !screen.hide_cursor() {
+        // A pending wrap leaves vt100's column one past the grid; a terminal shows the last one.
         let (row, col) = screen.cursor_position();
+        let col = col.min(screen.size().1.saturating_sub(1));
         if row < inner.height && col < inner.width {
             frame.set_cursor_position((inner.x + col, inner.y + row));
         }
@@ -293,6 +296,28 @@ mod tests {
             true,
         );
         assert!(!term.backend().cursor_visible(), "outside the rect: hidden");
+    }
+
+    #[test]
+    fn a_pending_wrap_shows_the_cursor_in_the_last_column() {
+        // A full row leaves vt100's cursor one past the grid (the wrap is lazy); a terminal
+        // shows it on the last column.
+        let full = parser(3, 10, b"0123456789");
+        assert_eq!(full.screen().cursor_position(), (0, 10));
+        let mut term = Terminal::new(TestBackend::new(30, 10)).expect("a test backend");
+        // A rect as wide as the grid, then one wider (a resize the child has not caught up with).
+        for area in [Rect::new(0, 0, 10, 4), Rect::new(3, 2, 20, 4)] {
+            draw(&mut term, area, full.screen(), FOCUSED, true);
+            assert!(
+                term.backend().cursor_visible(),
+                "{area:?}: the cursor shows"
+            );
+            assert_eq!(
+                term.get_cursor_position().expect("a position"),
+                Position::new(area.x + 9, area.y + 1),
+                "{area:?}: on the grid's last column"
+            );
+        }
     }
 
     #[test]
