@@ -690,7 +690,9 @@ fn reuse_until(now: Instant, expires_in_secs: u64) -> Instant {
 
 /// L-7 (CLEAN-8 #1): appends `chunk` within `cap` without ever letting `buf` reallocate in place:
 /// past its capacity it moves into a fresh zeroizing buffer of `max(need, 2 × capacity).min(cap)`,
-/// and the old one is wiped as it drops. `false`, with `buf` untouched, when `chunk` would pass `cap`.
+/// and the old one is wiped as it drops. `false`, with `buf` untouched, when `chunk` would pass
+/// `cap`.
+#[must_use]
 fn append(buf: &mut Zeroizing<Vec<u8>>, chunk: &[u8], cap: usize) -> bool {
     let Some(need) = buf
         .len()
@@ -703,7 +705,8 @@ fn append(buf: &mut Zeroizing<Vec<u8>>, chunk: &[u8], cap: usize) -> bool {
         let grown = need.max(buf.capacity().saturating_mul(2)).min(cap);
         let mut next = Zeroizing::new(Vec::with_capacity(grown));
         next.extend_from_slice(buf);
-        core::mem::swap(buf, &mut next); // `next` (the old buffer) drops wiped, spare capacity included
+        std::mem::swap(buf, &mut next);
+        // `next`, the old buffer, drops wiped, spare capacity included.
     }
     buf.extend_from_slice(chunk); // need <= capacity: never reallocates
     true

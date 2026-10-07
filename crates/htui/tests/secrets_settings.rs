@@ -205,9 +205,12 @@ fn qdrant_stored() -> QdrantSnapshot {
 // Demo: no keyring at all (D10)
 // ---------------------------------------------------------------------------------------------
 
-/// No guard on purpose: a `Memory` backend must not read a keyring, and a guard would hide one.
+/// Under a broken fake keyring (R1 L-2): a `Memory` backend must not read a keyring, and a
+/// regression that does reads the fake, never the real OS keyring, and answers `Unreadable`
+/// instead of `NotApplicable`.
 #[tokio::test]
 async fn demo_rows_are_not_applicable_and_read_no_keyring() {
+    let _keyring = common::mock_keyring_broken().await;
     let snapshot = info(&demo()).await;
     assert_eq!(
         snapshot,
@@ -218,9 +221,11 @@ async fn demo_rows_are_not_applicable_and_read_no_keyring() {
     );
 }
 
-/// No guard on purpose, as above: every write is refused before the keyring is reached.
+/// Under a broken fake keyring, as above: every write is refused before the keyring is reached,
+/// and a regression that reaches it is refused with the keyring's sentence, not the demo one.
 #[tokio::test]
 async fn demo_refuses_every_keyring_write() {
+    let _keyring = common::mock_keyring_broken().await;
     for request in [
         StoreRequest::SetInfisicalUrl("https://x.example".to_owned()),
         StoreRequest::ClearInfisicalUrl,
@@ -380,7 +385,7 @@ async fn every_landed_keyring_write_answers_a_higher_generation() {
     }
 }
 
-/// The four keyring writes, as `htui worker` would see them: by request.
+/// The four Settings keyring writes.
 fn the_four_writes() -> [StoreRequest; 4] {
     [
         StoreRequest::SetInfisicalUrl(STORED_URL.to_owned()),

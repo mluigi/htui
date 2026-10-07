@@ -30,6 +30,7 @@ use htui_core::model::{Project, ProjectId, Scope};
 use htui_core::secret::{INFISICAL, ProviderHealth, SecretError, SecretScope, project_scope};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 use zeroize::Zeroizing;
@@ -927,17 +928,20 @@ impl SecretsSection {
             )
     }
 
+    /// Row `index`'s style, by its absolute index in cursor order (H-22): the cursor's is
+    /// `theme.selected`.
+    fn style_of(&self, index: usize, theme: &Theme) -> Style {
+        if index == self.cursor {
+            theme.selected
+        } else {
+            theme.base
+        }
+    }
+
     /// The rows: the four fixed ones, the `Projects` line, one per project, then the guide and
     /// [`MARK_REFUSED`] (R1 M-1).
     fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        let style_of = |index: usize| {
-            if index == self.cursor {
-                theme.selected
-            } else {
-                theme.base
-            }
-        };
         for (index, row) in Row::FIXED.into_iter().enumerate() {
             push_row(
                 &mut lines,
@@ -945,7 +949,7 @@ impl SecretsSection {
                 FIXED_LABEL_WIDTH,
                 &self.row_text(row),
                 width,
-                style_of(index),
+                self.style_of(index, theme),
             );
         }
         lines.push(Line::default());
@@ -965,13 +969,6 @@ impl SecretsSection {
 
     /// The `Projects` heading and one row per project, or [`NO_WORKSPACE`].
     fn project_lines(&self, lines: &mut Vec<Line<'static>>, width: u16, theme: &Theme) {
-        let style_of = |index: usize| {
-            if index == self.cursor {
-                theme.selected
-            } else {
-                theme.base
-            }
-        };
         match &self.tree {
             None => lines.push(Line::styled(format!("  {NO_WORKSPACE}"), theme.dim)),
             Some(tree) => {
@@ -989,7 +986,7 @@ impl SecretsSection {
                         slug_width,
                         &self.project_text(&entry.project),
                         width,
-                        style_of(Row::FIXED.len() + index),
+                        self.style_of(Row::FIXED.len() + index, theme),
                     );
                 }
             }
@@ -1494,7 +1491,7 @@ fn push_row(
     label_width: usize,
     value: &str,
     width: u16,
-    style: ratatui::style::Style,
+    style: Style,
 ) {
     let gutter = label_width + 4;
     let room = usize::from(width).saturating_sub(gutter).max(1);

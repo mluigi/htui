@@ -5811,10 +5811,12 @@ async fn through_the_demo_loop(request: StoreRequest) -> StoreReply {
 }
 
 /// CLEAN-8 #9: a demo session's Qdrant read consults no keyring, through `serve` (the harness)
-/// and through the spawned loop (`--demo`) alike. No keyring guard on purpose: a `Memory` backend
-/// must not read a keyring, and a guard would hide one.
+/// and through the spawned loop (`--demo`) alike. Under a broken fake keyring (R1 L-2): a
+/// regression that reads one is never the real OS keyring, and answers `Unreadable` instead of
+/// `NotApplicable`.
 #[tokio::test]
 async fn qdrant_demo_reads_no_keyring() {
+    let _keyring = htui_store::testkit::mock_keyring_broken().await;
     assert_qdrant_not_applicable(
         htui::store_worker::serve(&qdrant_demo(), &StoreRequest::QdrantInfo).await,
         "serve",
@@ -5826,9 +5828,11 @@ async fn qdrant_demo_reads_no_keyring() {
 }
 
 /// CLEAN-8 #9: a demo session refuses every Qdrant keyring write before the keyring is reached,
-/// with the Secrets section's sentence. No guard on purpose, as above.
+/// with the Secrets section's sentence. Under a broken fake keyring, as above: a regression that
+/// reaches it is refused with the keyring's sentence, not the demo one.
 #[tokio::test]
 async fn qdrant_demo_refuses_every_keyring_write() {
+    let _keyring = htui_store::testkit::mock_keyring_broken().await;
     for request in [
         StoreRequest::SetQdrantUrl("https://q.example:6334".to_owned()),
         StoreRequest::SetQdrantApiKey(Redacted::new("qk-typed-123".to_owned())),

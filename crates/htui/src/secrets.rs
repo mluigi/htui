@@ -217,7 +217,7 @@ impl KeyringInfisical {
         // R1 M2: the lock stays held across the read (two walks must not stack OS unlock
         // prompts), so the read is bounded. A blocking thread cannot be cancelled: one that
         // times out outlives this call until the keyring answers, and its answer is dropped.
-        let read: KeyringRead =
+        let read =
             tokio::time::timeout(KEYRING_TIMEOUT, tokio::task::spawn_blocking(move || read()))
                 .await
                 .map_err(|_| SecretError::Config(KEYRING_SILENT.to_owned()))?
@@ -556,7 +556,8 @@ mod tests {
     }
 
     /// MOD-90 D1: another process's Settings write (`htui worker` sees the TUI's) bumps no
-    /// generation here; the write mark it stored alone rebuilds the latched provider.
+    /// generation here; the write mark it stored alone rebuilds the latched provider. The latch is
+    /// a real one (R1 L-3): a walk's refused login sets it, and the next walk logs in afresh.
     #[tokio::test]
     async fn a_write_mark_from_another_process_rebuilds_a_latched_provider() {
         let _guard = mock_keyring().await;
@@ -569,12 +570,25 @@ mod tests {
                 Err(SecretError::LoginRefusedEarlier),
             ])
         });
+        let project = provider_project();
+        let walk_1 = resolve_project(Some(&source), &project)
+            .await
+            .expect_err("walk 1 refuses");
+        assert_eq!(walk_1, SecretError::BadCredentials, "walk 1 latches");
         let first = source.provider().await.expect("a provider");
 
         // The other process's write: the same identity again, then a new mark. No
         // `note_keyring_write`: that generation is the other process's.
         store_identity(CLIENT_ID, CLIENT_SECRET);
         store_mark("m-2");
+        let walk_2 = resolve_project(Some(&source), &project)
+            .await
+            .expect_err("walk 2 refuses");
+        assert_eq!(
+            walk_2,
+            SecretError::BadCredentials,
+            "a fresh provider logs in again, not the latch's LoginRefusedEarlier"
+        );
         let second = source.provider().await.expect("a provider");
         let third = source.provider().await.expect("a provider");
 
