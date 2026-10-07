@@ -1,0 +1,11 @@
+---
+source: crates/htui/tests/queue_overlay.rs
+expression: inside
+---
+┌ Queue ────────────────────────────────────────────────────────────────────────┐
+│  queue: paused · demo: nothing is admitted                                    │
+│                                                                               │
+│> ANA-2   Orchestrator step graphs and ga…  queue paused                       │
+│  FEAT-2  Agent driver and chat tab         blocked                            │
+│                                                                               │
+│  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close │
