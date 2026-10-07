@@ -279,18 +279,39 @@ async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
     );
     assert!(!file.exists(), "the temp file is removed");
     gone(&pid).await;
-    // The dying editor's late events (its `Exited` at least) are inert (B4).
-    let mut late = 0;
+
+    // B4: the aborted editor's late events (its `Exited` at least) are inert. They are held back
+    // until a second editor is open, so a late `Exited` that were not filtered by id would end
+    // that one (with nothing open, `on_pane_event` has nothing to end either way).
+    let second_dir = TempDir::new().expect("a temp dir");
+    let second = script(&second_dir, "printf second-ready; exec sleep 30");
+    harness.key("E");
+    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+    open_editor(&mut harness, second, &second_tx);
+    pump(
+        &mut harness,
+        &mut second_rx,
+        "the second editor ready",
+        |harness| harness.render().contains("second-ready"),
+    )
+    .await;
+    let second_id = harness.app().editor_id();
+    let mut exited = false;
     while let Ok(Some(event)) = tokio::time::timeout(Duration::from_secs(1), rx.recv()).await {
+        exited |= matches!(event, PaneEvent::Exited { .. });
+        assert_ne!(Some(event.id()), second_id, "the first editor's event");
         harness.app().on_pane_event(event);
-        late += 1;
     }
-    assert!(late > 0, "the wait thread still reported the exit");
+    assert!(exited, "the wait thread still reported the first exit");
+    assert_eq!(
+        harness.app().editor_id(),
+        second_id,
+        "a late `Exited` ends nothing"
+    );
     let frame = harness.render();
-    assert!(!harness.app().editor_open());
     assert!(
-        notice(&frame).contains(EDITOR_ABORTED),
-        "a late `Exited` answers nothing: {frame}"
+        frame.contains("second-ready") && frame.contains("Ctrl+4 to htui"),
+        "the second editor still has its pane and the keys: {frame}"
     );
 }
 
