@@ -8045,6 +8045,14 @@ impl PgStore {
     /// the runner's reads is never closed by it, and a run that committed before the statement
     /// keeps the batch open. `None` when the batch did not close.
     ///
+    /// An admission in flight (`create_run` past its `FOR SHARE` on the batch, not yet committed)
+    /// is waited for first, by a `FOR UPDATE` on the batch row in a statement of its own. Without
+    /// it the UPDATE would wait on the share lock and then, the row being only locked and not
+    /// updated, go ahead on its statement-start snapshot, which never sees the admitted run; with
+    /// no entry clause left to cover that window (L4) the batch would close over a `queued` run.
+    /// Under `READ COMMITTED` the UPDATE, a later statement, sees every admission that held the
+    /// share lock, and none can take it again until this transaction ends.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
@@ -8053,7 +8061,18 @@ impl PgStore {
         batch: BatchId,
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
-        sqlx::query_as!(
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let open = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM queue_batch WHERE id = $1 AND closed_at IS NULL FOR UPDATE"#,
+            batch.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if open.is_none() {
+            return Ok(None);
+        }
+        let closed = sqlx::query_as!(
             QueueBatch,
             r#"
             UPDATE queue_batch b
@@ -8070,9 +8089,11 @@ impl PgStore {
             batch.as_uuid(),
             at,
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(map_sqlx)
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(closed)
     }
 
     /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
