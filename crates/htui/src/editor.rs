@@ -30,7 +30,7 @@ pub const NO_CHANGES: &str = "no changes";
 /// D24, R-3).
 pub const WAIT_FLAG: &str = " \u{2014} a GUI editor needs its wait flag, e.g. `code --wait`";
 
-/// The longest temp-file stem [`run`] keeps (blueprint D25), in chars.
+/// The longest temp-file stem [`TempEdit::create`] keeps (blueprint D25), in chars.
 const STEM_MAX: usize = 32;
 
 /// The editor used when neither `$VISUAL` nor `$EDITOR` names one.
@@ -215,77 +215,168 @@ pub trait Suspend {
     fn enter(&mut self) -> io::Result<()>;
 }
 
-/// Writes `text` to a temp file named after `stem`, runs `cmd` on it and reads it back (D9).
+/// How an editor process ended, whichever runner ran it (MOD-57 P8): [`run`]'s child process or
+/// the in-pane editor's pseudo-terminal child. [`TempEdit::finish`] reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EditorExit {
+    /// It exited with this code.
+    Code(i32),
+    /// A signal ended it.
+    Signal,
+}
+
+/// [`run`]'s child: a status without a code is a signal's.
+impl From<std::process::ExitStatus> for EditorExit {
+    fn from(status: std::process::ExitStatus) -> Self {
+        status.code().map_or(Self::Signal, Self::Code)
+    }
+}
+
+/// The pseudo-terminal child's: a named signal is a signal; a code past `i32` (a Windows
+/// `NTSTATUS`) saturates to `i32::MAX`, never wraps negative.
+impl From<&portable_pty::ExitStatus> for EditorExit {
+    fn from(status: &portable_pty::ExitStatus) -> Self {
+        if status.signal().is_some() {
+            Self::Signal
+        } else {
+            Self::Code(i32::try_from(status.exit_code()).unwrap_or(i32::MAX))
+        }
+    }
+}
+
+/// One edit's temp file (MOD-57 P8): written by [`create`](Self::create), read back by
+/// [`finish`](Self::finish), removed when it drops, on every path. Shared by [`run`] and the
+/// in-pane editor. `Debug` prints the path and the handed text's length, never the text.
+pub struct TempEdit {
+    /// Removed on drop (`tempfile::TempPath`).
+    path: tempfile::TempPath,
+    /// The text handed out, for the unchanged comparison.
+    handed: String,
+}
+
+impl core::fmt::Debug for TempEdit {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TempEdit")
+            .field("path", &self.path.display())
+            .field("text_len", &self.handed.len())
+            .finish()
+    }
+}
+
+impl TempEdit {
+    /// [`run`]'s first half: a `.md` temp file named `htui-<sanitised stem>-<random>` (D25),
+    /// holding `text`, its handle closed (a Windows editor could not write over it otherwise).
+    ///
+    /// # Errors
+    ///
+    /// `Failed("could not create a temp file: …")` or `Failed("could not write the temp file:
+    /// …")`: nothing was handed out, and nothing is left behind.
+    pub fn create(text: &str, stem: &str) -> Result<Self, ExternalEditOutcome> {
+        let stem = sanitise(stem);
+        let mut file = tempfile::Builder::new()
+            .prefix(&format!("htui-{stem}-"))
+            .suffix(".md")
+            .tempfile()
+            .map_err(|err| {
+                ExternalEditOutcome::Failed(format!("could not create a temp file: {err}"))
+            })?;
+        file.write_all(text.as_bytes()).map_err(|err| {
+            ExternalEditOutcome::Failed(format!("could not write the temp file: {err}"))
+        })?;
+        Ok(Self {
+            path: file.into_temp_path(),
+            handed: text.to_owned(),
+        })
+    }
+
+    /// The file the editor is handed.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// [`run`]'s second half: how the editor ended, then the file read back (D9, D23, D24).
+    ///
+    /// `exit` is `Err` when the editor could not be started at all. A non-zero code or a signal
+    /// is `Failed`, the platform shell's "could not start" codes with the `$VISUAL`/`$EDITOR`
+    /// sentence. Otherwise the file is read back: unreadable or not UTF-8 is `Failed`; equal to
+    /// the handed text after [`normalise_newlines`] on both sides is `Unchanged` (`quick` when
+    /// `elapsed` is under [`QUICK_EXIT`]); anything else is `Edited` with the normalised text.
+    /// Consumes `self`: the file is removed when this returns.
+    #[must_use]
+    pub fn finish(
+        self,
+        cmd: &EditorCommand,
+        exit: io::Result<EditorExit>,
+        elapsed: Duration,
+    ) -> ExternalEditOutcome {
+        use ExternalEditOutcome::{Edited, Failed, Unchanged};
+
+        match exit {
+            Err(err) => return Failed(start_failure(cmd, &err.to_string())),
+            Ok(EditorExit::Code(0)) => {}
+            // The platform shell started and could not start the editor (F-D, D23).
+            Ok(EditorExit::Code(code)) if is_start_failure(code) => {
+                return Failed(start_failure(cmd, "not found or not executable"));
+            }
+            Ok(exit) => {
+                let code = match exit {
+                    EditorExit::Code(code) => code.to_string(),
+                    EditorExit::Signal => "a signal".to_owned(),
+                };
+                return Failed(format!(
+                    "`{}` exited with {code}; nothing was changed",
+                    cmd.value()
+                ));
+            }
+        }
+
+        let bytes = match std::fs::read(&self.path) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return Failed(format!(
+                    "could not read the edited file back ({err}); nothing was changed"
+                ));
+            }
+        };
+        let Ok(read) = String::from_utf8(bytes) else {
+            return Failed("the edited file is not UTF-8; nothing was changed".to_owned());
+        };
+        let edited = normalise_newlines(&read);
+        if edited == normalise_newlines(&self.handed) {
+            Unchanged {
+                quick: elapsed < QUICK_EXIT,
+            }
+        } else {
+            Edited(edited)
+        }
+    }
+}
+
+/// Writes `text` to a temp file named after `stem`, runs `cmd` on it and reads it back (D9), over
+/// a [`TempEdit`].
 ///
 /// Stdio is inherited: the caller has already given the terminal away ([`run_suspended`]). The
-/// temp file is removed on every path out, a dropped future included, and the editor child is
-/// killed if the future is dropped (D25; on Windows only `cmd` is, see [`EditorCommand::command`]). While the editor runs, the terminal's interrupt keys
+/// temp file is removed on every path out, a dropped future included (the [`TempEdit`] drops
+/// with it), and the editor child is killed if the future is dropped (D25; on Windows only `cmd`
+/// is, see [`EditorCommand::command`]). While the editor runs, the terminal's interrupt keys
 /// reach the editor and not htui (`Interrupts`, private).
 pub async fn run(cmd: &EditorCommand, text: &str, stem: &str) -> ExternalEditOutcome {
-    use ExternalEditOutcome::{Edited, Failed, Unchanged};
-
-    let stem = sanitise(stem);
-    let mut file = match tempfile::Builder::new()
-        .prefix(&format!("htui-{stem}-"))
-        .suffix(".md")
-        .tempfile()
-    {
-        Ok(file) => file,
-        Err(err) => return Failed(format!("could not create a temp file: {err}")),
+    let temp = match TempEdit::create(text, stem) {
+        Ok(temp) => temp,
+        Err(outcome) => return outcome,
     };
-    if let Err(err) = file.write_all(text.as_bytes()) {
-        return Failed(format!("could not write the temp file: {err}"));
-    }
-    // Closes the handle (a Windows editor could not write over it otherwise); the path is removed
-    // when `path` drops, on every path out of here, the dropped-future one included.
-    let path = file.into_temp_path();
 
     // Held until the editor has returned, so Ctrl-C at a cooked-mode editor cannot end htui.
     let interrupts = Interrupts::hold();
     let started = Instant::now();
-    let status = tokio::process::Command::from(cmd.command(&path))
+    let status = tokio::process::Command::from(cmd.command(temp.path()))
         .kill_on_drop(true)
         .status()
         .await;
     let elapsed = started.elapsed();
     drop(interrupts);
-    let status = match status {
-        Ok(status) => status,
-        Err(err) => return Failed(start_failure(cmd, &err.to_string())),
-    };
-    if !status.success() {
-        // The platform shell started and could not start the editor (F-D, D23).
-        if status.code().is_some_and(is_start_failure) {
-            return Failed(start_failure(cmd, "not found or not executable"));
-        }
-        let code = status
-            .code()
-            .map_or_else(|| "a signal".to_owned(), |code| code.to_string());
-        return Failed(format!(
-            "`{}` exited with {code}; nothing was changed",
-            cmd.value()
-        ));
-    }
-
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return Failed(format!(
-                "could not read the edited file back ({err}); nothing was changed"
-            ));
-        }
-    };
-    let Ok(read) = String::from_utf8(bytes) else {
-        return Failed("the edited file is not UTF-8; nothing was changed".to_owned());
-    };
-    let edited = normalise_newlines(&read);
-    if edited == normalise_newlines(text) {
-        Unchanged {
-            quick: elapsed < QUICK_EXIT,
-        }
-    } else {
-        Edited(edited)
-    }
+    temp.finish(cmd, status.map(EditorExit::from), elapsed)
 }
 
 /// [`run`] with the terminal given to the editor and taken back (D9, D21).
@@ -609,6 +700,204 @@ mod tests {
     #[test]
     fn without_controls_keeps_line_breaks_and_tabs() {
         assert_eq!(without_controls("a\tb\n\u{1b}[31mc\u{7}"), "a\tb\n[31mc");
+    }
+
+    #[test]
+    fn editor_exit_from_both_runners() {
+        use portable_pty::ExitStatus;
+
+        assert_eq!(
+            EditorExit::from(&ExitStatus::with_exit_code(0)),
+            EditorExit::Code(0)
+        );
+        assert_eq!(
+            EditorExit::from(&ExitStatus::with_exit_code(3)),
+            EditorExit::Code(3)
+        );
+        assert_eq!(
+            EditorExit::from(&ExitStatus::with_signal("Hangup")),
+            EditorExit::Signal
+        );
+        // A code past `i32` (a Windows NTSTATUS) saturates rather than wrapping negative.
+        assert_eq!(
+            EditorExit::from(&ExitStatus::with_exit_code(u32::MAX)),
+            EditorExit::Code(i32::MAX)
+        );
+
+        #[cfg(unix)]
+        {
+            let status = |script: &str| {
+                std::process::Command::new("sh")
+                    .args(["-c", script])
+                    .status()
+                    .expect("run sh")
+            };
+            assert_eq!(EditorExit::from(status("exit 4")), EditorExit::Code(4));
+            assert_eq!(
+                EditorExit::from(status("kill -TERM $$")),
+                EditorExit::Signal
+            );
+        }
+    }
+
+    #[test]
+    fn temp_edit_create_writes_the_text_under_the_sanitised_stem() {
+        let temp = TempEdit::create("hello\n", "../a/b c").expect("create the temp file");
+        let path = temp.path().to_owned();
+        assert_eq!(path.parent(), Some(std::env::temp_dir().as_path()));
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap();
+        assert!(name.starts_with("htui-___a_b_c-"), "{name}");
+        assert!(name.ends_with(".md"), "{name}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "hello\n");
+        drop(temp);
+        assert!(!path.exists(), "{}", path.display());
+    }
+
+    /// What a [`TempEdit::finish`] row expects.
+    enum Want {
+        /// Exactly this outcome.
+        Is(ExternalEditOutcome),
+        /// `Failed`, with each of these in its sentence.
+        FailedWith(&'static [&'static str]),
+    }
+
+    #[test]
+    fn temp_edit_finish_maps_every_exit() {
+        use ExternalEditOutcome::{Edited, Failed, Unchanged};
+        use Want::{FailedWith, Is};
+
+        /// What the "editor" leaves in the file before `finish` reads it back.
+        enum File {
+            /// Untouched.
+            Kept,
+            /// Rewritten with these bytes.
+            Rewritten(&'static [u8]),
+            /// Removed.
+            Gone,
+        }
+
+        let cmd = EditorCommand {
+            value: "hx".to_owned(),
+            fallback: false,
+        };
+        let start_failure = if cfg!(windows) { 9009 } else { 127 };
+        let quick = Duration::from_millis(10);
+        let slow = Duration::from_secs(2);
+        let rows: Vec<(&str, File, io::Result<EditorExit>, Duration, Want)> = vec![
+            (
+                "appended",
+                File::Rewritten(b"hello\nmore\n"),
+                Ok(EditorExit::Code(0)),
+                quick,
+                Is(Edited("hello\nmore\n".to_owned())),
+            ),
+            (
+                "untouched, quick",
+                File::Kept,
+                Ok(EditorExit::Code(0)),
+                quick,
+                Is(Unchanged { quick: true }),
+            ),
+            (
+                "untouched, slow",
+                File::Kept,
+                Ok(EditorExit::Code(0)),
+                slow,
+                Is(Unchanged { quick: false }),
+            ),
+            (
+                "exit 3",
+                File::Rewritten(b"hello\nmore\n"),
+                Ok(EditorExit::Code(3)),
+                slow,
+                FailedWith(&["`hx` exited with 3; nothing was changed"]),
+            ),
+            (
+                "signal",
+                File::Kept,
+                Ok(EditorExit::Signal),
+                slow,
+                FailedWith(&["`hx` exited with a signal; nothing was changed"]),
+            ),
+            (
+                "not found",
+                File::Kept,
+                Ok(EditorExit::Code(start_failure)),
+                quick,
+                FailedWith(&["$VISUAL or $EDITOR", "not found or not executable"]),
+            ),
+            (
+                "spawn error",
+                File::Kept,
+                Err(io::Error::other("boom")),
+                quick,
+                FailedWith(&["could not start `hx` (boom)"]),
+            ),
+            (
+                "not utf-8",
+                File::Rewritten(b"\xff\xfe"),
+                Ok(EditorExit::Code(0)),
+                slow,
+                Is(Failed(
+                    "the edited file is not UTF-8; nothing was changed".to_owned(),
+                )),
+            ),
+            (
+                "crlf rewrite",
+                File::Rewritten(b"hello\r\nmore\r\n"),
+                Ok(EditorExit::Code(0)),
+                slow,
+                Is(Edited("hello\nmore\n".to_owned())),
+            ),
+            (
+                "crlf, same text",
+                File::Rewritten(b"hello\r\n"),
+                Ok(EditorExit::Code(0)),
+                slow,
+                Is(Unchanged { quick: false }),
+            ),
+            (
+                "file removed",
+                File::Gone,
+                Ok(EditorExit::Code(0)),
+                slow,
+                FailedWith(&[
+                    "could not read the edited file back (",
+                    "nothing was changed",
+                ]),
+            ),
+        ];
+        for (name, file, exit, elapsed, want) in rows {
+            let temp = TempEdit::create("hello\n", "implement").expect("create the temp file");
+            let path = temp.path().to_owned();
+            match file {
+                File::Kept => {}
+                File::Rewritten(bytes) => std::fs::write(&path, bytes).unwrap(),
+                File::Gone => std::fs::remove_file(&path).unwrap(),
+            }
+            let outcome = temp.finish(&cmd, exit, elapsed);
+            match want {
+                Is(want) => assert_eq!(outcome, want, "{name}"),
+                FailedWith(parts) => {
+                    let Failed(message) = &outcome else {
+                        panic!("{name}: expected Failed, got {outcome:?}");
+                    };
+                    for part in parts {
+                        assert!(message.contains(part), "{name}: {message}");
+                    }
+                }
+            }
+            assert!(!path.exists(), "{name} left {}", path.display());
+        }
+    }
+
+    #[test]
+    fn a_temp_edit_debug_prints_lengths_not_text() {
+        let temp = TempEdit::create("secret body", "implement").unwrap();
+        let shown = format!("{temp:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(shown.contains("text_len: 11"), "{shown}");
+        assert!(shown.contains("htui-implement-"), "{shown}");
     }
 
     /// Fake editors: `#!/bin/sh` scripts in a temp dir. No test launches a real editor.
