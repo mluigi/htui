@@ -337,7 +337,7 @@ impl App {
     /// The global actions [`offer`](Self::offer) takes: those that open a named view. Every other
     /// global action is [`action_for`](Self::action_for)'s fixed mapping.
     const fn is_offerable(act: Act) -> bool {
-        matches!(act, Act::Workspaces | Act::Find | Act::Waiting)
+        matches!(act, Act::Workspaces | Act::Find | Act::Waiting | Act::Queue)
     }
 
     /// What the shell does for `act`: the fixed mapping, then the offered table. `None` for

@@ -11,7 +11,9 @@ use crossterm::event::{KeyCode, KeyModifiers};
 
 use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::keys::Act;
-use crate::ui::overlay::{ConceptsSearch, MigrationPrompt, WaitingList, WorkspaceSwitcher};
+use crate::ui::overlay::{
+    ConceptsSearch, MigrationPrompt, QueueOverlay, WaitingList, WorkspaceSwitcher,
+};
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
     PersonasSection, PromptSection, QdrantSection, QueueSection, SecretsSection,
@@ -55,6 +57,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///     (MOD-13 milestone 2 D7), for the same reason: the tab's own arms read the item form.
 /// 11. The waiting list's factory goes in and global `Ctrl+W` is offered as [`Act::Waiting`] to
 ///     open it (MOD-69 D7), a chord for `Ctrl+F`'s reason.
+/// 12. The queue overlay's factory goes in and global `Ctrl+Q` is offered as [`Act::Queue`] to
+///     open it (MOD-12 M3 D8), a chord for the same reason.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -104,6 +108,14 @@ pub fn register_all(app: &mut App) {
     app.offer(
         Act::Waiting,
         Action::Overlay(OverlayAction::Open(WaitingList::ID)),
+    );
+
+    // MOD-12 M3 D8: the queue overlay, global `Ctrl+Q`. A chord, for `Ctrl+F`'s reason.
+    app.overlay_factories
+        .register(QueueOverlay::ID, || Box::new(QueueOverlay::new()));
+    app.offer(
+        Act::Queue,
+        Action::Overlay(OverlayAction::Open(QueueOverlay::ID)),
     );
 
     app.startup_overlay = Some(WorkspaceSwitcher::ID);

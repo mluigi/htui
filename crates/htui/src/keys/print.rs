@@ -66,7 +66,7 @@ mod tests {
     use super::print;
     use crate::keys::{Keys, load_str, quote};
 
-    /// Blueprint §4's lines 1-26 of the default print.
+    /// Blueprint §4's lines 1-26 of the default print, and the queue row (MOD-12 M3 D8): 27.
     const DEFAULT_HEAD: &str = r#"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
 # directory: ~/.config/htui on Linux, ~/Library/Application Support/htui on macOS, %APPDATA%\htui
 # on Windows. List only what you change: a list replaces that action's chords, [] unbinds it.
@@ -90,6 +90,7 @@ help         = ["?", "f1"]  # help
 workspaces   = ["w"]        # workspaces
 find         = ["ctrl-f"]   # find
 waiting      = ["ctrl-w"]   # waiting
+queue        = ["ctrl-q"]   # queue
 
 [overlay]
 close = ["esc"]  # close"#;
@@ -97,7 +98,7 @@ close = ["esc"]  # close"#;
     #[test]
     fn the_default_print_starts_with_the_header_global_and_overlay() {
         let printed = print(Keys::compiled());
-        let head: Vec<&str> = printed.lines().take(26).collect();
+        let head: Vec<&str> = printed.lines().take(27).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
         assert!(printed.ends_with("dismiss = [\"esc\"]  # dismiss\n"));
         assert!(!printed.ends_with("\n\n"));
@@ -116,7 +117,7 @@ close = ["esc"]  # close"#;
     #[test]
     fn a_changed_table_round_trips_and_keeps_its_marks() {
         let keys = load_str(
-            "[global]\nquit = [\"ctrl-q\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
+            "[global]\nquit = [\"ctrl-x\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
         )
         .expect("the file loads");
         let printed = print(&keys);
@@ -124,7 +125,7 @@ close = ["esc"]  # close"#;
         assert_eq!(reloaded, keys);
         assert_eq!(print(&reloaded), printed);
         for line in [
-            "quit         = [\"ctrl-q\"]   # quit (changed)",
+            "quit         = [\"ctrl-x\"]   # quit (changed)",
             "workspaces   = []           # workspaces (changed)",
             "close = [\"esc\", \"f2\"]  # close (changed)",
         ] {

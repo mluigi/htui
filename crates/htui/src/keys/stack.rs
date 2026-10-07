@@ -147,6 +147,7 @@ mod tests {
         assert_eq!(base(keys, "w"), [Act::Workspaces]);
         assert_eq!(base(keys, "ctrl-f"), [Act::Find]);
         assert_eq!(base(keys, "ctrl-w"), [Act::Waiting]);
+        assert_eq!(base(keys, "ctrl-q"), [Act::Queue]);
         assert_eq!(base(keys, "z"), []);
         assert_eq!(base(keys, "esc"), []);
     }

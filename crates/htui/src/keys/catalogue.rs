@@ -107,6 +107,8 @@ pub enum Act {
     Find,
     /// `global.waiting`: open the waiting list (offered by `register_all`).
     Waiting,
+    /// `global.queue`: open the queue overlay (offered by `register_all`).
+    Queue,
     /// `overlay.close`: close the top overlay.
     OverlayClose,
     /// `list.down`: the next row.
@@ -314,11 +316,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
     ),
     // `f1` is new (ANA-26 §6.5, D12); not `in_capture`, `?` is printable (B3).
     row(Act::Help, Global, "help", &["?", "f1"], "help"),
-    // Offered by `register_all` (D5): `app/mod.rs` workspace switcher, concepts search and
-    // waiting list (MOD-69 D7).
+    // Offered by `register_all` (D5): `app/mod.rs` workspace switcher, concepts search,
+    // waiting list (MOD-69 D7) and queue overlay (MOD-12 M3 D8). `queue` follows `waiting`, so
+    // the status line a 100-column frame cuts before `Ctrl+w waiting` is unchanged.
     row(Act::Workspaces, Global, "workspaces", &["w"], "workspaces"),
     row(Act::Find, Global, "find", &["ctrl-f"], "find"),
     row(Act::Waiting, Global, "waiting", &["ctrl-w"], "waiting"),
+    row(Act::Queue, Global, "queue", &["ctrl-q"], "queue"),
     // [overlay]: `keymap.rs`'s wildcard overlay row. In capture because the concepts field
     // returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
     capture_row(Act::OverlayClose, Overlay, "close", &["esc"], "close"),
@@ -458,6 +462,7 @@ mod tests {
         Act::Workspaces,
         Act::Find,
         Act::Waiting,
+        Act::Queue,
         Act::OverlayClose,
         Act::ListDown,
         Act::ListUp,
@@ -505,31 +510,32 @@ mod tests {
             Act::Workspaces => 13,
             Act::Find => 14,
             Act::Waiting => 15,
-            Act::OverlayClose => 16,
-            Act::ListDown => 17,
-            Act::ListUp => 18,
-            Act::ListTop => 19,
-            Act::ListBottom => 20,
-            Act::ListFold => 21,
-            Act::PaneScrollDown => 22,
-            Act::PaneScrollUp => 23,
-            Act::PanePageDown => 24,
-            Act::PanePageUp => 25,
-            Act::PaneNextSubtab => 26,
-            Act::PanePrevSubtab => 27,
-            Act::ConfirmYes => 28,
-            Act::ConfirmNo => 29,
-            Act::FormNextField => 30,
-            Act::FormPrevField => 31,
-            Act::FormSave => 32,
-            Act::FormExternalEditor => 33,
-            Act::Edit => 34,
-            Act::New => 35,
-            Act::Delete => 36,
-            Act::Clear => 37,
-            Act::Reload => 38,
-            Act::Back => 39,
-            Act::Dismiss => 40,
+            Act::Queue => 16,
+            Act::OverlayClose => 17,
+            Act::ListDown => 18,
+            Act::ListUp => 19,
+            Act::ListTop => 20,
+            Act::ListBottom => 21,
+            Act::ListFold => 22,
+            Act::PaneScrollDown => 23,
+            Act::PaneScrollUp => 24,
+            Act::PanePageDown => 25,
+            Act::PanePageUp => 26,
+            Act::PaneNextSubtab => 27,
+            Act::PanePrevSubtab => 28,
+            Act::ConfirmYes => 29,
+            Act::ConfirmNo => 30,
+            Act::FormNextField => 31,
+            Act::FormPrevField => 32,
+            Act::FormSave => 33,
+            Act::FormExternalEditor => 34,
+            Act::Edit => 35,
+            Act::New => 36,
+            Act::Delete => 37,
+            Act::Clear => 38,
+            Act::Reload => 39,
+            Act::Back => 40,
+            Act::Dismiss => 41,
         }
     }
 
@@ -554,7 +560,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 41);
+        assert_eq!(CATALOGUE.len(), 42);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -657,6 +663,7 @@ mod tests {
                 "workspaces",
                 "find",
                 "waiting",
+                "queue",
             ]
         );
     }

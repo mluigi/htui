@@ -81,7 +81,7 @@ mod binary {
         assert_eq!(stderr, "");
         assert_eq!(stdout, print(&load_path(&valid).expect("valid.toml loads")));
         assert!(
-            stdout.contains("quit         = [\"ctrl-q\"]   # quit (changed)\n"),
+            stdout.contains("quit         = [\"ctrl-x\"]   # quit (changed)\n"),
             "{stdout}"
         );
         assert!(
@@ -117,7 +117,7 @@ mod binary {
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
                      select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, workspaces, \
-                     find, waiting"
+                     find, waiting, queue"
                         .to_owned(),
                     r#"13: [global] quit = "shift-a": write a shifted letter as "A""#.to_owned(),
                 ],
@@ -336,14 +336,14 @@ mod app {
         assert!(!harness.app().should_quit, "`q` no longer quits");
         let frame = harness.render();
         assert!(
-            status_line(&frame).starts_with("Ctrl+q quit · Tab next tab"),
+            status_line(&frame).starts_with("Ctrl+x quit · Tab next tab"),
             "{frame}"
         );
 
         harness.key("?");
         assert!(harness.app().help_visible, "`?` opens the box");
         let frame = harness.render();
-        assert!(frame.contains("Ctrl+q/Ctrl+c quit"), "{frame}");
+        assert!(frame.contains("Ctrl+x/Ctrl+c quit"), "{frame}");
         harness.key("?");
         assert!(!harness.app().help_visible, "`?` closes it");
 
@@ -368,7 +368,7 @@ mod app {
         harness.key("esc");
         assert!(harness.app().overlays.is_empty(), "`Esc` still closes it");
 
-        harness.key("ctrl-q");
-        assert!(harness.app().should_quit, "`Ctrl+q` quits");
+        harness.key("ctrl-x");
+        assert!(harness.app().should_quit, "`Ctrl+x` quits");
     }
 }
