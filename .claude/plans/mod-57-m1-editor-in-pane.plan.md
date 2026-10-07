@@ -322,3 +322,9 @@ Templates (`Ctrl+E` on a draft: the claimed draft rect), the Notes compose box a
 nvim's start-up queries (DA2, OSC 10/11 colour, XTGETTCAP) go unanswered, so check that it starts
 without a delay and picks a sane background; and the `MIN_PANE` verdict above in the Notes compose
 box.
+
+**T7 notes.** Blueprint §9.1 test 1 (`ctrl_e_in_templates_edits_in_the_pane_end_to_end`) presses
+browse `E`, which claims nothing (F-12); it is committed as `e_in_templates_edits_in_the_pane_end_to_end`
+(the whole-tab-body path), and `ctrl_e_on_a_draft_edits_over_its_claimed_rect` adds the claimed-rect
+path the plan's T7 Action names (`0bce6b5f`). The docs list `F1` beside `?` under the M1 lock
+(`global.help` binds both).

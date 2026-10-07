@@ -119,7 +119,7 @@ If the pane cannot start (no pseudo-terminal available), the view says so and su
 | `Ctrl+x` | htui has the keys | aborts the edit: the editor is killed, nothing is read back |
 | `q` | htui has the keys | quits htui at once; the editor is killed, the edit is lost |
 | `Ctrl+C` | htui has the keys | quits htui, as everywhere in htui |
-| `?` | htui has the keys | the help box |
+| `?` or `F1` | htui has the keys | the help box |
 
 **While the editor has the keys, every key is the editor's**, `Ctrl+C` included (it is the
 editor's own interrupt, as in a terminal: vim cancels, nano shows the cursor position), `Ctrl+x`
@@ -142,7 +142,7 @@ MOD-67's user keymap; `editor.focus` will have to stay bound.
 ## While the editor is open (the M1 lock)
 
 In this first version, while an editor is open and htui has the keys, htui answers **only** the
-keys in the table above: `Ctrl+4`, `Ctrl+x`, `q`, `?` and `Ctrl+C`. Every other key is refused
+keys in the table above: `Ctrl+4`, `Ctrl+x`, `q`, `?`, `F1` and `Ctrl+C`. Every other key is refused
 with `the editor is open: Ctrl+4 to the editor · Ctrl+x abort`, and nothing in the view, the tab
 bar or an overlay moves. A paste goes to the editor while it has the keys (as a bracketed paste
 when the editor asked for one); while htui has the keys it is dropped, unless a modal prompt is
