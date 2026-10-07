@@ -134,9 +134,11 @@ shows its result without the latch line, since that write has given the next cal
 Changes take effect at the next walk, chat or check, with no restart: walks and chats read the
 keyring and the project's scope each time they resolve ([When htui resolves](#when-htui-resolves)).
 
-In a `--demo` session the URL, Identity and Health rows read `n/a in a demo session`, and htui
-never reads or writes the keyring: `e` and `c` on URL or Identity and every `t` are refused, and
-nothing is sent. Project scopes can still be edited, since they live in the store.
+In a `--demo` session the URL, Identity and Health rows read `n/a in a demo session`, and this
+section never reads or writes the keyring: `e` and `c` on URL or Identity and every `t` are
+refused, and nothing is sent. Project scopes can still be edited, since they live in the store.
+Settings > Qdrant is not guarded this way: in a demo session it still reads the keyring, and its
+`e` and `c` still write it.
 
 ## Base URL
 
