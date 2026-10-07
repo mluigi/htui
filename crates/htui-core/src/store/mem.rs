@@ -13404,6 +13404,198 @@ mod tests {
         );
     }
 
+    /// Review H2: a close cancels the batch's runs still `queued` (their items back to `open`,
+    /// their entries kept) and leaves its claimed runs and every run outside it alone.
+    #[tokio::test]
+    async fn close_batch_cancels_only_the_batch_runs_still_queued() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        let waiting = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(batch.id)))
+            .await
+            .expect("an open batch admits");
+        let claimed = store
+            .create_run(batch_run(ids::HTUI_CLEAN_1, Some(batch.id)))
+            .await
+            .expect("an open batch admits");
+        assert_eq!(
+            store
+                .claim_run(
+                    claimed.id,
+                    ids::BOX,
+                    Uuid::now_v7(),
+                    at,
+                    TimeDelta::minutes(5)
+                )
+                .await
+                .expect("the claim reads"),
+            Claim::Admitted
+        );
+        let outside = store.run(ids::RUN_2).await.expect("read").expect("RUN_2");
+        assert_eq!(outside.status, RunStatus::Queued, "the fixture's own run");
+
+        let later = at + TimeDelta::seconds(1);
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, later)
+            .await
+            .expect("the close is answered")
+            .expect("one was open");
+        let cancelled = store.run(waiting.id).await.expect("read").expect("the run");
+        assert_eq!(cancelled.status, RunStatus::Cancelled);
+        assert_eq!(
+            cancelled.finished_at,
+            Some(later.trunc_subsecs(TIMESTAMPTZ_DIGITS))
+        );
+        assert_eq!(
+            store
+                .item(ids::HTUI_ANA_2)
+                .await
+                .expect("read")
+                .map(|item| item.status),
+            Some(Status::Open),
+            "finish_run's mirror: a cancelled queued run reopens its item"
+        );
+        assert_eq!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("read")
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect::<Vec<_>>(),
+            [ids::HTUI_ANA_2],
+            "the entry stays"
+        );
+        assert_eq!(
+            store
+                .run(claimed.id)
+                .await
+                .expect("read")
+                .map(|run| run.status),
+            Some(RunStatus::Running)
+        );
+        assert_eq!(
+            store
+                .run(ids::RUN_2)
+                .await
+                .expect("read")
+                .map(|run| run.status),
+            Some(RunStatus::Queued),
+            "a run outside the batch is not the close's"
+        );
+        assert_eq!(
+            store
+                .claim_run(
+                    waiting.id,
+                    ids::BOX,
+                    Uuid::now_v7(),
+                    later,
+                    TimeDelta::minutes(5)
+                )
+                .await
+                .expect("the claim reads"),
+            Claim::NotClaimable,
+            "a claim after the close finds the run cancelled"
+        );
+        assert_eq!(
+            store.batch_cancelled_items(batch.id).await.expect("read"),
+            [ids::HTUI_ANA_2]
+        );
+    }
+
+    /// Review M1: the drain's close is of exactly the batch it names, and only while that batch
+    /// is still drained, so a pause and a resume between the drain's reads and its close are
+    /// never undone.
+    #[tokio::test]
+    async fn close_drained_batch_closes_only_the_drained_batch_it_names() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        let first = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close is answered")
+            .expect("one was open");
+        let second = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("a resume opens a new batch");
+        assert_eq!(
+            store
+                .close_drained_batch(first.id, at)
+                .await
+                .expect("answered"),
+            None,
+            "the checked batch is already closed"
+        );
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("read")
+                .map(|open| open.id),
+            Some(second.id),
+            "the resume's batch stays open"
+        );
+
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        assert_eq!(
+            store
+                .close_drained_batch(second.id, at)
+                .await
+                .expect("answered"),
+            None,
+            "an entry keeps it open"
+        );
+        assert!(store.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
+        let run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(second.id)))
+            .await
+            .expect("an open batch admits");
+        assert_eq!(
+            store
+                .close_drained_batch(second.id, at)
+                .await
+                .expect("answered"),
+            None,
+            "a live run of its own keeps it open"
+        );
+        store
+            .finish_run(run.id, RunStatus::Cancelled, None, at)
+            .await
+            .expect("a queued run cancels");
+        let closed = store
+            .close_drained_batch(second.id, at)
+            .await
+            .expect("answered")
+            .expect("drained now");
+        assert_eq!(closed.id, second.id);
+        assert_eq!(closed.closed_reason, Some(BatchClose::Drained));
+        assert_eq!(store.open_batch_of(ids::BOX).await.expect("read"), None);
+        assert_eq!(
+            store
+                .close_drained_batch(crate::model::BatchId::new(), at)
+                .await
+                .expect("answered"),
+            None,
+            "an unknown batch closes nothing"
+        );
+    }
+
     /// MOD-12 D3: only `done` and `closed` items leave the queue.
     #[tokio::test]
     async fn prune_finished_entries_drops_done_and_closed_items_only() {
