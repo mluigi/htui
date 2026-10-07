@@ -486,6 +486,29 @@ async fn set_machine_identity_stores_both_halves_and_answers_a_fresh_snapshot() 
 }
 
 #[tokio::test]
+async fn set_machine_identity_stores_the_trimmed_halves() {
+    // CLEAN-8 #4: spaces around either half are dropped before the keyring sees them.
+    let _keyring = common::mock_keyring().await;
+    let (_root, backend) = offline("secrets-trimmed").await;
+    let reply = serve(
+        &backend,
+        &StoreRequest::SetMachineIdentity(identity_entry(
+            " cid-typed-1\t",
+            "  zq7-client-secret-0123456789 ",
+        )),
+    )
+    .await;
+    assert_eq!(
+        keyring_written_of(reply, "set_machine_identity").identity,
+        IdentityState::Stored
+    );
+    assert!(
+        common::fake_machine_identity() == (Some(CLIENT_ID.to_owned()), Some(SECRET.to_owned())),
+        "both halves are stored trimmed"
+    );
+}
+
+#[tokio::test]
 async fn set_machine_identity_refuses_a_blank_half_and_stores_nothing() {
     let _keyring = common::mock_keyring().await;
     let (_root, backend) = offline("secrets-blank-half").await;

@@ -105,6 +105,8 @@ pub struct IdentityEntry {
 
 impl IdentityEntry {
     /// Both halves; the section trims them and refuses a blank one before building this.
+    /// [`to_identity`](Self::to_identity) trims again, so a worker write stores the trimmed
+    /// halves (CLEAN-8 #4).
     #[must_use]
     pub fn new(client_id: String, client_secret: Redacted) -> Self {
         Self {
@@ -125,10 +127,10 @@ impl IdentityEntry {
         self.client_secret.expose()
     }
 
-    /// The worker's copy for `htui_store::secret::set_machine_identity`: both halves wiped on
-    /// drop.
+    /// The worker's copy for `htui_store::secret::set_machine_identity`: both halves trimmed
+    /// (CLEAN-8 #4) and wiped on drop.
     pub(crate) fn to_identity(&self) -> MachineIdentity {
-        MachineIdentity::new(self.client_id(), self.expose_client_secret())
+        MachineIdentity::new(self.client_id().trim(), self.expose_client_secret().trim())
     }
 }
 
@@ -274,7 +276,7 @@ fn seam_sentence(err: &StoreError) -> String {
 /// A write on [`Backend::Memory`] is refused with [`DEMO_SESSION`] before anything else (D10). A
 /// URL is normalised again (defensive: the section already did) and a refusal is `Failed` with
 /// normalisation's sentence, which never echoes the URL. An identity with a blank half is
-/// refused with [`IDENTITY_INCOMPLETE`]. Every write that lands stores a new keyring write mark
+/// refused with [`IDENTITY_INCOMPLETE`]; one that is not is stored trimmed (CLEAN-8 #4). Every write that lands stores a new keyring write mark
 /// (MOD-90 D1, so another process sees it) and bumps the keyring-write generation (blueprint
 /// A-4), and answers the generation and a fresh snapshot under its own name
 /// ([`StoreReply::SecretsWritten`], R1 M-1, L-1); the read answers [`StoreReply::Secrets`].
