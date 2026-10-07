@@ -94,6 +94,7 @@ pub mod note;
 pub mod overlap;
 pub mod persona;
 pub mod queue;
+pub mod queue_settings;
 pub mod quota;
 pub mod relay;
 pub mod requirement;
@@ -149,6 +150,10 @@ pub use persona::{
 pub use queue::{
     BatchClose, BatchStop, MIN_BUDGET_FOR_NEW_ATTEMPT, QueueBatch, QueueEntry, admission_limit,
     admission_order, batch_budget, free_slots, min_budget_micros,
+};
+pub use queue_settings::{
+    QueueSetting, USD_NOT_A_NUMBER, USD_TOO_LARGE, USD_TOO_PRECISE, WINDOW_EMPTY, WINDOW_SHAPE,
+    format_usd, format_window, parse_usd, parse_window,
 };
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
