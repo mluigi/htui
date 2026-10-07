@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_agent::registry::caps_for;
+use htui_core::model::queue::BatchStop;
 use htui_core::model::quota::{self, Availability, SkipReason};
 use htui_core::model::{Agent, AgentBox, AgentId, Gate, RunStep, SnapshotCandidate, Transport};
 
@@ -34,9 +35,16 @@ pub struct SelectInput<'a> {
     pub cap_micros: Option<i64>,
     /// `app_setting.min_budget_for_new_attempt`, in USD micros, else `0` (OQ-6).
     pub min_budget_micros: i64,
+    /// MOD-12 M2 D5: the spend of the batch the run was admitted under (`run_batch_spend`), USD
+    /// micros; `None` when unknown, and for a run in no batch.
+    pub batch_spent_micros: Option<i64>,
+    /// MOD-12 M2 D2, D5: `snapshot.settings.per_token_cap_batch` when the run is in a batch, else
+    /// `None` (a manual run has no batch figure); `None` is unbounded.
+    pub batch_cap_micros: Option<i64>,
 }
 
-/// Why [`walk`] skipped a candidate: the first of D60's five rules that fired.
+/// Why [`walk`] skipped a candidate: the first of D60's five rules, and MOD-12 M2's two batch
+/// rules after them, that fired (seven in all).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SkipCause {
     /// Rule 1: the candidate's `agent_id` has no `agent` row.
@@ -54,6 +62,21 @@ pub enum SkipCause {
         /// `cap - spent`, in USD micros.
         remaining: i64,
         /// The minimum a new attempt needs, in USD micros.
+        min: i64,
+    },
+    /// Rule 6 (MOD-12 M2 D3, D5): the batch has spent its cap ([`BatchStop::CapReached`]).
+    BatchCapReached {
+        /// The batch's spend, USD micros.
+        spent: i64,
+        /// `per_token_cap_batch`, USD micros.
+        cap: i64,
+    },
+    /// Rule 7 (MOD-12 M2 D3, D5): the batch's remainder is below the minimum
+    /// ([`BatchStop::Budget`]).
+    BatchBudget {
+        /// `cap - spent`, USD micros.
+        remaining: i64,
+        /// The minimum a new attempt needs, USD micros.
         min: i64,
     },
 }
@@ -77,6 +100,16 @@ impl fmt::Display for SkipCause {
             Self::Budget { remaining, min } => {
                 write!(f, "budget: {remaining} micros left, {min} required")
             }
+            Self::BatchCapReached { spent, cap } => BatchStop::CapReached {
+                spent: *spent,
+                cap: *cap,
+            }
+            .fmt(f),
+            Self::BatchBudget { remaining, min } => BatchStop::Budget {
+                remaining: *remaining,
+                min: *min,
+            }
+            .fmt(f),
         }
     }
 }
@@ -340,6 +373,8 @@ mod tests {
             spent_micros: None,
             cap_micros: None,
             min_budget_micros: 0,
+            batch_spent_micros: None,
+            batch_cap_micros: None,
         }
     }
 
@@ -773,5 +808,129 @@ mod tests {
         assert_eq!(run_spend(&steps), Some(1_750));
         assert_eq!(run_spend(&steps[1..3]), None, "no step reports a cost");
         assert_eq!(run_spend(&[]), None);
+    }
+
+    /// MOD-12 M2 rule 6: a batch at its cap (equality reaches it) skips every candidate, and the
+    /// cause says so in the batch's words; one micro below admits both.
+    #[test]
+    fn a_batch_at_its_cap_skips_every_candidate() {
+        let candidates = two_acp();
+        let agents = agents();
+        let boxes = BTreeMap::new();
+        let reached = walk(&SelectInput {
+            batch_spent_micros: Some(500),
+            batch_cap_micros: Some(500),
+            ..input(&candidates, &agents, &boxes)
+        });
+        let cause = SkipCause::BatchCapReached {
+            spent: 500,
+            cap: 500,
+        };
+        assert!(
+            reached.eligible.is_empty(),
+            "the batch cap binds every candidate"
+        );
+        assert_eq!(reached.skipped.len(), candidates.len());
+        assert!(reached.skipped.iter().all(|skipped| skipped.cause == cause));
+        assert_eq!(cause.to_string(), "batch cap reached (500 of 500 micros)");
+
+        let under = walk(&SelectInput {
+            batch_spent_micros: Some(499),
+            batch_cap_micros: Some(500),
+            ..input(&candidates, &agents, &boxes)
+        });
+        assert_eq!(under.eligible, candidates, "below the batch cap");
+    }
+
+    /// MOD-12 M2 rule 7: a batch remainder below the minimum skips; exactly the minimum is enough.
+    #[test]
+    fn a_short_batch_budget_skips_and_exactly_the_minimum_is_enough() {
+        let candidates = two_acp();
+        let agents = agents();
+        let boxes = BTreeMap::new();
+        let base = SelectInput {
+            min_budget_micros: 200,
+            ..input(&candidates, &agents, &boxes)
+        };
+        let short = walk(&SelectInput {
+            batch_spent_micros: Some(900),
+            batch_cap_micros: Some(1_000),
+            ..base
+        });
+        let cause = SkipCause::BatchBudget {
+            remaining: 100,
+            min: 200,
+        };
+        assert_eq!(first_cause(&short), &cause);
+        assert!(short.eligible.is_empty());
+        assert_eq!(
+            cause.to_string(),
+            "batch budget: 100 micros left, 200 required"
+        );
+
+        let enough = walk(&SelectInput {
+            batch_spent_micros: Some(800),
+            batch_cap_micros: Some(1_000),
+            ..base
+        });
+        assert_eq!(enough.eligible, candidates, "exactly the minimum is enough");
+    }
+
+    /// OQ-6 for the batch: either batch figure unknown is unbounded.
+    #[test]
+    fn unknown_batch_figures_are_unbounded() {
+        let candidates = two_acp();
+        let agents = agents();
+        let boxes = BTreeMap::new();
+        for (spent, cap) in [(None, Some(1_000)), (Some(900), None), (None, None)] {
+            let walked = walk(&SelectInput {
+                min_budget_micros: 200,
+                batch_spent_micros: spent,
+                batch_cap_micros: cap,
+                ..input(&candidates, &agents, &boxes)
+            });
+            assert_eq!(walked.eligible, candidates, "{spent:?} of {cap:?}");
+            assert!(walked.skipped.is_empty());
+        }
+    }
+
+    /// MOD-12 M2: the run's own rules come first, so a run-level cause keeps its sentence.
+    #[test]
+    fn the_run_rules_come_before_the_batch_rules() {
+        let candidates = [candidate(ids::AGENT_CLAUDE, "claude")];
+        let agents = agents();
+        let boxes = BTreeMap::new();
+        let both_capped = walk(&SelectInput {
+            spent_micros: Some(500),
+            cap_micros: Some(500),
+            batch_spent_micros: Some(700),
+            batch_cap_micros: Some(700),
+            ..input(&candidates, &agents, &boxes)
+        });
+        assert_eq!(
+            first_cause(&both_capped),
+            &SkipCause::Quota(SkipReason::CapReached {
+                spent_micros: 500,
+                cap_micros: 500,
+            }),
+            "rule 2 before rule 6"
+        );
+
+        let short_and_capped = walk(&SelectInput {
+            spent_micros: Some(900),
+            cap_micros: Some(1_000),
+            min_budget_micros: 200,
+            batch_spent_micros: Some(700),
+            batch_cap_micros: Some(700),
+            ..input(&candidates, &agents, &boxes)
+        });
+        assert_eq!(
+            first_cause(&short_and_capped),
+            &SkipCause::Budget {
+                remaining: 100,
+                min: 200,
+            },
+            "rule 5 before rule 6"
+        );
     }
 }

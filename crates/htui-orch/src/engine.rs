@@ -3405,6 +3405,8 @@ where
             spent_micros: select::run_spend(&steps),
             cap_micros: snapshot.settings.per_token_cap_run,
             min_budget_micros: min_budget(&self.parts.app),
+            batch_spent_micros: None,
+            batch_cap_micros: None,
         }))
     }
 
