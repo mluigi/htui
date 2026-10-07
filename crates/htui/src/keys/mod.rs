@@ -10,6 +10,7 @@ pub mod catalogue;
 pub mod chord;
 pub mod hint;
 pub mod load;
+pub mod print;
 pub mod stack;
 pub mod validate;
 
@@ -17,6 +18,7 @@ pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, STATE_GUARDED};
 pub use chord::{CTRL_C, ChordError, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
 pub use load::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
+pub use print::print;
 pub use stack::{DECLARED, Layer, Stack};
 pub use validate::validate;
 
