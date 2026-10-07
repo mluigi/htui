@@ -8,9 +8,13 @@
 //!   caller (PD-2); the **wait** thread (`htui-pane-wait`) owns the child, polls it, and sends
 //!   [`PaneEvent::Exited`] once it is reaped.
 //! - The kill path (B5): [`PaneChild::kill`], or dropping the [`PtyChild`], asks the wait thread,
-//!   which runs portable-pty's escalating kill on the child it owns (SIGHUP, a 200 ms grace, then
-//!   SIGKILL; `TerminateProcess` on Windows) and reaps it. No pid-based signal is sent from the
-//!   caller, so a reaped pid that the system reuses is never hit.
+//!   which escalates on the child it owns and then reaps it. On unix the child leads its own
+//!   session and process group (portable-pty runs `setsid`), and the whole group gets SIGHUP, a
+//!   grace of up to 200 ms (cut short once the child has exited), then SIGKILL: a grandchild that
+//!   ignores SIGHUP (an `$EDITOR` wrapper that does not `exec`) cannot outlive the pane and keep
+//!   the slave, and so the reader, alive. Every signal is sent before the child is reaped, so its
+//!   pid, which is the group's id, cannot have been reused. On Windows: portable-pty's kill
+//!   (`TerminateProcess`). No signal is sent from the caller's thread.
 //! - [`PaneScreen`]: the VT screen a pane's output is parsed into (`vt100`), and the replies the
 //!   child is owed for its terminal queries (DSR, DA1).
 //! - [`encode_key`] and [`encode_paste`]: crossterm's keys and pastes as the bytes a legacy xterm
@@ -44,8 +48,12 @@ use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
 
-/// How often the wait thread polls the child while no kill is asked for.
+/// How often the wait thread polls the child while no kill is asked for, or during the grace.
 const POLL: Duration = Duration::from_millis(25);
+
+/// How long the child's group has between SIGHUP and SIGKILL (unix).
+#[cfg(unix)]
+const GRACE: Duration = Duration::from_millis(200);
 
 /// The reader thread's buffer: one `Output` carries at most this many bytes.
 const READ_CHUNK: usize = 8192;
@@ -64,7 +72,12 @@ impl PaneId {
     }
 }
 
-/// A pane's size in cells. Never 0 in either dimension (`vt100` and the kernel both dislike it).
+/// The smallest side of a pane, in cells. `vt100` 0.16.2 underflows on a 1-row or 1-column grid
+/// (`Grid::col_wrap`: a 1-row grid panics once a line wraps, a 1-column one on a wide character),
+/// and the kernel dislikes 0.
+const MIN_SIDE: u16 = 2;
+
+/// A pane's size in cells. Never under [`MIN_SIDE`] (2) in either dimension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneSize {
     /// Rows.
@@ -77,16 +90,16 @@ impl PaneSize {
     /// Before anything was drawn: 24x80.
     pub const DEFAULT: Self = Self { rows: 24, cols: 80 };
 
-    /// `rows`/`cols`, each at least 1.
+    /// `rows`/`cols`, each at least 2 (see [`MIN_SIDE`]).
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
-            rows: rows.max(1),
-            cols: cols.max(1),
+            rows: rows.max(MIN_SIDE),
+            cols: cols.max(MIN_SIDE),
         }
     }
 
-    /// The same size, floored again: the fields are public, so a literal can hold a 0.
+    /// The same size, floored again: the fields are public, so a literal can hold a 0 or a 1.
     fn floored(self) -> Self {
         Self::new(self.rows, self.cols)
     }
@@ -178,6 +191,9 @@ pub struct PtyChild {
     kill: Option<mpsc::Sender<()>>,
     /// For `Debug` and tests.
     pid: Option<u32>,
+    /// The wait, reader and writer threads, so a test can see them end.
+    #[cfg(test)]
+    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl PtyChild {
@@ -218,10 +234,13 @@ impl PtyChild {
         let waiting = thread::Builder::new()
             .name("htui-pane-wait".to_owned())
             .spawn(move || wait_for(child, &kill_rx, id, started, &wait_events));
-        if let Err(err) = waiting {
-            let _ = fallback.kill();
-            return Err(err);
-        }
+        let waiting = match waiting {
+            Ok(waiting) => waiting,
+            Err(err) => {
+                let _ = fallback.kill();
+                return Err(err);
+            }
+        };
         drop(fallback);
 
         // Any error below drops `kill_tx`, and the wait thread kills the child.
@@ -232,7 +251,7 @@ impl PtyChild {
             .take_writer()
             .map_err(|err| io::Error::other(err.to_string()))?;
 
-        thread::Builder::new()
+        let reading = thread::Builder::new()
             .name("htui-pane-read".to_owned())
             .spawn(move || {
                 let mut buf = [0u8; READ_CHUNK];
@@ -256,7 +275,7 @@ impl PtyChild {
             })?;
 
         let (input, input_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>();
-        thread::Builder::new()
+        let writing = thread::Builder::new()
             .name("htui-pane-write".to_owned())
             .spawn(move || {
                 while let Ok(chunk) = input_rx.recv() {
@@ -267,11 +286,17 @@ impl PtyChild {
                 // `writer` drops here, after `input` did: the pane is being dropped (F-10).
             })?;
 
+        let threads = vec![waiting, reading, writing];
+        // Detached outside tests: each thread ends on its own (EOF, a closed queue, a reap).
+        #[cfg(not(test))]
+        drop(threads);
         Ok(Self {
             master,
             input,
             kill: Some(kill_tx),
             pid,
+            #[cfg(test)]
+            threads,
         })
     }
 
@@ -299,11 +324,7 @@ fn wait_for(
             Ok(None) => {}
         }
         match kill.recv_timeout(POLL) {
-            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // The owned child's kill escalates: SIGHUP, a 200 ms grace, SIGKILL.
-                let _ = child.kill();
-                break child.wait();
-            }
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break end(&mut *child),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
@@ -312,6 +333,44 @@ fn wait_for(
         status,
         elapsed: started.elapsed(),
     });
+}
+
+/// Ends the child and its process group, then reaps the child (B5). `child` is not reaped yet:
+/// its last `try_wait` said it was running.
+#[cfg(unix)]
+fn end(child: &mut (dyn Child + Send + Sync)) -> io::Result<portable_pty::ExitStatus> {
+    use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
+
+    let Some(group) = child
+        .process_id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(Pid::from_raw)
+    else {
+        // No pid: portable-pty's own escalation, on the child alone.
+        let _ = child.kill();
+        return child.wait();
+    };
+    // The child is a session leader, so its pid is its group's id; unreaped, nobody else has it.
+    let _ = kill_process_group(group, Signal::HUP);
+    // Has the child exited? `NOWAIT` leaves it unreaped, so the group id stays ours.
+    let exited = || {
+        let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+        matches!(waitid(WaitId::Pid(group), options), Ok(Some(_)) | Err(_))
+    };
+    let deadline = Instant::now() + GRACE;
+    while !exited() && Instant::now() < deadline {
+        thread::sleep(POLL);
+    }
+    // Whatever is left of the group: the child, if it ignored SIGHUP, and any descendant.
+    let _ = kill_process_group(group, Signal::KILL);
+    child.wait()
+}
+
+/// Ends the child, then reaps it (B5): portable-pty's kill, `TerminateProcess`.
+#[cfg(not(unix))]
+fn end(child: &mut (dyn Child + Send + Sync)) -> io::Result<portable_pty::ExitStatus> {
+    let _ = child.kill();
+    child.wait()
 }
 
 impl PaneChild for PtyChild {
@@ -375,9 +434,12 @@ impl vt100::Callbacks for Replies {
     ) {
         let first = params.first().and_then(|param| param.first()).copied();
         match (i1, i2, c, first) {
-            // DSR, cursor position: 1-based row and column.
+            // DSR, cursor position: 1-based row and column. In the pending-wrap state `vt100`
+            // holds the column one past the edge; xterm reports the last column. (Origin mode,
+            // DECOM, is not honoured: `vt100` does not expose it or the scroll region.)
             (None, None, 'n', Some(6)) => {
                 let (row, col) = screen.cursor_position();
+                let col = col.min(screen.size().1.saturating_sub(1));
                 let _ = write!(
                     self.out,
                     "\x1b[{};{}R",
@@ -887,9 +949,12 @@ mod tests {
 
     #[test]
     fn resize_changes_the_grid_and_never_to_zero() {
-        assert_eq!(PaneSize::new(0, 0), PaneSize { rows: 1, cols: 1 });
-        assert_eq!(PaneSize::new(0, 7), PaneSize { rows: 1, cols: 7 });
-        assert_eq!(PaneSize::new(5, 0), PaneSize { rows: 5, cols: 1 });
+        // Floored at 2x2, not 1x1: see `MIN_SIDE`.
+        assert_eq!(PaneSize::new(0, 0), PaneSize { rows: 2, cols: 2 });
+        assert_eq!(PaneSize::new(1, 1), PaneSize { rows: 2, cols: 2 });
+        assert_eq!(PaneSize::new(0, 7), PaneSize { rows: 2, cols: 7 });
+        assert_eq!(PaneSize::new(5, 0), PaneSize { rows: 5, cols: 2 });
+        assert_eq!(PaneSize::new(2, 2), PaneSize { rows: 2, cols: 2 });
         assert_eq!(PaneSize::DEFAULT, PaneSize { rows: 24, cols: 80 });
 
         let mut screen = PaneScreen::new(PaneSize::DEFAULT);
@@ -899,12 +964,78 @@ mod tests {
         assert_eq!(screen.size(), PaneSize::new(30, 100));
         assert_eq!(screen.screen().size(), (30, 100));
         screen.resize(PaneSize::new(0, 0));
-        assert_eq!(screen.size(), PaneSize::new(1, 1));
-        // A literal zero (the fields are public) is floored too.
-        screen.resize(PaneSize { rows: 0, cols: 0 });
-        assert_eq!(screen.screen().size(), (1, 1));
-        let screen = PaneScreen::new(PaneSize { rows: 0, cols: 3 });
-        assert_eq!(screen.size(), PaneSize::new(1, 3));
+        assert_eq!(screen.size(), PaneSize::new(2, 2));
+        // A literal zero or one (the fields are public) is floored too.
+        screen.resize(PaneSize { rows: 0, cols: 1 });
+        assert_eq!(screen.screen().size(), (2, 2));
+        let screen = PaneScreen::new(PaneSize { rows: 1, cols: 3 });
+        assert_eq!(screen.size(), PaneSize::new(2, 3));
+        assert_eq!(PaneSize { rows: 0, cols: 1 }.pty().rows, 2);
+        assert_eq!(PaneSize { rows: 0, cols: 1 }.pty().cols, 2);
+    }
+
+    #[test]
+    fn the_smallest_grid_survives_wrapping_scrolling_and_wide_characters() {
+        // `vt100` 0.16.2 underflows on a 1-row or 1-column grid (`grid.rs` `col_wrap`): a
+        // 1-row grid panics once a line wraps, a 1-column one on a wide character.
+        let floor = PaneSize::new(0, 0);
+        assert!(floor.rows >= 2 && floor.cols >= 2, "{floor:?}");
+        let wide = "\u{4e2d}".repeat(3);
+        let line = "x".repeat(81);
+        let cases: [(PaneSize, &[u8]); 7] = [
+            (PaneSize::new(1, 80), line.as_bytes()),
+            (PaneSize::new(1, 2), b"9Dd"),
+            (PaneSize::new(1, 1), b"ab"),
+            (PaneSize::new(24, 1), wide.as_bytes()),
+            (PaneSize::new(0, 0), wide.as_bytes()),
+            (PaneSize { rows: 1, cols: 1 }, b"abc\r\nd"),
+            (PaneSize { rows: 0, cols: 1 }, wide.as_bytes()),
+        ];
+        for (size, bytes) in cases {
+            let mut screen = PaneScreen::new(size);
+            let _ = screen.feed(bytes);
+            let _ = screen.feed(bytes);
+        }
+        let mut screen = PaneScreen::new(PaneSize::DEFAULT);
+        screen.resize(PaneSize::new(0, 40));
+        let _ = screen.feed(&[b'y'; 100]);
+        screen.resize(PaneSize::new(24, 0));
+        let _ = screen.feed(wide.as_bytes());
+
+        // A seeded sweep of wrap-, scroll- and width-heavy tokens at the floor.
+        let tokens: [&[u8]; 14] = [
+            b"a",
+            "\u{4e2d}".as_bytes(),
+            b"\r",
+            b"\n",
+            b"\x08",
+            b"\x1b[2;2r",
+            b"\x1b[r",
+            b"\x1b[L",
+            b"\x1b[M",
+            b"\x1b[9D",
+            b"\x1b[9C",
+            b"\x1bM",
+            b"\x1b[?6h",
+            b"\x1b[?6l",
+        ];
+        let mut seed: u64 = 0x5eed;
+        let mut screen = PaneScreen::new(floor);
+        for _ in 0..20_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let pick = usize::try_from(seed >> 33).unwrap_or(0) % tokens.len();
+            let _ = screen.feed(tokens[pick]);
+        }
+    }
+
+    #[test]
+    fn a_dsr_in_the_pending_wrap_state_reports_the_last_column() {
+        let mut screen = PaneScreen::new(PaneSize::new(24, 10));
+        assert_eq!(screen.feed(b"0123456789\x1b[6n"), b"\x1b[1;10R");
+        // The wrap happens on the next character.
+        assert_eq!(screen.feed(b"a\x1b[6n"), b"\x1b[2;2R");
     }
 
     #[test]
@@ -1107,6 +1238,119 @@ mod tests {
             pane.child.kill();
             let status = pane.exited(Duration::from_secs(3)).await.expect("reaped");
             assert!(!status.success(), "{status:?}");
+        }
+
+        /// Waits (up to 10 s) for the script to write a pid into `pidfile`.
+        async fn read_pid(pidfile: &Path) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let pid = std::fs::read_to_string(pidfile).unwrap_or_default();
+                let pid = pid.trim();
+                if !pid.is_empty() {
+                    return pid.to_owned();
+                }
+                assert!(Instant::now() < deadline, "the script never wrote its pid");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Waits (up to 3 s) for `pid` to be gone.
+        async fn gone(pid: &str) {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while alive(pid) {
+                assert!(Instant::now() < deadline, "{pid} outlived its pane");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn a_hup_ignoring_grandchild_dies_with_the_pane() {
+            // A wrapper that does not `exec`: the editor is a grandchild, in the child's process
+            // group, and it ignores SIGHUP. It holds the slave, so while it lives the reader
+            // never sees EOF.
+            let dir = TempDir::new().unwrap();
+            let pidfile = dir.path().join("pid");
+            let mut pane = Pane::spawn(script(
+                &dir,
+                "sh -c 'trap \"\" HUP; printf %s $$ > \"$1\"; printf ready; exec sleep 30' sh \"$1\"; :",
+                &pidfile,
+            ));
+            pane.until_shown("ready").await;
+            let grandchild = read_pid(&pidfile).await;
+            assert_ne!(
+                pane.child.pid().map(|pid| pid.to_string()),
+                Some(grandchild.clone())
+            );
+            assert!(alive(&grandchild), "{grandchild} is not running yet");
+            pane.child.kill();
+            let status = pane.exited(Duration::from_secs(3)).await.expect("reaped");
+            assert!(!status.success(), "{status:?}");
+            gone(&grandchild).await;
+            // Every sender is gone: the reader saw EOF and the wait thread ended.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match pane.next(left).await {
+                    None => break,
+                    Some(event) => {
+                        assert!(matches!(event, PaneEvent::Output { .. }), "{event:?}");
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_large_write_to_a_stalled_child_never_blocks() {
+            // PD-2 / R-NF-3: the child never reads, so the line discipline's queue fills after a
+            // few KiB; `write` must still return at once.
+            let dir = TempDir::new().unwrap();
+            let pidfile = dir.path().join("pid");
+            let mut pane = Pane::spawn(script(
+                &dir,
+                "printf '%s' $$ > \"$1\"; printf ready; exec sleep 30",
+                &pidfile,
+            ));
+            pane.until_shown("ready").await;
+            let pid = read_pid(&pidfile).await;
+            // On a thread of its own, so a blocking `write` fails the test instead of hanging it.
+            let Pane {
+                mut child,
+                rx,
+                screen,
+                id,
+            } = pane;
+            let (done_tx, done_rx) = mpsc::channel();
+            thread::spawn(move || {
+                let chunk = vec![b'x'; 2 * 1024 * 1024];
+                let started = Instant::now();
+                child.write(&chunk);
+                child.write(&chunk);
+                let _ = done_tx.send((child, started.elapsed()));
+            });
+            let (child, took) = done_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("write blocked on a stalled child");
+            assert!(took < Duration::from_secs(1), "write took {took:?}");
+            let mut pane = Pane {
+                child,
+                rx,
+                screen,
+                id,
+            };
+
+            // The writer is stuck in the master write. Kill, then drop: every thread ends.
+            pane.child.kill();
+            let status = pane.exited(Duration::from_secs(3)).await.expect("reaped");
+            assert!(!status.success(), "{status:?}");
+            gone(&pid).await;
+            let threads = std::mem::take(&mut pane.child.threads);
+            assert_eq!(threads.len(), 3);
+            drop(pane);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !threads.iter().all(thread::JoinHandle::is_finished) {
+                assert!(Instant::now() < deadline, "a pane thread outlived the pane");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         }
 
         #[tokio::test]
