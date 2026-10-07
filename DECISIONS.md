@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-10](docs/decisions/mod/mod-10.md)** - Secret provider (done, 2026-10-07)
 - **[MOD-79](docs/decisions/mod/mod-79.md)** - MCP token off claude's argv (done, 2026-10-06)
 - **[MOD-55](docs/decisions/mod/mod-55.md)** - Ask an agent for help while editing a template or skill (done, 2026-10-06)
 - **[MOD-84](docs/decisions/mod/mod-84.md)** - Reflow item bodies before wrapping (done, 2026-10-04)
