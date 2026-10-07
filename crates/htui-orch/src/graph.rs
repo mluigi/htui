@@ -14,11 +14,12 @@
 use std::collections::BTreeMap;
 
 use htui_core::model::{
-    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, Gate, GraphSnapshot,
-    Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project, ProjectId,
-    ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase, RunMode, SkillBinding,
-    SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge, SnapshotPersona,
-    SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId, StepGraphPhase,
+    Agent, AgentBox, AgentId, Attachment, BindingChange, BoundSkill, BoxId, CapError, Gate,
+    GraphSnapshot, Isolation, Item, ItemId, ItemPatch, NewStepGraph, PhaseAgent, PhaseId, Project,
+    ProjectCaps, ProjectId, ProjectSettings, PromptTemplate, RepoId, ResolvedGraph, ResolvedPhase,
+    RunMode, SkillBinding, SkillBindingKey, SnapshotCandidate, SnapshotGraph, SnapshotJudge,
+    SnapshotPersona, SnapshotPhase, SnapshotSettings, SnapshotTemplate, StepGraph, StepGraphId,
+    StepGraphPhase,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, Result, StoreError, UpdateOutcome, WriteStore, check_attachment,
@@ -173,6 +174,16 @@ pub enum ResolveError {
         /// `step_graph_phase.name`.
         phase: String,
     },
+    /// A cap key in `project.settings` is not a non-negative integer (or the blob is not an
+    /// object). A run with an unreadable cap never starts: the cap is a spend guard, and reading
+    /// it as absent would run uncapped.
+    #[error("project {project}: {cause}")]
+    ProjectCaps {
+        /// The project whose settings were read.
+        project: ProjectId,
+        /// The offending key and what was found. Not named `source`: `CapError` is no `Error`.
+        cause: CapError,
+    },
     /// A candidate names an `agent` row that is not there, so `agent_name` cannot be denormalised.
     #[error("phase `{phase}` candidate {agent} names no agent row")]
     NoAgentRow {
@@ -319,6 +330,15 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
             entity: "project",
             id: item.project_id.to_string(),
         })?;
+    // The caps are read strictly and first: a malformed cap refuses the resolve, and a malformed
+    // *other* key must not turn the caps into `None` (the lenient decode below defaults the whole
+    // struct), so the snapshot's caps never come from `project_settings`.
+    let caps = ProjectCaps::from_settings(&project.settings).map_err(|cause| {
+        ResolveError::ProjectCaps {
+            project: project.id,
+            cause,
+        }
+    })?;
     let settings = project_settings(&project);
 
     // `UNIQUE (graph_id, position)` permits gaps, so the snapshot builder is what makes positions
@@ -356,8 +376,8 @@ pub async fn resolve<S: htui_core::store::WorkerStore, G: GraphSource>(
 
     let settings = SnapshotSettings {
         default_isolation: settings.default_isolation,
-        per_token_cap_run: settings.per_token_cap_run,
-        per_token_cap_batch: settings.per_token_cap_batch,
+        per_token_cap_run: caps.run_micros,
+        per_token_cap_batch: caps.batch_micros,
         max_fan_out: app_u32(app, "max_fan_out").unwrap_or(DEFAULT_MAX_FAN_OUT),
         max_agents_per_run: app_u32(app, "max_agents_per_run")
             .unwrap_or(DEFAULT_MAX_AGENTS_PER_RUN),
@@ -652,8 +672,28 @@ fn check_fan_out_caps(
 /// `project.settings` as ANA-2 §4.7 reads it; a blob that does not decode is read as defaults
 /// rather than as a failure, which is [`ProjectSettings`]'s own rule (every field defaults, so
 /// `'{}'` decodes).
+///
+/// A decode failure is warned about, because it silently defaults every non-cap key; the caps are
+/// read separately and strictly (`ProjectCaps::from_settings`), so they are not among them.
 fn project_settings(project: &Project) -> ProjectSettings {
-    serde_json::from_value(project.settings.clone()).unwrap_or_default()
+    match serde_json::from_value(project.settings.clone()) {
+        Ok(settings) => settings,
+        Err(err) => {
+            let empty = match &project.settings {
+                Value::Null => true,
+                Value::Object(map) => map.is_empty(),
+                _ => false,
+            };
+            if !empty {
+                tracing::warn!(
+                    project = %project.id,
+                    %err,
+                    "project.settings does not fully decode; its non-cap keys read as defaults"
+                );
+            }
+            ProjectSettings::default()
+        }
+    }
 }
 
 /// One `app_setting` value as a positive `i64`.
@@ -1339,6 +1379,41 @@ question and not a test fix. Decide the version bump first, then paste the new d
         assert_ne!(
             snapshot.topology, FEATURE_TOPOLOGY,
             "a resolved value moving is a different topology, which is the point of the digest"
+        );
+    }
+
+    /// An unrelated malformed key must not erase the caps: the lenient `ProjectSettings` decode
+    /// defaults the whole struct, so the caps are read on their own (CLEAN-9 T2).
+    #[tokio::test]
+    async fn an_unrelated_bad_key_keeps_the_caps() {
+        let store = store_with_settings(json!({
+            "copy_exclude": 5,
+            "per_token_cap_run": 700,
+            "per_token_cap_batch": 900,
+        }));
+        let snapshot = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect("a bad non-cap key does not refuse the resolve")
+            .snapshot;
+
+        assert_eq!(snapshot.settings.per_token_cap_run, Some(700));
+        assert_eq!(snapshot.settings.per_token_cap_batch, Some(900));
+    }
+
+    /// A malformed cap refuses the resolve, naming the project and the key.
+    #[tokio::test]
+    async fn a_bad_cap_key_refuses_the_resolve() {
+        let store = store_with_settings(json!({ "per_token_cap_run": "x" }));
+        let error = resolve_feat(&store, &TestSource::claude(&store))
+            .await
+            .expect_err("a cap that is not an integer is refused");
+
+        assert!(
+            matches!(
+                &error,
+                ResolveError::ProjectCaps { cause, .. } if cause.key == "per_token_cap_run"
+            ),
+            "{error}"
         );
     }
 

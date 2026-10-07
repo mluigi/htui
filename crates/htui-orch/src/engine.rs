@@ -3156,6 +3156,7 @@ where
                 | ResolveError::ReviewFanOut { .. }
                 | ResolveError::LocalFanOut { .. }
                 | ResolveError::NoCandidate { .. }
+                | ResolveError::ProjectCaps { .. }
                 | ResolveError::UnknownTouchedRepo { .. }),
             ) => {
                 let body = format!(

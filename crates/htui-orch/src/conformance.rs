@@ -541,6 +541,8 @@ pub const CASES: &[&str] = &[
     "the_review_loop_reruns_a_fanned_out_implement",
     // Plan D63: `max_fan_out` is refused at `StartRun`.
     "fan_out_above_max_fan_out_is_refused_at_start",
+    // CLEAN-9 T2: a malformed cap key refuses the start rather than running uncapped.
+    "a_malformed_cap_is_refused_at_start",
     // Plan D63 (OQ-1): `max_agents_per_run` is refused at `StartRun`.
     "max_agents_per_run_is_refused_at_start",
     // Plan D48 under `shared_serialized`: a candidate's deadline counts from its own `prepare`,
@@ -815,6 +817,9 @@ fn earlier_case<'a, H: CaseHarness>(
         }
         "fan_out_above_max_fan_out_is_refused_at_start" => {
             Box::pin(fan_out_above_max_fan_out_is_refused_at_start(harness))
+        }
+        "a_malformed_cap_is_refused_at_start" => {
+            Box::pin(a_malformed_cap_is_refused_at_start(harness))
         }
         "max_agents_per_run_is_refused_at_start" => {
             Box::pin(max_agents_per_run_is_refused_at_start(harness))
@@ -4112,6 +4117,39 @@ async fn fan_out_above_max_fan_out_is_refused_at_start<H: CaseHarness>(harness: 
             &refused,
             EngineError::Resolve(crate::graph::ResolveError::FanOutCap { phase, fan_out: 5, max: 4 })
                 if phase == "research"
+        ),
+        "{refused}"
+    );
+    assert!(
+        orch.store()
+            .runs(ids::HTUI_ANA_2)
+            .await
+            .expect("MemStore never fails a read")
+            .is_empty(),
+        "no run row"
+    );
+}
+
+/// CLEAN-9 T2: a cap that is not a non-negative integer is refused at `StartRun`, before a run row
+/// exists, rather than read as "no cap" and run uncapped.
+async fn a_malformed_cap_is_refused_at_start<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let project = item_of(&orch, ids::HTUI_ANA_2).await.project_id;
+    orch.store()
+        .set_project_settings(project, serde_json::json!({ "per_token_cap_run": "x" }));
+    let refused = orch
+        .dispatch(Command::StartRun {
+            item: ids::HTUI_ANA_2,
+            mode: RunMode::Manual,
+            repo_scope: None,
+        })
+        .await
+        .expect_err("a string cap is refused");
+    assert!(
+        matches!(
+            &refused,
+            EngineError::Resolve(crate::graph::ResolveError::ProjectCaps { cause, .. })
+                if cause.key == "per_token_cap_run"
         ),
         "{refused}"
     );
@@ -8319,8 +8357,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            108,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            109,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5 + 1: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -8356,7 +8394,8 @@ mod tests {
              the denials with and without a persona, and the judge never exposed), and MOD-12 \
              M1's three (criterion 23's two halves, criterion 24), and MOD-12 M2's five (the \
              batch walk refusal, the batch remainder, the manual run, the run cap across steps, \
-             and review R1's snapshotted run cap against a lowered live one)"
+             and review R1's snapshotted run cap against a lowered live one), and CLEAN-9 T2's one \
+             (a malformed cap key refused at start)"
         );
     }
 
