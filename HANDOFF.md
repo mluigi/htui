@@ -52,6 +52,14 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
+- [ ] **ANA-29 - Claude Code mods: developing htui, and using htui in other projects.** Research how
+  to build "mods" for Claude Code (plugins, skills, agents, hooks, rules, MCP config, settings) in
+  two directions. (a) Dev-side: what htui's own development should vendor in `.claude/` beyond
+  today's `handoff-*` and `plan*` skills, `code-architect`/`rust-reviewer` agents and Gortex
+  permissions, and what is better packaged as a Claude Code plugin. (b) Consumer-side: what htui
+  ships so other projects can drive it from Claude Code (the `docs/htui-mcp.md` MCP surface, a
+  plugin/skill bundle, install and update path, per-project config). Conclude with a recommended
+  shape, a split between the two, and the MOD items to file. No code before the verdict.
 - [ ] **ANA-28 - `heavy_build`: queue switch vs required box capability** (from MOD-11,
   `docs/decisions/mod/mod-11.md`). `R-MCP-3`, `R-ORCH-10`. R-MCP-3 says an item carrying the
   `heavy_build` tag forces `command_run` on. MOD-11 reads that tag from `item.required_tags`, the only
@@ -490,7 +498,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
+| ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-29 Claude Code mods) |
 | MOD-N   | 21 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-9 MOD-12 M2 review residuals, CLEAN-10 `cargo doc` private links) |
 | TOOL-N  | 0 |
