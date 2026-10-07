@@ -354,7 +354,7 @@ pub struct SecretsSection {
     unavailable: Option<String>,
     /// The scope's workspace tree: the project rows and their tokens.
     tree: Option<HierarchySnapshot>,
-    /// Index into [`rows`](SecretsSection::rows).
+    /// Index into the rows, in [`row_at`](SecretsSection::row_at)'s order.
     cursor: usize,
     /// Browsing, typing, or being asked a question.
     mode: Mode,
@@ -402,24 +402,27 @@ impl SecretsSection {
         Self::default()
     }
 
-    /// Every row, in cursor order.
-    fn rows(&self) -> Vec<Row> {
-        let projects = self.tree.as_ref().map_or(0, |tree| tree.projects.len());
-        Row::FIXED
-            .into_iter()
-            .chain((0..projects).map(Row::Project))
-            .collect()
+    /// How many rows: the four fixed, then one per project of the tree.
+    fn row_count(&self) -> usize {
+        Row::FIXED.len() + self.tree.as_ref().map_or(0, |tree| tree.projects.len())
+    }
+
+    /// Row `index` in cursor order; `index < row_count()`.
+    fn row_at(&self, index: usize) -> Row {
+        match Row::FIXED.get(index) {
+            Some(row) => *row,
+            None => Row::Project(index - Row::FIXED.len()),
+        }
     }
 
     /// The row under the cursor.
     fn row(&self) -> Row {
-        let rows = self.rows();
-        rows[self.cursor.min(rows.len() - 1)]
+        self.row_at(self.cursor.min(self.row_count() - 1))
     }
 
     /// Moves the cursor one row; no wrap.
     fn move_cursor(&mut self, down: bool) {
-        let last = self.rows().len() - 1;
+        let last = self.row_count() - 1;
         self.cursor = if down {
             self.cursor.saturating_add(1).min(last)
         } else {
@@ -429,7 +432,7 @@ impl SecretsSection {
 
     /// Puts the cursor back inside the rows after the tree changed.
     fn clamp_cursor(&mut self) {
-        self.cursor = self.cursor.min(self.rows().len() - 1);
+        self.cursor = self.cursor.min(self.row_count() - 1);
     }
 
     /// A project of the tree, by row index.
@@ -936,6 +939,28 @@ impl SecretsSection {
             );
         }
         lines.push(Line::default());
+        self.project_lines(&mut lines, width, theme);
+        if let Some(guide) = self.guide() {
+            lines.push(Line::default());
+            let room = usize::from(width).saturating_sub(2).max(1);
+            lines.extend(
+                wrapped(guide, room)
+                    .into_iter()
+                    .map(|line| Line::styled(format!("  {line}"), theme.dim)),
+            );
+        }
+        lines
+    }
+
+    /// The `Projects` heading and one row per project, or [`NO_WORKSPACE`].
+    fn project_lines(&self, lines: &mut Vec<Line<'static>>, width: u16, theme: &Theme) {
+        let style_of = |index: usize| {
+            if index == self.cursor {
+                theme.selected
+            } else {
+                theme.base
+            }
+        };
         match &self.tree {
             None => lines.push(Line::styled(format!("  {NO_WORKSPACE}"), theme.dim)),
             Some(tree) => {
@@ -948,7 +973,7 @@ impl SecretsSection {
                     .unwrap_or(0);
                 for (index, entry) in tree.projects.iter().enumerate() {
                     push_row(
-                        &mut lines,
+                        lines,
                         &entry.project.slug,
                         slug_width,
                         &self.project_text(&entry.project),
@@ -958,23 +983,17 @@ impl SecretsSection {
                 }
             }
         }
-        let guide = if self.latched() {
+    }
+
+    /// The guide under the rows: [`LATCHED`], else [`HEALTH_GUIDE`] on Health, else none.
+    fn guide(&self) -> Option<&'static str> {
+        if self.latched() {
             Some(LATCHED)
         } else if self.row() == Row::Health {
             Some(HEALTH_GUIDE)
         } else {
             None
-        };
-        if let Some(guide) = guide {
-            lines.push(Line::default());
-            let room = usize::from(width).saturating_sub(2).max(1);
-            lines.extend(
-                wrapped(guide, room)
-                    .into_iter()
-                    .map(|line| Line::styled(format!("  {line}"), theme.dim)),
-            );
         }
-        lines
     }
 
     /// The pane under the rows: the form, or the question, or nothing.
@@ -1124,6 +1143,13 @@ impl SecretsSection {
         true
     }
 
+    /// No tree for the scope: no project rows, and a scope form or question on one is closed.
+    fn on_tree_gone(&mut self) {
+        self.tree = None;
+        self.clamp_cursor();
+        self.closed_if_gone();
+    }
+
     /// A fresh keyring snapshot from a read: rows only, never a write's answer (R1 M-1).
     fn on_snapshot(&mut self, snapshot: &SecretsSnapshot) {
         self.unavailable = None;
@@ -1182,31 +1208,34 @@ impl SecretsSection {
                 self.mode = Mode::Browse;
                 self.say(if clear { SCOPE_CLEARED } else { SCOPE_SAVED });
             }
-            ScopeWrite::Stale => {
-                let current = tree
-                    .projects
-                    .iter()
-                    .find(|entry| entry.project.id == project)
-                    .map(|entry| entry.project.updated_at);
-                match (&mut self.mode, current) {
-                    (
-                        Mode::EditingScope {
-                            project: open,
-                            expected,
-                            ..
-                        },
-                        Some(updated_at),
-                    ) if *open == project => {
-                        *expected = updated_at;
-                        self.refuse(CHANGED_ELSEWHERE.to_owned());
-                    }
-                    (Mode::EditingScope { project: open, .. }, None) if *open == project => {
-                        self.mode = Mode::Browse;
-                        self.refuse(DELETED_ELSEWHERE.to_owned());
-                    }
-                    _ => self.refuse(CHANGED_ELSEWHERE_CLOSED.to_owned()),
-                }
+            ScopeWrite::Stale => self.on_scope_stale(project, tree),
+        }
+    }
+
+    /// A stale scope write: refresh the open form's token, close it if the project left, or say so.
+    fn on_scope_stale(&mut self, project: ProjectId, tree: &HierarchySnapshot) {
+        let current = tree
+            .projects
+            .iter()
+            .find(|entry| entry.project.id == project)
+            .map(|entry| entry.project.updated_at);
+        match (&mut self.mode, current) {
+            (
+                Mode::EditingScope {
+                    project: open,
+                    expected,
+                    ..
+                },
+                Some(updated_at),
+            ) if *open == project => {
+                *expected = updated_at;
+                self.refuse(CHANGED_ELSEWHERE.to_owned());
             }
+            (Mode::EditingScope { project: open, .. }, None) if *open == project => {
+                self.mode = Mode::Browse;
+                self.refuse(DELETED_ELSEWHERE.to_owned());
+            }
+            _ => self.refuse(CHANGED_ELSEWHERE_CLOSED.to_owned()),
         }
     }
 
@@ -1248,6 +1277,43 @@ impl SecretsSection {
                     self.scope_checks.insert(*project, (*at, outcome.clone()));
                 }
             }
+        }
+    }
+
+    /// A refused request: the keyring read, a write, or a check (blueprint A-1), in that order.
+    /// Any other request's refusal is not this section's, and changes nothing.
+    fn on_failed(&mut self, request: &'static str, message: &str, ctx: &Ctx<'_>) {
+        if request == READ_NAME {
+            // Only a real `SecretsInfo` is refused under this name (a write's read-back failure
+            // is the write's), so a write in flight stays in flight (R1 M-1).
+            self.unavailable = Some(message.to_owned());
+        } else if REQUEST_NAMES[1..].contains(&request) || request == SET_PROJECT_SECRET_SCOPE {
+            // A refused write. The shell has already put `{request}: {message}` on the status
+            // line; a question has nothing left to answer, an open scope form keeps its text. A
+            // refused scope write re-reads the tree: a project deleted elsewhere is refused
+            // `NotFound` before the CAS write, and the tree without it closes the form (R1 L-4).
+            if request == SET_PROJECT_SECRET_SCOPE {
+                ctx.request(StoreRequest::SecretsTree(ctx.scope.workspace_id));
+            }
+            self.busy = None;
+            if matches!(
+                self.mode,
+                Mode::ConfirmClearUrl | Mode::ConfirmClearIdentity | Mode::ConfirmClearScope { .. }
+            ) {
+                self.mode = Mode::Browse;
+            }
+            self.refuse(message.to_owned());
+        } else if request == CHECK_SECRET_PROVIDER {
+            // A refused check is not a check result.
+            if self.checking == Some(Checking::Provider) {
+                self.checking = None;
+            }
+            self.refuse(message.to_owned());
+        } else if request == CHECK_SECRET_SCOPE {
+            if matches!(self.checking, Some(Checking::Scope(_))) {
+                self.checking = None;
+            }
+            self.refuse(message.to_owned());
         }
     }
 }
@@ -1360,56 +1426,14 @@ impl SettingsSection for SecretsSection {
             | StoreReply::SecretsTree(Some(tree))
             | StoreReply::HierarchyStale(tree)
             | StoreReply::RepoPathsInferred { tree, .. } => self.adopt_passive(tree, ctx),
-            StoreReply::Hierarchy(None) | StoreReply::SecretsTree(None) => {
-                self.tree = None;
-                self.clamp_cursor();
-                self.closed_if_gone();
-            }
+            StoreReply::Hierarchy(None) | StoreReply::SecretsTree(None) => self.on_tree_gone(),
             StoreReply::SecretScopeWritten {
                 project,
                 tree,
                 outcome,
             } => self.on_scope_written(*project, tree, *outcome, ctx),
             StoreReply::SecretCheck(check) => self.on_check(check),
-            // Only a real `SecretsInfo` is refused under this name (a write's read-back failure is
-            // the write's), so a write in flight stays in flight (R1 M-1).
-            StoreReply::Failed { request, message } if *request == READ_NAME => {
-                self.unavailable = Some(message.clone());
-            }
-            // A refused write. The shell has already put `{request}: {message}` on the status
-            // line; a question has nothing left to answer, an open scope form keeps its text. A
-            // refused scope write re-reads the tree: a project deleted elsewhere is refused
-            // `NotFound` before the CAS write, and the tree without it closes the form (R1 L-4).
-            StoreReply::Failed { request, message }
-                if REQUEST_NAMES[1..].contains(request) || *request == SET_PROJECT_SECRET_SCOPE =>
-            {
-                if *request == SET_PROJECT_SECRET_SCOPE {
-                    ctx.request(StoreRequest::SecretsTree(ctx.scope.workspace_id));
-                }
-                self.busy = None;
-                if matches!(
-                    self.mode,
-                    Mode::ConfirmClearUrl
-                        | Mode::ConfirmClearIdentity
-                        | Mode::ConfirmClearScope { .. }
-                ) {
-                    self.mode = Mode::Browse;
-                }
-                self.refuse(message.clone());
-            }
-            // A refused check is not a check result.
-            StoreReply::Failed { request, message } if *request == CHECK_SECRET_PROVIDER => {
-                if self.checking == Some(Checking::Provider) {
-                    self.checking = None;
-                }
-                self.refuse(message.clone());
-            }
-            StoreReply::Failed { request, message } if *request == CHECK_SECRET_SCOPE => {
-                if matches!(self.checking, Some(Checking::Scope(_))) {
-                    self.checking = None;
-                }
-                self.refuse(message.clone());
-            }
+            StoreReply::Failed { request, message } => self.on_failed(request, message, ctx),
             _ => {}
         }
     }
@@ -1596,6 +1620,45 @@ mod tests {
             !printed.contains("cid-typed-1") && printed.contains("len: 11"),
             "{printed}"
         );
+    }
+
+    /// CLEAN-8 #5: the rows, indexed without a `Vec`, are the four fixed ones, then one per
+    /// project of the tree; with no tree, the four alone.
+    #[tokio::test]
+    async fn row_at_walks_the_fixed_rows_then_the_projects() {
+        let tree = crate::hierarchy::snapshot(
+            &htui_core::store::MemStore::demo(),
+            htui_core::fixtures::ids::WORKSPACE_GRAPHICS,
+            None,
+        )
+        .await
+        .expect("the demo store reads")
+        .expect("the demo store has the graphics workspace");
+        let n = tree.projects.len();
+        assert!(n > 0, "the graphics workspace has projects");
+        let walk = |section: &SecretsSection| {
+            (0..section.row_count())
+                .map(|index| section.row_at(index))
+                .collect::<Vec<_>>()
+        };
+
+        let section = SecretsSection {
+            tree: Some(tree.clone()),
+            ..SecretsSection::new()
+        };
+        assert_eq!(
+            walk(&section),
+            Row::FIXED
+                .into_iter()
+                .chain((0..n).map(Row::Project))
+                .collect::<Vec<_>>()
+        );
+
+        let section = SecretsSection {
+            tree: None,
+            ..SecretsSection::new()
+        };
+        assert_eq!(walk(&section), Row::FIXED);
     }
 
     /// The `busy` names are the request names, so a refused write is matched by its own name.
