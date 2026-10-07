@@ -51,6 +51,9 @@ pub trait Overlay {
     }
     /// A reply addressed to this overlay arrived and is not stale.
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
+    /// The shell's refresh tick reached this overlay, the top one (MOD-12 M3 D9): it may request a
+    /// re-read through `ctx`. Every other overlay keeps this no-op.
+    fn refresh(&mut self, _ctx: &mut Ctx<'_>) {}
     /// Draws over the whole frame. Use [`centered`](crate::ui::layout::centered) for the box.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
 }
