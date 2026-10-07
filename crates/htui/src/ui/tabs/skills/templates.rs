@@ -88,6 +88,9 @@ const NAMING_HINT: &str = "Enter create  Esc cancel";
 /// hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
 const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
 
+/// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
+const HANDED_OFF_HINT: &str = "the draft is in $EDITOR";
+
 /// The review phase's wire contract, the one a reviewer's output is parsed by (ANA-5 `:1323-1331`).
 const REVIEW_WIRE: &str = "wire: first 3 lines `---` / `verdict: approve|request-changes` / `---`";
 
@@ -512,8 +515,8 @@ impl TemplatesView {
             Constraint::Length(1),
         ])
         .areas(area);
-        let hint = match &self.mode {
-            Mode::Editing(editor) => {
+        let hint = match (&self.mode, self.handed_off()) {
+            (Mode::Editing(editor), _) => {
                 self.render_editor(frame, content, editor, ctx);
                 match &editor.help {
                     Some(help) => help.hint().to_owned(),
@@ -523,11 +526,15 @@ impl TemplatesView {
                     }
                 }
             }
-            Mode::Naming { .. } => {
+            (Mode::Browse, Some(editor)) => {
+                self.render_editor(frame, content, editor, ctx);
+                HANDED_OFF_HINT.to_owned()
+            }
+            (Mode::Naming { .. }, _) => {
                 self.render_browse(frame, content, ctx);
                 NAMING_HINT.to_owned()
             }
-            Mode::Browse => {
+            (Mode::Browse, None) => {
                 self.render_browse(frame, content, ctx);
                 BROWSE_HINT.to_owned()
             }
@@ -835,6 +842,18 @@ impl TemplatesView {
             editor,
             resume: true,
         });
+    }
+
+    /// The draft a `Ctrl+E` handed to `$EDITOR`, while the handoff is pending: still drawn, so its
+    /// text rect is still claimed for an in-pane editor (MOD-57 P2). Browse's `E` has no draft.
+    fn handed_off(&self) -> Option<&Editor> {
+        match &self.external {
+            Some(Pending {
+                editor,
+                resume: true,
+            }) => Some(editor),
+            _ => None,
+        }
     }
 
     /// `Ctrl+G` (MOD-55 P7, P8): the agent help opens on the draft as it is, for the template's
@@ -1410,6 +1429,58 @@ mod tests {
             .map(|x| buffer[(x, 0)].symbol())
             .collect();
         assert!(title.contains("plan \u{b7} editing from v2"), "{title:?}");
+
+        // `Ctrl+E` moves the draft into the pending handoff: while `$EDITOR` runs it is still
+        // drawn (locked: the editor has the keys) and its text still claimed, so the in-pane
+        // editor lands over the text with the title beside it, not over the whole body.
+        let mut view = view;
+        let mut ctx = Ctx::new(
+            &scope,
+            &[],
+            &top_bar,
+            &keymap,
+            &theme,
+            Origin::Tab(SkillsTab::ID),
+            &emit,
+        );
+        assert_eq!(view.on_key(ctrl('e'), &mut ctx), Handled::Consumed);
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        let (buffer, handed_off) = drawn(&view);
+        assert_eq!(
+            handed_off,
+            Some(claim),
+            "the handed-off draft claims its text"
+        );
+        let line = |y: u16, from: u16, to: u16| {
+            (from..to)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            line(claim.y, claim.x, claim.right()).starts_with("First line."),
+            "{:?}",
+            line(claim.y, claim.x, claim.right())
+        );
+        let title = line(0, 0, claim.right());
+        assert!(title.contains("plan \u{b7} editing from v2"), "{title:?}");
+        let hint = line(area.bottom() - 1, 0, area.width);
+        assert!(hint.contains(HANDED_OFF_HINT), "{hint:?}");
+
+        // Browse's `E` (F-12) has no draft to draw: the pane takes the tab body.
+        let view = TemplatesView {
+            external: Some(Pending {
+                editor: Editor::new(
+                    ids::PROJECT_VULKAN,
+                    "plan".to_owned(),
+                    Some(2),
+                    Some(2),
+                    "First line.\n",
+                ),
+                resume: false,
+            }),
+            ..TemplatesView::default()
+        };
+        assert_eq!(drawn(&view).1, None, "browse's `E` claims nothing");
     }
 
     /// The Harness's startup scope: the Graphics workspace and its one project.

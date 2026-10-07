@@ -995,7 +995,7 @@ pub(super) const fn marker(focused: bool) -> &'static str {
 
 /// Draws the form into the detail pane's `area` (D8).
 ///
-/// Returns the body's rect, which the Backlog claims for an in-pane editor (MOD-57 P2).
+/// Returns the body's rect, which the pane claims for an in-pane editor (MOD-57 P2).
 pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
     let title = match &form.context.item {
         Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
