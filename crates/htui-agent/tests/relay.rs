@@ -40,7 +40,8 @@ use htui_agent::fake::FakeDriver;
 use htui_agent::permission::{PolicyStage, evaluate};
 use htui_agent::persona::narrow;
 use htui_agent::record::{
-    Control, NoRelay, RELAY_GRACE, Recorder, Relay, RunCap, Signal, control_channel, drive, pump,
+    CapBasis, Control, NoRelay, RELAY_GRACE, Recorder, Relay, RunCap, Signal, control_channel,
+    drive, pump,
 };
 use htui_core::fixtures::ids;
 use htui_core::model::persona::SnapshotPersona;
@@ -2924,6 +2925,7 @@ async fn a_cap_breach_applies_no_follow_up() {
     let mut recorder = fenced_recorder(&fx, &scrubber).with_run_cap(RunCap {
         micros: 1_000,
         grace: Duration::ZERO,
+        basis: CapBasis::Run,
     });
     let turn0 = {
         let mut events = vec![

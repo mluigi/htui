@@ -29,7 +29,8 @@ use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::excerpt::{PassInput, excerpt_roots, step_pass, touched_prefixes};
 use htui_agent::record::{
-    Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, Signal, control_channel, drive,
+    CapBasis, Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, Signal, control_channel,
+    drive,
 };
 use htui_core::model::{
     AgentId, BatchId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus,
@@ -6180,6 +6181,7 @@ where
         if let Some(allowance) = allowance {
             recorder = recorder.with_run_cap(RunCap {
                 micros: allowance.micros,
+                basis: allowance.batch.map_or(CapBasis::Run, CapBasis::Batch),
                 // Nothing in this milestone spawns a process, so a grace of zero is the honest
                 // figure; milestone 3's worker passes its own (`record.rs:157-159`).
                 grace: std::time::Duration::ZERO,

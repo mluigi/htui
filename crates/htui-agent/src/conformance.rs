@@ -70,8 +70,8 @@ use crate::event::{
     ToolResultEvent, ToolResultStatus, UsageEvent,
 };
 use crate::record::{
-    AnsweredBy, CAP_EXCEEDED, CHUNK_FLUSH_BYTES, CapBreach, QuotaLatch, RecordError, Recorder,
-    RecorderSummary, RunCap, pump,
+    AnsweredBy, CAP_EXCEEDED, CHUNK_FLUSH_BYTES, CapBasis, CapBreach, QuotaLatch, RecordError,
+    Recorder, RecorderSummary, RunCap, pump,
 };
 
 // ---------------------------------------------------------------------------------------------
@@ -2897,6 +2897,7 @@ async fn play_capped<H: CaseHarness, S: WriteStore + htui_core::store::RecorderS
         recorder = recorder.with_run_cap(RunCap {
             micros,
             grace: Duration::from_millis(0),
+            basis: CapBasis::Run,
         });
     }
     recorder

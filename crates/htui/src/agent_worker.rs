@@ -53,7 +53,7 @@ use htui_agent::probe::{
     probe_agent, probe_snapshot,
 };
 use htui_agent::record::{
-    AnsweredBy, CapBreach, QuotaLatch, RecordError, Recorder, RunCap,
+    AnsweredBy, CapBasis, CapBreach, QuotaLatch, RecordError, Recorder, RunCap,
     enforce_breach as enforce_cap_breach,
 };
 use htui_agent::registry::{DriverFactory, caps_for};
@@ -4704,7 +4704,11 @@ pub async fn run_chat(args: ChatArgs) {
     // own `CANCEL_GRACE`, riding on `RunCap` so `htui_agent::record::pump` keeps its signature.
     recorder = recorder.with_quota_latch(quota_latch);
     if let Some(micros) = project_caps.run_micros {
-        recorder = recorder.with_run_cap(RunCap { micros, grace });
+        recorder = recorder.with_run_cap(RunCap {
+            micros,
+            grace,
+            basis: CapBasis::Run,
+        });
     }
 
     // The opening is a resume exactly when the spec resumes; a fallback is optional (review M-1).

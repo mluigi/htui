@@ -26,7 +26,8 @@ use htui_agent::event::{
     ToolCallEvent, ToolKind, ToolResultEvent, ToolResultStatus, UsageEvent,
 };
 use htui_agent::record::{
-    AnsweredBy, CHUNK_FLUSH_BYTES, CapBreach, QuotaLatch, RecordError, Recorder, RunCap, pump,
+    AnsweredBy, CHUNK_FLUSH_BYTES, CapBasis, CapBreach, QuotaLatch, RecordError, Recorder, RunCap,
+    pump,
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{
@@ -2588,7 +2589,50 @@ fn run_cap(micros: i64) -> RunCap {
     RunCap {
         micros,
         grace: Duration::from_millis(0),
+        basis: CapBasis::Run,
     }
+}
+
+/// A batch-basis allowance names the batch and its setting, and never the run's.
+#[tokio::test]
+async fn a_batch_basis_breach_names_the_batch_setting() {
+    let chat = chat_spec();
+    let scrubber = scrubber();
+    let store = open_chat(&chat).await;
+    let batch = htui_core::model::BatchId::new();
+    let mut recorder =
+        Recorder::new(&store, &scrubber, chat.step_id, false, None).with_run_cap(RunCap {
+            basis: CapBasis::Batch(batch),
+            ..run_cap(300)
+        });
+    let mut session = ScriptedSession::cancelling(
+        vec![usage(Some(350), None)],
+        vec![env(DriverEvent::Done(DoneEvent {
+            stop_reason: StopReason::Cancelled,
+        }))],
+    );
+    pump(&mut session, &mut recorder)
+        .await
+        .expect("the capped turn still reaches an end");
+
+    let log = rows(&store, chat.step_id).await;
+    let message = log
+        .iter()
+        .find(|row| row.kind == EventKind::Error)
+        .and_then(|row| row.payload["message"].as_str().map(str::to_owned))
+        .expect("an error row carries the breach");
+    assert!(
+        message.contains("per_token_cap_batch") && message.contains(&batch.to_string()),
+        "the row names the batch setting and the batch: {message}"
+    );
+    assert!(
+        !message.contains("per_token_cap_run"),
+        "and not the run setting: {message}"
+    );
+    assert!(
+        message.contains("the remainder of batch"),
+        "it still reads as a remainder: {message}"
+    );
 }
 
 /// The closing sequence of §11 criterion 8, with the one row that is allowed to sit inside it: a
@@ -2670,6 +2714,15 @@ async fn a_breach_is_reported_once_and_the_closing_rows_are_error_then_done() {
             ),
         "the message names the setting and says the figure is an estimate: {:?}",
         error.payload["message"]
+    );
+    assert_eq!(
+        error.payload["message"],
+        json!(
+            "session allowance reached: an estimated $0.0003 (350 micros) spent against an \
+             allowance of $0.0003 (300 micros), the remainder of \
+             project.settings.per_token_cap_run; the session was cancelled"
+        ),
+        "a run-basis allowance names the run setting it is the remainder of"
     );
     assert_eq!(log[5].payload["stop_reason"], json!("cancelled"));
     assert_eq!(

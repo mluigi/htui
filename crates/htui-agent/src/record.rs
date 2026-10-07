@@ -103,8 +103,8 @@ use std::time::Duration;
 
 use chrono::{DateTime, SubsecRound, Utc};
 use htui_core::model::{
-    AgentId, Billing, BoxId, EventKind, EventRole, PER_TOKEN_CAP_RUN, QuotaSource, SessionEvent,
-    StepId, UsageTotals, quota::normalize,
+    AgentId, BatchId, Billing, BoxId, EventKind, EventRole, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN,
+    QuotaSource, SessionEvent, StepId, UsageTotals, quota::normalize,
 };
 use htui_core::scrub::{Scrubber, Unmasked};
 use htui_core::store::{StepFence, StoreError};
@@ -172,8 +172,20 @@ pub struct QuotaLatch {
 pub struct RunCap {
     /// The cap in USD micros.
     pub micros: i64,
+    /// Which setting `micros` is the remainder of, so the breach row names the setting an operator
+    /// would edit (the figure is an *allowance*, not the setting's own value).
+    pub basis: CapBasis,
     /// How long the cancel this cap triggers may wait before the process tree is killed.
     pub grace: Duration,
+}
+
+/// The setting a [`RunCap`]'s allowance is the remainder of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapBasis {
+    /// `project.settings.per_token_cap_run` less what the run already spent.
+    Run,
+    /// The batch's `per_token_cap_batch` less what the batch already spent.
+    Batch(BatchId),
 }
 
 /// The verdict [`Recorder::record`] returns **once** per session: the row that took the running USD
@@ -1689,6 +1701,10 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         breach: CapBreach,
         transport_done: Option<DriverEnvelope>,
     ) -> Result<(), RecordError> {
+        let remainder_of = match self.run_cap.map_or(CapBasis::Run, |cap| cap.basis) {
+            CapBasis::Run => format!("project.settings.{PER_TOKEN_CAP_RUN}"),
+            CapBasis::Batch(id) => format!("batch {id}'s {PER_TOKEN_CAP_BATCH}"),
+        };
         let error = ErrorEvent {
             code: CAP_EXCEEDED.to_owned(),
             // "Estimated", because it is: ANA-4 §7 frames a client-side cap as a guard rail and
@@ -1699,10 +1715,14 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
             // spend of 350 and a cap of 300 as `$0.0003` twice — a row that says the cap was
             // reached and cannot say by how much. The micros are the number an operator would go
             // and edit, so they belong in the row that told them to.
+            //
+            // The figure is the session's **allowance**: the remainder of the run's (or, for a
+            // batch run, the batch's) cap after earlier spend, not the setting's own value. The
+            // row says so and names the setting the remainder is taken from.
             message: format!(
-                "per-run cap reached: an estimated ${:.4} ({} micros) spent against a cap of \
-                 ${:.4} (project.settings.{PER_TOKEN_CAP_RUN} = {} micros); the session was \
-                 cancelled",
+                "session allowance reached: an estimated ${:.4} ({} micros) spent against an \
+                 allowance of ${:.4} ({} micros), the remainder of {remainder_of}; the session \
+                 was cancelled",
                 breach.spent_micros as f64 / 1e6,
                 breach.spent_micros,
                 breach.cap_micros as f64 / 1e6,
