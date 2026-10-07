@@ -2038,7 +2038,7 @@ where
         ))
         .await;
         if let Err(err) = closed {
-            tracing::warn!(%run, %err, "closing a finished run's follow-up windows failed; what they hold stays pending");
+            tracing::warn!(%run, %err, "closing the follow-up windows of a run given back failed; what they hold stays pending");
         }
     }
 

@@ -890,9 +890,11 @@ pub(super) async fn request_follow_up(
 
 /// [`WriteStore::open_follow_ups`](htui_core::store::WriteStore::open_follow_ups) (D4, B-3, B-6):
 /// one transaction, in this order: the fence ([`lock_step_fence`], owner only), the window's
-/// upsert (which takes its row lock: an enqueue already holding `FOR SHARE` commits first, a later
-/// one waits and re-checks), then the refusal of every follow-up still pending on the step, whose
-/// fresh snapshot sees every row committed before the lock.
+/// upsert (which takes its row lock: over a window still open, an enqueue already holding
+/// `FOR SHARE` commits first and a later one waits and re-checks; over a closed window, an enqueue
+/// filters it out at `closed_at IS NULL` without waiting and is refused `SessionEnded`), then the
+/// refusal of every follow-up still pending on the step, whose fresh snapshot sees every row
+/// committed before the lock.
 pub(super) async fn open_follow_ups(
     store: &PgStore,
     run: RunId,
