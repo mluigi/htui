@@ -64,14 +64,14 @@ cap, and surfaces every parked or blocked item in a pausable queue overlay** wil
 time into finished bounded items** for **the maintainer**.
 We'll know we're right when **a batch of queued `FIX` / `CLEAN` / `TOOL` items reaches a terminal or
 escalated state with zero manual run starts, batch spend never exceeds `per_token_cap_batch` by more
-than one attempt, and every escalation appears in the overlay with its reason**.
+than one attempt per open session (amended at M2), and every escalation appears in the overlay with its reason**.
 
 ## Success Metrics
 
 | Metric | Target | How measured |
 |---|---|---|
 | Manual run starts in an unattended batch | 0 | Prototype batch of ≥3 queued `FIX`/`CLEAN`/`TOOL` items, every run row `mode = auto` |
-| Batch spend overshoot | ≤ one attempt's estimate above `per_token_cap_batch` | Conformance test over `MemStore` + Postgres test over `SUM(run_step.usage)` |
+| Batch spend overshoot | ≤ one attempt per concurrently open session of the batch above `per_token_cap_batch` (amended at M2, plan D7: one attempt when `max_concurrent_items = 1` and no fan-out) | Conformance test over `MemStore` + Postgres test over `SUM(run_step.usage)` |
 | Escalations visible | 100% of parked / blocked / refused queued items listed with reason | Overlay snapshot tests per reason; ANA-2 criterion 27 |
 | Manual/auto isolation | Overlapping manual and auto runs serialise in either order | ANA-2 criterion 26 as a test |
 | ANA-2 validation criteria 22–28 | all pass | One named test (or test group) per criterion |
@@ -122,7 +122,7 @@ reorder (M3).
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
 | 1 | Unattended runs | The maintainer queues items from the Backlog; the box runs them one after another (up to `max_concurrent_items` at once) in queue order, with non-hard gates skipped and recorded as `skipped`, hard gates still parking; pausing stops new admissions without touching running runs | complete | `.claude/plans/mod-12-m1-unattended-runs.plan.md` |
-| 2 | Spend guard | Each queue activation is a batch; once its spend reaches `per_token_cap_batch`, or a run's remaining budget is below one attempt, nothing further is admitted; the Settings tab edits the caps, `max_concurrent_items` and the (unenforced) scheduler window | in-progress | `.claude/plans/mod-12-m2-spend-guard.plan.md` |
+| 2 | Spend guard | Each queue activation is a batch; once its spend reaches `per_token_cap_batch`, or a run's remaining budget is below one attempt, nothing further is admitted; the Settings tab edits the caps, `max_concurrent_items` and the (unenforced) scheduler window | complete | `.claude/plans/mod-12-m2-spend-guard.plan.md` |
 | 3 | Queue overlay | One overlay shows the queue in order, what is running, and every escalation with its reason (review loop exhausted, judge undecided, missing tags, hard gate parked, blocked, targeted at another box), with pause/resume and reorder | pending | — |
 
 ## Open Questions

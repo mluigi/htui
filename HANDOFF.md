@@ -146,9 +146,23 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   it checked) with walk-end and resume wake-ups; Backlog `Q` (queue/dequeue) and `P` (resume/pause).
   ANA-2 criteria 22, 23, 24 (by construction, resume pinned), 26 and 27's pause half have tests.
   PRD `.claude/prds/mod-12-auto-mode-queue-runner.prd.md`, plan
-  `.claude/plans/mod-12-m1-unattended-runs.plan.md`. Remaining: M2 spend guard (batch cap, Settings
-  caps section), M3 queue overlay (escalations, reorder, off-box runs, the open-batch-on-`Q` question
-  of review L4).
+  `.claude/plans/mod-12-m1-unattended-runs.plan.md`.
+  **Phase 2 landed (`961e4f40`..`8b3aed9f`, 2026-10-07):** spend guard.
+  - The batch spend is the sum of its runs' integer `cost_micros`, never stored.
+  - Each run is held to its own project's `per_token_cap_batch` against the whole batch's spend, at
+    three points:
+    - the runner's admission (a stopped batch stays open);
+    - the candidate walk (`BatchCapReached` / `BatchBudget`, the item goes `blocked`);
+    - the session allowance `min(run cap - run spend, batch cap - batch spend)`, from the snapshot.
+      This also fixes the run cap being applied per step.
+  - Settings > Queue edits the two caps (in USD), `min_budget_for_new_attempt`, the app-wide and
+    per-box `max_concurrent_items`, and the stored-only `scheduler_window`.
+  - The PRD overshoot metric is amended to one attempt per open session. Review R1 is applied
+    (`docs/ANA-2.md` §4.10 and §5.4 as-built notes); its residuals are CLEAN-9.
+  - Plan `.claude/plans/mod-12-m2-spend-guard.plan.md`.
+
+  Remaining: M3 queue overlay (escalations including a capped batch, reorder, off-box runs, the
+  open-batch-on-`Q` question of M1 review L4).
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -471,6 +485,35 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   - A `--demo` guard on the Qdrant keyring arms: Settings > Qdrant still reads and writes the keyring in a demo
     session (`docs/htui-secrets.md`, Settings).
   Not blocked.
+- [ ] **CLEAN-9 - MOD-12 M2 review residuals** (from MOD-12 M2, plan
+  `.claude/plans/mod-12-m2-spend-guard.plan.md`). `R-AGT-7`, `R-TUI-8`.
+  - **Recorder error-row wording.** Since M2's D6 the recorder's `RunCap.micros` is the session's
+    remaining allowance, the smaller of run cap minus run spend and batch cap minus batch spend. The
+    `cap_exceeded` row in `crates/htui-agent/src/record.rs` still says
+    `project.settings.per_token_cap_run = <n> micros`, which is wrong whenever an earlier step spent
+    anything or the batch term binds. The row shows in the transcript and may be carried forward as
+    cached transcript. The item note and `run.failure` are correct. Fix: give `RunCap` a basis (run
+    remainder, or batch `<id>` remainder) and word the row as "session allowance reached".
+  - **One malformed project key uncaps the engine** (plan D11, review M3). `graph.rs` and
+    `Engine::project_settings` decode `project.settings` with `unwrap_or_default()`, so one bad
+    unrelated key (`"keep_raw_events": "yes"`) drops both caps from the snapshot and the recorder. The
+    runner (`ProjectCaps::from_settings`) still admits the run. Read the caps through
+    `ProjectCaps::from_settings` at snapshot time, and fail or note a malformed blob instead of
+    defaulting it.
+  - **Non-object `project.settings` gaps that only raw SQL can reach.** The Pg clear statements
+    (`pg/write.rs`, `settings - key`) apply on an array blob and raise 22023 on a scalar where Mem
+    refuses. `ProjectCaps::from_settings` reads a non-object blob as "no caps".
+  - **Test hardening.** `a_batch_overshoots_its_cap_by_at_most_one_attempt_pg` should also assert that
+    the batch is still open before the second sweep. The once-per-batch log levels (`info`, then
+    `debug`) are not pinned.
+  Not blocked.
+- [ ] **CLEAN-10 - `cargo doc` fails on private intra-doc links** (found at MOD-12 M2's gate).
+  `cargo doc --workspace --no-deps --all-features` stops with 17 errors in `htui-core` and
+  `htui-store`. They are public docs linking to private items (`close_batch` →
+  `State::finish_run`/`finish_run_on`, `upsert_agent`/`set_requirement_spec` → `cas_miss`,
+  `write_step_document`/`propose_link`/`add_step_note`/`withdraw_link` → `step_scope`, …) and one
+  unresolved `ensure_model`. All of them predate M2. Point those links at public items, or turn them
+  into plain code spans. Not blocked.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -490,5 +533,5 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
 | MOD-N   | 24 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-90 worker login latch, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 1 (CLEAN-8 MOD-10 M4 review residuals) |
+| CLEAN-N | 3 (CLEAN-8 MOD-10 M4 review residuals, CLEAN-9 MOD-12 M2 review residuals, CLEAN-10 `cargo doc` private links) |
 | TOOL-N  | 0 |

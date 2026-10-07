@@ -3,7 +3,9 @@
 **Source PRD**: `.claude/prds/mod-12-auto-mode-queue-runner.prd.md`
 **Selected Milestone**: 2 — Spend guard
 **Complexity**: Medium–Large
-**Status**: confirmed (maintainer, 2026-10-07) — implementation in progress
+**Status**: complete on `hr/MOD-12` at `8b3aed9f` (2026-10-07), including review round R1. The
+maintainer chose to apply every finding; the residuals went to CLEAN-9. Gate: 5395 passed, 0 failed.
+Blueprint `.claude/plans/mod-12-m2-spend-guard.blueprint.md`.
 **Routing**: plan path (milestone of an existing PRD), ultracode not recommended (`/handoff-run`
 verdict 2026-10-07, accepted). Waves below are decided by the file sets in "Files to Change".
 

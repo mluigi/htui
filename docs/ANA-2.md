@@ -1538,6 +1538,26 @@ couldn't score it"). The batch total has no column and does not get one: it is
 `SUM(run_step.usage->>'cost_micros')` over the batch's runs, computed at scheduling time by MOD-12,
 which is cheaper than a migration and cannot drift from the rows it sums.
 
+**As built (MOD-12 M2, `.claude/plans/mod-12-m2-spend-guard.plan.md`).** The batch figure is
+`batch_spend(batch)`, the sum of the integer `cost_micros` of the batch's steps, clamped into `i64`,
+and `None` when no step reports a cost. The cap is the run's **own project's**
+`per_token_cap_batch` (`project.settings`, USD micros; the run's snapshot freezes it) compared
+against the **whole batch's** spend. One rule, `batch_budget`, mirrors rule 2 and rule 5 (unknown is
+unbounded, equal is reached, exactly the minimum is enough). It is applied at three points:
+- the runner admits no further item of a project whose cap the batch has reached, or whose
+  remainder is below `min_budget_for_new_attempt`;
+- the candidate walk skips with `BatchCapReached` / `BatchBudget`, so a run starts no attempt it
+  cannot afford, and the item goes `blocked` with the cause in its note;
+- every graph session is capped at `min(run cap - run spend, batch cap - batch spend)`, both taken
+  from the snapshot, so the recorder cancels the session (`R-AGT-7`). The batch is named in the
+  failure note when its term binds.
+
+A batch that reaches its cap stays open and admits nothing; pause and resume open a fresh batch.
+The overshoot is bounded by the sessions already open when the cap is reached: one attempt per
+concurrently open session of the batch, which is the sum of the fan-out of its running phases. Each
+of those sessions is cut at what the batch had left when it started. Agents that report no USD
+cost are never batch-capped, the same "unknown is unbounded" rule the run cap has.
+
 ---
 
 ## 5. JSONB shapes
@@ -1635,6 +1655,13 @@ verification prefilter; anything else is a judge failure per §4.5.
 
 `scheduler_window` is reserved here so the key name exists before `R-ORCH-13` needs it; ANA-9 left
 the scheduler window as "a key, not a column" without naming it.
+
+**As built (MOD-12 M2).** The two `per_token_cap_*` rows above are seeded and **unread**: the caps
+are read from `project.settings` (`model/quota.rs`) and edited per project in `Settings > Queue`.
+`min_budget_for_new_attempt` is an unseeded `app_setting` key (a positive integer of USD micros,
+else `0`). `scheduler_window` has the shape `null | {"start":"HH:MM","end":"HH:MM"}`, in the box's
+local time, with `end < start` meaning the window crosses midnight. It is stored and edited, and
+nothing reads it.
 
 ---
 

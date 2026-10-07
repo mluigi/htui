@@ -1426,6 +1426,8 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
    D6 keeps that line's source and subtracts the run's spend; the batch term comes from the snapshot
    per D2. If the maintainer strikes D6's run half, `allowance`'s run term reverts to
    `settings.per_token_cap_run` with no subtraction, and `the_run_cap_spans_steps` goes.
+   **Superseded at review R1 (M1, `be7bd335`):** the run term is now taken from the run's snapshot,
+   as the walk and the batch term are, so a live cap edit cannot cut a snapshotted run at zero.
 8. **D1's SQL gains a cast and a guard.** `SUM(bigint)` is `numeric`, which the workspace `sqlx`
    cannot decode (no decimal feature), hence `::bigint`; and a non-integer `cost_micros` would raise
    `22P02` on the bare cast where Mem's `as_i64` skips it, hence the `~ '^-?[0-9]+$'` filter.
