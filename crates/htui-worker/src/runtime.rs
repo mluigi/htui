@@ -3834,6 +3834,14 @@ mod queue_store_errors {
             self.check("close_drained_batch")?;
             WorkerHost::close_drained_batch(&self.inner, batch, at).await
         }
+        async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+            self.check("batch_spend")?;
+            WorkerHost::batch_spend(&self.inner, batch).await
+        }
+        async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+            self.check("project_settings")?;
+            WorkerHost::project_settings(&self.inner, project).await
+        }
     }
 
     /// A runtime over `store` and a sweep's context over it, through [`Failing`].

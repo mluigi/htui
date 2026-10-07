@@ -12,12 +12,13 @@
 //! [`WriteStore`] method of the same name by path (UFCS): this module defines the new traits, so
 //! both families are in scope here and a method-call body would be ambiguous.
 //!
-//! `WorkerStore` is 58 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
+//! `WorkerStore` is 59 methods: 13 [`ReadStore`] reads, 6 [`WriteStore`] reads, 25 writes,
 //! `write_document`, MOD-42's three command methods, MOD-11's four agent writes and
-//! `item_by_key` (plan D13, B-4) and its five command-queue methods (plan D14); [`RelayStore`] is
-//! nine (MOD-42 plan D2, MOD-70 plan D4).
+//! `item_by_key` (plan D13, B-4), its five command-queue methods (plan D14) and MOD-12 M2's
+//! `run_batch_spend`; [`RelayStore`] is nine (MOD-42 plan D2, MOD-70 plan D4).
 //! `WorkerHost` is `writer` plus 20 reads (blueprint F-5); MOD-41 T7 adds the 22nd,
-//! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`.
+//! `queued_runs_on_box`; MOD-12 M1 adds seven (plan D3, D5, D6), the 29th `close_drained_batch`;
+//! MOD-12 M2 adds two (`batch_spend`, `project_settings`), 31.
 
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -460,6 +461,14 @@ pub trait WorkerStore: RecorderStore + RelayStore {
     ) -> impl Future<Output = Result<bool>> + Send;
     /// [`WriteStore::cancel_command`].
     fn cancel_command(&self, id: CommandRunId) -> impl Future<Output = Result<bool>> + Send;
+
+    /// MOD-12 M2 D5: the batch `run` was admitted under and that batch's spend
+    /// (`MemStore::run_batch_spend`); `None` for a manual or chat run. A `WorkerStore` read because
+    /// [`Run`] carries no `batch_id` and the mirror is untouched (plan D5).
+    fn run_batch_spend(
+        &self,
+        run: RunId,
+    ) -> impl Future<Output = Result<Option<(BatchId, Option<i64>)>>> + Send;
 }
 
 /// The supervisor's source (plan D4): the process's store and every read the runtime makes.
@@ -572,6 +581,16 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
         batch: BatchId,
         at: DateTime<Utc>,
     ) -> impl Future<Output = Result<Option<QueueBatch>>> + Send;
+
+    // -- MOD-12 M2 (plan D4): the runner's spend gate
+    /// `Backend::batch_spend`: the batch's spend, `None` when no step reports a cost (plan D1).
+    fn batch_spend(&self, batch: BatchId) -> impl Future<Output = Result<Option<i64>>> + Send;
+    /// `Backend::project_settings`: the project's `settings` blob, read live at admission
+    /// (plan D2); `None` for an unknown project.
+    fn project_settings(
+        &self,
+        project: ProjectId,
+    ) -> impl Future<Output = Result<Option<Value>>> + Send;
 }
 
 impl RecorderStore for MemStore {
@@ -942,6 +961,9 @@ impl WorkerStore for MemStore {
     }
     async fn cancel_command(&self, id: CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
+    }
+    async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
+        MemStore::run_batch_spend(self, run).await
     }
 }
 
