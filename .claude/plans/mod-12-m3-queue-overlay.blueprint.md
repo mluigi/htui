@@ -1018,7 +1018,8 @@ unchanged (§B.2.2).
 
 Gates:
 ```bash
-cargo test -p htui-worker --all-features -- --test-threads=1 --no-fail-fast 2>&1 | tee /tmp/m3-t2.log
+set -o pipefail   # the cargo exit code, not tee's; a grep on an aborted log is silent
+cargo test -p htui-worker --all-features --no-fail-fast -- --test-threads=1 2>&1 | tee /tmp/m3-t2.log
 grep -n -E 'SIGABRT|overflowed|test result: FAILED' /tmp/m3-t2.log
 cargo test -p htui-core --all-features batch
 cargo test -p htui-store --all-features --test pg_criteria -- --test-threads=1 batch drain
@@ -1056,7 +1057,7 @@ cargo test -p htui-store --all-features --test pg_criteria -- --test-threads=1 b
 Gates:
 ```bash
 cargo test -p htui-core --all-features
-cargo test -p htui-store --all-features -- --test-threads=1 --no-fail-fast
+cargo test -p htui-store --all-features --no-fail-fast -- --test-threads=1
 cargo build --workspace --all-features --all-targets
 (cd crates/htui-store && DATABASE_URL=postgres://postgres@localhost:5439/htui_sqlx cargo sqlx prepare --check)
 cargo test -p htui-worker --all-features -- --test-threads=1   # the order change under the runner
@@ -1086,7 +1087,7 @@ requests (seven, in order). `backlog/mod.rs`: `queue_sentence_covers_every_write
 `Moved { moved: true }` → `queue reordered (2 in queue)` and `Moved { moved: false }` →
 `already at that end of the queue`.
 
-Gate: `cargo test -p htui --all-features queue -- --test-threads=1 --no-fail-fast`.
+Gate: `cargo test -p htui --all-features --no-fail-fast queue -- --test-threads=1`.
 
 ### C.5 T5
 
@@ -1134,7 +1135,8 @@ Key tables: `tests/keys.rs:143` gains `("ctrl-q", QueueOverlay::ID)`; `keys/stac
 
 Gates:
 ```bash
-cargo test -p htui --all-features -- --test-threads=1 --no-fail-fast 2>&1 | tee /tmp/m3-t5.log
+set -o pipefail   # the cargo exit code, not tee's; a grep on an aborted log is silent
+cargo test -p htui --all-features --no-fail-fast -- --test-threads=1 2>&1 | tee /tmp/m3-t5.log
 grep -n -E 'SIGABRT|overflowed|test result: FAILED' /tmp/m3-t5.log
 cargo insta test -p htui --all-features   # exactly the new queue snapshots (8 unit + e2e if any), nothing else
 cargo run -p htui -- --print-keys | sed -n '20,24p'   # the queue line under waiting
@@ -1167,6 +1169,7 @@ Implementers commit incrementally (uncommitted subagent work dies with its sessi
 
 Full validation (plan §Validation, run by the orchestrator after T5 and again after T6):
 ```bash
+set -o pipefail   # the cargo exit code, not tee's
 cargo fmt --all -- --check
 cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo clippy --workspace -- -D warnings
