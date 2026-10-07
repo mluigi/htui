@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 
 use crate::app::{Ctx, Handled};
 use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
+use crate::secrets_settings::Redacted;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
@@ -15,6 +16,7 @@ const NOT_READ: &str = "not read yet";
 const STORED: &str = "stored";
 const CLEARED: &str = "the Qdrant settings are gone from the keyring";
 const NO_URL_YET: &str = "no Qdrant URL is stored; type one and press Enter";
+const EMPTY_KEY: &str = "nothing typed; the stored API key is unchanged";
 const REPLACES_URL: &str = "Enter replaces the stored Qdrant URL";
 const NOT_STORED: &str = "not stored";
 const UNREADABLE: &str = "the keyring could not be read";
@@ -169,7 +171,10 @@ impl QdrantSection {
                 let outcome = editor.input.on_key(key);
                 let mut key_text = None;
                 if let FieldOutcome::Submit = outcome {
-                    key_text = Some(editor.input.text().unwrap_or("").trim().to_owned());
+                    // MOD-10 M4 blueprint A-6: the field is masked, so `text()` is `None`; `take`
+                    // is its only read. The typed key is wiped here and travels redacted.
+                    let raw = zeroize::Zeroizing::new(editor.input.take());
+                    key_text = Some(Redacted::new(raw.trim().to_owned()));
                 }
                 (outcome, None, key_text)
             }
@@ -194,10 +199,13 @@ impl QdrantSection {
                 }
                 if let Some(key_text) = key_to_submit {
                     self.mode = Mode::Browse;
-                    self.send(
-                        StoreRequest::SetQdrantApiKey(zeroize::Zeroizing::new(key_text)),
-                        ctx,
-                    );
+                    // MOD-10 M4 R1 L-5: as the URL row, an empty submit changes nothing; removing
+                    // the key stays on `c`, behind its question.
+                    if key_text.is_empty() {
+                        self.say(EMPTY_KEY);
+                        return Handled::Consumed;
+                    }
+                    self.send(StoreRequest::SetQdrantApiKey(key_text), ctx);
                 }
                 Handled::Consumed
             }

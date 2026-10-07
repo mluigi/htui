@@ -34,7 +34,7 @@ use htui_core::model::{
 };
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
-use htui_core::secret::SecretSource;
+use htui_core::secret::{SecretScope, SecretSource};
 use htui_core::store::{
     DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
     WriteStore,
@@ -56,7 +56,7 @@ use crate::catalogue::{self, CatalogueSnapshot};
 use crate::concepts_worker::{self, ConceptsReply, ConceptsRuntime, ConceptsServed};
 use crate::connection::{self, Attempt, AttemptOutcome, ConnectionSnapshot};
 use crate::hand_written::{self, DocumentFormContext, HandText};
-use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete};
+use crate::hierarchy::{self, HierarchySnapshot, InferReport, MirrorAfterDelete, ScopeWrite};
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::persona_import::PersonaImports;
 use crate::persona_settings::{self, PersonaWrite};
@@ -65,6 +65,7 @@ use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
 };
 use crate::run_worker::{LiveChats, RunRuntime, RunServed, TuiRuns as _};
+use crate::secrets_settings::{self, IdentityEntry, Redacted, SecretCheck, SecretsSnapshot};
 use crate::skill_import::SkillImports;
 use crate::skills::{self, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::templates::{self, TemplateBody, TemplatesSnapshot};
@@ -848,10 +849,50 @@ pub enum StoreRequest {
     QdrantInfo,
     /// Request to set the Qdrant connection string.
     SetQdrantUrl(String),
-    /// Request to set the Qdrant API key.
-    SetQdrantApiKey(zeroize::Zeroizing<String>),
+    /// The API key, redacted in `Debug` (MOD-10 M4 D9); empty clears the stored key. The Settings
+    /// field never sends an empty one (R1 L-5): clearing there is `c`, behind a question.
+    SetQdrantApiKey(Redacted),
     /// Request to clear the Qdrant connection string.
     ClearQdrantSettings,
+    // MOD-10 milestone 4: Settings > Secrets.
+    /// The keyring rows of `Settings > Secrets` (D2). Answered with [`StoreReply::Secrets`].
+    SecretsInfo,
+    /// Store the Infisical base URL, already normalised on the UI task (D3). Not a secret: a
+    /// normalised URL has no user info, query or fragment. This and the three keyring writes
+    /// below answer [`StoreReply::SecretsWritten`] (R1 M-1).
+    SetInfisicalUrl(String),
+    /// Remove the stored URL.
+    ClearInfisicalUrl,
+    /// Store both halves of the machine identity (D4), redacted in `Debug`.
+    SetMachineIdentity(IdentityEntry),
+    /// Remove both halves.
+    ClearMachineIdentity,
+    /// Reachability plus a fresh login through the process's secret source (D5). Served by the
+    /// agent runtime's own task (`R-NF-3`); answered once with [`StoreReply::SecretCheck`] or
+    /// [`StoreReply::Failed`].
+    CheckSecretProvider,
+    /// How many keys `project`'s scope shows (D8): a count, never a name. Served like
+    /// [`Self::CheckSecretProvider`]; a project with no provider is answered without asking the
+    /// source.
+    CheckSecretScope {
+        /// The project whose scope is listed.
+        project: ProjectId,
+    },
+    /// Set or clear a project's secret scope, CAS on `project.updated_at` (D6). Answered with
+    /// [`StoreReply::SecretScopeWritten`] (blueprint A-1); not one of `hierarchy::REQUEST_NAMES`
+    /// (A-11).
+    SetProjectSecretScope {
+        /// The project written.
+        id: ProjectId,
+        /// The `updated_at` the editor opened on.
+        expected: DateTime<Utc>,
+        /// `Some` writes provider `infisical` and this scope; `None` clears both columns.
+        scope: Option<SecretScope>,
+    },
+    /// The scope's workspace tree for `Settings > Secrets`: [`Self::Hierarchy`]'s read under its
+    /// own name, answered with [`StoreReply::SecretsTree`] (MOD-10 M4 R1 L-3), so a Secrets
+    /// reload never reaches the Hierarchy section as the answer to its write in flight.
+    SecretsTree(WorkspaceId),
     /// MOD-64 D231: a concepts search, served by `concepts_worker::ConceptsRuntime` on a task of its
     /// own (`R-NF-3`). Answered with [`StoreReply::Concepts`], never `Failed` (D232).
     SearchConcepts(SearchQuery),
@@ -1172,6 +1213,17 @@ impl StoreRequest {
             Self::SetQdrantUrl(_) => "set_qdrant_url",
             Self::SetQdrantApiKey(_) => "set_qdrant_api_key",
             Self::ClearQdrantSettings => "clear_qdrant_settings",
+            // The five of `secrets_settings::REQUEST_NAMES`, in that order, then the checks and
+            // the scope write (MOD-10 M4).
+            Self::SecretsInfo => "secrets_info",
+            Self::SetInfisicalUrl(_) => "set_infisical_url",
+            Self::ClearInfisicalUrl => "clear_infisical_url",
+            Self::SetMachineIdentity(_) => "set_machine_identity",
+            Self::ClearMachineIdentity => "clear_machine_identity",
+            Self::CheckSecretProvider => "check_secret_provider",
+            Self::CheckSecretScope { .. } => "check_secret_scope",
+            Self::SetProjectSecretScope { .. } => "set_project_secret_scope",
+            Self::SecretsTree(..) => "secrets_tree",
             // The two of `concepts_worker::REQUEST_NAMES`, in that order (MOD-64 D241).
             Self::SearchConcepts(_) => "search_concepts",
             Self::IndexConcepts { .. } => "index_concepts",
@@ -1562,6 +1614,37 @@ pub enum StoreReply {
         /// The version the store allocated.
         version: i32,
     },
+    /// Answer to [`StoreRequest::SecretsInfo`] (D2): fresh keyring rows, never a write's answer.
+    Secrets(SecretsSnapshot),
+    /// A keyring write that landed, and the keyring as it is now (D2, R1 M-1). Self-naming: the
+    /// Secrets section lands its write in flight on this alone, never on a read's [`Self::Secrets`]
+    /// that the loop served before the write.
+    SecretsWritten {
+        /// The write's [`StoreRequest::name`].
+        request: &'static str,
+        /// The keyring-write generation this write made (R1 L-1): a provider built at a lower
+        /// one is rebuilt on the next `provider()` (blueprint A-4).
+        generation: u64,
+        /// The keyring rows read after the write.
+        snapshot: SecretsSnapshot,
+    },
+    /// Answer to [`StoreRequest::SecretsTree`]: [`Self::Hierarchy`]'s tree under the Secrets
+    /// section's own name (R1 L-3). `None` for a workspace that does not exist. The Hierarchy
+    /// section only adopts it.
+    SecretsTree(Option<Box<HierarchySnapshot>>),
+    /// One check's answer, from the agent runtime's task (D5, D8).
+    SecretCheck(SecretCheck),
+    /// Answer to [`StoreRequest::SetProjectSecretScope`] (D6, blueprint A-1): the workspace
+    /// re-read after the write and whether it applied. Self-naming: the Secrets section lands its
+    /// write on this alone; the Hierarchy section only adopts `tree`.
+    SecretScopeWritten {
+        /// The project written.
+        project: ProjectId,
+        /// The tree of the workspace the project was found in, read after the write.
+        tree: Box<HierarchySnapshot>,
+        /// Applied, or the token was spent.
+        outcome: ScopeWrite,
+    },
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -1924,10 +2007,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         },
         // The six chat requests (MOD-55's help among them) need the worker loop's own state (the
         // live sessions), and the two probes, the preview, the three install requests, MOD-21's
-        // four login ones, MOD-22's delivery and MOD-66's tool-paths write need the runtime that
-        // owns their tasks, so all eighteen are served ahead of this function, exactly as
-        // `ApplyMigrations` is. One of them that reaches here at all belongs to a caller with no
-        // runtime — the test harness without one — and saying so is more use than a panic.
+        // four login ones, MOD-22's delivery, MOD-66's tool-paths write and MOD-10 M4's provider
+        // and scope checks need the runtime that owns their tasks, so all twenty are served ahead
+        // of this function, exactly as `ApplyMigrations` is. One of them that reaches here at all
+        // belongs to a caller with no runtime — the test harness without one — and saying so is
+        // more use than a panic.
         StoreRequest::PromptPreview { .. }
         | StoreRequest::ChatStart { .. }
         | StoreRequest::ChatSend { .. }
@@ -1945,15 +2029,19 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::AuthOpen { .. }
         | StoreRequest::AuthDeliver { .. }
         | StoreRequest::AuthCancel
-        | StoreRequest::SetToolPaths { .. } => StoreReply::Failed {
+        | StoreRequest::SetToolPaths { .. }
+        | StoreRequest::CheckSecretProvider
+        | StoreRequest::CheckSecretScope { .. } => StoreReply::Failed {
             request: request.name(),
             message: "no agent runtime in this build".to_owned(),
         },
-        // The thirteen hierarchy requests, or-ed rather than guarded: this `match` has no wildcard,
-        // and an arm with a guard does not count towards exhaustivity, so `_ if …` would be an
-        // E0004 here (MOD-15 M3 plan F-12). The `?` is what keeps `spawn`'s `go_offline` working:
-        // an `Unreachable` from `hierarchy::serve` still drops an `Online` backend onto the mirror
-        // exactly as any other read does.
+        // The thirteen hierarchy requests plus MOD-10 M4's scope write (D6; not one of
+        // `hierarchy::REQUEST_NAMES`, blueprint A-11) and the Secrets section's tree read (R1
+        // L-3), or-ed rather than guarded: this `match` has no wildcard, and an arm with a guard
+        // does not count towards exhaustivity, so `_ if …` would be an E0004 here (MOD-15 M3 plan
+        // F-12). The `?` is what keeps `spawn`'s `go_offline` working: an `Unreachable` from
+        // `hierarchy::serve` still drops an `Online` backend onto the mirror exactly as any other
+        // read does.
         StoreRequest::Hierarchy(..)
         | StoreRequest::CreateWorkspace { .. }
         | StoreRequest::UpdateWorkspace { .. }
@@ -1966,8 +2054,10 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::DeleteReach(..)
         | StoreRequest::DeleteWorkspace(..)
         | StoreRequest::DeleteProject(..)
-        | StoreRequest::InferRepoPaths(..) => hierarchy::serve(backend, request).await?,
-        // The nine catalogue requests, or-ed for the same reason the thirteen above are: a guard
+        | StoreRequest::InferRepoPaths(..)
+        | StoreRequest::SetProjectSecretScope { .. }
+        | StoreRequest::SecretsTree(..) => hierarchy::serve(backend, request).await?,
+        // The nine catalogue requests, or-ed for the same reason the fourteen above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).
         StoreRequest::Catalogue(..)
@@ -1979,7 +2069,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::CreatePhase { .. }
         | StoreRequest::UpdatePhase { .. }
         | StoreRequest::SetPhaseBudget { .. } => catalogue::serve(backend, request).await?,
-        // The three prompt settings requests, or-ed for the same reason the twenty-two above are:
+        // The three prompt settings requests, or-ed for the same reason the twenty-three above are:
         // a guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …`
         // would be an E0004 here (MOD-15 M3 plan F-12, M5 plan F-13).
         StoreRequest::PromptSettings(..)
@@ -1999,7 +2089,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SaveSkillVersion { .. }
         | StoreRequest::SetSkillBinding { .. }
         | StoreRequest::ImportSkills { .. } => skills::serve(backend, request).await?,
-        // The four connection requests, or-ed for the same reason the twenty-five above are: a
+        // The four connection requests, or-ed for the same reason the twenty-six above are: a
         // guard does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would
         // be an E0004 here (MOD-15 M3 plan F-12, M6 plan D9). Only the read is answered: the three
         // writers need `reconnect`, `refresher` and the connect context, none of which a function
@@ -2008,7 +2098,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::SetDsn(_)
         | StoreRequest::ClearDsn
         | StoreRequest::RebuildCache => connection::serve(backend, request).await?,
-        // The three box requests, or-ed for the same reason the twenty-nine above are: a guard
+        // The three box requests, or-ed for the same reason the thirty above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, MOD-7 milestone 2 D46, MOD-51 D4).
         StoreRequest::Boxes | StoreRequest::EditBox { .. } | StoreRequest::SetProbeSpec { .. } => {
@@ -2074,6 +2164,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             request: request.name(),
             message: "handled in worker loop".to_owned(),
         },
+        // The five keyring requests of `Settings > Secrets`, or-ed for the reason the arms above
+        // are (MOD-15 M3 plan F-12; MOD-10 M4 D2). They need no loop state, so the loop's
+        // `other => try_serve` serves them too: the loop, the harness and `--demo` agree.
+        StoreRequest::SecretsInfo
+        | StoreRequest::SetInfisicalUrl(_)
+        | StoreRequest::ClearInfisicalUrl
+        | StoreRequest::SetMachineIdentity(_)
+        | StoreRequest::ClearMachineIdentity => secrets_settings::serve(backend, request).await?,
         // MOD-64 D231: the loop serves both through the concepts runtime; one that reaches here
         // belongs to a caller with none (the harness default), and is answered in the overlay's
         // own reply (D232).
@@ -2855,12 +2953,10 @@ pub(crate) fn spawn_with_concepts(
                         }
                         StoreRequest::SetQdrantUrl(url) => {
                             let url_str = url.clone();
-                            let res = tokio::task::spawn_blocking(move || {
-                                htui_store::secret::set_qdrant_url(&url_str)?;
-                                Ok::<(), StoreError>(())
+                            let res = crate::qdrant_settings_info::blocking_keyring(move || {
+                                htui_store::secret::set_qdrant_url(&url_str)
                             })
-                            .await
-                            .unwrap();
+                            .await;
                             if let Err(err) = res {
                                 failed("set_qdrant_url", &err)
                             } else {
@@ -2868,17 +2964,17 @@ pub(crate) fn spawn_with_concepts(
                             }
                         }
                         StoreRequest::SetQdrantApiKey(key) => {
-                            let k = key.as_str().to_string();
-                            let res = tokio::task::spawn_blocking(move || {
-                                if k.is_empty() {
-                                    htui_store::secret::clear_qdrant_api_key()?;
+                            // A zeroizing clone into the closure; nothing unzeroized
+                            // (MOD-10 M4 D9).
+                            let key = key.clone();
+                            let res = crate::qdrant_settings_info::blocking_keyring(move || {
+                                if key.expose().is_empty() {
+                                    htui_store::secret::clear_qdrant_api_key()
                                 } else {
-                                    htui_store::secret::set_qdrant_api_key(&k)?;
+                                    htui_store::secret::set_qdrant_api_key(key.expose())
                                 }
-                                Ok::<(), StoreError>(())
                             })
-                            .await
-                            .unwrap();
+                            .await;
                             if let Err(err) = res {
                                 failed("set_qdrant_api_key", &err)
                             } else {
@@ -2886,13 +2982,11 @@ pub(crate) fn spawn_with_concepts(
                             }
                         }
                         StoreRequest::ClearQdrantSettings => {
-                            let res = tokio::task::spawn_blocking(|| {
+                            let res = crate::qdrant_settings_info::blocking_keyring(|| {
                                 htui_store::secret::clear_qdrant_url()?;
-                                htui_store::secret::clear_qdrant_api_key()?;
-                                Ok::<(), StoreError>(())
+                                htui_store::secret::clear_qdrant_api_key()
                             })
-                            .await
-                            .unwrap();
+                            .await;
                             if let Err(err) = res {
                                 failed("clear_qdrant_settings", &err)
                             } else {
@@ -2900,8 +2994,9 @@ pub(crate) fn spawn_with_concepts(
                             }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
-                        // the probes, the tool-paths write, the installs and the logins need the
-                        // runtime that owns their tasks, so all of them go to the runtime before
+                        // the probes, the tool-paths write, the installs, the logins and the
+                        // secret provider and scope checks (MOD-10 M4 D5, D8) need the runtime
+                        // that owns their tasks, so all of them go to the runtime before
                         // `try_serve`, like `ApplyMigrations` above. An install reads the registry
                         // over the network and streams hundreds of megabytes, and a login waits on
                         // a human in a browser, so `Served::Deferred => continue` is the whole of
@@ -2924,7 +3019,9 @@ pub(crate) fn spawn_with_concepts(
                         | StoreRequest::AuthOpen { .. }
                         | StoreRequest::AuthDeliver { .. }
                         | StoreRequest::AuthCancel
-                        | StoreRequest::SetToolPaths { .. } => {
+                        | StoreRequest::SetToolPaths { .. }
+                        | StoreRequest::CheckSecretProvider
+                        | StoreRequest::CheckSecretScope { .. } => {
                             match runtime.serve(&backend, &tx, &envelope).await {
                                 Served::Reply(reply) => reply,
                                 // The session task answers this request itself, once.
@@ -6002,5 +6099,88 @@ mod tests {
             host.client(&lease.spec.env[htui_mcp::ENV_TOKEN]).is_err(),
             "the session ended with the host"
         );
+    }
+
+    /// MOD-10 M4 D5: the loop hands the provider check to the agent runtime, which answers it,
+    /// rather than to `try_serve`'s "no agent runtime in this build". A runtime with no source
+    /// (the `--demo` shape, blueprint A-5) answers its own one sentence.
+    #[tokio::test]
+    async fn the_loop_hands_the_provider_check_to_the_agent_runtime() {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(demo()),
+            req_rx,
+            rep_tx,
+            AgentRuntime::new(htui_agent::registry::DriverFactory::new()),
+        );
+        let reply = round_trip(&req_tx, &mut rep_rx, StoreRequest::CheckSecretProvider).await;
+        match reply {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, secrets_settings::CHECK_SECRET_PROVIDER);
+                assert_eq!(message, secrets_settings::NO_SOURCE_TO_CHECK);
+            }
+            other => panic!("the runtime answers the check: {other:?}"),
+        }
+        drop(req_tx);
+        let _ = worker.await;
+    }
+
+    /// `try_serve` has no runtime, so the check is refused by name, like every runtime request.
+    #[tokio::test]
+    async fn try_serve_refuses_the_provider_check_without_a_runtime() {
+        match serve(&demo(), &StoreRequest::CheckSecretProvider).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "check_secret_provider");
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a check with no runtime is refused, not served: {other:?}"),
+        }
+    }
+
+    /// MOD-10 M4 D8: the scope check goes to the agent runtime too. A runtime with no source
+    /// answers its own sentence under the check's name, before any project is read.
+    #[tokio::test]
+    async fn the_loop_hands_the_scope_check_to_the_agent_runtime() {
+        let (req_tx, req_rx) = mpsc::unbounded_channel();
+        let (rep_tx, mut rep_rx) = mpsc::unbounded_channel();
+        let worker = spawn_with(
+            Started::detached(demo()),
+            req_rx,
+            rep_tx,
+            AgentRuntime::new(htui_agent::registry::DriverFactory::new()),
+        );
+        let reply = round_trip(
+            &req_tx,
+            &mut rep_rx,
+            StoreRequest::CheckSecretScope {
+                project: ids::PROJECT_VULKAN,
+            },
+        )
+        .await;
+        match reply {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, secrets_settings::CHECK_SECRET_SCOPE);
+                assert_eq!(message, secrets_settings::NO_SOURCE_TO_CHECK);
+            }
+            other => panic!("the runtime answers the check: {other:?}"),
+        }
+        drop(req_tx);
+        let _ = worker.await;
+    }
+
+    /// `try_serve` has no runtime, so the scope check is refused by name as well.
+    #[tokio::test]
+    async fn try_serve_refuses_the_scope_check_without_a_runtime() {
+        let request = StoreRequest::CheckSecretScope {
+            project: ids::PROJECT_VULKAN,
+        };
+        match serve(&demo(), &request).await {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "check_secret_scope");
+                assert_eq!(message, "no agent runtime in this build");
+            }
+            other => panic!("a check with no runtime is refused, not served: {other:?}"),
+        }
     }
 }

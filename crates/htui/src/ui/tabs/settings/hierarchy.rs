@@ -979,6 +979,7 @@ impl HierarchySection {
                         slug: Some(editor.text(0)),
                         name: Some(editor.text(1)),
                         description: Some(editor.text(2)),
+                        secret: None,
                     },
                 }
             }
@@ -1373,6 +1374,16 @@ impl SettingsSection for HierarchySection {
                     ctx.emit(Action::SetScope {
                         workspace: first.clone(),
                     });
+                }
+            }
+            // MOD-10 M4 (blueprint A-1): the Secrets section's scope write. The tree is adopted so
+            // the tokens stay current; nothing else here is this section's — no `busy`, no
+            // editor, no notice, no scope follow.
+            // R1 L-3: the Secrets section's own tree read, adopted the same way.
+            StoreReply::SecretScopeWritten { tree, .. } | StoreReply::SecretsTree(Some(tree)) => {
+                if tree.workspace.id == ctx.scope.workspace_id {
+                    self.snapshot = Some((**tree).clone());
+                    self.clamp_cursor();
                 }
             }
             // MOD-49: a listing, or its refusal, for the open picker (blueprint D2, B-3). The

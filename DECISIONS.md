@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-10](docs/decisions/mod/mod-10.md)** - Secret provider (done, 2026-10-07)
 - **[MOD-78](docs/decisions/mod/mod-78.md)** - `command_run` lifecycle: lease check and cancel on session end (done, 2026-10-07)
 - **[MOD-70](docs/decisions/mod/mod-70.md)** - Follow-up command rows for engine steps (done, 2026-10-07)
 - **[MOD-79](docs/decisions/mod/mod-79.md)** - MCP token off claude's argv (done, 2026-10-06)

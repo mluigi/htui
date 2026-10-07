@@ -7,7 +7,9 @@
 //! what it was built from changed, so its login latch and cool-down (MOD-10 M2 D5) survive from
 //! one walk to the next.
 
-use std::sync::Arc;
+use std::cell::Cell;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use htui_core::secret::{MachineIdentity, SecretError, SecretFuture, SecretProvider, SecretSource};
 use sha2::{Digest as _, Sha256};
@@ -26,6 +28,60 @@ pub(crate) const KEYRING_SILENT: &str = "the OS keyring did not answer";
 /// enough for a human to answer an OS unlock prompt; past it the walk or chat is refused with
 /// [`KEYRING_SILENT`] and the next one asks again.
 pub(crate) const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// MOD-10 M4 (blueprint A-4): how many keyring writes `Settings > Secrets` has made in this
+/// process. A provider is reused only while this is unchanged, so entering the identity again —
+/// even the same one — gives the next walk, chat or check a fresh provider without the old
+/// one's login latch (M2 D5).
+static KEYRING_WRITES: AtomicU64 = AtomicU64::new(0);
+
+/// Called by `secrets_settings` after every successful URL or identity write or clear, with
+/// [`keyring_io`] still held. The generation the write made.
+pub(crate) fn note_keyring_write() -> u64 {
+    KEYRING_WRITES.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+/// MOD-10 M4 R1 L-2: serialises this process's keyring I/O. The identity is two keyring entries,
+/// written one after the other and read one after the other, so a read between the two writes of
+/// a Settings identity write would pair the new client ID with the old secret (or the reverse)
+/// and spend a login on it. [`KeyringInfisical::read_keyring`] reads both halves, and every
+/// Settings keyring write writes and calls [`note_keyring_write`], under this lock. Another
+/// process (`htui worker`) is not covered.
+///
+/// Held on blocking threads only. A read waiting on an OS unlock prompt holds it, so a Settings
+/// write waits for that prompt too: the loop stall H-7 already accepts.
+static KEYRING_IO: Mutex<()> = Mutex::new(());
+
+/// [`KEYRING_IO`], taken on a blocking thread. A poisoned lock guards no data, so it is taken
+/// anyway.
+pub(crate) fn keyring_io() -> MutexGuard<'static, ()> {
+    KEYRING_IO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+tokio::task_local! {
+    /// [`provider_with_generation`]'s slot: [`KeyringInfisical::current`] stores the generation
+    /// it built or reused its provider at.
+    static PROVIDER_GENERATION: Cell<u64>;
+}
+
+/// MOD-10 M4 R1 L-1: `source.provider()`, and the keyring-write generation that provider was
+/// built at ([`KeyringInfisical`]'s own; for any other source, the generation when the call
+/// started). The provider check reports it, so `Settings > Secrets` tells whether a landed write
+/// replaced the provider the check latched from the generations rather than from reply order: the
+/// check runs in a spawned task, and can wait on a walk's keyring read and build after a write
+/// sent later.
+pub(crate) async fn provider_with_generation(
+    source: &dyn SecretSource,
+) -> (u64, Result<Arc<dyn SecretProvider>, SecretError>) {
+    PROVIDER_GENERATION
+        .scope(Cell::new(KEYRING_WRITES.load(Ordering::SeqCst)), async {
+            let provider = source.provider().await;
+            (PROVIDER_GENERATION.with(Cell::get), provider)
+        })
+        .await
+}
 
 /// A keyring failure, as `Config`. `htui_store::secret`'s messages name slots, never values
 /// (`get_machine_identity`'s half-identity sentence included).
@@ -56,6 +112,8 @@ pub struct KeyringInfisical {
 /// The provider and what it was built from. The client secret is kept only as a SHA-256 digest
 /// to compare; the provider holds the identity itself.
 struct Cached {
+    /// [`KEYRING_WRITES`] as read before the keyring read this provider was built from.
+    generation: u64,
     url: String,
     client_id: String,
     secret_digest: [u8; 32],
@@ -64,9 +122,18 @@ struct Cached {
 
 impl Cached {
     /// Whether this provider was built from `url` and an identity with `client_id` and
-    /// `secret_digest`.
-    fn built_from(&self, url: &str, client_id: &str, secret_digest: &[u8; 32]) -> bool {
-        self.url == url && self.client_id == client_id && &self.secret_digest == secret_digest
+    /// `secret_digest`, with no Settings keyring write since (`generation`, blueprint A-4).
+    fn built_from(
+        &self,
+        generation: u64,
+        url: &str,
+        client_id: &str,
+        secret_digest: &[u8; 32],
+    ) -> bool {
+        self.generation == generation
+            && self.url == url
+            && self.client_id == client_id
+            && &self.secret_digest == secret_digest
     }
 }
 
@@ -106,9 +173,10 @@ impl KeyringInfisical {
         }
     }
 
-    /// The normalised URL and the identity the keyring holds now. Synchronous keyring I/O: run on
-    /// a blocking thread (`R-NF-3`).
+    /// The normalised URL and the identity the keyring holds now, under [`keyring_io`] (R1 L-2: never
+    /// half of a Settings write). Synchronous keyring I/O: run on a blocking thread (`R-NF-3`).
     fn read_keyring() -> Result<(String, MachineIdentity), SecretError> {
+        let _io = keyring_io();
         let raw = htui_store::secret::get_infisical_url()
             .map_err(|err| keyring_unreadable(&err))?
             .ok_or_else(|| SecretError::Config(NO_URL.to_owned()))?;
@@ -121,6 +189,11 @@ impl KeyringInfisical {
 
     async fn current(&self) -> Result<Arc<dyn SecretProvider>, SecretError> {
         let mut cached = self.cached.lock().await;
+        // Before the read (blueprint A-4): a write that lands during it forces one more rebuild
+        // next time, never one too few.
+        let generation = KEYRING_WRITES.load(Ordering::SeqCst);
+        // R1 L-1: the provider handed out below, cached or built, is this generation's.
+        let _ = PROVIDER_GENERATION.try_with(|at| at.set(generation));
         let read = Arc::clone(&self.read);
         // R1 M2: the lock stays held across the read (two walks must not stack OS unlock
         // prompts), so the read is bounded. A blocking thread cannot be cancelled: one that
@@ -132,13 +205,14 @@ impl KeyringInfisical {
                 .map_err(|_| SecretError::Config(KEYRING_UNFINISHED.to_owned()))??;
         let digest: [u8; 32] = Sha256::digest(identity.client_secret().as_bytes()).into();
         if let Some(held) = cached.as_ref()
-            && held.built_from(&url, identity.client_id(), &digest)
+            && held.built_from(generation, &url, identity.client_id(), &digest)
         {
             return Ok(Arc::clone(&held.provider));
         }
         let client_id = identity.client_id().to_owned();
         let provider = (self.build)(&url, identity)?;
         *cached = Some(Cached {
+            generation,
             url,
             client_id,
             secret_digest: digest,
@@ -176,7 +250,7 @@ impl SecretSource for KeyringInfisical {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::AtomicUsize;
 
     use htui_core::fixtures::ids;
     use htui_core::model::Project;
@@ -420,6 +494,119 @@ mod tests {
         assert_eq!(builds.count(), 1, "one provider served both walks");
     }
 
+    /// M4 blueprint A-4: re-entering the **same** identity after a refused login (an
+    /// `IdentityLocked`, or a fix on the server with an unchanged secret) changes none of the URL,
+    /// the client ID or the secret digest; the Settings write's generation alone gives the next
+    /// call a fresh provider without the latch.
+    #[tokio::test]
+    async fn entering_the_same_identity_again_rebuilds_a_latched_provider() {
+        let _guard = mock_keyring().await;
+        store_url(URL);
+        store_identity(CLIENT_ID, CLIENT_SECRET);
+        let (source, builds) = counting(|| {
+            FakeSecretProvider::new([
+                Err(SecretError::BadCredentials),
+                Err(SecretError::LoginRefusedEarlier),
+            ])
+        });
+        let first = source.provider().await.expect("a provider");
+
+        store_identity(CLIENT_ID, CLIENT_SECRET);
+        note_keyring_write();
+        let second = source.provider().await.expect("a provider");
+
+        assert_eq!(
+            builds.count(),
+            2,
+            "the same identity, written again, rebuilds"
+        );
+        assert!(!Arc::ptr_eq(&first, &second));
+        let third = source.provider().await.expect("a provider");
+        assert!(Arc::ptr_eq(&second, &third), "and the new one is kept");
+    }
+
+    /// An offline backend over a throwaway mirror: not `Memory`, so `secrets_settings::serve`
+    /// writes the keyring rather than refusing a demo session.
+    async fn offline() -> (tempfile::TempDir, htui_store::Backend) {
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = htui_store::CacheStore::open(root.path(), "secrets-generation", 1)
+            .await
+            .expect("open a throwaway mirror");
+        (root, htui_store::Backend::Offline { cache, since: None })
+    }
+
+    /// Serves `request` through the Settings > Secrets worker arm and expects its own answer.
+    async fn serve_write(
+        backend: &htui_store::Backend,
+        request: crate::store_worker::StoreRequest,
+    ) {
+        let reply = crate::secrets_settings::serve(backend, &request)
+            .await
+            .expect("the write is served");
+        assert!(
+            matches!(
+                reply,
+                crate::store_worker::StoreReply::SecretsWritten { request: named, .. }
+                    if named == request.name()
+            ),
+            "the write lands: {reply:?}"
+        );
+    }
+
+    /// M4 blueprint A-4 end to end: the Settings writes themselves, served through
+    /// `secrets_settings::serve`, give the next `provider()` a fresh provider even when they store
+    /// the very URL and identity the latched one was built from; a refused write does not.
+    #[tokio::test]
+    async fn a_settings_keyring_write_rebuilds_a_latched_provider() {
+        use crate::secrets_settings::{IdentityEntry, Redacted};
+        use crate::store_worker::StoreRequest;
+
+        let _guard = mock_keyring().await;
+        store_url(URL);
+        store_identity(CLIENT_ID, CLIENT_SECRET);
+        let (_root, backend) = offline().await;
+        let (source, builds) = counting(|| {
+            FakeSecretProvider::new([
+                Err(SecretError::BadCredentials),
+                Err(SecretError::LoginRefusedEarlier),
+            ])
+        });
+        let first = source.provider().await.expect("a provider");
+
+        let same_identity = || {
+            IdentityEntry::new(
+                CLIENT_ID.to_owned(),
+                Redacted::new(CLIENT_SECRET.to_owned()),
+            )
+        };
+        serve_write(&backend, StoreRequest::SetMachineIdentity(same_identity())).await;
+        let second = source.provider().await.expect("a provider");
+        assert_eq!(
+            builds.count(),
+            2,
+            "the same identity, saved again, rebuilds"
+        );
+        assert!(!Arc::ptr_eq(&first, &second));
+
+        serve_write(&backend, StoreRequest::SetInfisicalUrl(URL.to_owned())).await;
+        let third = source.provider().await.expect("a provider");
+        assert_eq!(builds.count(), 3, "the same URL, saved again, rebuilds");
+        assert!(!Arc::ptr_eq(&second, &third));
+
+        let blank = IdentityEntry::new(CLIENT_ID.to_owned(), Redacted::new(String::new()));
+        let refused =
+            crate::secrets_settings::serve(&backend, &StoreRequest::SetMachineIdentity(blank))
+                .await
+                .expect("a refusal is a reply");
+        assert!(
+            matches!(refused, crate::store_worker::StoreReply::Failed { .. }),
+            "a blank half is refused: {refused:?}"
+        );
+        let fourth = source.provider().await.expect("a provider");
+        assert_eq!(builds.count(), 3, "a refused write keeps the provider");
+        assert!(Arc::ptr_eq(&third, &fourth));
+    }
+
     /// R1 M2: a keyring read that never answers (an OS unlock prompt nobody answers) refuses
     /// the walk after [`KEYRING_TIMEOUT`] and gives the lock back; the blocking read itself
     /// cannot be cancelled and is released here only so the test does not leak its thread.
@@ -466,6 +653,162 @@ mod tests {
         release
             .send(())
             .expect("the blocking read is still waiting");
+    }
+
+    /// Takes [`keyring_io`] on a thread of its own, as a Settings write in progress does, until
+    /// the returned sender is sent to or dropped.
+    fn hold_keyring_io() -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (taken, is_taken) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            let _io = keyring_io();
+            taken.send(()).expect("the test waits for the lock");
+            let _ = released.recv();
+        });
+        is_taken.recv().expect("the holder takes the lock");
+        (release, holder)
+    }
+
+    /// Whether `task` is still running after a while of real time.
+    async fn still_waiting<T>(task: &tokio::task::JoinHandle<T>) -> bool {
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        !task.is_finished()
+    }
+
+    /// R1 L-2: the keyring read waits for a Settings write in progress, so it never pairs one
+    /// half of the identity it wrote with the other half it replaced.
+    #[tokio::test]
+    async fn a_keyring_read_waits_for_a_settings_write_in_progress() {
+        let _guard = mock_keyring().await;
+        store_url(URL);
+        store_identity(CLIENT_ID, CLIENT_SECRET);
+        let (source, builds) = counting(resolving);
+        let source = Arc::new(source);
+        let (release, holder) = hold_keyring_io();
+        let asking = Arc::clone(&source);
+        let call = tokio::spawn(async move { asking.provider().await.map(|_| ()) });
+        assert!(still_waiting(&call).await, "the read waits for the write");
+        assert_eq!(builds.count(), 0);
+
+        release.send(()).expect("the holder waits");
+        holder.join().expect("the holder does not panic");
+        call.await
+            .expect("the call does not panic")
+            .expect("a provider");
+        assert_eq!(builds.count(), 1);
+    }
+
+    /// What the keyring holds now, read past [`keyring_io`]: the URL, and whether an identity.
+    fn keyring_now() -> (Option<String>, bool) {
+        (
+            htui_store::secret::get_infisical_url().expect("the fake keyring answers"),
+            htui_store::secret::get_machine_identity()
+                .expect("the fake keyring answers")
+                .is_some(),
+        )
+    }
+
+    /// R1 L-2: every Settings keyring write, and its generation, waits for a keyring read in
+    /// progress.
+    #[tokio::test]
+    async fn a_settings_keyring_write_waits_for_a_keyring_read_in_progress() {
+        use crate::secrets_settings::{IdentityEntry, Redacted};
+        use crate::store_worker::StoreRequest;
+
+        let _guard = mock_keyring().await;
+        let (_root, backend) = offline().await;
+        let backend = Arc::new(backend);
+        let identity = || {
+            IdentityEntry::new(
+                CLIENT_ID.to_owned(),
+                Redacted::new(CLIENT_SECRET.to_owned()),
+            )
+        };
+        for request in [
+            StoreRequest::SetInfisicalUrl(URL.to_owned()),
+            StoreRequest::ClearInfisicalUrl,
+            StoreRequest::SetMachineIdentity(identity()),
+            StoreRequest::ClearMachineIdentity,
+        ] {
+            let name = request.name();
+            let before = (keyring_now(), KEYRING_WRITES.load(Ordering::SeqCst));
+            let (release, holder) = hold_keyring_io();
+            let serving = Arc::clone(&backend);
+            let write = tokio::spawn(async move { serve_write(&serving, request).await });
+            assert!(still_waiting(&write).await, "{name} waits for the read");
+            assert_eq!(
+                (keyring_now(), KEYRING_WRITES.load(Ordering::SeqCst)),
+                before,
+                "{name} has written nothing yet"
+            );
+            release.send(()).expect("the holder waits");
+            holder.join().expect("the holder does not panic");
+            write.await.expect("the write lands");
+            assert_ne!(keyring_now(), before.0, "{name} wrote");
+        }
+    }
+
+    /// R1 L-1: a provider check that waits on a walk's keyring read, while a Settings write
+    /// lands, builds after that write; it learns the write's generation, the one its provider was
+    /// built at, not the one when it started.
+    #[tokio::test]
+    async fn the_check_learns_the_generation_its_provider_was_built_at() {
+        // No keyring here: the guard only keeps the other generation bumps out.
+        let _guard = mock_keyring().await;
+        let started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let held = Mutex::new(Some(held));
+        let seen = Arc::clone(&started);
+        let builds = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&builds);
+        let source = Arc::new(KeyringInfisical::with_parts(
+            Box::new(move |_url, _identity| {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Ok(Arc::new(resolving()) as Arc<dyn SecretProvider>)
+            }),
+            Arc::new(move || {
+                seen.store(true, Ordering::SeqCst);
+                // The walk's read waits for the test; the check's answers at once.
+                let first = held
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .take();
+                if let Some(first) = first {
+                    let _ = first.recv();
+                }
+                Ok((
+                    URL.to_owned(),
+                    MachineIdentity::new(CLIENT_ID, CLIENT_SECRET),
+                ))
+            }),
+        ));
+        let walking = Arc::clone(&source);
+        let walk = tokio::spawn(async move { walking.provider().await.map(|_| ()) });
+        while !started.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
+        let checking = Arc::clone(&source);
+        let check = tokio::spawn(async move {
+            let (generation, provider) = provider_with_generation(checking.as_ref()).await;
+            (generation, provider.map(|_| ()))
+        });
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!check.is_finished(), "the check waits on the walk's read");
+
+        let written = note_keyring_write();
+        release.send(()).expect("the walk's read waits");
+        walk.await
+            .expect("the walk does not panic")
+            .expect("a provider");
+        let (generation, built) = check.await.expect("the check does not panic");
+        built.expect("a provider");
+        assert_eq!(
+            generation, written,
+            "built after the write, at its generation"
+        );
+        assert_eq!(builds.load(Ordering::SeqCst), 2, "the check rebuilt");
     }
 
     #[tokio::test]

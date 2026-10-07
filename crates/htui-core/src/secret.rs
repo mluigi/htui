@@ -38,14 +38,17 @@ pub trait SecretProvider: Send + Sync + core::fmt::Debug {
 
 /// Which secrets a project reads: an Infisical project, environment slug and folder path (D3).
 /// Stored in `project.secret_scope` as compact JSON (`to_column`); M4 writes it, M3 reads it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Its serde form is that column, and deserialising runs [`Self::new`]'s checks (MOD-10 M4 D7).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "ScopeColumn", into = "ScopeColumn")]
 pub struct SecretScope {
     project_id: String,
     environment: String,
     path: String,
 }
 
-/// The column's JSON, field for field. Private: only `parse`/`to_column` touch it.
+/// The column's JSON, field for field. Private: only `parse`, `to_column` and
+/// [`SecretScope`]'s serde touch it.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeColumn {
@@ -57,6 +60,25 @@ struct ScopeColumn {
 
 fn root_path() -> String {
     "/".to_owned()
+}
+
+impl TryFrom<ScopeColumn> for SecretScope {
+    type Error = SecretError;
+
+    /// [`SecretScope::new`]'s checks: deserialising validates (MOD-10 M4 D7).
+    fn try_from(column: ScopeColumn) -> Result<Self, SecretError> {
+        Self::new(column.project_id, column.environment, column.path)
+    }
+}
+
+impl From<SecretScope> for ScopeColumn {
+    fn from(scope: SecretScope) -> Self {
+        Self {
+            project_id: scope.project_id,
+            environment: scope.environment,
+            path: scope.path,
+        }
+    }
 }
 
 impl SecretScope {
@@ -130,7 +152,7 @@ impl SecretScope {
                 .collect();
             SecretError::Config(format!("the secret scope is not valid: {detail}"))
         })?;
-        Self::new(parsed.project_id, parsed.environment, parsed.path)
+        Self::try_from(parsed)
     }
 
     /// The column text: `{"project_id":"…","environment":"…","path":"…"}`, compact, in that key
@@ -139,12 +161,8 @@ impl SecretScope {
     pub fn to_column(&self) -> String {
         // A derived struct keeps its field order whatever `serde_json/preserve_order`
         // unification does; a `json!` map would not.
-        serde_json::to_string(&ScopeColumn {
-            project_id: self.project_id.clone(),
-            environment: self.environment.clone(),
-            path: self.path.clone(),
-        })
-        .expect("a struct of three strings always serialises")
+        serde_json::to_string(&ScopeColumn::from(self.clone()))
+            .expect("a struct of three strings always serialises")
     }
 
     /// The Infisical project ID.
@@ -792,6 +810,55 @@ mod tests {
         let scope = SecretScope::new("p1", "dev", "/").expect("valid scope");
         assert_eq!(
             scope.to_column(),
+            r#"{"project_id":"p1","environment":"dev","path":"/"}"#
+        );
+    }
+
+    /// MOD-10 M4 D7: a scope's serde form is its column, both ways.
+    #[test]
+    fn a_scope_serialises_as_its_column() {
+        let scope = SecretScope::new("p1", "dev", "/app/api").expect("valid scope");
+        assert_eq!(
+            serde_json::to_string(&scope).expect("a scope serialises"),
+            scope.to_column()
+        );
+        let back: SecretScope =
+            serde_json::from_str(&scope.to_column()).expect("the column deserialises");
+        assert_eq!(back, scope);
+    }
+
+    /// MOD-10 M4 D7: deserialising runs [`SecretScope::new`]'s checks, so no invalid scope can be
+    /// built through serde.
+    #[test]
+    fn deserialising_a_scope_validates_it() {
+        let empty = serde_json::from_str::<SecretScope>(r#"{"project_id":"","environment":"dev"}"#)
+            .expect_err("an empty project_id is refused");
+        assert!(
+            empty.to_string().contains("empty project_id"),
+            "unexpected error: {empty}"
+        );
+        let relative = serde_json::from_str::<SecretScope>(
+            r#"{"project_id":"p","environment":"dev","path":"x"}"#,
+        )
+        .expect_err("a relative path is refused");
+        assert!(
+            relative.to_string().contains("must start with"),
+            "unexpected error: {relative}"
+        );
+        serde_json::from_str::<SecretScope>(r#"{"project_id":"p","environment":"dev","extra":1}"#)
+            .expect_err("an unknown field is refused");
+        let rooted: SecretScope = serde_json::from_str(r#"{"project_id":"p","environment":"dev"}"#)
+            .expect("path is optional");
+        assert_eq!(rooted.path(), "/");
+    }
+
+    /// The bytes M3 reads from `project.secret_scope` do not move with the serde derive.
+    #[test]
+    fn to_column_is_unchanged() {
+        assert_eq!(
+            SecretScope::new("p1", "dev", "/")
+                .expect("valid scope")
+                .to_column(),
             r#"{"project_id":"p1","environment":"dev","path":"/"}"#
         );
     }

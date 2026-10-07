@@ -42,6 +42,7 @@ use crate::model::{
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
+use crate::secret::{INFISICAL, SecretScope, project_scope};
 use crate::store::error::StoreError;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
@@ -84,6 +85,7 @@ pub const CASES: &[&str] = &[
     "workspace_links_and_box_paths_upsert",
     "workspace_delete_reports_its_reach",
     "project_create_update_cas",
+    "project_secret_columns_set_clear_cas",
     "project_delete_takes_everything_and_says_so",
     "repo_round_trip_and_primary_flag",
     "item_kind_round_trip_and_prefix_rules",
@@ -263,6 +265,9 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         }
         "workspace_delete_reports_its_reach" => workspace_delete_reports_its_reach(store).await,
         "project_create_update_cas" => project_create_update_cas(store).await,
+        "project_secret_columns_set_clear_cas" => {
+            project_secret_columns_set_clear_cas(store).await;
+        }
         "project_delete_takes_everything_and_says_so" => {
             project_delete_takes_everything_and_says_so(store).await;
         }
@@ -3065,6 +3070,137 @@ async fn project_create_update_cas<S: WriteStore>(store: &S) {
             })
         ),
         "{CASE}: an unknown id is NotFound, got {unknown:?}"
+    );
+}
+
+/// MOD-10 M4 D7: [`ProjectPatch::secret`] writes `project.secret_provider` and
+/// `project.secret_scope` together under the same compare-and-set as the other columns: set,
+/// keep, a stale token, clear.
+async fn project_secret_columns_set_clear_cas<S: WriteStore>(store: &S) {
+    const CASE: &str = "project_secret_columns_set_clear_cas";
+    let columns =
+        |row: &crate::model::Project| (row.secret_provider.clone(), row.secret_scope.clone());
+    let scope = SecretScope::new("p-vault", "dev", "/ops").expect(CASE);
+    let other = SecretScope::new("p-other", "prod", "/").expect(CASE);
+    let created = store
+        .create_project(new_project("vault-ops"))
+        .await
+        .expect(CASE);
+
+    let set = applied(
+        CASE,
+        store
+            .update_project(
+                created.id,
+                created.updated_at,
+                ProjectPatch {
+                    secret: Some(Some(scope.clone())),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        columns(&set),
+        (Some(INFISICAL.to_owned()), Some(scope.to_column())),
+        "{CASE}: Some(Some(scope)) writes the provider and the scope's column"
+    );
+    assert_eq!(
+        project_scope(&set),
+        Ok(Some(scope.clone())),
+        "{CASE}: M3's reader reads back the scope written"
+    );
+    assert_eq!(
+        (&set.slug, &set.name, &set.description, &set.settings),
+        (
+            &created.slug,
+            &created.name,
+            &created.description,
+            &created.settings
+        ),
+        "{CASE}: a secret-only patch keeps every other column"
+    );
+    assert!(
+        set.updated_at > created.updated_at,
+        "{CASE}: a secret write advances the token"
+    );
+
+    let renamed = applied(
+        CASE,
+        store
+            .update_project(
+                set.id,
+                set.updated_at,
+                ProjectPatch {
+                    name: Some("Vault Ops".to_owned()),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(renamed.name, "Vault Ops", "{CASE}: the name patch applied");
+    assert_eq!(
+        columns(&renamed),
+        columns(&set),
+        "{CASE}: `secret: None` keeps both columns"
+    );
+
+    let current = stale(
+        CASE,
+        store
+            .update_project(
+                set.id,
+                set.updated_at,
+                ProjectPatch {
+                    secret: Some(Some(other)),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        current, renamed,
+        "{CASE}: Stale carries the row as it is now"
+    );
+    let read_back = store.project(set.id).await.expect(CASE).expect(CASE);
+    assert_eq!(
+        columns(&read_back),
+        columns(&set),
+        "{CASE}: a stale secret write changes nothing"
+    );
+
+    let cleared = applied(
+        CASE,
+        store
+            .update_project(
+                renamed.id,
+                renamed.updated_at,
+                ProjectPatch {
+                    secret: Some(None),
+                    ..ProjectPatch::default()
+                },
+            )
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        columns(&cleared),
+        (None, None),
+        "{CASE}: Some(None) clears both columns"
+    );
+    assert_eq!(
+        store.project(cleared.id).await.expect(CASE).as_ref(),
+        Some(&cleared),
+        "{CASE}: the read-back is the cleared row"
+    );
+
+    assert_eq!(
+        ProjectPatch::default().secret,
+        None,
+        "{CASE}: a default patch keeps the secret columns"
     );
 }
 

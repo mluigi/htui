@@ -12,8 +12,8 @@ use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
-    PersonasSection, PromptSection, QdrantSection, SectionId, SettingsSection, SettingsTab,
-    message,
+    PersonasSection, PromptSection, QdrantSection, SecretsSection, SectionId, SettingsSection,
+    SettingsTab, message,
 };
 use htui::ui::text_field::PASTE_DOES_NOT_FIT;
 use htui_agent::acp::Handshake;
@@ -1081,11 +1081,12 @@ async fn a_bracketed_paste_under_a_modal_overlay_reaches_no_field() {
 /// fixture: the moment a section makes the strip 101 columns wide this fails, and that is the one
 /// warning a snapshot of a clipped strip could not give.
 ///
-/// The seventh section is MOD-7 milestone 2's `Boxes` (D47) and the eighth MOD-26 milestone 2's
-/// `Personas` (D22), each appended last as `register_all` appends it. The eight (`Agents`,
-/// `Hierarchy`, `Kinds`, `Prompt`, `Connection`, `Qdrant`, `Boxes`, `Personas`) cost 71 of the 100
-/// columns, so the pin is re-run rather than relaxed — if a ninth ever does not fit, the fix is
-/// the strip's, not a shorter title.
+/// The seventh section is MOD-7 milestone 2's `Boxes` (D47), the eighth MOD-26 milestone 2's
+/// `Personas` (D22) and the ninth MOD-10 milestone 4's `Secrets` (D1), each appended last as
+/// `register_all` appends it. The nine (`Agents`, `Hierarchy`, `Kinds`, `Prompt`, `Connection`,
+/// `Qdrant`, `Boxes`, `Personas`, `Secrets`) cost 80 of the 100 columns, so the pin is re-run
+/// rather than relaxed — if a tenth ever does not fit, the fix is the strip's, not a shorter
+/// title.
 #[test]
 fn the_section_strip_fits_the_frame() {
     let sections: Vec<Box<dyn SettingsSection>> = vec![
@@ -1097,8 +1098,9 @@ fn the_section_strip_fits_the_frame() {
         Box::new(QdrantSection::new()),
         Box::new(BoxesSection::new()),
         Box::new(PersonasSection::new()),
+        Box::new(SecretsSection::new()),
     ];
-    assert_eq!(sections.len(), 8);
+    assert_eq!(sections.len(), 9);
     let width: usize = sections
         .iter()
         .map(|section| section.title().chars().count() + 2)
@@ -5671,6 +5673,36 @@ async fn a_qdrant_write_in_flight_refuses_e_and_c_but_not_r() {
         matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
         "one read, with a write still out"
     );
+}
+
+/// MOD-10 M4 R1 L-5: Enter on an empty key field, or one holding only spaces, leaves the stored key
+/// alone and says so, as the URL row does; removing the key stays on `c`, behind its question.
+#[tokio::test]
+async fn an_empty_qdrant_key_submit_sends_nothing() {
+    let bench = SectionBench::new().await;
+    for typed in ["", "   "] {
+        let mut section = QdrantSection::new();
+        bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+        let _ = bench.drained();
+
+        bench.key(&mut section, "j");
+        assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+        if !typed.is_empty() {
+            assert_eq!(bench.paste(&mut section, typed), Handled::Consumed);
+        }
+        assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+
+        assert!(
+            requests_of(&bench).is_empty(),
+            "{typed:?} sends no key write"
+        );
+        assert!(!section.captures_input(), "{typed:?} closes the field");
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(
+            rendered.contains("nothing typed; the stored API key is unchanged"),
+            "{typed:?}: {rendered}"
+        );
+    }
 }
 
 /// A reload sent just before a write lands first; it answers the reload, so the section never

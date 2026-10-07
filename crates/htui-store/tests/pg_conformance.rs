@@ -29,15 +29,16 @@ use htui_store::testkit as common;
 /// make it 142, and MOD-11 T8's four command-queue cases (plan D14) make it 146, and MOD-69's two waiting-list
 /// cases (plan D2, D4) make it 148, MOD-70 T0's nine follow-up cases (plan D1-D5, D9) make it 157
 /// and MOD-78's `lease_holds` case (plan D1, D2) makes it 158.
-const EXPECTED_CASES: usize = 158;
+/// and MOD-10 M4's secret-column case (plan D7) makes it 159.
+const EXPECTED_CASES: usize = 159;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (158 since MOD-70 T0's nine \
-         follow-up cases and MOD-78's `lease_holds` case)"
+        "every conformance case must run against PgStore too (159 since MOD-70 T0's nine \
+         follow-up cases, MOD-78's `lease_holds` case and MOD-10 M4's secret-column case)"
     );
 }
 

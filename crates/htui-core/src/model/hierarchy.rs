@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::ids::{BoxId, ProjectId, RepoId, UserId, WorkspaceId};
+use crate::secret::SecretScope;
 
 /// A row of `workspace` (§5.3): the scope the TUI is always inside (plan D10).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -106,6 +107,11 @@ pub struct ProjectPatch {
     pub name: Option<String>,
     /// `project.description`.
     pub description: Option<String>,
+    /// `project.secret_provider` and `project.secret_scope`, written together (MOD-10 M4 D7):
+    /// `None` keeps both, `Some(None)` clears both, `Some(Some(scope))` writes provider
+    /// [`INFISICAL`](crate::secret::INFISICAL) and `scope.to_column()`. A provider without a scope
+    /// cannot be stored through this field.
+    pub secret: Option<Option<SecretScope>>,
 }
 
 /// A row of `workspace_project` (§5.3): a project's membership and order inside a workspace.

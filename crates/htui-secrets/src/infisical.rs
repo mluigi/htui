@@ -601,7 +601,9 @@ fn map_list_status(
 ///
 /// # Errors
 ///
-/// [`SecretError::Config`], naming the reason. Never echoes the raw input.
+/// [`SecretError::Config`], naming the reason in a fixed sentence: no part of the input (scheme,
+/// host, user name or password) is echoed. A parse failure carries [`url::ParseError`]'s own text,
+/// which is fixed too.
 pub fn normalise_base_url(raw: &str) -> Result<String, SecretError> {
     parse_base(raw).map(|(base, _)| base)
 }
@@ -628,9 +630,7 @@ fn parse_base(raw: &str) -> Result<(String, bool), SecretError> {
     })?;
     let scheme = url.scheme();
     if scheme != "https" && scheme != "http" {
-        return Err(config(format!(
-            "the Infisical base URL must use https (got {scheme})"
-        )));
+        return Err(config("the Infisical base URL must use https".to_owned()));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err(config(
@@ -644,11 +644,11 @@ fn parse_base(raw: &str) -> Result<(String, bool), SecretError> {
     }
     let loopback = url.host().is_some_and(|h| is_loopback(&h));
     if scheme == "http" && !loopback {
-        let host = url.host_str().unwrap_or_default();
-        return Err(config(format!(
+        return Err(config(
             "the Infisical base URL must use https unless its host is loopback: the client \
-             secret would cross the network in plain text to {host}"
-        )));
+             secret would cross the network in plain text"
+                .to_owned(),
+        ));
     }
     let path = url.path().trim_end_matches('/');
     let prefix = path
@@ -964,12 +964,12 @@ mod tests {
             ("", "empty"),
             ("   ", "empty"),
             ("app.infisical.com", "absolute"),
-            ("ftp://example.com", "https (got ftp)"),
+            ("ftp://example.com", "must use https"),
             ("https://user:pw@example.com", "user name"),
             ("https://example.com/?x=1", "query"),
             ("https://example.com/#f", "query"),
-            ("http://192.168.1.10", "plain text to 192.168.1.10"),
-            ("http://infisical.lan", "plain text to infisical.lan"),
+            ("http://192.168.1.10", "plain text"),
+            ("http://infisical.lan", "plain text"),
             ("http://localhost.", "plain text"),
             ("http://0.0.0.0", "plain text"),
         ];
@@ -986,6 +986,29 @@ mod tests {
             panic!("userinfo must be refused");
         };
         assert!(!why.contains("pw"), "the refusal echoes the password");
+    }
+
+    /// The refusal reaches the Settings notice and the stored-URL row, so it is a fixed sentence:
+    /// no part of the input (a scheme that may be a pasted client ID, a host) comes back.
+    #[test]
+    fn a_refused_base_url_never_echoes_its_input() {
+        let rows = [
+            ("cid:s3cret", ["cid", "s3cret"]),
+            ("ftp://files.example", ["ftp", "files.example"]),
+            ("http://secret-host.example", ["secret-host", "example"]),
+            ("http://192.168.1.10", ["192.168", "1.10"]),
+        ];
+        for (input, fragments) in rows {
+            let Err(SecretError::Config(why)) = normalise_base_url(input) else {
+                panic!("input {input:?}: expected Config");
+            };
+            for fragment in fragments {
+                assert!(
+                    !why.contains(fragment),
+                    "input {input:?}: the refusal echoes {fragment:?}: {why}"
+                );
+            }
+        }
     }
 
     #[test]

@@ -2449,6 +2449,7 @@ impl WriteStore for PgStore {
     /// The compare-and-set of D3 over the three text columns. `settings` is **not** in the `SET`
     /// list: the key-level merge of [`set_setting`](WriteStore::set_setting) is that column's one
     /// writer, so an edit of the name cannot silently drop MOD-4's or MOD-12's keys (D8).
+    /// `secret` writes both secret columns in this statement (MOD-10 M4 D7).
     ///
     /// # Errors
     ///
@@ -2460,13 +2461,24 @@ impl WriteStore for PgStore {
         expected: DateTime<Utc>,
         patch: ProjectPatch,
     ) -> Result<CasOutcome<Project>> {
+        let (secret_set, secret_provider, secret_scope) = match &patch.secret {
+            None => (false, None, None),
+            Some(None) => (true, None, None),
+            Some(Some(scope)) => (
+                true,
+                Some(htui_core::secret::INFISICAL),
+                Some(scope.to_column()),
+            ),
+        };
         let updated = sqlx::query_as!(
             Project,
             r#"
             UPDATE project SET
-                slug        = COALESCE($3, slug),
-                name        = COALESCE($4, name),
-                description = COALESCE($5, description)
+                slug            = COALESCE($3, slug),
+                name            = COALESCE($4, name),
+                description     = COALESCE($5, description),
+                secret_provider = CASE WHEN $6 THEN $7 ELSE secret_provider END,
+                secret_scope    = CASE WHEN $6 THEN $8 ELSE secret_scope END
              WHERE id = $1 AND updated_at = $2
             RETURNING id              AS "id: ProjectId",
                       slug,
@@ -2484,6 +2496,9 @@ impl WriteStore for PgStore {
             patch.slug,
             patch.name,
             patch.description,
+            secret_set,
+            secret_provider,
+            secret_scope,
         )
         .fetch_optional(&self.pool)
         .await

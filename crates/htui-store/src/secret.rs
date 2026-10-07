@@ -465,11 +465,15 @@ pub fn clear_infisical_url() -> Result<()> {
     remove_slot(INFISICAL_URL_USER)
 }
 
+/// How the error for a half-stored identity starts (MOD-10 M4 blueprint A-7): the one prefix
+/// `Settings > Secrets` tells "half stored" from "unreadable" by. Both reach it as
+/// [`StoreError::Backend`]; only the message differs. No value is in either message.
+pub const HALF_STORED_IDENTITY: &str = "the Infisical machine identity is half stored";
+
 /// The error for an identity with one half stored and the other, `missing`, absent.
 fn half_identity(missing: &str) -> StoreError {
     StoreError::Backend(format!(
-        "the Infisical machine identity is half stored: {SERVICE}/{missing} is missing; enter \
-         the identity again"
+        "{HALF_STORED_IDENTITY}: {SERVICE}/{missing} is missing; enter the identity again"
     ))
 }
 

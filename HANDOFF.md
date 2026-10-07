@@ -14,7 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-07):** **MOD-78 is done** (`docs/decisions/mod/mod-78.md`): `command_run`
+**Current status (2026-10-07):** **MOD-10 is done** (`docs/decisions/mod/mod-10.md`): a project's secrets
+come from a self-hosted Infisical, reach the agent only through `SessionSpec.env`, and are masked by the same map in what a run stores.
+M1 hardened the scrubber (whole-token rules, exact-match masks, a typed `ScrubRefused` run failure); M2 added the
+`htui-secrets` crate (Universal Auth, a 401 latch, the machine identity in the executing box's keyring); M3 resolves
+once per walk into one `RunSecrets` that is both the agent's env and the walk's scrubber, and refuses the run with
+`secrets_refused: <cause>`; M4 added Settings > Secrets (URL, identity, health, per-project scope through
+`ProjectPatch.secret`; one conformance case, no migration). It filed **MOD-89** (`.env` in a worktree), **MOD-90**
+(`htui worker` keeps a refused login) and **CLEAN-8** (M4 review residuals).
+Before it, **MOD-78 is done** (`docs/decisions/mod/mod-78.md`): `command_run`
 checks the session's lease. A new lock-free store read, `lease_holds(run, fence)`, runs before the queue, while
 queued (once per heartbeat), at admission and on every heartbeat; a loss refuses the call or kills the command and
 cancels its row (`fenced: lease lost`). A session's `CancellationToken` (lease drop, `close`, last host) ends its
@@ -26,37 +34,11 @@ walking process claims it at the turn's `done` with a fenced compare-and-set tha
 it scrubbed at `turn + 1`, sends it and drives on, then closes the step's `follow_up_window`. Judges, chat
 and `pump` are unchanged; follow-up turns count toward the step deadline and the run cap. Migration `0017`;
 every box upgrades together (an older binary cannot cancel once it is applied).
-Before it, **MOD-79 is done** (`docs/decisions/mod/mod-79.md`): the MCP
-token is off claude's argv. `claude-cli` gets `--mcp-config=<path>` to a `0600` `mcp.json` in a per-session `0700`
-directory (`htui-cli-<pid>-<8 hex>`, same base as the socket; on Windows under the per-user temp dir, inheriting
-its DACL). The session task owns the file, so every exit removes it. `ResolvedLaunch`'s `Debug` redacts
-`--mcp-config` values. `htui_agent::private_dir` is now the one private-directory helper (`channel.rs` uses it).
-No migration, no new crate.
-Before it, **MOD-55 is done** (`docs/decisions/mod/mod-55.md`): `Ctrl+G` in
-the Skills tab's Templates and Library editors asks a registry agent for an edit. The body, the request and (for
-templates) the placeholder table go out as one help turn (`StoreRequest::EditHelp`): scrubbed before sending, fail
-closed; no tools and every permission denied (`ToolExposure::no_tools`, `--tools=` on `claude-cli`); closed after
-one turn; recorded as a chat run with step `edit_help`. The reply's last fenced block is shown as a diff and
-accepted into the buffer or discarded; saving is still the editor's own gate. No migration; one `.sqlx` entry
-replaced. It filed **MOD-86** (chat prompts scrubbed only before persisting) and **MOD-87** (chat cancel
-answered late or dropped).
-Before it, **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
-pane reflows an item's hard-wrapped Markdown before wrapping it. Soft-wrapped lines of a paragraph or list item
-join, list items hang under their text, blank lines, fences, headings, tables and quotes stay as written, and inline
-code is drawn in the accent style without its backticks (`ui::markdown`, `cells::wrap_spans`). The scroll counts
-the rows on screen. No dependency, no migration; 11 snapshots moved body rows only.
-Before it, **MOD-80 is done** (`docs/decisions/mod/mod-80.md`): theme
-and colour meaning. A selected row is one black-on-cyan block over every cell (`Theme::select`), cyan
-means focus and selection, and keys (bold), running (blue), warnings (yellow: `awaiting_approval`, a
-degraded store label, the waiting count) and diff-added (green) have their own `Theme` roles. `title` is
-the terminal foreground plus bold, `dim` is `Indexed(244)`, and active tabs are bold and underlined.
-`NO_COLOR` selects `Theme::monochrome()`, which marks everything with modifiers alone. Style only, no
-text or snapshot change. The remaining non-focus cyan is **MOD-85**.
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
 `0014`; MOD-11's was renumbered at the merge, and MOD-70's `0016` became `0017` at the merge with MOD-12. Pins: store
-conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from the merged tree), `READ_CASES` 15,
+conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15,
 `htui-orch` `CASES` re-pin from the merged tree; Postgres tables 45.
 ---
 
@@ -136,62 +118,6 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
   attempt, fanout_index)`; crash recovery of a child under ANA-2 §4.9; and whether graph steps deny
   the harness's own subagent tool, whose sessions htui never sees. Cites `R-MCP-2`, which already
   lists the tool.
-- [ ] **MOD-10 - Secret provider** (from ANA-7). `R-SEC-1..4`, `R-TUI-8`. `SecretProvider` trait,
-  Infisical implementation, environment injection at run start, scrubber with exact-match and
-  pattern masks, fail-closed persistence gate, Settings tab secret provider section. **No longer
-  blocked** — MOD-2 is done (`docs/decisions/mod/mod-2.md`) and shipped the `Scrubber` seam with the
-  fail-closed `MinimalScrubber` this item replaces *behind an unchanged trait*. Its call sites are
-  already fail-closed on every digested byte (MOD-2 D100 as corrected by that milestone's CRITICAL);
-  the one call site that was **missing** was **MOD-32**'s, now done
-  (`docs/decisions/mod/mod-32.md`). **MOD-4 wired no secrets** (done,
-  `docs/decisions/mod/mod-4.md`, plan D176): `htui-orch`'s `drive_once` builds every graph
-  `SessionSpec` with an empty `env`, and its comment names this item as the one that fills it.
-  **Relates to ANA-16** (`docs/ANA-16.md` §8, §9): open question on where secrets resolve, on the
-  worker or on the server; MOD-48 owns it, with `R-SEC-2` amended only if the server resolves them.
-  **Verifier boundary (MOD-62, 2026-09-29):** once this item fills the agent's `SessionSpec.env`
-  with resolved secrets, that map must never reach `htui-orch/src/verify.rs`. The verifier keeps
-  htui's own process environment (plan D30) and scrubs its output. A test pinning that the verify
-  child does not see a resolved secret belongs to this item.
-  **Run engine scrubber (MOD-61, folded in 2026-09-29):** the run engine's `MinimalScrubber` is
-  built with an empty secret list (`crates/htui-worker/src/runtime.rs:929`, since MOD-41), so `scrub`'s masking half
-  is inert on the run path and a `trim_record` string equal to a secret would be stored verbatim.
-  When this item resolves a run's secrets, build that scrubber from the **same** map that fills the
-  step's `SessionSpec.env` (`htui-orch` `drive_once`, `engine.rs:5987`), so the two cannot drift;
-  the chat path already does this from `spec.env` (`agent_worker.rs:3961`) and needs the same map.
-  The verifier's scrubber (`crates/htui-worker/src/runtime.rs:437`) stays pattern-only: handing it the map would put
-  the resolved secrets inside `verify.rs`. A test pinning that a record string equal to a resolved
-  secret is stored as `[REDACTED]` belongs to this item.
-  PRD `.claude/prds/mod-10-secret-provider.prd.md` (4 milestones; maintainer decisions: identity from
-  the executing box's keyring, typed run failure, per-project whole-run scope, self-hosted Infisical).
-  **Phase 1 landed (`857be690`..`7b2bfd0e`, 2026-10-04):** scrubber hardening. Whole-token pattern
-  rules (15, `regex` in `htui-core`; `openai_api_key` gate + prose filter; Stripe live keys only),
-  `MinimalScrubber::from_resolved` with a 6-char floor, one typed `RunFailure::ScrubRefused` sentence
-  on the plain-step, candidate, judge and chat paths, the opt-in `raw` re-checked per JSON pointer at
-  the flush, `R-SEC-3` amended. Plan `.claude/plans/mod-10-m1-scrubber-hardening.plan.md`; host audit
-  (T0) skipped. *(Note restored 2026-10-06: a later merge on main had dropped it.)*
-  **Phase 2 landed (`b2a4cfb8`..`5d93d748`, 2026-10-06):** Infisical provider. The
-  `htui_core::secret` seam (`SecretProvider`, `SecretScope`, `ResolvedSecrets`, `MachineIdentity`,
-  typed `SecretError` with 15 non-leaking variants); three keyring slots in `htui-store::secret`
-  (`infisical-url`, `infisical-client-id`, `infisical-client-secret`); the new `htui-secrets` crate
-  (Universal Auth, `GET /api/v4/secrets` with both imports spellings, folder-over-imports merge,
-  fail-closed validation, https except loopback, no redirects, body caps, a cancel-safe single-flight
-  login with a permanent 401 latch and a 30 s cool-down after an unanswered login). Operator page
-  `docs/htui-secrets.md`. Plan `.claude/plans/mod-10-m2-infisical-provider.plan.md`; the env-gated
-  live test against the maintainer's self-hosted Infisical is still to be run.
-  **Phase 3 landed (`f8d26e35`..`a4f9ab7e`, 2026-10-06):** run-start injection. One per-walk
-  `htui_orch::secrets::RunSecrets` is both the walk's scrubber and its env source, so the two cannot
-  drift. It resolves lazily, once per walk, at the first live step, fan-out group or judge (and before
-  an accept's verify). The agent gets exactly the resolved map as `SessionSpec.env`; a provider-less
-  project never touches the keyring. Any failure is `secrets_refused: <cause>` and fails the run before
-  a driver starts (transient causes too, no retry). Chats resolve in their own task and leave no run
-  row on refusal. `HTUI_`-prefixed keys (any case) are refused. One `KeyringInfisical` per process
-  (TUI and `htui worker`) shares the 401 latch, with a 120 s keyring timeout. Scrubber carry-overs:
-  escaped token starts, newline-free and multi-line forms, zeroize on drop, and a hold-back seam at the
-  16 KiB flush (residuals in `docs/htui-secrets.md`). The verify output and agent error text are
-  re-masked with the walk's scrubber. MOD-61 and MOD-62 tests landed. `Engine::dispatch` arms are boxed
-  for debug-build stack headroom. Plan `.claude/plans/mod-10-m3-run-start-injection.plan.md`. Host
-  steps still owed before merge: `scripts/scrub-audit.sql` (OQ-D) and the M2 live Infisical test.
-  Remaining: M4 Settings section.
 - [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
   gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
   overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
@@ -315,8 +241,9 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
   review H1's path). `cargo check` the `#[cfg(windows)]` half of `EnableButtonMouseCapture`
   (`crates/htui/src/terminal.rs`, MOD-74 D5), which no Linux build compiles.
   **From MOD-55 (review L1, `docs/decisions/mod/mod-55.md`):** `edit_help::holds_mask` compares `[REDACTED]` counts
-  in the sent body and the proposal. Once this item masks real values, the help runtime should report how many masks
-  it applied, so a body's literal `[REDACTED]` cannot hide a masked value from the double-accept.
+  in the sent body and the proposal. MOD-10 is done (`docs/decisions/mod/mod-10.md`), but a help turn still scrubs with
+  an empty `env` (pattern rules only). Once help turns mask a project's resolved values, the help runtime should
+  report how many masks it applied, so a body's literal `[REDACTED]` cannot hide a masked value from the double-accept.
 
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
@@ -377,7 +304,9 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
   registry, box profiles, settings, images, target build and digest; full resync on a stale cursor;
   worker-side cache; worker self-update. Targeted per-run secrets, never agent credentials
   (`R-AGT-9` unchanged). **Open question for the maintainer:** `R-SEC-2` amendment only if the server,
-  not the worker, resolves project secrets. Blocked on MOD-47, MOD-10.
+  not the worker, resolves project secrets. Blocked on MOD-47. MOD-10 is done (`docs/decisions/mod/mod-10.md`):
+  the executing box resolves a project's secrets with the machine identity in its own keyring; a headless worker
+  without one refuses, and delivering it is this item's.
 
 - [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, `docs/decisions/mod/mod-9.md`;
   merge of MOD-7 milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
@@ -488,7 +417,9 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
   is only logged. `R-ID-7` requires scrubbing before anything is persisted **or transmitted**, failing closed.
   MOD-55's help mode already does this (`prompt::scrub_section`, refused before the run is minted); a chat should
   scrub its first prompt the same way and refuse a follow-up whose scrub refuses. Open: what the Chat tab shows for
-  a refused follow-up in a live session. Not blocked; it gets stronger as MOD-10 fills in `SessionSpec.env`.
+  a refused follow-up in a live session. Not blocked. MOD-10 is done (`docs/decisions/mod/mod-10.md`): a chat on a
+  project with a secret scope now gets its resolved values in `SessionSpec.env`, and the chat's scrubber masks them,
+  so a scrub before sending would mask them too.
 
 - [ ] **MOD-87 - Chat cancel answered late or dropped during an unparked turn** (from MOD-55,
   `docs/decisions/mod/mod-55.md`). `R-TUI-6`. In `run_chat`, `run_turn` reads `commands` only while a permission
@@ -508,8 +439,38 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
   several parents, re-rooting from a node (the tree's `Enter` emits `Action::Reveal`), and how the hop depth
   (`+`/`-`) sits beside the flow's zoom. Not blocked. After MOD-67, which owns the key catalogue.
 
+- [ ] **MOD-89 - Warn or refuse when a run's worktree holds a `.env` file** (from MOD-10,
+  `docs/decisions/mod/mod-10.md`; PRD open question decided 2026-10-03: "follow-up item, filed at close-out").
+  `R-SEC-2`, `R-ID-7`. MOD-10 lets a project drop its `.env` by resolving secrets from Infisical into the agent's
+  `SessionSpec.env` only, but nothing stops a run on a tree that still holds one: the agent can read it, and from
+  there it reaches the LLM context and the stored transcript. Detect a `.env` (and similar files) in a run's
+  worktree at run start and warn or refuse. Open: which file names count,
+  warn vs refuse (and whether per project), whether a provider-less project is checked too, and where the warning
+  shows. Out of MOD-10's MVP by PRD scope. Not blocked.
+
+- [ ] **MOD-90 - Clear a refused Infisical login in `htui worker` when the same identity is re-entered** (from
+  MOD-10, `docs/decisions/mod/mod-10.md`, blueprint A-4). `R-SEC-4`, `R-TUI-8`. A 401 latches the process's one
+  `KeyringInfisical` provider. MOD-10 M4's keyring-write generation (`crates/htui/src/secrets.rs`) makes any
+  Settings > Secrets write, even of the same identity, rebuild the TUI's provider. The generation is per process,
+  so a separate `htui worker` rebuilds only when the stored URL, client ID or client secret changed, and keeps its
+  latch after the same identity is re-entered until it is restarted (documented in `docs/htui-secrets.md`, "Logins,
+  tokens and lockout safety"). Give the worker a way to see the write (a keyring-side marker, a store row, or a
+  command) without retrying a refused login on its own. Not blocked.
+
 ### Deferred backlog
 
+- [ ] **CLEAN-8 - MOD-10 M4 review residuals** (from MOD-10, `docs/decisions/mod/mod-10.md`). `R-SEC-3`, `R-TUI-8`.
+  - **L-7** (refuted as a finding, kept as hardening): `read_body` in `crates/htui-secrets/src/infisical.rs`
+    accumulates the response body, values included, in a growing `Vec<u8>` that is never wiped; read into a
+    pre-sized `Zeroizing` buffer instead.
+  - The 7 rust-reviewer NITs: `ProjectPatch`'s `Option<Option<SecretScope>>` loses `Some(None)` in a JSON round
+    trip; `SecretScope::to_column` clones; `secrets_settings::serve` refuses a blank half by trimmed text but
+    stores it untrimmed; `SecretsSection::rows()` allocates per call; `fresh_tree` repeats the re-read/CAS;
+    `HalfStored` vs `Unreadable` are told apart by a message prefix (blueprint A-7) instead of a typed error; long
+    `on_reply`/`on_scope_written`/`lines` functions.
+  - A `--demo` guard on the Qdrant keyring arms: Settings > Qdrant still reads and writes the keyring in a demo
+    session (`docs/htui-secrets.md`, Settings).
+  Not blocked.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -528,6 +489,6 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 23 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 0 |
+| MOD-N   | 24 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-90 worker login latch, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 1 (CLEAN-8 MOD-10 M4 review residuals) |
 | TOOL-N  | 0 |
