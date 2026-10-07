@@ -99,7 +99,7 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
@@ -1278,7 +1278,7 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(16),
+        MigrationState::Pending(17),
         "seventeen embedded migrations, none applied (through MOD-70's 0017_follow_up.sql)"
     );
 
@@ -1379,7 +1379,7 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(16),
+        MigrationState::Pending(17),
         "seventeen embedded migrations, through MOD-70's 0017_follow_up.sql"
     );
 
@@ -1388,7 +1388,7 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(16),
+        HeadlessError::MigrationsPending(17),
         "every one of the seventeen, through MOD-70's 0017_follow_up.sql, is pending"
     );
     assert_eq!(
@@ -1411,7 +1411,7 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(16),
+        HeadlessError::MigrationsPending(17),
         "every one of the seventeen, through MOD-70's 0017_follow_up.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
@@ -1563,7 +1563,7 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        16,
+        17,
         "the later applies migrate nothing: the seventeen embedded migrations (through MOD-70's \
          0017_follow_up.sql) are applied once"
     );

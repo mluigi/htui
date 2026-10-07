@@ -137,7 +137,7 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(16),
+        MigrationState::Pending(17),
         "the harness left the schema unapplied: seventeen embedded migrations, through MOD-70's \
          0017_follow_up.sql"
     );
@@ -153,7 +153,7 @@ async fn start_reports_the_pending_count_over_a_bare_database() {
 
     match next_event(&mut started, "a bare database").await {
         ConnEvent::MigrationsPending(_, pending) => assert_eq!(
-            pending, 16,
+            pending, 17,
             "all seventeen embedded migrations are waiting (R-STO-5: nothing is applied unasked); \
              seventeen embedded migrations, through MOD-70's 0017_follow_up.sql"
         ),
@@ -239,7 +239,7 @@ async fn apply_migrations_then_persist_writes_a_minted_id_back() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(16),
+        MigrationState::Pending(17),
         "the store was handed back before any registration (seventeen embedded migrations since \
          MOD-70's 0017_follow_up.sql)"
     );
