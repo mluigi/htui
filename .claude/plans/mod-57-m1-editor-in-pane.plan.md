@@ -171,7 +171,8 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo clippy --workspace -- -D warnings                      # featureless gate
 cargo test -p htui --all-features -- --test-threads=1        # scheduling-dependent suite
 cargo insta test -p htui --all-features --check               # every snapshot, not a grep
-CC=gcc AR=ar cargo check -p htui --target x86_64-pc-windows-gnu
+CC_x86_64_pc_windows_gnu=/tmp/mingw/mgcc AR_x86_64_pc_windows_gnu=/tmp/mingw/mar cargo check -p htui --target x86_64-pc-windows-gnu
+CC_x86_64_pc_windows_gnu=/tmp/mingw/mgcc AR_x86_64_pc_windows_gnu=/tmp/mingw/mar cargo check -p htui --lib --profile test --target x86_64-pc-windows-gnu   # cfg(windows) unit tests (T1 verify; d77d40e8)
 bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 ```
 
