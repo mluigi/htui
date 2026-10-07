@@ -13,10 +13,16 @@
 use std::collections::BTreeSet;
 
 use chrono::Utc;
+use htui::app::Action;
 use htui::queue_settings::{self, QueueSettingsSnapshot, REQUEST_NAMES};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
+use htui::testkit::SectionBench;
+use htui::ui::tabs::settings::SettingsSection;
+use htui::ui::tabs::settings::queue::{NOTHING_SET, QueueSection, UNKNOWN_COST};
 use htui_core::fixtures::ids;
-use htui_core::model::{DEFAULT_MAX_CONCURRENT_ITEMS, QueueSetting, Scope, WorkspaceId};
+use htui_core::model::{
+    DEFAULT_MAX_CONCURRENT_ITEMS, QueueSetting, Scope, USD_TOO_PRECISE, WorkspaceId,
+};
 use htui_core::store::{MemStore, QueueTarget, QueueToken, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
 use serde_json::{Value, json};
@@ -403,4 +409,454 @@ async fn serve_refuses_a_foreign_request_by_name() {
         err,
         StoreError::Backend("not a queue settings request: catalogue".to_owned())
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// ---- section ----
+//
+// The same settings from the other end, through a `SectionBench`: the section holds no store
+// (`R-NF-3`), so a test that needs a stored value writes it through `store_worker::serve` and hands
+// the section the snapshot that came back, exactly the path the shell takes.
+// -------------------------------------------------------------------------------------------
+
+/// Row indices over the `htui` scope: the project group, the `all boxes` group, the box group.
+mod row {
+    /// `run cap`.
+    pub const RUN_CAP: usize = 1;
+    /// `batch cap`.
+    pub const BATCH_CAP: usize = 2;
+    /// The `all boxes` header.
+    pub const APP_HEADER: usize = 3;
+    /// `min budget`.
+    pub const MIN_BUDGET: usize = 4;
+    /// The app default `max concurrent`.
+    pub const APP_LIMIT: usize = 5;
+    /// `window`.
+    pub const WINDOW: usize = 6;
+    /// This box's `max concurrent`.
+    pub const BOX_LIMIT: usize = 8;
+}
+
+/// A bench and a section with `snapshot` already delivered as a read's reply.
+async fn bench_from(snapshot: &QueueSettingsSnapshot) -> (SectionBench, QueueSection) {
+    let bench = SectionBench::new().await;
+    let mut section = QueueSection::new();
+    feed(&bench, &mut section, snapshot);
+    (bench, section)
+}
+
+/// Hands the section one read's reply and drops whatever it emitted.
+fn feed(bench: &SectionBench, section: &mut QueueSection, snapshot: &QueueSettingsSnapshot) {
+    bench.reply(
+        section,
+        &StoreReply::QueueSettings(Box::new(snapshot.clone())),
+    );
+    let _ = bench.drained();
+}
+
+/// Puts the cursor on `row`, from the top.
+fn move_to(bench: &SectionBench, section: &mut QueueSection, row: usize) {
+    for _ in 0..row {
+        bench.key(section, "j");
+    }
+}
+
+/// Types one key per char, as a user would.
+fn type_at(bench: &SectionBench, section: &mut QueueSection, text: &str) {
+    for c in text.chars() {
+        bench.key(section, &c.to_string());
+    }
+}
+
+/// Empties the open field, whatever it was prefilled with.
+fn clear_field(bench: &SectionBench, section: &mut QueueSection) {
+    for _ in 0..40 {
+        bench.key(section, "backspace");
+    }
+}
+
+/// Opens the editor on `row`, empties it and types `text`, without pressing `Enter`.
+fn edit(bench: &SectionBench, section: &mut QueueSection, row: usize, text: &str) {
+    move_to(bench, section, row);
+    bench.key(section, "e");
+    clear_field(bench, section);
+    type_at(bench, section, text);
+}
+
+/// The one store request a key emitted, or a panic naming what it emitted instead.
+#[track_caller]
+fn only_request(bench: &SectionBench) -> StoreRequest {
+    let asked = bench.drained();
+    match asked.as_slice() {
+        [Action::Store(request)] => request.clone(),
+        other => panic!("expected one store request: {other:?}"),
+    }
+}
+
+/// The frame line that starts with `label` after its indent, or a panic naming the frame.
+#[track_caller]
+fn line_of<'a>(frame: &'a str, label: &str, nth: usize) -> &'a str {
+    frame
+        .lines()
+        .filter(|line| line.trim_start().starts_with(label))
+        .nth(nth)
+        .unwrap_or_else(|| panic!("no line {nth} for `{label}`: {frame}"))
+}
+
+/// D8's three groups, each with its effective value: the project's caps unbounded, the app
+/// default of `max_concurrent_items` shown as the default it falls back to, the window flagged as
+/// stored-only, and the demo box's own limit of 2.
+#[tokio::test]
+async fn the_section_renders_three_groups_with_effective_values() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, section) = bench_from(&snapshot).await;
+
+    let frame = bench.render_section(&section, 100);
+
+    assert!(frame.contains("project vulkan-tutorials"), "{frame}");
+    assert!(frame.contains("all boxes"), "{frame}");
+    assert!(frame.contains("this box (DESKTOP-HTUI)"), "{frame}");
+    assert!(
+        line_of(&frame, "run cap", 0).contains("unbounded"),
+        "{frame}"
+    );
+    assert!(
+        line_of(&frame, "batch cap", 0).contains("unbounded"),
+        "{frame}"
+    );
+    assert!(line_of(&frame, "min budget", 0).contains("none"), "{frame}");
+    assert!(
+        line_of(&frame, "max concurrent", 0)
+            .contains(&format!("{DEFAULT_MAX_CONCURRENT_ITEMS} (default)")),
+        "{frame}"
+    );
+    assert!(
+        line_of(&frame, "max concurrent", 1).ends_with(" 2"),
+        "{frame}"
+    );
+    assert!(frame.contains(UNKNOWN_COST), "{frame}");
+    insta::assert_snapshot!("demo", frame);
+}
+
+/// D8: money is typed in USD and stored as micros. `1.5` on `batch cap` sends a set of
+/// 1 500 000 micros against the project's `updated_at`; the applied reply closes the editor and
+/// the row shows the dollars back.
+#[tokio::test]
+async fn a_usd_entry_stores_micros() {
+    let backend = demo();
+    let snapshot = bench_settings(&backend).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+
+    edit(&bench, &mut section, row::BATCH_CAP, "1.5");
+    assert!(section.captures_input());
+    insta::assert_snapshot!("editing", bench.render_section(&section, 100));
+    bench.key(&mut section, "enter");
+
+    let request = only_request(&bench);
+    let StoreRequest::SetQueueSetting {
+        target,
+        key,
+        value,
+        expected,
+        ..
+    } = &request
+    else {
+        panic!("expected a set: {request:?}");
+    };
+    assert_eq!(*target, QueueTarget::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, QueueSetting::PerTokenCapBatch);
+    assert_eq!(*value, json!(1_500_000));
+    assert_eq!(*expected, project_token(&snapshot));
+
+    // The worker applies it; the reply closes the editor and the row reads dollars.
+    let applied = serve(&backend, &request).await;
+    bench.reply(&mut section, &applied);
+    assert!(
+        !section.captures_input(),
+        "the write landed, so the editor closed"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(line_of(&frame, "batch cap", 0).contains("$1.50"), "{frame}");
+}
+
+/// Empty clears: a key that holds a value sends a clear against its token; a key that holds
+/// nothing says so and sends nothing.
+#[tokio::test]
+async fn an_empty_field_clears_the_key() {
+    let backend = demo();
+    let before = bench_settings(&backend).await;
+    let held = settings(
+        serve(
+            &backend,
+            &set_in_bench(
+                QueueTarget::Project(ids::PROJECT_VULKAN),
+                QueueSetting::PerTokenCapRun,
+                json!(2_000_000),
+                project_token(&before),
+            ),
+        )
+        .await,
+    );
+    let (bench, mut section) = bench_from(&held).await;
+
+    edit(&bench, &mut section, row::RUN_CAP, "");
+    bench.key(&mut section, "enter");
+    let request = only_request(&bench);
+    let StoreRequest::ClearQueueSetting {
+        scope,
+        target,
+        key,
+        expected,
+    } = &request
+    else {
+        panic!("expected a clear: {request:?}");
+    };
+    assert_eq!(
+        *scope,
+        section_scope().await,
+        "the bench's scope is re-read"
+    );
+    assert_eq!(*scope, graphics_scope());
+    assert_eq!(*target, QueueTarget::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, QueueSetting::PerTokenCapRun);
+    assert_eq!(*expected, project_token(&held));
+
+    // Nothing stored on `min budget`: no request, and the section says why.
+    let (bench, mut section) = bench_from(&held).await;
+    edit(&bench, &mut section, row::MIN_BUDGET, "");
+    bench.key(&mut section, "enter");
+    assert!(
+        bench.drained().is_empty(),
+        "nothing to clear, nothing asked"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(NOTHING_SET), "{frame}");
+}
+
+/// An invalid value shows the sentence that refuses it, keeps the editor open over the text, and
+/// writes nothing: the parser's for too many decimals, the validator's for a limit of 0.
+#[tokio::test]
+async fn an_invalid_value_shows_the_validators_sentence_and_writes_nothing() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+
+    edit(&bench, &mut section, row::BATCH_CAP, "1.2345678");
+    bench.key(&mut section, "enter");
+    assert!(bench.drained().is_empty(), "a refused value asks nothing");
+    assert!(section.captures_input(), "the editor stays open");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(USD_TOO_PRECISE), "{frame}");
+    insta::assert_snapshot!("invalid", frame);
+
+    bench.key(&mut section, "esc");
+    move_to(&bench, &mut section, row::BOX_LIMIT - row::BATCH_CAP);
+    bench.key(&mut section, "e");
+    clear_field(&bench, &mut section);
+    type_at(&bench, &mut section, "0");
+    bench.key(&mut section, "enter");
+    assert!(bench.drained().is_empty(), "a refused value asks nothing");
+    let sentence = QueueSetting::MaxConcurrentItems
+        .validate(&json!(0))
+        .expect_err("0 is refused");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(&sentence), "{frame}");
+}
+
+/// D8: the box limit cleared inherits the app default, and the row says what that comes to.
+#[tokio::test]
+async fn an_empty_box_limit_shows_the_inherited_value() {
+    let backend = demo();
+    let cleared = settings(
+        serve(
+            &backend,
+            &clear_in_bench(
+                QueueTarget::Box(ids::BOX),
+                QueueSetting::MaxConcurrentItems,
+                QueueToken::EditVersion(0),
+            ),
+        )
+        .await,
+    );
+    let (bench, section) = bench_from(&cleared).await;
+
+    let frame = bench.render_section(&section, 100);
+
+    assert!(
+        line_of(&frame, "max concurrent", 1)
+            .contains(&format!("inherit ({})", cleared.app_limit())),
+        "{frame}"
+    );
+}
+
+/// D10: the window is stored, not enforced, and the row says so whether it is set or not.
+#[tokio::test]
+async fn the_window_row_says_stored_not_enforced() {
+    let backend = demo();
+    let unset = bench_settings(&backend).await;
+    let (bench, section) = bench_from(&unset).await;
+    let frame = bench.render_section(&section, 100);
+    let row = line_of(&frame, "window", 0);
+    assert!(row.contains("not set"), "{row}");
+    assert!(row.contains("stored, not enforced"), "{row}");
+
+    // Typed as `22:00-06:00`, stored as D10's object, shown back as typed.
+    let (bench, mut section) = bench_from(&unset).await;
+    edit(&bench, &mut section, row::WINDOW, "22:00-06:00");
+    bench.key(&mut section, "enter");
+    let request = only_request(&bench);
+    let StoreRequest::SetQueueSetting { value, .. } = &request else {
+        panic!("expected a set: {request:?}");
+    };
+    assert_eq!(*value, json!({"start": "22:00", "end": "06:00"}));
+    bench.reply(&mut section, &serve(&backend, &request).await);
+    let frame = bench.render_section(&section, 100);
+    let row = line_of(&frame, "window", 0);
+    assert!(row.contains("22:00-06:00"), "{row}");
+    assert!(row.contains("stored, not enforced"), "{row}");
+}
+
+/// Offline the read is refused with the sentence every orchestration request gets off the server,
+/// and the section shows it rather than an empty list.
+#[tokio::test]
+async fn offline_the_section_says_the_server_is_needed() {
+    let bench = SectionBench::new().await;
+    let mut section = QueueSection::new();
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "queue_settings",
+            message: DATABASE_UNREACHABLE.to_owned(),
+        },
+    );
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(DATABASE_UNREACHABLE), "{frame}");
+    assert!(!frame.contains("all boxes"), "{frame}");
+    insta::assert_snapshot!("offline", frame);
+}
+
+/// A compare-and-set miss: the editor keeps its text, `CHANGED_ELSEWHERE` shows, and the next
+/// `Enter` carries the token the reload brought.
+#[tokio::test]
+async fn a_cas_conflict_shows_changed_elsewhere() {
+    let backend = demo();
+    let before = bench_settings(&backend).await;
+    let (bench, mut section) = bench_from(&before).await;
+
+    edit(&bench, &mut section, row::BOX_LIMIT, "4");
+    bench.key(&mut section, "enter");
+    let request = only_request(&bench);
+
+    // Someone else writes the box first, so the section's write misses its token.
+    let _ = settings(
+        serve(
+            &backend,
+            &set_in_bench(
+                QueueTarget::Box(ids::BOX),
+                QueueSetting::MaxConcurrentItems,
+                json!(3),
+                QueueToken::EditVersion(0),
+            ),
+        )
+        .await,
+    );
+    let missed = serve(&backend, &request).await;
+    assert!(
+        matches!(missed, StoreReply::QueueSettingsStale(_)),
+        "{missed:?}"
+    );
+    bench.reply(&mut section, &missed);
+
+    assert!(
+        section.captures_input(),
+        "the editor stays open over its text"
+    );
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(CHANGED_ELSEWHERE_HEAD), "{frame}");
+    insta::assert_snapshot!("changed_elsewhere", frame);
+
+    bench.key(&mut section, "enter");
+    let StoreRequest::SetQueueSetting {
+        value, expected, ..
+    } = only_request(&bench)
+    else {
+        panic!("expected the retry");
+    };
+    assert_eq!(value, json!(4), "the text was kept");
+    assert_eq!(expected, QueueToken::EditVersion(1), "the reload's token");
+}
+
+/// The editor captures input while open, and only then.
+#[tokio::test]
+async fn editing_captures_input() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+
+    assert!(!section.captures_input());
+    move_to(&bench, &mut section, row::APP_LIMIT);
+    bench.key(&mut section, "e");
+    assert!(section.captures_input());
+    bench.key(&mut section, "esc");
+    assert!(!section.captures_input());
+
+    // A header opens nothing.
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, row::APP_HEADER);
+    bench.key(&mut section, "e");
+    assert!(!section.captures_input());
+    assert!(bench.drained().is_empty());
+}
+
+/// The scope a [`SectionBench`] issues against: the demo fixture's first workspace.
+async fn section_scope() -> Scope {
+    let workspaces = MemStore::demo()
+        .workspaces()
+        .await
+        .expect("the memory store never fails");
+    Scope::from_workspace(workspaces.first().expect("the fixture has a workspace"))
+}
+
+/// The opening of the shared compare-and-set sentence (`settings/mod.rs`), which the section shows
+/// verbatim.
+const CHANGED_ELSEWHERE_HEAD: &str = "changed elsewhere since you opened it";
+
+/// One read of the bench's scope (Graphics, so the one project is `vulkan-tutorials`): the scope
+/// every request the section emits re-reads, so a frame before and after a write shows one world.
+async fn bench_settings(backend: &Backend) -> QueueSettingsSnapshot {
+    settings(serve(backend, &StoreRequest::QueueSettings(graphics_scope())).await)
+}
+
+/// [`set`] against the bench's scope.
+fn set_in_bench(
+    target: QueueTarget,
+    key: QueueSetting,
+    value: Value,
+    expected: QueueToken,
+) -> StoreRequest {
+    StoreRequest::SetQueueSetting {
+        scope: graphics_scope(),
+        target,
+        key,
+        value,
+        expected,
+    }
+}
+
+/// [`clear`] against the bench's scope.
+fn clear_in_bench(target: QueueTarget, key: QueueSetting, expected: QueueToken) -> StoreRequest {
+    StoreRequest::ClearQueueSetting {
+        scope: graphics_scope(),
+        target,
+        key,
+        expected,
+    }
+}
+
+/// The bench's scope, spelled out: the Graphics workspace and its one project.
+fn graphics_scope() -> Scope {
+    Scope {
+        workspace_id: ids::WORKSPACE_GRAPHICS,
+        project_ids: vec![ids::PROJECT_VULKAN],
+    }
 }

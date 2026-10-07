@@ -2,9 +2,10 @@
 //!
 //! A registry for the same reason the tabs and the detail sub-tabs are one (MOD-1 plan D5):
 //! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
-//! MOD-9's skills, MOD-15's hierarchy, MOD-26's persona registry (`Personas`, milestone 2) and
-//! MOD-10's secret provider (`Secrets`, milestone 4) each want a section of this tab, and each
-//! should be a file plus one `register` line rather than a `match` arm growing in here.
+//! MOD-9's skills, MOD-15's hierarchy, MOD-26's persona registry (`Personas`, milestone 2),
+//! MOD-10's secret provider (`Secrets`, milestone 4) and MOD-12's queue caps (`Queue`, milestone 2)
+//! each want a section of this tab, and each should be a file plus one `register` line rather
+//! than a `match` arm growing in here.
 //! [`SettingsSection`] mirrors
 //! [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
 //! [`on_scope_change`](SettingsSection::on_scope_change) where the detail pane has
@@ -19,6 +20,8 @@ pub mod personas;
 pub mod prompt;
 /// The Qdrant DSN settings section.
 pub mod qdrant;
+/// The queue settings section (MOD-12 M2).
+pub mod queue;
 pub mod secrets;
 
 use htui_core::model::Scope;
@@ -43,6 +46,7 @@ pub use kinds::KindsSection;
 pub use personas::PersonasSection;
 pub use prompt::PromptSection;
 pub use qdrant::QdrantSection;
+pub use queue::QueueSection;
 pub use secrets::SecretsSection;
 
 /// An optional column: an empty field clears it rather than storing `""`.
