@@ -404,6 +404,9 @@ impl htui_core::store::WorkerStore for PgStore {
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
     }
+    async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
+        PgStore::run_batch_spend(self, run).await
+    }
 }
 
 impl htui_core::store::RecorderStore for Writer {
@@ -779,6 +782,12 @@ impl htui_core::store::WorkerStore for Writer {
     async fn cancel_command(&self, id: htui_core::model::CommandRunId) -> Result<bool> {
         WriteStore::cancel_command(self, id).await
     }
+    async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
+        match self {
+            Self::Memory(store) => store.run_batch_spend(run).await,
+            Self::Online(pg) => pg.run_batch_spend(run).await,
+        }
+    }
 }
 
 impl htui_core::store::WorkerHost for PgStore {
@@ -885,6 +894,12 @@ impl htui_core::store::WorkerHost for PgStore {
     ) -> Result<Option<QueueBatch>> {
         PgStore::close_drained_batch(self, batch, at).await
     }
+    async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+        PgStore::batch_spend(self, batch).await
+    }
+    async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+        PgStore::project_settings(self, project).await
+    }
 }
 
 impl htui_core::store::WorkerHost for Backend {
@@ -990,6 +1005,12 @@ impl htui_core::store::WorkerHost for Backend {
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         Backend::close_drained_batch(self, batch, at).await
+    }
+    async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+        Backend::batch_spend(self, batch).await
+    }
+    async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+        Backend::project_settings(self, project).await
     }
 }
 

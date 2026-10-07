@@ -31,16 +31,17 @@ use htui_core::model::{
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
     PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
     PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueuedFollowUp,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision, RequirementSpec,
-    RequirementState, RequirementUpdate, Resolution, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepTree,
-    Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey,
-    SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch,
-    StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus, UserId,
-    VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps, scope_of,
+    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueSetting,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
+    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps,
+    scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -49,22 +50,24 @@ use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
     command_not_claimable, command_not_queued, document_needs_a_step, link_key,
-    link_not_proposed_by_run, link_outside_project, note_needs_a_step, reaped_note, self_link,
-    step_document_refusal, step_note_refusal, step_writes_own_item,
+    link_not_proposed_by_run, link_outside_project, note_needs_a_step,
+    project_settings_not_an_object, reaped_note, self_link, step_document_refusal,
+    step_note_refusal, step_writes_own_item,
 };
 use htui_core::store::{
-    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, ReadStore as _, Result,
-    SettingRung, StepFence, StoreError, StoredSetting, TransitionLaw, UpdateOutcome, WriteStore,
-    already_exists, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
-    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
-    finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move, invalid_area_code,
-    invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros,
-    legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
+    BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
+    QueueToken, ReadStore as _, Result, SettingRung, StepFence, StoreError, StoredSetting,
+    TransitionLaw, UpdateOutcome, WriteStore, already_exists, chat_step_status, check_attachment,
+    citation_key, close_out_needs_a_summary, expected_on_row, failure_disagrees_with_status,
+    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project, illegal_move,
+    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
+    lease_ttl_micros, legal_move, new_persona_refusal, new_skill_refusal, not_a_fanout_candidate,
     not_a_terminal_status, persona_is_bound, persona_patch_refusal, prompt_template_key,
-    prompt_template_refusal, references_no_row, requirement_withdrawn, reserved_phase_name,
-    resolution_not_closable, row_names_another_phase, row_names_another_step, run_is_terminal,
-    skill_body_refusal, skill_patch_refusal, skill_version_key, step_is_not_promotable,
-    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
+    prompt_template_refusal, queue_target_refusal, queue_token_refusal, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
+    row_names_another_step, run_is_terminal, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, step_is_not_promotable, summary_names_another_item, winner_is_not_settled,
+    withdrawn_requirement_cited,
 };
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -3897,13 +3900,15 @@ impl WriteStore for PgStore {
     /// when `expected` is `None` — a conflict is `Stale`, never an overwrite — and a plain
     /// compare-and-set `UPDATE` otherwise; `project.settings` takes
     /// `settings || jsonb_build_object(key, value)`, which is the key-level merge that leaves every
-    /// other key alone; `step_graph_phase.token_budget` takes the `INTEGER` [`validate`] has
-    /// already narrowed to `i32::MAX` for this rung (flag C).
+    /// other key alone, guarded by `jsonb_typeof(settings) = 'object'` because `||` would turn a
+    /// scalar or an array into an array (review R1 L2); `step_graph_phase.token_budget` takes the
+    /// `INTEGER` [`validate`] has already narrowed to `i32::MAX` for this rung (flag C).
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] for every validation refusal and for `expected: None` on
-    /// `Project` / `Phase`; [`StoreError::NotFound`] for an unknown project, phase or — under a
+    /// [`StoreError::Constraint`] for every validation refusal, for `expected: None` on
+    /// `Project` / `Phase`, and for a current token over a `project.settings` that is not an
+    /// object ([`project_settings_not_an_object`], `MemStore`'s sentence); [`StoreError::NotFound`] for an unknown project, phase or — under a
     /// token — `app_setting` row.
     async fn set_setting(
         &self,
@@ -3976,6 +3981,7 @@ impl WriteStore for PgStore {
                     r#"
                     UPDATE project SET settings = settings || jsonb_build_object($2::text, $3::jsonb)
                      WHERE id = $1 AND updated_at = $4
+                       AND jsonb_typeof(settings) = 'object'
                     RETURNING updated_at AS "updated_at!"
                     "#,
                     id.as_uuid(),
@@ -3992,7 +3998,13 @@ impl WriteStore for PgStore {
                         value: Some(value),
                         updated_at,
                     })),
-                    None => cas_miss(self.stored_setting(rung, key).await?, "project", id),
+                    // The token was current, so what missed is the blob guard (review R1 L2).
+                    None => match self.stored_setting(rung, key).await? {
+                        Some(stored) if stored.updated_at == token => Err(StoreError::Constraint(
+                            project_settings_not_an_object(id, key),
+                        )),
+                        current => cas_miss(current, "project", id),
+                    },
                 }
             }
             SettingRung::Phase(id) => {
@@ -4136,6 +4148,248 @@ impl WriteStore for PgStore {
             return Err(StoreError::Constraint(refusal));
         }
         self.stored_setting(rung, key).await
+    }
+
+    // queue settings (MOD-12 M2 D8, D9)
+
+    /// One queue key with its token: `App` with `stored_setting`'s `App` literal, `Project` with
+    /// its project literal, `Box` through [`PgStore::box_row`] filtered by this user. No new
+    /// offline entry.
+    async fn queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Result<Option<QueueStored>> {
+        if let Some(refusal) = queue_target_refusal(key, target) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        self.stored_queue_setting(target, key).await
+    }
+
+    /// One queue key's compare-and-set (MOD-12 M2 D9). The `App` and `Project` statements are
+    /// `set_setting`'s byte for byte, indentation included, so they reuse its offline entries
+    /// (MOD-51 F-9: the cache keys a statement by the SHA-256 of its text): they look mis-indented
+    /// here on purpose. The `Box` statement is `edit_box`'s guard over one merged key.
+    async fn set_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        value: Value,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        if let Some(refusal) = queue_target_refusal(key, target) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(refusal) = queue_token_refusal(key, target, expected, false) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        key.validate(&value).map_err(StoreError::Constraint)?;
+        let name = key.as_str();
+        match (target, expected) {
+            (QueueTarget::App, QueueToken::Stamp(want)) => {
+                let landed = match want {
+                    // "I expect no row": a conflict means somebody is there, and that is `Stale`.
+                    None => sqlx::query_scalar!(
+                        r#"
+                        INSERT INTO app_setting (key, value) VALUES ($1, $2)
+                        ON CONFLICT (key) DO NOTHING
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                        name,
+                        &value,
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?,
+                    Some(token) => sqlx::query_scalar!(
+                        r#"
+                        UPDATE app_setting SET value = $2
+                         WHERE key = $1 AND updated_at = $3
+                        RETURNING updated_at AS "updated_at!"
+                        "#,
+                        name,
+                        &value,
+                        token,
+                    )
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(map_sqlx)?,
+                };
+                match landed {
+                    Some(updated_at) => Ok(CasOutcome::Applied(QueueStored {
+                        value: Some(value),
+                        token: QueueToken::Stamp(Some(updated_at)),
+                    })),
+                    None => cas_miss(
+                        self.stored_queue_setting(target, key).await?,
+                        "app_setting",
+                        name,
+                    ),
+                }
+            }
+            (QueueTarget::Project(id), QueueToken::Stamp(Some(token))) => {
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    UPDATE project SET settings = settings || jsonb_build_object($2::text, $3::jsonb)
+                     WHERE id = $1 AND updated_at = $4
+                       AND jsonb_typeof(settings) = 'object'
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    id.as_uuid(),
+                    name,
+                    &value,
+                    token,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                match landed {
+                    Some(updated_at) => Ok(CasOutcome::Applied(QueueStored {
+                        value: Some(value),
+                        token: QueueToken::Stamp(Some(updated_at)),
+                    })),
+                    // The token was current, so what missed is the blob guard (review R1 L2).
+                    None => match self.stored_queue_setting(target, key).await? {
+                        Some(stored) if stored.token == expected => Err(StoreError::Constraint(
+                            project_settings_not_an_object(id, key),
+                        )),
+                        current => cas_miss(current, "project", id),
+                    },
+                }
+            }
+            (QueueTarget::Box(id), QueueToken::EditVersion(want)) => {
+                let me = self.this_user();
+                let written = sqlx::query!(
+                    r#"
+                    UPDATE box
+                       SET settings     = settings || jsonb_build_object($3::text, $4::jsonb),
+                           edit_version = edit_version + 1
+                     WHERE id = $1 AND user_id = $5 AND edit_version = $2
+                       AND jsonb_typeof(settings) = 'object'
+                    RETURNING settings, edit_version
+                    "#,
+                    id.as_uuid(),
+                    want,
+                    name,
+                    &value,
+                    me.as_uuid(),
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                match written {
+                    Some(row) => Ok(CasOutcome::Applied(QueueStored {
+                        value: row.settings.get(name).cloned(),
+                        token: QueueToken::EditVersion(row.edit_version),
+                    })),
+                    None => self.box_queue_miss(id, want, key).await,
+                }
+            }
+            // `queue_token_refusal` has refused every other pair; one it let through by mistake is a
+            // refusal here too, not a panic in the store (review R1).
+            _ => Err(StoreError::Constraint(format!(
+                "`{key}` on {target:?} does not take {expected:?}"
+            ))),
+        }
+    }
+
+    /// One queue key's removal (MOD-12 M2 D9): `clear_setting`'s `App` and `Project` statements
+    /// byte for byte (mis-indented on purpose, as above), and the `Box` guard of
+    /// [`set_queue_setting`](WriteStore::set_queue_setting) over `settings - key`.
+    async fn clear_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        if let Some(refusal) = queue_target_refusal(key, target) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(refusal) = queue_token_refusal(key, target, expected, true) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let name = key.as_str();
+        match (target, expected) {
+            (QueueTarget::App, QueueToken::Stamp(Some(token))) => {
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    DELETE FROM app_setting WHERE key = $1 AND updated_at = $2
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    name,
+                    token,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                match landed {
+                    // No row is left to carry a token: the next set presents `Stamp(None)`.
+                    Some(_) => Ok(CasOutcome::Applied(QueueStored {
+                        value: None,
+                        token: QueueToken::Stamp(None),
+                    })),
+                    None => cas_miss(
+                        self.stored_queue_setting(target, key).await?,
+                        "app_setting",
+                        name,
+                    ),
+                }
+            }
+            (QueueTarget::Project(id), QueueToken::Stamp(Some(token))) => {
+                let landed = sqlx::query_scalar!(
+                    r#"
+                    UPDATE project SET settings = settings - $2::text
+                     WHERE id = $1 AND updated_at = $3
+                    RETURNING updated_at AS "updated_at!"
+                    "#,
+                    id.as_uuid(),
+                    name,
+                    token,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                match landed {
+                    Some(updated_at) => Ok(CasOutcome::Applied(QueueStored {
+                        value: None,
+                        token: QueueToken::Stamp(Some(updated_at)),
+                    })),
+                    None => cas_miss(self.stored_queue_setting(target, key).await?, "project", id),
+                }
+            }
+            (QueueTarget::Box(id), QueueToken::EditVersion(want)) => {
+                let me = self.this_user();
+                let written = sqlx::query!(
+                    r#"
+                    UPDATE box
+                       SET settings     = settings - $3::text,
+                           edit_version = edit_version + 1
+                     WHERE id = $1 AND user_id = $4 AND edit_version = $2
+                       AND jsonb_typeof(settings) = 'object'
+                    RETURNING settings, edit_version
+                    "#,
+                    id.as_uuid(),
+                    want,
+                    name,
+                    me.as_uuid(),
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                match written {
+                    Some(row) => Ok(CasOutcome::Applied(QueueStored {
+                        value: row.settings.get(name).cloned(),
+                        token: QueueToken::EditVersion(row.edit_version),
+                    })),
+                    None => self.box_queue_miss(id, want, key).await,
+                }
+            }
+            // `queue_token_refusal` has refused every other pair; one it let through by mistake is a
+            // refusal here too, not a panic in the store (review R1).
+            _ => Err(StoreError::Constraint(format!(
+                "`{key}` on {target:?} does not take {expected:?}"
+            ))),
+        }
     }
 
     // deletes (D4)
@@ -7393,6 +7647,83 @@ fn concurrent_write(entity: &str, id: impl core::fmt::Display, what: &str) -> St
         "{entity} {id} is being written to: {DELETE_ATTEMPTS} attempts each found {what} committed \
          after the count, and the delete took nothing"
     )
+}
+
+/// MOD-12 M2 D9: the reads behind [`WriteStore::queue_setting`] and the queue writes' misses.
+impl PgStore {
+    /// One queue key with its token, the target check already made. `App` and `Project` are
+    /// `stored_setting`'s statements byte for byte, so they reuse its offline entries.
+    async fn stored_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Result<Option<QueueStored>> {
+        let name = key.as_str();
+        match target {
+            QueueTarget::App => {
+                let row = sqlx::query!(
+                    "SELECT value, updated_at FROM app_setting WHERE key = $1",
+                    name,
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                Ok(row.map(|row| QueueStored {
+                    value: Some(row.value),
+                    token: QueueToken::Stamp(Some(row.updated_at)),
+                }))
+            }
+            QueueTarget::Project(id) => {
+                let row = sqlx::query!(
+                    "SELECT settings, updated_at FROM project WHERE id = $1",
+                    id.as_uuid(),
+                )
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
+                Ok(row.map(|row| QueueStored {
+                    value: row.settings.get(name).cloned(),
+                    token: QueueToken::Stamp(Some(row.updated_at)),
+                }))
+            }
+            QueueTarget::Box(id) => {
+                let me = self.this_user();
+                Ok(self
+                    .box_row(id)
+                    .await?
+                    .filter(|row| row.user_id == me)
+                    .map(|row| QueueStored {
+                        value: row.settings.get(name).cloned(),
+                        token: QueueToken::EditVersion(row.edit_version),
+                    }))
+            }
+        }
+    }
+
+    /// A box queue write that touched no row, decided as `edit_box`'s miss is: no box of this
+    /// user is `NotFound`; the current token over a non-object blob is
+    /// [`BOX_SETTINGS_NOT_AN_OBJECT`]; anything else is `Stale` with the key as stored now.
+    async fn box_queue_miss(
+        &self,
+        id: BoxId,
+        expected: i32,
+        key: QueueSetting,
+    ) -> Result<CasOutcome<QueueStored>> {
+        let me = self.this_user();
+        match self.box_row(id).await?.filter(|row| row.user_id == me) {
+            None => Err(StoreError::NotFound {
+                entity: "box",
+                id: id.to_string(),
+            }),
+            Some(row) if row.edit_version == expected && !row.settings.is_object() => Err(
+                StoreError::Constraint(BOX_SETTINGS_NOT_AN_OBJECT.to_owned()),
+            ),
+            Some(row) => Ok(CasOutcome::Stale(QueueStored {
+                value: row.settings.get(key.as_str()).cloned(),
+                token: QueueToken::EditVersion(row.edit_version),
+            })),
+        }
+    }
 }
 
 impl PgStore {

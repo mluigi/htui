@@ -5446,6 +5446,97 @@ async fn edit_box_refuses_a_non_object_settings_blob() {
     db.drop_db().await;
 }
 
+/// Plants `settings` as the htui project's whole `settings` blob, around every writer.
+async fn plant_project_settings(pool: &PgPool, settings: &serde_json::Value) {
+    sqlx::query("UPDATE project SET settings = $2 WHERE id = $1")
+        .bind(ids::PROJECT_HTUI.as_uuid())
+        .bind(settings)
+        .execute(pool)
+        .await
+        .expect("plant the project settings");
+}
+
+/// MOD-12 M2 R1 L2: a key cannot be merged into a `project.settings` blob that is not a JSON
+/// object. `settings || jsonb_build_object(..)` would turn a scalar or an array into an array and
+/// answer `Applied` with a cap nothing reads; both writers of the merge (`set_queue_setting` and
+/// `set_setting`'s project rung) refuse it with `MemStore`'s sentence and write nothing, the token
+/// included. A spent token is still `Stale` first. The `MemStore` halves are
+/// `clear_setting_refuses_a_project_settings_that_is_not_an_object` and
+/// `set_queue_setting_refuses_a_project_settings_that_is_not_an_object`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_merge_refuses_a_non_object_settings_blob() {
+    use htui_core::model::QueueSetting;
+    use htui_core::store::StoreError;
+    use htui_core::store::traits::{QueueTarget, QueueToken, project_settings_not_an_object};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = QueueTarget::Project(ids::PROJECT_HTUI);
+    let cap = QueueSetting::PerTokenCapBatch;
+    let rung = SettingRung::Project(ids::PROJECT_HTUI);
+    let hops = SettingKey::UpstreamHops;
+    for blob in [serde_json::json!([]), serde_json::json!("x")] {
+        plant_project_settings(&db.pool, &blob).await;
+        let read = db
+            .store
+            .queue_setting(target, cap)
+            .await
+            .expect("the read answers")
+            .expect("the project exists");
+
+        assert_eq!(
+            db.store
+                .set_queue_setting(target, cap, serde_json::json!(1_000), read.token)
+                .await,
+            Err(StoreError::Constraint(project_settings_not_an_object(
+                ids::PROJECT_HTUI,
+                cap
+            ))),
+            "{blob}: the cap write is refused"
+        );
+        let QueueToken::Stamp(Some(token)) = read.token else {
+            panic!(
+                "{blob}: a project's token is its updated_at, got {:?}",
+                read.token
+            );
+        };
+        assert_eq!(
+            db.store
+                .set_setting(rung, hops, serde_json::json!(1), Some(token))
+                .await,
+            Err(StoreError::Constraint(project_settings_not_an_object(
+                ids::PROJECT_HTUI,
+                hops
+            ))),
+            "{blob}: set_setting's project rung shares the statement and the refusal"
+        );
+        assert_eq!(
+            db.store.queue_setting(target, cap).await.expect("read"),
+            Some(read.clone()),
+            "{blob}: neither refusal wrote anything, the token included"
+        );
+        let settings: serde_json::Value =
+            sqlx::query_scalar("SELECT settings FROM project WHERE id = $1")
+                .bind(ids::PROJECT_HTUI.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("the blob reads back");
+        assert_eq!(settings, blob, "{blob}: the blob is left as it was");
+
+        let spent = QueueToken::Stamp(Some(token - TimeDelta::seconds(1)));
+        assert_eq!(
+            db.store
+                .set_queue_setting(target, cap, serde_json::json!(1_000), spent)
+                .await,
+            Ok(CasOutcome::Stale(read)),
+            "{blob}: a spent token is Stale before the non-object blob refuses"
+        );
+    }
+
+    db.drop_db().await;
+}
+
 /// MOD-41 plan D9: an executor this build does not know never fails `BoxSettings`' decode, so
 /// `claim_run`'s admission still reads the box's `max_concurrent_items`: with one slot, the
 /// second claim is `SlotFull`.
@@ -7683,6 +7774,258 @@ async fn queue_surface_answers_alike_on_both_stores() {
         pg.active_runs_on_box(ids::BOX).await.expect("read"),
         mem.active_runs_on_box(ids::BOX).await.expect("read"),
     );
+
+    db.drop_db().await;
+}
+
+// ---- MOD-12 M2: batch spend (blueprint §C.1) ---------------------------------------------------
+
+/// A step of `run` at `position` whose `usage` is `usage`, on either store.
+macro_rules! step_with_usage {
+    ($store:expr, $run:expr, $position:expr, $usage:expr) => {{
+        let step = $store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: $run,
+                position: $position,
+                attempt: 0,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .expect("the step lands");
+        $store
+            .set_step_usage(StepFence::Unleased, step.id, $usage, None)
+            .await
+            .expect("the usage lands");
+    }};
+}
+
+/// `store::mem`'s `spend_fixture` on either store: batch A (two runs across projects, costs 700
+/// and 250, plus a `"x"` and a `1.5` cost that are skipped), batch B (1 000), batch C (one step
+/// without a cost) and a manual run costing 5 000. Answers `(a, b, c, a_run, manual)`.
+macro_rules! spend_fixture {
+    ($store:expr) => {{
+        use htui_core::model::BatchClose;
+        let store = $store;
+        let at = Utc::now();
+        let a = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch A opens");
+        let a_run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(a.id)))
+            .await
+            .expect("A admits ANA-2");
+        let a_other = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FEAT_1, Some(a.id))
+            })
+            .await
+            .expect("A admits another project's item");
+        step_with_usage!(store, a_run.id, 0, serde_json::json!({"cost_micros": 700, "input_tokens": 9}));
+        step_with_usage!(store, a_run.id, 1, serde_json::json!({"cost_micros": "x"}));
+        step_with_usage!(store, a_other.id, 0, serde_json::json!({"cost_micros": 250}));
+        step_with_usage!(store, a_other.id, 1, serde_json::json!({"cost_micros": 1.5}));
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("A was open");
+
+        let b = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch B opens");
+        let b_run = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FIX_1, Some(b.id))
+            })
+            .await
+            .expect("B admits");
+        step_with_usage!(store, b_run.id, 0, serde_json::json!({"cost_micros": 1_000}));
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("B was open");
+
+        let c = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch C opens");
+        let c_run = store
+            .create_run(batch_run(ids::HTUI_CLEAN_1, Some(c.id)))
+            .await
+            .expect("C admits");
+        step_with_usage!(store, c_run.id, 0, serde_json::json!({"input_tokens": 3}));
+
+        let manual = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_VULKAN,
+                ..race_run(ids::VULKAN_TOOL_1)
+            })
+            .await
+            .expect("a manual run");
+        step_with_usage!(store, manual.id, 0, serde_json::json!({"cost_micros": 5_000}));
+        (a.id, b.id, c.id, a_run.id, manual.id)
+    }};
+}
+
+/// MOD-12 M2 D1 (PRD metric "batch spend overshoot", the Pg half): `SUM(run_step.usage)` over a
+/// batch's runs answers what `MemStore` answers, the non-integer costs are skipped on Postgres
+/// too (no `22P02` from the cast), and a batch with no costed step is `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_spend_answers_alike_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (pg_a, pg_b, pg_c, _, _) = spend_fixture!(pg);
+    let (mem_a, mem_b, mem_c, _, _) = spend_fixture!(&mem);
+
+    for (pg_batch, mem_batch, expected) in [
+        (pg_a, mem_a, Some(950)),
+        (pg_b, mem_b, Some(1_000)),
+        (pg_c, mem_c, None),
+    ] {
+        let on_pg = pg.batch_spend(pg_batch).await.expect("the Postgres read");
+        assert_eq!(
+            on_pg,
+            mem.batch_spend(mem_batch).await.expect("the MemStore read"),
+            "one figure, both stores"
+        );
+        assert_eq!(on_pg, expected);
+    }
+    let unknown = htui_core::model::BatchId::new();
+    assert_eq!(pg.batch_spend(unknown).await.expect("read"), None);
+    assert_eq!(mem.batch_spend(unknown).await.expect("read"), None);
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M2 D5: on both stores a manual run is in no batch and a batch run answers its own
+/// store's batch id with that batch's spend; an unknown run is `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_batch_spend_answers_alike_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (pg_a, _, _, pg_run, pg_manual) = spend_fixture!(pg);
+    let (mem_a, _, _, mem_run, mem_manual) = spend_fixture!(&mem);
+
+    assert_eq!(pg.run_batch_spend(pg_manual).await.expect("read"), None);
+    assert_eq!(mem.run_batch_spend(mem_manual).await.expect("read"), None);
+    assert_eq!(
+        pg.run_batch_spend(pg_run).await.expect("read"),
+        Some((pg_a, Some(950)))
+    );
+    assert_eq!(
+        mem.run_batch_spend(mem_run).await.expect("read"),
+        Some((mem_a, Some(950)))
+    );
+    let unknown = RunId::new();
+    assert_eq!(pg.run_batch_spend(unknown).await.expect("read"), None);
+    assert_eq!(mem.run_batch_spend(unknown).await.expect("read"), None);
+
+    db.drop_db().await;
+}
+
+/// Two batches of costs only one store used to count, on either store: `D` holds a `100` beside a
+/// digit string (`"700"`), a digit string past `bigint`, an integer past `bigint` (`u64::MAX`) and
+/// a float written as `1e3` (serde sends `1000.0`); `E` holds two `i64::MAX` and a `-10`. Answers
+/// `(d, e)`.
+macro_rules! odd_spend_fixture {
+    ($store:expr) => {{
+        use htui_core::model::BatchClose;
+        let store = $store;
+        let at = Utc::now();
+        let d = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch D opens");
+        let d_run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(d.id)))
+            .await
+            .expect("D admits");
+        step_with_usage!(store, d_run.id, 0, serde_json::json!({"cost_micros": 100}));
+        step_with_usage!(store, d_run.id, 1, serde_json::json!({"cost_micros": "700"}));
+        step_with_usage!(
+            store,
+            d_run.id,
+            2,
+            serde_json::json!({"cost_micros": "99999999999999999999"})
+        );
+        step_with_usage!(store, d_run.id, 3, serde_json::json!({"cost_micros": u64::MAX}));
+        step_with_usage!(store, d_run.id, 4, serde_json::json!({"cost_micros": 1e3}));
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("D was open");
+
+        let e = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch E opens");
+        let e_run = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FIX_1, Some(e.id))
+            })
+            .await
+            .expect("E admits");
+        step_with_usage!(store, e_run.id, 0, serde_json::json!({"cost_micros": i64::MAX}));
+        step_with_usage!(store, e_run.id, 1, serde_json::json!({"cost_micros": i64::MAX}));
+        step_with_usage!(store, e_run.id, 2, serde_json::json!({"cost_micros": -10}));
+        (d.id, e.id)
+    }};
+}
+
+/// MOD-12 M2 R1 L1: one counting rule on both stores. A cost counts when it is a JSON number
+/// that is an integer within `bigint` (`jsonb_typeof = 'number'` on Postgres, `as_i64` here), so
+/// a digit string, an integer past `bigint` and a float are skipped alike; and the batch's figure
+/// is the exact sum clamped into `i64`, so a sum past `i64::MAX` answers `i64::MAX` on both
+/// instead of `22003` on Postgres (which would fail admission and every batch walk).
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_spend_counts_one_rule_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (pg_d, pg_e) = odd_spend_fixture!(pg);
+    let (mem_d, mem_e) = odd_spend_fixture!(&mem);
+
+    for (pg_batch, mem_batch, expected, what) in [
+        (
+            pg_d,
+            mem_d,
+            Some(100),
+            "only the in-range integer number counts",
+        ),
+        (
+            pg_e,
+            mem_e,
+            Some(i64::MAX),
+            "the exact sum, clamped into i64",
+        ),
+    ] {
+        let on_pg = pg.batch_spend(pg_batch).await.expect("the Postgres read");
+        assert_eq!(
+            on_pg,
+            mem.batch_spend(mem_batch).await.expect("the MemStore read"),
+            "{what}: one figure, both stores"
+        );
+        assert_eq!(on_pg, expected, "{what}");
+    }
 
     db.drop_db().await;
 }

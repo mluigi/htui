@@ -23,7 +23,7 @@ use htui_agent::event::PermissionOptionKind;
 use htui_core::fixtures::ids;
 use htui_core::model::kind::HEAVY_COMMAND_PREFIXES;
 use htui_core::model::{
-    AgentBox, AgentId, Billing, CommandRun, CommandRunStatus, DocumentId, EventKind, Gate,
+    AgentBox, AgentId, BatchId, Billing, CommandRun, CommandRunStatus, DocumentId, EventKind, Gate,
     GateOutcome, Isolation, Item, ItemId, ItemPatch, NewDocument, NewRepo, NewStepGraph, PhaseId,
     PhasePatch, RepoId, Resolution, Run, RunId, RunMode, RunStatus, RunStep, Status, StepGraphId,
     StepGraphPhase, StepId, StepStatus, VerifyOutcome,
@@ -142,6 +142,13 @@ pub trait Orchestrate {
     /// # Errors
     /// Whatever the engine refuses with.
     async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError>;
+
+    /// `Engine::enqueue_in_batch` (MOD-12 M2): the only way a case makes a batch run, which
+    /// `Command::StartRun` never does. Claim it with [`claim`](Orchestrate::claim).
+    ///
+    /// # Errors
+    /// Whatever the engine refuses with.
+    async fn enqueue_in_batch(&self, item: ItemId, batch: BatchId) -> Result<RunId, EngineError>;
 
     /// A second orchestrator over the same store, as a process started after this one died
     /// (plan D118): a new `owner`, fresh isolator and verifier, a clock past every lease.
@@ -271,6 +278,10 @@ impl Orchestrate for FakeOrchestrator {
 
     async fn claim(&self, run: RunId) -> Result<CommandOutcome, EngineError> {
         Self::claim(self, run).await
+    }
+
+    async fn enqueue_in_batch(&self, item: ItemId, batch: BatchId) -> Result<RunId, EngineError> {
+        Self::enqueue_in_batch(self, item, batch).await
     }
 
     fn restarted(&self) -> Self {
@@ -439,6 +450,10 @@ pub async fn until_stalled<F: Future>(fut: F, stalled: &Notify) {
 /// **Three for MOD-12 M1** (plan D10; ANA-2 criteria 23, 24): an auto run snapshots every phase
 /// whose gate is not hard `never` and walks it to `done` with no human, an auto run still parks at
 /// a hard gate, and a manual snapshot keeps every gate.
+///
+/// **Four for MOD-12 M2** (plan D5, D6; PRD metric "batch spend overshoot"): a batch at its cap
+/// starts no attempt, a batch run's session is cut at the batch's remainder, a manual run reads no
+/// batch figure, and the run cap spans steps.
 pub const CASES: &[&str] = &[
     // ANA-2 §12 criterion 1 (`docs/ANA-2.md:2085`): a FEAT graph walks its four phases.
     "feat_walks_end_to_end",
@@ -663,6 +678,15 @@ pub const CASES: &[&str] = &[
     "auto_mode_skips_soft_gates",
     "auto_mode_parks_at_a_hard_gate",
     "a_manual_snapshot_keeps_its_gates",
+    // MOD-12 M2 (plan D5, D6; PRD metric "batch spend overshoot"): a batch at its cap starts no
+    // attempt, a batch run's session is cut at the batch's remainder, a manual run reads no batch
+    // figure, and the run cap spans steps.
+    "a_batch_at_its_cap_starts_no_attempt",
+    "a_batch_run_session_is_capped_at_the_batch_remainder",
+    "a_manual_run_ignores_batch_figures",
+    "the_run_cap_spans_steps",
+    // MOD-12 M2 R1 (review M1): the session's run term is the snapshot's cap, as the walk's is.
+    "a_lowered_live_run_cap_does_not_cut_a_snapshotted_run",
 ];
 
 /// Run one case by name.
@@ -691,6 +715,7 @@ fn case<'a, H: CaseHarness>(name: &str, harness: &'a H) -> Pin<Box<dyn Future<Ou
         .or_else(|| input_case(name, harness))
         .or_else(|| command_queue_case(name, harness))
         .or_else(|| auto_mode_case(name, harness))
+        .or_else(|| spend_guard_case(name, harness))
         .unwrap_or_else(|| earlier_case(name, harness))
 }
 
@@ -1043,6 +1068,29 @@ fn auto_mode_case<'a, H: CaseHarness>(
         "auto_mode_skips_soft_gates" => Box::pin(auto_mode_skips_soft_gates(harness)),
         "auto_mode_parks_at_a_hard_gate" => Box::pin(auto_mode_parks_at_a_hard_gate(harness)),
         "a_manual_snapshot_keeps_its_gates" => Box::pin(a_manual_snapshot_keeps_its_gates(harness)),
+        _ => return None,
+    })
+}
+
+/// MOD-12 M2's five (plan D5, D6, and review R1's M1), boxed for [`case`]'s reason.
+fn spend_guard_case<'a, H: CaseHarness>(
+    name: &str,
+    harness: &'a H,
+) -> Option<Pin<Box<dyn Future<Output = ()> + 'a>>> {
+    Some(match name {
+        "a_batch_at_its_cap_starts_no_attempt" => {
+            Box::pin(a_batch_at_its_cap_starts_no_attempt(harness))
+        }
+        "a_batch_run_session_is_capped_at_the_batch_remainder" => Box::pin(
+            a_batch_run_session_is_capped_at_the_batch_remainder(harness),
+        ),
+        "a_manual_run_ignores_batch_figures" => {
+            Box::pin(a_manual_run_ignores_batch_figures(harness))
+        }
+        "the_run_cap_spans_steps" => Box::pin(the_run_cap_spans_steps(harness)),
+        "a_lowered_live_run_cap_does_not_cut_a_snapshotted_run" => Box::pin(
+            a_lowered_live_run_cap_does_not_cut_a_snapshotted_run(harness),
+        ),
         _ => return None,
     })
 }
@@ -7899,6 +7947,354 @@ async fn a_manual_snapshot_keeps_its_gates<H: CaseHarness>(harness: &H) {
     );
 }
 
+// -- MOD-12 milestone 2: the spend guard's walk and session halves (plan D5, D6) -----------------
+
+/// Opens the demo box's queue batch as the runner's resume does (MOD-12 D2).
+///
+/// # Panics
+/// When the demo box refuses a batch, which means the fixture moved.
+async fn open_batch<O: Orchestrate>(orch: &O) -> BatchId {
+    let user = orch
+        .store()
+        .this_user()
+        .expect("the demo fixture seeds exactly one `app_user`");
+    orch.store()
+        .open_batch(ids::BOX, user, orch.clock().now())
+        .await
+        .expect("the demo box opens a batch")
+        .id
+}
+
+/// `Engine::enqueue_in_batch` then `Engine::claim`, the runner's two calls, unwrapped to the run
+/// and its rest.
+///
+/// # Panics
+/// When either is refused, which every caller of this helper expects not to be.
+async fn run_in_batch<O: Orchestrate>(orch: &O, item: ItemId, batch: BatchId) -> (RunId, Rest) {
+    let run = orch
+        .enqueue_in_batch(item, batch)
+        .await
+        .expect("the batch is open and the item startable");
+    let outcome = orch.claim(run).await.expect("the box admits the run");
+    let CommandOutcome::Started { run: started, rest } = outcome else {
+        panic!("`claim` answers `Started`, not {outcome:?}");
+    };
+    assert_eq!(started, run, "the claim walked the run it was handed");
+    (run, rest)
+}
+
+/// Merges `key = micros` into the settings of `item`'s project, keeping every other key:
+/// `set_project_settings` replaces the whole blob (blueprint H-9).
+async fn plant_setting<O: Orchestrate>(orch: &O, item: ItemId, key: &str, micros: i64) {
+    let project = item_of(orch, item).await.project_id;
+    let mut settings = orch
+        .store()
+        .project_settings(project)
+        .await
+        .expect("MemStore never fails a read")
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    settings[key] = serde_json::json!(micros);
+    orch.store().set_project_settings(project, settings);
+}
+
+/// A fresh `open` ANA item on the HTUI project (`research`, then the hard `verdict`), declaring
+/// nothing: the demo project has no repo, so no two of its runs overlap.
+///
+/// # Panics
+/// When the mint is refused, which means the fixture moved.
+async fn mint_ana<O: Orchestrate>(orch: &O, title: &str) -> ItemId {
+    let user = orch
+        .store()
+        .this_user()
+        .expect("the demo fixture seeds exactly one `app_user`");
+    orch.store()
+        .mint_item(NewItem {
+            id: ItemId::new(),
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_ANA,
+            title: title.to_owned(),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: user,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("the ANA kind mints on the HTUI project")
+        .id
+}
+
+/// `batch`'s spend as the store computes it (plan D1).
+async fn spend_of<O: Orchestrate>(orch: &O, batch: BatchId) -> Option<i64> {
+    orch.store()
+        .batch_spend(batch)
+        .await
+        .expect("MemStore never fails a read")
+}
+
+/// `ANA-2` admitted under a fresh batch, its `research` costing 600: the auto run skips research's
+/// soft gate and parks at `verdict`'s hard one, leaving the batch at 600.
+async fn a_batch_that_spent_600<O: Orchestrate>(orch: &O) -> (BatchId, RunId) {
+    let batch = open_batch(orch).await;
+    orch.script(
+        "research",
+        1,
+        ScriptedStep::done_costing("the research", 600),
+    );
+    let (run, rest) = run_in_batch(orch, ids::HTUI_ANA_2, batch).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(1), None),
+        "auto skips `research`'s soft gate and parks at `verdict`'s hard one"
+    );
+    assert_eq!(spend_of(orch, batch).await, Some(600));
+    (batch, run)
+}
+
+/// MOD-12 M2 D5: a batch at its project's `per_token_cap_batch` starts no new attempt. The walk
+/// refuses the second run's first phase with rule 6, so it takes `refuse_no_candidate`'s path:
+/// the run fails `no_candidate_agent`, no step row is written, and the item is `blocked` with a
+/// note naming the batch, an escalation for M3 with no new state.
+async fn a_batch_at_its_cap_starts_no_attempt<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let (batch, first) = a_batch_that_spent_600(&orch).await;
+
+    plant_setting(&orch, ids::HTUI_ANA_2, "per_token_cap_batch", 500).await;
+    let second = mint_ana(&orch, "a second question").await;
+    let (run, rest) = run_in_batch(&orch, second, batch).await;
+    let cause = "batch cap reached (600 of 500 micros)";
+    assert_eq!((rest.run, rest.position), (RunStatus::Failed, Some(0)));
+    let Some(RunFailure::NoCandidateAgent { phase, detail }) = &rest.failure else {
+        panic!("a `no_candidate_agent` refusal, not {:?}", rest.failure);
+    };
+    assert_eq!(phase, "research");
+    assert!(detail.contains(cause), "the walk names the batch: {detail}");
+    assert!(
+        steps_of(&orch, run).await.is_empty(),
+        "stage 1 refuses before a step row exists"
+    );
+    assert_eq!(item_of(&orch, second).await.status, Status::Blocked);
+    let notes = notes_of(&orch, second).await;
+    assert!(
+        notes.iter().any(|note| note.contains(cause)),
+        "a refusal a human can read: {notes:?}"
+    );
+    assert_eq!(
+        run_of(&orch, first).await.status,
+        RunStatus::AwaitingApproval,
+        "the run that spent the batch is left parked"
+    );
+    assert_eq!(
+        spend_of(&orch, batch).await,
+        Some(600),
+        "the refusal spent nothing"
+    );
+}
+
+/// MOD-12 M2 D6, D7 (PRD metric "batch spend overshoot", Mem half): a batch run's session is
+/// allowed what the batch had left when it started. `verdict` (ungated here, so the breach fails
+/// the step instead of parking it) is handed the 400 `research` left of the 1 000 cap, spends 600,
+/// and is cut with a failure naming the batch; the overshoot is that one attempt, and the retry
+/// meets the walk's rule 6.
+async fn a_batch_run_session_is_capped_at_the_batch_remainder<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    repoint(&orch, ids::HTUI_ANA_2, |phase| {
+        if phase.name == "verdict" {
+            phase.gate = Gate::Never;
+        }
+    })
+    .await;
+    // Planted before the run is enqueued: the snapshot freezes it (plan D2).
+    plant_setting(&orch, ids::HTUI_ANA_2, "per_token_cap_batch", 1_000).await;
+    let batch = open_batch(&orch).await;
+    orch.script(
+        "research",
+        1,
+        ScriptedStep::done_costing("the research", 600),
+    );
+    orch.script("verdict", 1, ScriptedStep::done_costing("the verdict", 600));
+
+    let (run, rest) = run_in_batch(&orch, ids::HTUI_ANA_2, batch).await;
+    assert_eq!(
+        spec_of(&orch, &session("research", 0)).budget_micros,
+        Some(1_000),
+        "nothing spent yet: the whole batch cap"
+    );
+    assert_eq!(
+        spec_of(&orch, &session("verdict", 0)).budget_micros,
+        Some(400),
+        "what `research` left of the batch"
+    );
+    let verdict = step_at(&orch, run, 1, 1).await;
+    assert_eq!(verdict.status, StepStatus::Failed, "the recorder cut it");
+    let breached = format!("cap breached (batch {batch})");
+    let notes = notes_of(&orch, ids::HTUI_ANA_2).await;
+    assert!(
+        notes.contains(&format!("step `verdict` attempt 1: {breached}")),
+        "the failure names the batch: {notes:?}"
+    );
+    assert_eq!(
+        spend_of(&orch, batch).await,
+        Some(1_200),
+        "the overshoot is the one attempt in flight"
+    );
+
+    // The retry's stage 1 sees the batch over its cap and refuses (rule 6).
+    assert_eq!((rest.run, rest.position), (RunStatus::Failed, Some(1)));
+    let Some(RunFailure::NoCandidateAgent { phase, detail }) = &rest.failure else {
+        panic!("a `no_candidate_agent` refusal, not {:?}", rest.failure);
+    };
+    assert_eq!(phase, "verdict");
+    assert!(
+        detail.contains("batch cap reached (1200 of 1000 micros)"),
+        "{detail}"
+    );
+    assert_eq!(
+        steps_of(&orch, run).await.len(),
+        2,
+        "no second `verdict` attempt was written"
+    );
+}
+
+/// MOD-12 M2 D5, D6: a manual run is in no batch, so it reads no batch figure. Its project's
+/// `per_token_cap_batch` is 0 and the box's batch has spent 600, and still the manual run walks to
+/// its first gate, its session gets no cap at all, and its own 600 is not the batch's.
+async fn a_manual_run_ignores_batch_figures<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    let (batch, _) = a_batch_that_spent_600(&orch).await;
+    plant_setting(&orch, ids::HTUI_ANA_2, "per_token_cap_batch", 0).await;
+
+    let manual = mint_ana(&orch, "a manual question").await;
+    let (run, rest) = start(&orch, manual).await;
+    assert_eq!(
+        (rest.run, rest.position, rest.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "a manual run walks to its first gate: no batch rule refused it"
+    );
+    assert_eq!(
+        orch.store()
+            .run_batch_spend(run)
+            .await
+            .expect("MemStore never fails a read"),
+        None,
+        "a manual run is in no batch"
+    );
+    assert_eq!(
+        spec_of(&orch, &session("research", 0)).budget_micros,
+        None,
+        "no run cap and no batch: no cap at all"
+    );
+    let research = step_at(&orch, run, 0, 1).await;
+    assert_eq!(research.status, StepStatus::AwaitingApproval);
+    assert!(
+        !notes_of(&orch, manual)
+            .await
+            .iter()
+            .any(|note| note.contains("cap breached")),
+        "nothing was cut"
+    );
+    assert_eq!(
+        spend_of(&orch, batch).await,
+        Some(600),
+        "the manual run's spend is not the batch's"
+    );
+}
+
+/// MOD-12 M2 D6 (the per-step reading of `per_token_cap_run`, fixed): `plan`'s allowance is the
+/// 1 000 cap less the 600 `prd` spent, so its 500 breaches it. Before D6 each session had the
+/// whole 1 000 and `plan` passed.
+async fn the_run_cap_spans_steps<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |_| {}).await;
+    plant_setting(&orch, ids::HTUI_FEAT_3, "per_token_cap_run", 1_000).await;
+    orch.script("prd", 1, ScriptedStep::done_costing("the prd", 600));
+    orch.script("plan", 1, ScriptedStep::done_costing("the plan", 500));
+
+    let (run, rest) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        spec_of(&orch, &session("prd", 0)).budget_micros,
+        Some(1_000)
+    );
+    assert_eq!(
+        spec_of(&orch, &session("plan", 0)).budget_micros,
+        Some(400),
+        "the cap less what `prd` spent"
+    );
+    assert_eq!(step_at(&orch, run, 0, 1).await.status, StepStatus::Done);
+    assert_eq!(step_at(&orch, run, 1, 1).await.status, StepStatus::Failed);
+    let notes = notes_of(&orch, ids::HTUI_FEAT_3).await;
+    assert!(
+        notes.contains(&"step `plan` attempt 1: cap breached".to_owned()),
+        "the run's own cap: no batch named: {notes:?}"
+    );
+    assert_eq!((rest.run, rest.position), (RunStatus::Failed, Some(1)));
+    let Some(RunFailure::NoCandidateAgent { phase, detail }) = &rest.failure else {
+        panic!("a `no_candidate_agent` refusal, not {:?}", rest.failure);
+    };
+    assert_eq!(phase, "plan");
+    assert!(
+        detail.contains("quota: cap reached (1100 of 1000 micros)"),
+        "the retry's stage 1 sees the run over its cap: {detail}"
+    );
+}
+
+/// MOD-12 M2 D6 (review R1, M1): a session's run term is the run's snapshotted
+/// `per_token_cap_run`, the figure the walk's rule 2 reads. The run starts under a 10 000 cap,
+/// `prd` spends 2 000 and parks at its gate, and the live cap is then lowered to 1 000 (as
+/// Settings > Queue would). The walk admits `plan` (2 000 of 10 000), so its session is handed
+/// the snapshot's remainder, 8 000, and is not cut: a live term would have handed it 0 and cut it
+/// at its first costed row, on every retry.
+async fn a_lowered_live_run_cap_does_not_cut_a_snapshotted_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    // Planted before the run starts: the snapshot freezes it (plan D2).
+    plant_setting(&orch, ids::HTUI_FEAT_3, "per_token_cap_run", 10_000).await;
+    orch.script("prd", 1, ScriptedStep::done_costing("the prd", 2_000));
+    orch.script("plan", 1, ScriptedStep::done_costing("the plan", 500));
+
+    let (run, parked) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (parked.run, parked.position, parked.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "`prd` parks at its gate"
+    );
+    assert_eq!(
+        spec_of(&orch, &session("prd", 0)).budget_micros,
+        Some(10_000)
+    );
+
+    // The live cap is lowered below what the run has already spent; the snapshot keeps 10 000.
+    plant_setting(&orch, ids::HTUI_FEAT_3, "per_token_cap_run", 1_000).await;
+    let rest = approve(&orch, run, 1).await;
+
+    assert_eq!(
+        spec_of(&orch, &session("plan", 0)).budget_micros,
+        Some(8_000),
+        "the snapshot's cap less what `prd` spent, not the live cap's floor of 0"
+    );
+    assert_eq!(
+        step_at(&orch, run, 1, 1).await.status,
+        StepStatus::Done,
+        "`plan` spent 500 of its 8 000 and was not cut"
+    );
+    assert!(
+        !notes_of(&orch, ids::HTUI_FEAT_3)
+            .await
+            .iter()
+            .any(|note| note.contains("cap breached")),
+        "nothing was cut"
+    );
+    assert_eq!(rest.failure, None, "the run walked on: {rest:?}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -7923,8 +8319,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            103,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            108,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -7958,7 +8354,9 @@ mod tests {
              and MOD-73's one (a gate edit read by the next phase, plan D2), and MOD-11 T8's six \
              (plan D16, D17: `fan_out_only` at one agent, at two and on a `heavy_build` item, \
              the denials with and without a persona, and the judge never exposed), and MOD-12 \
-             M1's three (criterion 23's two halves, criterion 24)"
+             M1's three (criterion 23's two halves, criterion 24), and MOD-12 M2's five (the \
+             batch walk refusal, the batch remainder, the manual run, the run cap across steps, \
+             and review R1's snapshotted run cap against a lowered live one)"
         );
     }
 

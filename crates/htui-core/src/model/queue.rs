@@ -104,6 +104,78 @@ pub fn free_slots(limit: u32, running: usize, queued: usize) -> usize {
         .saturating_sub(running.saturating_add(queued))
 }
 
+/// `app_setting.min_budget_for_new_attempt` (OQ-6): unseeded; USD micros.
+pub const MIN_BUDGET_FOR_NEW_ATTEMPT: &str = "min_budget_for_new_attempt";
+
+/// OQ-6's reading of [`MIN_BUDGET_FOR_NEW_ATTEMPT`]: a positive integer, else `0`. A stray `0`, a
+/// negative, a string or a float all read as `0`, as `htui-orch`'s `min_budget` reads it, so the
+/// runner (MOD-12 M2 D4) and the walk agree on one number.
+#[must_use]
+pub fn min_budget_micros(app: &BTreeMap<String, Value>) -> i64 {
+    app.get(MIN_BUDGET_FOR_NEW_ATTEMPT)
+        .and_then(Value::as_i64)
+        .filter(|micros| *micros > 0)
+        .unwrap_or(0)
+}
+
+/// Why [`batch_budget`] admits no new attempt in a batch (MOD-12 M2 D3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchStop {
+    /// The batch has spent its project's `per_token_cap_batch` or more (rule 2's batch twin).
+    CapReached {
+        /// The batch's spend, USD micros.
+        spent: i64,
+        /// The cap compared against, USD micros.
+        cap: i64,
+    },
+    /// What is left is below `min_budget_for_new_attempt` (rule 5's batch twin).
+    Budget {
+        /// `cap - spent`, USD micros.
+        remaining: i64,
+        /// The minimum a new attempt needs, USD micros.
+        min: i64,
+    },
+}
+
+impl core::fmt::Display for BatchStop {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::CapReached { spent, cap } => {
+                write!(f, "batch cap reached ({spent} of {cap} micros)")
+            }
+            Self::Budget { remaining, min } => {
+                write!(f, "batch budget: {remaining} micros left, {min} required")
+            }
+        }
+    }
+}
+
+/// MOD-12 M2 D3: the one admission rule the runner, the walk and (through its figures) the
+/// recorder share, mirroring `select::walk`'s rule 2 and rule 5 exactly. Either figure unknown is
+/// unbounded (`Ok(None)`, OQ-6). `spent >= cap` is [`BatchStop::CapReached`] (equality reaches it);
+/// `cap - spent < min` is [`BatchStop::Budget`] (exactly the minimum is enough); otherwise
+/// `Ok(Some(cap - spent))`.
+///
+/// # Errors
+/// The [`BatchStop`] that refuses the attempt.
+pub fn batch_budget(
+    spent: Option<i64>,
+    cap: Option<i64>,
+    min: i64,
+) -> Result<Option<i64>, BatchStop> {
+    let (Some(spent), Some(cap)) = (spent, cap) else {
+        return Ok(None);
+    };
+    if spent >= cap {
+        return Err(BatchStop::CapReached { spent, cap });
+    }
+    let remaining = cap.saturating_sub(spent);
+    if remaining < min {
+        return Err(BatchStop::Budget { remaining, min });
+    }
+    Ok(Some(remaining))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +280,81 @@ mod tests {
         assert_eq!(free_slots(2, 1, 0), 1);
         assert_eq!(free_slots(2, 1, 1), 0);
         assert_eq!(free_slots(1, 3, 0), 0);
+    }
+
+    #[test]
+    fn batch_budget_is_unbounded_when_either_figure_is_unknown() {
+        assert_eq!(batch_budget(None, Some(1_000), 200), Ok(None));
+        assert_eq!(batch_budget(Some(900), None, 200), Ok(None));
+        assert_eq!(batch_budget(None, None, 200), Ok(None));
+    }
+
+    #[test]
+    fn batch_budget_is_reached_at_equality() {
+        assert_eq!(
+            batch_budget(Some(500), Some(500), 0),
+            Err(BatchStop::CapReached {
+                spent: 500,
+                cap: 500
+            })
+        );
+        assert_eq!(
+            batch_budget(Some(600), Some(500), 0),
+            Err(BatchStop::CapReached {
+                spent: 600,
+                cap: 500
+            })
+        );
+    }
+
+    #[test]
+    fn batch_budget_refuses_a_remainder_below_the_minimum() {
+        assert_eq!(
+            batch_budget(Some(900), Some(1_000), 200),
+            Err(BatchStop::Budget {
+                remaining: 100,
+                min: 200
+            })
+        );
+    }
+
+    #[test]
+    fn batch_budget_admits_exactly_the_minimum() {
+        assert_eq!(batch_budget(Some(800), Some(1_000), 200), Ok(Some(200)));
+        assert_eq!(
+            batch_budget(Some(0), Some(0), 0),
+            Err(BatchStop::CapReached { spent: 0, cap: 0 }),
+            "0 is a real cap"
+        );
+    }
+
+    #[test]
+    fn batch_stop_names_the_batch() {
+        assert_eq!(
+            BatchStop::CapReached {
+                spent: 500,
+                cap: 500
+            }
+            .to_string(),
+            "batch cap reached (500 of 500 micros)"
+        );
+        assert_eq!(
+            BatchStop::Budget {
+                remaining: 100,
+                min: 200
+            }
+            .to_string(),
+            "batch budget: 100 micros left, 200 required"
+        );
+    }
+
+    #[test]
+    fn min_budget_micros_reads_a_positive_integer_else_zero() {
+        let app = |value: Value| BTreeMap::from([(MIN_BUDGET_FOR_NEW_ATTEMPT.to_owned(), value)]);
+        assert_eq!(min_budget_micros(&app(json!(500))), 500);
+        assert_eq!(min_budget_micros(&BTreeMap::new()), 0, "absent");
+        for stray in [json!(0), json!(-5), json!("500"), json!(1.5)] {
+            assert_eq!(min_budget_micros(&app(stray.clone())), 0, "{stray}");
+        }
     }
 }

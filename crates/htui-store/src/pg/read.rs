@@ -2317,6 +2317,65 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-12 M2 D1: `Σ run_step.usage->'cost_micros'` over the runs admitted under `batch`;
+    /// `None` when no step reports an integer cost. One rule with `MemStore` (review R1 L1):
+    ///
+    /// - a cost counts when it is a JSON **number** written as an integer within `bigint`, which
+    ///   is what `serde_json`'s `as_i64` accepts. A digit string (`"700"`), an integer past
+    ///   `bigint` and a float (`1.5`, or `1e3`, which serde sends as `1000.0`) are skipped. The
+    ///   `CASE` orders the guards before the `::numeric` cast, so a non-number never reaches it;
+    /// - the figure is the exact `numeric` sum clamped into `bigint`, so a sum past `i64::MAX`
+    ///   answers `i64::MAX` rather than `22003`, which would fail admission and every batch walk.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT (CASE WHEN t.total > 9223372036854775807 THEN 9223372036854775807
+                         WHEN t.total < -9223372036854775808 THEN -9223372036854775808
+                         ELSE t.total
+                    END)::bigint AS "spent"
+              FROM (SELECT SUM(c.cost) AS total
+                      FROM (SELECT CASE WHEN jsonb_typeof(s.usage->'cost_micros') = 'number'
+                                         AND (s.usage->>'cost_micros') ~ '^-?[0-9]+$'
+                                        THEN (s.usage->>'cost_micros')::numeric
+                                   END AS cost
+                              FROM run_step s
+                              JOIN run r ON r.id = s.run_id
+                             WHERE r.batch_id = $1) c
+                     WHERE c.cost BETWEEN -9223372036854775808 AND 9223372036854775807) t
+            "#,
+            batch.as_uuid(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-12 M2 D5: `run`'s `batch_id` and [`PgStore::batch_spend`] of it; `None` for a manual or
+    /// chat run (`batch_id IS NULL`) and for an unknown run. Two statements: the second is
+    /// `batch_spend`'s, so the two answers cannot drift.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
+        let batch = sqlx::query_scalar!(
+            r#"SELECT batch_id AS "batch_id: BatchId" FROM run WHERE id = $1"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .flatten();
+        match batch {
+            Some(batch) => Ok(Some((batch, self.batch_spend(batch).await?))),
+            None => Ok(None),
+        }
+    }
+
     /// MOD-12 D6 (H-5): `claim_run`'s slot count — `running` runs executing on `box_id`, **not**
     /// `awaiting_approval` (that is [`active_runs_on_box`](PgStore::active_runs_on_box)). The
     /// query text is `claim_run`'s byte for byte, so it shares that `.sqlx` entry.

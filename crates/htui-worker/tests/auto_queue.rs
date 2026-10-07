@@ -17,6 +17,13 @@
 //!
 //! The ticker is one hour, so every sweep a case sees is an explicit `sweep_with` or the D8
 //! wake. The `_pg` cases return early without `HTUI_TEST_DATABASE_URL`.
+//!
+//! MOD-12 milestone 2 (blueprint §C.3) adds the runner's spend gate (plan D4): a costing harness
+//! whose every session reports a fixed USD cost, and cases over the batch's spend against each
+//! entry's project cap. The spend is always made by a run that is already parked when the cap is
+//! planted, so its snapshot froze no batch cap and nothing cuts its sessions (blueprint H-6); a
+//! run admitted under a cap is asserted admitted, never walked. The one exception is
+//! (pg-overshoot), which plants the cap first on purpose: it walks the cut and the overshoot.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,16 +37,18 @@ use htui_agent::driver::{
     PermissionRequestId, SessionSpec,
 };
 use htui_agent::error::DriverError;
-use htui_agent::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason};
+use htui_agent::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, UsageEvent};
 use htui_agent::fake::FakeDriver;
 use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::{demo_at, edit_agent, ids};
+use htui_core::model::QueueSetting;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, AgentSummary, BatchClose, Billing, BoxEdit, DocumentId, Executor,
-    ItemId, NewDocument, NewItem, NewRepo, NewStepGraph, PhaseId, Resolution, RunId, RunMode,
-    RunStatus, RunStep, RunSummary, SnapshotPhase, Status, StepGraphId, StepGraphPhase, Transport,
+    Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, Billing, BoxEdit, DocumentId,
+    Executor, ItemId, ItemKindId, MIN_BUDGET_FOR_NEW_ATTEMPT, NewDocument, NewItem, NewRepo,
+    NewStepGraph, PER_TOKEN_CAP_BATCH, PhaseId, ProjectId, Resolution, RunId, RunMode, RunStatus,
+    RunStep, RunSummary, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepStatus, Transport,
 };
-use htui_core::store::{CasOutcome, MemStore, ReadStore, WriteStore};
+use htui_core::store::{CasOutcome, MemStore, QueueTarget, ReadStore, WriteStore};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, Isolator};
 use htui_store::{Backend, PgStore, testkit};
@@ -149,11 +158,41 @@ async fn mint<S: WriteStore>(
     priority: i16,
     required_tags: Vec<String>,
 ) -> ItemId {
+    mint_in(
+        store,
+        (ids::PROJECT_HTUI, ids::KIND_HTUI_ANA),
+        title,
+        priority,
+        required_tags,
+    )
+    .await
+}
+
+/// A fresh `ANA` item of the agy project (MOD-12 M2's second project, its own caps).
+async fn mint_agy<S: WriteStore>(store: &S, title: &str, priority: i16) -> ItemId {
+    mint_in(
+        store,
+        (ids::PROJECT_AGY, ids::KIND_AGY_ANA),
+        title,
+        priority,
+        Vec::new(),
+    )
+    .await
+}
+
+/// A fresh item of `kind` in `project`, on the demo box.
+async fn mint_in<S: WriteStore>(
+    store: &S,
+    (project_id, kind_id): (ProjectId, ItemKindId),
+    title: &str,
+    priority: i16,
+    required_tags: Vec<String>,
+) -> ItemId {
     store
         .mint_item(NewItem {
             id: ItemId::new(),
-            project_id: ids::PROJECT_HTUI,
-            kind_id: ids::KIND_HTUI_ANA,
+            project_id,
+            kind_id,
             title: title.to_owned(),
             body: String::new(),
             required_tags,
@@ -173,9 +212,13 @@ async fn mint<S: WriteStore>(
 // ---------------------------------------------------------------------------------------------
 
 /// The transport the scripted row reaches: every session plays one `done` turn after taking one
-/// permit of the shared semaphore.
+/// permit of the shared semaphore. With a `cost`, the turn first reports that many USD micros
+/// (`htui-orch`'s `ScriptedStep::done_costing` shape), so a batch has a spend (MOD-12 M2).
 #[derive(Debug)]
-struct Hold(Arc<Semaphore>);
+struct Hold {
+    gate: Arc<Semaphore>,
+    cost: Option<i64>,
+}
 
 impl TransportBuilder for Hold {
     fn build(
@@ -184,12 +227,19 @@ impl TransportBuilder for Hold {
         _on_box: Option<&AgentBox>,
         caps: DriverCaps,
     ) -> Result<Box<dyn AgentDriver>, DriverError> {
-        let script = Script::one_turn(vec![ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
+        let mut events = Vec::new();
+        if let Some(cost) = self.cost {
+            events.push(ScriptEvent::Emit(DriverEvent::Usage(UsageEvent {
+                cost_micros: Some(cost),
+                ..UsageEvent::default()
+            })));
+        }
+        events.push(ScriptEvent::Emit(DriverEvent::Done(DoneEvent {
             stop_reason: StopReason::EndTurn,
-        }))]);
+        })));
         Ok(Box::new(HeldDriver {
-            inner: FakeDriver::new(agent.name.clone(), caps, script),
-            gate: Arc::clone(&self.0),
+            inner: FakeDriver::new(agent.name.clone(), caps, Script::one_turn(events)),
+            gate: Arc::clone(&self.gate),
         }))
     }
 }
@@ -344,6 +394,8 @@ struct Parts {
     gate: Arc<Semaphore>,
     opened: Arc<AtomicBool>,
     isolator: Arc<FakeIsolator>,
+    /// What every session reports spending, USD micros; `None` reports no usage.
+    cost: Option<i64>,
 }
 
 impl Parts {
@@ -352,6 +404,15 @@ impl Parts {
             gate: Arc::new(Semaphore::new(0)),
             opened: Arc::default(),
             isolator: Arc::new(FakeIsolator::new()),
+            cost: None,
+        }
+    }
+
+    /// [`Parts::new`] whose every session costs `micros` (MOD-12 M2).
+    fn costing(micros: i64) -> Self {
+        Self {
+            cost: Some(micros),
+            ..Self::new()
         }
     }
 
@@ -365,7 +426,13 @@ impl Parts {
     /// A runtime over the fakes: the claim scan on, the ticker an hour, the output author.
     fn runtime<H: htui_core::store::WorkerHost>(&self) -> RunRuntime<H, TestSink> {
         let mut factory = DriverFactory::new();
-        factory.register("acp", Box::new(Hold(Arc::clone(&self.gate))));
+        factory.register(
+            "acp",
+            Box::new(Hold {
+                gate: Arc::clone(&self.gate),
+                cost: self.cost,
+            }),
+        );
         RunRuntime::with_parts(
             Arc::clone(&self.isolator) as Arc<dyn Isolator>,
             Arc::new(FakeVerifier::new()),
@@ -412,6 +479,59 @@ impl Harness {
         harness
     }
 
+    /// [`Harness::open`] whose every session costs `micros` (MOD-12 M2).
+    async fn costing(micros: i64) -> Self {
+        let mut harness = Self::new().await;
+        harness.parts = Parts::costing(micros);
+        harness.parts.open();
+        harness
+    }
+
+    /// Plants `project`'s `per_token_cap_batch` (JSON, so a malformed one can be planted), merged
+    /// into its current `settings`: `set_project_settings` replaces the blob (blueprint H-9).
+    async fn cap_batch(&self, project: ProjectId, cap: serde_json::Value) {
+        let mut settings = self
+            .store
+            .project_settings(project)
+            .await
+            .expect("the read answers")
+            .expect("the project exists");
+        if !settings.is_object() {
+            settings = json!({});
+        }
+        settings
+            .as_object_mut()
+            .expect("an object")
+            .insert(PER_TOKEN_CAP_BATCH.to_owned(), cap);
+        self.store.set_project_settings(project, settings);
+    }
+
+    async fn batch_spend(&self, batch: BatchId) -> Option<i64> {
+        self.store
+            .batch_spend(batch)
+            .await
+            .expect("the read answers")
+    }
+
+    /// Whether `item` has a run admitted under `batch`.
+    async fn admitted_under(&self, item: ItemId, batch: BatchId) -> bool {
+        let members = self
+            .store
+            .batch_runs(batch)
+            .await
+            .expect("the read answers");
+        self.runs(item)
+            .await
+            .iter()
+            .any(|run| members.iter().any(|(member, _)| *member == run.id))
+    }
+
+    /// One explicit sweep, settled.
+    async fn sweep(&self, runtime: &mut RunRuntime<Backend, TestSink>) {
+        runtime.sweep_with(&self.backend(), &TestSink::default());
+        settle(runtime).await;
+    }
+
     fn backend(&self) -> Backend {
         Backend::memory(self.store.clone())
     }
@@ -427,7 +547,7 @@ impl Harness {
             .expect("the item queues");
     }
 
-    async fn resume(&self) -> htui_core::model::BatchId {
+    async fn resume(&self) -> BatchId {
         self.store
             .open_batch(ids::BOX, ids::USER, Utc::now())
             .await
@@ -1292,6 +1412,202 @@ async fn pausing_cancels_the_batch_runs_still_waiting() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// MOD-12 M2: the runner's spend gate (plan D4), over `Backend::Memory`
+// ---------------------------------------------------------------------------------------------
+
+/// What one parked htui ANA run spends under [`Harness::costing`]`(300)`: `research`'s session
+/// and `verdict`'s, before the hard gate parks it.
+const PARKED_SPEND: i64 = 600;
+
+/// M2 (a)-(c), (e): a costing harness whose batch has spent [`PARKED_SPEND`] through `A1`, an
+/// htui item now parked at `verdict`, with no cap planted yet (H-6).
+async fn spent_batch() -> (Harness, RunRuntime<Backend, TestSink>, BatchId) {
+    let h = Harness::costing(300).await;
+    let a1 = mint_ana(&h.store, "a1", 0).await;
+    h.queue(a1).await;
+    let batch = h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+    let run = h.only_run(a1).await;
+    assert_eq!(run.status, RunStatus::AwaitingApproval, "parked at verdict");
+    assert_eq!(
+        h.batch_spend(batch).await,
+        Some(PARKED_SPEND),
+        "the parked run's sessions are the batch's spend"
+    );
+    (h, runtime, batch)
+}
+
+/// M2 (a) D2, D4: a batch whose spend reached the htui project's `per_token_cap_batch` admits
+/// no further htui entry, and the loop goes on: an agy entry (no cap) behind it is admitted in
+/// the same sweep.
+#[tokio::test]
+async fn a_batch_at_a_projects_cap_admits_only_other_projects() {
+    let (h, mut runtime, batch) = spent_batch().await;
+    h.cap_batch(ids::PROJECT_HTUI, json!(PARKED_SPEND)).await;
+    let a2 = mint_ana(&h.store, "a2", 1).await;
+    let b1 = mint_agy(&h.store, "b1", 0).await;
+    h.queue(a2).await;
+    h.queue(b1).await;
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.runs(a2).await.is_empty(),
+        "the batch has spent the htui cap"
+    );
+    assert!(
+        h.admitted_under(b1, batch).await,
+        "agy has no cap, so its entry is admitted under the batch"
+    );
+}
+
+/// M2 (b) D3, D4: what the batch has left under the cap is below `min_budget_for_new_attempt`,
+/// so nothing is admitted.
+#[tokio::test]
+async fn a_remainder_below_the_minimum_admits_nothing() {
+    let (h, mut runtime, _batch) = spent_batch().await;
+    h.cap_batch(ids::PROJECT_HTUI, json!(PARKED_SPEND + 100))
+        .await;
+    h.store
+        .set_app_setting(MIN_BUDGET_FOR_NEW_ATTEMPT, json!(200));
+    let a2 = mint_ana(&h.store, "a2", 0).await;
+    h.queue(a2).await;
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.runs(a2).await.is_empty(),
+        "100 micros left is below the 200 a new attempt needs"
+    );
+
+    h.store
+        .set_app_setting(MIN_BUDGET_FOR_NEW_ATTEMPT, json!(100));
+    h.sweep(&mut runtime).await;
+    assert!(
+        !h.runs(a2).await.is_empty(),
+        "exactly the minimum left is enough"
+    );
+}
+
+/// M2 (c) D4: a stopped batch is left behind by a pause and a resume; the new batch has no spend
+/// yet (unbounded), so the entry is admitted under it. Admission only (H-6).
+#[tokio::test]
+async fn a_pause_and_a_resume_open_a_batch_that_admits_again() {
+    let (h, mut runtime, batch) = spent_batch().await;
+    h.cap_batch(ids::PROJECT_HTUI, json!(PARKED_SPEND)).await;
+    let a2 = mint_ana(&h.store, "a2", 0).await;
+    h.queue(a2).await;
+    h.sweep(&mut runtime).await;
+    assert!(h.runs(a2).await.is_empty(), "stopped by the batch's cap");
+
+    h.store
+        .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
+        .await
+        .expect("the write answers")
+        .expect("the batch was open");
+    let next = h.resume().await;
+    assert_ne!(next, batch);
+    assert_eq!(
+        h.batch_spend(next).await,
+        None,
+        "a new batch has spent nothing"
+    );
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.admitted_under(a2, next).await,
+        "the new batch admits the entry"
+    );
+}
+
+/// M2 (d) D4: a malformed cap fails its project's entries closed, and the next project's entry
+/// is admitted in the same sweep.
+#[tokio::test]
+async fn a_malformed_cap_skips_its_project_and_admits_the_next() {
+    let h = Harness::costing(300).await;
+    h.cap_batch(ids::PROJECT_HTUI, json!("lots")).await;
+    let a1 = mint_ana(&h.store, "a1", 1).await;
+    let b1 = mint_agy(&h.store, "b1", 0).await;
+    h.queue(a1).await;
+    h.queue(b1).await;
+    let batch = h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.runs(a1).await.is_empty(),
+        "a cap that cannot be read admits nothing of its project"
+    );
+    assert!(h.admitted_under(b1, batch).await);
+}
+
+/// M2 (e) D4: a batch every entry of which is stopped stays open, keeps its entries and is not
+/// drained (no new `closed_reason`), sweep after sweep.
+#[tokio::test]
+async fn a_stopped_batch_stays_open_and_keeps_its_entries() {
+    let (h, mut runtime, batch) = spent_batch().await;
+    h.cap_batch(ids::PROJECT_HTUI, json!(PARKED_SPEND)).await;
+    let a2 = mint_ana(&h.store, "a2", 0).await;
+    h.queue(a2).await;
+    h.sweep(&mut runtime).await;
+    h.sweep(&mut runtime).await;
+    assert!(h.runs(a2).await.is_empty(), "stopped by the batch's cap");
+    let open = h
+        .store
+        .open_batch_of(ids::BOX)
+        .await
+        .expect("the read answers")
+        .expect("the stopped batch is still open");
+    assert_eq!(open.id, batch);
+    assert_eq!(open.closed_at, None);
+    assert!(
+        h.store
+            .queue_entries(ids::BOX)
+            .await
+            .expect("the read answers")
+            .iter()
+            .any(|entry| entry.item_id == a2),
+        "the stopped entry keeps its place"
+    );
+}
+
+/// M2 (f) D1, D4: a manual run's spend is outside every batch, so a cap equal to it does not stop
+/// the batch's first admission.
+#[tokio::test]
+async fn a_manual_runs_spend_does_not_count_against_the_batch() {
+    let h = Harness::costing(300).await;
+    let backend = h.backend();
+    let sink = TestSink::default();
+    let mut runtime = h.runtime();
+    let manual = mint_ana(&h.store, "manual", 0).await;
+    let _ = runtime
+        .serve_request(&backend, &sink, 1, start_run(manual), &LiveChats::default())
+        .await;
+    settle(&mut runtime).await;
+    assert_eq!(
+        h.only_run(manual).await.status,
+        RunStatus::AwaitingApproval,
+        "a manual run keeps every gate, so it parks after its first session"
+    );
+    let manual_run = h.only_run(manual).await;
+    let spent: i64 = h
+        .store
+        .run_steps(manual_run.id)
+        .await
+        .expect("the read answers")
+        .iter()
+        .filter_map(|step| step.usage.as_ref()?.get("cost_micros")?.as_i64())
+        .sum();
+    assert_eq!(spent, 300, "the manual run spent outside any batch");
+
+    h.cap_batch(ids::PROJECT_HTUI, json!(300)).await;
+    let a1 = mint_ana(&h.store, "a1", 0).await;
+    h.queue(a1).await;
+    let batch = h.resume().await;
+    assert_eq!(h.batch_spend(batch).await, None, "no run of the batch yet");
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.admitted_under(a1, batch).await,
+        "the manual run's 300 micros are not the batch's"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
 // The cases over Postgres
 // ---------------------------------------------------------------------------------------------
 
@@ -1492,5 +1808,155 @@ async fn manual_and_auto_overlap_serialise_on_postgres() {
         RunReply::Orch(OrchReply::Done(_)) => {}
         other => panic!("the manual StartRun walked, not {other:?}"),
     }
+    db.drop_db().await;
+}
+
+/// (pg-overshoot) MOD-12 M2 D6, D7 (PRD metric "batch spend overshoot", the Pg half over
+/// `SUM(run_step.usage)`; review R1 L5): the runtime's walk over Postgres, mirroring `htui-orch`'s
+/// `a_batch_run_session_is_capped_at_the_batch_remainder`. A batch cap of 1 000 is planted
+/// **before** admission, so the snapshot freezes it, and every session reports 600 micros.
+/// `research` spends 600; `verdict` (ungated here, so the breach fails the step rather than
+/// parking it) is handed the 400 left, spends 600 and is cut, its failure naming the batch. The
+/// batch's Postgres sum is 1 200: past the cap by the one attempt that was in flight, no more. The
+/// retry meets the walk's batch rule and no second `verdict` attempt is written; the next queue
+/// entry is not admitted. Only batch-term behaviour is asserted: no `per_token_cap_run` is
+/// planted, so the run term is unbounded throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
+    const COST: i64 = 600;
+    const CAP: i64 = 1_000;
+    let Some(db) = testkit::demo_db().await else {
+        eprintln!("{}", testkit::SKIP);
+        return;
+    };
+    seed(
+        &db.store,
+        db.store.agents().await.expect("the fixture's agents"),
+        Repo::None,
+    )
+    .await;
+    // `verdict` is a hard gate in the demo graph, which would park the cut attempt for a human;
+    // ungated, the cut fails it and the walk tries again, as in the Mem case.
+    sqlx::query(
+        "UPDATE step_graph_phase SET gate = 'never', gate_hard = false WHERE name = 'verdict'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("verdict is ungated");
+    let target = QueueTarget::Project(ids::PROJECT_HTUI);
+    let token = db
+        .store
+        .queue_setting(target, QueueSetting::PerTokenCapBatch)
+        .await
+        .expect("the read answers")
+        .expect("the project exists")
+        .token;
+    let planted = db
+        .store
+        .set_queue_setting(target, QueueSetting::PerTokenCapBatch, json!(CAP), token)
+        .await
+        .expect("the cap write answers");
+    assert!(
+        matches!(planted, CasOutcome::Applied(_)),
+        "the cap lands: {planted:?}"
+    );
+
+    let parts = Parts::costing(COST);
+    parts.open();
+    let a1 = mint_ana(&db.store, "a1", 0).await;
+    db.store
+        .queue_item(a1, ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the item queues");
+    let batch = db
+        .store
+        .open_batch(ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the batch opens")
+        .id;
+    let mut runtime: RunRuntime<PgStore, TestSink> = parts.runtime();
+    runtime.sweep_with(&db.store, &TestSink::default());
+    settle(&mut runtime).await;
+
+    let run = pg_only_run(&db.store, a1).await;
+    assert_eq!(run.mode, RunMode::Auto);
+    let steps = db.store.run_steps(run.id).await.expect("the read answers");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.phase_name.as_str(), step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [
+            ("research", 1, StepStatus::Done),
+            ("verdict", 1, StepStatus::Failed)
+        ],
+        "the recorder cut verdict, and no second verdict attempt was written"
+    );
+    // The recorder's own cut (`cap_exceeded`, then `done: cancelled`); its wording is not pinned
+    // here. That the batch's remainder was the binding term is the failure's `(batch …)` below.
+    let codes: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'code' FROM session_event WHERE run_step_id = $1 AND kind = 'error'",
+    )
+    .bind(steps[1].id.as_uuid())
+    .fetch_all(&db.pool)
+    .await
+    .expect("the events read");
+    assert_eq!(codes, [json!("cap_exceeded")], "the recorder cut verdict");
+    let notes: Vec<String> = sqlx::query_scalar("SELECT body FROM item_note WHERE item_id = $1")
+        .bind(a1.as_uuid())
+        .fetch_all(&db.pool)
+        .await
+        .expect("the notes read");
+    assert!(
+        notes.iter().any(|note| note.contains(&format!(
+            "step `verdict` attempt 1: cap breached (batch {batch})"
+        ))),
+        "the failure names the batch: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("batch cap reached (1200 of 1000 micros)")),
+        "the retry met the walk's batch rule: {notes:?}"
+    );
+    assert_eq!(
+        db.store
+            .run(run.id)
+            .await
+            .expect("read")
+            .map(|run| run.status),
+        Some(RunStatus::Failed),
+        "the refused retry ends the run"
+    );
+
+    let spent = db
+        .store
+        .batch_spend(batch)
+        .await
+        .expect("the Postgres sum answers")
+        .expect("the batch has a spend");
+    assert_eq!(spent, 2 * COST, "Σ run_step.usage over the batch");
+    assert!(
+        spent > CAP && spent - CAP <= COST,
+        "the overshoot ({}) is at most the one attempt in flight ({COST})",
+        spent - CAP
+    );
+
+    let a2 = mint_ana(&db.store, "a2", 1).await;
+    db.store
+        .queue_item(a2, ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the item queues");
+    runtime.sweep_with(&db.store, &TestSink::default());
+    settle(&mut runtime).await;
+    assert!(
+        pg_runs(&db.store, a2).await.is_empty(),
+        "the batch is past its cap, so the next entry is not admitted"
+    );
+    assert_eq!(
+        db.store.batch_spend(batch).await.expect("read"),
+        Some(spent),
+        "nothing was spent after the cut"
+    );
     db.drop_db().await;
 }

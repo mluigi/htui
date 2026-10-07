@@ -1,0 +1,43 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                    UPDATE box\n                       SET settings     = settings - $3::text,\n                           edit_version = edit_version + 1\n                     WHERE id = $1 AND user_id = $4 AND edit_version = $2\n                       AND jsonb_typeof(settings) = 'object'\n                    RETURNING settings, edit_version\n                    ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "settings",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "settings"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "edit_version",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "edit_version"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "6a951eda51e98a638d440fe8ee70c0471a27ba3903232d87f46ccc34476bbec2"
+}

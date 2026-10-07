@@ -32,20 +32,21 @@ use htui_core::model::{
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
     PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent,
     PhaseId, PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
-    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
-    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementPatch, RequirementRevision, RequirementSpec, RequirementUpdate, Resolution,
+    ResolvedInput, Run, RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
+    SkillBinding, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission,
+    Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{
-    CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, ReadStore, Result, SettingRung,
-    StepFence, StoredSetting, UpdateOutcome, WriteStore,
+    CasOutcome, DeleteReach, DeleteTarget, MemStore, ParkOutcome, QueueStored, QueueTarget,
+    QueueToken, ReadStore, Result, SettingRung, StepFence, StoredSetting, UpdateOutcome,
+    WriteStore,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -870,6 +871,42 @@ impl WriteStore for Writer {
         match self {
             Self::Memory(store) => store.setting(rung, key).await,
             Self::Online(pg) => pg.setting(rung, key).await,
+        }
+    }
+
+    async fn queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Result<Option<QueueStored>> {
+        match self {
+            Self::Memory(store) => store.queue_setting(target, key).await,
+            Self::Online(pg) => pg.queue_setting(target, key).await,
+        }
+    }
+
+    async fn set_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        value: Value,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        match self {
+            Self::Memory(store) => store.set_queue_setting(target, key, value, expected).await,
+            Self::Online(pg) => pg.set_queue_setting(target, key, value, expected).await,
+        }
+    }
+
+    async fn clear_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        match self {
+            Self::Memory(store) => store.clear_queue_setting(target, key, expected).await,
+            Self::Online(pg) => pg.clear_queue_setting(target, key, expected).await,
         }
     }
 

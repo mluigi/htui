@@ -12,8 +12,8 @@ use htui_agent::error::DriverError;
 use htui_agent::event::{DoneEvent, StopReason};
 use htui_agent::record::CapBreach;
 use htui_core::model::{
-    BoxId, Document, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId, Run, RunId,
-    RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
+    BatchId, BoxId, Document, Gate, GateOutcome, GraphSnapshot, ItemId, NewNote, NoteId, Run,
+    RunId, RunStatus, RunStep, SnapshotPhase, Status, StepId, StepStatus, UserId, VerifyOutcome,
 };
 use htui_core::prompt::digest::{canonical, sha256_hex};
 use htui_core::store::{ParkOutcome, StepFence, StoreError};
@@ -118,8 +118,12 @@ pub enum StepFailure {
     Driver(String),
     /// `done` with `refusal`, `max_tokens` or `max_turn_requests` (`docs/ANA-2.md:439`).
     Stopped(StopReason),
-    /// `R-AGT-7`'s per-run cap was reached and the recorder cancelled the turn.
-    CapBreached,
+    /// `R-AGT-7`'s cap was reached and the recorder cancelled the turn. `batch` names the queue
+    /// batch when its remainder was the binding term of the session's allowance (MOD-12 M2 D6).
+    CapBreached {
+        /// The binding batch, or `None` for the run's own cap.
+        batch: Option<BatchId>,
+    },
     /// The step outlived `SnapshotPhase::deadline_seconds` (plan D8's *step* deadline; the verify
     /// deadline of `:515` is milestone 3's and is a different clock).
     DeadlineElapsed,
@@ -136,7 +140,8 @@ impl core::fmt::Display for StepFailure {
         match self {
             Self::Driver(message) => write!(f, "driver: {message}"),
             Self::Stopped(reason) => write!(f, "stop_reason: {reason}"),
-            Self::CapBreached => f.write_str("cap breached"),
+            Self::CapBreached { batch: None } => f.write_str("cap breached"),
+            Self::CapBreached { batch: Some(batch) } => write!(f, "cap breached (batch {batch})"),
             Self::DeadlineElapsed => f.write_str("deadline elapsed"),
             Self::MissingOutput => f.write_str("missing_output"),
             Self::VerifyFailed => f.write_str("verify_outcome: fail"),
@@ -205,6 +210,9 @@ pub struct SettleInput<'a> {
     pub driver: &'a Result<DoneEvent, DriverError>,
     /// `RecorderSummary::cap_breach` (`R-AGT-7`).
     pub cap_breach: Option<CapBreach>,
+    /// MOD-12 M2 D6: the batch whose remainder bound the session's allowance; read only with
+    /// `cap_breach`.
+    pub cap_batch: Option<BatchId>,
     /// When the step's own clock started: `run_step.started_at`, the `running` move, for a
     /// `fan_out = 1` step; the moment `prepare` answered for a fan-out candidate (plan D48), so a
     /// `shared_serialized` sibling is not charged for the per-repo lock wait.
@@ -253,7 +261,9 @@ pub fn settle(input: &SettleInput<'_>) -> Settle {
         StopReason::EndTurn | StopReason::Cancelled => {}
     }
     if input.cap_breach.is_some() {
-        return Settle::Failed(StepFailure::CapBreached);
+        return Settle::Failed(StepFailure::CapBreached {
+            batch: input.cap_batch,
+        });
     }
     if input.deadline_cut || deadline_elapsed(input) {
         return Settle::Failed(StepFailure::DeadlineElapsed);
@@ -1080,7 +1090,7 @@ mod tests {
     use htui_core::model::{Document, GraphSnapshot, VerifyOutcome};
 
     use htui_core::model::{
-        DocumentId, GateOutcome, NewDocument, NewRepo, NewRunStep, RepoId, Run, RunStep,
+        BatchId, DocumentId, GateOutcome, NewDocument, NewRepo, NewRunStep, RepoId, Run, RunStep,
         RunStepCommit, StepStatus,
     };
     use htui_core::store::{MemStore, ReadStore as _, StepFence, WriteStore as _};
@@ -1121,6 +1131,7 @@ mod tests {
         SettleInput {
             driver,
             cap_breach: None,
+            cap_batch: None,
             started_at: epoch(),
             now: epoch(),
             deadline_seconds: Some(7200),
@@ -1314,7 +1325,47 @@ mod tests {
             }),
             ..ok_input(&ended, None)
         };
-        assert_eq!(settle(&breached), Settle::Failed(StepFailure::CapBreached));
+        assert_eq!(
+            settle(&breached),
+            Settle::Failed(StepFailure::CapBreached { batch: None })
+        );
+    }
+
+    /// MOD-12 M2 D6: a breach whose binding term was the batch's remainder settles `CapBreached`
+    /// naming the batch. That sentence lands in the item note `note_step` writes
+    /// (``step `<phase>` attempt N: cap breached (batch <id>)``), and in `run.failure` when the
+    /// failure ends the run; `run_step.gate_note` is not written on a failed settle.
+    #[test]
+    fn a_batch_bound_breach_names_the_batch() {
+        let ended = done(StopReason::EndTurn);
+        let batch = BatchId::new();
+        let breached = SettleInput {
+            cap_breach: Some(CapBreach {
+                cap_micros: 400,
+                spent_micros: 600,
+                at: epoch(),
+            }),
+            cap_batch: Some(batch),
+            ..ok_input(&ended, None)
+        };
+        let failure = StepFailure::CapBreached { batch: Some(batch) };
+        assert_eq!(settle(&breached), Settle::Failed(failure.clone()));
+        assert_eq!(failure.to_string(), format!("cap breached (batch {batch})"));
+        assert_eq!(
+            failure.run_failure_text(),
+            format!("cap breached (batch {batch})")
+        );
+
+        let output = document("body");
+        let unbreached = SettleInput {
+            cap_batch: Some(batch),
+            ..ok_input(&ended, Some(&output))
+        };
+        assert_eq!(
+            settle(&unbreached),
+            Settle::Ok { note: None },
+            "the batch is read only with a breach"
+        );
     }
 
     /// MOD-37 M4 D1: a session the step deadline's timer cut settles `DeadlineElapsed` with the
@@ -1342,7 +1393,7 @@ mod tests {
         };
         assert_eq!(
             settle(&breached),
-            Settle::Failed(StepFailure::CapBreached),
+            Settle::Failed(StepFailure::CapBreached { batch: None }),
             "the cap breach outranks the cut"
         );
 
@@ -1419,7 +1470,10 @@ mod tests {
             StepFailure::Stopped(StopReason::Refusal).to_string(),
             "stop_reason: refusal"
         );
-        assert_eq!(StepFailure::CapBreached.to_string(), "cap breached");
+        assert_eq!(
+            StepFailure::CapBreached { batch: None }.to_string(),
+            "cap breached"
+        );
         assert_eq!(StepFailure::DeadlineElapsed.to_string(), "deadline elapsed");
         assert_eq!(StepFailure::MissingOutput.to_string(), "missing_output");
         assert_eq!(
@@ -1433,8 +1487,15 @@ mod tests {
             StepFailure::MissingOutput.run_failure_text(),
             "missing_output"
         );
-        assert!(StepFailure::CapBreached.run_failure().is_none());
-        assert_eq!(StepFailure::CapBreached.run_failure_text(), "cap breached");
+        assert!(
+            StepFailure::CapBreached { batch: None }
+                .run_failure()
+                .is_none()
+        );
+        assert_eq!(
+            StepFailure::CapBreached { batch: None }.run_failure_text(),
+            "cap breached"
+        );
     }
 
     /// §4.4 step 1 on the seeded `feature` graph, and on the two shapes plan D5 calls terminal.

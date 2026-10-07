@@ -34,9 +34,9 @@ use htui_agent::record::{Control, Signal};
 use htui_core::fixtures::ids;
 use htui_core::model::Transport;
 use htui_core::model::{
-    Agent, AgentBox, AgentId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item, ItemId,
-    NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph, Run, RunId,
-    RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
+    Agent, AgentBox, AgentId, BatchId, BoundSkill, BoxId, Document, DocumentId, Isolation, Item,
+    ItemId, NewDocument, PhaseAgent, PhaseId, ProjectId, PromptTemplate, RepoId, ResolvedGraph,
+    Run, RunId, RunStep, RunStepCommit, RunStepTree, SnapshotPhase, StepId, UserId, VerifyOutcome,
 };
 use htui_core::prompt::DiffBlock;
 use htui_core::secret::SecretSource;
@@ -2333,6 +2333,19 @@ impl FakeOrchestrator {
     /// Every [`EngineError`] the claim and the walk raise.
     pub async fn claim(&self, run: RunId) -> std::result::Result<CommandOutcome, EngineError> {
         crate::engine::claim_fake(self, run).await
+    }
+
+    /// `Engine::enqueue_in_batch` over the same parts (MOD-12 M2): an `auto` run of `item` under
+    /// `batch`, left `queued` for [`claim`](Self::claim).
+    ///
+    /// # Errors
+    /// Every [`EngineError`] the enqueue raises.
+    pub async fn enqueue_in_batch(
+        &self,
+        item: ItemId,
+        batch: BatchId,
+    ) -> std::result::Result<RunId, EngineError> {
+        crate::engine::enqueue_in_batch_fake(self, item, batch).await
     }
 
     /// `Engine::sweep` over the same parts (plan D98): adopt every expired lease on this box,

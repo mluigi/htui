@@ -1,6 +1,7 @@
 //! The run runtime (MOD-4 milestone 6, plan D153; MOD-41 plan D6, D7): every command on a task of
 //! its own, serialised per run, supervised, swept.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -16,9 +17,10 @@ use htui_agent::error::DriverError;
 use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, ProjectId, RepoId,
-    Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
-    WorkspaceId, admission_limit, admission_order, free_slots,
+    AgentId, AgentSummary, BatchId, BatchStop, BoxId, BoxProfile, CancelRequest, CapError,
+    Executor, ItemId, ProjectCaps, ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId,
+    RunKind, RunStatus, SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order,
+    batch_budget, free_slots, min_budget_micros,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::SecretSource;
@@ -228,6 +230,12 @@ struct Shared<P: ReplySink> {
     /// MOD-12 review M2: the queue runner's last sweep failed at a store call
     /// ([`Shared::queue_read_failed`]).
     queue_failing: AtomicBool,
+    /// MOD-12 M2 D4: the batch whose first spend stop was said at `info`; later stops of it are
+    /// `debug` (M3's overlay surfaces them).
+    batch_stop_noted: StdMutex<Option<BatchId>>,
+    /// MOD-12 M2 D4: the batch under which a malformed project cap was warned; later ones of it
+    /// are `debug`.
+    bad_cap_noted: StdMutex<Option<BatchId>>,
     /// I-1: the executor the last sweep read, so a change is logged once.
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
@@ -245,6 +253,16 @@ struct Shared<P: ReplySink> {
     applied: Notify,
     /// MOD-42 plan D11, B-19: the grace a graceful preempt gives a session's cancel.
     cancel_grace: Duration,
+}
+
+/// MOD-12 M2 D4: whether `batch` is new to `noted`, recording it if so (once-per-batch logs).
+fn first_of(noted: &StdMutex<Option<BatchId>>, batch: BatchId) -> bool {
+    let mut noted = noted.lock().unwrap_or_else(PoisonError::into_inner);
+    if *noted == Some(batch) {
+        return false;
+    }
+    *noted = Some(batch);
+    true
 }
 
 /// One task of the runtime, with the run it works on once it knows it.
@@ -306,6 +324,32 @@ impl<P: ReplySink> Shared<P> {
             tracing::info!("the queue runner reads its store again");
         }
         ended
+    }
+
+    /// MOD-12 M2 D4: `item` was not admitted under `batch` for `stop`, the cap reached or what is
+    /// left of it below `min_budget_for_new_attempt`; the message covers both and `stop` names
+    /// which (review R1). The first stop of a batch is `info`; every later one `debug`. True when
+    /// this one was the first.
+    fn note_batch_stop(&self, batch: BatchId, item: ItemId, stop: &BatchStop) -> bool {
+        let first = first_of(&self.batch_stop_noted, batch);
+        if first {
+            tracing::info!(%batch, %item, %stop, "the queue's batch admits no more under its spend cap");
+        } else {
+            tracing::debug!(%batch, %item, %stop, "the queue's batch admits no further entry");
+        }
+        first
+    }
+
+    /// MOD-12 M2 D4: `project`'s `settings` hold a malformed cap, so its entries fail closed.
+    /// Warned once per batch, `debug` after. True when this one warned.
+    fn note_bad_cap(&self, batch: BatchId, project: ProjectId, err: &CapError) -> bool {
+        let first = first_of(&self.bad_cap_noted, batch);
+        if first {
+            tracing::warn!(%batch, %project, %err, "a project's queue cap is malformed; its entries are not admitted");
+        } else {
+            tracing::debug!(%batch, %project, %err, "a project's queue cap is still malformed");
+        }
+        first
     }
 
     /// OQ-6: `run`'s resume failed again; its next one waits, 5 s doubling to 5 min. Warned once
@@ -1211,6 +1255,8 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweeping: AtomicBool::new(false),
                 sweep_again: AtomicBool::new(false),
                 queue_failing: AtomicBool::new(false),
+                batch_stop_noted: StdMutex::new(None),
+                bad_cap_noted: StdMutex::new(None),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
@@ -2112,6 +2158,14 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// batch and stops when it is no longer this one (a pause won the race, H-6). The `Kit` is read
 /// only when something is to be admitted. A failed store read stops the sweep's admission and is
 /// warned once per streak (review M2, [`Shared::queue_read_failed`]).
+///
+/// Before the `Kit`, the D3 spend gate (MOD-12 M2 D4): the batch's spend is read once per sweep
+/// and each ordered entry is held to its own project's `per_token_cap_batch` (read live, D2) and
+/// `min_budget_for_new_attempt` through [`batch_budget`]. A stopped entry is skipped and the next
+/// tried, since another project may have no cap; a malformed cap fails its entries closed. A batch
+/// whose every entry is stopped stays open and admits nothing (no `drain`); a pause and a resume
+/// open a fresh one. The first stop and the first malformed cap of a batch are logged once
+/// ([`Shared::note_batch_stop`], [`Shared::note_bad_cap`]).
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
@@ -2185,21 +2239,72 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         let running = host.running_runs_on_box(box_id).await?;
         let queued = host.queued_runs_on_box(box_id).await?.len();
         let app = host.app_settings().await?;
-        StoreResult::Ok(free_slots(
-            admission_limit(box_settings, &app),
-            running,
-            queued,
-        ))
+        let free = free_slots(admission_limit(box_settings, &app), running, queued);
+        StoreResult::Ok((free, app))
     };
-    let free = match slots.await {
-        Ok(free) => free,
+    let (free, app) = match slots.await {
+        Ok(pair) => pair,
         Err(err) => {
             shared.queue_read_failed("counting this box's free slots", &err);
             return;
         }
     };
-    shared.queue_reads_ok();
     if free == 0 {
+        shared.queue_reads_ok();
+        return;
+    }
+    // MOD-12 M2 D4: the batch's spend once per sweep, each entry's project caps live (D2), one
+    // rule for runner, walk and recorder (D3). A stopped entry is skipped and the next tried: a
+    // project without a cap may still admit. A malformed cap fails closed, and so does a project
+    // that reads as absent (review R1 L3): its caps are unknown, not unbounded. An entry goes with
+    // its item, and the item with its project (`0016_auto_queue.sql`), so an absent project is a
+    // delete racing this sweep and is said at `debug`; the next sweep no longer sees the entry.
+    let spent = match host.batch_spend(batch.id).await {
+        Ok(spent) => spent,
+        Err(err) => {
+            shared.queue_read_failed("reading its batch's spend", &err);
+            return;
+        }
+    };
+    let min = min_budget_micros(&app);
+    let project_of: HashMap<ItemId, ProjectId> = entries
+        .iter()
+        .map(|entry| (entry.item_id, entry.project_id))
+        .collect();
+    // `None`: the project read as absent.
+    let mut caps: HashMap<ProjectId, Option<Result<ProjectCaps, CapError>>> = HashMap::new();
+    let mut admissible = Vec::with_capacity(order.len());
+    for item in order {
+        let Some(&project) = project_of.get(&item) else {
+            continue;
+        };
+        if let Entry::Vacant(slot) = caps.entry(project) {
+            let settings = match host.project_settings(project).await {
+                Ok(settings) => settings,
+                Err(err) => {
+                    shared.queue_read_failed("reading a project's caps", &err);
+                    return;
+                }
+            };
+            slot.insert(settings.map(|settings| ProjectCaps::from_settings(&settings)));
+        }
+        match &caps[&project] {
+            None => {
+                tracing::debug!(batch = %batch.id, %item, %project, "the entry's project is gone; it is not admitted");
+            }
+            Some(Err(err)) => {
+                shared.note_bad_cap(batch.id, project, err);
+            }
+            Some(Ok(project_caps)) => match batch_budget(spent, project_caps.batch_micros, min) {
+                Ok(_) => admissible.push(item),
+                Err(stop) => {
+                    shared.note_batch_stop(batch.id, item, &stop);
+                }
+            },
+        }
+    }
+    shared.queue_reads_ok();
+    if admissible.is_empty() {
         return;
     }
     let kit = match Kit::read(&ctx.shared, host, false).await {
@@ -2212,7 +2317,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     let mut admitted = 0;
-    for item in order {
+    for item in admissible {
         if admitted >= free || ctx.shared.walks.closed() {
             break;
         }
@@ -3404,11 +3509,11 @@ mod tests {
 
     use htui_agent::registry::DriverFactory;
     use htui_core::fixtures::ids;
-    use htui_core::model::ItemId;
+    use htui_core::model::{BatchId, BatchStop, CapError, ItemId, PER_TOKEN_CAP_BATCH};
     use htui_core::store::{MemStore, StoreError};
     use htui_store::Backend;
 
-    use super::RunRuntime;
+    use super::{RunRuntime, first_of};
     use crate::address::Publish as _;
     use crate::{FrameKind, LiveChats, ReplySink, RunFrame, RunReply, RunRequest, RunServed};
 
@@ -3508,6 +3613,50 @@ mod tests {
             shared.queue_read_failed("its entries", &err),
             "a new streak warns again"
         );
+    }
+
+    /// MOD-12 M2 D4 (review R1 L4): `first_of` answers true for a batch it was not last told,
+    /// and remembers only the last one.
+    #[test]
+    fn first_of_is_true_once_per_batch() {
+        let noted = StdMutex::new(None);
+        let (a, b) = (BatchId::new(), BatchId::new());
+        assert!(first_of(&noted, a), "a new batch");
+        assert!(!first_of(&noted, a), "the same batch again");
+        assert!(first_of(&noted, b), "the next batch");
+        assert!(first_of(&noted, a), "only the last batch is remembered");
+    }
+
+    /// MOD-12 M2 D4 (review R1 L4): a batch's first spend stop and its first malformed cap are each
+    /// said once at their own level, independently, and again under a new batch.
+    #[test]
+    fn a_batch_says_its_first_stop_and_its_first_bad_cap_once_each() {
+        let runtime = runtime();
+        let shared = &runtime.shared;
+        let (a, b) = (BatchId::new(), BatchId::new());
+        let stop = BatchStop::CapReached {
+            spent: 600,
+            cap: 500,
+        };
+        let err = CapError {
+            key: PER_TOKEN_CAP_BATCH,
+            found: "\"lots\"".to_owned(),
+        };
+        assert!(shared.note_batch_stop(a, ids::HTUI_ANA_2, &stop), "info");
+        assert!(
+            !shared.note_batch_stop(a, ids::HTUI_FEAT_1, &stop),
+            "debug: another entry of the same batch"
+        );
+        assert!(
+            shared.note_bad_cap(a, ids::PROJECT_HTUI, &err),
+            "the bad cap has its own once"
+        );
+        assert!(!shared.note_bad_cap(a, ids::PROJECT_HTUI, &err));
+        assert!(
+            shared.note_batch_stop(b, ids::HTUI_ANA_2, &stop),
+            "a new batch"
+        );
+        assert!(shared.note_bad_cap(b, ids::PROJECT_HTUI, &err));
     }
 
     /// Plan D172, MOD-41 plan D7: a frame reaches every subscriber of its item, each at its own
@@ -3653,7 +3802,7 @@ mod tests {
 #[cfg(test)]
 mod queue_store_errors {
     use std::collections::BTreeMap;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
 
     use chrono::{DateTime, Utc};
@@ -3663,9 +3812,9 @@ mod queue_store_errors {
         AgentBox, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
         DocumentHead, Item, ItemId, ItemSummary, PhaseAgent, PhaseId, ProjectId, PromptTemplate,
         QueueBatch, QueueEntry, RepoBoxPath, ResolvedGraph, Run, RunId, RunStep, RunSummary, Scope,
-        UserId, WorkspaceSummary,
+        Status, UserId, WorkspaceSummary,
     };
-    use htui_core::store::{MemStore, Result, StoreError, WorkerHost};
+    use htui_core::store::{MemStore, ReadStore as _, Result, StoreError, WorkerHost};
     use htui_store::Backend;
     use serde_json::{Value, json};
 
@@ -3693,6 +3842,9 @@ mod queue_store_errors {
     struct Failing {
         inner: Backend,
         fail: Arc<StdMutex<Option<&'static str>>>,
+        /// Review R1 L3: `project_settings` answers `Ok(None)`, as for a project deleted between
+        /// the entry read and the cap read.
+        no_project: Arc<AtomicBool>,
         seen: Arc<StdMutex<Vec<(&'static str, bool)>>>,
         shared: Arc<OnceLock<Arc<Shared<Quiet>>>>,
     }
@@ -3834,6 +3986,17 @@ mod queue_store_errors {
             self.check("close_drained_batch")?;
             WorkerHost::close_drained_batch(&self.inner, batch, at).await
         }
+        async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+            self.check("batch_spend")?;
+            WorkerHost::batch_spend(&self.inner, batch).await
+        }
+        async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
+            self.check("project_settings")?;
+            if self.no_project.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
+            WorkerHost::project_settings(&self.inner, project).await
+        }
     }
 
     /// A runtime over `store` and a sweep's context over it, through [`Failing`].
@@ -3844,6 +4007,7 @@ mod queue_store_errors {
         let host = Failing {
             inner: Backend::memory(store),
             fail: Arc::default(),
+            no_project: Arc::default(),
             seen: Arc::default(),
             shared: Arc::default(),
         };
@@ -3901,6 +4065,8 @@ mod queue_store_errors {
             "running_runs_on_box",
             "queued_runs_on_box",
             "app_settings",
+            "batch_spend",
+            "project_settings",
         ] {
             fails_at(&host, &ctx, call).await;
         }
@@ -3924,6 +4090,53 @@ mod queue_store_errors {
         assert!(
             !ctx.shared.queue_failing.load(Ordering::SeqCst),
             "a drain that closes ends the streak"
+        );
+    }
+
+    /// MOD-12 M2 review R1 L3: an entry whose project reads as absent (a delete racing the
+    /// sweep) has no caps to read, so it fails closed: the engine is never asked to enqueue it,
+    /// and that is no store failure. Once its project reads again the engine is asked; the demo
+    /// has no agent for `research`, so that enqueue is refused and blocks the item, which is
+    /// what tells the two sweeps apart.
+    #[tokio::test]
+    async fn an_entry_whose_project_is_gone_is_not_admitted() {
+        let store = MemStore::demo();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the item queues");
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let status = || async {
+            store
+                .item(ids::HTUI_ANA_2)
+                .await
+                .expect("the read answers")
+                .expect("the fixture item")
+                .status
+        };
+        let before = status().await;
+        let (_runtime, host, ctx) = sweep_over(store.clone());
+        host.no_project.store(true, Ordering::SeqCst);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            status().await,
+            before,
+            "no caps to read is no enqueue, not an unbounded one"
+        );
+        assert!(
+            !ctx.shared.queue_failing.load(Ordering::SeqCst),
+            "an absent project is not a failing store"
+        );
+
+        host.no_project.store(false, Ordering::SeqCst);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            status().await,
+            Status::Blocked,
+            "with its project read, the entry reaches the engine (whose enqueue blocks it)"
         );
     }
 }

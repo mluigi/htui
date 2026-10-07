@@ -28,17 +28,17 @@ use crate::model::{
     PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaAnswer, PersonaId,
     PersonaMatch, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools, PhaseAgent, PhaseId,
     PhasePatch, Priority, ProbedTool, ProjectId, ProjectPatch, PromptScope, PromptTemplate,
-    PromptTemplateId, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId, RelayView,
-    RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId, RequirementFilter,
-    RequirementId, RequirementPatch, RequirementRevision, RequirementState, RequirementUpdate,
-    Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode,
-    RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome,
-    Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion, SnapshotGraph, SnapshotSettings,
-    Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, Transport, UpstreamEntry,
-    UserId, VerifyOutcome, WaitingCandidate, WaitingPermission, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, executor_scrub_refusal,
-    missing_tags_failure,
+    PromptTemplateId, QueueSetting, QueuedFollowUp, RelayOption, RelayOptionKind, RelaySessionId,
+    RelayView, RepoBoxPath, RepoId, RepoPatch, RepoScope, Requirement, RequirementAreaId,
+    RequirementFilter, RequirementId, RequirementPatch, RequirementRevision, RequirementState,
+    RequirementUpdate, Resolution, Run, RunCommandId, RunCommandKind, RunCommandStatus, RunId,
+    RunKind, RunMode, RunScope, RunStatus, RunStep, RunStepCommit, RunStepTree, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBindingKey, SkillId, SkillPatch, SkillVersion,
+    SnapshotGraph, SnapshotSettings, Status, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
+    StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount,
+    Transport, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, WaitingPermission,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, canonical_declared_tags,
+    executor_scrub_refusal, missing_tags_failure,
 };
 use crate::prompt::TemplateRole;
 use crate::prompt::settings::SettingKey;
@@ -47,13 +47,14 @@ use crate::store::error::StoreError;
 use crate::store::traits::{
     BLANK_PERSONA_BODY, BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT,
     CasOutcome, DeleteReach, DeleteTarget, EXECUTOR_MUST_BE_KNOWN, MAX_LEASE_TTL, ParkOutcome,
-    RULE_MATCHES_EVERYTHING, ReadStore, SettingRung, StepFence, StoredSetting, UpdateOutcome,
-    WriteStore, allow_names_an_mcp_tool, already_exists, citation_key, command_finish_status,
-    command_not_claimable, command_not_queued, document_needs_a_step, has_nul, illegal_move,
-    invalid_area_code, invalid_persona_name, kind_not_narrowable, link_key,
-    link_not_proposed_by_run, link_outside_project, not_a_tool_name, note_needs_a_step,
-    references_no_row, requirement_withdrawn, resolution_not_closable, rule_kind_unknown,
-    self_link, step_writes_own_item, withdrawn_requirement_cited,
+    QueueStored, QueueTarget, QueueToken, RULE_MATCHES_EVERYTHING, ReadStore, SettingRung,
+    StepFence, StoredSetting, UpdateOutcome, WriteStore, allow_names_an_mcp_tool, already_exists,
+    citation_key, command_finish_status, command_not_claimable, command_not_queued,
+    document_needs_a_step, has_nul, illegal_move, invalid_area_code, invalid_persona_name,
+    kind_not_narrowable, link_key, link_not_proposed_by_run, link_outside_project, not_a_tool_name,
+    note_needs_a_step, queue_target_refusal, queue_token_refusal, references_no_row,
+    requirement_withdrawn, resolution_not_closable, rule_kind_unknown, self_link,
+    step_writes_own_item, withdrawn_requirement_cited,
 };
 
 /// Case names in run order. A name never changes: MOD-6 reports per case.
@@ -217,6 +218,11 @@ pub const CASES: &[&str] = &[
     "relay_view_lists_the_newest_follow_up_per_step_without_text",
     "closing_a_dropped_walks_windows_needs_the_lease",
     "lease_holds_reads_the_owner",
+    "queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys",
+    "queue_setting_on_app_upserts_and_refuses_a_stale_token",
+    "clear_queue_setting_removes_the_key_on_every_target",
+    "queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor",
+    "queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -573,6 +579,21 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
             closing_a_dropped_walks_windows_needs_the_lease(store).await;
         }
         "lease_holds_reads_the_owner" => lease_holds_reads_the_owner(store).await,
+        "queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys" => {
+            queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys(store).await
+        }
+        "queue_setting_on_app_upserts_and_refuses_a_stale_token" => {
+            queue_setting_on_app_upserts_and_refuses_a_stale_token(store).await
+        }
+        "clear_queue_setting_removes_the_key_on_every_target" => {
+            clear_queue_setting_removes_the_key_on_every_target(store).await
+        }
+        "queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor" => {
+            queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor(store).await
+        }
+        "queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row" => {
+            queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row(store).await
+        }
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -19563,6 +19584,693 @@ async fn lease_holds_reads_the_owner<S: WriteStore>(store: &S) {
             Err(StoreError::NotFound { entity: "run", .. })
         ),
         "{CASE}: an unknown run is NotFound"
+    );
+}
+
+/// The token a queue write on `target` presents for `key` now: the read's, or `Stamp(None)` when
+/// the row is absent. Postgres seeds `max_concurrent_items` and `scheduler_window` app rows
+/// (`0003_orchestration.sql`) and the Mem demo seeds neither, so a case never assumes which.
+async fn queue_token<S: WriteStore>(
+    store: &S,
+    case: &str,
+    target: QueueTarget,
+    key: QueueSetting,
+) -> QueueToken {
+    store
+        .queue_setting(target, key)
+        .await
+        .expect(case)
+        .map_or(QueueToken::Stamp(None), |stored| stored.token)
+}
+
+/// MOD-12 M2 D9: a project key merges into `project.settings` under CAS on `updated_at`, exactly
+/// `set_setting`'s project rung, and every other key of the blob survives.
+async fn queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "queue_setting_on_a_project_merges_under_cas_and_keeps_foreign_keys";
+    let target = QueueTarget::Project(ids::PROJECT_HTUI);
+    let key = QueueSetting::PerTokenCapBatch;
+    let project = store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture project"));
+    let before = settings_map(CASE, &project.settings);
+    assert!(
+        !before.is_empty(),
+        "{CASE}: the fixture seeds keys this write must not disturb"
+    );
+    let read = store
+        .queue_setting(target, key)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: a present project answers Some"));
+    assert_eq!(
+        read,
+        QueueStored {
+            value: before.get(key.as_str()).cloned(),
+            token: QueueToken::Stamp(Some(project.updated_at)),
+        },
+        "{CASE}: the read carries the project's updated_at"
+    );
+
+    for token in [QueueToken::Stamp(None), QueueToken::EditVersion(0)] {
+        let refused = store
+            .set_queue_setting(target, key, json!(1_500_000), token)
+            .await;
+        assert_eq!(
+            refused,
+            Err(StoreError::Constraint(
+                queue_token_refusal(key, target, token, false)
+                    .unwrap_or_else(|| panic!("{CASE}: {token:?} is refused on a project"))
+            )),
+            "{CASE}: a token of the wrong kind is refused before the row"
+        );
+    }
+
+    let written = applied(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(1_500_000), read.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(written.value, Some(json!(1_500_000)), "{CASE}: as written");
+    assert!(
+        matches!(written.token, QueueToken::Stamp(Some(_))),
+        "{CASE}: the next token is the project's new updated_at, got {:?}",
+        written.token
+    );
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        Some(written.clone()),
+        "{CASE}: the read answers what was written"
+    );
+    let merged = settings_map(
+        CASE,
+        &store
+            .project(ids::PROJECT_HTUI)
+            .await
+            .expect(CASE)
+            .unwrap_or_else(|| panic!("{CASE}: the project survives its own settings write"))
+            .settings,
+    );
+    assert_eq!(
+        merged.get(key.as_str()),
+        Some(&json!(1_500_000)),
+        "{CASE}: the cap is stored in micros under its key"
+    );
+    for (name, value) in &before {
+        if name != key.as_str() {
+            assert_eq!(
+                merged.get(name),
+                Some(value),
+                "{CASE}: `{name}` survived the merge"
+            );
+        }
+    }
+
+    let spent = stale(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(1), read.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        spent, written,
+        "{CASE}: the CAS is on project.updated_at, which the merge advanced"
+    );
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        Some(written),
+        "{CASE}: a stale write wrote nothing"
+    );
+
+    let unknown = QueueTarget::Project(ProjectId::new());
+    assert_eq!(
+        store.queue_setting(unknown, key).await.expect(CASE),
+        None,
+        "{CASE}: an absent project answers None"
+    );
+    let missing = store
+        .set_queue_setting(unknown, key, json!(1), read.token)
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "project",
+                ..
+            })
+        ),
+        "{CASE}: an unknown project is NotFound, got {missing:?}"
+    );
+}
+
+/// MOD-12 M2 D9: an app key upserts its `app_setting` row under `set_setting`'s `expected` rule:
+/// `Stamp(None)` inserts, a second `Stamp(None)` is `Stale` carrying the row, the fresh token
+/// updates.
+async fn queue_setting_on_app_upserts_and_refuses_a_stale_token<S: WriteStore>(store: &S) {
+    const CASE: &str = "queue_setting_on_app_upserts_and_refuses_a_stale_token";
+    let target = QueueTarget::App;
+    let key = QueueSetting::MinBudgetForNewAttempt;
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        None,
+        "{CASE}: the minimum budget is seeded by neither store"
+    );
+
+    let inserted = applied(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(250_000), QueueToken::Stamp(None))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(inserted.value, Some(json!(250_000)), "{CASE}: as written");
+    assert!(
+        matches!(inserted.token, QueueToken::Stamp(Some(_))),
+        "{CASE}: the row's updated_at is the next token, got {:?}",
+        inserted.token
+    );
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        Some(inserted.clone()),
+        "{CASE}: the read answers the row"
+    );
+
+    let occupied = stale(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(300_000), QueueToken::Stamp(None))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        occupied, inserted,
+        "{CASE}: `Stamp(None)` against a row that exists is Stale, never an overwrite"
+    );
+
+    let updated = applied(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(300_000), inserted.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(updated.value, Some(json!(300_000)), "{CASE}: the update");
+    let spent = stale(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(400_000), inserted.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(spent, updated, "{CASE}: the first token is spent");
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        Some(updated),
+        "{CASE}: a stale write wrote nothing"
+    );
+
+    let limit = QueueSetting::MaxConcurrentItems;
+    let token = queue_token(store, CASE, target, limit).await;
+    let written = applied(
+        CASE,
+        store
+            .set_queue_setting(target, limit, json!(3), token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        written.value,
+        Some(json!(3)),
+        "{CASE}: the app's limit is written whatever its seed"
+    );
+    assert_eq!(
+        store.queue_setting(target, limit).await.expect(CASE),
+        Some(written),
+        "{CASE}: and read back"
+    );
+}
+
+/// MOD-12 M2 D9: a clear removes the key on every target, answering `Applied { value: None }`;
+/// on `App` no row is left, so the token is `Stamp(None)` and the read answers `None`.
+async fn clear_queue_setting_removes_the_key_on_every_target<S: WriteStore>(store: &S) {
+    const CASE: &str = "clear_queue_setting_removes_the_key_on_every_target";
+
+    // App.
+    let key = QueueSetting::MinBudgetForNewAttempt;
+    let row = applied(
+        CASE,
+        store
+            .set_queue_setting(QueueTarget::App, key, json!(5), QueueToken::Stamp(None))
+            .await
+            .expect(CASE),
+    );
+    let no_token = store
+        .clear_queue_setting(QueueTarget::App, key, QueueToken::Stamp(None))
+        .await;
+    assert_eq!(
+        no_token,
+        Err(StoreError::Constraint(
+            queue_token_refusal(key, QueueTarget::App, QueueToken::Stamp(None), true)
+                .unwrap_or_else(|| panic!("{CASE}: a clear needs a token"))
+        )),
+        "{CASE}: an App clear with `Stamp(None)` is refused"
+    );
+    let cleared = applied(
+        CASE,
+        store
+            .clear_queue_setting(QueueTarget::App, key, row.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        cleared,
+        QueueStored {
+            value: None,
+            token: QueueToken::Stamp(None),
+        },
+        "{CASE}: an App clear leaves no row to carry a token"
+    );
+    assert_eq!(
+        store
+            .queue_setting(QueueTarget::App, key)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: the row is gone"
+    );
+    let gone = store
+        .clear_queue_setting(QueueTarget::App, key, row.token)
+        .await;
+    assert!(
+        matches!(
+            gone,
+            Err(StoreError::NotFound {
+                entity: "app_setting",
+                ..
+            })
+        ),
+        "{CASE}: a token over an absent app_setting row is NotFound, got {gone:?}"
+    );
+    let gone = store
+        .set_queue_setting(QueueTarget::App, key, json!(5), row.token)
+        .await;
+    assert!(
+        matches!(
+            gone,
+            Err(StoreError::NotFound {
+                entity: "app_setting",
+                ..
+            })
+        ),
+        "{CASE}: so is a set with that token, got {gone:?}"
+    );
+
+    // Project.
+    let target = QueueTarget::Project(ids::PROJECT_HTUI);
+    let key = QueueSetting::PerTokenCapRun;
+    let token = queue_token(store, CASE, target, key).await;
+    let row = applied(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(0), token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(row.value, Some(json!(0)), "{CASE}: `0` is a real cap");
+    let cleared = applied(
+        CASE,
+        store
+            .clear_queue_setting(target, key, row.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(cleared.value, None, "{CASE}: a project clear has no value");
+    assert!(
+        matches!(cleared.token, QueueToken::Stamp(Some(_))),
+        "{CASE}: the project's new updated_at, got {:?}",
+        cleared.token
+    );
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        Some(cleared.clone()),
+        "{CASE}: a present project without the key answers Some(value: None)"
+    );
+    let settings = store
+        .project(ids::PROJECT_HTUI)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the project survives the clear"))
+        .settings;
+    assert!(
+        settings.get(key.as_str()).is_none(),
+        "{CASE}: the key left project.settings, got {settings}"
+    );
+    let again = applied(
+        CASE,
+        store
+            .clear_queue_setting(target, key, cleared.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(again.value, None, "{CASE}: clearing an absent key applies");
+    let stale_clear = stale(
+        CASE,
+        store
+            .clear_queue_setting(target, key, cleared.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(stale_clear, again, "{CASE}: a project clear is a CAS too");
+    let missing = store
+        .clear_queue_setting(QueueTarget::Project(ProjectId::new()), key, cleared.token)
+        .await;
+    assert!(
+        matches!(
+            missing,
+            Err(StoreError::NotFound {
+                entity: "project",
+                ..
+            })
+        ),
+        "{CASE}: an unknown project is NotFound, got {missing:?}"
+    );
+
+    // Box.
+    let target = QueueTarget::Box(ids::BOX);
+    let key = QueueSetting::MaxConcurrentItems;
+    let read = store
+        .queue_setting(target, key)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the demo box answers Some"));
+    assert_eq!(
+        read,
+        QueueStored {
+            value: Some(json!(2)),
+            token: QueueToken::EditVersion(0),
+        },
+        "{CASE}: the demo box's limit and edit_version"
+    );
+    let cleared = applied(
+        CASE,
+        store
+            .clear_queue_setting(target, key, read.token)
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        cleared,
+        QueueStored {
+            value: None,
+            token: QueueToken::EditVersion(1),
+        },
+        "{CASE}: a box clear bumps edit_version"
+    );
+    assert_eq!(
+        demo_box_settings(store, CASE).await,
+        json!({}),
+        "{CASE}: the key left box.settings"
+    );
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        Some(cleared),
+        "{CASE}: a present box without the key answers Some(value: None)"
+    );
+    let again = applied(
+        CASE,
+        store
+            .clear_queue_setting(target, key, QueueToken::EditVersion(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        again.token,
+        QueueToken::EditVersion(2),
+        "{CASE}: clearing an absent key applies and still bumps the guard"
+    );
+    let missing = store
+        .clear_queue_setting(
+            QueueTarget::Box(BoxId::new()),
+            key,
+            QueueToken::EditVersion(0),
+        )
+        .await;
+    assert!(
+        matches!(missing, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box is NotFound, got {missing:?}"
+    );
+}
+
+/// MOD-12 M2 D9: the box key merges into `box.settings` under the same `edit_version` guard as
+/// [`WriteStore::edit_box`], bumps it, and keeps `executor`; a write by either spends the other's
+/// token, because there is one guard.
+async fn queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "queue_setting_on_a_box_merges_under_edit_version_and_keeps_executor";
+    let target = QueueTarget::Box(ids::BOX);
+    let key = QueueSetting::MaxConcurrentItems;
+    let worker = store
+        .edit_box(ids::BOX, 0, executor_edit(Executor::Worker))
+        .await
+        .expect(CASE);
+    let CasOutcome::Applied(worker) = worker else {
+        panic!("{CASE}: the executor edit applies, got {worker:?}");
+    };
+    assert_eq!(worker.edit_version, 1, "{CASE}: the edit moved the token");
+    assert_eq!(
+        store.queue_setting(target, key).await.expect(CASE),
+        Some(QueueStored {
+            value: Some(json!(2)),
+            token: QueueToken::EditVersion(1),
+        }),
+        "{CASE}: the read carries edit_version"
+    );
+
+    let written = applied(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(3), QueueToken::EditVersion(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(
+        written,
+        QueueStored {
+            value: Some(json!(3)),
+            token: QueueToken::EditVersion(2),
+        },
+        "{CASE}: as written, edit_version bumped"
+    );
+    assert_eq!(
+        demo_box_settings(store, CASE).await,
+        json!({"max_concurrent_items": 3, "executor": "worker"}),
+        "{CASE}: the limit is merged and the executor survives"
+    );
+    let row = store
+        .boxes()
+        .await
+        .expect(CASE)
+        .into_iter()
+        .find(|record| record.row.id == ids::BOX)
+        .unwrap_or_else(|| panic!("{CASE}: the fixture has its box"))
+        .row;
+    assert_eq!(row.edit_version, 2, "{CASE}: the row's guard moved");
+    assert_eq!(
+        row.declared_tags, worker.declared_tags,
+        "{CASE}: no column but settings and edit_version changes"
+    );
+
+    let spent = stale(
+        CASE,
+        store
+            .set_queue_setting(target, key, json!(4), QueueToken::EditVersion(1))
+            .await
+            .expect(CASE),
+    );
+    assert_eq!(spent, written, "{CASE}: edit_version 1 is spent");
+    let editor = store
+        .edit_box(ids::BOX, 1, executor_edit(Executor::Tui))
+        .await
+        .expect(CASE);
+    assert!(
+        matches!(&editor, CasOutcome::Stale(row) if row.edit_version == 2),
+        "{CASE}: an edit_box on the old version is Stale too (one guard), got {editor:?}"
+    );
+    assert_eq!(
+        demo_box_settings(store, CASE).await,
+        json!({"max_concurrent_items": 3, "executor": "worker"}),
+        "{CASE}: neither stale write wrote"
+    );
+
+    let unknown = QueueTarget::Box(BoxId::new());
+    assert_eq!(
+        store.queue_setting(unknown, key).await.expect(CASE),
+        None,
+        "{CASE}: an unknown box answers None"
+    );
+    let missing = store
+        .set_queue_setting(unknown, key, json!(3), QueueToken::EditVersion(0))
+        .await;
+    assert!(
+        matches!(missing, Err(StoreError::NotFound { entity: "box", .. })),
+        "{CASE}: an unknown box is NotFound, got {missing:?}"
+    );
+}
+
+/// MOD-12 M2 D9: precedence. A key the target does not take, then a token of the wrong kind, then
+/// the validator, all before the row: a bad value on a spent token is `Constraint`, not `Stale`,
+/// and nothing is written.
+async fn queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row<S: WriteStore>(
+    store: &S,
+) {
+    const CASE: &str = "queue_setting_refuses_a_foreign_key_and_a_bad_value_before_the_row";
+    let boxes = store.boxes().await.expect(CASE);
+    let project = store.project(ids::PROJECT_HTUI).await.expect(CASE);
+    let box_target = QueueTarget::Box(ids::BOX);
+
+    for (target, key) in [
+        (QueueTarget::App, QueueSetting::PerTokenCapRun),
+        (box_target, QueueSetting::SchedulerWindow),
+        (
+            QueueTarget::Project(ids::PROJECT_HTUI),
+            QueueSetting::MaxConcurrentItems,
+        ),
+    ] {
+        let sentence = queue_target_refusal(key, target)
+            .unwrap_or_else(|| panic!("{CASE}: `{key}` is foreign on {target:?}"));
+        let refused = StoreError::Constraint(sentence);
+        // A token of the wrong kind as well: the key's refusal wins.
+        let token = QueueToken::EditVersion(0);
+        assert_eq!(
+            store
+                .set_queue_setting(target, key, json!(1), token)
+                .await
+                .expect_err(CASE),
+            refused,
+            "{CASE}: set `{key}` on {target:?}"
+        );
+        assert_eq!(
+            store
+                .clear_queue_setting(target, key, token)
+                .await
+                .expect_err(CASE),
+            refused,
+            "{CASE}: clear `{key}` on {target:?}"
+        );
+        assert_eq!(
+            store.queue_setting(target, key).await.expect_err(CASE),
+            refused,
+            "{CASE}: read `{key}` on {target:?}"
+        );
+    }
+    assert_eq!(
+        queue_target_refusal(QueueSetting::PerTokenCapRun, QueueTarget::App).as_deref(),
+        Some("`per_token_cap_run` is not an app setting"),
+        "{CASE}: the sentence"
+    );
+
+    let token = QueueToken::Stamp(None);
+    assert_eq!(
+        store
+            .set_queue_setting(
+                box_target,
+                QueueSetting::MaxConcurrentItems,
+                json!(0),
+                token
+            )
+            .await,
+        Err(StoreError::Constraint(
+            queue_token_refusal(QueueSetting::MaxConcurrentItems, box_target, token, false)
+                .unwrap_or_else(|| panic!("{CASE}: a Stamp on a box is refused"))
+        )),
+        "{CASE}: the token's kind is refused before the value"
+    );
+
+    let spent = QueueToken::EditVersion(99);
+    let bad = store
+        .set_queue_setting(
+            box_target,
+            QueueSetting::MaxConcurrentItems,
+            json!(0),
+            spent,
+        )
+        .await;
+    assert_eq!(
+        bad,
+        Err(StoreError::Constraint(
+            QueueSetting::MaxConcurrentItems
+                .validate(&json!(0))
+                .expect_err("0 is refused")
+        )),
+        "{CASE}: the validator runs before the compare-and-set: Constraint, not Stale"
+    );
+    let unknown = store
+        .set_queue_setting(
+            QueueTarget::Box(BoxId::new()),
+            QueueSetting::MaxConcurrentItems,
+            json!(0),
+            spent,
+        )
+        .await;
+    assert!(
+        matches!(unknown, Err(StoreError::Constraint(_))),
+        "{CASE}: and before the row is looked up, got {unknown:?}"
+    );
+    let window = json!({"start": "10:00", "end": "10:00"});
+    assert_eq!(
+        store
+            .set_queue_setting(
+                QueueTarget::App,
+                QueueSetting::SchedulerWindow,
+                window.clone(),
+                queue_token(store, CASE, QueueTarget::App, QueueSetting::SchedulerWindow).await,
+            )
+            .await,
+        Err(StoreError::Constraint(
+            QueueSetting::SchedulerWindow
+                .validate(&window)
+                .expect_err("an empty window is refused")
+        )),
+        "{CASE}: the window's validator"
+    );
+    let cap = QueueTarget::Project(ids::PROJECT_HTUI);
+    let cap_token = queue_token(store, CASE, cap, QueueSetting::PerTokenCapBatch).await;
+    assert_eq!(
+        store
+            .set_queue_setting(cap, QueueSetting::PerTokenCapBatch, json!(-1), cap_token)
+            .await,
+        Err(StoreError::Constraint(
+            "project.settings.per_token_cap_batch must be a non-negative integer of USD micros, \
+             got -1"
+                .to_owned()
+        )),
+        "{CASE}: a cap says CapError's sentence"
+    );
+
+    assert_eq!(
+        store.boxes().await.expect(CASE),
+        boxes,
+        "{CASE}: no refusal wrote to a box, its token included"
+    );
+    assert_eq!(
+        store.project(ids::PROJECT_HTUI).await.expect(CASE),
+        project,
+        "{CASE}: no refusal wrote to the project"
+    );
+    assert_eq!(
+        store
+            .queue_setting(QueueTarget::App, QueueSetting::MinBudgetForNewAttempt)
+            .await
+            .expect(CASE),
+        None,
+        "{CASE}: no refusal wrote an app row"
     );
 }
 

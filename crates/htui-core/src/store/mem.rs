@@ -37,8 +37,8 @@ use crate::model::{
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
     ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    QueueEntry, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
     RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
     Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId,
     RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
@@ -58,21 +58,22 @@ use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
-    EXECUTOR_MUST_BE_KNOWN, ParkOutcome, ReadStore, SettingRung, StepFence, StoredSetting,
-    UpdateOutcome, WriteStore, already_exists, batch_is_closed, chat_step_status, check_attachment,
-    citation_key, close_out_needs_a_summary, command_finish_status, command_not_claimable,
-    command_not_queued, document_needs_a_step, expected_on_row, failure_disagrees_with_status,
-    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
-    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run, link_outside_project,
-    new_persona_refusal, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
-    note_needs_a_step, persona_is_bound, persona_patch_refusal, prompt_template_key,
-    prompt_template_refusal, reaped_note, references_no_row, requirement_withdrawn,
-    reserved_phase_name, resolution_not_closable, row_names_another_phase, row_names_another_step,
-    run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal, skill_version_key,
-    step_document_refusal, step_is_not_promotable, step_note_refusal, step_slot_is_taken,
-    step_writes_own_item, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    EXECUTOR_MUST_BE_KNOWN, ParkOutcome, QueueStored, QueueTarget, QueueToken, ReadStore,
+    SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
+    batch_is_closed, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
+    command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
+    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
+    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
+    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
+    link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
+    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
+    persona_is_bound, persona_patch_refusal, project_settings_not_an_object, prompt_template_key,
+    prompt_template_refusal, queue_target_refusal, queue_token_refusal, reaped_note,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_phase, row_names_another_step, run_is_terminal, self_link,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
+    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -1159,6 +1160,29 @@ impl MemStore {
         }))
     }
 
+    /// MOD-12 M2 D1: `Σ run_step.usage["cost_micros"]` over the steps of every run admitted under
+    /// `batch`; `None` when no step reports an integer cost. Computed, never stored (ANA-2 §4.10).
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+        Ok(self.read(|state| state.batch_spend(batch)))
+    }
+
+    /// MOD-12 M2 D5: the batch `run` was admitted under, with [`MemStore::batch_spend`] of it;
+    /// `None` for a manual or chat run, and for an unknown run.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
+        Ok(self.read(|state| {
+            state
+                .run_batches
+                .get(&run)
+                .map(|batch| (*batch, state.batch_spend(*batch)))
+        }))
+    }
+
     /// MOD-12 D6: `claim_run`'s slot count — `running` runs executing on `box_id`, **not**
     /// `awaiting_approval` (that is [`MemStore::active_runs_on_box`]).
     ///
@@ -1341,6 +1365,30 @@ impl MemStore {
 }
 
 impl State {
+    /// [`MemStore::batch_spend`]'s body, `PgStore::batch_spend`'s rule (review R1 L1): `as_i64`
+    /// counts a JSON number that is an integer within `i64` and skips anything else (a digit
+    /// string, an integer past `i64`, a float), as `select::run_spend` does; the figure is the
+    /// exact sum (in `i128`, which `i64` costs cannot overflow) clamped into `i64`, so it does
+    /// not depend on the order the steps are visited in.
+    fn batch_spend(&self, batch: BatchId) -> Option<i64> {
+        let runs: HashSet<RunId> = self
+            .run_batches
+            .iter()
+            .filter(|(_, of)| **of == batch)
+            .map(|(run, _)| *run)
+            .collect();
+        self.steps
+            .values()
+            .filter(|step| runs.contains(&step.run_id))
+            .filter_map(|step| step.usage.as_ref()?.get("cost_micros")?.as_i64())
+            .fold(None, |total: Option<i128>, cost| {
+                Some(total.unwrap_or(0) + i128::from(cost))
+            })
+            .map(|total| {
+                i64::try_from(total).unwrap_or(if total > 0 { i64::MAX } else { i64::MIN })
+            })
+    }
+
     /// `project.slug`, or an empty string when the project is not loaded.
     fn project_slug(&self, id: ProjectId) -> String {
         self.projects
@@ -4136,7 +4184,9 @@ impl State {
                     .get_mut(&id)
                     .expect("the row was read a statement ago under the same lock");
                 let Some(map) = project.settings.as_object_mut() else {
-                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
+                    return Err(StoreError::Constraint(project_settings_not_an_object(
+                        id, key,
+                    )));
                 };
                 map.insert(name.to_owned(), value.clone());
                 project.updated_at = now;
@@ -4240,7 +4290,9 @@ impl State {
                     .get_mut(&id)
                     .expect("the row was read a statement ago under the same lock");
                 let Some(map) = project.settings.as_object_mut() else {
-                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
+                    return Err(StoreError::Constraint(project_settings_not_an_object(
+                        id, key,
+                    )));
                 };
                 map.remove(name);
                 project.updated_at = now;
@@ -4269,6 +4321,164 @@ impl State {
                     updated_at: now,
                 }))
             }
+        }
+    }
+
+    /// One queue key with its token (MOD-12 M2 D9), or `None` when the target's row is absent:
+    /// no `app_setting` row, no such project, or no box of `user` by that id.
+    fn queue_setting(
+        &self,
+        user: Option<UserId>,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Option<QueueStored> {
+        let name = key.as_str();
+        match target {
+            QueueTarget::App => self.app_settings.get(name).map(|(value, at)| QueueStored {
+                value: Some(value.clone()),
+                token: QueueToken::Stamp(Some(*at)),
+            }),
+            QueueTarget::Project(id) => self.projects.get(&id).map(|project| QueueStored {
+                value: project.settings.get(name).cloned(),
+                token: QueueToken::Stamp(Some(project.updated_at)),
+            }),
+            QueueTarget::Box(id) => self
+                .boxes
+                .get(&id)
+                .filter(|row| Some(row.user_id) == user)
+                .map(|row| QueueStored {
+                    value: row.settings.get(name).cloned(),
+                    token: QueueToken::EditVersion(row.edit_version),
+                }),
+        }
+    }
+
+    /// Writes (`Some`) or clears (`None`) one queue key (MOD-12 M2 D9): the target and token
+    /// refusals, the validator on a set, then the row as `set_setting`'s `App` and `Project` rungs
+    /// and `edit_box`'s lookup and guards do. `now` stands in for Postgres's trigger.
+    fn write_queue_setting(
+        &mut self,
+        user: Option<UserId>,
+        target: QueueTarget,
+        key: QueueSetting,
+        value: Option<Value>,
+        expected: QueueToken,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<QueueStored>> {
+        if let Some(refusal) = queue_target_refusal(key, target) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(refusal) = queue_token_refusal(key, target, expected, value.is_none()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(value) = &value {
+            key.validate(value).map_err(StoreError::Constraint)?;
+        }
+        let name = key.as_str();
+        match (target, expected) {
+            (QueueTarget::App, QueueToken::Stamp(want)) => {
+                let stored = self.queue_setting(user, target, key);
+                // `Stamp(None)` is "I expect no row": no row and no expectation match, or a row
+                // whose token is the one held.
+                let current = match (&stored, want) {
+                    (None, None) => true,
+                    (Some(row), Some(_)) => row.token == expected,
+                    (None, Some(_)) | (Some(_), None) => false,
+                };
+                if !current {
+                    return match stored {
+                        Some(row) => Ok(CasOutcome::Stale(row)),
+                        None => Err(StoreError::NotFound {
+                            entity: "app_setting",
+                            id: name.to_owned(),
+                        }),
+                    };
+                }
+                Ok(CasOutcome::Applied(match value {
+                    Some(value) => {
+                        self.app_settings
+                            .insert(name.to_owned(), (value.clone(), now));
+                        QueueStored {
+                            value: Some(value),
+                            token: QueueToken::Stamp(Some(now)),
+                        }
+                    }
+                    None => {
+                        self.app_settings.remove(name);
+                        QueueStored {
+                            value: None,
+                            token: QueueToken::Stamp(None),
+                        }
+                    }
+                }))
+            }
+            (QueueTarget::Project(id), QueueToken::Stamp(Some(_))) => {
+                let stored =
+                    self.queue_setting(user, target, key)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "project",
+                            id: id.to_string(),
+                        })?;
+                if stored.token != expected {
+                    return Ok(CasOutcome::Stale(stored));
+                }
+                let project = self
+                    .projects
+                    .get_mut(&id)
+                    .expect("the row was read a statement ago under the same lock");
+                let Some(map) = project.settings.as_object_mut() else {
+                    return Err(StoreError::Constraint(project_settings_not_an_object(
+                        id, key,
+                    )));
+                };
+                match &value {
+                    Some(value) => map.insert(name.to_owned(), value.clone()),
+                    None => map.remove(name),
+                };
+                project.updated_at = now;
+                Ok(CasOutcome::Applied(QueueStored {
+                    value,
+                    token: QueueToken::Stamp(Some(now)),
+                }))
+            }
+            (QueueTarget::Box(id), QueueToken::EditVersion(want)) => {
+                let Some(row) = self
+                    .boxes
+                    .get_mut(&id)
+                    .filter(|row| Some(row.user_id) == user)
+                else {
+                    return Err(StoreError::NotFound {
+                        entity: "box",
+                        id: id.to_string(),
+                    });
+                };
+                if row.edit_version != want {
+                    return Ok(CasOutcome::Stale(QueueStored {
+                        value: row.settings.get(name).cloned(),
+                        token: QueueToken::EditVersion(row.edit_version),
+                    }));
+                }
+                let Some(map) = row.settings.as_object_mut() else {
+                    return Err(StoreError::Constraint(
+                        BOX_SETTINGS_NOT_AN_OBJECT.to_owned(),
+                    ));
+                };
+                match &value {
+                    Some(value) => map.insert(name.to_owned(), value.clone()),
+                    None => map.remove(name),
+                };
+                row.edit_version += 1;
+                row.updated_at = now;
+                Ok(CasOutcome::Applied(QueueStored {
+                    value,
+                    token: QueueToken::EditVersion(row.edit_version),
+                }))
+            }
+            // `queue_token_refusal` has refused every other pair; one it let through by mistake is a
+            // refusal here too, not a panic in the store (review R1).
+            _ => Err(StoreError::Constraint(format!(
+                "`{key}` on {target:?} does not take {expected:?}"
+            ))),
         }
     }
 
@@ -7015,19 +7225,6 @@ fn probe_says_ready(probe: Option<&Value>) -> bool {
     probe.is_none_or(|doc| doc.get("status").and_then(Value::as_str) == Some("ready"))
 }
 
-/// The refusal both writers of `project.settings` give a blob that is not a JSON object (D7).
-///
-/// One sentence rather than two: `set_setting` cannot merge a key into a scalar and `clear_setting`
-/// cannot remove one from it, and what stops both is the same fact — the document is not a
-/// document. A wording per verb would be two sentences about one blob, which is the drift the text
-/// helpers in [`store::traits`](crate::store::traits) exist to prevent (review L4).
-///
-/// Private, because `PgStore` cannot reach it: `project.settings` is `JSONB NOT NULL DEFAULT '{}'`
-/// there and the merge is Postgres's own `||`.
-fn settings_not_an_object(id: ProjectId, key: SettingKey) -> String {
-    format!("project.settings of `{id}` is not a JSON object, so `{key}` cannot be merged into it")
-}
-
 /// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
 /// UUID is what `UserId::default()` yields, so it is rejected here rather than written and later
 /// refused by MOD-6's `PgStore`. An author that is non-nil but unknown is out of scope: the
@@ -8253,6 +8450,42 @@ impl WriteStore for MemStore {
             return Err(StoreError::Constraint(refusal));
         }
         Ok(self.read(|state| state.stored_setting(rung, key)))
+    }
+
+    async fn queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Result<Option<QueueStored>> {
+        if let Some(refusal) = queue_target_refusal(key, target) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let user = self.this_user();
+        Ok(self.read(|state| state.queue_setting(user, target, key)))
+    }
+
+    async fn set_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        value: Value,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        // Both before the write lock: `this_user` takes the read lock (blueprint F-K).
+        let user = self.this_user();
+        let now = self.now();
+        self.write(|state| state.write_queue_setting(user, target, key, Some(value), expected, now))
+    }
+
+    async fn clear_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        let user = self.this_user();
+        let now = self.now();
+        self.write(|state| state.write_queue_setting(user, target, key, None, expected, now))
     }
 
     async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>> {
@@ -10542,6 +10775,51 @@ mod tests {
             "a refused clear removed nothing"
         );
         assert_eq!(after, token, "and did not advance the token either");
+    }
+
+    /// MOD-12 M2 review R1 L2: a queue cap cannot be merged into a `project.settings` blob that is
+    /// not a JSON object either; the refusal is `set_setting`'s sentence and writes nothing, the
+    /// token included. The Postgres half is
+    /// `pg_criteria.rs::a_project_merge_refuses_a_non_object_settings_blob`.
+    #[tokio::test]
+    async fn set_queue_setting_refuses_a_project_settings_that_is_not_an_object() {
+        use crate::model::QueueSetting;
+        use crate::store::traits::{QueueTarget, project_settings_not_an_object};
+
+        let target = QueueTarget::Project(ids::PROJECT_HTUI);
+        let cap = QueueSetting::PerTokenCapBatch;
+        for blob in [json!([]), json!("x")] {
+            let store = MemStore::demo();
+            store.set_project_settings(ids::PROJECT_HTUI, blob.clone());
+            let read = store
+                .queue_setting(target, cap)
+                .await
+                .expect("the read answers")
+                .expect("the project exists");
+            assert_eq!(
+                store
+                    .set_queue_setting(target, cap, json!(1_000), read.token)
+                    .await,
+                Err(StoreError::Constraint(project_settings_not_an_object(
+                    ids::PROJECT_HTUI,
+                    cap
+                ))),
+                "{blob}"
+            );
+            assert_eq!(
+                store.queue_setting(target, cap).await.expect("read"),
+                Some(read),
+                "{blob}: the refusal wrote nothing, the token included"
+            );
+            assert_eq!(
+                store
+                    .project_settings(ids::PROJECT_HTUI)
+                    .await
+                    .expect("read"),
+                Some(blob.clone()),
+                "{blob}: the blob is left as it was"
+            );
+        }
     }
 
     /// MOD-42 I-4: every time the relay writes is the handle's clock (`clock_timestamp()` on
@@ -14587,6 +14865,179 @@ mod tests {
             assert!(state.queue_entries.is_empty(), "no entry remains");
             assert!(state.run_batches.is_empty(), "no run-batch pair remains");
         });
+    }
+
+    // ---- MOD-12 M2: batch spend (blueprint §C.1) -------------------------------------------
+
+    /// A step of `run` at `position` whose `usage` is `usage` (MOD-12 M2 spend fixtures).
+    async fn step_with_usage(store: &MemStore, run: RunId, position: i32, usage: Value) {
+        let step = store
+            .create_step(new_step(run, position, 0, 0))
+            .await
+            .expect("the step lands");
+        store
+            .set_step_usage(StepFence::Unleased, step.id, usage, None)
+            .await
+            .expect("the usage lands");
+    }
+
+    /// The batches and runs of [`spend_fixture`].
+    struct SpendFixture {
+        /// Two runs, costs 700 and 250, plus a `"x"` and a `1.5` cost that are skipped.
+        a: crate::model::BatchId,
+        /// One run costing 1 000.
+        b: crate::model::BatchId,
+        /// One run whose only step reports no cost.
+        c: crate::model::BatchId,
+        /// A run of batch A.
+        a_run: RunId,
+        /// A manual run costing 5 000, in no batch.
+        manual: RunId,
+    }
+
+    /// MOD-12 M2 D1: three batches opened one after another on the demo box (one open batch per
+    /// box), across projects, and a manual run beside them; `pg_criteria.rs` builds the same.
+    async fn spend_fixture(store: &MemStore) -> SpendFixture {
+        let at = Utc::now();
+        let a = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch A opens");
+        let a_run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(a.id)))
+            .await
+            .expect("A admits ANA-2");
+        let a_other = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FEAT_1, Some(a.id))
+            })
+            .await
+            .expect("A admits another project's item");
+        step_with_usage(
+            store,
+            a_run.id,
+            0,
+            json!({"cost_micros": 700, "input_tokens": 9}),
+        )
+        .await;
+        step_with_usage(store, a_run.id, 1, json!({"cost_micros": "x"})).await;
+        step_with_usage(store, a_other.id, 0, json!({"cost_micros": 250})).await;
+        step_with_usage(store, a_other.id, 1, json!({"cost_micros": 1.5})).await;
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("A was open");
+
+        let b = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch B opens");
+        let b_run = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FIX_1, Some(b.id))
+            })
+            .await
+            .expect("B admits");
+        step_with_usage(store, b_run.id, 0, json!({"cost_micros": 1_000})).await;
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("B was open");
+
+        let c = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch C opens");
+        let c_run = store
+            .create_run(batch_run(ids::HTUI_CLEAN_1, Some(c.id)))
+            .await
+            .expect("C admits");
+        step_with_usage(store, c_run.id, 0, json!({"input_tokens": 3})).await;
+
+        let manual = store
+            .create_run(graph_run(
+                ids::VULKAN_TOOL_1,
+                ids::PROJECT_VULKAN,
+                Vec::new(),
+            ))
+            .await
+            .expect("a manual run");
+        step_with_usage(store, manual.id, 0, json!({"cost_micros": 5_000})).await;
+        SpendFixture {
+            a: a.id,
+            b: b.id,
+            c: c.id,
+            a_run: a_run.id,
+            manual: manual.id,
+        }
+    }
+
+    /// MOD-12 M2 D1: no step reporting an integer cost is `None`, not `Some(0)` (unknown is
+    /// unbounded, OQ-6).
+    #[tokio::test]
+    async fn batch_spend_is_none_without_a_costed_step() {
+        let store = MemStore::demo();
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(batch.id)))
+            .await
+            .expect("an open batch admits");
+        assert_eq!(store.batch_spend(batch.id).await.expect("read"), None);
+        step_with_usage(&store, run.id, 0, json!({"input_tokens": 3})).await;
+        assert_eq!(
+            store.batch_spend(batch.id).await.expect("read"),
+            None,
+            "a usage row without a cost"
+        );
+    }
+
+    /// MOD-12 M2 D1: the sum is over the batch's runs only, across projects; a non-integer cost
+    /// is skipped and a manual run is no batch's.
+    #[tokio::test]
+    async fn batch_spend_sums_only_the_batch_runs() {
+        let store = MemStore::demo();
+        let fixture = spend_fixture(&store).await;
+        assert_eq!(store.batch_spend(fixture.a).await.expect("read"), Some(950));
+        assert_eq!(
+            store.batch_spend(fixture.b).await.expect("read"),
+            Some(1_000)
+        );
+        assert_eq!(store.batch_spend(fixture.c).await.expect("read"), None);
+        assert_eq!(
+            store
+                .batch_spend(crate::model::BatchId::new())
+                .await
+                .expect("read"),
+            None,
+            "an unknown batch has spent nothing known"
+        );
+    }
+
+    /// MOD-12 M2 D5: a manual run is in no batch; a batch run answers its batch and its spend.
+    #[tokio::test]
+    async fn run_batch_spend_is_none_for_a_manual_run() {
+        let store = MemStore::demo();
+        let fixture = spend_fixture(&store).await;
+        assert_eq!(
+            store.run_batch_spend(fixture.manual).await.expect("read"),
+            None
+        );
+        assert_eq!(
+            store.run_batch_spend(fixture.a_run).await.expect("read"),
+            Some((fixture.a, Some(950)))
+        );
+        assert_eq!(
+            store.run_batch_spend(RunId::new()).await.expect("read"),
+            None,
+            "an unknown run"
+        );
     }
 
     /// MOD-12 D6 (H-5): the runner's slot count is `claim_run`'s, `running` alone; a parked run

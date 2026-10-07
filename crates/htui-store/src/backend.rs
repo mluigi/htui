@@ -737,6 +737,21 @@ impl Backend {
         }
     }
 
+    /// MOD-12 M2 D1: the spend of `batch`, `Σ run_step.usage->>'cost_micros'` over its runs;
+    /// `None` when no step reports a cost.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+        match self {
+            Self::Memory(store) => store.batch_spend(batch).await,
+            Self::Online { pg, .. } => pg.batch_spend(batch).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
     /// MOD-12 D3, D9: the runs admitted under `batch`, `(id, status)` by `(queued_at, id)`.
     ///
     /// # Errors
