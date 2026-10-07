@@ -302,8 +302,19 @@ pub struct CapError {
     pub found: String,
 }
 
+/// The [`CapError::key`] sentinel for a `project.settings` document that is not a JSON object:
+/// no single cap key is at fault, the whole document is.
+pub const SETTINGS_DOCUMENT: &str = "";
+
 impl core::fmt::Display for CapError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.key == SETTINGS_DOCUMENT {
+            return write!(
+                f,
+                "project.settings must be a JSON object, got {}",
+                self.found
+            );
+        }
         write!(
             f,
             "project.settings.{} must be a non-negative integer of USD micros, got {}",
@@ -315,7 +326,9 @@ impl core::fmt::Display for CapError {
 impl ProjectCaps {
     /// Reads both cap keys out of a `project.settings` document.
     ///
-    /// Absent or `null` is `None` — unbounded. An integer `>= 0` is the cap. Anything else
+    /// An absent or `null` document is unbounded; any other non-object (array, string, number,
+    /// bool) is an error keyed [`SETTINGS_DOCUMENT`], since it cannot hold a cap the operator wrote.
+    /// Within an object, absent or `null` is `None` — unbounded. An integer `>= 0` is the cap. Anything else
     /// (negative, float, string, bool, object) is an **error**, because a cap the operator wrote
     /// and `htui` silently ignored is the risk table's "wrong by a factor of a million" in the
     /// other direction. `0` is a real cap: it cancels on the first row that reports any USD cost.
@@ -324,6 +337,12 @@ impl ProjectCaps {
     ///
     /// [`CapError`] naming the first offending key, in declaration order.
     pub fn from_settings(settings: &Value) -> Result<Self, CapError> {
+        if !settings.is_object() && !settings.is_null() {
+            return Err(CapError {
+                key: SETTINGS_DOCUMENT,
+                found: settings.to_string(),
+            });
+        }
         Ok(Self {
             run_micros: cap_at(settings, PER_TOKEN_CAP_RUN)?,
             batch_micros: cap_at(settings, PER_TOKEN_CAP_BATCH)?,
@@ -901,6 +920,23 @@ mod tests {
         let error = ProjectCaps::from_settings(&json!({ "per_token_cap_batch": -1 }))
             .expect_err("a negative batch cap is refused");
         assert_eq!(error.key, PER_TOKEN_CAP_BATCH);
+
+        // A document that is not an object cannot hold a cap, so it is refused rather than read
+        // as "no caps"; `null` stays the unbounded absence.
+        assert_eq!(
+            ProjectCaps::from_settings(&Value::Null).expect("a null document is unbounded"),
+            ProjectCaps::default()
+        );
+        for bad in [json!([]), json!("x"), json!(3)] {
+            let error = ProjectCaps::from_settings(&bad)
+                .expect_err("a non-object settings document is refused");
+            assert_eq!(error.key, SETTINGS_DOCUMENT);
+            assert_eq!(error.found, bad.to_string());
+            assert_eq!(
+                error.to_string(),
+                format!("project.settings must be a JSON object, got {bad}")
+            );
+        }
     }
 
     /// `tightest_window` takes the highest utilization and, on a tie, the first by id — which is

@@ -4099,6 +4099,7 @@ impl WriteStore for PgStore {
                     r#"
                     UPDATE project SET settings = settings - $2::text
                      WHERE id = $1 AND updated_at = $3
+                       AND jsonb_typeof(settings) = 'object'
                     RETURNING updated_at AS "updated_at!"
                     "#,
                     id.as_uuid(),
@@ -4108,6 +4109,16 @@ impl WriteStore for PgStore {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(map_sqlx)?;
+                if landed.is_none() {
+                    // Stale first, then refuse, as `MemStore` orders it: a current token on a
+                    // miss means the blob guard fired.
+                    return match self.stored_setting(rung, key).await? {
+                        Some(stored) if stored.updated_at == expected => Err(
+                            StoreError::Constraint(project_settings_not_an_object(id, key)),
+                        ),
+                        current => cas_miss(current, "project", id),
+                    };
+                }
                 (landed, "project", id.to_string())
             }
             SettingRung::Phase(id) => {
@@ -4340,6 +4351,7 @@ impl WriteStore for PgStore {
                     r#"
                     UPDATE project SET settings = settings - $2::text
                      WHERE id = $1 AND updated_at = $3
+                       AND jsonb_typeof(settings) = 'object'
                     RETURNING updated_at AS "updated_at!"
                     "#,
                     id.as_uuid(),
@@ -4354,7 +4366,13 @@ impl WriteStore for PgStore {
                         value: None,
                         token: QueueToken::Stamp(Some(updated_at)),
                     })),
-                    None => cas_miss(self.stored_queue_setting(target, key).await?, "project", id),
+                    // The token was current, so what missed is the blob guard.
+                    None => match self.stored_queue_setting(target, key).await? {
+                        Some(stored) if stored.token == expected => Err(StoreError::Constraint(
+                            project_settings_not_an_object(id, key),
+                        )),
+                        current => cas_miss(current, "project", id),
+                    },
                 }
             }
             (QueueTarget::Box(id), QueueToken::EditVersion(want)) => {

@@ -5537,6 +5537,86 @@ async fn a_project_merge_refuses_a_non_object_settings_blob() {
     db.drop_db().await;
 }
 
+/// MOD-12 M2 residual: the clearing writers share the merge's guard. `clear_setting`'s project
+/// rung and `clear_queue_setting` refuse a non-object `project.settings` blob with `MemStore`'s
+/// sentence and write nothing, the token included; a spent token is `Stale` first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_clear_refuses_a_non_object_settings_blob() {
+    use htui_core::model::QueueSetting;
+    use htui_core::store::StoreError;
+    use htui_core::store::traits::{QueueTarget, QueueToken, project_settings_not_an_object};
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let target = QueueTarget::Project(ids::PROJECT_HTUI);
+    let cap = QueueSetting::PerTokenCapBatch;
+    let rung = SettingRung::Project(ids::PROJECT_HTUI);
+    let hops = SettingKey::UpstreamHops;
+    for blob in [serde_json::json!([]), serde_json::json!("x")] {
+        plant_project_settings(&db.pool, &blob).await;
+        let read = db
+            .store
+            .queue_setting(target, cap)
+            .await
+            .expect("the read answers")
+            .expect("the project exists");
+        let QueueToken::Stamp(Some(token)) = read.token else {
+            panic!(
+                "{blob}: a project's token is its updated_at, got {:?}",
+                read.token
+            );
+        };
+
+        assert_eq!(
+            db.store.clear_setting(rung, hops, token).await,
+            Err(StoreError::Constraint(project_settings_not_an_object(
+                ids::PROJECT_HTUI,
+                hops
+            ))),
+            "{blob}: clear_setting's project rung is refused"
+        );
+        assert_eq!(
+            db.store.clear_queue_setting(target, cap, read.token).await,
+            Err(StoreError::Constraint(project_settings_not_an_object(
+                ids::PROJECT_HTUI,
+                cap
+            ))),
+            "{blob}: the cap clear is refused"
+        );
+        assert_eq!(
+            db.store.queue_setting(target, cap).await.expect("read"),
+            Some(read.clone()),
+            "{blob}: neither refusal wrote anything, the token included"
+        );
+        let settings: serde_json::Value =
+            sqlx::query_scalar("SELECT settings FROM project WHERE id = $1")
+                .bind(ids::PROJECT_HTUI.as_uuid())
+                .fetch_one(&db.pool)
+                .await
+                .expect("the blob reads back");
+        assert_eq!(settings, blob, "{blob}: the blob is left as it was");
+
+        let spent = token - TimeDelta::seconds(1);
+        let stale = db.store.clear_setting(rung, hops, spent).await;
+        assert!(
+            matches!(stale, Ok(CasOutcome::Stale(_))),
+            "{blob}: a spent token is Stale before the blob refuses, got {stale:?}"
+        );
+        let stale = db
+            .store
+            .clear_queue_setting(target, cap, QueueToken::Stamp(Some(spent)))
+            .await;
+        assert_eq!(
+            stale,
+            Ok(CasOutcome::Stale(read)),
+            "{blob}: the queue clear is Stale first too"
+        );
+    }
+
+    db.drop_db().await;
+}
+
 /// MOD-41 plan D9: an executor this build does not know never fails `BoxSettings`' decode, so
 /// `claim_run`'s admission still reads the box's `max_concurrent_items`: with one slot, the
 /// second claim is `SlotFull`.
