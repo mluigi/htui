@@ -21,6 +21,7 @@ use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
+use htui_core::model::QueueSetting;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
     BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
@@ -36,8 +37,8 @@ use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
 use htui_core::secret::{SecretScope, SecretSource};
 use htui_core::store::{
-    DeleteReach, DeleteTarget, ReadStore, Result as StoreResult, SettingRung, StoreError,
-    WriteStore,
+    DeleteReach, DeleteTarget, QueueTarget, QueueToken, ReadStore, Result as StoreResult,
+    SettingRung, StoreError, WriteStore,
 };
 use htui_store::cache::refresh::{RefreshSettings, Refresher};
 use htui_store::vector::SearchQuery;
@@ -61,6 +62,7 @@ use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::persona_import::PersonaImports;
 use crate::persona_settings::{self, PersonaWrite};
 use crate::prompt_settings::{self, SettingsSnapshot};
+use crate::queue_settings::{self, QueueSettingsSnapshot};
 use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
 };
@@ -1103,6 +1105,35 @@ pub enum StoreRequest {
         /// The text; prints as its length (D1).
         body: HandText,
     },
+    /// MOD-12 M2 D8: the queue settings of this scope: the three `app_setting` keys with their
+    /// tokens, each scope project's two caps, and this box's `max_concurrent_items` with the
+    /// effective value. Answered with [`StoreReply::QueueSettings`]; offline `DATABASE_UNREACHABLE`.
+    QueueSettings(Scope),
+    /// MOD-12 M2 D9: `set_queue_setting`. Answered with [`StoreReply::QueueSettings`] when it
+    /// applied, [`StoreReply::QueueSettingsStale`] when the token was spent.
+    SetQueueSetting {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Where the key is written.
+        target: QueueTarget,
+        /// Which key.
+        key: QueueSetting,
+        /// The validated JSON: micros for money, an integer, or a window object.
+        value: Value,
+        /// The token the editor opened on.
+        expected: QueueToken,
+    },
+    /// MOD-12 M2 D9: `clear_queue_setting`, so a cap is unbounded and the box limit inherits.
+    ClearQueueSetting {
+        /// The scope the reply re-reads.
+        scope: Scope,
+        /// Where the key is cleared.
+        target: QueueTarget,
+        /// Which key.
+        key: QueueSetting,
+        /// The token the editor opened on.
+        expected: QueueToken,
+    },
 }
 
 impl StoreRequest {
@@ -1259,6 +1290,10 @@ impl StoreRequest {
             Self::AddNote { .. } => "add_note",
             Self::DocumentForm { .. } => "document_form",
             Self::WriteDocument { .. } => "write_document",
+            // The three of `queue_settings::REQUEST_NAMES`, in that order (MOD-12 M2 D9).
+            Self::QueueSettings(..) => "queue_settings",
+            Self::SetQueueSetting { .. } => "set_queue_setting",
+            Self::ClearQueueSetting { .. } => "clear_queue_setting",
         }
     }
 }
@@ -1645,6 +1680,12 @@ pub enum StoreReply {
         /// Applied, or the token was spent.
         outcome: ScopeWrite,
     },
+    /// The scope's queue settings, freshly read: the answer to [`StoreRequest::QueueSettings`] and
+    /// to every queue-setting write that applied (MOD-12 M2 D8).
+    QueueSettings(Box<QueueSettingsSnapshot>),
+    /// A queue-setting write missed its token: the settings as they are now, for the editor to
+    /// reload against; it keeps its text and retries only on `Enter` (PRD D8's rule).
+    QueueSettingsStale(Box<QueueSettingsSnapshot>),
     /// The store failed. `request` is [`StoreRequest::name`].
     Failed {
         /// Which request failed.
@@ -2172,6 +2213,11 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::ClearInfisicalUrl
         | StoreRequest::SetMachineIdentity(_)
         | StoreRequest::ClearMachineIdentity => secrets_settings::serve(backend, request).await?,
+        // The three queue-setting requests of `Settings > Queue`, or-ed for the reason the arms
+        // above are (MOD-15 M3 plan F-12; MOD-12 M2 D9).
+        StoreRequest::QueueSettings(..)
+        | StoreRequest::SetQueueSetting { .. }
+        | StoreRequest::ClearQueueSetting { .. } => queue_settings::serve(backend, request).await?,
         // MOD-64 D231: the loop serves both through the concepts runtime; one that reaches here
         // belongs to a caller with none (the harness default), and is answered in the overlay's
         // own reply (D232).
@@ -5134,6 +5180,37 @@ mod tests {
                 StoreRequest::PauseQueue.name(),
             ],
             QUEUE_REQUEST_NAMES
+        );
+    }
+
+    /// The three queue-setting requests are named exactly as `queue_settings::REQUEST_NAMES` lists
+    /// them, so the section's `Failed` match and the worker cannot drift apart (MOD-12 M2 D9).
+    #[test]
+    fn queue_settings_requests_are_named_as_request_names_lists_them() {
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        assert_eq!(
+            [
+                StoreRequest::QueueSettings(scope.clone()).name(),
+                StoreRequest::SetQueueSetting {
+                    scope: scope.clone(),
+                    target: QueueTarget::Box(ids::BOX),
+                    key: QueueSetting::MaxConcurrentItems,
+                    value: Value::from(1),
+                    expected: QueueToken::EditVersion(0),
+                }
+                .name(),
+                StoreRequest::ClearQueueSetting {
+                    scope,
+                    target: QueueTarget::Box(ids::BOX),
+                    key: QueueSetting::MaxConcurrentItems,
+                    expected: QueueToken::EditVersion(0),
+                }
+                .name(),
+            ],
+            queue_settings::REQUEST_NAMES
         );
     }
 
