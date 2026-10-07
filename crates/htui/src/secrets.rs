@@ -488,7 +488,7 @@ mod tests {
         (root, htui_store::Backend::Offline { cache, since: None })
     }
 
-    /// Serves `request` through the Settings > Secrets worker arm and expects a snapshot.
+    /// Serves `request` through the Settings > Secrets worker arm and expects its own answer.
     async fn serve_write(
         backend: &htui_store::Backend,
         request: crate::store_worker::StoreRequest,
@@ -497,7 +497,11 @@ mod tests {
             .await
             .expect("the write is served");
         assert!(
-            matches!(reply, crate::store_worker::StoreReply::Secrets(_)),
+            matches!(
+                reply,
+                crate::store_worker::StoreReply::SecretsWritten { request: named, .. }
+                    if named == request.name()
+            ),
             "the write lands: {reply:?}"
         );
     }

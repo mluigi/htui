@@ -241,6 +241,10 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
         StoreRequest::Hierarchy(ws) => Ok(StoreReply::Hierarchy(
             snapshot(&writer, *ws, this_box).await?.map(Box::new),
         )),
+        // MOD-10 M4 R1 L-3: the same read, answered under the Secrets section's own name.
+        StoreRequest::SecretsTree(ws) => Ok(StoreReply::SecretsTree(
+            snapshot(&writer, *ws, this_box).await?.map(Box::new),
+        )),
         StoreRequest::CreateWorkspace {
             slug,
             name,

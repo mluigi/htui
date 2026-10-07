@@ -828,7 +828,8 @@ pub enum StoreRequest {
     /// The keyring rows of `Settings > Secrets` (D2). Answered with [`StoreReply::Secrets`].
     SecretsInfo,
     /// Store the Infisical base URL, already normalised on the UI task (D3). Not a secret: a
-    /// normalised URL has no user info, query or fragment.
+    /// normalised URL has no user info, query or fragment. This and the three keyring writes
+    /// below answer [`StoreReply::SecretsWritten`] (R1 M-1).
     SetInfisicalUrl(String),
     /// Remove the stored URL.
     ClearInfisicalUrl,
@@ -858,6 +859,10 @@ pub enum StoreRequest {
         /// `Some` writes provider `infisical` and this scope; `None` clears both columns.
         scope: Option<SecretScope>,
     },
+    /// The scope's workspace tree for `Settings > Secrets`: [`Self::Hierarchy`]'s read under its
+    /// own name, answered with [`StoreReply::SecretsTree`] (MOD-10 M4 R1 L-3), so a Secrets
+    /// reload never reaches the Hierarchy section as the answer to its write in flight.
+    SecretsTree(WorkspaceId),
     /// MOD-64 D231: a concepts search, served by `concepts_worker::ConceptsRuntime` on a task of its
     /// own (`R-NF-3`). Answered with [`StoreReply::Concepts`], never `Failed` (D232).
     SearchConcepts(SearchQuery),
@@ -1174,6 +1179,7 @@ impl StoreRequest {
             Self::CheckSecretProvider => "check_secret_provider",
             Self::CheckSecretScope { .. } => "check_secret_scope",
             Self::SetProjectSecretScope { .. } => "set_project_secret_scope",
+            Self::SecretsTree(..) => "secrets_tree",
             // The two of `concepts_worker::REQUEST_NAMES`, in that order (MOD-64 D241).
             Self::SearchConcepts(_) => "search_concepts",
             Self::IndexConcepts { .. } => "index_concepts",
@@ -1547,8 +1553,21 @@ pub enum StoreReply {
         /// The version the store allocated.
         version: i32,
     },
-    /// `SecretsInfo` and every keyring write's success (D2): the section re-renders from it.
+    /// Answer to [`StoreRequest::SecretsInfo`] (D2): fresh keyring rows, never a write's answer.
     Secrets(SecretsSnapshot),
+    /// A keyring write that landed, and the keyring as it is now (D2, R1 M-1). Self-naming: the
+    /// Secrets section lands its write in flight on this alone, never on a read's [`Self::Secrets`]
+    /// that the loop served before the write.
+    SecretsWritten {
+        /// The write's [`StoreRequest::name`].
+        request: &'static str,
+        /// The keyring rows read after the write.
+        snapshot: SecretsSnapshot,
+    },
+    /// Answer to [`StoreRequest::SecretsTree`]: [`Self::Hierarchy`]'s tree under the Secrets
+    /// section's own name (R1 L-3). `None` for a workspace that does not exist. The Hierarchy
+    /// section only adopts it.
+    SecretsTree(Option<Box<HierarchySnapshot>>),
     /// One check's answer, from the agent runtime's task (D5, D8).
     SecretCheck(SecretCheck),
     /// Answer to [`StoreRequest::SetProjectSecretScope`] (D6, blueprint A-1): the workspace
@@ -1910,11 +1929,12 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
             message: "no agent runtime in this build".to_owned(),
         },
         // The thirteen hierarchy requests plus MOD-10 M4's scope write (D6; not one of
-        // `hierarchy::REQUEST_NAMES`, blueprint A-11), or-ed rather than guarded: this `match` has
-        // no wildcard, and an arm with a guard does not count towards exhaustivity, so `_ if …`
-        // would be an E0004 here (MOD-15 M3 plan F-12). The `?` is what keeps `spawn`'s
-        // `go_offline` working: an `Unreachable` from `hierarchy::serve` still drops an `Online`
-        // backend onto the mirror exactly as any other read does.
+        // `hierarchy::REQUEST_NAMES`, blueprint A-11) and the Secrets section's tree read (R1
+        // L-3), or-ed rather than guarded: this `match` has no wildcard, and an arm with a guard
+        // does not count towards exhaustivity, so `_ if …` would be an E0004 here (MOD-15 M3 plan
+        // F-12). The `?` is what keeps `spawn`'s `go_offline` working: an `Unreachable` from
+        // `hierarchy::serve` still drops an `Online` backend onto the mirror exactly as any other
+        // read does.
         StoreRequest::Hierarchy(..)
         | StoreRequest::CreateWorkspace { .. }
         | StoreRequest::UpdateWorkspace { .. }
@@ -1928,7 +1948,8 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         | StoreRequest::DeleteWorkspace(..)
         | StoreRequest::DeleteProject(..)
         | StoreRequest::InferRepoPaths(..)
-        | StoreRequest::SetProjectSecretScope { .. } => hierarchy::serve(backend, request).await?,
+        | StoreRequest::SetProjectSecretScope { .. }
+        | StoreRequest::SecretsTree(..) => hierarchy::serve(backend, request).await?,
         // The nine catalogue requests, or-ed for the same reason the fourteen above are: a guard
         // does not count towards exhaustivity in a wildcard-free `match`, so `_ if …` would be an
         // E0004 here (MOD-15 M3 plan F-12, M4 plan F-2).

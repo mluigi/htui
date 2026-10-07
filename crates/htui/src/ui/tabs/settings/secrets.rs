@@ -2,7 +2,7 @@
 //! check, and each project's secret scope (MOD-10 milestone 4, D1, D3–D6, D8; OQ-1..4).
 //!
 //! It holds **no store handle** (`R-NF-3`): it names two reads ([`StoreRequest::SecretsInfo`] and
-//! the scope's [`StoreRequest::Hierarchy`]), is handed the [`SecretsSnapshot`] and the tree that
+//! the scope's [`StoreRequest::SecretsTree`]), is handed the [`SecretsSnapshot`] and the tree that
 //! come back, and every write and check leaves through `ctx.request`. What is on screen is always
 //! the last snapshot the worker assembled.
 //!
@@ -16,10 +16,12 @@
 //! a refusal is a sentence under the form. Normalisation's and [`SecretScope::new`]'s sentences
 //! name the reason or the field, never the value.
 //!
-//! The scope write answers under its own name ([`StoreReply::SecretScopeWritten`], blueprint
-//! A-1): this section lands its write on that alone, and takes a plain `Hierarchy` reply only as
-//! fresh rows. `--demo` (D10) shows `n/a`, refuses keyring edits and checks here (no request is
-//! sent), and still edits scopes, which live in the store.
+//! Every write answers under its own name: the scope write [`StoreReply::SecretScopeWritten`]
+//! (blueprint A-1), a keyring write [`StoreReply::SecretsWritten`] (R1 M-1). This section lands
+//! its write on that alone, and takes a read's `Secrets`, a `Hierarchy` or its own `SecretsTree`
+//! only as fresh rows; its tree read is its own (R1 L-3), so it never reaches the Hierarchy
+//! section as the answer to that section's write. `--demo` (D10) shows `n/a`, refuses keyring
+//! edits and checks here (no request is sent), and still edits scopes, which live in the store.
 
 use std::collections::BTreeMap;
 
@@ -674,7 +676,7 @@ impl SecretsSection {
 
     /// `Enter` in a form.
     fn submit(&mut self, ctx: &Ctx<'_>) {
-        if self.refused_busy() {
+        if self.refused_busy() || self.closed_if_gone() {
             return;
         }
         match self.mode {
@@ -775,6 +777,7 @@ impl SecretsSection {
             return Handled::Pass;
         }
         match key.code {
+            KeyCode::Char('y') if self.closed_if_gone() => {}
             KeyCode::Char('y') => match core::mem::take(&mut self.mode) {
                 Mode::ConfirmClearUrl => {
                     self.send(Write::ClearUrl, StoreRequest::ClearInfisicalUrl, ctx);
@@ -1085,20 +1088,61 @@ impl SecretsSection {
         true
     }
 
-    /// A fresh keyring snapshot, and what the keyring write that asked for it did.
+    /// A passive tree (a read, or another section's write): rows refresh, and a scope form or
+    /// question whose project left the tree is closed (R1 L-4).
+    fn adopt_passive(&mut self, tree: &HierarchySnapshot, ctx: &Ctx<'_>) {
+        if self.adopt(tree, ctx) {
+            self.closed_if_gone();
+        }
+    }
+
+    /// Closes a scope form or question whose project is no longer a row of the tree: it was
+    /// deleted or unlinked elsewhere, so its token can only be refused (R1 L-4). Whether it did.
+    fn closed_if_gone(&mut self) -> bool {
+        let project = match &self.mode {
+            Mode::EditingScope { project, .. } | Mode::ConfirmClearScope { project, .. } => {
+                *project
+            }
+            _ => return false,
+        };
+        let known = self.tree.as_ref().is_some_and(|tree| {
+            tree.projects
+                .iter()
+                .any(|entry| entry.project.id == project)
+        });
+        if known {
+            return false;
+        }
+        self.mode = Mode::Browse;
+        self.refuse(DELETED_ELSEWHERE.to_owned());
+        true
+    }
+
+    /// A fresh keyring snapshot from a read: rows only, never a write's answer (R1 M-1).
     fn on_snapshot(&mut self, snapshot: &SecretsSnapshot) {
         self.unavailable = None;
         self.snapshot = Some(snapshot.clone());
-        let said = match self.busy {
+    }
+
+    /// A keyring write's own answer (R1 M-1): fresh rows, and what the write did when it is this
+    /// section's write in flight. Any landed keyring write rebuilds the provider (A-4), so the
+    /// latch line and a provider check in flight are about what it replaced.
+    fn on_keyring_written(&mut self, request: &str, snapshot: &SecretsSnapshot) {
+        self.on_snapshot(snapshot);
+        let outdates = self.checking == Some(Checking::Provider);
+        self.rebuilt_since_check = true;
+        let said = match self.busy.filter(|busy| busy.name() == request) {
             Some(Write::Url) => URL_STORED,
             Some(Write::ClearUrl) => URL_CLEARED,
             Some(Write::Identity) => IDENTITY_STORED,
             Some(Write::ClearIdentity) => IDENTITY_CLEARED,
-            Some(Write::Scope { .. }) | None => return,
+            Some(Write::Scope { .. }) | None => {
+                self.landed(false, outdates);
+                return;
+            }
         };
-        self.landed(true, self.checking == Some(Checking::Provider));
+        self.landed(true, outdates);
         self.busy = None;
-        self.rebuilt_since_check = true;
         self.say(said);
     }
 
@@ -1119,7 +1163,7 @@ impl SecretsSection {
         ctx: &Ctx<'_>,
     ) {
         if !self.adopt(tree, ctx) {
-            ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
+            ctx.request(StoreRequest::SecretsTree(ctx.scope.workspace_id));
         }
         if outcome == ScopeWrite::Applied {
             self.scope_checks.remove(&project);
@@ -1213,11 +1257,11 @@ impl SettingsSection for SecretsSection {
     }
 
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest> {
-        // The Hierarchy section asks for the same tree: one staleness slot, so the newer reply
-        // reaches both sections (H-9).
+        // The tree under this section's own name (R1 L-3): a plain `Hierarchy` read answered
+        // while a Hierarchy write is in flight would be taken for that write's answer.
         vec![
             StoreRequest::SecretsInfo,
-            StoreRequest::Hierarchy(scope.workspace_id),
+            StoreRequest::SecretsTree(scope.workspace_id),
         ]
     }
 
@@ -1288,7 +1332,7 @@ impl SettingsSection for SecretsSection {
             // Never refused: re-reading is how a section that lost a reply recovers.
             KeyCode::Char('r') => {
                 ctx.request(StoreRequest::SecretsInfo);
-                ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
+                ctx.request(StoreRequest::SecretsTree(ctx.scope.workspace_id));
             }
             KeyCode::Esc if self.notice.is_some() => self.notice = None,
             _ => return Handled::Pass,
@@ -1299,15 +1343,18 @@ impl SettingsSection for SecretsSection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Secrets(snapshot) => self.on_snapshot(snapshot),
+            StoreReply::SecretsWritten { request, snapshot } => {
+                self.on_keyring_written(request, snapshot);
+            }
             // Passive: fresh rows and tokens, never this section's write's answer (H-4).
             StoreReply::Hierarchy(Some(tree))
+            | StoreReply::SecretsTree(Some(tree))
             | StoreReply::HierarchyStale(tree)
-            | StoreReply::RepoPathsInferred { tree, .. } => {
-                self.adopt(tree, ctx);
-            }
-            StoreReply::Hierarchy(None) => {
+            | StoreReply::RepoPathsInferred { tree, .. } => self.adopt_passive(tree, ctx),
+            StoreReply::Hierarchy(None) | StoreReply::SecretsTree(None) => {
                 self.tree = None;
                 self.clamp_cursor();
+                self.closed_if_gone();
             }
             StoreReply::SecretScopeWritten {
                 project,
@@ -1315,15 +1362,21 @@ impl SettingsSection for SecretsSection {
                 outcome,
             } => self.on_scope_written(*project, tree, *outcome, ctx),
             StoreReply::SecretCheck(check) => self.on_check(check),
+            // Only a real `SecretsInfo` is refused under this name (a write's read-back failure is
+            // the write's), so a write in flight stays in flight (R1 M-1).
             StoreReply::Failed { request, message } if *request == READ_NAME => {
-                self.busy = None;
                 self.unavailable = Some(message.clone());
             }
             // A refused write. The shell has already put `{request}: {message}` on the status
-            // line; a question has nothing left to answer, an open scope form keeps its text.
+            // line; a question has nothing left to answer, an open scope form keeps its text. A
+            // refused scope write re-reads the tree: a project deleted elsewhere is refused
+            // `NotFound` before the CAS write, and the tree without it closes the form (R1 L-4).
             StoreReply::Failed { request, message }
                 if REQUEST_NAMES[1..].contains(request) || *request == SET_PROJECT_SECRET_SCOPE =>
             {
+                if *request == SET_PROJECT_SECRET_SCOPE {
+                    ctx.request(StoreRequest::SecretsTree(ctx.scope.workspace_id));
+                }
                 self.busy = None;
                 if matches!(
                     self.mode,

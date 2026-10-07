@@ -92,6 +92,18 @@ fn snapshot_of(reply: StoreReply) -> SecretsSnapshot {
     }
 }
 
+/// A keyring write's own answer, named `request` (R1 M-1), or a panic naming what came instead.
+#[track_caller]
+fn keyring_written_of(reply: StoreReply, request: &str) -> SecretsSnapshot {
+    match reply {
+        StoreReply::SecretsWritten {
+            request: named,
+            snapshot,
+        } if named == request => snapshot,
+        other => panic!("expected `{request}`'s own reply, got {other:?}"),
+    }
+}
+
 /// `SecretsInfo` through `serve`.
 async fn info(backend: &Backend) -> SecretsSnapshot {
     snapshot_of(serve(backend, &StoreRequest::SecretsInfo).await)
@@ -316,7 +328,7 @@ async fn set_infisical_url_stores_the_normalised_form_and_answers_a_fresh_snapsh
     )
     .await;
     assert_eq!(
-        snapshot_of(reply).url,
+        keyring_written_of(reply, "set_infisical_url").url,
         UrlState::Stored("https://infisical.example.com".to_owned())
     );
     assert_eq!(
@@ -356,7 +368,10 @@ async fn set_machine_identity_stores_both_halves_and_answers_a_fresh_snapshot() 
         !shown.contains(SECRET) && !shown.contains(CLIENT_ID),
         "{shown}"
     );
-    assert_eq!(snapshot_of(reply).identity, IdentityState::Stored);
+    assert_eq!(
+        keyring_written_of(reply, "set_machine_identity").identity,
+        IdentityState::Stored
+    );
     assert_eq!(
         common::fake_machine_identity(),
         (Some(CLIENT_ID.to_owned()), Some(SECRET.to_owned()))
@@ -405,7 +420,10 @@ async fn clear_machine_identity_removes_both_halves() {
     secret::set_machine_identity(&MachineIdentity::new(CLIENT_ID, SECRET)).expect("stores");
     let (_root, backend) = offline("secrets-clear-identity").await;
     let reply = serve(&backend, &StoreRequest::ClearMachineIdentity).await;
-    assert_eq!(snapshot_of(reply).identity, IdentityState::NotStored);
+    assert_eq!(
+        keyring_written_of(reply, "clear_machine_identity").identity,
+        IdentityState::NotStored
+    );
     assert_eq!(common::fake_machine_identity(), (None, None));
 }
 
@@ -415,7 +433,10 @@ async fn clear_infisical_url_removes_the_url() {
     secret::set_infisical_url("https://x.example").expect("stores");
     let (_root, backend) = offline("secrets-clear-url").await;
     let reply = serve(&backend, &StoreRequest::ClearInfisicalUrl).await;
-    assert_eq!(snapshot_of(reply).url, UrlState::NotStored);
+    assert_eq!(
+        keyring_written_of(reply, "clear_infisical_url").url,
+        UrlState::NotStored
+    );
     assert_eq!(secret::get_infisical_url().expect("the fake reads"), None);
 }
 
@@ -732,6 +753,25 @@ fn the_scope_write_is_not_a_hierarchy_request_name() {
 // The scope check (D8)
 // ---------------------------------------------------------------------------------------------
 
+/// R1 L-3: the Secrets section's tree read is `Hierarchy`'s read under its own name, so its
+/// answer can never be taken for a Hierarchy write's.
+#[tokio::test]
+async fn the_secrets_tree_read_answers_the_hierarchy_tree_under_its_own_name() {
+    let backend = demo();
+    let request = StoreRequest::SecretsTree(ids::WORKSPACE_GRAPHICS);
+    assert_eq!(request.name(), "secrets_tree");
+    assert!(!hierarchy::REQUEST_NAMES.contains(&request.name()));
+    let tree = match serve(&backend, &request).await {
+        StoreReply::SecretsTree(Some(tree)) => *tree,
+        other => panic!("expected the Secrets tree, got {other:?}"),
+    };
+    let read = match serve(&backend, &StoreRequest::Hierarchy(ids::WORKSPACE_GRAPHICS)).await {
+        StoreReply::Hierarchy(Some(tree)) => *tree,
+        other => panic!("expected the hierarchy tree, got {other:?}"),
+    };
+    assert_eq!(tree, read);
+}
+
 /// A runtime holding `source` (when given) and the answer to one `CheckSecretScope` of `project`
 /// over `store`: the immediate `Served`, and the deferred reply when there is one.
 async fn scope_check_through(
@@ -973,6 +1013,27 @@ fn tree_reply(tree: &HierarchySnapshot) -> StoreReply {
     StoreReply::Hierarchy(Some(Box::new(tree.clone())))
 }
 
+/// A tree as the Secrets section's own read answers it (R1 L-3).
+fn secrets_tree_reply(tree: &HierarchySnapshot) -> StoreReply {
+    StoreReply::SecretsTree(Some(Box::new(tree.clone())))
+}
+
+/// `keyring_reply`'s rows as the keyring write `request`'s own answer (R1 M-1).
+#[track_caller]
+fn keyring_landed(request: &'static str, keyring_reply: StoreReply) -> StoreReply {
+    match keyring_reply {
+        StoreReply::Secrets(snapshot) => StoreReply::SecretsWritten { request, snapshot },
+        other => panic!("expected a keyring snapshot, got {other:?}"),
+    }
+}
+
+/// `tree` with `project` gone, as a re-read after a delete elsewhere answers it.
+fn without(tree: &HierarchySnapshot, project: ProjectId) -> HierarchySnapshot {
+    let mut tree = tree.clone();
+    tree.projects.retain(|entry| entry.project.id != project);
+    tree
+}
+
 /// A fixed check time, so the rows and snapshots are stable.
 fn at(hour: u32, minute: u32, second: u32) -> chrono::DateTime<Utc> {
     use chrono::TimeZone;
@@ -1082,7 +1143,7 @@ async fn wants_requests_names_the_keyring_read_and_the_tree() {
     assert!(
         matches!(
             wanted.as_slice(),
-            [StoreRequest::SecretsInfo, StoreRequest::Hierarchy(ws)] if *ws == ids::WORKSPACE_GRAPHICS
+            [StoreRequest::SecretsInfo, StoreRequest::SecretsTree(ws)] if *ws == ids::WORKSPACE_GRAPHICS
         ),
         "{wanted:?}"
     );
@@ -1278,9 +1339,12 @@ async fn c_on_identity_asks_then_clears() {
     ));
     bench.reply(
         &mut section,
-        &keyring(
-            UrlState::Stored(STORED_URL.to_owned()),
-            IdentityState::NotStored,
+        &keyring_landed(
+            "clear_machine_identity",
+            keyring(
+                UrlState::Stored(STORED_URL.to_owned()),
+                IdentityState::NotStored,
+            ),
         ),
     );
     let shown = frame(&bench, &section);
@@ -1308,7 +1372,10 @@ async fn c_on_url_asks_then_clears() {
     ));
     bench.reply(
         &mut section,
-        &keyring(UrlState::NotStored, IdentityState::Stored),
+        &keyring_landed(
+            "clear_infisical_url",
+            keyring(UrlState::NotStored, IdentityState::Stored),
+        ),
     );
     let shown = frame(&bench, &section);
     assert!(
@@ -1401,7 +1468,7 @@ async fn one_write_in_flight_refuses_e_and_c_but_not_r_or_t() {
     assert!(
         matches!(
             reads.as_slice(),
-            [StoreRequest::SecretsInfo, StoreRequest::Hierarchy(ws)] if *ws == ids::WORKSPACE_GRAPHICS
+            [StoreRequest::SecretsInfo, StoreRequest::SecretsTree(ws)] if *ws == ids::WORKSPACE_GRAPHICS
         ),
         "{reads:?}"
     );
@@ -1576,7 +1643,10 @@ async fn a_landed_identity_write_lifts_the_latch_line_until_the_next_check() {
         frame(&bench, &section).contains(latch),
         "the write has not landed yet"
     );
-    bench.reply(&mut section, &configured());
+    bench.reply(
+        &mut section,
+        &keyring_landed("set_machine_identity", configured()),
+    );
     let shown = frame(&bench, &section);
     assert!(!shown.contains(latch), "{shown}");
     assert!(shown.contains("last check 14:02:11"), "{shown}");
@@ -1614,7 +1684,10 @@ async fn a_check_answered_after_a_later_identity_write_does_not_bring_the_latch_
         requests(&bench).as_slice(),
         [StoreRequest::SetMachineIdentity(_)]
     ));
-    bench.reply(&mut section, &configured());
+    bench.reply(
+        &mut section,
+        &keyring_landed("set_machine_identity", configured()),
+    );
     bench.reply(&mut section, &refused());
     let shown = frame(&bench, &section);
     assert!(!shown.contains(latch), "{shown}");
@@ -1648,7 +1721,10 @@ async fn a_check_sent_after_an_identity_write_latches_on_its_answer() {
             StoreRequest::CheckSecretProvider
         ]
     ));
-    bench.reply(&mut section, &configured());
+    bench.reply(
+        &mut section,
+        &keyring_landed("set_machine_identity", configured()),
+    );
     bench.reply(
         &mut section,
         &StoreReply::SecretCheck(SecretCheck::Provider {
@@ -2182,6 +2258,229 @@ async fn a_refused_write_lands_on_the_section() {
         },
     );
     assert!(!frame(&bench, &section).contains("not ours"));
+}
+
+#[tokio::test]
+async fn a_read_sent_before_a_write_is_not_its_answer() {
+    // R1 M-1: the loop serves in order, so a `SecretsInfo` sent before the write answers first,
+    // from the keyring the write is about to replace. It is fresh rows, never the write's answer.
+    let latch = "the last login was refused";
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            outcome: Err(SecretError::BadCredentials),
+        }),
+    );
+    bench.key(&mut section, "r");
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    let sent = requests(&bench);
+    assert!(
+        matches!(sent.last(), Some(StoreRequest::SetMachineIdentity(_))),
+        "{sent:?}"
+    );
+
+    // The read's answer.
+    bench.reply(&mut section, &configured());
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains("identity stored"), "{shown}");
+    assert!(shown.contains("set_machine_identity in flight"), "{shown}");
+    assert!(shown.contains(latch), "nothing was rebuilt yet: {shown}");
+    bench.key(&mut section, "e");
+    assert!(!section.captures_input(), "the write is still in flight");
+    assert!(
+        frame(&bench, &section).contains("`set_machine_identity` is still in flight"),
+        "{}",
+        frame(&bench, &section)
+    );
+
+    // The write's own answer.
+    bench.reply(
+        &mut section,
+        &keyring_landed("set_machine_identity", configured()),
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("identity stored"), "{shown}");
+    assert!(!shown.contains(latch), "{shown}");
+    bench.key(&mut section, "e");
+    assert!(section.captures_input(), "the write is free again");
+}
+
+#[tokio::test]
+async fn a_refused_read_does_not_free_a_write_in_flight() {
+    // R1 M-1: only a real `SecretsInfo` is refused as `secrets_info`; a write whose read-back
+    // fails is refused under its own name.
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::ClearInfisicalUrl]
+    ));
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "secrets_info",
+            message: "keyring task failed: boom".to_owned(),
+        },
+    );
+    // `r` recovers the rows; the write is still out.
+    bench.reply(&mut section, &configured());
+    for key in ["e", "c"] {
+        bench.key(&mut section, key);
+        assert!(!section.captures_input(), "`{key}` opens nothing");
+        assert!(bench.drained().is_empty(), "`{key}` sends nothing");
+        let shown = frame(&bench, &section);
+        assert!(
+            shown.contains("`clear_infisical_url` is still in flight"),
+            "{shown}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_secrets_reload_reads_its_own_tree() {
+    // R1 L-3: `r` re-reads the tree under the section's own name, and the section adopts it.
+    let (bench, mut section, tree) = loaded(configured()).await;
+    bench.key(&mut section, "r");
+    let reads = requests(&bench);
+    assert!(
+        matches!(
+            reads.as_slice(),
+            [StoreRequest::SecretsInfo, StoreRequest::SecretsTree(ws)] if *ws == ids::WORKSPACE_GRAPHICS
+        ),
+        "{reads:?}"
+    );
+    let mut renamed = tree.clone();
+    renamed.projects[0].project.slug = "vulkan-renamed".to_owned();
+    bench.reply(&mut section, &secrets_tree_reply(&renamed));
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("vulkan-renamed"), "{shown}");
+}
+
+#[tokio::test]
+async fn the_hierarchy_section_adopts_a_secrets_tree_without_taking_it_as_its_write() {
+    // R1 L-3: a Secrets reload answered while a Hierarchy write is in flight is fresh rows for
+    // the Hierarchy section, never the answer that closes its editor.
+    let bench = SectionBench::new().await;
+    let mut hierarchy_section = HierarchySection::new();
+    let tree = graphics(&MemStore::demo()).await;
+    bench.reply(&mut hierarchy_section, &tree_reply(&tree));
+    let _ = bench.drained();
+
+    bench.key(&mut hierarchy_section, "e");
+    for c in "-2".chars() {
+        bench.key(&mut hierarchy_section, &c.to_string());
+    }
+    bench.key(&mut hierarchy_section, "Enter");
+    let sent = bench.drained();
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [Action::Store(StoreRequest::UpdateWorkspace { .. })]
+        ),
+        "{sent:?}"
+    );
+
+    let mut renamed = tree.clone();
+    renamed.workspace.name = "Graphics Renamed".to_owned();
+    bench.reply(&mut hierarchy_section, &secrets_tree_reply(&renamed));
+    assert!(bench.drained().is_empty(), "nothing emitted");
+    assert!(
+        hierarchy_section.captures_input(),
+        "the editor waits for its own write's answer"
+    );
+    let shown = bench.render_section(&hierarchy_section, 100);
+    assert!(
+        shown.contains("Graphics Renamed"),
+        "the tree is adopted: {shown}"
+    );
+
+    // Its own write's answer still closes it.
+    bench.reply(&mut hierarchy_section, &tree_reply(&renamed));
+    assert!(!hierarchy_section.captures_input());
+}
+
+#[tokio::test]
+async fn a_scope_write_refused_for_a_deleted_project_closes_the_form_on_the_re_read() {
+    // R1 L-4: a project deleted elsewhere is refused before the CAS write (`NotFound`), never
+    // answered `Stale`. The refusal re-reads the tree; the tree without the project closes the
+    // form, rather than leaving every `Enter` to be refused again.
+    let (bench, mut section, tree) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Enter");
+    let _ = the_scope_write(&requests(&bench));
+
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: SET_PROJECT_SECRET_SCOPE,
+            message: StoreError::NotFound {
+                entity: "workspace_project",
+                id: ids::PROJECT_VULKAN.to_string(),
+            }
+            .to_string(),
+        },
+    );
+    assert!(section.captures_input(), "a refusal alone keeps the text");
+    let reread = requests(&bench);
+    assert!(
+        matches!(
+            reread.as_slice(),
+            [StoreRequest::SecretsTree(ws)] if *ws == ids::WORKSPACE_GRAPHICS
+        ),
+        "{reread:?}"
+    );
+
+    bench.reply(
+        &mut section,
+        &secrets_tree_reply(&without(&tree, ids::PROJECT_VULKAN)),
+    );
+    assert!(!section.captures_input(), "the form closed");
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("deleted elsewhere"), "{shown}");
+    assert!(!shown.contains("vulkan-tutorials"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_tree_without_the_open_project_closes_its_form_or_question() {
+    // R1 L-4: any fresh tree of the scope's workspace that no longer holds the project ends the
+    // form or the question; its token could only be refused.
+    let (bench, mut section, tree) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.reply(
+        &mut section,
+        &tree_reply(&without(&tree, ids::PROJECT_VULKAN)),
+    );
+    assert!(!section.captures_input(), "the form closed");
+    assert!(frame(&bench, &section).contains("deleted elsewhere"));
+    assert!(bench.drained().is_empty());
+
+    let (bench, mut section, tree) = loaded_over(&scoped_store(), configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "c");
+    assert!(section.captures_input(), "the question is open");
+    bench.reply(
+        &mut section,
+        &secrets_tree_reply(&without(&tree, ids::PROJECT_VULKAN)),
+    );
+    assert!(!section.captures_input(), "the question closed");
+    bench.key(&mut section, "y");
+    assert!(bench.drained().is_empty(), "nothing is cleared");
+    assert!(frame(&bench, &section).contains("deleted elsewhere"));
 }
 
 #[tokio::test]

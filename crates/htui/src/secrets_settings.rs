@@ -267,7 +267,8 @@ fn seam_sentence(err: &StoreError) -> String {
 /// URL is normalised again (defensive: the section already did) and a refusal is `Failed` with
 /// normalisation's sentence, which never echoes the URL. An identity with a blank half is
 /// refused with [`IDENTITY_INCOMPLETE`]. Every write that lands bumps the keyring-write
-/// generation (blueprint A-4) and answers a fresh snapshot.
+/// generation (blueprint A-4) and answers a fresh snapshot under its own name
+/// ([`StoreReply::SecretsWritten`], R1 M-1); the read answers [`StoreReply::Secrets`].
 ///
 /// # Errors
 ///
@@ -277,7 +278,7 @@ fn seam_sentence(err: &StoreError) -> String {
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let demo = matches!(backend, Backend::Memory(_));
     match request {
-        StoreRequest::SecretsInfo => {}
+        StoreRequest::SecretsInfo => return Ok(StoreReply::Secrets(snapshot(backend).await?)),
         StoreRequest::SetInfisicalUrl(_)
         | StoreRequest::ClearInfisicalUrl
         | StoreRequest::SetMachineIdentity(_)
@@ -312,7 +313,10 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
             )));
         }
     }
-    Ok(StoreReply::Secrets(snapshot(backend).await?))
+    Ok(StoreReply::SecretsWritten {
+        request: request.name(),
+        snapshot: snapshot(backend).await?,
+    })
 }
 
 /// `request`'s `Failed` with `message`.

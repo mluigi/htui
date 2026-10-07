@@ -1379,7 +1379,8 @@ impl SettingsSection for HierarchySection {
             // MOD-10 M4 (blueprint A-1): the Secrets section's scope write. The tree is adopted so
             // the tokens stay current; nothing else here is this section's — no `busy`, no
             // editor, no notice, no scope follow.
-            StoreReply::SecretScopeWritten { tree, .. } => {
+            // R1 L-3: the Secrets section's own tree read, adopted the same way.
+            StoreReply::SecretScopeWritten { tree, .. } | StoreReply::SecretsTree(Some(tree)) => {
                 if tree.workspace.id == ctx.scope.workspace_id {
                     self.snapshot = Some((**tree).clone());
                     self.clamp_cursor();
