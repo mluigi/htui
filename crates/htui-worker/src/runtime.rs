@@ -3626,6 +3626,288 @@ mod tests {
     }
 }
 
+/// MOD-12 review M2, G2: every store call of the queue runner that fails (`admit`'s reads and
+/// prune, `drain`'s close) starts a streak the next success ends, and nothing ends a streak before
+/// the call that fails. Over a host that fails one named call and passes the rest to
+/// `Backend::memory`.
+#[cfg(test)]
+mod queue_store_errors {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
+
+    use chrono::{DateTime, Utc};
+    use htui_agent::registry::DriverFactory;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        AgentBox, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
+        DocumentHead, Item, ItemId, ItemSummary, PhaseAgent, PhaseId, ProjectId, PromptTemplate,
+        QueueBatch, QueueEntry, RepoBoxPath, ResolvedGraph, Run, RunId, RunStep, RunSummary, Scope,
+        UserId, WorkspaceSummary,
+    };
+    use htui_core::store::{MemStore, Result, StoreError, WorkerHost};
+    use htui_store::Backend;
+    use serde_json::{Value, json};
+
+    use super::{RunRuntime, Shared, TaskCtx, admit};
+    use crate::{ReplySink, RunReply};
+
+    /// A sink nothing is sent to that the test reads.
+    #[derive(Debug, Clone, Copy)]
+    struct Quiet;
+
+    impl ReplySink for Quiet {
+        type Addr = u64;
+        type Subscriber = u64;
+
+        fn subscriber(addr: &u64) -> u64 {
+            *addr
+        }
+
+        fn send(&self, _: &u64, _: RunReply) {}
+    }
+
+    /// `Backend::memory`, but the call named in `fail` answers an error. Each failing call
+    /// records its name and whether a streak stood when it was made.
+    #[derive(Clone)]
+    struct Failing {
+        inner: Backend,
+        fail: Arc<StdMutex<Option<&'static str>>>,
+        seen: Arc<StdMutex<Vec<(&'static str, bool)>>>,
+        shared: Arc<OnceLock<Arc<Shared<Quiet>>>>,
+    }
+
+    impl Failing {
+        fn fail(&self, call: Option<&'static str>) {
+            *self.fail.lock().unwrap_or_else(PoisonError::into_inner) = call;
+        }
+
+        fn seen(&self) -> Vec<(&'static str, bool)> {
+            std::mem::take(&mut *self.seen.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+
+        fn check(&self, call: &'static str) -> Result<()> {
+            if *self.fail.lock().unwrap_or_else(PoisonError::into_inner) != Some(call) {
+                return Ok(());
+            }
+            let streak = self
+                .shared
+                .get()
+                .is_some_and(|shared| shared.queue_failing.load(Ordering::SeqCst));
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((call, streak));
+            Err(StoreError::ReadOnly("a failing test store"))
+        }
+    }
+
+    impl WorkerHost for Failing {
+        type Store = <Backend as WorkerHost>::Store;
+
+        fn writer(&self) -> Option<Self::Store> {
+            WorkerHost::writer(&self.inner)
+        }
+        async fn box_info(&self) -> Result<Option<BoxInfo>> {
+            WorkerHost::box_info(&self.inner).await
+        }
+        async fn this_user(&self) -> Result<UserId> {
+            WorkerHost::this_user(&self.inner).await
+        }
+        async fn app_settings(&self) -> Result<BTreeMap<String, Value>> {
+            self.check("app_settings")?;
+            WorkerHost::app_settings(&self.inner).await
+        }
+        async fn box_profile(&self, id: BoxId) -> Result<Option<BoxProfile>> {
+            WorkerHost::box_profile(&self.inner, id).await
+        }
+        async fn agents(&self) -> Result<Vec<AgentSummary>> {
+            WorkerHost::agents(&self.inner).await
+        }
+        async fn box_row(&self, id: BoxId) -> Result<Option<BoxRow>> {
+            WorkerHost::box_row(&self.inner, id).await
+        }
+        async fn repo_paths(&self, box_id: BoxId) -> Result<Vec<RepoBoxPath>> {
+            WorkerHost::repo_paths(&self.inner, box_id).await
+        }
+        async fn workspaces(&self) -> Result<Vec<WorkspaceSummary>> {
+            WorkerHost::workspaces(&self.inner).await
+        }
+        async fn active_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+            WorkerHost::active_runs_on_box(&self.inner, box_id).await
+        }
+        async fn item(&self, id: ItemId) -> Result<Option<Item>> {
+            WorkerHost::item(&self.inner, id).await
+        }
+        async fn documents(&self, id: ItemId) -> Result<Vec<DocumentHead>> {
+            WorkerHost::documents(&self.inner, id).await
+        }
+        async fn runs(&self, id: ItemId) -> Result<Vec<RunSummary>> {
+            WorkerHost::runs(&self.inner, id).await
+        }
+        async fn run(&self, id: RunId) -> Result<Option<Run>> {
+            WorkerHost::run(&self.inner, id).await
+        }
+        async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
+            WorkerHost::run_steps(&self.inner, run).await
+        }
+        async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
+            WorkerHost::resolve_graph(&self.inner, item).await
+        }
+        async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
+            WorkerHost::phase_agents(&self.inner, phase).await
+        }
+        async fn prompt_template(
+            &self,
+            project: ProjectId,
+            name: &str,
+            version: Option<i32>,
+        ) -> Result<Option<PromptTemplate>> {
+            WorkerHost::prompt_template(&self.inner, project, name, version).await
+        }
+        async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
+            WorkerHost::agent_boxes(&self.inner, box_id).await
+        }
+        async fn bound_skills(
+            &self,
+            project: ProjectId,
+            phase: Option<PhaseId>,
+        ) -> Result<Vec<BoundSkill>> {
+            WorkerHost::bound_skills(&self.inner, project, phase).await
+        }
+        async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
+            WorkerHost::missing_tags(&self.inner, item, box_id).await
+        }
+        async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+            self.check("queued_runs_on_box")?;
+            WorkerHost::queued_runs_on_box(&self.inner, box_id).await
+        }
+        async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
+            self.check("ready_items")?;
+            WorkerHost::ready_items(&self.inner, scope, box_id).await
+        }
+        async fn running_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+            self.check("running_runs_on_box")?;
+            WorkerHost::running_runs_on_box(&self.inner, box_id).await
+        }
+        async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+            self.check("queue_entries")?;
+            WorkerHost::queue_entries(&self.inner, box_id).await
+        }
+        async fn open_batch_of(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+            self.check("open_batch_of")?;
+            WorkerHost::open_batch_of(&self.inner, box_id).await
+        }
+        async fn batch_cancelled_items(&self, batch: BatchId) -> Result<Vec<ItemId>> {
+            self.check("batch_cancelled_items")?;
+            WorkerHost::batch_cancelled_items(&self.inner, batch).await
+        }
+        async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
+            self.check("prune_finished_entries")?;
+            WorkerHost::prune_finished_entries(&self.inner, box_id).await
+        }
+        async fn close_drained_batch(
+            &self,
+            batch: BatchId,
+            at: DateTime<Utc>,
+        ) -> Result<Option<QueueBatch>> {
+            self.check("close_drained_batch")?;
+            WorkerHost::close_drained_batch(&self.inner, batch, at).await
+        }
+    }
+
+    /// A runtime over `store` and a sweep's context over it, through [`Failing`].
+    fn sweep_over(
+        store: MemStore,
+    ) -> (RunRuntime<Failing, Quiet>, Failing, TaskCtx<Failing, Quiet>) {
+        let runtime = RunRuntime::new(DriverFactory::new());
+        let host = Failing {
+            inner: Backend::memory(store),
+            fail: Arc::default(),
+            seen: Arc::default(),
+            shared: Arc::default(),
+        };
+        let _ = host.shared.set(Arc::clone(&runtime.shared));
+        let ctx = TaskCtx {
+            shared: Arc::clone(&runtime.shared),
+            host: host.clone(),
+            sink: Quiet,
+            addr: None,
+            name: "sweep",
+            tag: Arc::default(),
+        };
+        (runtime, host, ctx)
+    }
+
+    /// One `call` failing, twice: from no streak it starts one, and mid-streak it is still made
+    /// with the streak standing (nothing before it said the store reads again).
+    async fn fails_at(host: &Failing, ctx: &TaskCtx<Failing, Quiet>, call: &'static str) {
+        let streak = &ctx.shared.queue_failing;
+        host.fail(Some(call));
+        streak.store(false, Ordering::SeqCst);
+        admit(ctx, ids::BOX, &json!({})).await;
+        assert!(
+            streak.load(Ordering::SeqCst),
+            "{call}: a failure starts a streak"
+        );
+        admit(ctx, ids::BOX, &json!({})).await;
+        assert!(streak.load(Ordering::SeqCst), "{call}: and keeps it");
+        assert_eq!(
+            host.seen(),
+            [(call, false), (call, true)],
+            "{call} is reached, and no earlier call ends the streak it fails in"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_failing_queue_store_call_starts_a_streak_that_a_clean_sweep_ends() {
+        // An open batch with an entry whose item is ready: admission reaches its every read.
+        let store = MemStore::demo();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the item queues");
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store);
+        for call in [
+            "open_batch_of",
+            "prune_finished_entries",
+            "queue_entries",
+            "ready_items",
+            "batch_cancelled_items",
+            "running_runs_on_box",
+            "queued_runs_on_box",
+            "app_settings",
+        ] {
+            fails_at(&host, &ctx, call).await;
+        }
+        host.fail(None);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert!(
+            !ctx.shared.queue_failing.load(Ordering::SeqCst),
+            "a sweep past every read ends the streak"
+        );
+
+        // An open batch with no entry: admission drains it.
+        let store = MemStore::demo();
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store);
+        fails_at(&host, &ctx, "close_drained_batch").await;
+        host.fail(None);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert!(
+            !ctx.shared.queue_failing.load(Ordering::SeqCst),
+            "a drain that closes ends the streak"
+        );
+    }
+}
+
 /// MOD-41 I-1, OQ-2, OQ-5, OQ-6: the role gate over `Backend::memory`, role [`Role::Worker`]. The
 /// runtime is reached through its generic API alone (blueprint F-33).
 #[cfg(test)]
