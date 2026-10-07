@@ -1761,8 +1761,10 @@ fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
 
 /// D190's one-sweep-at-a-time task (MOD-12 D8: callable from a task's tail). A sweep asked for
 /// while one runs is not dropped: `sweep_again` makes the running one go round once more. A wake
-/// landing between the loop's last look at `sweep_again` and the guard's drop is still lost; the
-/// next tick covers it (blueprint H-8).
+/// landing between the loop's last look at `sweep_again` and the claim's release is not lost
+/// either (review L2, closing blueprint H-8's gap): the guard looks again after it releases the
+/// claim and asks for one more sweep here, whose own claim and close checks keep it to one sweep
+/// at a time and none after shutdown.
 fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
     shared: &Arc<Shared<P>>,
     host: &H,
@@ -1790,17 +1792,29 @@ fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
     };
     let tag = Arc::clone(&ctx.tag);
     let handle = tokio::spawn(async move {
-        /// Frees the one-sweep-at-a-time claim however the sweep ends.
-        struct Swept<P: ReplySink>(Arc<Shared<P>>);
-        impl<P: ReplySink> Drop for Swept<P> {
+        /// Frees the one-sweep-at-a-time claim however the sweep ends, then (review L2) sweeps
+        /// again when asked to after the loop's last look. The claim it frees is always its own
+        /// task's: the task exists only because [`spawn_sweep`]'s CAS took it, and nothing else
+        /// releases it. A wake it hands on that loses the CAS to another sweep sets
+        /// `sweep_again` there, so that sweep goes round once more instead.
+        struct Swept<H: htui_core::store::WorkerHost, P: ReplySink>(TaskCtx<H, P>);
+        impl<H: htui_core::store::WorkerHost, P: ReplySink> Drop for Swept<H, P> {
             fn drop(&mut self) {
-                self.0.sweeping.store(false, Ordering::SeqCst);
+                let ctx = &self.0;
+                ctx.shared.sweeping.store(false, Ordering::SeqCst);
+                // Off a runtime (a runtime's own teardown) nothing may spawn, and a panic here
+                // would abort the process mid-unwind.
+                if ctx.shared.sweep_again.swap(false, Ordering::SeqCst)
+                    && tokio::runtime::Handle::try_current().is_ok()
+                {
+                    spawn_sweep(&ctx.shared, &ctx.host, &ctx.sink);
+                }
             }
         }
-        let _swept = Swept(Arc::clone(&ctx.shared));
+        let swept = Swept(ctx);
         loop {
-            Box::pin(sweep_once(ctx.clone())).await;
-            if !ctx.shared.sweep_again.swap(false, Ordering::SeqCst) {
+            Box::pin(sweep_once(swept.0.clone())).await;
+            if !swept.0.shared.sweep_again.swap(false, Ordering::SeqCst) {
                 break;
             }
         }
