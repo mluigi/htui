@@ -1055,6 +1055,44 @@ mod tests {
         );
     }
 
+    /// The `LINES`/`COLUMNS` half of test 7 with the variables really inherited: a test cannot
+    /// plant them in its own process (`set_var` is `unsafe`), so it re-runs itself, alone, as a
+    /// child test binary that has them, and the child asserts `pty_command` drops them.
+    #[cfg(unix)]
+    #[test]
+    fn pty_command_drops_inherited_lines_and_columns() {
+        const CHILD: &str = "HTUI_EDITOR_TEST_ENV_CHILD";
+        const NAME: &str = "editor::tests::pty_command_drops_inherited_lines_and_columns";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args([NAME, "--exact", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("LINES", "7")
+                .env("COLUMNS", "9")
+                .output()
+                .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success(),
+                "child failed:\n{stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            // A filter that matched nothing would also succeed.
+            assert!(stdout.contains("1 passed"), "child ran no test:\n{stdout}");
+            return;
+        }
+        // The child: the variables are inherited, so the builder's base environment has them.
+        assert_eq!(std::env::var_os("LINES"), Some("7".into()));
+        assert_eq!(std::env::var_os("COLUMNS"), Some("9".into()));
+        let cmd = EditorCommand {
+            value: "vi".to_owned(),
+            fallback: false,
+        };
+        let command = cmd.pty_command(Path::new("/tmp/htui-implement-x.md"));
+        assert_eq!(command.get_env("LINES"), None);
+        assert_eq!(command.get_env("COLUMNS"), None);
+    }
+
     #[cfg(windows)]
     #[test]
     fn pty_command_names_the_file_in_its_directory() {
