@@ -994,7 +994,9 @@ pub(super) const fn marker(focused: bool) -> &'static str {
 }
 
 /// Draws the form into the detail pane's `area` (D8).
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) {
+///
+/// Returns the body's rect, which the Backlog claims for an in-pane editor (MOD-57 P2).
+pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
     let title = match &form.context.item {
         Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
         None => format!(" New item \u{b7} {} ", form.slug(form.context.project)),
@@ -1100,6 +1102,7 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         )),
         hint,
     );
+    body
 }
 
 /// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost.
@@ -1591,7 +1594,9 @@ mod tests {
         ))
         .expect("a test terminal");
         terminal
-            .draw(|frame| render(frame, frame.area(), form, &Theme::default()))
+            .draw(|frame| {
+                render(frame, frame.area(), form, &Theme::default());
+            })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1601,6 +1606,42 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// MOD-57 P2 (PD-3): `render` returns the rect its body is drawn in, which the Backlog claims
+    /// for an in-pane editor: inside the frame, under the body label and above the notice and
+    /// the hint.
+    #[tokio::test]
+    async fn render_returns_the_body_rect() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Body);
+        form.on_paste("First line.\nSecond.");
+        let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            right.width,
+            right.height,
+        ))
+        .expect("a test terminal");
+        let mut body = None;
+        terminal
+            .draw(|frame| body = Some(render(frame, frame.area(), &form, &Theme::default())))
+            .expect("the frame draws");
+        let body = body.expect("the frame drew");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (body.x..body.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert_eq!((body.x, body.width), (1, right.width - 2), "{body:?}");
+        assert!(row(body.y).starts_with("First line."), "{:?}", row(body.y));
+        assert!(
+            row(body.y - 1).starts_with("> body"),
+            "{:?}",
+            row(body.y - 1)
+        );
+        // The notice's two rows, the hint and the frame's bottom border are below it.
+        assert_eq!(body.bottom() + NOTICE_HEIGHT + 2, right.height, "{body:?}");
     }
 
     /// Every state shows as characters, because the snapshots are text (blueprint §4 render).

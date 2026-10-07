@@ -392,7 +392,8 @@ impl DetailTab for NotesTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            compose::render(frame, area, compose, " New note ", None, ctx.theme);
+            let body = compose::render(frame, area, compose, " New note ", None, ctx.theme);
+            ctx.claim_editor_area(body);
             return;
         }
         if self.item.is_none() {
@@ -449,10 +450,11 @@ mod tests {
     use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome};
     use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME};
     use crate::store_worker::StoreRequest;
-    use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key};
+    use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
     use crate::ui::tabs::backlog::detail::compose::{
         could_not_check, may_have_landed, not_written,
     };
+    use std::cell::Cell;
 
     const ITEM: ItemId = ids::HTUI_FEAT_1;
 
@@ -535,6 +537,36 @@ mod tests {
             pane.render(frame, area, &shell.ctx());
         });
         assert!(text.contains(" New note "), "{text}");
+    }
+
+    /// MOD-57 P2 (PD-3): the open area claims its body for an in-pane editor, the rect under its
+    /// top rule; the thread claims nothing.
+    #[tokio::test]
+    async fn the_compose_area_claims_its_body_for_the_editor() {
+        let shell = Shell::new();
+        let mut open = composing(&shell).await;
+        assert_eq!(
+            open.on_paste("First line.", &mut shell.ctx()),
+            Handled::Consumed
+        );
+        let cell = Cell::new(None);
+        let text = drawn(43, 23, |frame, area| {
+            open.render(frame, area, &shell.ctx().with_editor_area(&cell));
+        });
+        let claimed = cell.get().expect("the area claims its body");
+        assert_eq!(claimed, Rect::new(0, 1, 43, 21));
+        assert!(
+            row_from(&text, claimed).starts_with("First line."),
+            "{claimed:?} in\n{text}"
+        );
+
+        let thread = pane(&shell).await;
+        let cell = Cell::new(None);
+        let text = drawn(43, 23, |frame, area| {
+            thread.render(frame, area, &shell.ctx().with_editor_area(&cell));
+        });
+        assert!(!text.contains(" New note "), "{text}");
+        assert_eq!(cell.get(), None, "the thread claims nothing");
     }
 
     #[tokio::test]

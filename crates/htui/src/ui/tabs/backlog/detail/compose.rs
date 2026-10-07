@@ -540,6 +540,8 @@ pub fn could_not_check(why: &str, reread: &str) -> String {
 /// Draws the area over the sub-tab's whole content rect (D6): a top rule titled `title`, the
 /// one-line rows, the body, the notice and the hint. `kinds` is the Docs pane's hint text,
 /// drawn under a typed kind only.
+///
+/// Returns the body's rect, which the pane claims for an in-pane editor (MOD-57 P2).
 pub fn render(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -547,7 +549,7 @@ pub fn render(
     title: &str,
     kinds: Option<&str>,
     theme: &Theme,
-) {
+) -> Rect {
     let block = Block::new()
         .borders(Borders::TOP)
         .title(cells::clip(title, usize::from(area.width)));
@@ -629,6 +631,7 @@ pub fn render(
         Paragraph::new(Line::styled(cells::clip(text, all), theme.dim)),
         hint,
     );
+    body
 }
 
 /// The compose, Notes and Docs panes' shared test bench (blueprint E8): a `Ctx` kept alive for a
@@ -732,6 +735,17 @@ pub(super) mod bench {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// Row `rect.y` of a [`drawn`] text from cell column `rect.x` on (one char per cell, which
+    /// holds for the ASCII and box-drawing rows these tests read).
+    pub fn row_from(text: &str, rect: Rect) -> String {
+        text.lines()
+            .nth(usize::from(rect.y))
+            .unwrap_or_default()
+            .chars()
+            .skip(usize::from(rect.x))
+            .collect()
     }
 }
 
@@ -1114,6 +1128,63 @@ mod tests {
         for row in text.lines() {
             assert!(cell_width(row) <= 43, "{row:?}");
         }
+    }
+
+    /// MOD-57 P2 (PD-3): `render` returns the rect its body is drawn in, which the pane claims
+    /// for an in-pane editor: under the top rule for a note, under the kind, kinds, title and
+    /// body-label rows for a typed document, and above the hint either way.
+    #[test]
+    fn render_returns_the_body_rect() {
+        let mut compose = note();
+        compose.on_paste("First line.\nSecond.");
+        let mut body = None;
+        let text = drawn(43, 23, |frame, area| {
+            body = Some(render(
+                frame,
+                area,
+                &compose,
+                " New note ",
+                None,
+                &Theme::default(),
+            ));
+        });
+        let body = body.expect("the frame drew");
+        assert_eq!(body, Rect::new(0, 1, 43, 21));
+        assert!(
+            bench::row_from(&text, body).starts_with("First line."),
+            "{body:?} in\n{text}"
+        );
+
+        let mut compose = typed("FEAT-1");
+        let _ = compose.on_key(key(KeyCode::Tab));
+        let _ = compose.on_key(key(KeyCode::Tab));
+        assert_eq!(compose.focus(), Part::Body);
+        compose.on_paste("First line.");
+        let mut body = None;
+        let text = drawn(43, 23, |frame, area| {
+            body = Some(render(
+                frame,
+                area,
+                &compose,
+                " New document ",
+                Some("plan, prd, summary"),
+                &Theme::default(),
+            ));
+        });
+        let body = body.expect("the frame drew");
+        assert_eq!(body, Rect::new(0, 5, 43, 17));
+        assert!(
+            bench::row_from(&text, body).starts_with("First line."),
+            "{body:?} in\n{text}"
+        );
+        let above = Rect {
+            y: body.y - 1,
+            ..body
+        };
+        assert!(
+            bench::row_from(&text, above).starts_with("> body"),
+            "{text}"
+        );
     }
 
     /// A long notice keeps its end (the hedge) and the hint.

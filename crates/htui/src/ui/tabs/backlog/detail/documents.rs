@@ -589,7 +589,8 @@ impl DetailTab for DocumentsTab {
         if let Some(compose) = &self.compose {
             let title = self.compose_title(compose);
             let kinds = self.kinds();
-            compose::render(frame, area, compose, &title, Some(&kinds), ctx.theme);
+            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx.theme);
+            ctx.claim_editor_area(body);
             return;
         }
         if self.item.is_none() {
@@ -645,10 +646,11 @@ mod tests {
     use crate::hand_written::{self, DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME};
     use crate::store_worker::StoreRequest;
     use crate::ui::Theme;
-    use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key};
+    use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
     use crate::ui::tabs::backlog::detail::compose::{
         Part, could_not_check, may_have_landed, not_written,
     };
+    use std::cell::Cell;
 
     const ITEM: ItemId = ids::HTUI_FEAT_1;
 
@@ -843,6 +845,39 @@ mod tests {
         let text = drawn(43, 23, |frame, rect| pane.render(frame, rect, &shell.ctx()));
         assert!(text.contains(" New version of plan (from v2) "), "{text}");
         assert!(!text.contains("kinds:"), "{text}");
+    }
+
+    /// MOD-57 P2 (PD-3): the open form claims its body for an in-pane editor, the rect under its
+    /// kind, title and body-label rows; the table claims nothing.
+    #[tokio::test]
+    async fn the_compose_area_claims_its_body_for_the_editor() {
+        let shell = Shell::new();
+        let (store, backend) = demo();
+        let mut pane = pane(&shell, &store).await;
+        let cell = Cell::new(None);
+        let text = drawn(43, 23, |frame, rect| {
+            pane.render(frame, rect, &shell.ctx().with_editor_area(&cell));
+        });
+        assert!(text.contains(HINT), "the table is drawn:\n{text}");
+        assert_eq!(cell.get(), None, "the table claims nothing");
+
+        open(&shell, &backend, &mut pane, 'v').await;
+        let first = compose(&pane)
+            .body()
+            .lines()
+            .next()
+            .expect("plan v2 has a body")
+            .to_owned();
+        let cell = Cell::new(None);
+        let text = drawn(43, 23, |frame, rect| {
+            pane.render(frame, rect, &shell.ctx().with_editor_area(&cell));
+        });
+        let claimed = cell.get().expect("the form claims its body");
+        assert_eq!(claimed, Rect::new(0, 4, 43, 18));
+        assert!(
+            row_from(&text, claimed).starts_with(&first),
+            "{first:?} at {claimed:?} in\n{text}"
+        );
     }
 
     #[tokio::test]
