@@ -19,6 +19,8 @@ const NO_URL_YET: &str = "no Qdrant URL is stored; type one and press Enter";
 const EMPTY_KEY: &str = "nothing typed; the stored API key is unchanged";
 const REPLACES_URL: &str = "Enter replaces the stored Qdrant URL";
 const NOT_STORED: &str = "not stored";
+/// CLEAN-8 #9: both rows in a demo session, which has no keyring.
+const DEMO_ROW: &str = "n/a in a demo session";
 const UNREADABLE: &str = "the keyring could not be read";
 const UNREADABLE_GUIDE: &str =
     "the keyring could not be read; Enter tries to store a Qdrant URL in it";
@@ -456,6 +458,7 @@ impl SettingsSection for QdrantSection {
             }
             Some(QdrantState::NotStored) => NOT_STORED.to_owned(),
             Some(QdrantState::Unreadable(_)) => UNREADABLE.to_owned(),
+            Some(QdrantState::NotApplicable) => DEMO_ROW.to_owned(),
             None => NOT_READ.to_owned(),
         };
 
@@ -463,6 +466,7 @@ impl SettingsSection for QdrantSection {
             Some(QdrantState::Stored) => "stored \u{b7} <redacted>".to_owned(),
             Some(QdrantState::NotStored) => NOT_STORED.to_owned(),
             Some(QdrantState::Unreadable(_)) => UNREADABLE.to_owned(),
+            Some(QdrantState::NotApplicable) => DEMO_ROW.to_owned(),
             None => NOT_READ.to_owned(),
         };
 
