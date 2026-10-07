@@ -8648,6 +8648,77 @@ async fn a_pause_and_an_admission_serialise_on_the_batch_row() {
     db.drop_db().await;
 }
 
+/// MOD-12 M3 D4 (L4, Postgres only): the runner's drain and another runner's admission into the
+/// same batch serialise on the batch row, and the drain counts the admitted run.
+///
+/// Since an entry no longer keeps a batch open, only a live run of its own does; so an admission
+/// in flight - `create_run` held after its `FOR SHARE` on the batch, blocked on the box row's
+/// foreign-key lock a third transaction holds - must keep a `close_drained_batch` issued then
+/// from closing the batch over the run it is about to commit. A drain that waited on the lock and
+/// then judged "no live run" by its statement's start would close a batch that owns a `queued`
+/// auto run: no pause would cancel it, and no later batch would count it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_racing_an_admission_counts_the_admitted_run() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let at = Utc::now();
+    let batch = db
+        .store
+        .open_batch(ids::BOX, ids::USER, at)
+        .await
+        .expect("open");
+
+    let mut holder = db.pool.begin().await.expect("begin the box holder");
+    sqlx::query("SELECT 1 FROM box WHERE id = $1 FOR UPDATE")
+        .bind(ids::BOX.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("lock the box row");
+    let admit = tokio::spawn({
+        let store = db.store.clone();
+        let run = batch_run(ids::HTUI_ANA_2, Some(batch.id));
+        async move { store.create_run(run).await }
+    });
+    lock_waiters(&db.pool, 1).await;
+    let drain = tokio::spawn({
+        let store = db.store.clone();
+        async move { store.close_drained_batch(batch.id, at).await }
+    });
+    lock_waiters(&db.pool, 2).await;
+    assert!(
+        !drain.is_finished(),
+        "the drain waits on the admission's FOR SHARE"
+    );
+    holder.rollback().await.expect("release the box row");
+
+    let run = admit
+        .await
+        .expect("the admission task")
+        .expect("the batch was open when the run was inserted");
+    assert_eq!(
+        drain.await.expect("the drain task").expect("close"),
+        None,
+        "the run committed while the drain waited keeps the batch open"
+    );
+    assert_eq!(
+        db.store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| open.id),
+        Some(batch.id),
+        "the batch is still open"
+    );
+    assert_eq!(
+        db.store.batch_runs(batch.id).await.expect("read"),
+        [(run.id, RunStatus::Queued)],
+        "and owns its queued run"
+    );
+
+    db.drop_db().await;
+}
+
 // ------------------------------------------------------------------------------------------------
 // MOD-70 (plan D1-D5, I-1, I-3, I-4, I-5; blueprint §4.3, B-4, B-15, B-16): follow-ups for engine
 // steps across two boxes of one database.
