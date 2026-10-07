@@ -8,12 +8,12 @@ environment variable. This is MOD-10 (`docs/REQUIREMENTS.md` R-SEC-1, R-SEC-2, R
 client is the `htui-secrets` crate.
 
 A project whose `secret_provider` is set gets its secrets when a run or a chat starts an agent
-session ([At run start](#at-run-start)). **Not yet available:** the Settings section that stores
-the identity and the project's scope (milestone 4). Until then htui has no command or screen that
-writes the keyring entries or the project's two secret columns.
+session ([At run start](#at-run-start)). Store the URL and the identity, check the server, and
+set each project's scope in **Settings > Secrets** ([Settings](#settings)).
 
 - [Create a machine identity](#create-a-machine-identity)
 - [Keyring entries](#keyring-entries)
+- [Settings](#settings)
 - [Base URL](#base-url)
 - [Scope](#scope)
 - [Imports and precedence](#imports-and-precedence)
@@ -67,8 +67,76 @@ stored: htui/infisical-client-secret is missing; enter the identity again`) rath
 it as "no identity". If a write of the client secret fails, htui removes both entries, so an old
 secret never pairs with a new client ID. A blank entry reads as absent.
 
-htui does not yet have a command or a screen that writes these entries; the Settings section
-(milestone 4) will.
+Settings > Secrets writes these entries ([Settings](#settings)).
+
+## Settings
+
+**Settings > Secrets** holds four rows, then one row per project of the current workspace:
+
+| Row | Shows |
+|---|---|
+| Provider | `infisical`, the only provider this build knows |
+| URL | `stored · <URL>` (the [normalised](#base-url) form), `stored — not usable: <reason>`, or `not stored` |
+| Identity | `stored`, `not stored`, or the half-stored sentence ([Keyring entries](#keyring-entries)); never the client ID or the client secret |
+| Health | The last check of this session, or `not checked this session` |
+| One per project, by slug | `no secret provider`, or `infisical · <project ID> · <environment> · <path>`, then the last check of this session |
+
+A keyring that cannot be read shows `the keyring could not be read: ` and the keyring's own
+message on the URL and Identity rows, never `not stored`. With no workspace selected, the project
+rows are replaced by `no workspace: project scopes need one`.
+
+The keys, in browse:
+
+- **`e` on URL** opens the URL field, filled with the stored URL. `Enter` normalises it
+  ([Base URL](#base-url)) and stores the normalised form. A refused URL stores nothing: its
+  reason shows under the field, which stays open for the fix, and the URL is not repeated.
+  `Enter` on an empty field stores nothing either (`nothing typed; the stored URL is unchanged`);
+  `c` clears.
+- **`e` on Identity** opens two empty fields, the client ID and the client secret (`Tab` moves
+  between them). The client secret is masked as it is typed or pasted, and is never shown or read
+  back. Both halves are required. Storing replaces both entries, even when only one has changed.
+  The Identity row never shows the client ID; it is visible only in the field while you type it.
+- **`c` on URL or Identity** asks first (`y` / `n`). Clearing the identity removes both halves
+  together. `c` is offered on Identity when it is stored, half stored or unreadable, since
+  clearing both halves is the fix for the last two.
+- **`t` on Provider, URL, Identity or Health** checks the provider: it calls Infisical's status
+  endpoint, then logs in **afresh** with the stored identity. The Health row then reads
+  `last check <time>: server ok · login ok` (`server status not ok` when the status endpoint
+  answered with an error status but the login worked), or the error's sentence
+  ([Errors](#errors-and-what-to-do)). The time is UTC. A check is a login, so a refused one
+  latches exactly as a refused walk does
+  ([Logins, tokens and lockout safety](#logins-tokens-and-lockout-safety)); after one, a line
+  under the rows says so until the next URL or identity write.
+- **`e` on a project** opens three fields, filled with its scope or empty with a path of `/`:
+  the Infisical project ID, the environment slug and the folder path ([Scope](#scope)). The
+  scope is checked before it is sent: a refusal names the field, never its value, and the form
+  stays open. Saving sets `secret_provider` to `infisical` and writes the scope in the same
+  write. If the project changed elsewhere since the form opened, nothing is written, the form
+  keeps what you typed, and `Enter` tries again against the current row. If it was deleted
+  elsewhere, the form closes.
+- **`c` on a project** asks first, then clears both `secret_provider` and `secret_scope`: walks
+  and chats on that project then get no secrets.
+- **`t` on a project** checks its scope: it reads the scope the way a run does and shows how many
+  keys the identity can see (`checked <time>: <n> keys visible`), never their names or values.
+  It needs the same read access to the values as a run, and meets the same Infisical errors and
+  [refusals](#what-htui-refuses). A project with no scope is not checked.
+- **`r`** reads the keyring rows and the projects again. **`j`/`k`** (or the arrow keys) move
+  between rows, and `Esc` closes a form or a question without writing.
+
+One write and one check run at a time; a second is refused with a sentence and nothing is sent.
+
+Check results are kept for this session only, and are never stored. A project's check result is
+dropped when its scope is saved or cleared, and every project's when the workspace changes. A
+check that a later write overtakes is history: a scope check of a project whose scope was written
+while it ran shows no count, and a provider check during which a URL or identity write landed
+shows its result without the latch line, since that write has given the next call a new provider.
+
+Changes take effect at the next walk, chat or check, with no restart: walks and chats read the
+keyring and the project's scope each time they resolve ([When htui resolves](#when-htui-resolves)).
+
+In a `--demo` session the URL, Identity and Health rows read `n/a in a demo session`, and htui
+never reads or writes the keyring: `e` and `c` on URL or Identity and every `t` are refused, and
+nothing is sent. Project scopes can still be edited, since they live in the store.
 
 ## Base URL
 
@@ -175,7 +243,8 @@ after 120 seconds (an unlock prompt nobody answered) refuses that walk or chat a
 background, and the next walk reads again. A process keeps one provider: the
 TUI shares its one between its runs and its chats, and `htui worker` has its own. The provider is
 rebuilt only when the stored base URL (after [normalisation](#base-url)), client ID or client
-secret has changed, so an identity entered again takes effect at the next walk or chat, and
+secret has changed, or, in the TUI, after any URL or identity write in
+[Settings](#settings), so an identity entered again takes effect at the next walk or chat, and
 [one refused login](#logins-tokens-and-lockout-safety) holds across walks and chats: after a
 `BadCredentials`, every later walk of that process meets `LoginRefusedEarlier` until the identity
 is entered again.
@@ -369,8 +438,12 @@ provider **one** refused login:
   nothing.
 - The refusal is decided by the 401 status alone. A 401 whose body is cut short still counts as a
   refused login (`BadCredentials`): only a body read in full can show the lockout text.
-- To try again, enter the identity again. htui builds a new provider for the new identity, and
-  the new provider starts with a clean slate.
+- To try again, enter the identity again in Settings > Secrets. Any URL or identity write
+  there, a clear included and even of the same identity, gives the next walk, chat or check of
+  the TUI a new provider with a clean slate. An `htui worker` running as its own process builds a
+  new provider only when the stored URL, client ID or client secret has changed, so entering the
+  same identity again does not clear its refused login; restart it.
+- A health check is a login: a refused one latches exactly as a refused walk does.
 - A login runs to its end even when the call that started it gives up (a timeout, a cancelled
   task), and concurrent calls wait for that one login. So a provider spends at most one refused
   login, however many calls were waiting or gave up.
@@ -446,3 +519,7 @@ prints `resolved <n> keys`; on failure it names the step and the error variant (
 [Errors and what to do](#errors-and-what-to-do)). It never prints a key name, a value, the client
 secret or the token. Use a throwaway identity with read access to one test environment: the
 client secret sits in your shell's environment while the test runs.
+
+The test reads only these variables, never the keyring. To try the same server and identity in
+htui itself, store the URL and the identity in [Settings > Secrets](#settings) and press `t` on
+the Health row.
