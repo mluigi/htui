@@ -3106,7 +3106,11 @@ async fn p_resumes_then_pauses_the_queue() {
         .await
         .expect("the memory store never fails")
         .expect("`P` opened a batch");
-    assert_eq!(harness.app().status.as_deref(), Some("queue resumed"));
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("queue resumed (demo: nothing is admitted)"),
+        "the demo never admits, so its status line does not claim the queue runs (review L3)"
+    );
 
     keys(&mut harness, &["P"]).await;
     assert_eq!(

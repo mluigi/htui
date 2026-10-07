@@ -992,25 +992,34 @@ impl Tab for BacklogTab {
     }
 }
 
-/// MOD-12 D9: the status line after a queue write. `n` is the queue's length after it.
+/// MOD-12 D9 (review L3): what a running queue adds in `htui --demo`, whose runtime never admits.
+const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
+
+/// MOD-12 D9: the status line after a queue write. `n` is the queue's length after it. In
+/// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3).
 fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
     let n = view.entries.len();
     match *write {
-        QueueWrite::Queued { .. } => {
-            let state = if view.open_batch.is_some() {
-                "running"
-            } else {
-                "paused"
-            };
-            format!("queued {key} ({n} in queue, {state})")
-        }
+        QueueWrite::Queued { .. } => match (view.open_batch.is_some(), view.demo) {
+            (true, false) => format!("queued {key} ({n} in queue, running)"),
+            (true, true) => {
+                format!("queued {key} ({n} in queue, running; {DEMO_NOTHING_ADMITTED})")
+            }
+            (false, _) => format!("queued {key} ({n} in queue, paused)"),
+        },
         QueueWrite::Dequeued {
             was_queued: true, ..
         } => format!("dequeued {key} ({n} in queue)"),
         QueueWrite::Dequeued {
             was_queued: false, ..
         } => format!("{key} was not queued"),
+        QueueWrite::Resumed { already: false } if view.demo => {
+            format!("queue resumed ({DEMO_NOTHING_ADMITTED})")
+        }
         QueueWrite::Resumed { already: false } => "queue resumed".to_owned(),
+        QueueWrite::Resumed { already: true } if view.demo => {
+            format!("queue already running ({DEMO_NOTHING_ADMITTED})")
+        }
         QueueWrite::Resumed { already: true } => "queue already running".to_owned(),
         QueueWrite::Paused { already: true, .. } => "queue already paused".to_owned(),
         QueueWrite::Paused { live: 0, .. } => "queue paused".to_owned(),
@@ -1062,11 +1071,14 @@ mod tests {
         let paused = |n: usize| QueueView {
             entries: vec![item; n],
             open_batch: None,
+            demo: false,
         };
         let running = QueueView {
             entries: vec![item; 3],
             open_batch: Some(htui_core::model::BatchId::new()),
+            demo: false,
         };
+        let demo = |view: QueueView| QueueView { demo: true, ..view };
         let cases = [
             (
                 QueueWrite::Queued { item },
@@ -1101,8 +1113,38 @@ mod tests {
             ),
             (
                 QueueWrite::Resumed { already: true },
-                running,
+                running.clone(),
                 "queue already running",
+            ),
+            // Review L3: `htui --demo` never admits, so a running queue says so; a paused one
+            // and a dequeue are as true there as anywhere.
+            (
+                QueueWrite::Queued { item },
+                demo(running.clone()),
+                "queued K-1 (3 in queue, running; demo: nothing is admitted)",
+            ),
+            (
+                QueueWrite::Queued { item },
+                demo(paused(1)),
+                "queued K-1 (1 in queue, paused)",
+            ),
+            (
+                QueueWrite::Resumed { already: false },
+                demo(running.clone()),
+                "queue resumed (demo: nothing is admitted)",
+            ),
+            (
+                QueueWrite::Resumed { already: true },
+                demo(running),
+                "queue already running (demo: nothing is admitted)",
+            ),
+            (
+                QueueWrite::Paused {
+                    live: 0,
+                    already: false,
+                },
+                demo(paused(0)),
+                "queue paused",
             ),
             (
                 QueueWrite::Paused {
@@ -1171,6 +1213,7 @@ mod tests {
         let paused = |entries: Vec<ItemId>| QueueView {
             entries,
             open_batch: None,
+            demo: false,
         };
 
         press(&mut tab, &bench, KeyCode::Char('Q'));

@@ -1542,6 +1542,10 @@ pub struct QueueView {
     pub entries: Vec<ItemId>,
     /// The open batch; `None` = paused (D2).
     pub open_batch: Option<BatchId>,
+    /// The memory backend, i.e. `htui --demo`: its runtime never admits (no claim scan,
+    /// blueprint deviation 6), so an open batch runs nothing (review L3). Not a "runs here"
+    /// test: a Postgres box whose executor is a headless worker does run its queue.
+    pub demo: bool,
 }
 
 /// MOD-12 D9: what one queue write did.
@@ -2201,6 +2205,7 @@ async fn queue_view(backend: &Backend, box_id: BoxId) -> StoreResult<QueueView> 
             .map(|entry| entry.item_id)
             .collect(),
         open_batch: backend.open_batch_of(box_id).await?.map(|batch| batch.id),
+        demo: matches!(backend, Backend::Memory(_)),
     })
 }
 
@@ -4973,6 +4978,7 @@ mod tests {
             QueueView {
                 entries: Vec::new(),
                 open_batch: None,
+                demo: true,
             }
         );
 
