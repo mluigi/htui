@@ -14,7 +14,13 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-07):** **MOD-10 is done** (`docs/decisions/mod/mod-10.md`): a project's secrets
+**Current status (2026-10-07):** **MOD-86 and MOD-87 are done** (`docs/decisions/mod/mod-86.md`,
+`docs/decisions/mod/mod-87.md`), run together on `hr/MOD-86`. Every chat text (opening, promoted opening, resume
+handoff, follow-up, and a help opening on a provider project) is masked before a driver, row or tab frame sees it;
+a refusal is `not sent: the <section> matches the <rule> rule`, a refused follow-up leaves the chat live. A chat now
+serves commands while it streams: `Esc Esc` cuts the turn (`cancelled`), mid-turn sends are deferred, and every
+queued command is answered once after the run is closed (D206 kept). No migration, no UI change.
+Before them, **MOD-10 is done** (`docs/decisions/mod/mod-10.md`): a project's secrets
 come from a self-hosted Infisical, reach the agent only through `SessionSpec.env`, and are masked by the same map in what a run stores.
 M1 hardened the scrubber (whole-token rules, exact-match masks, a typed `ScrubRefused` run failure); M2 added the
 `htui-secrets` crate (Universal Auth, a 401 latch, the machine identity in the executing box's keyring); M3 resolves
@@ -22,18 +28,6 @@ once per walk into one `RunSecrets` that is both the agent's env and the walk's 
 `secrets_refused: <cause>`; M4 added Settings > Secrets (URL, identity, health, per-project scope through
 `ProjectPatch.secret`; one conformance case, no migration). It filed **MOD-89** (`.env` in a worktree), **MOD-90**
 (`htui worker` keeps a refused login) and **CLEAN-8** (M4 review residuals).
-Before it, **MOD-78 is done** (`docs/decisions/mod/mod-78.md`): `command_run`
-checks the session's lease. A new lock-free store read, `lease_holds(run, fence)`, runs before the queue, while
-queued (once per heartbeat), at admission and on every heartbeat; a loss refuses the call or kills the command and
-cancels its row (`fenced: lease lost`). A session's `CancellationToken` (lease drop, `close`, last host) ends its
-in-flight calls. No migration; one `.sqlx` entry.
-Before it, **MOD-70 is done** (`docs/decisions/mod/mod-70.md`): a follow-up
-typed in any TUI reaches a step an engine walks, in process or on a worker, on any box. `i` on a running
-engine step queues a `follow_up` `run_command` row (the typing box refuses a credential-shaped text); the
-walking process claims it at the turn's `done` with a fenced compare-and-set that nulls the text, records
-it scrubbed at `turn + 1`, sends it and drives on, then closes the step's `follow_up_window`. Judges, chat
-and `pump` are unchanged; follow-up turns count toward the step deadline and the run cap. Migration `0017`;
-every box upgrades together (an older binary cannot cancel once it is applied).
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -419,24 +413,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   agent, `ui/tabs/skills/agent_help.rs`) and the `AgentHelp` panel's keys (`Enter`/`y` accept, `Esc`/`n` discard),
   hard-coded today like `Ctrl+S`/`Ctrl+E`.
 
-- [ ] **MOD-86 - Scrub chat prompts before they are sent** (from MOD-55, `docs/decisions/mod/mod-55.md`).
-  `R-ID-7`, `R-SEC-3`. The Chat tab's `run_chat` sends the opening prompt and every follow-up to the driver
-  unscrubbed: the scrubber runs only on the recorded row (`record_prompt`, `record_follow_up`), and a refusal there
-  is only logged. `R-ID-7` requires scrubbing before anything is persisted **or transmitted**, failing closed.
-  MOD-55's help mode already does this (`prompt::scrub_section`, refused before the run is minted); a chat should
-  scrub its first prompt the same way and refuse a follow-up whose scrub refuses. Open: what the Chat tab shows for
-  a refused follow-up in a live session. Not blocked. MOD-10 is done (`docs/decisions/mod/mod-10.md`): a chat on a
-  project with a secret scope now gets its resolved values in `SessionSpec.env`, and the chat's scrubber masks them,
-  so a scrub before sending would mask them too.
-
-- [ ] **MOD-87 - Chat cancel answered late or dropped during an unparked turn** (from MOD-55,
-  `docs/decisions/mod/mod-55.md`). `R-TUI-6`. In `run_chat`, `run_turn` reads `commands` only while a permission
-  request is parked. So a `ChatCancel` sent while a chat streams is answered only after the turn's `Done`, and the
-  agent spends the whole turn. A second cancel queued behind a cancelled turn is dropped unanswered, which breaks
-  `ChatCommand`'s answered-exactly-once contract. MOD-55 fixed this for help turns only (a `select` on commands while
-  pulling events, and the queue drained and answered at the end). Apply the same to `ChatMode::Conversation`,
-  keeping promotions' behaviour. Not blocked.
-
 - [ ] **MOD-88 - Flow-graph mode for the Backlog item graph (rataflow)** (from MOD-14 and MOD-28,
   `docs/decisions/mod/mod-14.md`, `docs/decisions/mod/mod-28.md`). `R-TUI-1`. The Backlog detail's Graph
   sub-tab (`ui/tabs/backlog/detail/graph.rs`, MOD-14) shows an item's link neighbourhood only as a
@@ -497,6 +473,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-90 worker login latch, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 22 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-90 worker login latch, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 1 (CLEAN-8 MOD-10 M4 review residuals) |
 | TOOL-N  | 0 |
