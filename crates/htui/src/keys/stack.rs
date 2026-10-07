@@ -1,8 +1,9 @@
 //! Context stacks and the ordered-candidate resolution over them (ANA-26 §7.3).
 //!
-//! A stack lists the contexts a key reaches, narrowest first (MOD-67 D6). M1 ships two:
+//! A stack lists the contexts a key reaches, narrowest first (MOD-67 D6). MOD-67 M1 shipped two:
 //! [`Stack::BASE`] (the global layer) and [`Stack::OVERLAY`] (the overlay layer, then only
-//! `global.help`). A row for an act in a narrower layer shadows that act in every wider layer,
+//! `global.help`). MOD-57 adds the editor's two: [`Stack::EDITOR_FOCUSED`] and
+//! [`Stack::EDITOR_UNFOCUSED`]. A row for an act in a narrower layer shadows that act in every wider layer,
 //! bound or not (blueprint B6): that is how M2's narrower overrides and `reject = []` work.
 
 use super::{Act, Context, KeyChord, Keys};
@@ -76,6 +77,18 @@ impl Stack<'static> {
         Layer::all(Context::Overlay),
         Layer::only(Context::Global, &[Act::Help]),
     ]);
+
+    /// `[editor ∩ {focus}]`: MOD-57 P5. While the in-pane editor has the keys only the focus
+    /// toggle resolves; every other chord, `ctrl-c` included, is written to the editor.
+    pub const EDITOR_FOCUSED: Self = Self(&[Layer::only(Context::Editor, &[Act::EditorFocus])]);
+
+    /// `[editor, global ∩ {quit, help}]`: MOD-57 P6, the M1 lock. With the editor alive and
+    /// unfocused nothing else resolves; `App` refuses every other key on the status line. M2 opens
+    /// the rest of htui.
+    pub const EDITOR_UNFOCUSED: Self = Self(&[
+        Layer::all(Context::Editor),
+        Layer::only(Context::Global, &[Act::Quit, Act::Help]),
+    ]);
 }
 
 impl Keys {
@@ -148,6 +161,8 @@ mod tests {
         let keys = Keys::compiled();
         assert_eq!(keys.actions(Stack::BASE, CTRL_C), []);
         assert_eq!(keys.actions(Stack::OVERLAY, CTRL_C), []);
+        assert_eq!(keys.actions(Stack::EDITOR_FOCUSED, CTRL_C), []);
+        assert_eq!(keys.actions(Stack::EDITOR_UNFOCUSED, CTRL_C), []);
     }
 
     #[test]
@@ -181,5 +196,56 @@ mod tests {
     fn an_unbound_action_is_never_a_candidate() {
         let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &[]);
         assert_eq!(base(&keys, "q"), []);
+    }
+
+    // MOD-57 M1 (plan P5, P6): the in-pane editor's two stacks.
+
+    fn focused(keys: &Keys, spec: &str) -> Vec<Act> {
+        keys.actions(Stack::EDITOR_FOCUSED, chord(spec))
+    }
+
+    fn unfocused(keys: &Keys, spec: &str) -> Vec<Act> {
+        keys.actions(Stack::EDITOR_UNFOCUSED, chord(spec))
+    }
+
+    #[test]
+    fn the_focused_editor_stack_resolves_only_the_toggle() {
+        let keys = Keys::compiled();
+        assert_eq!(focused(keys, "ctrl-4"), [Act::EditorFocus]);
+        for spec in ["ctrl-x", "q", "?", "f1", "esc", "tab"] {
+            assert_eq!(focused(keys, spec), [], "{spec}");
+        }
+    }
+
+    #[test]
+    fn the_unfocused_editor_stack_is_the_m1_lock() {
+        let keys = Keys::compiled();
+        assert_eq!(unfocused(keys, "ctrl-4"), [Act::EditorFocus]);
+        assert_eq!(unfocused(keys, "ctrl-x"), [Act::EditorAbort]);
+        assert_eq!(unfocused(keys, "q"), [Act::Quit]);
+        assert_eq!(unfocused(keys, "?"), [Act::Help]);
+        assert_eq!(unfocused(keys, "f1"), [Act::Help]);
+        for spec in ["tab", "1", "w", "ctrl-f", "ctrl-w", "esc", "e", "ctrl-s"] {
+            assert_eq!(unfocused(keys, spec), [], "{spec}");
+        }
+    }
+
+    #[test]
+    fn the_editor_labels_come_through_the_stacks() {
+        let keys = Keys::compiled();
+        let label = |stack, act| keys.label(stack, act);
+        assert_eq!(
+            label(Stack::EDITOR_UNFOCUSED, Act::EditorFocus).as_deref(),
+            Some("Ctrl+4")
+        );
+        assert_eq!(
+            label(Stack::EDITOR_UNFOCUSED, Act::EditorAbort).as_deref(),
+            Some("Ctrl+x")
+        );
+        assert_eq!(
+            label(Stack::EDITOR_UNFOCUSED, Act::Quit).as_deref(),
+            Some("q")
+        );
+        assert_eq!(label(Stack::EDITOR_FOCUSED, Act::EditorAbort), None);
     }
 }

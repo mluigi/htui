@@ -18,7 +18,7 @@
 //! out. So `global.help` (`?`, `f1`) reaches help through `f1` while a field types `?`, and
 //! `global.quit` (`q`) is unreachable there. `ctrl-c` quits regardless.
 
-use Context::{Common, Confirm, Form, Global, List, Overlay, Pane};
+use Context::{Common, Confirm, Editor, Form, Global, List, Overlay, Pane};
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
 /// M1 has the global, overlay and shared contexts; M3-M5 append view contexts (`SettingsAgents`,
@@ -39,10 +39,14 @@ pub enum Context {
     Form,
     /// `[common]`: verbs every view that offers them shares (edit, new, delete, ...).
     Common,
+    /// `[editor]`: the in-pane editor's own keys (MOD-57). Focused, only `editor.focus`
+    /// resolves; unfocused, the M1 lock (`Stack`).
+    Editor,
 }
 
 impl Context {
-    /// The TOML table name: `global`, `overlay`, `list`, `pane`, `confirm`, `form`, `common`.
+    /// The TOML table name: `global`, `overlay`, `list`, `pane`, `confirm`, `form`, `common`,
+    /// `editor`.
     #[must_use]
     pub const fn table(self) -> &'static str {
         match self {
@@ -53,10 +57,12 @@ impl Context {
             Self::Confirm => "confirm",
             Self::Form => "form",
             Self::Common => "common",
+            Self::Editor => "editor",
         }
     }
 
-    /// The `?` box heading: `Global`, `Overlay`, `List`, `Pane`, `Confirm`, `Form`, `Common`.
+    /// The `?` box heading: `Global`, `Overlay`, `List`, `Pane`, `Confirm`, `Form`, `Common`,
+    /// `Editor`.
     #[must_use]
     pub const fn heading(self) -> &'static str {
         match self {
@@ -67,6 +73,7 @@ impl Context {
             Self::Confirm => "Confirm",
             Self::Form => "Form",
             Self::Common => "Common",
+            Self::Editor => "Editor",
         }
     }
 }
@@ -157,6 +164,10 @@ pub enum Act {
     Back,
     /// `common.dismiss`: clear the notice.
     Dismiss,
+    /// `editor.focus`: give the keys to the in-pane editor, or take them back.
+    EditorFocus,
+    /// `editor.abort`: kill the in-pane editor; nothing is read back.
+    EditorAbort,
 }
 
 impl Act {
@@ -427,6 +438,20 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // connection.rs:828, boxes.rs:739, hierarchy.rs:1294, kinds.rs:1511, prompt.rs:875.
     // Shares `Esc` with `back`: `STATE_GUARDED`.
     row(Act::Dismiss, Common, "dismiss", &["esc"], "dismiss"),
+    // [editor]: MOD-57 M1 (plan P4, P5). `ctrl-4` is what `ctrl-\` arrives as (`chord.rs`
+    // `legacy_arrival`; `ctrl-\` itself is refused as indistinguishable). In capture: while the
+    // editor is focused every other key, `ctrl-c` included, is the editor's. MOD-67 M2's loader
+    // must refuse a file that unbinds it, as it does `overlay.close`.
+    capture_row(
+        Act::EditorFocus,
+        Editor,
+        "focus",
+        &["ctrl-4"],
+        "editor focus",
+    ),
+    // Offered only while the editor is unfocused (`Stack::EDITOR_UNFOCUSED`): focused, `ctrl-x`
+    // is nano's exit and goes to the editor.
+    row(Act::EditorAbort, Editor, "abort", &["ctrl-x"], "abort edit"),
 ];
 
 /// Default pairs that share a chord in one context because a view accepts at most one of them
@@ -483,6 +508,8 @@ mod tests {
         Act::Reload,
         Act::Back,
         Act::Dismiss,
+        Act::EditorFocus,
+        Act::EditorAbort,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -530,6 +557,8 @@ mod tests {
             Act::Reload => 38,
             Act::Back => 39,
             Act::Dismiss => 40,
+            Act::EditorFocus => 41,
+            Act::EditorAbort => 42,
         }
     }
 
@@ -554,7 +583,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 41);
+        assert_eq!(CATALOGUE.len(), 43);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -587,6 +616,12 @@ mod tests {
     fn overlay_close_keeps_a_chord() {
         let close = Act::OverlayClose.spec().expect("overlay.close has a row");
         assert!(!close.defaults.is_empty());
+    }
+
+    #[test]
+    fn editor_focus_keeps_a_chord() {
+        let focus = Act::EditorFocus.spec().expect("editor.focus has a row");
+        assert!(!focus.defaults.is_empty());
     }
 
     #[test]
@@ -671,6 +706,7 @@ mod tests {
             (Context::Confirm, "confirm", "Confirm"),
             (Context::Form, "form", "Form"),
             (Context::Common, "common", "Common"),
+            (Context::Editor, "editor", "Editor"),
         ];
         for (context, name, heading) in table {
             assert_eq!(context.table(), name);
@@ -703,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_form_and_overlay_close_are_in_capture() {
+    fn only_the_form_overlay_close_and_editor_focus_are_in_capture() {
         let captured: HashSet<Act> = CATALOGUE
             .iter()
             .filter(|row| row.in_capture)
@@ -717,6 +753,7 @@ mod tests {
                 Act::FormSave,
                 Act::FormExternalEditor,
                 Act::OverlayClose,
+                Act::EditorFocus,
             ])
         );
     }
