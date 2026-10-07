@@ -1942,6 +1942,15 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
         spent - CAP
     );
 
+    // The batch must still be open, so the next sweep declining to admit is the cap, not a closed batch.
+    let closed: Option<String> =
+        sqlx::query_scalar("SELECT closed_reason FROM queue_batch WHERE id = $1")
+            .bind(batch.as_uuid())
+            .fetch_one(&db.pool)
+            .await
+            .expect("the batch row is read");
+    assert_eq!(closed, None, "the batch is still open after the overshoot");
+
     let a2 = mint_ana(&db.store, "a2", 1).await;
     db.store
         .queue_item(a2, ids::BOX, ids::USER, Utc::now())
