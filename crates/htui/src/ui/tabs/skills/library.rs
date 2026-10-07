@@ -681,7 +681,7 @@ impl LibraryView {
                 pane.render(frame, content, snapshot, ctx).to_owned()
             }
             (_, _, Mode::Editing(editor)) => {
-                self.render_editor(frame, content, editor, ctx.theme);
+                self.render_editor(frame, content, editor, ctx);
                 match &editor.help {
                     Some(help) => help.hint().to_owned(),
                     None => {
@@ -1767,19 +1767,20 @@ impl LibraryView {
     /// The editor over the whole content, its title carrying the draft's estimate (D82). An open
     /// agent help draws in the draft's place (MOD-55 B-2): a panel under a locked draft, or the
     /// proposal over all of it.
-    fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
+    fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let draft = match &editor.help {
-            Some(help) => help.render(frame, area, theme),
+            Some(help) => help.render(frame, area, ctx.theme),
             None => Some(area),
         };
         if let Some(draft) = draft {
-            self.render_draft(frame, draft, editor, theme);
+            self.render_draft(frame, draft, editor, ctx);
         }
     }
 
     /// The draft's block: the name, the versions and the estimate, and the text with its cursor
-    /// (dim under an open help, which has the keys).
-    fn render_draft(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
+    /// (dim under an open help, which has the keys). The text's rect is claimed for an in-pane
+    /// editor (MOD-57 P2), inside the block, so the name and versions stay visible beside it.
+    fn render_draft(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let name = editor.target.name();
         let tokens = estimate(name, editor.saves(), editor.area.text());
         let title = match (&editor.target, editor.from) {
@@ -1805,10 +1806,11 @@ impl LibraryView {
                 inner.width,
                 inner.height,
                 editor.help.is_none(),
-                theme,
+                ctx.theme,
             )),
             inner,
         );
+        ctx.claim_editor_area(inner);
     }
 }
 
@@ -1836,6 +1838,7 @@ fn browse_row(name: &str, head: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use chrono::TimeDelta;
@@ -2310,6 +2313,57 @@ mod tests {
             };
             request.clone()
         }
+    }
+
+    /// MOD-57 P2 (PD-3, F-12): an open draft claims the text rect inside its block, so the name,
+    /// versions and estimate in the block's title stay visible beside an in-pane editor; browse
+    /// (where `E` hands a selected row off) draws no draft and claims nothing.
+    #[test]
+    fn the_draft_claims_its_text_rect_and_browse_claims_nothing() {
+        let bench = Bench::new();
+        let area = Rect::new(0, 0, 100, 28);
+        let drawn = |view: &LibraryView| {
+            let cell = Cell::new(None);
+            let ctx = bench.ctx().with_editor_area(&cell);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .expect("a test terminal");
+            terminal
+                .draw(|frame| view.render(frame, area, &ctx))
+                .expect("the frame draws");
+            (terminal.backend().buffer().clone(), cell.get())
+        };
+
+        let (_, claim) = drawn(&LibraryView::default());
+        assert_eq!(claim, None, "browse claims nothing");
+
+        let target = Target::New {
+            name: "docs-style".to_owned(),
+            description: String::new(),
+        };
+        let view = LibraryView {
+            mode: Mode::Editing(Editor::new(target, 0, None, "First line.\nSecond.\n")),
+            ..LibraryView::default()
+        };
+        let (buffer, claim) = drawn(&view);
+        let claim = claim.expect("the draft claims its text");
+        // The content above the notice and hint rows, inside the draft's border.
+        assert_eq!(claim, Rect::new(1, 1, 98, 24));
+        let row = |y: u16| {
+            (claim.x..claim.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            row(claim.y).starts_with("First line."),
+            "{:?}",
+            row(claim.y)
+        );
+        assert!(
+            row(0).contains("docs-style \u{b7} new, saves v1"),
+            "{:?}",
+            row(0)
+        );
     }
 
     /// A `MemStore` whose clock never moves unless the test moves it: every write it stamps

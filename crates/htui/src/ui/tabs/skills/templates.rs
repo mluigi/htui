@@ -514,7 +514,7 @@ impl TemplatesView {
         .areas(area);
         let hint = match &self.mode {
             Mode::Editing(editor) => {
-                self.render_editor(frame, content, editor, ctx.theme);
+                self.render_editor(frame, content, editor, ctx);
                 match &editor.help {
                     Some(help) => help.hint().to_owned(),
                     None => {
@@ -1156,22 +1156,23 @@ impl TemplatesView {
     /// The editor: the draft on the left, the role's placeholders on the right (plan D14). An
     /// open agent help draws in the draft's place (MOD-55 B-2): a panel under a locked draft, or
     /// the proposal over all of it; the placeholder column stays, to check a proposal against.
-    fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
+    fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let [left, right] =
             Layout::horizontal([Constraint::Min(1), Constraint::Length(HELP_WIDTH)]).areas(area);
         let draft = match &editor.help {
-            Some(help) => help.render(frame, left, theme),
+            Some(help) => help.render(frame, left, ctx.theme),
             None => Some(left),
         };
         if let Some(draft) = draft {
-            self.render_draft(frame, draft, editor, theme);
+            self.render_draft(frame, draft, editor, ctx);
         }
-        self.render_placeholders(frame, right, editor, theme);
+        self.render_placeholders(frame, right, editor, ctx.theme);
     }
 
     /// The draft's block: the name, the versions, and the text with its cursor (dim under an
-    /// open help, which has the keys).
-    fn render_draft(&self, frame: &mut Frame<'_>, left: Rect, editor: &Editor, theme: &Theme) {
+    /// open help, which has the keys). The text's rect is claimed for an in-pane editor (MOD-57
+    /// P2), inside the block, so the name and versions stay visible beside it.
+    fn render_draft(&self, frame: &mut Frame<'_>, left: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let title = match (editor.token, editor.from) {
             (Some(token), from) => format!(
                 " {} \u{b7} editing from v{}, saves v{} ",
@@ -1190,10 +1191,11 @@ impl TemplatesView {
                 inner.width,
                 inner.height,
                 editor.help.is_none(),
-                theme,
+                ctx.theme,
             )),
             inner,
         );
+        ctx.claim_editor_area(inner);
     }
 
     /// The role's placeholders and, for the judge and `review`, the wire contract.
@@ -1275,6 +1277,7 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_agent::event::StopReason;
     use htui_core::model::StepId;
+    use std::cell::Cell;
 
     /// MOD-60 D1: the name is fitted in cells, so a wide name never pushes the head or the role
     /// right.
@@ -1339,6 +1342,74 @@ mod tests {
             .map(|span| cell_width(&span.content))
             .sum();
         assert_eq!(drawn, 40, "{lines:?}");
+    }
+
+    /// MOD-57 P2 (PD-3, F-12): an open draft claims the text rect inside its block, so the name
+    /// and versions in the block's title stay visible beside an in-pane editor; browse (where
+    /// `E` hands a selected row off) draws no draft and claims nothing.
+    #[test]
+    fn the_draft_claims_its_text_rect_and_browse_claims_nothing() {
+        let (top_bar, keymap, theme, emit) = (
+            TopBarState::default(),
+            Keymap::default_global(),
+            Theme::default(),
+            Emit::default(),
+        );
+        let scope = vulkan();
+        let area = Rect::new(0, 0, 100, 28);
+        let drawn = |view: &TemplatesView| {
+            let cell = Cell::new(None);
+            let ctx = Ctx::new(
+                &scope,
+                &[],
+                &top_bar,
+                &keymap,
+                &theme,
+                Origin::Tab(SkillsTab::ID),
+                &emit,
+            )
+            .with_editor_area(&cell);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .expect("a test terminal");
+            terminal
+                .draw(|frame| view.render(frame, area, &ctx))
+                .expect("the frame draws");
+            (terminal.backend().buffer().clone(), cell.get())
+        };
+
+        let (_, claim) = drawn(&TemplatesView::default());
+        assert_eq!(claim, None, "browse claims nothing");
+
+        let view = TemplatesView {
+            mode: Mode::Editing(Editor::new(
+                ids::PROJECT_VULKAN,
+                "plan".to_owned(),
+                Some(2),
+                None,
+                "First line.\nSecond.\n",
+            )),
+            ..TemplatesView::default()
+        };
+        let (buffer, claim) = drawn(&view);
+        let claim = claim.expect("the draft claims its text");
+        // The content above the notice and hint rows, less the placeholder column, inside the
+        // draft's border.
+        assert_eq!(claim, Rect::new(1, 1, 98 - HELP_WIDTH, 24));
+        let row = |y: u16| {
+            (claim.x..claim.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            row(claim.y).starts_with("First line."),
+            "{:?}",
+            row(claim.y)
+        );
+        let title: String = (0..claim.right())
+            .map(|x| buffer[(x, 0)].symbol())
+            .collect();
+        assert!(title.contains("plan \u{b7} editing from v2"), "{title:?}");
     }
 
     /// The Harness's startup scope: the Graphics workspace and its one project.
