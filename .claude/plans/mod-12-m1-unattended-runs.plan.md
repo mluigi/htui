@@ -3,6 +3,7 @@
 **Source PRD**: `.claude/prds/mod-12-auto-mode-queue-runner.prd.md`
 **Selected Milestone**: 1 — Unattended runs
 **Complexity**: Large
+**Status**: complete — merged on `hr/MOD-12` at `d19767df` (2026-10-07), review round included
 **Execution**: ultracode accepted for implement and review (PRD header). Waves below are decided by
 the file sets in "Files to Change", not by prose.
 

@@ -47,10 +47,10 @@ before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
 `claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
 the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
 with no run walking, never under a live walk. No migration.
-Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
-`heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
+Live coordinates after MOD-12 M1: migrations run through `0016_auto_queue` (`queue_entry`, `queue_batch`,
+`run.batch_id`), so **the next migration is `0017`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
 MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
-conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES` 15, `htui-orch` `CASES` 100.
+conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES` 15, `htui-orch` `CASES` 103.
 
 ---
 
@@ -191,6 +191,19 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   enqueue and at claim (`Claim::MissingTags`), so auto mode reuses them rather than adding a check.
   **Relates to ANA-16** (`docs/ANA-16.md` §8): target-box selection in auto mode is MOD-43's, which
   depends on this item for its auto-mode half.
+  **Phase 1 landed (`48ff0811`..`d19767df`, 2026-10-07):** unattended runs. Migration
+  `0016_auto_queue` (`queue_entry`, one item on one box; `queue_batch`, at most one open per box;
+  `run.batch_id`); `ready_items` in `priority DESC, created_at, id` order; the auto-mode gate
+  downgrade at snapshot time (`effective_gate`); the queue store surface on `MemStore`/`PgStore`/
+  `Backend` and the runner's `WorkerHost` methods; `Engine::enqueue_in_batch`; admission, prune and
+  drain in `sweep_once` (only the box's executing process, slots counted on running runs, a cancel
+  sticks for its batch, a pause cancels the batch's still-queued runs, the drain closes only the batch
+  it checked) with walk-end and resume wake-ups; Backlog `Q` (queue/dequeue) and `P` (resume/pause).
+  ANA-2 criteria 22, 23, 24 (by construction, resume pinned), 26 and 27's pause half have tests.
+  PRD `.claude/prds/mod-12-auto-mode-queue-runner.prd.md`, plan
+  `.claude/plans/mod-12-m1-unattended-runs.plan.md`. Remaining: M2 spend guard (batch cap, Settings
+  caps section), M3 queue overlay (escalations, reorder, off-box runs, the open-batch-on-`Q` question
+  of review L4).
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
