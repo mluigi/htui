@@ -1159,6 +1159,29 @@ impl MemStore {
         }))
     }
 
+    /// MOD-12 M2 D1: `Σ run_step.usage["cost_micros"]` over the steps of every run admitted under
+    /// `batch`; `None` when no step reports an integer cost. Computed, never stored (ANA-2 §4.10).
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+        Ok(self.read(|state| state.batch_spend(batch)))
+    }
+
+    /// MOD-12 M2 D5: the batch `run` was admitted under, with [`MemStore::batch_spend`] of it;
+    /// `None` for a manual or chat run, and for an unknown run.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s.
+    pub async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
+        Ok(self.read(|state| {
+            state
+                .run_batches
+                .get(&run)
+                .map(|batch| (*batch, state.batch_spend(*batch)))
+        }))
+    }
+
     /// MOD-12 D6: `claim_run`'s slot count — `running` runs executing on `box_id`, **not**
     /// `awaiting_approval` (that is [`MemStore::active_runs_on_box`]).
     ///
@@ -1341,6 +1364,24 @@ impl MemStore {
 }
 
 impl State {
+    /// [`MemStore::batch_spend`]'s body: `as_i64` skips a non-integer cost, as `select::run_spend`
+    /// does and as Postgres' text guard does.
+    fn batch_spend(&self, batch: BatchId) -> Option<i64> {
+        let runs: HashSet<RunId> = self
+            .run_batches
+            .iter()
+            .filter(|(_, of)| **of == batch)
+            .map(|(run, _)| *run)
+            .collect();
+        self.steps
+            .values()
+            .filter(|step| runs.contains(&step.run_id))
+            .filter_map(|step| step.usage.as_ref()?.get("cost_micros")?.as_i64())
+            .fold(None, |total, cost| {
+                Some(total.unwrap_or(0).saturating_add(cost))
+            })
+    }
+
     /// `project.slug`, or an empty string when the project is not loaded.
     fn project_slug(&self, id: ProjectId) -> String {
         self.projects
@@ -14587,6 +14628,179 @@ mod tests {
             assert!(state.queue_entries.is_empty(), "no entry remains");
             assert!(state.run_batches.is_empty(), "no run-batch pair remains");
         });
+    }
+
+    // ---- MOD-12 M2: batch spend (blueprint §C.1) -------------------------------------------
+
+    /// A step of `run` at `position` whose `usage` is `usage` (MOD-12 M2 spend fixtures).
+    async fn step_with_usage(store: &MemStore, run: RunId, position: i32, usage: Value) {
+        let step = store
+            .create_step(new_step(run, position, 0, 0))
+            .await
+            .expect("the step lands");
+        store
+            .set_step_usage(StepFence::Unleased, step.id, usage, None)
+            .await
+            .expect("the usage lands");
+    }
+
+    /// The batches and runs of [`spend_fixture`].
+    struct SpendFixture {
+        /// Two runs, costs 700 and 250, plus a `"x"` and a `1.5` cost that are skipped.
+        a: crate::model::BatchId,
+        /// One run costing 1 000.
+        b: crate::model::BatchId,
+        /// One run whose only step reports no cost.
+        c: crate::model::BatchId,
+        /// A run of batch A.
+        a_run: RunId,
+        /// A manual run costing 5 000, in no batch.
+        manual: RunId,
+    }
+
+    /// MOD-12 M2 D1: three batches opened one after another on the demo box (one open batch per
+    /// box), across projects, and a manual run beside them; `pg_criteria.rs` builds the same.
+    async fn spend_fixture(store: &MemStore) -> SpendFixture {
+        let at = Utc::now();
+        let a = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch A opens");
+        let a_run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(a.id)))
+            .await
+            .expect("A admits ANA-2");
+        let a_other = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FEAT_1, Some(a.id))
+            })
+            .await
+            .expect("A admits another project's item");
+        step_with_usage(
+            store,
+            a_run.id,
+            0,
+            json!({"cost_micros": 700, "input_tokens": 9}),
+        )
+        .await;
+        step_with_usage(store, a_run.id, 1, json!({"cost_micros": "x"})).await;
+        step_with_usage(store, a_other.id, 0, json!({"cost_micros": 250})).await;
+        step_with_usage(store, a_other.id, 1, json!({"cost_micros": 1.5})).await;
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("A was open");
+
+        let b = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch B opens");
+        let b_run = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FIX_1, Some(b.id))
+            })
+            .await
+            .expect("B admits");
+        step_with_usage(store, b_run.id, 0, json!({"cost_micros": 1_000})).await;
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("B was open");
+
+        let c = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch C opens");
+        let c_run = store
+            .create_run(batch_run(ids::HTUI_CLEAN_1, Some(c.id)))
+            .await
+            .expect("C admits");
+        step_with_usage(store, c_run.id, 0, json!({"input_tokens": 3})).await;
+
+        let manual = store
+            .create_run(graph_run(
+                ids::VULKAN_TOOL_1,
+                ids::PROJECT_VULKAN,
+                Vec::new(),
+            ))
+            .await
+            .expect("a manual run");
+        step_with_usage(store, manual.id, 0, json!({"cost_micros": 5_000})).await;
+        SpendFixture {
+            a: a.id,
+            b: b.id,
+            c: c.id,
+            a_run: a_run.id,
+            manual: manual.id,
+        }
+    }
+
+    /// MOD-12 M2 D1: no step reporting an integer cost is `None`, not `Some(0)` (unknown is
+    /// unbounded, OQ-6).
+    #[tokio::test]
+    async fn batch_spend_is_none_without_a_costed_step() {
+        let store = MemStore::demo();
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(batch.id)))
+            .await
+            .expect("an open batch admits");
+        assert_eq!(store.batch_spend(batch.id).await.expect("read"), None);
+        step_with_usage(&store, run.id, 0, json!({"input_tokens": 3})).await;
+        assert_eq!(
+            store.batch_spend(batch.id).await.expect("read"),
+            None,
+            "a usage row without a cost"
+        );
+    }
+
+    /// MOD-12 M2 D1: the sum is over the batch's runs only, across projects; a non-integer cost
+    /// is skipped and a manual run is no batch's.
+    #[tokio::test]
+    async fn batch_spend_sums_only_the_batch_runs() {
+        let store = MemStore::demo();
+        let fixture = spend_fixture(&store).await;
+        assert_eq!(store.batch_spend(fixture.a).await.expect("read"), Some(950));
+        assert_eq!(
+            store.batch_spend(fixture.b).await.expect("read"),
+            Some(1_000)
+        );
+        assert_eq!(store.batch_spend(fixture.c).await.expect("read"), None);
+        assert_eq!(
+            store
+                .batch_spend(crate::model::BatchId::new())
+                .await
+                .expect("read"),
+            None,
+            "an unknown batch has spent nothing known"
+        );
+    }
+
+    /// MOD-12 M2 D5: a manual run is in no batch; a batch run answers its batch and its spend.
+    #[tokio::test]
+    async fn run_batch_spend_is_none_for_a_manual_run() {
+        let store = MemStore::demo();
+        let fixture = spend_fixture(&store).await;
+        assert_eq!(
+            store.run_batch_spend(fixture.manual).await.expect("read"),
+            None
+        );
+        assert_eq!(
+            store.run_batch_spend(fixture.a_run).await.expect("read"),
+            Some((fixture.a, Some(950)))
+        );
+        assert_eq!(
+            store.run_batch_spend(RunId::new()).await.expect("read"),
+            None,
+            "an unknown run"
+        );
     }
 
     /// MOD-12 D6 (H-5): the runner's slot count is `claim_run`'s, `running` alone; a parked run
