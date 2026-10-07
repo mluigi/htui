@@ -749,6 +749,37 @@ mod tests {
         );
     }
 
+    /// MOD-12 M3 D7 (B.4.2 step 5): a row cancelled in this batch still has its tags read, so
+    /// one that now lacks a tag escalates (rule 8) rather than waiting on the next batch (rule
+    /// 10), which would not admit it either.
+    #[tokio::test]
+    async fn a_cancelled_row_missing_tags_reads_escalated() {
+        let mut data = demo_data();
+        let untagged = push_item(&mut data, ids::AGY_FIX_1, 32, Status::Open, &["docker"]);
+        let store = MemStore::from_demo(data);
+        let batch = resume(&store).await;
+        let run = batch_run(&store, untagged, ids::PROJECT_AGY, batch).await;
+        store
+            .finish_run(run, RunStatus::Cancelled, None, Utc::now())
+            .await
+            .expect("the run cancels");
+        queue(&store, &[untagged]).await;
+        assert_eq!(
+            store.batch_cancelled_items(batch).await.expect("read"),
+            [untagged],
+            "the fixture is not vacuous"
+        );
+
+        let overview = served(&Backend::memory(store)).await;
+
+        assert_eq!(overview.rows.len(), 1);
+        assert_eq!(overview.rows[0].0.status, Status::Open);
+        assert_eq!(
+            overview.rows[0].1,
+            EntryState::Escalated(Escalation::MissingTags(vec!["docker".to_owned()]))
+        );
+    }
+
     /// MOD-12 M3 D7: `slots_used` is the box's running runs plus its queued ones (`free_slots`'
     /// inputs), `slots_limit` the box's `max_concurrent_items`, and the batch its own spend.
     #[tokio::test]
