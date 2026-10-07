@@ -685,6 +685,8 @@ pub const CASES: &[&str] = &[
     "a_batch_run_session_is_capped_at_the_batch_remainder",
     "a_manual_run_ignores_batch_figures",
     "the_run_cap_spans_steps",
+    // MOD-12 M2 R1 (review M1): the session's run term is the snapshot's cap, as the walk's is.
+    "a_lowered_live_run_cap_does_not_cut_a_snapshotted_run",
 ];
 
 /// Run one case by name.
@@ -1070,7 +1072,7 @@ fn auto_mode_case<'a, H: CaseHarness>(
     })
 }
 
-/// MOD-12 M2's four (plan D5, D6), boxed for [`case`]'s reason.
+/// MOD-12 M2's five (plan D5, D6, and review R1's M1), boxed for [`case`]'s reason.
 fn spend_guard_case<'a, H: CaseHarness>(
     name: &str,
     harness: &'a H,
@@ -1086,6 +1088,9 @@ fn spend_guard_case<'a, H: CaseHarness>(
             Box::pin(a_manual_run_ignores_batch_figures(harness))
         }
         "the_run_cap_spans_steps" => Box::pin(the_run_cap_spans_steps(harness)),
+        "a_lowered_live_run_cap_does_not_cut_a_snapshotted_run" => Box::pin(
+            a_lowered_live_run_cap_does_not_cut_a_snapshotted_run(harness),
+        ),
         _ => return None,
     })
 }
@@ -8236,6 +8241,60 @@ async fn the_run_cap_spans_steps<H: CaseHarness>(harness: &H) {
     );
 }
 
+/// MOD-12 M2 D6 (review R1, M1): a session's run term is the run's snapshotted
+/// `per_token_cap_run`, the figure the walk's rule 2 reads. The run starts under a 10 000 cap,
+/// `prd` spends 2 000 and parks at its gate, and the live cap is then lowered to 1 000 (as
+/// Settings > Queue would). The walk admits `plan` (2 000 of 10 000), so its session is handed
+/// the snapshot's remainder, 8 000, and is not cut: a live term would have handed it 0 and cut it
+/// at its first costed row, on every retry.
+async fn a_lowered_live_run_cap_does_not_cut_a_snapshotted_run<H: CaseHarness>(harness: &H) {
+    let orch = harness.fresh();
+    feat_3_gated(&orch, Gate::Never, |phase| {
+        if phase.name == "prd" {
+            phase.gate = Gate::Always;
+        }
+    })
+    .await;
+    // Planted before the run starts: the snapshot freezes it (plan D2).
+    plant_setting(&orch, ids::HTUI_FEAT_3, "per_token_cap_run", 10_000).await;
+    orch.script("prd", 1, ScriptedStep::done_costing("the prd", 2_000));
+    orch.script("plan", 1, ScriptedStep::done_costing("the plan", 500));
+
+    let (run, parked) = start(&orch, ids::HTUI_FEAT_3).await;
+    assert_eq!(
+        (parked.run, parked.position, parked.failure),
+        (RunStatus::AwaitingApproval, Some(0), None),
+        "`prd` parks at its gate"
+    );
+    assert_eq!(
+        spec_of(&orch, &session("prd", 0)).budget_micros,
+        Some(10_000)
+    );
+
+    // The live cap is lowered below what the run has already spent; the snapshot keeps 10 000.
+    plant_setting(&orch, ids::HTUI_FEAT_3, "per_token_cap_run", 1_000).await;
+    let rest = approve(&orch, run, 1).await;
+
+    assert_eq!(
+        spec_of(&orch, &session("plan", 0)).budget_micros,
+        Some(8_000),
+        "the snapshot's cap less what `prd` spent, not the live cap's floor of 0"
+    );
+    assert_eq!(
+        step_at(&orch, run, 1, 1).await.status,
+        StepStatus::Done,
+        "`plan` spent 500 of its 8 000 and was not cut"
+    );
+    assert!(
+        !notes_of(&orch, ids::HTUI_FEAT_3)
+            .await
+            .iter()
+            .any(|note| note.contains("cap breached")),
+        "nothing was cut"
+    );
+    assert_eq!(rest.failure, None, "the run walked on: {rest:?}");
+}
+
 #[cfg(test)]
 mod tests {
     use super::{CASES, CaseHarness, FakeOrchestrator, run_all, run_case};
@@ -8260,8 +8319,8 @@ mod tests {
         assert_eq!(sorted.len(), CASES.len(), "case names are the suite's API");
         assert_eq!(
             CASES.len(),
-            107,
-            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 4: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
+            108,
+            "18 + 5 + 13 + 6 + 10 + 18 + 2 + 1 + 1 + 1 + 11 + 1 + 5 + 1 + 1 + 6 + 3 + 5: eighteen before milestone 4 (six ANA-2 §12 criteria, four §4.2 \
              contract lines, the `finish_run` seam, the three gate-table cells only an edited \
              gate reaches, plan D5's intermediate position, milestone 3's two verify outcomes \
              and `CancelRun`), milestone 4's five stage-1 cases (the `allowed_warning` \
@@ -8295,8 +8354,9 @@ mod tests {
              and MOD-73's one (a gate edit read by the next phase, plan D2), and MOD-11 T8's six \
              (plan D16, D17: `fan_out_only` at one agent, at two and on a `heavy_build` item, \
              the denials with and without a persona, and the judge never exposed), and MOD-12 \
-             M1's three (criterion 23's two halves, criterion 24), and MOD-12 M2's four (the \
-             batch walk refusal, the batch remainder, the manual run, the run cap across steps)"
+             M1's three (criterion 23's two halves, criterion 24), and MOD-12 M2's five (the \
+             batch walk refusal, the batch remainder, the manual run, the run cap across steps, \
+             and review R1's snapshotted run cap against a lowered live one)"
         );
     }
 
