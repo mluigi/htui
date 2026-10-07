@@ -5,7 +5,7 @@ use ratatui::text::{Line, Span};
 
 use crate::app::{Ctx, Handled};
 use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
-use crate::secrets_settings::Redacted;
+use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
@@ -118,6 +118,11 @@ impl QdrantSection {
         self.snapshot.as_ref().map(|s| &s.url_state)
     }
 
+    /// CLEAN-8 #9: the snapshot is a demo session's, which has no keyring to edit.
+    fn demo(&self) -> bool {
+        self.state() == Some(&QdrantState::NotApplicable)
+    }
+
     fn row(&self) -> Row {
         Row::ALL[self.cursor]
     }
@@ -135,10 +140,15 @@ impl QdrantSection {
     }
 
     /// Whether a key that opens an editor or a question is refused right now. A write in flight
-    /// says so, as the Connection section's does; `r` is deliberately not on this path.
+    /// says so, as the Connection section's does, and so does a demo session (CLEAN-8 #9), as the
+    /// Secrets section's does; `r` is deliberately not on this path.
     fn blocked(&mut self) -> bool {
         if let Some(busy) = self.busy {
             self.refuse(format!("`{busy}` is still in flight"));
+            return true;
+        }
+        if self.demo() {
+            self.refuse(DEMO_SESSION.to_owned());
             return true;
         }
         self.unavailable.is_some() || self.snapshot.is_none()
