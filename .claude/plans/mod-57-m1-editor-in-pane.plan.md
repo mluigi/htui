@@ -285,3 +285,38 @@ $EDITOR") instead of browse (`afd7ce3d`). Browse's `E` has no draft, draws brows
 claim it (PD-3, `2080cbac`). (3) **R0 F1.** `item_form::render` returns the rect of the field handed
 to `$EDITOR` (`external`), else Paths' when it is focused, else the body's: a Paths edit claims the
 3-row paths area, under `MIN_PANE`, so the pane takes the whole tab body (D1).
+
+## Manual run (T7)
+
+**Sandbox run, 2026-10-07 (hr sandbox, no nvim).** vim.tiny 9.1 and nano 7.2 (extracted at
+`/tmp/mod57-editors/root/usr/bin`), each as `$VISUAL`, driven through the real path the loop takes:
+the Templates harness, `E` on `implement`, `App::open_editor` with `PtyChild::spawn`, every
+`PaneEvent` through `App::on_pane_event`, a draw and `resize_editor` after each (a throwaway
+`--ignored` test, not committed; the committed real-child cases are `tests/editor_pane.rs`). The
+frames were read as text from the `TestBackend`.
+
+| Check | vim.tiny 9.1 | nano 7.2 |
+|---|---|---|
+| Draw (100x30, whole tab body: browse `E` claims nothing) | spawned at 26x100; file, `~` filler and the `"…" 16 lines, 541 bytes` message drawn under the `<value> · Ctrl+4 to htui` rule | spawned at 26x100; title bar, text, `[ Read 16 lines ]` and both help rows drawn |
+| Resize (terminal 100x30 → 120x40, after the next draw) | redrawn at 36x120: filler to the new last row | redrawn at 36x120: help rows re-laid to 8 columns at the new bottom |
+| `ctrl-c` forwarded | `Type  :qa  and press <Enter> to exit Vim`; htui did not quit, the editor stayed open | `[ line 1/17 … ]` (its cursor-position key); htui did not quit |
+| Keys | `gg`, `O`, `MANUAL`, `Esc`, `:wq`, `Enter` | `MANUAL`, `Enter`, `Ctrl+X` (exit; not htui's abort while focused), `y`, `Enter` at the file-name prompt |
+| Exit and read-back | `Edited`: the Templates draft opened with `MANUAL` as line 1, notice `edited in $EDITOR — Ctrl+S saves`; temp file removed | same |
+| Small pane (terminal 42x12, tab body 42x9: 8x42 grid) | the file message wrapped to two rows, so vim opened on `Press ENTER or type command to continue` (its hit-enter prompt; `Enter` continues) | usable: title, 3 text rows, status, both help rows (labels truncated) |
+| Abort (`Ctrl+4`, `Ctrl+x`) | notice `the editor was aborted; nothing was changed`; **left `/tmp/.htui-verdict-*.md.swp`** (vim's swap, preserved on SIGHUP) | same notice; **left `/tmp/htui-verdict-*.md.save`** (blueprint H-4) |
+
+Both recovery files are documented in `docs/htui-editor.md` (Limits) and were removed by hand. No
+editor process outlived its pane (`ps` after the runs). Neither editor stalled at start: each drew
+its first screen while the harness was still pumping its first events.
+
+**`MIN_PANE` verdict (PRD Q3).** Keep 40x8. At 8 rows nano is usable (3 text rows) and vim works
+after one hit-enter prompt when its open message is longer than the width (the temp path is long);
+smaller would not be worth drawing. Below it the pane takes the whole tab body, which is the right
+fallback. The nvim run in the Notes compose box (the PRD's case for this verdict) is still owed.
+
+**Owed by the maintainer, on the host (the sandbox has no nvim, blueprint H-18).** With
+`HTUI_EDITOR_PANE=1 VISUAL=nvim`: draw, keys, resize, `ctrl-c` forwarded, exit and read-back in
+Templates (`Ctrl+E` on a draft: the claimed draft rect), the Notes compose box and the item form;
+nvim's start-up queries (DA2, OSC 10/11 colour, XTGETTCAP) go unanswered, so check that it starts
+without a delay and picks a sane background; and the `MIN_PANE` verdict above in the Notes compose
+box.

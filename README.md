@@ -556,3 +556,4 @@ arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 - [`docs/personas.md`](docs/personas.md): agent personas and how they narrow a step.
 - [`docs/htui-mcp.md`](docs/htui-mcp.md): htui's MCP server, the tools every agent session gets.
 - [`docs/htui-secrets.md`](docs/htui-secrets.md): the Infisical secret provider — machine identity, base URL, errors.
+- [`docs/htui-editor.md`](docs/htui-editor.md): `E`/`Ctrl+E`, `$VISUAL`/`$EDITOR`, and the in-pane editor (`HTUI_EDITOR_PANE`).
