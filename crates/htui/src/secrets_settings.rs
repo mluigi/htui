@@ -276,9 +276,10 @@ fn seam_sentence(err: &StoreError) -> String {
 /// A write on [`Backend::Memory`] is refused with [`DEMO_SESSION`] before anything else (D10). A
 /// URL is normalised again (defensive: the section already did) and a refusal is `Failed` with
 /// normalisation's sentence, which never echoes the URL. An identity with a blank half is
-/// refused with [`IDENTITY_INCOMPLETE`]; one that is not is stored trimmed (CLEAN-8 #4). Every write that lands stores a new keyring write mark
-/// (MOD-90 D1, so another process sees it) and bumps the keyring-write generation (blueprint
-/// A-4), and answers the generation and a fresh snapshot under its own name
+/// refused with [`IDENTITY_INCOMPLETE`]; one that is not is stored trimmed (CLEAN-8 #4). Every
+/// write that lands stores a new keyring write mark (MOD-90 D1, so another process sees it) and
+/// bumps the keyring-write generation (blueprint A-4), and answers the generation, whether the
+/// mark was stored (MOD-90 D3, R1 M-1) and a fresh snapshot under its own name
 /// ([`StoreReply::SecretsWritten`], R1 M-1, L-1); the read answers [`StoreReply::Secrets`].
 ///
 /// # Errors
@@ -288,7 +289,7 @@ fn seam_sentence(err: &StoreError) -> String {
 /// one of this module's, which `try_serve` never sends here.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let demo = matches!(backend, Backend::Memory(_));
-    let generation = match request {
+    let (generation, mark_stored) = match request {
         StoreRequest::SecretsInfo => return Ok(StoreReply::Secrets(snapshot(backend).await?)),
         StoreRequest::SetInfisicalUrl(_)
         | StoreRequest::ClearInfisicalUrl
@@ -325,6 +326,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
     Ok(StoreReply::SecretsWritten {
         request: request.name(),
         generation,
+        mark_stored,
         snapshot: snapshot(backend).await?,
     })
 }
@@ -342,8 +344,10 @@ fn refused(request: &StoreRequest, message: String) -> StoreReply {
 /// `provider()` builds afresh (blueprint A-4); the generation it made. The write, the mark and the
 /// note happen under [`keyring_io`](crate::secrets::keyring_io) (R1 L-2), so no keyring read sees
 /// half of it, and a read that waited for it reads the generation it made only with what it
-/// wrote. A mark the keyring refuses is logged and the write still answers (D3).
-async fn keyring_write<F>(write: F) -> Result<u64>
+/// wrote. A mark the keyring refuses is logged and the write still answers (D3), with `false` as
+/// the second half so the Secrets section can say so (R1 M-1): the generation it made, and
+/// whether the mark was stored.
+async fn keyring_write<F>(write: F) -> Result<(u64, bool)>
 where
     F: FnOnce() -> Result<()> + Send + 'static,
 {
@@ -353,14 +357,19 @@ where
         // MOD-90 D1, D2: last, inside the write's own critical section. D3: best effort; the write
         // landed.
         let mark = uuid::Uuid::now_v7().to_string();
-        if let Err(err) = secret::set_infisical_write_mark(&mark) {
-            tracing::warn!(
-                slot = secret::INFISICAL_WRITE_MARK_USER,
-                %err,
-                "the keyring write mark was not stored; another htui process sees this write after a restart"
-            );
-        }
-        Ok(crate::secrets::note_keyring_write())
+        let mark_stored = match secret::set_infisical_write_mark(&mark) {
+            Ok(()) => true,
+            Err(err) => {
+                tracing::warn!(
+                    slot = secret::INFISICAL_WRITE_MARK_USER,
+                    %err,
+                    "the keyring write mark was not stored; another htui process misses this \
+                     write until it restarts if the write left the values unchanged"
+                );
+                false
+            }
+        };
+        Ok((crate::secrets::note_keyring_write(), mark_stored))
     })
     .await
     .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))?

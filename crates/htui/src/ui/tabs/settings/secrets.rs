@@ -102,6 +102,9 @@ const DEMO_KEYRING: &str = "a demo session never reads or writes the keyring";
 const DEMO_CHECK: &str = "a demo session has no secret provider to check";
 /// The guide under the rows while the cursor is on Health: a check is a login, and can latch.
 const HEALTH_GUIDE: &str = "t logs in afresh: a refused login stops walks, chats and checks from logging in again until the identity is entered again";
+/// The line under the rows after a keyring write whose write mark the keyring refused (MOD-90 D3,
+/// R1 M-1). Not a failure: the write landed, and this process rebuilds its provider.
+const MARK_REFUSED: &str = "the keyring refused htui/infisical-write-mark: a running htui worker sees the last write only after a restart if it left the values unchanged (an identity entered again)";
 /// The guide under the rows after a latching refusal (M2 D5).
 const LATCHED: &str = "the last login was refused: walks, chats and checks are refused until the identity is entered again (e on Identity)";
 /// `c` on the URL row.
@@ -373,6 +376,12 @@ pub struct SecretsSection {
     /// check runs in a spawned task, which can wait out a walk's keyring read and build after a
     /// write sent later, and can answer before an earlier write's read-back does.
     written_generation: u64,
+    /// The last landed keyring write's write mark was refused (MOD-90 D3, R1 M-1): a running
+    /// `htui worker` misses that write until it restarts if it left the values unchanged, so
+    /// [`MARK_REFUSED`] stays under the rows, as [`LATCHED`] does. Only the next landed keyring
+    /// write changes it, whose stored mark carries every write before it; a re-read cannot tell
+    /// whether another process has seen the write, so it keeps the line.
+    mark_refused: bool,
     /// The last scope check per project of this workspace, this session.
     scope_checks: BTreeMap<ProjectId, (DateTime<Utc>, Result<usize, SecretError>)>,
     /// Writes sent this session: numbers each write, so a landing one can tell whether it was
@@ -918,7 +927,8 @@ impl SecretsSection {
             )
     }
 
-    /// The rows: the four fixed ones, the `Projects` line, one per project, then the guide.
+    /// The rows: the four fixed ones, the `Projects` line, one per project, then the guide and
+    /// [`MARK_REFUSED`] (R1 M-1).
     fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let style_of = |index: usize| {
@@ -940,11 +950,12 @@ impl SecretsSection {
         }
         lines.push(Line::default());
         self.project_lines(&mut lines, width, theme);
-        if let Some(guide) = self.guide() {
+        let room = usize::from(width).saturating_sub(2).max(1);
+        let mark = self.mark_refused.then_some(MARK_REFUSED);
+        for note in [self.guide(), mark].into_iter().flatten() {
             lines.push(Line::default());
-            let room = usize::from(width).saturating_sub(2).max(1);
             lines.extend(
-                wrapped(guide, room)
+                wrapped(note, room)
                     .into_iter()
                     .map(|line| Line::styled(format!("  {line}"), theme.dim)),
             );
@@ -1158,10 +1169,18 @@ impl SecretsSection {
 
     /// A keyring write's own answer (R1 M-1): fresh rows, and what the write did when it is this
     /// section's write in flight. Any landed keyring write rebuilds a provider built before it
-    /// (A-4); its `generation` says which (R1 L-1).
-    fn on_keyring_written(&mut self, request: &str, generation: u64, snapshot: &SecretsSnapshot) {
+    /// (A-4); its `generation` says which (R1 L-1). `mark_stored` sets or drops [`MARK_REFUSED`]
+    /// (MOD-90 D3, R1 M-1).
+    fn on_keyring_written(
+        &mut self,
+        request: &str,
+        generation: u64,
+        mark_stored: bool,
+        snapshot: &SecretsSnapshot,
+    ) {
         self.on_snapshot(snapshot);
         self.written_generation = self.written_generation.max(generation);
+        self.mark_refused = !mark_stored;
         let said = match self.busy.filter(|busy| busy.name() == request) {
             Some(Write::Url) => URL_STORED,
             Some(Write::ClearUrl) => URL_CLEARED,
@@ -1417,9 +1436,10 @@ impl SettingsSection for SecretsSection {
             StoreReply::SecretsWritten {
                 request,
                 generation,
+                mark_stored,
                 snapshot,
             } => {
-                self.on_keyring_written(request, *generation, snapshot);
+                self.on_keyring_written(request, *generation, *mark_stored, snapshot);
             }
             // Passive: fresh rows and tokens, never this section's write's answer (H-4).
             StoreReply::Hierarchy(Some(tree))
@@ -1573,6 +1593,30 @@ mod tests {
 
         assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
         assert_eq!(line.spans[0].content, notice);
+    }
+
+    /// MOD-90 D3, R1 M-1: a refused write mark is a dim line under the rows, never an error.
+    #[test]
+    fn a_refused_write_mark_is_a_dim_line_under_the_rows() {
+        let theme = Theme::default();
+        let section = SecretsSection {
+            mark_refused: true,
+            ..SecretsSection::new()
+        };
+        let lines = section.lines(100, &theme);
+        let shown: Vec<&Line<'_>> = lines
+            .iter()
+            .filter(|line| line.to_string().contains("htui/infisical-write-mark"))
+            .collect();
+        assert_eq!(shown.len(), 1, "{lines:?}");
+        assert_eq!(shown[0].style, theme.dim);
+        assert!(
+            !SecretsSection::new()
+                .lines(100, &theme)
+                .iter()
+                .any(|line| line.to_string().contains("write-mark")),
+            "no line without a refused mark"
+        );
     }
 
     /// No mode prints what was typed into it; a notice prints its length.

@@ -1625,6 +1625,11 @@ pub enum StoreReply {
         /// The keyring-write generation this write made (R1 L-1): a provider built at a lower
         /// one is rebuilt on the next `provider()` (blueprint A-4).
         generation: u64,
+        /// Whether the write mark was stored after the write (MOD-90 D3, R1 M-1). `false` is not a
+        /// failure: the write landed and this process rebuilds its provider, but another process
+        /// (`htui worker`) misses a write that left the values unchanged until it restarts, and
+        /// the Secrets section says so.
+        mark_stored: bool,
         /// The keyring rows read after the write.
         snapshot: SecretsSnapshot,
     },

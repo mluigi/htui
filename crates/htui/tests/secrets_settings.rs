@@ -348,6 +348,16 @@ fn generation_of(reply: &StoreReply) -> u64 {
     }
 }
 
+/// Whether a keyring write's own answer says its write mark was stored (MOD-90 D3, R1 M-1), or a
+/// panic.
+#[track_caller]
+fn mark_stored_of(reply: &StoreReply) -> bool {
+    match reply {
+        StoreReply::SecretsWritten { mark_stored, .. } => *mark_stored,
+        other => panic!("expected a keyring write's answer, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn every_landed_keyring_write_answers_a_higher_generation() {
     // R1 L-1: the section compares a provider check's generation with these.
@@ -394,7 +404,12 @@ async fn every_landed_keyring_write_stores_a_new_mark() {
     assert_eq!(last, None, "an empty keyring has no mark");
     for request in the_four_writes() {
         let name = request.name();
-        keyring_written_of(serve(&backend, &request).await, name);
+        let reply = serve(&backend, &request).await;
+        assert!(
+            mark_stored_of(&reply),
+            "{name}: the reply says the mark landed (R1 M-1)"
+        );
+        keyring_written_of(reply, name);
         let mark = mark_now();
         assert!(mark.is_some(), "{name} stores a mark");
         assert_ne!(mark, last, "{name} stores a new mark");
@@ -431,6 +446,10 @@ async fn a_refused_mark_write_still_answers_written() {
         let name = request.name();
         let reply = serve(&backend, &request).await;
         let generation = generation_of(&reply);
+        assert!(
+            !mark_stored_of(&reply),
+            "{name}: the reply says the mark was refused (R1 M-1)"
+        );
         keyring_written_of(reply, name);
         assert!(generation > last, "{name}: {generation} after {last}");
         last = generation;
@@ -1156,6 +1175,7 @@ fn keyring_landed(request: &'static str, keyring_reply: StoreReply) -> StoreRepl
         StoreReply::Secrets(snapshot) => StoreReply::SecretsWritten {
             request,
             generation: 1,
+            mark_stored: true,
             snapshot,
         },
         other => panic!("expected a keyring snapshot, got {other:?}"),
@@ -1793,6 +1813,60 @@ async fn a_landed_identity_write_lifts_the_latch_line_until_the_next_check() {
 
     bench.reply(&mut section, &refused(1));
     assert!(frame(&bench, &section).contains(latch));
+}
+
+#[tokio::test]
+async fn a_refused_write_mark_shows_until_a_write_stores_one() {
+    // MOD-90 D3, R1 M-1: the write landed, so its own line says so and nothing is refused; the
+    // refused mark is a line under the rows, as the latch line is. A re-read keeps it (it cannot
+    // tell whether another process has seen the write); the next landed write that stores a mark
+    // drops it, since that mark carries every write before it.
+    let notice = "the keyring refused htui/infisical-write-mark";
+    let landed = |generation, mark_stored| match configured() {
+        StoreReply::Secrets(snapshot) => StoreReply::SecretsWritten {
+            request: "set_machine_identity",
+            generation,
+            mark_stored,
+            snapshot,
+        },
+        other => panic!("expected a keyring snapshot, got {other:?}"),
+    };
+    let store_identity = |bench: &SectionBench, section: &mut SecretsSection| {
+        go_to(bench, section, ROW_IDENTITY);
+        bench.key(section, "e");
+        type_text(bench, section, CLIENT_ID);
+        bench.key(section, "Tab");
+        type_text(bench, section, SECRET);
+        bench.key(section, "Enter");
+        assert!(matches!(
+            requests(bench).as_slice(),
+            [StoreRequest::SetMachineIdentity(_)]
+        ));
+    };
+    let (bench, mut section, _) = loaded(configured()).await;
+    assert!(!frame(&bench, &section).contains(notice));
+
+    store_identity(&bench, &mut section);
+    bench.reply(&mut section, &landed(1, false));
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(notice), "{shown}");
+    assert!(
+        shown.contains("identity stored"),
+        "the write landed: {shown}"
+    );
+    assert!(bench.errors().is_empty(), "a refused mark is not a failure");
+
+    bench.key(&mut section, "r");
+    let _ = bench.drained();
+    bench.reply(&mut section, &configured());
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(notice), "a re-read keeps it: {shown}");
+
+    store_identity(&bench, &mut section);
+    bench.reply(&mut section, &landed(2, true));
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains(notice), "{shown}");
+    assert!(shown.contains("identity stored"), "{shown}");
 }
 
 #[tokio::test]
