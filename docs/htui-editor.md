@@ -39,7 +39,9 @@ child, which is what lets `Ctrl+C` reach the editor and lets htui end it. It als
 must be **one command**:
 
 - `VAR=x nvim` (a leading assignment) does not start.
-- `a && b`, `a; b` and pipes run only their first part, or nothing.
+- `a; b` and `a && b` run only `a`, and without the file: `exec` replaces the shell, so `b`
+  (which the file was appended to) never runs.
+- `a | b` runs both sides, and only `b` gets the file.
 
 Wrap anything more in a small script and point `$VISUAL` at the script.
 
@@ -113,7 +115,7 @@ If the pane cannot start (no pseudo-terminal available), the view says so and su
 
 | Key | When | Does |
 |---|---|---|
-| `Ctrl+\`, shown as `Ctrl+4` | always | gives htui the keys, and back to the editor |
+| `Ctrl+\`, shown as `Ctrl+4` | always, except under a modal prompt ([below](#while-the-editor-is-open-the-m1-lock)) | gives htui the keys, and back to the editor |
 | `Ctrl+x` | htui has the keys | aborts the edit: the editor is killed, nothing is read back |
 | `q` | htui has the keys | quits htui at once; the editor is killed, the edit is lost |
 | `Ctrl+C` | htui has the keys | quits htui, as everywhere in htui |
@@ -143,14 +145,16 @@ In this first version, while an editor is open and htui has the keys, htui answe
 keys in the table above: `Ctrl+4`, `Ctrl+x`, `q`, `?` and `Ctrl+C`. Every other key is refused
 with `the editor is open: Ctrl+4 to the editor · Ctrl+x abort`, and nothing in the view, the tab
 bar or an overlay moves. A paste goes to the editor while it has the keys (as a bracketed paste
-when the editor asked for one) and is dropped otherwise.
+when the editor asked for one); while htui has the keys it is dropped, unless a modal prompt is
+open, which takes it as it takes the keys.
 
 - `q` and `Ctrl+C` quit at once, without a confirmation, and kill the editor: an unsaved edit is
   lost. Leave the editor normally (`:wq`, `Ctrl+X`) to keep it.
 - A modal prompt that a store reply opens during the edit (a migration prompt, say) takes htui's
-  keys: the status line reads `the editor is open: answer or close the prompt first`. Answer or
-  close it; then the lock is back. The first key you type for the editor when such a prompt
-  appears is swallowed rather than answering a prompt you had not seen yet.
+  keys: the status line reads `the editor is open: answer or close the prompt first`. Keys and
+  pastes go to the prompt, `Ctrl+4` included (`Ctrl+C` still quits). Answer or close it; then the
+  lock is back. The first key you type for the editor when such a prompt appears is swallowed
+  rather than answering a prompt you had not seen yet.
 - The editor stays with the tab that asked. Should a reply move htui to another tab, the first
   key typed for the editor is swallowed the same way, and `Ctrl+4` brings the editor's tab back
   with the keys.
