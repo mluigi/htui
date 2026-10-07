@@ -4558,8 +4558,10 @@ enum TurnEnd {
 /// MOD-86 D7: why a chat's session did not start: the transport refused it, or the text it was to
 /// open with did not scrub clean and was never sent.
 ///
-/// An enum rather than a `DriverError`: a `Transport("not sent …")` would claim a wire fault where
-/// nothing reached a wire, and `falls_back` and D60's `Spawn` re-probe both read the error.
+/// An enum rather than a `DriverError`. `DriverError::Scrub(Unmasked)` carries the rule but no
+/// section name, so its message could not say "not sent: the handoff matches …" (D9); and a
+/// `Transport("not sent …")` would claim a wire fault where nothing reached a wire, while
+/// `falls_back` and D60's `Spawn` re-probe both read the error.
 enum StartFailure {
     Driver(DriverError),
     Refused(SectionRefused),
@@ -5020,7 +5022,8 @@ pub async fn run_chat(args: ChatArgs) {
     }
 }
 
-/// Drives one turn: pulls events, records them, and serves commands while a request is parked.
+/// Drives one turn: pulls events, records them, and serves commands throughout: while a request
+/// is parked, and ahead of every pull.
 ///
 /// This is [`htui_agent::record::pump`]'s shape with one difference the plan's D28 did not have:
 /// `pump` cannot cross a parked permission request — `next_event` refuses while one is
@@ -7046,6 +7049,7 @@ pub(crate) mod tests {
         inner: Box<dyn AgentDriver>,
         probe: Arc<StallProbe>,
         at: StallAt,
+        sends: SendLog,
     }
 
     impl AgentDriver for StallDriver {
@@ -7064,6 +7068,11 @@ pub(crate) mod tests {
         ) -> htui_agent::driver::DriverFuture<'a, Box<dyn AgentSession>> {
             Box::pin(async move {
                 let inner = self.inner.start(spec, prompt).await?;
+                // The spy sits under the stall, so it sees only what reached the driver.
+                let inner = Box::new(SendSpy {
+                    inner,
+                    sends: Arc::clone(&self.sends),
+                });
                 Ok(Box::new(StallSession {
                     inner,
                     probe: Arc::clone(&self.probe),
@@ -7156,6 +7165,7 @@ pub(crate) mod tests {
         adapter: Arc<FakeAdapter>,
         probe: Arc<StallProbe>,
         at: StallAt,
+        sends: SendLog,
     }
 
     impl htui_agent::registry::TransportBuilder for StallBuilder {
@@ -7169,6 +7179,7 @@ pub(crate) mod tests {
                 inner: self.adapter.build(agent, on_box, caps)?,
                 probe: Arc::clone(&self.probe),
                 at: self.at,
+                sends: Arc::clone(&self.sends),
             }))
         }
     }
@@ -7178,6 +7189,23 @@ pub(crate) mod tests {
         script: Script,
         at: StallAt,
     ) -> (MemStore, Backend, AgentRuntime, AgentId, Arc<StallProbe>) {
+        let (store, backend, runtime, agent_id, probe, _sends) =
+            fixture_with_stall_and_sends(script, at).await;
+        (store, backend, runtime, agent_id, probe)
+    }
+
+    /// [`fixture_with_stall`], keeping the follow-ups that reached the driver too.
+    async fn fixture_with_stall_and_sends(
+        script: Script,
+        at: StallAt,
+    ) -> (
+        MemStore,
+        Backend,
+        AgentRuntime,
+        AgentId,
+        Arc<StallProbe>,
+        SendLog,
+    ) {
         let store = MemStore::from_demo(htui_core::fixtures::demo_data());
         let agent_id = AgentId::new();
         store
@@ -7187,6 +7215,7 @@ pub(crate) mod tests {
         let adapter = Arc::new(FakeAdapter::new());
         adapter.load(script);
         let probe = Arc::new(StallProbe::default());
+        let sends: SendLog = Arc::new(Mutex::new(Vec::new()));
         let mut factory = DriverFactory::new();
         factory.register(
             "cli/fake",
@@ -7194,11 +7223,12 @@ pub(crate) mod tests {
                 adapter,
                 probe: Arc::clone(&probe),
                 at,
+                sends: Arc::clone(&sends),
             }),
         );
         let backend = Backend::memory(store.clone());
         let runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
-        (store, backend, runtime, agent_id, probe)
+        (store, backend, runtime, agent_id, probe, sends)
     }
 
     /// Spawns `served`'s task, waits for its session to reach the stall, serves `then(step_id)` in
@@ -7579,6 +7609,67 @@ pub(crate) mod tests {
         assert!(
             stream_ends(&replies, StopReason::Cancelled),
             "the stream ends cancelled: {replies:?}"
+        );
+    }
+
+    /// MOD-87 D3 (review R1 M-1): follow-ups deferred mid-turn and then stranded by a cancel
+    /// that cuts the turn are answered once each, in the order they were sent, as an ended chat
+    /// answers them; none reaches the driver.
+    #[tokio::test]
+    async fn follow_ups_deferred_behind_a_cut_turn_are_answered_once_in_order() {
+        let script = Script::one_turn(vec![say("partial"), ScriptEvent::ExpectCancel]);
+        let (_store, backend, mut runtime, agent_id, probe, sends) =
+            fixture_with_stall_and_sends(script, StallAt::AfterChunk).await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let served = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await;
+
+        let (_step_id, replies) = at_stall(
+            &mut runtime,
+            &backend,
+            (tx, rx),
+            served,
+            &probe,
+            |step_id| {
+                vec![
+                    send_at(8, step_id, "x"),
+                    send_at(9, step_id, "y"),
+                    cancel_at(10, step_id),
+                ]
+            },
+        )
+        .await;
+
+        for seq in [8, 9] {
+            assert!(
+                matches!(
+                    at_seq(&replies, seq).as_slice(),
+                    [StoreReply::Failed { request: "chat_send", message }]
+                        if message == "this chat has ended"
+                ),
+                "the send at {seq} is answered exactly once: {replies:?}"
+            );
+        }
+        assert!(
+            matches!(
+                at_seq(&replies, 10).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::Cancelled
+                })]
+            ),
+            "{replies:?}"
+        );
+        assert!(sends_of(&sends).is_empty(), "nothing reached the driver");
+        let position = |seq: Seq| {
+            replies
+                .iter()
+                .position(|reply| reply.seq == seq)
+                .unwrap_or_else(|| panic!("an answer at {seq}: {replies:?}"))
+        };
+        assert!(
+            position(8) < position(9),
+            "first in, first answered: {replies:?}"
         );
     }
 
@@ -9301,7 +9392,7 @@ pub(crate) mod tests {
             (runtime, host)
         }
 
-        /// The number of rows in `step`'s log, as `backend`'s writer reads it.
+        /// The kind of every row in `step`'s log, in order, as `backend`'s writer reads it.
         async fn rows_of(backend: &Backend, step: htui_core::model::StepId) -> Vec<EventKind> {
             backend
                 .writer()
@@ -16674,7 +16765,8 @@ done
         use std::time::Duration;
 
         use htui_agent::conformance::{Script, ScriptEvent};
-        use htui_agent::driver::SessionSpec;
+        use htui_agent::driver::{AgentSessionRef, SessionSpec};
+        use htui_agent::error::DriverError;
         use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
         use htui_core::fixtures::ids;
         use htui_core::model::{EventKind, StepId};
@@ -17383,6 +17475,69 @@ done
                 "no row holds the value"
             );
             assert!(!format!("{replies:?}").contains(VALUE), "no frame holds it");
+        }
+
+        /// MOD-86 D7 (review R1 L-2): a failed resume's handoff that scrubs clean is sent
+        /// masked: the second start, the opening's `follow_up` row and its frame all carry the
+        /// masked copy. On a provider project, because only a resolved env reaches a promotion's
+        /// scrubber (`with_session_env` seeds `start`, which a promotion does not pass through).
+        #[tokio::test]
+        async fn a_fallback_handoff_is_masked_before_it_is_sent() {
+            let (store, backend, runtime, agent_id, starts) = fixture_with_failing_starts(
+                echo("ok"),
+                vec![DriverError::Transport("gone".to_owned())],
+            )
+            .await;
+            plant(&store, Some(INFISICAL));
+            let mut runtime = runtime.with_secret_source(resolving(&[("API_KEY", VALUE)]));
+            let path = OpeningPath::Resume {
+                session_ref: AgentSessionRef::new("banner-1"),
+                text: htui_orch::promote::RESUME_OPENING.to_owned(),
+                fallback: Some(htui_orch::HandoffText {
+                    text: format!("use {VALUE}"),
+                    digest: "d".to_owned(),
+                }),
+            };
+
+            let replies = attach_and_end(
+                &mut runtime,
+                &backend,
+                promoted(agent_id, path),
+                async |_| {},
+            )
+            .await;
+
+            let starts = starts_of(&starts);
+            assert_eq!(starts.len(), 2, "the resume, then the handoff");
+            assert_eq!(starts[1].1, "use [REDACTED]");
+            assert_eq!(
+                texts(&store, ids::STEP_PLAN, EventKind::FollowUp)
+                    .await
+                    .last()
+                    .map(String::as_str),
+                Some("use [REDACTED]")
+            );
+            assert!(
+                replies.iter().any(|reply| matches!(
+                    &reply.reply,
+                    StoreReply::Chat(ChatFrame::Event(envelope))
+                        if matches!(&envelope.event, DriverEvent::Other(other)
+                            if other.update == "follow_up"
+                                && other.body["text"] == "use [REDACTED]")
+                )),
+                "the opening's frame is masked: {replies:?}"
+            );
+            assert!(
+                !format!("{replies:?}").contains(VALUE),
+                "no frame holds the value"
+            );
+            assert!(
+                rows(&store, ids::STEP_PLAN)
+                    .await
+                    .iter()
+                    .all(|row| !row.contains(VALUE)),
+                "no row holds it"
+            );
         }
     }
 }
