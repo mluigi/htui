@@ -266,3 +266,12 @@ command or an overlay answer (`d6dc29f4`, and this round). (2) Unfocused under a
 take `on_key`'s overlay path (C3, the overlay, `Esc`/help, the modal swallow), so the prompt can be
 answered and the asking tab is never reached. (3) `editor_status` reads unfocused whenever the
 editor does not have the keys (off screen or covered).
+
+**T6 notes (refinements of blueprint §8.1, recorded per verify).** (1) `Ctrl+E` in Templates and
+Library moves the draft out of `Mode::Editing` into the pending handoff (`Pending { resume: true }`)
+before the editor opens, so `render_draft` never ran and nothing was claimed for the editor's whole
+life. While that handoff is pending, both views now draw the handed-off draft in `Mode::Browse`
+(`handed_off()`), claim its text rect, and show the hint `HANDED_OFF_HINT` ("the draft is in
+$EDITOR") instead of browse (`afd7ce3d`). Browse's `E` has no draft, draws browse and claims nothing
+(F-12). (2) `compose::render` and `item_form::render` return their body rect, and their callers
+claim it (PD-3, `2080cbac`).
