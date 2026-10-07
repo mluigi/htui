@@ -53,7 +53,7 @@ Use one identity per purpose, with read access to only what htui needs.
 ## Keyring entries
 
 htui keeps the server and the identity in three entries of the OS keyring, under the service
-`htui`, next to the Postgres DSN, plus a fourth that marks every change to them:
+`htui`, next to the Postgres DSN, plus a fourth that marks every write to them:
 
 | Entry | Holds |
 |---|---|
@@ -100,12 +100,16 @@ The keys, in browse:
   `c` clears.
 - **`e` on Identity** opens two empty fields, the client ID and the client secret (`Tab` moves
   between them). The client secret is masked as it is typed or pasted, and is never shown or read
-  back. Both halves are required, and spaces around either one are dropped. Storing replaces both
+  back. Both halves are required, and whitespace around either one is dropped. Storing replaces both
   entries, even when only one has changed.
   The Identity row never shows the client ID; it is visible only in the field while you type it.
 - **`c` on URL or Identity** asks first (`y` / `n`). Clearing the identity removes both halves
   together. `c` is offered on Identity when it is stored, half stored or unreadable, since
   clearing both halves is the fix for the last two.
+  If the keyring refuses the [write mark](#keyring-entries) after a URL or identity write or
+  clear, the write still lands, and a line under the rows says a running `htui worker` may need
+  a restart, until the next such write stores a mark
+  ([Logins, tokens and lockout safety](#logins-tokens-and-lockout-safety)).
 - **`t` on Provider, URL, Identity or Health** checks the provider: it calls Infisical's status
   endpoint, then logs in **afresh** with the stored identity. The Health row then reads
   `last check <time>: server ok · login ok` (`server status not ok` when the status endpoint
@@ -415,9 +419,12 @@ cases stay open:
 
 The resolved map and the masking list are wiped from memory when htui drops them: a walk's when
 the walk ends, a chat's map once its environment is built and its masking list when the chat
-ends, and a refused map at once. Infisical's response bodies, values included, are read into a
-buffer that is wiped as it grows and when it is dropped. Two copies are not htui's to wipe:
+ends, and a refused map at once. htui's own copy of Infisical's response bodies, values included,
+is read into a buffer that is wiped as it grows and when it is dropped. Three copies are not
+htui's to wipe:
 
+- the HTTP client's receive and TLS buffers, which the body passes through on its way to htui's
+  copy;
 - the environment handed to the agent's driver (`SessionSpec.env`, a plain map, and the copies the
   driver makes from it to start the agent);
 - the agent process's own environment block, which the operating system keeps for the life of
@@ -453,12 +460,15 @@ provider **one** refused login:
   refused login (`BadCredentials`): only a body read in full can show the lockout text.
 - To try again, enter the identity again in Settings > Secrets. Any URL or identity write
   there, a clear included and even of the same identity, gives the next walk, chat or check a new
-  provider with a clean slate, in the TUI and in an `htui worker` running as its own process
-  alike: the worker sees the write through the [write mark](#keyring-entries) at its next walk or
-  chat. Nothing else clears a refused login, so htui never retries one on its own. If the keyring
-  refuses the mark, the write itself still lands and the TUI still gets a new provider, but the log
-  says `the keyring write mark was not stored; another htui process sees this write after a
-  restart`: restart the worker then.
+  provider with a clean slate, in the TUI and in an `htui worker` on the same machine (same OS
+  keyring) alike: the worker sees the write through the [write mark](#keyring-entries) at its next
+  walk or chat. Nothing else clears a refused login, so htui never retries one on its own. If the
+  keyring refuses the mark, the write itself still lands and the TUI still gets a new provider,
+  but a running worker misses a write that left the values unchanged (an identity entered again)
+  until it restarts. Settings > Secrets says so under the rows (`the keyring refused
+  htui/infisical-write-mark: a running htui worker sees the last write only after a restart if it
+  left the values unchanged (an identity entered again)`) until the next write stores a mark, and
+  with `--log` the log has the same warning: restart the worker then.
 - A health check is a login: a refused one latches exactly as a refused walk does.
 - A login runs to its end even when the call that started it gives up (a timeout, a cancelled
   task), and concurrent calls wait for that one login. So a provider spends at most one refused
