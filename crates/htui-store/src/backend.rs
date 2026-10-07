@@ -704,6 +704,39 @@ impl Backend {
         }
     }
 
+    /// MOD-12 D3 (review M1): the drain's close of exactly `batch`, only while it is still
+    /// drained (no entry on its box, no live run of its own); `None` when it did not close.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn close_drained_batch(
+        &self,
+        batch: BatchId,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        match self {
+            Self::Memory(store) => store.close_drained_batch(batch, at).await,
+            Self::Online { pg, .. } => pg.close_drained_batch(batch, at).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 (review H1): the items with a `cancelled` run under `batch`, in uuid order.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn batch_cancelled_items(&self, batch: BatchId) -> Result<Vec<ItemId>> {
+        match self {
+            Self::Memory(store) => store.batch_cancelled_items(batch).await,
+            Self::Online { pg, .. } => pg.batch_cancelled_items(batch).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
     /// MOD-12 D3, D9: the runs admitted under `batch`, `(id, status)` by `(queued_at, id)`.
     ///
     /// # Errors

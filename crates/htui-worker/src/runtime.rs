@@ -16,9 +16,9 @@ use htui_agent::error::DriverError;
 use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BatchClose, BoxId, BoxProfile, CancelRequest, Executor, ItemId,
-    ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus,
-    SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order, free_slots,
+    AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, ProjectId, RepoId,
+    Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
+    WorkspaceId, admission_limit, admission_order, free_slots,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -2063,7 +2063,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
     };
     if entries.is_empty() {
-        drain(ctx, box_id, &batch).await;
+        drain(ctx, &batch).await;
         return;
     }
     let mut project_ids: Vec<ProjectId> = Vec::new();
@@ -2083,6 +2083,20 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         }
     };
+    // Review H1: a cancel sticks for the rest of its batch. The cancel moved the item back to
+    // `open` with its entry kept (D9: membership is the user's call), so without this the next
+    // sweep would admit it again; a pause and a resume open a new batch, which does.
+    let cancelled = match host.batch_cancelled_items(batch.id).await {
+        Ok(cancelled) => cancelled,
+        Err(err) => {
+            tracing::debug!(%err, "the queue runner could not read its batch's cancelled items");
+            return;
+        }
+    };
+    let ready: Vec<_> = ready
+        .into_iter()
+        .filter(|item| cancelled.binary_search(&item.id).is_err())
+        .collect();
     let order = admission_order(&entries, &ready);
     if order.is_empty() {
         return;
@@ -2144,23 +2158,16 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
 }
 
-/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live.
+/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live. The
+/// close is of exactly the batch `admit` read, and re-checks both conditions in the same write
+/// (review M1), so a pause and a resume between the reads and the close are never undone.
 async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
-    box_id: BoxId,
     batch: &htui_core::model::QueueBatch,
 ) {
-    let host = &ctx.host;
-    match host.batch_runs(batch.id).await {
-        Ok(runs) if runs.iter().all(|(_, status)| status.is_terminal()) => {}
-        Ok(_) => return,
-        Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read its batch's runs");
-            return;
-        }
-    }
-    match host
-        .close_batch(box_id, BatchClose::Drained, ctx.shared.clock.now())
+    match ctx
+        .host
+        .close_drained_batch(batch.id, ctx.shared.clock.now())
         .await
     {
         Ok(Some(_)) => tracing::info!(batch = %batch.id, "the queue drained"),

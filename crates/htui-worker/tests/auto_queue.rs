@@ -1120,6 +1120,177 @@ async fn a_rested_walk_wakes_the_sweep() {
     );
 }
 
+/// (l) Review H1: a cancelled auto run sticks for the rest of its batch. The cancel moves the
+/// item back to `open` and its entry stays, but the queue runner does not admit it again under
+/// the batch that ran it; a pause and a resume (a new batch) do.
+#[tokio::test]
+async fn a_cancelled_auto_run_is_not_readmitted_in_its_batch() {
+    let h = Harness::open().await;
+    let item = mint_ana(&h.store, "cancelled", 0).await;
+    h.queue(item).await;
+    let batch = h.resume().await;
+    let backend = h.backend();
+    let sink = TestSink::default();
+    let mut runtime = h.runtime();
+    runtime.sweep_with(&backend, &sink);
+    settle(&mut runtime).await;
+    let run = h.only_run(item).await;
+    assert_eq!(run.status, RunStatus::AwaitingApproval, "parked at verdict");
+
+    let cancel = RunRequest::Orch(OrchRequest::Command(Command::CancelRun { run: run.id }));
+    let _ = runtime
+        .serve_request(&backend, &sink, 3, cancel, &LiveChats::default())
+        .await;
+    settle(&mut runtime).await;
+    runtime.sweep_with(&backend, &sink);
+    settle(&mut runtime).await;
+    let only = h.only_run(item).await;
+    assert_eq!(
+        (only.id, only.status),
+        (run.id, RunStatus::Cancelled),
+        "the cancel sticks: no second run under the batch"
+    );
+    assert_eq!(h.status(item).await, Status::Open, "cancel moves it back");
+    assert_eq!(
+        h.store
+            .queue_entries(ids::BOX)
+            .await
+            .expect("the read answers")
+            .iter()
+            .map(|entry| entry.item_id)
+            .collect::<Vec<_>>(),
+        [item],
+        "the entry stays: queue membership is the user's call (D9)"
+    );
+    assert_eq!(
+        h.store.batch_runs(batch).await.expect("the read answers"),
+        vec![(run.id, RunStatus::Cancelled)]
+    );
+
+    h.store
+        .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
+        .await
+        .expect("the write answers")
+        .expect("the batch was open");
+    let next = h.resume().await;
+    runtime.sweep_with(&backend, &sink);
+    settle(&mut runtime).await;
+    let runs = h.runs(item).await;
+    assert_eq!(runs.len(), 2, "a new batch admits it once: {runs:?}");
+    let again = runs
+        .iter()
+        .find(|row| row.id != run.id)
+        .expect("the second run");
+    assert_eq!(again.mode, RunMode::Auto);
+    assert_eq!(
+        h.store.batch_runs(next).await.expect("the read answers"),
+        vec![(again.id, again.status)]
+    );
+}
+
+/// (m) Review H2, criterion 27: a pause stops the closed batch's runs still waiting to be
+/// claimed. Two runs are admitted; the second overlaps the first and waits `queued`. The pause
+/// cancels it (its item back to `open`, its entry kept), so when the first run ends nothing of
+/// the paused batch starts; a resume admits the item again.
+#[tokio::test]
+async fn pausing_cancels_the_batch_runs_still_waiting() {
+    let h = Harness::overlapping().await;
+    let (a, b) = (
+        mint_ana(&h.store, "a", 1).await,
+        mint_ana(&h.store, "b", 0).await,
+    );
+    h.queue(a).await;
+    h.queue(b).await;
+    let batch = h.resume().await;
+    let backend = h.backend();
+    let sink = TestSink::default();
+    let mut runtime = h.runtime();
+    runtime.sweep_with(&backend, &sink);
+    eventually("one run runs and the other exists", || async {
+        let (ra, rb) = (h.runs(a).await, h.runs(b).await);
+        ra.len() == 1 && rb.len() == 1 && [ra[0].status, rb[0].status].contains(&RunStatus::Running)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (ra, rb) = (h.only_run(a).await, h.only_run(b).await);
+    let (running, waiting, waiting_item) = if ra.status == RunStatus::Running {
+        (ra, rb, b)
+    } else {
+        (rb, ra, a)
+    };
+    assert_eq!(running.status, RunStatus::Running);
+    assert_eq!(
+        waiting.status,
+        RunStatus::Queued,
+        "the claim refused it (Overlaps)"
+    );
+
+    h.store
+        .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
+        .await
+        .expect("the write answers")
+        .expect("the batch was open");
+    assert_eq!(
+        h.only_run(waiting_item).await.status,
+        RunStatus::Cancelled,
+        "the pause cancelled the run still waiting"
+    );
+    assert_eq!(h.status(waiting_item).await, Status::Open);
+    assert!(
+        h.store
+            .queue_entries(ids::BOX)
+            .await
+            .expect("the read answers")
+            .iter()
+            .any(|entry| entry.item_id == waiting_item),
+        "the entry is kept"
+    );
+
+    h.parts.open();
+    settle(&mut runtime).await;
+    let rested = h
+        .runs(if waiting_item == a { b } else { a })
+        .await
+        .into_iter()
+        .next()
+        .expect("the running run");
+    assert_eq!(rested.id, running.id);
+    assert_eq!(
+        rested.status,
+        RunStatus::AwaitingApproval,
+        "the pause stopped nothing running"
+    );
+    h.store
+        .finish_run(rested.id, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("a parked run cancels");
+    runtime.sweep_with(&backend, &sink);
+    settle(&mut runtime).await;
+    let still = h.only_run(waiting_item).await;
+    assert_eq!(
+        (still.id, still.status),
+        (waiting.id, RunStatus::Cancelled),
+        "nothing of the paused batch starts"
+    );
+    assert_eq!(
+        h.store
+            .batch_runs(batch)
+            .await
+            .expect("the read answers")
+            .len(),
+        2
+    );
+
+    h.resume().await;
+    runtime.sweep_with(&backend, &sink);
+    settle(&mut runtime).await;
+    assert_eq!(
+        h.runs(waiting_item).await.len(),
+        2,
+        "a resume admits the cancelled item again"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The cases over Postgres
 // ---------------------------------------------------------------------------------------------

@@ -3135,7 +3135,8 @@ async fn p_resumes_then_pauses_the_queue() {
     assert_ne!(reopened.id, opened.id, "a resume opens a new batch (D2)");
 }
 
-/// D9: a pause names the batch's runs it leaves running.
+/// D9, review H2: a pause names the batch's runs it leaves running, and cancels (rather than
+/// counts) the ones still waiting to be claimed.
 #[tokio::test]
 async fn pausing_names_the_runs_still_running() {
     let store = MemStore::demo();
@@ -3143,30 +3144,59 @@ async fn pausing_names_the_runs_still_running() {
         .open_batch(ids::BOX, ids::USER, demo_at(2, 8))
         .await
         .expect("the batch opens");
-    store
-        .create_run(NewRun {
-            id: RunId::new(),
-            project_id: ids::PROJECT_HTUI,
-            item_id: ids::HTUI_ANA_2,
-            mode: RunMode::Auto,
-            target_box_id: ids::BOX,
-            started_by: ids::USER,
-            graph_snapshot: GraphSnapshot {
+    let mut admitted = Vec::new();
+    for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
+        let run = store
+            .create_run(NewRun {
+                id: RunId::new(),
+                project_id: ids::PROJECT_HTUI,
+                item_id: item,
                 mode: RunMode::Auto,
-                ..bare_snapshot()
-            },
-            repo_scope: Vec::new(),
-            queued_at: demo_at(2, 8),
-            batch_id: Some(batch.id),
-        })
-        .await
-        .expect("the run is admitted under the batch");
-    // No run runtime: nothing claims the run, so it stays `queued`, which is live.
+                target_box_id: ids::BOX,
+                started_by: ids::USER,
+                graph_snapshot: GraphSnapshot {
+                    mode: RunMode::Auto,
+                    ..bare_snapshot()
+                },
+                repo_scope: Vec::new(),
+                queued_at: demo_at(2, 8),
+                batch_id: Some(batch.id),
+            })
+            .await
+            .expect("the run is admitted under the batch");
+        admitted.push(run.id);
+    }
+    // No run runtime: the first is claimed by hand, the second stays `queued`.
+    assert_eq!(
+        store
+            .claim_run(
+                admitted[0],
+                ids::BOX,
+                uuid::Uuid::now_v7(),
+                demo_at(2, 9),
+                MAX_LEASE_TTL
+            )
+            .await
+            .expect("the claim reads"),
+        Claim::Admitted,
+    );
     let mut harness = backlog_over(store.clone()).await;
     keys(&mut harness, &["P"]).await;
     assert_eq!(
         harness.app().status.as_deref(),
         Some("queue paused \u{2014} 1 run still running")
+    );
+    let statuses: Vec<RunStatus> = store
+        .batch_runs(batch.id)
+        .await
+        .expect("the memory store never fails")
+        .into_iter()
+        .map(|(_, status)| status)
+        .collect();
+    assert_eq!(
+        statuses,
+        [RunStatus::Running, RunStatus::Cancelled],
+        "the pause cancelled the run still waiting"
     );
 }
 

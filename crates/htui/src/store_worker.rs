@@ -1564,10 +1564,10 @@ pub enum QueueWrite {
         /// Whether a batch was open before this write.
         already: bool,
     },
-    /// The batch closed `paused` with `live` of its runs `queued` or `running`; `already` when
-    /// none was open.
+    /// The batch closed `paused` with `live` of its runs `running`; `already` when none was
+    /// open. The close cancelled the batch's runs still `queued` (review H2), so none is counted.
     Paused {
-        /// The closed batch's runs still `queued` or `running`.
+        /// The closed batch's runs still `running`.
         live: usize,
         /// Whether no batch was open, so nothing closed.
         already: bool,
@@ -2156,9 +2156,7 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
                         .batch_runs(closed.id)
                         .await?
                         .iter()
-                        .filter(|(_, status)| {
-                            matches!(status, RunStatus::Queued | RunStatus::Running)
-                        })
+                        .filter(|(_, status)| *status == RunStatus::Running)
                         .count(),
                     already: false,
                 },

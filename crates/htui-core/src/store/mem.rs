@@ -979,20 +979,77 @@ impl MemStore {
 
     /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
     ///
+    /// In the same closure every run of the batch still `queued` is cancelled through
+    /// [`State::finish_run`], so its item goes back to `open` and its queue entry stays (review
+    /// H2): a pause stops the runs nobody has claimed yet. A `drained` close finds none.
+    ///
     /// # Errors
-    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    /// Never in practice: a `queued` run always cancels. The signature matches `PgStore`'s so
+    /// `Backend` can dispatch over both.
     pub async fn close_batch(
         &self,
         box_id: BoxId,
         reason: BatchClose,
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
+        let now = self.now();
+        self.write(|state| {
+            let Some(id) = state.open_batch_of(box_id).map(|batch| batch.id) else {
+                return Ok(None);
+            };
+            let stamp = at.trunc_subsecs(TIMESTAMPTZ_DIGITS);
+            let mut waiting: Vec<&Run> = state
+                .run_batches
+                .iter()
+                .filter(|(_, of)| **of == id)
+                .filter_map(|(run, _)| state.runs.get(run))
+                .filter(|row| row.status == RunStatus::Queued)
+                .collect();
+            waiting.sort_by_key(|row| (row.queued_at, row.id));
+            let waiting: Vec<RunId> = waiting.into_iter().map(|row| row.id).collect();
+            for run in waiting {
+                state.finish_run(run, RunStatus::Cancelled, None, stamp, now)?;
+            }
+            Ok(state.queue_batches.get_mut(&id).map(|batch| {
+                batch.closed_at = Some(stamp);
+                batch.closed_reason = Some(reason);
+                batch.clone()
+            }))
+        })
+    }
+
+    /// MOD-12 D3 (review M1): the drain's close, of exactly `batch` and only while it is still
+    /// drained: open, its box with no queue entry, and no run of its own `queued`, `running` or
+    /// `awaiting_approval`; one closure, as `PgStore`'s one UPDATE. `None` when it did not close.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn close_drained_batch(
+        &self,
+        batch: BatchId,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
         Ok(self.write(|state| {
-            let id = state.open_batch_of(box_id)?.id;
-            let batch = state.queue_batches.get_mut(&id)?;
-            batch.closed_at = Some(at.trunc_subsecs(TIMESTAMPTZ_DIGITS));
-            batch.closed_reason = Some(reason);
-            Some(batch.clone())
+            let row = state.queue_batches.get(&batch)?;
+            let box_id = row.box_id;
+            if row.closed_at.is_some()
+                || state
+                    .queue_entries
+                    .values()
+                    .any(|entry| entry.box_id == box_id)
+                || state
+                    .run_batches
+                    .iter()
+                    .filter(|(_, of)| **of == batch)
+                    .filter_map(|(run, _)| state.runs.get(run))
+                    .any(|row| row.status.is_active())
+            {
+                return None;
+            }
+            let row = state.queue_batches.get_mut(&batch)?;
+            row.closed_at = Some(at.trunc_subsecs(TIMESTAMPTZ_DIGITS));
+            row.closed_reason = Some(BatchClose::Drained);
+            Some(row.clone())
         }))
     }
 
@@ -1028,6 +1085,25 @@ impl MemStore {
                 .collect();
             runs.sort_by_key(|row| (row.queued_at, row.id));
             runs.into_iter().map(|row| (row.id, row.status)).collect()
+        }))
+    }
+
+    /// MOD-12 (review H1): the items with a `cancelled` run under `batch`, in uuid order (`ItemId`'s
+    /// `Ord`, Postgres' uuid order). The queue runner admits none of them again under that batch.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn batch_cancelled_items(&self, batch: BatchId) -> Result<Vec<ItemId>> {
+        Ok(self.read(|state| {
+            let items: BTreeSet<ItemId> = state
+                .run_batches
+                .iter()
+                .filter(|(_, of)| **of == batch)
+                .filter_map(|(run, _)| state.runs.get(run))
+                .filter(|row| row.status == RunStatus::Cancelled)
+                .filter_map(|row| row.item_id)
+                .collect();
+            items.into_iter().collect()
         }))
     }
 
