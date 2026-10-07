@@ -230,6 +230,8 @@ impl PtyChild {
 
         // The wait thread first: from here on, it owns the child and every kill goes through it.
         let (kill_tx, kill_rx) = mpsc::channel::<()>();
+        // Dropped by the wait thread once the child is reaped; the writer thread waits for it.
+        let (reaped_tx, reaped_rx) = mpsc::channel::<()>();
         // Only for the one path where the thread cannot start: `Builder::spawn` then drops the
         // closure, and the child with it, unkilled. The child is not reaped yet, so its pid is
         // still its own.
@@ -237,7 +239,10 @@ impl PtyChild {
         let wait_events = events.clone();
         let waiting = thread::Builder::new()
             .name("htui-pane-wait".to_owned())
-            .spawn(move || wait_for(child, &kill_rx, id, started, &wait_events));
+            .spawn(move || {
+                wait_for(child, &kill_rx, id, started, &wait_events);
+                drop(reaped_tx);
+            });
         let waiting = match waiting {
             Ok(waiting) => waiting,
             Err(err) => {
@@ -287,7 +292,10 @@ impl PtyChild {
                         break;
                     }
                 }
-                // `writer` drops here, after `input` did: the pane is being dropped (F-10).
+                // `writer` drops after `input` did (the pane is being dropped, F-10) **and** after
+                // the child is reaped: its drop types `\n` and VEOF, which a child that ignores
+                // SIGHUP would still read in the grace before SIGKILL (T2 verify round 3).
+                let _ = reaped_rx.recv();
             })?;
 
         let threads = vec![waiting, reading, writing];
@@ -1390,6 +1398,37 @@ mod tests {
             pane.child.kill();
             let status = pane.exited(Duration::from_secs(3)).await.expect("reaped");
             assert!(!status.success(), "{status:?}");
+        }
+
+        #[tokio::test]
+        async fn dropping_the_pane_types_nothing_into_a_child_that_outlives_sighup() {
+            // T2 verify round 3: the PTY writer's drop writes `\n` and VEOF. It must not happen
+            // while a child that ignores SIGHUP is still reading, in the grace before SIGKILL.
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("note.md");
+            let pane = Pane::spawn(script(
+                &dir,
+                "trap '' HUP; stty raw -echo; printf ready; dd bs=1 count=2 of=\"$1\" 2>/dev/null; exec sleep 30",
+                &file,
+            ));
+            let mut pane = pane;
+            pane.until_shown("ready").await;
+            let Pane { child, mut rx, .. } = pane;
+            drop(child);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(left, rx.recv())
+                    .await
+                    .expect("Exited in time")
+                {
+                    Some(PaneEvent::Exited { .. }) => break,
+                    Some(PaneEvent::Output { .. }) => {}
+                    None => panic!("the pane ended without Exited"),
+                }
+            }
+            let typed = std::fs::read(&file).unwrap_or_default();
+            assert!(typed.is_empty(), "the dying child read {typed:?}");
         }
 
         /// Waits (up to 10 s) for the script to write a pid into `pidfile`.
