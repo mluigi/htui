@@ -6176,7 +6176,7 @@ where
         // that sleeps through its lease writes nothing once another process has adopted it.
         .with_fence(StepFence::Lease(self.parts.owner));
         // MOD-12 M2 D6: the run's remainder and, for a batch run, the batch's, whichever is less.
-        let allowance = self.allowance(run, &settings).await?;
+        let allowance = self.allowance(run).await?;
         if let Some(allowance) = allowance {
             recorder = recorder.with_run_cap(RunCap {
                 micros: allowance.micros,
@@ -6196,27 +6196,30 @@ where
         Ok((recorder, allowance.and_then(|allowance| allowance.batch)))
     }
 
-    /// MOD-12 M2 D6: this session's [`Allowance`]: the run term from `settings` (the live project
-    /// settings `open_recorder` already reads for `per_token_cap_run`, unchanged) less the run's
-    /// own spend so far, and, for a batch run, the batch term from the snapshot (plan D2). The
-    /// snapshot is decoded only for a batch run. A separate `async fn` so `open_recorder`'s frame
-    /// stays small (blueprint H-1).
-    async fn allowance(
-        &self,
-        run: &Run,
-        settings: &ProjectSettings,
-    ) -> Result<Option<Allowance>, EngineError> {
+    /// MOD-12 M2 D6: this session's [`Allowance`]: the run term from the run's snapshot (the
+    /// `per_token_cap_run` the walk's rule 2 reads, [`walk_candidates`](Self::walk_candidates))
+    /// less the run's own spend so far, and, for a batch run, the batch term from the snapshot too
+    /// (plan D2). Review R1 (M1): the run term was the live project's cap, so a cap lowered after
+    /// the snapshot below the run's spend let the walk admit a session that was then handed `0`
+    /// and cut at its first costed row, on every retry; one raised never unblocked the walk.
+    ///
+    /// Every caller ([`session`](Self::session), `candidate_live`, `judge_sessions`) is a graph
+    /// run's walk holding a [`SnapshotPhase`] decoded from this same snapshot, so the decode
+    /// cannot newly fail here. Neither a chat run (`graph_snapshot` NULL, never walked) nor a
+    /// promoted step reaches it: a promotion hands the worker an [`Opening`] and the engine opens
+    /// no recorder for that chat, so their behaviour is unchanged. A separate `async fn` so
+    /// `open_recorder`'s frame stays small (blueprint H-1).
+    async fn allowance(&self, run: &Run) -> Result<Option<Allowance>, EngineError> {
+        let caps = Self::snapshot_of(run)?.settings;
         let steps = self.parts.store.run_steps(run.id).await?;
-        let batch = match self.parts.store.run_batch_spend(run.id).await? {
-            Some((id, spent)) => Some((
-                id,
-                Self::snapshot_of(run)?.settings.per_token_cap_batch,
-                spent,
-            )),
-            None => None,
-        };
+        let batch = self
+            .parts
+            .store
+            .run_batch_spend(run.id)
+            .await?
+            .map(|(id, spent)| (id, caps.per_token_cap_batch, spent));
         Ok(session_allowance(
-            settings.per_token_cap_run,
+            caps.per_token_cap_run,
             select::run_spend(&steps),
             batch,
         ))
