@@ -7402,6 +7402,23 @@ pub async fn claim_fake(
     engine.claim(run).await
 }
 
+/// [`Engine::enqueue_in_batch`] over a `FakeOrchestrator`'s parts (MOD-12 M2 conformance).
+///
+/// # Errors
+/// [`Engine::enqueue`]'s.
+#[cfg(feature = "test-support")]
+pub async fn enqueue_in_batch_fake(
+    orch: &crate::fake::FakeOrchestrator,
+    item: ItemId,
+    batch: BatchId,
+) -> Result<RunId, EngineError> {
+    let graphs = orch.graphs();
+    let driver = |_candidate: &SnapshotCandidate, key: &SessionKey<'_>| orch.driver_for_key(key);
+    let scrubber = RunSecrets::new(orch.secret_source());
+    let engine = Engine::new(fake_parts(orch, &graphs, &driver, &scrubber).await?);
+    engine.enqueue_in_batch(item, batch).await
+}
+
 /// [`Engine::resume`] over the same parts (ANA-2 §12 criterion 3).
 ///
 /// # Errors
