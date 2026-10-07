@@ -100,7 +100,7 @@ blueprint `7c492de4` (amendments A-1..A-11).
 Blueprint amendments that changed behaviour:
 - **A-4:** re-entering the **same** identity forces a provider rebuild via a keyring-write generation in
   `crates/htui/src/secrets.rs`; without it a latched provider survived until restart. The generation is per process
-  (see MOD-90).
+  (see MOD-90, done: `docs/decisions/mod/mod-90.md`, a keyring write mark carries the write across processes).
 - **A-5:** no secret source under `--demo`: a demo walk or chat on a scoped project is refused, and the section
   sends no keyring request in a demo session.
 - **A-6:** the Qdrant key field now stores what was typed. Before, a masked `TextField` always sent `""`, which the
@@ -118,7 +118,7 @@ refuted L-7. R1 applied all 9:
 - `478ca1db`: L-6 the demo doc scope, L-9 fixed URL refusal sentences;
 - `4194d0cb`, `cc040c2e`: blueprint and doc wording.
 
-L-7 and the NITs are carried in **CLEAN-8**.
+L-7 and the NITs are carried in **CLEAN-8** (done: `docs/decisions/clean/clean-8.md`).
 
 ## Commits
 
@@ -153,9 +153,9 @@ live Infisical and is not recorded yet.
 
 - **MOD-89** - warn or refuse when a run's worktree holds a `.env` file (PRD open question, decided 2026-10-03).
 - **MOD-90** - a separate `htui worker` keeps its 401 latch after the same identity is re-entered in the TUI (A-4's
-  generation is per process); documented in `docs/htui-secrets.md`.
+  generation is per process); documented in `docs/htui-secrets.md`. Done: `docs/decisions/mod/mod-90.md`.
 - **CLEAN-8** - review residuals: L-7 (`read_body` growing an unwiped `Vec<u8>`), the 7 NITs, and a `--demo` guard
-  on Settings > Qdrant's keyring arms.
+  on Settings > Qdrant's keyring arms. Done: `docs/decisions/clean/clean-8.md`.
 - **MOD-55 review L1** (`docs/decisions/mod/mod-55.md`), not filed: help turns still scrub with an empty `env`
   (pattern rules only), so `holds_mask`'s `[REDACTED]` count stays sound for now; once a help turn masks a project's
   resolved values, the runtime should report how many masks it applied. The note sits in HANDOFF under MOD-16.

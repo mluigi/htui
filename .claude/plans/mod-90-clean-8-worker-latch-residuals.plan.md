@@ -4,7 +4,7 @@
 **Routing:** plan path, no ultracode, both run together in sandbox `hr/MOD-90` (maintainer, 2026-10-07).
 **Complexity:** Medium. Ten small changes across five crates. None needs a migration, a `.sqlx` change or a changed
 snapshot.
-**Status:** CONFIRMED 2026-10-07 (D1–D6 as recommended).
+**Status:** DONE 2026-10-07 (D1–D6 as recommended; blueprint amendments A-1..A-5 accepted; R1 M-1 shown in the UI by maintainer choice). Write-ups `docs/decisions/mod/mod-90.md`, `docs/decisions/clean/clean-8.md`.
 
 ## Decisions for the maintainer (read first)
 
