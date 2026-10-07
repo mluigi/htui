@@ -2,22 +2,25 @@
 //! box's queue, the batch a queue activation is, and the pure rules the runner composes
 //! (plan D4-D6). Neither table is mirrored, so every store read of them is inherent.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::model::box_::{BoxSettings, DEFAULT_MAX_CONCURRENT_ITEMS};
-use crate::model::ids::{BatchId, BoxId, ItemId, ProjectId, UserId};
-use crate::model::item::ItemSummary;
+use crate::model::ids::{BatchId, BoxId, ItemId, ProjectId, RunId, StepId, UserId};
+use crate::model::item::{ItemSummary, Status};
+use crate::model::quota::CapError;
+use crate::model::run::{RunMode, RunStatus};
 
 str_enum!(
     /// `queue_batch.closed_reason` (MOD-12 D2, D3).
     BatchClose {
         /// `P` closed it: no new admission, running runs untouched.
         Paused => "paused",
-        /// No entry was left and no auto run of the batch was live.
+        /// Nothing was admissible and no auto run of the batch was live: the queue emptied
+        /// (M1 D3) or stalled (M3 D4, L4).
         Drained => "drained",
     }
 );
@@ -176,11 +179,293 @@ pub fn batch_budget(
     Ok(Some(remaining))
 }
 
+/// MOD-12 M3 D3: which way [`moved_order`] (and the stores' `move_queue_entry`) moves an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueMove {
+    /// One place towards the head of the queue.
+    Up,
+    /// One place towards its tail.
+    Down,
+}
+
+/// MOD-12 M3 D3: `order` with `item` swapped with its neighbour `to`; `None` when `item` is not
+/// in `order`, or is already at that end. Both stores call it, so Mem and Pg move alike.
+#[must_use]
+pub fn moved_order(order: &[ItemId], item: ItemId, to: QueueMove) -> Option<Vec<ItemId>> {
+    let _ = (order, item, to);
+    None
+}
+
+/// MOD-12 M3 D5, D6: the item's latest graph run, as [`QueueRow`] carries it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRunFact {
+    /// `run.id`.
+    pub id: RunId,
+    /// `run.status`.
+    pub status: RunStatus,
+    /// `run.mode`.
+    pub mode: RunMode,
+    /// `run.target_box_id`.
+    pub target_box_id: BoxId,
+    /// That box's `hostname`; `None` when no box row answers (Mem only; Pg's FK guarantees one).
+    pub target_hostname: Option<String>,
+    /// `run.failure`.
+    pub failure: Option<String>,
+    /// The run's first step `awaiting_approval` by `(position, attempt, fanout_index)`: a parked
+    /// gate. `None` for a judge park, which parks no step (`engine.rs` `park_selection`).
+    pub parked_step: Option<StepId>,
+}
+
+/// MOD-12 M3 D5, D6: one queue entry with what the overlay classifies it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueRow {
+    /// The `queue_entry` row (with its item's project).
+    pub entry: QueueEntry,
+    /// `item.key`, e.g. `FIX-3`.
+    pub key: String,
+    /// `item.title`.
+    pub title: String,
+    /// `item.status`.
+    pub status: Status,
+    /// `item.priority` (D2's tie-break; never written by a move).
+    pub priority: i16,
+    /// `item.created_at` (D2's second tie-break).
+    pub created_at: DateTime<Utc>,
+    /// The item's latest `kind = 'graph'` run by `(queued_at, id)`.
+    pub latest_run: Option<QueueRunFact>,
+    /// The body of the item's latest note by `(created_at, id)`, verbatim.
+    pub latest_note: Option<String>,
+    /// The keys of its live `blocked_by` targets that are not `done`/`closed`, in byte order.
+    pub open_blockers: Vec<String>,
+}
+
+/// MOD-12 M3 D5: why a ready entry is not admitted this batch: the runner's own three refusals
+/// in `admit` (M2 D4, review R1 L3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Hold {
+    /// [`batch_budget`] refused it.
+    Budget(BatchStop),
+    /// Its project's caps do not parse ([`ProjectCaps::from_settings`](crate::model::ProjectCaps)).
+    BadCap(CapError),
+    /// Its project read as absent (a delete racing the read).
+    ProjectGone,
+}
+
+/// MOD-12 M3 D5: why an entry waits without needing a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wait {
+    /// Open `blocked_by` targets, by key.
+    BlockedBy(Vec<String>),
+    /// A run of it was cancelled under the open batch (review H1).
+    CancelledInBatch,
+    /// No batch is open.
+    Paused,
+    /// Not ready for a reason the list above does not name: the item's status.
+    NotReady(Status),
+}
+
+/// MOD-12 M3 D5 (PRD hypothesis): why an entry needs a person.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Escalation {
+    /// A hard gate parked a step of the run.
+    HardGateParked {
+        /// The parked run.
+        run: RunId,
+        /// The parked step.
+        step: StepId,
+    },
+    /// A fan-out awaits a human selection: the run parked with no step parked.
+    JudgeUndecided {
+        /// The parked run.
+        run: RunId,
+        /// The item's latest note (the fan-out's selection note).
+        note: Option<String>,
+    },
+    /// The review loop gave up: item `blocked`, run `awaiting_approval`.
+    ReviewLoopExhausted {
+        /// The parked run.
+        run: RunId,
+        /// The item's latest note.
+        note: Option<String>,
+    },
+    /// The item is `blocked` with no parked run (a walk refusal, or by hand).
+    Blocked {
+        /// Its latest run, if any (for `Enter`).
+        run: Option<RunId>,
+        /// The item's latest note.
+        note: Option<String>,
+    },
+    /// The item is `failed`.
+    Failed {
+        /// Its latest run, if any (for `Enter`).
+        run: Option<RunId>,
+        /// That run's `failure`.
+        failure: Option<String>,
+    },
+    /// This box lacks tags the item requires (`R-ORCH-10`).
+    MissingTags(Vec<String>),
+}
+
+/// MOD-12 M3 D5: what one entry is doing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntryState {
+    /// A `queued` or `running` run targeted at this box.
+    Running {
+        /// The run.
+        run: RunId,
+        /// `Queued` (admitted, not claimed yet) or `Running`.
+        status: RunStatus,
+    },
+    /// A `queued` or `running` run targeted at another box (MOD-43 owns choosing; M3 reports).
+    Elsewhere {
+        /// The run.
+        run: RunId,
+        /// The target box's hostname.
+        hostname: Option<String>,
+        /// `Queued` or `Running`.
+        status: RunStatus,
+    },
+    /// Ready and admissible: the runner admits it at the next free slot.
+    Next,
+    /// Ready, but this batch will not admit it.
+    Held(Hold),
+    /// Not ready; nothing for a person to do.
+    Waiting(Wait),
+    /// A person is needed.
+    Escalated(Escalation),
+}
+
+impl EntryState {
+    /// Whether the overlay draws the row in the warning style.
+    #[must_use]
+    pub const fn is_escalated(&self) -> bool {
+        matches!(self, Self::Escalated(_))
+    }
+
+    /// The run and step `Enter` reveals (M3 D8): `(None, None)` reveals the item.
+    #[must_use]
+    pub fn reveal(&self) -> (Option<RunId>, Option<StepId>) {
+        (None, None)
+    }
+}
+
+/// MOD-12 M3 D5: the per-box, per-batch facts [`classify_entry`] reads, composed live by the
+/// serve module from the runner's own reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LiveFacts {
+    /// No batch is open.
+    pub paused: bool,
+    /// `ready_items` over the rows' projects on this box.
+    pub ready: HashSet<ItemId>,
+    /// `batch_cancelled_items` of the open batch; empty when paused.
+    pub cancelled: HashSet<ItemId>,
+    /// `missing_tags` of each `open` row that is not ready; empty lists are left out.
+    pub missing_tags: HashMap<ItemId, Vec<String>>,
+    /// The batch's [`Hold`] per project; empty when paused.
+    pub holds: HashMap<ProjectId, Hold>,
+}
+
+/// MOD-12 M3 D5: the open batch as the overlay's header shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchFigures {
+    /// `queue_batch.id`.
+    pub id: BatchId,
+    /// `queue_batch.opened_at`.
+    pub opened_at: DateTime<Utc>,
+    /// `batch_spend`, USD micros; `None` when no step reported a cost.
+    pub spent: Option<i64>,
+}
+
+/// MOD-12 M3 D5, D7: one box's queue for the overlay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueOverview {
+    /// This box.
+    pub box_id: BoxId,
+    /// The open batch; `None` is paused.
+    pub batch: Option<BatchFigures>,
+    /// `running` runs on the box plus `queued` runs targeted at it ([`free_slots`]' inputs).
+    pub slots_used: usize,
+    /// [`admission_limit`].
+    pub slots_limit: u32,
+    /// The rows in D2 order, each classified.
+    pub rows: Vec<(QueueRow, EntryState)>,
+    /// The memory backend (`htui --demo`), whose runtime never admits (M1 review L3).
+    pub demo: bool,
+}
+
+/// MOD-12 M3 D5: what `row` is doing on box `here`, given `live`. First match wins:
+///
+/// 1. a `queued`/`running` latest run targeted here is [`EntryState::Running`], 2. one targeted
+///    elsewhere is [`EntryState::Elsewhere`]; a live run beats everything below;
+/// 3. a `failed` item is [`Escalation::Failed`];
+/// 4. a `blocked` item whose latest run is parked is [`Escalation::ReviewLoopExhausted`],
+/// 5. any other `blocked` item is [`Escalation::Blocked`];
+/// 6. an `awaiting_approval` item whose parked run parked a step is
+///    [`Escalation::HardGateParked`], 7. one that parked no step is [`Escalation::JudgeUndecided`];
+/// 8. tags this box lacks are [`Escalation::MissingTags`];
+/// 9. open blockers are [`Wait::BlockedBy`];
+/// 10. a run cancelled in the open batch is [`Wait::CancelledInBatch`];
+/// 11. an item `ready_items` does not hold is [`Wait::NotReady`];
+/// 12. a closed batch is [`Wait::Paused`];
+/// 13. a [`Hold`] on the item's project is [`EntryState::Held`];
+/// 14. otherwise [`EntryState::Next`].
+///
+/// So [`EntryState::Held`] is reached only by a ready, uncancelled entry of an open batch: the
+/// complement of the runner's `admissible`.
+#[must_use]
+pub fn classify_entry(row: &QueueRow, here: BoxId, live: &LiveFacts) -> EntryState {
+    let _ = (row, here, live);
+    EntryState::Next
+}
+
+/// The first line of a note or failure: the overlay draws one row per entry, and the Runs pane
+/// holds the whole text.
+fn note_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("")
+}
+
+/// `head`, then ` (last note: …)` when there is a note.
+fn with_note(
+    f: &mut core::fmt::Formatter<'_>,
+    head: &str,
+    note: Option<&str>,
+) -> core::fmt::Result {
+    let _ = (head, note);
+    f.write_str("")
+}
+
+impl core::fmt::Display for Hold {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let _ = self;
+        f.write_str("")
+    }
+}
+
+impl core::fmt::Display for Wait {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let _ = self;
+        f.write_str("")
+    }
+}
+
+impl core::fmt::Display for Escalation {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let _ = self;
+        f.write_str("")
+    }
+}
+
+impl core::fmt::Display for EntryState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let _ = self;
+        f.write_str("")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::ids::ItemKindId;
-    use crate::model::item::Status;
     use serde_json::json;
 
     fn entry(item: ItemId, position: Option<i32>) -> QueueEntry {
@@ -355,6 +640,537 @@ mod tests {
         assert_eq!(min_budget_micros(&BTreeMap::new()), 0, "absent");
         for stray in [json!(0), json!(-5), json!("500"), json!(1.5)] {
             assert_eq!(min_budget_micros(&app(stray.clone())), 0, "{stray}");
+        }
+    }
+
+    // MOD-12 M3 T1: moved_order, classify_entry and the overlay's sentences.
+
+    const HERE_HOST: &str = "here";
+
+    fn here() -> BoxId {
+        BoxId::from_uuid(uuid::Uuid::from_u128(1))
+    }
+
+    fn there() -> BoxId {
+        BoxId::from_uuid(uuid::Uuid::from_u128(2))
+    }
+
+    fn row(status: Status) -> QueueRow {
+        QueueRow {
+            entry: entry(ItemId::new(), None),
+            key: "FIX-1".to_owned(),
+            title: "t".to_owned(),
+            status,
+            priority: 0,
+            created_at: DateTime::UNIX_EPOCH,
+            latest_run: None,
+            latest_note: None,
+            open_blockers: Vec::new(),
+        }
+    }
+
+    fn run(status: RunStatus, target: BoxId) -> QueueRunFact {
+        QueueRunFact {
+            id: RunId::new(),
+            status,
+            mode: RunMode::Auto,
+            target_box_id: target,
+            target_hostname: Some(if target == here() { HERE_HOST } else { "b" }.to_owned()),
+            failure: None,
+            parked_step: None,
+        }
+    }
+
+    /// The row's item ready, nothing else.
+    fn facts(row: &QueueRow) -> LiveFacts {
+        LiveFacts {
+            ready: HashSet::from([row.entry.item_id]),
+            ..LiveFacts::default()
+        }
+    }
+
+    fn budget_hold() -> Hold {
+        Hold::Budget(BatchStop::CapReached {
+            spent: 600,
+            cap: 500,
+        })
+    }
+
+    fn cap_error() -> CapError {
+        CapError {
+            key: crate::model::quota::PER_TOKEN_CAP_BATCH,
+            found: "\"x\"".to_owned(),
+        }
+    }
+
+    #[test]
+    fn moved_order_swaps_with_the_neighbour() {
+        let (a, b, c) = (ItemId::new(), ItemId::new(), ItemId::new());
+        assert_eq!(
+            moved_order(&[a, b, c], b, QueueMove::Up),
+            Some(vec![b, a, c])
+        );
+        assert_eq!(
+            moved_order(&[a, b, c], b, QueueMove::Down),
+            Some(vec![a, c, b])
+        );
+    }
+
+    #[test]
+    fn moved_order_is_none_at_an_end_or_off_the_list() {
+        let (a, b, c) = (ItemId::new(), ItemId::new(), ItemId::new());
+        assert_eq!(moved_order(&[a, b, c], a, QueueMove::Up), None, "head up");
+        assert_eq!(
+            moved_order(&[a, b, c], c, QueueMove::Down),
+            None,
+            "tail down"
+        );
+        assert_eq!(moved_order(&[a, b, c], ItemId::new(), QueueMove::Up), None);
+        assert_eq!(
+            moved_order(&[a, b, c], ItemId::new(), QueueMove::Down),
+            None
+        );
+        assert_eq!(moved_order(&[], a, QueueMove::Down), None, "an empty queue");
+    }
+
+    #[test]
+    fn a_live_run_here_reads_running_and_a_queued_one_admitted() {
+        let mut item = row(Status::InProgress);
+        let running = run(RunStatus::Running, here());
+        item.latest_run = Some(running.clone());
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Running {
+                run: running.id,
+                status: RunStatus::Running
+            }
+        );
+        assert_eq!(state.to_string(), "running here");
+
+        let queued = run(RunStatus::Queued, here());
+        item.status = Status::Queued;
+        item.latest_run = Some(queued.clone());
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Running {
+                run: queued.id,
+                status: RunStatus::Queued
+            }
+        );
+        assert_eq!(state.to_string(), "admitted, waiting to be claimed");
+    }
+
+    #[test]
+    fn a_live_run_elsewhere_beats_everything() {
+        let mut item = row(Status::Failed);
+        item.open_blockers = vec!["FEAT-1".to_owned()];
+        let mut live = facts(&item);
+        live.missing_tags
+            .insert(item.entry.item_id, vec!["gpu".to_owned()]);
+        live.holds.insert(item.entry.project_id, budget_hold());
+        live.cancelled.insert(item.entry.item_id);
+
+        let running = run(RunStatus::Running, there());
+        item.latest_run = Some(running.clone());
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(
+            state,
+            EntryState::Elsewhere {
+                run: running.id,
+                hostname: Some("b".to_owned()),
+                status: RunStatus::Running
+            }
+        );
+        assert_eq!(state.to_string(), "running on b");
+
+        let queued = run(RunStatus::Queued, there());
+        item.latest_run = Some(queued.clone());
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(
+            state,
+            EntryState::Elsewhere {
+                run: queued.id,
+                hostname: Some("b".to_owned()),
+                status: RunStatus::Queued
+            }
+        );
+        assert_eq!(state.to_string(), "queued for b");
+
+        let mut nameless = run(RunStatus::Running, there());
+        nameless.target_hostname = None;
+        item.latest_run = Some(nameless);
+        assert_eq!(
+            classify_entry(&item, here(), &live).to_string(),
+            "running on another box"
+        );
+    }
+
+    #[test]
+    fn a_failed_item_reads_failed_even_with_an_open_blocker() {
+        let mut item = row(Status::Failed);
+        item.open_blockers = vec!["FEAT-1".to_owned()];
+        let mut failed = run(RunStatus::Failed, here());
+        failed.failure = Some("boom\nat line 3".to_owned());
+        item.latest_run = Some(failed.clone());
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::Failed {
+                run: Some(failed.id),
+                failure: Some("boom\nat line 3".to_owned())
+            })
+        );
+        assert!(state.is_escalated());
+        assert_eq!(state.to_string(), "failed: boom");
+
+        item.latest_run = None;
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::Failed {
+                run: None,
+                failure: None
+            })
+        );
+        assert_eq!(state.to_string(), "failed");
+    }
+
+    #[test]
+    fn a_blocked_item_with_a_parked_run_reads_review_loop_exhausted() {
+        let mut item = row(Status::Blocked);
+        let parked = run(RunStatus::AwaitingApproval, here());
+        item.latest_run = Some(parked.clone());
+        item.latest_note = Some("review loop exhausted after 3 attempts".to_owned());
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::ReviewLoopExhausted {
+                run: parked.id,
+                note: Some("review loop exhausted after 3 attempts".to_owned())
+            })
+        );
+        assert_eq!(
+            state.to_string(),
+            "review loop exhausted (last note: review loop exhausted after 3 attempts)"
+        );
+
+        item.latest_note = None;
+        assert_eq!(
+            classify_entry(&item, here(), &facts(&item)).to_string(),
+            "review loop exhausted"
+        );
+    }
+
+    #[test]
+    fn a_blocked_item_without_a_parked_run_reads_blocked() {
+        let mut item = row(Status::Blocked);
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::Blocked {
+                run: None,
+                note: None
+            })
+        );
+        assert_eq!(state.to_string(), "blocked");
+
+        let done = run(RunStatus::Done, here());
+        item.latest_run = Some(done.clone());
+        item.latest_note = Some("no_candidate_agent: phase `research`".to_owned());
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::Blocked {
+                run: Some(done.id),
+                note: Some("no_candidate_agent: phase `research`".to_owned())
+            })
+        );
+        assert_eq!(
+            state.to_string(),
+            "blocked (last note: no_candidate_agent: phase `research`)"
+        );
+    }
+
+    #[test]
+    fn awaiting_approval_with_a_parked_step_reads_hard_gate_parked() {
+        let mut item = row(Status::AwaitingApproval);
+        let mut parked = run(RunStatus::AwaitingApproval, here());
+        let step = StepId::new();
+        parked.parked_step = Some(step);
+        item.latest_run = Some(parked.clone());
+        item.latest_note = Some("ignored".to_owned());
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::HardGateParked {
+                run: parked.id,
+                step
+            })
+        );
+        assert_eq!(state.to_string(), "hard gate parked");
+    }
+
+    #[test]
+    fn awaiting_approval_without_a_parked_step_reads_judge_undecided() {
+        let mut item = row(Status::AwaitingApproval);
+        let parked = run(RunStatus::AwaitingApproval, here());
+        item.latest_run = Some(parked.clone());
+        let note = "fan-out `p` attempt 2 awaits selection: 3 candidates";
+        item.latest_note = Some(note.to_owned());
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::JudgeUndecided {
+                run: parked.id,
+                note: Some(note.to_owned())
+            })
+        );
+        assert_eq!(
+            state.to_string(),
+            format!("judge undecided (last note: {note})")
+        );
+
+        item.latest_note = None;
+        assert_eq!(
+            classify_entry(&item, here(), &facts(&item)).to_string(),
+            "judge undecided"
+        );
+    }
+
+    #[test]
+    fn awaiting_approval_without_a_parked_run_is_not_ready() {
+        let mut item = row(Status::AwaitingApproval);
+        item.latest_run = Some(run(RunStatus::Done, here()));
+        let state = classify_entry(&item, here(), &LiveFacts::default());
+        assert_eq!(
+            state,
+            EntryState::Waiting(Wait::NotReady(Status::AwaitingApproval))
+        );
+        assert!(!state.is_escalated());
+        assert_eq!(state.to_string(), "not ready: item is awaiting_approval");
+    }
+
+    #[test]
+    fn missing_tags_beat_an_open_blocker() {
+        let mut item = row(Status::Open);
+        item.open_blockers = vec!["FEAT-1".to_owned()];
+        let mut live = LiveFacts::default();
+        live.missing_tags.insert(
+            item.entry.item_id,
+            vec!["cuda".to_owned(), "gpu".to_owned()],
+        );
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(
+            state,
+            EntryState::Escalated(Escalation::MissingTags(vec![
+                "cuda".to_owned(),
+                "gpu".to_owned()
+            ]))
+        );
+        assert_eq!(state.to_string(), "missing tags: cuda, gpu");
+
+        live.missing_tags.insert(item.entry.item_id, Vec::new());
+        assert_eq!(
+            classify_entry(&item, here(), &live),
+            EntryState::Waiting(Wait::BlockedBy(vec!["FEAT-1".to_owned()])),
+            "an empty tag list is no escalation"
+        );
+    }
+
+    #[test]
+    fn an_open_blocker_reads_waiting_on_its_keys() {
+        let mut item = row(Status::Open);
+        item.open_blockers = vec!["FEAT-1".to_owned(), "FEAT-2".to_owned()];
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(
+            state,
+            EntryState::Waiting(Wait::BlockedBy(vec![
+                "FEAT-1".to_owned(),
+                "FEAT-2".to_owned()
+            ]))
+        );
+        assert_eq!(state.to_string(), "waiting on FEAT-1, FEAT-2");
+    }
+
+    #[test]
+    fn cancelled_in_batch_reads_waiting() {
+        let item = row(Status::Open);
+        let mut live = facts(&item);
+        live.cancelled.insert(item.entry.item_id);
+        live.holds.insert(item.entry.project_id, budget_hold());
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(state, EntryState::Waiting(Wait::CancelledInBatch));
+        assert_eq!(
+            state.to_string(),
+            "cancelled in this batch; the next batch runs it"
+        );
+    }
+
+    #[test]
+    fn a_paused_queue_reads_paused_for_ready_entries_only() {
+        let item = row(Status::Open);
+        let mut live = facts(&item);
+        live.paused = true;
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(state, EntryState::Waiting(Wait::Paused));
+        assert_eq!(state.to_string(), "queue paused");
+
+        live.ready.clear();
+        assert_eq!(
+            classify_entry(&item, here(), &live),
+            EntryState::Waiting(Wait::NotReady(Status::Open))
+        );
+    }
+
+    #[test]
+    fn held_only_for_ready_entries_of_an_open_batch() {
+        let item = row(Status::Open);
+        let mut live = facts(&item);
+        live.holds.insert(item.entry.project_id, budget_hold());
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(state, EntryState::Held(budget_hold()));
+        assert!(!state.is_escalated());
+        assert_eq!(
+            state.to_string(),
+            "held: batch cap reached (600 of 500 micros)"
+        );
+
+        let budget = Hold::Budget(BatchStop::Budget {
+            remaining: 100,
+            min: 200,
+        });
+        assert_eq!(
+            budget.to_string(),
+            "batch budget: 100 micros left, 200 required"
+        );
+
+        let mut not_ready = live.clone();
+        not_ready.ready.clear();
+        assert_eq!(
+            classify_entry(&item, here(), &not_ready),
+            EntryState::Waiting(Wait::NotReady(Status::Open))
+        );
+
+        live.holds
+            .insert(item.entry.project_id, Hold::BadCap(cap_error()));
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(state, EntryState::Held(Hold::BadCap(cap_error())));
+        assert_eq!(state.to_string(), format!("held: {}", cap_error()));
+
+        live.holds.insert(item.entry.project_id, Hold::ProjectGone);
+        let state = classify_entry(&item, here(), &live);
+        assert_eq!(state, EntryState::Held(Hold::ProjectGone));
+        assert_eq!(state.to_string(), "held: its project is gone");
+
+        let mut other = live.clone();
+        other.holds.clear();
+        other.holds.insert(ProjectId::new(), Hold::ProjectGone);
+        assert_eq!(
+            classify_entry(&item, here(), &other),
+            EntryState::Next,
+            "another project's hold is not this entry's"
+        );
+    }
+
+    #[test]
+    fn a_ready_admissible_entry_reads_next() {
+        let item = row(Status::Open);
+        let state = classify_entry(&item, here(), &facts(&item));
+        assert_eq!(state, EntryState::Next);
+        assert!(!state.is_escalated());
+        assert_eq!(state.to_string(), "next to run");
+    }
+
+    #[test]
+    fn a_settled_live_run_does_not_shadow_the_item() {
+        let mut item = row(Status::Open);
+        item.latest_run = Some(run(RunStatus::Cancelled, there()));
+        assert_eq!(
+            classify_entry(&item, here(), &facts(&item)),
+            EntryState::Next,
+            "a cancelled run elsewhere is not live"
+        );
+
+        item.status = Status::InProgress;
+        assert_eq!(
+            classify_entry(&item, here(), &LiveFacts::default()).to_string(),
+            "not ready: item is in_progress"
+        );
+    }
+
+    #[test]
+    fn a_multi_line_note_shows_its_first_line() {
+        let mut item = row(Status::Blocked);
+        item.latest_note = Some("first\nsecond".to_owned());
+        assert_eq!(
+            classify_entry(&item, here(), &facts(&item)).to_string(),
+            "blocked (last note: first)"
+        );
+    }
+
+    #[test]
+    fn reveal_names_the_run_and_the_parked_step() {
+        let (run, step) = (RunId::new(), StepId::new());
+        assert_eq!(
+            EntryState::Escalated(Escalation::HardGateParked { run, step }).reveal(),
+            (Some(run), Some(step))
+        );
+        assert_eq!(EntryState::Next.reveal(), (None, None));
+        assert_eq!(
+            EntryState::Escalated(Escalation::Failed {
+                run: Some(run),
+                failure: None
+            })
+            .reveal(),
+            (Some(run), None)
+        );
+        assert_eq!(
+            EntryState::Escalated(Escalation::Failed {
+                run: None,
+                failure: None
+            })
+            .reveal(),
+            (None, None)
+        );
+        assert_eq!(
+            EntryState::Escalated(Escalation::Blocked {
+                run: Some(run),
+                note: None
+            })
+            .reveal(),
+            (Some(run), None)
+        );
+        assert_eq!(
+            EntryState::Running {
+                run,
+                status: RunStatus::Running
+            }
+            .reveal(),
+            (Some(run), None)
+        );
+        assert_eq!(
+            EntryState::Elsewhere {
+                run,
+                hostname: None,
+                status: RunStatus::Queued
+            }
+            .reveal(),
+            (Some(run), None)
+        );
+        for parked in [
+            Escalation::JudgeUndecided { run, note: None },
+            Escalation::ReviewLoopExhausted { run, note: None },
+        ] {
+            assert_eq!(EntryState::Escalated(parked).reveal(), (Some(run), None));
+        }
+        for idle in [
+            EntryState::Held(Hold::ProjectGone),
+            EntryState::Waiting(Wait::Paused),
+            EntryState::Escalated(Escalation::MissingTags(vec!["gpu".to_owned()])),
+        ] {
+            assert_eq!(idle.reveal(), (None, None), "{idle}");
         }
     }
 }
