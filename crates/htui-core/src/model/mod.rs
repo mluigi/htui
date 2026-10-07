@@ -148,8 +148,10 @@ pub use persona::{
     RuleLineError, SnapshotPersona,
 };
 pub use queue::{
-    BatchClose, BatchStop, MIN_BUDGET_FOR_NEW_ATTEMPT, QueueBatch, QueueEntry, admission_limit,
-    admission_order, batch_budget, free_slots, min_budget_micros,
+    BatchClose, BatchFigures, BatchStop, EntryState, Escalation, Hold, LiveFacts,
+    MIN_BUDGET_FOR_NEW_ATTEMPT, QueueBatch, QueueEntry, QueueMove, QueueOverview, QueueRow,
+    QueueRunFact, Wait, admission_limit, admission_order, batch_budget, classify_entry, free_slots,
+    min_budget_micros, moved_order,
 };
 pub use queue_settings::{
     QueueSetting, USD_NOT_A_NUMBER, USD_TOO_LARGE, USD_TOO_PRECISE, WINDOW_EMPTY, WINDOW_SHAPE,
