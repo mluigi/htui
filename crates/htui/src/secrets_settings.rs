@@ -185,6 +185,9 @@ pub enum SecretCheck {
     Provider {
         /// When the check finished.
         at: DateTime<Utc>,
+        /// The keyring-write generation the checked provider was built at (R1 L-1): its latch is
+        /// the shared provider's only while no landed write has a higher one.
+        generation: u64,
         /// The provider's health, or why there was none.
         outcome: std::result::Result<ProviderHealth, SecretError>,
     },
@@ -216,9 +219,13 @@ pub async fn snapshot(backend: &Backend) -> Result<SecretsSnapshot> {
             identity: IdentityState::NotApplicable,
         });
     }
-    tokio::task::spawn_blocking(|| SecretsSnapshot {
-        url: url_state(secret::get_infisical_url()),
-        identity: identity_state(secret::get_machine_identity()),
+    tokio::task::spawn_blocking(|| {
+        // R1 L-2: never half of a write.
+        let _io = crate::secrets::keyring_io();
+        SecretsSnapshot {
+            url: url_state(secret::get_infisical_url()),
+            identity: identity_state(secret::get_machine_identity()),
+        }
     })
     .await
     .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))
@@ -267,8 +274,8 @@ fn seam_sentence(err: &StoreError) -> String {
 /// URL is normalised again (defensive: the section already did) and a refusal is `Failed` with
 /// normalisation's sentence, which never echoes the URL. An identity with a blank half is
 /// refused with [`IDENTITY_INCOMPLETE`]. Every write that lands bumps the keyring-write
-/// generation (blueprint A-4) and answers a fresh snapshot under its own name
-/// ([`StoreReply::SecretsWritten`], R1 M-1); the read answers [`StoreReply::Secrets`].
+/// generation (blueprint A-4) and answers it and a fresh snapshot under its own name
+/// ([`StoreReply::SecretsWritten`], R1 M-1, L-1); the read answers [`StoreReply::Secrets`].
 ///
 /// # Errors
 ///
@@ -277,7 +284,7 @@ fn seam_sentence(err: &StoreError) -> String {
 /// one of this module's, which `try_serve` never sends here.
 pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
     let demo = matches!(backend, Backend::Memory(_));
-    match request {
+    let generation = match request {
         StoreRequest::SecretsInfo => return Ok(StoreReply::Secrets(snapshot(backend).await?)),
         StoreRequest::SetInfisicalUrl(_)
         | StoreRequest::ClearInfisicalUrl
@@ -292,7 +299,7 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 Ok(normalised) => normalised,
                 Err(err) => return Ok(refused(request, err.to_string())),
             };
-            keyring_write(move || secret::set_infisical_url(&normalised)).await?;
+            keyring_write(move || secret::set_infisical_url(&normalised)).await?
         }
         StoreRequest::ClearInfisicalUrl => keyring_write(secret::clear_infisical_url).await?,
         StoreRequest::SetMachineIdentity(entry) => {
@@ -301,20 +308,19 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
                 return Ok(refused(request, IDENTITY_INCOMPLETE.to_owned()));
             }
             let entry = entry.clone();
-            keyring_write(move || secret::set_machine_identity(&entry.to_identity())).await?;
+            keyring_write(move || secret::set_machine_identity(&entry.to_identity())).await?
         }
-        StoreRequest::ClearMachineIdentity => {
-            keyring_write(secret::clear_machine_identity).await?;
-        }
+        StoreRequest::ClearMachineIdentity => keyring_write(secret::clear_machine_identity).await?,
         other => {
             return Err(StoreError::Backend(format!(
                 "not a secrets request: {}",
                 other.name()
             )));
         }
-    }
+    };
     Ok(StoreReply::SecretsWritten {
         request: request.name(),
+        generation,
         snapshot: snapshot(backend).await?,
     })
 }
@@ -328,16 +334,20 @@ fn refused(request: &StoreRequest, message: String) -> StoreReply {
 }
 
 /// Runs one keyring write on a blocking thread and, when it lands, notes it so the next
-/// `provider()` builds afresh (blueprint A-4).
-async fn keyring_write<F>(write: F) -> Result<()>
+/// `provider()` builds afresh (blueprint A-4); the generation it made. The write and the note
+/// happen under [`keyring_io`](crate::secrets::keyring_io) (R1 L-2), so no keyring read sees half
+/// of it, and a read that waited for it reads the generation it made only with what it wrote.
+async fn keyring_write<F>(write: F) -> Result<u64>
 where
     F: FnOnce() -> Result<()> + Send + 'static,
 {
-    tokio::task::spawn_blocking(write)
-        .await
-        .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))??;
-    crate::secrets::note_keyring_write();
-    Ok(())
+    tokio::task::spawn_blocking(move || {
+        let _io = crate::secrets::keyring_io();
+        write()?;
+        Ok(crate::secrets::note_keyring_write())
+    })
+    .await
+    .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))?
 }
 
 #[cfg(test)]

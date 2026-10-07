@@ -1780,7 +1780,8 @@ impl AgentRuntime {
     /// with [`NO_SOURCE_TO_CHECK`] at once. Otherwise a spawned task asks the shared source for its
     /// provider and the provider for its health — a status GET and a **fresh login**, which can
     /// latch the shared provider exactly as a refused walk does (M2 D5) — and answers once with
-    /// [`SecretCheck::Provider`]. The task writes no `agent_box` row, so it is a
+    /// [`SecretCheck::Provider`], carrying the keyring-write generation that provider was built at
+    /// (R1 L-1). The task writes no `agent_box` row, so it is a
     /// [`Background::reading`]: swept, awaited by `finish_background`, aborted by `shutdown`.
     fn check_provider(
         &mut self,
@@ -1798,7 +1799,9 @@ impl AgentRuntime {
         let task = tokio::spawn(answering(
             "secret provider check",
             async move {
-                let outcome = match source.provider().await {
+                let (generation, provider) =
+                    crate::secrets::provider_with_generation(source.as_ref()).await;
+                let outcome = match provider {
                     Ok(provider) => provider.health().await,
                     Err(err) => Err(err),
                 };
@@ -1808,6 +1811,7 @@ impl AgentRuntime {
                     origin: addr.origin,
                     reply: StoreReply::SecretCheck(SecretCheck::Provider {
                         at: Utc::now(),
+                        generation,
                         outcome,
                     }),
                 });

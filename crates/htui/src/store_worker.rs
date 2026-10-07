@@ -1561,6 +1561,9 @@ pub enum StoreReply {
     SecretsWritten {
         /// The write's [`StoreRequest::name`].
         request: &'static str,
+        /// The keyring-write generation this write made (R1 L-1): a provider built at a lower
+        /// one is rebuilt on the next `provider()` (blueprint A-4).
+        generation: u64,
         /// The keyring rows read after the write.
         snapshot: SecretsSnapshot,
     },

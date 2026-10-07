@@ -364,10 +364,15 @@ pub struct SecretsSection {
     checking: Option<Checking>,
     /// The last provider check of this session.
     provider_check: Option<(DateTime<Utc>, Result<ProviderHealth, SecretError>)>,
-    /// A keyring write landed after [`provider_check`](Self::provider_check): the provider that
-    /// check latched is rebuilt on the next `provider()` (blueprint A-4), so its latch line is
-    /// no longer true. The next provider check answers afresh.
-    rebuilt_since_check: bool,
+    /// The keyring-write generation the provider [`provider_check`](Self::provider_check) asked
+    /// was built at (R1 L-1).
+    check_generation: u64,
+    /// The highest keyring-write generation a landed write has answered. A provider built at a
+    /// lower one is rebuilt on the next `provider()` (blueprint A-4), so the latch line of a check
+    /// that asked it is no longer true. Decided from generations, not reply order (R1 L-1): the
+    /// check runs in a spawned task, which can wait out a walk's keyring read and build after a
+    /// write sent later, and can answer before an earlier write's read-back does.
+    written_generation: u64,
     /// The last scope check per project of this workspace, this session.
     scope_checks: BTreeMap<ProjectId, (DateTime<Utc>, Result<usize, SecretError>)>,
     /// Writes sent this session: numbers each write, so a landing one can tell whether it was
@@ -377,10 +382,11 @@ pub struct SecretsSection {
     busy_seq: u64,
     /// [`writes_sent`](Self::writes_sent) when the check in flight was sent.
     check_seq: u64,
-    /// A write sent after the check in flight has landed, and that check is about what it
-    /// replaced: the loop serves in order, so the check ran first (a keyring write against the
-    /// provider check, a project's scope write against that project's check). Its answer is
-    /// history: it latches nothing and caches no count.
+    /// A project's scope write sent after that project's scope check in flight has landed, and
+    /// the check is about what it replaced: the loop serves in order and reads the project row
+    /// before the check's task starts, so the check read first. Its answer is history: it caches
+    /// no count. Not used for the provider check, which reads the keyring in its spawned task
+    /// ([`written_generation`](Self::written_generation), R1 L-1).
     check_outdated: bool,
     /// The last outcome.
     notice: Option<Notice>,
@@ -895,9 +901,9 @@ impl SecretsSection {
     }
 
     /// Whether the last provider check latched the shared provider (M2 D5), and no keyring
-    /// write has landed since to rebuild it (A-4).
+    /// write that landed has rebuilt it (A-4, R1 L-1).
     fn latched(&self) -> bool {
-        !self.rebuilt_since_check
+        self.check_generation >= self.written_generation
             && matches!(
                 self.provider_check,
                 Some((
@@ -1125,29 +1131,24 @@ impl SecretsSection {
     }
 
     /// A keyring write's own answer (R1 M-1): fresh rows, and what the write did when it is this
-    /// section's write in flight. Any landed keyring write rebuilds the provider (A-4), so the
-    /// latch line and a provider check in flight are about what it replaced.
-    fn on_keyring_written(&mut self, request: &str, snapshot: &SecretsSnapshot) {
+    /// section's write in flight. Any landed keyring write rebuilds a provider built before it
+    /// (A-4); its `generation` says which (R1 L-1).
+    fn on_keyring_written(&mut self, request: &str, generation: u64, snapshot: &SecretsSnapshot) {
         self.on_snapshot(snapshot);
-        let outdates = self.checking == Some(Checking::Provider);
-        self.rebuilt_since_check = true;
+        self.written_generation = self.written_generation.max(generation);
         let said = match self.busy.filter(|busy| busy.name() == request) {
             Some(Write::Url) => URL_STORED,
             Some(Write::ClearUrl) => URL_CLEARED,
             Some(Write::Identity) => IDENTITY_STORED,
             Some(Write::ClearIdentity) => IDENTITY_CLEARED,
-            Some(Write::Scope { .. }) | None => {
-                self.landed(false, outdates);
-                return;
-            }
+            Some(Write::Scope { .. }) | None => return,
         };
-        self.landed(true, outdates);
         self.busy = None;
         self.say(said);
     }
 
-    /// A write landed. When it `outdates` the check in flight and was not this section's write
-    /// sent before that check, the check ran against what the write replaced.
+    /// A scope write landed. When it `outdates` the scope check in flight and was not this
+    /// section's write sent before that check, the check ran against what the write replaced.
     fn landed(&mut self, ours: bool, outdates: bool) {
         if outdates && !(ours && self.busy_seq <= self.check_seq) {
             self.check_outdated = true;
@@ -1209,7 +1210,7 @@ impl SecretsSection {
         }
     }
 
-    /// Ends the check in flight when `check` is it; whether a write outdated it.
+    /// Ends the check in flight when `check` is it; whether a scope write outdated it.
     fn answered(&mut self, check: Checking) -> bool {
         if self.checking != Some(check) {
             return false;
@@ -1221,12 +1222,16 @@ impl SecretsSection {
     /// One check's answer.
     fn on_check(&mut self, check: &SecretCheck) {
         match check {
-            SecretCheck::Provider { at, outcome } => {
-                let outdated = self.answered(Checking::Provider);
+            SecretCheck::Provider {
+                at,
+                generation,
+                outcome,
+            } => {
+                self.answered(Checking::Provider);
                 self.provider_check = Some((*at, outcome.clone()));
-                // A keyring write that landed during the check has already rebuilt what it
-                // latched (A-4).
-                self.rebuilt_since_check = outdated;
+                // Whether a landed write has rebuilt what it latched (A-4) is `latched`'s
+                // comparison, whichever reply came first (R1 L-1).
+                self.check_generation = *generation;
             }
             SecretCheck::Scope {
                 project,
@@ -1343,8 +1348,12 @@ impl SettingsSection for SecretsSection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Secrets(snapshot) => self.on_snapshot(snapshot),
-            StoreReply::SecretsWritten { request, snapshot } => {
-                self.on_keyring_written(request, snapshot);
+            StoreReply::SecretsWritten {
+                request,
+                generation,
+                snapshot,
+            } => {
+                self.on_keyring_written(request, *generation, snapshot);
             }
             // Passive: fresh rows and tokens, never this section's write's answer (H-4).
             StoreReply::Hierarchy(Some(tree))

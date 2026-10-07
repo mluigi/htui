@@ -99,6 +99,7 @@ fn keyring_written_of(reply: StoreReply, request: &str) -> SecretsSnapshot {
         StoreReply::SecretsWritten {
             request: named,
             snapshot,
+            ..
         } if named == request => snapshot,
         other => panic!("expected `{request}`'s own reply, got {other:?}"),
     }
@@ -336,6 +337,37 @@ async fn set_infisical_url_stores_the_normalised_form_and_answers_a_fresh_snapsh
         Some("https://infisical.example.com".to_owned()),
         "the normalised form is what is stored"
     );
+}
+
+/// The generation a keyring write's own answer carries, or a panic.
+#[track_caller]
+fn generation_of(reply: &StoreReply) -> u64 {
+    match reply {
+        StoreReply::SecretsWritten { generation, .. } => *generation,
+        other => panic!("expected a keyring write's answer, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn every_landed_keyring_write_answers_a_higher_generation() {
+    // R1 L-1: the section compares a provider check's generation with these.
+    let _keyring = common::mock_keyring().await;
+    let (_root, backend) = offline("secrets-generation").await;
+    let mut last = 0;
+    for request in [
+        StoreRequest::SetInfisicalUrl(STORED_URL.to_owned()),
+        StoreRequest::SetMachineIdentity(identity_entry(CLIENT_ID, SECRET)),
+        StoreRequest::ClearMachineIdentity,
+        StoreRequest::ClearInfisicalUrl,
+    ] {
+        let generation = generation_of(&serve(&backend, &request).await);
+        assert!(
+            generation > last,
+            "{}: {generation} after {last}",
+            request.name()
+        );
+        last = generation;
+    }
 }
 
 #[tokio::test]
@@ -1018,11 +1050,16 @@ fn secrets_tree_reply(tree: &HierarchySnapshot) -> StoreReply {
     StoreReply::SecretsTree(Some(Box::new(tree.clone())))
 }
 
-/// `keyring_reply`'s rows as the keyring write `request`'s own answer (R1 M-1).
+/// `keyring_reply`'s rows as the keyring write `request`'s own answer (R1 M-1), the session's
+/// first keyring write: generation 1 (R1 L-1).
 #[track_caller]
 fn keyring_landed(request: &'static str, keyring_reply: StoreReply) -> StoreReply {
     match keyring_reply {
-        StoreReply::Secrets(snapshot) => StoreReply::SecretsWritten { request, snapshot },
+        StoreReply::Secrets(snapshot) => StoreReply::SecretsWritten {
+            request,
+            generation: 1,
+            snapshot,
+        },
         other => panic!("expected a keyring snapshot, got {other:?}"),
     }
 }
@@ -1498,6 +1535,7 @@ async fn t_on_a_keyring_row_sends_one_provider_check() {
             &mut section,
             &StoreReply::SecretCheck(SecretCheck::Provider {
                 at: at(14, 2, 11),
+                generation: 0,
                 outcome: Err(SecretError::NoIdentity),
             }),
         );
@@ -1519,6 +1557,7 @@ async fn a_second_t_while_checking_is_refused() {
         &mut section,
         &StoreReply::SecretCheck(SecretCheck::Provider {
             at: at(14, 2, 11),
+            generation: 0,
             outcome: Ok(ProviderHealth {
                 base_url: STORED_URL.to_owned(),
                 server_ok: true,
@@ -1577,6 +1616,7 @@ async fn a_provider_check_shows_on_the_health_row() {
             &mut section,
             &StoreReply::SecretCheck(SecretCheck::Provider {
                 at: at(14, 2, 11),
+                generation: 0,
                 outcome,
             }),
         );
@@ -1606,6 +1646,7 @@ async fn a_latching_refusal_shows_the_latch_line() {
             &mut section,
             &StoreReply::SecretCheck(SecretCheck::Provider {
                 at: at(14, 2, 11),
+                generation: 0,
                 outcome: Err(error.clone()),
             }),
         );
@@ -1619,14 +1660,15 @@ async fn a_landed_identity_write_lifts_the_latch_line_until_the_next_check() {
     // A-4: every landed keyring write rebuilds the provider, so the latch the last check saw is
     // gone; the Health row keeps the check's own outcome, and the next check speaks again.
     let latch = "the last login was refused";
-    let refused = || {
+    let refused = |generation| {
         StoreReply::SecretCheck(SecretCheck::Provider {
             at: at(14, 2, 11),
+            generation,
             outcome: Err(SecretError::BadCredentials),
         })
     };
     let (bench, mut section, _) = loaded(configured()).await;
-    bench.reply(&mut section, &refused());
+    bench.reply(&mut section, &refused(0));
     assert!(frame(&bench, &section).contains(latch));
 
     go_to(&bench, &mut section, ROW_IDENTITY);
@@ -1651,7 +1693,7 @@ async fn a_landed_identity_write_lifts_the_latch_line_until_the_next_check() {
     assert!(!shown.contains(latch), "{shown}");
     assert!(shown.contains("last check 14:02:11"), "{shown}");
 
-    bench.reply(&mut section, &refused());
+    bench.reply(&mut section, &refused(1));
     assert!(frame(&bench, &section).contains(latch));
 }
 
@@ -1661,9 +1703,10 @@ async fn a_check_answered_after_a_later_identity_write_does_not_bring_the_latch_
     // the write lands before the answer, and A-4 rebuilds on the next `provider()`. Its refusal
     // stays on the Health row as history, and is no latch.
     let latch = "the last login was refused";
-    let refused = || {
+    let refused = |generation| {
         StoreReply::SecretCheck(SecretCheck::Provider {
             at: at(14, 2, 11),
+            generation,
             outcome: Err(SecretError::BadCredentials),
         })
     };
@@ -1688,7 +1731,8 @@ async fn a_check_answered_after_a_later_identity_write_does_not_bring_the_latch_
         &mut section,
         &keyring_landed("set_machine_identity", configured()),
     );
-    bench.reply(&mut section, &refused());
+    // Built before the write: generation 0.
+    bench.reply(&mut section, &refused(0));
     let shown = frame(&bench, &section);
     assert!(!shown.contains(latch), "{shown}");
     assert!(shown.contains("last check 14:02:11"), "{shown}");
@@ -1696,7 +1740,7 @@ async fn a_check_answered_after_a_later_identity_write_does_not_bring_the_latch_
     // The next check speaks again.
     go_to(&bench, &mut section, ROW_HEALTH);
     bench.key(&mut section, "t");
-    bench.reply(&mut section, &refused());
+    bench.reply(&mut section, &refused(1));
     assert!(frame(&bench, &section).contains(latch));
 }
 
@@ -1729,10 +1773,82 @@ async fn a_check_sent_after_an_identity_write_latches_on_its_answer() {
         &mut section,
         &StoreReply::SecretCheck(SecretCheck::Provider {
             at: at(14, 2, 11),
+            generation: 1,
             outcome: Err(SecretError::BadCredentials),
         }),
     );
     let shown = frame(&bench, &section);
+    assert!(shown.contains(latch), "{shown}");
+}
+
+#[tokio::test]
+async fn a_check_that_built_after_a_later_write_latches_on_its_answer() {
+    // R1 L-1: the check is served first but runs in a spawned task, which can wait out a walk's
+    // keyring read and build its provider after the write sent later has landed. Its answer
+    // carries that provider's generation, the write's own: the shared provider is latched now.
+    let latch = "the last login was refused";
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [
+            StoreRequest::CheckSecretProvider,
+            StoreRequest::SetMachineIdentity(_)
+        ]
+    ));
+    bench.reply(
+        &mut section,
+        &keyring_landed("set_machine_identity", configured()),
+    );
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            generation: 1,
+            outcome: Err(SecretError::BadCredentials),
+        }),
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(latch), "{shown}");
+}
+
+#[tokio::test]
+async fn a_write_answered_after_a_check_that_built_after_it_keeps_the_latch() {
+    // R1 L-1: the write lands first, but its answer waits on the keyring read-back, so the
+    // check's answer can come first. Both carry generation 1: the provider the check latched is
+    // the write's own, and the write arriving after does not lift its latch line.
+    let latch = "the last login was refused";
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            generation: 1,
+            outcome: Err(SecretError::BadCredentials),
+        }),
+    );
+    assert!(frame(&bench, &section).contains(latch));
+    bench.reply(
+        &mut section,
+        &keyring_landed("set_machine_identity", configured()),
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("identity stored"), "{shown}");
     assert!(shown.contains(latch), "{shown}");
 }
 
@@ -2270,6 +2386,7 @@ async fn a_read_sent_before_a_write_is_not_its_answer() {
         &mut section,
         &StoreReply::SecretCheck(SecretCheck::Provider {
             at: at(14, 2, 11),
+            generation: 0,
             outcome: Err(SecretError::BadCredentials),
         }),
     );
@@ -2550,6 +2667,7 @@ async fn snapshot_configured_health_ok() {
         &mut section,
         &StoreReply::SecretCheck(SecretCheck::Provider {
             at: at(14, 2, 11),
+            generation: 0,
             outcome: Ok(ProviderHealth {
                 base_url: STORED_URL.to_owned(),
                 server_ok: true,
@@ -2567,6 +2685,7 @@ async fn snapshot_health_refused() {
         &mut section,
         &StoreReply::SecretCheck(SecretCheck::Provider {
             at: at(14, 2, 11),
+            generation: 0,
             outcome: Err(SecretError::BadCredentials),
         }),
     );
