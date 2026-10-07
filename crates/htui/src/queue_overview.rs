@@ -2,11 +2,22 @@
 //! reads (`ready_items`, `batch_cancelled_items`, `batch_spend`, `batch_budget`, `admission_limit`),
 //! so the overlay says what `admit` would do. Classification is `htui_core::model::classify_entry`.
 
-use htui_core::model::QueueOverview;
+use std::collections::{HashMap, HashSet};
+
+use htui_core::model::{
+    BatchFigures, Hold, ItemId, LiveFacts, ProjectCaps, ProjectId, QueueOverview, Scope, Status,
+    WorkspaceId, admission_limit, batch_budget, classify_entry, min_budget_micros,
+};
 use htui_core::store::{Result, StoreError};
 use htui_store::Backend;
 
 /// [`StoreRequest::QueueOverview`](crate::store_worker::StoreRequest::QueueOverview)'s answer.
+///
+/// The reads follow `admit` (`htui-worker`'s runtime): the ready set is `ready_items` over the
+/// rows' projects less the batch's cancelled items, and a ready row's project is held when its
+/// caps read absent, do not parse, or `batch_budget` refuses the batch's spend. `missing_tags` is
+/// read once per `open` row that is not ready (D6's accepted N+1); a `NotFound` there (a delete
+/// racing this read) reads as no tags.
 ///
 /// # Errors
 /// `NotFound` "this box" before registration; offline, `Unreachable(DATABASE_UNREACHABLE)` from
@@ -19,14 +30,112 @@ pub async fn overview(backend: &Backend) -> Result<QueueOverview> {
             entity: "box",
             id: "this box".to_owned(),
         })?;
-    // Not composed yet (MOD-12 M3 T4): the next commit reads the queue.
+    let box_id = info.box_id;
+    let rows = backend.queue_rows(box_id).await?;
+    let batch = backend.open_batch_of(box_id).await?;
+    let cancelled: HashSet<ItemId> = match &batch {
+        Some(open) => backend
+            .batch_cancelled_items(open.id)
+            .await?
+            .into_iter()
+            .collect(),
+        None => HashSet::new(),
+    };
+
+    // The runner's placeholder scope: the entries' projects, first-seen order.
+    let mut project_ids: Vec<ProjectId> = Vec::new();
+    for row in &rows {
+        if !project_ids.contains(&row.entry.project_id) {
+            project_ids.push(row.entry.project_id);
+        }
+    }
+    let scope = Scope {
+        workspace_id: WorkspaceId::default(),
+        project_ids,
+    };
+    let ready: HashSet<ItemId> = backend
+        .ready_items(&scope, box_id)
+        .await?
+        .into_iter()
+        .map(|item| item.id)
+        .filter(|item| !cancelled.contains(item))
+        .collect();
+
+    let mut missing_tags = HashMap::new();
+    for row in &rows {
+        let item = row.entry.item_id;
+        if row.status != Status::Open || ready.contains(&item) || cancelled.contains(&item) {
+            continue;
+        }
+        let tags = match backend.missing_tags(item, box_id).await {
+            Ok(tags) => tags,
+            Err(StoreError::NotFound { .. }) => Vec::new(),
+            Err(err) => return Err(err),
+        };
+        if !tags.is_empty() {
+            missing_tags.insert(item, tags);
+        }
+    }
+
+    let app = backend.app_settings().await?;
+    let slots_used = backend.running_runs_on_box(box_id).await?
+        + backend.queued_runs_on_box(box_id).await?.len();
+    let slots_limit = admission_limit(&info.settings, &app);
+
+    let mut holds = HashMap::new();
+    let figures = match &batch {
+        Some(open) => {
+            let spent = backend.batch_spend(open.id).await?;
+            let min = min_budget_micros(&app);
+            let mut seen: HashSet<ProjectId> = HashSet::new();
+            for row in rows.iter().filter(|row| ready.contains(&row.entry.item_id)) {
+                let project = row.entry.project_id;
+                if !seen.insert(project) {
+                    continue;
+                }
+                let hold = match backend.project_settings(project).await? {
+                    None => Some(Hold::ProjectGone),
+                    Some(settings) => match ProjectCaps::from_settings(&settings) {
+                        Err(err) => Some(Hold::BadCap(err)),
+                        Ok(caps) => batch_budget(spent, caps.batch_micros, min)
+                            .err()
+                            .map(Hold::Budget),
+                    },
+                };
+                if let Some(hold) = hold {
+                    holds.insert(project, hold);
+                }
+            }
+            Some(BatchFigures {
+                id: open.id,
+                opened_at: open.opened_at,
+                spent,
+            })
+        }
+        None => None,
+    };
+
+    let live = LiveFacts {
+        paused: batch.is_none(),
+        ready,
+        cancelled,
+        missing_tags,
+        holds,
+    };
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            let state = classify_entry(&row, box_id, &live);
+            (row, state)
+        })
+        .collect();
     Ok(QueueOverview {
-        box_id: info.box_id,
-        batch: None,
-        slots_used: 0,
-        slots_limit: 0,
-        rows: Vec::new(),
-        demo: false,
+        box_id,
+        batch: figures,
+        slots_used,
+        slots_limit,
+        rows,
+        demo: matches!(backend, Backend::Memory(_)),
     })
 }
 
