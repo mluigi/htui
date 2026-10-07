@@ -889,6 +889,37 @@ mod tests {
     }
 
     #[test]
+    fn the_row_window_keeps_the_cursor_drawn() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        let rows = (1..=20)
+            .map(|n| (row(&format!("W-{n:02}"), "t"), EntryState::Next))
+            .collect();
+        bench.feed(&mut overlay, overview(rows));
+
+        // A 12-line frame holds a 10-line box: header, blank, four rows, blank, hint.
+        let top = bench.render_at(&overlay, 100, 12);
+        assert!(top.contains("> W-01"), "{top}");
+        assert!(top.contains("W-04"), "{top}");
+        assert!(!top.contains("W-05"), "{top}");
+
+        for _ in 0..19 {
+            bench.code(&mut overlay, KeyCode::Char('j'));
+        }
+        let bottom = bench.render_at(&overlay, 100, 12);
+        assert!(
+            bottom.contains("> W-20"),
+            "the cursor row is drawn: {bottom}"
+        );
+        assert!(bottom.contains("W-17"), "{bottom}");
+        assert!(!bottom.contains("W-16"), "{bottom}");
+        assert!(
+            !bottom.contains("W-01"),
+            "the first row scrolled off: {bottom}"
+        );
+    }
+
+    #[test]
     fn a_long_title_is_cut_at_its_column() {
         let bench = Bench::new();
         let mut overlay = QueueOverlay::new();
