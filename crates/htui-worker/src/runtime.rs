@@ -2254,7 +2254,10 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     // MOD-12 M2 D4: the batch's spend once per sweep, each entry's project caps live (D2), one
     // rule for runner, walk and recorder (D3). A stopped entry is skipped and the next tried: a
-    // project without a cap may still admit. A malformed cap fails closed.
+    // project without a cap may still admit. A malformed cap fails closed, and so does a project
+    // that reads as absent (review R1 L3): its caps are unknown, not unbounded. An entry goes with
+    // its item, and the item with its project (`0016_auto_queue.sql`), so an absent project is a
+    // delete racing this sweep and is said at `debug`; the next sweep no longer sees the entry.
     let spent = match host.batch_spend(batch.id).await {
         Ok(spent) => spent,
         Err(err) => {
@@ -2267,7 +2270,8 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .iter()
         .map(|entry| (entry.item_id, entry.project_id))
         .collect();
-    let mut caps: HashMap<ProjectId, Result<ProjectCaps, CapError>> = HashMap::new();
+    // `None`: the project read as absent.
+    let mut caps: HashMap<ProjectId, Option<Result<ProjectCaps, CapError>>> = HashMap::new();
     let mut admissible = Vec::with_capacity(order.len());
     for item in order {
         let Some(&project) = project_of.get(&item) else {
@@ -2275,19 +2279,22 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         };
         if let Entry::Vacant(slot) = caps.entry(project) {
             let settings = match host.project_settings(project).await {
-                Ok(settings) => settings.unwrap_or(Value::Null),
+                Ok(settings) => settings,
                 Err(err) => {
                     shared.queue_read_failed("reading a project's caps", &err);
                     return;
                 }
             };
-            slot.insert(ProjectCaps::from_settings(&settings));
+            slot.insert(settings.map(|settings| ProjectCaps::from_settings(&settings)));
         }
         match &caps[&project] {
-            Err(err) => {
+            None => {
+                tracing::debug!(batch = %batch.id, %item, %project, "the entry's project is gone; it is not admitted");
+            }
+            Some(Err(err)) => {
                 shared.note_bad_cap(batch.id, project, err);
             }
-            Ok(project_caps) => match batch_budget(spent, project_caps.batch_micros, min) {
+            Some(Ok(project_caps)) => match batch_budget(spent, project_caps.batch_micros, min) {
                 Ok(_) => admissible.push(item),
                 Err(stop) => {
                     shared.note_batch_stop(batch.id, item, &stop);
@@ -3794,7 +3801,7 @@ mod tests {
 #[cfg(test)]
 mod queue_store_errors {
     use std::collections::BTreeMap;
-    use std::sync::atomic::Ordering;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
 
     use chrono::{DateTime, Utc};
@@ -3804,9 +3811,9 @@ mod queue_store_errors {
         AgentBox, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
         DocumentHead, Item, ItemId, ItemSummary, PhaseAgent, PhaseId, ProjectId, PromptTemplate,
         QueueBatch, QueueEntry, RepoBoxPath, ResolvedGraph, Run, RunId, RunStep, RunSummary, Scope,
-        UserId, WorkspaceSummary,
+        Status, UserId, WorkspaceSummary,
     };
-    use htui_core::store::{MemStore, Result, StoreError, WorkerHost};
+    use htui_core::store::{MemStore, ReadStore as _, Result, StoreError, WorkerHost};
     use htui_store::Backend;
     use serde_json::{Value, json};
 
@@ -3834,6 +3841,9 @@ mod queue_store_errors {
     struct Failing {
         inner: Backend,
         fail: Arc<StdMutex<Option<&'static str>>>,
+        /// Review R1 L3: `project_settings` answers `Ok(None)`, as for a project deleted between
+        /// the entry read and the cap read.
+        no_project: Arc<AtomicBool>,
         seen: Arc<StdMutex<Vec<(&'static str, bool)>>>,
         shared: Arc<OnceLock<Arc<Shared<Quiet>>>>,
     }
@@ -3981,6 +3991,9 @@ mod queue_store_errors {
         }
         async fn project_settings(&self, project: ProjectId) -> Result<Option<Value>> {
             self.check("project_settings")?;
+            if self.no_project.load(Ordering::SeqCst) {
+                return Ok(None);
+            }
             WorkerHost::project_settings(&self.inner, project).await
         }
     }
@@ -3993,6 +4006,7 @@ mod queue_store_errors {
         let host = Failing {
             inner: Backend::memory(store),
             fail: Arc::default(),
+            no_project: Arc::default(),
             seen: Arc::default(),
             shared: Arc::default(),
         };
@@ -4075,6 +4089,53 @@ mod queue_store_errors {
         assert!(
             !ctx.shared.queue_failing.load(Ordering::SeqCst),
             "a drain that closes ends the streak"
+        );
+    }
+
+    /// MOD-12 M2 review R1 L3: an entry whose project reads as absent (a delete racing the
+    /// sweep) has no caps to read, so it fails closed: the engine is never asked to enqueue it,
+    /// and that is no store failure. Once its project reads again the engine is asked; the demo
+    /// has no agent for `research`, so that enqueue is refused and blocks the item, which is
+    /// what tells the two sweeps apart.
+    #[tokio::test]
+    async fn an_entry_whose_project_is_gone_is_not_admitted() {
+        let store = MemStore::demo();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the item queues");
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let status = || async {
+            store
+                .item(ids::HTUI_ANA_2)
+                .await
+                .expect("the read answers")
+                .expect("the fixture item")
+                .status
+        };
+        let before = status().await;
+        let (_runtime, host, ctx) = sweep_over(store.clone());
+        host.no_project.store(true, Ordering::SeqCst);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            status().await,
+            before,
+            "no caps to read is no enqueue, not an unbounded one"
+        );
+        assert!(
+            !ctx.shared.queue_failing.load(Ordering::SeqCst),
+            "an absent project is not a failing store"
+        );
+
+        host.no_project.store(false, Ordering::SeqCst);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            status().await,
+            Status::Blocked,
+            "with its project read, the entry reaches the engine (whose enqueue blocks it)"
         );
     }
 }
