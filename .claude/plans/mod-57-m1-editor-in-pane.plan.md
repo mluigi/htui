@@ -241,3 +241,20 @@ directory; kill escalation through the owned child; a second edit answered
 trick fails; the gate uses a mingw toolchain extracted to `/tmp/mingw`
 (`CC_x86_64_pc_windows_gnu=/tmp/mingw/mgcc AR_x86_64_pc_windows_gnu=/tmp/mingw/mar`), green at T0
 (`1c8c9e3c`).
+
+**Accepted during implementation (maintainer, 2026-10-07):**
+- **PD-10 — process-group kill.** portable-pty's kill signals the child alone, so a SIGHUP-ignoring
+  grandchild kept the slave (and the reader thread) alive. `editor::pane` signals the child's
+  process group through `rustix` (HUP, `GRACE`, KILL; `waitid(NOWAIT)` so the group id stays the
+  child's until the signals are out), on a kill and on a natural exit. `rustix` is a unix-only
+  workspace dependency (`c5743b96`); 1.1.4 with `process` was already in the graph.
+- **PD-11 — 2x2 size floor.** `vt100` 0.16.2 panics on a 1-row or 1-column grid; `PaneSize`
+  floors at 2x2 (blueprint said 1x1). No effect at `MIN_PANE` 40x8.
+
+**Wave 1 (T1-T4) notes.** Lanes merged `9e4fef58`/`30581a87`/`01809e8d`. Verify rounds found and
+fixed: wide-cell split panic on a narrowing resize, pending-wrap cursor column, rule row not reset
+over the tab, the PTY writer's `\n`+VEOF reaching a SIGHUP-ignoring child (writer now held until
+the reap), a unix-only test blocking the Windows unit-test check (`d77d40e8`). Carried to T7 and
+MOD-16: on **Windows** `Ctrl+\` arrives as `ctrl-\` (not `ctrl-4`), so only a physical `Ctrl+4`
+reaches `editor.focus` there; the docs must say the alias is unix-only, and MOD-16's Windows list
+gains the editor focus key.
