@@ -544,9 +544,10 @@ fn scope_check_failed(message: String) -> Vec<StoreReply> { /* CHECK_SECRET_SCOP
 `71 → 80` of 100 columns, verified). Appended last in `register_all`.
 
 **Reads**: `wants_requests(scope) = vec![StoreRequest::SecretsInfo,
-StoreRequest::Hierarchy(scope.workspace_id)]`. (The Hierarchy section asks for the same tree; both
-are one `(origin, kind)` staleness slot, so the older of the two replies is dropped and the newer
-reaches both sections, H-9.)
+StoreRequest::SecretsTree(scope.workspace_id)]`. (R1 L-3: the tree is read under this section's own
+name, served like `Hierarchy` and answered `SecretsTree(tree)`, so a Secrets read is never taken by
+the Hierarchy section for its own write's answer; that section adopts it passively. This replaced
+the shared `Hierarchy(ws)` slot of H-9.)
 
 **State** (hand-written `Debug` on every type holding a `TextField`; derived elsewhere):
 
@@ -639,14 +640,15 @@ every mode but `Browse`.
 
 | Reply | Effect |
 |---|---|
-| `Secrets(s)` | `unavailable = None`; replace snapshot; if `busy` is a keyring write, take it and say `URL_STORED` / `URL_CLEARED` / `IDENTITY_STORED` / `IDENTITY_CLEARED` |
-| `Hierarchy(Some(t))`, `HierarchyStale(t)`, `RepoPathsInferred { tree: t, .. }` | adopt `t` **only if** `t.workspace.id == ctx.scope.workspace_id`; clamp the cursor; never touches `busy`, `mode`, `notice` (passive) |
-| `Hierarchy(None)` | `tree = None`, clamp |
-| `SecretScopeWritten { project, tree, outcome }` | `busy` taken only if it is `Write::Scope { project: p, .. }` with `p == project`; adopt `tree` (same-workspace rule; otherwise also `ctx.request(Hierarchy(scope ws))`). `Applied` → Browse, `SCOPE_SAVED` or `SCOPE_CLEARED`, drop `scope_checks[project]`. `Stale` with `EditingScope` open → the project's row in `tree` (any workspace: the token is the row's) → `expected = updated_at`, `CHANGED_ELSEWHERE`; row absent → Browse, `DELETED_ELSEWHERE`; `Stale` with no form → `CHANGED_ELSEWHERE_CLOSED` |
-| `SecretCheck(Provider { at, outcome })` | `checking = None` if `Provider`; `provider_check = Some((at, outcome))` |
+| `Secrets(s)` | `unavailable = None`; replace snapshot. A read's answer only: never touches `busy` (R1 M-1) |
+| `SecretsWritten { request, generation, snapshot }` | a keyring write's own answer (R1 M-1): `unavailable = None`; replace snapshot; `written_generation = max(written_generation, generation)` (R1 L-1); only if `busy` is the keyring write named `request`, take it and say `URL_STORED` / `URL_CLEARED` / `IDENTITY_STORED` / `IDENTITY_CLEARED` |
+| `Hierarchy(Some(t))`, `SecretsTree(Some(t))`, `HierarchyStale(t)`, `RepoPathsInferred { tree: t, .. }` | adopt `t` **only if** `t.workspace.id == ctx.scope.workspace_id`; clamp the cursor; never touches `busy`, `mode`, `notice` (passive) |
+| `Hierarchy(None)`, `SecretsTree(None)` | `tree = None`, clamp; an open scope form or question on a project no longer in the tree closes with `DELETED_ELSEWHERE` (R1 L-4) |
+| `SecretScopeWritten { project, tree, outcome }` | `busy` taken only if it is `Write::Scope { project: p, .. }` with `p == project`; adopt `tree` (same-workspace rule; otherwise also `ctx.request(SecretsTree(scope ws))`, R1 L-3). `Applied` → Browse, `SCOPE_SAVED` or `SCOPE_CLEARED`, drop `scope_checks[project]`. `Stale` with `EditingScope` open → the project's row in `tree` (any workspace: the token is the row's) → `expected = updated_at`, `CHANGED_ELSEWHERE`; row absent → Browse, `DELETED_ELSEWHERE`; `Stale` with no form → `CHANGED_ELSEWHERE_CLOSED` |
+| `SecretCheck(Provider { at, generation, outcome })` | `checking = None` if `Provider`; `provider_check = Some((at, outcome))`; `check_generation = generation`. The latch line shows only while `check_generation >= written_generation`: a provider built before a landed write is rebuilt on the next `provider()` (A-4), whichever reply came first (R1 L-1) |
 | `SecretCheck(Scope { project, at, outcome })` | clear `checking` if it is this project; store in `scope_checks` only if the project is in `tree` |
-| `Failed { READ_NAME }` | `busy = None`, `unavailable = Some(message)` |
-| `Failed { r }` with `r ∈ REQUEST_NAMES[1..]` or `SET_PROJECT_SECRET_SCOPE` | `busy = None`, `Notice::Error(message)`; confirm modes back to Browse; an open scope form stays |
+| `Failed { READ_NAME }` | `unavailable = Some(message)`; `busy` untouched: a write's read-back failure answers under the write's name (R1 M-1) |
+| `Failed { r }` with `r ∈ REQUEST_NAMES[1..]` or `SET_PROJECT_SECRET_SCOPE` | `busy = None`, `Notice::Error(message)`; confirm modes back to Browse; an open scope form stays; a refused scope write also sends `SecretsTree(scope ws)`, whose tree closes the form if the project is gone (R1 L-4) |
 | `Failed { CHECK_SECRET_PROVIDER / CHECK_SECRET_SCOPE }` | clear `checking`, `Notice::Error(message)`; not stored as a check result |
 | anything else | ignored |
 
@@ -742,14 +744,16 @@ in `lib.rs`'s `mod tests` (or a new one).
 ## C. Data flow
 
 1. **Activation** of the Settings tab: `SettingsTab::wants_requests` collects every section's
-   reads → `SecretsInfo`, `Hierarchy(ws)` (twice, one slot) → loop `other => try_serve` →
-   `secrets_settings::snapshot` (one `spawn_blocking`, two keyring reads; Memory: none) and
-   `hierarchy::serve`. Both replies reach every section; Secrets keeps the snapshot and the tree.
+   reads → `SecretsInfo`, `SecretsTree(ws)` and Hierarchy's own `Hierarchy(ws)` (R1 L-3) → loop
+   `other => try_serve` → `secrets_settings::snapshot` (one `spawn_blocking`, two keyring reads;
+   Memory: none) and `hierarchy::serve`. Every reply reaches every section; Secrets keeps the
+   snapshot and the tree.
 2. **URL**: `e` → field → `Enter` → `normalise_base_url` on the UI task → `SetInfisicalUrl(n)` →
-   `serve` (re-normalise, keyring write, `note_keyring_write`) → `Secrets(fresh)` → `URL_STORED`.
+   `serve` (re-normalise, keyring write, `note_keyring_write`) → `SecretsWritten { fresh }` (R1
+   M-1) → `URL_STORED`.
 3. **Identity**: `e` → two fields → `Enter` → `take()` into `Zeroizing` → `IdentityEntry` →
    `SetMachineIdentity` (Debug `IdentityEntry(<redacted>)`) → `set_machine_identity` (pairwise,
-   removes both on a failed second write) → `note_keyring_write` → `Secrets(fresh)`.
+   removes both on a failed second write) → `note_keyring_write` → `SecretsWritten { fresh }`.
 4. **Next walk / chat / check**: `KeyringInfisical::provider` reads the keyring, sees a new
    generation (A-4) or changed inputs, builds a fresh `InfisicalProvider`: no latch carried over.
 5. **Health**: `t` → `CheckSecretProvider` → loop runtime arm → `AgentRuntime::check_provider` →
@@ -998,8 +1002,9 @@ other `.snap.new` appears (memory: snapshot impact needs a full insta run).
   (spawned task; `KeyringInfisical`'s own 120 s bound).
 - **H-8 `--all-features`.** `tests/*.rs` in `htui` run 0 tests without `testkit` and still say
   `ok` (memory). Every gate carries `--all-features`.
-- **H-9 Duplicate `Hierarchy(ws)` read.** Two sections, one `(origin, kind)` slot: the first
-  reply is dropped at the gate, the second reaches both. One extra read per activation; harmless.
+- **H-9 Duplicate `Hierarchy(ws)` read.** Superseded by R1 L-3: Secrets reads its tree as
+  `SecretsTree(ws)`, its own `(origin, kind)` slot, so the shared slot is gone. Two tree reads per
+  activation, one per section; harmless.
 - **H-10 `.sqlx` regeneration.** From `crates/htui-store`, never `--workspace`; always
   `-- --all-targets --all-features` or the feature-gated entries are deleted (memory). Expected
   diff: exactly one `D` and one `??`. Recovery:
