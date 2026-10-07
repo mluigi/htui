@@ -1274,3 +1274,30 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
     the blueprint settles that it **writes nothing** (no positions materialised).
 13. **"Latest run" is the latest `kind = 'graph'` run.** A chat run attached to the item is not the
     queue's run (settled here; the plan is silent).
+14. **T5 as built: three more files follow the new `[global]` action** (beyond §F-6). Every list of
+    `[global]`'s actions gains `queue`: `keys/catalogue.rs` `the_global_block_is_in_status_line_order`,
+    `keys/load.rs` `every_error_is_reported_and_sorted_by_line` (the `quitt` unknown-action report),
+    and the same report through the binary in `tests/keys_file.rs` (`:117-120`, besides `:84`,
+    `:346`, `:371`).
+15. **T5 as built: a failed overview read drops the rows.** §B.5.2 sets only `failure`; the overlay
+    also clears `overview`, so the keys over the unavailable line (`j`/`k`/`J`/`K`/`P`/`Q`/`Enter`)
+    are consumed and do nothing, as on an unread list: a reorder, pause or dequeue never acts on rows
+    the box is not showing. The next good read brings the rows back and the cursor re-finds its
+    item. Pinned by `a_failed_read_shows_the_unavailable_line`. Before the first reply and while
+    failed, the box shows no header: the reading or unavailable line, a blank, the hint.
+16. **T5 as built: a failed read backs off, and a refused write keeps the status line.** `refresh`
+    asks again after a failed read only every `REFRESHES_PER_RETRY` (10) refresh ticks (about 10 s),
+    not every tick: offline every read is refused and `App::on_reply` would re-post the refusal to the
+    status line each second. A good read ends the back-off. When a refused queue write's re-read
+    fails too, the overlay emits the write's `"{request}: {message}"` again, so the status line names
+    the write, not the read. Pinned by `a_failed_read_is_asked_again_only_every_tenth_refresh` and
+    `a_refused_write_keeps_its_own_failure_on_the_status_line`.
+17. **T5 as built: the header, the unavailable line and the hint are clipped to the box with an
+    ellipsis** (`cells::clip`), besides the sentence column. The offline message is wider than a
+    100-column box; the whole message is on the status line too. (The waiting list leaves its hint
+    uncut; MOD-81 owns width rules.)
+18. **Upgrade note for T6: `ctrl-q` is taken.** A `keys.toml` written before M3 that binds `ctrl-q`
+    in `[global]` (e.g. `quit = ["ctrl-q"]`) is now refused at startup (exit 2, "`ctrl-q` is already
+    global.queue (default) in [global]"). Rebind or unbind the queue (`queue = []`) to keep it. T6's
+    documents say so; `tests/keys_file.rs`
+    `a_global_ctrl_q_binding_collides_with_the_queue_until_queue_is_rebound` pins both.
