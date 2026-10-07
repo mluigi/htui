@@ -48,6 +48,9 @@ clap               = { workspace = true }
 crossterm          = { workspace = true }
 futures            = { workspace = true }
 ratatui            = { workspace = true }
+# MOD-57 M1 (plan P10): the in-pane editor's PTY and VT parser.
+portable-pty       = { workspace = true }
+vt100              = { workspace = true }
 # MOD-9: `signal` holds Ctrl-C and Ctrl-\ off htui while `$EDITOR` has the cooked tty (editor.rs).
 # MOD-11 blueprint H-15: `io-std`, the stdio `htui mcp` splices; named here rather than left to
 # feature unification through `htui-mcp`.

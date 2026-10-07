@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 use htui_core::prompt::render::normalise_newlines;
 
+/// The in-pane editor's process side (MOD-57 M1).
+pub mod pane;
+
 /// Below this, an unchanged return is reported as "quick" (MOD-9 blueprint D24): the shape of a
 /// GUI editor started without `--wait`, which returns at once and leaves the file untouched.
 pub const QUICK_EXIT: Duration = Duration::from_secs(1);
