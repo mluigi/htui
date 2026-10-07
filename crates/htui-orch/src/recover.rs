@@ -337,6 +337,7 @@ pub fn resettle(
     settle(&SettleInput {
         driver: &driver,
         cap_breach: None,
+        cap_batch: None,
         started_at,
         now,
         deadline_seconds: None,

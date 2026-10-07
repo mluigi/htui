@@ -3698,6 +3698,7 @@ where
                 cut: deadline_cut,
             },
             cap_breach,
+            cap_batch,
         ) = self
             .session(
                 run,
@@ -3746,6 +3747,7 @@ where
         let settled = gate::settle(&SettleInput {
             driver: &result,
             cap_breach,
+            cap_batch,
             started_at,
             now,
             deadline_seconds: phase.deadline_seconds,
@@ -4391,7 +4393,7 @@ where
 
         // -- stage 4: this candidate's own session (plan D68) ---------------------------------
         let key = SessionKey::of(step);
-        let mut recorder = self.open_recorder(run, step, prompt).await?;
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, prompt).await?;
         // MOD-37 M4 D1: what is left of the candidate's own deadline (from its `prepare`, D48).
         let deadline = self.deadline_at(phase, started_at);
         let Driven {
@@ -4452,6 +4454,7 @@ where
         let settled = gate::settle(&SettleInput {
             driver: &result,
             cap_breach,
+            cap_batch,
             started_at,
             now,
             deadline_seconds: phase.deadline_seconds,
@@ -5265,7 +5268,7 @@ where
             .await?;
         let jp = judge_phase(phase, prompts.template.clone(), candidate);
 
-        let mut recorder = self.open_recorder(run, judge, &prompts.forward).await?;
+        let (mut recorder, cap_batch) = self.open_recorder(run, judge, &prompts.forward).await?;
         let calls = self
             .judge_calls(run, &jp, attempt, judge, prompts, &prepared, &mut recorder)
             .await;
@@ -5277,7 +5280,7 @@ where
         if let Some(breach) = finished?.cap_breach {
             return Ok(Err(JudgeFailure::SessionFailed(format!(
                 "{} ({breach:?})",
-                gate::StepFailure::CapBreached
+                gate::StepFailure::CapBreached { batch: cap_batch }
             ))));
         }
         Ok(Ok(documents))
@@ -6103,8 +6106,15 @@ where
         cwd: PathBuf,
         extra_dirs: Vec<PathBuf>,
         started_at: DateTime<Utc>,
-    ) -> Result<(Driven, Option<htui_agent::record::CapBreach>), EngineError> {
-        let mut recorder = self.open_recorder(run, step, prompt).await?;
+    ) -> Result<
+        (
+            Driven,
+            Option<htui_agent::record::CapBreach>,
+            Option<BatchId>,
+        ),
+        EngineError,
+    > {
+        let (mut recorder, cap_batch) = self.open_recorder(run, step, prompt).await?;
         // MOD-37 M4 D1: what is left of the step deadline as the session starts.
         let deadline = self.deadline_at(phase, started_at);
         // A spawn failure is folded in rather than propagated straight out of the `?`: the
@@ -6136,10 +6146,11 @@ where
             }
         };
         let summary = recorder.finish().await?;
-        Ok((result, summary.cap_breach))
+        Ok((result, summary.cap_breach, cap_batch))
     }
 
-    /// A step's [`Recorder`], with the run cap applied and `prompt` recorded as its seq-0 row.
+    /// A step's [`Recorder`], with D6's allowance applied (MOD-12 M2), and the batch when its
+    /// remainder bound it, and `prompt` recorded as its seq-0 row.
     ///
     /// `record_prompt_digesting` also writes `run_step.prompt_digest`, so every session a step
     /// opens — a candidate's one, the judge's two (plan D52) — is recorded against the digest of
@@ -6151,7 +6162,7 @@ where
         run: &Run,
         step: &RunStep,
         prompt: &AssembledPrompt,
-    ) -> Result<Recorder<'a, S>, EngineError> {
+    ) -> Result<(Recorder<'a, S>, Option<BatchId>), EngineError> {
         let project = self.project(run.project_id).await?;
         let settings = Self::project_settings(&project);
         let mut recorder = Recorder::new(
@@ -6164,9 +6175,11 @@ where
         // MOD-40 plan D2: the walk's lease rides every row, usage and digest write, so a walk
         // that sleeps through its lease writes nothing once another process has adopted it.
         .with_fence(StepFence::Lease(self.parts.owner));
-        if let Some(micros) = settings.per_token_cap_run {
+        // MOD-12 M2 D6: the run's remainder and, for a batch run, the batch's, whichever is less.
+        let allowance = self.allowance(run, &settings).await?;
+        if let Some(allowance) = allowance {
             recorder = recorder.with_run_cap(RunCap {
-                micros,
+                micros: allowance.micros,
                 // Nothing in this milestone spawns a process, so a grace of zero is the honest
                 // figure; milestone 3's worker passes its own (`record.rs:157-159`).
                 grace: std::time::Duration::ZERO,
@@ -6180,7 +6193,33 @@ where
                 self.now(),
             )
             .await?;
-        Ok(recorder)
+        Ok((recorder, allowance.and_then(|allowance| allowance.batch)))
+    }
+
+    /// MOD-12 M2 D6: this session's [`Allowance`]: the run term from `settings` (the live project
+    /// settings `open_recorder` already reads for `per_token_cap_run`, unchanged) less the run's
+    /// own spend so far, and, for a batch run, the batch term from the snapshot (plan D2). The
+    /// snapshot is decoded only for a batch run. A separate `async fn` so `open_recorder`'s frame
+    /// stays small (blueprint H-1).
+    async fn allowance(
+        &self,
+        run: &Run,
+        settings: &ProjectSettings,
+    ) -> Result<Option<Allowance>, EngineError> {
+        let steps = self.parts.store.run_steps(run.id).await?;
+        let batch = match self.parts.store.run_batch_spend(run.id).await? {
+            Some((id, spent)) => Some((
+                id,
+                Self::snapshot_of(run)?.settings.per_token_cap_batch,
+                spent,
+            )),
+            None => None,
+        };
+        Ok(session_allowance(
+            settings.per_token_cap_run,
+            select::run_spend(&steps),
+            batch,
+        ))
     }
 
     /// MOD-10 D11/D12 (blueprint A-1): this walk's secrets, ready for `run`'s project before a
@@ -6320,7 +6359,8 @@ where
             permission: policy.clone(),
             retain_raw: settings.keep_raw_events,
             resume: None,
-            budget_micros: settings.per_token_cap_run,
+            // MOD-12 M2 D6: the recorder's cap, so the two read one number (D83).
+            budget_micros: recorder.run_cap().map(|cap| cap.micros),
             prompt: lease.as_ref().and_then(|lease| lease.prompt.clone()),
         };
         // MOD-37 M4 (review L3): `deadline` was fixed before the start, so the start counts
@@ -7143,6 +7183,54 @@ pub fn required_inputs(phase: &SnapshotPhase, phases: &[SnapshotPhase]) -> Vec<S
         .collect()
 }
 
+/// MOD-12 M2 D6: what one session may spend, and the batch when the batch's remainder was the
+/// binding term (so a breach can name it, D6's last bullet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Allowance {
+    /// The recorder's cap and the driver's `budget_micros`, USD micros, never below 0.
+    micros: i64,
+    /// `Some` only when the batch term is strictly smaller than the run term (or the only one).
+    batch: Option<BatchId>,
+}
+
+/// MOD-12 M2 D6: `min(run_cap - run_spent, batch_cap - batch_spent)` over the caps that are known,
+/// floored at 0; an unknown spend against a known cap reads as 0 (today's recorder starts every
+/// session at zero, so a run with no costed step keeps its whole cap). No cap known: `None`, no cap
+/// is set (unchanged). A tie names the run, so the shipped `cap breached` text is kept.
+/// `batch` is `(id, per_token_cap_batch, batch_spend)`.
+fn session_allowance(
+    run_cap: Option<i64>,
+    run_spent: Option<i64>,
+    batch: Option<(BatchId, Option<i64>, Option<i64>)>,
+) -> Option<Allowance> {
+    let run = run_cap.map(|cap| cap.saturating_sub(run_spent.unwrap_or(0)).max(0));
+    let batch_term = batch.and_then(|(id, cap, spent)| {
+        cap.map(|cap| (id, cap.saturating_sub(spent.unwrap_or(0)).max(0)))
+    });
+    match (run, batch_term) {
+        (None, None) => None,
+        (Some(micros), None) => Some(Allowance {
+            micros,
+            batch: None,
+        }),
+        (None, Some((id, micros))) => Some(Allowance {
+            micros,
+            batch: Some(id),
+        }),
+        (Some(run), Some((id, batch))) => Some(if batch < run {
+            Allowance {
+                micros: batch,
+                batch: Some(id),
+            }
+        } else {
+            Allowance {
+                micros: run,
+                batch: None,
+            }
+        }),
+    }
+}
+
 /// A promoted step's chat directories (ANA-2 `:1208-1213`): the primary repo's tree as `cwd`,
 /// else the first tree, and every other tree beside it. `None` for a step with no tree.
 fn chat_dirs(trees: &[RunStepTree], repos: &[Repo]) -> Option<(PathBuf, Vec<PathBuf>)> {
@@ -7433,9 +7521,9 @@ mod tests {
     use htui_agent::event::StopReason;
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep, NewStepGraph,
-        PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus, SnapshotCandidate,
-        SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
+        BatchId, BoxEdit, Gate, GateOutcome, GraphSnapshot, ItemPatch, NewRepo, NewRunStep,
+        NewStepGraph, PhaseId, PhasePatch, RepoId, Resolution, RunMode, RunStatus,
+        SnapshotCandidate, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepId, StepStatus,
     };
     use htui_core::store::mem::MemFault;
     use htui_core::store::{CasOutcome, MemStore, ReadStore as _, StepFence, WriteStore as _};
@@ -8194,6 +8282,101 @@ mod tests {
         }
     }
 
+    /// MOD-12 M2 D6: the session gets the smaller of the run's and the batch's remainders.
+    #[test]
+    fn session_allowance_takes_the_smaller_known_term() {
+        let batch = BatchId::new();
+        assert_eq!(
+            super::session_allowance(
+                Some(1_000),
+                Some(600),
+                Some((batch, Some(5_000), Some(4_800)))
+            ),
+            Some(super::Allowance {
+                micros: 200,
+                batch: Some(batch),
+            }),
+            "the batch's 200 binds under the run's 400"
+        );
+        assert_eq!(
+            super::session_allowance(
+                Some(1_000),
+                Some(600),
+                Some((batch, Some(5_000), Some(100)))
+            ),
+            Some(super::Allowance {
+                micros: 400,
+                batch: None,
+            }),
+            "the run's 400 binds under the batch's 4 900"
+        );
+    }
+
+    /// MOD-12 M2 D6: the batch is named only when its term binds: a tie keeps the run's text, and
+    /// a batch term with no run cap names the batch.
+    #[test]
+    fn session_allowance_names_the_batch_only_when_it_binds() {
+        let batch = BatchId::new();
+        assert_eq!(
+            super::session_allowance(Some(1_000), Some(600), Some((batch, Some(500), Some(100)))),
+            Some(super::Allowance {
+                micros: 400,
+                batch: None,
+            }),
+            "equal terms name the run"
+        );
+        assert_eq!(
+            super::session_allowance(None, Some(600), Some((batch, Some(500), Some(100)))),
+            Some(super::Allowance {
+                micros: 400,
+                batch: Some(batch),
+            }),
+            "the batch alone names the batch"
+        );
+        assert_eq!(
+            super::session_allowance(Some(1_000), None, Some((batch, None, Some(100)))),
+            Some(super::Allowance {
+                micros: 1_000,
+                batch: None,
+            }),
+            "a batch with no cap has no term"
+        );
+    }
+
+    /// MOD-12 M2 D6: an over-spent term is `0`, an unknown spend is `0`, and no cap is no cap.
+    #[test]
+    fn session_allowance_floors_at_zero_and_reads_unknown_spend_as_zero() {
+        let batch = BatchId::new();
+        assert_eq!(
+            super::session_allowance(Some(1_000), Some(1_500), None),
+            Some(super::Allowance {
+                micros: 0,
+                batch: None,
+            })
+        );
+        assert_eq!(
+            super::session_allowance(None, None, Some((batch, Some(500), Some(900)))),
+            Some(super::Allowance {
+                micros: 0,
+                batch: Some(batch),
+            })
+        );
+        assert_eq!(
+            super::session_allowance(Some(1_000), None, None),
+            Some(super::Allowance {
+                micros: 1_000,
+                batch: None,
+            }),
+            "a run with no costed step keeps its whole cap"
+        );
+        assert_eq!(
+            super::session_allowance(None, Some(600), Some((batch, None, Some(900)))),
+            None,
+            "no cap known sets no cap"
+        );
+        assert_eq!(super::session_allowance(None, None, None), None);
+    }
+
     /// Plants `project.settings.per_token_cap_run = cap_micros` on FEAT-3's project, keeping every
     /// other key of the blob: `set_project_settings` replaces the whole document.
     async fn cap_feat_3(harness: &Harness, cap_micros: i64) {
@@ -8379,9 +8562,11 @@ mod tests {
         );
     }
 
-    /// The cap half of plan D60 rule 2 through the same wiring: `prd` and `plan` each spend 600 —
-    /// under the 1000 cap per session, so the recorder's own breach (plan D70) never fires — and
-    /// `implement`'s stage 1 sees the run at 1200 of 1000 and refuses it with no minimum set.
+    /// The cap half of plan D60 rule 2 through the same wiring: `prd` and `plan` each spend 600.
+    /// Since MOD-12 M2 D6 the cap spans steps, so `plan`'s session is allowed the 400 `prd` left
+    /// and the recorder cuts it (plan D70, `cap breached`); `plan`'s next attempt's stage 1 then
+    /// sees the run at 1200 of 1000 and refuses it with no minimum set. (Before D6 each session
+    /// had the whole 1000, both passed, and `implement`'s stage 1 was the one that refused.)
     #[tokio::test]
     async fn stage_one_refuses_a_run_whose_spend_reached_the_cap() {
         let harness = Harness::new().await;
@@ -8396,12 +8581,12 @@ mod tests {
 
         let (run, rest) = start_ungated(&harness).await;
         let expected = RunFailure::NoCandidateAgent {
-            phase: "implement".to_owned(),
+            phase: "plan".to_owned(),
             detail: "claude (quota: cap reached (1200 of 1000 micros))".to_owned(),
         };
         assert_eq!(
             (rest.run, rest.position, rest.failure.as_ref()),
-            (RunStatus::Failed, Some(2), Some(&expected))
+            (RunStatus::Failed, Some(1), Some(&expected))
         );
         assert_eq!(
             harness
@@ -8411,7 +8596,19 @@ mod tests {
                 .iter()
                 .map(|step| (step.phase_name.as_str(), step.status))
                 .collect::<Vec<_>>(),
-            [("prd", StepStatus::Done), ("plan", StepStatus::Done)]
+            [("prd", StepStatus::Done), ("plan", StepStatus::Failed)]
+        );
+        let notes = harness
+            .orch
+            .store
+            .notes(ids::HTUI_FEAT_3)
+            .await
+            .expect("MemStore never fails a read");
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.body == "step `plan` attempt 1: cap breached"),
+            "the run's own cap, no batch named"
         );
     }
 
