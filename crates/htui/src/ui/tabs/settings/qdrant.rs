@@ -16,6 +16,7 @@ const NOT_READ: &str = "not read yet";
 const STORED: &str = "stored";
 const CLEARED: &str = "the Qdrant settings are gone from the keyring";
 const NO_URL_YET: &str = "no Qdrant URL is stored; type one and press Enter";
+const EMPTY_KEY: &str = "nothing typed; the stored API key is unchanged";
 const REPLACES_URL: &str = "Enter replaces the stored Qdrant URL";
 const NOT_STORED: &str = "not stored";
 const UNREADABLE: &str = "the keyring could not be read";
@@ -198,6 +199,12 @@ impl QdrantSection {
                 }
                 if let Some(key_text) = key_to_submit {
                     self.mode = Mode::Browse;
+                    // MOD-10 M4 R1 L-5: as the URL row, an empty submit changes nothing; removing
+                    // the key stays on `c`, behind its question.
+                    if key_text.is_empty() {
+                        self.say(EMPTY_KEY);
+                        return Handled::Consumed;
+                    }
                     self.send(StoreRequest::SetQdrantApiKey(key_text), ctx);
                 }
                 Handled::Consumed

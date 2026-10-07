@@ -820,7 +820,8 @@ pub enum StoreRequest {
     QdrantInfo,
     /// Request to set the Qdrant connection string.
     SetQdrantUrl(String),
-    /// The API key, redacted in `Debug` (MOD-10 M4 D9); empty clears the stored key.
+    /// The API key, redacted in `Debug` (MOD-10 M4 D9); empty clears the stored key. The Settings
+    /// field never sends an empty one (R1 L-5): clearing there is `c`, behind a question.
     SetQdrantApiKey(Redacted),
     /// Request to clear the Qdrant connection string.
     ClearQdrantSettings,
@@ -2719,12 +2720,10 @@ pub(crate) fn spawn_with_concepts(
                         }
                         StoreRequest::SetQdrantUrl(url) => {
                             let url_str = url.clone();
-                            let res = tokio::task::spawn_blocking(move || {
-                                htui_store::secret::set_qdrant_url(&url_str)?;
-                                Ok::<(), StoreError>(())
+                            let res = crate::qdrant_settings_info::blocking_keyring(move || {
+                                htui_store::secret::set_qdrant_url(&url_str)
                             })
-                            .await
-                            .unwrap();
+                            .await;
                             if let Err(err) = res {
                                 failed("set_qdrant_url", &err)
                             } else {
@@ -2735,16 +2734,14 @@ pub(crate) fn spawn_with_concepts(
                             // A zeroizing clone into the closure; nothing unzeroized
                             // (MOD-10 M4 D9).
                             let key = key.clone();
-                            let res = tokio::task::spawn_blocking(move || {
+                            let res = crate::qdrant_settings_info::blocking_keyring(move || {
                                 if key.expose().is_empty() {
-                                    htui_store::secret::clear_qdrant_api_key()?;
+                                    htui_store::secret::clear_qdrant_api_key()
                                 } else {
-                                    htui_store::secret::set_qdrant_api_key(key.expose())?;
+                                    htui_store::secret::set_qdrant_api_key(key.expose())
                                 }
-                                Ok::<(), StoreError>(())
                             })
-                            .await
-                            .unwrap();
+                            .await;
                             if let Err(err) = res {
                                 failed("set_qdrant_api_key", &err)
                             } else {
@@ -2752,13 +2749,11 @@ pub(crate) fn spawn_with_concepts(
                             }
                         }
                         StoreRequest::ClearQdrantSettings => {
-                            let res = tokio::task::spawn_blocking(|| {
+                            let res = crate::qdrant_settings_info::blocking_keyring(|| {
                                 htui_store::secret::clear_qdrant_url()?;
-                                htui_store::secret::clear_qdrant_api_key()?;
-                                Ok::<(), StoreError>(())
+                                htui_store::secret::clear_qdrant_api_key()
                             })
-                            .await
-                            .unwrap();
+                            .await;
                             if let Err(err) = res {
                                 failed("clear_qdrant_settings", &err)
                             } else {

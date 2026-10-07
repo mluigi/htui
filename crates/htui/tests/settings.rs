@@ -5675,6 +5675,36 @@ async fn a_qdrant_write_in_flight_refuses_e_and_c_but_not_r() {
     );
 }
 
+/// MOD-10 M4 R1 L-5: Enter on an empty key field, or one holding only spaces, leaves the stored key
+/// alone and says so, as the URL row does; removing the key stays on `c`, behind its question.
+#[tokio::test]
+async fn an_empty_qdrant_key_submit_sends_nothing() {
+    let bench = SectionBench::new().await;
+    for typed in ["", "   "] {
+        let mut section = QdrantSection::new();
+        bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+        let _ = bench.drained();
+
+        bench.key(&mut section, "j");
+        assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+        if !typed.is_empty() {
+            assert_eq!(bench.paste(&mut section, typed), Handled::Consumed);
+        }
+        assert_eq!(bench.key(&mut section, "Enter"), Handled::Consumed);
+
+        assert!(
+            requests_of(&bench).is_empty(),
+            "{typed:?} sends no key write"
+        );
+        assert!(!section.captures_input(), "{typed:?} closes the field");
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(
+            rendered.contains("nothing typed; the stored API key is unchanged"),
+            "{typed:?}: {rendered}"
+        );
+    }
+}
+
 /// A reload sent just before a write lands first; it answers the reload, so the section never
 /// says the settings were cleared before the clear has run, and the clear's refusal still lands.
 #[tokio::test]

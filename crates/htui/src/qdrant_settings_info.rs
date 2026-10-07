@@ -1,3 +1,22 @@
+use htui_core::store::{Result, StoreError};
+
+/// Runs one Qdrant keyring call on a blocking thread. A task that fails to join (it panicked) is a
+/// [`StoreError::Backend`], as in `secrets_settings`, so it never panics the store loop that
+/// awaits it (MOD-10 M4 R1 L-8).
+///
+/// # Errors
+///
+/// What `call` returns, or [`StoreError::Backend`] when the task fails to join.
+pub(crate) async fn blocking_keyring<T, F>(call: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(call)
+        .await
+        .map_err(|err| StoreError::Backend(format!("keyring task failed: {err}")))?
+}
+
 /// Represents the presence or readability of a Qdrant setting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QdrantState {
@@ -23,12 +42,8 @@ pub struct QdrantSnapshot {
 impl QdrantSnapshot {
     /// Fetches the current Qdrant settings from the keyring.
     pub async fn fetch() -> Self {
-        let url_res = tokio::task::spawn_blocking(htui_store::secret::get_qdrant_url)
-            .await
-            .unwrap();
-        let key_res = tokio::task::spawn_blocking(htui_store::secret::get_qdrant_api_key)
-            .await
-            .unwrap();
+        let url_res = blocking_keyring(htui_store::secret::get_qdrant_url).await;
+        let key_res = blocking_keyring(htui_store::secret::get_qdrant_api_key).await;
 
         let (url_state, url_summary) = match url_res {
             Ok(Some(u)) => (QdrantState::Stored, Some(u)),
@@ -47,5 +62,24 @@ impl QdrantSnapshot {
             key_state,
             url_summary,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MOD-10 M4 R1 L-8: a keyring task that panics is a `Backend` error, not a panic on the
+    /// store loop that awaits it.
+    #[tokio::test]
+    async fn a_panicking_keyring_task_is_a_backend_error() {
+        let res = blocking_keyring(|| -> Result<()> { panic!("boom") }).await;
+        match res {
+            Err(StoreError::Backend(message)) => {
+                assert!(message.starts_with("keyring task failed"), "{message}");
+            }
+            other => panic!("a join failure is a Backend error, got {other:?}"),
+        }
+        assert_eq!(blocking_keyring(|| Ok(7)).await.expect("joins"), 7);
     }
 }
