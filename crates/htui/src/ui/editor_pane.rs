@@ -7,8 +7,9 @@
 //! pinned to the grid's width with `CellDiffOption::ForcedWidth`, so ratatui's diff never
 //! re-measures a VS16 emoji or a halfwidth sound mark (which `vt100` counts per code point and
 //! ratatui per string) and never skips the cell behind it (plan "Widths"). Every covered cell is
-//! reset first, so a smaller screen leaves nothing stale. The terminal's real cursor is the only
-//! cursor drawn (MOD-57 B9); nothing here keeps state, logs or formats the screen's contents.
+//! reset first, the rule row included, so a smaller screen or the tab drawn underneath leaves
+//! nothing stale. The terminal's real cursor is the only cursor drawn (MOD-57 B9); nothing here
+//! keeps state, logs or formats the screen's contents.
 
 use std::num::NonZeroU16;
 
@@ -17,7 +18,7 @@ use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::{Block, Borders, Clear};
 
 use crate::ui::Theme;
 use crate::ui::cells::clip;
@@ -48,6 +49,8 @@ pub fn render(
         .border_style(style)
         .title(Line::styled(clip(title, usize::from(area.width)), style));
     let inner = block.inner(area);
+    // `Block` only patches its styles over what the tab drew there: reset the rule row first.
+    frame.render_widget(Clear, Rect { height: 1, ..area });
     frame.render_widget(block, area);
     draw_screen(frame.buffer_mut(), inner, screen);
     if focused && !screen.hide_cursor() {
@@ -434,6 +437,42 @@ mod tests {
             true,
         );
         assert_eq!(cells(&narrow, 0, 0, 10), " nvim · C…");
+    }
+
+    #[test]
+    fn the_rule_row_is_reset_over_what_the_tab_drew() {
+        // T3 verify round 3: the pane is drawn over the tab's body (T5), whose selected row or
+        // cursor cell can sit under the rule. None of its background or modifiers may survive.
+        let theme = Theme::default();
+        let parser = parser(3, 10, b"x");
+        let mut term = Terminal::new(TestBackend::new(10, 4)).expect("a test backend");
+        term.draw(|frame| {
+            let buf = frame.buffer_mut();
+            for x in 0..10 {
+                buf[(x, 0)].set_style(Style::new().fg(Color::Black).bg(Color::Cyan));
+            }
+            buf[(3, 0)]
+                .set_style(Style::new().add_modifier(Modifier::REVERSED | Modifier::UNDERLINED));
+            render(
+                frame,
+                Rect::new(0, 0, 10, 4),
+                parser.screen(),
+                " t ",
+                false,
+                &theme,
+            );
+        })
+        .expect("the pane draws");
+        let expected = styled(theme.dim);
+        for x in 0..10 {
+            let cell = &term.backend().buffer()[(x, 0)];
+            assert_eq!(cell.bg, Color::Reset, "x {x}: the tab's background is gone");
+            assert_eq!(
+                (cell.fg, cell.modifier),
+                (expected.fg, expected.modifier),
+                "x {x}: only the rule's style"
+            );
+        }
     }
 
     #[test]
