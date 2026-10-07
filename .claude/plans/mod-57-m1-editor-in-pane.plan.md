@@ -225,3 +225,18 @@ Step 3.5, 2026-10-07. Every claim checked against the tree or by compile/run pro
 | `cargo-insta` and the Windows gnu target are installed | TRUE | `cargo-insta 1.48.0`; `rustup target list --installed` |
 | No `deny.toml` licence policy to satisfy | TRUE | none in the repo; all new crates MIT / Apache / BSD-2 |
 | T1-T4 file sets are disjoint | TRUE | Independence table: `editor.rs` / `editor/pane.rs` / `ui/editor_pane.rs`+`ui/mod.rs` / `keys/*`; the two `mod` lines are T0's |
+
+## Blueprint amendments (2026-10-07)
+
+Blueprint `.claude/plans/mod-57-m1-editor-in-pane.blueprint.md` (`fe8761a9`) §13 proposed PD-1..PD-9;
+the maintainer accepted all nine (resize after the draw; a writer thread per pane; `compose::render`
+and `item_form::render` return their body rect and `notes.rs`/`documents.rs` join T6; two
+cross-task tests move to T5/T7; the child's cwd and environment set, Windows argv via the temp
+directory; kill escalation through the owned child; a second edit answered
+`Failed(EDITOR_BUSY)` to the asking tab; new `app/pane.rs`). The default focus chord stays
+`ctrl-4`, labelled `Ctrl+4`; the docs say "`Ctrl+\` (shown as `Ctrl+4`)" (blueprint F-9).
+
+**Windows cross-check.** Since `aws-lc-sys` 0.45 (via `rustls`) is in the tree, the host-gcc
+trick fails; the gate uses a mingw toolchain extracted to `/tmp/mingw`
+(`CC_x86_64_pc_windows_gnu=/tmp/mingw/mgcc AR_x86_64_pc_windows_gnu=/tmp/mingw/mar`), green at T0
+(`1c8c9e3c`).
