@@ -8038,11 +8038,12 @@ impl PgStore {
         Ok(closed)
     }
 
-    /// MOD-12 D3 (review M1): the drain's close, of exactly `batch` and only while it is still
-    /// drained: open, its box with no queue entry, and no run of its own `queued`, `running` or
-    /// `awaiting_approval`. The re-check is the UPDATE's own `WHERE`, so a resume that opened a
-    /// new batch after the drain's reads is never closed by it, and an entry or a run that
-    /// committed before the statement keeps the batch open. `None` when the batch did not close.
+    /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
+    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. Entries do not
+    /// keep it open: the runner calls it when nothing is admissible (an empty queue, or a stalled
+    /// one). The re-check is the UPDATE's own `WHERE`, so a resume that opened a new batch after
+    /// the runner's reads is never closed by it, and a run that committed before the statement
+    /// keeps the batch open. `None` when the batch did not close.
     ///
     /// # Errors
     ///
@@ -8058,7 +8059,6 @@ impl PgStore {
             UPDATE queue_batch b
                SET closed_at = $2, closed_reason = 'drained'
              WHERE b.id = $1 AND b.closed_at IS NULL
-               AND NOT EXISTS (SELECT 1 FROM queue_entry e WHERE e.box_id = b.box_id)
                AND NOT EXISTS (
                        SELECT 1 FROM run r
                         WHERE r.batch_id = b.id

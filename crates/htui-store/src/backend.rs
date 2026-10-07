@@ -704,8 +704,9 @@ impl Backend {
         }
     }
 
-    /// MOD-12 D3 (review M1): the drain's close of exactly `batch`, only while it is still
-    /// drained (no entry on its box, no live run of its own); `None` when it did not close.
+    /// MOD-12 D3 (review M1): the runner's close of exactly `batch`, only while it is still
+    /// closable (open, no live run of its own; entries do not count, M3 D4); `None` when it did
+    /// not close.
     ///
     /// # Errors
     ///

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE queue_batch b\n               SET closed_at = $2, closed_reason = 'drained'\n             WHERE b.id = $1 AND b.closed_at IS NULL\n               AND NOT EXISTS (SELECT 1 FROM queue_entry e WHERE e.box_id = b.box_id)\n               AND NOT EXISTS (\n                       SELECT 1 FROM run r\n                        WHERE r.batch_id = b.id\n                          AND r.status IN ('queued', 'running', 'awaiting_approval'))\n            RETURNING b.id AS \"id: BatchId\", b.box_id AS \"box_id: BoxId\", b.opened_at,\n                      b.opened_by AS \"opened_by: UserId\", b.closed_at,\n                      b.closed_reason AS \"closed_reason: BatchClose\"\n            ",
+  "query": "\n            UPDATE queue_batch b\n               SET closed_at = $2, closed_reason = 'drained'\n             WHERE b.id = $1 AND b.closed_at IS NULL\n               AND NOT EXISTS (\n                       SELECT 1 FROM run r\n                        WHERE r.batch_id = b.id\n                          AND r.status IN ('queued', 'running', 'awaiting_approval'))\n            RETURNING b.id AS \"id: BatchId\", b.box_id AS \"box_id: BoxId\", b.opened_at,\n                      b.opened_by AS \"opened_by: UserId\", b.closed_at,\n                      b.closed_reason AS \"closed_reason: BatchClose\"\n            ",
   "describe": {
     "columns": [
       {
@@ -85,5 +85,5 @@
       true
     ]
   },
-  "hash": "ea96aa2e54249586c42c081a154e350700395ffa094950f15bacfe57bbcf3174"
+  "hash": "a16a6d7abd1f0f341c82b57bb539a541afe200c10dd8d9ce9f600833e4447863"
 }

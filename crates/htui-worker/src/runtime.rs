@@ -2162,10 +2162,14 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// Before the `Kit`, the D3 spend gate (MOD-12 M2 D4): the batch's spend is read once per sweep
 /// and each ordered entry is held to its own project's `per_token_cap_batch` (read live, D2) and
 /// `min_budget_for_new_attempt` through [`batch_budget`]. A stopped entry is skipped and the next
-/// tried, since another project may have no cap; a malformed cap fails its entries closed. A batch
-/// whose every entry is stopped stays open and admits nothing (no `drain`); a pause and a resume
-/// open a fresh one. The first stop and the first malformed cap of a batch are logged once
-/// ([`Shared::note_batch_stop`], [`Shared::note_bad_cap`]).
+/// tried, since another project may have no cap; a malformed cap fails its entries closed. The
+/// first stop and the first malformed cap of a batch are logged once ([`Shared::note_batch_stop`],
+/// [`Shared::note_bad_cap`]).
+///
+/// MOD-12 M3 D4 (L4): when the tick has a free slot and nothing is admissible (no entry ready, or
+/// every ready entry stopped by the spend gate), the batch closes `drained` like an empty one,
+/// unless a run of its own is live; a later `Q` then waits for `P`. A tick with no free slot, a
+/// failed read and an enqueue refusal never close.
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
@@ -2196,7 +2200,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         }
     };
     if entries.is_empty() {
-        drain(ctx, &batch).await;
+        drain(ctx, &batch, Drain::Empty).await;
         return;
     }
     let mut project_ids: Vec<ProjectId> = Vec::new();
@@ -2231,10 +2235,8 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .filter(|item| cancelled.binary_search(&item.id).is_err())
         .collect();
     let order = admission_order(&entries, &ready);
-    if order.is_empty() {
-        shared.queue_reads_ok();
-        return;
-    }
+    // MOD-12 M3 D4: the slots before the stall check, so a tick with no free slot (one may be
+    // held by a manual run) never closes the batch, whatever `order` holds.
     let slots = async {
         let running = host.running_runs_on_box(box_id).await?;
         let queued = host.queued_runs_on_box(box_id).await?.len();
@@ -2251,6 +2253,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     };
     if free == 0 {
         shared.queue_reads_ok();
+        return;
+    }
+    if order.is_empty() {
+        // L4: nothing is ready (not ready, cancelled in this batch, or escalated).
+        drain(ctx, &batch, Drain::Stalled).await;
         return;
     }
     // MOD-12 M2 D4: the batch's spend once per sweep, each entry's project caps live (D2), one
@@ -2305,6 +2312,9 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     shared.queue_reads_ok();
     if admissible.is_empty() {
+        // L4: a free slot, and every ordered entry stopped by the spend gate, a malformed cap or
+        // an absent project.
+        drain(ctx, &batch, Drain::Stalled).await;
         return;
     }
     let kit = match Kit::read(&ctx.shared, host, false).await {
@@ -2344,12 +2354,23 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
 }
 
-/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live. The
-/// close is of exactly the batch `admit` read, and re-checks both conditions in the same write
-/// (review M1), so a pause and a resume between the reads and the close are never undone.
+/// Why `admit` closes its batch (MOD-12 M3 D4). Log text only: the store's predicate is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// No entry is left (M1 D3).
+    Empty,
+    /// Entries are left, but none is admissible this tick (L4).
+    Stalled,
+}
+
+/// MOD-12 D3, M3 D4 (L4): a batch with nothing admissible (no entry left, or a stalled queue)
+/// closes `drained` once no run of its own is live. The close is of exactly the batch `admit`
+/// read, and re-checks its condition in the same write (review M1), so a pause and a resume
+/// between the reads and the close are never undone.
 async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     batch: &htui_core::model::QueueBatch,
+    why: Drain,
 ) {
     match ctx
         .host
@@ -2359,7 +2380,13 @@ async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
         Ok(closed) => {
             ctx.shared.queue_reads_ok();
             if closed.is_some() {
-                tracing::info!(batch = %batch.id, "the queue drained");
+                match why {
+                    Drain::Empty => tracing::info!(batch = %batch.id, "the queue drained"),
+                    Drain::Stalled => tracing::info!(
+                        batch = %batch.id,
+                        "the queue stalled with nothing admissible; its batch closed"
+                    ),
+                }
             }
         }
         Err(err) => {

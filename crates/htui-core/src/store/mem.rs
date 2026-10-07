@@ -1071,9 +1071,12 @@ impl MemStore {
         })
     }
 
-    /// MOD-12 D3 (review M1): the drain's close, of exactly `batch` and only while it is still
-    /// drained: open, its box with no queue entry, and no run of its own `queued`, `running` or
-    /// `awaiting_approval`; one closure, as `PgStore`'s one UPDATE. `None` when it did not close.
+    /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
+    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. Entries do not
+    /// keep it open: the runner calls it when nothing is admissible (an empty queue, or a stalled
+    /// one). The re-check is one closure, as `PgStore`'s is the UPDATE's own `WHERE`, so a resume
+    /// that opened a new batch after the runner's reads is never closed by it, and a run that
+    /// committed before the close keeps the batch open. `None` when it did not close.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
@@ -1084,12 +1087,7 @@ impl MemStore {
     ) -> Result<Option<QueueBatch>> {
         Ok(self.write(|state| {
             let row = state.queue_batches.get(&batch)?;
-            let box_id = row.box_id;
             if row.closed_at.is_some()
-                || state
-                    .queue_entries
-                    .values()
-                    .any(|entry| entry.box_id == box_id)
                 || state
                     .run_batches
                     .iter()
