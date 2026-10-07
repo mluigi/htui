@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 
 use htui_agent::probe::{ProbeSnapshot, ProbeStatus};
 use htui_agent::registry::caps_for;
-use htui_core::model::queue::BatchStop;
+use htui_core::model::queue::{BatchStop, batch_budget};
 use htui_core::model::quota::{self, Availability, SkipReason};
 use htui_core::model::{Agent, AgentBox, AgentId, Gate, RunStep, SnapshotCandidate, Transport};
 
@@ -160,7 +160,8 @@ impl Walk {
     }
 }
 
-/// D60's walk: each candidate is kept or skipped by the first of five rules that fires.
+/// D60's walk: each candidate is kept or skipped by the first of seven rules that fires (D60's
+/// five, then MOD-12 M2's two batch rules).
 ///
 /// 1. no `agent` row → [`SkipCause::NoAgentRow`];
 /// 2. `quota::available` over the box row's quota and the caller's spend and cap skips →
@@ -172,7 +173,10 @@ impl Walk {
 /// 4. a disabled agent, a disabled box row, or a probe that parses with a status other than
 ///    `ready` → [`SkipCause::NotReady`]; an absent or unparseable probe is unknown and does not
 ///    skip;
-/// 5. spend and cap both known with `cap - spent < min_budget` → [`SkipCause::Budget`].
+/// 5. spend and cap both known with `cap - spent < min_budget` → [`SkipCause::Budget`];
+/// 6. batch spend and cap both known with `spent >= cap` → [`SkipCause::BatchCapReached`];
+/// 7. batch spend and cap both known with `cap - spent < min_budget` →
+///    [`SkipCause::BatchBudget`].
 #[must_use]
 pub fn walk(input: &SelectInput<'_>) -> Walk {
     let mut walked = Walk::default();
@@ -189,7 +193,8 @@ pub fn walk(input: &SelectInput<'_>) -> Walk {
     walked
 }
 
-/// The first of D60's five rules that skips `candidate`, or `None` when it is eligible.
+/// The first of the seven rules (D60's five, MOD-12 M2's two) that skips `candidate`, or `None`
+/// when it is eligible.
 fn skip_cause(input: &SelectInput<'_>, candidate: &SnapshotCandidate) -> Option<SkipCause> {
     let Some(agent) = input.agents.get(&candidate.agent_id) else {
         return Some(SkipCause::NoAgentRow);
@@ -222,6 +227,18 @@ fn skip_cause(input: &SelectInput<'_>, candidate: &SnapshotCandidate) -> Option<
                 min: input.min_budget_micros,
             });
         }
+    }
+    // Rules 6 and 7 (MOD-12 M2 D3): the batch twins of rules 2 and 5, after the run's own so a
+    // run-level cause keeps its sentence. Unknown is unbounded (OQ-6).
+    if let Err(stop) = batch_budget(
+        input.batch_spent_micros,
+        input.batch_cap_micros,
+        input.min_budget_micros,
+    ) {
+        return Some(match stop {
+            BatchStop::CapReached { spent, cap } => SkipCause::BatchCapReached { spent, cap },
+            BatchStop::Budget { remaining, min } => SkipCause::BatchBudget { remaining, min },
+        });
     }
     None
 }

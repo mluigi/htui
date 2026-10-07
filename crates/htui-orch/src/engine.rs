@@ -39,7 +39,7 @@ use htui_core::model::{
     RepoId, Resolution, Run, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary,
     SessionEvent, SnapshotCandidate, SnapshotPersona, SnapshotPhase, SnapshotTemplate, Status,
     StepFiles, StepId, StepOutcome, StepStatus, TIMESTAMPTZ_DIGITS, Transport, UserId,
-    VerifyOutcome, missing_tags_failure,
+    VerifyOutcome, min_budget_micros, missing_tags_failure,
 };
 use htui_core::prompt::excerpt::{
     BUILTIN_ID, ExcerptAudit, ExcerptSet, RepoPath, RepoRoot, RootSource,
@@ -121,9 +121,6 @@ const DIRTY_AT_START: &str = "dirty at step start";
 /// N2's reason when plan D131 completes a D93 park a crash cut short: the reason the sweep had
 /// was in the note it never wrote, and a clean tree says it was a refusal, not a dirty start.
 const PARK_CUT_SHORT: &str = "the sweep that failed the step stopped before it parked the run";
-
-/// The `app_setting` key of stage 1's budget rule (plan D60 rule 5, OQ-6). Unseeded: absent is `0`.
-const MIN_BUDGET_KEY: &str = "min_budget_for_new_attempt";
 
 /// `no_candidate_agent`'s detail when the walk skipped nothing and the selector still declined
 /// every eligible candidate (plan D62).
@@ -3354,7 +3351,9 @@ where
     /// The `agent` rows come from [`GraphSource::agent`] and the `agent_box` rows from
     /// [`GraphSource::agent_boxes`] for this engine's box; the spend is the run's own
     /// (`select::run_spend`), the cap the snapshot's `per_token_cap_run`, and the minimum
-    /// `app_setting.min_budget_for_new_attempt`. The inline-approval interlock is rule 3 of the
+    /// `app_setting.min_budget_for_new_attempt` (`htui_core::model::queue::min_budget_micros`, the
+    /// runner's reading too); and, for a run admitted under a batch, the batch's spend against the
+    /// snapshot's `per_token_cap_batch` (MOD-12 M2 D5). The inline-approval interlock is rule 3 of the
     /// walk and still reads `registry::caps_for` from the **agent row**, never from a built driver
     /// (ANA-4 `:554`, plan D6).
     async fn stage_one(
@@ -3395,6 +3394,8 @@ where
             .map(|row| (row.agent_id, row))
             .collect();
         let steps = self.parts.store.run_steps(run.id).await?;
+        // MOD-12 M2 D5: a batch run is walked against its batch too; a manual or chat run is not.
+        let batch = self.parts.store.run_batch_spend(run.id).await?;
         Ok(select::walk(&SelectInput {
             candidates,
             agents: &agents,
@@ -3404,9 +3405,9 @@ where
             inline_prompt: self.parts.tools.is_some(),
             spent_micros: select::run_spend(&steps),
             cap_micros: snapshot.settings.per_token_cap_run,
-            min_budget_micros: min_budget(&self.parts.app),
-            batch_spent_micros: None,
-            batch_cap_micros: None,
+            min_budget_micros: min_budget_micros(&self.parts.app),
+            batch_spent_micros: batch.and_then(|(_, spent)| spent),
+            batch_cap_micros: batch.and(snapshot.settings.per_token_cap_batch),
         }))
     }
 
@@ -7142,17 +7143,6 @@ pub fn required_inputs(phase: &SnapshotPhase, phases: &[SnapshotPhase]) -> Vec<S
         .collect()
 }
 
-/// `app_setting.min_budget_for_new_attempt` in USD micros (OQ-6), else `0`.
-///
-/// The key is unseeded, so a stray `0`, a negative, a string or a float all read as `0` —
-/// `graph.rs`'s "positive or the rung is silent" rule for the same table (blueprint H-19).
-fn min_budget(app: &BTreeMap<String, Value>) -> i64 {
-    app.get(MIN_BUDGET_KEY)
-        .and_then(Value::as_i64)
-        .filter(|micros| *micros > 0)
-        .unwrap_or(0)
-}
-
 /// A promoted step's chat directories (ANA-2 `:1208-1213`): the primary repo's tree as `cwd`,
 /// else the first tree, and every other tree beside it. `None` for a step with no tree.
 fn chat_dirs(trees: &[RunStepTree], repos: &[Repo]) -> Option<(PathBuf, Vec<PathBuf>)> {
@@ -8185,15 +8175,22 @@ mod tests {
         let app = |value: serde_json::Value| {
             BTreeMap::from([("min_budget_for_new_attempt".to_owned(), value)])
         };
-        assert_eq!(super::min_budget(&BTreeMap::new()), 0);
-        assert_eq!(super::min_budget(&app(serde_json::json!(250_000))), 250_000);
+        assert_eq!(super::min_budget_micros(&BTreeMap::new()), 0);
+        assert_eq!(
+            super::min_budget_micros(&app(serde_json::json!(250_000))),
+            250_000
+        );
         for silent in [
             serde_json::json!(0),
             serde_json::json!(-5),
             serde_json::json!("250000"),
             serde_json::json!(2.5),
         ] {
-            assert_eq!(super::min_budget(&app(silent.clone())), 0, "{silent}");
+            assert_eq!(
+                super::min_budget_micros(&app(silent.clone())),
+                0,
+                "{silent}"
+            );
         }
     }
 
