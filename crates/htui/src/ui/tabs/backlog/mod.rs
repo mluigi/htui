@@ -2598,8 +2598,9 @@ mod tests {
         tab.item_form = Some(form);
 
         let cell = Cell::new(None);
-        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
-            .expect("a test terminal");
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
         terminal
             .draw(|frame| tab.render(frame, area, &bench.ctx().with_editor_area(&cell)))
             .expect("the frame draws");
