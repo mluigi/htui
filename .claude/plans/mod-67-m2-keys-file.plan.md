@@ -64,8 +64,8 @@ overlay keys become configurable end to end. No default changes; no view file is
   table's valid names (for an unknown table, the valid tables). The file's list **replaces** that
   action's defaults; `[]` unbinds. The **narrower-context override** of a shared verb (ANA §7.4
   step 5, `[settings.boxes] reload = …`) needs a view context, and M2 has none: it lands with M3's
-  first view context. `Keys`' `Row` gains `line: Option<usize>` (the file line that set it, `None`
-  for a default): validation and `--print-keys` both read it.
+  first view context. `Keys`' `Row` gains `line: Option<usize>` (the file line of an entry whose list
+  differs from the default, `None` otherwise; `Keys` equality compares bindings, not lines: PA-3): validation and `--print-keys` both read it.
 - **D8 — Checks (ANA §7.4 steps 3-7), all collected, none short-circuiting:**
   1. TOML syntax (one error, with the parser's span → line; nothing else is checked after it);
   2. `version`; unknown table; unknown name; a value that is not a chord or a list of chords;
@@ -75,9 +75,10 @@ overlay keys become configurable end to end. No default changes; no view file is
   5. collisions: two actions sharing a chord **in one context** (every context, including the
      shared ones no view consumes yet), and two candidates for one chord **in any declared stack**
      (`stack::DECLARED`, new: `Stack::BASE` "on every screen", `Stack::OVERLAY` "over an overlay";
-     M3-M5 append theirs). A pair is allowed only if both rows are defaults (`line == None`) and the
-     pair is on `STATE_GUARDED`; a pair the user creates is always an error, reported on the user's
-     line. The shadowing allow-list kind (ANA §7.4) lands with M3's first form stack; M2 has no
+     M3-M5 append theirs). A pair is allowed for a chord only if the pair is on `STATE_GUARDED` and the
+     chord is a catalogue default of **both** actions (amended by PA-2); a chord the user adds to
+     either side is checked like any other, so a pair the user creates is always an error, reported
+     on the user's line. The shadowing allow-list kind (ANA §7.4) lands with M3's first form stack; M2 has no
      stack that needs it;
   6. an `in_capture` action bound to a printable chord.
   A unit test asserts the compiled defaults pass 2-6 with no error.
@@ -97,8 +98,16 @@ overlay keys become configurable end to end. No default changes; no view file is
 - **D11 — Known limit, stated, not fixed in M2.** `App::on_key` tries the overlay, then the tab,
   then the global layer. A chord a view or an overlay still matches on `KeyCode` (all of them until
   M3-M5) is taken there first, so `[global] quit = ["e"]` is eaten by Settings' `e`, and an overlay
-  that handles `Esc` itself still closes on it after `[overlay] close = ["x"]`. The validator cannot
+  that handles `Esc` itself still closes on it after `[overlay] close = ["f2"]` (PA-1: `x` is refused, `overlay.close` is `in_capture`). The validator cannot
   see hand-written arms; M3-M5 remove them. README says so in one sentence.
+
+## Amendments (maintainer, 2026-10-07, from blueprint §14)
+
+- **PA-1** (D11): the README example is `[overlay] close = ["f2"]`; `["x"]` never loads.
+- **PA-2** (D8 step 5): the allow-list is per chord: a `STATE_GUARDED` pair may share a chord only
+  when it is a catalogue default of both actions. Replaces "both rows are defaults".
+- **PA-3** (D7, D10): `line` is set only when the list differs from the default; `Row` equality
+  ignores `line`.
 
 ## Patterns to Mirror
 
