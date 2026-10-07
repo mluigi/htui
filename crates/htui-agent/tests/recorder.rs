@@ -810,6 +810,32 @@ impl WriteStore for SpyStore {
     ) -> StoreResult<Option<StoredSetting>> {
         self.inner.setting(rung, key).await
     }
+    async fn queue_setting(
+        &self,
+        target: htui_core::store::QueueTarget,
+        key: htui_core::model::QueueSetting,
+    ) -> StoreResult<Option<htui_core::store::QueueStored>> {
+        self.inner.queue_setting(target, key).await
+    }
+    async fn set_queue_setting(
+        &self,
+        target: htui_core::store::QueueTarget,
+        key: htui_core::model::QueueSetting,
+        value: Value,
+        expected: htui_core::store::QueueToken,
+    ) -> StoreResult<CasOutcome<htui_core::store::QueueStored>> {
+        self.inner
+            .set_queue_setting(target, key, value, expected)
+            .await
+    }
+    async fn clear_queue_setting(
+        &self,
+        target: htui_core::store::QueueTarget,
+        key: htui_core::model::QueueSetting,
+        expected: htui_core::store::QueueToken,
+    ) -> StoreResult<CasOutcome<htui_core::store::QueueStored>> {
+        self.inner.clear_queue_setting(target, key, expected).await
+    }
     async fn delete_reach(&self, target: DeleteTarget) -> StoreResult<Option<DeleteReach>> {
         self.inner.delete_reach(target).await
     }
