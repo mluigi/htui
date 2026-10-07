@@ -326,13 +326,14 @@ impl<P: ReplySink> Shared<P> {
         ended
     }
 
-    /// MOD-12 M2 D4: `item` was not admitted under `batch` for `stop`. The first stop of a batch
-    /// is `info` ("the queue's batch reached its cap"); every later one `debug`. True when this
-    /// one was the first.
+    /// MOD-12 M2 D4: `item` was not admitted under `batch` for `stop`, the cap reached or what is
+    /// left of it below `min_budget_for_new_attempt`; the message covers both and `stop` names
+    /// which (review R1). The first stop of a batch is `info`; every later one `debug`. True when
+    /// this one was the first.
     fn note_batch_stop(&self, batch: BatchId, item: ItemId, stop: &BatchStop) -> bool {
         let first = first_of(&self.batch_stop_noted, batch);
         if first {
-            tracing::info!(%batch, %item, %stop, "the queue's batch reached its cap");
+            tracing::info!(%batch, %item, %stop, "the queue's batch admits no more under its spend cap");
         } else {
             tracing::debug!(%batch, %item, %stop, "the queue's batch admits no further entry");
         }
