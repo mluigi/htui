@@ -16,9 +16,10 @@ use htui_agent::error::DriverError;
 use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, ProjectId, RepoId,
-    Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
-    WorkspaceId, admission_limit, admission_order, free_slots,
+    AgentId, AgentSummary, BatchId, BatchStop, BoxId, BoxProfile, CancelRequest, CapError,
+    Executor, ItemId, ProjectCaps, ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId,
+    RunKind, RunStatus, SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order,
+    batch_budget, free_slots, min_budget_micros,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::SecretSource;
@@ -228,6 +229,12 @@ struct Shared<P: ReplySink> {
     /// MOD-12 review M2: the queue runner's last sweep failed at a store call
     /// ([`Shared::queue_read_failed`]).
     queue_failing: AtomicBool,
+    /// MOD-12 M2 D4: the batch whose first spend stop was said at `info`; later stops of it are
+    /// `debug` (M3's overlay surfaces them).
+    batch_stop_noted: StdMutex<Option<BatchId>>,
+    /// MOD-12 M2 D4: the batch under which a malformed project cap was warned; later ones of it
+    /// are `debug`.
+    bad_cap_noted: StdMutex<Option<BatchId>>,
     /// I-1: the executor the last sweep read, so a change is logged once.
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
@@ -245,6 +252,16 @@ struct Shared<P: ReplySink> {
     applied: Notify,
     /// MOD-42 plan D11, B-19: the grace a graceful preempt gives a session's cancel.
     cancel_grace: Duration,
+}
+
+/// MOD-12 M2 D4: whether `batch` is new to `noted`, recording it if so (once-per-batch logs).
+fn first_of(noted: &StdMutex<Option<BatchId>>, batch: BatchId) -> bool {
+    let mut noted = noted.lock().unwrap_or_else(PoisonError::into_inner);
+    if *noted == Some(batch) {
+        return false;
+    }
+    *noted = Some(batch);
+    true
 }
 
 /// One task of the runtime, with the run it works on once it knows it.
@@ -306,6 +323,31 @@ impl<P: ReplySink> Shared<P> {
             tracing::info!("the queue runner reads its store again");
         }
         ended
+    }
+
+    /// MOD-12 M2 D4: `item` was not admitted under `batch` for `stop`. The first stop of a batch
+    /// is `info` ("the queue's batch reached its cap"); every later one `debug`. True when this
+    /// one was the first.
+    fn note_batch_stop(&self, batch: BatchId, item: ItemId, stop: &BatchStop) -> bool {
+        let first = first_of(&self.batch_stop_noted, batch);
+        if first {
+            tracing::info!(%batch, %item, %stop, "the queue's batch reached its cap");
+        } else {
+            tracing::debug!(%batch, %item, %stop, "the queue's batch admits no further entry");
+        }
+        first
+    }
+
+    /// MOD-12 M2 D4: `project`'s `settings` hold a malformed cap, so its entries fail closed.
+    /// Warned once per batch, `debug` after. True when this one warned.
+    fn note_bad_cap(&self, batch: BatchId, project: ProjectId, err: &CapError) -> bool {
+        let first = first_of(&self.bad_cap_noted, batch);
+        if first {
+            tracing::warn!(%batch, %project, %err, "a project's queue cap is malformed; its entries are not admitted");
+        } else {
+            tracing::debug!(%batch, %project, %err, "a project's queue cap is still malformed");
+        }
+        first
     }
 
     /// OQ-6: `run`'s resume failed again; its next one waits, 5 s doubling to 5 min. Warned once
@@ -1211,6 +1253,8 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweeping: AtomicBool::new(false),
                 sweep_again: AtomicBool::new(false),
                 queue_failing: AtomicBool::new(false),
+                batch_stop_noted: StdMutex::new(None),
+                bad_cap_noted: StdMutex::new(None),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
@@ -2112,6 +2156,14 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// batch and stops when it is no longer this one (a pause won the race, H-6). The `Kit` is read
 /// only when something is to be admitted. A failed store read stops the sweep's admission and is
 /// warned once per streak (review M2, [`Shared::queue_read_failed`]).
+///
+/// Before the `Kit`, the D3 spend gate (MOD-12 M2 D4): the batch's spend is read once per sweep
+/// and each ordered entry is held to its own project's `per_token_cap_batch` (read live, D2) and
+/// `min_budget_for_new_attempt` through [`batch_budget`]. A stopped entry is skipped and the next
+/// tried, since another project may have no cap; a malformed cap fails its entries closed. A batch
+/// whose every entry is stopped stays open and admits nothing (no `drain`); a pause and a resume
+/// open a fresh one. The first stop and the first malformed cap of a batch are logged once
+/// ([`Shared::note_batch_stop`], [`Shared::note_bad_cap`]).
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
@@ -2185,21 +2237,65 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         let running = host.running_runs_on_box(box_id).await?;
         let queued = host.queued_runs_on_box(box_id).await?.len();
         let app = host.app_settings().await?;
-        StoreResult::Ok(free_slots(
-            admission_limit(box_settings, &app),
-            running,
-            queued,
-        ))
+        let free = free_slots(admission_limit(box_settings, &app), running, queued);
+        StoreResult::Ok((free, app))
     };
-    let free = match slots.await {
-        Ok(free) => free,
+    let (free, app) = match slots.await {
+        Ok(pair) => pair,
         Err(err) => {
             shared.queue_read_failed("counting this box's free slots", &err);
             return;
         }
     };
-    shared.queue_reads_ok();
     if free == 0 {
+        shared.queue_reads_ok();
+        return;
+    }
+    // MOD-12 M2 D4: the batch's spend once per sweep, each entry's project caps live (D2), one
+    // rule for runner, walk and recorder (D3). A stopped entry is skipped and the next tried: a
+    // project without a cap may still admit. A malformed cap fails closed.
+    let spent = match host.batch_spend(batch.id).await {
+        Ok(spent) => spent,
+        Err(err) => {
+            shared.queue_read_failed("reading its batch's spend", &err);
+            return;
+        }
+    };
+    let min = min_budget_micros(&app);
+    let project_of: HashMap<ItemId, ProjectId> = entries
+        .iter()
+        .map(|entry| (entry.item_id, entry.project_id))
+        .collect();
+    let mut caps: HashMap<ProjectId, Result<ProjectCaps, CapError>> = HashMap::new();
+    let mut admissible = Vec::with_capacity(order.len());
+    for item in order {
+        let Some(&project) = project_of.get(&item) else {
+            continue;
+        };
+        if !caps.contains_key(&project) {
+            let settings = match host.project_settings(project).await {
+                Ok(settings) => settings.unwrap_or(Value::Null),
+                Err(err) => {
+                    shared.queue_read_failed("reading a project's caps", &err);
+                    return;
+                }
+            };
+            caps.insert(project, ProjectCaps::from_settings(&settings));
+        }
+        match &caps[&project] {
+            Err(err) => {
+                shared.note_bad_cap(batch.id, project, err);
+            }
+            Ok(project_caps) => match batch_budget(spent, project_caps.batch_micros, min) {
+                Ok(_) => admissible.push(item),
+                Err(stop) => {
+                    shared.note_batch_stop(batch.id, item, &stop);
+                }
+            },
+        }
+    }
+    shared.queue_reads_ok();
+    if admissible.is_empty() {
         return;
     }
     let kit = match Kit::read(&ctx.shared, host, false).await {
@@ -2212,7 +2308,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     let driver = |candidate: &SnapshotCandidate, _key: &SessionKey<'_>| kit.driver(candidate);
     let engine = kit.engine(&driver);
     let mut admitted = 0;
-    for item in order {
+    for item in admissible {
         if admitted >= free || ctx.shared.walks.closed() {
             break;
         }
