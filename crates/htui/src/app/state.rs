@@ -768,9 +768,9 @@ impl App {
         let chord = KeyChord::from_event(key);
 
         // MOD-57 P5, P6: a live in-pane editor answers first. Focused, it takes every key,
-        // `ctrl-c` included (ANA-26 §6.4's one exception); unfocused, the M1 lock.
-        if self.editor.is_some() {
-            self.editor_key(key, chord);
+        // `ctrl-c` included (ANA-26 §6.4's one exception); unfocused, the M1 lock, except under a
+        // modal overlay, whose keys take the path below.
+        if self.editor.is_some() && self.editor_key(key, chord) {
             return;
         }
 

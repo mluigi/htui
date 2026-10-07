@@ -50,6 +50,7 @@ use crate::editor::{
     PANE_VAR, TempEdit,
 };
 use crate::keys::{Act, CTRL_C, Hint, HintSpec, KeyChord, Stack};
+use crate::ui::overlay::Overlay;
 use crate::ui::tabs::TabId;
 
 /// PRD Q3: the smallest claimed rect a pane uses; below it, the whole tab body. 40x8 until T7's
@@ -237,23 +238,29 @@ impl App {
     }
 
     /// A key while an editor is alive (P5, P6): focused, the editor's unless it is the focus
-    /// toggle; unfocused, the M1 lock. Nothing reaches an overlay, a tab or a keymap.
-    pub(super) fn editor_key(&mut self, key: KeyEvent, chord: KeyChord) {
+    /// toggle; unfocused, the M1 lock. `false` hands the key back to [`App::on_key`]'s overlay
+    /// path: only while unfocused under a modal overlay, which a reply can open over the editor
+    /// (the migration prompt) and which never reaches the asking tab. Otherwise nothing reaches
+    /// an overlay, a tab or a keymap.
+    pub(super) fn editor_key(&mut self, key: KeyEvent, chord: KeyChord) -> bool {
         let visible = self.editor_visible();
+        let covered = self.overlays.top().is_some_and(Overlay::is_modal);
         let Some(editor) = self.editor.as_mut() else {
-            return;
+            return false;
         };
         // A focused editor that is not on screen (a reply moved the active tab): htui has the
         // keys from now on. The key that finds it so was typed for the editor (a vim `ctrl-c`,
         // the `q` of `:wq`), so it is swallowed with the refusal, never run as a lock command:
         // it must not quit, abort or move a tab.
-        if editor.focused && !visible {
+        // The same for a modal overlay drawn over it (T5 verify round 3): the key must not answer
+        // a prompt the user had not seen yet.
+        if editor.focused && (!visible || covered) {
             editor.focused = false;
             self.status = Some(format!(
                 "{EDITOR_LOCKED}: {}",
                 self.keys.hint(Stack::EDITOR_UNFOCUSED, LOCK_HINT)
             ));
-            return;
+            return true;
         }
         if editor.focused {
             if self
@@ -262,19 +269,24 @@ impl App {
                 .contains(&Act::EditorFocus)
             {
                 editor.focused = false;
-                return;
+                return true;
             }
             let application_cursor = editor.screen.screen().application_cursor();
             if let Some(bytes) = encode_key(key, application_cursor) {
                 editor.child.write(&bytes);
             }
-            return;
+            return true;
         }
 
+        // Unfocused under a modal overlay: the overlay's key, through `on_key`'s own path (C3,
+        // the overlay, `Esc`/help, the modal swallow).
+        if covered {
+            return false;
+        }
         // ANA-26 C3 holds while htui has the keys.
         if chord == CTRL_C {
             self.update(Action::Quit);
-            return;
+            return true;
         }
         let tab = editor.tab;
         match self
@@ -301,6 +313,7 @@ impl App {
                 ));
             }
         }
+        true
     }
 
     /// A paste while an editor is alive: to the editor when it is focused and on screen
@@ -349,11 +362,12 @@ impl App {
     }
 
     /// The status line while an editor is alive and no error is up; `None` without one. A focused
-    /// editor whose tab is not on screen does not have the keys ([`editor_key`](Self::editor_key)
-    /// hands them to htui), so it reads as unfocused.
+    /// editor whose tab is not on screen, or under a modal overlay, does not have the keys
+    /// ([`editor_key`](Self::editor_key) hands them to htui), so it reads as unfocused.
     pub(super) fn editor_status(&self) -> Option<String> {
         let editor = self.editor.as_ref()?;
-        Some(if editor.focused && self.editor_visible() {
+        let covered = self.overlays.top().is_some_and(Overlay::is_modal);
+        Some(if editor.focused && self.editor_visible() && !covered {
             format!(
                 "the editor has the keys \u{b7} {}",
                 self.keys.hint(Stack::EDITOR_FOCUSED, FOCUSED_HINT)
@@ -551,6 +565,34 @@ mod tests {
             Vec::new()
         }
         fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Consumed
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    /// A modal overlay that records the keys it is given and passes `Esc` (so the overlay
+    /// stack closes it).
+    struct Prompt(Rc<RefCell<Vec<KeyEvent>>>);
+
+    impl Overlay for Prompt {
+        fn id(&self) -> OverlayId {
+            OverlayId("prompt")
+        }
+        fn title(&self) -> &str {
+            "Prompt"
+        }
+        fn is_modal(&self) -> bool {
+            true
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            if key.code == KeyCode::Esc {
+                return Handled::Pass;
+            }
+            self.0.borrow_mut().push(key);
             Handled::Consumed
         }
         fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
@@ -1072,6 +1114,63 @@ mod tests {
             app.on_key(ctrl('c'));
             assert!(app.should_quit, "the next ctrl-c is htui's");
         }
+    }
+
+    #[test]
+    fn a_modal_overlay_over_a_focused_editor_takes_the_keys_after_one_is_swallowed() {
+        // T5 verify round 3: a reply can open a modal prompt (the migration y/n) over a focused
+        // editor. The key that finds it was typed for the editor and must not answer the prompt;
+        // after that the prompt has the keys, and the asking tab never does.
+        let (mut app, benches) = shell(&[ASKER, OTHER]);
+        let log = Log::default();
+        open(&mut app, ASKER, &log);
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        app.push_overlay(Box::new(Prompt(Rc::clone(&heard))));
+
+        app.on_key(plain('y'));
+        assert!(writes(&log).is_empty(), "not the editor's");
+        assert!(heard.borrow().is_empty(), "not the prompt's either");
+        assert_eq!(app.status.as_deref(), Some(REFUSAL));
+        assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
+
+        app.on_key(plain('n'));
+        assert_eq!(heard.borrow().len(), 1, "the prompt has the keys now");
+        assert!(writes(&log).is_empty());
+        assert!(
+            benches[0].seen.borrow().keys.is_empty(),
+            "the asking tab never does"
+        );
+        assert!(app.editor_open());
+
+        // ctrl-c still quits at once (ANA-26 C3).
+        let mut quit = app;
+        quit.on_key(ctrl('c'));
+        assert!(quit.should_quit);
+    }
+
+    #[test]
+    fn closing_the_overlay_hands_the_lock_back() {
+        let (mut app, _benches) = shell(&[ASKER, OTHER]);
+        let log = Log::default();
+        open(&mut app, ASKER, &log);
+        app.on_key(ctrl('4'));
+        let heard = Rc::new(RefCell::new(Vec::new()));
+        app.push_overlay(Box::new(Prompt(Rc::clone(&heard))));
+
+        app.on_key(plain('y'));
+        assert_eq!(
+            heard.borrow().len(),
+            1,
+            "unfocused: the prompt answers at once"
+        );
+        app.on_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.overlays.is_empty(), "Esc closes it");
+
+        app.on_key(plain('a'));
+        assert_eq!(app.status.as_deref(), Some(REFUSAL), "the M1 lock again");
+        app.on_key(ctrl('4'));
+        app.on_key(plain('a'));
+        assert_eq!(writes(&log).len(), 1, "refocused: the editor's");
     }
 
     #[test]
