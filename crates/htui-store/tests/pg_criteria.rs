@@ -7983,14 +7983,39 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
 
 /// Review H2 (Postgres only): a claim racing a pause either admits first, and the run stays
 /// `running`, or finds the run cancelled and answers `NotClaimable`; never a claimed run of a
-/// paused batch that the pause also cancelled, nor a queued one left behind.
+/// paused batch that the pause also cancelled, nor a queued one left behind. Both orders are
+/// forced (review G1): whichever of the two queues first on the held run row takes it first.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled() {
-    use htui_core::model::BatchClose;
-
     let Some(db) = common::demo_db().await else {
         return;
     };
+    // The close first: the claim finds the run cancelled and the item open again, so the same
+    // item can be raced once more with the claim first.
+    assert_eq!(
+        claim_racing_a_pause(&db, false).await,
+        (Claim::NotClaimable, RunStatus::Cancelled, Status::Open),
+        "the close won: the claim found the run cancelled"
+    );
+    assert_eq!(
+        claim_racing_a_pause(&db, true).await,
+        (Claim::Admitted, RunStatus::Running, Status::InProgress),
+        "the claim won: the close found no queued run"
+    );
+
+    db.drop_db().await;
+}
+
+/// One round of [`a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled`] on a fresh
+/// batch and run: the run row is held, the first of the two (the claim when `claim_first`)
+/// queues on it, then the other, then the row is released. Answers the claim and the run's and
+/// the item's statuses after both have ended.
+async fn claim_racing_a_pause(
+    db: &common::TestDb,
+    claim_first: bool,
+) -> (Claim, RunStatus, Status) {
+    use htui_core::model::BatchClose;
+
     let at = Utc::now();
     let batch = db
         .store
@@ -8009,14 +8034,13 @@ async fn a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled() {
         .execute(&mut *holder)
         .await
         .expect("lock the run row");
-    let close = tokio::spawn({
+    let spawn_close = || {
         let store = db.store.clone();
-        async move { store.close_batch(ids::BOX, BatchClose::Paused, at).await }
-    });
-    lock_waiters(&db.pool, 1).await;
-    let claim = tokio::spawn({
+        tokio::spawn(async move { store.close_batch(ids::BOX, BatchClose::Paused, at).await })
+    };
+    let spawn_claim = || {
         let store = db.store.clone();
-        async move {
+        tokio::spawn(async move {
             store
                 .claim_run(
                     run.id,
@@ -8026,9 +8050,21 @@ async fn a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled() {
                     TimeDelta::minutes(5),
                 )
                 .await
-        }
-    });
-    lock_waiters(&db.pool, 2).await;
+        })
+    };
+    let (close, claim) = if claim_first {
+        let claim = spawn_claim();
+        lock_waiters(&db.pool, 1).await;
+        let close = spawn_close();
+        lock_waiters(&db.pool, 2).await;
+        (close, claim)
+    } else {
+        let close = spawn_close();
+        lock_waiters(&db.pool, 1).await;
+        let claim = spawn_claim();
+        lock_waiters(&db.pool, 2).await;
+        (close, claim)
+    };
     holder.rollback().await.expect("release the run row");
 
     close
@@ -8051,21 +8087,7 @@ async fn a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled() {
         .expect("read")
         .expect("the item")
         .status;
-    match claim {
-        Claim::Admitted => assert_eq!(
-            (status, item),
-            (RunStatus::Running, Status::InProgress),
-            "the claim won: the close found no queued run"
-        ),
-        Claim::NotClaimable => assert_eq!(
-            (status, item),
-            (RunStatus::Cancelled, Status::Open),
-            "the close won: the claim found the run cancelled"
-        ),
-        other => panic!("the claim admits or finds the run gone, not {other:?}"),
-    }
-
-    db.drop_db().await;
+    (claim, status, item)
 }
 
 /// MOD-12 D2: two racing resumes on two handles open one batch, and both answer it.
