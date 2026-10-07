@@ -88,7 +88,7 @@ rataflow               = { workspace = true }
 # MOD-57 M1 (pane.rs kill path): SIGHUP then SIGKILL to the in-pane editor's process group, and a
 # non-reaping `waitid`, without `unsafe`. 1.1.4 with `process` is already in htui's graph (via
 # cap-std and fs4), so nothing new is compiled.
-rustix                 = { version = "1.1", features = ["process"] }
+rustix                 = { workspace = true }
 
 [dev-dependencies]
 # The chat tab's snapshots drive the fake transport through the same registry the ACP one uses.
