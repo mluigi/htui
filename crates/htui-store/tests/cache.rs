@@ -676,6 +676,7 @@ async fn the_mirror_lists_waiting_candidates_like_postgres() {
         },
         repo_scope: Vec::new(),
         queued_at: at,
+        batch_id: None,
     };
     let new_step = |run: RunId, fanout_index: i32| NewRunStep {
         id: StepId::new(),

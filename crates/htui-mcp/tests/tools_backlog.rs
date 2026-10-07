@@ -84,6 +84,7 @@ impl Leased {
                 graph_snapshot: snapshot(),
                 repo_scope: Vec::new(),
                 queued_at: Utc::now(),
+                batch_id: None,
             })
             .await
             .expect("the run is created");

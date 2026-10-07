@@ -31,14 +31,14 @@ pub mod filter;
 pub mod item_form;
 pub mod list;
 
-use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, StepId};
+use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, Status, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
-use crate::store_worker::{StoreReply, StoreRequest};
+use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
 };
@@ -70,6 +70,23 @@ const ITEMS_READ: &str = "items";
 /// Refreshes between two `Runs` polls: five of the shell's one-second refreshes, so 5 s (MOD-41
 /// plan D16, OQ-3).
 const REFRESHES_PER_RUNS_POLL: u32 = 5;
+
+/// MOD-12 D9: what `Q` says with the cursor on a project header.
+const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
+
+/// MOD-12 D9: the toggle `Q` or `P` asked for, decided by the `QueueState` read it is waiting on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum QueueIntent {
+    /// `Q` on this item (its key, for the status line).
+    Item {
+        /// The item.
+        id: ItemId,
+        /// Its key.
+        key: String,
+    },
+    /// `P`.
+    Pause,
+}
 
 /// A reveal waiting for the next `Items` reply (MOD-64 D235), with the key its miss is reported by
 /// and, for `RevealTarget::Step`, the run and step the Runs pane is to focus (MOD-69 plan D8).
@@ -119,6 +136,12 @@ pub struct BacklogTab {
     /// Blueprint E8: the `ItemForm` read `N`/`e` is waiting on; a reply opens a form only when it
     /// answers this.
     opening: Option<Opening>,
+    /// MOD-12 D9: the toggle the pending `QueueState` read decides. That read's answer takes
+    /// it, so one intent is at most one write (review NIT-intent).
+    queue_intent: Option<QueueIntent>,
+    /// MOD-12 D9: the item write in flight and its key, for the status line its answer sets.
+    /// Kept apart from `queue_intent`, so the answer never wipes a toggle pressed since.
+    queue_writing: Option<(ItemId, String)>,
 }
 
 /// What `N` or `e` asked for, so only the answer to it opens a form (blueprint E8): a tab's
@@ -167,6 +190,8 @@ impl BacklogTab {
             form: None,
             item_form: None,
             opening: None,
+            queue_intent: None,
+            queue_writing: None,
         }
     }
 
@@ -400,6 +425,69 @@ impl BacklogTab {
             project,
             item: Some(id),
         });
+    }
+
+    /// MOD-12 D9: `Q`. A finished item is refused here and nothing is sent; any other reads the
+    /// queue first, and the reply decides between queue and dequeue.
+    fn toggle_queued(&mut self, ctx: &Ctx<'_>) {
+        let Some(item) = self.item() else {
+            ctx.emit(Action::Error(NO_ITEM_TO_QUEUE.to_owned()));
+            return;
+        };
+        if matches!(item.status, Status::Done | Status::Closed) {
+            ctx.emit(Action::Error(format!(
+                "{} is {}: nothing to queue",
+                item.key, item.status
+            )));
+            return;
+        }
+        self.queue_intent = Some(QueueIntent::Item {
+            id: item.id,
+            key: item.key.clone(),
+        });
+        ctx.request(StoreRequest::QueueState);
+    }
+
+    /// MOD-12 D9: the queue as it is now decides the write the pending toggle sends, and spends
+    /// the toggle: one intent is at most one write (review NIT-intent). A read nobody here asked
+    /// for (no intent) is ignored.
+    fn on_queue(&mut self, view: &QueueView, ctx: &Ctx<'_>) {
+        let Some(intent) = self.queue_intent.take() else {
+            return;
+        };
+        let request = match intent {
+            QueueIntent::Item { id, key } => {
+                let request = if view.entries.contains(&id) {
+                    StoreRequest::DequeueItem { item: id }
+                } else {
+                    StoreRequest::QueueItem { item: id }
+                };
+                self.queue_writing = Some((id, key));
+                request
+            }
+            QueueIntent::Pause if view.open_batch.is_some() => StoreRequest::PauseQueue,
+            QueueIntent::Pause => StoreRequest::ResumeQueue,
+        };
+        ctx.request(request);
+    }
+
+    /// MOD-12 D9: a queue write landed; the status line says what it did. A toggle pressed since
+    /// is left for its own read (review NIT-intent).
+    fn on_queue_written(&mut self, write: &QueueWrite, view: &QueueView, ctx: &Ctx<'_>) {
+        let key = match write {
+            QueueWrite::Queued { item } | QueueWrite::Dequeued { item, .. } => {
+                match self.queue_writing.take_if(|(id, _)| id == item) {
+                    Some((_, key)) => key,
+                    None => self
+                        .items
+                        .iter()
+                        .find(|row| row.id == *item)
+                        .map_or_else(|| item.to_string(), |row| row.key.clone()),
+                }
+            }
+            QueueWrite::Resumed { .. } | QueueWrite::Paused { .. } => String::new(),
+        };
+        ctx.emit(Action::Error(queue_sentence(write, &key, view)));
     }
 
     /// A key while the item form is open (D8, A7).
@@ -678,6 +766,14 @@ impl Tab for BacklogTab {
             // SHIFT, both as `Char('N')` here (blueprint E4).
             KeyCode::Char('N') => self.open_new(ctx),
             KeyCode::Char('e') => self.open_edit(ctx),
+            // MOD-12 D9: `Q` toggles the cursor item's queue membership, `P` this box's queue.
+            // Each reads the queue first; the reply decides the write (no cached state goes stale
+            // when a worker drains the batch).
+            KeyCode::Char('Q') => self.toggle_queued(ctx),
+            KeyCode::Char('P') => {
+                self.queue_intent = Some(QueueIntent::Pause);
+                ctx.request(StoreRequest::QueueState);
+            }
             // A project header folds; on an item row there is nothing to fold, and `Enter` is
             // the detail pane's — the Runs pane replays the step under its cursor with it
             // (MOD-2 D39). Without this the pane would never see the key at all.
@@ -693,6 +789,25 @@ impl Tab for BacklogTab {
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
+        // MOD-12 D9: the queue read and writes, ahead of the list's.
+        match reply {
+            StoreReply::Queue(view) => return self.on_queue(view, ctx),
+            StoreReply::QueueWritten { write, view } => {
+                return self.on_queue_written(write, view, ctx);
+            }
+            // `App::on_reply` already put the failure on the status line.
+            // A refused read spends its toggle; a refused write only its in-flight key, never a
+            // toggle pressed since (review NIT-intent).
+            StoreReply::Failed { request, .. } if QUEUE_REQUEST_NAMES.contains(request) => {
+                if *request == StoreRequest::QueueState.name() {
+                    self.queue_intent = None;
+                } else {
+                    self.queue_writing = None;
+                }
+                return;
+            }
+            _ => {}
+        }
         // MOD-13 milestone 2: the item form's read and writes, before the list's.
         match reply {
             StoreReply::ItemForm(context) => return self.on_item_form(context, ctx),
@@ -877,6 +992,46 @@ impl Tab for BacklogTab {
     }
 }
 
+/// MOD-12 D9 (review L3): what a running queue adds in `htui --demo`, whose runtime never admits.
+const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
+
+/// MOD-12 D9: the status line after a queue write. `n` is the queue's length after it. In
+/// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3).
+fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
+    let n = view.entries.len();
+    match *write {
+        QueueWrite::Queued { .. } => match (view.open_batch.is_some(), view.demo) {
+            (true, false) => format!("queued {key} ({n} in queue, running)"),
+            (true, true) => {
+                format!("queued {key} ({n} in queue, running; {DEMO_NOTHING_ADMITTED})")
+            }
+            (false, _) => format!("queued {key} ({n} in queue, paused)"),
+        },
+        QueueWrite::Dequeued {
+            was_queued: true, ..
+        } => format!("dequeued {key} ({n} in queue)"),
+        QueueWrite::Dequeued {
+            was_queued: false, ..
+        } => format!("{key} was not queued"),
+        QueueWrite::Resumed { already: false } if view.demo => {
+            format!("queue resumed ({DEMO_NOTHING_ADMITTED})")
+        }
+        QueueWrite::Resumed { already: false } => "queue resumed".to_owned(),
+        QueueWrite::Resumed { already: true } if view.demo => {
+            format!("queue already running ({DEMO_NOTHING_ADMITTED})")
+        }
+        QueueWrite::Resumed { already: true } => "queue already running".to_owned(),
+        QueueWrite::Paused { already: true, .. } => "queue already paused".to_owned(),
+        QueueWrite::Paused { live: 0, .. } => "queue paused".to_owned(),
+        QueueWrite::Paused { live: 1, .. } => {
+            "queue paused \u{2014} 1 run still running".to_owned()
+        }
+        QueueWrite::Paused { live, .. } => {
+            format!("queue paused \u{2014} {live} runs still running")
+        }
+    }
+}
+
 /// Splits the body region into the list pane and the detail pane.
 fn panes(area: Rect) -> [Rect; 2] {
     Layout::horizontal([
@@ -908,6 +1063,293 @@ mod tests {
     use crossterm::event::{MouseButton, MouseEventKind};
     use htui_core::model::ItemFilter;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
+
+    /// MOD-12 D9 (blueprint §B.5.2): every row of the queue sentence table.
+    #[test]
+    fn queue_sentence_covers_every_write() {
+        let item = ItemId::new();
+        let paused = |n: usize| QueueView {
+            entries: vec![item; n],
+            open_batch: None,
+            demo: false,
+        };
+        let running = QueueView {
+            entries: vec![item; 3],
+            open_batch: Some(htui_core::model::BatchId::new()),
+            demo: false,
+        };
+        let demo = |view: QueueView| QueueView { demo: true, ..view };
+        let cases = [
+            (
+                QueueWrite::Queued { item },
+                paused(1),
+                "queued K-1 (1 in queue, paused)",
+            ),
+            (
+                QueueWrite::Queued { item },
+                running.clone(),
+                "queued K-1 (3 in queue, running)",
+            ),
+            (
+                QueueWrite::Dequeued {
+                    item,
+                    was_queued: true,
+                },
+                paused(0),
+                "dequeued K-1 (0 in queue)",
+            ),
+            (
+                QueueWrite::Dequeued {
+                    item,
+                    was_queued: false,
+                },
+                paused(0),
+                "K-1 was not queued",
+            ),
+            (
+                QueueWrite::Resumed { already: false },
+                running.clone(),
+                "queue resumed",
+            ),
+            (
+                QueueWrite::Resumed { already: true },
+                running.clone(),
+                "queue already running",
+            ),
+            // Review L3: `htui --demo` never admits, so a running queue says so; a paused one
+            // and a dequeue are as true there as anywhere.
+            (
+                QueueWrite::Queued { item },
+                demo(running.clone()),
+                "queued K-1 (3 in queue, running; demo: nothing is admitted)",
+            ),
+            (
+                QueueWrite::Queued { item },
+                demo(paused(1)),
+                "queued K-1 (1 in queue, paused)",
+            ),
+            (
+                QueueWrite::Resumed { already: false },
+                demo(running.clone()),
+                "queue resumed (demo: nothing is admitted)",
+            ),
+            (
+                QueueWrite::Resumed { already: true },
+                demo(running),
+                "queue already running (demo: nothing is admitted)",
+            ),
+            (
+                QueueWrite::Paused {
+                    live: 0,
+                    already: false,
+                },
+                demo(paused(0)),
+                "queue paused",
+            ),
+            (
+                QueueWrite::Paused {
+                    live: 0,
+                    already: true,
+                },
+                paused(0),
+                "queue already paused",
+            ),
+            (
+                QueueWrite::Paused {
+                    live: 0,
+                    already: false,
+                },
+                paused(0),
+                "queue paused",
+            ),
+            (
+                QueueWrite::Paused {
+                    live: 1,
+                    already: false,
+                },
+                paused(0),
+                "queue paused \u{2014} 1 run still running",
+            ),
+            (
+                QueueWrite::Paused {
+                    live: 2,
+                    already: false,
+                },
+                paused(0),
+                "queue paused \u{2014} 2 runs still running",
+            ),
+        ];
+        for (write, view, sentence) in cases {
+            assert_eq!(queue_sentence(&write, "K-1", &view), sentence, "{write:?}");
+        }
+    }
+
+    /// The queue requests among `actions`, by name; a `queue_item` names its item too.
+    fn queue_requests(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::QueueItem { item }) => {
+                    Some(format!("queue_item {item}"))
+                }
+                Action::Store(request) if QUEUE_REQUEST_NAMES.contains(&request.name()) => {
+                    Some(request.name().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// MOD-12 D9 (review NIT-intent): one intent is at most one write, and a write's answer does
+    /// not wipe a newer intent: `P` pressed while `Q`'s write is in flight still sends its own.
+    #[tokio::test]
+    async fn p_pressed_while_q_writes_still_sends_its_write() {
+        let bench = Bench::new().await;
+        let ana_2 = htui_core::fixtures::ids::HTUI_ANA_2;
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ana_2)),
+            ..bench.tab()
+        };
+        let paused = |entries: Vec<ItemId>| QueueView {
+            entries,
+            open_batch: None,
+            demo: false,
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('Q'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            [format!("queue_item {ana_2}")]
+        );
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            Vec::<String>::new(),
+            "the intent was spent on the first read: one intent, one write"
+        );
+
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(
+            &StoreReply::QueueWritten {
+                write: QueueWrite::Queued { item: ana_2 },
+                view: paused(vec![ana_2]),
+            },
+            &mut bench.ctx(),
+        );
+        let actions = bench.actions();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Error(status) if status == "queued ANA-2 (1 in queue, paused)"
+            )),
+            "Q's write still says what it did: {actions:?}"
+        );
+        tab.on_reply(&StoreReply::Queue(paused(vec![ana_2])), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["resume_queue"],
+            "P's read still decides P's write"
+        );
+    }
+
+    /// MOD-12 D9 (review NIT-intent, G3): a refused write spends only its own in-flight key, so
+    /// `P` pressed while `Q`'s write is refused (review L1's `queued elsewhere`) still sends its
+    /// own write; a refused read spends the toggle it was for.
+    #[tokio::test]
+    async fn a_refused_queue_write_keeps_a_newer_toggle_and_a_refused_read_spends_it() {
+        let bench = Bench::new().await;
+        let ana_2 = htui_core::fixtures::ids::HTUI_ANA_2;
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ana_2)),
+            ..bench.tab()
+        };
+        let paused = |entries: Vec<ItemId>| QueueView {
+            entries,
+            open_batch: None,
+            demo: false,
+        };
+        let refused = |request: &'static str| StoreReply::Failed {
+            request,
+            message: "the item is queued on another box; dequeue it there".to_owned(),
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('Q'));
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["queue_state".to_owned(), format!("queue_item {ana_2}")]
+        );
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(
+            &refused(StoreRequest::QueueItem { item: ana_2 }.name()),
+            &mut bench.ctx(),
+        );
+        assert!(
+            tab.queue_writing.is_none(),
+            "the refused write's key is spent"
+        );
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["resume_queue"],
+            "P's read still decides P's write"
+        );
+
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(&refused(StoreRequest::QueueState.name()), &mut bench.ctx());
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            Vec::<String>::new(),
+            "a refused read spent its toggle: a later read writes nothing"
+        );
+    }
+
+    /// MOD-12 D9 (review NIT-intent, G3): a write's answer names its item by the key taken when
+    /// it was sent, so an item gone from the list meanwhile is still named by its key.
+    #[tokio::test]
+    async fn a_queue_write_names_its_item_after_the_list_dropped_it() {
+        let bench = Bench::new().await;
+        let ana_2 = htui_core::fixtures::ids::HTUI_ANA_2;
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ana_2)),
+            ..bench.tab()
+        };
+        let paused = |entries: Vec<ItemId>| QueueView {
+            entries,
+            open_batch: None,
+            demo: false,
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('Q'));
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["queue_state".to_owned(), format!("queue_item {ana_2}")]
+        );
+        tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
+        let _ = bench.actions();
+        tab.on_reply(
+            &StoreReply::QueueWritten {
+                write: QueueWrite::Queued { item: ana_2 },
+                view: paused(vec![ana_2]),
+            },
+            &mut bench.ctx(),
+        );
+        let actions = bench.actions();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Error(status) if status == "queued ANA-2 (1 in queue, paused)"
+            )),
+            "named by its key, not its id: {actions:?}"
+        );
+    }
 
     /// A sub-tab that records every key it is offered and captures while `capturing` is set (the
     /// `tests/settings.rs` probe, one level down).
@@ -984,6 +1426,8 @@ mod tests {
             form: None,
             item_form: None,
             opening: None,
+            queue_intent: None,
+            queue_writing: None,
         };
 
         let (top_bar, keymap, theme, emit) = (
@@ -1159,6 +1603,8 @@ mod tests {
             form: None,
             item_form: None,
             opening: None,
+            queue_intent: None,
+            queue_writing: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -1209,6 +1655,8 @@ mod tests {
             form: None,
             item_form: None,
             opening: None,
+            queue_intent: None,
+            queue_writing: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -1311,7 +1759,7 @@ mod tests {
 
     fn done_only() -> BacklogFilter {
         BacklogFilter {
-            statuses: vec![htui_core::model::Status::Done],
+            statuses: vec![Status::Done],
             ..BacklogFilter::default()
         }
     }
@@ -1526,7 +1974,7 @@ mod tests {
             items_reads(&actions),
             [(
                 ItemFilter {
-                    statuses: Some(vec![htui_core::model::Status::Done]),
+                    statuses: Some(vec![Status::Done]),
                     ..ItemFilter::default()
                 },
                 false
@@ -1639,7 +2087,7 @@ mod tests {
         let done: Vec<ItemSummary> = bench
             .items
             .iter()
-            .filter(|item| item.status == htui_core::model::Status::Done)
+            .filter(|item| item.status == Status::Done)
             .cloned()
             .collect();
         assert!(
@@ -2059,7 +2507,7 @@ mod tests {
     }
 
     /// The rows of `bench` with `status`.
-    fn with_status(bench: &Bench, status: htui_core::model::Status) -> Vec<ItemSummary> {
+    fn with_status(bench: &Bench, status: Status) -> Vec<ItemSummary> {
         bench
             .items
             .iter()
@@ -2105,7 +2553,7 @@ mod tests {
         let mut tab = bench.tab();
         tab.apply(done_only(), &bench.ctx());
         tab.on_reply(
-            &StoreReply::Items(with_status(&bench, htui_core::model::Status::Done)),
+            &StoreReply::Items(with_status(&bench, Status::Done)),
             &mut bench.ctx(),
         );
         assert_eq!(tab.shown, done_only());

@@ -1492,6 +1492,12 @@ downgrade, and that the audit record shows both what was configured and what was
 is one line: `gate_effective = if run.mode == Auto && !gate_hard { Never } else { gate }`. The trace
 is `gate_outcome = 'skipped'` per §4.2.
 
+**As built (MOD-12 M1).** Queue membership is a `queue_entry` row (an item queued on at most one
+box), and a queue activation is a `queue_batch` row whose `id` each auto run records in
+`run.batch_id` (`0016_auto_queue.sql`). A box's queue runs iff it has an open batch: pause closes it
+(cancelling the batch's runs still `queued`), and resume opens a new one. Queue order is
+`position NULLS LAST`, then `ready_items` order.
+
 Timer-based auto-approval is rejected. Jules auto-approves a plan on a timer ("if you navigate away,
 Jules will eventually auto-approve the plan, which is set on a timer",
 https://jules.google/docs/review-plan/), which makes `gate_outcome` record a decision nobody made.

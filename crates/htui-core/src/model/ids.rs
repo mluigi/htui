@@ -125,4 +125,6 @@ id_newtype!(
     RelaySessionId,
     /// `persona.id` (MOD-26 plan D1): one agent persona of the global registry.
     PersonaId,
+    /// `queue_batch.id` (MOD-12 plan D1): one queue activation of one box.
+    BatchId,
 );

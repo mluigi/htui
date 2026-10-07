@@ -101,6 +101,7 @@ async fn park_ana_2(store: &MemStore) -> (RunId, StepId, Uuid) {
             graph_snapshot: snapshot,
             repo_scope: Vec::new(),
             queued_at: at,
+            batch_id: None,
         })
         .await
         .expect("create_run")

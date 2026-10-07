@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                SELECT id AS \"id: RunId\"\n                  FROM run\n                 WHERE batch_id = $1 AND status = 'queued'\n                 ORDER BY queued_at, id\n                   FOR UPDATE\n                ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "34e3d2deec8e85d103c31b8eadf2425b4d271a5725ee5e7dc0cfaf8966342d2b"
+}

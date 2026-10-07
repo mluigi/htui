@@ -34,6 +34,8 @@ htui-orch  = { workspace = true, features = ["test-support"] }
 htui-agent = { workspace = true, features = ["test-support"] }
 htui-store = { workspace = true, features = ["demo", "test-support"] }
 tokio      = { workspace = true, features = ["test-util", "rt-multi-thread"] }
+# MOD-12 D3: the drained case reads `queue_batch.closed_reason`, which no store read returns.
+sqlx       = { workspace = true }
 
 [lints]
 workspace = true

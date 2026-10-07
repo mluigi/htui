@@ -32,8 +32,8 @@ use htui_agent::record::{
     Control, RELAY_GRACE, RELAY_POLL, Recorder, Relay, RunCap, Signal, control_channel, drive,
 };
 use htui_core::model::{
-    AgentId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus, Document,
-    DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
+    AgentId, BatchId, BoundSkill, BoxId, BoxProfile, Claim, CommandRunId, CommandRunStatus,
+    Document, DocumentId, EventKind, Gate, GateOutcome, GraphSnapshot, Isolation, Item, ItemId,
     NewCommandRun, NewNote, NewRun, NewRunStep, NoteId, Project, ProjectId, ProjectSettings,
     PromptScope, RelaySessionId, Repo, RepoId, Resolution, Run, RunId, RunStatus, RunStep,
     RunStepCommit, RunStepTree, RunSummary, SessionEvent, SnapshotCandidate, SnapshotPersona,
@@ -679,6 +679,30 @@ where
         mode: htui_core::model::RunMode,
         repo_scope: Option<Vec<RepoId>>,
     ) -> Result<RunId, EngineError> {
+        Box::pin(self.enqueue_with(item, mode, repo_scope, None)).await
+    }
+
+    /// MOD-12 D6, D7: [`Self::enqueue`] for the queue runner — an `auto` run over the item's
+    /// default scope, recorded under `batch`. `create_run` refuses a closed or unknown batch.
+    ///
+    /// # Errors
+    /// [`Self::enqueue`]'s.
+    pub async fn enqueue_in_batch(
+        &self,
+        item: ItemId,
+        batch: BatchId,
+    ) -> Result<RunId, EngineError> {
+        Box::pin(self.enqueue_with(item, htui_core::model::RunMode::Auto, None, Some(batch))).await
+    }
+
+    /// The body `enqueue` had, with `batch_id` threaded into `NewRun` (MOD-12 D7).
+    async fn enqueue_with(
+        &self,
+        item: ItemId,
+        mode: htui_core::model::RunMode,
+        repo_scope: Option<Vec<RepoId>>,
+        batch: Option<BatchId>,
+    ) -> Result<RunId, EngineError> {
         let item = self.item(item).await?;
         // R-ORCH-10 at queue time (MOD-7 milestone 3, D79): before resolution, so an item that
         // lacks tags *and* has no candidate is refused for the tags, the cheaper box-level fact.
@@ -729,6 +753,7 @@ where
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: now,
+                batch_id: batch,
             })
             .await?;
         Ok(id)
@@ -9151,6 +9176,7 @@ mod tests {
                 graph_snapshot: snapshot,
                 repo_scope: Vec::new(),
                 queued_at: now,
+                batch_id: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -12423,6 +12449,7 @@ mod tests {
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
+                batch_id: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -12527,6 +12554,7 @@ mod tests {
                 graph_snapshot: resolved.snapshot,
                 repo_scope: resolved.repo_scope,
                 queued_at: harness.orch.clock.now(),
+                batch_id: None,
             })
             .await
             .expect("MemStore creates the run");
@@ -12651,6 +12679,65 @@ mod tests {
             matches!(resumed, Resume::Walked(_)),
             "a body edit is not a topology change (I-3): {resumed:?}"
         );
+    }
+
+    /// MOD-12 review M3, blueprint H-3: a resume re-resolves the live graph under the run's own
+    /// `mode` (the one read of `run.mode` after its insert), so a parked auto run whose snapshot
+    /// downgraded its soft gates resumes `Walked`, not `TopologyChanged`; a parked manual run of
+    /// the same graph, which kept them, resumes `Walked` too.
+    #[tokio::test]
+    async fn a_parked_run_resumes_under_its_own_mode() {
+        for mode in [RunMode::Auto, RunMode::Manual] {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| phase.gate = Gate::Always)
+                .await;
+            for attempt in [1, 2] {
+                harness
+                    .orch
+                    .script("review", attempt, ScriptedStep::review("approve", "fine"));
+            }
+            let CommandOutcome::Started { run, rest } = harness
+                .dispatch(Command::StartRun {
+                    item: ids::HTUI_FEAT_3,
+                    mode,
+                    repo_scope: None,
+                })
+                .await
+                .expect("the walk starts")
+            else {
+                panic!("`StartRun` answers `Started`");
+            };
+            assert_eq!(rest.run, RunStatus::AwaitingApproval, "{mode:?} parks");
+            let snapshot = snapshot_of(&harness, run).await;
+            assert_eq!(snapshot.mode, mode);
+            let downgraded = snapshot
+                .phases
+                .iter()
+                .any(|phase| phase.gate_effective == Gate::Never);
+            assert_eq!(
+                downgraded,
+                mode == RunMode::Auto,
+                "{mode:?}: only an auto snapshot differs from the manual resolution"
+            );
+            if mode == RunMode::Auto {
+                let parked = snapshot
+                    .phases
+                    .iter()
+                    .find(|phase| Some(phase.position) == rest.position)
+                    .expect("the run parked at a phase of its snapshot");
+                assert!(parked.gate_hard, "an auto run parks at its hard gate");
+            }
+
+            let resumed = Box::pin(harness.resume(run))
+                .await
+                .expect("the run is readable");
+            assert!(
+                matches!(resumed, Resume::Walked(_)),
+                "{mode:?}: a resume resolves under the run's own mode: {resumed:?}"
+            );
+        }
     }
 
     /// The driver factory's contract: one driver per `(phase, attempt)`, because `FakeDriver`

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,\n                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope)\n            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[])\n            RETURNING id               AS \"id: RunId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      item_id          AS \"item_id: ItemId\",\n                      kind             AS \"kind: RunKind\",\n                      mode             AS \"mode: RunMode\",\n                      status           AS \"status: RunStatus\",\n                      target_box_id    AS \"target_box_id: BoxId\",\n                      executing_box_id AS \"executing_box_id: BoxId\",\n                      graph_snapshot,\n                      started_by       AS \"started_by: UserId\",\n                      queued_at,\n                      started_at,\n                      finished_at,\n                      failure,\n                      repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                      lease_box_id     AS \"lease_box_id: BoxId\",\n                      lease_expires_at,\n                      updated_at\n            ",
+  "query": "\n            INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id,\n                             executing_box_id, graph_snapshot, started_by, queued_at, repo_scope,\n                             batch_id)\n            VALUES ($1, $2, $3, 'graph', $4, 'queued', $5, NULL, $6, $7, $8, $9::uuid[], $10)\n            RETURNING id               AS \"id: RunId\",\n                      project_id       AS \"project_id: ProjectId\",\n                      item_id          AS \"item_id: ItemId\",\n                      kind             AS \"kind: RunKind\",\n                      mode             AS \"mode: RunMode\",\n                      status           AS \"status: RunStatus\",\n                      target_box_id    AS \"target_box_id: BoxId\",\n                      executing_box_id AS \"executing_box_id: BoxId\",\n                      graph_snapshot,\n                      started_by       AS \"started_by: UserId\",\n                      queued_at,\n                      started_at,\n                      finished_at,\n                      failure,\n                      repo_scope       AS \"repo_scope: Vec<RepoId>\",\n                      lease_box_id     AS \"lease_box_id: BoxId\",\n                      lease_expires_at,\n                      updated_at\n            ",
   "describe": {
     "columns": [
       {
@@ -212,7 +212,8 @@
         "Jsonb",
         "Uuid",
         "Timestamptz",
-        "UuidArray"
+        "UuidArray",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -236,5 +237,5 @@
       false
     ]
   },
-  "hash": "eb3ab1ed0aeb41e6174e244bcacd2ae57b0711d804c1960f034a01ebba399475"
+  "hash": "e232ce4004ece9873b5c18ae388709fafe269f772a239428f043ba22696014f2"
 }

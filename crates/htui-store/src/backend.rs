@@ -25,13 +25,14 @@ use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
-    AgentBox, AgentSummary, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow, CoverageRow, Document,
-    DocumentHead, DocumentId, Item, ItemCitation, ItemFilter, ItemId, ItemKind, ItemKindId,
-    ItemSummary, LinkGraph, Note, PhaseAgent, PhaseId, Project, ProjectId, ProjectRef, PromptScope,
-    PromptTemplate, RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter,
-    RequirementId, RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId,
-    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
-    StepId, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WorkspaceSummary,
+    AgentBox, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
+    CoverageRow, Document, DocumentHead, DocumentId, Item, ItemCitation, ItemFilter, ItemId,
+    ItemKind, ItemKindId, ItemSummary, LinkGraph, Note, PhaseAgent, PhaseId, Project, ProjectId,
+    ProjectRef, PromptScope, PromptTemplate, QueueBatch, QueueEntry, RepoBoxPath, RepoId,
+    Requirement, RequirementArea, RequirementFilter, RequirementId, RequirementRevision,
+    RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, ToolCallCount,
+    UpstreamEntry, UserId, WaitingCandidate, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -584,6 +585,183 @@ impl Backend {
         match self {
             Self::Memory(store) => store.queued_runs_on_box(box_id).await,
             Self::Online { pg, .. } => pg.queued_runs_on_box(box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D1: queue `item` on `box_id`; idempotent, an item already queued answers its stored
+    /// entry unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn queue_item(
+        &self,
+        item: ItemId,
+        box_id: BoxId,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<QueueEntry> {
+        match self {
+            Self::Memory(store) => store.queue_item(item, box_id, by, at).await,
+            Self::Online { pg, .. } => pg.queue_item(item, box_id, by, at).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D9: `item` leaves whatever queue holds it; `false` when none did.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn dequeue_item(&self, item: ItemId) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.dequeue_item(item).await,
+            Self::Online { pg, .. } => pg.dequeue_item(item).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D4: `box_id`'s queue entries, `position NULLS LAST, queued_at, item_id`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+        match self {
+            Self::Memory(store) => store.queue_entries(box_id).await,
+            Self::Online { pg, .. } => pg.queue_entries(box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D2: resume: `box_id`'s open batch, opened now unless one already is.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn open_batch(
+        &self,
+        box_id: BoxId,
+        by: UserId,
+        at: DateTime<Utc>,
+    ) -> Result<QueueBatch> {
+        match self {
+            Self::Memory(store) => store.open_batch(box_id, by, at).await,
+            Self::Online { pg, .. } => pg.open_batch(box_id, by, at).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D2: `box_id`'s open batch, if any: whether its queue runs.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn open_batch_of(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        match self {
+            Self::Memory(store) => store.open_batch_of(box_id).await,
+            Self::Online { pg, .. } => pg.open_batch_of(box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn close_batch(
+        &self,
+        box_id: BoxId,
+        reason: BatchClose,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        match self {
+            Self::Memory(store) => store.close_batch(box_id, reason, at).await,
+            Self::Online { pg, .. } => pg.close_batch(box_id, reason, at).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
+        match self {
+            Self::Memory(store) => store.prune_finished_entries(box_id).await,
+            Self::Online { pg, .. } => pg.prune_finished_entries(box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D3 (review M1): the drain's close of exactly `batch`, only while it is still
+    /// drained (no entry on its box, no live run of its own); `None` when it did not close.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn close_drained_batch(
+        &self,
+        batch: BatchId,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        match self {
+            Self::Memory(store) => store.close_drained_batch(batch, at).await,
+            Self::Online { pg, .. } => pg.close_drained_batch(batch, at).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 (review H1): the items with a `cancelled` run under `batch`, in uuid order.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn batch_cancelled_items(&self, batch: BatchId) -> Result<Vec<ItemId>> {
+        match self {
+            Self::Memory(store) => store.batch_cancelled_items(batch).await,
+            Self::Online { pg, .. } => pg.batch_cancelled_items(batch).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D3, D9: the runs admitted under `batch`, `(id, status)` by `(queued_at, id)`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn batch_runs(&self, batch: BatchId) -> Result<Vec<(RunId, RunStatus)>> {
+        match self {
+            Self::Memory(store) => store.batch_runs(batch).await,
+            Self::Online { pg, .. } => pg.batch_runs(batch).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D6: `claim_run`'s slot count, `running` runs executing on `box_id` (not
+    /// `awaiting_approval`, which [`Backend::active_runs_on_box`] also counts).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn running_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+        match self {
+            Self::Memory(store) => store.running_runs_on_box(box_id).await,
+            Self::Online { pg, .. } => pg.running_runs_on_box(box_id).await,
             Self::Offline { .. } => Err(orchestration_offline()),
         }
     }
