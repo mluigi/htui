@@ -9677,6 +9677,7 @@ struct QueueFacts {
     laptop: BoxId,
     cancelled: RunId,
     latest: RunId,
+    chat: RunId,
     laptop_run: RunId,
     steps: [StepId; 3],
     notes: [htui_core::model::NoteId; 2],
@@ -9689,6 +9690,7 @@ impl QueueFacts {
             laptop: BoxId::new(),
             cancelled: RunId::new(),
             latest: RunId::new(),
+            chat: RunId::new(),
             laptop_run: RunId::new(),
             steps: [StepId::new(), StepId::new(), StepId::new()],
             notes: [
@@ -9700,9 +9702,10 @@ impl QueueFacts {
 }
 
 /// The edges out of `HTUI_ANA_2` both stores plant: `(to, kind, tombstoned)`. `TOOL-1` (awaiting
-/// approval) and `FEAT-1` (in progress) are its open blockers; `ANA-1` is done, the `FEAT-3`
-/// edge is tombstoned and `FEAT-2`'s is `relates`.
-const QUEUE_EDGES: [(ItemId, htui_core::model::LinkKind, bool); 5] = [
+/// approval) and `FEAT-1` (in progress) are its open blockers, and so is `agy` `FEAT-1` (open):
+/// another project's item with the same key, which lists `FEAT-1` once, not twice. `ANA-1` is
+/// done, the `FEAT-3` edge is tombstoned and `FEAT-2`'s is `relates`.
+const QUEUE_EDGES: [(ItemId, htui_core::model::LinkKind, bool); 6] = [
     (
         ids::HTUI_TOOL_1,
         htui_core::model::LinkKind::BlockedBy,
@@ -9710,6 +9713,11 @@ const QUEUE_EDGES: [(ItemId, htui_core::model::LinkKind, bool); 5] = [
     ),
     (
         ids::HTUI_FEAT_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::AGY_FEAT_1,
         htui_core::model::LinkKind::BlockedBy,
         false,
     ),
@@ -9726,7 +9734,10 @@ const QUEUE_EDGES: [(ItemId, htui_core::model::LinkKind, bool); 5] = [
     (ids::HTUI_FEAT_2, htui_core::model::LinkKind::Relates, false),
 ];
 
-/// `MemStore::demo()` plus `facts.laptop` (`LAPTOP-B`) and [`QUEUE_EDGES`].
+/// `MemStore::demo()` plus `facts.laptop` (`LAPTOP-B`), [`QUEUE_EDGES`] and `facts.chat`: a chat
+/// run on `HTUI_ANA_2` queued after every graph run [`plant_queue_facts`] writes, which
+/// `queue_rows` must not take for the latest run. `NewRun` has no kind, so it is planted here,
+/// already `done`: an active run would hold the item `queued` and refuse the next `create_run`.
 fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
     let mut data = htui_core::fixtures::demo_data();
     let mut laptop = data
@@ -9749,6 +9760,27 @@ fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
             deleted_at: tombstoned.then_some(facts.at),
         });
     }
+    let chat_at = facts.at + TimeDelta::seconds(2);
+    data.runs.push(htui_core::model::Run {
+        id: facts.chat,
+        project_id: ids::PROJECT_HTUI,
+        item_id: Some(ids::HTUI_ANA_2),
+        kind: htui_core::model::RunKind::Chat,
+        mode: RunMode::Manual,
+        status: RunStatus::Done,
+        target_box_id: ids::BOX,
+        executing_box_id: None,
+        graph_snapshot: None,
+        started_by: ids::USER,
+        queued_at: chat_at,
+        started_at: Some(chat_at),
+        finished_at: Some(chat_at),
+        failure: None,
+        repo_scope: Vec::new(),
+        lease_box_id: None,
+        lease_expires_at: None,
+        updated_at: chat_at,
+    });
     htui_core::store::MemStore::from_demo(data)
 }
 
@@ -9777,6 +9809,20 @@ async fn queue_facts_pg(pool: &PgPool, facts: &QueueFacts) {
         .await
         .expect("plant an edge");
     }
+    sqlx::query(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+         graph_snapshot, started_by, queued_at, started_at, finished_at, updated_at) \
+         VALUES ($1, $2, $3, 'chat', 'manual', 'done', $4, NULL, $5, $6, $6, $6, $6)",
+    )
+    .bind(facts.chat.as_uuid())
+    .bind(ids::PROJECT_HTUI.as_uuid())
+    .bind(ids::HTUI_ANA_2.as_uuid())
+    .bind(ids::BOX.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .bind(facts.at + TimeDelta::seconds(2))
+    .execute(pool)
+    .await
+    .expect("plant the chat run");
 }
 
 /// The runs, steps and notes `queue_rows` reads, through the trait so both stores take the same
@@ -9926,10 +9972,15 @@ async fn queue_rows_answer_alike_on_both_stores() {
     let ana = &rows[2];
     assert_eq!(
         ana.latest_run.as_ref().map(|run| (run.id, run.status)),
-        Some((facts.latest, RunStatus::Queued))
+        Some((facts.latest, RunStatus::Queued)),
+        "the latest graph run, not the later chat run"
     );
     assert_eq!(ana.latest_note.as_deref(), Some("the later note"));
-    assert_eq!(ana.open_blockers, ["FEAT-1", "TOOL-1"]);
+    assert_eq!(
+        ana.open_blockers,
+        ["FEAT-1", "TOOL-1"],
+        "`htui` and `agy` `FEAT-1` list one key"
+    );
     assert_eq!(
         rows[3].open_blockers,
         ["FEAT-1"],
