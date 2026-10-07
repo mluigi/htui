@@ -180,8 +180,9 @@ impl QueueOverlay {
     /// line), a blank line, then the hint.
     ///
     /// `room` is the box's inner width and `text_width` the room the sentence column gets;
-    /// `None` is the natural size, nothing clipped. The header and the unavailable line are
-    /// clipped to `room` with an ellipsis too (the whole failure is on the status line as well).
+    /// `None` is the natural size, nothing clipped. The header, the unavailable line and the hint
+    /// are clipped to `room` with an ellipsis too (the whole failure is on the status line as
+    /// well).
     /// `visible` is how many rows fit: the window always holds the cursor.
     fn lines(
         &self,
@@ -235,7 +236,7 @@ impl QueueOverlay {
             }
         };
         lines.push(Line::raw(""));
-        lines.push(Line::styled(format!("{NO_CURSOR}{HINT}"), theme.dim));
+        lines.push(Line::styled(clipped(HINT), theme.dim));
         lines
     }
 
@@ -909,6 +910,14 @@ mod tests {
         assert!(
             clipped.trim_end_matches('│').trim_end().ends_with('…'),
             "{rendered}"
+        );
+        let hint = rendered
+            .lines()
+            .find(|line| line.contains("j/k move"))
+            .expect("the hint is drawn");
+        assert!(
+            hint.trim_end_matches('│').trim_end().ends_with('…'),
+            "a hint wider than the box is cut with an ellipsis: {rendered}"
         );
         insta::assert_snapshot!("narrow", rendered);
     }
