@@ -227,6 +227,45 @@ mod binary {
         assert!(stderr.ends_with(&format!("\n{HINT}")), "{stderr}");
     }
 
+    /// MOD-12 M3 D8: `ctrl-q` is now `global.queue` by default, so a file written before it that
+    /// binds `ctrl-q` in `[global]` is refused; unbinding `queue` (or rebinding it) loads it again.
+    #[test]
+    fn a_global_ctrl_q_binding_collides_with_the_queue_until_queue_is_rebound() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = home.path().join("upgrade.toml");
+
+        std::fs::write(&path, "[global]\nquit = [\"ctrl-q\"]\n").expect("the file is written");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert_eq!(stdout, "");
+        let line = r#"2: [global] quit = "ctrl-q": "ctrl-q" is already global.queue (default) in [global]"#;
+        assert_eq!(stderr, report("upgrade", &path, &[line.to_owned()]));
+
+        std::fs::write(&path, "[global]\nquit = [\"ctrl-q\"]\nqueue = []\n")
+            .expect("the file is written");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        let queue = stdout
+            .lines()
+            .find(|line| line.starts_with("queue "))
+            .expect("the queue row is printed");
+        assert!(queue.contains("= []"), "{stdout}");
+        assert!(queue.ends_with("# queue (changed)"), "{stdout}");
+        let quit = stdout
+            .lines()
+            .find(|line| line.starts_with("quit "))
+            .expect("the quit row is printed");
+        assert!(quit.contains(r#"["ctrl-q"]"#), "{stdout}");
+    }
+
     #[test]
     fn keys_and_default_keys_are_refused_together() {
         let home = tempfile::tempdir().expect("a throwaway home");
