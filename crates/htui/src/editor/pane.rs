@@ -2,20 +2,53 @@
 //!
 //! What lives here:
 //!
+//! - [`PtyChild`]: a child on a pseudo-terminal and three threads per pane. The **reader**
+//!   (`htui-pane-read`) sends what the child draws as [`PaneEvent::Output`]; the **writer**
+//!   (`htui-pane-write`) writes queued input, so a paste into a stalled child never blocks the
+//!   caller (PD-2); the **wait** thread (`htui-pane-wait`) owns the child, polls it, and sends
+//!   [`PaneEvent::Exited`] once it is reaped.
+//! - The kill path (B5): [`PaneChild::kill`], or dropping the [`PtyChild`], asks the wait thread,
+//!   which runs portable-pty's escalating kill on the child it owns (SIGHUP, a 200 ms grace, then
+//!   SIGKILL; `TerminateProcess` on Windows) and reaps it. No pid-based signal is sent from the
+//!   caller, so a reaped pid that the system reuses is never hit.
 //! - [`PaneScreen`]: the VT screen a pane's output is parsed into (`vt100`), and the replies the
 //!   child is owed for its terminal queries (DSR, DA1).
 //! - [`encode_key`] and [`encode_paste`]: crossterm's keys and pastes as the bytes a legacy xterm
 //!   sends (no kitty protocol, PRD Q4).
 //! - [`PaneId`], [`PaneSize`], [`PaneEvent`]: what the shell and the pane's threads exchange.
 //!
-//! Bytes and screen contents are never logged or `Debug`ged: only lengths and sizes.
+//! Nothing here blocks the caller: `write` queues, `resize` is one ioctl, `kill` sends on a
+//! channel (R-NF-3). Bytes and screen contents are never logged or `Debug`ged: only lengths and
+//! sizes.
+//!
+//! [`PtyChild`]: crate::editor::pane::PtyChild
+//! [`PaneEvent::Output`]: crate::editor::pane::PaneEvent::Output
+//! [`PaneEvent::Exited`]: crate::editor::pane::PaneEvent::Exited
+//! [`PaneChild::kill`]: crate::editor::pane::PaneChild::kill
+//! [`PaneScreen`]: crate::editor::pane::PaneScreen
+//! [`encode_key`]: crate::editor::pane::encode_key
+//! [`encode_paste`]: crate::editor::pane::encode_paste
+//! [`PaneId`]: crate::editor::pane::PaneId
+//! [`PaneSize`]: crate::editor::pane::PaneSize
+//! [`PaneEvent`]: crate::editor::pane::PaneEvent
 
 use std::fmt;
-use std::io::Write as _;
+use std::io::{self, Read as _, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
+use tokio::sync::mpsc::UnboundedSender;
 use zeroize::Zeroizing;
+
+/// How often the wait thread polls the child while no kill is asked for.
+const POLL: Duration = Duration::from_millis(25);
+
+/// The reader thread's buffer: one `Output` carries at most this many bytes.
+const READ_CHUNK: usize = 8192;
 
 /// One in-pane editor's identity. Every event carries it, so the shell drops events of an editor
 /// it has already finished or aborted (MOD-57 B4).
@@ -57,6 +90,17 @@ impl PaneSize {
     fn floored(self) -> Self {
         Self::new(self.rows, self.cols)
     }
+
+    /// As portable-pty wants it (no pixel size).
+    fn pty(self) -> PtySize {
+        let Self { rows, cols } = self.floored();
+        PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
 }
 
 /// What a pane's threads tell the shell. `Debug` prints lengths, never bytes.
@@ -73,9 +117,9 @@ pub enum PaneEvent {
         /// The pane.
         id: PaneId,
         /// Its status, or why waiting failed.
-        status: std::io::Result<portable_pty::ExitStatus>,
+        status: io::Result<portable_pty::ExitStatus>,
         /// Since the spawn, measured by the wait thread.
-        elapsed: std::time::Duration,
+        elapsed: Duration,
     },
 }
 
@@ -108,6 +152,203 @@ impl fmt::Debug for PaneEvent {
                 .field("elapsed", elapsed)
                 .finish(),
         }
+    }
+}
+
+/// The process side of an in-pane editor (MOD-57 B2). [`PtyChild`] is the real one; `App` tests
+/// use a recording fake. No method blocks.
+pub trait PaneChild: fmt::Debug {
+    /// Queues `bytes` for the child's input.
+    fn write(&mut self, bytes: &[u8]);
+    /// Tells the kernel, and so the child (`SIGWINCH`), the new size.
+    fn resize(&mut self, size: PaneSize);
+    /// Asks for the child to end: SIGHUP, then SIGKILL after a grace (B5). Idempotent.
+    fn kill(&mut self);
+}
+
+/// A child on a pseudo-terminal, with its reader, writer and wait threads. Dropping it kills the
+/// child. `Debug` prints the pid only.
+pub struct PtyChild {
+    /// Kept for `resize`. Dropped after the kill request (`Drop` runs before the fields drop).
+    master: Box<dyn MasterPty + Send>,
+    /// The writer thread's queue; dropping it ends the thread, which drops the PTY writer then
+    /// (F-10: that writes a newline and `VEOF`, so it must not happen to a live editor first).
+    input: mpsc::Sender<Zeroizing<Vec<u8>>>,
+    /// The wait thread's kill request; `None` once sent.
+    kill: Option<mpsc::Sender<()>>,
+    /// For `Debug` and tests.
+    pid: Option<u32>,
+}
+
+impl PtyChild {
+    /// Opens a PTY of `size`, spawns `command` on it, drops the slave, starts the threads.
+    ///
+    /// The caller never `Debug`s `command`: it carries the whole environment.
+    ///
+    /// # Errors
+    /// The PTY could not be opened, the command could not be spawned, or a thread could not be
+    /// started (the child, if spawned, is then killed by the wait thread or, if that thread never
+    /// started, by a SIGHUP taken before it).
+    pub fn spawn(
+        command: portable_pty::CommandBuilder,
+        size: PaneSize,
+        id: PaneId,
+        events: UnboundedSender<PaneEvent>,
+    ) -> io::Result<Self> {
+        let pair = native_pty_system()
+            .openpty(size.pty())
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        // At once: while htui holds the slave, the reader never sees EOF.
+        drop(pair.slave);
+        let master = pair.master;
+        let pid = child.process_id();
+        let started = Instant::now();
+
+        // The wait thread first: from here on, it owns the child and every kill goes through it.
+        let (kill_tx, kill_rx) = mpsc::channel::<()>();
+        // Only for the one path where the thread cannot start: `Builder::spawn` then drops the
+        // closure, and the child with it, unkilled. The child is not reaped yet, so its pid is
+        // still its own.
+        let mut fallback = child.clone_killer();
+        let wait_events = events.clone();
+        let waiting = thread::Builder::new()
+            .name("htui-pane-wait".to_owned())
+            .spawn(move || wait_for(child, &kill_rx, id, started, &wait_events));
+        if let Err(err) = waiting {
+            let _ = fallback.kill();
+            return Err(err);
+        }
+        drop(fallback);
+
+        // Any error below drops `kill_tx`, and the wait thread kills the child.
+        let mut reader = master
+            .try_clone_reader()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+        let mut writer = master
+            .take_writer()
+            .map_err(|err| io::Error::other(err.to_string()))?;
+
+        thread::Builder::new()
+            .name("htui-pane-read".to_owned())
+            .spawn(move || {
+                let mut buf = [0u8; READ_CHUNK];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let output = PaneEvent::Output {
+                                id,
+                                bytes: buf[..n].to_vec(),
+                            };
+                            if events.send(output).is_err() {
+                                break;
+                            }
+                        }
+                        Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                        // EIO once the child is gone (Linux), or a real failure: the pane is over.
+                        Err(_) => break,
+                    }
+                }
+            })?;
+
+        let (input, input_rx) = mpsc::channel::<Zeroizing<Vec<u8>>>();
+        thread::Builder::new()
+            .name("htui-pane-write".to_owned())
+            .spawn(move || {
+                while let Ok(chunk) = input_rx.recv() {
+                    if writer.write_all(&chunk).is_err() || writer.flush().is_err() {
+                        break;
+                    }
+                }
+                // `writer` drops here, after `input` did: the pane is being dropped (F-10).
+            })?;
+
+        Ok(Self {
+            master,
+            input,
+            kill: Some(kill_tx),
+            pid,
+        })
+    }
+
+    /// The child's pid, if the platform has one.
+    #[must_use]
+    pub fn pid(&self) -> Option<u32> {
+        self.pid
+    }
+}
+
+/// The wait thread (B5): polls `child` every [`POLL`] until it ends or a kill is asked for (or
+/// the asking side is gone), then reaps it and sends `Exited`. A failed send (the loop is gone)
+/// is ignored.
+fn wait_for(
+    mut child: Box<dyn Child + Send + Sync>,
+    kill: &mpsc::Receiver<()>,
+    id: PaneId,
+    started: Instant,
+    events: &UnboundedSender<PaneEvent>,
+) {
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Err(err) => break Err(err),
+            Ok(None) => {}
+        }
+        match kill.recv_timeout(POLL) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The owned child's kill escalates: SIGHUP, a 200 ms grace, SIGKILL.
+                let _ = child.kill();
+                break child.wait();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    };
+    let _ = events.send(PaneEvent::Exited {
+        id,
+        status,
+        elapsed: started.elapsed(),
+    });
+}
+
+impl PaneChild for PtyChild {
+    fn write(&mut self, bytes: &[u8]) {
+        if self.input.send(Zeroizing::new(bytes.to_vec())).is_err() {
+            tracing::debug!(
+                len = bytes.len(),
+                "pane input dropped: the writer has ended"
+            );
+        }
+    }
+
+    fn resize(&mut self, size: PaneSize) {
+        let size = size.floored();
+        if self.master.resize(size.pty()).is_err() {
+            tracing::debug!(rows = size.rows, cols = size.cols, "pane resize failed");
+        }
+    }
+
+    fn kill(&mut self) {
+        if let Some(kill) = self.kill.take() {
+            let _ = kill.send(());
+        }
+    }
+}
+
+impl Drop for PtyChild {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+impl fmt::Debug for PtyChild {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PtyChild")
+            .field("pid", &self.pid)
+            .finish_non_exhaustive()
     }
 }
 
@@ -689,9 +930,249 @@ mod tests {
         let exited = PaneEvent::Exited {
             id,
             status: Ok(portable_pty::ExitStatus::with_exit_code(0)),
-            elapsed: std::time::Duration::from_millis(5),
+            elapsed: Duration::from_millis(5),
         };
         assert_eq!(exited.id(), id);
         assert_ne!(PaneId::next(), id);
+    }
+
+    /// Real children on a real PTY (blueprint §4.7 tests 8-14): real time, never paused. Each test
+    /// holds its `PtyChild`, so a failing assertion kills the child on drop.
+    #[cfg(unix)]
+    mod real {
+        use std::path::Path;
+        use std::time::{Duration, Instant};
+
+        use portable_pty::CommandBuilder;
+        use tempfile::TempDir;
+        use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+
+        use super::super::*;
+
+        /// `body` written to a script in `dir` (as `editor.rs`'s `scripts::script` does) and run
+        /// as `sh <script> <file>`: `$1` is `file`. Run through `sh` rather than executed, so a
+        /// concurrent fork elsewhere in the test binary cannot make it `ETXTBSY`.
+        fn script(dir: &TempDir, body: &str, file: &Path) -> CommandBuilder {
+            let path = dir.path().join("editor.sh");
+            std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write the script");
+            let mut cmd = CommandBuilder::new("sh");
+            cmd.arg(&path);
+            cmd.arg(file);
+            cmd.env("TERM", "xterm-256color");
+            cmd.env_remove("LINES");
+            cmd.env_remove("COLUMNS");
+            cmd.cwd(dir.path());
+            cmd
+        }
+
+        /// A spawned pane, the receiving end of its events and the screen they are parsed into.
+        struct Pane {
+            child: PtyChild,
+            rx: UnboundedReceiver<PaneEvent>,
+            screen: PaneScreen,
+            id: PaneId,
+        }
+
+        impl Pane {
+            fn spawn(command: CommandBuilder) -> Self {
+                let (tx, rx) = unbounded_channel();
+                let id = PaneId::next();
+                // The sender moves into the pane: the test keeps none (test 13).
+                let child = PtyChild::spawn(command, PaneSize::DEFAULT, id, tx).expect("spawn");
+                Self {
+                    child,
+                    rx,
+                    screen: PaneScreen::new(PaneSize::DEFAULT),
+                    id,
+                }
+            }
+
+            /// The next event within `limit`; `None` once every sender is gone.
+            async fn next(&mut self, limit: Duration) -> Option<PaneEvent> {
+                tokio::time::timeout(limit, self.rx.recv())
+                    .await
+                    .expect("an event in time")
+            }
+
+            /// Feeds an `Output` into the screen and writes the replies back.
+            fn absorb(&mut self, event: &PaneEvent) {
+                assert_eq!(event.id(), self.id);
+                if let PaneEvent::Output { bytes, .. } = event {
+                    let replies = self.screen.feed(bytes);
+                    if !replies.is_empty() {
+                        self.child.write(&replies);
+                    }
+                }
+            }
+
+            /// Pumps output until the screen shows `text`, within 10 s.
+            async fn until_shown(&mut self, text: &str) {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !self.screen.screen().contents().contains(text) {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    let event = self.next(left).await.expect("the pane is still running");
+                    assert!(
+                        matches!(event, PaneEvent::Output { .. }),
+                        "exited before showing {text:?}: {event:?}"
+                    );
+                    self.absorb(&event);
+                }
+            }
+
+            /// Pumps output until `Exited`, within `limit`.
+            async fn exited(&mut self, limit: Duration) -> io::Result<portable_pty::ExitStatus> {
+                let deadline = Instant::now() + limit;
+                loop {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    match self.next(left).await.expect("an Exited before the end") {
+                        PaneEvent::Exited { id, status, .. } => {
+                            assert_eq!(id, self.id);
+                            return status;
+                        }
+                        output => self.absorb(&output),
+                    }
+                }
+            }
+        }
+
+        /// As `editor.rs`'s `suspension::alive`: a pid that `ps` no longer lists, or lists as a
+        /// zombie, is gone.
+        fn alive(pid: &str) -> bool {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid])
+                .output()
+                .expect("run ps");
+            let stat = String::from_utf8_lossy(&out.stdout);
+            let stat = stat.trim();
+            !stat.is_empty() && !stat.starts_with('Z')
+        }
+
+        #[tokio::test]
+        async fn a_scripted_editor_draws_reads_a_line_and_exits() {
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("note.md");
+            std::fs::write(&file, "hello\n").unwrap();
+            let mut pane = Pane::spawn(script(
+                &dir,
+                "printf ready; IFS= read -r line; printf '%s\\n' \"$line\" > \"$1\"",
+                &file,
+            ));
+            assert!(pane.child.pid().is_some());
+            pane.until_shown("ready").await;
+            pane.child.write(b"edited\r");
+            let status = pane.exited(Duration::from_secs(10)).await.expect("reaped");
+            assert!(status.success(), "{status:?}");
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), "edited\n");
+        }
+
+        #[tokio::test]
+        async fn the_child_sees_the_size_and_a_resize() {
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("note.md");
+            let mut pane = Pane::spawn(script(&dir, "stty size; read x; stty size; read y", &file));
+            pane.until_shown("24 80").await;
+            let size = PaneSize::new(30, 100);
+            pane.child.resize(size);
+            pane.screen.resize(size);
+            pane.child.write(b"\r");
+            pane.until_shown("30 100").await;
+            pane.child.write(b"\r");
+            let status = pane.exited(Duration::from_secs(10)).await.expect("reaped");
+            assert!(status.success(), "{status:?}");
+        }
+
+        #[tokio::test]
+        async fn kill_ends_the_child_and_exited_follows() {
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("note.md");
+            let mut pane = Pane::spawn(script(&dir, "printf ready; exec sleep 30", &file));
+            pane.until_shown("ready").await;
+            pane.child.kill();
+            pane.child.kill(); // idempotent
+            let status = pane.exited(Duration::from_secs(3)).await.expect("reaped");
+            assert!(!status.success(), "{status:?}");
+        }
+
+        #[tokio::test]
+        async fn a_hup_ignoring_child_is_killed_by_escalation() {
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("note.md");
+            let mut pane = Pane::spawn(script(
+                &dir,
+                "trap '' HUP; printf ready; while :; do sleep 0.1; done",
+                &file,
+            ));
+            // The trap is set before `ready`, so SIGHUP alone cannot end it.
+            pane.until_shown("ready").await;
+            pane.child.kill();
+            let status = pane.exited(Duration::from_secs(3)).await.expect("reaped");
+            assert!(!status.success(), "{status:?}");
+        }
+
+        #[tokio::test]
+        async fn dropping_the_child_leaves_no_process() {
+            let dir = TempDir::new().unwrap();
+            let pidfile = dir.path().join("pid");
+            let pane = Pane::spawn(script(
+                &dir,
+                "printf '%s' $$ > \"$1\"; exec sleep 30",
+                &pidfile,
+            ));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let pid = loop {
+                let pid = std::fs::read_to_string(&pidfile).unwrap_or_default();
+                if !pid.is_empty() {
+                    break pid;
+                }
+                assert!(Instant::now() < deadline, "the script never wrote its pid");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                pane.child.pid().map(|pid| pid.to_string()),
+                Some(pid.clone())
+            );
+            assert!(alive(&pid), "{pid} is not running yet");
+            drop(pane);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while alive(&pid) {
+                assert!(Instant::now() < deadline, "{pid} outlived its pane");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        #[tokio::test]
+        async fn both_threads_end_after_exit() {
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("note.md");
+            let mut pane = Pane::spawn(script(&dir, "exit 0", &file));
+            let status = pane.exited(Duration::from_secs(10)).await.expect("reaped");
+            assert!(status.success(), "{status:?}");
+            // The reader saw EOF (the slave was dropped) and the wait thread ended: every sender
+            // is gone while the pane itself is still held.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match pane.next(left).await {
+                    None => break,
+                    Some(event) => {
+                        assert!(matches!(event, PaneEvent::Output { .. }), "{event:?}");
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_dsr_from_the_child_is_answered() {
+            let dir = TempDir::new().unwrap();
+            let file = dir.path().join("reply");
+            let mut pane = Pane::spawn(script(
+                &dir,
+                "stty -icanon -echo; printf '\\033[6n'; dd bs=1 count=6 2>/dev/null > \"$1\"",
+                &file,
+            ));
+            let status = pane.exited(Duration::from_secs(10)).await.expect("reaped");
+            assert!(status.success(), "{status:?}");
+            assert_eq!(std::fs::read(&file).unwrap(), b"\x1b[1;1R");
+        }
     }
 }
