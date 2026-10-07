@@ -755,8 +755,8 @@ impl App {
     }
 
     /// The propagation chain (blueprint C.4, MOD-67 D6), stopping at the first consumer: the
-    /// in-pane editor (MOD-57), `ctrl-c`, the top overlay, the overlay stack, the modal swallow, the active tab, its legacy rows, the
-    /// base stack.
+    /// in-pane editor (MOD-57), `ctrl-c`, the top overlay, the overlay stack, the modal swallow,
+    /// the active tab, its legacy rows, the base stack.
     ///
     /// `ctrl-c` is checked here only: a bracketed paste has no key table
     /// ([`on_paste`](Self::on_paste)), so a pasted `U+0003` never quits.

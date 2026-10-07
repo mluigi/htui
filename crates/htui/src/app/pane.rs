@@ -339,10 +339,12 @@ impl App {
         );
     }
 
-    /// The status line while an editor is alive and no error is up; `None` without one.
+    /// The status line while an editor is alive and no error is up; `None` without one. A focused
+    /// editor whose tab is not on screen does not have the keys ([`editor_key`](Self::editor_key)
+    /// hands them to htui), so it reads as unfocused.
     pub(super) fn editor_status(&self) -> Option<String> {
         let editor = self.editor.as_ref()?;
-        Some(if editor.focused {
+        Some(if editor.focused && self.editor_visible() {
             format!(
                 "the editor has the keys \u{b7} {}",
                 self.keys.hint(Stack::EDITOR_FOCUSED, FOCUSED_HINT)
@@ -861,7 +863,8 @@ mod tests {
         exited(&mut app, 3, Duration::from_secs(2));
         let heard = &benches[0].seen.borrow().heard;
         assert!(
-            matches!(&heard[..], [ExternalEditOutcome::Failed(why)] if why.contains("exited with 3")),
+            matches!(&heard[..], [ExternalEditOutcome::Failed(why)]
+                if why.contains("exited with 3")),
             "{heard:?}"
         );
     }
@@ -1013,6 +1016,9 @@ mod tests {
             "no pane"
         );
         assert!(!term.backend().cursor_visible(), "no cursor");
+        // Still focused, but off screen: the status line says htui has the keys (it has).
+        assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
+        assert!(row_from(term.backend().buffer(), 0, 29).starts_with(UNFOCUSED_STATUS));
 
         app.on_key(plain('a'));
         assert!(
