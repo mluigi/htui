@@ -3,7 +3,7 @@
 //!
 //! It holds the last [`QueueOverview`] the store worker answered and re-reads it after every queue
 //! write, after a failed queue write, and on the shell's refresh tick (M3 D9) while no read is in
-//! flight.
+//! flight. A failed read is asked again only every [`REFRESHES_PER_RETRY`]th refresh tick.
 
 use htui_core::model::{EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd};
 use ratatui::Frame;
@@ -54,6 +54,11 @@ const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
 /// [`StoreRequest::name`] of [`StoreRequest::QueueOverview`]: its `Failed` is shown, not re-read.
 const OVERVIEW: &str = QUEUE_REQUEST_NAMES[5];
 
+/// After a failed read, `refresh` asks again on every tenth refresh tick (about ten seconds), not
+/// every one: an unreachable store refuses each read, and `App::on_reply` would re-post the
+/// refusal to the status line every second.
+const REFRESHES_PER_RETRY: u32 = 10;
+
 /// Lists this box's queue and steers it.
 #[derive(Debug)]
 pub struct QueueOverlay {
@@ -68,6 +73,12 @@ pub struct QueueOverlay {
     /// A `QueueOverview` is in flight: `refresh` asks for none. `true` from `new`, because the
     /// shell sends `wants_requests`' read as it pushes the overlay.
     in_flight: bool,
+    /// Refresh ticks `refresh` still lets pass before it asks again after a failed read.
+    retry_in: u32,
+    /// A refused queue write's status line (`"{request}: {message}"`) while its re-read is in
+    /// flight: if that read fails too, its failure would replace the write's on the status line,
+    /// so the overlay posts the write's again.
+    write_failure: Option<String>,
 }
 
 impl Default for QueueOverlay {
@@ -89,6 +100,8 @@ impl QueueOverlay {
             cursor: 0,
             anchor: None,
             in_flight: true,
+            retry_in: 0,
+            write_failure: None,
         }
     }
 
@@ -399,6 +412,8 @@ impl Overlay for QueueOverlay {
                 self.overview = Some(overview.as_ref().clone());
                 self.failure = None;
                 self.in_flight = false;
+                self.retry_in = 0;
+                self.write_failure = None;
                 self.reanchor();
             }
             StoreReply::QueueWritten { .. } => self.reread(ctx),
@@ -407,8 +422,13 @@ impl Overlay for QueueOverlay {
                 self.overview = None;
                 self.failure = Some(message.clone());
                 self.in_flight = false;
+                self.retry_in = REFRESHES_PER_RETRY - 1;
+                if let Some(write) = self.write_failure.take() {
+                    ctx.emit(Action::Error(write));
+                }
             }
-            StoreReply::Failed { request, .. } if QUEUE_REQUEST_NAMES.contains(request) => {
+            StoreReply::Failed { request, message } if QUEUE_REQUEST_NAMES.contains(request) => {
+                self.write_failure = Some(format!("{request}: {message}"));
                 self.reread(ctx);
             }
             _ => {}
@@ -416,9 +436,14 @@ impl Overlay for QueueOverlay {
     }
 
     fn refresh(&mut self, ctx: &mut Ctx<'_>) {
-        if !self.in_flight {
-            self.reread(ctx);
+        if self.in_flight {
+            return;
         }
+        if self.retry_in > 0 {
+            self.retry_in -= 1;
+            return;
+        }
+        self.reread(ctx);
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
@@ -1254,7 +1279,7 @@ mod tests {
         overlay.refresh(&mut bench.ctx());
         assert!(bench.drained().is_empty(), "the tick's read is in flight");
 
-        // A failed read clears it too.
+        // A failed read clears it too, and is asked again after the back-off.
         bench.reply(
             &mut overlay,
             &StoreReply::Failed {
@@ -1262,10 +1287,122 @@ mod tests {
                 message: "boom".to_owned(),
             },
         );
+        for _ in 0..REFRESHES_PER_RETRY {
+            overlay.refresh(&mut bench.ctx());
+        }
+        assert_one_request(&bench.drained(), |request| {
+            matches!(request, StoreRequest::QueueOverview)
+        });
+    }
+
+    #[test]
+    fn a_failed_read_is_asked_again_only_every_tenth_refresh() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        let failed = StoreReply::Failed {
+            request: OVERVIEW,
+            message: StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()).to_string(),
+        };
+        bench.reply(&mut overlay, &failed);
+        assert_eq!(REFRESHES_PER_RETRY, 10);
+
+        for round in 0..2 {
+            for tick in 1..REFRESHES_PER_RETRY {
+                overlay.refresh(&mut bench.ctx());
+                assert!(
+                    bench.drained().is_empty(),
+                    "round {round}, refresh {tick}: an unreachable store is not asked every second"
+                );
+            }
+            overlay.refresh(&mut bench.ctx());
+            assert_one_request(&bench.drained(), |request| {
+                matches!(request, StoreRequest::QueueOverview)
+            });
+            bench.reply(&mut overlay, &failed);
+        }
+
+        // A good read ends the back-off: the next refresh asks at once.
+        bench.feed(&mut overlay, overview(abc()));
         overlay.refresh(&mut bench.ctx());
         assert_one_request(&bench.drained(), |request| {
             matches!(request, StoreRequest::QueueOverview)
         });
+    }
+
+    #[test]
+    fn a_refused_write_keeps_its_own_failure_on_the_status_line() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        bench.feed(&mut overlay, overview(abc()));
+        let unreachable = StoreError::Unreachable(DATABASE_UNREACHABLE.to_owned()).to_string();
+
+        bench.reply(
+            &mut overlay,
+            &StoreReply::Failed {
+                request: "pause_queue",
+                message: unreachable.clone(),
+            },
+        );
+        assert_one_request(&bench.drained(), |request| {
+            matches!(request, StoreRequest::QueueOverview)
+        });
+
+        // `App::on_reply` posts the read's failure over the write's; the overlay puts the write's
+        // back, so the status line names what the user asked for.
+        bench.reply(
+            &mut overlay,
+            &StoreReply::Failed {
+                request: OVERVIEW,
+                message: unreachable.clone(),
+            },
+        );
+        match bench.drained().as_slice() {
+            [Action::Error(message)] => {
+                assert_eq!(message, &format!("pause_queue: {unreachable}"));
+            }
+            other => panic!("expected the write's failure again: {other:?}"),
+        }
+
+        // Once said, it is not said again by a later failed read.
+        for _ in 0..REFRESHES_PER_RETRY {
+            overlay.refresh(&mut bench.ctx());
+        }
+        bench.drained();
+        bench.reply(
+            &mut overlay,
+            &StoreReply::Failed {
+                request: OVERVIEW,
+                message: unreachable,
+            },
+        );
+        assert!(bench.drained().is_empty());
+    }
+
+    #[test]
+    fn a_refused_write_followed_by_a_good_read_says_nothing_more() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        bench.feed(&mut overlay, overview(abc()));
+        bench.reply(
+            &mut overlay,
+            &StoreReply::Failed {
+                request: "move_queue_entry",
+                message: "not found: entry".to_owned(),
+            },
+        );
+        bench.drained();
+        bench.feed(&mut overlay, overview(abc()));
+        assert!(bench.drained().is_empty());
+
+        // A later failed read does not dig the old write failure back up.
+        bench.reply(
+            &mut overlay,
+            &StoreReply::Failed {
+                request: OVERVIEW,
+                message: "boom".to_owned(),
+            },
+        );
+        assert!(bench.drained().is_empty());
     }
 
     #[test]
