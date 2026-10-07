@@ -258,3 +258,11 @@ the reap), a unix-only test blocking the Windows unit-test check (`d77d40e8`). C
 MOD-16: on **Windows** `Ctrl+\` arrives as `ctrl-\` (not `ctrl-4`), so only a physical `Ctrl+4`
 reaches `editor.focus` there; the docs must say the alias is unix-only, and MOD-16's Windows list
 gains the editor focus key.
+
+**T5 notes (refinements of blueprint §7.4, recorded per verify).** (1) A focused editor found off
+screen (a reply moved the tab) or under a modal overlay (a reply opened the migration prompt)
+loses focus and the key that finds it is **swallowed** with the lock refusal, never run as a lock
+command or an overlay answer (`d6dc29f4`, and this round). (2) Unfocused under a modal overlay, keys
+take `on_key`'s overlay path (C3, the overlay, `Esc`/help, the modal swallow), so the prompt can be
+answered and the asking tab is never reached. (3) `editor_status` reads unfocused whenever the
+editor does not have the keys (off screen or covered).
