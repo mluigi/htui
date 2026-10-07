@@ -85,8 +85,10 @@ struct Check {
 
 impl Check {
     /// Reports that `first` and `second` both bind `chord` (`place` ends the message), unless
-    /// the pair was reported already or is allowed. The reported row is the one with the later
-    /// line (`None`, a default, before any line), `second` on a tie.
+    /// the pair was reported already or is allowed. The reported row is the one that added
+    /// `chord` (it is not that row's catalogue default) when exactly one did (review L1);
+    /// otherwise the one with the later line (`None`, a default, before any line), `second` on
+    /// a tie.
     fn report(&mut self, first: &Row, second: &Row, chord: KeyChord, place: &str) {
         let a = (first.context, first.act);
         let b = (second.context, second.act);
@@ -99,10 +101,11 @@ impl Check {
             return;
         }
         self.reported.push((a, b, chord));
-        let (reported, other) = if first.line > second.line {
-            (first, second)
-        } else {
-            (second, first)
+        let (reported, other) = match (added(first, chord), added(second, chord)) {
+            (true, false) => (first, second),
+            (false, true) => (second, first),
+            _ if first.line > second.line => (first, second),
+            _ => (second, first),
         };
         let origin = other
             .line
@@ -126,12 +129,14 @@ fn allowed(first: &Row, second: &Row, chord: KeyChord) -> bool {
     let guarded = STATE_GUARDED
         .iter()
         .any(|&pair| pair == (first.act, second.act) || pair == (second.act, first.act));
-    let default_of = |row: &Row| {
-        Keys::compiled()
-            .chords(row.context, row.act)
-            .contains(&chord)
-    };
-    guarded && default_of(first) && default_of(second)
+    guarded && !added(first, chord) && !added(second, chord)
+}
+
+/// Whether `row` binds `chord` beyond its catalogue defaults: the user added it.
+fn added(row: &Row, chord: KeyChord) -> bool {
+    !Keys::compiled()
+        .chords(row.context, row.act)
+        .contains(&chord)
 }
 
 /// `[table] name` of `row`, as an error's subject.
@@ -197,6 +202,19 @@ mod tests {
             one(
                 3,
                 r#"[global] help = "x": "x" is already global.quit (line 2) in [global]"#
+            )
+        );
+    }
+
+    /// Review L1: the error sits on the row that added the chord, not on the later row that
+    /// keeps it as a default.
+    #[test]
+    fn a_collision_is_reported_where_the_chord_was_added() {
+        assert_eq!(
+            errors("[global]\nquit = [\"w\"]\nworkspaces = [\"w\", \"z\"]\n"),
+            one(
+                2,
+                r#"[global] quit = "w": "w" is already global.workspaces (line 3) in [global]"#
             )
         );
     }

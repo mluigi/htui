@@ -16,11 +16,11 @@
 //! resolves through `XDG_CONFIG_HOME`. Every child ends in 0 or a refusal (2), so nothing reaches
 //! Sentry (H-9).
 
-use std::path::{Path, PathBuf};
-
-/// `tests/fixtures/keys/<name>.toml`.
-fn fixture(name: &str) -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+/// `tests/fixtures/keys/<name>.toml`. Only the Unix binary cases and the `testkit` App case read
+/// fixtures, so it is compiled for them alone (review L2).
+#[cfg(any(unix, feature = "testkit"))]
+fn fixture(name: &str) -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/keys")
         .join(format!("{name}.toml"))
 }
