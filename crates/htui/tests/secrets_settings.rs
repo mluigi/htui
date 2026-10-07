@@ -2895,6 +2895,31 @@ async fn snapshot_identity_form() {
     insta::assert_snapshot!("identity_form", frame(&bench, &section));
 }
 
+/// MOD-90 D3, R1 M-1: a landed identity write whose write mark the keyring refused.
+#[tokio::test]
+async fn snapshot_write_mark_refused() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    let StoreReply::Secrets(snapshot) = configured() else {
+        unreachable!("configured() is a keyring read")
+    };
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretsWritten {
+            request: "set_machine_identity",
+            generation: 1,
+            mark_stored: false,
+            snapshot,
+        },
+    );
+    insta::assert_snapshot!("write_mark_refused", frame(&bench, &section));
+}
+
 #[tokio::test]
 async fn snapshot_demo() {
     let (bench, section, _) = loaded(demo_keyring()).await;
