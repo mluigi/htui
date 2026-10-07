@@ -1,0 +1,8 @@
+---
+source: crates/htui/src/ui/editor_pane.rs
+expression: text(&buffer)
+---
+ nvim · htui has the …
+hello red
+中文X
+❤️Y ｱﾞZ
