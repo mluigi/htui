@@ -192,8 +192,14 @@ pub enum QueueMove {
 /// in `order`, or is already at that end. Both stores call it, so Mem and Pg move alike.
 #[must_use]
 pub fn moved_order(order: &[ItemId], item: ItemId, to: QueueMove) -> Option<Vec<ItemId>> {
-    let _ = (order, item, to);
-    None
+    let at = order.iter().position(|id| *id == item)?;
+    let other = match to {
+        QueueMove::Up => at.checked_sub(1)?,
+        QueueMove::Down => Some(at + 1).filter(|next| *next < order.len())?,
+    };
+    let mut moved = order.to_vec();
+    moved.swap(at, other);
+    Some(moved)
 }
 
 /// MOD-12 M3 D5, D6: the item's latest graph run, as [`QueueRow`] carries it.
@@ -345,7 +351,22 @@ impl EntryState {
     /// The run and step `Enter` reveals (M3 D8): `(None, None)` reveals the item.
     #[must_use]
     pub fn reveal(&self) -> (Option<RunId>, Option<StepId>) {
-        (None, None)
+        match self {
+            Self::Running { run, .. }
+            | Self::Elsewhere { run, .. }
+            | Self::Escalated(
+                Escalation::JudgeUndecided { run, .. }
+                | Escalation::ReviewLoopExhausted { run, .. },
+            ) => (Some(*run), None),
+            Self::Escalated(Escalation::HardGateParked { run, step }) => (Some(*run), Some(*step)),
+            Self::Escalated(Escalation::Blocked { run, .. } | Escalation::Failed { run, .. }) => {
+                (*run, None)
+            }
+            Self::Next
+            | Self::Held(_)
+            | Self::Waiting(_)
+            | Self::Escalated(Escalation::MissingTags(_)) => (None, None),
+        }
     }
 }
 
@@ -414,8 +435,70 @@ pub struct QueueOverview {
 /// complement of the runner's `admissible`.
 #[must_use]
 pub fn classify_entry(row: &QueueRow, here: BoxId, live: &LiveFacts) -> EntryState {
-    let _ = (row, here, live);
-    EntryState::Next
+    let item = row.entry.item_id;
+    let latest = row.latest_run.as_ref();
+    if let Some(run) =
+        latest.filter(|run| matches!(run.status, RunStatus::Queued | RunStatus::Running))
+    {
+        return if run.target_box_id == here {
+            EntryState::Running {
+                run: run.id,
+                status: run.status,
+            }
+        } else {
+            EntryState::Elsewhere {
+                run: run.id,
+                hostname: run.target_hostname.clone(),
+                status: run.status,
+            }
+        };
+    }
+    let parked = latest.filter(|run| run.status == RunStatus::AwaitingApproval);
+    let note = || row.latest_note.clone();
+    let escalation = match (row.status, parked) {
+        (Status::Failed, _) => Some(Escalation::Failed {
+            run: latest.map(|run| run.id),
+            failure: latest.and_then(|run| run.failure.clone()),
+        }),
+        (Status::Blocked, Some(run)) => Some(Escalation::ReviewLoopExhausted {
+            run: run.id,
+            note: note(),
+        }),
+        (Status::Blocked, None) => Some(Escalation::Blocked {
+            run: latest.map(|run| run.id),
+            note: note(),
+        }),
+        (Status::AwaitingApproval, Some(run)) => Some(match run.parked_step {
+            Some(step) => Escalation::HardGateParked { run: run.id, step },
+            None => Escalation::JudgeUndecided {
+                run: run.id,
+                note: note(),
+            },
+        }),
+        _ => live
+            .missing_tags
+            .get(&item)
+            .filter(|tags| !tags.is_empty())
+            .map(|tags| Escalation::MissingTags(tags.clone())),
+    };
+    if let Some(escalation) = escalation {
+        return EntryState::Escalated(escalation);
+    }
+    if !row.open_blockers.is_empty() {
+        return EntryState::Waiting(Wait::BlockedBy(row.open_blockers.clone()));
+    }
+    if live.cancelled.contains(&item) {
+        return EntryState::Waiting(Wait::CancelledInBatch);
+    }
+    if !live.ready.contains(&item) {
+        return EntryState::Waiting(Wait::NotReady(row.status));
+    }
+    if live.paused {
+        return EntryState::Waiting(Wait::Paused);
+    }
+    live.holds
+        .get(&row.entry.project_id)
+        .map_or(EntryState::Next, |hold| EntryState::Held(hold.clone()))
 }
 
 /// The first line of a note or failure: the overlay draws one row per entry, and the Runs pane
@@ -430,35 +513,77 @@ fn with_note(
     head: &str,
     note: Option<&str>,
 ) -> core::fmt::Result {
-    let _ = (head, note);
-    f.write_str("")
+    match note {
+        Some(note) => write!(f, "{head} (last note: {})", note_line(note)),
+        None => f.write_str(head),
+    }
 }
 
 impl core::fmt::Display for Hold {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let _ = self;
-        f.write_str("")
+        match self {
+            Self::Budget(stop) => write!(f, "{stop}"),
+            Self::BadCap(error) => write!(f, "{error}"),
+            Self::ProjectGone => f.write_str("its project is gone"),
+        }
     }
 }
 
 impl core::fmt::Display for Wait {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let _ = self;
-        f.write_str("")
+        match self {
+            Self::BlockedBy(keys) => write!(f, "waiting on {}", keys.join(", ")),
+            Self::CancelledInBatch => {
+                f.write_str("cancelled in this batch; the next batch runs it")
+            }
+            Self::Paused => f.write_str("queue paused"),
+            Self::NotReady(status) => write!(f, "not ready: item is {}", status.as_str()),
+        }
     }
 }
 
 impl core::fmt::Display for Escalation {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let _ = self;
-        f.write_str("")
+        match self {
+            Self::HardGateParked { .. } => f.write_str("hard gate parked"),
+            Self::JudgeUndecided { note, .. } => with_note(f, "judge undecided", note.as_deref()),
+            Self::ReviewLoopExhausted { note, .. } => {
+                with_note(f, "review loop exhausted", note.as_deref())
+            }
+            Self::Blocked { note, .. } => with_note(f, "blocked", note.as_deref()),
+            Self::Failed {
+                failure: Some(failure),
+                ..
+            } => write!(f, "failed: {}", note_line(failure)),
+            Self::Failed { failure: None, .. } => f.write_str("failed"),
+            Self::MissingTags(tags) => write!(f, "missing tags: {}", tags.join(", ")),
+        }
     }
 }
 
 impl core::fmt::Display for EntryState {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let _ = self;
-        f.write_str("")
+        match self {
+            Self::Running {
+                status: RunStatus::Queued,
+                ..
+            } => f.write_str("admitted, waiting to be claimed"),
+            Self::Running { .. } => f.write_str("running here"),
+            Self::Elsewhere {
+                hostname, status, ..
+            } => {
+                let host = hostname.as_deref().unwrap_or("another box");
+                if *status == RunStatus::Queued {
+                    write!(f, "queued for {host}")
+                } else {
+                    write!(f, "running on {host}")
+                }
+            }
+            Self::Next => f.write_str("next to run"),
+            Self::Held(hold) => write!(f, "held: {hold}"),
+            Self::Waiting(wait) => write!(f, "{wait}"),
+            Self::Escalated(escalation) => write!(f, "{escalation}"),
+        }
     }
 }
 
