@@ -3054,6 +3054,7 @@ dependencies = [
  "portable-pty",
  "rataflow",
  "ratatui",
+ "rustix",
  "sentry",
  "sentry-anyhow",
  "sentry-tracing",
