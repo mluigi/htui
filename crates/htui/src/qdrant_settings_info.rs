@@ -1,4 +1,8 @@
 use htui_core::store::{Result, StoreError};
+use htui_store::Backend;
+
+use crate::secrets_settings::DEMO_SESSION;
+use crate::store_worker::{StoreReply, StoreRequest};
 
 /// Runs one Qdrant keyring call on a blocking thread. A task that fails to join (it panicked) is a
 /// [`StoreError::Backend`], as in `secrets_settings`, so it never panics the store loop that
@@ -26,6 +30,8 @@ pub enum QdrantState {
     NotStored,
     /// The setting could not be read from the keyring.
     Unreadable(String),
+    /// `Backend::Memory`: no keyring consulted (CLEAN-8 #9, D6).
+    NotApplicable,
 }
 
 /// A snapshot of the current Qdrant settings in the OS keyring.
@@ -63,6 +69,70 @@ impl QdrantSnapshot {
             url_summary,
         }
     }
+}
+
+/// CLEAN-8 #9: the four Settings > Qdrant requests, for `try_serve` (the loop's `other` arm, the
+/// harness and `--demo` alike). On [`Backend::Memory`] the read is [`QdrantState::NotApplicable`]
+/// and every write is refused with [`DEMO_SESSION`] before the keyring is reached, as the Secrets
+/// section's are.
+///
+/// # Errors
+///
+/// A keyring call's [`StoreError::Backend`], which the caller renders under the request's name;
+/// a failed join; and [`StoreError::Backend`] for a request that is not one of the four, which
+/// `try_serve` never sends here.
+pub(crate) async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreReply> {
+    let demo = matches!(backend, Backend::Memory(_));
+    Ok(match request {
+        StoreRequest::QdrantInfo if demo => StoreReply::Qdrant(QdrantSnapshot {
+            url_state: QdrantState::NotApplicable,
+            key_state: QdrantState::NotApplicable,
+            url_summary: None,
+        }),
+        StoreRequest::SetQdrantUrl(_)
+        | StoreRequest::SetQdrantApiKey(_)
+        | StoreRequest::ClearQdrantSettings
+            if demo =>
+        {
+            StoreReply::Failed {
+                request: request.name(),
+                message: DEMO_SESSION.to_owned(),
+            }
+        }
+        StoreRequest::QdrantInfo => StoreReply::Qdrant(QdrantSnapshot::fetch().await),
+        StoreRequest::SetQdrantUrl(url) => {
+            let url = url.clone();
+            blocking_keyring(move || htui_store::secret::set_qdrant_url(&url)).await?;
+            StoreReply::Qdrant(QdrantSnapshot::fetch().await)
+        }
+        StoreRequest::SetQdrantApiKey(key) => {
+            // A zeroizing clone into the closure; nothing unzeroized (MOD-10 M4 D9).
+            let key = key.clone();
+            blocking_keyring(move || {
+                if key.expose().is_empty() {
+                    htui_store::secret::clear_qdrant_api_key()
+                } else {
+                    htui_store::secret::set_qdrant_api_key(key.expose())
+                }
+            })
+            .await?;
+            StoreReply::Qdrant(QdrantSnapshot::fetch().await)
+        }
+        StoreRequest::ClearQdrantSettings => {
+            blocking_keyring(|| {
+                htui_store::secret::clear_qdrant_url()?;
+                htui_store::secret::clear_qdrant_api_key()
+            })
+            .await?;
+            StoreReply::Qdrant(QdrantSnapshot::fetch().await)
+        }
+        other => {
+            return Err(StoreError::Backend(format!(
+                "not a qdrant request: {}",
+                other.name()
+            )));
+        }
+    })
 }
 
 #[cfg(test)]
