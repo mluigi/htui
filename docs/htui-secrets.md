@@ -128,8 +128,9 @@ One write and one check run at a time; a second is refused with a sentence and n
 Check results are kept for this session only, and are never stored. A project's check result is
 dropped when its scope is saved or cleared, and every project's when the workspace changes. A
 check that a later write overtakes is history: a scope check of a project whose scope was written
-while it ran shows no count, and a provider check during which a URL or identity write landed
-shows its result without the latch line, since that write has given the next call a new provider.
+while it ran shows no count, and a provider check whose provider was built before a URL or
+identity write landed shows its result without the latch line, since that write has given the next
+call a new provider. A check that built its provider after the write keeps the latch line.
 
 Changes take effect at the next walk, chat or check, with no restart: walks and chats read the
 keyring and the project's scope each time they resolve ([When htui resolves](#when-htui-resolves)).
