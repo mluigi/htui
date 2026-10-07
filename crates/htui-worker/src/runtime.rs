@@ -3909,6 +3909,8 @@ mod queue_store_errors {
             "running_runs_on_box",
             "queued_runs_on_box",
             "app_settings",
+            "batch_spend",
+            "project_settings",
         ] {
             fails_at(&host, &ctx, call).await;
         }
