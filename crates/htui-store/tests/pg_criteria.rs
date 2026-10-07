@@ -7847,6 +7847,98 @@ async fn run_batch_spend_answers_alike_on_both_stores() {
     db.drop_db().await;
 }
 
+/// Two batches of costs only one store used to count, on either store: `D` holds a `100` beside a
+/// digit string (`"700"`), a digit string past `bigint`, an integer past `bigint` (`u64::MAX`) and
+/// a float written as `1e3` (serde sends `1000.0`); `E` holds two `i64::MAX` and a `-10`. Answers
+/// `(d, e)`.
+macro_rules! odd_spend_fixture {
+    ($store:expr) => {{
+        use htui_core::model::BatchClose;
+        let store = $store;
+        let at = Utc::now();
+        let d = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch D opens");
+        let d_run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(d.id)))
+            .await
+            .expect("D admits");
+        step_with_usage!(store, d_run.id, 0, serde_json::json!({"cost_micros": 100}));
+        step_with_usage!(store, d_run.id, 1, serde_json::json!({"cost_micros": "700"}));
+        step_with_usage!(
+            store,
+            d_run.id,
+            2,
+            serde_json::json!({"cost_micros": "99999999999999999999"})
+        );
+        step_with_usage!(store, d_run.id, 3, serde_json::json!({"cost_micros": u64::MAX}));
+        step_with_usage!(store, d_run.id, 4, serde_json::json!({"cost_micros": 1e3}));
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("D was open");
+
+        let e = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch E opens");
+        let e_run = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FIX_1, Some(e.id))
+            })
+            .await
+            .expect("E admits");
+        step_with_usage!(store, e_run.id, 0, serde_json::json!({"cost_micros": i64::MAX}));
+        step_with_usage!(store, e_run.id, 1, serde_json::json!({"cost_micros": i64::MAX}));
+        step_with_usage!(store, e_run.id, 2, serde_json::json!({"cost_micros": -10}));
+        (d.id, e.id)
+    }};
+}
+
+/// MOD-12 M2 R1 L1: one counting rule on both stores. A cost counts when it is a JSON number
+/// that is an integer within `bigint` (`jsonb_typeof = 'number'` on Postgres, `as_i64` here), so
+/// a digit string, an integer past `bigint` and a float are skipped alike; and the batch's figure
+/// is the exact sum clamped into `i64`, so a sum past `i64::MAX` answers `i64::MAX` on both
+/// instead of `22003` on Postgres (which would fail admission and every batch walk).
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_spend_counts_one_rule_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (pg_d, pg_e) = odd_spend_fixture!(pg);
+    let (mem_d, mem_e) = odd_spend_fixture!(&mem);
+
+    for (pg_batch, mem_batch, expected, what) in [
+        (
+            pg_d,
+            mem_d,
+            Some(100),
+            "only the in-range integer number counts",
+        ),
+        (
+            pg_e,
+            mem_e,
+            Some(i64::MAX),
+            "the exact sum, clamped into i64",
+        ),
+    ] {
+        let on_pg = pg.batch_spend(pg_batch).await.expect("the Postgres read");
+        assert_eq!(
+            on_pg,
+            mem.batch_spend(mem_batch).await.expect("the MemStore read"),
+            "{what}: one figure, both stores"
+        );
+        assert_eq!(on_pg, expected, "{what}");
+    }
+
+    db.drop_db().await;
+}
+
 /// MOD-12 D7, H-6: on both stores a run records its batch (`batch_runs`), a closed batch refuses
 /// the run with `Constraint` and an unknown one with `NotFound { entity: "queue_batch" }`.
 #[tokio::test(flavor = "multi_thread")]

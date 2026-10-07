@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT (CASE WHEN t.total > 9223372036854775807 THEN 9223372036854775807\n                         WHEN t.total < -9223372036854775808 THEN -9223372036854775808\n                         ELSE t.total\n                    END)::bigint AS \"spent\"\n              FROM (SELECT SUM(c.cost) AS total\n                      FROM (SELECT CASE WHEN jsonb_typeof(s.usage->'cost_micros') = 'number'\n                                         AND (s.usage->>'cost_micros') ~ '^-?[0-9]+$'\n                                        THEN (s.usage->>'cost_micros')::numeric\n                                   END AS cost\n                              FROM run_step s\n                              JOIN run r ON r.id = s.run_id\n                             WHERE r.batch_id = $1) c\n                     WHERE c.cost BETWEEN -9223372036854775808 AND 9223372036854775807) t\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "spent",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f5e32cf2ac2ceeec03e4b4fa4c902aa2a08639ad8ceae25d20e665096a8adbea"
+}

@@ -2317,10 +2317,15 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
-    /// MOD-12 M2 D1: `Σ (run_step.usage->>'cost_micros')::bigint` over the runs admitted under
-    /// `batch`; `None` when no step reports an integer cost. The text guard keeps a non-integer
-    /// cost out of the sum (Mem's `as_i64` skips it) instead of raising `22P02` on the cast, and
-    /// the outer `::bigint` turns `SUM`'s `numeric` back into what the driver decodes.
+    /// MOD-12 M2 D1: `Σ run_step.usage->'cost_micros'` over the runs admitted under `batch`;
+    /// `None` when no step reports an integer cost. One rule with `MemStore` (review R1 L1):
+    ///
+    /// - a cost counts when it is a JSON **number** written as an integer within `bigint`, which
+    ///   is what `serde_json`'s `as_i64` accepts. A digit string (`"700"`), an integer past
+    ///   `bigint` and a float (`1.5`, or `1e3`, which serde sends as `1000.0`) are skipped. The
+    ///   `CASE` orders the guards before the `::numeric` cast, so a non-number never reaches it;
+    /// - the figure is the exact `numeric` sum clamped into `bigint`, so a sum past `i64::MAX`
+    ///   answers `i64::MAX` rather than `22003`, which would fail admission and every batch walk.
     ///
     /// # Errors
     ///
@@ -2328,11 +2333,19 @@ impl PgStore {
     pub async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
         sqlx::query_scalar!(
             r#"
-            SELECT SUM((s.usage->>'cost_micros')::bigint)::bigint AS "spent"
-              FROM run_step s
-              JOIN run r ON r.id = s.run_id
-             WHERE r.batch_id = $1
-               AND (s.usage->>'cost_micros') ~ '^-?[0-9]+$'
+            SELECT (CASE WHEN t.total > 9223372036854775807 THEN 9223372036854775807
+                         WHEN t.total < -9223372036854775808 THEN -9223372036854775808
+                         ELSE t.total
+                    END)::bigint AS "spent"
+              FROM (SELECT SUM(c.cost) AS total
+                      FROM (SELECT CASE WHEN jsonb_typeof(s.usage->'cost_micros') = 'number'
+                                         AND (s.usage->>'cost_micros') ~ '^-?[0-9]+$'
+                                        THEN (s.usage->>'cost_micros')::numeric
+                                   END AS cost
+                              FROM run_step s
+                              JOIN run r ON r.id = s.run_id
+                             WHERE r.batch_id = $1) c
+                     WHERE c.cost BETWEEN -9223372036854775808 AND 9223372036854775807) t
             "#,
             batch.as_uuid(),
         )

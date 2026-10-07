@@ -1365,8 +1365,11 @@ impl MemStore {
 }
 
 impl State {
-    /// [`MemStore::batch_spend`]'s body: `as_i64` skips a non-integer cost, as `select::run_spend`
-    /// does and as Postgres' text guard does.
+    /// [`MemStore::batch_spend`]'s body, `PgStore::batch_spend`'s rule (review R1 L1): `as_i64`
+    /// counts a JSON number that is an integer within `i64` and skips anything else (a digit
+    /// string, an integer past `i64`, a float), as `select::run_spend` does; the figure is the
+    /// exact sum (in `i128`, which `i64` costs cannot overflow) clamped into `i64`, so it does
+    /// not depend on the order the steps are visited in.
     fn batch_spend(&self, batch: BatchId) -> Option<i64> {
         let runs: HashSet<RunId> = self
             .run_batches
@@ -1378,8 +1381,11 @@ impl State {
             .values()
             .filter(|step| runs.contains(&step.run_id))
             .filter_map(|step| step.usage.as_ref()?.get("cost_micros")?.as_i64())
-            .fold(None, |total, cost| {
-                Some(total.unwrap_or(0).saturating_add(cost))
+            .fold(None, |total: Option<i128>, cost| {
+                Some(total.unwrap_or(0) + i128::from(cost))
+            })
+            .map(|total| {
+                i64::try_from(total).unwrap_or(if total > 0 { i64::MAX } else { i64::MIN })
             })
     }
 
