@@ -7768,6 +7768,328 @@ async fn create_run_round_trips_its_batch() {
     db.drop_db().await;
 }
 
+/// Review H2, M1: on both stores a close cancels the batch's runs still `queued` (item back to
+/// `open`, entry kept) and nothing else, `batch_cancelled_items` names their items, and the
+/// drain's close is of exactly the drained batch it names.
+#[tokio::test(flavor = "multi_thread")]
+async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch() {
+    use htui_core::model::BatchClose;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+    let ttl = TimeDelta::minutes(5);
+
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    let waiting = batch_run(ids::HTUI_ANA_2, Some(pg_batch.id));
+    let claimed = batch_run(ids::HTUI_CLEAN_1, Some(pg_batch.id));
+    for run in [&waiting, &claimed] {
+        pg.create_run(run.clone()).await.expect("pg admits");
+        mem.create_run(NewRun {
+            batch_id: Some(mem_batch.id),
+            ..run.clone()
+        })
+        .await
+        .expect("mem admits");
+    }
+    let owner = uuid::Uuid::now_v7();
+    assert_eq!(
+        pg.claim_run(claimed.id, ids::BOX, owner, at, ttl)
+            .await
+            .expect("claim"),
+        Claim::Admitted
+    );
+    assert_eq!(
+        mem.claim_run(claimed.id, ids::BOX, owner, at, ttl)
+            .await
+            .expect("claim"),
+        Claim::Admitted
+    );
+
+    let (pg_closed, mem_closed) = (
+        pg.close_batch(ids::BOX, BatchClose::Paused, later)
+            .await
+            .expect("close")
+            .expect("one was open"),
+        mem.close_batch(ids::BOX, BatchClose::Paused, later)
+            .await
+            .expect("close")
+            .expect("one was open"),
+    );
+    assert_eq!(batch_shape(&pg_closed), batch_shape(&mem_closed));
+    let pg_runs = pg.batch_runs(pg_batch.id).await.expect("read");
+    assert_eq!(
+        pg_runs,
+        mem.batch_runs(mem_batch.id).await.expect("read"),
+        "same runs, same statuses"
+    );
+    let mut expected = vec![
+        (waiting.id, RunStatus::Cancelled),
+        (claimed.id, RunStatus::Running),
+    ];
+    expected.sort_by_key(|(id, _)| *id);
+    let mut sorted = pg_runs.clone();
+    sorted.sort_by_key(|(id, _)| *id);
+    assert_eq!(sorted, expected, "only the queued run was cancelled");
+    for store_run in [
+        pg.run(waiting.id).await.expect("read"),
+        mem.run(waiting.id).await.expect("read"),
+    ] {
+        assert_eq!(
+            store_run.expect("the run").finished_at,
+            Some(later),
+            "the close's instant"
+        );
+    }
+    for status in [
+        pg.item(ids::HTUI_ANA_2)
+            .await
+            .expect("read")
+            .map(|item| item.status),
+        mem.item(ids::HTUI_ANA_2)
+            .await
+            .expect("read")
+            .map(|item| item.status),
+    ] {
+        assert_eq!(status, Some(Status::Open), "finish_run's mirror");
+    }
+    assert_eq!(
+        pg.queue_entries(ids::BOX).await.expect("read"),
+        mem.queue_entries(ids::BOX).await.expect("read"),
+        "the entry stays on both"
+    );
+    assert_eq!(
+        pg.run(ids::RUN_2)
+            .await
+            .expect("read")
+            .map(|run| run.status),
+        Some(RunStatus::Queued),
+        "a run outside the batch is not the close's"
+    );
+    assert_eq!(
+        pg.batch_cancelled_items(pg_batch.id).await.expect("read"),
+        [ids::HTUI_ANA_2]
+    );
+    assert_eq!(
+        mem.batch_cancelled_items(mem_batch.id).await.expect("read"),
+        [ids::HTUI_ANA_2]
+    );
+    assert_eq!(
+        pg.claim_run(waiting.id, ids::BOX, owner, later, ttl)
+            .await
+            .expect("claim"),
+        mem.claim_run(waiting.id, ids::BOX, owner, later, ttl)
+            .await
+            .expect("claim"),
+    );
+
+    let pg_next = pg
+        .open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    let mem_next = mem
+        .open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    assert_eq!(
+        pg.close_drained_batch(pg_batch.id, later)
+            .await
+            .expect("close"),
+        None
+    );
+    assert_eq!(
+        mem.close_drained_batch(mem_batch.id, later)
+            .await
+            .expect("close"),
+        None
+    );
+    assert_eq!(
+        pg.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|b| b.id),
+        Some(pg_next.id),
+        "the resume's batch survives the old batch's drain"
+    );
+    assert_eq!(
+        pg.close_drained_batch(pg_next.id, later)
+            .await
+            .expect("close"),
+        None,
+        "an entry keeps it open"
+    );
+    assert_eq!(
+        mem.close_drained_batch(mem_next.id, later)
+            .await
+            .expect("close"),
+        None
+    );
+    assert!(pg.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
+    assert!(mem.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
+    let live = batch_run(ids::HTUI_ANA_2, Some(pg_next.id));
+    pg.create_run(live.clone()).await.expect("pg admits");
+    mem.create_run(NewRun {
+        batch_id: Some(mem_next.id),
+        ..live.clone()
+    })
+    .await
+    .expect("mem admits");
+    assert_eq!(
+        pg.close_drained_batch(pg_next.id, later)
+            .await
+            .expect("close"),
+        None,
+        "a live run of its own keeps it open"
+    );
+    assert_eq!(
+        mem.close_drained_batch(mem_next.id, later)
+            .await
+            .expect("close"),
+        None
+    );
+    pg.finish_run(live.id, RunStatus::Cancelled, None, later)
+        .await
+        .expect("cancel");
+    mem.finish_run(live.id, RunStatus::Cancelled, None, later)
+        .await
+        .expect("cancel");
+    let (pg_drained, mem_drained) = (
+        pg.close_drained_batch(pg_next.id, later)
+            .await
+            .expect("close")
+            .expect("drained"),
+        mem.close_drained_batch(mem_next.id, later)
+            .await
+            .expect("close")
+            .expect("drained"),
+    );
+    assert_eq!(pg_drained.id, pg_next.id);
+    assert_eq!(batch_shape(&pg_drained), batch_shape(&mem_drained));
+    assert_eq!(pg_drained.closed_reason, Some(BatchClose::Drained));
+
+    db.drop_db().await;
+}
+
+/// Review H2 (Postgres only): a claim racing a pause either admits first, and the run stays
+/// `running`, or finds the run cancelled and answers `NotClaimable`; never a claimed run of a
+/// paused batch that the pause also cancelled, nor a queued one left behind. Both orders are
+/// forced (review G1): whichever of the two queues first on the held run row takes it first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    // The close first: the claim finds the run cancelled and the item open again, so the same
+    // item can be raced once more with the claim first.
+    assert_eq!(
+        claim_racing_a_pause(&db, false).await,
+        (Claim::NotClaimable, RunStatus::Cancelled, Status::Open),
+        "the close won: the claim found the run cancelled"
+    );
+    assert_eq!(
+        claim_racing_a_pause(&db, true).await,
+        (Claim::Admitted, RunStatus::Running, Status::InProgress),
+        "the claim won: the close found no queued run"
+    );
+
+    db.drop_db().await;
+}
+
+/// One round of [`a_claim_racing_a_pause_admits_first_or_finds_the_run_cancelled`] on a fresh
+/// batch and run: the run row is held, the first of the two (the claim when `claim_first`)
+/// queues on it, then the other, then the row is released. Answers the claim and the run's and
+/// the item's statuses after both have ended.
+async fn claim_racing_a_pause(
+    db: &common::TestDb,
+    claim_first: bool,
+) -> (Claim, RunStatus, Status) {
+    use htui_core::model::BatchClose;
+
+    let at = Utc::now();
+    let batch = db
+        .store
+        .open_batch(ids::BOX, ids::USER, at)
+        .await
+        .expect("open");
+    let run = db
+        .store
+        .create_run(batch_run(ids::HTUI_ANA_2, Some(batch.id)))
+        .await
+        .expect("an open batch admits");
+
+    let mut holder = db.pool.begin().await.expect("begin the run holder");
+    sqlx::query("SELECT 1 FROM run WHERE id = $1 FOR UPDATE")
+        .bind(run.id.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("lock the run row");
+    let spawn_close = || {
+        let store = db.store.clone();
+        tokio::spawn(async move { store.close_batch(ids::BOX, BatchClose::Paused, at).await })
+    };
+    let spawn_claim = || {
+        let store = db.store.clone();
+        tokio::spawn(async move {
+            store
+                .claim_run(
+                    run.id,
+                    ids::BOX,
+                    uuid::Uuid::now_v7(),
+                    at,
+                    TimeDelta::minutes(5),
+                )
+                .await
+        })
+    };
+    let (close, claim) = if claim_first {
+        let claim = spawn_claim();
+        lock_waiters(&db.pool, 1).await;
+        let close = spawn_close();
+        lock_waiters(&db.pool, 2).await;
+        (close, claim)
+    } else {
+        let close = spawn_close();
+        lock_waiters(&db.pool, 1).await;
+        let claim = spawn_claim();
+        lock_waiters(&db.pool, 2).await;
+        (close, claim)
+    };
+    holder.rollback().await.expect("release the run row");
+
+    close
+        .await
+        .expect("the close task")
+        .expect("close")
+        .expect("the batch was open");
+    let claim = claim.await.expect("the claim task").expect("claim");
+    let status = db
+        .store
+        .run(run.id)
+        .await
+        .expect("read")
+        .expect("the run")
+        .status;
+    let item = db
+        .store
+        .item(ids::HTUI_ANA_2)
+        .await
+        .expect("read")
+        .expect("the item")
+        .status;
+    (claim, status, item)
+}
+
 /// MOD-12 D2: two racing resumes on two handles open one batch, and both answer it.
 #[tokio::test(flavor = "multi_thread")]
 async fn two_resumes_open_one_batch() {
@@ -7869,8 +8191,9 @@ async fn a_pause_and_an_admission_serialise_on_the_batch_row() {
     assert_eq!(closed.id, batch.id);
     assert_eq!(
         db.store.batch_runs(batch.id).await.expect("read"),
-        [(run.id, RunStatus::Queued)],
-        "the run joined before the close committed"
+        [(run.id, RunStatus::Cancelled)],
+        "the run joined before the close committed, and the close cancelled it as still queued \
+         (review H2)"
     );
 
     let late = db

@@ -7866,6 +7866,8 @@ async fn auto_mode_parks_at_a_hard_gate<H: CaseHarness>(harness: &H) {
 
 /// ANA-2 §12 criterion 24 (MOD-12 D10): a manual run of the same soft-gated graph keeps every
 /// gate — the snapshot says `always`, and the walk parks at position 0 and then at 1.
+/// Criterion 24 holds by construction past this case: no `UPDATE` writes `run.mode` (only the
+/// run's insert does), and the walk reads only its snapshot's `gate_effective`.
 async fn a_manual_snapshot_keeps_its_gates<H: CaseHarness>(harness: &H) {
     let orch = harness.fresh();
     feat_3_gated(&orch, Gate::Always, |phase| phase.gate_hard = false).await;

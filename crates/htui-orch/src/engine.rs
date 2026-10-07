@@ -12465,6 +12465,65 @@ mod tests {
         );
     }
 
+    /// MOD-12 review M3, blueprint H-3: a resume re-resolves the live graph under the run's own
+    /// `mode` (the one read of `run.mode` after its insert), so a parked auto run whose snapshot
+    /// downgraded its soft gates resumes `Walked`, not `TopologyChanged`; a parked manual run of
+    /// the same graph, which kept them, resumes `Walked` too.
+    #[tokio::test]
+    async fn a_parked_run_resumes_under_its_own_mode() {
+        for mode in [RunMode::Auto, RunMode::Manual] {
+            let harness = Harness::new().await;
+            harness.free_feat_3().await;
+            harness
+                .repoint(ids::HTUI_FEAT_3, |phase| phase.gate = Gate::Always)
+                .await;
+            for attempt in [1, 2] {
+                harness
+                    .orch
+                    .script("review", attempt, ScriptedStep::review("approve", "fine"));
+            }
+            let CommandOutcome::Started { run, rest } = harness
+                .dispatch(Command::StartRun {
+                    item: ids::HTUI_FEAT_3,
+                    mode,
+                    repo_scope: None,
+                })
+                .await
+                .expect("the walk starts")
+            else {
+                panic!("`StartRun` answers `Started`");
+            };
+            assert_eq!(rest.run, RunStatus::AwaitingApproval, "{mode:?} parks");
+            let snapshot = snapshot_of(&harness, run).await;
+            assert_eq!(snapshot.mode, mode);
+            let downgraded = snapshot
+                .phases
+                .iter()
+                .any(|phase| phase.gate_effective == Gate::Never);
+            assert_eq!(
+                downgraded,
+                mode == RunMode::Auto,
+                "{mode:?}: only an auto snapshot differs from the manual resolution"
+            );
+            if mode == RunMode::Auto {
+                let parked = snapshot
+                    .phases
+                    .iter()
+                    .find(|phase| Some(phase.position) == rest.position)
+                    .expect("the run parked at a phase of its snapshot");
+                assert!(parked.gate_hard, "an auto run parks at its hard gate");
+            }
+
+            let resumed = Box::pin(harness.resume(run))
+                .await
+                .expect("the run is readable");
+            assert!(
+                matches!(resumed, Resume::Walked(_)),
+                "{mode:?}: a resume resolves under the run's own mode: {resumed:?}"
+            );
+        }
+    }
+
     /// The driver factory's contract: one driver per `(phase, attempt)`, because `FakeDriver`
     /// plays its script once (blueprint H-12).
     #[tokio::test]

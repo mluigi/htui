@@ -893,6 +893,118 @@ async fn skill_version_miss(
     }
 }
 
+/// [`WriteStore::finish_run`]'s whole body on `conn`, inside the caller's transaction: the run's
+/// terminal move and the item's mirror ([`finish_run_item_mirror`]), with the run then the item
+/// taken `FOR UPDATE`. `finish_run` wraps it in a transaction of its own; MOD-12's
+/// [`close_batch`](PgStore::close_batch) runs it for each run of the batch still `queued`, in the
+/// close's transaction (review H2).
+async fn finish_run_on(
+    conn: &mut PgConnection,
+    run: RunId,
+    to: RunStatus,
+    failure: Option<&str>,
+    at: DateTime<Utc>,
+) -> Result<()> {
+    // The raw SQL keeps the indentation it had inside `finish_run`, so its `.sqlx` entry stands.
+    let Some(row) = sqlx::query!(
+        r#"
+            SELECT status  AS "status: RunStatus",
+                   item_id AS "item_id: ItemId"
+              FROM run
+             WHERE id = $1
+               FOR UPDATE
+            "#,
+        run.as_uuid(),
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(map_sqlx)?
+    else {
+        return Err(StoreError::NotFound {
+            entity: "run",
+            id: run.to_string(),
+        });
+    };
+
+    if !to.is_terminal() {
+        return Err(StoreError::Constraint(finish_run_needs_a_terminal_status(
+            run, to,
+        )));
+    }
+    if failure.is_some() != (to == RunStatus::Failed) {
+        return Err(StoreError::Constraint(failure_disagrees_with_status(
+            run,
+            to,
+            failure.is_some(),
+        )));
+    }
+    // A terminal row reaches nothing, so `legal_move` is the whole refusal: `run_is_terminal`
+    // would only say the same thing in a second sentence.
+    legal_move(row.status, to)?;
+
+    sqlx::query!(
+        "UPDATE run \
+            SET status      = $2, \
+                failure     = COALESCE($3, failure), \
+                finished_at = COALESCE(finished_at, $4) \
+          WHERE id = $1",
+        run.as_uuid(),
+        to as RunStatus,
+        failure,
+        at,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(map_sqlx)?;
+
+    if let Some(item) = row.item_id {
+        let Some(current) = sqlx::query_scalar!(
+            r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
+            item.as_uuid(),
+        )
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(map_sqlx)?
+        else {
+            // The foreign key makes this unreachable; it is an early return rather than a
+            // panic because a missing parent is the database's fault, not the caller's.
+            return Ok(());
+        };
+
+        let live = sqlx::query_scalar!(
+            "SELECT count(*) FROM run \
+              WHERE item_id = $1 AND id <> $2 \
+                AND status IN ('queued','running','awaiting_approval')",
+            item.as_uuid(),
+            run.as_uuid(),
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(map_sqlx)?
+        .unwrap_or_default();
+
+        if live == 0
+            && let Some(target) = finish_run_item_mirror(to, current)
+        {
+            sqlx::query!(
+                "UPDATE item \
+                    SET status    = $3, \
+                        closed_at = CASE WHEN $4 THEN clock_timestamp() ELSE NULL END \
+                  WHERE id = $1 AND status = $2",
+                item.as_uuid(),
+                current.as_str(),
+                target.as_str(),
+                target.is_terminal(),
+            )
+            .execute(&mut *conn)
+            .await
+            .map_err(map_sqlx)?;
+        }
+    }
+
+    Ok(())
+}
+
 impl WriteStore for PgStore {
     /// Mints an item: counter upsert, key assembly and revision 1 in one statement (ANA-9 §7.1).
     ///
@@ -4173,8 +4285,10 @@ impl WriteStore for PgStore {
 
         // MOD-12 D7, H-6: a run joins only an open batch. `FOR SHARE` conflicts with
         // `close_batch`'s UPDATE, so a pause and an admission serialise on the batch row and a run
-        // never joins a batch that has already closed. The lock order is item, then batch;
-        // `close_batch` takes no item lock, so the two never cycle.
+        // never joins a batch that has already closed. The lock order here is item, then batch;
+        // `close_batch` locks batch, then run, then item, but only the items of the batch's
+        // `queued` runs, which are `queued` themselves - and this item is `open` or `failed`, or
+        // `legal_move` above refused it before the batch lock - so the two never wait on one item.
         if let Some(batch) = new.batch_id {
             let open = sqlx::query_scalar!(
                 r#"SELECT closed_at IS NULL AS "open!" FROM queue_batch WHERE id = $1 FOR SHARE"#,
@@ -5838,103 +5952,7 @@ impl WriteStore for PgStore {
         at: DateTime<Utc>,
     ) -> Result<()> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-
-        let Some(row) = sqlx::query!(
-            r#"
-            SELECT status  AS "status: RunStatus",
-                   item_id AS "item_id: ItemId"
-              FROM run
-             WHERE id = $1
-               FOR UPDATE
-            "#,
-            run.as_uuid(),
-        )
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_sqlx)?
-        else {
-            return Err(StoreError::NotFound {
-                entity: "run",
-                id: run.to_string(),
-            });
-        };
-
-        if !to.is_terminal() {
-            return Err(StoreError::Constraint(finish_run_needs_a_terminal_status(
-                run, to,
-            )));
-        }
-        if failure.is_some() != (to == RunStatus::Failed) {
-            return Err(StoreError::Constraint(failure_disagrees_with_status(
-                run,
-                to,
-                failure.is_some(),
-            )));
-        }
-        // A terminal row reaches nothing, so `legal_move` is the whole refusal: `run_is_terminal`
-        // would only say the same thing in a second sentence.
-        legal_move(row.status, to)?;
-
-        sqlx::query!(
-            "UPDATE run \
-                SET status      = $2, \
-                    failure     = COALESCE($3, failure), \
-                    finished_at = COALESCE(finished_at, $4) \
-              WHERE id = $1",
-            run.as_uuid(),
-            to as RunStatus,
-            failure,
-            at,
-        )
-        .execute(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
-
-        if let Some(item) = row.item_id {
-            let Some(current) = sqlx::query_scalar!(
-                r#"SELECT status AS "status: Status" FROM item WHERE id = $1 FOR UPDATE"#,
-                item.as_uuid(),
-            )
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(map_sqlx)?
-            else {
-                // The foreign key makes this unreachable; it is an early return rather than a
-                // panic because a missing parent is the database's fault, not the caller's.
-                return tx.commit().await.map_err(map_sqlx);
-            };
-
-            let live = sqlx::query_scalar!(
-                "SELECT count(*) FROM run \
-                  WHERE item_id = $1 AND id <> $2 \
-                    AND status IN ('queued','running','awaiting_approval')",
-                item.as_uuid(),
-                run.as_uuid(),
-            )
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(map_sqlx)?
-            .unwrap_or_default();
-
-            if live == 0
-                && let Some(target) = finish_run_item_mirror(to, current)
-            {
-                sqlx::query!(
-                    "UPDATE item \
-                        SET status    = $3, \
-                            closed_at = CASE WHEN $4 THEN clock_timestamp() ELSE NULL END \
-                      WHERE id = $1 AND status = $2",
-                    item.as_uuid(),
-                    current.as_str(),
-                    target.as_str(),
-                    target.is_terminal(),
-                )
-                .execute(&mut *tx)
-                .await
-                .map_err(map_sqlx)?;
-            }
-        }
-
+        finish_run_on(&mut tx, run, to, failure, at).await?;
         tx.commit().await.map_err(map_sqlx)
     }
 
@@ -7547,6 +7565,14 @@ impl PgStore {
     /// UPDATE conflicts with `create_run`'s `FOR SHARE` on the row, so a pause and an admission
     /// serialise (H-6).
     ///
+    /// In the same transaction, every run of the batch still `queued` is cancelled through
+    /// [`finish_run_on`], so its item goes back to `open` by `finish_run`'s mirror and its queue
+    /// entry stays (review H2): a pause stops the runs no process has claimed yet, not only the
+    /// admissions. The runs are locked `FOR UPDATE` after the batch row, so a racing `claim_run`
+    /// (which locks the run row first) either claims the run before this reads it - the run is
+    /// `running` and left alone - or finds it `cancelled` and answers `NotClaimable`. A `drained`
+    /// close finds no such run: the drain closes only a batch whose runs are all terminal.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
@@ -7556,7 +7582,8 @@ impl PgStore {
         reason: BatchClose,
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
-        sqlx::query_as!(
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let closed = sqlx::query_as!(
             QueueBatch,
             r#"
             UPDATE queue_batch
@@ -7568,6 +7595,63 @@ impl PgStore {
             "#,
             box_id.as_uuid(),
             reason.as_str(),
+            at,
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if let Some(batch) = &closed {
+            let waiting = sqlx::query_scalar!(
+                r#"
+                SELECT id AS "id: RunId"
+                  FROM run
+                 WHERE batch_id = $1 AND status = 'queued'
+                 ORDER BY queued_at, id
+                   FOR UPDATE
+                "#,
+                batch.id.as_uuid(),
+            )
+            .fetch_all(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+            for run in waiting {
+                finish_run_on(&mut tx, run, RunStatus::Cancelled, None, at).await?;
+            }
+        }
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(closed)
+    }
+
+    /// MOD-12 D3 (review M1): the drain's close, of exactly `batch` and only while it is still
+    /// drained: open, its box with no queue entry, and no run of its own `queued`, `running` or
+    /// `awaiting_approval`. The re-check is the UPDATE's own `WHERE`, so a resume that opened a
+    /// new batch after the drain's reads is never closed by it, and an entry or a run that
+    /// committed before the statement keeps the batch open. `None` when the batch did not close.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn close_drained_batch(
+        &self,
+        batch: BatchId,
+        at: DateTime<Utc>,
+    ) -> Result<Option<QueueBatch>> {
+        sqlx::query_as!(
+            QueueBatch,
+            r#"
+            UPDATE queue_batch b
+               SET closed_at = $2, closed_reason = 'drained'
+             WHERE b.id = $1 AND b.closed_at IS NULL
+               AND NOT EXISTS (SELECT 1 FROM queue_entry e WHERE e.box_id = b.box_id)
+               AND NOT EXISTS (
+                       SELECT 1 FROM run r
+                        WHERE r.batch_id = b.id
+                          AND r.status IN ('queued', 'running', 'awaiting_approval'))
+            RETURNING b.id AS "id: BatchId", b.box_id AS "box_id: BoxId", b.opened_at,
+                      b.opened_by AS "opened_by: UserId", b.closed_at,
+                      b.closed_reason AS "closed_reason: BatchClose"
+            "#,
+            batch.as_uuid(),
             at,
         )
         .fetch_optional(&self.pool)

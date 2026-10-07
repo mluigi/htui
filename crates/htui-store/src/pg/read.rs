@@ -2296,6 +2296,27 @@ impl PgStore {
         Ok(rows.into_iter().map(|row| (row.id, row.status)).collect())
     }
 
+    /// MOD-12 (review H1): the items with a `cancelled` run under `batch`, in uuid order. The
+    /// queue runner admits none of them again under that batch: a cancel sticks until a resume.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn batch_cancelled_items(&self, batch: BatchId) -> Result<Vec<ItemId>> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT DISTINCT item_id AS "item_id!: ItemId"
+              FROM run
+             WHERE batch_id = $1 AND status = 'cancelled' AND item_id IS NOT NULL
+             ORDER BY 1
+            "#,
+            batch.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
     /// MOD-12 D6 (H-5): `claim_run`'s slot count — `running` runs executing on `box_id`, **not**
     /// `awaiting_approval` (that is [`active_runs_on_box`](PgStore::active_runs_on_box)). The
     /// query text is `claim_run`'s byte for byte, so it shares that `.sqlx` entry.

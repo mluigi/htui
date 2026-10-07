@@ -16,9 +16,9 @@ use htui_agent::error::DriverError;
 use htui_agent::record::{Control, Signal};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{
-    AgentId, AgentSummary, BatchClose, BoxId, BoxProfile, CancelRequest, Executor, ItemId,
-    ProjectId, RepoId, Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus,
-    SnapshotCandidate, UserId, WorkspaceId, admission_limit, admission_order, free_slots,
+    AgentId, AgentSummary, BoxId, BoxProfile, CancelRequest, Executor, ItemId, ProjectId, RepoId,
+    Run, RunCommandId, RunCommandStatus, RunId, RunKind, RunStatus, SnapshotCandidate, UserId,
+    WorkspaceId, admission_limit, admission_order, free_slots,
 };
 use htui_core::scrub::MinimalScrubber;
 use htui_core::store::{Result as StoreResult, StoreError};
@@ -221,6 +221,9 @@ struct Shared<P: ReplySink> {
     sweeping: AtomicBool,
     /// MOD-12 D8: a sweep asked for while one ran; the running one sweeps once more before it ends.
     sweep_again: AtomicBool,
+    /// MOD-12 review M2: the queue runner's last sweep failed at a store call
+    /// ([`Shared::queue_read_failed`]).
+    queue_failing: AtomicBool,
     /// I-1: the executor the last sweep read, so a change is logged once.
     last_executor: StdMutex<Option<Executor>>,
     /// OQ-6, blueprint B-10: the runs whose resume keeps failing (role [`Role::Worker`] only).
@@ -275,6 +278,30 @@ impl<P: ReplySink> Shared<P> {
                 tracing::debug!(%executor, executes, "this box's executor; the TUI executes only on `tui`");
             }
         }
+    }
+
+    /// MOD-12 review M2: a store call of the queue runner (`admit`'s reads and prune, `drain`'s
+    /// close) failed at `step`, so the sweep admits nothing. Warned on the first failure of a
+    /// streak, at `debug` after it, so an outage neither hides at the default `info` filter nor
+    /// warns every sweep. True when this failure started the streak.
+    fn queue_read_failed(&self, step: &'static str, err: &StoreError) -> bool {
+        let first = !self.queue_failing.swap(true, Ordering::SeqCst);
+        if first {
+            tracing::warn!(step, %err, "the queue runner's store call failed; the queue admits nothing until it succeeds");
+        } else {
+            tracing::debug!(step, %err, "the queue runner's store call failed again");
+        }
+        first
+    }
+
+    /// MOD-12 review M2: a sweep got past every store call of the queue runner; said once, at
+    /// `info`, when it ends a streak of [`Shared::queue_read_failed`]. True when it did.
+    fn queue_reads_ok(&self) -> bool {
+        let ended = self.queue_failing.swap(false, Ordering::SeqCst);
+        if ended {
+            tracing::info!("the queue runner reads its store again");
+        }
+        ended
     }
 
     /// OQ-6: `run`'s resume failed again; its next one waits, 5 s doubling to 5 min. Warned once
@@ -1174,6 +1201,7 @@ impl<H: htui_core::store::WorkerHost, P: ReplySink> RunRuntime<H, P> {
                 sweep_fixed: false,
                 sweeping: AtomicBool::new(false),
                 sweep_again: AtomicBool::new(false),
+                queue_failing: AtomicBool::new(false),
                 last_executor: StdMutex::default(),
                 backoff: StdMutex::default(),
                 polling: AtomicBool::new(false),
@@ -1761,8 +1789,13 @@ fn spawn_supervised<H: htui_core::store::WorkerHost, P: ReplySink>(
 
 /// D190's one-sweep-at-a-time task (MOD-12 D8: callable from a task's tail). A sweep asked for
 /// while one runs is not dropped: `sweep_again` makes the running one go round once more. A wake
-/// landing between the loop's last look at `sweep_again` and the guard's drop is still lost; the
-/// next tick covers it (blueprint H-8).
+/// landing between the loop's last look at `sweep_again` and the claim's release is not lost
+/// either (review L2, closing blueprint H-8's gap): the guard looks again after it releases the
+/// claim and asks for one more sweep here, whose own claim and close checks keep it to one sweep
+/// at a time and none after shutdown. Nor is a wake whose claim fails just before that release
+/// but whose `sweep_again` lands after the guard's look (review G2): having published the flag,
+/// the loser tries the claim once more, so either the holder had not yet released it (and its
+/// guard's look, ordered after that try, sees the flag) or this call takes it and sweeps.
 fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
     shared: &Arc<Shared<P>>,
     host: &H,
@@ -1777,7 +1810,16 @@ fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
         .is_err()
     {
         shared.sweep_again.store(true, Ordering::SeqCst);
-        return;
+        // Review G2: a holder that released between the failed claim and the store above has
+        // already looked at `sweep_again`; this second try takes its claim, and the sweep it
+        // starts spends the flag on its loop's first look.
+        if shared
+            .sweeping
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
     }
     shared.publisher.wire(sink);
     let ctx = TaskCtx {
@@ -1790,17 +1832,29 @@ fn spawn_sweep<H: htui_core::store::WorkerHost, P: ReplySink>(
     };
     let tag = Arc::clone(&ctx.tag);
     let handle = tokio::spawn(async move {
-        /// Frees the one-sweep-at-a-time claim however the sweep ends.
-        struct Swept<P: ReplySink>(Arc<Shared<P>>);
-        impl<P: ReplySink> Drop for Swept<P> {
+        /// Frees the one-sweep-at-a-time claim however the sweep ends, then (review L2) sweeps
+        /// again when asked to after the loop's last look. The claim it frees is always its own
+        /// task's: the task exists only because [`spawn_sweep`]'s CAS took it, and nothing else
+        /// releases it. A wake it hands on that loses the CAS to another sweep sets
+        /// `sweep_again` there, so that sweep goes round once more instead.
+        struct Swept<H: htui_core::store::WorkerHost, P: ReplySink>(TaskCtx<H, P>);
+        impl<H: htui_core::store::WorkerHost, P: ReplySink> Drop for Swept<H, P> {
             fn drop(&mut self) {
-                self.0.sweeping.store(false, Ordering::SeqCst);
+                let ctx = &self.0;
+                ctx.shared.sweeping.store(false, Ordering::SeqCst);
+                // Off a runtime (a runtime's own teardown) nothing may spawn, and a panic here
+                // would abort the process mid-unwind.
+                if ctx.shared.sweep_again.swap(false, Ordering::SeqCst)
+                    && tokio::runtime::Handle::try_current().is_ok()
+                {
+                    spawn_sweep(&ctx.shared, &ctx.host, &ctx.sink);
+                }
             }
         }
-        let _swept = Swept(Arc::clone(&ctx.shared));
+        let swept = Swept(ctx);
         loop {
-            Box::pin(sweep_once(ctx.clone())).await;
-            if !ctx.shared.sweep_again.swap(false, Ordering::SeqCst) {
+            Box::pin(sweep_once(swept.0.clone())).await;
+            if !swept.0.shared.sweep_again.swap(false, Ordering::SeqCst) {
                 break;
             }
         }
@@ -2036,34 +2090,39 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// the batch (D7). Every refusal is logged at `debug` and the next entry tried; one that writes a
 /// note on its item (rung 4, missing tags) is visible there. A `Constraint` re-reads the open
 /// batch and stops when it is no longer this one (a pause won the race, H-6). The `Kit` is read
-/// only when something is to be admitted.
+/// only when something is to be admitted. A failed store read stops the sweep's admission and is
+/// warned once per streak (review M2, [`Shared::queue_read_failed`]).
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
     box_settings: &Value,
 ) {
     let host = &ctx.host;
+    let shared = &ctx.shared;
     let batch = match host.open_batch_of(box_id).await {
         Ok(Some(batch)) => batch,
-        Ok(None) => return,
+        Ok(None) => {
+            shared.queue_reads_ok();
+            return;
+        }
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read this box's batch");
+            shared.queue_read_failed("reading this box's open batch", &err);
             return;
         }
     };
     if let Err(err) = host.prune_finished_entries(box_id).await {
-        tracing::debug!(%err, "the queue runner could not prune its finished entries");
+        shared.queue_read_failed("pruning its finished entries", &err);
         return;
     }
     let entries = match host.queue_entries(box_id).await {
         Ok(entries) => entries,
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read its entries");
+            shared.queue_read_failed("reading its entries", &err);
             return;
         }
     };
     if entries.is_empty() {
-        drain(ctx, box_id, &batch).await;
+        drain(ctx, &batch).await;
         return;
     }
     let mut project_ids: Vec<ProjectId> = Vec::new();
@@ -2079,12 +2138,27 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     let ready = match host.ready_items(&scope, box_id).await {
         Ok(ready) => ready,
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read the ready items");
+            shared.queue_read_failed("reading the ready items", &err);
             return;
         }
     };
+    // Review H1: a cancel sticks for the rest of its batch. The cancel moved the item back to
+    // `open` with its entry kept (D9: membership is the user's call), so without this the next
+    // sweep would admit it again; a pause and a resume open a new batch, which does.
+    let cancelled = match host.batch_cancelled_items(batch.id).await {
+        Ok(cancelled) => cancelled,
+        Err(err) => {
+            shared.queue_read_failed("reading its batch's cancelled items", &err);
+            return;
+        }
+    };
+    let ready: Vec<_> = ready
+        .into_iter()
+        .filter(|item| cancelled.binary_search(&item.id).is_err())
+        .collect();
     let order = admission_order(&entries, &ready);
     if order.is_empty() {
+        shared.queue_reads_ok();
         return;
     }
     let slots = async {
@@ -2100,10 +2174,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     let free = match slots.await {
         Ok(free) => free,
         Err(err) => {
-            tracing::debug!(%err, "the queue runner could not count this box's free slots");
+            shared.queue_read_failed("counting this box's free slots", &err);
             return;
         }
     };
+    shared.queue_reads_ok();
     if free == 0 {
         return;
     }
@@ -2144,28 +2219,28 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
 }
 
-/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live.
+/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live. The
+/// close is of exactly the batch `admit` read, and re-checks both conditions in the same write
+/// (review M1), so a pause and a resume between the reads and the close are never undone.
 async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
-    box_id: BoxId,
     batch: &htui_core::model::QueueBatch,
 ) {
-    let host = &ctx.host;
-    match host.batch_runs(batch.id).await {
-        Ok(runs) if runs.iter().all(|(_, status)| status.is_terminal()) => {}
-        Ok(_) => return,
-        Err(err) => {
-            tracing::debug!(%err, "the queue runner could not read its batch's runs");
-            return;
-        }
-    }
-    match host
-        .close_batch(box_id, BatchClose::Drained, ctx.shared.clock.now())
+    match ctx
+        .host
+        .close_drained_batch(batch.id, ctx.shared.clock.now())
         .await
     {
-        Ok(Some(_)) => tracing::info!(batch = %batch.id, "the queue drained"),
-        Ok(None) => {}
-        Err(err) => tracing::debug!(%err, "the queue runner could not close its drained batch"),
+        Ok(closed) => {
+            ctx.shared.queue_reads_ok();
+            if closed.is_some() {
+                tracing::info!(batch = %batch.id, "the queue drained");
+            }
+        }
+        Err(err) => {
+            ctx.shared
+                .queue_read_failed("closing its drained batch", &err);
+        }
     }
 }
 
@@ -3310,7 +3385,7 @@ mod tests {
     use htui_agent::registry::DriverFactory;
     use htui_core::fixtures::ids;
     use htui_core::model::ItemId;
-    use htui_core::store::MemStore;
+    use htui_core::store::{MemStore, StoreError};
     use htui_store::Backend;
 
     use super::RunRuntime;
@@ -3389,6 +3464,30 @@ mod tests {
             run: None,
             kind: FrameKind::Changed,
         }
+    }
+
+    /// MOD-12 review M2: a queue read that keeps failing is warned about once per streak, not once
+    /// per sweep, and the sweep that reads past it again says so once.
+    #[test]
+    fn a_failing_queue_read_warns_once_per_streak() {
+        let runtime = runtime();
+        let shared = &runtime.shared;
+        let err = StoreError::ReadOnly("a test");
+        assert!(!shared.queue_reads_ok(), "no streak to end yet");
+        assert!(
+            shared.queue_read_failed("its entries", &err),
+            "the first failure warns"
+        );
+        assert!(
+            !shared.queue_read_failed("the ready items", &err),
+            "the next one, at any step, does not"
+        );
+        assert!(shared.queue_reads_ok(), "the streak's end is noted");
+        assert!(!shared.queue_reads_ok(), "once");
+        assert!(
+            shared.queue_read_failed("its entries", &err),
+            "a new streak warns again"
+        );
     }
 
     /// Plan D172, MOD-41 plan D7: a frame reaches every subscriber of its item, each at its own
@@ -3523,6 +3622,288 @@ mod tests {
             sink.frames_of(ids::HTUI_FEAT_1),
             [11],
             "at its later subscription's address"
+        );
+    }
+}
+
+/// MOD-12 review M2, G2: every store call of the queue runner that fails (`admit`'s reads and
+/// prune, `drain`'s close) starts a streak the next success ends, and nothing ends a streak before
+/// the call that fails. Over a host that fails one named call and passes the rest to
+/// `Backend::memory`.
+#[cfg(test)]
+mod queue_store_errors {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, Mutex as StdMutex, OnceLock, PoisonError};
+
+    use chrono::{DateTime, Utc};
+    use htui_agent::registry::DriverFactory;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{
+        AgentBox, AgentSummary, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
+        DocumentHead, Item, ItemId, ItemSummary, PhaseAgent, PhaseId, ProjectId, PromptTemplate,
+        QueueBatch, QueueEntry, RepoBoxPath, ResolvedGraph, Run, RunId, RunStep, RunSummary, Scope,
+        UserId, WorkspaceSummary,
+    };
+    use htui_core::store::{MemStore, Result, StoreError, WorkerHost};
+    use htui_store::Backend;
+    use serde_json::{Value, json};
+
+    use super::{RunRuntime, Shared, TaskCtx, admit};
+    use crate::{ReplySink, RunReply};
+
+    /// A sink nothing is sent to that the test reads.
+    #[derive(Debug, Clone, Copy)]
+    struct Quiet;
+
+    impl ReplySink for Quiet {
+        type Addr = u64;
+        type Subscriber = u64;
+
+        fn subscriber(addr: &u64) -> u64 {
+            *addr
+        }
+
+        fn send(&self, _: &u64, _: RunReply) {}
+    }
+
+    /// `Backend::memory`, but the call named in `fail` answers an error. Each failing call
+    /// records its name and whether a streak stood when it was made.
+    #[derive(Clone)]
+    struct Failing {
+        inner: Backend,
+        fail: Arc<StdMutex<Option<&'static str>>>,
+        seen: Arc<StdMutex<Vec<(&'static str, bool)>>>,
+        shared: Arc<OnceLock<Arc<Shared<Quiet>>>>,
+    }
+
+    impl Failing {
+        fn fail(&self, call: Option<&'static str>) {
+            *self.fail.lock().unwrap_or_else(PoisonError::into_inner) = call;
+        }
+
+        fn seen(&self) -> Vec<(&'static str, bool)> {
+            std::mem::take(&mut *self.seen.lock().unwrap_or_else(PoisonError::into_inner))
+        }
+
+        fn check(&self, call: &'static str) -> Result<()> {
+            if *self.fail.lock().unwrap_or_else(PoisonError::into_inner) != Some(call) {
+                return Ok(());
+            }
+            let streak = self
+                .shared
+                .get()
+                .is_some_and(|shared| shared.queue_failing.load(Ordering::SeqCst));
+            self.seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push((call, streak));
+            Err(StoreError::ReadOnly("a failing test store"))
+        }
+    }
+
+    impl WorkerHost for Failing {
+        type Store = <Backend as WorkerHost>::Store;
+
+        fn writer(&self) -> Option<Self::Store> {
+            WorkerHost::writer(&self.inner)
+        }
+        async fn box_info(&self) -> Result<Option<BoxInfo>> {
+            WorkerHost::box_info(&self.inner).await
+        }
+        async fn this_user(&self) -> Result<UserId> {
+            WorkerHost::this_user(&self.inner).await
+        }
+        async fn app_settings(&self) -> Result<BTreeMap<String, Value>> {
+            self.check("app_settings")?;
+            WorkerHost::app_settings(&self.inner).await
+        }
+        async fn box_profile(&self, id: BoxId) -> Result<Option<BoxProfile>> {
+            WorkerHost::box_profile(&self.inner, id).await
+        }
+        async fn agents(&self) -> Result<Vec<AgentSummary>> {
+            WorkerHost::agents(&self.inner).await
+        }
+        async fn box_row(&self, id: BoxId) -> Result<Option<BoxRow>> {
+            WorkerHost::box_row(&self.inner, id).await
+        }
+        async fn repo_paths(&self, box_id: BoxId) -> Result<Vec<RepoBoxPath>> {
+            WorkerHost::repo_paths(&self.inner, box_id).await
+        }
+        async fn workspaces(&self) -> Result<Vec<WorkspaceSummary>> {
+            WorkerHost::workspaces(&self.inner).await
+        }
+        async fn active_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+            WorkerHost::active_runs_on_box(&self.inner, box_id).await
+        }
+        async fn item(&self, id: ItemId) -> Result<Option<Item>> {
+            WorkerHost::item(&self.inner, id).await
+        }
+        async fn documents(&self, id: ItemId) -> Result<Vec<DocumentHead>> {
+            WorkerHost::documents(&self.inner, id).await
+        }
+        async fn runs(&self, id: ItemId) -> Result<Vec<RunSummary>> {
+            WorkerHost::runs(&self.inner, id).await
+        }
+        async fn run(&self, id: RunId) -> Result<Option<Run>> {
+            WorkerHost::run(&self.inner, id).await
+        }
+        async fn run_steps(&self, run: RunId) -> Result<Vec<RunStep>> {
+            WorkerHost::run_steps(&self.inner, run).await
+        }
+        async fn resolve_graph(&self, item: ItemId) -> Result<Option<ResolvedGraph>> {
+            WorkerHost::resolve_graph(&self.inner, item).await
+        }
+        async fn phase_agents(&self, phase: PhaseId) -> Result<Vec<PhaseAgent>> {
+            WorkerHost::phase_agents(&self.inner, phase).await
+        }
+        async fn prompt_template(
+            &self,
+            project: ProjectId,
+            name: &str,
+            version: Option<i32>,
+        ) -> Result<Option<PromptTemplate>> {
+            WorkerHost::prompt_template(&self.inner, project, name, version).await
+        }
+        async fn agent_boxes(&self, box_id: BoxId) -> Result<Vec<AgentBox>> {
+            WorkerHost::agent_boxes(&self.inner, box_id).await
+        }
+        async fn bound_skills(
+            &self,
+            project: ProjectId,
+            phase: Option<PhaseId>,
+        ) -> Result<Vec<BoundSkill>> {
+            WorkerHost::bound_skills(&self.inner, project, phase).await
+        }
+        async fn missing_tags(&self, item: ItemId, box_id: BoxId) -> Result<Vec<String>> {
+            WorkerHost::missing_tags(&self.inner, item, box_id).await
+        }
+        async fn queued_runs_on_box(&self, box_id: BoxId) -> Result<Vec<(RunId, DateTime<Utc>)>> {
+            self.check("queued_runs_on_box")?;
+            WorkerHost::queued_runs_on_box(&self.inner, box_id).await
+        }
+        async fn ready_items(&self, scope: &Scope, box_id: BoxId) -> Result<Vec<ItemSummary>> {
+            self.check("ready_items")?;
+            WorkerHost::ready_items(&self.inner, scope, box_id).await
+        }
+        async fn running_runs_on_box(&self, box_id: BoxId) -> Result<usize> {
+            self.check("running_runs_on_box")?;
+            WorkerHost::running_runs_on_box(&self.inner, box_id).await
+        }
+        async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+            self.check("queue_entries")?;
+            WorkerHost::queue_entries(&self.inner, box_id).await
+        }
+        async fn open_batch_of(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+            self.check("open_batch_of")?;
+            WorkerHost::open_batch_of(&self.inner, box_id).await
+        }
+        async fn batch_cancelled_items(&self, batch: BatchId) -> Result<Vec<ItemId>> {
+            self.check("batch_cancelled_items")?;
+            WorkerHost::batch_cancelled_items(&self.inner, batch).await
+        }
+        async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
+            self.check("prune_finished_entries")?;
+            WorkerHost::prune_finished_entries(&self.inner, box_id).await
+        }
+        async fn close_drained_batch(
+            &self,
+            batch: BatchId,
+            at: DateTime<Utc>,
+        ) -> Result<Option<QueueBatch>> {
+            self.check("close_drained_batch")?;
+            WorkerHost::close_drained_batch(&self.inner, batch, at).await
+        }
+    }
+
+    /// A runtime over `store` and a sweep's context over it, through [`Failing`].
+    fn sweep_over(
+        store: MemStore,
+    ) -> (RunRuntime<Failing, Quiet>, Failing, TaskCtx<Failing, Quiet>) {
+        let runtime = RunRuntime::new(DriverFactory::new());
+        let host = Failing {
+            inner: Backend::memory(store),
+            fail: Arc::default(),
+            seen: Arc::default(),
+            shared: Arc::default(),
+        };
+        let _ = host.shared.set(Arc::clone(&runtime.shared));
+        let ctx = TaskCtx {
+            shared: Arc::clone(&runtime.shared),
+            host: host.clone(),
+            sink: Quiet,
+            addr: None,
+            name: "sweep",
+            tag: Arc::default(),
+        };
+        (runtime, host, ctx)
+    }
+
+    /// One `call` failing, twice: from no streak it starts one, and mid-streak it is still made
+    /// with the streak standing (nothing before it said the store reads again).
+    async fn fails_at(host: &Failing, ctx: &TaskCtx<Failing, Quiet>, call: &'static str) {
+        let streak = &ctx.shared.queue_failing;
+        host.fail(Some(call));
+        streak.store(false, Ordering::SeqCst);
+        admit(ctx, ids::BOX, &json!({})).await;
+        assert!(
+            streak.load(Ordering::SeqCst),
+            "{call}: a failure starts a streak"
+        );
+        admit(ctx, ids::BOX, &json!({})).await;
+        assert!(streak.load(Ordering::SeqCst), "{call}: and keeps it");
+        assert_eq!(
+            host.seen(),
+            [(call, false), (call, true)],
+            "{call} is reached, and no earlier call ends the streak it fails in"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_failing_queue_store_call_starts_a_streak_that_a_clean_sweep_ends() {
+        // An open batch with an entry whose item is ready: admission reaches its every read.
+        let store = MemStore::demo();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the item queues");
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store);
+        for call in [
+            "open_batch_of",
+            "prune_finished_entries",
+            "queue_entries",
+            "ready_items",
+            "batch_cancelled_items",
+            "running_runs_on_box",
+            "queued_runs_on_box",
+            "app_settings",
+        ] {
+            fails_at(&host, &ctx, call).await;
+        }
+        host.fail(None);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert!(
+            !ctx.shared.queue_failing.load(Ordering::SeqCst),
+            "a sweep past every read ends the streak"
+        );
+
+        // An open batch with no entry: admission drains it.
+        let store = MemStore::demo();
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store);
+        fails_at(&host, &ctx, "close_drained_batch").await;
+        host.fail(None);
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert!(
+            !ctx.shared.queue_failing.load(Ordering::SeqCst),
+            "a drain that closes ends the streak"
         );
     }
 }

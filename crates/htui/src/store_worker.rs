@@ -1542,6 +1542,10 @@ pub struct QueueView {
     pub entries: Vec<ItemId>,
     /// The open batch; `None` = paused (D2).
     pub open_batch: Option<BatchId>,
+    /// The memory backend, i.e. `htui --demo`: its runtime never admits (no claim scan,
+    /// blueprint deviation 6), so an open batch runs nothing (review L3). Not a "runs here"
+    /// test: a Postgres box whose executor is a headless worker does run its queue.
+    pub demo: bool,
 }
 
 /// MOD-12 D9: what one queue write did.
@@ -1564,10 +1568,10 @@ pub enum QueueWrite {
         /// Whether a batch was open before this write.
         already: bool,
     },
-    /// The batch closed `paused` with `live` of its runs `queued` or `running`; `already` when
-    /// none was open.
+    /// The batch closed `paused` with `live` of its runs `running`; `already` when none was
+    /// open. The close cancelled the batch's runs still `queued` (review H2), so none is counted.
     Paused {
-        /// The closed batch's runs still `queued` or `running`.
+        /// The closed batch's runs still `running`.
         live: usize,
         /// Whether no batch was open, so nothing closed.
         already: bool,
@@ -2133,7 +2137,16 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
         }
         StoreRequest::QueueItem { item } => {
             let user = backend.this_user().await?;
-            backend.queue_item(*item, box_id, user, now()).await?;
+            let entry = backend.queue_item(*item, box_id, user, now()).await?;
+            // D1: an item is queued on at most one box, and an existing entry is kept as it is.
+            // One on another box is not this box's to report as queued (review L1); dequeueing
+            // it from here is the M3 overlay's (D11).
+            if entry.box_id != box_id {
+                return Ok(StoreReply::Failed {
+                    request: request.name(),
+                    message: QUEUED_ELSEWHERE.to_owned(),
+                });
+            }
             QueueWrite::Queued { item: *item }
         }
         StoreRequest::DequeueItem { item } => QueueWrite::Dequeued {
@@ -2156,9 +2169,7 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
                         .batch_runs(closed.id)
                         .await?
                         .iter()
-                        .filter(|(_, status)| {
-                            matches!(status, RunStatus::Queued | RunStatus::Running)
-                        })
+                        .filter(|(_, status)| *status == RunStatus::Running)
                         .count(),
                     already: false,
                 },
@@ -2181,6 +2192,9 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
     })
 }
 
+/// MOD-12 D9 (review L1): `QueueItem`'s refusal when the item is already queued on another box.
+const QUEUED_ELSEWHERE: &str = "the item is queued on another box; dequeue it there";
+
 /// MOD-12 D9: `box_id`'s queue: its entries in queue order and its open batch.
 async fn queue_view(backend: &Backend, box_id: BoxId) -> StoreResult<QueueView> {
     Ok(QueueView {
@@ -2191,6 +2205,7 @@ async fn queue_view(backend: &Backend, box_id: BoxId) -> StoreResult<QueueView> 
             .map(|entry| entry.item_id)
             .collect(),
         open_batch: backend.open_batch_of(box_id).await?.map(|batch| batch.id),
+        demo: matches!(backend, Backend::Memory(_)),
     })
 }
 
@@ -4963,6 +4978,7 @@ mod tests {
             QueueView {
                 entries: Vec::new(),
                 open_batch: None,
+                demo: true,
             }
         );
 
@@ -4993,6 +5009,50 @@ mod tests {
             }
             other => panic!("a pause answers `QueueWritten`: {other:?}"),
         }
+    }
+
+    /// MOD-12 D9 (review L1): an item queued on another box stays there (one box per item, D1),
+    /// so `Q` from this box is refused with where to dequeue it rather than answered `Queued`
+    /// with a count that leaves it out. This box's view still lacks it.
+    #[tokio::test]
+    async fn queueing_an_item_queued_on_another_box_is_refused() {
+        let mut data = demo_data();
+        let mut elsewhere = data.boxes[0].clone();
+        elsewhere.id = BoxId::new();
+        elsewhere.hostname = "elsewhere".to_owned();
+        let other = elsewhere.id;
+        data.boxes.push(elsewhere);
+        let store = MemStore::from_demo(data);
+        store
+            .queue_item(ids::HTUI_ANA_2, other, ids::USER, Utc::now())
+            .await
+            .expect("the item is queued on the other box");
+        let backend = Backend::memory(store);
+
+        match serve(
+            &backend,
+            &StoreRequest::QueueItem {
+                item: ids::HTUI_ANA_2,
+            },
+        )
+        .await
+        {
+            StoreReply::Failed { request, message } => {
+                assert_eq!(request, "queue_item");
+                assert_eq!(
+                    message,
+                    "the item is queued on another box; dequeue it there"
+                );
+            }
+            other => panic!("an item queued elsewhere is refused: {other:?}"),
+        }
+        let StoreReply::Queue(view) = serve(&backend, &StoreRequest::QueueState).await else {
+            panic!("`QueueState` answers `Queue`");
+        };
+        assert!(
+            !view.entries.contains(&ids::HTUI_ANA_2),
+            "the entry stays on the other box: {view:?}"
+        );
     }
 
     /// MOD-66 D7, blueprint B12: the tool-paths write is named by its own const, outside
