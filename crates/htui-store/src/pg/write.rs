@@ -50,8 +50,9 @@ use htui_core::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     COMMAND_STALE_AFTER, EXECUTOR_MUST_BE_KNOWN, batch_is_closed, command_finish_status,
     command_not_claimable, command_not_queued, document_needs_a_step, link_key,
-    link_not_proposed_by_run, link_outside_project, note_needs_a_step, reaped_note, self_link,
-    step_document_refusal, step_note_refusal, step_writes_own_item,
+    link_not_proposed_by_run, link_outside_project, note_needs_a_step,
+    project_settings_not_an_object, reaped_note, self_link, step_document_refusal,
+    step_note_refusal, step_writes_own_item,
 };
 use htui_core::store::{
     BindingFacts, CasOutcome, DeleteReach, DeleteTarget, ParkOutcome, QueueStored, QueueTarget,
@@ -3899,13 +3900,15 @@ impl WriteStore for PgStore {
     /// when `expected` is `None` — a conflict is `Stale`, never an overwrite — and a plain
     /// compare-and-set `UPDATE` otherwise; `project.settings` takes
     /// `settings || jsonb_build_object(key, value)`, which is the key-level merge that leaves every
-    /// other key alone; `step_graph_phase.token_budget` takes the `INTEGER` [`validate`] has
-    /// already narrowed to `i32::MAX` for this rung (flag C).
+    /// other key alone, guarded by `jsonb_typeof(settings) = 'object'` because `||` would turn a
+    /// scalar or an array into an array (review R1 L2); `step_graph_phase.token_budget` takes the
+    /// `INTEGER` [`validate`] has already narrowed to `i32::MAX` for this rung (flag C).
     ///
     /// # Errors
     ///
-    /// [`StoreError::Constraint`] for every validation refusal and for `expected: None` on
-    /// `Project` / `Phase`; [`StoreError::NotFound`] for an unknown project, phase or — under a
+    /// [`StoreError::Constraint`] for every validation refusal, for `expected: None` on
+    /// `Project` / `Phase`, and for a current token over a `project.settings` that is not an
+    /// object ([`project_settings_not_an_object`], `MemStore`'s sentence); [`StoreError::NotFound`] for an unknown project, phase or — under a
     /// token — `app_setting` row.
     async fn set_setting(
         &self,
@@ -3978,6 +3981,7 @@ impl WriteStore for PgStore {
                     r#"
                     UPDATE project SET settings = settings || jsonb_build_object($2::text, $3::jsonb)
                      WHERE id = $1 AND updated_at = $4
+                       AND jsonb_typeof(settings) = 'object'
                     RETURNING updated_at AS "updated_at!"
                     "#,
                     id.as_uuid(),
@@ -3994,7 +3998,13 @@ impl WriteStore for PgStore {
                         value: Some(value),
                         updated_at,
                     })),
-                    None => cas_miss(self.stored_setting(rung, key).await?, "project", id),
+                    // The token was current, so what missed is the blob guard (review R1 L2).
+                    None => match self.stored_setting(rung, key).await? {
+                        Some(stored) if stored.updated_at == token => Err(StoreError::Constraint(
+                            project_settings_not_an_object(id, key),
+                        )),
+                        current => cas_miss(current, "project", id),
+                    },
                 }
             }
             SettingRung::Phase(id) => {
@@ -4222,6 +4232,7 @@ impl WriteStore for PgStore {
                     r#"
                     UPDATE project SET settings = settings || jsonb_build_object($2::text, $3::jsonb)
                      WHERE id = $1 AND updated_at = $4
+                       AND jsonb_typeof(settings) = 'object'
                     RETURNING updated_at AS "updated_at!"
                     "#,
                     id.as_uuid(),
@@ -4237,7 +4248,13 @@ impl WriteStore for PgStore {
                         value: Some(value),
                         token: QueueToken::Stamp(Some(updated_at)),
                     })),
-                    None => cas_miss(self.stored_queue_setting(target, key).await?, "project", id),
+                    // The token was current, so what missed is the blob guard (review R1 L2).
+                    None => match self.stored_queue_setting(target, key).await? {
+                        Some(stored) if stored.token == expected => Err(StoreError::Constraint(
+                            project_settings_not_an_object(id, key),
+                        )),
+                        current => cas_miss(current, "project", id),
+                    },
                 }
             }
             (QueueTarget::Box(id), QueueToken::EditVersion(want)) => {

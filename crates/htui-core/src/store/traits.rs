@@ -2325,6 +2325,19 @@ pub const EXECUTOR_MUST_BE_KNOWN: &str = "executor must be tui or worker";
 /// blob that is not a JSON object (Postgres' `jsonb_set` errors on a scalar or an array).
 pub const BOX_SETTINGS_NOT_AN_OBJECT: &str = "box.settings is not a JSON object";
 
+/// The refusal every writer of `project.settings` gives a blob that is not a JSON object (D7;
+/// MOD-12 M2 review R1 L2): the merges of [`WriteStore::set_setting`]'s project rung and
+/// [`WriteStore::set_queue_setting`], and `MemStore`'s removals.
+///
+/// One sentence rather than two: a key cannot be merged into a scalar or removed from one, and
+/// what stops both is the same fact — the document is not a document. Shared with `PgStore`,
+/// whose `settings || jsonb_build_object(..)` would otherwise turn a scalar or an array into an
+/// array and answer `Applied` with a key nothing reads.
+#[must_use]
+pub fn project_settings_not_an_object(id: ProjectId, key: impl core::fmt::Display) -> String {
+    format!("project.settings of `{id}` is not a JSON object, so `{key}` cannot be merged into it")
+}
+
 /// MOD-51 D2: [`WriteStore::set_box_probe_spec`]'s refusal of an overlay that is not a JSON
 /// object. The probe would ignore one too; the store refuses it without the probe's help.
 pub const BOX_PROBE_SPEC_NOT_AN_OBJECT: &str = "box_probe_spec is not a JSON object";

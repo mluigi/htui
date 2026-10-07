@@ -67,13 +67,13 @@ use crate::store::traits::{
     item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
     link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
     new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
-    persona_is_bound, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
-    queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
-    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
-    row_names_another_step, run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal,
-    skill_version_key, step_document_refusal, step_is_not_promotable, step_note_refusal,
-    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
-    withdrawn_requirement_cited,
+    persona_is_bound, persona_patch_refusal, project_settings_not_an_object, prompt_template_key,
+    prompt_template_refusal, queue_target_refusal, queue_token_refusal, reaped_note,
+    references_no_row, requirement_withdrawn, reserved_phase_name, resolution_not_closable,
+    row_names_another_phase, row_names_another_step, run_is_terminal, self_link,
+    skill_body_refusal, skill_patch_refusal, skill_version_key, step_document_refusal,
+    step_is_not_promotable, step_note_refusal, step_slot_is_taken, step_writes_own_item,
+    summary_names_another_item, winner_is_not_settled, withdrawn_requirement_cited,
 };
 use uuid::Uuid;
 
@@ -4184,7 +4184,9 @@ impl State {
                     .get_mut(&id)
                     .expect("the row was read a statement ago under the same lock");
                 let Some(map) = project.settings.as_object_mut() else {
-                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
+                    return Err(StoreError::Constraint(project_settings_not_an_object(
+                        id, key,
+                    )));
                 };
                 map.insert(name.to_owned(), value.clone());
                 project.updated_at = now;
@@ -4288,7 +4290,9 @@ impl State {
                     .get_mut(&id)
                     .expect("the row was read a statement ago under the same lock");
                 let Some(map) = project.settings.as_object_mut() else {
-                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
+                    return Err(StoreError::Constraint(project_settings_not_an_object(
+                        id, key,
+                    )));
                 };
                 map.remove(name);
                 project.updated_at = now;
@@ -4423,7 +4427,9 @@ impl State {
                     .get_mut(&id)
                     .expect("the row was read a statement ago under the same lock");
                 let Some(map) = project.settings.as_object_mut() else {
-                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
+                    return Err(StoreError::Constraint(project_settings_not_an_object(
+                        id, key,
+                    )));
                 };
                 match &value {
                     Some(value) => map.insert(name.to_owned(), value.clone()),
@@ -7213,19 +7219,6 @@ fn rows(count: usize) -> u64 {
 /// JSON `null` and a document without a `status` are both `false`, as the `COALESCE` makes them.
 fn probe_says_ready(probe: Option<&Value>) -> bool {
     probe.is_none_or(|doc| doc.get("status").and_then(Value::as_str) == Some("ready"))
-}
-
-/// The refusal both writers of `project.settings` give a blob that is not a JSON object (D7).
-///
-/// One sentence rather than two: `set_setting` cannot merge a key into a scalar and `clear_setting`
-/// cannot remove one from it, and what stops both is the same fact — the document is not a
-/// document. A wording per verb would be two sentences about one blob, which is the drift the text
-/// helpers in [`store::traits`](crate::store::traits) exist to prevent (review L4).
-///
-/// Private, because `PgStore` cannot reach it: `project.settings` is `JSONB NOT NULL DEFAULT '{}'`
-/// there and the merge is Postgres's own `||`.
-fn settings_not_an_object(id: ProjectId, key: impl core::fmt::Display) -> String {
-    format!("project.settings of `{id}` is not a JSON object, so `{key}` cannot be merged into it")
 }
 
 /// A revision author must name a real `app_user` row (§5.5 `REFERENCES app_user(id)`); the nil
@@ -10778,6 +10771,51 @@ mod tests {
             "a refused clear removed nothing"
         );
         assert_eq!(after, token, "and did not advance the token either");
+    }
+
+    /// MOD-12 M2 review R1 L2: a queue cap cannot be merged into a `project.settings` blob that is
+    /// not a JSON object either; the refusal is `set_setting`'s sentence and writes nothing, the
+    /// token included. The Postgres half is
+    /// `pg_criteria.rs::a_project_merge_refuses_a_non_object_settings_blob`.
+    #[tokio::test]
+    async fn set_queue_setting_refuses_a_project_settings_that_is_not_an_object() {
+        use crate::model::QueueSetting;
+        use crate::store::traits::{QueueTarget, project_settings_not_an_object};
+
+        let target = QueueTarget::Project(ids::PROJECT_HTUI);
+        let cap = QueueSetting::PerTokenCapBatch;
+        for blob in [json!([]), json!("x")] {
+            let store = MemStore::demo();
+            store.set_project_settings(ids::PROJECT_HTUI, blob.clone());
+            let read = store
+                .queue_setting(target, cap)
+                .await
+                .expect("the read answers")
+                .expect("the project exists");
+            assert_eq!(
+                store
+                    .set_queue_setting(target, cap, json!(1_000), read.token)
+                    .await,
+                Err(StoreError::Constraint(project_settings_not_an_object(
+                    ids::PROJECT_HTUI,
+                    cap
+                ))),
+                "{blob}"
+            );
+            assert_eq!(
+                store.queue_setting(target, cap).await.expect("read"),
+                Some(read),
+                "{blob}: the refusal wrote nothing, the token included"
+            );
+            assert_eq!(
+                store
+                    .project_settings(ids::PROJECT_HTUI)
+                    .await
+                    .expect("read"),
+                Some(blob.clone()),
+                "{blob}: the blob is left as it was"
+            );
+        }
     }
 
     /// MOD-42 I-4: every time the relay writes is the handle's clock (`clock_timestamp()` on
