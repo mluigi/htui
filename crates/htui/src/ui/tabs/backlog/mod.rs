@@ -136,8 +136,12 @@ pub struct BacklogTab {
     /// Blueprint E8: the `ItemForm` read `N`/`e` is waiting on; a reply opens a form only when it
     /// answers this.
     opening: Option<Opening>,
-    /// MOD-12 D9: the toggle the pending `QueueState` read decides.
+    /// MOD-12 D9: the toggle the pending `QueueState` read decides. That read's answer takes
+    /// it, so one intent is at most one write (review NIT-intent).
     queue_intent: Option<QueueIntent>,
+    /// MOD-12 D9: the item write in flight and its key, for the status line its answer sets.
+    /// Kept apart from `queue_intent`, so the answer never wipes a toggle pressed since.
+    queue_writing: Option<(ItemId, String)>,
 }
 
 /// What `N` or `e` asked for, so only the answer to it opens a form (blueprint E8): a tab's
@@ -187,6 +191,7 @@ impl BacklogTab {
             item_form: None,
             opening: None,
             queue_intent: None,
+            queue_writing: None,
         }
     }
 
@@ -443,33 +448,45 @@ impl BacklogTab {
         ctx.request(StoreRequest::QueueState);
     }
 
-    /// MOD-12 D9: the queue as it is now decides the write the pending toggle sends. A read
-    /// nobody here asked for (no intent) is ignored.
-    fn on_queue(&self, view: &QueueView, ctx: &Ctx<'_>) {
-        let request = match &self.queue_intent {
-            Some(QueueIntent::Item { id, .. }) if view.entries.contains(id) => {
-                StoreRequest::DequeueItem { item: *id }
+    /// MOD-12 D9: the queue as it is now decides the write the pending toggle sends, and spends
+    /// the toggle: one intent is at most one write (review NIT-intent). A read nobody here asked
+    /// for (no intent) is ignored.
+    fn on_queue(&mut self, view: &QueueView, ctx: &Ctx<'_>) {
+        let Some(intent) = self.queue_intent.take() else {
+            return;
+        };
+        let request = match intent {
+            QueueIntent::Item { id, key } => {
+                let request = if view.entries.contains(&id) {
+                    StoreRequest::DequeueItem { item: id }
+                } else {
+                    StoreRequest::QueueItem { item: id }
+                };
+                self.queue_writing = Some((id, key));
+                request
             }
-            Some(QueueIntent::Item { id, .. }) => StoreRequest::QueueItem { item: *id },
-            Some(QueueIntent::Pause) if view.open_batch.is_some() => StoreRequest::PauseQueue,
-            Some(QueueIntent::Pause) => StoreRequest::ResumeQueue,
-            None => return,
+            QueueIntent::Pause if view.open_batch.is_some() => StoreRequest::PauseQueue,
+            QueueIntent::Pause => StoreRequest::ResumeQueue,
         };
         ctx.request(request);
     }
 
-    /// MOD-12 D9: a queue write landed; the status line says what it did.
+    /// MOD-12 D9: a queue write landed; the status line says what it did. A toggle pressed since
+    /// is left for its own read (review NIT-intent).
     fn on_queue_written(&mut self, write: &QueueWrite, view: &QueueView, ctx: &Ctx<'_>) {
-        let key = match (&self.queue_intent, write) {
-            (Some(QueueIntent::Item { key, .. }), _) => key.clone(),
-            (_, QueueWrite::Queued { item } | QueueWrite::Dequeued { item, .. }) => self
-                .items
-                .iter()
-                .find(|row| row.id == *item)
-                .map_or_else(|| item.to_string(), |row| row.key.clone()),
-            _ => String::new(),
+        let key = match write {
+            QueueWrite::Queued { item } | QueueWrite::Dequeued { item, .. } => {
+                match self.queue_writing.take_if(|(id, _)| id == item) {
+                    Some((_, key)) => key,
+                    None => self
+                        .items
+                        .iter()
+                        .find(|row| row.id == *item)
+                        .map_or_else(|| item.to_string(), |row| row.key.clone()),
+                }
+            }
+            QueueWrite::Resumed { .. } | QueueWrite::Paused { .. } => String::new(),
         };
-        self.queue_intent = None;
         ctx.emit(Action::Error(queue_sentence(write, &key, view)));
     }
 
@@ -779,8 +796,14 @@ impl Tab for BacklogTab {
                 return self.on_queue_written(write, view, ctx);
             }
             // `App::on_reply` already put the failure on the status line.
+            // A refused read spends its toggle; a refused write only its in-flight key, never a
+            // toggle pressed since (review NIT-intent).
             StoreReply::Failed { request, .. } if QUEUE_REQUEST_NAMES.contains(request) => {
-                self.queue_intent = None;
+                if *request == StoreRequest::QueueState.name() {
+                    self.queue_intent = None;
+                } else {
+                    self.queue_writing = None;
+                }
                 return;
             }
             _ => {}
@@ -1119,6 +1142,76 @@ mod tests {
         }
     }
 
+    /// The queue requests among `actions`, by name; a `queue_item` names its item too.
+    fn queue_requests(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|action| match action {
+                Action::Store(StoreRequest::QueueItem { item }) => {
+                    Some(format!("queue_item {item}"))
+                }
+                Action::Store(request) if QUEUE_REQUEST_NAMES.contains(&request.name()) => {
+                    Some(request.name().to_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// MOD-12 D9 (review NIT-intent): one intent is at most one write, and a write's answer does
+    /// not wipe a newer intent: `P` pressed while `Q`'s write is in flight still sends its own.
+    #[tokio::test]
+    async fn p_pressed_while_q_writes_still_sends_its_write() {
+        let bench = Bench::new().await;
+        let ana_2 = htui_core::fixtures::ids::HTUI_ANA_2;
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ana_2)),
+            ..bench.tab()
+        };
+        let paused = |entries: Vec<ItemId>| QueueView {
+            entries,
+            open_batch: None,
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('Q'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            [format!("queue_item {ana_2}")]
+        );
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            Vec::<String>::new(),
+            "the intent was spent on the first read: one intent, one write"
+        );
+
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(
+            &StoreReply::QueueWritten {
+                write: QueueWrite::Queued { item: ana_2 },
+                view: paused(vec![ana_2]),
+            },
+            &mut bench.ctx(),
+        );
+        let actions = bench.actions();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Error(status) if status == "queued ANA-2 (1 in queue, paused)"
+            )),
+            "Q's write still says what it did: {actions:?}"
+        );
+        tab.on_reply(&StoreReply::Queue(paused(vec![ana_2])), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["resume_queue"],
+            "P's read still decides P's write"
+        );
+    }
+
     /// A sub-tab that records every key it is offered and captures while `capturing` is set (the
     /// `tests/settings.rs` probe, one level down).
     #[derive(Debug)]
@@ -1195,6 +1288,7 @@ mod tests {
             item_form: None,
             opening: None,
             queue_intent: None,
+            queue_writing: None,
         };
 
         let (top_bar, keymap, theme, emit) = (
@@ -1371,6 +1465,7 @@ mod tests {
             item_form: None,
             opening: None,
             queue_intent: None,
+            queue_writing: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
@@ -1422,6 +1517,7 @@ mod tests {
             item_form: None,
             opening: None,
             queue_intent: None,
+            queue_writing: None,
         };
         let (top_bar, keymap, theme, emit) = (
             TopBarState::default(),
