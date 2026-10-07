@@ -22,7 +22,8 @@
 //! whose every session reports a fixed USD cost, and cases over the batch's spend against each
 //! entry's project cap. The spend is always made by a run that is already parked when the cap is
 //! planted, so its snapshot froze no batch cap and nothing cuts its sessions (blueprint H-6); a
-//! run admitted under a cap is asserted admitted, never walked.
+//! run admitted under a cap is asserted admitted, never walked. The one exception is
+//! (pg-overshoot), which plants the cap first on purpose: it walks the cut and the overshoot.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,13 +41,14 @@ use htui_agent::event::{DoneEvent, DriverEnvelope, DriverEvent, StopReason, Usag
 use htui_agent::fake::FakeDriver;
 use htui_agent::registry::{DriverFactory, TransportBuilder};
 use htui_core::fixtures::{demo_at, edit_agent, ids};
+use htui_core::model::QueueSetting;
 use htui_core::model::{
     Agent, AgentBox, AgentId, AgentSummary, BatchClose, BatchId, Billing, BoxEdit, DocumentId,
     Executor, ItemId, ItemKindId, MIN_BUDGET_FOR_NEW_ATTEMPT, NewDocument, NewItem, NewRepo,
     NewStepGraph, PER_TOKEN_CAP_BATCH, PhaseId, ProjectId, Resolution, RunId, RunMode, RunStatus,
-    RunStep, RunSummary, SnapshotPhase, Status, StepGraphId, StepGraphPhase, Transport,
+    RunStep, RunSummary, SnapshotPhase, Status, StepGraphId, StepGraphPhase, StepStatus, Transport,
 };
-use htui_core::store::{CasOutcome, MemStore, ReadStore, WriteStore};
+use htui_core::store::{CasOutcome, MemStore, QueueTarget, ReadStore, WriteStore};
 use htui_orch::fake::{FakeIsolator, FakeVerifier};
 use htui_orch::{Command, Isolator};
 use htui_store::{Backend, PgStore, testkit};
@@ -1806,5 +1808,155 @@ async fn manual_and_auto_overlap_serialise_on_postgres() {
         RunReply::Orch(OrchReply::Done(_)) => {}
         other => panic!("the manual StartRun walked, not {other:?}"),
     }
+    db.drop_db().await;
+}
+
+/// (pg-overshoot) MOD-12 M2 D6, D7 (PRD metric "batch spend overshoot", the Pg half over
+/// `SUM(run_step.usage)`; review R1 L5): the runtime's walk over Postgres, mirroring `htui-orch`'s
+/// `a_batch_run_session_is_capped_at_the_batch_remainder`. A batch cap of 1 000 is planted
+/// **before** admission, so the snapshot freezes it, and every session reports 600 micros.
+/// `research` spends 600; `verdict` (ungated here, so the breach fails the step rather than
+/// parking it) is handed the 400 left, spends 600 and is cut, its failure naming the batch. The
+/// batch's Postgres sum is 1 200: past the cap by the one attempt that was in flight, no more. The
+/// retry meets the walk's batch rule and no second `verdict` attempt is written; the next queue
+/// entry is not admitted. Only batch-term behaviour is asserted: no `per_token_cap_run` is
+/// planted, so the run term is unbounded throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
+    const COST: i64 = 600;
+    const CAP: i64 = 1_000;
+    let Some(db) = testkit::demo_db().await else {
+        eprintln!("{}", testkit::SKIP);
+        return;
+    };
+    seed(
+        &db.store,
+        db.store.agents().await.expect("the fixture's agents"),
+        Repo::None,
+    )
+    .await;
+    // `verdict` is a hard gate in the demo graph, which would park the cut attempt for a human;
+    // ungated, the cut fails it and the walk tries again, as in the Mem case.
+    sqlx::query(
+        "UPDATE step_graph_phase SET gate = 'never', gate_hard = false WHERE name = 'verdict'",
+    )
+    .execute(&db.pool)
+    .await
+    .expect("verdict is ungated");
+    let target = QueueTarget::Project(ids::PROJECT_HTUI);
+    let token = db
+        .store
+        .queue_setting(target, QueueSetting::PerTokenCapBatch)
+        .await
+        .expect("the read answers")
+        .expect("the project exists")
+        .token;
+    let planted = db
+        .store
+        .set_queue_setting(target, QueueSetting::PerTokenCapBatch, json!(CAP), token)
+        .await
+        .expect("the cap write answers");
+    assert!(
+        matches!(planted, CasOutcome::Applied(_)),
+        "the cap lands: {planted:?}"
+    );
+
+    let parts = Parts::costing(COST);
+    parts.open();
+    let a1 = mint_ana(&db.store, "a1", 0).await;
+    db.store
+        .queue_item(a1, ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the item queues");
+    let batch = db
+        .store
+        .open_batch(ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the batch opens")
+        .id;
+    let mut runtime: RunRuntime<PgStore, TestSink> = parts.runtime();
+    runtime.sweep_with(&db.store, &TestSink::default());
+    settle(&mut runtime).await;
+
+    let run = pg_only_run(&db.store, a1).await;
+    assert_eq!(run.mode, RunMode::Auto);
+    let steps = db.store.run_steps(run.id).await.expect("the read answers");
+    assert_eq!(
+        steps
+            .iter()
+            .map(|step| (step.phase_name.as_str(), step.attempt, step.status))
+            .collect::<Vec<_>>(),
+        [
+            ("research", 1, StepStatus::Done),
+            ("verdict", 1, StepStatus::Failed)
+        ],
+        "the recorder cut verdict, and no second verdict attempt was written"
+    );
+    // The recorder's own cut (`cap_exceeded`, then `done: cancelled`); its wording is not pinned
+    // here. That the batch's remainder was the binding term is the failure's `(batch …)` below.
+    let codes: Vec<serde_json::Value> = sqlx::query_scalar(
+        "SELECT payload->'code' FROM session_event WHERE run_step_id = $1 AND kind = 'error'",
+    )
+    .bind(steps[1].id.as_uuid())
+    .fetch_all(&db.pool)
+    .await
+    .expect("the events read");
+    assert_eq!(codes, [json!("cap_exceeded")], "the recorder cut verdict");
+    let notes: Vec<String> = sqlx::query_scalar("SELECT body FROM item_note WHERE item_id = $1")
+        .bind(a1.as_uuid())
+        .fetch_all(&db.pool)
+        .await
+        .expect("the notes read");
+    assert!(
+        notes.iter().any(|note| note.contains(&format!(
+            "step `verdict` attempt 1: cap breached (batch {batch})"
+        ))),
+        "the failure names the batch: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("batch cap reached (1200 of 1000 micros)")),
+        "the retry met the walk's batch rule: {notes:?}"
+    );
+    assert_eq!(
+        db.store
+            .run(run.id)
+            .await
+            .expect("read")
+            .map(|run| run.status),
+        Some(RunStatus::Failed),
+        "the refused retry ends the run"
+    );
+
+    let spent = db
+        .store
+        .batch_spend(batch)
+        .await
+        .expect("the Postgres sum answers")
+        .expect("the batch has a spend");
+    assert_eq!(spent, 2 * COST, "Σ run_step.usage over the batch");
+    assert!(
+        spent > CAP && spent - CAP <= COST,
+        "the overshoot ({}) is at most the one attempt in flight ({COST})",
+        spent - CAP
+    );
+
+    let a2 = mint_ana(&db.store, "a2", 1).await;
+    db.store
+        .queue_item(a2, ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the item queues");
+    runtime.sweep_with(&db.store, &TestSink::default());
+    settle(&mut runtime).await;
+    assert!(
+        pg_runs(&db.store, a2).await.is_empty(),
+        "the batch is past its cap, so the next entry is not admitted"
+    );
+    assert_eq!(
+        db.store.batch_spend(batch).await.expect("read"),
+        Some(spent),
+        "nothing was spent after the cut"
+    );
     db.drop_db().await;
 }
