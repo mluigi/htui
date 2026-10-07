@@ -571,12 +571,12 @@ impl App {
     /// Unlike a key it does not clear the status line: a paste nothing took did nothing, and one a
     /// field refused says why through the same line.
     ///
-    /// MOD-57: while an in-pane editor is alive a paste goes to it (focused and on screen) or
-    /// nowhere; it never reaches a view or an overlay (the M1 lock).
+    /// MOD-57: while an in-pane editor is alive a paste follows a key's rule (R0 F2): to the
+    /// editor while it has the keys, else swallowed or dropped (the M1 lock), except unfocused
+    /// under a modal overlay, where the overlay's path below has it. It never reaches a view.
     pub fn on_paste(&mut self, text: &Zeroizing<String>) {
         self.dirty = true;
-        if self.editor.is_some() {
-            self.editor_paste(text);
+        if self.editor.is_some() && self.editor_paste(text) {
             return;
         }
 
