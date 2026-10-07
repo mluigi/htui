@@ -63,6 +63,7 @@ use htui_core::model::{
     Transport,
 };
 use htui_core::prompt::edit_help::{self, HelpPrompt};
+use htui_core::prompt::{SectionRefused, scrub_section};
 use htui_core::scrub::MinimalScrubber;
 use htui_core::secret::{SecretError, SecretSource, project_scope, resolve_project};
 use htui_core::store::{ReadStore as _, StoreError, WriteStore};
@@ -2287,14 +2288,31 @@ impl AgentRuntime {
             .ok_or_else(|| StoreError::Unreachable(htui_store::DATABASE_UNREACHABLE.to_owned()))?;
         // MOD-10 fills this from the secret provider; until then a session carries none, and the
         // scrubber built over it therefore masks the credential prefixes only. Read here, ahead
-        // of everything else, because a help's prompt is scrubbed with it before anything exists
-        // (MOD-55 P2). A test seeds it (MOD-55 review M2) to give the scrub a value to mask.
+        // of everything else, because a help's prompt (MOD-55 P2) and a chat's opening (MOD-86
+        // D6) are scrubbed with it before anything exists; a provider project's values are only
+        // known in `run_chat`, which scrubs the opening again (D7). A test seeds it (MOD-55
+        // review M2) to give the scrub a value to mask.
         #[cfg(not(test))]
         let env: BTreeMap<String, String> = BTreeMap::new();
         #[cfg(test)]
         let env = self.session_env.clone();
         let (prompt, mode) = match opening {
-            Opening::Chat(text) => (text, ChatMode::Conversation),
+            Opening::Chat(text) => {
+                // MOD-86 D6: help's MOD-55 P2 shape for a chat's opening, before the box, the
+                // registry row, the lease and the run: a refusal leaves nothing and reaches no
+                // driver. The chat's own construction (`run_chat`), so its second pass over the
+                // same env is deterministic; the short keys are `run_chat`'s to log.
+                let (scrubber, _short) = MinimalScrubber::from_resolved(&env);
+                match scrub_section(&scrubber, &text, "prompt") {
+                    Ok(masked) => (masked, ChatMode::Conversation),
+                    Err(refused) => {
+                        return Ok(Served::Reply(StoreReply::Failed {
+                            request: "chat_start",
+                            message: format!("not sent: {refused}"),
+                        }));
+                    }
+                }
+            }
             Opening::Help(help) => {
                 // MOD-55 P2: the session's own scrubber, before the box, the registry row, the
                 // lease or the run: a refusal leaves nothing behind and reaches no driver. It is a
@@ -2770,7 +2788,8 @@ impl ChatBinding {
 /// MOD-55 P1: what `start` sends first.
 #[derive(Debug)]
 enum Opening {
-    /// `ChatStart`'s text, sent as typed (the chat path's own `R-ID-7` gap, out of scope here).
+    /// `ChatStart`'s text, scrubbed in `start` before anything is minted, then again with the
+    /// resolved scrubber in `run_chat` before the driver starts (MOD-86 D6, D7).
     Chat(String),
     /// `EditHelp`'s prompt: assembled and scrubbed before anything is minted (P2).
     Help(HelpPrompt),
@@ -4536,6 +4555,26 @@ enum TurnEnd {
     CapExceeded,
 }
 
+/// MOD-86 D7: why a chat's session did not start: the transport refused it, or the text it was to
+/// open with did not scrub clean and was never sent.
+///
+/// An enum rather than a `DriverError`: a `Transport("not sent …")` would claim a wire fault where
+/// nothing reached a wire, and `falls_back` and D60's `Spawn` re-probe both read the error.
+enum StartFailure {
+    Driver(DriverError),
+    Refused(SectionRefused),
+}
+
+impl StartFailure {
+    /// The sentence the `Failed` reply and the stream's `Failed` carry.
+    fn message(&self) -> String {
+        match self {
+            Self::Driver(err) => err.to_string(),
+            Self::Refused(refused) => format!("not sent: {refused}"),
+        }
+    }
+}
+
 /// One chat session, start to finish.
 ///
 /// Owns the driver, the writer, the recorder and the session handle; answers the `ChatStart`
@@ -4563,7 +4602,9 @@ pub async fn run_chat(args: ChatArgs) {
     } = args;
 
     // MOD-10 D12/D13 (blueprint A-12): a provider project's secrets resolve here, in the chat's
-    // own task, and a fresh chat's run is written only once they did.
+    // own task, and a fresh chat's run is written only once they did. MOD-86 D7: read before
+    // `secrets` is consumed, and the run is written only once the opening scrubbed clean too.
+    let run_deferred = secrets.is_some() && matches!(binding, ChatBinding::Fresh(..));
     if let Some(ChatSecrets { source, project }) = secrets {
         match resolve_project(source.as_deref(), &project).await {
             Ok(resolved) => {
@@ -4586,18 +4627,6 @@ pub async fn run_chat(args: ChatArgs) {
                 return;
             }
         }
-        if let ChatBinding::Fresh(chat, closed) = &binding {
-            if let Err(err) = writer.start_chat_run(chat).await {
-                let message = err.to_string();
-                frames.to_stream(StoreReply::Failed {
-                    request: mode.request(&binding),
-                    message: message.clone(),
-                });
-                frames.failed(message);
-                return;
-            }
-            closed.store(false, Ordering::Release);
-        }
     }
     // MOD-10 D11 for chats: the scrubber is built from the very map the env holds.
     let (scrubber, short) = MinimalScrubber::from_resolved(&spec.env);
@@ -4607,6 +4636,46 @@ pub async fn run_chat(args: ChatArgs) {
             keys = ?short,
             "these secrets are shorter than the masking floor: injected, not masked"
         );
+    }
+    // MOD-86 D7, D9: the text the driver opens with, scrubbed with the resolved scrubber before
+    // anything starts: a provider project's values are known only here. Every mode (blueprint
+    // A-4): a help on a provider project was scrubbed in `start` without them. Idempotent over a
+    // masked text, but masking can expose a credential prefix glued to a value (H-9), so this pass
+    // can refuse what `start`'s accepted. A refusal precedes `frames.accept`: the tab holds no
+    // session to send on, and the receiver drops with nothing in it.
+    let section = match &binding {
+        ChatBinding::Fresh(..) => "prompt",
+        ChatBinding::Promoted { .. } => "opening",
+    };
+    let prompt = match scrub_section(&scrubber, &prompt, section) {
+        Ok(masked) => masked,
+        Err(refused) => {
+            let message = format!("not sent: {refused}");
+            frames.to_stream(StoreReply::Failed {
+                request: mode.request(&binding),
+                message: message.clone(),
+            });
+            // A provider chat's run is not written yet (D13's shape); any other fresh chat's is,
+            // and closes `failed` as a start failure's does; a promoted step's is the engine's
+            // (`close` is a no-op, D205).
+            if !run_deferred {
+                binding.close(&writer, RunStatus::Failed).await;
+            }
+            frames.failed(message);
+            return;
+        }
+    };
+    if run_deferred && let ChatBinding::Fresh(chat, closed) = &binding {
+        if let Err(err) = writer.start_chat_run(chat).await {
+            let message = err.to_string();
+            frames.to_stream(StoreReply::Failed {
+                request: mode.request(&binding),
+                message: message.clone(),
+            });
+            frames.failed(message);
+            return;
+        }
+        closed.store(false, Ordering::Release);
     }
     let step_id = binding.step_id();
     // Read before the spec moves into the driver: the tab's banner needs it (MOD-11 D18).
@@ -4645,7 +4714,8 @@ pub async fn run_chat(args: ChatArgs) {
     };
     // MOD-37 M5: a promoted resume that fails is reported, then the chat opens with the handoff
     // in the same bind. `Ok` carries the session, the text recorded as its opening, how it opened
-    // and the notice owed the tab; `Err` the refusal and that notice.
+    // and the notice owed the tab; `Err` the refusal (the transport's, or MOD-86's scrub of the
+    // handoff) and that notice.
     let started = match (first, fallback) {
         (Ok(session), _) => {
             let opening = if resuming {
@@ -4675,27 +4745,27 @@ pub async fn run_chat(args: ChatArgs) {
                 resume: None,
                 ..spec
             };
-            match driver.start(handoff_spec, fallback.handoff.clone()).await {
-                Ok(session) => Ok((
-                    session,
-                    fallback.handoff,
-                    StepOpening::ResumeFailed,
-                    envelope,
-                )),
-                Err(err) => Err((err, envelope)),
+            // MOD-86 D7, D9: the handoff is scrubbed at its point of use, after the notice
+            // (H-7: the resume did fail), before the second start.
+            match scrub_section(&scrubber, &fallback.handoff, "handoff") {
+                Err(refused) => Err((StartFailure::Refused(refused), envelope)),
+                Ok(handoff) => match driver.start(handoff_spec, handoff.clone()).await {
+                    Ok(session) => Ok((session, handoff, StepOpening::ResumeFailed, envelope)),
+                    Err(err) => Err((StartFailure::Driver(err), envelope)),
+                },
             }
         }
-        (Err(err), _) => Err((err, None)),
+        (Err(err), _) => Err((StartFailure::Driver(err), None)),
     };
 
     let (mut session, opening_text, opening, notice) = match started {
         Ok(started) => started,
-        Err((err, notice)) => {
+        Err((failure, notice)) => {
             // MOD-37 M5 (H-7): the report reaches the tab before the refusal.
             if let Some(notice) = notice {
                 frames.event(notice);
             }
-            let message = err.to_string();
+            let message = failure.message();
             frames.to_stream(StoreReply::Failed {
                 request: mode.request(&binding),
                 message: message.clone(),
@@ -4713,7 +4783,9 @@ pub async fn run_chat(args: ChatArgs) {
             // `Spawn` alone (blueprint H-8): `Unresolved` names the tool in its own message and
             // `Transport` is about the wire, not the row. And no transport fallback of any kind —
             // a CLI agent is its own registry row, never a degraded mode of an ACP one.
-            if let (DriverError::Spawn(_), Some(reprobe)) = (&err, reprobe) {
+            if let (StartFailure::Driver(DriverError::Spawn(_)), Some(reprobe)) =
+                (&failure, reprobe)
+            {
                 drop(commands);
                 run_reprobe(reprobe).await;
             }
@@ -4839,7 +4911,21 @@ pub async fn run_chat(args: ChatArgs) {
                 None => commands.recv().await,
             };
             match command {
-                Some(ChatCommand::Send { text, reply }) => break (text, reply),
+                // MOD-86 D8: scrubbed before it is sent. D5: a refusal is answered at the send's
+                // own address, naming the section and the rule; nothing is sent, recorded or
+                // framed, and the chat goes on waiting on the user.
+                Some(ChatCommand::Send { text, reply }) => {
+                    match scrub_section(&scrubber, &text, "follow-up") {
+                        Ok(masked) => break (masked, reply),
+                        Err(refused) => frames.reply(
+                            &reply,
+                            StoreReply::Failed {
+                                request: "chat_send",
+                                message: format!("not sent: {refused}"),
+                            },
+                        ),
+                    }
+                }
                 Some(ChatCommand::Answer { reply, .. }) => {
                     frames.reply(
                         &reply,
@@ -5932,6 +6018,53 @@ pub(crate) mod tests {
     /// The errors [`FailingStarts`] fails its next starts with, front first.
     type Failures = Arc<Mutex<VecDeque<DriverError>>>;
 
+    /// Where [`SendSpy`] writes down every follow-up its session was sent.
+    type SendLog = Arc<Mutex<Vec<String>>>;
+
+    /// MOD-86 (blueprint A-6): a session that writes down every follow-up text it is sent, then
+    /// delegates, so a case can assert on what reached the driver.
+    #[derive(Debug)]
+    struct SendSpy {
+        inner: Box<dyn AgentSession>,
+        sends: SendLog,
+    }
+
+    impl AgentSession for SendSpy {
+        fn session_ref(&self) -> Option<&AgentSessionRef> {
+            self.inner.session_ref()
+        }
+
+        fn next_event<'a>(
+            &'a mut self,
+        ) -> htui_agent::driver::DriverFuture<'a, Option<DriverEnvelope>> {
+            self.inner.next_event()
+        }
+
+        fn send_follow_up<'a>(
+            &'a mut self,
+            text: String,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            // The lock released here: the delegate's future is `Send`.
+            self.sends
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(text.clone());
+            self.inner.send_follow_up(text)
+        }
+
+        fn answer_permission<'a>(
+            &'a mut self,
+            request_id: PermissionRequestId,
+            answer: PermissionAnswer,
+        ) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.answer_permission(request_id, answer)
+        }
+
+        fn cancel<'a>(&'a mut self, grace: Duration) -> htui_agent::driver::DriverFuture<'a, ()> {
+            self.inner.cancel(grace)
+        }
+    }
+
     /// MOD-37 M5: the fake driver, failing its first starts with `failures` (front first) and
     /// writing down every `(spec, prompt)` it was started with.
     #[derive(Debug)]
@@ -5939,6 +6072,7 @@ pub(crate) mod tests {
         inner: Box<dyn AgentDriver>,
         starts: StartLog,
         failures: Failures,
+        sends: SendLog,
     }
 
     impl AgentDriver for FailingStarts {
@@ -5968,7 +6102,12 @@ pub(crate) mod tests {
             if let Some(err) = failure {
                 return Box::pin(async move { Err(err) });
             }
-            self.inner.start(spec, prompt)
+            let started = self.inner.start(spec, prompt);
+            let sends = Arc::clone(&self.sends);
+            Box::pin(async move {
+                let inner = started.await?;
+                Ok(Box::new(SendSpy { inner, sends }) as Box<dyn AgentSession>)
+            })
         }
     }
 
@@ -5979,6 +6118,7 @@ pub(crate) mod tests {
         adapter: Arc<FakeAdapter>,
         starts: StartLog,
         failures: Failures,
+        sends: SendLog,
     }
 
     impl htui_agent::registry::TransportBuilder for FailingBuilder {
@@ -5992,6 +6132,7 @@ pub(crate) mod tests {
                 inner: self.adapter.build(agent, on_box, caps)?,
                 starts: Arc::clone(&self.starts),
                 failures: Arc::clone(&self.failures),
+                sends: Arc::clone(&self.sends),
             }))
         }
     }
@@ -6002,6 +6143,24 @@ pub(crate) mod tests {
         script: Script,
         failures: Vec<DriverError>,
     ) -> (MemStore, Backend, AgentRuntime, AgentId, StartLog) {
+        let (store, backend, runtime, agent_id, starts, _sends) =
+            fixture_with_logs(script, failures).await;
+        (store, backend, runtime, agent_id, starts)
+    }
+
+    /// MOD-86: [`fixture_with_failing_starts`] with no failures, keeping the follow-ups the
+    /// sessions were sent too.
+    async fn fixture_with_send_log(
+        script: Script,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId, StartLog, SendLog) {
+        fixture_with_logs(script, Vec::new()).await
+    }
+
+    /// The body of [`fixture_with_failing_starts`] and [`fixture_with_send_log`].
+    async fn fixture_with_logs(
+        script: Script,
+        failures: Vec<DriverError>,
+    ) -> (MemStore, Backend, AgentRuntime, AgentId, StartLog, SendLog) {
         let store = MemStore::from_demo(htui_core::fixtures::demo_data());
         let agent_id = AgentId::new();
         store
@@ -6012,6 +6171,7 @@ pub(crate) mod tests {
         let adapter = Arc::new(FakeAdapter::new());
         adapter.load(script);
         let starts: StartLog = Arc::new(Mutex::new(Vec::new()));
+        let sends: SendLog = Arc::new(Mutex::new(Vec::new()));
         let mut factory = DriverFactory::new();
         factory.register(
             "cli/fake",
@@ -6019,12 +6179,18 @@ pub(crate) mod tests {
                 adapter,
                 starts: Arc::clone(&starts),
                 failures: Arc::new(Mutex::new(failures.into())),
+                sends: Arc::clone(&sends),
             }),
         );
 
         let backend = Backend::memory(store.clone());
         let runtime = AgentRuntime::new(factory).with_grace(Duration::from_millis(0));
-        (store, backend, runtime, agent_id, starts)
+        (store, backend, runtime, agent_id, starts, sends)
+    }
+
+    /// The follow-ups [`SendSpy`] saw, in order.
+    fn sends_of(sends: &SendLog) -> Vec<String> {
+        sends.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// The starts [`FailingStarts`] saw, in order.
@@ -7792,6 +7958,380 @@ pub(crate) mod tests {
         );
         assert!(runtime.live_steps().is_empty());
         assert_eq!(run_status(&store, step_id).await, RunStatus::Done);
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // MOD-86: a chat's text is scrubbed before it is sent (D5-D9)
+    // -----------------------------------------------------------------------------------------
+
+    /// A key the `github_token` rule refuses.
+    fn github_key() -> String {
+        format!("ghp_{}", "A1b2".repeat(9))
+    }
+
+    /// A value seeded into the session's env, long enough to be masked.
+    const MASKED: &str = "hunter2-secret-value";
+
+    /// The text of the stream's local `prompt` frame.
+    fn prompt_frame_text(replies: &[ReplyEnvelope]) -> Option<&str> {
+        replies.iter().find_map(|reply| match &reply.reply {
+            StoreReply::Chat(ChatFrame::Event(envelope)) if reply.seq == 7 => {
+                match &envelope.event {
+                    DriverEvent::Other(other) if other.update == "prompt" => {
+                        other.body["text"].as_str()
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+    }
+
+    /// The `text` of every `kind` row in `step`'s log.
+    async fn texts_of(store: &MemStore, step: StepId, kind: EventKind) -> Vec<String> {
+        store
+            .step_events(step)
+            .await
+            .expect("the log reads")
+            .unwrap_or_default()
+            .iter()
+            .filter(|row| row.kind == kind)
+            .filter_map(|row| row.payload["text"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// MOD-86 D6: a credential in a chat's opening refuses the chat before anything exists: no
+    /// step, no run, no driver start, and a `Failed` naming the section and the rule that never
+    /// carries the text (help's MOD-55 P2 shape).
+    #[tokio::test]
+    async fn a_chat_prompt_with_a_credential_is_refused_before_anything_is_minted() {
+        let (store, backend, mut runtime, agent_id, slot) =
+            fixture_with_spec_spy(Script::one_turn(vec![ends(StopReason::EndTurn)]), None).await;
+        let before = store.active_runs(&scope()).await.expect("count");
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let served = runtime
+            .serve(
+                &backend,
+                &tx,
+                &envelope(7, start(agent_id, &format!("use {}", github_key()))),
+            )
+            .await;
+
+        match served {
+            Served::Reply(StoreReply::Failed { request, message }) => {
+                assert_eq!(request, "chat_start");
+                assert_eq!(
+                    message,
+                    "not sent: the prompt matches the github_token rule"
+                );
+                assert!(!message.contains("ghp_"), "the key leaked: {message}");
+            }
+            other => panic!("a key is refused before the start: {other:?}"),
+        }
+        assert!(runtime.steps().is_empty(), "no step: {:?}", runtime.steps());
+        assert!(runtime.live_steps().is_empty());
+        assert_eq!(
+            store.active_runs(&scope()).await.expect("count"),
+            before,
+            "no run was minted"
+        );
+        assert!(
+            slot.lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none(),
+            "no driver was started"
+        );
+        drop(tx);
+        assert!(rx.recv().await.is_none(), "nothing else is sent");
+    }
+
+    /// MOD-86 D6, D7: what the driver opens with is the masked prompt, and the `prompt` row and
+    /// the tab's local `prompt` frame carry the same masked copy.
+    #[tokio::test]
+    async fn the_chat_driver_is_sent_the_masked_prompt() {
+        let (store, backend, runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            Vec::new(),
+        )
+        .await;
+        let mut runtime = runtime.with_session_env(BTreeMap::from([(
+            "HTUI_TEST_SECRET".to_owned(),
+            MASKED.to_owned(),
+        )]));
+
+        let (step_id, replies) = run(
+            &mut runtime,
+            &backend,
+            start(agent_id, &format!("use {MASKED}")),
+        )
+        .await;
+
+        let starts = starts_of(&starts);
+        assert_eq!(starts.len(), 1, "one start");
+        assert_eq!(starts[0].1, "use [REDACTED]");
+        assert_eq!(
+            texts_of(&store, step_id, EventKind::Prompt).await,
+            ["use [REDACTED]"]
+        );
+        assert_eq!(prompt_frame_text(&replies), Some("use [REDACTED]"));
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        assert!(
+            !format!("{log:?}{replies:?}").contains(MASKED),
+            "nothing carries the secret"
+        );
+    }
+
+    /// MOD-86 D8: a follow-up is masked before it is sent; the driver, the `follow_up` row and
+    /// the reply frame all carry the masked copy.
+    #[tokio::test]
+    async fn a_follow_up_is_masked_before_it_is_sent() {
+        let (store, backend, runtime, agent_id, _starts, sends) =
+            fixture_with_send_log(Script::turns(vec![
+                vec![ends(StopReason::EndTurn)],
+                vec![ends(StopReason::EndTurn)],
+            ]))
+            .await;
+        let mut runtime = runtime.with_session_env(BTreeMap::from([(
+            "HTUI_TEST_SECRET".to_owned(),
+            MASKED.to_owned(),
+        )]));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await
+        else {
+            panic!("a chat start opens a session")
+        };
+
+        let replies = converse(
+            &mut runtime,
+            &backend,
+            (tx, rx),
+            task,
+            vec![
+                vec![send_at(8, step_id, &format!("use {MASKED}"))],
+                vec![cancel_at(9, step_id)],
+            ],
+        )
+        .await;
+
+        assert_eq!(sends_of(&sends), ["use [REDACTED]"]);
+        assert_eq!(
+            texts_of(&store, step_id, EventKind::FollowUp).await,
+            ["use [REDACTED]"]
+        );
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [reply] if follow_up_text(reply) == Some("use [REDACTED]")
+            ),
+            "{replies:?}"
+        );
+        let log = store
+            .step_events(step_id)
+            .await
+            .expect("the log reads")
+            .expect("a log");
+        assert!(
+            !format!("{log:?}{replies:?}").contains(MASKED),
+            "nothing carries the secret"
+        );
+    }
+
+    /// MOD-86 D5, D8: a follow-up that does not scrub clean is refused at its own address with
+    /// the section and the rule: nothing is sent, recorded or framed, the chat goes on, and the
+    /// next clean follow-up is sent as usual.
+    #[tokio::test]
+    async fn a_refused_follow_up_is_not_sent_and_the_chat_goes_on() {
+        let (store, backend, mut runtime, agent_id, _starts, sends) =
+            fixture_with_send_log(Script::turns(vec![
+                vec![ends(StopReason::EndTurn)],
+                vec![ends(StopReason::EndTurn)],
+            ]))
+            .await;
+        let (tx, rx) = mpsc::unbounded_channel();
+        let Served::Start { step_id, task } = runtime
+            .serve(&backend, &tx, &envelope(7, start(agent_id, "hello")))
+            .await
+        else {
+            panic!("a chat start opens a session")
+        };
+
+        let replies = converse(
+            &mut runtime,
+            &backend,
+            (tx, rx),
+            task,
+            vec![
+                vec![
+                    send_at(8, step_id, &format!("use {}", github_key())),
+                    send_at(9, step_id, "clean"),
+                ],
+                vec![cancel_at(10, step_id)],
+            ],
+        )
+        .await;
+
+        assert!(
+            matches!(
+                at_seq(&replies, 8).as_slice(),
+                [StoreReply::Failed { request: "chat_send", message }]
+                    if message == "not sent: the follow-up matches the github_token rule"
+            ),
+            "{replies:?}"
+        );
+        assert!(
+            !format!("{replies:?}").contains("ghp_"),
+            "no reply carries the key"
+        );
+        assert_eq!(sends_of(&sends), ["clean"]);
+        assert_eq!(
+            texts_of(&store, step_id, EventKind::FollowUp).await,
+            ["clean"]
+        );
+        assert!(
+            matches!(
+                at_seq(&replies, 9).as_slice(),
+                [reply] if follow_up_text(reply) == Some("clean")
+            ),
+            "{replies:?}"
+        );
+        assert!(
+            matches!(
+                at_seq(&replies, 10).as_slice(),
+                [StoreReply::Chat(ChatFrame::Ended {
+                    stop_reason: StopReason::EndTurn
+                })]
+            ),
+            "{replies:?}"
+        );
+        assert_eq!(run_status(&store, step_id).await, RunStatus::Done);
+    }
+
+    /// MOD-86 D7, D9: a promoted step's opening that does not scrub clean fails the promotion
+    /// before any driver starts: the stream is the refusal and the failure, the step's log is
+    /// its tail, and the engine's run is untouched.
+    #[tokio::test]
+    async fn a_promoted_opening_with_a_credential_is_refused() {
+        let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            Vec::new(),
+        )
+        .await;
+        let tail = kinds_of(&store, ids::STEP_PLAN).await;
+        let run_before = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+
+        // Bounded: an opening that wrongly starts opens a chat nobody ends.
+        let replies = tokio::time::timeout(
+            Duration::from_secs(30),
+            attach_and_await(
+                &mut runtime,
+                &backend,
+                promoted(
+                    agent_id,
+                    OpeningPath::Handoff {
+                        text: format!("use {}", github_key()),
+                        digest: "d-handoff".to_owned(),
+                    },
+                ),
+            ),
+        )
+        .await
+        .expect("the promotion fails without a session");
+
+        let sentence = "not sent: the opening matches the github_token rule";
+        assert!(
+            matches!(
+                replies.iter().map(|reply| &reply.reply).collect::<Vec<_>>().as_slice(),
+                [
+                    StoreReply::Failed { request, message },
+                    StoreReply::Chat(ChatFrame::Failed { message: streamed }),
+                ] if *request == PROMOTE_STEP && message == sentence && streamed == sentence
+            ),
+            "{replies:?}"
+        );
+        assert!(starts_of(&starts).is_empty(), "no driver started");
+        assert_eq!(
+            kinds_of(&store, ids::STEP_PLAN).await,
+            tail,
+            "nothing written"
+        );
+        let run_after = store
+            .run(ids::RUN_1)
+            .await
+            .expect("the read answers")
+            .expect("the fixture's run");
+        assert_eq!(run_after.status, run_before.status, "the run is untouched");
+    }
+
+    /// MOD-86 D7: a failed resume's handoff that does not scrub clean fails the chat before the
+    /// second start, after the `resume_failed` notice (MOD-37 H-7: the resume did fail).
+    #[tokio::test]
+    async fn a_handoff_with_a_credential_fails_the_chat_after_the_notice() {
+        let (store, backend, mut runtime, agent_id, starts) = fixture_with_failing_starts(
+            Script::one_turn(vec![ends(StopReason::EndTurn)]),
+            vec![DriverError::Transport("gone".to_owned())],
+        )
+        .await;
+        let tail_len = kinds_of(&store, ids::STEP_PLAN).await.len();
+        let path = OpeningPath::Resume {
+            session_ref: AgentSessionRef::new("banner-1"),
+            text: htui_orch::promote::RESUME_OPENING.to_owned(),
+            fallback: Some(htui_orch::HandoffText {
+                text: format!("use {}", github_key()),
+                digest: "d".to_owned(),
+            }),
+        };
+
+        // Bounded: a handoff that wrongly starts opens a chat nobody ends.
+        let replies = tokio::time::timeout(
+            Duration::from_secs(30),
+            attach_and_await(&mut runtime, &backend, promoted(agent_id, path)),
+        )
+        .await
+        .expect("the chat fails without a second session");
+
+        assert_eq!(starts_of(&starts).len(), 1, "the resume only");
+        let reported = replies
+            .iter()
+            .position(is_resume_failed_frame)
+            .unwrap_or_else(|| panic!("the tab hears the notice: {replies:?}"));
+        let refused = replies
+            .iter()
+            .position(|reply| {
+                matches!(&reply.reply, StoreReply::Failed { request, message }
+                    if *request == PROMOTE_STEP
+                        && message == "not sent: the handoff matches the github_token rule")
+            })
+            .unwrap_or_else(|| panic!("the promotion is refused: {replies:?}"));
+        let ended = replies
+            .iter()
+            .position(|reply| matches!(reply.reply, StoreReply::Chat(ChatFrame::Failed { .. })))
+            .unwrap_or_else(|| panic!("the chat failed: {replies:?}"));
+        assert!(
+            reported < refused && refused < ended,
+            "notice, refusal, failure: {replies:?}"
+        );
+        assert!(
+            !format!("{replies:?}").contains("ghp_"),
+            "no reply carries the key"
+        );
+        let kinds = kinds_of(&store, ids::STEP_PLAN).await;
+        assert_eq!(kinds.len(), tail_len + 1, "the notice and nothing else");
+        assert!(!kinds.contains(&EventKind::FollowUp), "no opening recorded");
+        assert_eq!(
+            opening_of(&store, ids::STEP_PLAN).await,
+            Some(StepOpening::ResumeFailed)
+        );
     }
 
     // -----------------------------------------------------------------------------------------
@@ -16138,6 +16678,7 @@ done
         use htui_agent::event::{DoneEvent, DriverEvent, StopReason, TextChunk};
         use htui_core::fixtures::ids;
         use htui_core::model::{EventKind, StepId};
+        use htui_core::prompt::scrub_section;
         use htui_core::scrub::{MinimalScrubber, Scrubber as _};
         use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
         use htui_core::secret::{
@@ -16150,7 +16691,8 @@ done
 
         use super::{
             SpecSlot, attach_and_await, attach_and_end, end_after_turn as end, envelope,
-            fixture_with_spec_spy, promote_addr, promoted, run, run_of, scope, start,
+            fixture_with_failing_starts, fixture_with_spec_spy, help, help_script, promote_addr,
+            promoted, run, run_help, run_of, scope, start, starts_of,
         };
         use crate::agent_worker::{PROMOTE_STEP, Served};
         use crate::store_worker::{ChatFrame, ReplyEnvelope, RequestEnvelope, StoreReply};
@@ -16646,6 +17188,201 @@ done
                 .expect("the read answers")
                 .expect("the fixture's run");
             assert_eq!(run_after.status, run_before.status, "and so is its run");
+        }
+
+        /// The text of the stream's local `prompt` frame.
+        fn prompt_frame(replies: &[ReplyEnvelope]) -> Option<String> {
+            replies.iter().find_map(|reply| match &reply.reply {
+                StoreReply::Chat(ChatFrame::Event(envelope)) if reply.seq == 7 => {
+                    match &envelope.event {
+                        DriverEvent::Other(other) if other.update == "prompt" => {
+                            other.body["text"].as_str().map(str::to_owned)
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+        }
+
+        /// The `text` of every `kind` row in `step`'s log.
+        async fn texts(store: &MemStore, step: StepId, kind: EventKind) -> Vec<String> {
+            store
+                .step_events(step)
+                .await
+                .expect("the log reads")
+                .unwrap_or_default()
+                .iter()
+                .filter(|row| row.kind == kind)
+                .filter_map(|row| row.payload["text"].as_str().map(str::to_owned))
+                .collect()
+        }
+
+        /// MOD-86 D7: a provider project's resolved values are known only in `run_chat`, so the
+        /// opening is scrubbed there with the resolved scrubber before the driver starts: the
+        /// driver, the `prompt` row and the tab's frame all carry the masked copy.
+        #[tokio::test]
+        async fn a_provider_chat_masks_its_resolved_value_before_sending() {
+            let (store, backend, runtime, agent_id, starts) =
+                fixture_with_failing_starts(echo("ok"), Vec::new()).await;
+            plant(&store, Some(INFISICAL));
+            let mut runtime = runtime.with_secret_source(resolving(&[("API_KEY", VALUE)]));
+
+            let (step_id, replies) = run(
+                &mut runtime,
+                &backend,
+                start(agent_id, &format!("use {VALUE}")),
+            )
+            .await;
+
+            let starts = starts_of(&starts);
+            assert_eq!(starts.len(), 1, "one start");
+            assert_eq!(starts[0].1, "use [REDACTED]");
+            assert_eq!(
+                starts[0].0.env,
+                map(&[("API_KEY", VALUE)]),
+                "the env is still the resolved map"
+            );
+            assert_eq!(
+                texts(&store, step_id, EventKind::Prompt).await,
+                ["use [REDACTED]"]
+            );
+            assert_eq!(prompt_frame(&replies).as_deref(), Some("use [REDACTED]"));
+            let rows = rows(&store, step_id).await;
+            assert!(
+                rows.iter().all(|row| !row.contains(VALUE)),
+                "no row holds the value"
+            );
+            assert!(!format!("{replies:?}").contains(VALUE), "no frame holds it");
+        }
+
+        /// MOD-86 D7 (blueprint H-9): masking can expose a credential prefix glued to a resolved
+        /// value, so `run_chat`'s pass can refuse what `start`'s accepted. The refusal answers as
+        /// D13's does: no session, and a provider chat's deferred run is never written.
+        #[tokio::test]
+        async fn a_provider_chat_whose_opening_is_refused_writes_no_run() {
+            let prompt = format!("{VALUE}ghp_{}", "A1b2".repeat(9));
+            assert!(
+                scrub_section(
+                    &MinimalScrubber::from_resolved(&BTreeMap::new()).0,
+                    &prompt,
+                    "prompt"
+                )
+                .is_ok(),
+                "unmasked, the key is no token start, so `start` accepts it"
+            );
+            let (store, backend, runtime, agent_id, starts) =
+                fixture_with_failing_starts(echo("ok"), Vec::new()).await;
+            plant(&store, Some(INFISICAL));
+            let source = resolving(&[("API_KEY", VALUE)]);
+            let mut runtime = runtime.with_secret_source(source.clone());
+            let active = store.active_runs(&scope()).await.expect("count");
+
+            let (step_id, replies) = run(&mut runtime, &backend, start(agent_id, &prompt)).await;
+
+            assert!(
+                is_refusal(
+                    &stream(&replies),
+                    "chat_start",
+                    "not sent: the prompt matches the github_token rule"
+                ),
+                "{replies:?}"
+            );
+            assert!(starts_of(&starts).is_empty(), "no session was started");
+            assert!(
+                store
+                    .run(run_of(step_id))
+                    .await
+                    .expect("the read answers")
+                    .is_none(),
+                "no run was written"
+            );
+            assert!(rows(&store, step_id).await.is_empty(), "no row either");
+            assert_eq!(store.active_runs(&scope()).await.expect("count"), active);
+            assert_eq!(source.calls(), 1);
+        }
+
+        /// MOD-86 D7: a promoted step's opening is scrubbed with the resolved scrubber too.
+        #[tokio::test]
+        async fn a_promoted_opening_is_masked_with_the_resolved_value() {
+            let (store, backend, runtime, agent_id, starts) =
+                fixture_with_failing_starts(echo("ok"), Vec::new()).await;
+            plant(&store, Some(INFISICAL));
+            let mut runtime = runtime.with_secret_source(resolving(&[("API_KEY", VALUE)]));
+
+            let replies = attach_and_end(
+                &mut runtime,
+                &backend,
+                promoted(
+                    agent_id,
+                    OpeningPath::Handoff {
+                        text: format!("use {VALUE}"),
+                        digest: "d-handoff".to_owned(),
+                    },
+                ),
+                async |_| {},
+            )
+            .await;
+
+            let starts = starts_of(&starts);
+            assert_eq!(starts.len(), 1, "one start");
+            assert_eq!(starts[0].1, "use [REDACTED]");
+            assert_eq!(
+                texts(&store, ids::STEP_PLAN, EventKind::FollowUp)
+                    .await
+                    .last()
+                    .map(String::as_str),
+                Some("use [REDACTED]")
+            );
+            assert!(
+                replies.iter().any(|reply| matches!(
+                    &reply.reply,
+                    StoreReply::Chat(ChatFrame::Event(envelope))
+                        if matches!(&envelope.event, DriverEvent::Other(other)
+                            if other.update == "follow_up"
+                                && other.body["text"] == "use [REDACTED]")
+                )),
+                "the opening's frame is masked: {replies:?}"
+            );
+            assert!(
+                !format!("{replies:?}").contains(VALUE),
+                "no frame holds the value"
+            );
+        }
+
+        /// MOD-86 blueprint A-4: a help on a provider project resolves its secrets in `run_chat`,
+        /// after `start` scrubbed its prompt without them, so `run_chat`'s opening pass runs in
+        /// every mode: a resolved value in the edited body reaches the help's driver masked.
+        #[tokio::test]
+        async fn a_provider_help_masks_its_resolved_value_before_sending() {
+            let (store, backend, runtime, agent_id, starts) =
+                fixture_with_failing_starts(help_script(), Vec::new()).await;
+            plant(&store, Some(INFISICAL));
+            let mut runtime = runtime.with_secret_source(resolving(&[("API_KEY", VALUE)]));
+
+            let (step_id, replies) = run_help(
+                &mut runtime,
+                &backend,
+                help(agent_id, &format!("pw {VALUE}\n"), "tidy it"),
+            )
+            .await;
+
+            let starts = starts_of(&starts);
+            assert_eq!(starts.len(), 1, "one start");
+            assert!(
+                starts[0].1.contains("pw [REDACTED]"),
+                "the body is masked: {:?}",
+                starts[0].1
+            );
+            assert!(!starts[0].1.contains(VALUE), "the driver saw the value");
+            assert!(
+                rows(&store, step_id)
+                    .await
+                    .iter()
+                    .all(|row| !row.contains(VALUE)),
+                "no row holds the value"
+            );
+            assert!(!format!("{replies:?}").contains(VALUE), "no frame holds it");
         }
     }
 }

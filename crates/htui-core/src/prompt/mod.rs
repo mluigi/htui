@@ -1325,7 +1325,8 @@ pub fn scrub_section(
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("the {section} matches the {rule} rule")]
 pub struct SectionRefused {
-    /// `"name"`, `"body"` or `"request"` for a help prompt.
+    /// `"name"`, `"body"` or `"request"` for a help prompt; `"prompt"`, `"follow-up"`, `"opening"`
+    /// (a promoted step's) or `"handoff"` (a failed resume's fallback) for a chat (MOD-86 D9).
     pub section: &'static str,
     /// The scrubber's rule name, e.g. `"github_token"`.
     pub rule: &'static str,

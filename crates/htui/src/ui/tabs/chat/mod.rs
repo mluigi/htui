@@ -1543,4 +1543,31 @@ mod tests {
         assert!(tab.composer.is_active(), "and the composer stays open");
         assert!(shell.emit.is_empty(), "the tab sent nothing");
     }
+
+    /// MOD-86 D5: a follow-up the runtime refused for a credential shows on the hint line, and
+    /// the session stays live: nothing is added to the transcript and nothing is sent again (the
+    /// refused text is not kept, so the user retypes it without the secret).
+    #[test]
+    fn a_refused_follow_up_shows_on_the_hint_and_keeps_the_session_live() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        let rows = tab.transcript.len();
+        let sentence = "not sent: the follow-up matches the github_token rule";
+
+        tab.on_reply(
+            &StoreReply::Failed {
+                request: "chat_send",
+                message: sentence.to_owned(),
+            },
+            &mut shell.ctx(),
+        );
+
+        assert_eq!(tab.hint(), sentence);
+        assert!(
+            tab.session().is_some_and(|session| session.ended.is_none()),
+            "the session is still live"
+        );
+        assert_eq!(tab.transcript.len(), rows, "nothing joins the transcript");
+        assert!(shell.emit.take().is_empty(), "nothing is sent again");
+    }
 }
