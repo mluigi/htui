@@ -72,7 +72,8 @@ use crate::keymap::Keymap;
 /// Startup order (blueprint D.4), and it matters: logging, then the two keyring flags — which exit
 /// **before** any terminal work, so the DSN is typed into a normal shell and never into a raw-mode
 /// terminal — then the two concepts-index flags (MOD-34), which also print to the shell and exit,
-/// then the backend, then the worker, then the shell, then the terminal. `htui provision`
+/// then the key file (MOD-67), which `--print-keys` prints and exits on, then the backend
+/// (`--demo`'s included), then the worker, then the shell, then the terminal. `htui provision`
 /// (MOD-45) comes right after logging, before the keyring flags; it prints to the shell and exits.
 /// With `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
 ///
@@ -85,8 +86,9 @@ use crate::keymap::Keymap;
 /// # Errors
 ///
 /// Fails when the log file cannot be opened, when the keyring refuses a `--set-dsn` /
-/// `--clear-dsn`, when the config directory or the cache file cannot be opened, or when drawing to
-/// the terminal fails. The terminal is restored on every path out of here, error included
+/// `--clear-dsn`, when the key file cannot be read or is invalid ([`keys::KeysError`], exit 2),
+/// when the config directory or the cache file cannot be opened, or when drawing to the terminal
+/// fails. The terminal is restored on every path out of here, error included
 /// (MOD-1 plan D8).
 pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     if matches!(args.command, Some(cli::Command::Mcp)) {
@@ -125,6 +127,18 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
             limit: args.limit.unwrap_or(concepts::DEFAULT_LIMIT),
         })
         .await;
+    }
+
+    // MOD-67 M2 D5: the key file, after every flag that exits without the TUI and before the
+    // backend, `--demo` included (ANA-26 §6.3), so a bad file stops htui before the store or the
+    // terminal is touched (§7.4 step 8). `--print-keys` ends here.
+    let keys = keys::resolve(
+        args.keys.as_deref(),
+        args.default_keys,
+        identity::config_root_path().ok().as_deref(),
+    )?;
+    if args.print_keys {
+        return print_keys(&mut std::io::stdout().lock(), &keys::print(&keys));
     }
 
     let started = if args.demo {
@@ -183,6 +197,8 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     app.top_bar.store = label;
     // MOD-80 D4: a NO_COLOR terminal gets the modifier-only theme.
     app.theme = ui::Theme::from_no_color(std::env::var_os("NO_COLOR").as_deref());
+    // MOD-67 M2 D5: before `register_all`, so every `Ctx` the shell builds carries the file's keys.
+    app.keys = keys;
     app::register_all(&mut app);
     app.start();
 
@@ -202,6 +218,16 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     }
 
     outcome.map_err(anyhow::Error::from)
+}
+
+/// `--print-keys` (MOD-67 M2 D10): the table on stdout. A reader that closed the pipe early
+/// (`htui --print-keys | head`) is not a failure (B-4): `print!` would panic there, exit 101 and
+/// reach Sentry.
+fn print_keys(out: &mut dyn std::io::Write, text: &str) -> anyhow::Result<()> {
+    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
+        Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(err.into()),
+        _ => Ok(()),
+    }
 }
 
 /// `--set-dsn`: one line from stdin into the OS keyring, then exit (plan D7, `R-STO-1`).
@@ -284,7 +310,32 @@ fn secret_source(demo: bool) -> Option<Arc<dyn htui_core::secret::SecretSource>>
 
 #[cfg(test)]
 mod tests {
-    use super::{secret_source, session_dsn};
+    use super::{print_keys, secret_source, session_dsn};
+
+    /// A writer whose every write fails with `kind`.
+    struct Failing(std::io::ErrorKind);
+
+    impl std::io::Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(self.0.into())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(self.0.into())
+        }
+    }
+
+    /// MOD-67 M2 B-4: `htui --print-keys | head` is not a failure (`print!` would panic on the
+    /// closed pipe, exit 101 and reach Sentry); any other write error still is.
+    #[test]
+    fn print_keys_writes_the_text_and_ignores_a_closed_pipe() {
+        let mut out = Vec::new();
+        print_keys(&mut out, "version = 1\n").expect("written");
+        assert_eq!(out, b"version = 1\n");
+        print_keys(&mut Failing(std::io::ErrorKind::BrokenPipe), "x\n")
+            .expect("a closed pipe is not an error");
+        assert!(print_keys(&mut Failing(std::io::ErrorKind::Other), "x\n").is_err());
+    }
 
     /// M4 blueprint A-5: `--demo` hands the runtimes no secret source, so nothing in a demo
     /// session can reach the developer's keyring; a real session gets one. Building reads nothing.
