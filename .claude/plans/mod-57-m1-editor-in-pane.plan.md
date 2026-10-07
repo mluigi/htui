@@ -265,7 +265,15 @@ loses focus and the key that finds it is **swallowed** with the lock refusal, ne
 command or an overlay answer (`d6dc29f4`, and this round). (2) Unfocused under a modal overlay, keys
 take `on_key`'s overlay path (C3, the overlay, `Esc`/help, the modal swallow), so the prompt can be
 answered and the asking tab is never reached. (3) `editor_status` reads unfocused whenever the
-editor does not have the keys (off screen or covered).
+editor does not have the keys (off screen or covered). (4) **R0 (pre-T7 fix round).** One private
+predicate, `editor_has_keys()` (focused, its tab on screen, no modal overlay, no `?` box), is what
+`editor_key`, `editor_paste`, `editor_status` and `draw_editor` (title and cursor) all read. A paste
+follows a key's rule: the first key or paste that finds a focused editor without the keys is
+swallowed with the refusal and unfocuses it; unfocused under a modal overlay both take the
+overlay's path (`on_paste`'s too, which never passes on to the tab). Under a modal overlay the
+status line and the refusal offer no editor key: "the editor is open: answer or close the prompt
+first" (`PROMPT_FIRST`). The `?` box swallows no key, so a view can ask for the editor under it:
+`open_editor` closes the box when the editor opens with the keys.
 
 **T6 notes (refinements of blueprint §8.1, recorded per verify).** (1) `Ctrl+E` in Templates and
 Library moves the draft out of `Mode::Editing` into the pending handoff (`Pending { resume: true }`)
@@ -274,4 +282,6 @@ life. While that handoff is pending, both views now draw the handed-off draft in
 (`handed_off()`), claim its text rect, and show the hint `HANDED_OFF_HINT` ("the draft is in
 $EDITOR") instead of browse (`afd7ce3d`). Browse's `E` has no draft, draws browse and claims nothing
 (F-12). (2) `compose::render` and `item_form::render` return their body rect, and their callers
-claim it (PD-3, `2080cbac`).
+claim it (PD-3, `2080cbac`). (3) **R0 F1.** `item_form::render` returns the rect of the field handed
+to `$EDITOR` (`external`), else Paths' when it is focused, else the body's: a Paths edit claims the
+3-row paths area, under `MIN_PANE`, so the pane takes the whole tab body (D1).
