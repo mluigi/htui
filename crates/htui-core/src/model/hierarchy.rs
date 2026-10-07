@@ -110,7 +110,13 @@ pub struct ProjectPatch {
     /// `project.secret_provider` and `project.secret_scope`, written together (MOD-10 M4 D7):
     /// `None` keeps both, `Some(None)` clears both, `Some(Some(scope))` writes provider
     /// [`INFISICAL`](crate::secret::INFISICAL) and `scope.to_column()`. A provider without a scope
-    /// cannot be stored through this field.
+    /// cannot be stored through this field. On the wire an absent key is `None` and `null` is
+    /// `Some(None)` (CLEAN-8 #2).
+    #[serde(
+        default,
+        deserialize_with = "crate::model::kind::present_option",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub secret: Option<Option<SecretScope>>,
 }
 
@@ -236,4 +242,36 @@ pub struct WorkspaceSummary {
     pub name: String,
     /// The workspace's projects, ordered by `workspace_project.position`.
     pub projects: Vec<ProjectRef>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// CLEAN-8 #2: `ProjectPatch.secret`'s three states survive a JSON round trip, as
+    /// `PhasePatch.persona`'s do. An absent key keeps the scope (`None`), `null` clears it
+    /// (`Some(None)`) and a scope writes it (`Some(Some(scope))`); a plain `Option<Option<_>>`
+    /// reads `null` back as `None` and loses the clear.
+    #[test]
+    fn project_patch_secret_round_trips_all_three_states() {
+        let scope = SecretScope::new("p1", "dev", "/").expect("a valid scope");
+        for (secret, json) in [
+            (None, "{}"),
+            (Some(None), r#"{"secret":null}"#),
+            (
+                Some(Some(scope)),
+                r#"{"secret":{"project_id":"p1","environment":"dev","path":"/"}}"#,
+            ),
+        ] {
+            let patch = ProjectPatch {
+                secret: secret.clone(),
+                ..ProjectPatch::default()
+            };
+            let text = serde_json::to_string(&patch).expect("a patch serialises");
+            let back: ProjectPatch = serde_json::from_str(&text).expect("a patch deserialises");
+            assert_eq!(back, patch, "`{text}` round-trips");
+            let read: ProjectPatch = serde_json::from_str(json).expect("the literal deserialises");
+            assert_eq!(read.secret, secret, "`{json}` reads as {secret:?}");
+        }
+    }
 }

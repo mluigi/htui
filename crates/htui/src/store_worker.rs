@@ -1660,6 +1660,11 @@ pub enum StoreReply {
         /// The keyring-write generation this write made (R1 L-1): a provider built at a lower
         /// one is rebuilt on the next `provider()` (blueprint A-4).
         generation: u64,
+        /// Whether the write mark was stored after the write (MOD-90 D3, R1 M-1). `false` is not a
+        /// failure: the write landed and this process rebuilds its provider, but another process
+        /// (`htui worker`) misses a write that left the values unchanged until it restarts, and
+        /// the Secrets section says so.
+        mark_stored: bool,
         /// The keyring rows read after the write.
         snapshot: SecretsSnapshot,
     },
@@ -2198,13 +2203,15 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
         // spawned loop answers it from its own task before reaching here (review M-1); this arm
         // is `serve`'s, for the harness and `--demo`.
         StoreRequest::ListDir { path, show_hidden } => list_dir(path, *show_hidden).await?,
+        // The four `Settings > Qdrant` requests, or-ed for the reason the arms above are (MOD-15 M3
+        // plan F-12). They need no loop state, so the loop, the harness and `--demo` all serve
+        // these here (CLEAN-8 #9), and a `Memory` backend reads and writes no keyring.
         StoreRequest::QdrantInfo
         | StoreRequest::SetQdrantUrl(_)
         | StoreRequest::SetQdrantApiKey(_)
-        | StoreRequest::ClearQdrantSettings => StoreReply::Failed {
-            request: request.name(),
-            message: "handled in worker loop".to_owned(),
-        },
+        | StoreRequest::ClearQdrantSettings => {
+            crate::qdrant_settings_info::serve(backend, request).await?
+        }
         // The five keyring requests of `Settings > Secrets`, or-ed for the reason the arms above
         // are (MOD-15 M3 plan F-12; MOD-10 M4 D2). They need no loop state, so the loop's
         // `other => try_serve` serves them too: the loop, the harness and `--demo` agree.
@@ -2993,51 +3000,6 @@ pub(crate) fn spawn_with_concepts(
                                     |err| failed("rebuild_cache", &err),
                                     StoreReply::Connection,
                                 )
-                        }
-                        StoreRequest::QdrantInfo => {
-                            StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
-                        }
-                        StoreRequest::SetQdrantUrl(url) => {
-                            let url_str = url.clone();
-                            let res = crate::qdrant_settings_info::blocking_keyring(move || {
-                                htui_store::secret::set_qdrant_url(&url_str)
-                            })
-                            .await;
-                            if let Err(err) = res {
-                                failed("set_qdrant_url", &err)
-                            } else {
-                                StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
-                            }
-                        }
-                        StoreRequest::SetQdrantApiKey(key) => {
-                            // A zeroizing clone into the closure; nothing unzeroized
-                            // (MOD-10 M4 D9).
-                            let key = key.clone();
-                            let res = crate::qdrant_settings_info::blocking_keyring(move || {
-                                if key.expose().is_empty() {
-                                    htui_store::secret::clear_qdrant_api_key()
-                                } else {
-                                    htui_store::secret::set_qdrant_api_key(key.expose())
-                                }
-                            })
-                            .await;
-                            if let Err(err) = res {
-                                failed("set_qdrant_api_key", &err)
-                            } else {
-                                StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
-                            }
-                        }
-                        StoreRequest::ClearQdrantSettings => {
-                            let res = crate::qdrant_settings_info::blocking_keyring(|| {
-                                htui_store::secret::clear_qdrant_url()?;
-                                htui_store::secret::clear_qdrant_api_key()
-                            })
-                            .await;
-                            if let Err(err) = res {
-                                failed("clear_qdrant_settings", &err)
-                            } else {
-                                StoreReply::Qdrant(crate::qdrant_settings_info::QdrantSnapshot::fetch().await)
-                            }
                         }
                         // The chat requests need this loop's own state - the live sessions - and
                         // the probes, the tool-paths write, the installs, the logins and the

@@ -47,8 +47,8 @@ pub struct SecretScope {
     path: String,
 }
 
-/// The column's JSON, field for field. Private: only `parse`, `to_column` and
-/// [`SecretScope`]'s serde touch it.
+/// The column's JSON, field for field. Private: only `parse` and [`SecretScope`]'s serde touch
+/// it; `to_column` writes its borrowed twin, [`ScopeColumnRef`].
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ScopeColumn {
@@ -56,6 +56,15 @@ struct ScopeColumn {
     environment: String,
     #[serde(default = "root_path")]
     path: String,
+}
+
+/// [`ScopeColumn`] borrowed, for [`SecretScope::to_column`]: same fields, same order, no clone
+/// (CLEAN-8 #3).
+#[derive(Serialize)]
+struct ScopeColumnRef<'a> {
+    project_id: &'a str,
+    environment: &'a str,
+    path: &'a str,
 }
 
 fn root_path() -> String {
@@ -161,8 +170,12 @@ impl SecretScope {
     pub fn to_column(&self) -> String {
         // A derived struct keeps its field order whatever `serde_json/preserve_order`
         // unification does; a `json!` map would not.
-        serde_json::to_string(&ScopeColumn::from(self.clone()))
-            .expect("a struct of three strings always serialises")
+        serde_json::to_string(&ScopeColumnRef {
+            project_id: &self.project_id,
+            environment: &self.environment,
+            path: &self.path,
+        })
+        .expect("a struct of three strings always serialises")
     }
 
     /// The Infisical project ID.

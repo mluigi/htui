@@ -205,9 +205,12 @@ fn qdrant_stored() -> QdrantSnapshot {
 // Demo: no keyring at all (D10)
 // ---------------------------------------------------------------------------------------------
 
-/// No guard on purpose: a `Memory` backend must not read a keyring, and a guard would hide one.
+/// Under a broken fake keyring (R1 L-2): a `Memory` backend must not read a keyring, and a
+/// regression that does reads the fake, never the real OS keyring, and answers `Unreadable`
+/// instead of `NotApplicable`.
 #[tokio::test]
 async fn demo_rows_are_not_applicable_and_read_no_keyring() {
+    let _keyring = common::mock_keyring_broken().await;
     let snapshot = info(&demo()).await;
     assert_eq!(
         snapshot,
@@ -218,9 +221,11 @@ async fn demo_rows_are_not_applicable_and_read_no_keyring() {
     );
 }
 
-/// No guard on purpose, as above: every write is refused before the keyring is reached.
+/// Under a broken fake keyring, as above: every write is refused before the keyring is reached,
+/// and a regression that reaches it is refused with the keyring's sentence, not the demo one.
 #[tokio::test]
 async fn demo_refuses_every_keyring_write() {
+    let _keyring = common::mock_keyring_broken().await;
     for request in [
         StoreRequest::SetInfisicalUrl("https://x.example".to_owned()),
         StoreRequest::ClearInfisicalUrl,
@@ -348,6 +353,16 @@ fn generation_of(reply: &StoreReply) -> u64 {
     }
 }
 
+/// Whether a keyring write's own answer says its write mark was stored (MOD-90 D3, R1 M-1), or a
+/// panic.
+#[track_caller]
+fn mark_stored_of(reply: &StoreReply) -> bool {
+    match reply {
+        StoreReply::SecretsWritten { mark_stored, .. } => *mark_stored,
+        other => panic!("expected a keyring write's answer, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn every_landed_keyring_write_answers_a_higher_generation() {
     // R1 L-1: the section compares a provider check's generation with these.
@@ -368,6 +383,90 @@ async fn every_landed_keyring_write_answers_a_higher_generation() {
         );
         last = generation;
     }
+}
+
+/// The four Settings keyring writes.
+fn the_four_writes() -> [StoreRequest; 4] {
+    [
+        StoreRequest::SetInfisicalUrl(STORED_URL.to_owned()),
+        StoreRequest::SetMachineIdentity(identity_entry(CLIENT_ID, SECRET)),
+        StoreRequest::ClearMachineIdentity,
+        StoreRequest::ClearInfisicalUrl,
+    ]
+}
+
+/// The write mark the fake holds now (MOD-90 D1).
+fn mark_now() -> Option<String> {
+    secret::get_infisical_write_mark().expect("the fake reads")
+}
+
+#[tokio::test]
+async fn every_landed_keyring_write_stores_a_new_mark() {
+    // MOD-90 D1: another process (`htui worker`) sees a landed write by its new mark alone.
+    let _keyring = common::mock_keyring().await;
+    let (_root, backend) = offline("secrets-mark").await;
+    let mut last = mark_now();
+    assert_eq!(last, None, "an empty keyring has no mark");
+    for request in the_four_writes() {
+        let name = request.name();
+        let reply = serve(&backend, &request).await;
+        assert!(
+            mark_stored_of(&reply),
+            "{name}: the reply says the mark landed (R1 M-1)"
+        );
+        keyring_written_of(reply, name);
+        let mark = mark_now();
+        assert!(mark.is_some(), "{name} stores a mark");
+        assert_ne!(mark, last, "{name} stores a new mark");
+        last = mark;
+    }
+
+    // A refused write stores no mark: a blank half, a URL normalisation refuses, a demo session.
+    let blank = StoreRequest::SetMachineIdentity(identity_entry(CLIENT_ID, "  "));
+    failed_of(serve(&backend, &blank).await);
+    assert_eq!(mark_now(), last, "a blank half stores no mark");
+    let lan = StoreRequest::SetInfisicalUrl("http://192.168.1.10".to_owned());
+    failed_of(serve(&backend, &lan).await);
+    assert_eq!(mark_now(), last, "a refused URL stores no mark");
+    for request in the_four_writes() {
+        failed_of(serve(&demo(), &request).await);
+        assert_eq!(mark_now(), last, "a demo {} stores no mark", request.name());
+    }
+
+    // MOD-90 D2: the mark is written last, so a write the keyring refuses leaves it as it was.
+    common::refuse_fake_store(secret::INFISICAL_CLIENT_SECRET_USER);
+    let refused = StoreRequest::SetMachineIdentity(identity_entry(CLIENT_ID, SECRET));
+    failed_of(serve(&backend, &refused).await);
+    assert_eq!(mark_now(), last, "a keyring-refused write stores no mark");
+}
+
+#[tokio::test]
+async fn a_refused_mark_write_still_answers_written() {
+    // MOD-90 D3: the write landed; only the mark is lost, so the reply is still the write's own.
+    let _keyring = common::mock_keyring().await;
+    common::refuse_fake_store(secret::INFISICAL_WRITE_MARK_USER);
+    let (_root, backend) = offline("secrets-mark-refused").await;
+    let mut last = 0;
+    for request in the_four_writes() {
+        let name = request.name();
+        let reply = serve(&backend, &request).await;
+        let generation = generation_of(&reply);
+        assert!(
+            !mark_stored_of(&reply),
+            "{name}: the reply says the mark was refused (R1 M-1)"
+        );
+        keyring_written_of(reply, name);
+        assert!(generation > last, "{name}: {generation} after {last}");
+        last = generation;
+        if matches!(request, StoreRequest::SetMachineIdentity(_)) {
+            assert!(
+                common::fake_machine_identity()
+                    == (Some(CLIENT_ID.to_owned()), Some(SECRET.to_owned())),
+                "the identity landed"
+            );
+        }
+    }
+    assert_eq!(mark_now(), None, "the refused mark was never stored");
 }
 
 #[tokio::test]
@@ -407,6 +506,29 @@ async fn set_machine_identity_stores_both_halves_and_answers_a_fresh_snapshot() 
     assert_eq!(
         common::fake_machine_identity(),
         (Some(CLIENT_ID.to_owned()), Some(SECRET.to_owned()))
+    );
+}
+
+#[tokio::test]
+async fn set_machine_identity_stores_the_trimmed_halves() {
+    // CLEAN-8 #4: spaces around either half are dropped before the keyring sees them.
+    let _keyring = common::mock_keyring().await;
+    let (_root, backend) = offline("secrets-trimmed").await;
+    let reply = serve(
+        &backend,
+        &StoreRequest::SetMachineIdentity(identity_entry(
+            " cid-typed-1\t",
+            "  zq7-client-secret-0123456789 ",
+        )),
+    )
+    .await;
+    assert_eq!(
+        keyring_written_of(reply, "set_machine_identity").identity,
+        IdentityState::Stored
+    );
+    assert!(
+        common::fake_machine_identity() == (Some(CLIENT_ID.to_owned()), Some(SECRET.to_owned())),
+        "both halves are stored trimmed"
     );
 }
 
@@ -1058,6 +1180,7 @@ fn keyring_landed(request: &'static str, keyring_reply: StoreReply) -> StoreRepl
         StoreReply::Secrets(snapshot) => StoreReply::SecretsWritten {
             request,
             generation: 1,
+            mark_stored: true,
             snapshot,
         },
         other => panic!("expected a keyring snapshot, got {other:?}"),
@@ -1695,6 +1818,60 @@ async fn a_landed_identity_write_lifts_the_latch_line_until_the_next_check() {
 
     bench.reply(&mut section, &refused(1));
     assert!(frame(&bench, &section).contains(latch));
+}
+
+#[tokio::test]
+async fn a_refused_write_mark_shows_until_a_write_stores_one() {
+    // MOD-90 D3, R1 M-1: the write landed, so its own line says so and nothing is refused; the
+    // refused mark is a line under the rows, as the latch line is. A re-read keeps it (it cannot
+    // tell whether another process has seen the write); the next landed write that stores a mark
+    // drops it, since that mark carries every write before it.
+    let notice = "the keyring refused htui/infisical-write-mark";
+    let landed = |generation, mark_stored| match configured() {
+        StoreReply::Secrets(snapshot) => StoreReply::SecretsWritten {
+            request: "set_machine_identity",
+            generation,
+            mark_stored,
+            snapshot,
+        },
+        other => panic!("expected a keyring snapshot, got {other:?}"),
+    };
+    let store_identity = |bench: &SectionBench, section: &mut SecretsSection| {
+        go_to(bench, section, ROW_IDENTITY);
+        bench.key(section, "e");
+        type_text(bench, section, CLIENT_ID);
+        bench.key(section, "Tab");
+        type_text(bench, section, SECRET);
+        bench.key(section, "Enter");
+        assert!(matches!(
+            requests(bench).as_slice(),
+            [StoreRequest::SetMachineIdentity(_)]
+        ));
+    };
+    let (bench, mut section, _) = loaded(configured()).await;
+    assert!(!frame(&bench, &section).contains(notice));
+
+    store_identity(&bench, &mut section);
+    bench.reply(&mut section, &landed(1, false));
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(notice), "{shown}");
+    assert!(
+        shown.contains("identity stored"),
+        "the write landed: {shown}"
+    );
+    assert!(bench.errors().is_empty(), "a refused mark is not a failure");
+
+    bench.key(&mut section, "r");
+    let _ = bench.drained();
+    bench.reply(&mut section, &configured());
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(notice), "a re-read keeps it: {shown}");
+
+    store_identity(&bench, &mut section);
+    bench.reply(&mut section, &landed(2, true));
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains(notice), "{shown}");
+    assert!(shown.contains("identity stored"), "{shown}");
 }
 
 #[tokio::test]
@@ -2716,6 +2893,31 @@ async fn snapshot_identity_form() {
     bench.key(&mut section, "Tab");
     type_text(&bench, &mut section, SECRET);
     insta::assert_snapshot!("identity_form", frame(&bench, &section));
+}
+
+/// MOD-90 D3, R1 M-1: a landed identity write whose write mark the keyring refused.
+#[tokio::test]
+async fn snapshot_write_mark_refused() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    let StoreReply::Secrets(snapshot) = configured() else {
+        unreachable!("configured() is a keyring read")
+    };
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretsWritten {
+            request: "set_machine_identity",
+            generation: 1,
+            mark_stored: false,
+            snapshot,
+        },
+    );
+    insta::assert_snapshot!("write_mark_refused", frame(&bench, &section));
 }
 
 #[tokio::test]

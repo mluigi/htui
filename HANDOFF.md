@@ -14,20 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-07):** **MOD-86 and MOD-87 are done** (`docs/decisions/mod/mod-86.md`,
-`docs/decisions/mod/mod-87.md`), run together on `hr/MOD-86`. Every chat text (opening, promoted opening, resume
-handoff, follow-up, and a help opening on a provider project) is masked before a driver, row or tab frame sees it;
-a refusal is `not sent: the <section> matches the <rule> rule`, a refused follow-up leaves the chat live. A chat now
-serves commands while it streams: `Esc Esc` cuts the turn (`cancelled`), mid-turn sends are deferred, and every
-queued command is answered once after the run is closed (D206 kept). No migration, no UI change.
-Before them, **MOD-10 is done** (`docs/decisions/mod/mod-10.md`): a project's secrets
-come from a self-hosted Infisical, reach the agent only through `SessionSpec.env`, and are masked by the same map in what a run stores.
-M1 hardened the scrubber (whole-token rules, exact-match masks, a typed `ScrubRefused` run failure); M2 added the
-`htui-secrets` crate (Universal Auth, a 401 latch, the machine identity in the executing box's keyring); M3 resolves
-once per walk into one `RunSecrets` that is both the agent's env and the walk's scrubber, and refuses the run with
-`secrets_refused: <cause>`; M4 added Settings > Secrets (URL, identity, health, per-project scope through
-`ProjectPatch.secret`; one conformance case, no migration). It filed **MOD-89** (`.env` in a worktree), **MOD-90**
-(`htui worker` keeps a refused login) and **CLEAN-8** (M4 review residuals).
+**Current status (2026-10-07):** **MOD-90 and CLEAN-8 are done** (`docs/decisions/mod/mod-90.md`,
+`docs/decisions/clean/clean-8.md`), run together on `hr/MOD-90`. A fourth keyring entry, `htui/infisical-write-mark`,
+is replaced by every Settings > Secrets URL or identity write, so an `htui worker` sharing the keyring drops a refused
+login when the same identity is entered again; a refused mark write shows a line in Settings. CLEAN-8 wiped the
+Infisical body buffer, typed the half-stored identity, guarded Settings > Qdrant in `--demo` and applied the M4 nits.
+No migration. Before them, **MOD-86 and MOD-87** (`docs/decisions/mod/mod-86.md`, `docs/decisions/mod/mod-87.md`):
+every chat text is masked before a driver, row or tab frame sees it, and a chat serves commands while it streams
+(`Esc Esc` cuts the turn). Before those, **MOD-10 is done** (`docs/decisions/mod/mod-10.md`): a project's secrets come
+from a self-hosted Infisical, reach the agent only through `SessionSpec.env`, and are masked by the same map in what a
+run stores; it also filed **MOD-89** (`.env` in a worktree).
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -446,29 +442,8 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   warn vs refuse (and whether per project), whether a provider-less project is checked too, and where the warning
   shows. Out of MOD-10's MVP by PRD scope. Not blocked.
 
-- [ ] **MOD-90 - Clear a refused Infisical login in `htui worker` when the same identity is re-entered** (from
-  MOD-10, `docs/decisions/mod/mod-10.md`, blueprint A-4). `R-SEC-4`, `R-TUI-8`. A 401 latches the process's one
-  `KeyringInfisical` provider. MOD-10 M4's keyring-write generation (`crates/htui/src/secrets.rs`) makes any
-  Settings > Secrets write, even of the same identity, rebuild the TUI's provider. The generation is per process,
-  so a separate `htui worker` rebuilds only when the stored URL, client ID or client secret changed, and keeps its
-  latch after the same identity is re-entered until it is restarted (documented in `docs/htui-secrets.md`, "Logins,
-  tokens and lockout safety"). Give the worker a way to see the write (a keyring-side marker, a store row, or a
-  command) without retrying a refused login on its own. Not blocked.
-
 ### Deferred backlog
 
-- [ ] **CLEAN-8 - MOD-10 M4 review residuals** (from MOD-10, `docs/decisions/mod/mod-10.md`). `R-SEC-3`, `R-TUI-8`.
-  - **L-7** (refuted as a finding, kept as hardening): `read_body` in `crates/htui-secrets/src/infisical.rs`
-    accumulates the response body, values included, in a growing `Vec<u8>` that is never wiped; read into a
-    pre-sized `Zeroizing` buffer instead.
-  - The 7 rust-reviewer NITs: `ProjectPatch`'s `Option<Option<SecretScope>>` loses `Some(None)` in a JSON round
-    trip; `SecretScope::to_column` clones; `secrets_settings::serve` refuses a blank half by trimmed text but
-    stores it untrimmed; `SecretsSection::rows()` allocates per call; `fresh_tree` repeats the re-read/CAS;
-    `HalfStored` vs `Unreadable` are told apart by a message prefix (blueprint A-7) instead of a typed error; long
-    `on_reply`/`on_scope_written`/`lines` functions.
-  - A `--demo` guard on the Qdrant keyring arms: Settings > Qdrant still reads and writes the keyring in a demo
-    session (`docs/htui-secrets.md`, Settings).
-  Not blocked.
 - [ ] **CLEAN-9 - MOD-12 M2 review residuals** (from MOD-12 M2, plan
   `.claude/plans/mod-12-m2-spend-guard.plan.md`). `R-AGT-7`, `R-TUI-8`.
   - **Recorder error-row wording.** Since M2's D6 the recorder's `RunCap.micros` is the session's
@@ -516,6 +491,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 22 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-90 worker login latch, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 3 (CLEAN-8 MOD-10 M4 review residuals, CLEAN-9 MOD-12 M2 review residuals, CLEAN-10 `cargo doc` private links) |
+| MOD-N   | 21 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 2 (CLEAN-9 MOD-12 M2 review residuals, CLEAN-10 `cargo doc` private links) |
 | TOOL-N  | 0 |

@@ -7,7 +7,10 @@
 use htui::agent_settings::{AgentDraft, AgentWrite};
 use htui::app::{Action, Ctx, Handled};
 use htui::qdrant_settings_info::{QdrantSnapshot, QdrantState};
-use htui::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
+use htui::secrets_settings::{DEMO_SESSION, Redacted};
+use htui::store_worker::{
+    AuthFrame, InstallFrame, Origin, RequestEnvelope, StoreReply, StoreRequest,
+};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::{
@@ -27,6 +30,7 @@ use htui_agent::probe::{CredentialTier, ProbeSnapshot, ProbeSource, ProbeStatus,
 use htui_agent::{ArchiveFormat, InstallOutcome, InstallPhase, InstallPlan, ManualSteps};
 use htui_core::model::{Agent, AgentBox, AgentId, AgentSummary, Billing, BoxId, Scope, Transport};
 use htui_core::store::{MemStore, WriteStore};
+use htui_store::{Backend, Started};
 use ratatui::Frame;
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
@@ -5751,5 +5755,137 @@ async fn a_qdrant_reload_just_before_a_write_is_not_taken_as_its_answer() {
     assert!(
         !rendered.contains("the Qdrant settings are gone from the keyring"),
         "{rendered}"
+    );
+}
+
+/// The backend a `--demo` shell (and the harness) runs on: `Memory`, which has no keyring.
+fn qdrant_demo() -> Backend {
+    Backend::memory(MemStore::demo())
+}
+
+/// The demo answer to a Qdrant read: both rows `NotApplicable` and no URL summary.
+#[track_caller]
+fn assert_qdrant_not_applicable(reply: StoreReply, path: &str) {
+    match reply {
+        StoreReply::Qdrant(snapshot) => {
+            assert_eq!(snapshot.url_state, QdrantState::NotApplicable, "{path}");
+            assert_eq!(snapshot.key_state, QdrantState::NotApplicable, "{path}");
+            assert_eq!(snapshot.url_summary, None, "{path}");
+        }
+        other => panic!("{path}: expected a not-applicable Qdrant snapshot, got {other:?}"),
+    }
+}
+
+/// A demo write's refusal: `Failed`, named by the request, saying a demo has no keyring.
+#[track_caller]
+fn assert_qdrant_demo_refusal(reply: StoreReply, name: &str, path: &str) {
+    match reply {
+        StoreReply::Failed { request, message } => {
+            assert_eq!(request, name, "{path}");
+            assert_eq!(message, DEMO_SESSION, "{path}");
+        }
+        other => panic!("{path}: expected `{name}` refused, got {other:?}"),
+    }
+}
+
+/// One request through a spawned store loop over the demo backend: the path `--demo` takes
+/// (CLEAN-8 #9, blueprint A-2), where `serve` is the harness's.
+async fn through_the_demo_loop(request: StoreRequest) -> StoreReply {
+    let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (rep_tx, mut rep_rx) = tokio::sync::mpsc::unbounded_channel();
+    let worker = htui::store_worker::spawn(Started::detached(qdrant_demo()), req_rx, rep_tx);
+    req_tx
+        .send(RequestEnvelope {
+            seq: 1,
+            origin: Origin::App,
+            request,
+        })
+        .expect("the worker is alive");
+    let envelope = tokio::time::timeout(std::time::Duration::from_secs(5), rep_rx.recv())
+        .await
+        .expect("the loop answers within five seconds")
+        .expect("the loop answers");
+    assert_eq!(envelope.seq, 1, "the answer goes to the request's address");
+    drop(req_tx);
+    worker.await.expect("the worker stops with its channel");
+    envelope.reply
+}
+
+/// CLEAN-8 #9: a demo session's Qdrant read consults no keyring, through `serve` (the harness)
+/// and through the spawned loop (`--demo`) alike. Under a broken fake keyring (R1 L-2): a
+/// regression that reads one is never the real OS keyring, and answers `Unreadable` instead of
+/// `NotApplicable`.
+#[tokio::test]
+async fn qdrant_demo_reads_no_keyring() {
+    let _keyring = htui_store::testkit::mock_keyring_broken().await;
+    assert_qdrant_not_applicable(
+        htui::store_worker::serve(&qdrant_demo(), &StoreRequest::QdrantInfo).await,
+        "serve",
+    );
+    assert_qdrant_not_applicable(
+        through_the_demo_loop(StoreRequest::QdrantInfo).await,
+        "the spawned loop",
+    );
+}
+
+/// CLEAN-8 #9: a demo session refuses every Qdrant keyring write before the keyring is reached,
+/// with the Secrets section's sentence. Under a broken fake keyring, as above: a regression that
+/// reaches it is refused with the keyring's sentence, not the demo one.
+#[tokio::test]
+async fn qdrant_demo_refuses_every_keyring_write() {
+    let _keyring = htui_store::testkit::mock_keyring_broken().await;
+    for request in [
+        StoreRequest::SetQdrantUrl("https://q.example:6334".to_owned()),
+        StoreRequest::SetQdrantApiKey(Redacted::new("qk-typed-123".to_owned())),
+        StoreRequest::ClearQdrantSettings,
+    ] {
+        let name = request.name();
+        assert_qdrant_demo_refusal(
+            htui::store_worker::serve(&qdrant_demo(), &request).await,
+            name,
+            "serve",
+        );
+    }
+    assert_qdrant_demo_refusal(
+        through_the_demo_loop(StoreRequest::ClearQdrantSettings).await,
+        "clear_qdrant_settings",
+        "the spawned loop",
+    );
+}
+
+/// CLEAN-8 #9: a demo snapshot opens no editor, shows both rows as not applicable, refuses `e` and
+/// `c` with the demo sentence and sends nothing, and `r` still re-reads.
+#[tokio::test]
+async fn qdrant_demo_section_offers_no_edit() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Qdrant(QdrantSnapshot {
+            url_state: QdrantState::NotApplicable,
+            key_state: QdrantState::NotApplicable,
+            url_summary: None,
+        }),
+    );
+    let _ = bench.drained();
+    assert!(!section.captures_input(), "a demo snapshot opens no editor");
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(rendered.contains("n/a in a demo session"), "{rendered}");
+
+    for chord in ["e", "c"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed);
+        assert!(requests_of(&bench).is_empty(), "`{chord}` sends nothing");
+        assert!(!section.captures_input(), "`{chord}` opens nothing");
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(
+            rendered.contains(DEMO_SESSION),
+            "`{chord}` is refused with the demo sentence: {rendered}"
+        );
+    }
+
+    assert_eq!(bench.key(&mut section, "r"), Handled::Consumed);
+    assert!(
+        matches!(requests_of(&bench).as_slice(), [StoreRequest::QdrantInfo]),
+        "`r` still re-reads in a demo"
     );
 }
