@@ -60,16 +60,16 @@ use crate::model::{
     NewPromptTemplate, NewRepo, NewRequirement, NewRequirementArea, NewRun, NewRunStep, NewSkill,
     NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice,
     PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId,
-    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueuedFollowUp,
-    RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
-    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run, RunCommand, RunCommandId,
-    RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit, RunStepTree, RunSummary, Scope,
-    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingKey, SkillId, SkillPatch,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId,
-    StepOpening, StepOutcome, StepPermission, StepStatus, ToolCallCount, UpstreamEntry, UserId,
-    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject,
+    PhasePatch, Project, ProjectId, ProjectPatch, PromptScope, PromptTemplate, QueueSetting,
+    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
+    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementUpdate, Resolution, ResolvedInput, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunStatus, RunStep, RunStepCommit,
+    RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
+    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject,
 };
 use crate::prompt::settings::{Rungs, SettingKey};
 use crate::prompt::template::{TemplateRole, parse};
@@ -550,9 +550,10 @@ pub trait WriteStore: ReadStore {
     /// neither can stale an open editor.
     ///
     /// **Every human writer of `box` is this compare-and-set** (MOD-40 plan D6, `docs/ANA-16.md`
-    /// C7). It is `box.settings`' only writer, which admission reads under `claim_run`'s row lock:
-    /// key by key (`executor` only), under the same `edit_version` guard, and every other key
-    /// (`max_concurrent_items`, `command_limits`, unknown ones) survives. A second, unguarded
+    /// C7). It and [`set_queue_setting`](WriteStore::set_queue_setting)'s `Box` target (MOD-12 M2
+    /// D9) are `box.settings`' only writers, which admission reads under `claim_run`'s row lock:
+    /// both key by key (`executor` here, `max_concurrent_items` there), under the same
+    /// `edit_version` guard, and every other key (`command_limits`, unknown ones) survives. A second, unguarded
     /// `UPDATE box SET settings` would let two editors overwrite each other silently.
     ///
     /// Answers [`CasOutcome::Applied`] with the row as written, or [`CasOutcome::Stale`] with the
@@ -1146,6 +1147,65 @@ pub trait WriteStore: ReadStore {
     /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) when the key is not
     /// accepted on the rung.
     async fn setting(&self, rung: SettingRung, key: SettingKey) -> Result<Option<StoredSetting>>;
+
+    // queue settings (MOD-12 M2 D8, D9)
+
+    /// One queue key on one target with its token (MOD-12 M2 D9). `None` only when the target's
+    /// row is absent (`App`: no `app_setting` row; `Project`: no such id; `Box`: no such id, or a
+    /// box of another `app_user`); a present project or box without the key answers `Some` with
+    /// `value: None`.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) with
+    /// [`queue_target_refusal`]'s sentence.
+    async fn queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Result<Option<QueueStored>>;
+
+    /// Writes one queue key (MOD-12 M2 D9). Precedence: [`queue_target_refusal`],
+    /// [`queue_token_refusal`], [`QueueSetting::validate`] (before the compare-and-set, as
+    /// `set_setting` validates first), then the row: `NotFound`, `Stale`, and last a non-object
+    /// blob (`Constraint`).
+    ///
+    /// - `App` upserts its row (`Stamp(None)` = "I expect no row"; `Stale` if one exists).
+    /// - `Project` merges the key into `project.settings` under CAS on `updated_at`,
+    ///   [`set_setting`](WriteStore::set_setting)'s project rung exactly.
+    /// - `Box` merges it into `box.settings` under CAS on `edit_version`, bumping it as
+    ///   [`edit_box`](WriteStore::edit_box) does, every other key (`executor`, `command_limits`,
+    ///   unknown ones) kept.
+    ///
+    /// `Applied` carries the value as written and the next token; `Stale` the key as stored now
+    /// with its token. A refusal writes nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::Constraint`](crate::store::StoreError::Constraint) for the three refusals
+    /// and for [`BOX_SETTINGS_NOT_AN_OBJECT`] or a project blob that is not an object;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an absent row (on `App`,
+    /// a `Stamp(Some)` naming a row that is gone, as `set_setting` answers).
+    async fn set_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        value: Value,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>>;
+
+    /// Removes one queue key (MOD-12 M2 D9): `DELETE` on `app_setting`, `settings - key` on the
+    /// project (CAS on `updated_at`) or the box (CAS on `edit_version`, bumped). `Applied`
+    /// carries `value: None`; on `App` its token is `Stamp(None)`, because no row is left to carry
+    /// one. Clearing an absent key of a present project or box applies.
+    ///
+    /// # Errors
+    /// The refusals of [`set_queue_setting`](WriteStore::set_queue_setting) minus the validator;
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) for an absent row.
+    async fn clear_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>>;
 
     // deletes (D4)
 
@@ -3027,4 +3087,113 @@ pub struct StoredSetting {
     pub value: Option<Value>,
     /// The rung row's `updated_at`: the CAS token, never written by hand.
     pub updated_at: DateTime<Utc>,
+}
+
+/// MOD-12 M2 D9: where a queue key is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueTarget {
+    /// One `app_setting` row, keyed by [`QueueSetting::as_str`].
+    App,
+    /// One key of a project's `settings`.
+    Project(ProjectId),
+    /// One key of a box's `settings` (this user's boxes only, [`WriteStore::edit_box`]'s reach).
+    Box(BoxId),
+}
+
+impl QueueTarget {
+    /// The keys this target takes, in row order.
+    #[must_use]
+    pub const fn keys(self) -> &'static [QueueSetting] {
+        match self {
+            Self::App => &QueueSetting::APP_KEYS,
+            Self::Project(_) => &QueueSetting::PROJECT_KEYS,
+            Self::Box(_) => &QueueSetting::BOX_KEYS,
+        }
+    }
+
+    /// The word the refusals name this target by: `app`, `project` or `box`.
+    #[must_use]
+    pub const fn kind(self) -> &'static str {
+        match self {
+            Self::App => "app",
+            Self::Project(_) => "project",
+            Self::Box(_) => "box",
+        }
+    }
+}
+
+/// MOD-12 M2 D9: the compare-and-set token a queue write presents and a read answers. Two kinds
+/// because the box target's guard is `box.edit_version` ([`WriteStore::edit_box`]'s) and the
+/// others' is the row's `updated_at` ([`WriteStore::set_setting`]'s rungs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QueueToken {
+    /// `app_setting.updated_at` or `project.updated_at`. `None` is "I expect no row": accepted on
+    /// an `App` set only, as `set_setting`'s `expected: None`.
+    Stamp(Option<DateTime<Utc>>),
+    /// `box.edit_version`.
+    EditVersion(i32),
+}
+
+/// MOD-12 M2 D9: one queue key as stored, with its token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueStored {
+    /// The stored JSON; `None` when the target's row holds no value for the key.
+    pub value: Option<Value>,
+    /// The token the next write presents. After an `App` clear: `Stamp(None)`.
+    pub token: QueueToken,
+}
+
+/// MOD-12 M2 D9: the sentence for `key` on a `target` that does not take it, or `None`.
+#[must_use]
+pub fn queue_target_refusal(key: QueueSetting, target: QueueTarget) -> Option<String> {
+    (!target.keys().contains(&key)).then(|| {
+        format!(
+            "`{key}` is not a{} {} setting",
+            article(target),
+            target.kind()
+        )
+    })
+}
+
+/// `a` or `an` before [`QueueTarget::kind`].
+const fn article(target: QueueTarget) -> &'static str {
+    match target {
+        QueueTarget::App => "n",
+        QueueTarget::Project(_) | QueueTarget::Box(_) => "",
+    }
+}
+
+/// MOD-12 M2 D9: the sentence for a token of the wrong kind for `target` (an `EditVersion` on
+/// `App`/`Project`, a `Stamp` on `Box`, `Stamp(None)` on `Project`, or on any clear), or `None`.
+#[must_use]
+pub fn queue_token_refusal(
+    key: QueueSetting,
+    target: QueueTarget,
+    token: QueueToken,
+    clearing: bool,
+) -> Option<String> {
+    let kind = target.kind();
+    let (needs, why) = match (target, token) {
+        (QueueTarget::App, QueueToken::EditVersion(_)) => (
+            "the app_setting row's `updated_at`",
+            "`edit_version` guards a box",
+        ),
+        (QueueTarget::App, QueueToken::Stamp(None)) if clearing => (
+            "the app_setting row's `updated_at`",
+            "a clear removes a row, and `Stamp(None)` expects none",
+        ),
+        (QueueTarget::Project(_), QueueToken::EditVersion(_)) => {
+            ("the project's `updated_at`", "`edit_version` guards a box")
+        }
+        (QueueTarget::Project(_), QueueToken::Stamp(None)) => (
+            "the project's `updated_at`",
+            "a project exists before its settings, so `Stamp(None)` is no insert",
+        ),
+        (QueueTarget::Box(_), QueueToken::Stamp(_)) => (
+            "the box's `edit_version`",
+            "`updated_at` guards an app_setting row or a project",
+        ),
+        _ => return None,
+    };
+    Some(format!("`{key}` on {kind} needs {needs}: {why}"))
 }

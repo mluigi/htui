@@ -37,8 +37,8 @@ use crate::model::{
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
     ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
-    Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    QueueEntry, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
+    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
     RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
     Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId,
     RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
@@ -58,20 +58,21 @@ use crate::store::error::{Result, StoreError};
 use crate::store::traits::{
     BOX_PROBE_SPEC_CLEAR_NEEDS_A_TOKEN, BOX_PROBE_SPEC_NOT_AN_OBJECT, BOX_SETTINGS_NOT_AN_OBJECT,
     BindingFacts, COMMAND_STALE_AFTER, CasOutcome, DeleteReach, DeleteTarget,
-    EXECUTOR_MUST_BE_KNOWN, ParkOutcome, ReadStore, SettingRung, StepFence, StoredSetting,
-    UpdateOutcome, WriteStore, already_exists, batch_is_closed, chat_step_status, check_attachment,
-    citation_key, close_out_needs_a_summary, command_finish_status, command_not_claimable,
-    command_not_queued, document_needs_a_step, expected_on_row, failure_disagrees_with_status,
-    finish_run_item_mirror, finish_run_needs_a_terminal_status, graph_not_in_project,
-    invalid_area_code, invalid_prefix, item_has_a_live_run, item_kind_is_held, item_not_in_project,
-    lease_ttl_micros, legal_move, link_key, link_not_proposed_by_run, link_outside_project,
-    new_persona_refusal, new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status,
-    note_needs_a_step, persona_is_bound, persona_patch_refusal, prompt_template_key,
-    prompt_template_refusal, reaped_note, references_no_row, requirement_withdrawn,
-    reserved_phase_name, resolution_not_closable, row_names_another_phase, row_names_another_step,
-    run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal, skill_version_key,
-    step_document_refusal, step_is_not_promotable, step_note_refusal, step_slot_is_taken,
-    step_writes_own_item, summary_names_another_item, winner_is_not_settled,
+    EXECUTOR_MUST_BE_KNOWN, ParkOutcome, QueueStored, QueueTarget, QueueToken, ReadStore,
+    SettingRung, StepFence, StoredSetting, UpdateOutcome, WriteStore, already_exists,
+    batch_is_closed, chat_step_status, check_attachment, citation_key, close_out_needs_a_summary,
+    command_finish_status, command_not_claimable, command_not_queued, document_needs_a_step,
+    expected_on_row, failure_disagrees_with_status, finish_run_item_mirror,
+    finish_run_needs_a_terminal_status, graph_not_in_project, invalid_area_code, invalid_prefix,
+    item_has_a_live_run, item_kind_is_held, item_not_in_project, lease_ttl_micros, legal_move,
+    link_key, link_not_proposed_by_run, link_outside_project, new_persona_refusal,
+    new_skill_refusal, not_a_fanout_candidate, not_a_terminal_status, note_needs_a_step,
+    persona_is_bound, persona_patch_refusal, prompt_template_key, prompt_template_refusal,
+    queue_target_refusal, queue_token_refusal, reaped_note, references_no_row,
+    requirement_withdrawn, reserved_phase_name, resolution_not_closable, row_names_another_phase,
+    row_names_another_step, run_is_terminal, self_link, skill_body_refusal, skill_patch_refusal,
+    skill_version_key, step_document_refusal, step_is_not_promotable, step_note_refusal,
+    step_slot_is_taken, step_writes_own_item, summary_names_another_item, winner_is_not_settled,
     withdrawn_requirement_cited,
 };
 use uuid::Uuid;
@@ -4313,6 +4314,158 @@ impl State {
         }
     }
 
+    /// One queue key with its token (MOD-12 M2 D9), or `None` when the target's row is absent:
+    /// no `app_setting` row, no such project, or no box of `user` by that id.
+    fn queue_setting(
+        &self,
+        user: Option<UserId>,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Option<QueueStored> {
+        let name = key.as_str();
+        match target {
+            QueueTarget::App => self.app_settings.get(name).map(|(value, at)| QueueStored {
+                value: Some(value.clone()),
+                token: QueueToken::Stamp(Some(*at)),
+            }),
+            QueueTarget::Project(id) => self.projects.get(&id).map(|project| QueueStored {
+                value: project.settings.get(name).cloned(),
+                token: QueueToken::Stamp(Some(project.updated_at)),
+            }),
+            QueueTarget::Box(id) => self
+                .boxes
+                .get(&id)
+                .filter(|row| Some(row.user_id) == user)
+                .map(|row| QueueStored {
+                    value: row.settings.get(name).cloned(),
+                    token: QueueToken::EditVersion(row.edit_version),
+                }),
+        }
+    }
+
+    /// Writes (`Some`) or clears (`None`) one queue key (MOD-12 M2 D9): the target and token
+    /// refusals, the validator on a set, then the row as `set_setting`'s `App` and `Project` rungs
+    /// and `edit_box`'s lookup and guards do. `now` stands in for Postgres's trigger.
+    fn write_queue_setting(
+        &mut self,
+        user: Option<UserId>,
+        target: QueueTarget,
+        key: QueueSetting,
+        value: Option<Value>,
+        expected: QueueToken,
+        now: DateTime<Utc>,
+    ) -> Result<CasOutcome<QueueStored>> {
+        if let Some(refusal) = queue_target_refusal(key, target) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(refusal) = queue_token_refusal(key, target, expected, value.is_none()) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        if let Some(value) = &value {
+            key.validate(value).map_err(StoreError::Constraint)?;
+        }
+        let name = key.as_str();
+        match (target, expected) {
+            (QueueTarget::App, QueueToken::Stamp(want)) => {
+                let stored = self.queue_setting(user, target, key);
+                // `Stamp(None)` is "I expect no row": no row and no expectation match, or a row
+                // whose token is the one held.
+                let current = match (&stored, want) {
+                    (None, None) => true,
+                    (Some(row), Some(_)) => row.token == expected,
+                    (None, Some(_)) | (Some(_), None) => false,
+                };
+                if !current {
+                    return match stored {
+                        Some(row) => Ok(CasOutcome::Stale(row)),
+                        None => Err(StoreError::NotFound {
+                            entity: "app_setting",
+                            id: name.to_owned(),
+                        }),
+                    };
+                }
+                Ok(CasOutcome::Applied(match value {
+                    Some(value) => {
+                        self.app_settings
+                            .insert(name.to_owned(), (value.clone(), now));
+                        QueueStored {
+                            value: Some(value),
+                            token: QueueToken::Stamp(Some(now)),
+                        }
+                    }
+                    None => {
+                        self.app_settings.remove(name);
+                        QueueStored {
+                            value: None,
+                            token: QueueToken::Stamp(None),
+                        }
+                    }
+                }))
+            }
+            (QueueTarget::Project(id), QueueToken::Stamp(Some(_))) => {
+                let stored =
+                    self.queue_setting(user, target, key)
+                        .ok_or_else(|| StoreError::NotFound {
+                            entity: "project",
+                            id: id.to_string(),
+                        })?;
+                if stored.token != expected {
+                    return Ok(CasOutcome::Stale(stored));
+                }
+                let project = self
+                    .projects
+                    .get_mut(&id)
+                    .expect("the row was read a statement ago under the same lock");
+                let Some(map) = project.settings.as_object_mut() else {
+                    return Err(StoreError::Constraint(settings_not_an_object(id, key)));
+                };
+                match &value {
+                    Some(value) => map.insert(name.to_owned(), value.clone()),
+                    None => map.remove(name),
+                };
+                project.updated_at = now;
+                Ok(CasOutcome::Applied(QueueStored {
+                    value,
+                    token: QueueToken::Stamp(Some(now)),
+                }))
+            }
+            (QueueTarget::Box(id), QueueToken::EditVersion(want)) => {
+                let Some(row) = self
+                    .boxes
+                    .get_mut(&id)
+                    .filter(|row| Some(row.user_id) == user)
+                else {
+                    return Err(StoreError::NotFound {
+                        entity: "box",
+                        id: id.to_string(),
+                    });
+                };
+                if row.edit_version != want {
+                    return Ok(CasOutcome::Stale(QueueStored {
+                        value: row.settings.get(name).cloned(),
+                        token: QueueToken::EditVersion(row.edit_version),
+                    }));
+                }
+                let Some(map) = row.settings.as_object_mut() else {
+                    return Err(StoreError::Constraint(
+                        BOX_SETTINGS_NOT_AN_OBJECT.to_owned(),
+                    ));
+                };
+                match &value {
+                    Some(value) => map.insert(name.to_owned(), value.clone()),
+                    None => map.remove(name),
+                };
+                row.edit_version += 1;
+                row.updated_at = now;
+                Ok(CasOutcome::Applied(QueueStored {
+                    value,
+                    token: QueueToken::EditVersion(row.edit_version),
+                }))
+            }
+            _ => unreachable!("queue_token_refusal answered every other target and token pair"),
+        }
+    }
+
     /// The `box_probe_spec` row with its token (MOD-51 D2): `app_settings` holds it beside the
     /// ten `SettingKey` rows, under a key no `SettingKey` spells.
     fn box_probe_spec(&self) -> Option<StoredSetting> {
@@ -7065,7 +7218,7 @@ fn probe_says_ready(probe: Option<&Value>) -> bool {
 ///
 /// Private, because `PgStore` cannot reach it: `project.settings` is `JSONB NOT NULL DEFAULT '{}'`
 /// there and the merge is Postgres's own `||`.
-fn settings_not_an_object(id: ProjectId, key: SettingKey) -> String {
+fn settings_not_an_object(id: ProjectId, key: impl core::fmt::Display) -> String {
     format!("project.settings of `{id}` is not a JSON object, so `{key}` cannot be merged into it")
 }
 
@@ -8294,6 +8447,42 @@ impl WriteStore for MemStore {
             return Err(StoreError::Constraint(refusal));
         }
         Ok(self.read(|state| state.stored_setting(rung, key)))
+    }
+
+    async fn queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+    ) -> Result<Option<QueueStored>> {
+        if let Some(refusal) = queue_target_refusal(key, target) {
+            return Err(StoreError::Constraint(refusal));
+        }
+        let user = self.this_user();
+        Ok(self.read(|state| state.queue_setting(user, target, key)))
+    }
+
+    async fn set_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        value: Value,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        // Both before the write lock: `this_user` takes the read lock (blueprint F-K).
+        let user = self.this_user();
+        let now = self.now();
+        self.write(|state| state.write_queue_setting(user, target, key, Some(value), expected, now))
+    }
+
+    async fn clear_queue_setting(
+        &self,
+        target: QueueTarget,
+        key: QueueSetting,
+        expected: QueueToken,
+    ) -> Result<CasOutcome<QueueStored>> {
+        let user = self.this_user();
+        let now = self.now();
+        self.write(|state| state.write_queue_setting(user, target, key, None, expected, now))
     }
 
     async fn delete_reach(&self, target: DeleteTarget) -> Result<Option<DeleteReach>> {
