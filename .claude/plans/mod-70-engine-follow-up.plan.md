@@ -1,6 +1,6 @@
 # Plan: MOD-70 — Follow-up command rows for engine steps
 
-**Status: CONFIRMED by the maintainer 2026-10-06, OQ-1…OQ-6 as recommended (`i` key, `follow_up_window`
+**Status: IMPLEMENTED 2026-10-07 (T0-T6, review rounds R1/R2; `docs/decisions/mod/mod-70.md`). CONFIRMED by the maintainer 2026-10-06, OQ-1…OQ-6 as recommended (`i` key, `follow_up_window`
 table, follow-up turns count toward the step deadline and the run cap, refuse before the session
 starts, a dead walk's row waits for recovery or cancel, text never echoed). Fact-checked at step 3.5
 (141 claims, 123 true, 13 partial, 5 false (4 distinct); all amended in place, see "Verified claims").**

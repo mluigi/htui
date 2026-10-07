@@ -14,7 +14,14 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-04):** **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
+**Current status (2026-10-07):** **MOD-70 is done** (`docs/decisions/mod/mod-70.md`): a follow-up
+typed in any TUI reaches a step an engine walks, in process or on a worker, on any box. `i` on a running
+engine step queues a `follow_up` `run_command` row (the typing box refuses a credential-shaped text); the
+walking process claims it at the turn's `done` with a fenced compare-and-set that nulls the text, records
+it scrubbed at `turn + 1`, sends it and drives on, then closes the step's `follow_up_window`. Judges, chat
+and `pump` are unchanged; follow-up turns count toward the step deadline and the run cap. Migration `0016`;
+every box upgrades together (an older binary cannot cancel once it is applied).
+Before it, **MOD-84 is done** (`docs/decisions/mod/mod-84.md`): the Body
 pane reflows an item's hard-wrapped Markdown before wrapping it. Soft-wrapped lines of a paragraph or list item
 join, list items hang under their text, blank lines, fences, headings, tables and quotes stay as written, and inline
 code is drawn in the accent style without its backticks (`ui::markdown`, `cells::wrap_spans`). The scroll counts
@@ -26,32 +33,9 @@ degraded store label, the waiting count) and diff-added (green) have their own `
 the terminal foreground plus bold, `dim` is `Indexed(244)`, and active tabs are bold and underlined.
 `NO_COLOR` selects `Theme::monochrome()`, which marks everything with modifiers alone. Style only, no
 text or snapshot change. The remaining non-focus cyan is **MOD-85**.
-Before it, **MOD-77 is done** (`docs/decisions/mod/mod-77.md`): every fenced
-Postgres step writer locks the step before the run, `park_step`'s order, so none can deadlock (`40P01`)
-against a park. Step updaters take `FOR NO KEY UPDATE OF s FOR SHARE OF r` up front; reader-inserters
-(`append_events`, `record_commits`, the relay's `open_permission`) take `FOR KEY SHARE OF s FOR SHARE OF
-r`; `finish_chat_run` locks its step first. Fifteen deterministic lock-order tests. No migration; `.sqlx`
-regenerated.
-Before it, **MOD-69 is done** (`docs/decisions/mod/mod-69.md`): a
-waiting-on-you list. `Ctrl+W` opens, from every screen, an overlay listing every run in the active
-workspace that waits on a person, one row per reason (gate, selection, judge failed, unblock,
-interrupted, open permission with its tool); `Enter` opens the item's Runs tab on that step. The top
-bar reads `N working · M waiting`. It is derived each tick by `StoreRequest::Waiting` (replacing
-`ActiveRuns`) from `ReadStore::waiting_candidates` + `WriteStore::open_permissions` and the pure
-`htui_worker::waiting`, which reuses the Runs pane's guards; the list keeps no state. `R-TUI-11`
-added, `R-TUI-1` amended. No migration, no new crate, four new `.sqlx` entries. It spawned **MOD-75**
-(agent question tool, blocked on MOD-11).
-Before it, **MOD-76 is done** (`docs/decisions/mod/mod-76.md`): MOD-37's four
-carried risks. R-32 and R-53 closed as accepted with no code. The Runs pane shortens `agent/model`
-before it cuts it (a trailing `-YYYYMMDD` and a leading `{agent}-` go, so
-`claude/claude-sonnet-4-5-20250929` reads `claude/sonnet-4-5`). A `command_limits` edit now reaches
-the verifier with no restart: the TUI at its next walking `StartRun`, `htui worker` at its next sweep
-with no run walking, never under a live walk. No migration.
-Live coordinates after MOD-11: migrations run through `0015_command_queue` (`command_run.claimed_by`,
-`heartbeat_at`), so **the next migration is `0016`** (cache: `0005`). MOD-37's `0014_run_step_opening` and
-MOD-11's queue migration both landed as `0014`; MOD-11's was renumbered at the merge. Pins: store
-conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES` 15, `htui-orch` `CASES` 100.
-
+Live coordinates after MOD-70: migrations run through `0016_follow_up` (`run_command.run_step_id`,
+`text`; `follow_up_window`), so **the next migration is `0017`** (cache: `0005`). Pins: store conformance
+`CASES` 157, `READ_CASES` 15, `htui-orch` `CASES` 100; Postgres tables 43.
 ---
 
 ## Open items
@@ -283,13 +267,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
   review H1's path). `cargo check` the `#[cfg(windows)]` half of `EnableButtonMouseCapture`
   (`crates/htui/src/terminal.rs`, MOD-74 D5), which no Linux build compiles.
 
-- [ ] **MOD-70 - Follow-up command rows for engine steps** (from MOD-42, PRD Q9;
-  `docs/decisions/mod/mod-42.md`). `R-AGT-1`, `R-HIS-1`. MOD-42's `run_command` table carries only
-  `kind = 'cancel'`; a follow-up typed in any TUI for a step an engine walks (in process or on a
-  worker, on any box) would be a second kind, applied by the lease holder like a cancel. Open first:
-  the engine has no follow-up verb and ANA-2 no state that accepts one (a walk's session ends at
-  `done` before the step parks, `docs/ANA-2.md:1235-1238`), and the text is typed on one box but must
-  be scrubbed on the executing box (`R-SEC-3`, `R-ID-7`). Not blocked.
 - [ ] **MOD-78 - `command_run` lifecycle: lease check and cancel on session end** (from MOD-11,
   `docs/decisions/mod/mod-11.md`). `R-MCP-1`, `R-MCP-3`. `command_run` is not fenced (MOD-11's I-3
   reads "every item write"). A session whose walk lost its lease can queue and run commands until the
@@ -489,6 +466,6 @@ conformance `CASES` 146 (148 with MOD-69's two waiting-list cases), `READ_CASES`
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-70 engine follow-up, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 23 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-79 MCP token off argv, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-55 agent help in the editor, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

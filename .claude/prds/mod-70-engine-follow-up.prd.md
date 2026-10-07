@@ -117,8 +117,8 @@ Decisions taken at the PRD gate (maintainer, 2026-10-06, recommended answers):
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Follow-up row and engine verb | A follow-up row queued for a `running` step (any executor, any box) is applied at the next turn end, recorded scrubbed at `turn + 1`, and resolved `applied`/`refused` with its text cleared (proven by store conformance and engine/worker tests) | in-progress | `.claude/plans/mod-70-engine-follow-up.plan.md` (T0-T4) |
-| 2 | Runs-tab follow-up | The user types a follow-up with `f` on a running step in any TUI, sees it queued and how it resolved; docs updated | in-progress | `.claude/plans/mod-70-engine-follow-up.plan.md` (T5, T6) |
+| 1 | Follow-up row and engine verb | A follow-up row queued for a `running` step (any executor, any box) is applied at the next turn end, recorded scrubbed at `turn + 1`, and resolved `applied`/`refused` with its text cleared (proven by store conformance and engine/worker tests) | complete | `.claude/plans/mod-70-engine-follow-up.plan.md` (T0-T4) |
+| 2 | Runs-tab follow-up | The user types a follow-up with `f` on a running step in any TUI, sees it queued and how it resolved; docs updated | complete | `.claude/plans/mod-70-engine-follow-up.plan.md` (T5, T6) |
 
 ## Open Questions
 
@@ -146,4 +146,4 @@ Decisions taken at the PRD gate (maintainer, 2026-10-06, recommended answers):
 | A cancel and a follow-up interleave | Low | Medium | Cancel refuses pending follow-ups (Q4); conformance case |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: COMPLETE — both milestones shipped (2026-10-07); write-up `docs/decisions/mod/mod-70.md`.*
