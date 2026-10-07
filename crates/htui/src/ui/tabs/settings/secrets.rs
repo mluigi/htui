@@ -362,6 +362,10 @@ pub struct SecretsSection {
     checking: Option<Checking>,
     /// The last provider check of this session.
     provider_check: Option<(DateTime<Utc>, Result<ProviderHealth, SecretError>)>,
+    /// A keyring write landed after [`provider_check`](Self::provider_check): the provider that
+    /// check latched is rebuilt on the next `provider()` (blueprint A-4), so its latch line is
+    /// no longer true. The next provider check answers afresh.
+    rebuilt_since_check: bool,
     /// The last scope check per project of this workspace, this session.
     scope_checks: BTreeMap<ProjectId, (DateTime<Utc>, Result<usize, SecretError>)>,
     /// The last outcome.
@@ -871,17 +875,19 @@ impl SecretsSection {
         format!("{scope}{check}")
     }
 
-    /// Whether the last provider check latched the shared provider (M2 D5).
+    /// Whether the last provider check latched the shared provider (M2 D5), and no keyring
+    /// write has landed since to rebuild it (A-4).
     fn latched(&self) -> bool {
-        matches!(
-            self.provider_check,
-            Some((
-                _,
-                Err(SecretError::BadCredentials
-                    | SecretError::IdentityLocked
-                    | SecretError::LoginRefusedEarlier)
-            ))
-        )
+        !self.rebuilt_since_check
+            && matches!(
+                self.provider_check,
+                Some((
+                    _,
+                    Err(SecretError::BadCredentials
+                        | SecretError::IdentityLocked
+                        | SecretError::LoginRefusedEarlier)
+                ))
+            )
     }
 
     /// The rows: the four fixed ones, the `Projects` line, one per project, then the guide.
@@ -1075,6 +1081,7 @@ impl SecretsSection {
             Some(Write::Scope { .. }) | None => return,
         };
         self.busy = None;
+        self.rebuilt_since_check = true;
         self.say(said);
     }
 
@@ -1139,6 +1146,7 @@ impl SecretsSection {
                     self.checking = None;
                 }
                 self.provider_check = Some((*at, outcome.clone()));
+                self.rebuilt_since_check = false;
             }
             SecretCheck::Scope {
                 project,

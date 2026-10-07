@@ -1548,6 +1548,44 @@ async fn a_latching_refusal_shows_the_latch_line() {
 }
 
 #[tokio::test]
+async fn a_landed_identity_write_lifts_the_latch_line_until_the_next_check() {
+    // A-4: every landed keyring write rebuilds the provider, so the latch the last check saw is
+    // gone; the Health row keeps the check's own outcome, and the next check speaks again.
+    let latch = "the last login was refused";
+    let refused = || {
+        StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            outcome: Err(SecretError::BadCredentials),
+        })
+    };
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(&mut section, &refused());
+    assert!(frame(&bench, &section).contains(latch));
+
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::SetMachineIdentity(_)]
+    ));
+    assert!(
+        frame(&bench, &section).contains(latch),
+        "the write has not landed yet"
+    );
+    bench.reply(&mut section, &configured());
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains(latch), "{shown}");
+    assert!(shown.contains("last check 14:02:11"), "{shown}");
+
+    bench.reply(&mut section, &refused());
+    assert!(frame(&bench, &section).contains(latch));
+}
+
+#[tokio::test]
 async fn a_scope_check_shows_a_count() {
     let (bench, mut section, _) = loaded_over(&scoped_store(), configured()).await;
     for (count, expected) in [(12, "12 keys visible"), (1, "1 key visible")] {

@@ -3,8 +3,9 @@
 //! A registry for the same reason the tabs and the detail sub-tabs are one (MOD-1 plan D5):
 //! MOD-2's agent registry, MOD-7's `Boxes` section (every box of the user, this box marked),
 //! MOD-9's skills, MOD-15's hierarchy, MOD-26's persona registry (`Personas`, milestone 2) and
-//! MOD-10's secret provider (`Secrets`, milestone 4) each want a section of this tab, and each should be a file plus one `register` line rather
-//! than a `match` arm growing in here. [`SettingsSection`] mirrors
+//! MOD-10's secret provider (`Secrets`, milestone 4) each want a section of this tab, and each
+//! should be a file plus one `register` line rather than a `match` arm growing in here.
+//! [`SettingsSection`] mirrors
 //! [`DetailTab`](crate::ui::tabs::backlog::detail::DetailTab) one level across, with
 //! [`on_scope_change`](SettingsSection::on_scope_change) where the detail pane has
 //! `on_item_change`: a section is scoped to a workspace, not to an item.
