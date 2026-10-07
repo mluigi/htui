@@ -453,13 +453,9 @@ pub async fn serve(backend: &Backend, request: &StoreRequest) -> Result<StoreRep
 /// and this read is a [`StoreError::NotFound`] rather than a `Hierarchy(None)`: the write just
 /// succeeded against it.
 async fn reread(writer: &Writer, ws: WorkspaceId, this_box: Option<BoxId>) -> Result<StoreReply> {
-    let snapshot = snapshot(writer, ws, this_box)
-        .await?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "workspace",
-            id: ws.to_string(),
-        })?;
-    Ok(StoreReply::Hierarchy(Some(Box::new(snapshot))))
+    Ok(StoreReply::Hierarchy(Some(Box::new(
+        fresh_tree(writer, ws, this_box).await?,
+    ))))
 }
 
 /// A compare-and-set outcome as a reply: `Applied` answers the fresh tree, `Stale` answers the
@@ -473,23 +469,16 @@ async fn cas<T>(
     this_box: Option<BoxId>,
     outcome: &CasOutcome<T>,
 ) -> Result<StoreReply> {
-    match outcome {
-        CasOutcome::Applied(_) => reread(writer, ws, this_box).await,
-        CasOutcome::Stale(_) => {
-            let snapshot =
-                snapshot(writer, ws, this_box)
-                    .await?
-                    .ok_or_else(|| StoreError::NotFound {
-                        entity: "workspace",
-                        id: ws.to_string(),
-                    })?;
-            Ok(StoreReply::HierarchyStale(Box::new(snapshot)))
-        }
-    }
+    let tree = Box::new(fresh_tree(writer, ws, this_box).await?);
+    Ok(match outcome {
+        CasOutcome::Applied(_) => StoreReply::Hierarchy(Some(tree)),
+        CasOutcome::Stale(_) => StoreReply::HierarchyStale(tree),
+    })
 }
 
 /// The tree for a write, or [`StoreError::NotFound`] when the workspace vanished under it: the
-/// write was just made against it, so `None` is not an answer.
+/// write was just made against it, so `None` is not an answer. The one place that refusal is
+/// built: `reread`, `cas` and `infer` all re-read through here (CLEAN-8 #6).
 async fn fresh_tree(
     writer: &Writer,
     ws: WorkspaceId,
@@ -574,12 +563,7 @@ async fn infer(
     this_box: Option<BoxId>,
 ) -> Result<StoreReply> {
     let box_id = box_id(this_box)?;
-    let tree = snapshot(writer, ws, this_box)
-        .await?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "workspace",
-            id: ws.to_string(),
-        })?;
+    let tree = fresh_tree(writer, ws, this_box).await?;
     let Some(root_row) = &tree.root_path else {
         return Ok(StoreReply::RepoPathsInferred {
             tree: Box::new(tree),
@@ -651,12 +635,7 @@ async fn infer(
         });
     }
 
-    let fresh = snapshot(writer, ws, this_box)
-        .await?
-        .ok_or_else(|| StoreError::NotFound {
-            entity: "workspace",
-            id: ws.to_string(),
-        })?;
+    let fresh = fresh_tree(writer, ws, this_box).await?;
     Ok(StoreReply::RepoPathsInferred {
         tree: Box::new(fresh),
         report: InferReport {
