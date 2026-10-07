@@ -1,0 +1,246 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT e.item_id         AS \"item_id: ItemId\",\n                   i.project_id      AS \"project_id: ProjectId\",\n                   e.box_id          AS \"box_id: BoxId\",\n                   e.position,\n                   e.queued_at,\n                   e.queued_by       AS \"queued_by: UserId\",\n                   i.key             AS \"key!\",\n                   i.title,\n                   i.status          AS \"status: Status\",\n                   i.priority,\n                   i.created_at,\n                   lr.id             AS \"run_id?: RunId\",\n                   lr.status         AS \"run_status?: RunStatus\",\n                   lr.mode           AS \"run_mode?: RunMode\",\n                   lr.target_box_id  AS \"run_target?: BoxId\",\n                   lr.hostname       AS \"run_hostname?\",\n                   lr.failure        AS \"run_failure?\",\n                   lr.parked_step    AS \"run_parked_step?: StepId\",\n                   ln.body           AS \"note?\",\n                   COALESCE(ob.keys, '{}'::text[]) AS \"blockers!\"\n              FROM queue_entry e\n              JOIN item i ON i.id = e.item_id\n              LEFT JOIN LATERAL (\n                    SELECT r.id, r.status, r.mode, r.target_box_id, tb.hostname, r.failure,\n                           (SELECT s.id FROM run_step s\n                             WHERE s.run_id = r.id AND s.status = 'awaiting_approval'\n                             ORDER BY s.position, s.attempt, s.fanout_index\n                             LIMIT 1) AS parked_step\n                      FROM run r\n                      LEFT JOIN box tb ON tb.id = r.target_box_id\n                     WHERE r.item_id = i.id AND r.kind = 'graph'\n                     ORDER BY r.queued_at DESC, r.id DESC\n                     LIMIT 1\n                   ) lr ON true\n              LEFT JOIN LATERAL (\n                    SELECT n.body FROM item_note n\n                     WHERE n.item_id = i.id\n                     ORDER BY n.created_at DESC, n.id DESC\n                     LIMIT 1\n                   ) ln ON true\n              LEFT JOIN LATERAL (\n                    SELECT array_agg(t.key ORDER BY t.key COLLATE \"C\") AS keys\n                      FROM item_link l JOIN item t ON t.id = l.to_item_id\n                     WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'\n                       AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed')\n                   ) ob ON true\n             WHERE e.box_id = $1\n             ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_entry",
+            "name": "item_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "project_id: ProjectId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "project_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "box_id: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_entry",
+            "name": "box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "position",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "queue_entry",
+            "name": "position"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "queued_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "queue_entry",
+            "name": "queued_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "queued_by: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_entry",
+            "name": "queued_by"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "title",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "title"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "status: Status",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "priority",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "priority"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "run_id?: RunId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "run_status?: RunStatus",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "run_mode?: RunMode",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "mode"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "run_target?: BoxId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "target_box_id"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "run_hostname?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "box",
+            "name": "hostname"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "run_failure?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "run",
+            "name": "failure"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "run_parked_step?: StepId",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 18,
+        "name": "note?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "item_note",
+            "name": "body"
+          }
+        }
+      },
+      {
+        "ordinal": 19,
+        "name": "blockers!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      null,
+      false,
+      null
+    ]
+  },
+  "hash": "609623b8e564843db833c2f7385e09e2a72a3c506fd21b090c8473d6605ed46a"
+}

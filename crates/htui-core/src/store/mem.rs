@@ -37,18 +37,18 @@ use crate::model::{
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
     ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
-    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps,
-    prompt_summary, scope_of,
+    QueueEntry, QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId,
+    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
+    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -961,52 +961,79 @@ impl MemStore {
         Ok(self.write(|state| state.queue_entries.remove(&item).is_some()))
     }
 
-    /// MOD-12 M3 D3: stub (red).
+    /// MOD-12 M3 D3: moves `item` one place `to` in `box_id`'s queue, in one closure. The first
+    /// move of a queue writes `position = 1..n` over every entry in the current D2 order, so an
+    /// entry queued later (`None`) goes after them. `false`, writing nothing, when `item` is not
+    /// in `box_id`'s queue or is already at that end. Never touches `item.priority`.
     ///
     /// # Errors
-    /// Never.
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn move_queue_entry(
         &self,
         box_id: BoxId,
         item: ItemId,
-        to: crate::model::QueueMove,
+        to: QueueMove,
     ) -> Result<bool> {
-        let _ = (box_id, item, to);
-        Ok(false)
+        Ok(self.write(|state| {
+            let order: Vec<ItemId> = state
+                .queue_sorted(box_id)
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect();
+            let Some(moved) = moved_order(&order, item, to) else {
+                return false;
+            };
+            for (position, id) in (1..).zip(moved) {
+                if let Some(entry) = state.queue_entries.get_mut(&id) {
+                    entry.position = Some(position);
+                }
+            }
+            true
+        }))
     }
 
-    /// MOD-12 D4: `box_id`'s entries, `position NULLS LAST, queued_at, item_id`. `ItemId`'s `Ord`
-    /// is uuid byte order, which is Postgres' uuid order.
+    /// MOD-12 D4, M3 D2: `box_id`'s queue entries in queue order, `position NULLS LAST, priority
+    /// DESC, created_at, id`: `admission_order`'s order over every entry, ready or not.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
-        Ok(self.read(|state| {
-            let mut rows: Vec<QueueEntry> = state
-                .queue_entries
-                .values()
-                .filter(|entry| entry.box_id == box_id)
-                .cloned()
-                .collect();
-            rows.sort_by_key(|entry| {
-                (
-                    entry.position.is_none(),
-                    entry.position,
-                    entry.queued_at,
-                    entry.item_id,
-                )
-            });
-            rows
-        }))
+        Ok(self.read(|state| state.queue_sorted(box_id)))
     }
 
-    /// MOD-12 M3 D6: stub (red).
+    /// MOD-12 M3 D6: `box_id`'s entries in queue order (D2), each with its item's key, title,
+    /// status, priority and `created_at`, its latest graph run (target hostname, parked step), its
+    /// latest note and its open `blocked_by` keys. An entry whose item is gone is skipped, as
+    /// Postgres' inner join skips it.
     ///
     /// # Errors
-    /// Never.
-    pub async fn queue_rows(&self, box_id: BoxId) -> Result<Vec<crate::model::QueueRow>> {
-        let _ = box_id;
-        Ok(Vec::new())
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn queue_rows(&self, box_id: BoxId) -> Result<Vec<QueueRow>> {
+        Ok(self.read(|state| {
+            state
+                .queue_sorted(box_id)
+                .into_iter()
+                .filter_map(|entry| {
+                    let item = state.items.get(&entry.item_id)?;
+                    Some(QueueRow {
+                        key: item.key.clone(),
+                        title: item.title.clone(),
+                        status: item.status,
+                        priority: item.priority,
+                        created_at: item.created_at,
+                        latest_run: state.latest_queue_run(item.id),
+                        latest_note: state
+                            .notes
+                            .iter()
+                            .filter(|note| note.item_id == item.id)
+                            .max_by_key(|note| (note.created_at, note.id))
+                            .map(|note| note.body.clone()),
+                        open_blockers: state.open_blocker_keys(item.id),
+                        entry,
+                    })
+                })
+                .collect()
+        }))
     }
 
     /// MOD-12 D2: resume — the open batch of `box_id`, opened now under a fresh `BatchId` unless
@@ -1056,7 +1083,7 @@ impl MemStore {
     /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
     ///
     /// In the same closure every run of the batch still `queued` is cancelled through
-    /// [`State::finish_run`], so its item goes back to `open` and its queue entry stays (review
+    /// `State::finish_run`, so its item goes back to `open` and its queue entry stays (review
     /// H2): a pause stops the runs nobody has claimed yet. A `drained` close finds none.
     ///
     /// # Errors
@@ -4933,6 +4960,75 @@ impl State {
         self.queue_batches
             .values()
             .find(|batch| batch.box_id == box_id && batch.closed_at.is_none())
+    }
+
+    /// MOD-12 M3 D2: `box_id`'s entries in queue order: `position` first (`None` last), then the
+    /// item's `priority DESC, created_at, id` (`ready_items`' order). `ItemId`'s `Ord` is uuid
+    /// byte order, Postgres' uuid order.
+    fn queue_sorted(&self, box_id: BoxId) -> Vec<QueueEntry> {
+        let mut rows: Vec<QueueEntry> = self
+            .queue_entries
+            .values()
+            .filter(|entry| entry.box_id == box_id)
+            .cloned()
+            .collect();
+        rows.sort_by_cached_key(|entry| {
+            let item = self.items.get(&entry.item_id);
+            (
+                entry.position.is_none(),
+                entry.position,
+                core::cmp::Reverse(item.map_or(0, |item| item.priority)),
+                item.map(|item| item.created_at),
+                entry.item_id,
+            )
+        });
+        rows
+    }
+
+    /// MOD-12 M3 D6: `item`'s latest `kind = 'graph'` run by `(queued_at, id)`, with its target
+    /// box's hostname and its first `awaiting_approval` step by `(position, attempt,
+    /// fanout_index)`.
+    fn latest_queue_run(&self, item: ItemId) -> Option<QueueRunFact> {
+        let run = self
+            .runs
+            .values()
+            .filter(|run| run.item_id == Some(item) && run.kind == RunKind::Graph)
+            .max_by_key(|run| (run.queued_at, run.id))?;
+        Some(QueueRunFact {
+            id: run.id,
+            status: run.status,
+            mode: run.mode,
+            target_box_id: run.target_box_id,
+            target_hostname: self
+                .boxes
+                .get(&run.target_box_id)
+                .map(|row| row.hostname.clone()),
+            failure: run.failure.clone(),
+            parked_step: self
+                .steps
+                .values()
+                .filter(|step| step.run_id == run.id && step.status == StepStatus::AwaitingApproval)
+                .min_by_key(|step| (step.position, step.attempt, step.fanout_index))
+                .map(|step| step.id),
+        })
+    }
+
+    /// MOD-12 M3 D6: the keys of `item`'s live `blocked_by` targets that are not terminal, in
+    /// byte order, once each: [`State::is_ready`]'s blocker rule, named.
+    fn open_blocker_keys(&self, item: ItemId) -> Vec<String> {
+        let keys: BTreeSet<String> = self
+            .links
+            .iter()
+            .filter(|link| {
+                link.deleted_at.is_none()
+                    && link.kind == LinkKind::BlockedBy
+                    && link.from_item_id == item
+            })
+            .filter_map(|link| self.items.get(&link.to_item_id))
+            .filter(|target| !target.status.is_terminal())
+            .map(|target| target.key.clone())
+            .collect();
+        keys.into_iter().collect()
     }
 
     /// [`State::require_run`] for an `item`.

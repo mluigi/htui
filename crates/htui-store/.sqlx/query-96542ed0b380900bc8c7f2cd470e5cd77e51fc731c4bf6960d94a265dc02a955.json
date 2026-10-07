@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT item_id FROM queue_entry WHERE box_id = $1 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "queue_entry",
+            "name": "item_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "96542ed0b380900bc8c7f2cd470e5cd77e51fc731c4bf6960d94a265dc02a955"
+}

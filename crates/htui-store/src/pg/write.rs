@@ -31,17 +31,17 @@ use htui_core::model::{
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
     PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
     PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueSetting,
-    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
-    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps,
-    scope_of,
+    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, moved_order,
+    overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -7938,19 +7938,78 @@ impl PgStore {
         Ok(gone == 1)
     }
 
-    /// MOD-12 M3 D3: stub (red).
+    /// MOD-12 M3 D3: moves `item` one place `to` in `box_id`'s queue, atomically. The first move
+    /// of a queue writes `position = 1..n` over every entry in the current D2 order, so an entry
+    /// queued later (`NULL`) goes after them. `false`, writing nothing, when `item` is not in
+    /// `box_id`'s queue or is already at that end. Never touches `item.priority`.
+    ///
+    /// One transaction, three statements (blueprint §B.3.3, §F-12):
+    /// 1. lock the box's entries, **without** `ORDER BY`: under `READ COMMITTED` a locking select
+    ///    that waited on a concurrent move may return its rows in their pre-wait order;
+    /// 2. re-read them in D2 order with [`queue_entries`](PgStore::queue_entries)' literal, byte
+    ///    for byte; a later statement, its snapshot sees every commit the lock waited for;
+    /// 3. write the moved order as `position = 1..n` in one `UNNEST` update.
+    ///
+    /// A concurrent `queue_item` inserts `NULL`, which sorts after the written positions; a
+    /// concurrent `dequeue_item` waits on the row lock.
     ///
     /// # Errors
     ///
-    /// Never.
+    /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn move_queue_entry(
         &self,
         box_id: BoxId,
         item: ItemId,
-        to: htui_core::model::QueueMove,
+        to: QueueMove,
     ) -> Result<bool> {
-        let _ = (box_id, item, to);
-        Ok(false)
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        sqlx::query_scalar!(
+            "SELECT item_id FROM queue_entry WHERE box_id = $1 FOR UPDATE",
+            box_id.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let entries = sqlx::query_as!(
+            QueueEntry,
+            r#"
+            SELECT e.item_id    AS "item_id: ItemId",
+                   i.project_id AS "project_id: ProjectId",
+                   e.box_id     AS "box_id: BoxId",
+                   e.position,
+                   e.queued_at,
+                   e.queued_by  AS "queued_by: UserId"
+              FROM queue_entry e JOIN item i ON i.id = e.item_id
+             WHERE e.box_id = $1
+             ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let order: Vec<ItemId> = entries.iter().map(|entry| entry.item_id).collect();
+        let Some(moved) = moved_order(&order, item, to) else {
+            return Ok(false); // the dropped `tx` rolls back: nothing was written
+        };
+        let items: Vec<Uuid> = moved.iter().map(|id| id.as_uuid()).collect();
+        let positions: Vec<i32> = (1..).take(items.len()).collect();
+        sqlx::query!(
+            r#"
+            UPDATE queue_entry e
+               SET position = v.position
+              FROM UNNEST($2::uuid[], $3::int4[]) AS v(item_id, position)
+             WHERE e.box_id = $1 AND e.item_id = v.item_id
+            "#,
+            box_id.as_uuid(),
+            &items[..],
+            &positions[..],
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
     }
 
     /// MOD-12 D2: resume — the open batch of `box_id`, opened now under a fresh [`BatchId`]
