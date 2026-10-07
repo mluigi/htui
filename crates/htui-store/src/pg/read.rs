@@ -2248,6 +2248,16 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-12 M3 D6: stub (red).
+    ///
+    /// # Errors
+    ///
+    /// Never.
+    pub async fn queue_rows(&self, box_id: BoxId) -> Result<Vec<htui_core::model::QueueRow>> {
+        let _ = box_id;
+        Ok(Vec::new())
+    }
+
     /// MOD-12 D2: `box_id`'s open batch, if any: whether its queue runs. `uq_queue_batch_open`
     /// keeps it at most one.
     ///

@@ -28,11 +28,11 @@ use htui_core::model::{
     AgentBox, AgentSummary, BatchClose, BatchId, BoundSkill, BoxId, BoxInfo, BoxProfile, BoxRow,
     CoverageRow, Document, DocumentHead, DocumentId, Item, ItemCitation, ItemFilter, ItemId,
     ItemKind, ItemKindId, ItemSummary, LinkGraph, Note, PhaseAgent, PhaseId, Project, ProjectId,
-    ProjectRef, PromptScope, PromptTemplate, QueueBatch, QueueEntry, RepoBoxPath, RepoId,
-    Requirement, RequirementArea, RequirementFilter, RequirementId, RequirementRevision,
-    RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId, StepId, ToolCallCount,
-    UpstreamEntry, UserId, WaitingCandidate, WorkspaceSummary,
+    ProjectRef, PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueueMove, QueueRow,
+    RepoBoxPath, RepoId, Requirement, RequirementArea, RequirementFilter, RequirementId,
+    RequirementRevision, RequirementSpec, ResolvedGraph, ResolvedInput, Run, RunId, RunStatus,
+    RunStep, RunStepCommit, RunStepTree, RunSummary, Scope, SessionEvent, StepGraph, StepGraphId,
+    StepId, ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WorkspaceSummary,
 };
 use htui_core::store::{MemStore, ReadStore, Result, StoreError};
 use serde_json::Value;
@@ -624,7 +624,29 @@ impl Backend {
         }
     }
 
-    /// MOD-12 D4: `box_id`'s queue entries, `position NULLS LAST, queued_at, item_id`.
+    /// MOD-12 M3 D3: moves `item` one place `to` in `box_id`'s queue, atomically; the first move
+    /// writes `position = 1..n` over the current order. `false`, writing nothing, when `item` is
+    /// not in `box_id`'s queue or is already at that end. Never touches `item.priority`.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn move_queue_entry(
+        &self,
+        box_id: BoxId,
+        item: ItemId,
+        to: QueueMove,
+    ) -> Result<bool> {
+        match self {
+            Self::Memory(store) => store.move_queue_entry(box_id, item, to).await,
+            Self::Online { pg, .. } => pg.move_queue_entry(box_id, item, to).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 D4, M3 D2: `box_id`'s queue entries in queue order, `position NULLS LAST, priority
+    /// DESC, created_at, id`.
     ///
     /// # Errors
     ///
@@ -634,6 +656,22 @@ impl Backend {
         match self {
             Self::Memory(store) => store.queue_entries(box_id).await,
             Self::Online { pg, .. } => pg.queue_entries(box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
+    /// MOD-12 M3 D6: `box_id`'s entries in queue order (D2), each with its item's key, title,
+    /// status, priority and `created_at`, its latest graph run (target hostname, parked step), its
+    /// latest note and its open `blocked_by` keys.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn queue_rows(&self, box_id: BoxId) -> Result<Vec<QueueRow>> {
+        match self {
+            Self::Memory(store) => store.queue_rows(box_id).await,
+            Self::Online { pg, .. } => pg.queue_rows(box_id).await,
             Self::Offline { .. } => Err(orchestration_offline()),
         }
     }
@@ -1144,6 +1182,33 @@ mod tests {
         );
         assert!(connecting.box_info().await.expect("mirror read").is_none());
 
+        cache.close().await;
+    }
+
+    /// MOD-12 M3 D3, D6: the queue overlay's read and its move are orchestration, refused offline
+    /// rather than answered from the mirror.
+    #[tokio::test]
+    async fn an_offline_backend_refuses_the_queue_rows_and_the_move() {
+        use htui_core::fixtures::ids;
+        use htui_core::model::QueueMove;
+        use htui_core::store::StoreError;
+
+        let root = tempfile::tempdir().expect("temp root");
+        let cache = cache(root.path()).await;
+        let offline = Backend::Offline {
+            cache: cache.clone(),
+            since: None,
+        };
+        assert!(matches!(
+            offline.queue_rows(ids::BOX).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline
+                .move_queue_entry(ids::BOX, ids::HTUI_ANA_2, QueueMove::Up)
+                .await,
+            Err(StoreError::Unreachable(_))
+        ));
         cache.close().await;
     }
 }

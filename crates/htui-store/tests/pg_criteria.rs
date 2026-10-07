@@ -7662,7 +7662,11 @@ async fn queue_surface_answers_alike_on_both_stores() {
         "same entries, same order"
     );
     assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].item_id, ids::HTUI_ANA_2, "queued_at first");
+    assert_eq!(
+        entries[0].item_id,
+        ids::HTUI_ANA_1,
+        "priority, then created_at (M3 D2)"
+    );
 
     assert!(matches!(
         pg.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
@@ -9591,6 +9595,438 @@ async fn an_unknown_actor_on_a_follow_up_is_refused_before_the_status() {
         common::count(&db.pool, "run_command").await,
         0,
         "nothing was written"
+    );
+
+    db.drop_db().await;
+}
+
+// ---- MOD-12 M3: D2 order, queue_rows, move_queue_entry (blueprint §C.3) ------------------------
+
+/// A ready, untagged `htui` FEAT at `priority` under the id `id`, minted on `store`.
+async fn queue_feat<S: htui_core::store::WriteStore>(store: &S, id: ItemId, priority: i16) {
+    store
+        .mint_item(NewItem {
+            id,
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: format!("queue order at priority {priority}"),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("the mint lands");
+}
+
+/// `box_id`'s queue on Postgres and on `mem`, asserted equal (positions included), as item ids.
+async fn queue_alike(pg: &PgStore, mem: &htui_core::store::MemStore, box_id: BoxId) -> Vec<ItemId> {
+    let entries = pg.queue_entries(box_id).await.expect("queue_entries");
+    assert_eq!(
+        entries,
+        mem.queue_entries(box_id).await.expect("queue_entries"),
+        "same entries, same order, same positions"
+    );
+    entries.into_iter().map(|entry| entry.item_id).collect()
+}
+
+/// MOD-12 M3 D2: both stores read one queue order, `position NULLS LAST, priority DESC,
+/// created_at, id`: priorities 0/2/1 queued in that order read 2, 1, then the fixture's priority-0
+/// `ANA-1` and `ANA-2` by `created_at`, then the minted priority-0 FEAT.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_entries_follow_one_order_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (p0, p2, p1) = (ItemId::new(), ItemId::new(), ItemId::new());
+    for (id, priority) in [(p0, 0), (p2, 2), (p1, 1)] {
+        queue_feat(pg, id, priority).await;
+        queue_feat(&mem, id, priority).await;
+    }
+    let at = Utc::now();
+    for (seconds, item) in [p0, p2, p1, ids::HTUI_ANA_2, ids::HTUI_ANA_1]
+        .into_iter()
+        .enumerate()
+    {
+        let when = at + TimeDelta::seconds(i64::try_from(seconds).expect("small"));
+        pg.queue_item(item, ids::BOX, ids::USER, when)
+            .await
+            .expect("queue on Postgres");
+        mem.queue_item(item, ids::BOX, ids::USER, when)
+            .await
+            .expect("queue on MemStore");
+    }
+
+    assert_eq!(
+        queue_alike(pg, &mem, ids::BOX).await,
+        [p2, p1, ids::HTUI_ANA_1, ids::HTUI_ANA_2, p0],
+        "priority, then created_at; never queued_at"
+    );
+
+    db.drop_db().await;
+}
+
+/// The ids and instant [`plant_queue_facts`] writes under, shared by both stores.
+struct QueueFacts {
+    at: DateTime<Utc>,
+    laptop: BoxId,
+    cancelled: RunId,
+    latest: RunId,
+    laptop_run: RunId,
+    steps: [StepId; 3],
+    notes: [htui_core::model::NoteId; 2],
+}
+
+impl QueueFacts {
+    fn new() -> Self {
+        Self {
+            at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+            laptop: BoxId::new(),
+            cancelled: RunId::new(),
+            latest: RunId::new(),
+            laptop_run: RunId::new(),
+            steps: [StepId::new(), StepId::new(), StepId::new()],
+            notes: [
+                htui_core::model::NoteId::new(),
+                htui_core::model::NoteId::new(),
+            ],
+        }
+    }
+}
+
+/// The edges out of `HTUI_ANA_2` both stores plant: `(to, kind, tombstoned)`. `TOOL-1` (awaiting
+/// approval) and `FEAT-1` (in progress) are its open blockers; `ANA-1` is done, the `FEAT-3`
+/// edge is tombstoned and `FEAT-2`'s is `relates`.
+const QUEUE_EDGES: [(ItemId, htui_core::model::LinkKind, bool); 5] = [
+    (
+        ids::HTUI_TOOL_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::HTUI_FEAT_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::HTUI_ANA_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::HTUI_FEAT_3,
+        htui_core::model::LinkKind::BlockedBy,
+        true,
+    ),
+    (ids::HTUI_FEAT_2, htui_core::model::LinkKind::Relates, false),
+];
+
+/// `MemStore::demo()` plus `facts.laptop` (`LAPTOP-B`) and [`QUEUE_EDGES`].
+fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
+    let mut data = htui_core::fixtures::demo_data();
+    let mut laptop = data
+        .boxes
+        .iter()
+        .find(|row| row.id == ids::BOX)
+        .expect("the demo box")
+        .clone();
+    laptop.id = facts.laptop;
+    laptop.hostname = "LAPTOP-B".to_owned();
+    data.boxes.push(laptop);
+    for (to, kind, tombstoned) in QUEUE_EDGES {
+        data.links.push(htui_core::model::ItemLink {
+            from_item_id: ids::HTUI_ANA_2,
+            to_item_id: to,
+            kind,
+            proposed_by_step_id: None,
+            created_at: facts.at,
+            updated_at: facts.at,
+            deleted_at: tombstoned.then_some(facts.at),
+        });
+    }
+    htui_core::store::MemStore::from_demo(data)
+}
+
+/// The Postgres twin of [`queue_facts_mem`]'s additions, by raw inserts.
+async fn queue_facts_pg(pool: &PgPool, facts: &QueueFacts) {
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, $2, 'LAPTOP-B', 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(facts.laptop.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .execute(pool)
+    .await
+    .expect("plant LAPTOP-B");
+    for (to, kind, tombstoned) in QUEUE_EDGES {
+        sqlx::query(
+            "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at, \
+             deleted_at) VALUES ($1, $2, $3, $4, $4, $5)",
+        )
+        .bind(ids::HTUI_ANA_2.as_uuid())
+        .bind(to.as_uuid())
+        .bind(kind.as_str())
+        .bind(facts.at)
+        .bind(tombstoned.then_some(facts.at))
+        .execute(pool)
+        .await
+        .expect("plant an edge");
+    }
+}
+
+/// The runs, steps and notes `queue_rows` reads, through the trait so both stores take the same
+/// ids and instants: on `HTUI_ANA_2` a cancelled graph run then a later queued one, and two
+/// notes; on `AGY_FIX_1` a run targeted at `LAPTOP-B` with steps at positions 0 (pending), 2 and 1
+/// (both parked).
+async fn plant_queue_facts<S: htui_core::store::WriteStore>(store: &S, facts: &QueueFacts) {
+    use htui_core::model::{NewNote, NewRunStep, StepStatus};
+
+    let at = facts.at;
+    store
+        .create_run(NewRun {
+            id: facts.cancelled,
+            queued_at: at,
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("the first run");
+    store
+        .finish_run(facts.cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect("cancel it");
+    store
+        .create_run(NewRun {
+            id: facts.latest,
+            queued_at: at + TimeDelta::seconds(1),
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("the latest run");
+    for (index, (id, body)) in facts
+        .notes
+        .into_iter()
+        .zip(["the earlier note", "the later note"])
+        .enumerate()
+    {
+        store
+            .add_note(NewNote {
+                id,
+                item_id: ids::HTUI_ANA_2,
+                body: body.to_owned(),
+                created_by: ids::USER,
+                box_id: None,
+                via_step_id: None,
+                created_at: at + TimeDelta::seconds(i64::try_from(index).expect("small")),
+            })
+            .await
+            .expect("the note lands");
+    }
+    store
+        .create_run(NewRun {
+            id: facts.laptop_run,
+            project_id: ids::PROJECT_AGY,
+            target_box_id: facts.laptop,
+            queued_at: at,
+            ..race_run(ids::AGY_FIX_1)
+        })
+        .await
+        .expect("the LAPTOP-B run");
+    for (step, (position, park)) in facts
+        .steps
+        .into_iter()
+        .zip([(0, false), (2, true), (1, true)])
+    {
+        store
+            .create_step(NewRunStep {
+                id: step,
+                run_id: facts.laptop_run,
+                position,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .expect("the step");
+        if park {
+            for (from, to) in [
+                (StepStatus::Pending, StepStatus::Running),
+                (StepStatus::Running, StepStatus::AwaitingApproval),
+            ] {
+                assert!(
+                    store
+                        .transition_step(step, from, to, at)
+                        .await
+                        .expect("the step moves")
+                );
+            }
+        }
+    }
+}
+
+/// MOD-12 M3 D6: the same planted runs, steps, notes and edges answer the same `queue_rows` on
+/// both stores, fixture rows included: the latest graph run with its target hostname and first
+/// parked step, the latest note, the open blockers in byte order, all in D2 order.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_rows_answer_alike_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let facts = QueueFacts::new();
+    let mem = queue_facts_mem(&facts);
+    queue_facts_pg(&db.pool, &facts).await;
+    plant_queue_facts(pg, &facts).await;
+    plant_queue_facts(&mem, &facts).await;
+    for item in [
+        ids::HTUI_ANA_2,
+        ids::AGY_FIX_1,
+        ids::HTUI_FEAT_2,
+        ids::HTUI_FEAT_1,
+        ids::HTUI_FEAT_3,
+        ids::HTUI_CLEAN_1,
+    ] {
+        pg.queue_item(item, ids::BOX, ids::USER, facts.at)
+            .await
+            .expect("queue on Postgres");
+        mem.queue_item(item, ids::BOX, ids::USER, facts.at)
+            .await
+            .expect("queue on MemStore");
+    }
+
+    let rows = pg
+        .queue_rows(ids::BOX)
+        .await
+        .expect("queue_rows on Postgres");
+    assert_eq!(
+        rows,
+        mem.queue_rows(ids::BOX)
+            .await
+            .expect("queue_rows on MemStore"),
+        "one answer, both stores"
+    );
+    assert_eq!(
+        rows.iter().map(|row| row.entry.item_id).collect::<Vec<_>>(),
+        [
+            ids::HTUI_FEAT_1,
+            ids::HTUI_FEAT_3,
+            ids::HTUI_ANA_2,
+            ids::HTUI_FEAT_2,
+            ids::HTUI_CLEAN_1,
+            ids::AGY_FIX_1,
+        ],
+        "priority 2, 1, then created_at"
+    );
+    let ana = &rows[2];
+    assert_eq!(
+        ana.latest_run.as_ref().map(|run| (run.id, run.status)),
+        Some((facts.latest, RunStatus::Queued))
+    );
+    assert_eq!(ana.latest_note.as_deref(), Some("the later note"));
+    assert_eq!(ana.open_blockers, ["FEAT-1", "TOOL-1"]);
+    assert_eq!(
+        rows[3].open_blockers,
+        ["FEAT-1"],
+        "the fixture's FEAT-2 edge"
+    );
+    let laptop = rows[5].latest_run.as_ref().expect("the LAPTOP-B run");
+    assert_eq!(
+        (
+            laptop.target_box_id,
+            laptop.target_hostname.as_deref(),
+            laptop.parked_step
+        ),
+        (facts.laptop, Some("LAPTOP-B"), Some(facts.steps[2]))
+    );
+    assert!(
+        pg.queue_rows(facts.laptop)
+            .await
+            .expect("an empty queue")
+            .is_empty()
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 D3: the same moves answer the same booleans and leave the same queue, positions
+/// included, on both stores; an entry queued after the moves goes last.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_queue_entry_answers_alike_on_both_stores() {
+    use htui_core::model::QueueMove;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now();
+    // Priority 0 each: created_at decides, ANA-2, FEAT-2, CLEAN-1.
+    let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+    for item in [c, b, a] {
+        pg.queue_item(item, ids::BOX, ids::USER, at)
+            .await
+            .expect("queue on Postgres");
+        mem.queue_item(item, ids::BOX, ids::USER, at)
+            .await
+            .expect("queue on MemStore");
+    }
+
+    for (item, to, moved, order) in [
+        (a, QueueMove::Up, false, [a, b, c]),
+        (c, QueueMove::Down, false, [a, b, c]),
+        (ids::HTUI_FIX_1, QueueMove::Up, false, [a, b, c]),
+        (b, QueueMove::Up, true, [b, a, c]),
+        (b, QueueMove::Up, false, [b, a, c]),
+        (a, QueueMove::Down, true, [b, c, a]),
+    ] {
+        let on_pg = pg
+            .move_queue_entry(ids::BOX, item, to)
+            .await
+            .expect("the Postgres move");
+        let on_mem = mem
+            .move_queue_entry(ids::BOX, item, to)
+            .await
+            .expect("the MemStore move");
+        assert_eq!((on_pg, on_mem), (moved, moved), "{item} {to:?}");
+        assert_eq!(queue_alike(pg, &mem, ids::BOX).await, order);
+    }
+    let positions: Vec<Option<i32>> = pg
+        .queue_entries(ids::BOX)
+        .await
+        .expect("read")
+        .into_iter()
+        .map(|entry| entry.position)
+        .collect();
+    assert_eq!(positions, [Some(1), Some(2), Some(3)]);
+
+    let d = ItemId::new();
+    queue_feat(pg, d, 9).await;
+    queue_feat(&mem, d, 9).await;
+    pg.queue_item(d, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue on Postgres");
+    mem.queue_item(d, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue on MemStore");
+    assert_eq!(
+        queue_alike(pg, &mem, ids::BOX).await,
+        [b, c, a, d],
+        "an entry queued after a move goes last, whatever its priority"
+    );
+    let item = pg.item(b).await.expect("read").expect("FEAT-2");
+    assert_eq!(
+        (item.priority, item.version),
+        {
+            let mem_item = mem.item(b).await.expect("read").expect("FEAT-2");
+            (mem_item.priority, mem_item.version)
+        },
+        "a move never touches the item"
     );
 
     db.drop_db().await;

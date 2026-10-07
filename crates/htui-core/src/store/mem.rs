@@ -961,6 +961,20 @@ impl MemStore {
         Ok(self.write(|state| state.queue_entries.remove(&item).is_some()))
     }
 
+    /// MOD-12 M3 D3: stub (red).
+    ///
+    /// # Errors
+    /// Never.
+    pub async fn move_queue_entry(
+        &self,
+        box_id: BoxId,
+        item: ItemId,
+        to: crate::model::QueueMove,
+    ) -> Result<bool> {
+        let _ = (box_id, item, to);
+        Ok(false)
+    }
+
     /// MOD-12 D4: `box_id`'s entries, `position NULLS LAST, queued_at, item_id`. `ItemId`'s `Ord`
     /// is uuid byte order, which is Postgres' uuid order.
     ///
@@ -984,6 +998,15 @@ impl MemStore {
             });
             rows
         }))
+    }
+
+    /// MOD-12 M3 D6: stub (red).
+    ///
+    /// # Errors
+    /// Never.
+    pub async fn queue_rows(&self, box_id: BoxId) -> Result<Vec<crate::model::QueueRow>> {
+        let _ = box_id;
+        Ok(Vec::new())
     }
 
     /// MOD-12 D2: resume — the open batch of `box_id`, opened now under a fresh `BatchId` unless
@@ -15081,5 +15104,437 @@ mod tests {
             active,
             "active_runs_on_box still counts it"
         );
+    }
+
+    // ---- MOD-12 M3: D2 order, queue_rows, move_queue_entry (blueprint §C.3) -------------------
+
+    use crate::model::{LinkKind, QueueMove};
+
+    /// `box_id`'s queue as item ids, in `queue_entries`' order.
+    async fn queued_ids(store: &MemStore, box_id: BoxId) -> Vec<ItemId> {
+        store
+            .queue_entries(box_id)
+            .await
+            .expect("the read is total")
+            .into_iter()
+            .map(|entry| entry.item_id)
+            .collect()
+    }
+
+    /// Queues `items` on the demo box in this order, one second apart on `clock`.
+    async fn queue_in_order(store: &MemStore, clock: &TestClock, items: &[ItemId]) {
+        for item in items {
+            store
+                .queue_item(*item, ids::BOX, ids::USER, clock.now())
+                .await
+                .expect("the item queues");
+            clock.advance(TimeDelta::seconds(1));
+        }
+    }
+
+    /// Every entry's `position` on the demo box, in queue order.
+    async fn queued_positions(store: &MemStore) -> Vec<Option<i32>> {
+        store
+            .queue_entries(ids::BOX)
+            .await
+            .expect("the read is total")
+            .into_iter()
+            .map(|entry| entry.position)
+            .collect()
+    }
+
+    /// The demo store plus a second box, `LAPTOP-B`, and five edges out of `HTUI_ANA_2` (which has
+    /// none in the fixture): `blocked_by` to `TOOL-1` (awaiting approval) and `FEAT-1` (in
+    /// progress), the two open blockers; `blocked_by` to `ANA-1` (done) and, tombstoned, to
+    /// `FEAT-3` (queued); `relates` to `FEAT-2` (blocked).
+    fn queue_rows_store() -> (MemStore, BoxId) {
+        let mut data = crate::fixtures::demo_data();
+        let mut laptop = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the demo box")
+            .clone();
+        laptop.id = BoxId::new();
+        laptop.hostname = "LAPTOP-B".to_owned();
+        let laptop_id = laptop.id;
+        data.boxes.push(laptop);
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        for (to, kind, tombstoned) in [
+            (ids::HTUI_TOOL_1, LinkKind::BlockedBy, false),
+            (ids::HTUI_FEAT_1, LinkKind::BlockedBy, false),
+            (ids::HTUI_ANA_1, LinkKind::BlockedBy, false),
+            (ids::HTUI_FEAT_3, LinkKind::BlockedBy, true),
+            (ids::HTUI_FEAT_2, LinkKind::Relates, false),
+        ] {
+            data.links.push(crate::model::ItemLink {
+                from_item_id: ids::HTUI_ANA_2,
+                to_item_id: to,
+                kind,
+                proposed_by_step_id: None,
+                created_at: at,
+                updated_at: at,
+                deleted_at: tombstoned.then_some(at),
+            });
+        }
+        (MemStore::from_demo(data), laptop_id)
+    }
+
+    /// MOD-12 M3 D2: `queue_entries` is `position NULLS LAST, priority DESC, created_at, id`, not
+    /// `queued_at`. Priorities 0/2/1 queued in that order read 2, 1, 0; the fixture's `ANA-1` and
+    /// `ANA-2` (priority 0, created before every mint) read by `created_at`, ahead of the minted
+    /// priority-0 item; an entry with a position leads.
+    #[tokio::test]
+    async fn queue_entries_sort_position_then_priority_then_created_at() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let p0 = ready_feat(&store, ItemId::new(), 0).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p2 = ready_feat(&store, ItemId::new(), 2).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p1 = ready_feat(&store, ItemId::new(), 1).await;
+        clock.advance(TimeDelta::seconds(1));
+        queue_in_order(
+            &store,
+            &clock,
+            &[p0, p2, p1, ids::HTUI_ANA_2, ids::HTUI_ANA_1],
+        )
+        .await;
+
+        assert_eq!(
+            queued_ids(&store, ids::BOX).await,
+            [p2, p1, ids::HTUI_ANA_1, ids::HTUI_ANA_2, p0],
+            "priority, then created_at; never queued_at"
+        );
+
+        store.write(|state| {
+            state
+                .queue_entries
+                .get_mut(&p0)
+                .expect("p0 is queued")
+                .position = Some(1);
+        });
+        assert_eq!(
+            queued_ids(&store, ids::BOX).await,
+            [p0, p2, p1, ids::HTUI_ANA_1, ids::HTUI_ANA_2],
+            "a position leads"
+        );
+    }
+
+    /// MOD-12 M3 D2: `admission_order` over `queue_entries` and `ready_items` is `queue_entries`
+    /// filtered to the ready items: the overlay, the move and the runner read one order.
+    #[tokio::test]
+    async fn queue_entries_and_admission_order_agree() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let p0 = ready_feat(&store, ItemId::new(), 0).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p1 = ready_feat(&store, ItemId::new(), 1).await;
+        clock.advance(TimeDelta::seconds(1));
+        queue_in_order(
+            &store,
+            &clock,
+            &[p0, ids::HTUI_FEAT_2, ids::HTUI_ANA_2, ids::HTUI_CLEAN_1, p1],
+        )
+        .await;
+        store.write(|state| {
+            state
+                .queue_entries
+                .get_mut(&ids::HTUI_ANA_2)
+                .expect("ANA-2 is queued")
+                .position = Some(1);
+        });
+
+        let entries = store.queue_entries(ids::BOX).await.expect("read");
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let ready = store.ready_items(&scope, ids::BOX).await.expect("read");
+        let ready_ids: std::collections::HashSet<ItemId> =
+            ready.iter().map(|item| item.id).collect();
+        let filtered: Vec<ItemId> = entries
+            .iter()
+            .map(|entry| entry.item_id)
+            .filter(|id| ready_ids.contains(id))
+            .collect();
+
+        assert_eq!(crate::model::admission_order(&entries, &ready), filtered);
+        assert_eq!(filtered, [ids::HTUI_ANA_2, p1, p0]);
+    }
+
+    /// MOD-12 M3 D6: a row carries the item's latest **graph** run by `queued_at` (a chat run of
+    /// the item queued later is not the queue's run), its latest note, and the keys of its live
+    /// `blocked_by` targets that are not `done`/`closed`, in byte order. An entry with none of
+    /// them carries none.
+    #[tokio::test]
+    async fn queue_rows_carry_the_latest_graph_run_note_and_open_blockers() {
+        let (store, _) = queue_rows_store();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let run_at = |seconds: i64| NewRun {
+            queued_at: at + TimeDelta::seconds(seconds),
+            ..graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new())
+        };
+        // Created in this order so that each run is the item's only live one when it lands.
+        let first = store.create_run(run_at(0)).await.expect("first run").id;
+        store
+            .finish_run(first, RunStatus::Cancelled, None, at)
+            .await
+            .expect("cancel the first");
+        let chat = store.create_run(run_at(2)).await.expect("the later run").id;
+        store
+            .finish_run(chat, RunStatus::Cancelled, None, at)
+            .await
+            .expect("cancel it");
+        store.write(|state| {
+            state.runs.get_mut(&chat).expect("the run").kind = RunKind::Chat;
+        });
+        let latest = store
+            .create_run(run_at(1))
+            .await
+            .expect("latest graph run")
+            .id;
+        for (seconds, body) in [(1, "the later note"), (0, "the earlier note")] {
+            store
+                .add_note(NewNote {
+                    id: NoteId::new(),
+                    item_id: ids::HTUI_ANA_2,
+                    body: body.to_owned(),
+                    created_by: ids::USER,
+                    box_id: None,
+                    via_step_id: None,
+                    created_at: at + TimeDelta::seconds(seconds),
+                })
+                .await
+                .expect("the note lands");
+        }
+        for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
+            store
+                .queue_item(item, ids::BOX, ids::USER, at)
+                .await
+                .expect("queue");
+        }
+
+        let rows = store.queue_rows(ids::BOX).await.expect("read");
+        assert_eq!(
+            rows.iter().map(|row| row.entry.item_id).collect::<Vec<_>>(),
+            [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1],
+            "queue order (D2)"
+        );
+        let ana = &rows[0];
+        assert_eq!(
+            (ana.key.as_str(), ana.status, ana.priority, ana.entry.box_id),
+            ("ANA-2", Status::Queued, 0, ids::BOX)
+        );
+        assert_eq!(
+            ana.latest_run,
+            Some(crate::model::QueueRunFact {
+                id: latest,
+                status: RunStatus::Queued,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                target_hostname: Some("DESKTOP-HTUI".to_owned()),
+                failure: None,
+                parked_step: None,
+            }),
+            "the latest graph run by queued_at; the chat run queued later is not the queue's"
+        );
+        assert_eq!(ana.latest_note.as_deref(), Some("the later note"));
+        assert_eq!(
+            ana.open_blockers,
+            ["FEAT-1", "TOOL-1"],
+            "done, tombstoned and relates edges are not open blockers"
+        );
+
+        let clean = &rows[1];
+        assert_eq!(
+            (
+                clean.key.as_str(),
+                clean.status,
+                &clean.latest_run,
+                &clean.latest_note,
+                clean.open_blockers.is_empty()
+            ),
+            ("CLEAN-1", Status::Failed, &None, &None, true)
+        );
+    }
+
+    /// MOD-12 M3 D6: the latest run names its first parked step by `(position, attempt,
+    /// fanout_index)` and its target box's hostname; a `blocked_by` to a `done` item is no open
+    /// blocker. A box with no entry reads no row.
+    #[tokio::test]
+    async fn queue_rows_name_the_parked_step_and_the_target_hostname() {
+        let (store, laptop) = queue_rows_store();
+        let run = store
+            .create_run(NewRun {
+                target_box_id: laptop,
+                ..graph_run(ids::AGY_FIX_1, ids::PROJECT_AGY, Vec::new())
+            })
+            .await
+            .expect("a run on LAPTOP-B")
+            .id;
+        let at = Utc::now();
+        let mut parked = Vec::new();
+        for (position, park) in [(0, false), (2, true), (1, true)] {
+            let step = store
+                .create_step(new_step(run, position, 1, 0))
+                .await
+                .expect("the step")
+                .id;
+            if park {
+                for (from, to) in [
+                    (StepStatus::Pending, StepStatus::Running),
+                    (StepStatus::Running, StepStatus::AwaitingApproval),
+                ] {
+                    assert!(
+                        store
+                            .transition_step(step, from, to, at)
+                            .await
+                            .expect("the step moves")
+                    );
+                }
+                parked.push(step);
+            }
+        }
+        store
+            .queue_item(ids::AGY_FIX_1, ids::BOX, ids::USER, at)
+            .await
+            .expect("queue");
+
+        let rows = store.queue_rows(ids::BOX).await.expect("read");
+        assert_eq!(rows.len(), 1);
+        let fact = rows[0].latest_run.as_ref().expect("the run");
+        assert_eq!(fact.id, run);
+        assert_eq!(fact.target_box_id, laptop);
+        assert_eq!(fact.target_hostname.as_deref(), Some("LAPTOP-B"));
+        assert_eq!(
+            fact.parked_step,
+            Some(parked[1]),
+            "position 1 parks before position 2"
+        );
+        assert!(
+            rows[0].open_blockers.is_empty(),
+            "AGY ANA-1 is done, so FIX-1 has no open blocker"
+        );
+        assert!(store.queue_rows(laptop).await.expect("read").is_empty());
+    }
+
+    /// MOD-12 M3 D3: the first move writes `position = 1..n` over the current order, then swaps.
+    #[tokio::test]
+    async fn move_queue_entry_writes_every_position_and_swaps() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        // Priority 0 each: created_at decides, ANA-2 (n 1), FEAT-2 (n 3), CLEAN-1 (n 7).
+        let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+        queue_in_order(&store, &clock, &[c, b, a]).await;
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, b, c]);
+
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, b, QueueMove::Up)
+                .await
+                .expect("the move is answered")
+        );
+        assert_eq!(queued_ids(&store, ids::BOX).await, [b, a, c]);
+        assert_eq!(queued_positions(&store).await, [Some(1), Some(2), Some(3)]);
+
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, b, QueueMove::Down)
+                .await
+                .expect("the move is answered")
+        );
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, b, c]);
+        assert_eq!(queued_positions(&store).await, [Some(1), Some(2), Some(3)]);
+    }
+
+    /// MOD-12 M3 D3 (blueprint §F-12): moving the first entry up, the last down, an item not
+    /// queued, or an item queued on another box answers `false` and writes nothing.
+    #[tokio::test]
+    async fn move_queue_entry_at_an_end_or_off_the_queue_writes_nothing() {
+        let (store, laptop) = queue_rows_store();
+        let at = Utc::now();
+        let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+        for item in [a, b, c] {
+            store
+                .queue_item(item, ids::BOX, ids::USER, at)
+                .await
+                .expect("queue");
+        }
+        store
+            .queue_item(ids::AGY_FIX_1, laptop, ids::USER, at)
+            .await
+            .expect("queue on LAPTOP-B");
+
+        for (item, to, why) in [
+            (a, QueueMove::Up, "the first entry up"),
+            (c, QueueMove::Down, "the last entry down"),
+            (ids::HTUI_FIX_1, QueueMove::Up, "an item not queued"),
+            (ids::AGY_FIX_1, QueueMove::Up, "an item on another box"),
+        ] {
+            assert!(
+                !store
+                    .move_queue_entry(ids::BOX, item, to)
+                    .await
+                    .expect("the move is answered"),
+                "{why}"
+            );
+        }
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, b, c]);
+        assert_eq!(queued_positions(&store).await, [None, None, None]);
+        assert_eq!(
+            store.queue_entries(laptop).await.expect("read")[0].position,
+            None
+        );
+    }
+
+    /// MOD-12 M3 D3: an entry queued after a move (`position` NULL) goes after every positioned
+    /// one, whatever its priority.
+    #[tokio::test]
+    async fn an_entry_queued_after_a_move_goes_last() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+        queue_in_order(&store, &clock, &[a, b, c]).await;
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, c, QueueMove::Up)
+                .await
+                .expect("the move")
+        );
+        let d = ready_feat(&store, ItemId::new(), 9).await;
+        queue_in_order(&store, &clock, &[d]).await;
+
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, c, b, d]);
+        assert_eq!(
+            queued_positions(&store).await,
+            [Some(1), Some(2), Some(3), None]
+        );
+    }
+
+    /// MOD-12 M3 D3: a move writes `queue_entry.position` only; `item.priority` and the item's
+    /// version (its CAS token) are untouched.
+    #[tokio::test]
+    async fn move_queue_entry_never_touches_priority() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let (a, b) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2);
+        queue_in_order(&store, &clock, &[a, b]).await;
+        let before = |item| {
+            let store = store.clone();
+            async move {
+                let row = store.item(item).await.expect("read").expect("the item");
+                (row.priority, row.version, row.updated_at)
+            }
+        };
+        let (a_before, b_before) = (before(a).await, before(b).await);
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, b, QueueMove::Up)
+                .await
+                .expect("the move")
+        );
+        assert_eq!(queued_ids(&store, ids::BOX).await, [b, a]);
+        assert_eq!((before(a).await, before(b).await), (a_before, b_before));
     }
 }

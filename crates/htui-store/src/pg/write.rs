@@ -7938,6 +7938,21 @@ impl PgStore {
         Ok(gone == 1)
     }
 
+    /// MOD-12 M3 D3: stub (red).
+    ///
+    /// # Errors
+    ///
+    /// Never.
+    pub async fn move_queue_entry(
+        &self,
+        box_id: BoxId,
+        item: ItemId,
+        to: htui_core::model::QueueMove,
+    ) -> Result<bool> {
+        let _ = (box_id, item, to);
+        Ok(false)
+    }
+
     /// MOD-12 D2: resume — the open batch of `box_id`, opened now under a fresh [`BatchId`]
     /// unless one is already open. Idempotent: `uq_queue_batch_open` turns the second of two
     /// racing inserts into a no-op, and both answer the row that won. A close that slips between
