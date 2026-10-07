@@ -18,7 +18,9 @@
 //!   is encoded ([`encode_key`]) and written. Unfocused is the M1 lock
 //!   ([`Stack::EDITOR_UNFOCUSED`]): `ctrl-c` and `global.quit` quit, `global.help` toggles the
 //!   `?` box, `editor.focus` refocuses (bringing the asking tab back, B16), `editor.abort` kills
-//!   the editor and answers [`EDITOR_ABORTED`]; anything else is refused on the status line.
+//!   the editor and answers [`EDITOR_ABORTED`]; anything else is refused on the status line. A
+//!   focused editor a reply moved off screen loses the keys, and the key that finds it so (typed
+//!   for the editor) is swallowed with the refusal rather than run through the lock.
 //! - **Where it draws (P2).** The active tab names its editing rect through
 //!   [`Ctx::claim_editor_area`](crate::app::Ctx::claim_editor_area) during its render; the pane
 //!   goes there when the claim is at least [`MIN_PANE`] inside the body, else over the whole
@@ -242,9 +244,16 @@ impl App {
             return;
         };
         // A focused editor that is not on screen (a reply moved the active tab): htui has the
-        // keys.
+        // keys from now on. The key that finds it so was typed for the editor (a vim `ctrl-c`,
+        // the `q` of `:wq`), so it is swallowed with the refusal, never run as a lock command:
+        // it must not quit, abort or move a tab.
         if editor.focused && !visible {
             editor.focused = false;
+            self.status = Some(format!(
+                "{EDITOR_LOCKED}: {}",
+                self.keys.hint(Stack::EDITOR_UNFOCUSED, LOCK_HINT)
+            ));
+            return;
         }
         if editor.focused {
             if self
@@ -1036,6 +1045,33 @@ mod tests {
         assert_eq!(app.editor_status().as_deref(), Some(FOCUSED_STATUS));
         term.draw(|frame| app.render(frame)).expect("draws");
         assert!(text(term.backend().buffer()).contains(FOCUSED_TITLE));
+    }
+
+    #[test]
+    fn the_key_that_finds_a_focused_editor_off_screen_is_swallowed() {
+        for key in [ctrl('c'), plain('q'), ctrl('x'), ctrl('4')] {
+            let (mut app, benches) = shell(&[ASKER, OTHER]);
+            let log = Log::default();
+            open(&mut app, ASKER, &log);
+            // A reply moved the active tab while the user typed into the editor.
+            assert!(app.tabs.focus(OTHER));
+
+            app.on_key(key);
+            assert!(!app.should_quit, "{key:?} meant for the editor never quits");
+            assert!(app.editor_open(), "{key:?} never aborts");
+            assert!(
+                writes(&log).is_empty(),
+                "{key:?} is not the editor's either"
+            );
+            assert_eq!(app.status.as_deref(), Some(REFUSAL), "{key:?}");
+            assert_eq!(app.tabs.active_id(), Some(OTHER), "{key:?} moves nothing");
+            assert!(benches[1].seen.borrow().keys.is_empty());
+            assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
+
+            // From here on the M1 lock holds.
+            app.on_key(ctrl('c'));
+            assert!(app.should_quit, "the next ctrl-c is htui's");
+        }
     }
 
     #[test]
