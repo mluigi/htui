@@ -19,11 +19,13 @@
 //! store. Nothing installs it but `crate::testkit::mock_keyring`; with it uninstalled the
 //! production path below is what runs, unchanged (blueprint flag L, ruling §0.3).
 //!
-//! The module also holds the Infisical base URL and machine identity (MOD-10 D7): three entries
+//! The module also holds the Infisical base URL and machine identity (MOD-10 D7): four entries
 //! under [`SERVICE`], [`INFISICAL_URL_USER`] (`infisical-url`), [`INFISICAL_CLIENT_ID_USER`]
-//! (`infisical-client-id`) and [`INFISICAL_CLIENT_SECRET_USER`] (`infisical-client-secret`). A
-//! half-stored identity is an error, not `None`, and [`set_machine_identity`] never leaves one
-//! behind. The `test-support` fake honours its `refuse_store` switch for these entries only.
+//! (`infisical-client-id`), [`INFISICAL_CLIENT_SECRET_USER`] (`infisical-client-secret`) and
+//! [`INFISICAL_WRITE_MARK_USER`] (`infisical-write-mark`), a random value every Settings write
+//! replaces so another htui process sees the write (MOD-90 D1). A half-stored identity is an
+//! error, not `None`, and [`set_machine_identity`] never leaves one behind. The `test-support`
+//! fake honours its `refuse_store` switch for these entries only.
 
 use htui_core::secret::MachineIdentity;
 use htui_core::store::{Result, StoreError};
@@ -47,6 +49,9 @@ pub const INFISICAL_URL_USER: &str = "infisical-url";
 pub const INFISICAL_CLIENT_ID_USER: &str = "infisical-client-id";
 /// Keyring user name of the Infisical machine identity's client secret (MOD-10 D7, ANA-7 §3.3).
 pub const INFISICAL_CLIENT_SECRET_USER: &str = "infisical-client-secret";
+/// Keyring user name of the Infisical write mark (MOD-90 D1): a UUIDv7 replaced by every
+/// Settings > Secrets URL or identity write or clear, so another process sees the write.
+pub const INFISICAL_WRITE_MARK_USER: &str = "infisical-write-mark";
 
 /// What an installed stand-in answers with (D18, flag L).
 ///
@@ -63,6 +68,7 @@ pub(crate) struct FakeSlots {
     pub infisical_url: Option<String>,
     pub infisical_client_id: Option<String>,
     pub infisical_client_secret: Option<String>,
+    pub infisical_write_mark: Option<String>,
     /// MOD-10 T2: the user name whose **store** fails, as `Fake::Broken` would fail it. Every
     /// other call still answers. Honoured by the Infisical slots only. `Fake::Broken` cannot test
     /// "the second write fails" because it fails the first one too.
@@ -385,6 +391,7 @@ fn infisical_field<'a>(slots: &'a mut FakeSlots, user: &str) -> &'a mut Option<S
         INFISICAL_URL_USER => &mut slots.infisical_url,
         INFISICAL_CLIENT_ID_USER => &mut slots.infisical_client_id,
         INFISICAL_CLIENT_SECRET_USER => &mut slots.infisical_client_secret,
+        INFISICAL_WRITE_MARK_USER => &mut slots.infisical_write_mark,
         other => unreachable!("not an Infisical keyring user: {other}"),
     }
 }
@@ -463,6 +470,26 @@ pub fn set_infisical_url(url: &str) -> Result<()> {
 /// [`StoreError::Backend`] when the keyring refuses the delete.
 pub fn clear_infisical_url() -> Result<()> {
     remove_slot(INFISICAL_URL_USER)
+}
+
+/// The stored write mark, if any (MOD-90 D1, D4: a missing one, from a keyring written before
+/// MOD-90, is `None`). Blank reads as `None`, as every Infisical entry.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] for any keyring failure other than a missing entry.
+pub fn get_infisical_write_mark() -> Result<Option<String>> {
+    read_slot(INFISICAL_WRITE_MARK_USER)
+}
+
+/// Replaces the write mark (MOD-90 D1). Honours the fake's `refuse_store`. Nothing removes the
+/// mark.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when the keyring refuses the write.
+pub fn set_infisical_write_mark(mark: &str) -> Result<()> {
+    write_slot(INFISICAL_WRITE_MARK_USER, mark)
 }
 
 /// How the error for a half-stored identity starts (MOD-10 M4 blueprint A-7): the one prefix
@@ -871,9 +898,9 @@ mod headless_dsn_tests {
 #[cfg(test)]
 mod machine_identity_tests {
     use super::{
-        INFISICAL_CLIENT_ID_USER, INFISICAL_CLIENT_SECRET_USER, INFISICAL_URL_USER, SERVICE,
-        clear_infisical_url, clear_machine_identity, get_infisical_url, get_machine_identity,
-        set_infisical_url, set_machine_identity,
+        INFISICAL_CLIENT_ID_USER, INFISICAL_CLIENT_SECRET_USER, INFISICAL_URL_USER,
+        INFISICAL_WRITE_MARK_USER, SERVICE, clear_infisical_url, clear_machine_identity,
+        get_infisical_url, get_machine_identity, set_infisical_url, set_machine_identity,
     };
     use crate::testkit::{
         BROKEN_KEYRING, fake_machine_identity, mock_keyring, mock_keyring_broken, refuse_fake_store,
@@ -893,6 +920,7 @@ mod machine_identity_tests {
         assert_eq!(INFISICAL_URL_USER, "infisical-url");
         assert_eq!(INFISICAL_CLIENT_ID_USER, "infisical-client-id");
         assert_eq!(INFISICAL_CLIENT_SECRET_USER, "infisical-client-secret");
+        assert_eq!(INFISICAL_WRITE_MARK_USER, "infisical-write-mark");
     }
 
     #[tokio::test]

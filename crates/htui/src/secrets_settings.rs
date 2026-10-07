@@ -273,8 +273,9 @@ fn seam_sentence(err: &StoreError) -> String {
 /// A write on [`Backend::Memory`] is refused with [`DEMO_SESSION`] before anything else (D10). A
 /// URL is normalised again (defensive: the section already did) and a refusal is `Failed` with
 /// normalisation's sentence, which never echoes the URL. An identity with a blank half is
-/// refused with [`IDENTITY_INCOMPLETE`]. Every write that lands bumps the keyring-write
-/// generation (blueprint A-4) and answers it and a fresh snapshot under its own name
+/// refused with [`IDENTITY_INCOMPLETE`]. Every write that lands stores a new keyring write mark
+/// (MOD-90 D1, so another process sees it) and bumps the keyring-write generation (blueprint
+/// A-4), and answers the generation and a fresh snapshot under its own name
 /// ([`StoreReply::SecretsWritten`], R1 M-1, L-1); the read answers [`StoreReply::Secrets`].
 ///
 /// # Errors
@@ -333,10 +334,12 @@ fn refused(request: &StoreRequest, message: String) -> StoreReply {
     }
 }
 
-/// Runs one keyring write on a blocking thread and, when it lands, notes it so the next
-/// `provider()` builds afresh (blueprint A-4); the generation it made. The write and the note
-/// happen under [`keyring_io`](crate::secrets::keyring_io) (R1 L-2), so no keyring read sees half
-/// of it, and a read that waited for it reads the generation it made only with what it wrote.
+/// Runs one keyring write on a blocking thread and, when it lands, stores a new write mark (MOD-90
+/// D1: another process's next `provider()` builds afresh) and notes it so this process's next
+/// `provider()` builds afresh (blueprint A-4); the generation it made. The write, the mark and the
+/// note happen under [`keyring_io`](crate::secrets::keyring_io) (R1 L-2), so no keyring read sees
+/// half of it, and a read that waited for it reads the generation it made only with what it
+/// wrote. A mark the keyring refuses is logged and the write still answers (D3).
 async fn keyring_write<F>(write: F) -> Result<u64>
 where
     F: FnOnce() -> Result<()> + Send + 'static,
@@ -344,6 +347,16 @@ where
     tokio::task::spawn_blocking(move || {
         let _io = crate::secrets::keyring_io();
         write()?;
+        // MOD-90 D1, D2: last, inside the write's own critical section. D3: best effort; the write
+        // landed.
+        let mark = uuid::Uuid::now_v7().to_string();
+        if let Err(err) = secret::set_infisical_write_mark(&mark) {
+            tracing::warn!(
+                slot = secret::INFISICAL_WRITE_MARK_USER,
+                %err,
+                "the keyring write mark was not stored; another htui process sees this write after a restart"
+            );
+        }
         Ok(crate::secrets::note_keyring_write())
     })
     .await

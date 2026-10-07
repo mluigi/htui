@@ -370,6 +370,81 @@ async fn every_landed_keyring_write_answers_a_higher_generation() {
     }
 }
 
+/// The four keyring writes, as `htui worker` would see them: by request.
+fn the_four_writes() -> [StoreRequest; 4] {
+    [
+        StoreRequest::SetInfisicalUrl(STORED_URL.to_owned()),
+        StoreRequest::SetMachineIdentity(identity_entry(CLIENT_ID, SECRET)),
+        StoreRequest::ClearMachineIdentity,
+        StoreRequest::ClearInfisicalUrl,
+    ]
+}
+
+/// The write mark the fake holds now (MOD-90 D1).
+fn mark_now() -> Option<String> {
+    secret::get_infisical_write_mark().expect("the fake reads")
+}
+
+#[tokio::test]
+async fn every_landed_keyring_write_stores_a_new_mark() {
+    // MOD-90 D1: another process (`htui worker`) sees a landed write by its new mark alone.
+    let _keyring = common::mock_keyring().await;
+    let (_root, backend) = offline("secrets-mark").await;
+    let mut last = mark_now();
+    assert_eq!(last, None, "an empty keyring has no mark");
+    for request in the_four_writes() {
+        let name = request.name();
+        keyring_written_of(serve(&backend, &request).await, name);
+        let mark = mark_now();
+        assert!(mark.is_some(), "{name} stores a mark");
+        assert_ne!(mark, last, "{name} stores a new mark");
+        last = mark;
+    }
+
+    // A refused write stores no mark: a blank half, a URL normalisation refuses, a demo session.
+    let blank = StoreRequest::SetMachineIdentity(identity_entry(CLIENT_ID, "  "));
+    failed_of(serve(&backend, &blank).await);
+    assert_eq!(mark_now(), last, "a blank half stores no mark");
+    let lan = StoreRequest::SetInfisicalUrl("http://192.168.1.10".to_owned());
+    failed_of(serve(&backend, &lan).await);
+    assert_eq!(mark_now(), last, "a refused URL stores no mark");
+    for request in the_four_writes() {
+        failed_of(serve(&demo(), &request).await);
+        assert_eq!(mark_now(), last, "a demo {} stores no mark", request.name());
+    }
+
+    // MOD-90 D2: the mark is written last, so a write the keyring refuses leaves it as it was.
+    common::refuse_fake_store(secret::INFISICAL_CLIENT_SECRET_USER);
+    let refused = StoreRequest::SetMachineIdentity(identity_entry(CLIENT_ID, SECRET));
+    failed_of(serve(&backend, &refused).await);
+    assert_eq!(mark_now(), last, "a keyring-refused write stores no mark");
+}
+
+#[tokio::test]
+async fn a_refused_mark_write_still_answers_written() {
+    // MOD-90 D3: the write landed; only the mark is lost, so the reply is still the write's own.
+    let _keyring = common::mock_keyring().await;
+    common::refuse_fake_store(secret::INFISICAL_WRITE_MARK_USER);
+    let (_root, backend) = offline("secrets-mark-refused").await;
+    let mut last = 0;
+    for request in the_four_writes() {
+        let name = request.name();
+        let reply = serve(&backend, &request).await;
+        let generation = generation_of(&reply);
+        keyring_written_of(reply, name);
+        assert!(generation > last, "{name}: {generation} after {last}");
+        last = generation;
+        if matches!(request, StoreRequest::SetMachineIdentity(_)) {
+            assert!(
+                common::fake_machine_identity()
+                    == (Some(CLIENT_ID.to_owned()), Some(SECRET.to_owned())),
+                "the identity landed"
+            );
+        }
+    }
+    assert_eq!(mark_now(), None, "the refused mark was never stored");
+}
+
 #[tokio::test]
 async fn set_infisical_url_refuses_what_does_not_normalise_and_stores_nothing() {
     let _keyring = common::mock_keyring().await;
