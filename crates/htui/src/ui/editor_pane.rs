@@ -2,12 +2,13 @@
 //!
 //! The child draws into a `vt100` grid; this module copies that grid into ratatui's buffer cell
 //! by cell, under a one-row top rule that carries the title (MOD-57 B14). The grid is the truth:
-//! a wide cell is drawn with its continuation left blank, and every drawn cell is pinned to the
-//! grid's width with `CellDiffOption::ForcedWidth`, so ratatui's diff never re-measures a VS16
-//! emoji or a halfwidth sound mark (which `vt100` counts per code point and ratatui per string)
-//! and never skips the cell behind it (plan "Widths"). Every covered cell is reset first, so a
-//! smaller screen leaves nothing stale. The terminal's real cursor is the only cursor drawn
-//! (MOD-57 B9); nothing here keeps state, logs or formats the screen's contents.
+//! a wide cell is drawn with its continuation left blank (in the wide cell's style, which the
+//! terminal painted there, so a shrunk coloured wide cell is repainted), and every drawn cell is
+//! pinned to the grid's width with `CellDiffOption::ForcedWidth`, so ratatui's diff never
+//! re-measures a VS16 emoji or a halfwidth sound mark (which `vt100` counts per code point and
+//! ratatui per string) and never skips the cell behind it (plan "Widths"). Every covered cell is
+//! reset first, so a smaller screen leaves nothing stale. The terminal's real cursor is the only
+//! cursor drawn (MOD-57 B9); nothing here keeps state, logs or formats the screen's contents.
 
 use std::num::NonZeroU16;
 
@@ -57,8 +58,9 @@ pub fn render(
 }
 
 /// The grid into `area`: every covered cell is reset, then holds the grid cell at its offset, or
-/// stays blank when the grid has none there, when it is a wide cell's continuation or when a wide
-/// cell would not fit in the last column. A drawn cell's diff width is the grid's (`ForcedWidth`).
+/// stays blank when the grid has none there, when it is a wide cell's continuation (blank in the
+/// wide cell's style) or when a wide cell would not fit in the last column. A blank grid cell
+/// keeps its style. A drawn cell's diff width is the grid's (`ForcedWidth`).
 fn draw_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
     let area = area.intersection(buf.area);
     for y in 0..area.height {
@@ -68,7 +70,15 @@ fn draw_screen(buf: &mut Buffer, area: Rect, screen: &vt100::Screen) {
             let Some(cell) = screen.cell(y, x) else {
                 continue;
             };
-            if cell.is_wide_continuation() || (cell.is_wide() && x + 1 == area.width) {
+            if cell.is_wide_continuation() {
+                // Blank, but in the wide cell's style: the terminal painted this column with it,
+                // so the next frame's diff sees a change when a default blank replaces it.
+                if let Some(wide) = x.checked_sub(1).and_then(|left| screen.cell(y, left)) {
+                    target.set_style(style_of(wide));
+                }
+                continue;
+            }
+            if cell.is_wide() && x + 1 == area.width {
                 continue;
             }
             target.set_style(style_of(cell));
@@ -399,6 +409,66 @@ mod tests {
             true,
         );
         assert_eq!(cells(&narrow, 0, 0, 10), " nvim · C…");
+    }
+
+    #[test]
+    fn a_blank_cell_keeps_its_background() {
+        // `EL` with a blue background: the rest of the row is blank, yet blue (a status line).
+        let parser = parser(2, 10, b"ab\x1b[44m\x1b[K\x1b[0m");
+        assert!(!parser.screen().cell(0, 5).expect("a cell").has_contents());
+        let mut term = Terminal::new(TestBackend::new(10, 3)).expect("a test backend");
+        draw(
+            &mut term,
+            Rect::new(0, 0, 10, 3),
+            parser.screen(),
+            FOCUSED,
+            true,
+        );
+        let buffer = term.backend().buffer();
+        for x in 2..10 {
+            assert_eq!(buffer[(x, 1)].symbol(), " ", "column {x} is blank");
+            assert_eq!(
+                buffer[(x, 1)].bg,
+                Color::Indexed(4),
+                "column {x} stays blue"
+            );
+        }
+        assert_eq!(
+            buffer[(1, 1)].bg,
+            Color::Reset,
+            "`b` was written before the SGR"
+        );
+        assert_eq!(buffer[(0, 2)].bg, Color::Reset, "the next row is untouched");
+    }
+
+    #[test]
+    fn a_shrunk_wide_cell_repaints_its_coloured_trailing_column() {
+        // The terminal paints both columns of a wide cell with its background (or reverse
+        // video); when a narrow cell and a default blank replace it, the diff must send the
+        // blank, or the right half stays coloured (ratatui #2585).
+        let area = Rect::new(0, 0, 4, 1);
+        for first in ["\x1b[44m中\x1b[0m", "\x1b[7m中\x1b[0m"] {
+            let mut prev = Buffer::empty(area);
+            draw_screen(&mut prev, area, parser(1, 4, first.as_bytes()).screen());
+            let painted = Buffer::empty(area).diff(&prev);
+            assert!(
+                painted.iter().all(|&(x, _, _)| x != 1),
+                "{first:?}: the continuation is never sent, the wide cell covers it"
+            );
+
+            let mut next = Buffer::empty(area);
+            draw_screen(&mut next, area, parser(1, 4, b"a").screen());
+            let sent: Vec<(u16, u16, String)> = prev
+                .diff(&next)
+                .into_iter()
+                .map(|(x, y, cell)| (x, y, cell.symbol().to_owned()))
+                .collect();
+            assert_eq!(
+                sent,
+                [(0, 0, "a".to_owned()), (1, 0, " ".to_owned())],
+                "{first:?} then `a`"
+            );
+        }
     }
 
     #[test]
