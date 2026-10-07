@@ -1078,6 +1078,52 @@ mod tests {
     }
 
     #[test]
+    fn the_status_escalations_beat_missing_tags() {
+        let tagged = |item: &QueueRow| {
+            let mut live = facts(item);
+            live.missing_tags
+                .insert(item.entry.item_id, vec!["gpu".to_owned()]);
+            live
+        };
+
+        let mut failed = row(Status::Failed);
+        failed.latest_run = Some(run(RunStatus::Failed, here()));
+        assert!(matches!(
+            classify_entry(&failed, here(), &tagged(&failed)),
+            EntryState::Escalated(Escalation::Failed { .. })
+        ));
+
+        let mut exhausted = row(Status::Blocked);
+        exhausted.latest_run = Some(run(RunStatus::AwaitingApproval, here()));
+        assert!(matches!(
+            classify_entry(&exhausted, here(), &tagged(&exhausted)),
+            EntryState::Escalated(Escalation::ReviewLoopExhausted { .. })
+        ));
+
+        let blocked = row(Status::Blocked);
+        assert!(matches!(
+            classify_entry(&blocked, here(), &tagged(&blocked)),
+            EntryState::Escalated(Escalation::Blocked { .. })
+        ));
+
+        let mut gate = row(Status::AwaitingApproval);
+        let mut parked = run(RunStatus::AwaitingApproval, here());
+        parked.parked_step = Some(StepId::new());
+        gate.latest_run = Some(parked);
+        assert!(matches!(
+            classify_entry(&gate, here(), &tagged(&gate)),
+            EntryState::Escalated(Escalation::HardGateParked { .. })
+        ));
+
+        let mut judge = row(Status::AwaitingApproval);
+        judge.latest_run = Some(run(RunStatus::AwaitingApproval, here()));
+        assert!(matches!(
+            classify_entry(&judge, here(), &tagged(&judge)),
+            EntryState::Escalated(Escalation::JudgeUndecided { .. })
+        ));
+    }
+
+    #[test]
     fn missing_tags_beat_an_open_blocker() {
         let mut item = row(Status::Open);
         item.open_blockers = vec!["FEAT-1".to_owned()];
