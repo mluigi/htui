@@ -34,6 +34,7 @@ pub mod prompt_settings;
 pub mod provision;
 /// State and summary of the Qdrant connection string.
 pub mod qdrant_settings_info;
+pub mod queue_overview;
 pub mod queue_settings;
 pub mod requirements;
 pub mod run_worker;

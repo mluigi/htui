@@ -485,7 +485,9 @@ impl BacklogTab {
                         .map_or_else(|| item.to_string(), |row| row.key.clone()),
                 }
             }
-            QueueWrite::Resumed { .. } | QueueWrite::Paused { .. } => String::new(),
+            QueueWrite::Resumed { .. } | QueueWrite::Paused { .. } | QueueWrite::Moved { .. } => {
+                String::new()
+            }
         };
         ctx.emit(Action::Error(queue_sentence(write, &key, view)));
     }
@@ -1029,6 +1031,10 @@ fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
         QueueWrite::Paused { live, .. } => {
             format!("queue paused \u{2014} {live} runs still running")
         }
+        // MOD-12 M3 D7: the Backlog never sends `MoveQueueEntry` and replies are addressed by
+        // origin, so these exist for exhaustivity; every other sentence is unchanged.
+        QueueWrite::Moved { moved: true } => format!("queue reordered ({n} in queue)"),
+        QueueWrite::Moved { moved: false } => "already at that end of the queue".to_owned(),
     }
 }
 
@@ -1177,6 +1183,17 @@ mod tests {
                 },
                 paused(0),
                 "queue paused \u{2014} 2 runs still running",
+            ),
+            // MOD-12 M3 D7: never sent by the Backlog; the match is exhaustive.
+            (
+                QueueWrite::Moved { moved: true },
+                paused(2),
+                "queue reordered (2 in queue)",
+            ),
+            (
+                QueueWrite::Moved { moved: false },
+                paused(2),
+                "already at that end of the queue",
             ),
         ];
         for (write, view, sentence) in cases {

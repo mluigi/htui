@@ -21,7 +21,6 @@ use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
-use htui_core::model::QueueSetting;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
     BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
@@ -33,6 +32,7 @@ use htui_core::model::{
     TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch,
     WorkspaceSummary,
 };
+use htui_core::model::{QueueMove, QueueOverview, QueueSetting};
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
 use htui_core::secret::{SecretScope, SecretSource};
@@ -62,6 +62,7 @@ use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::persona_import::PersonaImports;
 use crate::persona_settings::{self, PersonaWrite};
 use crate::prompt_settings::{self, SettingsSnapshot};
+use crate::queue_overview;
 use crate::queue_settings::{self, QueueSettingsSnapshot};
 use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
@@ -91,14 +92,16 @@ pub const PROMPT_PREVIEW: &str = "prompt_preview";
 /// of the thirteen offline refusals, and the Hierarchy section matches its `Failed` by this name.
 pub const LIST_DIR: &str = "list_dir";
 
-/// [`StoreRequest::name`] of the five queue requests (MOD-12 D9), in variant order: the Backlog
-/// matches a queue request's `Failed` by these.
-pub const QUEUE_REQUEST_NAMES: [&str; 5] = [
+/// [`StoreRequest::name`] of the seven queue requests (MOD-12 D9, M3 D7), in variant order: the
+/// Backlog matches a queue request's `Failed` by these, and the queue overlay by its two.
+pub const QUEUE_REQUEST_NAMES: [&str; 7] = [
     "queue_state",
     "queue_item",
     "dequeue_item",
     "resume_queue",
     "pause_queue",
+    "queue_overview",
+    "move_queue_entry",
 ];
 
 /// The most entries one [`StoreReply::DirListing`] carries; the rest is its `more` (MOD-49 P4).
@@ -380,6 +383,17 @@ pub enum StoreRequest {
     ResumeQueue,
     /// MOD-12 D2, D9: pause — close this box's open batch `paused`; running runs continue.
     PauseQueue,
+    /// MOD-12 M3 D7: this box's queue with every entry's state, for the queue overlay. Answered
+    /// with [`StoreReply::QueueOverview`]; offline `DATABASE_UNREACHABLE`.
+    QueueOverview,
+    /// MOD-12 M3 D3: move `item` one place `to` in this box's queue (`queue_entry.position`; the
+    /// item's priority is untouched). Answered with [`StoreReply::QueueWritten`] (`Moved`).
+    MoveQueueEntry {
+        /// The item.
+        item: ItemId,
+        /// Which way.
+        to: QueueMove,
+    },
     /// The persona registry by name (MOD-26 M2 D21). Served by [`persona_settings::serve`]
     /// through the writer: personas are not mirrored, so offline it is refused with
     /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::Personas`].
@@ -1172,12 +1186,14 @@ impl StoreRequest {
             Self::SetAgentOnBox { .. } => "set_agent_on_box",
             // Served by the agent runtime, not `agent_settings::serve` (MOD-66 D7).
             Self::SetToolPaths { .. } => agent_settings::SET_TOOL_PATHS,
-            // The five of `QUEUE_REQUEST_NAMES`, in that order (MOD-12 D9).
+            // The seven of `QUEUE_REQUEST_NAMES`, in that order (MOD-12 D9, M3 D7).
             Self::QueueState => "queue_state",
             Self::QueueItem { .. } => "queue_item",
             Self::DequeueItem { .. } => "dequeue_item",
             Self::ResumeQueue => "resume_queue",
             Self::PauseQueue => "pause_queue",
+            Self::QueueOverview => "queue_overview",
+            Self::MoveQueueEntry { .. } => "move_queue_entry",
             // The five of `persona_settings::REQUEST_NAMES`, in that order (MOD-26 M2 D21).
             Self::Personas => "personas",
             Self::CreatePersona { .. } => "create_persona",
@@ -1585,13 +1601,16 @@ pub enum StoreReply {
     },
     /// Answer to [`StoreRequest::QueueState`].
     Queue(QueueView),
-    /// Answer to the four queue writes: what was done, and the queue after it.
+    /// Answer to the five queue writes: what was done, and the queue after it.
     QueueWritten {
         /// The write.
         write: QueueWrite,
         /// The queue after it.
         view: QueueView,
     },
+    /// Answer to [`StoreRequest::QueueOverview`] (MOD-12 M3 D7). Boxed, as
+    /// [`StoreReply::QueueSettings`] is: the rows can be long.
+    QueueOverview(Box<QueueOverview>),
     /// The registry after an import, and what happened to every file (D20). Boxed: the report
     /// can be long.
     PersonaImports(Box<PersonaImports>),
@@ -1703,7 +1722,8 @@ pub enum StoreReply {
 /// MOD-12 D9: this box's queue as the Backlog needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueView {
-    /// The queued items, `position NULLS LAST, queued_at, item_id`.
+    /// The queued items in queue order (M3 D2): `position NULLS LAST, priority DESC, created_at,
+    /// id`.
     pub entries: Vec<ItemId>,
     /// The open batch; `None` = paused (D2).
     pub open_batch: Option<BatchId>,
@@ -1740,6 +1760,12 @@ pub enum QueueWrite {
         live: usize,
         /// Whether no batch was open, so nothing closed.
         already: bool,
+    },
+    /// MOD-12 M3 D3: a move; `moved` is `false` when the entry was already at that end or not in
+    /// this box's queue, and nothing was written.
+    Moved {
+        /// Whether the order changed.
+        moved: bool,
     },
 }
 
@@ -2287,13 +2313,19 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 },
             }
         }
-        // The five queue requests, or-ed for the reason the arms above are: a guard does not
-        // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-12 D9).
+        // The six queue requests `serve_queue` answers, or-ed for the reason the arms above are: a
+        // guard does not count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan
+        // F-12, MOD-12 D9, M3 D7).
         StoreRequest::QueueState
         | StoreRequest::QueueItem { .. }
         | StoreRequest::DequeueItem { .. }
         | StoreRequest::ResumeQueue
-        | StoreRequest::PauseQueue => serve_queue(backend, request).await?,
+        | StoreRequest::PauseQueue
+        | StoreRequest::MoveQueueEntry { .. } => serve_queue(backend, request).await?,
+        // MOD-12 M3 D7: the overlay's read composes the runner's own reads (`queue_overview`).
+        StoreRequest::QueueOverview => {
+            StoreReply::QueueOverview(Box::new(queue_overview::overview(backend).await?))
+        }
         // MOD-70 D3, D13: refused offline before anything is sent; a refusal is its sentence.
         StoreRequest::FollowUp { step, text } => {
             let writer = backend
@@ -2332,7 +2364,7 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
     })
 }
 
-/// MOD-12 D9: the five queue requests over `backend`'s inherent queue methods. This box is
+/// MOD-12 D9, M3 D3: the six queue writes and reads over `backend`'s inherent queue methods. This box is
 /// `box_info()`'s, the author `this_user()`, every time `Utc::now()` truncated to the microsecond.
 ///
 /// Memory serves them (blueprint deviation 6: `--demo` writes the rows, and its runtime never
@@ -2396,6 +2428,9 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
                 },
             }
         }
+        StoreRequest::MoveQueueEntry { item, to } => QueueWrite::Moved {
+            moved: backend.move_queue_entry(box_id, *item, *to).await?,
+        },
         other => {
             return Ok(StoreReply::Failed {
                 request: other.name(),
@@ -5123,7 +5158,7 @@ mod tests {
         );
     }
 
-    /// The five queue requests are named exactly as `QUEUE_REQUEST_NAMES` lists them, so the
+    /// The seven queue requests are named exactly as `QUEUE_REQUEST_NAMES` lists them, so the
     /// Backlog's `Failed` match and the worker cannot drift apart (MOD-12 D9).
     #[test]
     fn queue_requests_are_named_as_queue_request_names_lists_them() {
@@ -5140,6 +5175,12 @@ mod tests {
                 .name(),
                 StoreRequest::ResumeQueue.name(),
                 StoreRequest::PauseQueue.name(),
+                StoreRequest::QueueOverview.name(),
+                StoreRequest::MoveQueueEntry {
+                    item: ids::HTUI_ANA_2,
+                    to: QueueMove::Up,
+                }
+                .name(),
             ],
             QUEUE_REQUEST_NAMES
         );
