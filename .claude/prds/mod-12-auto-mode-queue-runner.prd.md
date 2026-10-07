@@ -123,7 +123,7 @@ reorder (M3).
 |---|---|---|---|---|
 | 1 | Unattended runs | The maintainer queues items from the Backlog; the box runs them one after another (up to `max_concurrent_items` at once) in queue order, with non-hard gates skipped and recorded as `skipped`, hard gates still parking; pausing stops new admissions without touching running runs | complete | `.claude/plans/mod-12-m1-unattended-runs.plan.md` |
 | 2 | Spend guard | Each queue activation is a batch; once its spend reaches `per_token_cap_batch`, or a run's remaining budget is below one attempt, nothing further is admitted; the Settings tab edits the caps, `max_concurrent_items` and the (unenforced) scheduler window | complete | `.claude/plans/mod-12-m2-spend-guard.plan.md` |
-| 3 | Queue overlay | One overlay shows the queue in order, what is running, and every escalation with its reason (review loop exhausted, judge undecided, missing tags, hard gate parked, blocked, targeted at another box), with pause/resume and reorder | pending | — |
+| 3 | Queue overlay | One overlay shows the queue in order, what is running, and every escalation with its reason (review loop exhausted, judge undecided, missing tags, hard gate parked, blocked, targeted at another box), with pause/resume and reorder | in-progress | `.claude/plans/mod-12-m3-queue-overlay.plan.md` |
 
 ## Open Questions
 
