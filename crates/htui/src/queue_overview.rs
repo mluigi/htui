@@ -64,7 +64,7 @@ pub async fn overview(backend: &Backend) -> Result<QueueOverview> {
     let mut missing_tags = HashMap::new();
     for row in &rows {
         let item = row.entry.item_id;
-        if row.status != Status::Open || ready.contains(&item) || cancelled.contains(&item) {
+        if row.status != Status::Open || ready.contains(&item) {
             continue;
         }
         let tags = match backend.missing_tags(item, box_id).await {
