@@ -4474,7 +4474,11 @@ impl State {
                     token: QueueToken::EditVersion(row.edit_version),
                 }))
             }
-            _ => unreachable!("queue_token_refusal answered every other target and token pair"),
+            // `queue_token_refusal` has refused every other pair; one it let through by mistake is a
+            // refusal here too, not a panic in the store (review R1).
+            _ => Err(StoreError::Constraint(format!(
+                "`{key}` on {target:?} does not take {expected:?}"
+            ))),
         }
     }
 
