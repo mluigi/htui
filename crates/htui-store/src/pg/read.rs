@@ -2317,6 +2317,52 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-12 M2 D1: `Σ (run_step.usage->>'cost_micros')::bigint` over the runs admitted under
+    /// `batch`; `None` when no step reports an integer cost. The text guard keeps a non-integer
+    /// cost out of the sum (Mem's `as_i64` skips it) instead of raising `22P02` on the cast, and
+    /// the outer `::bigint` turns `SUM`'s `numeric` back into what the driver decodes.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
+        sqlx::query_scalar!(
+            r#"
+            SELECT SUM((s.usage->>'cost_micros')::bigint)::bigint AS "spent"
+              FROM run_step s
+              JOIN run r ON r.id = s.run_id
+             WHERE r.batch_id = $1
+               AND (s.usage->>'cost_micros') ~ '^-?[0-9]+$'
+            "#,
+            batch.as_uuid(),
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-12 M2 D5: `run`'s `batch_id` and [`PgStore::batch_spend`] of it; `None` for a manual or
+    /// chat run (`batch_id IS NULL`) and for an unknown run. Two statements: the second is
+    /// `batch_spend`'s, so the two answers cannot drift.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn run_batch_spend(&self, run: RunId) -> Result<Option<(BatchId, Option<i64>)>> {
+        let batch = sqlx::query_scalar!(
+            r#"SELECT batch_id AS "batch_id: BatchId" FROM run WHERE id = $1"#,
+            run.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)?
+        .flatten();
+        match batch {
+            Some(batch) => Ok(Some((batch, self.batch_spend(batch).await?))),
+            None => Ok(None),
+        }
+    }
+
     /// MOD-12 D6 (H-5): `claim_run`'s slot count — `running` runs executing on `box_id`, **not**
     /// `awaiting_approval` (that is [`active_runs_on_box`](PgStore::active_runs_on_box)). The
     /// query text is `claim_run`'s byte for byte, so it shares that `.sqlx` entry.

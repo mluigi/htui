@@ -7687,6 +7687,166 @@ async fn queue_surface_answers_alike_on_both_stores() {
     db.drop_db().await;
 }
 
+// ---- MOD-12 M2: batch spend (blueprint §C.1) ---------------------------------------------------
+
+/// A step of `run` at `position` whose `usage` is `usage`, on either store.
+macro_rules! step_with_usage {
+    ($store:expr, $run:expr, $position:expr, $usage:expr) => {{
+        let step = $store
+            .create_step(htui_core::model::NewRunStep {
+                id: StepId::new(),
+                run_id: $run,
+                position: $position,
+                attempt: 0,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .expect("the step lands");
+        $store
+            .set_step_usage(StepFence::Unleased, step.id, $usage, None)
+            .await
+            .expect("the usage lands");
+    }};
+}
+
+/// `store::mem`'s `spend_fixture` on either store: batch A (two runs across projects, costs 700
+/// and 250, plus a `"x"` and a `1.5` cost that are skipped), batch B (1 000), batch C (one step
+/// without a cost) and a manual run costing 5 000. Answers `(a, b, c, a_run, manual)`.
+macro_rules! spend_fixture {
+    ($store:expr) => {{
+        use htui_core::model::BatchClose;
+        let store = $store;
+        let at = Utc::now();
+        let a = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch A opens");
+        let a_run = store
+            .create_run(batch_run(ids::HTUI_ANA_2, Some(a.id)))
+            .await
+            .expect("A admits ANA-2");
+        let a_other = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FEAT_1, Some(a.id))
+            })
+            .await
+            .expect("A admits another project's item");
+        step_with_usage!(store, a_run.id, 0, serde_json::json!({"cost_micros": 700, "input_tokens": 9}));
+        step_with_usage!(store, a_run.id, 1, serde_json::json!({"cost_micros": "x"}));
+        step_with_usage!(store, a_other.id, 0, serde_json::json!({"cost_micros": 250}));
+        step_with_usage!(store, a_other.id, 1, serde_json::json!({"cost_micros": 1.5}));
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("A was open");
+
+        let b = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch B opens");
+        let b_run = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_AGY,
+                ..batch_run(ids::AGY_FIX_1, Some(b.id))
+            })
+            .await
+            .expect("B admits");
+        step_with_usage!(store, b_run.id, 0, serde_json::json!({"cost_micros": 1_000}));
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close")
+            .expect("B was open");
+
+        let c = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("batch C opens");
+        let c_run = store
+            .create_run(batch_run(ids::HTUI_CLEAN_1, Some(c.id)))
+            .await
+            .expect("C admits");
+        step_with_usage!(store, c_run.id, 0, serde_json::json!({"input_tokens": 3}));
+
+        let manual = store
+            .create_run(NewRun {
+                project_id: ids::PROJECT_VULKAN,
+                ..race_run(ids::VULKAN_TOOL_1)
+            })
+            .await
+            .expect("a manual run");
+        step_with_usage!(store, manual.id, 0, serde_json::json!({"cost_micros": 5_000}));
+        (a.id, b.id, c.id, a_run.id, manual.id)
+    }};
+}
+
+/// MOD-12 M2 D1 (PRD metric "batch spend overshoot", the Pg half): `SUM(run_step.usage)` over a
+/// batch's runs answers what `MemStore` answers, the non-integer costs are skipped on Postgres
+/// too (no `22P02` from the cast), and a batch with no costed step is `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn batch_spend_answers_alike_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (pg_a, pg_b, pg_c, _, _) = spend_fixture!(pg);
+    let (mem_a, mem_b, mem_c, _, _) = spend_fixture!(&mem);
+
+    for (pg_batch, mem_batch, expected) in [
+        (pg_a, mem_a, Some(950)),
+        (pg_b, mem_b, Some(1_000)),
+        (pg_c, mem_c, None),
+    ] {
+        let on_pg = pg.batch_spend(pg_batch).await.expect("the Postgres read");
+        assert_eq!(
+            on_pg,
+            mem.batch_spend(mem_batch).await.expect("the MemStore read"),
+            "one figure, both stores"
+        );
+        assert_eq!(on_pg, expected);
+    }
+    let unknown = htui_core::model::BatchId::new();
+    assert_eq!(pg.batch_spend(unknown).await.expect("read"), None);
+    assert_eq!(mem.batch_spend(unknown).await.expect("read"), None);
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M2 D5: on both stores a manual run is in no batch and a batch run answers its own
+/// store's batch id with that batch's spend; an unknown run is `None`.
+#[tokio::test(flavor = "multi_thread")]
+async fn run_batch_spend_answers_alike_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (pg_a, _, _, pg_run, pg_manual) = spend_fixture!(pg);
+    let (mem_a, _, _, mem_run, mem_manual) = spend_fixture!(&mem);
+
+    assert_eq!(pg.run_batch_spend(pg_manual).await.expect("read"), None);
+    assert_eq!(mem.run_batch_spend(mem_manual).await.expect("read"), None);
+    assert_eq!(
+        pg.run_batch_spend(pg_run).await.expect("read"),
+        Some((pg_a, Some(950)))
+    );
+    assert_eq!(
+        mem.run_batch_spend(mem_run).await.expect("read"),
+        Some((mem_a, Some(950)))
+    );
+    let unknown = RunId::new();
+    assert_eq!(pg.run_batch_spend(unknown).await.expect("read"), None);
+    assert_eq!(mem.run_batch_spend(unknown).await.expect("read"), None);
+
+    db.drop_db().await;
+}
+
 /// MOD-12 D7, H-6: on both stores a run records its batch (`batch_runs`), a closed batch refuses
 /// the run with `Constraint` and an unknown one with `NotFound { entity: "queue_batch" }`.
 #[tokio::test(flavor = "multi_thread")]

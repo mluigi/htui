@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT SUM((s.usage->>'cost_micros')::bigint)::bigint AS \"spent\"\n              FROM run_step s\n              JOIN run r ON r.id = s.run_id\n             WHERE r.batch_id = $1\n               AND (s.usage->>'cost_micros') ~ '^-?[0-9]+$'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "spent",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "eb2049806ba50f6cd5c847e4419a888e70a4103bcf635362b7ac63a6d36da1ec"
+}
