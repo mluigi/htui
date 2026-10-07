@@ -1,0 +1,22 @@
+---
+source: crates/htui/src/ui/overlay/queue.rs
+expression: rendered
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ┌ Queue ───────────────────────────────────────────────────────────────────────────────────────┐
+  │  the queue is unavailable: store unreachable: this box browses its read-only cache and star… │
+  │                                                                                              │
+  │  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close                │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

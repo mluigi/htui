@@ -1,0 +1,24 @@
+---
+source: crates/htui/src/ui/overlay/queue.rs
+expression: rendered
+---
+
+
+
+
+
+
+
+
+
+
+
+          ┌ Queue ────────────────────────────────────────────────────────────────────────┐
+          │  queue: running · batch since 14:02 · $1.20 spent · 1/2 slots                 │
+          │                                                                               │
+          │> A-1  t  next to run                                                          │
+          │  B-2  t  next to run                                                          │
+          │  C-3  t  next to run                                                          │
+          │                                                                               │
+          │  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close │
+          └───────────────────────────────────────────────────────────────────────────────┘
