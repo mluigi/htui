@@ -1586,6 +1586,81 @@ async fn a_landed_identity_write_lifts_the_latch_line_until_the_next_check() {
 }
 
 #[tokio::test]
+async fn a_check_answered_after_a_later_identity_write_does_not_bring_the_latch_back() {
+    // The check was sent first, so the loop served it against the identity the write replaced;
+    // the write lands before the answer, and A-4 rebuilds on the next `provider()`. Its refusal
+    // stays on the Health row as history, and is no latch.
+    let latch = "the last login was refused";
+    let refused = || {
+        StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            outcome: Err(SecretError::BadCredentials),
+        })
+    };
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::CheckSecretProvider]
+    ));
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::SetMachineIdentity(_)]
+    ));
+    bench.reply(&mut section, &configured());
+    bench.reply(&mut section, &refused());
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains(latch), "{shown}");
+    assert!(shown.contains("last check 14:02:11"), "{shown}");
+
+    // The next check speaks again.
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    bench.reply(&mut section, &refused());
+    assert!(frame(&bench, &section).contains(latch));
+}
+
+#[tokio::test]
+async fn a_check_sent_after_an_identity_write_latches_on_its_answer() {
+    // The write was sent first, so the loop served the check against the new identity: the
+    // write landing before the answer does not lift what that answer says.
+    let latch = "the last login was refused";
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [
+            StoreRequest::SetMachineIdentity(_),
+            StoreRequest::CheckSecretProvider
+        ]
+    ));
+    bench.reply(&mut section, &configured());
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            outcome: Err(SecretError::BadCredentials),
+        }),
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(latch), "{shown}");
+}
+
+#[tokio::test]
 async fn a_scope_check_shows_a_count() {
     let (bench, mut section, _) = loaded_over(&scoped_store(), configured()).await;
     for (count, expected) in [(12, "12 keys visible"), (1, "1 key visible")] {
@@ -1614,6 +1689,92 @@ async fn a_scope_check_shows_a_count() {
         }),
     );
     assert!(!frame(&bench, &section).contains("99 keys"));
+}
+
+#[tokio::test]
+async fn a_scope_check_answered_after_a_later_scope_write_is_not_kept() {
+    // The check was sent first, so the loop read the scope the write replaced: its count is not
+    // the new scope's, and the row says nothing until the next check.
+    let store = scoped_store();
+    let backend = Backend::memory(store.clone());
+    let (bench, mut section, _) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "t");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::CheckSecretScope { .. }]
+    ));
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "Tab");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "/v2");
+    bench.key(&mut section, "Enter");
+    let request = requests(&bench).pop().expect("the write");
+    let reply = serve(&backend, &request).await;
+    assert!(matches!(
+        reply,
+        StoreReply::SecretScopeWritten {
+            outcome: ScopeWrite::Applied,
+            ..
+        }
+    ));
+    bench.reply(&mut section, &reply);
+    let check = |count| {
+        StoreReply::SecretCheck(SecretCheck::Scope {
+            project: ids::PROJECT_VULKAN,
+            at: at(14, 3, 5),
+            outcome: Ok(count),
+        })
+    };
+    bench.reply(&mut section, &check(12));
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("/app/v2"), "the new scope: {shown}");
+    assert!(!flat.contains("12 keys"), "{shown}");
+    assert!(!flat.contains("checking"), "{shown}");
+
+    // The next check is kept.
+    bench.key(&mut section, "t");
+    bench.reply(&mut section, &check(3));
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("checked 14:03:05: 3 keys visible"), "{shown}");
+}
+
+#[tokio::test]
+async fn a_scope_check_sent_after_a_scope_write_is_kept() {
+    // The clear was sent first, so the loop read the cleared row: the answer is the current one.
+    let store = scoped_store();
+    let backend = Backend::memory(store.clone());
+    let (bench, mut section, _) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    bench.key(&mut section, "t");
+    let sent = requests(&bench);
+    assert!(
+        matches!(
+            sent.as_slice(),
+            [
+                StoreRequest::SetProjectSecretScope { scope: None, .. },
+                StoreRequest::CheckSecretScope { .. }
+            ]
+        ),
+        "{sent:?}"
+    );
+    let reply = serve(&backend, &sent[0]).await;
+    bench.reply(&mut section, &reply);
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Scope {
+            project: ids::PROJECT_VULKAN,
+            at: at(14, 3, 5),
+            outcome: Err(SecretError::Config("no provider".to_owned())),
+        }),
+    );
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("checked 14:03:05"), "{shown}");
 }
 
 #[tokio::test]

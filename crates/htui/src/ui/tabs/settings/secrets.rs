@@ -368,6 +368,18 @@ pub struct SecretsSection {
     rebuilt_since_check: bool,
     /// The last scope check per project of this workspace, this session.
     scope_checks: BTreeMap<ProjectId, (DateTime<Utc>, Result<usize, SecretError>)>,
+    /// Writes sent this session: numbers each write, so a landing one can tell whether it was
+    /// sent before or after the check in flight.
+    writes_sent: u64,
+    /// [`writes_sent`](Self::writes_sent) when the write in flight was sent.
+    busy_seq: u64,
+    /// [`writes_sent`](Self::writes_sent) when the check in flight was sent.
+    check_seq: u64,
+    /// A write sent after the check in flight has landed, and that check is about what it
+    /// replaced: the loop serves in order, so the check ran first (a keyring write against the
+    /// provider check, a project's scope write against that project's check). Its answer is
+    /// history: it latches nothing and caches no count.
+    check_outdated: bool,
     /// The last outcome.
     notice: Option<Notice>,
 }
@@ -442,6 +454,8 @@ impl SecretsSection {
     /// Sends one write and remembers it until its reply.
     fn send(&mut self, write: Write, request: StoreRequest, ctx: &Ctx<'_>) {
         self.busy = Some(write);
+        self.writes_sent += 1;
+        self.busy_seq = self.writes_sent;
         self.notice = None;
         ctx.request(request);
     }
@@ -449,6 +463,8 @@ impl SecretsSection {
     /// Sends one check and remembers it until its answer.
     fn check(&mut self, checking: Checking, request: StoreRequest, ctx: &Ctx<'_>) {
         self.checking = Some(checking);
+        self.check_seq = self.writes_sent;
+        self.check_outdated = false;
         self.notice = None;
         ctx.request(request);
     }
@@ -1080,9 +1096,18 @@ impl SecretsSection {
             Some(Write::ClearIdentity) => IDENTITY_CLEARED,
             Some(Write::Scope { .. }) | None => return,
         };
+        self.landed(true, self.checking == Some(Checking::Provider));
         self.busy = None;
         self.rebuilt_since_check = true;
         self.say(said);
+    }
+
+    /// A write landed. When it `outdates` the check in flight and was not this section's write
+    /// sent before that check, the check ran against what the write replaced.
+    fn landed(&mut self, ours: bool, outdates: bool) {
+        if outdates && !(ours && self.busy_seq <= self.check_seq) {
+            self.check_outdated = true;
+        }
     }
 
     /// The scope write's own answer (D6, blueprint A-1).
@@ -1098,6 +1123,8 @@ impl SecretsSection {
         }
         if outcome == ScopeWrite::Applied {
             self.scope_checks.remove(&project);
+            let ours = matches!(self.busy, Some(Write::Scope { project: p, .. }) if p == project);
+            self.landed(ours, self.checking == Some(Checking::Scope(project)));
         }
         let clear = match self.busy {
             Some(Write::Scope { project: p, clear }) if p == project => clear,
@@ -1138,30 +1165,37 @@ impl SecretsSection {
         }
     }
 
+    /// Ends the check in flight when `check` is it; whether a write outdated it.
+    fn answered(&mut self, check: Checking) -> bool {
+        if self.checking != Some(check) {
+            return false;
+        }
+        self.checking = None;
+        core::mem::take(&mut self.check_outdated)
+    }
+
     /// One check's answer.
     fn on_check(&mut self, check: &SecretCheck) {
         match check {
             SecretCheck::Provider { at, outcome } => {
-                if self.checking == Some(Checking::Provider) {
-                    self.checking = None;
-                }
+                let outdated = self.answered(Checking::Provider);
                 self.provider_check = Some((*at, outcome.clone()));
-                self.rebuilt_since_check = false;
+                // A keyring write that landed during the check has already rebuilt what it
+                // latched (A-4).
+                self.rebuilt_since_check = outdated;
             }
             SecretCheck::Scope {
                 project,
                 at,
                 outcome,
             } => {
-                if self.checking == Some(Checking::Scope(*project)) {
-                    self.checking = None;
-                }
+                let outdated = self.answered(Checking::Scope(*project));
                 let known = self.tree.as_ref().is_some_and(|tree| {
                     tree.projects
                         .iter()
                         .any(|entry| entry.project.id == *project)
                 });
-                if known {
+                if known && !outdated {
                     self.scope_checks.insert(*project, (*at, outcome.clone()));
                 }
             }
