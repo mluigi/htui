@@ -87,11 +87,16 @@ impl QueueSetting {
                 }
                 .to_string()),
             },
+            // Review R1: the section takes this in dollars, so an integer is read back in dollars
+            // too, beside the micros it is stored as. Anything else is shown as written.
             Self::MinBudgetForNewAttempt => match value.as_i64() {
                 Some(micros) if micros > 0 => Ok(()),
-                _ => Err(format!(
-                    "app_setting.min_budget_for_new_attempt must be a positive integer of USD \
-                     micros, got {value}"
+                found => Err(format!(
+                    "app_setting.min_budget_for_new_attempt must be at least $0.000001, got {}",
+                    found.map_or_else(
+                        || value.to_string(),
+                        |micros| format!("{} ({micros} USD micros)", format_usd(micros))
+                    )
                 )),
             },
             Self::MaxConcurrentItems => match value.as_u64() {
@@ -313,13 +318,21 @@ mod tests {
     fn min_budget_takes_a_positive_integer() {
         let key = QueueSetting::MinBudgetForNewAttempt;
         assert_eq!(key.validate(&json!(1)), Ok(()));
-        for (value, found) in [(json!(0), "0"), (json!(-1), "-1"), (json!("5"), "\"5\"")] {
+        // Review R1: the section takes dollars, so an integer is also read back in dollars; the
+        // stored unit stays named.
+        for (value, found) in [
+            (json!(0), "$0.00 (0 USD micros)"),
+            (json!(-1), "-$0.000001 (-1 USD micros)"),
+            (json!("5"), "\"5\""),
+            (json!(1.5), "1.5"),
+        ] {
             assert_eq!(
                 key.validate(&value),
                 Err(format!(
-                    "app_setting.min_budget_for_new_attempt must be a positive integer of USD \
-                     micros, got {found}"
-                ))
+                    "app_setting.min_budget_for_new_attempt must be at least $0.000001, got \
+                     {found}"
+                )),
+                "{value}"
             );
         }
     }

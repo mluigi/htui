@@ -662,6 +662,28 @@ async fn an_invalid_value_shows_the_validators_sentence_and_writes_nothing() {
     assert!(frame.contains(&sentence), "{frame}");
 }
 
+/// Review R1: a minimum budget typed in dollars is refused in dollars. `0` parses (to 0 micros) and
+/// the validator refuses it with a sentence that reads the amount back as typed, `$0.00`, beside
+/// the stored micros.
+#[tokio::test]
+async fn a_zero_minimum_budget_is_refused_in_dollars() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+
+    edit(&bench, &mut section, row::MIN_BUDGET, "0");
+    bench.key(&mut section, "enter");
+    assert!(bench.drained().is_empty(), "a refused value asks nothing");
+    let sentence = QueueSetting::MinBudgetForNewAttempt
+        .validate(&json!(0))
+        .expect_err("0 is refused");
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains(&sentence), "{frame}");
+    assert!(
+        sentence.contains("at least $0.000001, got $0.00"),
+        "{sentence}"
+    );
+}
+
 /// D8: the box limit cleared inherits the app default, and the row says what that comes to.
 #[tokio::test]
 async fn an_empty_box_limit_shows_the_inherited_value() {
