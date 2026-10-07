@@ -41,6 +41,32 @@ pub struct Args {
     )]
     pub dsn_stdin: bool,
 
+    /// Read key bindings from this file instead of `keys.toml` in htui's config directory
+    /// (MOD-67). A missing or invalid file stops htui with status 2.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["default_keys", "set_dsn", "clear_dsn", "index_items", "search_items"]
+    )]
+    pub keys: Option<PathBuf>,
+
+    /// Ignore `keys.toml` for this run and start with the default keys.
+    #[arg(
+        long,
+        conflicts_with_all = ["keys", "set_dsn", "clear_dsn", "index_items", "search_items"]
+    )]
+    pub default_keys: bool,
+
+    /// Print the keys in force as a commented `keys.toml` and exit; with an invalid file, print
+    /// its errors and exit with status 2.
+    #[arg(
+        long,
+        conflicts_with_all = [
+            "set_dsn", "clear_dsn", "index_items", "search_items", "dsn_stdin", "demo", "offline"
+        ]
+    )]
+    pub print_keys: bool,
+
     /// Open from the local cache and never attempt a connection (demos, tests, a flaky network).
     #[arg(long)]
     pub offline: bool,
@@ -374,6 +400,60 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    /// MOD-67 M2 D4: the three key flags parse alone and beside every flag that starts the TUI.
+    #[test]
+    fn the_key_flags_parse_alone_and_beside_the_tui_flags() {
+        let args = Args::try_parse_from(["htui", "--keys", "k.toml"]).expect("parse");
+        assert_eq!(args.keys.as_deref(), Some(std::path::Path::new("k.toml")));
+        assert!(!args.default_keys);
+        assert!(!args.print_keys);
+        let args = Args::try_parse_from(["htui", "--default-keys"]).expect("parse");
+        assert!(args.default_keys);
+        assert_eq!(args.keys, None);
+        let args = Args::try_parse_from(["htui", "--print-keys"]).expect("parse");
+        assert!(args.print_keys);
+        for good in [
+            &["htui", "--print-keys", "--keys", "k.toml"][..],
+            &["htui", "--print-keys", "--default-keys"],
+            &["htui", "--keys", "k.toml", "--demo"],
+            &["htui", "--keys", "k.toml", "--offline"],
+            &["htui", "--keys", "k.toml", "--dsn-stdin"],
+            &["htui", "--default-keys", "--demo"],
+        ] {
+            assert!(Args::try_parse_from(good).is_ok(), "{good:?} must parse");
+        }
+    }
+
+    /// MOD-67 M2 D4: a flag that exits before the keys are read refuses the key flags, which it
+    /// would silently ignore; `--print-keys` also refuses every flag of a TUI it never starts.
+    #[test]
+    fn the_key_flags_refuse_flags_that_never_read_keys() {
+        let mut refused: Vec<Vec<&str>> = vec![vec!["--keys", "k", "--default-keys"]];
+        for key_flag in [&["--keys", "k"][..], &["--default-keys"], &["--print-keys"]] {
+            for other in [
+                &["--set-dsn"][..],
+                &["--clear-dsn"],
+                &["--index-items"],
+                &["--search-items", "q"],
+            ] {
+                refused.push([key_flag, other].concat());
+            }
+        }
+        for other in ["--dsn-stdin", "--demo", "--offline"] {
+            refused.push(vec!["--print-keys", other]);
+        }
+        refused.push(vec!["--print-keys", "worker"]);
+        refused.push(vec!["--keys", "k", "worker"]);
+        for flags in refused {
+            let mut argv = vec!["htui"];
+            argv.extend_from_slice(&flags);
+            assert!(
+                Args::try_parse_from(&argv).is_err(),
+                "{argv:?} must not parse"
+            );
+        }
     }
 
     /// `R-STO-1`: no top-level argument reads the environment but `--log`.
