@@ -438,10 +438,12 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // connection.rs:828, boxes.rs:739, hierarchy.rs:1294, kinds.rs:1511, prompt.rs:875.
     // Shares `Esc` with `back`: `STATE_GUARDED`.
     row(Act::Dismiss, Common, "dismiss", &["esc"], "dismiss"),
-    // [editor]: MOD-57 M1 (plan P4, P5). `ctrl-4` is what `ctrl-\` arrives as (`chord.rs`
-    // `legacy_arrival`; `ctrl-\` itself is refused as indistinguishable). In capture: while the
-    // editor is focused every other key, `ctrl-c` included, is the editor's. MOD-67 M2's loader
-    // must refuse a file that unbinds it, as it does `overlay.close`.
+    // [editor]: MOD-57 M1 (plan P4, P5). `ctrl-4` is what `ctrl-\` arrives as on unix (`chord.rs`
+    // `legacy_arrival`; `ctrl-\` itself is refused as indistinguishable). On Windows crossterm
+    // delivers `ctrl-\` as `Char('\\')` + CONTROL, so there only a physical `ctrl-4` matches
+    // (MOD-16 H-10/H-11, T7's docs). In capture: while the editor is focused every other key,
+    // `ctrl-c` included, is the editor's. MOD-67 M2's loader must refuse a file that unbinds it,
+    // as it does `overlay.close`.
     capture_row(
         Act::EditorFocus,
         Editor,

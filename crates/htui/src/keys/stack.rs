@@ -3,8 +3,9 @@
 //! A stack lists the contexts a key reaches, narrowest first (MOD-67 D6). MOD-67 M1 shipped two:
 //! [`Stack::BASE`] (the global layer) and [`Stack::OVERLAY`] (the overlay layer, then only
 //! `global.help`). MOD-57 adds the editor's two: [`Stack::EDITOR_FOCUSED`] and
-//! [`Stack::EDITOR_UNFOCUSED`]. A row for an act in a narrower layer shadows that act in every wider layer,
-//! bound or not (blueprint B6): that is how M2's narrower overrides and `reject = []` work.
+//! [`Stack::EDITOR_UNFOCUSED`]. A row for an act in a narrower layer shadows that act in every
+//! wider layer, bound or not (blueprint B6): that is how M2's narrower overrides and
+//! `reject = []` work.
 
 use super::{Act, Context, KeyChord, Keys};
 
