@@ -376,7 +376,9 @@ impl Inner {
         // D5: a 401 refuses the identity whatever happens to its body, so a body cut short or
         // over the cap can never turn a rejected login into a retried one.
         if status == reqwest::StatusCode::UNAUTHORIZED {
-            return Err(LoginFailure::Refused(login_refusal(body.as_deref().ok())));
+            return Err(LoginFailure::Refused(login_refusal(
+                body.as_deref().ok().map(Vec::as_slice),
+            )));
         }
         let body = body.map_err(LoginFailure::Other)?;
         if status.is_success() {
@@ -686,14 +688,36 @@ fn reuse_until(now: Instant, expires_in_secs: u64) -> Instant {
         .unwrap_or(now)
 }
 
+/// L-7 (CLEAN-8 #1): appends `chunk` within `cap` without ever letting `buf` reallocate in place:
+/// past its capacity it moves into a fresh zeroizing buffer of `max(need, 2 × capacity).min(cap)`,
+/// and the old one is wiped as it drops. `false`, with `buf` untouched, when `chunk` would pass `cap`.
+fn append(buf: &mut Zeroizing<Vec<u8>>, chunk: &[u8], cap: usize) -> bool {
+    let Some(need) = buf
+        .len()
+        .checked_add(chunk.len())
+        .filter(|need| *need <= cap)
+    else {
+        return false;
+    };
+    if need > buf.capacity() {
+        let grown = need.max(buf.capacity().saturating_mul(2)).min(cap);
+        let mut next = Zeroizing::new(Vec::with_capacity(grown));
+        next.extend_from_slice(buf);
+        core::mem::swap(buf, &mut next); // `next` (the old buffer) drops wiped, spare capacity included
+    }
+    buf.extend_from_slice(chunk); // need <= capacity: never reallocates
+    true
+}
+
 /// The body, read chunk by chunk up to `cap`: a declared length over it is refused before the
 /// read, an undeclared one as soon as the bytes read pass it. Over the cap is `Protocol` naming
-/// the status and the cap, never the body; a transport error is `Unreachable`.
+/// the status and the cap, never the body; a transport error is `Unreachable`. The buffer is
+/// presized to the declared length and wiped on drop, every outgrown copy included (CLEAN-8 #1).
 async fn read_body(
     endpoint: &'static str,
     mut response: reqwest::Response,
     cap: BodyCap,
-) -> Result<Vec<u8>, SecretError> {
+) -> Result<Zeroizing<Vec<u8>>, SecretError> {
     let too_large = |status: reqwest::StatusCode| {
         protocol(
             endpoint,
@@ -711,16 +735,19 @@ async fn read_body(
     {
         return Err(too_large(status));
     }
-    let mut body = Vec::new();
+    let presize = response
+        .content_length()
+        .map_or(0, |n| usize::try_from(n).unwrap_or(usize::MAX))
+        .min(cap.bytes);
+    let mut body = Zeroizing::new(Vec::with_capacity(presize));
     while let Some(chunk) = response
         .chunk()
         .await
         .map_err(|e| unreachable(endpoint, e))?
     {
-        if chunk.len() > cap.bytes - body.len() {
+        if !append(&mut body, &chunk, cap.bytes) {
             return Err(too_large(status));
         }
-        body.extend_from_slice(&chunk);
     }
     Ok(body)
 }
@@ -1342,5 +1369,49 @@ mod tests {
             let url = host(no);
             assert!(!is_loopback(&url.host().expect("a host")), "{no}");
         }
+    }
+
+    #[test]
+    fn append_fills_a_presized_buffer_in_place() {
+        let mut buf = Zeroizing::new(Vec::with_capacity(10));
+        let p = buf.as_ptr();
+        assert!(append(&mut buf, &[1; 4], 10));
+        assert!(append(&mut buf, &[2; 6], 10));
+        assert_eq!(buf.as_ptr(), p, "a presized buffer never moves");
+        assert_eq!(&buf[..], [1, 1, 1, 1, 2, 2, 2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn append_grows_by_a_fresh_buffer_and_keeps_the_bytes() {
+        let mut buf = Zeroizing::new(Vec::with_capacity(2));
+        assert!(append(&mut buf, b"abc", 64));
+        assert!(append(&mut buf, b"de", 64));
+        assert_eq!(&buf[..], b"abcde");
+        assert!(buf.capacity() >= 5);
+    }
+
+    #[test]
+    fn append_never_grows_past_the_cap() {
+        let mut buf = Zeroizing::new(Vec::new());
+        assert!(append(&mut buf, b"abc", 5));
+        assert!(append(&mut buf, b"de", 5));
+        assert_eq!(&buf[..], b"abcde");
+        assert!(buf.capacity() <= 5, "capacity {}", buf.capacity());
+    }
+
+    #[test]
+    fn append_over_the_cap_refuses_and_changes_nothing() {
+        let mut buf = Zeroizing::new(Vec::new());
+        assert!(append(&mut buf, b"abcd", 5));
+        let capacity = buf.capacity();
+        assert!(!append(&mut buf, b"xy", 5));
+        assert_eq!(&buf[..], b"abcd");
+        assert_eq!(buf.capacity(), capacity);
+        assert!(append(&mut buf, b"e", 5));
+        assert!(
+            append(&mut buf, &[], 5),
+            "an empty chunk fits a full buffer"
+        );
+        assert_eq!(&buf[..], b"abcde");
     }
 }
