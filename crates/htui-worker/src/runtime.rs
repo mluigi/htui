@@ -1,6 +1,7 @@
 //! The run runtime (MOD-4 milestone 6, plan D153; MOD-41 plan D6, D7): every command on a task of
 //! its own, serialised per run, supervised, swept.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::marker::PhantomData;
@@ -2272,7 +2273,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         let Some(&project) = project_of.get(&item) else {
             continue;
         };
-        if !caps.contains_key(&project) {
+        if let Entry::Vacant(slot) = caps.entry(project) {
             let settings = match host.project_settings(project).await {
                 Ok(settings) => settings.unwrap_or(Value::Null),
                 Err(err) => {
@@ -2280,7 +2281,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
                     return;
                 }
             };
-            caps.insert(project, ProjectCaps::from_settings(&settings));
+            slot.insert(ProjectCaps::from_settings(&settings));
         }
         match &caps[&project] {
             Err(err) => {

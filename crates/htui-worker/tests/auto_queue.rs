@@ -545,7 +545,7 @@ impl Harness {
             .expect("the item queues");
     }
 
-    async fn resume(&self) -> htui_core::model::BatchId {
+    async fn resume(&self) -> BatchId {
         self.store
             .open_batch(ids::BOX, ids::USER, Utc::now())
             .await
