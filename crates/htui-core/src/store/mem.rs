@@ -14658,10 +14658,11 @@ mod tests {
     }
 
     /// Review M1: the drain's close is of exactly the batch it names, and only while that batch
-    /// is still drained, so a pause and a resume between the drain's reads and its close are
-    /// never undone.
+    /// is still open with no live run of its own, so a pause and a resume between the drain's
+    /// reads and its close are never undone. MOD-12 M3 D4 (L4): entries do not keep it open, so
+    /// the runner can close a stalled batch.
     #[tokio::test]
-    async fn close_drained_batch_closes_only_the_drained_batch_it_names() {
+    async fn close_drained_batch_closes_only_its_batch_and_ignores_entries() {
         let store = MemStore::demo();
         let at = Utc::now();
         let first = store
@@ -14699,15 +14700,6 @@ mod tests {
             .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
             .await
             .expect("the item queues");
-        assert_eq!(
-            store
-                .close_drained_batch(second.id, at)
-                .await
-                .expect("answered"),
-            None,
-            "an entry keeps it open"
-        );
-        assert!(store.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
         let run = store
             .create_run(batch_run(ids::HTUI_ANA_2, Some(second.id)))
             .await
@@ -14732,6 +14724,17 @@ mod tests {
         assert_eq!(closed.id, second.id);
         assert_eq!(closed.closed_reason, Some(BatchClose::Drained));
         assert_eq!(store.open_batch_of(ids::BOX).await.expect("read"), None);
+        assert_eq!(
+            store
+                .queue_entries(ids::BOX)
+                .await
+                .expect("read")
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect::<Vec<_>>(),
+            [ids::HTUI_ANA_2],
+            "the entry did not keep it open, and the close left it queued (M3 D4)"
+        );
         assert_eq!(
             store
                 .close_drained_batch(crate::model::BatchId::new(), at)

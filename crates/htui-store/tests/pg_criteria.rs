@@ -8115,7 +8115,8 @@ async fn create_run_round_trips_its_batch() {
 
 /// Review H2, M1: on both stores a close cancels the batch's runs still `queued` (item back to
 /// `open`, entry kept) and nothing else, `batch_cancelled_items` names their items, and the
-/// drain's close is of exactly the drained batch it names.
+/// drain's close is of exactly the batch it names, held open only by a live run of its own: an
+/// entry does not keep it open (MOD-12 M3 D4, L4).
 #[tokio::test(flavor = "multi_thread")]
 async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch() {
     use htui_core::model::BatchClose;
@@ -8267,21 +8268,6 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
         Some(pg_next.id),
         "the resume's batch survives the old batch's drain"
     );
-    assert_eq!(
-        pg.close_drained_batch(pg_next.id, later)
-            .await
-            .expect("close"),
-        None,
-        "an entry keeps it open"
-    );
-    assert_eq!(
-        mem.close_drained_batch(mem_next.id, later)
-            .await
-            .expect("close"),
-        None
-    );
-    assert!(pg.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
-    assert!(mem.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
     let live = batch_run(ids::HTUI_ANA_2, Some(pg_next.id));
     pg.create_run(live.clone()).await.expect("pg admits");
     mem.create_run(NewRun {
@@ -8322,6 +8308,114 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
     assert_eq!(pg_drained.id, pg_next.id);
     assert_eq!(batch_shape(&pg_drained), batch_shape(&mem_drained));
     assert_eq!(pg_drained.closed_reason, Some(BatchClose::Drained));
+    let pg_entries = pg.queue_entries(ids::BOX).await.expect("read");
+    assert_eq!(
+        pg_entries,
+        mem.queue_entries(ids::BOX).await.expect("read"),
+        "the drain closed over the entry on both, and kept it"
+    );
+    assert_eq!(
+        pg_entries
+            .iter()
+            .map(|entry| entry.item_id)
+            .collect::<Vec<_>>(),
+        [ids::HTUI_ANA_2]
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 D4 (L4): a stalled batch, open with an entry and no run of its own live, closes
+/// `drained` alike on both stores; a `queued` run of its own keeps the next one open on both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_batch_closes_alike_on_both_stores() {
+    use htui_core::model::BatchClose;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let (pg_closed, mem_closed) = (
+        pg.close_drained_batch(pg_batch.id, later)
+            .await
+            .expect("close")
+            .expect("an entry does not keep it open"),
+        mem.close_drained_batch(mem_batch.id, later)
+            .await
+            .expect("close")
+            .expect("an entry does not keep it open"),
+    );
+    assert_eq!(pg_closed.id, pg_batch.id);
+    assert_eq!(batch_shape(&pg_closed), batch_shape(&mem_closed));
+    assert_eq!(pg_closed.closed_reason, Some(BatchClose::Drained));
+    assert_eq!(pg_closed.closed_at, Some(later));
+    assert_eq!(pg.open_batch_of(ids::BOX).await.expect("read"), None);
+    assert_eq!(mem.open_batch_of(ids::BOX).await.expect("read"), None);
+    assert_eq!(
+        pg.queue_entries(ids::BOX).await.expect("read"),
+        mem.queue_entries(ids::BOX).await.expect("read"),
+        "the entry stays on both"
+    );
+
+    let pg_next = pg
+        .open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    let mem_next = mem
+        .open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    let live = batch_run(ids::HTUI_ANA_2, Some(pg_next.id));
+    pg.create_run(live.clone()).await.expect("pg admits");
+    mem.create_run(NewRun {
+        batch_id: Some(mem_next.id),
+        ..live.clone()
+    })
+    .await
+    .expect("mem admits");
+    assert_eq!(
+        pg.close_drained_batch(pg_next.id, later)
+            .await
+            .expect("close"),
+        None,
+        "a queued run of its own keeps it open"
+    );
+    assert_eq!(
+        mem.close_drained_batch(mem_next.id, later)
+            .await
+            .expect("close"),
+        None,
+        "a queued run of its own keeps it open"
+    );
+    assert_eq!(
+        pg.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| batch_shape(&open)),
+        mem.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| batch_shape(&open)),
+    );
+    assert_eq!(
+        pg.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| open.id),
+        Some(pg_next.id)
+    );
 
     db.drop_db().await;
 }

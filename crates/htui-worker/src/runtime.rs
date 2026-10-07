@@ -4097,7 +4097,9 @@ mod queue_store_errors {
     /// sweep) has no caps to read, so it fails closed: the engine is never asked to enqueue it,
     /// and that is no store failure. Once its project reads again the engine is asked; the demo
     /// has no agent for `research`, so that enqueue is refused and blocks the item, which is
-    /// what tells the two sweeps apart.
+    /// what tells the two sweeps apart. MOD-12 M3 D4 (L4): with its only entry refused, the
+    /// first sweep had a free slot and nothing admissible, so it closed the batch; a resume opens
+    /// the second sweep's.
     #[tokio::test]
     async fn an_entry_whose_project_is_gone_is_not_admitted() {
         let store = MemStore::demo();
@@ -4130,6 +4132,18 @@ mod queue_store_errors {
             !ctx.shared.queue_failing.load(Ordering::SeqCst),
             "an absent project is not a failing store"
         );
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers"),
+            None,
+            "an absent project stalls the batch, which closes (CLOSE 3)"
+        );
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("a resume opens a new batch");
 
         host.no_project.store(false, Ordering::SeqCst);
         admit(&ctx, ids::BOX, &json!({})).await;

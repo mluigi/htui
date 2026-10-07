@@ -18,6 +18,11 @@
 //! The ticker is one hour, so every sweep a case sees is an explicit `sweep_with` or the D8
 //! wake. The `_pg` cases return early without `HTUI_TEST_DATABASE_URL`.
 //!
+//! MOD-12 milestone 3 (plan D4, review L4; blueprint §C.2) closes a stalled batch: a sweep with a
+//! free slot and nothing admissible closes the batch `drained` like an empty one, unless a run of
+//! its own is live, so a later `Q` waits for `P`. A sweep with no free slot and an enqueue
+//! refusal never close.
+//!
 //! MOD-12 milestone 2 (blueprint §C.3) adds the runner's spend gate (plan D4): a costing harness
 //! whose every session reports a fixed USD cost, and cases over the batch's spend against each
 //! entry's project cap. The spend is always made by a run that is already parked when the cap is
@@ -700,7 +705,8 @@ async fn a_resumed_box_admits_in_queue_order_up_to_the_cap() {
     );
 }
 
-/// (c) D5: an entry `ready_items` does not hold waits, and is admitted once it is ready.
+/// (c) D5: an entry `ready_items` does not hold waits, and is admitted once it is ready. M3 D4
+/// (L4): the wait stalls the batch, which closes, so the unblocked entry runs after a resume.
 #[tokio::test]
 async fn a_queued_item_that_is_not_ready_waits_then_runs() {
     let h = Harness::open().await;
@@ -717,6 +723,14 @@ async fn a_queued_item_that_is_not_ready_waits_then_runs() {
     runtime.sweep_with(&h.backend(), &TestSink::default());
     settle(&mut runtime).await;
     assert!(h.runs(item).await.is_empty(), "a blocked item is not ready");
+    assert_eq!(
+        h.store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("the read answers"),
+        None,
+        "nothing admissible and nothing live: the batch stalled and closed"
+    );
 
     assert!(
         h.store
@@ -724,9 +738,14 @@ async fn a_queued_item_that_is_not_ready_waits_then_runs() {
             .await
             .expect("blocked -> open is legal")
     );
+    let next = h.resume().await;
     runtime.sweep_with(&h.backend(), &TestSink::default());
     settle(&mut runtime).await;
     assert_eq!(h.only_run(item).await.mode, RunMode::Auto);
+    assert!(
+        h.admitted_under(item, next).await,
+        "under the resume's batch"
+    );
 }
 
 /// (d) PRD D1, blueprint deviation 7: an item whose tags the box lacks is not ready, so it waits
@@ -1001,9 +1020,10 @@ async fn a_live_batch_run_keeps_the_drained_batch_open() {
     );
 }
 
-/// (f2) D3: a `blocked` entry keeps its place and the batch open.
+/// (f2) D3, M3 D4 (L4): a `blocked` entry keeps its place, but not the batch: with nothing
+/// admissible and no live run of its own, the batch closes `drained`.
 #[tokio::test]
-async fn a_blocked_entry_keeps_the_batch_open() {
+async fn a_blocked_entry_keeps_its_place_and_its_stalled_batch_closes() {
     let h = Harness::open().await;
     let item = mint_ana(&h.store, "blocked", 0).await;
     assert!(
@@ -1021,9 +1041,17 @@ async fn a_blocked_entry_keeps_the_batch_open() {
         h.store
             .open_batch_of(ids::BOX)
             .await
+            .expect("the read answers"),
+        None,
+        "the stalled batch closed"
+    );
+    assert!(
+        h.store
+            .batch_runs(batch)
+            .await
             .expect("the read answers")
-            .map(|open| open.id),
-        Some(batch)
+            .is_empty(),
+        "it admitted nothing"
     );
     let entries = h
         .store
@@ -1287,12 +1315,18 @@ async fn a_cancelled_auto_run_is_not_readmitted_in_its_batch() {
         vec![(run.id, RunStatus::Cancelled)]
     );
 
-    h.store
-        .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
-        .await
-        .expect("the write answers")
-        .expect("the batch was open");
+    // M3 D4 (L4): its only entry cancelled in it and no run of its own live, the batch stalled
+    // and closed; the resume is the pause and resume of the H1 rule.
+    assert_eq!(
+        h.store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("the read answers"),
+        None,
+        "the stalled batch closed"
+    );
     let next = h.resume().await;
+    assert_ne!(next, batch);
     runtime.sweep_with(&backend, &sink);
     settle(&mut runtime).await;
     let runs = h.runs(item).await;
@@ -1536,8 +1570,9 @@ async fn a_malformed_cap_skips_its_project_and_admits_the_next() {
     assert!(h.admitted_under(b1, batch).await);
 }
 
-/// M2 (e) D4: a batch every entry of which is stopped stays open, keeps its entries and is not
-/// drained (no new `closed_reason`), sweep after sweep.
+/// M2 (e) D4: a batch every entry of which is stopped keeps its entries and stays open while
+/// A1's parked run is live (M3 L4: without it the stalled batch closes, as
+/// `a_batch_whose_every_entry_is_held_closes` shows), sweep after sweep.
 #[tokio::test]
 async fn a_stopped_batch_stays_open_and_keeps_its_entries() {
     let (h, mut runtime, batch) = spent_batch().await;
@@ -1604,6 +1639,228 @@ async fn a_manual_runs_spend_does_not_count_against_the_batch() {
     assert!(
         h.admitted_under(a1, batch).await,
         "the manual run's 300 micros are not the batch's"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-12 M3 D4 (review L4): a stalled batch closes, over `Backend::Memory`
+// ---------------------------------------------------------------------------------------------
+
+/// Whether `h`'s box has a batch open, and which.
+async fn open_batch(h: &Harness) -> Option<BatchId> {
+    h.store
+        .open_batch_of(ids::BOX)
+        .await
+        .expect("the read answers")
+        .map(|open| open.id)
+}
+
+/// The item ids of `h`'s box's queue, in queue order.
+async fn queued(h: &Harness) -> Vec<ItemId> {
+    h.store
+        .queue_entries(ids::BOX)
+        .await
+        .expect("the read answers")
+        .iter()
+        .map(|entry| entry.item_id)
+        .collect()
+}
+
+/// Mints an ANA item and moves it `open -> blocked`.
+async fn mint_blocked(h: &Harness, title: &str) -> ItemId {
+    let item = mint_ana(&h.store, title, 0).await;
+    assert!(
+        h.store
+            .transition(item, Status::Open, Status::Blocked)
+            .await
+            .expect("open -> blocked is legal")
+    );
+    item
+}
+
+/// M3 (a) D4: a batch whose only entry is `blocked` and which has no live run closes `drained`
+/// and keeps the entry; a ready item queued afterwards is not admitted until a resume opens a new
+/// batch.
+#[tokio::test]
+async fn a_stalled_batch_closes_and_a_later_queue_waits_for_resume() {
+    let h = Harness::open().await;
+    let blocked = mint_blocked(&h, "blocked").await;
+    h.queue(blocked).await;
+    let batch = h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+    assert_eq!(open_batch(&h).await, None, "the stalled batch closed");
+    assert_eq!(queued(&h).await, [blocked], "its entry is kept");
+    assert!(
+        h.store
+            .batch_runs(batch)
+            .await
+            .expect("the read answers")
+            .is_empty(),
+        "it admitted nothing"
+    );
+
+    let ready = mint_ana(&h.store, "ready", 0).await;
+    h.queue(ready).await;
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.runs(ready).await.is_empty(),
+        "a Q after the close spends nothing without a P"
+    );
+
+    let next = h.resume().await;
+    assert_ne!(next, batch);
+    h.sweep(&mut runtime).await;
+    assert!(
+        h.admitted_under(ready, next).await,
+        "the resume's new batch admits it"
+    );
+    assert!(h.runs(blocked).await.is_empty());
+}
+
+/// M3 (b) D4: a parked auto run is live, so the batch it parks in stays open even though its
+/// item (`awaiting_approval`) is not ready and nothing else is queued.
+#[tokio::test]
+async fn a_parked_auto_run_keeps_a_stalled_batch_open() {
+    let h = Harness::open().await;
+    let a = mint_ana(&h.store, "a", 0).await;
+    h.queue(a).await;
+    let batch = h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+    let run = h.only_run(a).await;
+    assert_eq!(run.status, RunStatus::AwaitingApproval, "parked at verdict");
+    assert_eq!(h.status(a).await, Status::AwaitingApproval, "so not ready");
+
+    h.sweep(&mut runtime).await;
+    assert_eq!(
+        open_batch(&h).await,
+        Some(batch),
+        "nothing is admissible, but the batch's parked run is live"
+    );
+    assert_eq!(queued(&h).await, [a]);
+}
+
+/// M3 (c) D4: a sweep with free slots whose every ready entry is held by the batch's spend gate
+/// closes the batch `drained`; the held entry keeps its place and nothing more is spent.
+#[tokio::test]
+async fn a_batch_whose_every_entry_is_held_closes() {
+    let (h, mut runtime, batch) = spent_batch().await;
+    let members = h.store.batch_runs(batch).await.expect("the read answers");
+    let [(a1, RunStatus::AwaitingApproval)] = members[..] else {
+        panic!("A1's parked run is the batch's only run: {members:?}");
+    };
+    h.store
+        .finish_run(a1, RunStatus::Cancelled, None, Utc::now())
+        .await
+        .expect("a parked run cancels");
+    h.cap_batch(ids::PROJECT_HTUI, json!(PARKED_SPEND)).await;
+    let a2 = mint_ana(&h.store, "a2", 0).await;
+    h.queue(a2).await;
+    h.sweep(&mut runtime).await;
+    assert!(h.runs(a2).await.is_empty(), "held by the batch's cap");
+    assert_eq!(open_batch(&h).await, None, "every entry held: it closed");
+    assert!(queued(&h).await.contains(&a2), "the held entry is kept");
+    assert_eq!(h.batch_spend(batch).await, Some(PARKED_SPEND));
+}
+
+/// M3 (d) D4: with no free slot (a manual run holds the box's one) a batch with an admissible
+/// entry stays open; once the manual run parks, the wake admits the entry under that batch.
+#[tokio::test]
+async fn zero_free_slots_never_close_a_batch_with_admissible_entries() {
+    let h = Harness::with_box_settings(json!({ "max_concurrent_items": 1 })).await;
+    let (x, batch, mut runtime) = slot_held_by_a_manual_run(&h, false).await;
+    assert!(h.runs(x).await.is_empty(), "no free slot");
+    assert_eq!(
+        open_batch(&h).await,
+        Some(batch),
+        "zero free slots never close"
+    );
+
+    h.parts.open();
+    settle(&mut runtime).await;
+    assert!(
+        h.admitted_under(x, batch).await,
+        "the manual run parked, and the wake admitted X under the same batch"
+    );
+}
+
+/// M3 (d2) D4, blueprint §B.2.2 step 8: with no free slot a stalled batch stays open too; once
+/// the manual run parks and frees the slot, the wake's sweep closes it.
+#[tokio::test]
+async fn zero_free_slots_never_close_a_stalled_batch() {
+    let h = Harness::with_box_settings(json!({ "max_concurrent_items": 1 })).await;
+    let (x, batch, mut runtime) = slot_held_by_a_manual_run(&h, true).await;
+    assert_eq!(
+        open_batch(&h).await,
+        Some(batch),
+        "zero free slots return before the stall close"
+    );
+
+    h.parts.open();
+    settle(&mut runtime).await;
+    assert_eq!(
+        open_batch(&h).await,
+        None,
+        "a free slot and nothing admissible: the wake's sweep closed it"
+    );
+    assert!(h.runs(x).await.is_empty());
+    assert_eq!(queued(&h).await, [x]);
+}
+
+/// (d), (d2): a manual run of a fresh item holds the box's one slot `running` (sessions held),
+/// then X (`blocked` when `blocked_x`) is queued, a batch opened and one sweep made. The sweep
+/// is not settled, since the manual walk is held; a pause covers the sweep's few store reads.
+async fn slot_held_by_a_manual_run(
+    h: &Harness,
+    blocked_x: bool,
+) -> (ItemId, BatchId, RunRuntime<Backend, TestSink>) {
+    let backend = h.backend();
+    let sink = TestSink::default();
+    let mut runtime = h.runtime();
+    let manual = mint_ana(&h.store, "manual", 0).await;
+    let _ = runtime
+        .serve_request(&backend, &sink, 1, start_run(manual), &LiveChats::default())
+        .await;
+    eventually("the manual run runs", || {
+        has_run_at(&h.store, manual, RunStatus::Running)
+    })
+    .await;
+    let x = if blocked_x {
+        mint_blocked(h, "x").await
+    } else {
+        mint_ana(&h.store, "x", 0).await
+    };
+    h.queue(x).await;
+    let batch = h.resume().await;
+    runtime.sweep_with(&backend, &sink);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.only_run(manual).await.status,
+        RunStatus::Running,
+        "the manual run still holds the slot"
+    );
+    (x, batch, runtime)
+}
+
+/// M3 (f) D4: an enqueue refusal is transient, so a batch whose only entry the engine refuses
+/// stays open, sweep after sweep.
+#[tokio::test]
+async fn an_enqueue_refusal_never_closes_the_batch() {
+    let h = Harness::open().await;
+    let broken = mint_ana(&h.store, "broken", 0).await;
+    repoint_at_no_template(&h.store, broken).await;
+    h.queue(broken).await;
+    let batch = h.resume().await;
+    let mut runtime = h.runtime();
+    h.sweep(&mut runtime).await;
+    h.sweep(&mut runtime).await;
+    assert!(h.runs(broken).await.is_empty(), "the engine refused it");
+    assert_eq!(h.status(broken).await, Status::Open);
+    assert_eq!(
+        open_batch(&h).await,
+        Some(batch),
+        "a refusal never closes the batch"
     );
 }
 
