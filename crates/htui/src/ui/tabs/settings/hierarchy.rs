@@ -1376,6 +1376,15 @@ impl SettingsSection for HierarchySection {
                     });
                 }
             }
+            // MOD-10 M4 (blueprint A-1): the Secrets section's scope write. The tree is adopted so
+            // the tokens stay current; nothing else here is this section's — no `busy`, no
+            // editor, no notice, no scope follow.
+            StoreReply::SecretScopeWritten { tree, .. } => {
+                if tree.workspace.id == ctx.scope.workspace_id {
+                    self.snapshot = Some((**tree).clone());
+                    self.clamp_cursor();
+                }
+            }
             // MOD-49: a listing, or its refusal, for the open picker (blueprint D2, B-3). The
             // shell has already put a refusal on the status line too (D16).
             StoreReply::DirListing(_)

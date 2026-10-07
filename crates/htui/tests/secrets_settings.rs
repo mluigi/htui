@@ -11,6 +11,10 @@
 //! guard are the `Backend::Memory` ones, which prove that no keyring is read at all (D10), where a
 //! guard would hide the bug they exist to catch, and the `Debug` and runtime cases, which reach no
 //! keyring.
+//!
+//! The **section half** (T3) drives `SecretsSection` through `SectionBench`: keys in, `Action`s
+//! and frames out, with no store behind it (`R-NF-3`). Its replies are built by hand, or served
+//! by `serve` over a `MemStore` where the case is about a write's own answer.
 #![cfg(feature = "testkit")]
 
 use std::sync::Arc;
@@ -28,10 +32,10 @@ use htui::secrets_settings::{
 };
 use htui::store_worker::{Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
-use htui::ui::tabs::settings::QdrantSection;
+use htui::ui::tabs::settings::{HierarchySection, QdrantSection, SecretsSection, SettingsSection};
 use htui_agent::registry::DriverFactory;
 use htui_core::fixtures::ids;
-use htui_core::model::{NewProject, Project, ProjectId};
+use htui_core::model::{NewProject, Project, ProjectId, Scope};
 use htui_core::secret::fake::{FakeSecretProvider, FakeSecretSource};
 use htui_core::secret::{
     INFISICAL, MachineIdentity, ProviderHealth, ResolvedSecrets, SecretError, SecretFuture,
@@ -926,4 +930,1179 @@ async fn a_harness_without_an_agent_runtime_refuses_the_scope_check_by_name() {
         harness.app().status.as_deref(),
         Some("check_secret_scope: no agent runtime in this harness")
     );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The section (T3): `SecretsSection` through `SectionBench` (D1, D3–D6, D8; A-1)
+// ---------------------------------------------------------------------------------------------
+
+/// The normalised URL the keyring rows show when one is stored.
+const STORED_URL: &str = "https://infisical.example.com";
+
+/// Row indices in cursor order: the four fixed rows, then the projects.
+const ROW_URL: usize = 1;
+const ROW_IDENTITY: usize = 2;
+const ROW_HEALTH: usize = 3;
+const ROW_FIRST_PROJECT: usize = 4;
+
+/// A keyring snapshot reply.
+fn keyring(url: UrlState, identity: IdentityState) -> StoreReply {
+    StoreReply::Secrets(SecretsSnapshot { url, identity })
+}
+
+/// Both rows stored.
+fn configured() -> StoreReply {
+    keyring(
+        UrlState::Stored(STORED_URL.to_owned()),
+        IdentityState::Stored,
+    )
+}
+
+/// Neither row stored.
+fn not_configured() -> StoreReply {
+    keyring(UrlState::NotStored, IdentityState::NotStored)
+}
+
+/// `--demo`: no keyring consulted.
+fn demo_keyring() -> StoreReply {
+    keyring(UrlState::NotApplicable, IdentityState::NotApplicable)
+}
+
+/// A tree as the read answers it.
+fn tree_reply(tree: &HierarchySnapshot) -> StoreReply {
+    StoreReply::Hierarchy(Some(Box::new(tree.clone())))
+}
+
+/// A fixed check time, so the rows and snapshots are stable.
+fn at(hour: u32, minute: u32, second: u32) -> chrono::DateTime<Utc> {
+    use chrono::TimeZone;
+    Utc.with_ymd_and_hms(2026, 10, 7, hour, minute, second)
+        .single()
+        .expect("a valid instant")
+}
+
+/// The `Action::Store`s the section emitted since the last drain.
+fn requests(bench: &SectionBench) -> Vec<StoreRequest> {
+    bench
+        .drained()
+        .into_iter()
+        .filter_map(|action| match action {
+            Action::Store(request) => Some(request),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Types `text` one key at a time.
+fn type_text(bench: &SectionBench, section: &mut SecretsSection, text: &str) {
+    for c in text.chars() {
+        let chord = if c == ' ' {
+            "space".to_owned()
+        } else {
+            c.to_string()
+        };
+        bench.key(section, &chord);
+    }
+}
+
+/// Moves the cursor to `row` from the top.
+fn go_to(bench: &SectionBench, section: &mut SecretsSection, row: usize) {
+    for _ in 0..8 {
+        bench.key(section, "k");
+    }
+    for _ in 0..row {
+        bench.key(section, "j");
+    }
+}
+
+/// A section over `keyring_reply` and `store`'s `Graphics` tree, with nothing left to drain.
+async fn loaded_over(
+    store: &MemStore,
+    keyring_reply: StoreReply,
+) -> (SectionBench, SecretsSection, HierarchySnapshot) {
+    let bench = SectionBench::new().await;
+    let mut section = SecretsSection::new();
+    let tree = graphics(store).await;
+    bench.reply(&mut section, &keyring_reply);
+    bench.reply(&mut section, &tree_reply(&tree));
+    let _ = bench.drained();
+    (bench, section, tree)
+}
+
+/// [`loaded_over`] the plain demo store.
+async fn loaded(keyring_reply: StoreReply) -> (SectionBench, SecretsSection, HierarchySnapshot) {
+    loaded_over(&MemStore::demo(), keyring_reply).await
+}
+
+/// The rendered section at 100 columns.
+fn frame(bench: &SectionBench, section: &SecretsSection) -> String {
+    bench.render_section(section, 100)
+}
+
+/// `tree` with `Vulkan`'s row replaced by the store's current one.
+async fn refreshed(store: &MemStore) -> HierarchySnapshot {
+    graphics(store).await
+}
+
+/// A scope write's own reply.
+fn scope_written(project: ProjectId, tree: &HierarchySnapshot, outcome: ScopeWrite) -> StoreReply {
+    StoreReply::SecretScopeWritten {
+        project,
+        tree: Box::new(tree.clone()),
+        outcome,
+    }
+}
+
+/// The scope-form request out of a drain, or a panic.
+#[track_caller]
+fn the_scope_write(
+    requests: &[StoreRequest],
+) -> (ProjectId, chrono::DateTime<Utc>, Option<SecretScope>) {
+    match requests {
+        [
+            StoreRequest::SetProjectSecretScope {
+                id,
+                expected,
+                scope,
+            },
+        ] => (*id, *expected, scope.clone()),
+        other => panic!("exactly one scope write, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn wants_requests_names_the_keyring_read_and_the_tree() {
+    let bench = SectionBench::new().await;
+    let section = SecretsSection::new();
+    let scope = Scope {
+        workspace_id: ids::WORKSPACE_GRAPHICS,
+        project_ids: vec![ids::PROJECT_VULKAN],
+    };
+    let wanted = section.wants_requests(&scope);
+    assert!(
+        matches!(
+            wanted.as_slice(),
+            [StoreRequest::SecretsInfo, StoreRequest::Hierarchy(ws)] if *ws == ids::WORKSPACE_GRAPHICS
+        ),
+        "{wanted:?}"
+    );
+    assert_eq!(section.title(), "Secrets");
+    assert_eq!(section.id(), SecretsSection::ID);
+    let _ = bench.drained();
+}
+
+#[tokio::test]
+async fn rows_come_from_the_snapshot_and_the_tree() {
+    let (bench, section, _) = loaded(keyring(
+        UrlState::Stored(STORED_URL.to_owned()),
+        IdentityState::NotStored,
+    ))
+    .await;
+    let shown = frame(&bench, &section);
+    for expected in [
+        "infisical",
+        "stored \u{b7} https://infisical.example.com",
+        "not stored",
+        "not checked this session",
+        "Projects",
+        "vulkan-tutorials",
+        "no secret provider",
+    ] {
+        assert!(shown.contains(expected), "`{expected}` in {shown}");
+    }
+}
+
+#[tokio::test]
+async fn e_on_url_sends_the_normalised_url() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    assert!(section.captures_input());
+    type_text(&bench, &mut section, " https://Infisical.Example.com/api/ ");
+    bench.key(&mut section, "Enter");
+
+    match requests(&bench).as_slice() {
+        [StoreRequest::SetInfisicalUrl(url)] => assert_eq!(url, STORED_URL),
+        other => panic!("exactly one URL write, got {other:?}"),
+    }
+    assert!(!section.captures_input(), "back to the rows");
+}
+
+#[tokio::test]
+async fn a_refused_url_emits_nothing_and_the_notice_never_repeats_it() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, URL_WITH_PASSWORD);
+    bench.key(&mut section, "Enter");
+
+    assert!(bench.drained().is_empty(), "a refusal emits nothing (D3)");
+    assert!(section.captures_input(), "the field stays open");
+    let refusal = htui_secrets::normalise_base_url(URL_WITH_PASSWORD)
+        .expect_err("a URL with a password is refused")
+        .to_string();
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains(&refusal), "{refusal} in {shown}");
+    // The field itself shows what was typed (it is a plain field); the notice does not repeat it.
+    assert!(!refusal.contains("hunter2"), "{refusal}");
+    let printed = format!("{section:?}");
+    assert!(!printed.contains("hunter2"), "{printed}");
+}
+
+#[tokio::test]
+async fn the_identity_form_sends_one_redacted_entry() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+
+    let before = frame(&bench, &section);
+    assert!(!before.contains(SECRET), "{before}");
+    assert!(before.contains('\u{2022}'), "{before}");
+    assert!(before.contains("(28)"), "{before}");
+    assert!(bench.drained().is_empty(), "nothing before Enter");
+
+    bench.key(&mut section, "Enter");
+    match requests(&bench).as_slice() {
+        [StoreRequest::SetMachineIdentity(entry)] => {
+            assert_eq!(entry.client_id(), CLIENT_ID);
+            assert_eq!(entry.expose_client_secret(), SECRET);
+            let shown = format!("{entry:?}");
+            assert!(
+                !shown.contains(SECRET) && !shown.contains(CLIENT_ID),
+                "{shown}"
+            );
+        }
+        other => panic!("exactly one identity write, got {other:?}"),
+    }
+    assert!(!section.captures_input());
+}
+
+#[tokio::test]
+async fn a_blank_identity_half_emits_nothing() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+
+    // No secret.
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Enter");
+    assert!(bench.drained().is_empty());
+    assert!(section.captures_input(), "the form stays open");
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("both the client ID and the client secret are required"),
+        "{shown}"
+    );
+    bench.key(&mut section, "Esc");
+
+    // No client ID.
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    bench.key(&mut section, "Enter");
+    assert!(bench.drained().is_empty());
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("(0)"),
+        "the secret field was replaced: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn tab_and_backtab_move_between_the_identity_fields() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "s");
+    bench.key(&mut section, "BackTab");
+    type_text(&bench, &mut section, "i");
+    bench.key(&mut section, "Down");
+    type_text(&bench, &mut section, "t");
+    bench.key(&mut section, "Up");
+    type_text(&bench, &mut section, "d");
+    bench.key(&mut section, "Enter");
+
+    match requests(&bench).as_slice() {
+        [StoreRequest::SetMachineIdentity(entry)] => {
+            assert_eq!(entry.client_id(), "id");
+            assert_eq!(entry.expose_client_secret(), "st");
+        }
+        other => panic!("exactly one identity write, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn esc_drops_the_identity_form() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    assert_eq!(bench.key(&mut section, "Esc"), Handled::Consumed);
+
+    assert!(!section.captures_input());
+    assert!(bench.drained().is_empty());
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains("client secret:"), "{shown}");
+    // Reopening starts empty.
+    bench.key(&mut section, "e");
+    let shown = frame(&bench, &section);
+    assert!(
+        !shown.contains(CLIENT_ID) && shown.contains("(0)"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn c_on_identity_asks_then_clears() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "c");
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("Remove the machine identity"), "{shown}");
+    bench.key(&mut section, "n");
+    assert!(bench.drained().is_empty(), "`n` sends nothing");
+    assert!(!section.captures_input());
+
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::ClearMachineIdentity]
+    ));
+    bench.reply(
+        &mut section,
+        &keyring(
+            UrlState::Stored(STORED_URL.to_owned()),
+            IdentityState::NotStored,
+        ),
+    );
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("the machine identity is gone from the keyring"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn c_on_url_asks_then_clears() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "c");
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("Remove the Infisical URL"), "{shown}");
+    bench.key(&mut section, "Esc");
+    assert!(bench.drained().is_empty());
+
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::ClearInfisicalUrl]
+    ));
+    bench.reply(
+        &mut section,
+        &keyring(UrlState::NotStored, IdentityState::Stored),
+    );
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("the Infisical URL is gone from the keyring"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn c_on_a_row_with_nothing_stored_is_refused_by_its_row_text() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    for row in [ROW_URL, ROW_IDENTITY] {
+        go_to(&bench, &mut section, row);
+        bench.key(&mut section, "c");
+        assert!(!section.captures_input(), "no question over nothing");
+        assert!(bench.drained().is_empty());
+        let shown = frame(&bench, &section);
+        let hint = shown.lines().last().unwrap_or_default().to_owned();
+        assert!(hint.contains("not stored"), "{hint}");
+        bench.key(&mut section, "Esc");
+    }
+
+    let unreadable = "the keyring is locked";
+    let (bench, mut section, _) = loaded(keyring(
+        UrlState::Unreadable(unreadable.to_owned()),
+        IdentityState::NotStored,
+    ))
+    .await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "c");
+    assert!(
+        !section.captures_input(),
+        "an unreadable URL is not offered"
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(unreadable), "{shown}");
+}
+
+#[tokio::test]
+async fn c_on_a_half_stored_identity_is_offered() {
+    let half = format!(
+        "{}: infisical-client-secret is missing",
+        secret::HALF_STORED_IDENTITY
+    );
+    let (bench, mut section, _) = loaded(keyring(
+        UrlState::NotStored,
+        IdentityState::HalfStored(half.clone()),
+    ))
+    .await;
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains(&half),
+        "the seam's sentence verbatim: {shown}"
+    );
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "c");
+    assert!(section.captures_input(), "clearing a half is the fix");
+    bench.key(&mut section, "y");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::ClearMachineIdentity]
+    ));
+}
+
+#[tokio::test]
+async fn one_write_in_flight_refuses_e_and_c_but_not_r_or_t() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    assert_eq!(requests(&bench).len(), 1);
+
+    for key in ["e", "c"] {
+        bench.key(&mut section, key);
+        assert!(!section.captures_input(), "`{key}` opens nothing");
+        assert!(bench.drained().is_empty(), "`{key}` sends nothing");
+        let shown = frame(&bench, &section);
+        assert!(
+            shown.contains("`clear_infisical_url` is still in flight"),
+            "{shown}"
+        );
+    }
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    assert!(!section.captures_input(), "a project edit waits too");
+
+    bench.key(&mut section, "r");
+    let reads = requests(&bench);
+    assert!(
+        matches!(
+            reads.as_slice(),
+            [StoreRequest::SecretsInfo, StoreRequest::Hierarchy(ws)] if *ws == ids::WORKSPACE_GRAPHICS
+        ),
+        "{reads:?}"
+    );
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::CheckSecretProvider]
+    ));
+}
+
+#[tokio::test]
+async fn t_on_a_keyring_row_sends_one_provider_check() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    for row in [0, ROW_URL, ROW_IDENTITY, ROW_HEALTH] {
+        go_to(&bench, &mut section, row);
+        bench.key(&mut section, "t");
+        assert!(
+            matches!(
+                requests(&bench).as_slice(),
+                [StoreRequest::CheckSecretProvider]
+            ),
+            "row {row}"
+        );
+        assert!(frame(&bench, &section).contains("checking\u{2026}"));
+        bench.reply(
+            &mut section,
+            &StoreReply::SecretCheck(SecretCheck::Provider {
+                at: at(14, 2, 11),
+                outcome: Err(SecretError::NoIdentity),
+            }),
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_second_t_while_checking_is_refused() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    assert_eq!(requests(&bench).len(), 1);
+    bench.key(&mut section, "t");
+    assert!(bench.drained().is_empty());
+    assert!(frame(&bench, &section).contains("a check is still running"));
+
+    // The answer frees it.
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            outcome: Ok(ProviderHealth {
+                base_url: STORED_URL.to_owned(),
+                server_ok: true,
+            }),
+        }),
+    );
+    bench.key(&mut section, "t");
+    assert_eq!(requests(&bench).len(), 1);
+}
+
+#[tokio::test]
+async fn t_on_a_provider_less_project_emits_nothing() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "t");
+    assert!(bench.drained().is_empty());
+    assert!(frame(&bench, &section).contains("this project has no secret scope to check"));
+}
+
+#[tokio::test]
+async fn t_on_a_scoped_project_sends_a_scope_check() {
+    let (bench, mut section, _) = loaded_over(&scoped_store(), configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "t");
+    match requests(&bench).as_slice() {
+        [StoreRequest::CheckSecretScope { project }] => assert_eq!(*project, ids::PROJECT_VULKAN),
+        other => panic!("exactly one scope check, got {other:?}"),
+    }
+    assert!(frame(&bench, &section).contains("\u{b7} checking\u{2026}"));
+}
+
+#[tokio::test]
+async fn a_provider_check_shows_on_the_health_row() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    for (outcome, expected) in [
+        (
+            Ok(ProviderHealth {
+                base_url: STORED_URL.to_owned(),
+                server_ok: true,
+            }),
+            "last check 14:02:11: server ok \u{b7} login ok".to_owned(),
+        ),
+        (
+            Ok(ProviderHealth {
+                base_url: STORED_URL.to_owned(),
+                server_ok: false,
+            }),
+            "last check 14:02:11: server status not ok \u{b7} login ok".to_owned(),
+        ),
+        (
+            Err(SecretError::NoIdentity),
+            format!("last check 14:02:11: {}", SecretError::NoIdentity),
+        ),
+    ] {
+        bench.reply(
+            &mut section,
+            &StoreReply::SecretCheck(SecretCheck::Provider {
+                at: at(14, 2, 11),
+                outcome,
+            }),
+        );
+        let shown = frame(&bench, &section);
+        let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(&expected), "`{expected}` in {shown}");
+    }
+}
+
+#[tokio::test]
+async fn a_latching_refusal_shows_the_latch_line() {
+    let latch = "the last login was refused";
+    for (error, latches) in [
+        (SecretError::BadCredentials, true),
+        (SecretError::IdentityLocked, true),
+        (SecretError::LoginRefusedEarlier, true),
+        (
+            SecretError::Unreachable {
+                endpoint: "/api/status",
+                cause: "connection refused".to_owned(),
+            },
+            false,
+        ),
+    ] {
+        let (bench, mut section, _) = loaded(configured()).await;
+        bench.reply(
+            &mut section,
+            &StoreReply::SecretCheck(SecretCheck::Provider {
+                at: at(14, 2, 11),
+                outcome: Err(error.clone()),
+            }),
+        );
+        let shown = frame(&bench, &section);
+        assert_eq!(shown.contains(latch), latches, "{error:?}: {shown}");
+    }
+}
+
+#[tokio::test]
+async fn a_scope_check_shows_a_count() {
+    let (bench, mut section, _) = loaded_over(&scoped_store(), configured()).await;
+    for (count, expected) in [(12, "12 keys visible"), (1, "1 key visible")] {
+        bench.reply(
+            &mut section,
+            &StoreReply::SecretCheck(SecretCheck::Scope {
+                project: ids::PROJECT_VULKAN,
+                at: at(14, 3, 5),
+                outcome: Ok(count),
+            }),
+        );
+        let shown = frame(&bench, &section);
+        let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            flat.contains(&format!("checked 14:03:05: {expected}")),
+            "{shown}"
+        );
+    }
+    // A project not in the tree is not stored.
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Scope {
+            project: ProjectId::new(),
+            at: at(14, 4, 0),
+            outcome: Ok(99),
+        }),
+    );
+    assert!(!frame(&bench, &section).contains("99 keys"));
+}
+
+#[tokio::test]
+async fn e_on_a_project_opens_the_scope_form_prefilled() {
+    // A scoped project: its column's three fields.
+    let (bench, mut section, _) = loaded_over(&scoped_store(), configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    assert!(section.captures_input());
+    let shown = frame(&bench, &section);
+    for expected in ["project ID: p-graphics", "environment: dev", "path: /app"] {
+        let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(flat.contains(expected), "`{expected}` in {shown}");
+    }
+
+    // An unscoped one: blank, path `/`.
+    let (bench, mut section, tree) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p1");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Enter");
+    let (id, expected, scope) = the_scope_write(&requests(&bench));
+    assert_eq!(id, ids::PROJECT_VULKAN);
+    assert_eq!(expected, row_in(&tree, ids::PROJECT_VULKAN).updated_at);
+    assert_eq!(
+        scope,
+        Some(SecretScope::new("p1", "dev", "/").expect("valid"))
+    );
+}
+
+#[tokio::test]
+async fn a_refused_scope_emits_nothing_and_names_the_field() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p1");
+    // Environment left empty.
+    bench.key(&mut section, "Enter");
+    assert!(bench.drained().is_empty());
+    assert!(section.captures_input(), "the form is kept");
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("empty environment"), "{shown}");
+}
+
+#[tokio::test]
+async fn enter_on_the_scope_form_sends_the_write_with_the_token_and_stays_open() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "app");
+    bench.key(&mut section, "Enter");
+
+    let (id, expected, scope) = the_scope_write(&requests(&bench));
+    assert_eq!(id, ids::PROJECT_VULKAN);
+    assert_eq!(expected, row_in(&tree, ids::PROJECT_VULKAN).updated_at);
+    assert_eq!(scope, Some(a_scope()));
+    assert!(
+        section.captures_input(),
+        "the form stays open until the reply"
+    );
+
+    bench.key(&mut section, "Enter");
+    assert!(
+        bench.drained().is_empty(),
+        "a second Enter while busy is refused"
+    );
+}
+
+#[tokio::test]
+async fn its_own_applied_write_closes_the_form_and_says_so() {
+    let store = MemStore::demo();
+    let backend = Backend::memory(store.clone());
+    let (bench, mut section, _) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "app");
+    bench.key(&mut section, "Enter");
+    let request = requests(&bench).pop().expect("the write");
+    let reply = serve(&backend, &request).await;
+    assert!(matches!(
+        reply,
+        StoreReply::SecretScopeWritten {
+            outcome: ScopeWrite::Applied,
+            ..
+        }
+    ));
+
+    bench.reply(&mut section, &reply);
+    assert!(!section.captures_input(), "closed");
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("scope saved"), "{shown}");
+    assert!(
+        flat.contains("infisical \u{b7} p-graphics \u{b7} dev \u{b7} /app"),
+        "the row is the written tree's: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_scope_write_keeps_the_text_and_takes_the_new_token() {
+    let store = MemStore::demo();
+    let (bench, mut section, _) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Enter");
+    let (_, first, _) = the_scope_write(&requests(&bench));
+
+    // Someone else moves the row.
+    let row = stored(&store, ids::PROJECT_VULKAN).await;
+    store
+        .update_project(
+            ids::PROJECT_VULKAN,
+            row.updated_at,
+            htui_core::model::ProjectPatch {
+                name: Some("Vulkan Elsewhere".to_owned()),
+                ..htui_core::model::ProjectPatch::default()
+            },
+        )
+        .await
+        .expect("the store writes");
+    let current = refreshed(&store).await;
+    bench.reply(
+        &mut section,
+        &scope_written(ids::PROJECT_VULKAN, &current, ScopeWrite::Stale),
+    );
+
+    assert!(section.captures_input(), "the form is kept");
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("changed elsewhere since you opened it"),
+        "{shown}"
+    );
+    assert!(flat.contains("p-graphics"), "the text is kept: {shown}");
+
+    bench.key(&mut section, "Enter");
+    let (_, second, _) = the_scope_write(&requests(&bench));
+    assert_ne!(first, second);
+    assert_eq!(second, row_in(&current, ids::PROJECT_VULKAN).updated_at);
+}
+
+#[tokio::test]
+async fn a_stale_clear_says_nothing_was_written() {
+    let store = scoped_store();
+    let (bench, mut section, tree) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let _ = requests(&bench);
+    bench.reply(
+        &mut section,
+        &scope_written(ids::PROJECT_VULKAN, &tree, ScopeWrite::Stale),
+    );
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat.contains("changed elsewhere; nothing was written"),
+        "{shown}"
+    );
+}
+
+#[tokio::test]
+async fn c_on_a_scoped_project_asks_then_sends_scope_none() {
+    let (bench, mut section, tree) = loaded_over(&scoped_store(), configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "c");
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("Remove `vulkan-tutorials`'s secret scope?"),
+        "{shown}"
+    );
+    bench.key(&mut section, "n");
+    assert!(bench.drained().is_empty());
+
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let (id, expected, scope) = the_scope_write(&requests(&bench));
+    assert_eq!(id, ids::PROJECT_VULKAN);
+    assert_eq!(expected, row_in(&tree, ids::PROJECT_VULKAN).updated_at);
+    assert_eq!(scope, None);
+
+    // A project with no provider has nothing to clear.
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "c");
+    assert!(bench.drained().is_empty());
+    assert!(frame(&bench, &section).contains("this project has no secret scope to clear"));
+}
+
+#[tokio::test]
+async fn a_hierarchy_reply_refreshes_rows_but_is_never_taken_as_the_scope_write() {
+    let store = MemStore::demo();
+    let (bench, mut section, _) = loaded_over(&store, configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, "dev");
+    bench.key(&mut section, "Enter");
+    let _ = requests(&bench);
+
+    // Another writer's tree, through the plain read and the stale reply.
+    store.set_project_secret_columns(
+        ids::PROJECT_VULKAN,
+        Some(INFISICAL),
+        Some(
+            &SecretScope::new("p-other", "prod", "/")
+                .expect("valid")
+                .to_column(),
+        ),
+    );
+    let other = refreshed(&store).await;
+    bench.reply(&mut section, &tree_reply(&other));
+    bench.reply(
+        &mut section,
+        &StoreReply::HierarchyStale(Box::new(other.clone())),
+    );
+
+    assert!(
+        section.captures_input(),
+        "the form is still open: not its write's answer"
+    );
+    let shown = frame(&bench, &section);
+    let flat = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(flat.contains("p-other"), "the rows were refreshed: {shown}");
+    assert!(!flat.contains("scope saved"), "{shown}");
+    bench.key(&mut section, "Enter");
+    assert!(bench.drained().is_empty(), "still busy");
+}
+
+#[tokio::test]
+async fn a_tree_of_another_workspace_is_not_adopted() {
+    let (bench, mut section, tree) = loaded(configured()).await;
+    let mut elsewhere = tree.clone();
+    elsewhere.workspace.id = htui_core::model::WorkspaceId::new();
+    elsewhere.projects[0].project.slug = "somewhere-else".to_owned();
+    bench.reply(&mut section, &tree_reply(&elsewhere));
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("vulkan-tutorials"), "{shown}");
+    assert!(!shown.contains("somewhere-else"), "{shown}");
+}
+
+#[tokio::test]
+async fn the_hierarchy_section_adopts_a_scope_write_tree_without_its_attribution() {
+    let bench = SectionBench::new().await;
+    let mut hierarchy_section = HierarchySection::new();
+    let tree = graphics(&MemStore::demo()).await;
+    bench.reply(&mut hierarchy_section, &tree_reply(&tree));
+    let _ = bench.drained();
+
+    let mut renamed = tree.clone();
+    renamed.projects[0].project.name = "Vulkan Renamed".to_owned();
+    for outcome in [ScopeWrite::Stale, ScopeWrite::Applied] {
+        bench.reply(
+            &mut hierarchy_section,
+            &scope_written(ids::PROJECT_VULKAN, &renamed, outcome),
+        );
+        assert!(bench.drained().is_empty(), "{outcome:?}: nothing emitted");
+        let shown = bench.render_section(&hierarchy_section, 100);
+        assert!(!shown.contains("reloaded; press p again"), "{shown}");
+        assert!(
+            shown.contains("Vulkan Renamed"),
+            "the tree is adopted: {shown}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_scope_change_drops_an_open_form_and_the_project_rows() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-graphics");
+    assert!(section.captures_input());
+
+    section.on_scope_change(&Scope {
+        workspace_id: htui_core::model::WorkspaceId::new(),
+        project_ids: Vec::new(),
+    });
+    assert!(!section.captures_input(), "the form went with the scope");
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains("vulkan-tutorials"), "{shown}");
+    assert!(
+        shown.contains("no workspace: project scopes need one"),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(STORED_URL),
+        "the keyring rows survive: {shown}"
+    );
+}
+
+#[tokio::test]
+async fn the_section_debug_holds_no_typed_text() {
+    let (bench, mut section, _) = loaded(not_configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    let printed = format!("{section:?}");
+    assert!(
+        !printed.contains(CLIENT_ID) && !printed.contains(SECRET),
+        "{printed}"
+    );
+    bench.key(&mut section, "Esc");
+
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, URL_WITH_PASSWORD);
+    let printed = format!("{section:?}");
+    assert!(!printed.contains("hunter2"), "{printed}");
+    bench.key(&mut section, "Esc");
+
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, "p-typed-scope");
+    let printed = format!("{section:?}");
+    assert!(!printed.contains("p-typed-scope"), "{printed}");
+}
+
+#[tokio::test]
+async fn a_refused_read_is_unavailable_and_r_recovers() {
+    let bench = SectionBench::new().await;
+    let mut section = SecretsSection::new();
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "secrets_info",
+            message: "keyring task failed: boom".to_owned(),
+        },
+    );
+    let shown = frame(&bench, &section);
+    assert!(
+        shown.contains("secret settings are unavailable: keyring task failed: boom"),
+        "{shown}"
+    );
+    assert_eq!(shown.lines().last(), Some("r reload"));
+
+    bench.key(&mut section, "r");
+    assert_eq!(requests(&bench).len(), 2);
+    bench.reply(&mut section, &configured());
+    let shown = frame(&bench, &section);
+    assert!(!shown.contains("unavailable"), "{shown}");
+    assert!(shown.contains(STORED_URL), "{shown}");
+}
+
+#[tokio::test]
+async fn a_refused_write_lands_on_the_section() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    bench.key(&mut section, "c");
+    bench.key(&mut section, "y");
+    let _ = requests(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "clear_infisical_url",
+            message: "store backend error: cannot remove the keyring entry".to_owned(),
+        },
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("cannot remove the keyring entry"), "{shown}");
+    // Not busy any more: `c` asks again.
+    bench.key(&mut section, "c");
+    assert!(section.captures_input());
+    bench.key(&mut section, "Esc");
+
+    // A refused check clears its flight and is not a result.
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    let _ = requests(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: CHECK_SECRET_PROVIDER,
+            message: NO_SOURCE_TO_CHECK.to_owned(),
+        },
+    );
+    let shown = frame(&bench, &section);
+    assert!(shown.contains(NO_SOURCE_TO_CHECK), "{shown}");
+    assert!(shown.contains("not checked this session"), "{shown}");
+    bench.key(&mut section, "t");
+    assert_eq!(requests(&bench).len(), 1, "the check is free again");
+
+    // Another section's refusal is not this one's.
+    bench.reply(
+        &mut section,
+        &StoreReply::Failed {
+            request: "set_dsn",
+            message: "not ours".to_owned(),
+        },
+    );
+    assert!(!frame(&bench, &section).contains("not ours"));
+}
+
+#[tokio::test]
+async fn demo_refuses_keyring_edits_and_checks_but_edits_scopes() {
+    let (bench, mut section, _) = loaded(demo_keyring()).await;
+    let shown = frame(&bench, &section);
+    assert!(shown.contains("n/a in a demo session"), "{shown}");
+
+    for row in [ROW_URL, ROW_IDENTITY] {
+        go_to(&bench, &mut section, row);
+        bench.key(&mut section, "e");
+        assert!(!section.captures_input(), "row {row}");
+        assert!(
+            frame(&bench, &section).contains("a demo session never reads or writes the keyring")
+        );
+        bench.key(&mut section, "Esc");
+    }
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    assert!(bench.drained().is_empty(), "no check in a demo");
+    assert!(frame(&bench, &section).contains("a demo session has no secret provider to check"));
+    bench.key(&mut section, "Esc");
+
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    bench.key(&mut section, "e");
+    assert!(
+        section.captures_input(),
+        "scopes live in the store, not the keyring"
+    );
+}
+
+#[tokio::test]
+async fn the_product_registers_secrets_last() {
+    let mut harness = Harness::demo();
+    htui::app::register_all(harness.app());
+    harness.settle().await;
+    harness.key("4");
+    harness.settle().await;
+    for _ in 0..8 {
+        harness.key("l");
+    }
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(frame.contains(" Personas  Secrets "), "{frame}");
+    assert!(
+        frame.contains("e edit \u{b7} c clear \u{b7} t check \u{b7} r reload \u{b7} j/k rows"),
+        "the active section is Secrets: {frame}"
+    );
+    assert!(frame.contains("n/a in a demo session"), "{frame}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Snapshots (D.4 #31)
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn snapshot_not_configured() {
+    let (bench, section, _) = loaded(not_configured()).await;
+    insta::assert_snapshot!("not_configured", frame(&bench, &section));
+}
+
+#[tokio::test]
+async fn snapshot_configured_health_ok() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            outcome: Ok(ProviderHealth {
+                base_url: STORED_URL.to_owned(),
+                server_ok: true,
+            }),
+        }),
+    );
+    go_to(&bench, &mut section, ROW_HEALTH);
+    insta::assert_snapshot!("configured_health_ok", frame(&bench, &section));
+}
+
+#[tokio::test]
+async fn snapshot_health_refused() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Provider {
+            at: at(14, 2, 11),
+            outcome: Err(SecretError::BadCredentials),
+        }),
+    );
+    insta::assert_snapshot!("health_refused", frame(&bench, &section));
+}
+
+#[tokio::test]
+async fn snapshot_project_scope_checked() {
+    let (bench, mut section, _) = loaded_over(&scoped_store(), configured()).await;
+    bench.reply(
+        &mut section,
+        &StoreReply::SecretCheck(SecretCheck::Scope {
+            project: ids::PROJECT_VULKAN,
+            at: at(14, 3, 5),
+            outcome: Ok(12),
+        }),
+    );
+    go_to(&bench, &mut section, ROW_FIRST_PROJECT);
+    insta::assert_snapshot!("project_scope_checked", frame(&bench, &section));
+}
+
+#[tokio::test]
+async fn snapshot_identity_form() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    type_text(&bench, &mut section, CLIENT_ID);
+    bench.key(&mut section, "Tab");
+    type_text(&bench, &mut section, SECRET);
+    insta::assert_snapshot!("identity_form", frame(&bench, &section));
+}
+
+#[tokio::test]
+async fn snapshot_demo() {
+    let (bench, section, _) = loaded(demo_keyring()).await;
+    insta::assert_snapshot!("demo", frame(&bench, &section));
 }
