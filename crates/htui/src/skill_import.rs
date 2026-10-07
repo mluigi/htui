@@ -739,6 +739,8 @@ mod tests {
         );
     }
 
+    // `std::os::unix::fs::symlink`: a Windows symlink needs a privilege the test box may lack.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_directory_is_not_descended() {
         let dir = tree();
