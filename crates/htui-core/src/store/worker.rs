@@ -423,6 +423,12 @@ pub trait WorkerStore: RecorderStore + RelayStore {
         project: ProjectId,
         key: &str,
     ) -> impl Future<Output = Result<Option<ItemId>>> + Send;
+    /// [`WriteStore::lease_holds`].
+    fn lease_holds(
+        &self,
+        run: RunId,
+        fence: StepFence,
+    ) -> impl Future<Output = Result<bool>> + Send;
 
     // -- MOD-11 M4 (plan D14): the command queue `command_run` drives
     /// [`WriteStore::enqueue_command`].
@@ -906,6 +912,9 @@ impl WorkerStore for MemStore {
     }
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         WriteStore::item_by_key(self, project, key).await
+    }
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
+        WriteStore::lease_holds(self, run, fence).await
     }
     async fn enqueue_command(&self, new: NewCommandRun) -> Result<CommandRun> {
         WriteStore::enqueue_command(self, new).await

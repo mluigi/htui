@@ -1992,6 +1992,20 @@ pub trait WriteStore: ReadStore {
     /// The backend's own failures only.
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>>;
 
+    /// MOD-78 D1: whether `run` carries `fence`'s lease now: `run.lease_owner IS NOT DISTINCT FROM`
+    /// [`StepFence::owner`], the predicate every fenced write uses ([`StepFence`]), read with no row
+    /// lock (no `FOR SHARE`), so the answer may be stale by the time the caller acts on it. Owner
+    /// only, never the expiry (MOD-78 D2): an expired lease nobody has taken still holds, as it still
+    /// writes. `command_run` reads it before it queues, while queued at most once per heartbeat, at
+    /// admission, and on every heartbeat (MOD-78 D3), because the queue's own writes take no
+    /// fence. A read on `WriteStore` by the `command_runs` precedent: `run.lease_owner` is not a
+    /// [`Run`] field, so no `ReadStore` read answers it.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`](crate::store::StoreError::NotFound) `{ entity: "run" }` for an
+    /// unknown run; the backend's own failures.
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool>;
+
     // -- MOD-11 M4: the command queue (plan D14, OQ-3, B-16) ------------------------------------
 
     /// D14: inserts a `queued` row. The row's own fields are the caller's (F-S), `queued_at`

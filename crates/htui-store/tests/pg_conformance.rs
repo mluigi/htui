@@ -27,17 +27,17 @@ use htui_store::testkit as common;
 /// MOD-13 milestone 5's hand-written round trip (plan D12) makes it 135, MOD-37 milestone 5's
 /// `run_step.opening` case (R-48) makes it 136, MOD-11 T1's six fenced-write cases (plan D13, B-4)
 /// make it 142, and MOD-11 T8's four command-queue cases (plan D14) make it 146, and MOD-69's two waiting-list
-/// cases (plan D2, D4) make it 148, and MOD-70 T0's nine follow-up cases (plan D1-D5, D9) make
-/// it 157.
-const EXPECTED_CASES: usize = 157;
+/// cases (plan D2, D4) make it 148, MOD-70 T0's nine follow-up cases (plan D1-D5, D9) make it 157
+/// and MOD-78's `lease_holds` case (plan D1, D2) makes it 158.
+const EXPECTED_CASES: usize = 158;
 
 #[test]
 fn case_list_matches_mem_store() {
     assert_eq!(
         htui_core::store::conformance::CASES.len(),
         EXPECTED_CASES,
-        "every conformance case must run against PgStore too (157 since MOD-70 T0's nine \
-         follow-up cases)"
+        "every conformance case must run against PgStore too (158 since MOD-70 T0's nine \
+         follow-up cases and MOD-78's `lease_holds` case)"
     );
 }
 

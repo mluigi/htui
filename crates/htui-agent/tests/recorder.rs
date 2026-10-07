@@ -1020,6 +1020,9 @@ impl WriteStore for SpyStore {
     async fn item_by_key(&self, project: ProjectId, key: &str) -> StoreResult<Option<ItemId>> {
         self.inner.item_by_key(project, key).await
     }
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> StoreResult<bool> {
+        self.inner.lease_holds(run, fence).await
+    }
     async fn enqueue_command(&self, new: NewCommandRun) -> StoreResult<CommandRun> {
         self.inner.enqueue_command(new).await
     }

@@ -214,6 +214,7 @@ pub const CASES: &[&str] = &[
     "pending_commands_list_cancels_only",
     "relay_view_lists_the_newest_follow_up_per_step_without_text",
     "closing_a_dropped_walks_windows_needs_the_lease",
+    "lease_holds_reads_the_owner",
 ];
 
 /// Runs one case by name against an already-loaded store.
@@ -566,6 +567,7 @@ pub async fn run_case<S: WriteStore>(name: &str, store: &S) {
         "closing_a_dropped_walks_windows_needs_the_lease" => {
             closing_a_dropped_walks_windows_needs_the_lease(store).await;
         }
+        "lease_holds_reads_the_owner" => lease_holds_reads_the_owner(store).await,
         other => panic!("unknown conformance case `{other}`; CASES and run_case disagree"),
     }
 }
@@ -19091,7 +19093,8 @@ async fn claim_command_admits_up_to_the_limit_in_queue_order<S: WriteStore>(stor
 /// MOD-11 D14: only the claimant beats or finishes a running row. A stranger's beat and finish
 /// answer `false` and move nothing; the claimant's finish lands its status, exit code and output
 /// with a finish instant, after which its own beat is `false`; finishing to `queued` or `running`
-/// is refused before anything is read.
+/// is refused before anything is read. A claimant may end its row `cancelled` with no exit code
+/// and its output (MOD-78 D4).
 async fn beat_and_finish_need_the_claimant<S: WriteStore>(store: &S) {
     const CASE: &str = "beat_and_finish_need_the_claimant";
     let new = queued_command("build", seam_clock());
@@ -19192,6 +19195,43 @@ async fn beat_and_finish_need_the_claimant<S: WriteStore>(store: &S) {
         done,
         "{CASE}: the second finish moved nothing"
     );
+
+    // MOD-78 D4: a claimant stopped on a lost lease ends its row `cancelled`, with no exit code
+    // and the output it kept.
+    let lost = queued_command("build", seam_clock() + TimeDelta::seconds(1));
+    store.enqueue_command(lost.clone()).await.expect(CASE);
+    store
+        .claim_command(lost.id, claimant, 1)
+        .await
+        .expect(CASE)
+        .unwrap_or_else(|| panic!("{CASE}: the second row is admitted"));
+    assert!(
+        store
+            .finish_command(
+                lost.id,
+                claimant,
+                CommandRunStatus::Cancelled,
+                None,
+                Some("x".to_owned())
+            )
+            .await
+            .expect(CASE),
+        "{CASE}: the claimant finishes its row cancelled"
+    );
+    let cancelled = command_row(CASE, store, lost.id).await;
+    assert_eq!(
+        (
+            cancelled.status,
+            cancelled.exit_code,
+            cancelled.output.as_deref()
+        ),
+        (CommandRunStatus::Cancelled, None, Some("x")),
+        "{CASE}: cancelled, no exit code, the output kept"
+    );
+    assert!(
+        cancelled.finished_at.is_some(),
+        "{CASE}: with a finish instant"
+    );
 }
 
 /// MOD-11 D14: [`WriteStore::cancel_command`] ends a `queued` or `running` row as `cancelled`
@@ -19277,6 +19317,116 @@ async fn cancel_command_ends_a_queued_or_running_row<S: WriteStore>(store: &S) {
             id: unknown_id.to_string(),
         }),
         "{CASE}: an unknown row is NotFound"
+    );
+}
+
+/// MOD-78 D1, D2: [`WriteStore::lease_holds`] answers whether the run's `lease_owner` is the
+/// fence's owner, `IS NOT DISTINCT FROM`: a claimed run holds its owner's fence and no other, a
+/// taken run its taker's, an expired lease nobody took still its owner's (owner only, never the
+/// expiry), a released run and a chat run `Unleased`. An unknown run is `NotFound`.
+async fn lease_holds_reads_the_owner<S: WriteStore>(store: &S) {
+    const CASE: &str = "lease_holds_reads_the_owner";
+    let at = seam_clock();
+    let (a, b) = (Uuid::now_v7(), Uuid::now_v7());
+    let (run, _) = leased_step(CASE, store, a, at).await;
+    assert_eq!(
+        (
+            store
+                .lease_holds(run, StepFence::Lease(a))
+                .await
+                .expect(CASE),
+            store
+                .lease_holds(run, StepFence::Lease(b))
+                .await
+                .expect(CASE),
+            store
+                .lease_holds(run, StepFence::Unleased)
+                .await
+                .expect(CASE),
+        ),
+        (true, false, false),
+        "{CASE}: A's claim holds A's fence and no other"
+    );
+
+    taken_by(CASE, store, run, a, b).await;
+    assert_eq!(
+        (
+            store
+                .lease_holds(run, StepFence::Lease(a))
+                .await
+                .expect(CASE),
+            store
+                .lease_holds(run, StepFence::Lease(b))
+                .await
+                .expect(CASE),
+        ),
+        (false, true),
+        "{CASE}: once B takes the lease, B's fence holds and A's does not"
+    );
+
+    assert!(
+        store
+            .refresh_lease(run, b, TimeDelta::zero())
+            .await
+            .expect(CASE),
+        "{CASE}: B's lease lapses"
+    );
+    assert!(
+        store
+            .lease_holds(run, StepFence::Lease(b))
+            .await
+            .expect(CASE),
+        "{CASE}: an expired lease nobody took still holds (D2: owner only)"
+    );
+
+    assert!(
+        store.release_lease(run, b).await.expect(CASE),
+        "{CASE}: B releases the run"
+    );
+    assert_eq!(
+        (
+            store
+                .lease_holds(run, StepFence::Unleased)
+                .await
+                .expect(CASE),
+            store
+                .lease_holds(run, StepFence::Lease(b))
+                .await
+                .expect(CASE),
+        ),
+        (true, false),
+        "{CASE}: a released run holds `Unleased` and no owner"
+    );
+
+    let chat = ChatRunSpec::mint(
+        ids::PROJECT_HTUI,
+        ids::BOX,
+        ids::USER,
+        Some(ids::AGENT_CLAUDE),
+        Some("sonnet".to_owned()),
+    );
+    store.start_chat_run(&chat).await.expect(CASE);
+    assert_eq!(
+        (
+            store
+                .lease_holds(chat.run_id, StepFence::Unleased)
+                .await
+                .expect(CASE),
+            store
+                .lease_holds(chat.run_id, StepFence::Lease(a))
+                .await
+                .expect(CASE),
+        ),
+        (true, false),
+        "{CASE}: a chat run holds no lease, so `Unleased` holds there"
+    );
+
+    assert!(
+        matches!(
+            store.lease_holds(RunId::new(), StepFence::Unleased).await,
+            Err(StoreError::NotFound { entity: "run", .. })
+        ),
+        "{CASE}: an unknown run is NotFound"
     );
 }
 

@@ -14,7 +14,12 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-07):** **MOD-70 is done** (`docs/decisions/mod/mod-70.md`): a follow-up
+**Current status (2026-10-07):** **MOD-78 is done** (`docs/decisions/mod/mod-78.md`): `command_run`
+checks the session's lease. A new lock-free store read, `lease_holds(run, fence)`, runs before the queue, while
+queued (once per heartbeat), at admission and on every heartbeat; a loss refuses the call or kills the command and
+cancels its row (`fenced: lease lost`). A session's `CancellationToken` (lease drop, `close`, last host) ends its
+in-flight calls. No migration; one `.sqlx` entry.
+Before it, **MOD-70 is done** (`docs/decisions/mod/mod-70.md`): a follow-up
 typed in any TUI reaches a step an engine walks, in process or on a worker, on any box. `i` on a running
 engine step queues a `follow_up` `run_command` row (the typing box refuses a credential-shaped text); the
 walking process claims it at the turn's `done` with a fenced compare-and-set that nulls the text, records
@@ -313,14 +318,6 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
   in the sent body and the proposal. Once this item masks real values, the help runtime should report how many masks
   it applied, so a body's literal `[REDACTED]` cannot hide a masked value from the double-accept.
 
-- [ ] **MOD-78 - `command_run` lifecycle: lease check and cancel on session end** (from MOD-11,
-  `docs/decisions/mod/mod-11.md`). `R-MCP-1`, `R-MCP-3`. `command_run` is not fenced (MOD-11's I-3
-  reads "every item write"). A session whose walk lost its lease can queue and run commands until the
-  walk notices at its next renewal (`docs/htui-mcp.md`, "Scope"). Add a lock-free `lease_owner` check
-  before `enqueue_command` and on each heartbeat, and kill the child on a loss. Review L5: dropping
-  the lease only sets the session's `ended`. Add a cancellation signal on `Session` (a `watch` or a
-  `CancellationToken`) that `Served::call` selects against, so an in-flight call ends with its
-  session. Not blocked.
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
@@ -531,6 +528,6 @@ conformance `CASES` 146 plus the waiting-list and follow-up cases (re-pin from t
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 24 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-78 command_run lifecycle, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 23 (MOD-10 secrets, MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-86 chat prompt scrub, MOD-87 chat cancel, MOD-88 item-graph flow mode, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 0 |
 | TOOL-N  | 0 |

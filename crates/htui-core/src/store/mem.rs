@@ -116,10 +116,10 @@ pub struct MemStore {
     clock: MemClock,
 }
 
-/// MOD-4 plan D152: a write [`MemStore::set_fault`] can make fail, so a test can tell "the store
+/// MOD-4 plan D152: a call [`MemStore::set_fault`] can make fail, so a test can tell "the store
 /// cannot answer" apart from "the row is gone".
 ///
-/// A test seam only: nothing in production switches one on. A faulted write answers
+/// A test seam only: nothing in production switches one on. A faulted call answers
 /// [`StoreError::Unreachable`] before it touches any state, until it is switched off.
 #[cfg(feature = "test-support")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -132,6 +132,9 @@ pub enum MemFault {
     ItemTransition,
     /// [`WriteStore::record_opening`] (MOD-37 review N-4).
     RecordOpening,
+    /// [`WriteStore::lease_holds`] (MOD-78 D5): a read, so `command_run` can tell a store blip
+    /// from a lost lease.
+    LeaseHolds,
 }
 
 /// A `step_permission` row with its `owner`, which [`StepPermission`] deliberately omits
@@ -5185,6 +5188,13 @@ impl State {
         Ok(true)
     }
 
+    /// MOD-78 D1: [`State::fence_holds`]'s predicate on a run. `lease_owners` holds a run only
+    /// while its lease names an owner, so a missing entry is Postgres's `NULL`.
+    fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
+        self.require_run(run)?;
+        Ok(self.lease_owners.get(&run).copied() == fence.owner())
+    }
+
     /// A `run_step` at `pending` with every settle column `NULL`.
     fn create_step(&mut self, new: NewRunStep, now: DateTime<Utc>) -> Result<RunStep> {
         if self.steps.contains_key(&new.id) {
@@ -8489,6 +8499,12 @@ impl WriteStore for MemStore {
 
     async fn item_by_key(&self, project: ProjectId, key: &str) -> Result<Option<ItemId>> {
         Ok(self.read(|state| state.item_by_key(project, key)))
+    }
+
+    async fn lease_holds(&self, run: RunId, fence: StepFence) -> Result<bool> {
+        #[cfg(feature = "test-support")]
+        self.check_fault(MemFault::LeaseHolds)?;
+        self.read(|state| state.lease_holds(run, fence))
     }
 
     // ---- MOD-11 M4 (plan D14, B-16): the command queue, one `write` closure each ----
