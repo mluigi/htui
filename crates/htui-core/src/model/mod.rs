@@ -146,7 +146,10 @@ pub use persona::{
     PersonaMatch, PersonaNotInSnapshot, PersonaPatch, PersonaPermission, PersonaRule, PersonaTools,
     RuleLineError, SnapshotPersona,
 };
-pub use queue::{BatchClose, QueueBatch, QueueEntry, admission_limit, admission_order, free_slots};
+pub use queue::{
+    BatchClose, BatchStop, MIN_BUDGET_FOR_NEW_ATTEMPT, QueueBatch, QueueEntry, admission_limit,
+    admission_order, batch_budget, free_slots, min_budget_micros,
+};
 pub use quota::{
     Availability, CapError, PER_TOKEN_CAP_BATCH, PER_TOKEN_CAP_RUN, ProjectCaps, Quota,
     QuotaSource, QuotaWindow, SkipReason, Spend, available, normalize,
