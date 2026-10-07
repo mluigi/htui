@@ -1,13 +1,15 @@
 //! `keys.toml` to [`Keys`] (MOD-67 M2; ANA-26 §7.1, §7.4 steps 1-6, §7.5): find the file, parse
 //! it with spans, check names and chords strictly, merge it over the catalogue, and report every
-//! error with its line.
+//! error with its line. [`validate()`] adds the checks over the merged keys.
 
 use std::path::{Path, PathBuf};
 
 use toml::Spanned;
 use toml::de::{DeString, DeTable, DeValue};
 
-use super::{Act, CATALOGUE, CTRL_C, ChordError, Context, KeyChord, Keys, contexts, quote};
+use super::{
+    Act, CATALOGUE, CTRL_C, ChordError, Context, KeyChord, Keys, contexts, quote, validate,
+};
 
 /// The key file's name under the config root.
 pub const FILE_NAME: &str = "keys.toml";
@@ -110,6 +112,7 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
     let Loader {
         keys, mut errors, ..
     } = loader;
+    errors.extend(validate(&keys));
     errors.sort_by_key(|error| error.line);
     if errors.is_empty() {
         Ok(keys)
