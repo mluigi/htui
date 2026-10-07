@@ -2257,7 +2257,9 @@ impl PgStore {
     /// The latest run is the latest `kind = 'graph'` run by `(queued_at, id)`; its parked step is
     /// its first `awaiting_approval` step by `(position, attempt, fanout_index)`. The blocker
     /// clause is [`ready_items`](PgStore::ready_items)' verbatim, so "open blocker" and "not ready
-    /// for a blocker" are one rule; `COLLATE "C"` is `MemStore`'s byte order.
+    /// for a blocker" are one rule; `COLLATE "C"` is `MemStore`'s byte order. Keys are unique only
+    /// per project and a link may cross projects, so the keys are `DISTINCT`: two open blockers
+    /// keyed `FEAT-1` list it once, as `MemStore`'s set does.
     ///
     /// # Errors
     ///
@@ -2306,7 +2308,7 @@ impl PgStore {
                      LIMIT 1
                    ) ln ON true
               LEFT JOIN LATERAL (
-                    SELECT array_agg(t.key ORDER BY t.key COLLATE "C") AS keys
+                    SELECT array_agg(DISTINCT t.key COLLATE "C" ORDER BY t.key COLLATE "C") AS keys
                       FROM item_link l JOIN item t ON t.id = l.to_item_id
                      WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
                        AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed')
