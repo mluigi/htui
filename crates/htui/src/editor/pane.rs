@@ -12,9 +12,11 @@
 //!   session and process group (portable-pty runs `setsid`), and the whole group gets SIGHUP, a
 //!   grace of up to 200 ms (cut short once the child has exited), then SIGKILL: a grandchild that
 //!   ignores SIGHUP (an `$EDITOR` wrapper that does not `exec`) cannot outlive the pane and keep
-//!   the slave, and so the reader, alive. Every signal is sent before the child is reaped, so its
-//!   pid, which is the group's id, cannot have been reused. On Windows: portable-pty's kill
-//!   (`TerminateProcess`). No signal is sent from the caller's thread.
+//!   the slave, and so the reader, alive. A child that exits on its own is noticed unreaped
+//!   (`waitid` with `WNOWAIT`), and the rest of its group gets the same SIGHUP and SIGKILL. Every
+//!   signal is sent before the child is reaped, so its pid, which is the group's id, cannot have
+//!   been reused. On Windows: portable-pty's kill (`TerminateProcess`). No signal is sent from
+//!   the caller's thread.
 //! - [`PaneScreen`]: the VT screen a pane's output is parsed into (`vt100`), and the replies the
 //!   child is owed for its terminal queries (DSR, DA1).
 //! - [`encode_key`] and [`encode_paste`]: crossterm's keys and pastes as the bytes a legacy xterm
@@ -77,7 +79,8 @@ impl PaneId {
 /// and the kernel dislikes 0.
 const MIN_SIDE: u16 = 2;
 
-/// A pane's size in cells. Never under [`MIN_SIDE`] (2) in either dimension.
+/// A pane's size in cells. Never under 2 in either dimension (`vt100` cannot take 1, the kernel
+/// dislikes 0).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PaneSize {
     /// Rows.
@@ -90,7 +93,7 @@ impl PaneSize {
     /// Before anything was drawn: 24x80.
     pub const DEFAULT: Self = Self { rows: 24, cols: 80 };
 
-    /// `rows`/`cols`, each at least 2 (see [`MIN_SIDE`]).
+    /// `rows`/`cols`, each at least 2.
     #[must_use]
     pub fn new(rows: u16, cols: u16) -> Self {
         Self {
@@ -191,8 +194,9 @@ pub struct PtyChild {
     kill: Option<mpsc::Sender<()>>,
     /// For `Debug` and tests.
     pid: Option<u32>,
-    /// The wait, reader and writer threads, so a test can see them end.
-    #[cfg(test)]
+    /// The wait, reader and writer threads, so a test can see them end (the real-child tests
+    /// are unix-only).
+    #[cfg(all(test, unix))]
     threads: Vec<thread::JoinHandle<()>>,
 }
 
@@ -288,14 +292,14 @@ impl PtyChild {
 
         let threads = vec![waiting, reading, writing];
         // Detached outside tests: each thread ends on its own (EOF, a closed queue, a reap).
-        #[cfg(not(test))]
+        #[cfg(not(all(test, unix)))]
         drop(threads);
         Ok(Self {
             master,
             input,
             kill: Some(kill_tx),
             pid,
-            #[cfg(test)]
+            #[cfg(all(test, unix))]
             threads,
         })
     }
@@ -318,10 +322,8 @@ fn wait_for(
     events: &UnboundedSender<PaneEvent>,
 ) {
     let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Ok(status),
-            Err(err) => break Err(err),
-            Ok(None) => {}
+        if let Some(status) = ended(&mut *child) {
+            break status;
         }
         match kill.recv_timeout(POLL) {
             Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break end(&mut *child),
@@ -335,8 +337,39 @@ fn wait_for(
     });
 }
 
-/// Ends the child and its process group, then reaps the child (B5). `child` is not reaped yet:
-/// its last `try_wait` said it was running.
+/// Whether `child` has ended on its own: `None` while it runs; once it has exited, the rest of
+/// its process group is ended as on a kill ([`end`]: SIGHUP, then SIGKILL at once, the child
+/// being gone) and the child reaped. The kernel's own SIGHUP at the child's exit does not end a
+/// job that ignores it, and that job would hold the slave, and so the reader, open. The probe
+/// does not reap, so the group's id stays the child's while the signals go out.
+#[cfg(unix)]
+fn ended(child: &mut (dyn Child + Send + Sync)) -> Option<io::Result<portable_pty::ExitStatus>> {
+    use rustix::process::{Pid, WaitId, WaitIdOptions, waitid};
+
+    let Some(pid) = child
+        .process_id()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(Pid::from_raw)
+    else {
+        return child.try_wait().transpose();
+    };
+    let options = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    match waitid(WaitId::Pid(pid), options) {
+        Ok(None) => None,
+        Ok(Some(_)) => Some(end(child)),
+        // Not ours to probe (never expected): reap as before, without signalling a group whose
+        // id may no longer be the child's.
+        Err(_) => child.try_wait().transpose(),
+    }
+}
+
+/// Whether `child` has ended on its own; if so, reaped.
+#[cfg(not(unix))]
+fn ended(child: &mut (dyn Child + Send + Sync)) -> Option<io::Result<portable_pty::ExitStatus>> {
+    child.try_wait().transpose()
+}
+
+/// Ends the child and its process group, then reaps the child (B5). `child` is not reaped yet.
 #[cfg(unix)]
 fn end(child: &mut (dyn Child + Send + Sync)) -> io::Result<portable_pty::ExitStatus> {
     use rustix::process::{Pid, Signal, WaitId, WaitIdOptions, kill_process_group, waitid};
@@ -493,10 +526,51 @@ impl PaneScreen {
     }
 
     /// Resizes the grid (`Screen::set_size`).
+    ///
+    /// `vt100` 0.16.2 keeps a wide character whose second half falls off a narrower edge: a wide
+    /// cell in the last column, which the next erase or write of that column indexes past (a
+    /// panic on the UI task). A grid, shown or not, left holding one is cleared; the editor
+    /// redraws on the `SIGWINCH` the same resize sends it.
     pub fn resize(&mut self, size: PaneSize) {
         let size = size.floored();
-        self.parser.screen_mut().set_size(size.rows, size.cols);
+        let (_, cols) = self.parser.screen().size();
+        let screen = self.parser.screen_mut();
+        screen.set_size(size.rows, size.cols);
+        if size.cols < cols {
+            clear_split_wide(screen);
+        }
     }
+}
+
+/// Clears each grid of `screen` that holds a wide cell in its last column (see
+/// [`PaneScreen::resize`]). The sequences go through a scratch parser that `screen` is swapped
+/// into, so the pane's parser, maybe halfway through the child's escape sequence, is not fed
+/// them, and no reply is queued. Mode 47 switches grids without saving, restoring or clearing
+/// anything.
+fn clear_split_wide(screen: &mut vt100::Screen) {
+    fn clear_shown(scratch: &mut vt100::Parser) {
+        let screen = scratch.screen();
+        let (rows, cols) = screen.size();
+        let split =
+            (0..rows).any(|row| screen.cell(row, cols - 1).is_some_and(vt100::Cell::is_wide));
+        if split {
+            scratch.process(b"\x1b[2J");
+        }
+    }
+
+    let mut scratch = vt100::Parser::new(MIN_SIDE, MIN_SIDE, 0);
+    std::mem::swap(scratch.screen_mut(), screen);
+    let alternate = scratch.screen().alternate_screen();
+    let (other, back): (&[u8], &[u8]) = if alternate {
+        (b"\x1b[?47l", b"\x1b[?47h")
+    } else {
+        (b"\x1b[?47h", b"\x1b[?47l")
+    };
+    clear_shown(&mut scratch);
+    scratch.process(other);
+    clear_shown(&mut scratch);
+    scratch.process(back);
+    std::mem::swap(scratch.screen_mut(), screen);
 }
 
 impl fmt::Debug for PaneScreen {
@@ -1031,6 +1105,84 @@ mod tests {
     }
 
     #[test]
+    fn narrowing_past_a_wide_character_leaves_a_grid_that_takes_any_output() {
+        // `vt100` 0.16.2's `set_size` keeps a wide character whose second half falls off the new
+        // edge: a wide cell in the last column, and the next erase or write of it indexes past
+        // the row. On either grid: the one not shown is resized too.
+        let wide = format!("{}\u{4e2d}", "x".repeat(78));
+        let after: [&[u8]; 4] = [
+            b"\x1b[1;79H\x1b[K",
+            b"\x1b[1;79H\x1b[1K",
+            b"\x1b[1;79Hy",
+            b"\x1b[1;79H\x1b[X",
+        ];
+        for (fill, then) in [
+            (String::new(), String::new()),
+            (String::new(), "\x1b[?1049h".to_owned()),
+            ("\x1b[?1049h".to_owned(), "\x1b[?1049l".to_owned()),
+        ] {
+            for bytes in after {
+                let mut screen = PaneScreen::new(PaneSize::DEFAULT);
+                let _ = screen.feed(format!("{fill}{wide}").as_bytes());
+                let alternate = screen.screen().alternate_screen();
+                screen.resize(PaneSize::new(24, 79));
+                assert_eq!(screen.screen().alternate_screen(), alternate);
+                assert_eq!(screen.size(), PaneSize::new(24, 79));
+                let _ = screen.feed(then.as_bytes());
+                let _ = screen.feed(bytes);
+            }
+        }
+
+        // Nothing is cleared when no wide character is split, and the modes survive.
+        let mut screen = PaneScreen::new(PaneSize::DEFAULT);
+        let _ = screen.feed(b"\x1b[?1h\x1b[?2004hkept\x1b[3;5H");
+        screen.resize(PaneSize::new(24, 40));
+        assert!(screen.screen().contents().contains("kept"));
+        assert!(screen.screen().application_cursor());
+        assert!(screen.screen().bracketed_paste());
+        assert!(!screen.screen().alternate_screen());
+        assert_eq!(screen.screen().cursor_position(), (2, 4));
+
+        // A split mid-sequence: the live parser's half-read escape is not disturbed.
+        let mut screen = PaneScreen::new(PaneSize::DEFAULT);
+        let _ = screen.feed(wide.as_bytes());
+        let _ = screen.feed(b"\x1b[?20");
+        screen.resize(PaneSize::new(24, 79));
+        let _ = screen.feed(b"04h");
+        assert!(screen.screen().bracketed_paste());
+
+        // A seeded sweep: wide characters, erases and writes with narrowing resizes between.
+        let tokens: [&[u8]; 10] = [
+            "\u{4e2d}".as_bytes(),
+            b"a",
+            b"\x1b[K",
+            b"\x1b[1K",
+            b"\x1b[1J",
+            b"\x1b[X",
+            b"\x1b[P",
+            b"\x1b[9C",
+            b"\r\n",
+            b"\x1b[?1049h",
+        ];
+        let mut seed: u64 = 0x0057;
+        let mut screen = PaneScreen::new(PaneSize::new(4, 9));
+        for _ in 0..20_000 {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let pick = usize::try_from(seed >> 33).unwrap_or(0);
+            if pick % 7 == 0 {
+                let cols = u16::try_from(pick % 9).unwrap_or(0);
+                screen.resize(PaneSize::new(4, cols));
+            } else if pick % 11 == 0 {
+                let _ = screen.feed(b"\x1b[?1049l");
+            } else {
+                let _ = screen.feed(tokens[pick % tokens.len()]);
+            }
+        }
+    }
+
+    #[test]
     fn a_dsr_in_the_pending_wrap_state_reports_the_last_column() {
         let mut screen = PaneScreen::new(PaneSize::new(24, 10));
         assert_eq!(screen.feed(b"0123456789\x1b[6n"), b"\x1b[1;10R");
@@ -1285,6 +1437,35 @@ mod tests {
             pane.child.kill();
             let status = pane.exited(Duration::from_secs(3)).await.expect("reaped");
             assert!(!status.success(), "{status:?}");
+            gone(&grandchild).await;
+            // Every sender is gone: the reader saw EOF and the wait thread ended.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match pane.next(left).await {
+                    None => break,
+                    Some(event) => {
+                        assert!(matches!(event, PaneEvent::Output { .. }), "{event:?}");
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn a_hup_ignoring_grandchild_dies_when_the_child_exits_on_its_own() {
+            // The child exits by itself, leaving a job in its group that ignores the kernel's
+            // SIGHUP and holds the slave: nothing calls `kill`, and the pane is still held.
+            let dir = TempDir::new().unwrap();
+            let pidfile = dir.path().join("pid");
+            let mut pane = Pane::spawn(script(
+                &dir,
+                "sh -c 'trap \"\" HUP; printf %s $$ > \"$1\"; exec sleep 30' sh \"$1\" &\n\
+                 while [ ! -s \"$1\" ]; do sleep 0.02; done; printf ready; exit 0",
+                &pidfile,
+            ));
+            let status = pane.exited(Duration::from_secs(10)).await.expect("reaped");
+            assert!(status.success(), "{status:?}");
+            let grandchild = read_pid(&pidfile).await;
             gone(&grandchild).await;
             // Every sender is gone: the reader saw EOF and the wait thread ended.
             let deadline = Instant::now() + Duration::from_secs(3);
