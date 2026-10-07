@@ -1255,6 +1255,102 @@ mod tests {
         );
     }
 
+    /// MOD-12 D9 (review NIT-intent, G3): a refused write spends only its own in-flight key, so
+    /// `P` pressed while `Q`'s write is refused (review L1's `queued elsewhere`) still sends its
+    /// own write; a refused read spends the toggle it was for.
+    #[tokio::test]
+    async fn a_refused_queue_write_keeps_a_newer_toggle_and_a_refused_read_spends_it() {
+        let bench = Bench::new().await;
+        let ana_2 = htui_core::fixtures::ids::HTUI_ANA_2;
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ana_2)),
+            ..bench.tab()
+        };
+        let paused = |entries: Vec<ItemId>| QueueView {
+            entries,
+            open_batch: None,
+            demo: false,
+        };
+        let refused = |request: &'static str| StoreReply::Failed {
+            request,
+            message: "the item is queued on another box; dequeue it there".to_owned(),
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('Q'));
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["queue_state".to_owned(), format!("queue_item {ana_2}")]
+        );
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(
+            &refused(StoreRequest::QueueItem { item: ana_2 }.name()),
+            &mut bench.ctx(),
+        );
+        assert!(
+            tab.queue_writing.is_none(),
+            "the refused write's key is spent"
+        );
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["resume_queue"],
+            "P's read still decides P's write"
+        );
+
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        assert_eq!(queue_requests(&bench.actions()), ["queue_state"]);
+        tab.on_reply(&refused(StoreRequest::QueueState.name()), &mut bench.ctx());
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            Vec::<String>::new(),
+            "a refused read spent its toggle: a later read writes nothing"
+        );
+    }
+
+    /// MOD-12 D9 (review NIT-intent, G3): a write's answer names its item by the key taken when
+    /// it was sent, so an item gone from the list meanwhile is still named by its key.
+    #[tokio::test]
+    async fn a_queue_write_names_its_item_after_the_list_dropped_it() {
+        let bench = Bench::new().await;
+        let ana_2 = htui_core::fixtures::ids::HTUI_ANA_2;
+        let mut tab = BacklogTab {
+            selected: Some(Selection::Item(ana_2)),
+            ..bench.tab()
+        };
+        let paused = |entries: Vec<ItemId>| QueueView {
+            entries,
+            open_batch: None,
+            demo: false,
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('Q'));
+        tab.on_reply(&StoreReply::Queue(paused(Vec::new())), &mut bench.ctx());
+        assert_eq!(
+            queue_requests(&bench.actions()),
+            ["queue_state".to_owned(), format!("queue_item {ana_2}")]
+        );
+        tab.on_reply(&StoreReply::Items(Vec::new()), &mut bench.ctx());
+        let _ = bench.actions();
+        tab.on_reply(
+            &StoreReply::QueueWritten {
+                write: QueueWrite::Queued { item: ana_2 },
+                view: paused(vec![ana_2]),
+            },
+            &mut bench.ctx(),
+        );
+        let actions = bench.actions();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Error(status) if status == "queued ANA-2 (1 in queue, paused)"
+            )),
+            "named by its key, not its id: {actions:?}"
+        );
+    }
+
     /// A sub-tab that records every key it is offered and captures while `capturing` is set (the
     /// `tests/settings.rs` probe, one level down).
     #[derive(Debug)]
