@@ -3501,11 +3501,11 @@ mod tests {
 
     use htui_agent::registry::DriverFactory;
     use htui_core::fixtures::ids;
-    use htui_core::model::ItemId;
+    use htui_core::model::{BatchId, BatchStop, CapError, ItemId, PER_TOKEN_CAP_BATCH};
     use htui_core::store::{MemStore, StoreError};
     use htui_store::Backend;
 
-    use super::RunRuntime;
+    use super::{RunRuntime, first_of};
     use crate::address::Publish as _;
     use crate::{FrameKind, LiveChats, ReplySink, RunFrame, RunReply, RunRequest, RunServed};
 
@@ -3605,6 +3605,50 @@ mod tests {
             shared.queue_read_failed("its entries", &err),
             "a new streak warns again"
         );
+    }
+
+    /// MOD-12 M2 D4 (review R1 L4): `first_of` answers true for a batch it was not last told,
+    /// and remembers only the last one.
+    #[test]
+    fn first_of_is_true_once_per_batch() {
+        let noted = StdMutex::new(None);
+        let (a, b) = (BatchId::new(), BatchId::new());
+        assert!(first_of(&noted, a), "a new batch");
+        assert!(!first_of(&noted, a), "the same batch again");
+        assert!(first_of(&noted, b), "the next batch");
+        assert!(first_of(&noted, a), "only the last batch is remembered");
+    }
+
+    /// MOD-12 M2 D4 (review R1 L4): a batch's first spend stop and its first malformed cap are each
+    /// said once at their own level, independently, and again under a new batch.
+    #[test]
+    fn a_batch_says_its_first_stop_and_its_first_bad_cap_once_each() {
+        let runtime = runtime();
+        let shared = &runtime.shared;
+        let (a, b) = (BatchId::new(), BatchId::new());
+        let stop = BatchStop::CapReached {
+            spent: 600,
+            cap: 500,
+        };
+        let err = CapError {
+            key: PER_TOKEN_CAP_BATCH,
+            found: "\"lots\"".to_owned(),
+        };
+        assert!(shared.note_batch_stop(a, ids::HTUI_ANA_2, &stop), "info");
+        assert!(
+            !shared.note_batch_stop(a, ids::HTUI_FEAT_1, &stop),
+            "debug: another entry of the same batch"
+        );
+        assert!(
+            shared.note_bad_cap(a, ids::PROJECT_HTUI, &err),
+            "the bad cap has its own once"
+        );
+        assert!(!shared.note_bad_cap(a, ids::PROJECT_HTUI, &err));
+        assert!(
+            shared.note_batch_stop(b, ids::HTUI_ANA_2, &stop),
+            "a new batch"
+        );
+        assert!(shared.note_bad_cap(b, ids::PROJECT_HTUI, &err));
     }
 
     /// Plan D172, MOD-41 plan D7: a frame reaches every subscriber of its item, each at its own
