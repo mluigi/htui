@@ -8,7 +8,7 @@ review-finding verification only; `rust-reviewer` stays the gate. Implement: not
 files, mostly a serial chain).
 **Selected milestone**: M2 only. M3-M6 are later runs.
 **Complexity**: Medium (~11 files, two new modules, no snapshot churn intended)
-**Status**: confirmed by the maintainer (2026-10-07); implementing
+**Status**: done (M2 landed 2026-10-07, `d4be4861`..`97cad2aa`); M3-M6 are later runs
 
 ## Summary
 
@@ -228,6 +228,24 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] A broken file exits 2 with every error as `keys.toml:LINE:` and reaches no Sentry
 - [ ] `--print-keys` output round-trips through the loader
 - [ ] Patterns mirrored, not reinvented
+
+## Review gate (2026-10-07)
+
+`rust-reviewer`: approve; 0 CRITICAL/HIGH/MEDIUM, 4 LOW, 5 NIT. One adversarial verifier per
+finding (Workflow `wf_b942228d-094`).
+
+- **Applied** (`97cad2aa`): L1 (a collision is reported on the row that added the chord, not
+  the later row keeping it as a default; test `a_collision_is_reported_where_the_chord_was_added`),
+  L2 (`tests/keys_file.rs` `fixture()` is `cfg(any(unix, feature = "testkit"))`: dead code on
+  Windows without `testkit`; the reviewer's unused-import half was wrong).
+- **Dropped after verification**: L3 (same-line errors in inline tables come in key order; every
+  line is right, the risk table accepted iteration order), L4 (no size cap on `--keys`: the user's
+  own file, and `read_to_string` fails cleanly under a memory limit), N1-N5 (style or unreachable:
+  `let _ = write!` matches the crate, the header's `~/.config` shorthand matches the README and
+  `identity.rs`, `line_of` offsets are always char boundaries, the `--default-keys` hint is D9's
+  text, the startup read is sync like `--dsn-stdin`).
+- **Carried to M3**: the narrower-context override of a shared verb (D7) and the shadowing
+  allow-list kind (D8 step 5) need M3's first view context and form stack.
 
 ## Verified claims (plan fact-check, 2026-10-07)
 
