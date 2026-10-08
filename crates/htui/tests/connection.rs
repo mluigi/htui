@@ -1714,6 +1714,87 @@ async fn enter_on_the_rebuild_row_is_r() {
     assert!(bench.drained().is_empty());
 }
 
+/// MOD-67 M3 (D14): `rebuild` rebound in `[settings.connection]` answers its new chord only, and
+/// the hint names it. `Enter` on the Rebuild row is its own act (`activate`), so it still asks.
+#[tokio::test]
+async fn a_rebound_rebuild_answers_its_new_chord_and_the_hint_names_it() {
+    let keys = htui::keys::load_str("version = 1\n[settings.connection]\nrebuild = \"X\"\n")
+        .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = ConnectionSection::new();
+    feed(&bench, &mut section, &stored_snapshot());
+
+    assert_eq!(
+        hint_of(&frame_of(&bench, &section)),
+        "e edit DSN \u{b7} c clear DSN \u{b7} X rebuild cache \u{b7} r reload \u{b7} j/k rows"
+    );
+    assert_eq!(
+        bench.key(&mut section, "R"),
+        Handled::Pass,
+        "the old chord is not the section's any more"
+    );
+    assert!(!section.captures_input(), "`R` asks nothing");
+
+    assert_eq!(bench.key(&mut section, "X"), Handled::Consumed);
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("Rebuild the mirror?"),
+        "{section:?}"
+    );
+    bench.key(&mut section, "n");
+    assert!(!section.captures_input(), "`n` closed the question");
+
+    for _ in 0..3 {
+        bench.key(&mut section, "j");
+    }
+    assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+    assert!(
+        flattened(&frame_of(&bench, &section)).contains("Rebuild the mirror?"),
+        "`Enter` on the Rebuild row still asks: {section:?}"
+    );
+    assert!(bench.drained().is_empty(), "asking sends nothing");
+}
+
+/// MOD-67 M3 (ANA-26 §2.6 defect 1): a browse key is a chord, modifiers included, so `ctrl-e`,
+/// `alt-c` and `ctrl-r` are not `e`, `c` and `r`; at a question `alt-y` is not `y`. A chord the
+/// modal global layer admits (CONTROL, ALT, a function key) passes to the shell, and every other
+/// unused key is swallowed, in the field as at the question.
+#[tokio::test]
+async fn modifier_chords_are_not_their_letters_and_modal_modes_pass_only_shell_chords() {
+    let (bench, mut section) = bench_with(&stored_snapshot()).await;
+
+    assert_eq!(bench.key(&mut section, "ctrl-e"), Handled::Pass);
+    assert!(!section.captures_input(), "`ctrl-e` opens no field");
+    assert_eq!(bench.key(&mut section, "alt-c"), Handled::Pass);
+    assert!(!section.captures_input(), "`alt-c` asks nothing");
+    assert_eq!(bench.key(&mut section, "ctrl-r"), Handled::Pass);
+    assert!(requested(&bench).is_empty(), "`ctrl-r` reads nothing");
+
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    assert!(section.captures_input(), "the clear question");
+    assert_eq!(bench.key(&mut section, "alt-y"), Handled::Pass);
+    assert!(section.captures_input(), "`alt-y` answers nothing");
+    assert!(requested(&bench).is_empty(), "and clears nothing");
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass, "help is F1");
+    assert_eq!(
+        bench.key(&mut section, "q"),
+        Handled::Consumed,
+        "`q` is swallowed"
+    );
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+    assert!(!section.captures_input(), "`Esc` is still no");
+
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    assert!(section.captures_input(), "the field");
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass, "help is F1");
+    assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
+    assert_eq!(
+        bench.key(&mut section, "tab"),
+        Handled::Consumed,
+        "the tab stays"
+    );
+    assert!(section.captures_input(), "the field is still open");
+}
+
 /// A rebuild needs a mirror, and `--demo` has none.
 #[tokio::test]
 async fn rebuild_refuses_in_a_demo_session() {
