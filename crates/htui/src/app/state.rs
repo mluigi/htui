@@ -226,6 +226,10 @@ pub struct App {
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
     /// `startup_overlay` is one: the shell must not name a concrete view (MOD-1 blueprint D).
     pub migration_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// The quit question (MOD-57 M2 E4): opened by `global.quit` while an in-pane editor is
+    /// alive. Set by [`register_all`](crate::app::register_all), an id for `migration_overlay`'s
+    /// reason; `None` (a bare shell) quits at once, as M1 did.
+    pub quit_overlay: Option<crate::ui::overlay::OverlayId>,
     /// Tab that shows a replayed step (MOD-2 D39, `R-HIS-2`).
     ///
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
@@ -304,6 +308,7 @@ impl App {
             ticks: 0,
             startup_overlay: None,
             migration_overlay: None,
+            quit_overlay: None,
             replay_tab: None,
             reveal_tabs: Vec::new(),
             migration_prompt_shown: false,
@@ -376,7 +381,8 @@ impl App {
     /// offered.
     pub(super) fn action_for(&self, act: Act) -> Option<Action> {
         match act {
-            Act::Quit => Some(Action::Quit),
+            // MOD-57 M2 E4: asks first while an in-pane editor is alive.
+            Act::Quit => Some(self.request_quit()),
             Act::NextTab => Some(Action::Tab(TabAction::Next)),
             Act::PrevTab => Some(Action::Tab(TabAction::Prev)),
             Act::Help => Some(Action::ToggleHelp),

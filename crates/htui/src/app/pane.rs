@@ -27,7 +27,7 @@
 //!   every global the shell maps acts (tab switches included); anything else is refused, so
 //!   nothing reaches the asking view. On any other tab only `editor.focus` is checked (it brings
 //!   the asking tab back, B16) and every other key and paste is that tab's.
-//! - **M2 (PRD D4, D5).** E4: `global.quit` asks first (`App::request_quit`); `ctrl-c` quits
+//! - **M2 (PRD D4, D5).** E4: `global.quit` asks first ([`App::request_quit`]); `ctrl-c` quits
 //!   at once. E5: nothing steers the asking tab (a scope change, a reveal into it). E6: another
 //!   tab's status line is led by the open edit and the way back. E7: the `?` box lists the
 //!   editor keys that act where the user is. E8: the mouse is the view's on another tab.
@@ -51,7 +51,7 @@ use ratatui::Frame;
 use ratatui::layout::{Rect, Size};
 use zeroize::Zeroizing;
 
-use crate::app::action::{Action, TabAction};
+use crate::app::action::{Action, OverlayAction, TabAction};
 use crate::app::state::App;
 use crate::editor::pane::{PaneChild, PaneEvent, PaneId, PaneScreen, PaneSize};
 use crate::editor::pane::{encode_key, encode_paste};
@@ -507,6 +507,17 @@ impl App {
         })
     }
 
+    /// MOD-57 M2 E4 (PRD D5): what `global.quit` resolves to. With an editor alive and
+    /// `quit_overlay` set, opening the quit question; else [`Action::Quit`]. `ctrl-c` never comes
+    /// here (ANA-26 C3 quits at once), and the question's `y` emits `Action::Quit` itself.
+    #[must_use]
+    pub(super) fn request_quit(&self) -> Action {
+        match (self.editor.is_some(), self.quit_overlay) {
+            (true, Some(id)) => Action::Overlay(OverlayAction::Open(id)),
+            _ => Action::Quit,
+        }
+    }
+
     /// MOD-57 M2 E6: what leads another tab's status line while an editor is alive:
     /// `editing in <Tab> · Ctrl+4 back · `, the way back dropped under a modal overlay (where it
     /// does not act) or when unbound. Always ends with the separator. `None` without an editor
@@ -598,7 +609,7 @@ mod tests {
     use crate::keymap::Keymap;
     use crate::keys::{Act, Context, Keys, Stack};
     use crate::store_worker::{StoreReply, StoreRequest};
-    use crate::ui::overlay::{Overlay, OverlayId};
+    use crate::ui::overlay::{Overlay, OverlayId, QuitConfirm};
     use crate::ui::tabs::{Tab, TabId};
 
     /// What the fake child was asked to do.
@@ -864,6 +875,23 @@ mod tests {
         (app, benches, log)
     }
 
+    /// Registers the quit question and names it as the quit overlay, as `register_all` does.
+    fn confirmable(app: &mut App) {
+        app.overlay_factories
+            .register(QuitConfirm::ID, || Box::new(QuitConfirm::new()));
+        app.quit_overlay = Some(QuitConfirm::ID);
+    }
+
+    /// The id of the overlay on top.
+    fn top(app: &App) -> Option<OverlayId> {
+        app.overlays.top().map(Overlay::id)
+    }
+
+    /// Whether the open editor has been handed the keys (`focused`).
+    fn focused(app: &App) -> bool {
+        app.editor.as_ref().is_some_and(|editor| editor.focused)
+    }
+
     /// The keys `bench`'s tab saw, as chords' codes.
     fn codes(bench: &Bench) -> Vec<KeyCode> {
         bench
@@ -1040,20 +1068,128 @@ mod tests {
         assert_eq!(writes(&log), vec![b"a".to_vec()]);
     }
 
+    /// MOD-57 M2 E4 (rewrites M1's `unfocused_ctrl_c_and_q_quit_at_once`): `ctrl-c` quits at
+    /// once; `q` asks first. A bare shell (no quit overlay) quits at once, as M1 did.
     #[test]
-    fn unfocused_ctrl_c_and_q_quit_at_once() {
-        for key in [ctrl('c'), plain('q')] {
-            let (mut app, _benches, log) = opened();
-            app.on_key(ctrl('4'));
-            app.on_key(key);
-            assert!(app.should_quit, "{key:?} quits");
+    fn unfocused_ctrl_c_quits_at_once_and_q_asks_first() {
+        let (mut app, _benches, log) = opened();
+        confirmable(&mut app);
+        app.on_key(ctrl('4'));
+        app.on_key(ctrl('c'));
+        assert!(app.should_quit, "ctrl-c quits at once");
+        assert!(writes(&log).is_empty());
+        drop(app);
+        assert_eq!(
+            log.borrow().last(),
+            Some(&Call::Dropped),
+            "the child goes with App"
+        );
+
+        let (mut app, _benches, log) = opened();
+        confirmable(&mut app);
+        app.on_key(ctrl('4'));
+        app.on_key(plain('q'));
+        assert!(!app.should_quit, "`q` asks first");
+        assert_eq!(top(&app), Some(QuitConfirm::ID));
+        assert!(app.editor_open());
+        assert!(writes(&log).is_empty());
+
+        let (mut app, _benches, log) = opened();
+        app.on_key(ctrl('4'));
+        app.on_key(plain('q'));
+        assert!(app.should_quit, "a bare shell quits at once");
+        drop(app);
+        assert_eq!(log.borrow().last(), Some(&Call::Dropped));
+    }
+
+    /// MOD-57 M2 E4, from the asking tab and from another: `n` and `Esc` keep the edit as it was
+    /// (unfocused, where the user was), `y` quits and the editor goes with `App`.
+    #[test]
+    fn q_asks_first_y_quits_and_n_keeps_the_editor() {
+        for from_other in [false, true] {
+            let (mut app, benches, log) = unfocused_two();
+            confirmable(&mut app);
+            if from_other {
+                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+            }
+            let here = app.tabs.active_id();
+
+            for close in [plain('n'), press(KeyCode::Esc, KeyModifiers::NONE)] {
+                app.on_key(plain('q'));
+                assert_eq!(top(&app), Some(QuitConfirm::ID), "{from_other}: asked");
+                assert!(!app.should_quit);
+                app.on_key(close);
+                assert!(app.overlays.is_empty(), "{from_other} {close:?}: closed");
+                assert!(app.editor_open(), "{from_other} {close:?}: the edit stays");
+                assert!(!focused(&app), "{from_other} {close:?}: unfocused");
+                assert_eq!(
+                    app.tabs.active_id(),
+                    here,
+                    "{from_other}: where the user was"
+                );
+            }
+
+            app.on_key(plain('q'));
+            app.on_key(plain('y'));
+            assert!(app.should_quit, "{from_other}: `y` quits");
             assert!(writes(&log).is_empty());
+            assert!(benches[0].seen.borrow().keys.is_empty());
             drop(app);
+            assert_eq!(log.borrow().last(), Some(&Call::Dropped), "{from_other}");
+        }
+    }
+
+    /// ANA-26 C3 with an editor alive: `ctrl-c` quits at once on the asking tab, on another, and
+    /// under the quit question.
+    #[test]
+    fn ctrl_c_quits_at_once_on_any_tab_and_under_the_question() {
+        for (other, asked) in [(false, false), (true, false), (false, true), (true, true)] {
+            let (mut app, _benches, log) = unfocused_two();
+            confirmable(&mut app);
+            if other {
+                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+            }
+            if asked {
+                app.on_key(plain('q'));
+                assert_eq!(top(&app), Some(QuitConfirm::ID));
+            }
+            app.on_key(ctrl('c'));
+            assert!(app.should_quit, "other {other}, asked {asked}");
+            assert!(writes(&log).is_empty());
+        }
+    }
+
+    /// The question's stack admits no `global.quit`: a second `q` is swallowed by the modal path.
+    #[test]
+    fn q_under_the_question_is_swallowed_and_opens_no_second_box() {
+        let (mut app, benches, _log) = unfocused_two();
+        confirmable(&mut app);
+        app.on_key(plain('q'));
+        app.on_key(plain('q'));
+        assert_eq!(app.overlays.iter().count(), 1, "one question");
+        assert!(!app.should_quit);
+        assert!(app.editor_open());
+        assert!(benches[0].seen.borrow().keys.is_empty());
+    }
+
+    /// B-M2-5: an editor that exits under the question leaves it up; `y` still quits, `n` closes.
+    #[test]
+    fn an_editor_that_exits_under_the_question_leaves_it_up_and_y_still_quits() {
+        for (answer, quits) in [(plain('y'), true), (plain('n'), false)] {
+            let (mut app, benches, _log) = unfocused_two();
+            confirmable(&mut app);
+            app.on_key(plain('q'));
+            exited(&mut app, 0, Duration::from_secs(2));
+            assert!(!app.editor_open());
             assert_eq!(
-                log.borrow().last(),
-                Some(&Call::Dropped),
-                "the child goes with App"
+                benches[0].seen.borrow().heard.len(),
+                1,
+                "the asker heard it"
             );
+            assert_eq!(top(&app), Some(QuitConfirm::ID), "the question stays up");
+            app.on_key(answer);
+            assert_eq!(app.should_quit, quits, "{answer:?}");
+            assert_eq!(app.overlays.is_empty(), !quits, "{answer:?}");
         }
     }
 

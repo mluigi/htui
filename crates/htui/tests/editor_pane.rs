@@ -19,6 +19,7 @@ use htui::app::register_all;
 use htui::editor::pane::{PaneChild, PaneEvent, PtyChild};
 use htui::editor::{EDITOR_ABORTED, EditorCommand};
 use htui::testkit::Harness;
+use htui::ui::overlay::{Overlay, QuitConfirm};
 use htui_core::store::MemStore;
 use tempfile::TempDir;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -405,7 +406,8 @@ async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
     );
 }
 
-/// PRD metric: quitting htui with a live editor leaves no child behind.
+/// PRD metric: quitting htui with a live editor leaves no child behind. MOD-57 M2 E4 (PRD D5):
+/// `q` asks first, the editor still alive under the question; `y` quits.
 #[tokio::test]
 async fn quitting_with_a_live_editor_leaves_no_child() {
     let dir = TempDir::new().expect("a temp dir");
@@ -431,10 +433,16 @@ async fn quitting_with_a_live_editor_leaves_no_child() {
 
     harness.key("ctrl-4");
     harness.key("q");
-    assert!(
-        harness.app().should_quit,
-        "`q` quits at once while htui has the keys"
+    assert!(!harness.app().should_quit, "`q` asks first");
+    assert_eq!(
+        harness.app().overlays.top().map(Overlay::id),
+        Some(QuitConfirm::ID),
+        "the quit question is up"
     );
+    assert!(harness.app().editor_open(), "the editor lives under it");
+    assert!(alive(&pid), "the editor runs under the question");
+    harness.key("y");
+    assert!(harness.app().should_quit, "`y` quits");
     drop(harness);
     gone(&pid).await;
 }

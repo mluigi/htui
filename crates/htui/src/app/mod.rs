@@ -16,7 +16,7 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::keys::Act;
 use crate::ui::overlay::{
-    ConceptsSearch, MigrationPrompt, QueueOverlay, WaitingList, WorkspaceSwitcher,
+    ConceptsSearch, MigrationPrompt, QueueOverlay, QuitConfirm, WaitingList, WorkspaceSwitcher,
 };
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
@@ -63,6 +63,8 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 ///     open it (MOD-69 D7), a chord for `Ctrl+F`'s reason.
 /// 12. The queue overlay's factory goes in and global `Ctrl+Q` is offered as [`Act::Queue`] to
 ///     open it (MOD-12 M3 D8), a chord for the same reason.
+/// 13. The quit question's factory goes in and it is named as the quit overlay (MOD-57 M2 E4);
+///     no key opens it but `global.quit` with an in-pane editor alive.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
 /// [`App::new`] and [`App::start`].
@@ -127,6 +129,11 @@ pub fn register_all(app: &mut App) {
     app.overlay_factories
         .register(MigrationPrompt::ID, || Box::new(MigrationPrompt::new()));
     app.migration_overlay = Some(MigrationPrompt::ID);
+
+    // MOD-57 M2 E4: the quit question, an id for the migration prompt's reason.
+    app.overlay_factories
+        .register(QuitConfirm::ID, || Box::new(QuitConfirm::new()));
+    app.quit_overlay = Some(QuitConfirm::ID);
 
     app.replay_tab = Some(ChatTab::ID);
     // MOD-64 D235: which tab selects a revealed item or requirement. Ids, not views, for the reason
