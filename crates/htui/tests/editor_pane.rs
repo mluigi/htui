@@ -449,7 +449,8 @@ async fn quitting_with_a_live_editor_leaves_no_child() {
 }
 
 /// MOD-57 M2 (PRD D4): with htui holding the keys the user leaves the asking tab, the editor
-/// waits undrawn, the other tab's status line names the edit and the way back, the `?` box offers
+/// waits undrawn, the other tab's keys reach it (`j` moves Backlog's selection, M2 R1 M-3), its
+/// status line names the edit and the way back, the `?` box offers
 /// `editor.focus`, and `Ctrl+4` brings the editor back with the keys; its exit still reads the
 /// file back into the asking view.
 #[tokio::test]
@@ -495,6 +496,20 @@ async fn the_editor_waits_while_another_tab_works_and_reads_back_on_return() {
         last.starts_with("editing in Skills \u{b7} Ctrl+4 back"),
         "the status line names the edit: {frame}"
     );
+    assert!(
+        frame.contains("\u{250c} FEAT-1 "),
+        "FEAT-1 selected: {frame}"
+    );
+
+    // M2 R1 M-3: a key reaches the other tab while the editor waits.
+    harness.key("j");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} TOOL-1 "),
+        "`j` moved Backlog's selection: {frame}"
+    );
+    assert!(harness.app().editor_open(), "the editor still waits");
 
     harness.key("?");
     let frame = harness.render();

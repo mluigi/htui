@@ -613,7 +613,9 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{EDITOR_LOCKED, MIN_PANE};
-    use crate::app::{Action, App, Ctx, Handled, RevealKind, RevealTarget, TabAction};
+    use crate::app::{
+        Action, App, Ctx, Handled, OverlayAction, RevealKind, RevealTarget, TabAction,
+    };
     use crate::editor::pane::{PaneChild, PaneEvent, PaneSize};
     use crate::editor::{
         EDITOR_ABORTED, EDITOR_BUSY, EditorCommand, ExternalEdit, ExternalEditOutcome, PANE_VAR,
@@ -812,6 +814,40 @@ mod tests {
         }
         fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
             self.0.borrow_mut().push(text.to_owned());
+            Handled::Consumed
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    /// A workspace switcher stub (M2 R1 M-3): `Enter` picks `Platform` as the real one does
+    /// (`SetScope`, then its own close); every other key is its own.
+    struct Switcher;
+
+    impl Switcher {
+        const ID: OverlayId = OverlayId("switcher");
+    }
+
+    impl Overlay for Switcher {
+        fn id(&self) -> OverlayId {
+            Self::ID
+        }
+        fn title(&self) -> &str {
+            "Switcher"
+        }
+        fn is_modal(&self) -> bool {
+            true
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+            if key.code == KeyCode::Enter {
+                ctx.emit(Action::SetScope {
+                    workspace: workspace("Platform"),
+                });
+                ctx.emit(Action::Overlay(OverlayAction::Close));
+            }
             Handled::Consumed
         }
         fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
@@ -1277,6 +1313,49 @@ mod tests {
             app.take_external_edit().is_none(),
             "no view asked for anything"
         );
+    }
+
+    /// M2 R1 M-3 (E3, E5): an offered global opens its view from the asking tab: `w` opens the
+    /// switcher, whose pick is refused (E5) with the scope unchanged and the overlays closed;
+    /// `ctrl-f` opens the find overlay. The asking tab sees none of it.
+    #[test]
+    fn on_the_asking_tab_an_offered_global_opens_and_a_pick_is_refused() {
+        let (mut app, benches, log) = unfocused_two();
+        app.overlay_factories
+            .register(Switcher::ID, || Box::new(Switcher));
+        app.offer(
+            Act::Workspaces,
+            Action::Overlay(OverlayAction::Open(Switcher::ID)),
+        );
+        app.overlay_factories
+            .register(OverlayId("shade"), || Box::new(Shade));
+        app.offer(
+            Act::Find,
+            Action::Overlay(OverlayAction::Open(OverlayId("shade"))),
+        );
+        let scope = app.scope.clone();
+        let name = app.top_bar.workspace.clone();
+
+        app.on_key(plain('w'));
+        assert_eq!(top(&app), Some(Switcher::ID), "`w` opens the switcher");
+        assert_eq!(app.status, None);
+        app.on_key(press(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.status.as_deref(), Some(STEER_REFUSAL));
+        assert!(app.overlays.is_empty(), "the switcher closed");
+        assert_eq!(app.scope, scope, "the scope stays");
+        assert_eq!(app.top_bar.workspace, name);
+        assert!(app.editor_open());
+        assert_eq!(app.tabs.active_id(), Some(ASKER));
+
+        app.status = None;
+        app.on_key(ctrl('f'));
+        assert_eq!(top(&app), Some(OverlayId("shade")), "`Ctrl+f` opens find");
+        assert_eq!(app.status, None);
+        assert!(
+            benches[0].seen.borrow().keys.is_empty(),
+            "the asker saw nothing"
+        );
+        assert!(writes(&log).is_empty());
     }
 
     /// MOD-57 M2 E3: on another tab its keys reach it, as if no editor were alive.
