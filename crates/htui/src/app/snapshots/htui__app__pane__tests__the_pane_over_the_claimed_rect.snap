@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/app/pane.rs
+expression: text(buffer)
+---
+no workspace · no box ·  · 0 working · 0 waiting
+ 1 asker
+┌ asker ───────────────────────────────────────────────────────────────────────────────────────────┐
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW nvim · Ctrl+4 to htui ───────────────────────────────────── VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEWhello from the pane                                          VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW~                                                            VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW~                                                            VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW                                                             VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+│VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIEW VIE│
+└──────────────────────────────────────────────────────────────────────────────────────────────────┘
+the editor has the keys · Ctrl+4 to htui

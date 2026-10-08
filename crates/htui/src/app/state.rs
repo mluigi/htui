@@ -9,11 +9,12 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use tokio::sync::mpsc;
 
 use crate::app::action::{Action, Handled, OverlayAction, RevealKind, TabAction};
-use crate::editor::{ExternalEdit, ExternalEditOutcome};
+use crate::app::pane::OpenEditor;
+use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
 use crate::keymap::{KeyScope, Keymap};
 use crate::keys::{Act, CTRL_C, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
@@ -93,6 +94,8 @@ pub struct Ctx<'a> {
     origin: Origin,
     /// The action sink.
     emit: &'a Emit,
+    /// MOD-57 P2: where the active tab names its editing rect; `None` at every other site.
+    editor_area: Option<&'a Cell<Option<Rect>>>,
 }
 
 impl<'a> Ctx<'a> {
@@ -116,6 +119,7 @@ impl<'a> Ctx<'a> {
             keys: Keys::compiled(),
             origin,
             emit,
+            editor_area: None,
         }
     }
 
@@ -124,6 +128,23 @@ impl<'a> Ctx<'a> {
     pub fn with_keys(mut self, keys: &'a Keys) -> Self {
         self.keys = keys;
         self
+    }
+
+    /// Lends this context the cell [`claim_editor_area`](Self::claim_editor_area) writes. Only
+    /// `App::render` calls it, for the active tab's render.
+    #[must_use]
+    pub fn with_editor_area(mut self, cell: &'a Cell<Option<Rect>>) -> Self {
+        self.editor_area = Some(cell);
+        self
+    }
+
+    /// MOD-57 P2: names `area` as the rect this view's text is edited in, so an in-pane editor the
+    /// view asked for draws over it. A no-op outside the active tab's render; the last claim of a
+    /// frame wins.
+    pub fn claim_editor_area(&self, area: Rect) {
+        if let Some(cell) = self.editor_area {
+            cell.set(Some(area));
+        }
     }
 
     /// The keys in force, for hint rows and labels (M3-M5). The borrow lives as long as the
@@ -242,6 +263,13 @@ pub struct App {
     /// MOD-74 D1: mouse capture as the loop last applied it, the edge `mouse_capture` detects.
     /// `take_external_edit` clears it for the editor's `leave` (D2).
     pub(super) mouse: bool,
+    /// MOD-57: the in-pane editor, while one is alive (one at a time, P6).
+    pub(super) editor: Option<OpenEditor>,
+    /// MOD-57 P2: the active tab's claim this frame. `None` at the top of every `render`.
+    pub(super) editor_area: Cell<Option<Rect>>,
+    /// MOD-57 P2: where the active tab's pane goes, as the last frame computed it; read by
+    /// `open_editor` (the spawn size) and `resize_editor`.
+    pub(super) editor_rect: Option<(TabId, Rect)>,
 }
 
 impl App {
@@ -283,6 +311,9 @@ impl App {
             connection_redirect_done: false,
             pending_edit: None,
             mouse: false,
+            editor: None,
+            editor_area: Cell::new(None),
+            editor_rect: None,
         }
     }
 
@@ -460,7 +491,17 @@ impl App {
     /// is about to suspend, and `Suspend::leave` turns capture off without the app knowing: so a
     /// capture that was on is lost here (MOD-74 D2), and the loop's next `mouse_capture` re-enables
     /// it with no stale gesture.
+    ///
+    /// MOD-57 PD-8: while an in-pane editor is alive a second edit is not handed to the loop; the
+    /// asking tab is answered `Failed(EDITOR_BUSY)` here, so a view waiting for one outcome gets
+    /// exactly one.
     pub fn take_external_edit(&mut self) -> Option<(TabId, ExternalEdit)> {
+        if self.editor.is_some()
+            && let Some((tab, _)) = self.pending_edit.take()
+        {
+            self.finish_external_edit(tab, ExternalEditOutcome::Failed(EDITOR_BUSY.to_owned()));
+            return None;
+        }
         let edit = self.pending_edit.take();
         if edit.is_some() && self.mouse {
             self.lose_mouse();
@@ -529,8 +570,15 @@ impl App {
     ///
     /// Unlike a key it does not clear the status line: a paste nothing took did nothing, and one a
     /// field refused says why through the same line.
+    ///
+    /// MOD-57: while an in-pane editor is alive a paste follows a key's rule (R0 F2): to the
+    /// editor while it has the keys, else swallowed or dropped (the M1 lock), except unfocused
+    /// under a modal overlay, where the overlay's path below has it. It never reaches a view.
     pub fn on_paste(&mut self, text: &Zeroizing<String>) {
         self.dirty = true;
+        if self.editor.is_some() && self.editor_paste(text) {
+            return;
+        }
 
         if let Some(id) = self.overlays.top().map(Overlay::id) {
             let origin = Origin::Overlay(id);
@@ -607,9 +655,13 @@ impl App {
     /// step. No overlay may be open and the `?` box may not be up — both draw over the tab, and a
     /// click through them would act on what they hide (blueprint E7) — and the active tab must
     /// want it.
+    ///
+    /// MOD-57: off while an in-pane editor is alive, so the terminal keeps its own selection over
+    /// the pane; M2 narrows this to a focused pane on screen.
     #[must_use]
     pub fn wants_mouse(&self) -> bool {
-        self.overlays.is_empty()
+        self.editor.is_none()
+            && self.overlays.is_empty()
             && !self.help_visible
             && self.tabs.active().is_some_and(Tab::wants_mouse)
     }
@@ -702,9 +754,9 @@ impl App {
         }
     }
 
-    /// The propagation chain (blueprint C.4, MOD-67 D6), stopping at the first consumer: `ctrl-c`,
-    /// the top overlay, the overlay stack, the modal swallow, the active tab, its legacy rows, the
-    /// base stack.
+    /// The propagation chain (blueprint C.4, MOD-67 D6), stopping at the first consumer: the
+    /// in-pane editor (MOD-57), `ctrl-c`, the top overlay, the overlay stack, the modal swallow,
+    /// the active tab, its legacy rows, the base stack.
     ///
     /// `ctrl-c` is checked here only: a bracketed paste has no key table
     /// ([`on_paste`](Self::on_paste)), so a pasted `U+0003` never quits.
@@ -715,8 +767,15 @@ impl App {
         self.status = None;
         let chord = KeyChord::from_event(key);
 
-        // `ctrl-c` quits before any overlay or view sees it (ANA-26 §6.4, MOD-67 D6). MOD-57 adds
-        // the one exception (a focused child-process pane) and its leave action.
+        // MOD-57 P5, P6: a live in-pane editor answers first. Focused, it takes every key,
+        // `ctrl-c` included (ANA-26 §6.4's one exception); unfocused, the M1 lock, except under a
+        // modal overlay, whose keys take the path below.
+        if self.editor.is_some() && self.editor_key(key, chord) {
+            return;
+        }
+
+        // `ctrl-c` quits before any overlay or view sees it (ANA-26 §6.4, MOD-67 D6). MOD-57's
+        // exception is the step above.
         if chord == CTRL_C {
             self.update(Action::Quit);
             return;
@@ -829,13 +888,14 @@ impl App {
         .with_keys(&self.keys)
     }
 
-    /// Draws one frame: top bar, tab strip, the active tab, the status line, then the overlays
-    /// bottom-up and the help box on top.
+    /// Draws one frame: top bar, tab strip, the active tab, the in-pane editor over it (MOD-57
+    /// P1), the status line, then the overlays bottom-up and the help box on top.
     ///
     /// Rendering is read-only by contract: a view that emits here is not applied until the next
     /// key or reply drains the queue.
     pub fn render(&mut self, frame: &mut Frame<'_>) {
         self.dirty = false;
+        self.editor_area.set(None);
         let area = frame.area();
         let chrome = layout::chrome(area);
 
@@ -844,7 +904,9 @@ impl App {
 
         match self.tabs.active() {
             Some(tab) => {
-                let ctx = self.ctx(Origin::Tab(tab.id()));
+                let ctx = self
+                    .ctx(Origin::Tab(tab.id()))
+                    .with_editor_area(&self.editor_area);
                 tab.render(frame, chrome.body, &ctx);
             }
             None => {
@@ -856,10 +918,13 @@ impl App {
             }
         }
 
+        self.draw_editor(frame, chrome.body);
+
         let (status, style) = match &self.status {
             Some(message) => (message.clone(), self.theme.error),
             None => (
-                self.keys.status_line(|act| self.action_for(act).is_some()),
+                self.editor_status()
+                    .unwrap_or_else(|| self.keys.status_line(|act| self.action_for(act).is_some())),
                 self.theme.dim,
             ),
         };
@@ -876,7 +941,8 @@ impl App {
     }
 
     /// The `?` box (MOD-67 D8), rebuilt from the live state every frame: the overlay context (if
-    /// one is up), the active tab's legacy rows, the global context, then the closing line.
+    /// one is up), the editor context (while an in-pane editor is alive, MOD-57), the active tab's
+    /// legacy rows, the global context, then the closing line.
     ///
     /// Each logical line is packed into rows that fit the box ([`HelpLine::rows`]), so the box is
     /// exactly as tall as what it shows and no row is clipped.
@@ -887,6 +953,9 @@ impl App {
         let mut lines: Vec<HelpLine> = Vec::new();
         if !self.overlays.is_empty() {
             lines.extend(self.keys.help_line(Context::Overlay, offered));
+        }
+        if self.editor.is_some() {
+            lines.extend(self.keys.help_line(Context::Editor, |_| true));
         }
         if let Some(tab) = self.tabs.active() {
             let legacy = self.keymap.help_line(&KeyScope::Tab(tab.id()));

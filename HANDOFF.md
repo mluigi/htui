@@ -256,6 +256,11 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   in the sent body and the proposal. MOD-10 is done (`docs/decisions/mod/mod-10.md`), but a help turn still scrubs with
   an empty `env` (pattern rules only). Once help turns mask a project's resolved values, the help runtime should
   report how many masks it applied, so a body's literal `[REDACTED]` cannot hide a masked value from the double-accept.
+  **MOD-57 M1 added the in-pane editor's Windows half** (`docs/htui-editor.md`, Windows): ConPTY
+  through `portable-pty` (`cmd /S /C` with the temp directory as the working directory); `Ctrl+\`
+  arrives as `ctrl-\` there, so only a physical `Ctrl+4` reaches `editor.focus`; the kill is
+  `TerminateProcess` (no process-group kill); `ClosePseudoConsole` runs on its own thread; and a
+  forwarded `Ctrl+C` must reach the editor without ending htui.
 
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
@@ -336,6 +341,17 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   **Keys (ANA-26, `R-TUI-10`):** the reserved leave chord is an action in MOD-67's catalogue, never a
   hard-coded key, and this pane is the one place `ctrl-c` is forwarded instead of quitting; the
   leave action must stay bound (`docs/ANA-26.md` §6.4).
+  **Phase 1 landed (`1c8c9e3c`..`a464ac21`, 2026-10-08):** the editor in the pane, opt-in with
+  `HTUI_EDITOR_PANE=1` (user guide `docs/htui-editor.md`). `portable-pty` 0.9 and `vt100` 0.16 with
+  htui's own widget (not `tui-term`), plus unix-only `rustix` for a process-group kill (PD-10). The
+  pane draws over the asking view's editing area, or the tab body below 40x8. Catalogue context
+  `editor`: `editor.focus` (`ctrl-4`, which `Ctrl+\` sends on unix) and `editor.abort` (`ctrl-x`).
+  Focused, every key goes to the editor, `ctrl-c` included; unfocused, the M1 lock (focus, abort,
+  quit, help; a modal prompt takes the keys after one swallowed key). Review R1 fixed a `vt100`
+  ICH/IL/SD stall on the UI task (stateful CSI clamp) and added back-pressure (bounded channel,
+  time-boxed drain). Residue: R1 L-2 (stray keystrokes on a thread-spawn failure); the nvim run is
+  owed on the host; the Windows half is MOD-16's. Plan `.claude/plans/mod-57-m1-editor-in-pane.plan.md`.
+  **Remaining: M2** - htui usable while an edit is open (tabs, the quit confirm), then close-out.
 
 - [ ] **MOD-67 - Configurable hotkeys: named actions, `keys.toml`, generated hints** (from ANA-26,
   `docs/ANA-26.md`, `docs/decisions/ana/ana-26.md`). `R-TUI-10`, `R-TUI-1`, `R-STO-1`, `R-NF-1`.
@@ -372,6 +388,11 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   still matches itself wins until M3-M5 (README "Changing keys"). The narrower-context override of a
   shared verb and the shadowing allow-list kind land with M3's first view context
   (`.claude/plans/mod-67-m2-keys-file.plan.md`, "Review gate").
+  **MOD-57 M1 appended (2026-10-08)** `Context::Editor` (`editor.focus` `ctrl-4`, `editor.abort`
+  `ctrl-x`) and `Stack::EDITOR_FOCUSED`/`EDITOR_UNFOCUSED` to the catalogue. Whichever of MOD-57 and
+  M2 lands second: the loader keeps `editor.focus` bound beside `overlay.close`, refuses `ctrl-c` in
+  `[editor]`, gains the `Context::Editor` arm, and checks `[editor]` chords against `global.quit`
+  and `global.help` (`.claude/plans/mod-57-m1-editor-in-pane.blueprint.md` §6.4).
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,

@@ -282,4 +282,43 @@ mod tests {
         assert!(std::ptr::eq(Keys::compiled(), Keys::compiled()));
         assert_eq!(*Keys::compiled(), Keys::defaults());
     }
+
+    // MOD-57 M1 (plan P4): the in-pane editor's keys.
+
+    #[test]
+    fn editor_focus_is_bound_and_not_printable() {
+        let chords = Keys::compiled().chords(super::Context::Editor, super::Act::EditorFocus);
+        assert!(!chords.is_empty(), "editor.focus is unbound");
+        for chord in chords {
+            assert!(
+                !chord.is_printable(),
+                "editor.focus binds {}",
+                chord.label()
+            );
+            assert_ne!(*chord, CTRL_C, "editor.focus binds ctrl-c");
+        }
+    }
+
+    #[test]
+    fn the_editor_keys_do_not_collide_with_quit_or_help() {
+        use super::{Act, Context};
+        let keys = Keys::compiled();
+        let stacked: Vec<KeyChord> = [Act::Quit, Act::Help]
+            .into_iter()
+            .flat_map(|act| keys.chords(Context::Global, act).to_vec())
+            .collect();
+        for row in CATALOGUE
+            .iter()
+            .filter(|row| row.context == Context::Editor)
+        {
+            for chord in keys.chords(Context::Editor, row.act) {
+                assert!(
+                    !stacked.contains(chord),
+                    "[editor] {} shares {} with global quit/help",
+                    row.name,
+                    chord.label()
+                );
+            }
+        }
+    }
 }

@@ -994,7 +994,11 @@ pub(super) const fn marker(focused: bool) -> &'static str {
 }
 
 /// Draws the form into the detail pane's `area` (D8).
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) {
+///
+/// Returns the rect the pane claims for an in-pane editor (MOD-57 P2): the field handed to
+/// `$EDITOR`, else the focused one when it is Paths, else the body. The paths rect is
+/// `PATHS_HEIGHT` rows, under `MIN_PANE`, so a Paths edit gets the whole tab body (R0 F1).
+pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
     let title = match &form.context.item {
         Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
         None => format!(" New item \u{b7} {} ", form.slug(form.context.project)),
@@ -1100,6 +1104,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         )),
         hint,
     );
+    match form.external.unwrap_or(form.focus) {
+        Field::Paths => paths,
+        _ => body,
+    }
 }
 
 /// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost.
@@ -1591,7 +1599,9 @@ mod tests {
         ))
         .expect("a test terminal");
         terminal
-            .draw(|frame| render(frame, frame.area(), form, &Theme::default()))
+            .draw(|frame| {
+                render(frame, frame.area(), form, &Theme::default());
+            })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
         (0..buffer.area.height)
@@ -1601,6 +1611,83 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
+    }
+
+    /// MOD-57 P2 (PD-3): `render` returns the rect its body is drawn in, which the Backlog claims
+    /// for an in-pane editor: inside the frame, under the body label and above the notice and
+    /// the hint.
+    #[tokio::test]
+    async fn render_returns_the_body_rect() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Body);
+        form.on_paste("First line.\nSecond.");
+        let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+            right.width,
+            right.height,
+        ))
+        .expect("a test terminal");
+        let mut body = None;
+        terminal
+            .draw(|frame| body = Some(render(frame, frame.area(), &form, &Theme::default())))
+            .expect("the frame draws");
+        let body = body.expect("the frame drew");
+        let buffer = terminal.backend().buffer();
+        let row = |y: u16| {
+            (body.x..body.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert_eq!((body.x, body.width), (1, right.width - 2), "{body:?}");
+        assert!(row(body.y).starts_with("First line."), "{:?}", row(body.y));
+        assert!(
+            row(body.y - 1).starts_with("> body"),
+            "{:?}",
+            row(body.y - 1)
+        );
+        // The notice's two rows, the hint and the frame's bottom border are below it.
+        assert_eq!(body.bottom() + NOTICE_HEIGHT + 2, right.height, "{body:?}");
+    }
+
+    /// MOD-57 R0 F1: with Paths focused or handed to `$EDITOR`, `render` returns the paths rect,
+    /// never the body the editor is not editing. It is `PATHS_HEIGHT` rows, under `MIN_PANE`, so
+    /// the pane goes over the whole tab body (D1).
+    #[tokio::test]
+    async fn render_returns_the_paths_rect_when_paths_is_handed_off() {
+        let mut form = new_form().await;
+        focus_on(&mut form, Field::Paths);
+        form.on_paste("src/**");
+        let [_, right] = panes(chrome(Rect::new(0, 0, DEFAULT_SIZE.0, DEFAULT_SIZE.1)).body);
+        let drawn = |form: &ItemForm| {
+            let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
+                right.width,
+                right.height,
+            ))
+            .expect("a test terminal");
+            let mut rect = None;
+            terminal
+                .draw(|frame| rect = Some(render(frame, frame.area(), form, &Theme::default())))
+                .expect("the frame draws");
+            let rect = rect.expect("the frame drew");
+            let buffer = terminal.backend().buffer();
+            let row = |y: u16| {
+                (rect.x..rect.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            };
+            (rect, row(rect.y - 1), row(rect.y))
+        };
+        let (focused, _, _) = drawn(&form);
+
+        let _ = handed(&mut form);
+        assert_eq!(form.external, Some(Field::Paths));
+        let (paths, label, first) = drawn(&form);
+        assert_eq!(paths, focused, "focused or handed off, the same rect");
+        assert_eq!((paths.x, paths.width), (1, right.width - 2), "{paths:?}");
+        assert_eq!(paths.height, PATHS_HEIGHT, "{paths:?}");
+        assert!(paths.height < crate::app::MIN_PANE.height);
+        assert!(label.starts_with("> paths"), "{label:?}");
+        assert!(first.starts_with("src/**"), "{first:?}");
     }
 
     /// Every state shows as characters, because the snapshots are text (blueprint §4 render).

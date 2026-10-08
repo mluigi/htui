@@ -116,6 +116,9 @@ const INFO_HINT: &str = "Tab field  Ctrl+S save  Esc cancel";
 /// `Ctrl+G` is MOD-55's, hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
 const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
 
+/// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
+const HANDED_OFF_HINT: &str = "the draft is in $EDITOR";
+
 /// `Ctrl+G` with no project in the workspace (MOD-55 P7): a help turn is a chat run, and a run
 /// belongs to a project.
 const NO_PROJECT: &str = "no project in this workspace \u{2014} agent help records its run in one";
@@ -676,12 +679,12 @@ impl LibraryView {
             Constraint::Length(1),
         ])
         .areas(area);
-        let hint = match (&self.attach, &self.snapshot, &self.mode) {
-            (Some(pane), Some(snapshot), _) => {
+        let hint = match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
+            (Some(pane), Some(snapshot), _, _) => {
                 pane.render(frame, content, snapshot, ctx).to_owned()
             }
-            (_, _, Mode::Editing(editor)) => {
-                self.render_editor(frame, content, editor, ctx.theme);
+            (_, _, Mode::Editing(editor), _) => {
+                self.render_editor(frame, content, editor, ctx);
                 match &editor.help {
                     Some(help) => help.hint().to_owned(),
                     None => {
@@ -690,11 +693,15 @@ impl LibraryView {
                     }
                 }
             }
-            (_, _, Mode::Report { outcomes, cursor }) => {
+            (_, _, Mode::Browse, Some(editor)) => {
+                self.render_editor(frame, content, editor, ctx);
+                HANDED_OFF_HINT.to_owned()
+            }
+            (_, _, Mode::Report { outcomes, cursor }, _) => {
                 self.render_report(frame, content, outcomes, *cursor, ctx);
                 REPORT_HINT.to_owned()
             }
-            (_, _, mode) => {
+            (_, _, mode, _) => {
                 self.render_browse(frame, content, ctx);
                 match mode {
                     Mode::Naming { .. } | Mode::Describing { .. } => NAMING_HINT,
@@ -1243,6 +1250,18 @@ impl LibraryView {
         });
     }
 
+    /// The draft a `Ctrl+E` handed to `$EDITOR`, while the handoff is pending: still drawn, so its
+    /// text rect is still claimed for an in-pane editor (MOD-57 P2). Browse's `E` has no draft.
+    fn handed_off(&self) -> Option<&Editor> {
+        match &self.external {
+            Some(Pending {
+                editor,
+                resume: true,
+            }) => Some(editor),
+            _ => None,
+        }
+    }
+
     /// A key while the attachments pane is open: the pane decides, the view sends.
     fn on_attach_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let (Some(pane), Some(snapshot)) = (&mut self.attach, &self.snapshot) else {
@@ -1767,19 +1786,20 @@ impl LibraryView {
     /// The editor over the whole content, its title carrying the draft's estimate (D82). An open
     /// agent help draws in the draft's place (MOD-55 B-2): a panel under a locked draft, or the
     /// proposal over all of it.
-    fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
+    fn render_editor(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let draft = match &editor.help {
-            Some(help) => help.render(frame, area, theme),
+            Some(help) => help.render(frame, area, ctx.theme),
             None => Some(area),
         };
         if let Some(draft) = draft {
-            self.render_draft(frame, draft, editor, theme);
+            self.render_draft(frame, draft, editor, ctx);
         }
     }
 
     /// The draft's block: the name, the versions and the estimate, and the text with its cursor
-    /// (dim under an open help, which has the keys).
-    fn render_draft(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, theme: &Theme) {
+    /// (dim under an open help, which has the keys). The text's rect is claimed for an in-pane
+    /// editor (MOD-57 P2), inside the block, so the name and versions stay visible beside it.
+    fn render_draft(&self, frame: &mut Frame<'_>, area: Rect, editor: &Editor, ctx: &Ctx<'_>) {
         let name = editor.target.name();
         let tokens = estimate(name, editor.saves(), editor.area.text());
         let title = match (&editor.target, editor.from) {
@@ -1805,10 +1825,11 @@ impl LibraryView {
                 inner.width,
                 inner.height,
                 editor.help.is_none(),
-                theme,
+                ctx.theme,
             )),
             inner,
         );
+        ctx.claim_editor_area(inner);
     }
 }
 
@@ -1836,6 +1857,7 @@ fn browse_row(name: &str, head: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::sync::Arc;
 
     use chrono::TimeDelta;
@@ -2310,6 +2332,102 @@ mod tests {
             };
             request.clone()
         }
+    }
+
+    /// MOD-57 P2 (PD-3, F-12): an open draft claims the text rect inside its block, so the name,
+    /// versions and estimate in the block's title stay visible beside an in-pane editor; browse
+    /// (where `E` hands a selected row off) draws no draft and claims nothing.
+    #[test]
+    fn the_draft_claims_its_text_rect_and_browse_claims_nothing() {
+        let bench = Bench::new();
+        let area = Rect::new(0, 0, 100, 28);
+        let drawn = |view: &LibraryView| {
+            let cell = Cell::new(None);
+            let ctx = bench.ctx().with_editor_area(&cell);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(area.width, area.height))
+                    .expect("a test terminal");
+            terminal
+                .draw(|frame| view.render(frame, area, &ctx))
+                .expect("the frame draws");
+            (terminal.backend().buffer().clone(), cell.get())
+        };
+
+        let (_, claim) = drawn(&LibraryView::default());
+        assert_eq!(claim, None, "browse claims nothing");
+
+        let target = Target::New {
+            name: "docs-style".to_owned(),
+            description: String::new(),
+        };
+        let view = LibraryView {
+            mode: Mode::Editing(Editor::new(target, 0, None, "First line.\nSecond.\n")),
+            ..LibraryView::default()
+        };
+        let (buffer, claim) = drawn(&view);
+        let claim = claim.expect("the draft claims its text");
+        // The content above the notice and hint rows, inside the draft's border.
+        assert_eq!(claim, Rect::new(1, 1, 98, 24));
+        let row = |y: u16| {
+            (claim.x..claim.right())
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            row(claim.y).starts_with("First line."),
+            "{:?}",
+            row(claim.y)
+        );
+        assert!(
+            row(0).contains("docs-style \u{b7} new, saves v1"),
+            "{:?}",
+            row(0)
+        );
+
+        // `Ctrl+E` moves the draft into the pending handoff: while `$EDITOR` runs it is still
+        // drawn (locked: the editor has the keys) and its text still claimed, so the in-pane
+        // editor lands over the text with the title beside it, not over the whole body.
+        let mut view = view;
+        let mut ctx = bench.ctx();
+        assert_eq!(view.on_key(ctrl('e'), &mut ctx), Handled::Consumed);
+        assert!(matches!(view.mode, Mode::Browse), "{:?}", view.mode);
+        let (buffer, handed_off) = drawn(&view);
+        assert_eq!(
+            handed_off,
+            Some(claim),
+            "the handed-off draft claims its text"
+        );
+        let line = |y: u16, from: u16, to: u16| {
+            (from..to)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        assert!(
+            line(claim.y, claim.x, claim.right()).starts_with("First line."),
+            "{:?}",
+            line(claim.y, claim.x, claim.right())
+        );
+        let title = line(0, 0, claim.right());
+        assert!(
+            title.contains("docs-style \u{b7} new, saves v1"),
+            "{title:?}"
+        );
+        let hint = line(area.bottom() - 1, 0, area.width);
+        assert!(hint.contains(HANDED_OFF_HINT), "{hint:?}");
+
+        // Browse's `E` (F-12) has no draft to draw: the pane takes the tab body.
+        let target = Target::New {
+            name: "docs-style".to_owned(),
+            description: String::new(),
+        };
+        let view = LibraryView {
+            external: Some(Pending {
+                editor: Editor::new(target, 0, None, "First line.\n"),
+                resume: false,
+            }),
+            ..LibraryView::default()
+        };
+        assert_eq!(drawn(&view).1, None, "browse's `E` claims nothing");
     }
 
     /// A `MemStore` whose clock never moves unless the test moves it: every write it stamps

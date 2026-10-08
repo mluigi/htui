@@ -934,7 +934,7 @@ impl Tab for BacklogTab {
         }
         // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
         match &self.item_form {
-            Some(form) => item_form::render(frame, right, form, ctx.theme),
+            Some(form) => ctx.claim_editor_area(item_form::render(frame, right, form, ctx.theme)),
             None => detail::render(
                 frame,
                 right,
@@ -2504,6 +2504,114 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// MOD-57 P2 (PD-3): the open item form claims its body for an in-pane editor, the rect
+    /// `item_form::render` returns in the detail pane's place; the detail pane claims nothing.
+    #[tokio::test]
+    async fn the_item_form_claims_its_body_for_the_editor() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        let (width, height) = DEFAULT_SIZE;
+        let area = Rect::new(0, 0, width, height);
+        let claimed = |tab: &BacklogTab| {
+            let cell = Cell::new(None);
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                    .expect("a test terminal");
+            terminal
+                .draw(|frame| tab.render(frame, area, &bench.ctx().with_editor_area(&cell)))
+                .expect("the frame draws");
+            (terminal.backend().buffer().clone(), cell.get())
+        };
+        assert_eq!(claimed(&tab).1, None, "the detail pane claims nothing");
+
+        let backend = htui_store::Backend::memory(MemStore::demo());
+        let request = StoreRequest::ItemForm {
+            project: htui_core::fixtures::ids::PROJECT_HTUI,
+            item: None,
+        };
+        let context = match item_writes::serve(&backend, &request).await {
+            Ok(StoreReply::ItemForm(context)) => *context,
+            other => panic!("the form read answered {other:?}"),
+        };
+        let mut form = ItemForm::open_new(context, &bench.projects, None);
+        // Title, Priority, Tags, Graph, Paths, Body.
+        for _ in 0..5 {
+            let _ = form.on_key(KeyEvent::from(KeyCode::Tab));
+        }
+        form.on_paste("First line.");
+        tab.item_form = Some(form);
+        let (buffer, claim) = claimed(&tab);
+        let claim = claim.expect("the form claims its body");
+
+        let [_, right] = panes(area);
+        let mut alone = ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+            .expect("a test terminal");
+        let mut body = None;
+        alone
+            .draw(|frame| {
+                body = Some(item_form::render(
+                    frame,
+                    right,
+                    tab.item_form.as_ref().expect("open"),
+                    &Theme::default(),
+                ));
+            })
+            .expect("the frame draws");
+        assert_eq!(Some(claim), body, "the claim is the form's body");
+        let row: String = (claim.x..claim.right())
+            .map(|x| buffer[(x, claim.y)].symbol())
+            .collect();
+        assert!(row.starts_with("First line."), "{row:?} at {claim:?}");
+    }
+
+    /// MOD-57 R0 F1: with Paths handed to `$EDITOR` the form claims the paths rect, not its body:
+    /// three rows, under `MIN_PANE`, so the pane goes over the whole tab body (D1) rather than
+    /// over a body it is not editing.
+    #[tokio::test]
+    async fn the_item_form_claims_its_paths_when_paths_is_handed_off() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        let (width, height) = DEFAULT_SIZE;
+        let area = Rect::new(0, 0, width, height);
+        let backend = htui_store::Backend::memory(MemStore::demo());
+        let request = StoreRequest::ItemForm {
+            project: htui_core::fixtures::ids::PROJECT_HTUI,
+            item: None,
+        };
+        let context = match item_writes::serve(&backend, &request).await {
+            Ok(StoreReply::ItemForm(context)) => *context,
+            other => panic!("the form read answered {other:?}"),
+        };
+        let mut form = ItemForm::open_new(context, &bench.projects, None);
+        // Title, Priority, Tags, Graph, Paths.
+        for _ in 0..4 {
+            let _ = form.on_key(KeyEvent::from(KeyCode::Tab));
+        }
+        form.on_paste("src/**");
+        let handed = form.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(&handed, ItemFormOutcome::External(edit) if edit.text == "src/**"),
+            "{handed:?}"
+        );
+        tab.item_form = Some(form);
+
+        let cell = Cell::new(None);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height))
+                .expect("a test terminal");
+        terminal
+            .draw(|frame| tab.render(frame, area, &bench.ctx().with_editor_area(&cell)))
+            .expect("the frame draws");
+        let claim = cell.get().expect("the form claims the paths");
+        assert_eq!(claim.height, 3, "{claim:?}");
+        assert!(claim.height < crate::app::MIN_PANE.height);
+        let buffer = terminal.backend().buffer();
+        let row: String = (claim.x..claim.right())
+            .map(|x| buffer[(x, claim.y)].symbol())
+            .collect();
+        assert!(row.starts_with("src/**"), "{row:?} at {claim:?}");
     }
 
     /// The rows of `bench` with `status`.

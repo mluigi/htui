@@ -3,6 +3,7 @@
 
 mod cells;
 pub mod diff;
+pub mod editor_pane;
 pub mod layout;
 mod markdown;
 pub mod overlay;

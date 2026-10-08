@@ -1,10 +1,14 @@
 //! The shell: state, actions, the update function and the view registrations.
 
 pub mod action;
+mod pane;
 pub mod state;
 pub mod update;
 
 pub use action::{Action, Handled, OverlayAction, RevealKind, RevealTarget, TabAction};
+// Only tests outside `app` read it (the item form's and the Backlog's claim tests, R1 nit a).
+#[cfg(test)]
+pub(crate) use pane::MIN_PANE;
 pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 
 use crossterm::event::{KeyCode, KeyModifiers};
