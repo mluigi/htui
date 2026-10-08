@@ -728,6 +728,21 @@ impl Backend {
         }
     }
 
+    /// MOD-12 M3 review R1 L4: `box_id`'s most recently closed batch, whatever is open now;
+    /// `None` before any closed.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports; offline, [`StoreError::Unreachable`] with
+    /// [`DATABASE_UNREACHABLE`].
+    pub async fn last_closed_batch(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        match self {
+            Self::Memory(store) => store.last_closed_batch(box_id).await,
+            Self::Online { pg, .. } => pg.last_closed_batch(box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
     /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
     ///
     /// # Errors
@@ -1207,7 +1222,8 @@ mod tests {
     }
 
     /// MOD-12 M3 D3, D6: the queue overlay's reads and its move are orchestration, refused
-    /// offline rather than answered from the mirror; review R1 M2's batched tag read too.
+    /// offline rather than answered from the mirror; review R1 M2's batched tag read and L4's
+    /// last close too.
     #[tokio::test]
     async fn an_offline_backend_refuses_the_queue_rows_and_the_move() {
         use htui_core::fixtures::ids;
@@ -1232,6 +1248,10 @@ mod tests {
         ));
         assert!(matches!(
             offline.missing_tags_of(&[ids::HTUI_ANA_2], ids::BOX).await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.last_closed_batch(ids::BOX).await,
             Err(StoreError::Unreachable(_))
         ));
         cache.close().await;

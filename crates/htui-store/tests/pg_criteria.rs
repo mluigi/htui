@@ -10421,3 +10421,91 @@ async fn missing_tags_of_answers_missing_tags_per_item_on_both_stores() {
 
     db.drop_db().await;
 }
+
+/// Review R1 L4: `last_closed_batch` answers the box's most recently closed batch alike on both
+/// stores (its close reason and instant are what the overlay's header shows), whatever is open
+/// now; `None` before any batch closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_closed_batch_answers_alike_on_both_stores() {
+    use htui_core::model::BatchClose;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+
+    assert_eq!(pg.last_closed_batch(ids::BOX).await.expect("read"), None);
+    assert_eq!(mem.last_closed_batch(ids::BOX).await.expect("read"), None);
+    let pg_first = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    assert_eq!(
+        pg.last_closed_batch(ids::BOX).await.expect("read"),
+        None,
+        "an open batch is not closed"
+    );
+    pg.close_batch(ids::BOX, BatchClose::Paused, at)
+        .await
+        .expect("pause");
+    mem.close_batch(ids::BOX, BatchClose::Paused, at)
+        .await
+        .expect("pause");
+    let (pg_paused, mem_paused) = (
+        pg.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("one closed"),
+        mem.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("one closed"),
+    );
+    assert_eq!(pg_paused.id, pg_first.id);
+    assert_eq!(batch_shape(&pg_paused), batch_shape(&mem_paused));
+    assert_eq!(pg_paused.closed_reason, Some(BatchClose::Paused));
+
+    let pg_second = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_second = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    pg.close_drained_batch(pg_second.id, None, later)
+        .await
+        .expect("drain")
+        .expect("nothing keeps it open");
+    mem.close_drained_batch(mem_second.id, None, later)
+        .await
+        .expect("drain")
+        .expect("nothing keeps it open");
+    pg.open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    mem.open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    let (pg_drained, mem_drained) = (
+        pg.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("two closed"),
+        mem.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("two closed"),
+    );
+    assert_eq!(
+        pg_drained.id, pg_second.id,
+        "the latest close, a third batch open"
+    );
+    assert_eq!(batch_shape(&pg_drained), batch_shape(&mem_drained));
+    assert_eq!(
+        (pg_drained.closed_reason, pg_drained.closed_at),
+        (Some(BatchClose::Drained), Some(later))
+    );
+    assert_eq!(
+        pg.last_closed_batch(BoxId::new()).await.expect("read"),
+        None,
+        "another box has none"
+    );
+
+    db.drop_db().await;
+}

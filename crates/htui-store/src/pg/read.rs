@@ -2439,6 +2439,35 @@ impl PgStore {
         .map_err(map_sqlx)
     }
 
+    /// MOD-12 M3 review R1 L4: `box_id`'s most recently closed batch, by `closed_at DESC, id
+    /// DESC`, whatever is open now; `None` before any closed. Its `closed_reason` tells the queue
+    /// overlay's header why a queue the user resumed reads paused again (a stall's drain).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn last_closed_batch(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        sqlx::query_as!(
+            QueueBatch,
+            r#"
+            SELECT id            AS "id: BatchId",
+                   box_id        AS "box_id: BoxId",
+                   opened_at,
+                   opened_by     AS "opened_by: UserId",
+                   closed_at,
+                   closed_reason AS "closed_reason: BatchClose"
+              FROM queue_batch
+             WHERE box_id = $1 AND closed_at IS NOT NULL
+             ORDER BY closed_at DESC, id DESC
+             LIMIT 1
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
     /// MOD-12 D3, D9: the runs admitted under `batch`, `(id, status)` by `(queued_at, id)`.
     /// `run.batch_id` is not a [`Run`] field (D7), so this is the one read of batch membership.
     ///

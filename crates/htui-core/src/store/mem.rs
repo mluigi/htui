@@ -1109,6 +1109,24 @@ impl MemStore {
         Ok(self.read(|state| state.open_batch_of(box_id).cloned()))
     }
 
+    /// MOD-12 M3 review R1 L4: `box_id`'s most recently closed batch, by `(closed_at, id)`,
+    /// whatever is open now; `None` before any closed. Its `closed_reason` tells the queue
+    /// overlay's header why a queue the user resumed reads paused again (a stall's drain).
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn last_closed_batch(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        Ok(self.read(|state| {
+            state
+                .queue_batches
+                .values()
+                .filter(|batch| batch.box_id == box_id)
+                .filter_map(|batch| batch.closed_at.map(|closed| (closed, batch)))
+                .max_by_key(|(closed, batch)| (*closed, batch.id))
+                .map(|(_, batch)| batch.clone())
+        }))
+    }
+
     /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
     ///
     /// In the same closure every run of the batch still `queued` is cancelled through
@@ -15767,5 +15785,62 @@ mod tests {
             store.missing_tags_of(&items, BoxId::new()).await,
             Err(StoreError::NotFound { entity: "box", .. })
         ));
+    }
+
+    /// Review R1 L4: `last_closed_batch` is the box's most recently closed batch, whatever is
+    /// open now; `None` before any batch closed.
+    #[tokio::test]
+    async fn last_closed_batch_is_the_latest_close() {
+        let store = MemStore::demo();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let later = at + TimeDelta::seconds(1);
+        let last = || async {
+            store
+                .last_closed_batch(ids::BOX)
+                .await
+                .expect("the read answers")
+        };
+        assert_eq!(last().await, None, "no batch yet");
+        let first = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        assert_eq!(last().await, None, "an open batch is not closed");
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close answers");
+        let paused = last().await.expect("one closed");
+        assert_eq!(
+            (paused.id, paused.closed_reason, paused.closed_at),
+            (first.id, Some(BatchClose::Paused), Some(at))
+        );
+        let second = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("a resume opens");
+        store
+            .close_drained_batch(second.id, None, later)
+            .await
+            .expect("the drain answers")
+            .expect("nothing keeps it open");
+        store
+            .open_batch(ids::BOX, ids::USER, later)
+            .await
+            .expect("a resume opens");
+        let drained = last().await.expect("two closed");
+        assert_eq!(
+            (drained.id, drained.closed_reason, drained.closed_at),
+            (second.id, Some(BatchClose::Drained), Some(later)),
+            "the latest close, with a third batch open"
+        );
+        assert_eq!(
+            store
+                .last_closed_batch(BoxId::new())
+                .await
+                .expect("the read answers"),
+            None,
+            "another box has none"
+        );
     }
 }
