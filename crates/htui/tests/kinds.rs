@@ -2457,3 +2457,99 @@ async fn the_cursor_row_is_drawn_selected() {
     assert_eq!(missing.len(), 1, "{missing:?}");
     assert_eq!(missing[0].1.trim(), "ANA  analysis \u{b7} graph missing");
 }
+
+// -------------------------------------------------------------------------------------------
+// MOD-67 M3 (lane L-C): Browse dispatches through `views::KINDS_BROWSE`, so a chord matches with
+// its modifiers, and every mode resolves through its own stack.
+// -------------------------------------------------------------------------------------------
+
+/// ANA-26 §2.6 defect 1 (MOD-67 D14): `ctrl-d` on a kind is not `d`. It used to open the delete
+/// question, because Browse matched `key.code` alone; the other browse letters with `CONTROL`
+/// held open or send nothing either.
+#[tokio::test]
+async fn ctrl_d_in_browse_opens_no_delete_question() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+
+    assert_eq!(bench.key(&mut section, "ctrl-d"), Handled::Pass);
+    assert!(!section.captures_input(), "no question was opened");
+    assert!(
+        !bench
+            .render_section(&section, 100)
+            .contains("a kind any item uses is refused"),
+        "no question on screen"
+    );
+
+    for chord in ["ctrl-n", "ctrl-g", "ctrl-e", "ctrl-r"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+        assert!(!section.captures_input(), "{chord} opened nothing");
+        assert!(bench.drained().is_empty(), "{chord} asked nothing");
+    }
+}
+
+/// MOD-67 D5: an `ALT` chord is not an answer. `alt-y` at the delete question used to send the
+/// delete (only `CONTROL` was carved out); now it is swallowed and the question stays.
+#[tokio::test]
+async fn alt_y_does_not_answer_the_delete_question() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    for _ in 0..4 {
+        bench.key(&mut section, "j");
+    }
+    bench.key(&mut section, "d");
+
+    bench.key(&mut section, "alt-y");
+    assert!(bench.drained().is_empty(), "`alt-y` deleted nothing");
+    assert!(section.captures_input(), "the question is still up");
+    assert_eq!(bench.key(&mut section, "q"), Handled::Consumed, "and modal");
+    assert_eq!(
+        bench.key(&mut section, "ctrl-c"),
+        Handled::Pass,
+        "`ctrl-c` passes"
+    );
+}
+
+/// MOD-67 M3 `VIEW_DEFAULTS`: the editor moves its focus on `Down` and `Up` as on `Tab` and
+/// `Shift+Tab`.
+#[tokio::test]
+async fn the_editor_moves_focus_on_down_and_up() {
+    let (bench, mut section, _) = bench_with_demo().await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+
+    assert_eq!(bench.key(&mut section, "down"), Handled::Consumed);
+    type_at(&bench, &mut section, "docs");
+    assert_eq!(bench.key(&mut section, "up"), Handled::Consumed);
+    type_at(&bench, &mut section, "DOC");
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("prefix     : DOC"), "{frame}");
+    assert!(frame.contains("name       : docs"), "{frame}");
+}
+
+/// MOD-67 D14, a second rebinding: `[settings.kinds] graph = "G"` opens the graph editor on `G`,
+/// leaves `g` inert, and the hint row follows.
+#[tokio::test]
+async fn a_rebound_graph_acts_on_its_new_chord_and_the_hint_follows() {
+    let keys = htui::keys::load_str("version = 1\n[settings.kinds]\ngraph = \"G\"\n")
+        .expect("the key file loads");
+    let (bench, mut section, _) = bench_with_demo().await;
+    let bench = bench.with_keys(keys);
+    bench.key(&mut section, "j");
+
+    assert!(
+        bench
+            .render_section(&section, 100)
+            .contains("e edit \u{b7} G graph \u{b7} d delete kind"),
+        "{}",
+        bench.render_section(&section, 100)
+    );
+    assert_eq!(bench.key(&mut section, "g"), Handled::Pass);
+    assert!(!section.captures_input(), "`g` is unbound now");
+    assert_eq!(bench.key(&mut section, "G"), Handled::Consumed);
+    assert!(
+        bench
+            .render_section(&section, 100)
+            .contains("name       : analysis"),
+        "`G` opened the kind's graph"
+    );
+}
