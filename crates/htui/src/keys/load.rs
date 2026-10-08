@@ -415,13 +415,19 @@ impl Loader<'_> {
                 Ok(chord) => chords.push(chord),
             }
         }
-        if spec.act == Act::OverlayClose && items.is_empty() {
-            self.push(
-                key_line,
-                format!(
-                    "[{table}] {name}: must keep at least one chord: overlays swallow every other key"
-                ),
-            );
+        if items.is_empty() {
+            // The two acts nothing else replaces (MOD-67 M2 D8; M4 D8.1, MOD-57 §6.4).
+            let why = match spec.act {
+                Act::OverlayClose => Some("overlays swallow every other key"),
+                Act::EditorFocus => Some("the in-pane editor is left only through it"),
+                _ => None,
+            };
+            if let Some(why) = why {
+                self.push(
+                    key_line,
+                    format!("[{table}] {name}: must keep at least one chord: {why}"),
+                );
+            }
         }
         self.keys.set(context, spec.act, chords, key_line);
         self.set.push((context, spec.act));
@@ -463,7 +469,8 @@ mod tests {
                           settings, settings.agents, settings.hierarchy, settings.kinds, \
                           settings.prompt, settings.connection, settings.qdrant, settings.boxes, \
                           settings.personas, settings.secrets, settings.queue, concepts, \
-                          switcher, migration, waiting";
+                          switcher, migration, waiting, skills, skills.library, \
+                          skills.templates, skills.attach, skills.help, requirements";
 
     #[test]
     fn an_empty_file_is_the_defaults() {
@@ -677,6 +684,31 @@ mod tests {
         );
     }
 
+    /// MOD-67 M4 D8.1, D8.3: `editor.focus` must keep a chord, and `ctrl-c` is refused in
+    /// `[editor]` as everywhere.
+    #[test]
+    fn editor_focus_must_keep_a_chord() {
+        assert_eq!(
+            errors("[editor]\nfocus = []\n"),
+            one(
+                2,
+                "[editor] focus: must keep at least one chord: the in-pane editor is left only \
+                 through it"
+            )
+        );
+        assert_eq!(
+            errors("[editor]\nfocus = \"ctrl-c\"\n"),
+            one(
+                2,
+                r#"[editor] focus = "ctrl-c": ctrl-c always quits and cannot be bound"#
+            )
+        );
+        assert!(
+            load_str("[editor]\nabort = []\n").is_ok(),
+            "abort may be unbound"
+        );
+    }
+
     /// `tests/fixtures/keys/errors.toml` (blueprint §11.2; the fixture itself lands with Task 7).
     const ERRORS_TOML: &str = r#"# MOD-67 M2 fixture: one of each entry error, out of order on purpose.
 version = 2
@@ -719,6 +751,11 @@ quit = ["x", "shift-a"]
             (
                 13,
                 r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#,
+            ),
+            // MOD-67 M4: and `x` detaches in the Library's attachments pane.
+            (
+                13,
+                r#"[global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#,
             ),
         ]
         .into_iter()
@@ -967,6 +1004,32 @@ quit = ["x", "shift-a"]
                 2,
                 "[settings.prompt] probe: no such action; [settings.prompt] may override down, \
                  up, edit, reload, dismiss, next_section, prev_section"
+            )
+        );
+    }
+
+    /// MOD-67 M4 §3.1: `[skills.library]` overrides a `[skills]` verb in the Library alone;
+    /// `[skills.templates]` lists what it has and may override.
+    #[test]
+    fn a_skills_view_table_overrides_its_shared_verbs() {
+        let keys = load_str("[skills.library]\ndiff = \"D\"\n").expect("loads");
+        assert_eq!(
+            keys.actions(views::LIBRARY_BROWSE, chord("D")),
+            [Act::SkillsDiff]
+        );
+        assert_eq!(keys.actions(views::LIBRARY_BROWSE, chord("d")), []);
+        assert_eq!(
+            keys.actions(views::TEMPLATES_BROWSE, chord("d")),
+            [Act::SkillsDiff]
+        );
+        assert_eq!(
+            errors("[skills.templates]\nimport = \"x\"\n"),
+            one(
+                2,
+                "[skills.templates] import: no such action; [skills.templates] has diff_default, \
+                 and may override down, up, scroll_down, scroll_up, page_down, page_up, save, \
+                 external_editor, edit, new, reload, switch_view, prev_version, next_version, \
+                 base, diff, edit_externally, ask_agent"
             )
         );
     }

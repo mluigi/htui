@@ -188,7 +188,11 @@ async fn revealing_a_requirement_the_filter_hides_clears_the_filter() {
     reveal(&mut harness, r_sto_1()).await;
     let frame = harness.render();
     assert!(frame.contains(" Requirements (3) \u{2500}"), "{frame}");
-    assert!(!frame.contains("\u{b7} /"), "the filter is gone: {frame}");
+    // The tree title's `· /priority`; the hint row has its own `· / filter` (MOD-67 M4).
+    assert!(
+        !frame.contains("\u{b7} /priority"),
+        "the filter is gone: {frame}"
+    );
     assert!(frame.contains(&titled("R-STO-1")), "{frame}");
 }
 

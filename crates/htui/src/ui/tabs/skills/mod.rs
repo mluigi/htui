@@ -20,9 +20,10 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
+use crate::keys::{Act, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::registry::{Tab, TabId};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 use library::LibraryView;
 use templates::TemplatesView;
@@ -56,6 +57,14 @@ impl SkillsTab {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The shown view's stack: [`Tab::key_stack`]'s, which always has one.
+    fn stack(&self) -> Stack<'static> {
+        match self.view {
+            View::Skills => self.library.key_stack(),
+            View::Templates => self.templates.key_stack(),
+        }
     }
 
     /// The other view.
@@ -101,18 +110,29 @@ impl Tab for SkillsTab {
         }
     }
 
+    /// The shown view's stack (MOD-67 M4 D4), always one: the Library's (the attachments pane's
+    /// while it is open, else an open agent help's, else its mode's) or the Templates view's (an
+    /// open agent help's, else its mode's).
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
+    /// The view switch is `skills.switch_view` (MOD-67 M4 D5), resolved through the shown view's
+    /// stack. Chord equality includes modifiers, so `ctrl-l`, `ctrl-h`, `alt-l` or `shift-right`
+    /// no longer switch (ANA-26 §2.6 defect 1). Every other key goes to the shown view.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        // An open editor, form or name prompt owns every key it uses: `l` is a letter there, not
-        // a view switch (the chat composer's and the Settings sections' rule).
+        // A capturing mode answers first: `l` is a letter there (its stack has no `skills`
+        // switch either, D5).
         let captured = match self.view {
             View::Skills => self.library.captures_input(),
             View::Templates => self.templates.captures_input(),
         };
         if !captured
-            && matches!(
-                key.code,
-                KeyCode::Char('h' | 'l' | '[' | ']') | KeyCode::Left | KeyCode::Right
-            )
+            && ctx
+                .keys()
+                .actions(self.stack(), KeyChord::from_event(key))
+                .first()
+                == Some(&Act::SkillsSwitchView)
         {
             self.toggle();
             return Handled::Consumed;

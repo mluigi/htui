@@ -17,7 +17,7 @@ use super::{
 /// shares a chord with an action in **its own context** that the file leaves at its default
 /// takes the chord, and that action loses it (unbound when it has no other). A
 /// [`STATE_GUARDED`] pair that shares the chord by default keeps sharing it, and
-/// `overlay.close` never gives way (it must keep a chord).
+/// `overlay.close` and `editor.focus` never give way (each must keep a chord; MOD-67 M4 D8.1).
 ///
 /// Across contexts nothing gives way, and [`validate`]'s stack rules stand: two entries on one
 /// chord are an error, and so is a chord an entry shares with another context's default only
@@ -30,7 +30,7 @@ pub(super) fn give_way(keys: &mut Keys) {
         for (index, default) in keys.rows.iter().enumerate() {
             if default.entry.is_some()
                 || default.context != entry.context
-                || default.act == Act::OverlayClose
+                || matches!(default.act, Act::OverlayClose | Act::EditorFocus)
             {
                 continue;
             }
@@ -370,6 +370,12 @@ mod tests {
                     r#"[global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
                         .to_owned()
                 ),
+                // MOD-67 M4: the first stack where `esc` goes back and help is unfiltered.
+                (
+                    2,
+                    r#"[global] help = "esc": "esc" is already common.back (default) in the Library import report"#
+                        .to_owned()
+                ),
             ]
         );
         assert_eq!(
@@ -500,9 +506,50 @@ mod tests {
     fn a_global_rebind_onto_a_view_verb_is_refused() {
         assert_eq!(
             errors("[global]\nquit = \"x\"\n"),
+            [
+                (
+                    2,
+                    r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
+                        .to_owned()
+                ),
+                (
+                    2,
+                    r#"[global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#
+                        .to_owned()
+                ),
+            ]
+        );
+    }
+
+    /// MOD-67 M4 D8.1: `editor.focus` never gives its chord way to an `[editor]` entry, so the
+    /// entry collides instead of silently unbinding the focus toggle.
+    #[test]
+    fn editor_focus_never_gives_way() {
+        assert_eq!(
+            errors("[editor]\nabort = \"ctrl-4\"\n"),
             one(
                 2,
-                r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
+                r#"[editor] abort = "ctrl-4": "ctrl-4" is already editor.focus (default) in [editor]"#
+            )
+        );
+    }
+
+    /// MOD-67 M4 D8.2 (PA-4): the editor stacks are declared, so an `[editor]` chord on a global
+    /// default is refused, and so is a global chord on an editor default.
+    #[test]
+    fn an_editor_chord_on_a_global_default_is_refused_either_way() {
+        assert_eq!(
+            errors("[editor]\nabort = \"f1\"\n"),
+            one(
+                2,
+                r#"[editor] abort = "f1": "f1" is already global.help (default) in the in-pane editor"#
+            )
+        );
+        assert_eq!(
+            errors("[global]\nquit = [\"q\", \"ctrl-x\"]\n"),
+            one(
+                2,
+                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (default) in the in-pane editor"#
             )
         );
     }

@@ -28,6 +28,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
+use crate::keys::Act;
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
@@ -450,9 +451,77 @@ impl Scroll {
             KeyCode::PageUp => -PAGE,
             _ => return Handled::Pass,
         };
+        self.step(step, len)
+    }
+
+    /// One pane-scroll act (MOD-67 M4): `pane.scroll_down`/`scroll_up` one row,
+    /// `pane.page_down`/`page_up` ten, clamped as `on_key`; `Pass` for any other act.
+    pub fn apply(&mut self, act: Act, len: usize) -> Handled {
+        let step: isize = match act {
+            Act::PaneScrollDown => 1,
+            Act::PaneScrollUp => -1,
+            Act::PanePageDown => PAGE,
+            Act::PanePageUp => -PAGE,
+            _ => return Handled::Pass,
+        };
+        self.step(step, len)
+    }
+
+    /// Moves `step` rows, clamped to the last of `len` rows.
+    fn step(&mut self, step: isize, len: usize) -> Handled {
         let max = u16::try_from(len.saturating_sub(1)).unwrap_or(u16::MAX);
         let next = usize::from(self.offset).saturating_add_signed(step);
         self.offset = u16::try_from(next).unwrap_or(u16::MAX).min(max);
         Handled::Consumed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use super::Scroll;
+    use crate::app::Handled;
+    use crate::keys::Act;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn apply_steps_and_clamps_like_on_key() {
+        let pairs = [
+            (Act::PaneScrollDown, KeyCode::Char('J')),
+            (Act::PaneScrollUp, KeyCode::Char('K')),
+            (Act::PanePageDown, KeyCode::PageDown),
+            (Act::PanePageUp, KeyCode::PageUp),
+        ];
+        for start in [0, 3, 4, 12, 30] {
+            for len in [0, 1, 5, 25] {
+                for (act, code) in pairs {
+                    let (mut by_act, mut by_key) = (Scroll::at(start), Scroll::at(start));
+                    assert_eq!(by_act.apply(act, len), Handled::Consumed, "{act:?}");
+                    assert_eq!(by_key.on_key(key(code), len), Handled::Consumed);
+                    assert_eq!(by_act, by_key, "{act:?} from {start} over {len}");
+                }
+            }
+        }
+
+        let mut scroll = Scroll::default();
+        assert_eq!(scroll.apply(Act::PaneScrollDown, 5), Handled::Consumed);
+        assert_eq!(scroll.offset(), 1);
+        assert_eq!(scroll.apply(Act::PanePageDown, 25), Handled::Consumed);
+        assert_eq!(scroll.offset(), 11);
+        assert_eq!(scroll.apply(Act::PanePageDown, 15), Handled::Consumed);
+        assert_eq!(scroll.offset(), 14, "the page clamps at len - 1");
+        assert_eq!(scroll.apply(Act::PanePageUp, 15), Handled::Consumed);
+        assert_eq!(scroll.offset(), 4);
+        assert_eq!(scroll.apply(Act::PanePageUp, 15), Handled::Consumed);
+        assert_eq!(scroll.offset(), 0);
+
+        let mut scroll = Scroll::at(2);
+        assert_eq!(scroll.apply(Act::Edit, 5), Handled::Pass);
+        assert_eq!(scroll.apply(Act::ListDown, 5), Handled::Pass);
+        assert_eq!(scroll, Scroll::at(2), "a passed act moves nothing");
     }
 }

@@ -34,11 +34,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::library::{Notice, Sent};
-use crate::app::Ctx;
+use crate::app::{Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::skills::{ProjectSkills, SkillsSnapshot};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells;
-use crate::ui::{TextField, Theme};
+use crate::ui::tabs::settings::modal_rest;
+use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 /// A row's label field, in cells: a label is fitted to it with `cells::fit`, so the summary stays
@@ -75,16 +77,35 @@ const NOTHING_ATTACHED: &str = "nothing attached here";
 const KEPT: &str = "kept";
 
 /// The hint row in Browse.
-const BROWSE_HINT: &str = "j/k move  Enter edit  x detach  r reload  Esc back";
+const BROWSE_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::AttachChoose, "edit"),
+    Hint::One(Act::AttachDetach, "detach"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::One(Act::Back, "back"),
+];
 
-/// The hint row on the form.
-const FORM_HINT: &str = "Tab/Up/Down field  Space activation  Ctrl+R repo  Ctrl+S save  Esc cancel";
+/// The hint row on the form: `Space` is the activation's own key, `Esc` the form's.
+const FORM_HINT: HintSpec = &[
+    Hint::All(Act::FormNextField, "field"),
+    Hint::Text("Space activation"),
+    Hint::One(Act::AttachRepo, "repo"),
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The hint row in the repo picker.
-const PICKER_HINT: &str = "j/k move  Enter insert  Esc back";
+const PICKER_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::AttachChoose, "insert"),
+    Hint::One(Act::Back, "back"),
+];
 
 /// The hint row at the detach question.
-const CONFIRM_HINT: &str = "y detach  any other key keeps it";
+const CONFIRM_HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "detach"),
+    Hint::Text("any other key keeps it"),
+];
 
 /// The attachments of one skill (D83). Holds no snapshot; every method takes the view's.
 #[derive(Debug)]
@@ -229,14 +250,36 @@ pub(super) enum AttachOutcome {
     },
 }
 
-/// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
-fn plain(key: &KeyEvent) -> bool {
-    (key.modifiers - KeyModifiers::SHIFT).is_empty()
+impl From<Handled> for AttachOutcome {
+    /// `modal_rest`'s answer as the pane's (MOD-67 M4).
+    fn from(handled: Handled) -> Self {
+        match handled {
+            Handled::Consumed => Self::Consumed,
+            Handled::Pass => Self::Pass,
+        }
+    }
 }
 
-/// A `CONTROL` chord (`SHIFT` allowed).
-fn chord(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
+/// A key on the form's activation, which is not typed (a widget's value key, MOD-67 M4 D10):
+/// `Space` (no modifier but `SHIFT`) cycles `always \u{2192} glob \u{2192} off`, `Enter` submits
+/// and `Esc` cancels as a text field's do; anything else passes to the form's stack.
+fn activation_key(form: &mut Form, key: KeyEvent) -> FieldOutcome {
+    if !(key.modifiers - KeyModifiers::SHIFT).is_empty() {
+        return FieldOutcome::Pass;
+    }
+    match key.code {
+        KeyCode::Char(' ') => {
+            form.activation = match form.activation {
+                Activation::Always => Activation::Glob,
+                Activation::Glob => Activation::Off,
+                Activation::Off => Activation::Always,
+            };
+            FieldOutcome::Consumed
+        }
+        KeyCode::Enter => FieldOutcome::Submit,
+        KeyCode::Esc => FieldOutcome::Cancel,
+        _ => FieldOutcome::Pass,
+    }
 }
 
 impl AttachPane {
@@ -272,6 +315,17 @@ impl AttachPane {
         };
         field.on_paste(text);
         true
+    }
+
+    /// The pane's stack in its mode (MOD-67 M4 D4); `LibraryView::key_stack` returns it while the
+    /// pane is open.
+    pub(super) fn key_stack(&self) -> Stack<'static> {
+        match self.mode {
+            AttachMode::Browse => views::ATTACH_BROWSE,
+            AttachMode::Form(_) => views::ATTACH_FORM,
+            AttachMode::Picker { .. } => views::ATTACH_PICKER,
+            AttachMode::ConfirmDetach { .. } => views::ATTACH_CONFIRM,
+        }
     }
 
     /// Whether the form, the picker or the detach question is taking every key.
@@ -329,77 +383,97 @@ impl AttachPane {
         self.cursor = self.cursor.min(rows(snapshot).len().saturating_sub(1));
     }
 
-    /// One key (the table of blueprint §6.6).
+    /// One key (the table of blueprint §6.6), resolved through the mode's stack
+    /// ([`key_stack`](Self::key_stack), read before the mode is taken: the take leaves `Browse`).
     pub(super) fn on_key(
         &mut self,
         key: KeyEvent,
         snapshot: &SkillsSnapshot,
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
+        let stack = self.key_stack();
+        let chord = KeyChord::from_event(key);
         match core::mem::take(&mut self.mode) {
-            AttachMode::Browse => self.on_browse_key(key, snapshot, ctx),
-            AttachMode::Form(form) => self.on_form_key(form, key, snapshot, ctx),
-            AttachMode::Picker { form, cursor } => self.on_picker_key(form, cursor, key, snapshot),
+            AttachMode::Browse => self.on_browse_key(stack, chord, snapshot, ctx),
+            AttachMode::Form(form) => self.on_form_key(stack, form, key, snapshot, ctx),
+            AttachMode::Picker { form, cursor } => {
+                self.on_picker_key(stack, form, cursor, chord, snapshot, ctx)
+            }
             AttachMode::ConfirmDetach {
                 key: row,
                 token,
                 target,
-            } => self.on_confirm_key(row, token, target, key, ctx),
+            } => self.on_confirm_key(stack, row, token, target, chord, ctx),
         }
     }
 
-    /// Browse. `h`/`l` and every other key pass, so the view switch still works and the pane
-    /// stays open behind it.
+    /// Browse, through `views::ATTACH_BROWSE`: each candidate act of the chord, the first this
+    /// pane uses taken. `common.back` and the Library's own `skills.library.attach` close the
+    /// pane. Every other key passes, so the view switch still works and the pane stays open
+    /// behind it.
     fn on_browse_key(
         &mut self,
-        key: KeyEvent,
+        stack: Stack<'static>,
+        chord: KeyChord,
         snapshot: &SkillsSnapshot,
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
-        if !plain(&key) {
-            return AttachOutcome::Pass;
-        }
         let rows = rows(snapshot);
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.cursor = (self.cursor + 1).min(rows.len().saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => self.cursor = self.cursor.saturating_sub(1),
-            KeyCode::Enter => {
-                if let Some(row) = rows.get(self.cursor) {
-                    let (form, hint) = self.open_form(*row, snapshot, ctx);
-                    self.mode = AttachMode::Form(form);
-                    // §7.3's last row: a model-decided or manual file became `always` here, and
-                    // the maintainer is told so beside the form rather than only in the report.
-                    if let Some(hint) = hint {
-                        return AttachOutcome::Notice(Notice::Info(hint.to_owned()));
-                    }
+        for act in ctx.keys().actions(stack, chord) {
+            match act {
+                Act::ListDown => {
+                    self.cursor = (self.cursor + 1).min(rows.len().saturating_sub(1));
                 }
+                Act::ListUp => self.cursor = self.cursor.saturating_sub(1),
+                Act::AttachChoose => return self.choose(&rows, snapshot, ctx),
+                Act::AttachDetach => return self.ask_detach(&rows, snapshot, ctx),
+                Act::Reload => ctx.request(StoreRequest::Skills(ctx.scope.clone())),
+                Act::Back | Act::LibraryAttach => return AttachOutcome::Close,
+                _ => continue,
             }
-            KeyCode::Char('x') => {
-                let Some(row) = rows.get(self.cursor) else {
-                    return AttachOutcome::Consumed;
-                };
-                let key = self.key_of(*row, snapshot);
-                let Some(stored) = snapshot.binding(key) else {
-                    return AttachOutcome::Notice(Notice::Info(NOTHING_ATTACHED.to_owned()));
-                };
-                let target = target(*row, snapshot, ctx);
-                let name = skill_name(snapshot, self.skill);
-                let question =
-                    format!("detach `{name}` from {target}? y detaches, any other key keeps it");
-                self.mode = AttachMode::ConfirmDetach {
-                    key,
-                    token: stored.updated_at,
-                    target,
-                };
-                return AttachOutcome::Notice(Notice::Info(question));
+            return AttachOutcome::Consumed;
+        }
+        AttachOutcome::Pass
+    }
+
+    /// `attach.choose` in Browse: the form over the cursor's row.
+    fn choose(&mut self, rows: &[ARow], snapshot: &SkillsSnapshot, ctx: &Ctx<'_>) -> AttachOutcome {
+        if let Some(row) = rows.get(self.cursor) {
+            let (form, hint) = self.open_form(*row, snapshot, ctx);
+            self.mode = AttachMode::Form(form);
+            // §7.3's last row: a model-decided or manual file became `always` here, and the
+            // maintainer is told so beside the form rather than only in the report.
+            if let Some(hint) = hint {
+                return AttachOutcome::Notice(Notice::Info(hint.to_owned()));
             }
-            KeyCode::Char('r') => ctx.request(StoreRequest::Skills(ctx.scope.clone())),
-            KeyCode::Esc | KeyCode::Char('a') => return AttachOutcome::Close,
-            _ => return AttachOutcome::Pass,
         }
         AttachOutcome::Consumed
+    }
+
+    /// `attach.detach` in Browse: the question over the cursor's row, or why there is nothing to
+    /// detach.
+    fn ask_detach(
+        &mut self,
+        rows: &[ARow],
+        snapshot: &SkillsSnapshot,
+        ctx: &Ctx<'_>,
+    ) -> AttachOutcome {
+        let Some(row) = rows.get(self.cursor) else {
+            return AttachOutcome::Consumed;
+        };
+        let key = self.key_of(*row, snapshot);
+        let Some(stored) = snapshot.binding(key) else {
+            return AttachOutcome::Notice(Notice::Info(NOTHING_ATTACHED.to_owned()));
+        };
+        let target = target(*row, snapshot, ctx);
+        let name = skill_name(snapshot, self.skill);
+        let question = format!("detach `{name}` from {target}? y detaches, any other key keeps it");
+        self.mode = AttachMode::ConfirmDetach {
+            key,
+            token: stored.updated_at,
+            target,
+        };
+        AttachOutcome::Notice(Notice::Info(question))
     }
 
     /// `Enter` on a row: the stored attachment, or the defaults for a new one (`always`, `latest`,
@@ -463,50 +537,44 @@ impl AttachPane {
         (form, None)
     }
 
-    /// The form (D103: `Enter` and `Ctrl+S` both save, `Esc` closes without asking).
+    /// The form (D103: `Enter` and `form.save` both save, `Esc` closes without asking), widget
+    /// first (MOD-67 M4 PA-3): the focused field, or the activation's own keys, see the key; what
+    /// they pass resolves through `views::ATTACH_FORM`: `attach.repo` opens the picker,
+    /// `form.save` saves, `form.next_field`/`prev_field` (`Tab`, `Down`, `Shift+Tab`, `Up`) move
+    /// the focus. Any other key is `modal_rest`'s: a stray letter on the activation is swallowed,
+    /// so it neither lands in a field nor reaches the shell, while `F1` and ALT chords pass.
     fn on_form_key(
         &mut self,
+        stack: Stack<'static>,
         mut form: Form,
         key: KeyEvent,
         snapshot: &SkillsSnapshot,
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
-        if chord(&key) {
-            return match key.code {
-                KeyCode::Char('r' | 'R') => self.open_picker(form, snapshot, ctx),
-                KeyCode::Char('s' | 'S') => self.save(form, ctx),
-                _ => {
-                    self.mode = AttachMode::Form(form);
-                    AttachOutcome::Pass
+        let outcome = match form.focus {
+            FormField::Activation => activation_key(&mut form, key),
+            FormField::Pin => form.pin.on_key(key),
+            FormField::Position => form.position.on_key(key),
+            FormField::Languages => form.languages.on_key(key),
+            FormField::Globs => form.globs.on_key(key),
+        };
+        match outcome {
+            FieldOutcome::Consumed => {}
+            FieldOutcome::Submit => return self.save(form, ctx),
+            // The mode was taken: leaving it so closes the form.
+            FieldOutcome::Cancel => return AttachOutcome::Consumed,
+            FieldOutcome::Pass => {
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::AttachRepo) => return self.open_picker(form, snapshot, ctx),
+                    Some(Act::FormSave) => return self.save(form, ctx),
+                    Some(Act::FormNextField) => form.focus = form.focus.step(true),
+                    Some(Act::FormPrevField) => form.focus = form.focus.step(false),
+                    _ => {
+                        self.mode = AttachMode::Form(form);
+                        return modal_rest(stack, chord).into();
+                    }
                 }
-            };
-        }
-        match key.code {
-            KeyCode::Esc => return AttachOutcome::Consumed,
-            KeyCode::Enter => return self.save(form, ctx),
-            KeyCode::Tab | KeyCode::Down => form.focus = form.focus.step(true),
-            KeyCode::BackTab | KeyCode::Up => form.focus = form.focus.step(false),
-            KeyCode::Char(' ') if form.focus == FormField::Activation => {
-                form.activation = match form.activation {
-                    Activation::Always => Activation::Glob,
-                    Activation::Glob => Activation::Off,
-                    Activation::Off => Activation::Always,
-                };
-            }
-            // The activation is not typed: every other key on it is swallowed, so a stray letter
-            // neither lands in a field nor reaches the shell.
-            _ if form.focus == FormField::Activation => {}
-            _ => {
-                let field = match form.focus {
-                    FormField::Pin => &mut form.pin,
-                    FormField::Position => &mut form.position,
-                    FormField::Languages => &mut form.languages,
-                    FormField::Globs | FormField::Activation => &mut form.globs,
-                };
-                // `Enter`, `Esc`, `Tab` and the arrows were taken above, so what reaches the field
-                // is text or a cursor key; anything it passes (`F(n)`, `Insert`) is swallowed with
-                // the form open, as the activation's keys are.
-                field.on_key(key);
             }
         }
         self.mode = AttachMode::Form(form);
@@ -535,31 +603,30 @@ impl AttachPane {
         AttachOutcome::Consumed
     }
 
-    /// The picker. `Enter` types `<repo>:` into the globs field at its cursor, one char key at a
-    /// time (D101: `TextField` has no insert API, and a key is what inserts at the cursor), after
-    /// `, ` when the text before the cursor ends in anything but `,` or whitespace.
+    /// The picker, through `views::ATTACH_PICKER`. `attach.choose` types `<repo>:` into the globs
+    /// field at its cursor, one char key at a time (D101: `TextField` has no insert API, and a key
+    /// is what inserts at the cursor), after `, ` when the text before the cursor ends in anything
+    /// but `,` or whitespace; `common.back` returns to the form. Any other key is `modal_rest`'s.
     fn on_picker_key(
         &mut self,
+        stack: Stack<'static>,
         mut form: Form,
         mut cursor: usize,
-        key: KeyEvent,
+        chord: KeyChord,
         snapshot: &SkillsSnapshot,
+        ctx: &Ctx<'_>,
     ) -> AttachOutcome {
-        if chord(&key) {
-            self.mode = AttachMode::Picker { form, cursor };
-            return AttachOutcome::Pass;
-        }
         let repos: &[String] = form
             .key
             .project
             .and_then(|project| snapshot.project(project))
             .map_or(&[], |entry| entry.repos.as_slice());
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ListDown) => {
                 cursor = (cursor + 1).min(repos.len().saturating_sub(1));
             }
-            KeyCode::Char('k') | KeyCode::Up => cursor = cursor.saturating_sub(1),
-            KeyCode::Enter => {
+            Some(Act::ListUp) => cursor = cursor.saturating_sub(1),
+            Some(Act::AttachChoose) => {
                 if let Some(repo) = repos.get(cursor) {
                     // A glob typed right before the cursor is a list entry of its own: `, ` keeps
                     // the qualifier off it.
@@ -577,36 +644,44 @@ impl AttachPane {
                 self.mode = AttachMode::Form(form);
                 return AttachOutcome::Consumed;
             }
-            KeyCode::Esc => {
+            Some(Act::Back) => {
                 self.mode = AttachMode::Form(form);
                 return AttachOutcome::Consumed;
             }
-            _ => {}
+            _ => {
+                self.mode = AttachMode::Picker { form, cursor };
+                return modal_rest(stack, chord).into();
+            }
         }
         self.mode = AttachMode::Picker { form, cursor };
         AttachOutcome::Consumed
     }
 
-    /// The detach question: modal, `y` or keep (the kinds editor's shape, a `CONTROL` chord the
-    /// carve-out so `ctrl-c` still quits).
+    /// The detach question, through `views::ATTACH_CONFIRM`: `confirm.yes` detaches,
+    /// `confirm.no` keeps. A key the stack passes (CONTROL, ALT and function keys: `ctrl-c`
+    /// quits, `F1` opens help) leaves the question open; any other key keeps the attachment.
+    /// Chord equality includes the modifiers, so `alt-y` detaches nothing (ANA-26 §2.6 defect 3).
     fn on_confirm_key(
         &mut self,
+        stack: Stack<'static>,
         row: SkillBindingKey,
         token: DateTime<Utc>,
         target: String,
-        key: KeyEvent,
+        chord: KeyChord,
         ctx: &Ctx<'_>,
     ) -> AttachOutcome {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.mode = AttachMode::ConfirmDetach {
-                key: row,
-                token,
-                target,
-            };
-            return AttachOutcome::Pass;
-        }
-        if key.code != KeyCode::Char('y') {
-            return AttachOutcome::Notice(Notice::Info(KEPT.to_owned()));
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes) => {}
+            Some(Act::ConfirmNo) => return AttachOutcome::Notice(Notice::Info(KEPT.to_owned())),
+            _ if stack.passes(chord) => {
+                self.mode = AttachMode::ConfirmDetach {
+                    key: row,
+                    token,
+                    target,
+                };
+                return AttachOutcome::Pass;
+            }
+            _ => return AttachOutcome::Notice(Notice::Info(KEPT.to_owned())),
         }
         AttachOutcome::Save {
             request: Box::new(StoreRequest::SetSkillBinding {
@@ -669,14 +744,14 @@ impl AttachPane {
 
     // --- frames --------------------------------------------------------------------------------
 
-    /// Draws the pane into `area` and returns its hint row.
+    /// Draws the pane into `area` and returns its hint row, through the mode's stack.
     pub(super) fn render(
         &self,
         frame: &mut Frame<'_>,
         area: Rect,
         snapshot: &SkillsSnapshot,
         ctx: &Ctx<'_>,
-    ) -> &'static str {
+    ) -> String {
         let (rows_area, panel) = match &self.mode {
             AttachMode::Form(_) | AttachMode::Picker { .. } => {
                 let [rows_area, panel] =
@@ -687,7 +762,7 @@ impl AttachPane {
             AttachMode::Browse | AttachMode::ConfirmDetach { .. } => (area, None),
         };
         self.render_rows(frame, rows_area, snapshot, ctx);
-        match (&self.mode, panel) {
+        let spec = match (&self.mode, panel) {
             (AttachMode::Form(form), Some(panel)) => {
                 render_form(frame, panel, form, snapshot, self.skill, ctx);
                 FORM_HINT
@@ -698,7 +773,8 @@ impl AttachPane {
             }
             (AttachMode::ConfirmDetach { .. }, _) => CONFIRM_HINT,
             _ => BROWSE_HINT,
-        }
+        };
+        ctx.keys().hint(self.key_stack(), spec)
     }
 
     /// The rows, the cursor's highlighted and kept in view.

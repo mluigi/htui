@@ -133,7 +133,17 @@ close = ["esc"]  # close"#;
         let printed = print(Keys::compiled());
         let head: Vec<&str> = printed.lines().take(27).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
-        assert!(printed.ends_with("[waiting]\nopen = [\"enter\"]  # open step\n"));
+        assert!(
+            printed.ends_with(
+                "[requirements]\nnew_area   = [\"a\"]              # new area\n\
+                               amend      = [\"e\"]              # amend\n\
+                               withdraw   = [\"W\"]              # withdraw\n\
+                               filter     = [\"/\"]              # filter\n\
+                               next_field = [\"tab\", \"down\"]    # next field\n\
+                               prev_field = [\"backtab\", \"up\"]  # previous field\n"
+            ),
+            "{printed}"
+        );
         assert!(!printed.ends_with("\n\n"));
         assert!(printed.lines().all(|line| line == line.trim_end()));
         assert!(printed.lines().all(|line| line.chars().count() <= 100));
@@ -150,7 +160,7 @@ close = ["esc"]  # close"#;
     #[test]
     fn a_changed_table_round_trips_and_keeps_its_marks() {
         let keys = load_str(
-            "[global]\nquit = [\"ctrl-x\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
+            "[global]\nquit = [\"ctrl-y\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
         )
         .expect("the file loads");
         let printed = print(&keys);
@@ -158,7 +168,7 @@ close = ["esc"]  # close"#;
         assert_eq!(reloaded, keys);
         assert_eq!(print(&reloaded), printed);
         for line in [
-            "quit         = [\"ctrl-x\"]   # quit (changed)",
+            "quit         = [\"ctrl-y\"]   # quit (changed)",
             "workspaces   = []           # workspaces (changed)",
             "close = [\"esc\", \"f2\"]  # close (changed)",
         ] {
@@ -199,6 +209,30 @@ close = ["esc"]  # close"#;
         assert_eq!(reloaded, keys);
         assert!(!print(&reloaded).contains("unbound by"));
         assert!(!print(&reloaded).contains("lost \""));
+    }
+
+    /// MOD-67 M4 D8.4: `[editor]` prints and reads back like any table.
+    #[test]
+    fn the_editor_table_round_trips() {
+        let keys = load_str("[editor]\nfocus = [\"ctrl-4\", \"f12\"]\nabort = []\n")
+            .expect("the file loads");
+        let printed = print(&keys);
+        let reloaded = load_str(&printed).expect("the print loads");
+        assert_eq!(reloaded, keys);
+        assert_eq!(print(&reloaded), printed);
+        let table = printed
+            .split("\n\n")
+            .find(|table| table.starts_with("[editor]\n"))
+            .expect("an editor table");
+        assert_eq!(
+            table.lines().collect::<Vec<_>>(),
+            [
+                "[editor]",
+                "focus = [\"ctrl-4\", \"f12\"]  # editor focus (changed)",
+                "abort = []                 # abort edit (changed)",
+            ]
+        );
+        assert_eq!(printed.matches("(changed)").count(), 2);
     }
 
     #[test]

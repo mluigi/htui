@@ -32,10 +32,11 @@ use htui::ui::overlay::{
     ConceptsSearch, MigrationPrompt, Overlay, OverlayId, QueueOverlay, WaitingList,
     WorkspaceSwitcher,
 };
-use htui::ui::tabs::BacklogTab;
 use htui::ui::tabs::settings::{
-    ConnectionSection, QdrantSection, SectionId, SettingsSection, SettingsTab,
+    BoxesSection, ConnectionSection, PersonasSection, QdrantSection, SectionId, SettingsSection,
+    SettingsTab,
 };
+use htui::ui::tabs::{BacklogTab, SkillsTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::Scope;
 use htui_store::testkit as common;
@@ -423,6 +424,89 @@ async fn ctrl_l_and_ctrl_h_do_not_cycle_sections() {
     assert!(on_connection(&frame), "`h` moved back: {frame}");
 }
 
+/// MOD-67 M4 D5 pin (ANA-26 §2.6 defect 1): the Skills view switch is `skills.switch_view`
+/// resolved through the shown view's stack, whole chords, so a modified `l`, `h` or arrow no
+/// longer switches. The views tell apart by their browse hints: only the Library imports.
+#[tokio::test]
+async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
+    let mut harness = Harness::demo().with_tab(Box::new(SkillsTab::new()));
+    harness.drive_to_end().await;
+    let on_library = |frame: &str| frame.contains("I import");
+    let frame = harness.render();
+    assert!(on_library(&frame), "the tab opens on the Library: {frame}");
+
+    for key in ["ctrl-l", "ctrl-h", "alt-l", "shift-right"] {
+        harness.key(key);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(on_library(&frame), "`{key}` did not switch: {frame}");
+    }
+
+    harness.key("l");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(!on_library(&frame), "`l` showed Templates: {frame}");
+    assert!(frame.contains("default"), "the Templates hint: {frame}");
+    harness.key("h");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(on_library(&frame), "`h` went back: {frame}");
+}
+
+/// MOD-67 M4 PA-2 pin at the shell: a capturing Skills mode offers no view switch (`l` is typed)
+/// and still hands `Tab` to the shell, the draft kept; the agent help over it too.
+#[tokio::test]
+async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
+    let mut harness = shell(true).await;
+    harness.key("2");
+    harness.key("l");
+    harness.drive_to_end().await;
+    for _ in 0..20 {
+        harness.key("k");
+    }
+    for _ in 0..20 {
+        if harness.render().contains("\u{250c} implement v") {
+            break;
+        }
+        harness.key("j");
+    }
+    harness.key("e");
+    harness.key("l");
+    let frame = harness.render();
+    assert!(frame.contains("lYou are running"), "`l` is typed: {frame}");
+    let skills_then_requirements = |harness: &mut Harness| {
+        harness.key("tab");
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("requirements"),
+            "`Tab` passes to the shell"
+        );
+        harness.key("2");
+        assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
+    };
+    skills_then_requirements(&mut harness);
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("lYou are running"),
+        "the draft survived: {frame}"
+    );
+
+    harness.key("ctrl-g");
+    harness.drive_to_end().await;
+    harness.key("l");
+    let frame = harness.render();
+    assert!(
+        frame.contains("ask: l"),
+        "`l` is typed into the request: {frame}"
+    );
+    skills_then_requirements(&mut harness);
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("ask: l"), "the help survived: {frame}");
+    assert!(frame.contains("lYou are running"), "and the draft: {frame}");
+}
+
 #[tokio::test]
 async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
     let mut harness =
@@ -530,4 +614,151 @@ async fn a_kitty_ctrl_capital_is_the_ctrl_chord() {
         on_connection(&frame),
         "a kitty ctrl-shift-l did not cycle: {frame}"
     );
+}
+
+/// The five `TextArea` editors outside the Backlog (MOD-67 M4 D6).
+#[derive(Clone, Copy, Debug)]
+enum TextAreaEditor {
+    Library,
+    Templates,
+    RequirementsMint,
+    BoxesQuirks,
+    PersonasBody,
+}
+
+impl TextAreaEditor {
+    const ALL: [Self; 5] = [
+        Self::Library,
+        Self::Templates,
+        Self::RequirementsMint,
+        Self::BoxesQuirks,
+        Self::PersonasBody,
+    ];
+}
+
+/// Moves a Skills view's tree onto `name`: to the top, then down until the body pane is titled
+/// with it (`tests/templates.rs`' `select`).
+fn select_skills_row(harness: &mut Harness, name: &str) {
+    for _ in 0..20 {
+        harness.key("k");
+    }
+    let title = format!("\u{250c} {name} v");
+    for _ in 0..20 {
+        if harness.render().contains(&title) {
+            return;
+        }
+        harness.key("j");
+    }
+    panic!("`{name}` is not in the tree:\n{}", harness.render());
+}
+
+/// A settled demo shell with `keys` installed (the defaults when `None`), `editor` open on it and
+/// `DRAFTED` typed into it, nothing queued.
+async fn open_text_area_editor(editor: TextAreaEditor, keys: Option<&str>) -> Harness {
+    let mut harness = Harness::over(htui_core::store::MemStore::demo());
+    if let Some(file) = keys {
+        harness = harness.with_keys(load_str(file).expect("the keys load"));
+    }
+    match editor {
+        TextAreaEditor::Library | TextAreaEditor::Templates => {
+            register_all(harness.app());
+            harness.settle().await;
+            harness.key("2");
+            harness.settle().await;
+            if matches!(editor, TextAreaEditor::Library) {
+                select_skills_row(&mut harness, "tests");
+            } else {
+                harness.key("l");
+                harness.settle().await;
+                select_skills_row(&mut harness, "implement");
+            }
+            harness.key("e");
+        }
+        TextAreaEditor::RequirementsMint => {
+            register_all(harness.app());
+            harness.settle().await;
+            harness.key("w");
+            harness.settle().await;
+            harness.key("j");
+            harness.key("enter");
+            harness.settle().await;
+            harness.key("3");
+            harness.settle().await;
+            harness.key("n");
+        }
+        TextAreaEditor::BoxesQuirks | TextAreaEditor::PersonasBody => {
+            let (section, open): (Box<dyn SettingsSection>, &str) = match editor {
+                TextAreaEditor::BoxesQuirks => (Box::new(BoxesSection::new()), "e"),
+                _ => (Box::new(PersonasSection::new()), "b"),
+            };
+            harness = harness.with_tab(Box::new(SettingsTab::with_sections(vec![section])));
+            harness.settle().await;
+            harness.key(open);
+        }
+    }
+    harness.settle().await;
+    for c in DRAFTED.chars() {
+        harness.key(&c.to_string());
+    }
+    assert!(
+        harness.render().contains(DRAFTED),
+        "{editor:?}: the draft is typed: {}",
+        harness.render()
+    );
+    assert_eq!(harness.queued(), 0, "{editor:?}: nothing sent yet");
+    harness
+}
+
+/// What the D6 pin types into each editor.
+const DRAFTED: &str = "Drafted";
+
+/// MOD-67 M4 D6: a `TextArea` no longer saves on its own `ctrl-s`, so with `[form] save = "f2"`
+/// every `TextArea` editor outside the Backlog saves on `F2` (one write request) and `ctrl-s`
+/// does nothing there (no request, the frame unchanged: nothing typed, the draft kept); with the
+/// defaults `ctrl-s` saves each, through `form.save`.
+#[tokio::test]
+async fn a_rebound_save_is_the_only_save_in_every_text_area_editor() {
+    for editor in TextAreaEditor::ALL {
+        let mut harness =
+            open_text_area_editor(editor, Some("version = 1\n[form]\nsave = \"f2\"\n")).await;
+        let before = harness.render();
+        harness.key("ctrl-s");
+        assert_eq!(harness.queued(), 0, "{editor:?}: `ctrl-s` sends nothing");
+        assert_eq!(
+            harness.render(),
+            before,
+            "{editor:?}: `ctrl-s` changed nothing"
+        );
+        harness.key("f2");
+        assert_eq!(harness.queued(), 1, "{editor:?}: `F2` sends one write");
+
+        let mut harness = open_text_area_editor(editor, None).await;
+        harness.key("ctrl-s");
+        assert_eq!(
+            harness.queued(),
+            1,
+            "{editor:?}: with the defaults `ctrl-s` sends one write"
+        );
+    }
+}
+
+/// MOD-67 M4 (README "Changing keys"): the example of a Backlog key winning over a global one
+/// loads, and `f` stays the Backlog's (the Backlog does not read the file yet).
+#[tokio::test]
+async fn the_readme_backlog_example_loads_and_f_stays_the_backlogs() {
+    let keys =
+        load_str("version = 1\n\n[global]\nquit = [\"f\"]\n").expect("the README example loads");
+    let mut harness = Harness::demo()
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_keys(keys);
+    harness.drive_to_end().await;
+    assert!(!harness.render().contains(" Filter "));
+    harness.key("f");
+    assert!(
+        !harness.app().should_quit,
+        "`f` does not quit on the Backlog"
+    );
+    let frame = harness.render();
+    assert!(frame.contains(" Filter "), "`f` opened the filter: {frame}");
 }

@@ -31,6 +31,10 @@ pub enum Hint {
     Pair(Act, Act, &'static str),
     /// Every admitted chord of the act, joined by `/`, then `text`: `n/Esc cancel` (MOD-67 D9).
     All(Act, &'static str),
+    /// The act's first two admitted chords, joined by `/`, then `text`: a toggle such as
+    /// `skills.switch_view`, whose six defaults `All` would spell out, reads `h/l view` (MOD-67
+    /// M4 R1). One admitted chord renders alone.
+    Two(Act, &'static str),
     /// Fixed text: a widget's own key (`Enter store`, `Esc cancel`) or a note (`typed text is
     /// never shown`). Never dropped, unless it is empty.
     Text(&'static str),
@@ -112,8 +116,8 @@ impl Keys {
     }
 
     /// A view's hint row: each element through `stack`, unbound ones dropped, joined by ` · `
-    /// (ANA-26 §7.6). `One` and `Pair` take the first admitted chord, `All` every one; `Text`
-    /// is written as is.
+    /// (ANA-26 §7.6). `One` and `Pair` take the first admitted chord, `Two` the first two, `All`
+    /// every one; `Text` is written as is.
     #[must_use]
     pub fn hint(&self, stack: Stack<'_>, spec: HintSpec) -> String {
         let labelled = |labels: Vec<String>, text: &str| {
@@ -128,6 +132,9 @@ impl Keys {
                     .collect(),
                 text,
             ),
+            Hint::Two(act, text) => {
+                labelled(self.labels(stack, act).into_iter().take(2).collect(), text)
+            }
             Hint::All(act, text) => labelled(self.labels(stack, act), text),
             Hint::Text(text) => (!text.is_empty()).then(|| text.to_owned()),
         };
@@ -137,20 +144,30 @@ impl Keys {
             .join(SEP)
     }
 
-    /// The status line (D7, MOD-67 M3 PA-9) from `stack`'s global layer: quit first, always,
-    /// as its first admitted chord, else `Ctrl+c`; then every other `Global` row the layer
-    /// admits that is `offered` and has an admitted chord, in catalogue order, its first
-    /// admitted chord, rows sharing a help label collapsed to the first (the digits), joined by
-    /// ` · `. `Stack::BASE` gives the M1 line.
+    /// The status line (D7, MOD-67 M3 PA-9) from `stack`'s global layers: quit first, always,
+    /// as its first admitted chord, else `Ctrl+c`; then every other `Global` row in catalogue
+    /// order that is `offered` and has an admitted chord, each through the **first** global
+    /// layer that offers it (`Stack::admits`), its first admitted chord, rows sharing a help
+    /// label collapsed to the first (the digits), joined by ` · `. `Stack::BASE` gives the M1
+    /// line; a stack with one global layer renders exactly as before (MOD-67 M4 PA-2).
     #[must_use]
     pub fn status_line(&self, stack: Stack<'_>, offered: impl Fn(Act) -> bool) -> String {
-        let global = stack.global();
-        let admitted = |row: &&super::Row| {
-            row.context == Context::Global
-                && global.is_some_and(|(index, _)| stack.admits(index, row.act))
+        // The first global layer that offers `act` (a `TABS` layer before `MODAL`, M4 PA-2).
+        let layer_of = |act: Act| {
+            stack
+                .layers()
+                .iter()
+                .copied()
+                .enumerate()
+                .find(|&(index, layer)| {
+                    layer.context() == Context::Global && stack.admits(index, act)
+                })
+                .map(|(_, layer)| layer)
         };
+        let admitted =
+            |row: &&super::Row| row.context == Context::Global && layer_of(row.act).is_some();
         let first_chord = |row: &super::Row| {
-            global.and_then(|(_, layer)| {
+            layer_of(row.act).and_then(|layer| {
                 row.chords
                     .iter()
                     .copied()
@@ -184,21 +201,28 @@ impl Keys {
     /// layer's `Context::heading`. A row is listed under the first layer that admits it and has
     /// a row for it (the `actions` shadowing rule, L-B Q6), with every chord that layer admits;
     /// rows sharing a help label merge, and a row with no admitted chord drops. `offered` is
-    /// consulted for `Global` rows only. The global layer always lists quit: its admitted
-    /// chords (none when the layer does not admit `Quit`) and the fixed `Ctrl+c`. A layer that
+    /// consulted for `Global` rows only. Every global layer of the stack renders as **one**
+    /// `Global:` line at the last global layer's place (MOD-67 M4 PA-2): quit first (its admitted
+    /// chords, none when no global layer admits `Quit`, then the fixed `Ctrl+c`), then the rows
+    /// in layer order, an act listed under the first global layer that offers it. A layer that
     /// lists nothing has no line.
     #[must_use]
     pub fn help_lines(&self, stack: Stack<'_>, offered: impl Fn(Act) -> bool) -> Vec<HelpLine> {
         let mut seen: Vec<Act> = Vec::new();
         let mut lines = Vec::new();
-        let global = stack.global().map(|(index, _)| index);
+        let last_global = stack.global().map(|(index, _)| index);
+        // Shared by every global layer: opened with quit's placeholder, pushed at the last one.
+        let quit_help = Act::Quit.spec().map_or("quit", |spec| spec.help);
+        let mut global_merged: Vec<(&str, Vec<KeyChord>)> = vec![(quit_help, Vec::new())];
         for (index, layer) in stack.layers().iter().enumerate() {
+            let is_global = layer.context() == Context::Global;
             let mut here = Vec::new();
-            let mut merged: Vec<(&str, Vec<KeyChord>)> = Vec::new();
-            if global == Some(index) {
-                let help = Act::Quit.spec().map_or("quit", |spec| spec.help);
-                merged.push((help, Vec::new()));
-            }
+            let mut local: Vec<(&str, Vec<KeyChord>)> = Vec::new();
+            let merged = if is_global {
+                &mut global_merged
+            } else {
+                &mut local
+            };
             let rows = self
                 .rows
                 .iter()
@@ -223,7 +247,10 @@ impl Keys {
                 }
             }
             seen.extend(here);
-            if global == Some(index)
+            if is_global && last_global != Some(index) {
+                continue; // the one `Global:` line sits at the last global layer
+            }
+            if is_global
                 && let Some((_, quit)) = merged.first_mut()
                 && !quit.contains(&CTRL_C)
             {
@@ -494,6 +521,33 @@ mod tests {
         assert_eq!(keys.label(views::CAPTURE, Act::Help).as_deref(), Some("F1"));
     }
 
+    /// MOD-67 M4 R1 L2: `Two` shows a toggle's first two admitted chords (`h/l view`), every
+    /// one when it has fewer, and follows a rebind.
+    #[test]
+    fn two_lists_the_first_two_admitted_chords() {
+        let layers = [Layer::all(Context::Skills)];
+        let stack = Stack::new(&layers);
+        let spec = &[Hint::Two(Act::SkillsSwitchView, "view")];
+        assert_eq!(Keys::compiled().hint(stack, spec), "h/l view");
+        let keys = Keys::defaults().with_chords(Context::Skills, Act::SkillsSwitchView, &["v"]);
+        assert_eq!(keys.hint(stack, spec), "v view");
+        let keys = Keys::defaults().with_chords(
+            Context::Skills,
+            Act::SkillsSwitchView,
+            &["right", "left", "v"],
+        );
+        assert_eq!(keys.hint(stack, spec), "Right/Left view");
+        let keys = Keys::defaults().with_chords(Context::Skills, Act::SkillsSwitchView, &[]);
+        assert_eq!(keys.hint(stack, spec), "");
+        let modal = [Layer::modal(Context::Skills)];
+        let keys = Keys::defaults().with_chords(
+            Context::Skills,
+            Act::SkillsSwitchView,
+            &["h", "f2", "l", "f3"],
+        );
+        assert_eq!(keys.hint(Stack::new(&modal), spec), "F2/F3 view");
+    }
+
     #[test]
     fn the_status_line_follows_the_stacks_global_layer() {
         let keys = Keys::compiled();
@@ -560,6 +614,33 @@ mod tests {
             texts(keys.help_lines(views::CAPTURE, all)),
             ["Global: Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"]
         );
+    }
+
+    /// MOD-67 M4 PA-2: every global layer of a stack feeds the status line and one `Global:`
+    /// line of the `?` box; the closer follows the last (modal) one.
+    #[test]
+    fn a_tabs_layer_shows_on_the_status_line_and_in_one_global_line() {
+        use views::TEMPLATES_EDITOR;
+        let keys = Keys::compiled();
+        let tabs = "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help";
+        assert_eq!(
+            keys.status_line(TEMPLATES_EDITOR, all),
+            format!("{tabs} · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue")
+        );
+        assert_eq!(keys.status_line(TEMPLATES_EDITOR, bare), tabs);
+        assert_eq!(
+            texts(keys.help_lines(TEMPLATES_EDITOR, all)),
+            [
+                "Skills: Ctrl+g ask agent".to_owned(),
+                "Form: Ctrl+s save · Ctrl+e $EDITOR".to_owned(),
+                format!("Global: {tabs} · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"),
+            ]
+        );
+        assert_eq!(
+            keys.help_closer(TEMPLATES_EDITOR).as_deref(),
+            Some("F1 closes this box")
+        );
+        assert!(!TEMPLATES_EDITOR.passes(crate::keys::KeyChord::parse_strict("tab").expect("tab")));
     }
 
     #[test]

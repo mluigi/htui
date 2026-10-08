@@ -10,10 +10,10 @@
 //! none of them can split a combining sequence (MOD-54 D8, D13). Hard lines only: no soft wrap, undo, selection, history, mask or
 //! `Zeroizing` (MOD-9 PRD risk row 5; what it holds is not secret, though its `Debug` still prints
 //! lengths only). A bracketed paste arrives whole through [`TextArea::on_paste`] (MOD-22 review
-//! M-1), its line breaks kept. `ctrl-s` submits, because `Enter` breaks the line and no
-//! terminal mode that reports `Ctrl+Enter` is enabled (MOD-7 plan OQ-16); every other chord
-//! passes to the caller. [`TextArea::with_text`] turns `\r\n` and a lone `\r` into `\n` (MOD-7
-//! D59), so the text it hands back is what an editor opened on compares against.
+//! M-1), its line breaks kept. Every chord passes to the caller, `ctrl-s` included: its owner
+//! saves on `form.save` (MOD-67 M4 D6), and since `Enter` breaks the line a `TextArea` never
+//! submits. [`TextArea::with_text`] turns `\r\n` and a lone `\r` into `\n` (MOD-7 D59), so the
+//! text it hands back is what an editor opened on compares against.
 //!
 //! **Everything drawn is counted in display cells** (MOD-54 D9, D11), through
 //! `crate::ui::cells`, the same module [`TextField`](crate::ui::TextField) counts by: a wide char
@@ -182,21 +182,17 @@ impl TextArea {
 
     /// Feeds one key; `page` is how many lines `PageUp`/`PageDown` move (at least one).
     ///
-    /// Any chord (`CONTROL`, `ALT`, `SUPER`, `META`, `HYPER`) passes, except `ctrl-s`, which
-    /// submits; so `ctrl-c` and `ctrl-e` reach the caller. `SHIFT` alone is a capital, not a
-    /// chord. `Char` inserts unless it is a control char, which is swallowed; `Enter` inserts
-    /// `\n`; `Backspace`/`Delete` join lines at their ends; `Left`/`Right` cross them; `Up`/`Down`
-    /// and `PageUp`/`PageDown` keep the goal column; `Home`/`End` stay on the line; `Esc` cancels
-    /// and everything else passes. Edits happen in place: no key builds a new `String`.
+    /// Any chord (`CONTROL`, `ALT`, `SUPER`, `META`, `HYPER`) passes, `ctrl-s` included: its
+    /// owner saves on `form.save` (MOD-67 M4 D6); so `ctrl-c` and `ctrl-e` reach the caller too,
+    /// and no key returns [`FieldOutcome::Submit`]. `SHIFT` alone is a capital, not a chord.
+    /// `Char` inserts unless it is a control char, which is swallowed; `Enter` inserts `\n`;
+    /// `Backspace`/`Delete` join lines at their ends; `Left`/`Right` cross them; `Up`/`Down` and
+    /// `PageUp`/`PageDown` keep the goal column; `Home`/`End` stay on the line; `Esc` cancels and
+    /// everything else passes. Edits happen in place: no key builds a new `String`.
     pub fn on_key(&mut self, key: KeyEvent, page: u16) -> FieldOutcome {
         let chord = key.modifiers.intersection(CHORD);
         if !chord.is_empty() {
-            return if chord == KeyModifiers::CONTROL && matches!(key.code, KeyCode::Char('s' | 'S'))
-            {
-                FieldOutcome::Submit
-            } else {
-                FieldOutcome::Pass
-            };
+            return FieldOutcome::Pass;
         }
         let page = usize::from(page.max(1));
         match key.code {
@@ -1054,11 +1050,12 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_s_submits_and_esc_cancels() {
+    fn ctrl_s_passes_and_esc_cancels() {
         let mut area = at_end("a\nb");
         assert_eq!(
             area.on_key(chord(KeyCode::Char('s'), KeyModifiers::CONTROL), 10),
-            FieldOutcome::Submit
+            FieldOutcome::Pass,
+            "its owner saves on `form.save` (MOD-67 M4 D6)"
         );
         assert_eq!(
             area.on_key(
@@ -1068,8 +1065,8 @@ mod tests {
                 ),
                 10
             ),
-            FieldOutcome::Submit,
-            "`SHIFT` on top of `CONTROL` still submits"
+            FieldOutcome::Pass,
+            "`SHIFT` on top of `CONTROL` passes too"
         );
         assert_eq!(press(&mut area, KeyCode::Esc), FieldOutcome::Cancel);
         assert_eq!(area.text(), "a\nb");

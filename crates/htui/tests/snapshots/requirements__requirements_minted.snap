@@ -30,5 +30,5 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                           ││                                                     │
 └───────────────────────────────────────────┘└─────────────────────────────────────────────────────┘
  minted R-ENT-3
- j/k move  Enter fold  / filter  a area  n new  e amend  W withdraw  r reload
+ j/k move · Enter fold · / filter · a area · n new · e amend · W withdraw · r reload
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find

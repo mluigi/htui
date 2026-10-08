@@ -30,5 +30,5 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 
- Enter accept  Esc discard  J/K PgUp/PgDn scroll
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+ Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page
+Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+

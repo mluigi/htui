@@ -632,8 +632,9 @@ impl PersonasSection {
         }
     }
 
-    /// One key while the body editor is open: the `TextArea` first (its own `Ctrl+s` submits,
-    /// D13), then `form.save` through `PERSONAS_EDITOR` for a rebound chord.
+    /// One key while the body editor is open: the `TextArea` first, then `form.save` through
+    /// `PERSONAS_EDITOR`, the only save: the widget passes `Ctrl+s` like every chord (MOD-67 M4
+    /// D6).
     fn on_body_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Mode::Body(editor) = &mut self.mode else {
             return Handled::Pass;
@@ -646,6 +647,7 @@ impl PersonasSection {
                 }
                 Handled::Consumed
             }
+            // Unreachable since MOD-67 M4 D6: a `TextArea` never submits.
             FieldOutcome::Submit => {
                 self.save_body(ctx);
                 Handled::Consumed
@@ -776,6 +778,7 @@ impl PersonasSection {
                 }
                 Handled::Consumed
             }
+            // Unreachable since MOD-67 M4 D6: a `TextArea` never submits.
             FieldOutcome::Submit => {
                 self.save_rules(ctx);
                 Handled::Consumed
@@ -1667,8 +1670,8 @@ fn form_navigation(keys: &Keys, chord: KeyChord, focus: &mut usize, fields: usiz
 }
 
 /// What the body and rules editors do with a key their `TextArea` passed on: `Ok` for
-/// `form.save` through `PERSONAS_EDITOR` (a rebound save chord; the widget's own `Ctrl+s` never
-/// gets here, D13), else `Err` with [`modal_rest`]'s answer.
+/// `form.save` through `PERSONAS_EDITOR` (the editors' only save: the widget passes `Ctrl+s` like
+/// every chord, MOD-67 M4 D6), else `Err` with [`modal_rest`]'s answer.
 fn editor_act(keys: &Keys, key: KeyEvent) -> Result<(), Handled> {
     let stack = views::PERSONAS_EDITOR;
     let chord = KeyChord::from_event(key);

@@ -30,5 +30,5 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 └────────────────────────────────────────────────────────────┘└────────────────────────────────────┘
  saved elsewhere since you opened it — v2 is now the latest; your draft is kept and Ctrl+S saves it
  as v3
- Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel  L1:C7
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+ Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C7
+Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+

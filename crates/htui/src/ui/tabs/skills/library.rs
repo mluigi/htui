@@ -39,15 +39,16 @@ use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::Scroll;
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
@@ -97,37 +98,63 @@ const BINDING_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{20
 const DETACH_CHANGED_ELSEWHERE: &str = "this attachment changed elsewhere \u{2014} nothing was \
                                         detached; its row shows it as it is now";
 
-/// The hint row in Browse (96 chars: `j/k` carries no word so the row fits 100 columns). `I
-/// import` took the room `h/l view` had: the switch line right above names both views.
-const BROWSE_HINT: &str = "j/k  ,/. version  b base  d diff  e edit  E $EDITOR  n new  I import  \
-                           i info  a attach  r reload";
+/// The hint row in Browse (96 cells with the defaults: `j/k` carries no word, and `r reload` is
+/// left out, so the row fits 100 columns with its ` \u{b7} ` separators; MOD-67 M4). `I import`
+/// took the room `h/l view` had: the switch line right above names both views.
+const BROWSE_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
+    Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
+    Hint::One(Act::SkillsBase, "base"),
+    Hint::One(Act::SkillsDiff, "diff"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::SkillsEditExternally, "$EDITOR"),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::LibraryImport, "import"),
+    Hint::One(Act::LibraryInfo, "info"),
+    Hint::One(Act::LibraryAttach, "attach"),
+];
 
-/// The pane's bottom border while its lines overflow it.
-const SCROLL_HINT: &str = " J/K PgUp/PgDn scroll ";
+/// The pane's bottom border while its lines overflow it: the pane keys, through
+/// `LIBRARY_BROWSE` whatever the mode.
+const SCROLL_HINT: HintSpec = &[
+    Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
+    Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
+];
 
-/// The hint row while naming or describing a new skill.
-const NAMING_HINT: &str = "Enter next  Esc cancel";
+/// The hint row while naming or describing a new skill: `Enter` and `Esc` are the field's.
+const NAMING_HINT: HintSpec = &[Hint::Text("Enter next"), Hint::Text("Esc cancel")];
 
-/// The hint row on the rename form.
-const INFO_HINT: &str = "Tab field  Ctrl+S save  Esc cancel";
+/// The hint row on the rename form (`Esc` is the field's).
+const INFO_HINT: HintSpec = &[
+    Hint::One(Act::FormNextField, "field"),
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The hint row in the editor, before the cursor's `L{line}:C{col}`.
-///
-/// `Ctrl+G` is MOD-55's, hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
-const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
+/// The hint row in the editor, before the cursor's `L{line}:C{col}` (`Esc` is the area's).
+const EDIT_HINT: HintSpec = &[
+    Hint::One(Act::FormSave, "save"),
+    Hint::One(Act::SkillsAskAgent, "ask agent"),
+    Hint::One(Act::FormExternalEditor, "$EDITOR"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
-const HANDED_OFF_HINT: &str = "the draft is in $EDITOR";
+const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
 
 /// `Ctrl+G` with no project in the workspace (MOD-55 P7): a help turn is a chat run, and a run
 /// belongs to a project.
 const NO_PROJECT: &str = "no project in this workspace \u{2014} agent help records its run in one";
 
-/// The hint row on the import form.
-const IMPORT_HINT: &str = "Enter import  Esc cancel";
+/// The hint row on the import form: `Enter` and `Esc` are the field's.
+const IMPORT_HINT: HintSpec = &[Hint::Text("Enter import"), Hint::Text("Esc cancel")];
 
 /// The hint row on the import report.
-const REPORT_HINT: &str = "j/k move  r reload  Esc back";
+const REPORT_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::One(Act::Back, "back"),
+];
 
 /// An import went out.
 const IMPORTING: &str = "importing\u{2026}";
@@ -461,17 +488,39 @@ fn outcome_row(outcome: &ImportOutcome) -> (char, String, bool) {
     }
 }
 
-/// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
-fn plain(key: &KeyEvent) -> bool {
-    (key.modifiers - KeyModifiers::SHIFT).is_empty()
-}
-
-/// A `CONTROL` chord (`SHIFT` allowed).
-fn chord(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
+/// A prompt's key its field passed (MOD-67 M4 PA-2): `global.next_tab`/`prev_tab` pass, so the
+/// shell switches tabs with the prompt kept; anything else is `modal_rest`'s through
+/// `views::LIBRARY_PROMPT`.
+fn prompt_rest(key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+    let chord = KeyChord::from_event(key);
+    match ctx.keys().actions(views::LIBRARY_PROMPT, chord).first() {
+        Some(Act::NextTab | Act::PrevTab) => Handled::Pass,
+        _ => modal_rest(views::LIBRARY_PROMPT, chord),
+    }
 }
 
 impl LibraryView {
+    /// The current mode's stack (MOD-67 M4 D4), always one: the attachments pane's while it is
+    /// open, else an open agent help's, else the mode's. `SkillsTab::key_stack`, `on_key` and
+    /// the hint read it.
+    pub(super) fn key_stack(&self) -> Stack<'static> {
+        if let Some(pane) = &self.attach {
+            return pane.key_stack();
+        }
+        match &self.mode {
+            Mode::Browse => views::LIBRARY_BROWSE,
+            Mode::Naming { .. } | Mode::Describing { .. } | Mode::ImportPath { .. } => {
+                views::LIBRARY_PROMPT
+            }
+            Mode::Info(_) => views::LIBRARY_INFO,
+            Mode::Editing(editor) => match &editor.help {
+                Some(help) => help.key_stack(),
+                None => views::LIBRARY_EDITOR,
+            },
+            Mode::Report { .. } => views::LIBRARY_REPORT,
+        }
+    }
+
     /// Whether an editor, a prompt, the rename form, or the attachments pane's form, picker or
     /// question is taking every key (D100).
     pub(super) fn captures_input(&self) -> bool {
@@ -533,7 +582,7 @@ impl LibraryView {
         }
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
-            Mode::Naming { .. } | Mode::Describing { .. } => self.on_naming_key(key),
+            Mode::Naming { .. } | Mode::Describing { .. } => self.on_naming_key(key, ctx),
             Mode::Info(_) => self.on_info_key(key, ctx),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
             Mode::ImportPath { .. } => self.on_import_key(key, ctx),
@@ -680,36 +729,39 @@ impl LibraryView {
         ])
         .areas(area);
         let hint = match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
-            (Some(pane), Some(snapshot), _, _) => {
-                pane.render(frame, content, snapshot, ctx).to_owned()
-            }
+            (Some(pane), Some(snapshot), _, _) => pane.render(frame, content, snapshot, ctx),
             (_, _, Mode::Editing(editor), _) => {
                 self.render_editor(frame, content, editor, ctx);
                 match &editor.help {
-                    Some(help) => help.hint().to_owned(),
+                    Some(help) => help.hint(ctx.keys()),
                     None => {
                         let (line, col) = editor.area.cursor_line_col();
-                        format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                        format!(
+                            "{} \u{b7} L{}:C{}",
+                            ctx.keys().hint(self.key_stack(), EDIT_HINT),
+                            line + 1,
+                            col + 1
+                        )
                     }
                 }
             }
             (_, _, Mode::Browse, Some(editor)) => {
                 self.render_editor(frame, content, editor, ctx);
-                HANDED_OFF_HINT.to_owned()
+                ctx.keys().hint(self.key_stack(), HANDED_OFF_HINT)
             }
             (_, _, Mode::Report { outcomes, cursor }, _) => {
                 self.render_report(frame, content, outcomes, *cursor, ctx);
-                REPORT_HINT.to_owned()
+                ctx.keys().hint(self.key_stack(), REPORT_HINT)
             }
             (_, _, mode, _) => {
                 self.render_browse(frame, content, ctx);
-                match mode {
+                let spec = match mode {
                     Mode::Naming { .. } | Mode::Describing { .. } => NAMING_HINT,
                     Mode::Info(_) => INFO_HINT,
                     Mode::ImportPath { .. } => IMPORT_HINT,
                     Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => BROWSE_HINT,
-                }
-                .to_owned()
+                };
+                ctx.keys().hint(self.key_stack(), spec)
             }
         };
         frame.render_widget(
@@ -729,43 +781,53 @@ impl LibraryView {
 
     // --- keys ----------------------------------------------------------------------------------
 
-    /// Browse (§6.3). Every key here misses the global table, and the tab took `h`/`l`/`[`/`]` and
-    /// the arrows first.
+    /// Browse (§6.3; MOD-67 M4 L-A §2): each candidate act of the chord through
+    /// `views::LIBRARY_BROWSE`, the first this view uses taken. Chord equality includes the
+    /// modifiers, so `ctrl-e` is not `e`. Anything else passes for the shell to resolve through the
+    /// same stack (`q`, `Tab`, the digits, `?`). The tab took `skills.switch_view` first.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if !plain(&key) {
-            return Handled::Pass;
-        }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(true),
-            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(false),
-            KeyCode::Char('r') => {
-                self.notice = None;
-                ctx.request(StoreRequest::Skills(ctx.scope.clone()));
-            }
-            KeyCode::Char('n') => {
-                if self.snapshot.is_some() {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::LIBRARY_BROWSE, chord) {
+            match act {
+                Act::ListDown => self.move_cursor(true),
+                Act::ListUp => self.move_cursor(false),
+                Act::Reload => {
                     self.notice = None;
-                    self.mode = Mode::Naming {
+                    ctx.request(StoreRequest::Skills(ctx.scope.clone()));
+                }
+                Act::New => {
+                    if self.snapshot.is_some() {
+                        self.notice = None;
+                        self.mode = Mode::Naming {
+                            field: TextField::new(),
+                        };
+                    }
+                }
+                Act::LibraryImport => {
+                    self.notice = None;
+                    self.mode = Mode::ImportPath {
                         field: TextField::new(),
                     };
                 }
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.pane_rows.get());
+                }
+                Act::SkillsPrevVersion
+                | Act::SkillsNextVersion
+                | Act::SkillsBase
+                | Act::SkillsDiff
+                | Act::Edit
+                | Act::SkillsEditExternally
+                | Act::LibraryInfo
+                | Act::LibraryAttach => {
+                    self.notice = None;
+                    self.on_skill_key(act, ctx);
+                }
+                _ => continue,
             }
-            KeyCode::Char('I') => {
-                self.notice = None;
-                self.mode = Mode::ImportPath {
-                    field: TextField::new(),
-                };
-            }
-            KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
-                return self.scroll.on_key(key, self.pane_rows.get());
-            }
-            KeyCode::Char(c @ (',' | '.' | 'b' | 'd' | 'e' | 'E' | 'i' | 'a')) => {
-                self.notice = None;
-                self.on_skill_key(c, ctx);
-            }
-            _ => return Handled::Pass,
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
     /// A version, diff, edit, rename or attach key. With no skill under the cursor (an empty
@@ -773,7 +835,7 @@ impl LibraryView {
     /// hand-written row reaches that) opens `e`/`E` on an empty body over head token 0, which the
     /// writer saves as v1; `i` and `a` work as for any skill; the version, base and diff keys have
     /// nothing to act on (MOD-9 D127, D134).
-    fn on_skill_key(&mut self, key: char, ctx: &Ctx<'_>) {
+    fn on_skill_key(&mut self, act: Act, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -795,8 +857,8 @@ impl LibraryView {
             (Some(head), Some((version, body))) => (head, Some(version), body),
             _ => (0, None, String::new()),
         };
-        match key {
-            ',' | '.' => {
+        match act {
+            Act::SkillsPrevVersion | Act::SkillsNextVersion => {
                 let Some((head, shown_version)) = versioned else {
                     return;
                 };
@@ -804,7 +866,7 @@ impl LibraryView {
                     .iter()
                     .position(|version| *version == shown_version)
                     .unwrap_or(0);
-                let index = if key == ',' {
+                let index = if act == Act::SkillsPrevVersion {
                     index.saturating_sub(1)
                 } else {
                     (index + 1).min(versions.len().saturating_sub(1))
@@ -813,14 +875,14 @@ impl LibraryView {
                 self.shown = (version != head).then_some(version);
                 self.scroll.reset();
             }
-            'b' => {
+            Act::SkillsBase => {
                 let Some((_, shown_version)) = versioned else {
                     return;
                 };
                 self.base = Some(shown_version);
                 self.notice = Some(Notice::Info(format!("base v{shown_version}")));
             }
-            'd' => {
+            Act::SkillsDiff => {
                 let Some((_, shown_version)) = versioned else {
                     return;
                 };
@@ -836,11 +898,11 @@ impl LibraryView {
                 }
                 self.scroll.reset();
             }
-            'e' => {
+            Act::Edit => {
                 let target = Target::Version { skill, name };
                 self.mode = Mode::Editing(Editor::new(target, token, from, &body));
             }
-            'E' => {
+            Act::SkillsEditExternally => {
                 ctx.emit(Action::EditExternally(ExternalEdit {
                     text: body.clone(),
                     stem: name.clone(),
@@ -851,7 +913,7 @@ impl LibraryView {
                     resume: false,
                 });
             }
-            'i' => {
+            Act::LibraryInfo => {
                 self.mode = Mode::Info(InfoForm {
                     skill,
                     token: entry.skill.updated_at,
@@ -860,20 +922,22 @@ impl LibraryView {
                     focus: 0,
                 });
             }
-            'a' => self.attach = Some(AttachPane::new(skill)),
+            Act::LibraryAttach => self.attach = Some(AttachPane::new(skill)),
             _ => {}
         }
     }
 
     /// `n`'s two prompts. A refused name keeps the prompt open, so a typo is one `Backspace` away.
-    fn on_naming_key(&mut self, key: KeyEvent) -> Handled {
+    /// The field sees a key first (`Enter` and `Esc` are its own); what it passes goes to
+    /// [`prompt_rest`].
+    fn on_naming_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Naming { field } | Mode::Describing { field, .. } => field.on_key(key),
             _ => return Handled::Pass,
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => prompt_rest(key, ctx),
             FieldOutcome::Cancel => {
                 self.mode = Mode::Browse;
                 self.notice = None;
@@ -907,7 +971,7 @@ impl LibraryView {
         };
         match field.on_key(key) {
             FieldOutcome::Consumed => Handled::Consumed,
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => prompt_rest(key, ctx),
             FieldOutcome::Cancel => {
                 self.mode = Mode::Browse;
                 self.notice = None;
@@ -933,32 +997,32 @@ impl LibraryView {
         }
     }
 
-    /// The import report: `j`/`k` move, `J`/`K` scroll, `r` re-reads the library behind it, `Esc`
-    /// returns to Browse. Every other key passes, so the tab and the shell keep theirs.
+    /// The import report, through `views::LIBRARY_REPORT`: `list.down`/`up` move, the pane acts
+    /// scroll, `common.reload` re-reads the library behind it, `common.back` returns to Browse.
+    /// Every other key passes, so the tab and the shell keep theirs.
     fn on_report_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if !plain(&key) {
-            return Handled::Pass;
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::LIBRARY_REPORT, chord) {
+            let Mode::Report { outcomes, cursor } = &mut self.mode else {
+                return Handled::Pass;
+            };
+            match act {
+                Act::Back => {
+                    self.mode = Mode::Browse;
+                    self.notice = None;
+                    self.scroll.reset();
+                }
+                Act::ListDown => *cursor = (*cursor + 1).min(outcomes.len().saturating_sub(1)),
+                Act::ListUp => *cursor = cursor.saturating_sub(1),
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.pane_rows.get());
+                }
+                Act::Reload => ctx.request(StoreRequest::Skills(ctx.scope.clone())),
+                _ => continue,
+            }
+            return Handled::Consumed;
         }
-        let Mode::Report { outcomes, cursor } = &mut self.mode else {
-            return Handled::Pass;
-        };
-        match key.code {
-            KeyCode::Esc => {
-                self.mode = Mode::Browse;
-                self.notice = None;
-                self.scroll.reset();
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                *cursor = (*cursor + 1).min(outcomes.len().saturating_sub(1));
-            }
-            KeyCode::Char('k') | KeyCode::Up => *cursor = cursor.saturating_sub(1),
-            KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
-                return self.scroll.on_key(key, self.pane_rows.get());
-            }
-            KeyCode::Char('r') => ctx.request(StoreRequest::Skills(ctx.scope.clone())),
-            _ => return Handled::Pass,
-        }
-        Handled::Consumed
+        Handled::Pass
     }
 
     /// `Enter` on a new name (D71): an invalid or taken name is refused and the prompt stays;
@@ -985,12 +1049,11 @@ impl LibraryView {
         };
     }
 
-    /// The rename form: `Tab`/`Shift+Tab`/arrows move, `Enter` or `Ctrl+S` save, `Esc` closes.
+    /// The rename form, widget first (MOD-67 M4 PA-3): the focused field's `Enter` saves and its
+    /// `Esc` closes; what it passes resolves through `views::LIBRARY_INFO`, where
+    /// `form.next_field`/`prev_field` (`Tab`, `Shift+Tab`, `Down`, `Up`) move and `form.save`
+    /// (`Ctrl+s`) saves. Any other key is `modal_rest`'s.
     fn on_info_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if chord(&key) && matches!(key.code, KeyCode::Char('s' | 'S')) {
-            self.save_info(ctx);
-            return Handled::Consumed;
-        }
         let Mode::Info(form) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -1014,14 +1077,20 @@ impl LibraryView {
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass => match key.code {
-                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                    form.focus = 1 - form.focus;
-                    Handled::Consumed
+            FieldOutcome::Pass => {
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(views::LIBRARY_INFO, chord).first() {
+                    Some(Act::FormNextField | Act::FormPrevField) => {
+                        form.focus = 1 - form.focus;
+                        Handled::Consumed
+                    }
+                    Some(Act::FormSave) => {
+                        self.save_info(ctx);
+                        Handled::Consumed
+                    }
+                    _ => modal_rest(views::LIBRARY_INFO, chord),
                 }
-                _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-                _ => Handled::Consumed,
-            },
+            }
         }
     }
 
@@ -1066,24 +1135,19 @@ impl LibraryView {
         );
     }
 
-    /// The editor: `Ctrl+S` (the area's `Submit`), `Ctrl+G`, `Ctrl+E` and `Esc` are the view's;
-    /// `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept; everything else
-    /// is text. An open agent help (MOD-55) takes every key first: the draft is locked under it,
-    /// and `Ctrl+S`/`Ctrl+E`/`Ctrl+G` are refused until it closes.
+    /// The editor, widget first (MOD-67 M4 PA-3): the area takes text and `Esc` (its `Cancel`);
+    /// every chord it passes, `ctrl-s` included (D6), resolves through `views::LIBRARY_EDITOR`:
+    /// `form.save` saves, `skills.ask_agent` opens the agent help, `form.external_editor` hands the
+    /// draft to `$EDITOR`, and `global.next_tab`/`prev_tab` pass so the shell switches tabs with
+    /// the draft kept (PA-2). Any other key is `modal_rest`'s. An open agent help (MOD-55) takes
+    /// every key first: the draft is locked under it, and the editor's verbs are refused until it
+    /// closes.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if let Mode::Editing(editor) = &mut self.mode
             && let Some(help) = editor.help.as_mut()
         {
             let outcome = help.on_key(key, ctx);
             return self.apply_help(outcome);
-        }
-        if chord(&key) && matches!(key.code, KeyCode::Char('g' | 'G')) {
-            self.open_help(ctx);
-            return Handled::Consumed;
-        }
-        if chord(&key) && matches!(key.code, KeyCode::Char('e' | 'E')) {
-            self.hand_off(ctx);
-            return Handled::Consumed;
         }
         let busy = self.busy;
         let page = self.page.get();
@@ -1097,10 +1161,6 @@ impl LibraryView {
                     editor.esc_armed = false;
                     self.notice = None;
                 }
-                Handled::Consumed
-            }
-            FieldOutcome::Submit => {
-                self.save_editor(ctx);
                 Handled::Consumed
             }
             FieldOutcome::Cancel => {
@@ -1117,7 +1177,19 @@ impl LibraryView {
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass => Handled::Pass,
+            // A `TextArea` never submits since MOD-67 M4 D6: `ctrl-s` passes, and only
+            // `form.save` below saves.
+            FieldOutcome::Submit | FieldOutcome::Pass => {
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(views::LIBRARY_EDITOR, chord).first() {
+                    Some(Act::FormSave) => self.save_editor(ctx),
+                    Some(Act::SkillsAskAgent) => self.open_help(ctx),
+                    Some(Act::FormExternalEditor) => self.hand_off(ctx),
+                    Some(Act::NextTab | Act::PrevTab) => return Handled::Pass,
+                    _ => return modal_rest(views::LIBRARY_EDITOR, chord),
+                }
+                Handled::Consumed
+            }
         }
     }
 
@@ -1269,7 +1341,8 @@ impl LibraryView {
             return Handled::Pass;
         };
         // The form's save is in flight: its reply closes the form or keeps it, so `Esc` waits for
-        // it, as the editor's does.
+        // it, as the editor's does. `Esc` is the form's own cancel key (widget-owned, MOD-67 M4
+        // D10), not a resolved act.
         if let Some(busy) = self.busy
             && pane.in_form()
             && key.code == KeyCode::Esc
@@ -1598,7 +1671,8 @@ impl LibraryView {
         let mut block = Block::new().borders(Borders::ALL).title(title);
         let visible = usize::from(pane_area.height.saturating_sub(2));
         if rows > visible || self.scroll.offset() > 0 {
-            block = block.title_bottom(Line::styled(SCROLL_HINT, theme.dim).right_aligned());
+            let hint = format!(" {} ", ctx.keys().hint(views::LIBRARY_BROWSE, SCROLL_HINT));
+            block = block.title_bottom(Line::styled(hint, theme.dim).right_aligned());
         }
         let inner = block.inner(pane_area);
         frame.render_widget(block, pane_area);
@@ -1861,6 +1935,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::TimeDelta;
+    use crossterm::event::KeyModifiers;
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
     use htui_core::model::{Attachment, ProjectRef, Scope, SkillBindingKey, StepId};
@@ -2413,7 +2488,7 @@ mod tests {
             "{title:?}"
         );
         let hint = line(area.bottom() - 1, 0, area.width);
-        assert!(hint.contains(HANDED_OFF_HINT), "{hint:?}");
+        assert!(hint.contains("the draft is in $EDITOR"), "{hint:?}");
 
         // Browse's `E` (F-12) has no draft to draw: the pane takes the tab body.
         let target = Target::New {

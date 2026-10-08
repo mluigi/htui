@@ -6,6 +6,9 @@
 //! so a form saves on `Ctrl+S` from any field, and on `Enter` only from a one-line last field
 //! (MOD-39 blueprint F-1). A form answers each key with a [`FormOutcome`]; the tab validates and
 //! sends, so what a form holds never reaches the store but through `StoreRequest`.
+//!
+//! MOD-67 M4: a form sees only plain keys, and only the keys its focused widget uses are the
+//! form's: the field moves and the save are acts the tab resolves on a [`FormOutcome::Pass`].
 
 use htui_core::model::{Priority, ProjectId, RequirementAreaId, RequirementId};
 use ratatui::Frame;
@@ -33,6 +36,8 @@ pub(super) enum FormOutcome {
     Cancel,
     /// Validate and send (or, for a withdraw's first stage, go on).
     Submit,
+    /// A key the focused widget did not use: the tab resolves it (MOD-67 M4).
+    Pass,
 }
 
 /// `a`: a new area in a project.
@@ -76,8 +81,16 @@ impl AreaForm {
         };
     }
 
-    /// A key that is not a `CONTROL` chord: `Tab`/`Shift+Tab`/`Up`/`Down` switch field, `Enter`
-    /// on the code moves to the title and on the title submits, `Esc` cancels.
+    /// The other field (`form.next_field` and `form.prev_field`: two fields, one toggle).
+    pub(super) fn toggle(&mut self) {
+        self.focus = match self.focus {
+            AreaFocus::Code => AreaFocus::Title,
+            AreaFocus::Title => AreaFocus::Code,
+        };
+    }
+
+    /// A plain key: `Enter` on the code moves to the title and on the title submits, `Esc`
+    /// cancels; a key the field does not use passes (the tab moves the focus on it, MOD-67 M4).
     pub(super) fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
         let field = match self.focus {
             AreaFocus::Code => &mut self.code,
@@ -90,19 +103,8 @@ impl AreaForm {
             }
             FieldOutcome::Submit => FormOutcome::Submit,
             FieldOutcome::Cancel => FormOutcome::Cancel,
-            FieldOutcome::Pass
-                if matches!(
-                    key.code,
-                    KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down
-                ) =>
-            {
-                self.focus = match self.focus {
-                    AreaFocus::Code => AreaFocus::Title,
-                    AreaFocus::Title => AreaFocus::Code,
-                };
-                FormOutcome::Stay
-            }
-            FieldOutcome::Consumed | FieldOutcome::Pass => FormOutcome::Stay,
+            FieldOutcome::Consumed => FormOutcome::Stay,
+            FieldOutcome::Pass => FormOutcome::Pass,
         }
     }
 
@@ -270,8 +272,8 @@ impl RequirementForm {
         }
     }
 
-    /// The next (`forward`) or previous field, wrapping.
-    fn cycle(&mut self, forward: bool) {
+    /// The next (`forward`) or previous field, wrapping (`form.next_field`, `form.prev_field`).
+    pub(super) fn cycle(&mut self, forward: bool) {
         let order = self.order();
         let at = order
             .iter()
@@ -285,7 +287,6 @@ impl RequirementForm {
         self.focus = order[next];
     }
 
-    /// A key that is not a `CONTROL` chord (the tab took `Ctrl+S`): `Tab`/`Shift+Tab` cycle
     /// A bracketed paste into the focused field (MOD-22 review M-1). The priority toggle is not a
     /// field: a paste there is dropped, so its `m` and `l` toggle nothing.
     pub(super) fn on_paste(&mut self, text: &str) {
@@ -299,20 +300,11 @@ impl RequirementForm {
         }
     }
 
-    /// `Body → Rationale → Priority (→ Deciding)`; on the priority `m` is must, `l` later and
-    /// `Space`/`←`/`→` toggle; `Enter` on the deciding key submits; `Esc` anywhere cancels.
+    /// A plain key to the focused field: on the priority `m` is must, `l` later and
+    /// `Space`/`←`/`→` toggle (the choice's value keys, MOD-67 M4 D10); `Enter` on the deciding
+    /// key submits; `Esc` anywhere cancels. A key the field does not use passes: the tab moves the
+    /// focus `Body → Rationale → Priority (→ Deciding)` or saves on it.
     pub(super) fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
-        match key.code {
-            KeyCode::Tab => {
-                self.cycle(true);
-                return FormOutcome::Stay;
-            }
-            KeyCode::BackTab => {
-                self.cycle(false);
-                return FormOutcome::Stay;
-            }
-            _ => {}
-        }
         match self.focus {
             FormFocus::Body | FormFocus::Rationale => {
                 let area = if self.focus == FormFocus::Body {
@@ -322,8 +314,10 @@ impl RequirementForm {
                 };
                 match area.on_key(key, PAGE) {
                     FieldOutcome::Cancel => FormOutcome::Cancel,
-                    FieldOutcome::Submit => FormOutcome::Submit,
-                    FieldOutcome::Consumed | FieldOutcome::Pass => FormOutcome::Stay,
+                    FieldOutcome::Consumed => FormOutcome::Stay,
+                    // A `TextArea` never submits since MOD-67 M4 D6: `ctrl-s` passes, and only
+                    // `form.save` saves.
+                    FieldOutcome::Submit | FieldOutcome::Pass => FormOutcome::Pass,
                 }
             }
             FormFocus::Priority => {
@@ -337,14 +331,15 @@ impl RequirementForm {
                         };
                     }
                     KeyCode::Esc => return FormOutcome::Cancel,
-                    _ => {}
+                    _ => return FormOutcome::Pass,
                 }
                 FormOutcome::Stay
             }
             FormFocus::Deciding => match self.deciding.on_key(key) {
                 FieldOutcome::Submit => FormOutcome::Submit,
                 FieldOutcome::Cancel => FormOutcome::Cancel,
-                FieldOutcome::Consumed | FieldOutcome::Pass => FormOutcome::Stay,
+                FieldOutcome::Consumed => FormOutcome::Stay,
+                FieldOutcome::Pass => FormOutcome::Pass,
             },
         }
     }
@@ -506,8 +501,8 @@ impl WithdrawForm {
         };
     }
 
-    /// A key that is not a `CONTROL` chord: the stage's field takes it; `Enter` submits the
-    /// stage, `Esc` cancels.
+    /// A plain key: the stage's field takes it; `Enter` submits the stage, `Esc` cancels, a key
+    /// the field does not use passes (MOD-67 M4).
     pub(super) fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
         let field = match self {
             Self::Deciding { field, .. } | Self::Typed { field, .. } => field,
@@ -515,7 +510,8 @@ impl WithdrawForm {
         match field.on_key(key) {
             FieldOutcome::Submit => FormOutcome::Submit,
             FieldOutcome::Cancel => FormOutcome::Cancel,
-            FieldOutcome::Consumed | FieldOutcome::Pass => FormOutcome::Stay,
+            FieldOutcome::Consumed => FormOutcome::Stay,
+            FieldOutcome::Pass => FormOutcome::Pass,
         }
     }
 

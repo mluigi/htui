@@ -82,7 +82,7 @@ mod binary {
         assert_eq!(stderr, "");
         assert_eq!(stdout, print(&load_path(&valid).expect("valid.toml loads")));
         assert!(
-            stdout.contains("quit         = [\"ctrl-x\"]   # quit (changed)\n"),
+            stdout.contains("quit         = [\"ctrl-y\"]   # quit (changed)\n"),
             "{stdout}"
         );
         assert!(
@@ -116,7 +116,8 @@ mod binary {
                      confirm, form, common, editor, settings, settings.agents, settings.hierarchy, \
                      settings.kinds, settings.prompt, settings.connection, settings.qdrant, \
                      settings.boxes, settings.personas, settings.secrets, settings.queue, \
-                     concepts, switcher, migration, waiting"
+                     concepts, switcher, migration, waiting, skills, skills.library, \
+                     skills.templates, skills.attach, skills.help, requirements"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
@@ -125,6 +126,8 @@ mod binary {
                         .to_owned(),
                     r#"13: [global] quit = "shift-a": write a shifted letter as "A""#.to_owned(),
                     r#"13: [global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
+                        .to_owned(),
+                    r#"13: [global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#
                         .to_owned(),
                 ],
             ),
@@ -157,6 +160,8 @@ mod binary {
                     r#"6: [global] help = "esc": "esc" is already common.dismiss (default) in Settings > Agents"#
                         .to_owned(),
                     r#"6: [global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
+                        .to_owned(),
+                    r#"6: [global] help = "esc": "esc" is already common.back (default) in the Library import report"#
                         .to_owned(),
                     r#"9: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),
@@ -301,6 +306,25 @@ mod binary {
         assert_eq!(stderr, report("both", &path, &[line.to_owned()]));
     }
 
+    /// MOD-67 M4 D8.1 end to end: a file that leaves the in-pane editor no way out is refused
+    /// before anything starts, on the entry's line.
+    #[test]
+    fn an_editor_file_that_unbinds_focus_exits_2() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = home.path().join("editor.toml");
+        std::fs::write(&path, "[editor]\nfocus = []\n").expect("the file is written");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert_eq!(stdout, "");
+        let line = "2: [editor] focus: must keep at least one chord: the in-pane editor is left \
+                    only through it";
+        assert_eq!(stderr, report("editor", &path, &[line.to_owned()]));
+    }
+
     #[test]
     fn keys_and_default_keys_are_refused_together() {
         let home = tempfile::tempdir().expect("a throwaway home");
@@ -410,14 +434,14 @@ mod app {
         assert!(!harness.app().should_quit, "`q` no longer quits");
         let frame = harness.render();
         assert!(
-            status_line(&frame).starts_with("Ctrl+x quit · Tab next tab"),
+            status_line(&frame).starts_with("Ctrl+y quit · Tab next tab"),
             "{frame}"
         );
 
         harness.key("?");
         assert!(harness.app().help_visible, "`?` opens the box");
         let frame = harness.render();
-        assert!(frame.contains("Ctrl+x/Ctrl+c quit"), "{frame}");
+        assert!(frame.contains("Ctrl+y/Ctrl+c quit"), "{frame}");
         harness.key("?");
         assert!(!harness.app().help_visible, "`?` closes it");
 
@@ -442,8 +466,8 @@ mod app {
         harness.key("esc");
         assert!(harness.app().overlays.is_empty(), "`Esc` still closes it");
 
-        harness.key("ctrl-x");
-        assert!(harness.app().should_quit, "`Ctrl+x` quits");
+        harness.key("ctrl-y");
+        assert!(harness.app().should_quit, "`Ctrl+y` quits");
     }
 
     /// MOD-12 M3 R1 H1: the shell over a file that gives `ctrl-q` to quit starts, shows quit on

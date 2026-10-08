@@ -16,7 +16,7 @@
 
 use core::cell::Cell;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use htui_agent::event::{DriverEvent, StopReason};
 use htui_core::model::{AgentId, ProjectId, StepId};
 use htui_core::prompt::edit_help::{self, HelpPrompt, HelpTarget};
@@ -25,11 +25,13 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use crate::app::Ctx;
+use crate::app::{Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{ChatFrame, EDIT_HELP, StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::tabs::backlog::detail::Scroll;
-use crate::ui::{TextField, Theme, diff};
+use crate::ui::tabs::settings::modal_rest;
+use crate::ui::{FieldOutcome, TextField, Theme, diff};
 
 /// `StoreRequest::ChatCancel`'s request name: its `Failed` (the chat ended before the cancel
 /// reached it) is a cancelling help's end (H-1).
@@ -67,6 +69,38 @@ const MASKED: &str = "the proposal holds [REDACTED] where a masked value was \u{
 /// What a view says once an accepted proposal replaced its buffer.
 pub(super) const ACCEPTED: &str = "proposal accepted \u{2014} Ctrl+S saves it";
 
+/// The hint while the request is typed (MOD-67 M4 D9): `Enter` and `Esc` are the field's.
+const ASKING_HINT: HintSpec = &[
+    Hint::Text("Enter ask"),
+    Hint::Pair(Act::SkillsHelpPrevAgent, Act::SkillsHelpNextAgent, "agent"),
+    Hint::Text("Esc back"),
+];
+
+/// The hint once a cancel is on its way.
+const CANCELLING_HINT: HintSpec = &[Hint::Text(CANCELLING)];
+
+/// The hint while the agent works.
+const WAITING_HINT: HintSpec = &[
+    Hint::Text("waiting for the agent"),
+    Hint::One(Act::SkillsHelpCancel, "cancel"),
+];
+
+/// The hint over a proposal.
+const PROPOSAL_HINT: HintSpec = &[
+    Hint::One(Act::SkillsHelpAccept, "accept"),
+    Hint::All(Act::ConfirmNo, "discard"),
+    Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
+    Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
+];
+
+/// The hint over an answer with nothing to accept: `skills.help.accept` closes it too.
+const ANSWERED_HINT: HintSpec = &[
+    Hint::Text("nothing to accept"),
+    Hint::One(Act::SkillsHelpAccept, "close"),
+    Hint::All(Act::ConfirmNo, "close"),
+    Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
+];
+
 /// The panel's height under the draft, borders included: the request line and the agent line.
 const PANEL_HEIGHT: u16 = 4;
 
@@ -87,7 +121,8 @@ pub(super) enum Report {
 pub(super) enum HelpOutcome {
     /// Taken; nothing for the view to do.
     Consumed,
-    /// Not the help's: `Tab`/`Shift+Tab` and chords it does not own go to the shell.
+    /// Not the help's: `global.next_tab`/`prev_tab` and what the stack's modal global layer lets
+    /// through (CONTROL, ALT, function keys) go to the shell.
     Pass,
     /// The help stays open; the view shows this.
     Note(Report),
@@ -232,9 +267,14 @@ impl core::fmt::Debug for AgentHelp {
     }
 }
 
-/// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
-fn plain(key: &KeyEvent) -> bool {
-    (key.modifiers - KeyModifiers::SHIFT).is_empty()
+impl From<Handled> for HelpOutcome {
+    /// `modal_rest`'s answer as the help's (MOD-67 M4, L-A §6.2).
+    fn from(handled: Handled) -> Self {
+        match handled {
+            Handled::Consumed => Self::Consumed,
+            Handled::Pass => Self::Pass,
+        }
+    }
 }
 
 impl AgentHelp {
@@ -255,79 +295,74 @@ impl AgentHelp {
         }
     }
 
-    /// A key while the help is open (blueprint §4.2; first match wins).
+    /// The stack of the help's state (MOD-67 M4 D4, D7): `HELP_ASKING`, `HELP_WAITING`
+    /// (starting, streaming, cancelling) or `HELP_PROPOSAL` (proposal, answered).
+    pub(super) const fn key_stack(&self) -> Stack<'static> {
+        match self.state {
+            State::Asking => views::HELP_ASKING,
+            State::Starting { .. } | State::Streaming { .. } | State::Cancelling => {
+                views::HELP_WAITING
+            }
+            State::Proposal { .. } | State::Answered { .. } => views::HELP_PROPOSAL,
+        }
+    }
+
+    /// The stack of the editor under the help, whose verbs (`form.save`,
+    /// `form.external_editor`, `skills.ask_agent`) are refused while the help is open.
+    const fn editor_stack(&self) -> Stack<'static> {
+        match self.target {
+            HelpTarget::Skill { .. } => views::LIBRARY_EDITOR,
+            HelpTarget::Template { .. } => views::TEMPLATES_EDITOR,
+        }
+    }
+
+    /// A key while the help is open (blueprint §4.2, MOD-67 M4 D7). The request field sees a
+    /// key first while asking (`Enter` asks, `Esc` closes); then the state's own acts through
+    /// [`key_stack`](Self::key_stack); then the editor's verbs, resolved through the editor's
+    /// stack (a rebound one too), are refused with a note; `global.next_tab`/`prev_tab` pass,
+    /// the draft kept (PA-2); anything else is `modal_rest`'s: CONTROL, ALT and function keys
+    /// pass, the rest is taken, so the draft under the help is locked.
     pub(super) fn on_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> HelpOutcome {
-        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+        if matches!(self.state, State::Asking) {
+            match self.request.on_key(key) {
+                FieldOutcome::Consumed => return HelpOutcome::Consumed,
+                FieldOutcome::Submit => return self.ask(ctx),
+                FieldOutcome::Cancel => return HelpOutcome::Close(None),
+                FieldOutcome::Pass => {}
+            }
+        }
+        let stack = self.key_stack();
+        let chord = KeyChord::from_event(key);
+        let act = ctx.keys().actions(stack, chord).first().copied();
+        if let Some(outcome) = act.and_then(|act| self.on_act(act, ctx)) {
+            return outcome;
+        }
+        let refused = ctx
+            .keys()
+            .actions(self.editor_stack(), chord)
+            .iter()
+            .any(|act| {
+                matches!(
+                    act,
+                    Act::FormSave | Act::FormExternalEditor | Act::SkillsAskAgent
+                )
+            });
+        if refused {
+            return HelpOutcome::Note(Report::Info(HELP_OPEN.to_owned()));
+        }
+        if matches!(act, Some(Act::NextTab | Act::PrevTab)) {
             return HelpOutcome::Pass;
         }
-        if key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL {
-            return if matches!(key.code, KeyCode::Char('s' | 'S' | 'e' | 'E' | 'g' | 'G')) {
-                HelpOutcome::Note(Report::Info(HELP_OPEN.to_owned()))
-            } else {
-                HelpOutcome::Pass
-            };
-        }
-        match &mut self.state {
-            State::Asking => self.on_asking_key(key, ctx),
-            State::Starting { cancel, .. } => {
-                if key.code == KeyCode::Esc {
-                    *cancel = true;
-                    return HelpOutcome::Note(Report::Info(CANCELLING.to_owned()));
-                }
-                HelpOutcome::Consumed
-            }
-            State::Streaming { step_id, .. } => {
-                if key.code == KeyCode::Esc {
-                    ctx.request(StoreRequest::ChatCancel { step_id: *step_id });
-                    self.state = State::Cancelling;
-                    return HelpOutcome::Note(Report::Info(CANCELLING.to_owned()));
-                }
-                HelpOutcome::Consumed
-            }
-            State::Cancelling => HelpOutcome::Consumed,
-            State::Proposal {
-                proposed,
-                masked,
-                armed,
-                ..
-            } => match key.code {
-                KeyCode::Enter | KeyCode::Char('y') if plain(&key) => {
-                    if *masked && !*armed {
-                        *armed = true;
-                        HelpOutcome::Note(Report::Error(MASKED.to_owned()))
-                    } else {
-                        HelpOutcome::Accept(core::mem::take(proposed))
-                    }
-                }
-                KeyCode::Esc | KeyCode::Char('n') if plain(&key) => {
-                    HelpOutcome::Close(Some(Report::Info(DISCARDED.to_owned())))
-                }
-                _ => self.scroll_key(key),
-            },
-            State::Answered { .. } => match key.code {
-                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('n') if plain(&key) => {
-                    HelpOutcome::Close(None)
-                }
-                _ => self.scroll_key(key),
-            },
-        }
+        modal_rest(stack, chord).into()
     }
 
-    /// `J`/`K`/`PageDown`/`PageUp` over the Proposal/Answered pane; anything else is taken.
-    fn scroll_key(&mut self, key: KeyEvent) -> HelpOutcome {
-        if plain(&key) {
-            self.scroll.on_key(key, self.rows.get());
-        }
-        HelpOutcome::Consumed
-    }
-
-    /// Asking: the agent choice, the send, the close, and the request's text.
-    fn on_asking_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> HelpOutcome {
+    /// One of the state's own acts; `None` when the state has no use for `act`.
+    fn on_act(&mut self, act: Act, ctx: &Ctx<'_>) -> Option<HelpOutcome> {
         let count = self.agents.as_ref().map_or(0, Vec::len);
-        match key.code {
-            KeyCode::Up | KeyCode::Down if plain(&key) => {
+        let outcome = match (&mut self.state, act) {
+            (State::Asking, Act::SkillsHelpPrevAgent | Act::SkillsHelpNextAgent) => {
                 if count > 0 {
-                    self.agent = if key.code == KeyCode::Down {
+                    self.agent = if act == Act::SkillsHelpNextAgent {
                         (self.agent + 1) % count
                     } else {
                         (self.agent + count - 1) % count
@@ -335,13 +370,45 @@ impl AgentHelp {
                 }
                 HelpOutcome::Consumed
             }
-            KeyCode::Enter if plain(&key) => self.ask(ctx),
-            KeyCode::Esc if plain(&key) => HelpOutcome::Close(None),
-            _ => {
-                self.request.on_key(key);
-                HelpOutcome::Consumed
+            (State::Starting { cancel, .. }, Act::SkillsHelpCancel) => {
+                *cancel = true;
+                HelpOutcome::Note(Report::Info(CANCELLING.to_owned()))
             }
-        }
+            (State::Streaming { step_id, .. }, Act::SkillsHelpCancel) => {
+                ctx.request(StoreRequest::ChatCancel { step_id: *step_id });
+                self.state = State::Cancelling;
+                HelpOutcome::Note(Report::Info(CANCELLING.to_owned()))
+            }
+            (State::Cancelling, Act::SkillsHelpCancel) => HelpOutcome::Consumed,
+            (
+                State::Proposal {
+                    proposed,
+                    masked,
+                    armed,
+                    ..
+                },
+                Act::SkillsHelpAccept,
+            ) => {
+                if *masked && !*armed {
+                    *armed = true;
+                    HelpOutcome::Note(Report::Error(MASKED.to_owned()))
+                } else {
+                    HelpOutcome::Accept(core::mem::take(proposed))
+                }
+            }
+            (State::Proposal { .. }, Act::ConfirmNo) => {
+                HelpOutcome::Close(Some(Report::Info(DISCARDED.to_owned())))
+            }
+            (State::Answered { .. }, Act::ConfirmNo | Act::SkillsHelpAccept) => {
+                HelpOutcome::Close(None)
+            }
+            (
+                State::Proposal { .. } | State::Answered { .. },
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp,
+            ) => self.scroll.apply(act, self.rows.get()).into(),
+            _ => return None,
+        };
+        Some(outcome)
     }
 
     /// `Enter` while asking: the request goes out, or a note says why not.
@@ -517,15 +584,17 @@ impl AgentHelp {
         }
     }
 
-    /// The hint row while the help is open.
-    pub(super) fn hint(&self) -> &'static str {
-        match self.state {
-            State::Asking => "Enter ask  Up/Down agent  Esc back",
-            State::Starting { cancel: true, .. } | State::Cancelling => CANCELLING,
-            State::Starting { .. } | State::Streaming { .. } => "waiting for the agent  Esc cancel",
-            State::Proposal { .. } => "Enter accept  Esc discard  J/K PgUp/PgDn scroll",
-            State::Answered { .. } => "nothing to accept  Esc close  J/K scroll",
-        }
+    /// The hint row while the help is open, through [`key_stack`](Self::key_stack) (MOD-67 M4
+    /// D9).
+    pub(super) fn hint(&self, keys: &Keys) -> String {
+        let spec = match self.state {
+            State::Asking => ASKING_HINT,
+            State::Starting { cancel: true, .. } | State::Cancelling => CANCELLING_HINT,
+            State::Starting { .. } | State::Streaming { .. } => WAITING_HINT,
+            State::Proposal { .. } => PROPOSAL_HINT,
+            State::Answered { .. } => ANSWERED_HINT,
+        };
+        keys.hint(self.key_stack(), spec)
     }
 
     /// Draws into `area` (B-2); returns the rect left for the locked draft, `None` when the help
@@ -726,6 +795,7 @@ pub(super) mod fixtures {
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::Scope;
     use ratatui::Terminal;
@@ -735,6 +805,7 @@ mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
+    use crate::keys::{Context, Keys, load_str, views};
     use crate::store_worker::Origin;
     use crate::ui::tabs::SkillsTab;
 
@@ -750,6 +821,8 @@ mod tests {
         theme: Theme,
         /// What the help emitted.
         emit: Emit,
+        /// A rebound table, else the compiled defaults.
+        keys: Option<Keys>,
     }
 
     impl Bench {
@@ -763,11 +836,20 @@ mod tests {
                 keymap: Keymap::default_global(),
                 theme: Theme::default(),
                 emit: Emit::default(),
+                keys: None,
+            }
+        }
+
+        /// A bench whose `Ctx` hands out `src` loaded as a key file.
+        fn with_keys(src: &str) -> Self {
+            Self {
+                keys: Some(load_str(src).expect("the test's key file loads")),
+                ..Self::new()
             }
         }
 
         fn ctx(&self) -> Ctx<'_> {
-            Ctx::new(
+            let ctx = Ctx::new(
                 &self.scope,
                 &[],
                 &self.top_bar,
@@ -775,7 +857,11 @@ mod tests {
                 &self.theme,
                 Origin::Tab(SkillsTab::ID),
                 &self.emit,
-            )
+            );
+            match &self.keys {
+                Some(keys) => ctx.with_keys(keys),
+                None => ctx,
+            }
         }
 
         /// The requests emitted since the last drain.
@@ -865,7 +951,10 @@ mod tests {
         let help = AgentHelp::open(target(), ids::PROJECT_VULKAN, "body", &bench.ctx());
         assert!(matches!(bench.sent().as_slice(), [StoreRequest::Agents]));
         assert!(matches!(help.state, State::Asking));
-        assert_eq!(help.hint(), "Enter ask  Up/Down agent  Esc back");
+        assert_eq!(
+            help.hint(Keys::compiled()),
+            "Enter ask \u{b7} Up/Down agent \u{b7} Esc back"
+        );
     }
 
     /// H-2: the first enabled agent is the default, and `Enter` sends the body as it was when the
@@ -902,7 +991,10 @@ mod tests {
             matches!(&help.state, State::Starting { agent, cancel: false } if agent == "c"),
             "{help:?}"
         );
-        assert_eq!(help.hint(), "waiting for the agent  Esc cancel");
+        assert_eq!(
+            help.hint(Keys::compiled()),
+            "waiting for the agent \u{b7} Esc cancel"
+        );
     }
 
     /// H-3: `Up`/`Down` cycle the enabled agents and wrap.
@@ -977,8 +1069,8 @@ mod tests {
         assert!(unified.contains("+new"), "{unified}");
         assert!(!masked && !armed);
         assert_eq!(
-            help.hint(),
-            "Enter accept  Esc discard  J/K PgUp/PgDn scroll"
+            help.hint(Keys::compiled()),
+            "Enter accept \u{b7} n/Esc discard \u{b7} J/K scroll \u{b7} PgUp/PgDn page"
         );
     }
 
@@ -991,7 +1083,16 @@ mod tests {
             matches!(&help.state, State::Answered { text, same: false, .. } if text == "It reads fine as it is."),
             "{help:?}"
         );
-        assert_eq!(help.hint(), "nothing to accept  Esc close  J/K scroll");
+        assert_eq!(
+            help.hint(Keys::compiled()),
+            "nothing to accept \u{b7} Enter close \u{b7} n/Esc close \u{b7} J/K scroll"
+        );
+        // MOD-67 M4 R1: `skills.help.accept` closes an answer too, and its hint follows a rebind.
+        let keys = Keys::defaults().with_chords(Context::SkillsHelp, Act::SkillsHelpAccept, &["a"]);
+        assert_eq!(
+            help.hint(&keys),
+            "nothing to accept \u{b7} a close \u{b7} n/Esc close \u{b7} J/K scroll"
+        );
 
         let help = answered(&bench, "old\n", "Unchanged:\n```\nold\n```\n");
         assert!(
@@ -1096,7 +1197,7 @@ mod tests {
                 matches!(sent.as_slice(), [StoreRequest::ChatCancel { step_id }] if *step_id == step),
                 "{sent:?}"
             );
-            assert_eq!(help.hint(), "cancelling\u{2026}");
+            assert_eq!(help.hint(Keys::compiled()), "cancelling\u{2026}");
             assert_eq!(
                 help.on_key(plain(KeyCode::Esc), &bench.ctx()),
                 HelpOutcome::Consumed,
@@ -1444,5 +1545,81 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// MOD-67 M4 D7: the editor's verbs are refused through its own stack, so a rebound one is
+    /// refused and the old chord is just a chord the help passes.
+    #[test]
+    fn a_rebound_ask_agent_is_refused_while_open() {
+        let bench = Bench::with_keys("[skills]\nask_agent = \"f3\"\n");
+        let open = HelpOutcome::Note(Report::Info(HELP_OPEN.to_owned()));
+        let mut helps = vec![
+            asking(&bench, "old\n"),
+            streaming(&bench, "old\n", StepId::new()),
+        ];
+        helps.push(answered(&bench, "old\n", "```\nnew\n```"));
+        for mut help in helps {
+            assert_eq!(
+                help.on_key(plain(KeyCode::F(3)), &bench.ctx()),
+                open,
+                "{help:?}"
+            );
+            assert_eq!(
+                help.on_key(ctrl('g'), &bench.ctx()),
+                HelpOutcome::Pass,
+                "{help:?}"
+            );
+        }
+    }
+
+    /// MOD-67 M4 D7 (ANA-26 ALT defect): accepting compares whole chords.
+    #[test]
+    fn alt_y_accepts_nothing() {
+        let bench = Bench::new();
+        let mut help = answered(&bench, "old\n", "```\nnew\n```");
+        assert_eq!(
+            help.on_key(
+                KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+                &bench.ctx()
+            ),
+            HelpOutcome::Pass
+        );
+        assert!(matches!(help.state, State::Proposal { .. }), "{help:?}");
+    }
+
+    /// MOD-67 M4 (blueprint §1 item 5): `F1` reaches the shell's help from every state.
+    #[test]
+    fn f1_passes_from_every_state() {
+        let bench = Bench::new();
+        let helps = [
+            asking(&bench, "old\n"),
+            streaming(&bench, "old\n", StepId::new()),
+            answered(&bench, "old\n", "```\nnew\n```"),
+        ];
+        for mut help in helps {
+            assert_eq!(
+                help.on_key(plain(KeyCode::F(1)), &bench.ctx()),
+                HelpOutcome::Pass,
+                "{help:?}"
+            );
+        }
+        assert!(bench.sent().is_empty());
+    }
+
+    /// MOD-67 M4 D4, D7: the stack is the state's.
+    #[test]
+    fn the_stack_follows_the_state() {
+        let bench = Bench::new();
+        let mut help = asking(&bench, "old\n");
+        assert_eq!(help.key_stack(), views::HELP_ASKING);
+        type_request(&mut help, &bench, "x");
+        help.on_key(plain(KeyCode::Enter), &bench.ctx());
+        assert_eq!(help.key_stack(), views::HELP_WAITING);
+        let help = streaming(&bench, "old\n", StepId::new());
+        assert_eq!(help.key_stack(), views::HELP_WAITING);
+        let help = answered(&bench, "old\n", "```\nnew\n```");
+        assert_eq!(help.key_stack(), views::HELP_PROPOSAL);
+        let help = answered(&bench, "old\n", "no block");
+        assert_eq!(help.key_stack(), views::HELP_PROPOSAL);
     }
 }

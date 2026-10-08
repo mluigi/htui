@@ -206,10 +206,14 @@ impl Stack<'static> {
 
 /// Every stack the validator walks (ANA-26 §7.3, MOD-67 M2 D8 step 5), each with the phrase its
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
-/// ([`views`](super::views)); M4-M5 append theirs.
+/// ([`views`](super::views)). M4 appends the Skills and Requirements stacks and the two editor
+/// stacks (MOD-57 §6.4, D8.2), the editor stacks right after the overlay's, so an `[editor]`
+/// chord is checked against `global.quit` and `global.help`; M5 appends its own.
 pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("on every screen", Stack::BASE),
     ("over an overlay", Stack::OVERLAY),
+    ("in the focused in-pane editor", Stack::EDITOR_FOCUSED),
+    ("in the in-pane editor", Stack::EDITOR_UNFOCUSED),
     ("in Settings", views::SETTINGS_TAB),
     ("while a field captures keys", views::CAPTURE),
     ("in Settings > Agents", views::AGENTS_BROWSE),
@@ -256,6 +260,30 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the workspace switcher", views::SWITCHER),
     ("in the migration prompt", views::MIGRATION),
     ("in the waiting list", views::WAITING_LIST),
+    ("in Skills > Library", views::LIBRARY_BROWSE),
+    (
+        "in a Library name, description or import prompt",
+        views::LIBRARY_PROMPT,
+    ),
+    ("in the Library rename form", views::LIBRARY_INFO),
+    ("in the Library editor", views::LIBRARY_EDITOR),
+    ("in the Library import report", views::LIBRARY_REPORT),
+    ("in Skills > Library > Attachments", views::ATTACH_BROWSE),
+    ("in the Attachments form", views::ATTACH_FORM),
+    ("in the Attachments repo picker", views::ATTACH_PICKER),
+    ("in the Attachments detach question", views::ATTACH_CONFIRM),
+    ("in Skills > Templates", views::TEMPLATES_BROWSE),
+    ("in the Templates name prompt", views::TEMPLATES_PROMPT),
+    ("in the Templates editor", views::TEMPLATES_EDITOR),
+    ("in the agent help prompt", views::HELP_ASKING),
+    ("while the agent help waits", views::HELP_WAITING),
+    ("in the agent help proposal", views::HELP_PROPOSAL),
+    ("in Requirements", views::REQUIREMENTS_BROWSE),
+    ("in a Requirements form", views::REQUIREMENTS_FORM),
+    (
+        "in the Requirements withdraw form",
+        views::REQUIREMENTS_WITHDRAW,
+    ),
 ];
 
 impl Keys {
@@ -299,7 +327,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{DECLARED, Layer, Stack};
-    use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, views};
+    use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, load_str, views};
 
     fn chord(spec: &str) -> KeyChord {
         KeyChord::parse_strict(spec).expect("a valid spec")
@@ -334,9 +362,36 @@ mod tests {
     fn declared_starts_with_base_and_overlay_and_holds_every_view_stack() {
         assert_eq!(DECLARED[0], ("on every screen", Stack::BASE));
         assert_eq!(DECLARED[1], ("over an overlay", Stack::OVERLAY));
-        assert_eq!(DECLARED.len(), 36);
+        // MOD-67 M4 D8.2 (PA-4): the in-pane editor's two stacks, one phrase each.
+        assert_eq!(
+            DECLARED[2],
+            ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
+        );
+        assert_eq!(
+            DECLARED[3],
+            ("in the in-pane editor", Stack::EDITOR_UNFOCUSED)
+        );
+        assert_eq!(DECLARED.len(), 56);
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
+    }
+
+    /// MOD-67 M4 R1 L1: `skills.switch_view` is offered only by the Library and Templates
+    /// browse stacks, so a global chord on its `h` is refused naming those views, never a Skills
+    /// stack no view is ever in.
+    #[test]
+    fn a_global_chord_on_the_view_switch_names_the_skills_views() {
+        let messages: Vec<String> = match load_str("[global]\nhelp = [\"?\", \"f1\", \"h\"]\n") {
+            Ok(_) => panic!("`h` is skills.switch_view's"),
+            Err(errors) => errors.into_iter().map(|error| error.message).collect(),
+        };
+        assert_eq!(
+            messages,
+            [
+                r#"[global] help = "h": "h" is already settings.prev_section (default) in Settings"#,
+                r#"[global] help = "h": "h" is already skills.switch_view (default) in Skills > Library"#,
+            ]
+        );
     }
 
     #[test]

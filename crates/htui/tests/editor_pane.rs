@@ -212,7 +212,7 @@ async fn e_in_templates_edits_in_the_pane_end_to_end() {
         "the view heard `Edited`: {frame}"
     );
     assert!(
-        hint(&frame).contains("Ctrl+S save"),
+        hint(&frame).contains("Ctrl+s save"),
         "the view's editor is open on the draft: {frame}"
     );
     // The appended line, at the draft's end.
@@ -298,7 +298,7 @@ async fn ctrl_e_on_a_draft_edits_over_its_claimed_rect() {
 
     let frame = harness.render();
     assert!(
-        hint(&frame).contains("Ctrl+S save"),
+        hint(&frame).contains("Ctrl+s save"),
         "the draft is back in the view's editor: {frame}"
     );
     assert!(

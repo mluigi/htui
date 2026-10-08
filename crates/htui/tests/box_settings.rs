@@ -1211,10 +1211,11 @@ async fn a_boxes_reload_override_moves_boxes_alone() {
     assert_eq!(harness.queued(), 1, "Prompt still reloads on `r`");
 }
 
-/// MOD-67 M3 (D13): a rebound `form.save` saves the quirks editor under its new chord and the
-/// hint names it; the `TextArea`'s own `ctrl-s` still saves too, until M4 moves it.
+/// MOD-67 M3 (D13), M4 (D6): a rebound `form.save` saves the quirks editor under its new chord
+/// and the hint names it; the `TextArea` passes `ctrl-s` like every chord, so `ctrl-s` saves only
+/// while it is `form.save`'s chord (the defaults).
 #[tokio::test]
-async fn a_rebound_save_saves_the_quirks_editor_and_ctrl_s_still_does() {
+async fn a_rebound_save_saves_the_quirks_editor_and_ctrl_s_no_longer_does() {
     let keys = htui::keys::load_str("version = 1\n[form]\nsave = \"ctrl-x\"\n")
         .expect("the key file loads");
     let bench = SectionBench::new().await.with_keys(keys);
@@ -1228,6 +1229,14 @@ async fn a_rebound_save_saves_the_quirks_editor_and_ctrl_s_still_does() {
         "{frame}"
     );
     type_at(&bench, &mut section, "x");
+    let typed = bench.render_section(&section, 100);
+    bench.key(&mut section, "ctrl-s");
+    assert!(requests(&bench).is_empty(), "`ctrl-s` sends nothing");
+    assert_eq!(
+        bench.render_section(&section, 100),
+        typed,
+        "`ctrl-s` typed nothing and the draft is kept"
+    );
     assert_eq!(bench.key(&mut section, "ctrl-x"), Handled::Consumed);
     only_edit(&requests(&bench));
 
