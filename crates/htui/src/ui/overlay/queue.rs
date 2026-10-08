@@ -56,6 +56,11 @@ const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
 /// [`StoreRequest::name`] of [`StoreRequest::QueueOverview`]: its `Failed` is shown, not re-read.
 const OVERVIEW: &str = QUEUE_REQUEST_NAMES[5];
 
+/// M3 review R1 M2: after a good read, `refresh` asks again on every third refresh tick (about
+/// three seconds): the overview is about ten reads on the serial store worker, so every other
+/// request would wait behind it each second the overlay is open.
+const REFRESHES_PER_READ: u32 = 3;
+
 /// After a failed read, `refresh` asks again on every tenth refresh tick (about ten seconds), not
 /// every one: an unreachable store refuses each read, and `App::on_reply` would re-post the
 /// refusal to the status line every second.
@@ -1364,11 +1369,15 @@ mod tests {
         assert!(bench.drained().is_empty(), "the open read is in flight");
 
         bench.feed(&mut overlay, overview(abc()));
-        overlay.refresh(&mut bench.ctx());
+        for _ in 0..REFRESHES_PER_READ {
+            overlay.refresh(&mut bench.ctx());
+        }
         assert_one_request(&bench.drained(), |request| {
             matches!(request, StoreRequest::QueueOverview)
         });
-        overlay.refresh(&mut bench.ctx());
+        for _ in 0..REFRESHES_PER_READ {
+            overlay.refresh(&mut bench.ctx());
+        }
         assert!(bench.drained().is_empty(), "the tick's read is in flight");
 
         // A failed read clears it too, and is asked again after the back-off.
@@ -1413,12 +1422,59 @@ mod tests {
             bench.reply(&mut overlay, &failed);
         }
 
-        // A good read ends the back-off: the next refresh asks at once.
+        // A good read ends the back-off: the read cadence takes over.
         bench.feed(&mut overlay, overview(abc()));
-        overlay.refresh(&mut bench.ctx());
+        for _ in 0..REFRESHES_PER_READ {
+            overlay.refresh(&mut bench.ctx());
+        }
         assert_one_request(&bench.drained(), |request| {
             matches!(request, StoreRequest::QueueOverview)
         });
+    }
+
+    /// M3 review R1 M2: the overview costs the serial store worker about ten reads, so a good
+    /// read is refreshed every third refresh tick (about three seconds), not every one; a write's
+    /// re-read does not wait.
+    #[test]
+    fn a_good_read_is_refreshed_only_every_third_refresh() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        assert_eq!(REFRESHES_PER_READ, 3);
+        for round in 0..2 {
+            bench.feed(&mut overlay, overview(abc()));
+            for tick in 1..REFRESHES_PER_READ {
+                overlay.refresh(&mut bench.ctx());
+                assert!(
+                    bench.drained().is_empty(),
+                    "round {round}, refresh {tick}: not every second"
+                );
+            }
+            overlay.refresh(&mut bench.ctx());
+            assert_one_request(&bench.drained(), |request| {
+                matches!(request, StoreRequest::QueueOverview)
+            });
+        }
+
+        // A write's reply re-reads at once, whatever the cadence.
+        bench.feed(&mut overlay, overview(abc()));
+        bench.reply(
+            &mut overlay,
+            &StoreReply::QueueWritten {
+                write: QueueWrite::Moved { moved: true },
+                view: QueueView {
+                    entries: Vec::new(),
+                    open_batch: None,
+                    demo: false,
+                },
+            },
+        );
+        assert!(
+            bench
+                .drained()
+                .iter()
+                .any(|action| matches!(action, Action::Store(StoreRequest::QueueOverview))),
+            "the write's re-read"
+        );
     }
 
     #[test]

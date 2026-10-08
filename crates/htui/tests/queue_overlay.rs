@@ -1,6 +1,7 @@
 //! The queue overlay (MOD-12 M3 D8, D9), end to end through a `Harness` over the memory backend:
 //! global `Ctrl+Q` opens it on this box's queue, `J`/`K`, `P` and `Q` write through the store
-//! worker and the overlay re-reads, and the shell's refresh tick re-reads it while it is open.
+//! worker and the overlay re-reads, and every third shell refresh tick re-reads it while it is
+//! open.
 //!
 //! The memory backend is `htui --demo`'s: its header reads `demo: nothing is admitted` and its
 //! runtime never admits, so every entry keeps its place between keys. The agent runtime keeps a
@@ -220,10 +221,18 @@ async fn the_overlay_re_reads_on_the_refresh_tick() {
     harness.drive_to_end().await;
     assert_eq!(row_order(&mut harness, &keys), ["ANA-2"]);
 
-    // One shell refresh (`update.rs`'s private `TICKS_PER_REFRESH` is 4).
-    for _ in 0..4 {
-        harness.app().update(Action::Tick);
-    }
+    // One shell refresh (`update.rs`'s private `TICKS_PER_REFRESH` is 4) is not enough: the
+    // overlay re-reads every third refresh (M3 review R1 M2).
+    let refresh = |harness: &mut Harness| {
+        for _ in 0..4 {
+            harness.app().update(Action::Tick);
+        }
+    };
+    refresh(&mut harness);
+    refresh(&mut harness);
+    harness.drive_to_end().await;
+    assert_eq!(row_order(&mut harness, &keys), ["ANA-2"]);
+    refresh(&mut harness);
     harness.drive_to_end().await;
     let rows = row_order(&mut harness, &keys);
     assert_eq!(rows.len(), 2, "{rows:?}");
