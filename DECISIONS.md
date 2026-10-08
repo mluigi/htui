@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-57](docs/decisions/mod/mod-57.md)** - Run the external editor inside the TUI pane (done, 2026-10-08)
 - **[MOD-12](docs/decisions/mod/mod-12.md)** - Auto mode queue runner (done, 2026-10-08)
 - **[CLEAN-9](docs/decisions/clean/clean-9.md)** - MOD-12 M2 review residuals (done, 2026-10-08)
 - **[CLEAN-8](docs/decisions/clean/clean-8.md)** - MOD-10 M4 review residuals (done, 2026-10-07)

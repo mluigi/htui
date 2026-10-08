@@ -6,7 +6,7 @@
 **Routing**: plan path on the PRD's milestone 2 (`/handoff-run MOD-57`, accepted 2026-10-08); ultracode
 for implement recommended at low confidence, to be taken only if the fact-check shows ≥3 disjoint lanes
 (it does not: see Independence).
-**Status**: CONFIRMED (2026-10-08) — E1-E10 as proposed; Q-A as proposed (close at M2, nvim run and the 10-edit hypothesis owed on the host); no ultracode (plain agents, T1 ∥ T2).
+**Status**: DONE (2026-10-08) — implemented `3eaf624b`..`ccf06c9a`, reviews R1 and R2 applied; write-up `docs/decisions/mod/mod-57.md`. Was: CONFIRMED (2026-10-08) — E1-E10 as proposed; Q-A as proposed (close at M2, nvim run and the 10-edit hypothesis owed on the host); no ultracode (plain agents, T1 ∥ T2).
 
 ## Summary
 
@@ -201,3 +201,12 @@ review: 2993 passed, 0 failed, 3 ignored. Maintainer decisions:
 | L-3 | Off-screen editor output sets `dirty` | **Fix**: dirty only when visible |
 | L-4 | Hierarchy's refused scope refreshes are not retried after the edit | **Docs** (T4) |
 | nits | redundant check (`update.rs:292`), `editor_key` > 50 lines, constant-only test, `titles()` Vec per frame, `ctrl-4` silent under the question, asking tab's status line silent on tab switching | **Fix** all |
+
+## Review R2 (2026-10-08)
+
+Focused re-review of R1 (`5d7025f1..a07f94f1`): approve. Its LOWs applied test-first: LOW-1 a held
+abort key does not confirm (`5543c59e`); LOW-2 `Action::AbortEdit` only from the abort question
+(`7ccb5488`); LOW-3 the question closes when the asking tab leaves the screen (`19a1f7b0`); test gaps
+(a covered question removed on exit, a paste under the question) and nits (`ccf06c9a`). `ctrl-4` under
+the abort question keeps the maintainer's "any other key keeps" rule (closes it, editor unfocused).
+Final serial gate: 3013 passed, 0 failed, 3 ignored; fmt, clippy both ways, insta, Windows check green.

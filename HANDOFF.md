@@ -14,15 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-08):** **MOD-12 is done** (`docs/decisions/mod/mod-12.md`): auto mode runs
+**Current status (2026-10-08):** **MOD-57 is done** (`docs/decisions/mod/mod-57.md`): with `HTUI_EDITOR_PANE=1`,
+`E`/`Ctrl+E` run `$VISUAL`/`$EDITOR` inside the asking pane; with focus in htui (`Ctrl+4`) every other tab works
+while the editor waits, and quit and abort ask first. Owed on the host: an nvim run in the pane and the PRD's
+10-edit trial. Before it, **MOD-12** (`docs/decisions/mod/mod-12.md`): auto mode runs
 explicitly queued items unattended, holds each batch to its spend cap, and `ctrl-q` opens the queue overlay
 (order, escalations with reasons, reorder, pause/resume); a stalled batch closes, so a later `Q` never starts
 spending. A user's `keys.toml` entry now takes a chord from an action left at its default, with a notice. Owed on
-the host: the Postgres gate and the PRD's prototype batch. Before it, **CLEAN-9** (`docs/decisions/clean/clean-9.md`):
+the host: the Postgres gate and the PRD's prototype batch. Before that, **CLEAN-9** (`docs/decisions/clean/clean-9.md`):
 the recorder's `cap_exceeded` row names the session allowance and what bound it, and a malformed cap key refuses the
-enqueue. Filed **CLEAN-11** for the leftovers. Before that, **MOD-90 and CLEAN-8** (`docs/decisions/mod/mod-90.md`,
-`docs/decisions/clean/clean-8.md`): a fourth keyring entry, `htui/infisical-write-mark`, is replaced by every
-Settings > Secrets URL or identity write. No migration.
+enqueue. Filed **CLEAN-11** for the leftovers.
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -214,7 +215,9 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   through `portable-pty` (`cmd /S /C` with the temp directory as the working directory); `Ctrl+\`
   arrives as `ctrl-\` there, so only a physical `Ctrl+4` reaches `editor.focus`; the kill is
   `TerminateProcess` (no process-group kill); `ClosePseudoConsole` runs on its own thread; and a
-  forwarded `Ctrl+C` must reach the editor without ending htui.
+  forwarded `Ctrl+C` must reach the editor without ending htui. MOD-57 is done
+  (`docs/decisions/mod/mod-57.md`); its M2 adds to this check: other tabs working while the ConPTY editor
+  waits, and the quit and abort questions killing it.
 
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
@@ -280,34 +283,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   the executing box resolves a project's secrets with the machine identity in its own keyring; a headless worker
   without one refuses, and delivering it is this item's.
 
-- [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, `docs/decisions/mod/mod-9.md`;
-  merge of MOD-7 milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
-  in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
-  and runs `$VISUAL`/`$EDITOR` full-screen (`crates/htui/src/editor.rs`). Offer a toggle that runs
-  the editor inside the editing pane instead, with the rest of the TUI still drawn: a pseudo-terminal
-  (`portable-pty`, ConPTY on Windows) feeding a VT parser (`vt100`) drawn by a ratatui widget
-  (`tui-term`), keys forwarded to the child with one reserved chord to leave, resize forwarded,
-  and the file read back through the same `parse` gate on exit. Works for any editor, nvim
-  included. The alternative, nvim's `--embed` RPC UI (`nvim-rs`), is nvim-only and was not
-  preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
-  Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
-  `docs/decisions/mod/mod-54.md`), and every other row fits through the same module (MOD-60,
-  done: `docs/decisions/mod/mod-60.md`).
-  **Keys (ANA-26, `R-TUI-10`):** the reserved leave chord is an action in MOD-67's catalogue, never a
-  hard-coded key, and this pane is the one place `ctrl-c` is forwarded instead of quitting; the
-  leave action must stay bound (`docs/ANA-26.md` §6.4).
-  **Phase 1 landed (`1c8c9e3c`..`a464ac21`, 2026-10-08):** the editor in the pane, opt-in with
-  `HTUI_EDITOR_PANE=1` (user guide `docs/htui-editor.md`). `portable-pty` 0.9 and `vt100` 0.16 with
-  htui's own widget (not `tui-term`), plus unix-only `rustix` for a process-group kill (PD-10). The
-  pane draws over the asking view's editing area, or the tab body below 40x8. Catalogue context
-  `editor`: `editor.focus` (`ctrl-4`, which `Ctrl+\` sends on unix) and `editor.abort` (`ctrl-x`).
-  Focused, every key goes to the editor, `ctrl-c` included; unfocused, the M1 lock (focus, abort,
-  quit, help; a modal prompt takes the keys after one swallowed key). Review R1 fixed a `vt100`
-  ICH/IL/SD stall on the UI task (stateful CSI clamp) and added back-pressure (bounded channel,
-  time-boxed drain). Residue: R1 L-2 (stray keystrokes on a thread-spawn failure); the nvim run is
-  owed on the host; the Windows half is MOD-16's. Plan `.claude/plans/mod-57-m1-editor-in-pane.plan.md`.
-  **Remaining: M2** - htui usable while an edit is open (tabs, the quit confirm), then close-out.
-
 - [ ] **MOD-67 - Configurable hotkeys: named actions, `keys.toml`, generated hints** (from ANA-26,
   `docs/ANA-26.md`, `docs/decisions/ana/ana-26.md`). `R-TUI-10`, `R-TUI-1`, `R-STO-1`, `R-NF-1`.
   Every key outside text entry becomes a named action in one compiled-in catalogue (about 100
@@ -354,11 +329,12 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `NO_MATCHES` `Ctrl+R`, `RELOADED` "press p again", `NOT_A_VALUE_ROW` "`e` edits"); a `picker`
   context for the hierarchy directory picker (L-C Q3)
   (`.claude/plans/mod-67-m3-settings-overlays.plan.md`, "Review gate").
-  **MOD-57 M1 appended (2026-10-08)** `Context::Editor` (`editor.focus` `ctrl-4`, `editor.abort`
-  `ctrl-x`) and `Stack::EDITOR_FOCUSED`/`EDITOR_UNFOCUSED` to the catalogue. Whichever of MOD-57 and
-  M2 lands second: the loader keeps `editor.focus` bound beside `overlay.close`, refuses `ctrl-c` in
-  `[editor]`, gains the `Context::Editor` arm, and checks `[editor]` chords against `global.quit`
-  and `global.help` (`.claude/plans/mod-57-m1-editor-in-pane.blueprint.md` §6.4).
+  **MOD-57 (done, `docs/decisions/mod/mod-57.md`)** added `Context::Editor` (`editor.focus` `ctrl-4`,
+  `editor.abort` `ctrl-x`), `Stack::EDITOR_FOCUSED`/`EDITOR_OPEN` and `views::QUIT_CONFIRM`/`ABORT_CONFIRM`
+  (`DECLARED` 39). Its M2 landed the loader follow-ups: `editor.focus` must keep a chord and never gives
+  way, its chord is refused in every other table, `[editor]` is checked against every global "while an
+  edit is open", and a `[global]` entry may take `editor.abort`'s default chord (give-way across tables,
+  that one case only).
   **MOD-12 M3 changed one M2 rule (2026-10-08, `docs/decisions/mod/mod-12.md`, review R1 H1):** within one
   table a user's entry takes a chord from an action left at its default (that action loses it, with a stderr
   notice and a `--print-keys` mark); two user entries on one chord stay an error. It also added the global
@@ -480,6 +456,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-29 Claude Code mods) |
-| MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 19 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals) |
 | TOOL-N  | 0 |
