@@ -763,6 +763,11 @@ mod tests {
                 ctx.emit(Action::EditExternally(asked()));
                 return Handled::Consumed;
             }
+            // M2 R2 LOW-2: a tab that tries to abort the edit itself.
+            if key.code == KeyCode::Char('!') {
+                ctx.emit(Action::AbortEdit);
+                return Handled::Consumed;
+            }
             Handled::Pass
         }
         fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
@@ -1533,6 +1538,24 @@ mod tests {
             vec![ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned())]
         );
         assert!(benches[1].seen.borrow().heard.is_empty());
+    }
+
+    /// M2 R2 LOW-2: only the abort question may emit `AbortEdit`. A tab that emits it (here the
+    /// other tab, whose keys are its own) kills nothing.
+    #[test]
+    fn a_tab_emitting_abort_edit_kills_nothing() {
+        let (mut app, benches, log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(plain('!'));
+        assert_eq!(
+            codes(&benches[1]),
+            vec![KeyCode::Char('!')],
+            "the view had it"
+        );
+        assert!(app.editor_open(), "a tab cannot abort the edit");
+        assert!(log.borrow().is_empty(), "no kill");
+        assert!(benches.iter().all(|b| b.seen.borrow().heard.is_empty()));
     }
 
     /// MOD-57 M2 (PD-8 across tabs): another tab may ask for the editor; it is answered

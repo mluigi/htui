@@ -499,6 +499,15 @@ impl App {
                         }
                         _ => self.update(Action::Error(EDITOR_NEEDS_A_TAB.to_owned())),
                     },
+                    // MOD-57 M2 R2 LOW-2: only the abort question confirms an abort. The bare
+                    // shell's direct abort (no question registered) goes through `update`, not
+                    // here.
+                    Action::AbortEdit => match origin {
+                        Origin::Overlay(id) if self.abort_overlay == Some(*id) => {
+                            self.update(Action::AbortEdit);
+                        }
+                        _ => tracing::warn!(?origin, "AbortEdit from outside the abort question"),
+                    },
                     other => self.update(other),
                 }
             }
