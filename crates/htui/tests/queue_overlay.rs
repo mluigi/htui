@@ -229,3 +229,53 @@ async fn the_overlay_re_reads_on_the_refresh_tick() {
     assert_eq!(rows.len(), 2, "{rows:?}");
     assert!(rows.contains(&"TOOL-1".to_owned()), "{rows:?}");
 }
+
+/// MOD-12 M3 review R1 M1: the overlay shows a running batch; the runner closes it as stalled
+/// (L4) before the next read; `P` meant pause, and the pause names the batch the box showed, so
+/// it is refused rather than read as a resume: no batch opens, and the box re-reads the queue.
+#[tokio::test]
+async fn p_over_a_batch_the_runner_closed_is_refused_and_opens_nothing() {
+    let store = queued(&[ids::HTUI_ANA_2]).await;
+    let seen = store
+        .open_batch(ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the batch opens")
+        .id;
+    let mut harness = opened(&store).await;
+    let header = |harness: &mut Harness| queue_box(&harness.render())[1].clone();
+    assert!(
+        header(&mut harness).contains("queue: running"),
+        "{}",
+        harness.render()
+    );
+
+    // The runner's stall close (L4), behind the overlay's back: admit read ANA-2's entry.
+    store
+        .close_drained_batch(seen, &[ids::HTUI_ANA_2], Utc::now())
+        .await
+        .expect("the store answers")
+        .expect("the stalled batch closed");
+
+    harness.key("P");
+    harness.drive_to_end().await;
+    assert_eq!(
+        store.open_batch_of(ids::BOX).await.expect("reads"),
+        None,
+        "no batch opened"
+    );
+    let last = store
+        .last_closed_batch(ids::BOX)
+        .await
+        .expect("reads")
+        .expect("a batch closed");
+    assert_eq!(last.id, seen, "the runner's close is the last one");
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("queue already paused: its batch closed before P reached it")
+    );
+    assert!(
+        header(&mut harness).contains("queue: paused"),
+        "the box re-read the queue: {}",
+        harness.render()
+    );
+}

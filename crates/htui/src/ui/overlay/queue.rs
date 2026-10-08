@@ -1254,9 +1254,10 @@ mod tests {
                 },
             },
         );
-        assert_one_request(&bench.drained(), |request| {
-            matches!(request, StoreRequest::QueueOverview)
-        });
+        match bench.drained().as_slice() {
+            [Action::Error(_), Action::Store(StoreRequest::QueueOverview)] => {}
+            other => panic!("expected the write's sentence, then the re-read: {other:?}"),
+        }
 
         bench.feed(&mut overlay, overview(abc()));
         bench.reply(
@@ -1282,6 +1283,55 @@ mod tests {
             },
         );
         assert!(bench.drained().is_empty(), "not a queue request");
+    }
+
+    /// M3 review R1 N2: a write's reply puts the Backlog's sentence for it on the status line,
+    /// then re-reads: a move at the end says so, a dequeue names its row's key, and a refused `P`
+    /// (M1) says the queue changed.
+    #[test]
+    fn a_queue_write_says_what_it_did_then_re_reads() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        let rows = abc();
+        let b = rows[1].0.entry.item_id;
+        let entries: Vec<ItemId> = rows.iter().map(|(row, _)| row.entry.item_id).collect();
+        bench.feed(&mut overlay, overview(rows));
+        let view = |entries: &[ItemId], open_batch| QueueView {
+            entries: entries.to_vec(),
+            open_batch,
+            demo: false,
+        };
+
+        let cases = [
+            (
+                QueueWrite::Moved { moved: false },
+                view(&entries, Some(BatchId::new())),
+                "already at that end of the queue",
+            ),
+            (
+                QueueWrite::Dequeued {
+                    item: b,
+                    was_queued: true,
+                },
+                view(&entries[..2], Some(BatchId::new())),
+                "dequeued B-2 (2 in queue)",
+            ),
+            (
+                QueueWrite::Stale { pause: true },
+                view(&entries, None),
+                "queue already paused: its batch closed before P reached it",
+            ),
+        ];
+        for (write, view, sentence) in cases {
+            bench.reply(&mut overlay, &StoreReply::QueueWritten { write, view });
+            match bench.drained().as_slice() {
+                [
+                    Action::Error(said),
+                    Action::Store(StoreRequest::QueueOverview),
+                ] => assert_eq!(said, sentence),
+                other => panic!("expected {sentence:?}, then the re-read: {other:?}"),
+            }
+        }
     }
 
     #[test]
