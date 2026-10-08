@@ -469,4 +469,50 @@ mod tests {
             }
         }
     }
+
+    /// MOD-67 M3 T7: every view stack this module declares is the stack of some view. The
+    /// shell's own `BASE` and `OVERLAY` are not declared here; a stack nothing names would be
+    /// validated (and refuse key files) for a mode no view is ever in.
+    #[test]
+    fn every_view_stack_is_named_by_a_view() {
+        const VIEWS: &[&str] = &[
+            include_str!("../ui/tabs/settings/mod.rs"),
+            include_str!("../ui/tabs/settings/agents.rs"),
+            include_str!("../ui/tabs/settings/boxes.rs"),
+            include_str!("../ui/tabs/settings/connection.rs"),
+            include_str!("../ui/tabs/settings/hierarchy.rs"),
+            include_str!("../ui/tabs/settings/kinds.rs"),
+            include_str!("../ui/tabs/settings/personas.rs"),
+            include_str!("../ui/tabs/settings/prompt.rs"),
+            include_str!("../ui/tabs/settings/qdrant.rs"),
+            include_str!("../ui/tabs/settings/queue.rs"),
+            include_str!("../ui/tabs/settings/secrets.rs"),
+            include_str!("../ui/overlay/concepts_search.rs"),
+            include_str!("../ui/overlay/migration_prompt.rs"),
+            include_str!("../ui/overlay/waiting_list.rs"),
+            include_str!("../ui/overlay/workspace_switcher.rs"),
+        ];
+        let named = |name: &str| {
+            let wanted = format!("views::{name}");
+            VIEWS.iter().any(|source| {
+                source.match_indices(&wanted).any(|(at, _)| {
+                    !source[at + wanted.len()..]
+                        .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+                })
+            })
+        };
+        let declared: Vec<&str> = include_str!("views.rs")
+            .lines()
+            .filter_map(|line| line.strip_prefix("pub const "))
+            .filter_map(|rest| rest.split_once(": Stack<'static>").map(|(name, _)| name))
+            .collect();
+        assert_eq!(
+            declared.len(),
+            DECLARED.len() - 2,
+            "views.rs stacks vs DECLARED"
+        );
+        for name in declared {
+            assert!(named(name), "no view names views::{name}");
+        }
+    }
 }

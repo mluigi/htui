@@ -1346,8 +1346,8 @@ impl KindsSection {
         }
     }
 
-    /// The stack of the current mode (MOD-67 M3): the only place a mode maps to its keys —
-    /// `key_stack`, every `on_*_key` and the hint row read it.
+    /// The stack of the current mode (MOD-67 M3), as `key_stack` reports it. Each `on_*_key`
+    /// handler names its own mode's constant, which is this one whenever it runs.
     fn stack(&self) -> Stack<'static> {
         match &self.mode {
             Mode::Browse => views::KINDS_BROWSE,

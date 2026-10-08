@@ -2,9 +2,8 @@
 //!
 //! The shell opens this overlay when a [`StoreReply::StoreState`] carries a pending count; `y`
 //! (`confirm.yes`) applies, `n` and `Esc` (`confirm.no`) leave the schema alone and the shell
-//! reading from the local mirror. It
-//! holds no store handle and no channel: the count arrives through `on_reply`, the decision leaves
-//! through `Ctx` (`R-NF-3`).
+//! reading from the local mirror. It holds no store handle and no channel: the count arrives
+//! through `on_reply`, the decision leaves through `Ctx` (`R-NF-3`).
 //!
 //! Shaped exactly like [`WorkspaceSwitcher`](super::WorkspaceSwitcher): a centred, modal box with
 //! its own hint line, never blank.

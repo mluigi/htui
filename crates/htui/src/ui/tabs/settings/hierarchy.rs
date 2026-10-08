@@ -504,9 +504,10 @@ impl HierarchySection {
         }
     }
 
-    /// The stack of the current mode (MOD-67 M3): the only place a mode maps to its keys —
-    /// `key_stack`, every `on_*_key` and the hint row read it. The typed confirmation, the delete
-    /// in flight and the picker are a field or a widget and nothing else ([`views::CAPTURE`]).
+    /// The stack of the current mode (MOD-67 M3), as `key_stack`, the delete and the picker read
+    /// it; the browse and editor handlers name their own mode's constant, which is this one
+    /// whenever they run. The typed confirmation, the delete in flight and the picker are a field
+    /// or a widget and nothing else ([`views::CAPTURE`]).
     fn stack(&self) -> Stack<'static> {
         match &self.mode {
             Mode::Browse => views::HIERARCHY_BROWSE,
