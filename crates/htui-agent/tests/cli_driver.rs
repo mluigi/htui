@@ -23,7 +23,7 @@ use std::time::Duration;
 use chrono::Utc;
 #[cfg(unix)]
 use htui_agent::cli::ClaudeStreamAdapter;
-use htui_agent::cli::{ISOLATION_ARGS, argv, refuse_widening, usd};
+use htui_agent::cli::{ISOLATION_ARGS, argv, refuse_settings_override, refuse_widening, usd};
 #[cfg(unix)]
 use htui_agent::cli::{McpConfigFile, SessionOptions, open_session};
 #[cfg(unix)]
@@ -993,6 +993,83 @@ fn a_tool_less_session_is_isolated_too() {
     assert_eq!(args[at - 2], "--strict-mcp-config", "{args:?}");
     assert!(args[at - 1].starts_with("--disallowedTools="), "{args:?}");
     assert_eq!(args[at + ISOLATION_ARGS.len()..], ["--x"], "{args:?}");
+}
+
+/// MOD-91 D8: a later `--settings` replaces `htui`'s own whole (T1 case 1a), so an isolated row
+/// refuses one in `extra_args` unless its value is inline JSON setting `"disableAllHooks": true`.
+/// Spaced or joined, a path (`htui` does not read the operator's file), `false`, a non-object, a
+/// dangling flag, and one behind an unrelated flag are all refused. The refusal names the flag and
+/// both fixes, and never the value: a settings value can carry an `env` block (`R-SEC-2`).
+#[test]
+fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
+    for extra in [
+        &["--settings", r#"{"env":{"TOKEN":"s3cret"}}"#][..],
+        &[r#"--settings={"env":{"TOKEN":"s3cret"}}"#],
+        &["--settings", "/op/settings.json"],
+        &["--settings=/op/settings.json"],
+        &["--settings", r#"{"disableAllHooks":false}"#],
+        &["--settings", "[1]"],
+        &["--settings"],
+        &["--x", "--settings", "/op/settings.json"],
+        &[
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--settings",
+            "/op/settings.json",
+        ],
+    ] {
+        let refused = refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .expect_err(&format!("{extra:?} must be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("agent transport error: "),
+            "a transport refusal, never a spawn failure: {refused:?}"
+        );
+        for named in ["--settings", "disableAllHooks", "mods"] {
+            assert!(
+                message.contains(named),
+                "{extra:?}: names {named}: {message}"
+            );
+        }
+        for secret in ["s3cret", "/op/settings.json", "TOKEN"] {
+            assert!(
+                !message.contains(secret),
+                "{extra:?}: never quotes the value: {message}"
+            );
+        }
+    }
+}
+
+/// MOD-91 D8: a `--settings` that keeps the hooks lever passes, spaced, joined or whitespace-laden,
+/// whatever else it sets; so does a row with no `--settings`, and `--setting-sources`, which is a
+/// different flag.
+#[test]
+fn a_settings_that_keeps_the_hooks_lever_passes() {
+    for extra in [
+        &["--settings", r#"{"disableAllHooks":true}"#][..],
+        &[r#"--settings={"disableAllHooks":true,"env":{"A":"b"}}"#],
+        &[
+            "--settings",
+            r#"{ "disableAllHooks" : true, "env": { "A": "b" } }"#,
+        ],
+        &[],
+        &["--x"],
+        &["--setting-sources", "user"],
+        &["--setting-sources=user,project"],
+    ] {
+        refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .unwrap_or_else(|err| panic!("{extra:?} keeps the session isolated: {err}"));
+    }
+}
+
+/// MOD-91 D8: a row that opts back in has nothing to keep, so its `extra_args` are not read.
+#[test]
+fn an_opted_in_row_is_never_checked_for_settings() {
+    refuse_settings_override(
+        &cli_settings("acceptEdits", &["--settings", "/op/settings.json"]),
+        true,
+    )
+    .expect("an opted-in row is not this check's business");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2343,6 +2420,29 @@ async fn a_tool_less_start_with_widening_extra_args_is_refused_before_the_spawn(
     assert!(
         matches!(&refused, DriverError::Transport(message)
             if message.contains("--dangerously-skip-permissions")),
+        "{refused:?}"
+    );
+}
+
+/// MOD-91 D8: the refusal comes before the spawn, as the widening one does. The row names a
+/// command that does not exist, so a driver that spawned first would answer `Spawn` instead.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_isolated_start_with_an_overriding_settings_is_refused_before_the_spawn() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut row = scripted_row(&dir.path().join("absent"), serde_json::Map::new());
+    row.settings["cli"]["extra_args"] = json!(["--settings", "/op/settings.json"]);
+
+    let Err(refused) = driver(&row)
+        .start(spec(dir.path().to_path_buf()), "hello".to_owned())
+        .await
+    else {
+        panic!("an isolated session refuses the row");
+    };
+
+    assert!(
+        matches!(&refused, DriverError::Transport(message)
+            if message.contains("--settings") && !message.contains("/op/settings.json")),
         "{refused:?}"
     );
 }
