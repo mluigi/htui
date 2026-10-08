@@ -143,8 +143,11 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
             project: args.project,
             decisions: args.decisions,
             limit: args.limit.unwrap_or(concepts::DEFAULT_LIMIT),
+            cwd: args.cwd,
+            json: args.json,
         })
-        .await;
+        .await
+        .map_err(anyhow::Error::from);
     }
 
     // MOD-67 M2 D5: the key file, after every flag that exits without the TUI and before the

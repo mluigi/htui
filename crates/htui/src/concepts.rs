@@ -7,13 +7,18 @@
 //! affected (`docs/ANA-19.md` §2 invariant 3). The automatic sync belongs to the headless worker
 //! (MOD-41) and the agent-facing tool to the MCP server (MOD-11).
 //!
-//! Both connect headless (`PgStore::connect_headless`, MOD-40 plan D8): a pending schema or a
-//! build below the database's target version is refused, never migrated.
+//! `--index-items` connects headless (`PgStore::connect_headless`, MOD-40 plan D8): a pending
+//! schema or a build below the database's target version is refused, never migrated.
+//! `--search-items` reads only (MOD-92): `PgStore::connect_read_only` and
+//! `QdrantStore::open_existing`, with the same refusals, and answers through `state_cmd` with exit
+//! 3 when Postgres or Qdrant does not answer, 2 on a refusal and 1 on a failure, as lines or
+//! (`--json`) one document.
 //!
 //! The worker's background sync (MOD-41 plan D19) lives here too: [`spawn_index_job`] reads the
 //! keyring once at `htui worker` start and, when it holds a Qdrant URL, spawns [`index_loop`],
 //! which re-syncs every project at start and then every [`sync_interval`].
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -32,6 +37,9 @@ use htui_store::{HeadlessError, PgStore, identity, secret};
 use serde_json::Value;
 
 use crate::concepts_worker::{self, QdrantIndex};
+use crate::state_cmd::{
+    self, Answer, ErrorCode, Failure, IndexAnswer, Kind, Outcome, SearchAnswer, StateExit,
+};
 
 /// Options of `--search-items`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +52,10 @@ pub struct SearchOptions {
     pub decisions: bool,
     /// Most hits printed.
     pub limit: u64,
+    /// `--cwd`: only the project whose repository, registered on this box, holds this path (MOD-92).
+    pub cwd: Option<PathBuf>,
+    /// `--json`: one versioned document instead of lines (MOD-92).
+    pub json: bool,
 }
 
 /// Hits `--search-items` prints when `--limit` is not given.
@@ -78,6 +90,9 @@ pub fn query(text: &str, projects: Vec<ProjectId>, decisions: bool, limit: u64) 
     }
 }
 
+/// The sentence a search or an index run refuses with when the keyring holds no Qdrant URL.
+const NO_QDRANT_URL: &str = "no Qdrant URL is stored; set one in Settings > Qdrant";
+
 /// Builds the Qdrant settings from what the keyring holds.
 ///
 /// # Errors
@@ -88,7 +103,7 @@ pub fn settings_from(
     api_key: Option<String>,
 ) -> anyhow::Result<QdrantSettings> {
     let Some(url) = url else {
-        bail!("no Qdrant URL is stored; set one in Settings > Qdrant");
+        bail!("{NO_QDRANT_URL}");
     };
     Ok(QdrantSettings::new(url, api_key)?)
 }
@@ -107,19 +122,24 @@ async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
     let pg = PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
         .await
         .map_err(headless_refusal)?;
-    // Said on stderr only when a download happens: this command's log goes nowhere without
-    // `--log`, and 133 MB is otherwise a silent pause (review L4).
-    let files = model::ensure_model_noting(|line| eprintln!("{line}"))
-        .await
-        .context("cannot load the embedding model")?;
-    let embedder = tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))
-        .await
-        .context("the embedding model's loader stopped")?
-        .context("cannot load the embedding model")?;
+    let embedder = load_embedder().await?;
     let store = QdrantStore::connect(&settings, embedder)
         .await
         .map_err(qdrant_refusal)?;
     Ok((pg, store))
+}
+
+/// The embedding model, downloaded first if this box has none. Said on stderr only when a download
+/// happens: these commands' log goes nowhere without `--log`, and 133 MB is otherwise a silent
+/// pause (review L4); stdout stays the command's.
+async fn load_embedder() -> anyhow::Result<RtenEmbedder> {
+    let files = model::ensure_model_noting(|line| eprintln!("{line}"))
+        .await
+        .context("cannot load the embedding model")?;
+    tokio::task::spawn_blocking(move || RtenEmbedder::load(&files))
+        .await
+        .context("the embedding model's loader stopped")?
+        .context("cannot load the embedding model")
 }
 
 /// A failed `QdrantStore::connect` as the error a user reads, at all three sites that connect
@@ -418,27 +438,112 @@ pub(crate) async fn apart<T: Send + 'static>(
     answered.await.ok()
 }
 
-/// `--search-items`: prints the best hits, one per line.
+/// `--search-items`: the best hits, as lines or (`--json`) one document (MOD-92). Read-only:
+/// `PgStore::connect_read_only` and `QdrantStore::open_existing`; a missing collection is an empty
+/// index, never created. The embedding model may still be downloaded into the user cache (plan D8);
+/// its notes go to stderr.
 ///
 /// # Errors
-///
-/// As [`index_items`].
-pub async fn search_items(options: &SearchOptions) -> anyhow::Result<()> {
-    let (pg, store) = open().await?;
-    let projects: Vec<ProjectId> = scopes(&pg, options.project.as_deref())
-        .await?
-        .into_iter()
-        .flat_map(|s| s.project_ids)
-        .collect();
+/// [`StateExit`]: 3 when Postgres or Qdrant does not answer, 2 on a refusal (no URL, no DSN,
+/// schema, scope, embedder mismatch), 1 on a model or read failure.
+pub async fn search_items(options: &SearchOptions) -> Result<(), StateExit> {
+    let outcome = match search_answer(options).await {
+        Ok(search) => Outcome::Search(search),
+        Err(failure) => Outcome::Failed(failure),
+    };
+    let answer = Answer {
+        kind: Kind::Search,
+        outcome,
+    };
+    state_cmd::emit(&mut std::io::stdout().lock(), &answer, options.json)
+}
+
+/// [`search_items`]' reads, in A-2's order: the Qdrant settings, the DSN, `box.toml` (for `--cwd`
+/// only), the read-only connect, the scope, then the model and the index.
+async fn search_answer(options: &SearchOptions) -> Result<SearchAnswer, Failure> {
+    let settings = keyring_qdrant_settings()?;
+    let dsn = state_cmd::read_dsn()?;
+    let identity = match options.cwd {
+        Some(_) => state_cmd::read_identity()?,
+        None => None,
+    };
+    let pg = PgStore::connect_read_only(
+        &dsn,
+        identity.as_ref().map(|identity| identity.box_id),
+        CONNECT_TIMEOUT,
+    )
+    .await
+    .map_err(Failure::from_connect)?;
+    let projects = match options.cwd.as_deref() {
+        Some(cwd) => {
+            let workspaces = pg
+                .workspaces()
+                .await
+                .map_err(|err| Failure::from_read(&err))?;
+            vec![state_cmd::cwd_project(&pg, &workspaces, cwd, identity.as_ref()).await?]
+        }
+        None => projects_of(
+            scopes(&pg, options.project.as_deref())
+                .await
+                .map_err(|err| match err.downcast_ref::<StoreError>() {
+                    Some(err) => Failure::from_read(err),
+                    None => Failure::refused(ErrorCode::UnknownProject, err.to_string()),
+                })?,
+        ),
+    };
     let query = query(&options.query, projects, options.decisions, options.limit);
-    let hits = store.search(&query).await?;
-    if hits.is_empty() {
-        eprintln!("no matches (run `htui --index-items` if the index is empty)");
+    Ok(SearchAnswer {
+        query: options.query.clone(),
+        decisions: options.decisions,
+        index: search_index(&settings, &query).await,
+    })
+}
+
+/// The scopes' projects, in scope order.
+fn projects_of(scopes: Vec<Scope>) -> Vec<ProjectId> {
+    scopes.into_iter().flat_map(|s| s.project_ids).collect()
+}
+
+/// The Qdrant settings the keyring holds, or the search's refusal (A-2): checked before Postgres,
+/// with `settings_from`'s sentences.
+fn keyring_qdrant_settings() -> Result<QdrantSettings, Failure> {
+    let keyring = |err: StoreError| Failure::refused(ErrorCode::KeyringUnreadable, err.to_string());
+    let Some(url) = secret::get_qdrant_url().map_err(keyring)? else {
+        return Err(Failure::refused(ErrorCode::NoQdrantUrl, NO_QDRANT_URL));
+    };
+    let api_key = secret::get_qdrant_api_key().map_err(keyring)?;
+    settings_from(Some(url), api_key)
+        .map_err(|err| Failure::refused(ErrorCode::QdrantUrlUnusable, format!("{err:#}")))
+}
+
+/// The model, then the existing collection, then the search (MOD-92 G8): a missing collection is an
+/// empty index and is never created.
+async fn search_index(settings: &QdrantSettings, query: &SearchQuery) -> IndexAnswer {
+    let embedder = match load_embedder().await {
+        Ok(embedder) => embedder,
+        Err(err) => return IndexAnswer::Failed(format!("{err:#}")),
+    };
+    let store = match QdrantStore::open_existing(settings, embedder).await {
+        Ok(Some(store)) => store,
+        Ok(None) => return IndexAnswer::Empty,
+        Err(err) => return index_refusal(err),
+    };
+    match store.search(query).await {
+        Ok(hits) => IndexAnswer::Hits(hits),
+        Err(err) => index_refusal(err),
     }
-    for hit in &hits {
-        println!("{}", format_hit(hit));
+}
+
+/// A failed open or search: an embedder mismatch is a refusal, anything else "cannot reach
+/// Qdrant" (`qdrant_refusal`'s sentences).
+fn index_refusal(err: StoreError) -> IndexAnswer {
+    let mismatch = is_embedder_mismatch(&err);
+    let sentence = format!("{:#}", qdrant_refusal(err));
+    if mismatch {
+        IndexAnswer::Refused(sentence)
+    } else {
+        IndexAnswer::Offline(sentence)
     }
-    Ok(())
 }
 
 /// One result line: key, where it matched, score and snippet. Where it matched names a closed
@@ -641,6 +746,38 @@ mod tests {
             };
             assert_eq!(q.resolutions, expected, "decisions = {decisions}");
         }
+    }
+
+    /// MOD-92 D6: without `--project` or `--cwd`, `--search-items` still searches every
+    /// workspace's projects, in workspace order, each workspace's by position.
+    #[tokio::test]
+    async fn search_options_default_keeps_every_workspace() {
+        let options = SearchOptions {
+            query: "closed items".into(),
+            project: None,
+            decisions: false,
+            limit: DEFAULT_LIMIT,
+            cwd: None,
+            json: true,
+        };
+        let workspaces = MemStore::demo()
+            .workspaces()
+            .await
+            .expect("the demo answers");
+        assert!(workspaces.len() >= 2, "{workspaces:?}");
+        let scopes: Vec<Scope> = workspaces.iter().map(Scope::from_workspace).collect();
+        let expected: Vec<ProjectId> = scopes
+            .iter()
+            .flat_map(|scope| scope.project_ids.clone())
+            .collect();
+        let q = query(
+            &options.query,
+            projects_of(scopes),
+            options.decisions,
+            options.limit,
+        );
+        assert_eq!(q.projects, expected);
+        assert_eq!(q.limit, DEFAULT_LIMIT);
     }
 
     #[test]
