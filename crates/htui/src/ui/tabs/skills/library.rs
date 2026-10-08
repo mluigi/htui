@@ -39,6 +39,7 @@ use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
+use crate::keys::Stack;
 use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -472,6 +473,11 @@ fn chord(key: &KeyEvent) -> bool {
 }
 
 impl LibraryView {
+    /// The current mode's stack (MOD-67 M4); filled by lane L-A.
+    pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
+        None
+    }
+
     /// Whether an editor, a prompt, the rename form, or the attachments pane's form, picker or
     /// question is taking every key (D100).
     pub(super) fn captures_input(&self) -> bool {

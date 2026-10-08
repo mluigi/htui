@@ -32,10 +32,10 @@ use htui::ui::overlay::{
     ConceptsSearch, MigrationPrompt, Overlay, OverlayId, QueueOverlay, WaitingList,
     WorkspaceSwitcher,
 };
-use htui::ui::tabs::BacklogTab;
 use htui::ui::tabs::settings::{
     ConnectionSection, QdrantSection, SectionId, SettingsSection, SettingsTab,
 };
+use htui::ui::tabs::{BacklogTab, SkillsTab};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::Scope;
 use htui_store::testkit as common;
@@ -421,6 +421,35 @@ async fn ctrl_l_and_ctrl_h_do_not_cycle_sections() {
     harness.drive_to_end().await;
     let frame = harness.render();
     assert!(on_connection(&frame), "`h` moved back: {frame}");
+}
+
+/// MOD-67 M4 D5 pin (ANA-26 §2.6 defect 1): the Skills view switch is `skills.switch_view`
+/// resolved through the shown view's stack, whole chords, so a modified `l`, `h` or arrow no
+/// longer switches. The views tell apart by their browse hints: only the Library imports.
+#[tokio::test]
+async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
+    let mut harness = Harness::demo().with_tab(Box::new(SkillsTab::new()));
+    harness.drive_to_end().await;
+    let on_library = |frame: &str| frame.contains("I import");
+    let frame = harness.render();
+    assert!(on_library(&frame), "the tab opens on the Library: {frame}");
+
+    for key in ["ctrl-l", "ctrl-h", "alt-l", "shift-right"] {
+        harness.key(key);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(on_library(&frame), "`{key}` did not switch: {frame}");
+    }
+
+    harness.key("l");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(!on_library(&frame), "`l` showed Templates: {frame}");
+    assert!(frame.contains("default"), "the Templates hint: {frame}");
+    harness.key("h");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(on_library(&frame), "`h` went back: {frame}");
 }
 
 #[tokio::test]

@@ -29,6 +29,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
+use crate::keys::Stack;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells::{self, cell_width};
@@ -347,6 +348,11 @@ impl TemplatesView {
             }
         }
         true
+    }
+
+    /// The current mode's stack (MOD-67 M4); filled by lane L-B.
+    pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
+        None
     }
 
     /// Whether an editor or the name prompt is taking every key.
