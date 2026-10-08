@@ -37,11 +37,11 @@ to candidate (a) by T2, D8 added after T1 case 1a, `isolation_live.rs` moved to 
   is D6's "leaves every other settings key untouched" in the strongest form: an edit that does not
   touch the field never rewrites the JSONB, and the seven existing tests that pin `settings`
   unchanged stay valid (F7).
-- **B6 — The refusal for an unmergeable settings document names the form label** `user extensions
+- **B6 — The refusal for an unmergeable settings document names the form label** `mods
   (y/n)` (not a new `SETTINGS_FIELD`), so "every refusal names a form label" holds and the focus
   lands on the field that caused it. It only fires when the draft changes the value over a stored
   document that is not a JSON object.
-- **B7 — The create form defaults `user extensions` to `n` even when `settings_from` copies a row
+- **B7 — The create form defaults `mods` to `n` even when `settings_from` copies a row
   that opted in (D6 default).** The copy is the safe direction; the README says so.
 - **B8 — The live test stub MCP server is a Python fixture script, not a re-exec of the test
   binary.** libtest prints its `running N tests` header to stdout, which is the MCP stdio channel
@@ -131,7 +131,7 @@ skip unless `flag == "--settings"` exactly (so `--setting-sources` never matches
 `joined`, else consume `args.next()`; keep going only if
 `serde_json::from_str::<Value>(value).ok().and_then(|v| v.get(HOOKS_OFF).and_then(Value::as_bool)) == Some(true)`
 (a non-object, a path, a dangling `--settings`, `false` all fail). Message, one sentence, e.g.:
-``an isolated session refuses this row's `--settings` extra argument: a later `--settings` replaces htui's own, so it must set `"disableAllHooks": true` itself, or set `user extensions` to y``.
+``an isolated session refuses this row's `--settings` extra argument: a later `--settings` replaces htui's own, so it must set `"disableAllHooks": true` itself, or set `mods` to y in Settings > Agents``.
 
 `argv` rule list — insert between 6¾ and 7 (D2):
 
@@ -199,7 +199,7 @@ New tests:
 8. `an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever` — grid: spaced and joined
    `{"env":{"TOKEN":"s3cret"}}`, a path (spaced and joined), `{"disableAllHooks":false}`, `[1]`,
    a dangling `--settings`, one after an unrelated flag. Each: `Transport`, message contains
-   `--settings`, `disableAllHooks` and `user extensions`, and never `s3cret` / the path.
+   `--settings`, `disableAllHooks` and `mods`, and never `s3cret` / the path.
 9. `a_settings_that_keeps_the_hooks_lever_passes` — spaced, joined, and whitespace-laden
    `{ "disableAllHooks" : true, "env": {…} }`; no `--settings` at all; `--setting-sources user`
    (not the same flag).
