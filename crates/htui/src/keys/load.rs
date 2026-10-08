@@ -463,7 +463,8 @@ mod tests {
                           settings, settings.agents, settings.hierarchy, settings.kinds, \
                           settings.prompt, settings.connection, settings.qdrant, settings.boxes, \
                           settings.personas, settings.secrets, settings.queue, concepts, \
-                          switcher, migration, waiting";
+                          switcher, migration, waiting, skills, skills.library, \
+                          skills.templates, skills.attach, skills.help, requirements";
 
     #[test]
     fn an_empty_file_is_the_defaults() {

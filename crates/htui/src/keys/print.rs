@@ -133,7 +133,10 @@ close = ["esc"]  # close"#;
         let printed = print(Keys::compiled());
         let head: Vec<&str> = printed.lines().take(27).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
-        assert!(printed.ends_with("[waiting]\nopen = [\"enter\"]  # open step\n"));
+        assert!(
+            printed.ends_with("filter   = [\"/\"]  # filter\n"),
+            "{printed}"
+        );
         assert!(!printed.ends_with("\n\n"));
         assert!(printed.lines().all(|line| line == line.trim_end()));
         assert!(printed.lines().all(|line| line.chars().count() <= 100));

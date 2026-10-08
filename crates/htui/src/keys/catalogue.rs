@@ -22,16 +22,22 @@
 //! overlay, in strip order (plan D1). A view context holds the view's own verbs; the shared verbs
 //! it inherits through `Layer::view` may be overridden per view (D10), and [`VIEW_DEFAULTS`] adds
 //! the extra chords a view takes today on a shared act (D12 as amended by PA-1).
+//!
+//! MOD-67 M4 appends the Skills and Requirements contexts (plan D1): `skills`, a shared context
+//! holding the verbs Library and Templates share (the view switch, the version cursor, base,
+//! diff, `E`, `ctrl-g`), then one view context per Skills view or pane and `requirements`.
 
 use Context::{
-    Common, Concepts, Confirm, Editor, Form, Global, List, Overlay, Pane, Settings, SettingsAgents,
-    SettingsBoxes, SettingsConnection, SettingsHierarchy, SettingsKinds, SettingsPersonas,
-    SettingsSecrets, Switcher, Waiting,
+    Common, Concepts, Confirm, Editor, Form, Global, List, Overlay, Pane, Requirements, Settings,
+    SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy, SettingsKinds,
+    SettingsPersonas, SettingsSecrets, Skills, SkillsAttach, SkillsHelp, SkillsLibrary,
+    SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
 /// M1 has the global, overlay and shared contexts; M3 appends the Settings and overlay view
-/// contexts; M4-M5 append theirs (`BacklogRuns`, ...), each in its own block.
+/// contexts; M4 the Skills and Requirements ones; M5 appends its own (`BacklogRuns`, ...), each in
+/// its own block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Context {
     /// `[global]`: reachable from every screen, checked last.
@@ -81,6 +87,19 @@ pub enum Context {
     Migration,
     /// `[waiting]`: the waiting list overlay.
     Waiting,
+    /// `[skills]`: the verbs the Skills tab's Library and Templates views share (MOD-67 M4 D1);
+    /// a shared context, like `settings`, so each view's table may override them.
+    Skills,
+    /// `[skills.library]`: the Library view.
+    SkillsLibrary,
+    /// `[skills.templates]`: the Templates view.
+    SkillsTemplates,
+    /// `[skills.attach]`: the Library's attachments pane.
+    SkillsAttach,
+    /// `[skills.help]`: the editors' agent help (prompt, wait and proposal).
+    SkillsHelp,
+    /// `[requirements]`: the Requirements tab.
+    Requirements,
 }
 
 impl Context {
@@ -110,6 +129,12 @@ impl Context {
         Self::Switcher,
         Self::Migration,
         Self::Waiting,
+        Self::Skills,
+        Self::SkillsLibrary,
+        Self::SkillsTemplates,
+        Self::SkillsAttach,
+        Self::SkillsHelp,
+        Self::Requirements,
     ];
 
     /// The TOML table name: `global`, `overlay`, `list`, ..., `settings.agents`, `concepts`.
@@ -139,6 +164,12 @@ impl Context {
             Self::Switcher => "switcher",
             Self::Migration => "migration",
             Self::Waiting => "waiting",
+            Self::Skills => "skills",
+            Self::SkillsLibrary => "skills.library",
+            Self::SkillsTemplates => "skills.templates",
+            Self::SkillsAttach => "skills.attach",
+            Self::SkillsHelp => "skills.help",
+            Self::Requirements => "requirements",
         }
     }
 
@@ -170,11 +201,18 @@ impl Context {
             Self::Switcher => "Workspaces",
             Self::Migration => "Schema",
             Self::Waiting => "Waiting on you",
+            Self::Skills => "Skills",
+            Self::SkillsLibrary => "Library",
+            Self::SkillsTemplates => "Templates",
+            Self::SkillsAttach => "Attachments",
+            Self::SkillsHelp => "Agent help",
+            Self::Requirements => "Requirements",
         }
     }
 
-    /// A view's own context (a Settings section or an overlay): hosts view verbs, D10 overrides
-    /// and [`VIEW_DEFAULTS`]; skipped by the validator's per-context pass (MOD-67 M3 PA-4).
+    /// A view's own context (a Settings section, an overlay, a Skills view or pane, the
+    /// Requirements tab): hosts view verbs, D10 overrides and [`VIEW_DEFAULTS`]; skipped by the
+    /// validator's per-context pass (MOD-67 M3 PA-4).
     #[must_use]
     pub const fn is_view(self) -> bool {
         matches!(
@@ -193,16 +231,27 @@ impl Context {
                 | Self::Switcher
                 | Self::Migration
                 | Self::Waiting
+                | Self::SkillsLibrary
+                | Self::SkillsTemplates
+                | Self::SkillsAttach
+                | Self::SkillsHelp
+                | Self::Requirements
         )
     }
 
     /// A shared context a view layer may inherit and override (MOD-67 D10, PA-3): `list`,
-    /// `pane`, `confirm`, `form`, `common`, `settings`.
+    /// `pane`, `confirm`, `form`, `common`, `settings`, `skills` (M4).
     #[must_use]
     pub const fn is_shared(self) -> bool {
         matches!(
             self,
-            Self::List | Self::Pane | Self::Confirm | Self::Form | Self::Common | Self::Settings
+            Self::List
+                | Self::Pane
+                | Self::Confirm
+                | Self::Form
+                | Self::Common
+                | Self::Settings
+                | Self::Skills
         )
     }
 }
@@ -369,6 +418,50 @@ pub enum Act {
     SwitcherSwitch,
     /// `waiting.open`: open the selected waiting step.
     WaitingOpen,
+    /// `skills.switch_view`: toggle between the Library and Templates views.
+    SkillsSwitchView,
+    /// `skills.prev_version`: move the version cursor to the older version.
+    SkillsPrevVersion,
+    /// `skills.next_version`: move the version cursor to the newer version.
+    SkillsNextVersion,
+    /// `skills.base`: make the selected version the diff base.
+    SkillsBase,
+    /// `skills.diff`: diff the selected version against the base.
+    SkillsDiff,
+    /// `skills.edit_externally`: edit the selected item in `$EDITOR` from browse.
+    SkillsEditExternally,
+    /// `skills.ask_agent`: open the agent help over an editor (MOD-55).
+    SkillsAskAgent,
+    /// `skills.library.import`: import skills from a path.
+    LibraryImport,
+    /// `skills.library.info`: rename and describe the selected skill.
+    LibraryInfo,
+    /// `skills.library.attach`: open or close the attachments pane.
+    LibraryAttach,
+    /// `skills.templates.diff_default`: diff the template against its default.
+    TemplatesDiffDefault,
+    /// `skills.attach.choose`: edit the selected attachment, or insert the picked repo.
+    AttachChoose,
+    /// `skills.attach.detach`: detach the selected attachment.
+    AttachDetach,
+    /// `skills.attach.repo`: open the repo picker from the attachment form.
+    AttachRepo,
+    /// `skills.help.prev_agent`: the previous agent in the help prompt.
+    SkillsHelpPrevAgent,
+    /// `skills.help.next_agent`: the next agent in the help prompt.
+    SkillsHelpNextAgent,
+    /// `skills.help.accept`: accept the agent's proposal.
+    SkillsHelpAccept,
+    /// `skills.help.cancel`: cancel the agent's turn.
+    SkillsHelpCancel,
+    /// `requirements.new_area`: create an area.
+    RequirementsNewArea,
+    /// `requirements.amend`: amend the selected requirement.
+    RequirementsAmend,
+    /// `requirements.withdraw`: withdraw the selected requirement.
+    RequirementsWithdraw,
+    /// `requirements.filter`: filter the tree.
+    RequirementsFilter,
 }
 
 impl Act {
@@ -612,7 +705,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "previous field",
     ),
     // text_area.rs:194, item_form.rs:275, requirements/mod.rs:233, attach.rs:477,
-    // library.rs:939. Every site also accepts `ctrl-S` (blueprint F-7, M4).
+    // library.rs:990. Every site also accepts `ctrl-S` (blueprint F-7, M4). The Library,
+    // Templates and Requirements editors resolve it after their widget passes the chord (MOD-67
+    // M4 PA-3).
     capture_row(Act::FormSave, Form, "save", &["ctrl-s"], "save"),
     // item_form.rs:281 (label at :63), library.rs:1021, templates.rs:689. Same `E` alias.
     capture_row(
@@ -647,8 +742,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // `legacy_arrival`; `ctrl-\` itself is refused as indistinguishable). On Windows crossterm
     // delivers `ctrl-\` as `Char('\\')` + CONTROL, so there only a physical `ctrl-4` matches
     // (MOD-16 H-10/H-11, T7's docs). In capture: while the editor is focused every other key,
-    // `ctrl-c` included, is the editor's. MOD-67 M2's loader must refuse a file that unbinds it,
-    // as it does `overlay.close`.
+    // `ctrl-c` included, is the editor's. The loader refuses a file that unbinds it (MOD-67 M4
+    // D8.1), as it does `overlay.close`.
     capture_row(
         Act::EditorFocus,
         Editor,
@@ -915,6 +1010,166 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // [waiting]
     // waiting_list.rs:284.
     row(Act::WaitingOpen, Waiting, "open", &["enter"], "open step"),
+    // [skills]: the verbs Library and Templates share (MOD-67 M4 D2), one row each, so
+    // `[skills.library]` and `[skills.templates]` may override them per view.
+    // skills/mod.rs:111-118: one toggle between two views (D2), so no next/prev pair.
+    row(
+        Act::SkillsSwitchView,
+        Skills,
+        "switch_view",
+        &["h", "l", "[", "]", "left", "right"],
+        "switch view",
+    ),
+    // library.rs:762, :799, templates.rs:576, :616 (`','`).
+    row(
+        Act::SkillsPrevVersion,
+        Skills,
+        "prev_version",
+        &[","],
+        "older version",
+    ),
+    // The same arms (`'.'`).
+    row(
+        Act::SkillsNextVersion,
+        Skills,
+        "next_version",
+        &["."],
+        "newer version",
+    ),
+    // library.rs:816, templates.rs:626.
+    row(Act::SkillsBase, Skills, "base", &["b"], "diff base"),
+    // library.rs:823, templates.rs:630.
+    row(Act::SkillsDiff, Skills, "diff", &["d"], "diff"),
+    // library.rs:843, templates.rs:657: browse `E`; the editor's `ctrl-e` is
+    // `form.external_editor`.
+    row(
+        Act::SkillsEditExternally,
+        Skills,
+        "edit_externally",
+        &["E"],
+        "edit in $EDITOR",
+    ),
+    // library.rs:1080, templates.rs:741 (MOD-55): offered inside the editors.
+    capture_row(
+        Act::SkillsAskAgent,
+        Skills,
+        "ask_agent",
+        &["ctrl-g"],
+        "ask agent",
+    ),
+    // [skills.library]
+    // library.rs:753.
+    row(
+        Act::LibraryImport,
+        SkillsLibrary,
+        "import",
+        &["I"],
+        "import",
+    ),
+    // library.rs:854 (`'i'`).
+    row(Act::LibraryInfo, SkillsLibrary, "info", &["i"], "rename"),
+    // library.rs:863 opens the pane, attach.rs:399 (`a`) closes it: the same toggle.
+    row(
+        Act::LibraryAttach,
+        SkillsLibrary,
+        "attach",
+        &["a"],
+        "attachments",
+    ),
+    // [skills.templates]
+    // templates.rs:643.
+    row(
+        Act::TemplatesDiffDefault,
+        SkillsTemplates,
+        "diff_default",
+        &["D"],
+        "diff default",
+    ),
+    // [skills.attach]
+    // attach.rs:368 (browse: edit the row), :562 (picker: insert the repo).
+    row(
+        Act::AttachChoose,
+        SkillsAttach,
+        "choose",
+        &["enter"],
+        "choose row",
+    ),
+    // attach.rs:379.
+    row(Act::AttachDetach, SkillsAttach, "detach", &["x"], "detach"),
+    // attach.rs:476: in the form, beside its text fields.
+    capture_row(
+        Act::AttachRepo,
+        SkillsAttach,
+        "repo",
+        &["ctrl-r"],
+        "repo picker",
+    ),
+    // [skills.help]: the editors' agent help (MOD-55). Its discard is `confirm.no`.
+    // agent_help.rs:328 (`Up`): in the prompt, beside its text field.
+    capture_row(
+        Act::SkillsHelpPrevAgent,
+        SkillsHelp,
+        "prev_agent",
+        &["up"],
+        "previous agent",
+    ),
+    // agent_help.rs:328 (`Down`).
+    capture_row(
+        Act::SkillsHelpNextAgent,
+        SkillsHelp,
+        "next_agent",
+        &["down"],
+        "next agent",
+    ),
+    // agent_help.rs:294, and :308's `Enter`.
+    row(
+        Act::SkillsHelpAccept,
+        SkillsHelp,
+        "accept",
+        &["enter", "y"],
+        "accept",
+    ),
+    // agent_help.rs:273, :280.
+    row(
+        Act::SkillsHelpCancel,
+        SkillsHelp,
+        "cancel",
+        &["esc"],
+        "cancel the turn",
+    ),
+    // [requirements]
+    // requirements/mod.rs:448 (`'a'`).
+    row(
+        Act::RequirementsNewArea,
+        Requirements,
+        "new_area",
+        &["a"],
+        "new area",
+    ),
+    // requirements/mod.rs:448 (`'e'`).
+    row(
+        Act::RequirementsAmend,
+        Requirements,
+        "amend",
+        &["e"],
+        "amend",
+    ),
+    // requirements/mod.rs:448 (`'W'`).
+    row(
+        Act::RequirementsWithdraw,
+        Requirements,
+        "withdraw",
+        &["W"],
+        "withdraw",
+    ),
+    // requirements/mod.rs:438.
+    row(
+        Act::RequirementsFilter,
+        Requirements,
+        "filter",
+        &["/"],
+        "filter",
+    ),
 ];
 
 /// Extra default chords a view adds to a shared act, on top of whatever the shared row resolves
@@ -1000,12 +1255,18 @@ mod tests {
             Context::Switcher => 20,
             Context::Migration => 21,
             Context::Waiting => 22,
+            Context::Skills => 23,
+            Context::SkillsLibrary => 24,
+            Context::SkillsTemplates => 25,
+            Context::SkillsAttach => 26,
+            Context::SkillsHelp => 27,
+            Context::Requirements => 28,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 23);
+        assert_eq!(Context::ALL.len(), 29);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -1124,6 +1385,28 @@ mod tests {
         Act::ConceptsDown,
         Act::SwitcherSwitch,
         Act::WaitingOpen,
+        Act::SkillsSwitchView,
+        Act::SkillsPrevVersion,
+        Act::SkillsNextVersion,
+        Act::SkillsBase,
+        Act::SkillsDiff,
+        Act::SkillsEditExternally,
+        Act::SkillsAskAgent,
+        Act::LibraryImport,
+        Act::LibraryInfo,
+        Act::LibraryAttach,
+        Act::TemplatesDiffDefault,
+        Act::AttachChoose,
+        Act::AttachDetach,
+        Act::AttachRepo,
+        Act::SkillsHelpPrevAgent,
+        Act::SkillsHelpNextAgent,
+        Act::SkillsHelpAccept,
+        Act::SkillsHelpCancel,
+        Act::RequirementsNewArea,
+        Act::RequirementsAmend,
+        Act::RequirementsWithdraw,
+        Act::RequirementsFilter,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -1209,6 +1492,28 @@ mod tests {
             Act::ConceptsDown => 76,
             Act::SwitcherSwitch => 77,
             Act::WaitingOpen => 78,
+            Act::SkillsSwitchView => 79,
+            Act::SkillsPrevVersion => 80,
+            Act::SkillsNextVersion => 81,
+            Act::SkillsBase => 82,
+            Act::SkillsDiff => 83,
+            Act::SkillsEditExternally => 84,
+            Act::SkillsAskAgent => 85,
+            Act::LibraryImport => 86,
+            Act::LibraryInfo => 87,
+            Act::LibraryAttach => 88,
+            Act::TemplatesDiffDefault => 89,
+            Act::AttachChoose => 90,
+            Act::AttachDetach => 91,
+            Act::AttachRepo => 92,
+            Act::SkillsHelpPrevAgent => 93,
+            Act::SkillsHelpNextAgent => 94,
+            Act::SkillsHelpAccept => 95,
+            Act::SkillsHelpCancel => 96,
+            Act::RequirementsNewArea => 97,
+            Act::RequirementsAmend => 98,
+            Act::RequirementsWithdraw => 99,
+            Act::RequirementsFilter => 100,
         }
     }
 
@@ -1233,7 +1538,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 79);
+        assert_eq!(CATALOGUE.len(), 101);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -1381,6 +1686,12 @@ mod tests {
             (Context::Switcher, "switcher", "Workspaces"),
             (Context::Migration, "migration", "Schema"),
             (Context::Waiting, "waiting", "Waiting on you"),
+            (Context::Skills, "skills", "Skills"),
+            (Context::SkillsLibrary, "skills.library", "Library"),
+            (Context::SkillsTemplates, "skills.templates", "Templates"),
+            (Context::SkillsAttach, "skills.attach", "Attachments"),
+            (Context::SkillsHelp, "skills.help", "Agent help"),
+            (Context::Requirements, "requirements", "Requirements"),
         ];
         assert_eq!(table.len(), Context::ALL.len());
         for (context, name, heading) in table {
@@ -1392,6 +1703,17 @@ mod tests {
                 !(context.is_view() && context.is_shared()),
                 "{context:?} is both a view and a shared context"
             );
+        }
+        // MOD-67 M4 §3.1: `skills` is shared (Library and Templates inherit it), the rest views.
+        assert!(Context::Skills.is_shared() && !Context::Skills.is_view());
+        for context in [
+            Context::SkillsLibrary,
+            Context::SkillsTemplates,
+            Context::SkillsAttach,
+            Context::SkillsHelp,
+            Context::Requirements,
+        ] {
+            assert!(context.is_view() && !context.is_shared(), "{context:?}");
         }
     }
 
@@ -1420,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn in_capture_acts_are_the_form_overlay_close_editor_focus_and_concepts() {
+    fn in_capture_acts_are_the_form_overlay_close_editor_focus_concepts_and_the_skills_chords() {
         let captured: HashSet<Act> = CATALOGUE
             .iter()
             .filter(|row| row.in_capture)
@@ -1440,6 +1762,10 @@ mod tests {
                 Act::ConceptsReindex,
                 Act::ConceptsUp,
                 Act::ConceptsDown,
+                Act::SkillsAskAgent,
+                Act::AttachRepo,
+                Act::SkillsHelpPrevAgent,
+                Act::SkillsHelpNextAgent,
             ])
         );
     }
