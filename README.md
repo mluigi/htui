@@ -224,7 +224,11 @@ bound.
 
 A table named after a Settings section or a pop-up changes a shared action there alone:
 `[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every other section keeps `r`.
-`htui --print-keys` lists every table and what each one may change.
+`htui --print-keys` prints every table that has keys. To see what a table may change, write a name
+htui does not know in it: the error lists every action that table has and every shared action it
+may override. A line copied from `--print-keys` into such a table, like
+`[settings.agents] next_field`, replaces that row, so it stops following the shared `[form]`,
+`[common]` or `[confirm]` line; delete it to let it follow again.
 
 A global key must not be a key that Settings or a pop-up already uses: `[global] quit = ["x"]` is
 refused, because `x` cancels in **Settings › Agents**. Some Settings forms also move between fields
