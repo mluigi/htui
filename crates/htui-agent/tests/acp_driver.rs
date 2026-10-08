@@ -64,6 +64,7 @@ use htui_agent::event::{
 };
 use htui_agent::launch::AcpSettings;
 use htui_agent::launch::ResolvedLaunch;
+use htui_agent::launch::SESSION_VAR;
 #[cfg(unix)]
 use htui_agent::launch::{AgentSettings, SessionSettings, spawn};
 use htui_agent::probe::{
@@ -849,7 +850,8 @@ fn executable(path: &Path, contents: &str) {
 }
 
 /// D58 at the seam that decides it: a usable snapshot is what the session would spawn, arguments
-/// included, and `spec.env` is still applied last and still wins (`R-SEC-2`).
+/// included, and `spec.env` is still applied last and still wins (`R-SEC-2`). `HTUI_SESSION=1`
+/// (MOD-91 D4) is inserted after the spec's env, so it is in the map too.
 ///
 /// `ready` and `unauthenticated` are both asserted here rather than left to the pure case, because
 /// blueprint H-4 is a *driver* claim — an unauthenticated box spawns the recorded launch and lets
@@ -895,6 +897,7 @@ async fn a_usable_snapshot_is_what_the_driver_would_spawn_marker_included() {
         assert_eq!(
             launch.env,
             BTreeMap::from([
+                ("HTUI_SESSION".to_owned(), "1".to_owned()),
                 ("ROW_VAR".to_owned(), "row".to_owned()),
                 ("SECRET".to_owned(), "s".to_owned()),
                 ("SHARED".to_owned(), "spec".to_owned()),
@@ -903,6 +906,64 @@ async fn a_usable_snapshot_is_what_the_driver_would_spawn_marker_included() {
              on a key both hold (`R-SEC-2`); status {status:?}"
         );
     }
+}
+
+/// MOD-91 D4: what an ACP session would spawn carries `HTUI_SESSION=1` whether or not the row
+/// opts back in, and neither the recorded launch's env nor the spec's can set it to anything
+/// else: it is inserted after both. The adapter passes its `process.env` to the CLI it spawns
+/// (`acp-agent.js:5915-5925`), so this is what reaches Claude Code. A login's launch
+/// ([`AcpDriver::launch_in`]) is not a session and stays unmarked (blueprint B3).
+#[tokio::test]
+async fn launch_for_marks_the_session_whatever_the_setting() {
+    let tmp = tempfile::tempdir().expect("temp box");
+    let command = plain_file(&tmp.path().join("bin/htui-fake-adapter"));
+    for user_extensions in [false, true] {
+        for (row_env, spec_env) in [(None, None), (Some("0"), None), (None, Some("0"))] {
+            let mut agent = unresolvable_row();
+            agent.settings["user_extensions"] = json!(user_extensions);
+            let recorded = ResolvedLaunch {
+                command: command.clone(),
+                args: vec![MARKER.to_owned()],
+                env: row_env
+                    .map(|value| BTreeMap::from([(SESSION_VAR.to_owned(), value.to_owned())]))
+                    .unwrap_or_default(),
+            };
+            let row_on_box = on_box(
+                &agent,
+                &snapshot(ProbeSource::Probe, ProbeStatus::Ready, recorded),
+            );
+            let driver =
+                AcpDriver::from_row_with_probe(&agent, Some(&row_on_box), caps_for(&agent))
+                    .expect("the row's launch parses");
+            let mut with = spec(tmp.path().to_path_buf());
+            if let Some(value) = spec_env {
+                with.env.insert(SESSION_VAR.to_owned(), value.to_owned());
+            }
+
+            let resolved = driver
+                .launch_for(&with)
+                .await
+                .expect("a ready snapshot is usable");
+            assert_eq!(
+                resolved.env.get(SESSION_VAR).map(String::as_str),
+                Some("1"),
+                "user_extensions {user_extensions}, row {row_env:?}, spec {spec_env:?}"
+            );
+
+            if row_env.is_none() {
+                let login = driver
+                    .launch_in(tmp.path())
+                    .await
+                    .expect("a ready snapshot is usable");
+                assert_eq!(
+                    login.env.get(SESSION_VAR),
+                    None,
+                    "a login is not a session (user_extensions {user_extensions})"
+                );
+            }
+        }
+    }
+    assert_eq!(SESSION_VAR, "HTUI_SESSION");
 }
 
 /// [`AgentDriver::start`], retrying the `ETXTBSY` window a fixture executable opens.

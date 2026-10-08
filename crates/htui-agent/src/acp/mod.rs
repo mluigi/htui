@@ -311,11 +311,19 @@ impl AcpDriver {
     /// `spec.env` is applied **last** and wins (`R-SEC-2`): the row's environment holds paths, the
     /// spec's holds what the secret provider produced for this run.
     ///
+    /// `HTUI_SESSION=1` ([`crate::launch::SESSION_VAR`], MOD-91 D4) goes in after `spec.env`, on
+    /// every session whatever `user_extensions` says; the adapter passes its `process.env` to the
+    /// CLI it spawns (`acp-agent.js:5915-5925`), so the variable reaches Claude Code. Only
+    /// [`io`](Self::io) calls this in production, so it marks exactly the sessions: a login
+    /// resolves through [`launch_in`](Self::launch_in) and a probe through `launch::spawn`, and
+    /// neither is a session (blueprint B3).
+    ///
     /// # Errors
     /// [`launch_in`](Self::launch_in)'s, unchanged.
     pub async fn launch_for(&self, spec: &SessionSpec) -> Result<ResolvedLaunch> {
         let mut resolved = self.launch_in(&spec.cwd).await?;
         resolved.env.extend(spec.env.clone());
+        crate::launch::mark_session(&mut resolved.env);
         Ok(resolved)
     }
 
