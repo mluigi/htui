@@ -1218,7 +1218,9 @@ async fn session_main(
         Some(previous) => {
             let restored =
                 match restore_route(&init.agent_capabilities, &options.settings.acp.session) {
-                    Ok(route) => restore_session(&cx, &spec, previous, route, ready, child).await,
+                    Ok(route) => {
+                        restore_session(&cx, &spec, previous, route, ready, child, meta).await
+                    }
                     Err(why) => Err(DriverError::Transport(format!(
                         "cannot resume session `{}`: {why}",
                         previous.as_str()
@@ -1857,6 +1859,9 @@ fn restore_route(
 /// request that was actually sent. Whatever either request queued ahead of its answer is
 /// discarded ([`drain_replay`]): a load's replay, and any update an agent sends before its
 /// `session/resume` answer (review N-1), so the first event after the banner is the new turn's.
+///
+/// `meta` is the same `_meta` as `session/new`'s ([`session_meta`], MOD-91 D5): the adapter's
+/// `getOrCreateSession` forwards `params._meta` on both routes (`acp-agent.js:5699-5720`, T2).
 async fn restore_session(
     cx: &ConnectionTo<Agent>,
     spec: &SessionSpec,
@@ -1864,13 +1869,15 @@ async fn restore_session(
     route: Restore,
     ready: &Mutex<ReadyCell>,
     child: &Mutex<ChildGuard>,
+    meta: Option<Meta>,
 ) -> Result<agent_client_protocol::ActiveSession<'static, Agent>> {
     match route {
         Restore::Resume => {
             at_step(ready, "session/resume");
             let request = ResumeSessionRequest::new(previous.as_str().to_owned(), spec.cwd.clone())
                 .additional_directories(spec.extra_dirs.clone())
-                .mcp_servers(spec.mcp.iter().map(acp_server).collect());
+                .mcp_servers(spec.mcp.iter().map(acp_server).collect())
+                .meta(meta);
             let mut session = cx
                 .resume_session_from(request)
                 .block_task()
@@ -1889,7 +1896,8 @@ async fn restore_session(
             at_step(ready, "session/load");
             let request = LoadSessionRequest::new(previous.as_str().to_owned(), spec.cwd.clone())
                 .additional_directories(spec.extra_dirs.clone())
-                .mcp_servers(spec.mcp.iter().map(acp_server).collect());
+                .mcp_servers(spec.mcp.iter().map(acp_server).collect())
+                .meta(meta);
             let mut session = cx
                 .load_session_from(request)
                 .block_task()

@@ -1446,18 +1446,38 @@ fn methods(seen: &[(String, Value)]) -> Vec<&str> {
 
 /// Opens a session resuming [`PRIOR_SESSION`] in `cwd` against [`restoring_agent`], with
 /// `session` as `settings.acp.session` and, when `with_child`, a `sleep 1000` child whose pid the
-/// case can assert on.
+/// case can assert on. Every other setting is the default, so the session is isolated (MOD-91 D3).
 #[cfg(unix)]
-#[expect(
-    clippy::disallowed_methods,
-    reason = "test fakes run under no TUI panic hook"
-)]
 async fn open_restoring(
     cwd: &Path,
     caps: Value,
     resume: Answer,
     load: Answer,
     session: SessionSettings,
+    with_child: bool,
+) -> Restore {
+    let settings = AgentSettings {
+        acp: AcpSettings {
+            session,
+            ..AcpSettings::default()
+        },
+        ..AgentSettings::default()
+    };
+    open_restoring_with(cwd, caps, resume, load, settings, with_child).await
+}
+
+/// [`open_restoring`] under the whole row settings `settings`: what MOD-91's `_meta` cases vary.
+#[cfg(unix)]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "test fakes run under no TUI panic hook"
+)]
+async fn open_restoring_with(
+    cwd: &Path,
+    caps: Value,
+    resume: Answer,
+    load: Answer,
+    settings: AgentSettings,
     with_child: bool,
 ) -> Restore {
     let child = if with_child {
@@ -1497,7 +1517,7 @@ async fn open_restoring(
         child,
     };
     let mut options = options(PATIENT_HANDSHAKE);
-    options.settings.acp.session = session;
+    options.settings = settings;
 
     let opened = open_session(
         io,
@@ -2106,4 +2126,72 @@ async fn session_new_sends_no_claude_code_meta_when_opted_in() {
             .is_none(),
         "an opted-in session/new carries no `claudeCode`: {params}"
     );
+}
+
+/// MOD-91 D5: a restored session carries the same `_meta` as `session/new`, because the adapter's
+/// `getOrCreateSession` forwards `params._meta` on both routes (`acp-agent.js:5699-5720`, T2). A
+/// restore that dropped it would reopen an isolated step with the user's extensions loaded. The
+/// grid is both routes (`resume` advertised, then `loadSession` only) by both settings.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_resume_and_a_load_carry_the_same_meta() {
+    let routes = [
+        (
+            "session/resume",
+            json!({ "sessionCapabilities": { "resume": {} } }),
+        ),
+        ("session/load", json!({ "loadSession": true })),
+    ];
+    for (method, caps) in routes {
+        for user_extensions in [false, true] {
+            let tmp = tempfile::tempdir().expect("temp cwd");
+            let settings = AgentSettings {
+                user_extensions,
+                ..AgentSettings::default()
+            };
+            let mut restore = open_restoring_with(
+                tmp.path(),
+                caps.clone(),
+                Answer::Ok,
+                Answer::Ok,
+                settings,
+                false,
+            )
+            .await;
+            let opened = std::mem::replace(&mut restore.opened, Err(DriverError::Closed));
+            let session = opened.unwrap_or_else(|err| {
+                panic!("{method} restores (user_extensions {user_extensions}): {err:?}")
+            });
+            let seen = restore.seen();
+
+            let restored: Vec<_> = seen.iter().filter(|(sent, _)| sent == method).collect();
+            assert_eq!(
+                restored.len(),
+                1,
+                "one `{method}` (user_extensions {user_extensions}): {:?}",
+                methods(&seen)
+            );
+            let params = &restored[0].1;
+            assert_restore_params(params, tmp.path());
+            if user_extensions {
+                assert!(
+                    params
+                        .get("_meta")
+                        .and_then(|meta| meta.get("claudeCode"))
+                        .is_none(),
+                    "an opted-in `{method}` carries no `claudeCode`: {params}"
+                );
+            } else {
+                assert_eq!(
+                    params["_meta"],
+                    Value::Object(isolation_meta()),
+                    "an isolated `{method}` carries the lever: {params}"
+                );
+            }
+
+            drop(session);
+            restore.agent.abort();
+            let _ = restore.agent.await;
+        }
+    }
 }
