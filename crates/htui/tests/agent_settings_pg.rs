@@ -267,6 +267,7 @@ async fn a_create_lands_on_postgres_and_a_taken_name_is_the_stores_sentence() {
         default_model: Some("any".to_owned()),
         billing: Billing::PerToken,
         enabled: false,
+        user_extensions: false,
     };
     let create = StoreRequest::CreateAgent {
         name: "agent-x".to_owned(),
@@ -303,6 +304,44 @@ async fn a_create_lands_on_postgres_and_a_taken_name_is_the_stores_sentence() {
         4,
         "the second create wrote nothing"
     );
+
+    stack.drop_db().await;
+}
+
+/// MOD-91 D6 on Postgres: `mods (y/n)` set to `y` lands in the JSONB as
+/// `settings.user_extensions`, the re-read prefills `y`, and every other key reads back as it was.
+#[tokio::test]
+async fn user_extensions_round_trips_through_postgres() {
+    let Some(stack) = Stack::new().await else {
+        return;
+    };
+    let before = row(&stack.agents().await, ids::AGENT_CLAUDE_CLI).clone();
+    let draft = AgentDraft {
+        user_extensions: true,
+        ..agent_settings::draft_of(&before.agent)
+    };
+
+    let (_, outcome) = written(
+        serve(
+            &stack.backend,
+            &StoreRequest::EditAgent {
+                agent_id: ids::AGENT_CLAUDE_CLI,
+                expected: before.agent.updated_at,
+                draft,
+            },
+        )
+        .await,
+    );
+    assert!(matches!(outcome, AgentWrite::Edited { .. }), "{outcome:?}");
+
+    let after = row(&stack.agents().await, ids::AGENT_CLAUDE_CLI).clone();
+    assert!(agent_settings::draft_of(&after.agent).user_extensions);
+    assert_eq!(after.agent.settings["user_extensions"], json!(true));
+    let mut rest = after.agent.settings.clone();
+    rest.as_object_mut()
+        .expect("an object")
+        .remove("user_extensions");
+    assert_eq!(rest, before.agent.settings, "every other key is kept");
 
     stack.drop_db().await;
 }

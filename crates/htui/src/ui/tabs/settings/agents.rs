@@ -2166,6 +2166,7 @@ impl Editor {
             default_model: self.text(FIELD_LABELS[5]),
             billing: self.text(FIELD_LABELS[6]),
             enabled: self.text(FIELD_LABELS[7]),
+            user_extensions: self.text(FIELD_LABELS[8]),
         });
         match &mut self.target {
             Target::Create { settings_from } => {
