@@ -23,10 +23,11 @@
 //!   refusal and unfocuses it, rather than run as a command or answer a prompt. With htui
 //!   holding the keys, `ctrl-c` quits at `on_key`'s one C3 site and a modal overlay's keys are
 //!   the overlay's. On the asking tab a key resolves through [`Stack::EDITOR_OPEN`]:
-//!   `editor.focus` refocuses, `editor.abort` kills the editor and answers [`EDITOR_ABORTED`],
-//!   every global the shell maps acts (tab switches included); anything else is refused, so
-//!   nothing reaches the asking view. On any other tab only `editor.focus` is checked (it brings
-//!   the asking tab back, B16) and every other key and paste is that tab's.
+//!   `editor.focus` refocuses, `editor.abort` asks first (the abort question, M2 R1 M-2: only
+//!   `editor.abort` again kills the editor and answers [`EDITOR_ABORTED`]; any other key keeps
+//!   the edit), every global the shell maps acts (tab switches included); anything else is
+//!   refused, so nothing reaches the asking view. On any other tab only `editor.focus` is
+//!   checked (it brings the asking tab back, B16) and every other key and paste is that tab's.
 //! - **M2 (PRD D4, D5).** E4: `global.quit` asks first ([`App::request_quit`]); `ctrl-c` quits
 //!   at once. E5: nothing steers the asking tab (a scope change, a reveal into it). E6: another
 //!   tab's status line is led by the open edit and the way back. E7: the `?` box lists the
@@ -214,6 +215,9 @@ impl App {
                 let Some(OpenEditor { tab, temp, cmd, .. }) = self.editor.take() else {
                     return;
                 };
+                // M2 R1 M-2: the edit the abort question asked about has ended. (The quit
+                // question stays: B-M2-5.)
+                self.close_abort_question();
                 let outcome = match status {
                     Ok(status) => temp.finish(&cmd, Ok(EditorExit::from(&status)), elapsed),
                     // R1 L-1: the editor started (the spawn succeeded) and waiting on it failed,
@@ -444,7 +448,11 @@ impl App {
                     return true;
                 }
                 Act::EditorAbort => {
-                    self.abort_editor();
+                    // M2 R1 M-2: asks first; the `?` box closes, as the question's keys are
+                    // all its own.
+                    self.help_visible = false;
+                    let action = self.request_abort();
+                    self.update(action);
                     return true;
                 }
                 other => {
@@ -550,6 +558,17 @@ impl App {
         }
     }
 
+    /// MOD-57 M2 R1 M-2: what `editor.abort` on the asking tab resolves to. With `abort_overlay`
+    /// set, opening the abort question (only `editor.abort` again aborts); else
+    /// [`Action::AbortEdit`] at once (a bare shell, as M1 did).
+    #[must_use]
+    fn request_abort(&self) -> Action {
+        match self.abort_overlay {
+            Some(id) => Action::Overlay(OverlayAction::Open(id)),
+            None => Action::AbortEdit,
+        }
+    }
+
     /// MOD-57 M2 E5: `the editor is open in <Tab>: finish or abort it first` while an editor is
     /// alive: the refusal of a scope change or of a reveal into the asking tab.
     #[must_use]
@@ -584,14 +603,22 @@ impl App {
 
     /// `editor.abort` (B8): the kill is requested and the temp file removed at once, and the
     /// asking tab is answered `Failed(EDITOR_ABORTED)`. A later event of the editor is inert.
-    fn abort_editor(&mut self) {
+    pub(super) fn abort_editor(&mut self) {
         let Some(mut editor) = self.editor.take() else {
             return;
         };
+        self.close_abort_question();
         let tab = editor.tab;
         editor.child.kill();
         drop(editor);
         self.finish_external_edit(tab, ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned()));
+    }
+
+    /// Closes the abort question if it is open (M2 R1 M-2): the edit it asks about has ended.
+    fn close_abort_question(&mut self) {
+        if let Some(id) = self.abort_overlay {
+            self.close_overlay(id);
+        }
     }
 }
 
@@ -654,7 +681,7 @@ mod tests {
     use crate::keymap::{Binding, KeyChord, KeyScope, Keymap};
     use crate::keys::{Act, Context, Keys, Stack, views};
     use crate::store_worker::{StoreReply, StoreRequest};
-    use crate::ui::overlay::{Overlay, OverlayId, QuitConfirm};
+    use crate::ui::overlay::{AbortConfirm, Overlay, OverlayId, QuitConfirm};
     use crate::ui::tabs::{Tab, TabId};
 
     /// What the fake child was asked to do.
@@ -952,6 +979,14 @@ mod tests {
         open(&mut app, ASKER, &log);
         app.on_key(ctrl('4'));
         (app, benches, log)
+    }
+
+    /// Registers the abort question and names it as the abort overlay, as `register_all` does
+    /// (M2 R1 M-2).
+    fn abortable(app: &mut App) {
+        app.overlay_factories
+            .register(AbortConfirm::ID, || Box::new(AbortConfirm::new()));
+        app.abort_overlay = Some(AbortConfirm::ID);
     }
 
     /// Registers the quit question and names it as the quit overlay, as `register_all` does.
@@ -1705,6 +1740,133 @@ mod tests {
         let frame = text(term.backend().buffer());
         assert!(frame.contains("Global:"), "{frame}");
         assert!(!frame.contains("Editor:"), "{frame}");
+    }
+
+    /// M2 R1 M-2: `editor.abort` asks first. nano's habitual `ctrl-x`, `y` (the asking tab
+    /// unfocused after a tab switch) keeps the edit: `y` is not the abort key, so it closes the
+    /// question, and neither key reaches the asking view or the editor.
+    #[test]
+    fn abort_asks_first_and_the_nano_sequence_keeps_the_edit() {
+        let (mut app, benches, log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        assert_eq!(top(&app), Some(AbortConfirm::ID), "asked");
+        assert!(app.editor_open());
+        assert!(benches[0].seen.borrow().heard.is_empty());
+
+        app.on_key(plain('y'));
+        assert!(app.overlays.is_empty(), "closed");
+        assert!(app.editor_open(), "the edit stays");
+        assert!(!focused(&app), "as it was");
+        assert_eq!(app.tabs.active_id(), Some(ASKER));
+        assert!(benches[0].seen.borrow().heard.is_empty());
+        assert!(benches.iter().all(|b| b.seen.borrow().keys.is_empty()));
+        assert!(writes(&log).is_empty());
+        assert_eq!(app.status, None, "`y` is not refused either");
+    }
+
+    /// M2 R1 M-2: the abort key again aborts: the asking tab hears `Failed(EDITOR_ABORTED)` and
+    /// the question is gone.
+    #[test]
+    fn abort_again_aborts() {
+        let (mut app, benches, log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        app.on_key(ctrl('x'));
+        assert!(!app.editor_open());
+        assert!(app.overlays.is_empty());
+        assert_eq!(
+            benches[0].seen.borrow().heard,
+            vec![ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned())]
+        );
+        assert!(benches[1].seen.borrow().heard.is_empty());
+        assert_eq!(*log.borrow(), vec![Call::Kill, Call::Dropped]);
+    }
+
+    /// M2 R1 M-2: every other key closes the question and keeps the edit, unfocused, and is
+    /// consumed: `Esc`, `?` (no box opens), `q` (no quit question), `ctrl-4` (no refocus).
+    #[test]
+    fn every_other_key_under_the_abort_question_keeps_the_edit() {
+        for key in [
+            plain('y'),
+            press(KeyCode::Esc, KeyModifiers::NONE),
+            plain('?'),
+            plain('q'),
+            ctrl('4'),
+            press(KeyCode::Enter, KeyModifiers::NONE),
+            press(KeyCode::Tab, KeyModifiers::NONE),
+        ] {
+            let (mut app, benches, log) = unfocused_two();
+            abortable(&mut app);
+            confirmable(&mut app);
+            app.on_key(ctrl('x'));
+            app.on_key(key);
+            assert!(app.overlays.is_empty(), "{key:?}: closed, nothing opened");
+            assert!(app.editor_open(), "{key:?}");
+            assert!(!focused(&app), "{key:?}");
+            assert!(!app.help_visible, "{key:?}");
+            assert!(!app.should_quit, "{key:?}");
+            assert_eq!(app.tabs.active_id(), Some(ASKER), "{key:?}");
+            assert!(benches.iter().all(|b| b.seen.borrow().keys.is_empty()));
+            assert!(writes(&log).is_empty(), "{key:?}");
+        }
+    }
+
+    /// M2 R1 M-2: `ctrl-c` under the abort question quits at once (ANA-26 C3).
+    #[test]
+    fn ctrl_c_under_the_abort_question_quits() {
+        let (mut app, _benches, _log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        app.on_key(ctrl('c'));
+        assert!(app.should_quit);
+    }
+
+    /// M2 R1 M-2: an editor that exits under the abort question takes it along (the edit it
+    /// asked about has ended); the asking tab hears the exit, not an abort.
+    #[test]
+    fn an_editor_that_exits_under_the_abort_question_closes_it() {
+        let (mut app, benches, _log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        exited(&mut app, 0, Duration::from_secs(2));
+        assert!(!app.editor_open());
+        assert!(app.overlays.is_empty(), "the question went with the edit");
+        let heard = benches[0].seen.borrow().heard.clone();
+        assert_eq!(heard.len(), 1);
+        assert_ne!(
+            heard[0],
+            ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned())
+        );
+    }
+
+    /// M2 R1 M-2: the question is drawn over the asking tab, its hint generated from the keys;
+    /// the `?` box closes when it opens, and the status line says to close it first.
+    #[test]
+    fn the_abort_question_is_drawn_with_the_abort_key() {
+        let (mut app, _benches, _log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(plain('?'));
+        assert!(app.help_visible);
+        app.on_key(ctrl('x'));
+        assert!(!app.help_visible, "the box closes");
+        assert_eq!(app.editor_status().as_deref(), Some(COVERED));
+        let term = draw(&mut app, 100, 30);
+        let frame = text(term.backend().buffer());
+        assert!(frame.contains("Abort the edit and lose it?"), "{frame}");
+        assert!(
+            frame.contains("Ctrl+x again aborts \u{b7} any other key keeps editing"),
+            "{frame}"
+        );
+        insta::assert_snapshot!("the_abort_question", frame);
+
+        app.on_key(plain('n'));
+        app.keys = Keys::defaults().with_chords(Context::Editor, Act::EditorAbort, &["f9"]);
+        app.on_key(press(KeyCode::F(9), KeyModifiers::NONE));
+        let frame = text(draw(&mut app, 100, 30).backend().buffer());
+        assert!(frame.contains("F9 again aborts"), "{frame}");
+        app.on_key(press(KeyCode::F(9), KeyModifiers::NONE));
+        assert!(!app.editor_open(), "the rebound key aborts");
     }
 
     #[test]

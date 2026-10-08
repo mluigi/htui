@@ -38,6 +38,7 @@ impl App {
             // The unstamped path (`Origin::App`, or a keymap binding): only a tab can open the
             // editor, because only a tab can be handed the outcome (MOD-9 D10).
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
+            Action::AbortEdit => self.abort_editor(),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
@@ -102,6 +103,14 @@ impl App {
         };
         self.overlays.pop();
         self.forget_overlay(id);
+    }
+
+    /// Closes the overlay `id` wherever it is in the stack and forgets its requests (D240): the
+    /// abort question when its edit ends (MOD-57 M2 R1 M-2). Nothing if it is not open.
+    pub(super) fn close_overlay(&mut self, id: OverlayId) {
+        if self.overlays.remove(id) {
+            self.forget_overlay(id);
+        }
     }
 
     /// Closes every overlay and forgets their requests (D240): `CloseAll` and a scope change.

@@ -259,6 +259,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the migration prompt", views::MIGRATION),
     ("in the waiting list", views::WAITING_LIST),
     ("in the quit question", views::QUIT_CONFIRM),
+    ("in the abort question", views::ABORT_CONFIRM),
     (WHILE_EDITING, Stack::EDITOR_OPEN),
 ];
 
@@ -338,7 +339,7 @@ mod tests {
     fn declared_starts_with_base_and_overlay_and_holds_every_view_stack() {
         assert_eq!(DECLARED[0], ("on every screen", Stack::BASE));
         assert_eq!(DECLARED[1], ("over an overlay", Stack::OVERLAY));
-        assert_eq!(DECLARED.len(), 38);
+        assert_eq!(DECLARED.len(), 39);
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");

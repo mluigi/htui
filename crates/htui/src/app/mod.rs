@@ -16,7 +16,8 @@ use crossterm::event::{KeyCode, KeyModifiers};
 use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::keys::Act;
 use crate::ui::overlay::{
-    ConceptsSearch, MigrationPrompt, QueueOverlay, QuitConfirm, WaitingList, WorkspaceSwitcher,
+    AbortConfirm, ConceptsSearch, MigrationPrompt, QueueOverlay, QuitConfirm, WaitingList,
+    WorkspaceSwitcher,
 };
 use crate::ui::tabs::settings::{
     AgentsSection, BoxesSection, ConnectionSection, HierarchySection, KindsSection,
@@ -134,6 +135,10 @@ pub fn register_all(app: &mut App) {
     app.overlay_factories
         .register(QuitConfirm::ID, || Box::new(QuitConfirm::new()));
     app.quit_overlay = Some(QuitConfirm::ID);
+    // MOD-57 M2 R1 M-2: the abort question, for the same reason.
+    app.overlay_factories
+        .register(AbortConfirm::ID, || Box::new(AbortConfirm::new()));
+    app.abort_overlay = Some(AbortConfirm::ID);
 
     app.replay_tab = Some(ChatTab::ID);
     // MOD-64 D235: which tab selects a revealed item or requirement. Ids, not views, for the reason

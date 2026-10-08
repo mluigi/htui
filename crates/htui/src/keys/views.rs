@@ -1,8 +1,9 @@
 //! Every converted view mode's context stack (MOD-67 D3): views import them, never declare one.
 //!
 //! Each stack opens with the view's own layer ([`Layer::view`]: the mode's own acts plus the
-//! shared acts a wider layer offers, PA-3), except [`SETTINGS_TAB`], [`CAPTURE`] and
-//! [`QUIT_CONFIRM`], which have none, and ends with the global layer: unfiltered in a
+//! shared acts a wider layer offers, PA-3), except [`SETTINGS_TAB`], [`CAPTURE`],
+//! [`QUIT_CONFIRM`] and [`ABORT_CONFIRM`] (only `editor.abort`), which have none, and ends
+//! with the global layer: unfiltered in a
 //! browse mode, [`Layer::modal`] in a capturing or confirming one (D5). Layer order is fixed:
 //! view, `settings`, `confirm`, `form`, `common`, `list`, `overlay`, `global` (only the layers
 //! present). `keys::DECLARED` lists every one of them with the phrase its collision errors end
@@ -329,6 +330,11 @@ pub const MIGRATION: Stack<'static> =
 /// so `[confirm]`, `[overlay]` and `[global] help` rebind it, and no `[quit]` table exists.
 pub const QUIT_CONFIRM: Stack<'static> = Stack::new(&[CONFIRM, OVERLAY, HELP]);
 
+/// The abort question (MOD-57 M2 R1 M-2): `editor.abort` again aborts; every other key keeps the
+/// edit, so no other layer: not even `overlay.close` or `global.help` act there.
+pub const ABORT_CONFIRM: Stack<'static> =
+    Stack::new(&[Layer::only(Context::Editor, &[Act::EditorAbort])]);
+
 /// The waiting list overlay.
 pub const WAITING_LIST: Stack<'static> = Stack::new(&[
     Layer::view(Context::Waiting, &[Act::WaitingOpen]),
@@ -355,6 +361,7 @@ mod tests {
         SETTINGS_TAB,
         CAPTURE,
         QUIT_CONFIRM,
+        ABORT_CONFIRM,
     ];
 
     fn chord(spec: &str) -> KeyChord {
@@ -520,6 +527,7 @@ mod tests {
             include_str!("../ui/tabs/settings/qdrant.rs"),
             include_str!("../ui/tabs/settings/queue.rs"),
             include_str!("../ui/tabs/settings/secrets.rs"),
+            include_str!("../ui/overlay/abort_confirm.rs"),
             include_str!("../ui/overlay/concepts_search.rs"),
             include_str!("../ui/overlay/migration_prompt.rs"),
             include_str!("../ui/overlay/quit_confirm.rs"),

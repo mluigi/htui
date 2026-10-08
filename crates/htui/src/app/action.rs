@@ -57,6 +57,9 @@ pub enum Action {
     /// `App::drain`, which holds it for the event loop; any other origin is refused on the status
     /// line.
     EditExternally(ExternalEdit),
+    /// `editor.abort` confirmed (MOD-57 M2 R1 M-2, the abort question's): kill the in-pane editor
+    /// and answer its tab `Failed(EDITOR_ABORTED)`; nothing without one.
+    AbortEdit,
     /// Show or hide the key help.
     ToggleHelp,
     /// Put a message on the status line: what a `StoreReply::Failed` becomes.

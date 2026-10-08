@@ -318,8 +318,9 @@ async fn ctrl_e_on_a_draft_edits_over_its_claimed_rect() {
 }
 
 /// P5: a focused editor gets `ctrl-c` (the line discipline turns it into its own SIGINT, htui
-/// does not quit); `editor.focus` then `editor.abort` end it, the view hears `EDITOR_ABORTED`,
-/// and the child is gone.
+/// does not quit); after `editor.focus`, `editor.abort` asks first (M2 R1 M-2): nano's `ctrl-x`,
+/// `y` keeps the edit, and `editor.abort` twice ends it, the view hears `EDITOR_ABORTED`, and the
+/// child is gone.
 #[tokio::test]
 async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
     let dir = TempDir::new().expect("a temp dir");
@@ -359,10 +360,21 @@ async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
 
     harness.key("ctrl-4");
     harness.key("ctrl-x");
+    assert!(harness.app().editor_open(), "abort asks first");
+    let frame = harness.render();
     assert!(
-        !harness.app().editor_open(),
-        "abort closes the editor at once"
+        frame.contains("Abort the edit and lose it?")
+            && frame.contains("Ctrl+x again aborts \u{b7} any other key keeps editing"),
+        "the question: {frame}"
     );
+    harness.key("y");
+    assert!(harness.app().editor_open(), "`y` keeps the edit");
+    assert!(harness.app().overlays.is_empty(), "and closes the question");
+    assert!(alive(&pid), "the editor is untouched");
+
+    harness.key("ctrl-x");
+    harness.key("ctrl-x");
+    assert!(!harness.app().editor_open(), "abort again aborts");
     assert!(!harness.app().should_quit);
     let frame = harness.render();
     assert!(

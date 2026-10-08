@@ -230,6 +230,10 @@ pub struct App {
     /// alive. Set by [`register_all`](crate::app::register_all), an id for `migration_overlay`'s
     /// reason; `None` (a bare shell) quits at once, as M1 did.
     pub quit_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// The abort question (MOD-57 M2 R1 M-2): opened by `editor.abort` on the asking tab. Set by
+    /// [`register_all`](crate::app::register_all), an id for `migration_overlay`'s reason; `None`
+    /// (a bare shell) aborts at once, as M1 did.
+    pub abort_overlay: Option<crate::ui::overlay::OverlayId>,
     /// Tab that shows a replayed step (MOD-2 D39, `R-HIS-2`).
     ///
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
@@ -309,6 +313,7 @@ impl App {
             startup_overlay: None,
             migration_overlay: None,
             quit_overlay: None,
+            abort_overlay: None,
             replay_tab: None,
             reveal_tabs: Vec::new(),
             migration_prompt_shown: false,
