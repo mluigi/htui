@@ -18,7 +18,9 @@
 //!   been reused. On Windows: portable-pty's kill (`TerminateProcess`). No signal is sent from
 //!   the caller's thread.
 //! - [`PaneScreen`]: the VT screen a pane's output is parsed into (`vt100`), and the replies the
-//!   child is owed for its terminal queries (DSR, DA1).
+//!   child is owed for its terminal queries (DSR, DA1). The output passes a CSI clamp first
+//!   (`CsiClamp`, R1 H-1): `vt100` repeats ICH, IL and SD as many times as their count asks, on
+//!   the UI task, so their counts are held to the screen's size.
 //! - [`encode_key`] and [`encode_paste`]: crossterm's keys and pastes as the bytes a legacy xterm
 //!   sends (no kitty protocol, PRD Q4).
 //! - [`PaneId`], [`PaneSize`], [`PaneEvent`]: what the shell and the pane's threads exchange.
@@ -456,6 +458,164 @@ impl fmt::Debug for PtyChild {
 pub struct PaneScreen {
     /// The grid, its modes, and the replies queued while parsing.
     parser: vt100::Parser<Replies>,
+    /// What the child's bytes go through before the parser (R1 H-1).
+    clamp: CsiClamp,
+    /// The clamped bytes of one feed, kept for the next.
+    clamped: Vec<u8>,
+}
+
+/// ESC, CAN and SUB: the bytes that end a sequence from inside it (`vte`'s "anywhere").
+const ESC: u8 = 0x1B;
+/// See [`ESC`].
+const CAN: u8 = 0x18;
+/// See [`ESC`].
+const SUB: u8 = 0x1A;
+
+/// `vte` 0.15 keeps at most this many parameters and subparameters (`params.rs`, `MAX_PARAMS`);
+/// what follows them changes nothing it dispatches.
+const VTE_MAX_PARAMS: usize = 32;
+
+/// Where the clamp is in the child's output: `vte` 0.15's states, as far as a CSI needs them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum ClampState {
+    /// Text, or any sequence that is not a CSI (OSC, DCS, an `ESC` final): only an ESC matters.
+    #[default]
+    Ground,
+    /// After an ESC (already passed on).
+    Escape,
+    /// After `ESC [`: the `[` and the parameters are held until the final byte.
+    Csi,
+    /// A CSI with a private marker or an intermediate: passed on as it comes.
+    Passing,
+}
+
+/// R1 H-1: `vt100` 0.16.2 runs ICH (`CSI n @`, quadratic in the row), IL (`CSI n L`) and SD
+/// (`CSI n T`) `n` times, uncapped, on the UI task: one `CSI 65535 @` took half a second. Past a
+/// screen's width (ICH) or height (IL, SD) every count is the same edit, so the clamp rewrites
+/// that count to the screen's size before `vt100` sees it.
+///
+/// Stateful, because `vte` is: a sequence split across two reads is one sequence. It mirrors
+/// `vte`'s transitions: an ESC restarts from anywhere (inside an OSC or a DCS too); `ESC [`
+/// starts a CSI; inside one, a C0 byte other than CAN, SUB and ESC is executed in place, so it is
+/// passed on at once, ahead of the held CSI (the order `vte` executes them in); CAN and SUB
+/// abort it; a private marker (`0x3C`-`0x3F`) or an intermediate (`0x20`-`0x2F`) makes it a
+/// sequence `vt100` does not read as ICH, IL or SD, passed on as it comes; DEL and bytes from
+/// `0x80` are ignored. No digit is held raw (leading zeros would grow the buffer without bound):
+/// each parameter is counted as `vte` counts it (a saturating `u16`) and written back in decimal,
+/// at most [`VTE_MAX_PARAMS`] of them. Every other byte is passed on unchanged.
+#[derive(Debug, Default)]
+struct CsiClamp {
+    /// Where the last byte left it.
+    state: ClampState,
+    /// The held CSI's first parameter; `None` before its first digit.
+    first: Option<u16>,
+    /// The held CSI's further parameters: each separator (`;` or `:`) and its number.
+    rest: Vec<(u8, Option<u16>)>,
+}
+
+impl CsiClamp {
+    /// Passes `bytes` on to `out`, clamped for a screen of `size` (the size the sequence's final
+    /// byte meets). A CSI not yet complete is held for the next call.
+    fn filter(&mut self, bytes: &[u8], size: PaneSize, out: &mut Vec<u8>) {
+        for &byte in bytes {
+            match self.state {
+                ClampState::Ground => {
+                    out.push(byte);
+                    if byte == ESC {
+                        self.state = ClampState::Escape;
+                    }
+                }
+                ClampState::Escape => match byte {
+                    b'[' => {
+                        self.first = None;
+                        self.rest.clear();
+                        self.state = ClampState::Csi;
+                    }
+                    // Another sequence (an `ESC` final, OSC, DCS, ...) or an abort.
+                    CAN | SUB | 0x20..=0x7E => {
+                        out.push(byte);
+                        self.state = ClampState::Ground;
+                    }
+                    // ESC again, a C0 byte (executed), DEL or a high byte: still after an ESC.
+                    _ => out.push(byte),
+                },
+                ClampState::Csi => match byte {
+                    // Restart: the held CSI is dropped, as `vte` drops it. The ESC already
+                    // passed on stays in `vt100`'s escape state, which this one continues.
+                    ESC => {
+                        out.push(byte);
+                        self.state = ClampState::Escape;
+                    }
+                    CAN | SUB => {
+                        out.push(byte);
+                        self.state = ClampState::Ground;
+                    }
+                    0x00..=0x1F => out.push(byte),
+                    b'0'..=b'9' => self.digit(byte - b'0'),
+                    b':' | b';' => {
+                        if self.rest.len() < VTE_MAX_PARAMS {
+                            self.rest.push((byte, None));
+                        }
+                    }
+                    0x20..=0x2F | 0x3C..=0x3F => {
+                        self.release(out);
+                        out.push(byte);
+                        self.state = ClampState::Passing;
+                    }
+                    0x40..=0x7E => {
+                        let limit = match byte {
+                            b'@' => Some(size.cols),
+                            b'L' | b'T' => Some(size.rows),
+                            _ => None,
+                        };
+                        if let (Some(limit), Some(first)) = (limit, self.first.as_mut()) {
+                            *first = (*first).min(limit);
+                        }
+                        self.release(out);
+                        out.push(byte);
+                        self.state = ClampState::Ground;
+                    }
+                    // DEL and high bytes: ignored inside a CSI.
+                    _ => {}
+                },
+                ClampState::Passing => {
+                    out.push(byte);
+                    match byte {
+                        ESC => self.state = ClampState::Escape,
+                        CAN | SUB | 0x40..=0x7E => self.state = ClampState::Ground,
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    /// One digit of the current parameter. Past [`VTE_MAX_PARAMS`] it changes nothing.
+    fn digit(&mut self, digit: u8) {
+        if self.rest.len() >= VTE_MAX_PARAMS {
+            return;
+        }
+        let param = match self.rest.last_mut() {
+            Some((_, param)) => param,
+            None => &mut self.first,
+        };
+        let value = param.unwrap_or(0);
+        *param = Some(value.saturating_mul(10).saturating_add(u16::from(digit)));
+    }
+
+    /// Passes the held `[` and parameters on.
+    fn release(&mut self, out: &mut Vec<u8>) {
+        out.push(b'[');
+        if let Some(first) = self.first.take() {
+            let _ = write!(out, "{first}");
+        }
+        for (separator, param) in self.rest.drain(..) {
+            out.push(separator);
+            if let Some(param) = param {
+                let _ = write!(out, "{param}");
+            }
+        }
+    }
 }
 
 /// The callbacks: replies queued while parsing.
@@ -510,13 +670,17 @@ impl PaneScreen {
                 0,
                 Replies { out: Vec::new() },
             ),
+            clamp: CsiClamp::default(),
+            clamped: Vec::new(),
         }
     }
 
     /// Parses `bytes`; returns the replies to write back to the child (often empty).
     #[must_use]
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<u8> {
-        self.parser.process(bytes);
+        self.clamped.clear();
+        self.clamp.filter(bytes, self.size(), &mut self.clamped);
+        self.parser.process(&self.clamped);
         std::mem::take(&mut self.parser.callbacks_mut().out)
     }
 
@@ -1196,6 +1360,259 @@ mod tests {
         assert_eq!(screen.feed(b"0123456789\x1b[6n"), b"\x1b[1;10R");
         // The wrap happens on the next character.
         assert_eq!(screen.feed(b"a\x1b[6n"), b"\x1b[2;2R");
+    }
+
+    /// R1 H-1: `vt100` 0.16.2 runs ICH (`ESC [n@`, quadratically), IL (`ESC [nL`) and SD
+    /// (`ESC [nT`) `n` times, uncapped: one `ESC [65535@` cost half a second on the UI task. The
+    /// clamp holds each to a screen's worth, split across feeds and behind leading zeros too.
+    #[test]
+    fn huge_insert_and_scroll_counts_cost_a_screen_not_their_count() {
+        let bound = Duration::from_secs(1);
+        for last in ['@', 'L', 'T'] {
+            let forms: [Vec<String>; 4] = [
+                vec![format!("\x1b[65535{last}")],
+                vec!["\x1b[655".to_owned(), format!("35{last}")],
+                vec!["\x1b[".to_owned(), format!("65535{last}")],
+                vec!["\x1b[0000000000".to_owned(), format!("000065535{last}")],
+            ];
+            for form in forms {
+                let mut screen = PaneScreen::new(PaneSize::DEFAULT);
+                let _ = screen.feed("x".repeat(80 * 24).as_bytes());
+                let _ = screen.feed(b"\x1b[3;5H\x1b[2;20r\x1b[5;7H");
+                let started = Instant::now();
+                for round in 0..1000 {
+                    for part in &form {
+                        let _ = screen.feed(part.as_bytes());
+                    }
+                    let took = started.elapsed();
+                    assert!(
+                        took < bound,
+                        "{form:?}: {took:?} after {} rounds",
+                        round + 1
+                    );
+                }
+            }
+        }
+    }
+
+    /// The screen after `before` then `sequence` (fed in `parts`) through the clamp, against a
+    /// plain `vt100` parser fed the same bytes unclamped: identical, cell by cell, and again
+    /// after more output (the rows' wrap flags).
+    fn assert_clamp_is_invisible(size: PaneSize, before: &str, parts: &[&str]) {
+        let mut clamped = PaneScreen::new(size);
+        let mut plain = vt100::Parser::new(size.rows, size.cols, 0);
+        let _ = clamped.feed(before.as_bytes());
+        plain.process(before.as_bytes());
+        for part in parts {
+            let _ = clamped.feed(part.as_bytes());
+            plain.process(part.as_bytes());
+        }
+        let what = format!("{before:?} then {parts:?}");
+        assert_same_screen(clamped.screen(), plain.screen(), &what);
+        let after = "XY\u{4e2d}Z\r\nW";
+        let _ = clamped.feed(after.as_bytes());
+        plain.process(after.as_bytes());
+        assert_same_screen(
+            clamped.screen(),
+            plain.screen(),
+            &format!("{what}, then more"),
+        );
+    }
+
+    fn assert_same_screen(clamped: &vt100::Screen, plain: &vt100::Screen, what: &str) {
+        assert_eq!(clamped.contents(), plain.contents(), "{what}");
+        assert_eq!(
+            clamped.contents_formatted(),
+            plain.contents_formatted(),
+            "{what}"
+        );
+        assert_eq!(clamped.cursor_position(), plain.cursor_position(), "{what}");
+        let (rows, cols) = plain.size();
+        for row in 0..rows {
+            for col in 0..cols {
+                let cell = |screen: &vt100::Screen| {
+                    screen.cell(row, col).map(|cell| {
+                        (
+                            cell.contents().to_owned(),
+                            cell.is_wide(),
+                            cell.is_wide_continuation(),
+                            cell.bgcolor(),
+                        )
+                    })
+                };
+                assert_eq!(cell(clamped), cell(plain), "{what} at {row},{col}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_clamped_count_draws_what_the_unclamped_one_does() {
+        // 6x10: every count from 1 past the screen up is the same edit, so the plain parser can
+        // take them unclamped here (cheaply: the grid is small).
+        let size = PaneSize::new(6, 10);
+        let lines = "1aaaaaaaaa\r\n2bbbbbbbbb\r\n3ccccccccc\r\n4ddddddddd\r\n5eeeeeeeee\r\n6fffff";
+        let befores = [
+            // The cursor mid-row.
+            format!("{lines}\x1b[1;4H"),
+            // On a wide character's second half (ICH keeps it a continuation).
+            format!("{lines}\x1b[1;1Hab\u{4e2d}cd\u{4e2d}ef\x1b[1;4H"),
+            // In a scroll region (DECSTBM), and below one.
+            format!("{lines}\x1b[2;4r\x1b[3;2H"),
+            format!("{lines}\x1b[2;3r\x1b[5;2H"),
+            // Pending wrap, with a background colour to carry.
+            format!("{lines}\x1b[44m\x1b[6;1H0123456789"),
+        ];
+        for before in &befores {
+            for last in ['@', 'L', 'T'] {
+                let mut counts = vec!["", "0", "1", "5", "6", "9", "10", "11", "300", "1000"];
+                if last != '@' {
+                    // ICH is quadratic unclamped; IL and SD are linear, so the full count.
+                    counts.push("65535");
+                }
+                for count in counts {
+                    let whole = format!("\x1b[{count}{last}");
+                    assert_clamp_is_invisible(size, before, &[&whole]);
+                    // Split at every byte: the clamp keeps its state across feeds.
+                    for at in 1..whole.len() {
+                        assert_clamp_is_invisible(size, before, &[&whole[..at], &whole[at..]]);
+                    }
+                }
+            }
+        }
+
+        // What `vte` does inside a CSI, kept: C0 runs in place, DEL and high bytes are ignored,
+        // CAN/SUB abort, ESC restarts, leading zeros and saturation count as `vte` counts them,
+        // a second parameter or a subparameter rides along, and a parameter list past `vte`'s 32
+        // is cut where `vte` cuts it.
+        let many = format!("\x1b[300{}@", ";1".repeat(40));
+        let edge = [
+            "\x1b[3\r00@",
+            "\x1b[3\n00L",
+            "\x1b[30\x7f0@",
+            "\x1b[30\u{e9}0@",
+            "\x1b[300\x18@",
+            "\x1b[300\x1aL",
+            "\x1b[300\x1b[2@",
+            "\x1b\x07[300@",
+            "\x1b[000000000000300@",
+            "\x1b[99999999L",
+            "\x1b[300;5@",
+            "\x1b[300:5@",
+            "\x1b[;300@",
+            &many,
+            "\x1b]0;[300@\x07",
+            "\x1b]0;t\x1b[300@",
+            "\x1bP[300@\x1b\\",
+            "\x1b (300@",
+            "\x1b[?300@",
+            "\x1b[300 @",
+            "\x1b[3?00@",
+        ];
+        for before in &befores {
+            for sequence in edge {
+                assert_clamp_is_invisible(size, before, &[sequence]);
+                for at in 1..sequence.len() {
+                    if sequence.is_char_boundary(at) {
+                        assert_clamp_is_invisible(
+                            size,
+                            before,
+                            &[&sequence[..at], &sequence[at..]],
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The bytes the clamp hands `vt100` for `parts`, fed in turn, at `size`.
+    fn clamped(size: PaneSize, parts: &[&str]) -> Vec<String> {
+        let mut clamp = CsiClamp::default();
+        parts
+            .iter()
+            .map(|part| {
+                let mut out = Vec::new();
+                clamp.filter(part.as_bytes(), size, &mut out);
+                String::from_utf8(out).expect("UTF-8 in, UTF-8 out")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_clamp_rewrites_only_the_count_of_ich_il_and_sd() {
+        let size = PaneSize::DEFAULT;
+        // Passed through byte for byte: every other sequence, the private and intermediate forms
+        // of the three, and counts within the screen.
+        for bytes in [
+            "plain [65535@ text\r\n",
+            "\x1b[?1049h",
+            "\x1b[?2004h",
+            "\x1b[?1h\x1b[?25l",
+            "\x1b[38;2;1;2;3m",
+            "\x1b[38:2::1:2:3m",
+            "\x1b[38;5;196m\x1b[0m",
+            "\x1b[2;20r",
+            "\x1b[3;7H",
+            "\x1b[8;30;100t",
+            "\x1b[6n\x1b[5n\x1b[c\x1b[>c",
+            "\x1b[>65535@",
+            "\x1b[?65535L",
+            "\x1b[65535 @",
+            "\x1b[65535$T",
+            "\x1b[80@\x1b[24L\x1b[24T",
+            "\x1b[@\x1b[L\x1b[T\x1b[0@",
+            "\x1b[65535M\x1b[65535S\x1b[65535P\x1b[65535X\x1b[65535C",
+            "\x1b]0;[65535@\x07",
+            "\x1bP[65535@\x1b\\",
+            "\x1b(B\x1b7\x1b8\x1bM",
+        ] {
+            assert_eq!(clamped(size, &[bytes]).concat(), bytes, "{bytes:?}");
+        }
+        // Clamped: the count of ICH to the columns, of IL and SD to the rows.
+        for (bytes, to) in [
+            ("\x1b[65535@", "\x1b[80@"),
+            ("\x1b[81@", "\x1b[80@"),
+            ("\x1b[65535L", "\x1b[24L"),
+            ("\x1b[25T", "\x1b[24T"),
+            ("\x1b[00000065535;7@", "\x1b[80;7@"),
+            ("\x1b[65535:2L", "\x1b[24:2L"),
+            ("\x1b]0;t\x1b[65535@", "\x1b]0;t\x1b[80@"),
+            ("\x1b[65\r535@", "\x1b\r[80@"),
+        ] {
+            assert_eq!(clamped(size, &[bytes]).concat(), to, "{bytes:?}");
+        }
+        // Across feeds: nothing of the count is passed on until its final byte.
+        assert_eq!(
+            clamped(size, &["ab\x1b[655", "35", "@cd"]),
+            ["ab\x1b", "", "[80@cd"]
+        );
+        // The size at the final byte is the one that counts.
+        let mut clamp = CsiClamp::default();
+        let mut out = Vec::new();
+        clamp.filter(b"\x1b[6553", PaneSize::DEFAULT, &mut out);
+        clamp.filter(b"5L", PaneSize::new(30, 100), &mut out);
+        assert_eq!(out, b"\x1b[30L");
+    }
+
+    #[test]
+    fn the_clamp_keeps_the_screen_modes_and_replies() {
+        let mut screen = PaneScreen::new(PaneSize::DEFAULT);
+        let modes = b"\x1b[?1049h\x1b[?2004h\x1b[38;2;1;2;3mA\x1b[38:2::4:5:6mB\x1b[38;5;196mC";
+        let _ = screen.feed(modes);
+        let mut plain = vt100::Parser::new(24, 80, 0);
+        plain.process(modes);
+        assert!(screen.screen().alternate_screen());
+        assert!(screen.screen().bracketed_paste());
+        let fg = |screen: &vt100::Screen, col| screen.cell(0, col).map(vt100::Cell::fgcolor);
+        assert_eq!(fg(screen.screen(), 0), Some(vt100::Color::Rgb(1, 2, 3)));
+        assert_eq!(fg(screen.screen(), 2), Some(vt100::Color::Idx(196)));
+        for col in 0..3 {
+            assert_eq!(fg(screen.screen(), col), fg(plain.screen(), col), "{col}");
+        }
+        // A query split across feeds is answered once it is whole, as before.
+        assert!(screen.feed(b"\x1b[").is_empty());
+        assert_eq!(screen.feed(b"6n"), b"\x1b[1;4R");
+        assert!(screen.feed(b"\x1b").is_empty());
+        assert_eq!(screen.feed(b"[c"), b"\x1b[?62;22c");
     }
 
     #[test]
