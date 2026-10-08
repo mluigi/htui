@@ -58,6 +58,18 @@ back in can stand down.
   It writes only `settings.user_extensions` and leaves every other settings key untouched. It
   appears for every row, because nothing branches on name or transport. The README says it only
   matters for Claude Code rows. No new table column.
+- **D8 — An operator `--settings` must isolate too (added after T1 case 1a; maintainer, 2026-10-08).**
+  A later `--settings` replaces htui's own rather than merging with it. So, before the spawn, an
+  isolated session (`user_extensions` false) **refuses** a row whose `cli.extra_args` carry
+  `--settings` (spaced or `=`-joined), unless that value is inline JSON whose object sets
+  `"disableAllHooks": true`. A path value is refused, because htui does not read the operator's
+  file.
+  - The message names both fixes: add `"disableAllHooks":true` to that value, or set
+    `user extensions = y`.
+  - The error is `DriverError::Transport`, never `Spawn`. This is `refuse_widening`'s shape: it
+    never rewrites operator arguments.
+  - A row that opts back in is never checked.
+  - This lands in T3.
 - **D7 — Out of scope.** These stay: the managed repo's `CLAUDE.md` (ANA-29 §12 Q1; it needs
   `--safe-mode`, which the probe records only), plugin agents and plugin MCP servers (recorded,
   with a follow-up item filed if the probe shows a clean lever), and user MCP servers
@@ -213,7 +225,7 @@ back in can stand down.
 |---|---|---|
 | `disableAllHooks` also stops the ACP adapter's programmatic SDK hooks and breaks tool-call completion or the edit report | Medium | T2 tests this explicitly; falls back to candidate (b), `settingSources` |
 | A flag breaks subscription auth, as `--bare` did (D92) | Low–medium | T1 matrix, plus T6 re-runs `chat_live_cli` on the shipped argv |
-| An operator's own `--settings` in `extra_args` replaces ours and silently re-enables hooks | Medium | T1 (1a) measures last-wins vs merge. If last-wins, document it in the README beside the opt-in (the operator's `extra_args` win by design) |
+| An operator's own `--settings` in `extra_args` replaces ours and silently re-enables hooks | **Confirmed** (T1 1a: last wins) | D8: refused before the spawn unless that value itself sets `disableAllHooks` |
 | The probe touches the shared `~/.claude` | Low with the scratch `CLAUDE_CONFIG_DIR` | Never write to the real dir; the access-token-only copy prevents refresh-token rotation |
 | The access token expires mid-probe (about 2.5 h at planning time) | Medium | Maintainer refreshes on the host; the probe aborts with a clear auth message |
 | `_meta.claudeCode.options.settings` replaces the adapter's `CLAUDE_MODEL_CONFIG`-derived settings (`:5894-5900`) | Low (env not set by htui) | Documented in the code comment; T2 notes it |
@@ -265,7 +277,34 @@ See §Verified claims.
 
 ## Probe results
 
-_(T1/T2 fill this in.)_
+### T1 — CLI (2026-10-08, `claude` 2.1.294, subscription OAuth, scratch `CLAUDE_CONFIG_DIR`)
+
+Setup: a user-scope mod `probe-user@mod91-probe` (directory marketplace, `claude plugin install`,
+scope user), a skills-directory mod `probe-proj@skills-dir` in a trusted git checkout used as cwd,
+one user skill, one project skill, and a user `SessionStart` settings hook that touches a marker.
+htui-shaped spawn: `-p` stream-json, `--mcp-config=<file>` naming a stub stdio server `htui` that
+serves `permission_prompt` (always allows, logs each call), `--permission-prompt-tool
+mcp__htui__permission_prompt`, `--permission-mode default`, one turn asking for a gated
+`Bash touch`. Mods read from `--debug-file` ("hooks module <id> loaded" / "not loaded").
+
+| Case | Flags | Auth | htui MCP + prompt tool | User mod | Skills-dir mod | Settings hook | Skills | Verdict |
+|---|---|---|---|---|---|---|---|---|
+| 0 | none | ✓ | connected, 1 prompt call, Bash ran | **loaded** | **loaded** | **fired** | both listed | baseline positive: the hazard is real |
+| 1 | `--settings '{"disableAllHooks":true}' --disable-slash-commands` | ✓ | connected, 1 prompt call, Bash ran | not loaded | not loaded | not fired | 0 | **D1 passes** |
+| 1a | 1 then `--settings '{"env":{…}}'` (an `extra_args` copy) | ✓ | ✓ | **loaded** | **loaded** | **fired** | 0 | **a later `--settings` replaces ours, no merge** |
+| 2 | `--safe-mode` | — | **exit 1**: "MCP tool mcp__htui__permission_prompt (passed via --permission-prompt-tool) not found" | — | — | — | — | out: drops htui's server |
+| 3 | `--setting-sources project,local` | ✓ | ✓ | not loaded | **loaded** | not fired | project skill listed | not enough alone |
+| 4 | 1 plus `enabledPlugins:{<each>:false}` | ✓ | ✓ | gone | gone | not fired | 0 | removes whole plugins, but only by **name**: not a generic default |
+| 5 | 1, user plugin also ships an agent and an `.mcp.json` server | ✓ | ✓ | not loaded | not loaded | not fired | 0 | plugin agent `probe-user:probe-agent` **stays**; plugin MCP server `plugin:probe-user:probe-mcp` **stays, connected** |
+
+Notes:
+- Claude Code's **built-in** mods (`cc-plugin-agents-md@builtin`) load under every lever:
+  "built-in plugins load regardless". They are not the user's and are out of MOD-91's scope.
+- Plugin agents and plugin MCP servers survive `disableAllHooks` (case 5). The only lever that
+  removes them is per-name `enabledPlugins` (case 4). A generic default would have to enumerate the
+  user's installed plugins, so per D7 no follow-up lever is adopted, and none is filed.
+- **Case 1a amends the plan's risk row.** An operator `--settings` in `extra_args` silently undoes
+  isolation. See D8.
 
 ## Acceptance
 
