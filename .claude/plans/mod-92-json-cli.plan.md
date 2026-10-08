@@ -242,3 +242,15 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] Scope: first workspace / `--project` / `--cwd`, each tested
 - [ ] Every document shape pinned by an insta snapshot and documented in `docs/htui-cli.md`
 - [ ] Gate green (fmt, clippy x2, serial tests, validator)
+
+## Amendments after the blueprint (2026-10-08)
+
+The blueprint (`.claude/plans/mod-92-json-cli.blueprint.md`, "Plan amendments and clarifications")
+records A-1 to A-11; they are accepted as written. Two needed the maintainer:
+
+- **A-3 accepted:** `--search-items` uses the same exit codes with and without `--json` (3 offline,
+  2 refused, 1 error); messages unchanged; the README notes the change.
+- **Sentry:** exit 1 from the new verbs stays reported (plan D3 as written); 2 and 3 never report.
+
+Execution: T1 on the primary tree, T2 in worktree `target/wt/mod-92-t2` (branch `mod-92-t2`) to avoid
+the htui-store compile coupling, merged before T3.
