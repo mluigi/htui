@@ -3869,6 +3869,9 @@ mod queue_store_errors {
         fn send(&self, _: &u64, _: RunReply) {}
     }
 
+    /// An item and the instant it is queued at, by [`Failing::queue_before_close`].
+    type LateEntry = (ItemId, DateTime<Utc>);
+
     /// `Backend::memory`, but the call named in `fail` answers an error. Each failing call
     /// records its name and whether a streak stood when it was made.
     #[derive(Clone)]
@@ -3880,7 +3883,7 @@ mod queue_store_errors {
         no_project: Arc<AtomicBool>,
         /// Review R1 L2: an item queued (at that instant) just before `close_drained_batch`
         /// runs, as by a `queue_item` that commits between `admit`'s entry read and its close.
-        queue_before_close: Arc<StdMutex<Option<(ItemId, DateTime<Utc>)>>>,
+        queue_before_close: Arc<StdMutex<Option<LateEntry>>>,
         seen: Arc<StdMutex<Vec<(&'static str, bool)>>>,
         shared: Arc<OnceLock<Arc<Shared<Quiet>>>>,
     }
