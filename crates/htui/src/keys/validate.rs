@@ -1,8 +1,53 @@
 //! The key file's semantic checks over the merged keys (MOD-67 M2 D8 steps 5-6; ANA-26 §7.4
 //! step 7): collisions in every context and in every declared stack, and printable chords on
-//! actions offered while a field captures.
+//! actions offered while a field captures. Before them, [`give_way`] lets an entry of the file
+//! take its chord from an action the file leaves at its default (MOD-12 M3 R1 H1).
 
-use super::{Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Row, STATE_GUARDED, quote};
+use super::{
+    Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Lost, Row, STATE_GUARDED, quote,
+};
+
+/// The user's binding wins (MOD-12 M3 R1 H1, maintainer 2026-10-08): an entry of the file that
+/// shares a chord with an action in **its own context** that the file leaves at its default
+/// takes the chord, and that action loses it (unbound when it has no other). A
+/// [`STATE_GUARDED`] pair that shares the chord by default keeps sharing it, and
+/// `overlay.close` never gives way (it must keep a chord).
+///
+/// Across contexts nothing gives way, and [`validate`]'s stack rules stand: two entries on one
+/// chord are an error, and so is a chord an entry shares with another context's default only
+/// where a [`DECLARED`] stack makes both candidates (today the overlay stack: `[global] help`
+/// against `overlay.close`, either way). A context no declared stack composes with the entry's
+/// is not compared: `[global] quit = ["j"]` loads, and `list.down` keeps `j`.
+pub(super) fn give_way(keys: &mut Keys) {
+    let mut taken: Vec<(usize, Lost)> = Vec::new();
+    for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
+        for (index, default) in keys.rows.iter().enumerate() {
+            if default.entry.is_some()
+                || default.context != entry.context
+                || default.act == Act::OverlayClose
+            {
+                continue;
+            }
+            for &chord in entry.chords.iter().filter(|c| default.chords.contains(c)) {
+                if !allowed(entry, default, chord) {
+                    taken.push((
+                        index,
+                        Lost {
+                            chord,
+                            to: entry.act,
+                            line: entry.entry.unwrap_or(0),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    for (index, lost) in taken {
+        let row = &mut keys.rows[index];
+        row.chords.retain(|&chord| chord != lost.chord);
+        row.lost.push(lost);
+    }
+}
 
 /// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
 /// The compiled defaults give none (`the_compiled_defaults_validate`).
@@ -109,11 +154,12 @@ impl Check {
         };
         let origin = other
             .line
+            .or(other.entry)
             .map_or_else(|| "default".to_owned(), |line| format!("line {line}"));
         let shown = quote(&chord.spec());
         let other_name = other.act.spec().map_or("", |spec| spec.name);
         self.errors.push(KeyFileError {
-            line: reported.line.unwrap_or(0),
+            line: reported.line.or(reported.entry).unwrap_or(0),
             message: format!(
                 "{} = {shown}: {shown} is already {}.{other_name} ({origin}) {place}",
                 subject(reported),
@@ -151,7 +197,11 @@ fn subject(row: &Row) -> String {
 #[cfg(test)]
 mod tests {
     use super::validate;
-    use crate::keys::{Keys, load_str};
+    use crate::keys::{Act, Context, KeyChord, Keys, load_str};
+
+    fn chord(spec: &str) -> KeyChord {
+        KeyChord::parse_strict(spec).expect("a valid spec")
+    }
 
     /// `src`'s full error vector as `(line, message)`, or empty when it loads.
     fn errors(src: &str) -> Vec<(usize, String)> {
@@ -174,12 +224,40 @@ mod tests {
     }
 
     #[test]
-    fn two_actions_sharing_a_chord_in_one_context_are_refused_on_the_users_line() {
+    fn two_entries_sharing_a_chord_in_one_context_are_refused_on_the_users_line() {
         assert_eq!(
-            errors("[list]\ntop = [\"j\"]\n"),
+            errors("[list]\ndown = [\"j\"]\ntop = [\"j\"]\n"),
             one(
-                2,
-                r#"[list] top = "j": "j" is already list.down (default) in [list]"#
+                3,
+                r#"[list] top = "j": "j" is already list.down (line 2) in [list]"#
+            )
+        );
+    }
+
+    /// MOD-12 M3 R1 H1: an entry takes a chord from an action the file leaves at its default.
+    /// That action keeps its other chords, and its row is no change of the user's.
+    #[test]
+    fn an_entry_takes_its_chord_from_an_action_left_at_its_default() {
+        let keys = load_str("[list]\ntop = [\"j\"]\n").expect("the default gives way");
+        assert_eq!(keys.chords(Context::List, Act::ListTop), [chord("j")]);
+        assert_eq!(keys.chords(Context::List, Act::ListDown), [chord("down")]);
+        assert_eq!(keys.line(Context::List, Act::ListDown), None);
+
+        let keys = load_str("[global]\nquit = [\"ctrl-q\"]\n").expect("the queue gives way");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("ctrl-q")]);
+        assert!(keys.chords(Context::Global, Act::Queue).is_empty());
+        assert_eq!(keys.line(Context::Global, Act::Queue), None);
+    }
+
+    /// An entry that repeats an action's default is still the user's: a second entry on its
+    /// chord collides, and the report names the entry's line.
+    #[test]
+    fn an_entry_equal_to_its_default_keeps_its_chord() {
+        assert_eq!(
+            errors("[global]\nqueue = [\"ctrl-q\"]\nquit = [\"ctrl-q\"]\n"),
+            one(
+                3,
+                r#"[global] quit = "ctrl-q": "ctrl-q" is already global.queue (line 2) in [global]"#
             )
         );
     }
@@ -187,10 +265,10 @@ mod tests {
     #[test]
     fn a_shared_context_no_view_offers_yet_is_still_checked() {
         assert_eq!(
-            errors("[confirm]\nyes = [\"n\"]\n"),
+            errors("[confirm]\nyes = [\"n\"]\nno = [\"n\"]\n"),
             one(
                 2,
-                r#"[confirm] yes = "n": "n" is already confirm.no (default) in [confirm]"#
+                r#"[confirm] yes = "n": "n" is already confirm.no (line 3) in [confirm]"#
             )
         );
     }
@@ -219,6 +297,9 @@ mod tests {
         );
     }
 
+    /// A default only gives way in its own table (MOD-12 M3 R1 H1): where a declared stack
+    /// makes both candidates, a chord the user adds onto another table's default is still
+    /// refused, either way.
     #[test]
     fn a_collision_over_an_overlay_is_found_in_the_overlay_stack() {
         assert_eq!(
@@ -228,15 +309,36 @@ mod tests {
                 r#"[global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
             )
         );
+        assert_eq!(
+            errors("[overlay]\nclose = [\"esc\", \"f1\"]\n"),
+            one(
+                2,
+                r#"[overlay] close = "f1": "f1" is already global.help (default) over an overlay"#
+            )
+        );
+    }
+
+    /// MOD-12 M3 R1 H1 review: across contexts nothing gives way, and only a declared stack
+    /// compares two contexts. No declared stack composes `[list]` with `[global]`, so a global
+    /// entry on a list default loads with no notice, and the list action keeps its chord.
+    #[test]
+    fn a_global_entry_on_a_list_default_loads_and_the_list_action_keeps_it() {
+        let keys = load_str("[global]\nquit = [\"j\"]\n").expect("no declared stack compares them");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("j")]);
+        assert_eq!(
+            keys.chords(Context::List, Act::ListDown),
+            [chord("j"), chord("down")]
+        );
+        assert!(keys.notices().is_empty());
     }
 
     #[test]
     fn a_collision_seen_by_two_checks_is_reported_once() {
         assert_eq!(
-            errors("[global]\nquit = [\"w\"]\n"),
+            errors("[global]\nworkspaces = [\"z\"]\nquit = [\"z\"]\n"),
             one(
-                2,
-                r#"[global] quit = "w": "w" is already global.workspaces (default) in [global]"#
+                3,
+                r#"[global] quit = "z": "z" is already global.workspaces (line 2) in [global]"#
             )
         );
     }
@@ -247,10 +349,13 @@ mod tests {
     }
 
     /// PA-2: the allow-list is per chord. `esc` is a default of both `back` and `dismiss`, so
-    /// adding `backspace` to `back` keeps that share allowed; a chord the user gives both is not.
+    /// adding `backspace` to `back` keeps that share allowed, and `dismiss` keeps `esc`; a chord
+    /// the user gives both is not.
     #[test]
     fn a_state_guarded_pair_is_allowed_only_on_a_chord_both_have_by_default() {
         assert_eq!(errors("[common]\nback = [\"esc\", \"backspace\"]\n"), []);
+        let keys = load_str("[common]\nback = [\"esc\", \"backspace\"]\n").expect("loads");
+        assert_eq!(keys.chords(Context::Common, Act::Dismiss), [chord("esc")]);
         assert_eq!(
             errors("[common]\ndismiss = [\"x\"]\nback = [\"x\"]\n"),
             one(

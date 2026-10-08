@@ -3,12 +3,13 @@
 //!
 //! - `binary` (Unix): `htui --keys F --print-keys` prints the table (exit 0) or the exact §7.5
 //!   report on stderr (exit 2, nothing on stdout); a bad file stops the TUI before the terminal;
-//!   a missing named file exits 2; clap refuses `--keys` beside `--default-keys`.
+//!   a missing named file exits 2; clap refuses `--keys` beside `--default-keys`. An entry that
+//!   takes `ctrl-q` from the defaulted queue loads with a notice on stderr (MOD-12 M3 R1 H1).
 //! - `default_path` (Linux): the config directory's `keys.toml` is read, a missing one is the
 //!   defaults and creates nothing, `--default-keys` ignores a broken one.
 //! - `app` (`testkit`): a shell whose `app.keys` came from `valid.toml` quits on the rebound chord
 //!   and no longer on `q`, closes an overlay on `F2`, and shows both on the status line and the
-//!   `?` box.
+//!   `?` box; one from `quit_ctrl_q.toml` quits on `ctrl-q` and never opens the queue.
 //!
 //! No case may read the developer's own `keys.toml` (blueprint F-9, H-10): every child runs with
 //! a cleared environment, `HOME` and `XDG_CONFIG_HOME` both set to a temporary directory, and
@@ -142,13 +143,13 @@ mod binary {
             (
                 "collision",
                 vec![
-                    r#"3: [global] quit = "w": "w" is already global.workspaces (default) in [global]"#
+                    r#"5: [global] quit = "w": "w" is already global.workspaces (line 4) in [global]"#
                         .to_owned(),
-                    r#"4: [global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
+                    r#"6: [global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
                         .to_owned(),
-                    r#"7: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
+                    r#"9: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),
-                    r#"10: [list] top = "j": "j" is already list.down (default) in [list]"#
+                    r#"13: [list] top = "j": "j" is already list.down (line 12) in [list]"#
                         .to_owned(),
                 ],
             ),
@@ -227,14 +228,56 @@ mod binary {
         assert!(stderr.ends_with(&format!("\n{HINT}")), "{stderr}");
     }
 
-    /// MOD-12 M3 D8: `ctrl-q` is now `global.queue` by default, so a file written before it that
-    /// binds `ctrl-q` in `[global]` is refused; unbinding `queue` (or rebinding it) loads it again.
+    /// MOD-12 M3 D8 made `ctrl-q` `global.queue`'s default. MOD-12 M3 R1 H1: a file written
+    /// before it that binds `ctrl-q` in `[global]` still loads. The user's entry wins, the queue
+    /// (which the file leaves at its default) is unbound, stderr says so, and `--print-keys`
+    /// marks the queue row with the action that took its chord.
     #[test]
-    fn a_global_ctrl_q_binding_collides_with_the_queue_until_queue_is_rebound() {
+    fn a_global_ctrl_q_binding_takes_ctrl_q_from_the_queue_with_a_notice() {
         let home = tempfile::tempdir().expect("a throwaway home");
-        let path = home.path().join("upgrade.toml");
+        let path = fixture("quit_ctrl_q");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert_eq!(
+            stderr,
+            format!(
+                "htui: {}:4: [global] quit = \"ctrl-q\" takes \"ctrl-q\" from global.queue, which \
+                 is now unbound\n",
+                path.display()
+            )
+        );
+        assert_eq!(stdout, print(&load_path(&path).expect("the file loads")));
+        let row = |name: &str| {
+            stdout
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("no {name} row in {stdout}"))
+                .to_owned()
+        };
+        assert!(row("queue").contains("= []"), "{stdout}");
+        assert!(
+            row("queue").ends_with("# queue (unbound by quit)"),
+            "{stdout}"
+        );
+        assert!(row("quit").contains(r#"= ["ctrl-q"]"#), "{stdout}");
+        assert!(row("quit").ends_with("# quit (changed)"), "{stdout}");
+    }
 
-        std::fs::write(&path, "[global]\nquit = [\"ctrl-q\"]\n").expect("the file is written");
+    /// Two entries of the file on one chord are still refused (MOD-67 M2 D8 step 5), even when
+    /// one of them repeats its action's default.
+    #[test]
+    fn two_entries_on_ctrl_q_are_still_refused() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = home.path().join("both.toml");
+        std::fs::write(
+            &path,
+            "[global]\nquit = [\"ctrl-q\"]\nqueue = [\"ctrl-q\"]\n",
+        )
+        .expect("the file is written");
         let output = run(
             &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
             home.path(),
@@ -242,28 +285,9 @@ mod binary {
         let (stdout, stderr) = text(&output);
         assert_eq!(output.status.code(), Some(2), "{stderr}");
         assert_eq!(stdout, "");
-        let line = r#"2: [global] quit = "ctrl-q": "ctrl-q" is already global.queue (default) in [global]"#;
-        assert_eq!(stderr, report("upgrade", &path, &[line.to_owned()]));
-
-        std::fs::write(&path, "[global]\nquit = [\"ctrl-q\"]\nqueue = []\n")
-            .expect("the file is written");
-        let output = run(
-            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
-            home.path(),
-        );
-        let (stdout, stderr) = text(&output);
-        assert_eq!(output.status.code(), Some(0), "{stderr}");
-        let queue = stdout
-            .lines()
-            .find(|line| line.starts_with("queue "))
-            .expect("the queue row is printed");
-        assert!(queue.contains("= []"), "{stdout}");
-        assert!(queue.ends_with("# queue (changed)"), "{stdout}");
-        let quit = stdout
-            .lines()
-            .find(|line| line.starts_with("quit "))
-            .expect("the quit row is printed");
-        assert!(quit.contains(r#"["ctrl-q"]"#), "{stdout}");
+        let line =
+            r#"2: [global] quit = "ctrl-q": "ctrl-q" is already global.queue (line 3) in [global]"#;
+        assert_eq!(stderr, report("both", &path, &[line.to_owned()]));
     }
 
     #[test]
@@ -409,5 +433,36 @@ mod app {
 
         harness.key("ctrl-x");
         assert!(harness.app().should_quit, "`Ctrl+x` quits");
+    }
+
+    /// MOD-12 M3 R1 H1: the shell over a file that gives `ctrl-q` to quit starts, shows quit on
+    /// it, offers no queue key, and quits on it without opening the queue.
+    #[tokio::test]
+    async fn a_quit_on_ctrl_q_quits_and_leaves_the_queue_unbound() {
+        let keys = htui::keys::load_path(&fixture("quit_ctrl_q")).expect("the file loads");
+        let mut harness =
+            Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+        harness.app().keys = keys;
+        register_all(harness.app());
+        harness.drive_to_end().await;
+
+        let frame = harness.render();
+        assert!(
+            status_line(&frame).starts_with("Ctrl+q quit · Tab next tab"),
+            "{frame}"
+        );
+        harness.key("?");
+        let frame = harness.render();
+        assert!(frame.contains("Ctrl+q/Ctrl+c quit"), "{frame}");
+        assert!(!frame.contains("Ctrl+q queue"), "{frame}");
+        harness.key("?");
+        assert!(!harness.app().help_visible, "`?` closes the box");
+
+        harness.key("ctrl-q");
+        assert!(
+            harness.app().overlays.is_empty(),
+            "`Ctrl+q` no longer opens the queue"
+        );
+        assert!(harness.app().should_quit, "`Ctrl+q` quits");
     }
 }

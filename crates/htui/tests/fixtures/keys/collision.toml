@@ -1,5 +1,7 @@
-# MOD-67 M2 fixture: collisions in one context and over an overlay, and typed text in a form.
+# MOD-67 M2 fixture: collisions between two entries in one context and over an overlay, and typed
+# text in a form. A default the file leaves alone gives way instead (MOD-12 M3 R1 H1).
 [global]
+workspaces = ["w", "z"]
 quit = ["w"]
 help = ["esc"]
 
@@ -7,4 +9,5 @@ help = ["esc"]
 save = ["s"]
 
 [list]
+down = ["j"]
 top = ["j"]

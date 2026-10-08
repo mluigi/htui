@@ -1191,7 +1191,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 | H-3 | Mem/Pg parity of the new reads | D2 tie-break `i.id` (Pg) vs `entry.item_id` (Mem, the same uuid, `ItemId` `Ord` = uuid byte order); blockers `COLLATE "C"` vs `String` order; latest run `(queued_at, id)`, latest note `(created_at, id)`; `kind = 'graph'` both sides; timestamps microsecond-truncated | The three parity tests of §C.3; never compare minted ids across stores |
 | H-4 | Snapshot churn | 37 snapshots render the global status line, every one cut before `Ctrl+w waiting` at 100 columns (`grep -rh 'Ctrl+f find' --include=*.snap`); no snapshot holds the help box's global line | The `queue` row goes **after** `waiting` (§B.5.3), so no existing `.snap` changes; `cargo insta test` must list only `htui__ui__overlay__queue__tests__*` and `queue_overlay__*` |
 | H-5 | The Backlog's wildcard-free matches | `QueueWrite` at `backlog/mod.rs:477-489`, `:1001-1033`; `QUEUE_REQUEST_NAMES` is `[&str; 5]` (`store_worker.rs:96`) used at `:801`, `:1195` | T4 adds `Moved` to both matches and resizes the array to 7 in the same commit as the variants, or `htui` does not build |
-| H-6 | Key-file collision | `load_str` runs `validate` (`keys/load.rs`, `validate.rs:15-60`): two actions on one chord in `[global]` are refused. `valid.toml` and `print.rs:119` bind `quit = ["ctrl-q"]` | T5 moves those to `ctrl-x` (unbound: no `"ctrl-x"` anywhere in `crates/htui`) (§F-6) |
+| H-6 | Key-file collision | `load_str` runs `validate` (`keys/load.rs`, `validate.rs:15-60`): two actions on one chord in `[global]` are refused. `valid.toml` and `print.rs:119` bind `quit = ["ctrl-q"]` | T5 moves those to `ctrl-x` (unbound: no `"ctrl-x"` anywhere in `crates/htui`) (§F-6). Since R1 H1 a user's entry over a default it shares a table with is no longer refused (§F-18) |
 | H-7 | Test infrastructure | Repo memories "htui integration tests need testkit", "htui suite green is scheduling-dependent", "featureless clippy gate" | `--all-features`, `--test-threads=1`; `cargo clippy --workspace -- -D warnings` at T2, T3, T5 and the end |
 | H-8 | Resume over a stalled queue | `run_worker.rs:1784` (D8: the loop sweeps right after `ResumeQueue`) | A `P` over a queue with nothing admissible closes again at that sweep: the Backlog's `queue resumed` is followed by a paused queue on the next read. Accepted by D4 ("Q/P status lines unchanged"); T6 says so in ANA-2 |
 | H-9 | A stall at zero free slots | §B.2.2 step 8 returns before CLOSE 2 | The batch stays open until a slot frees; the first tick with a free slot and nothing admissible closes it. In that window a newly queued ready item can be admitted without a new `P`. The cost of the hard constraint; §F-4 |
@@ -1247,7 +1247,8 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
    - `keys/stack.rs:149`: the base-stack test lists the offered globals (an added assertion).
    - `tests/keys_file.rs` (`:84`, `:346`, `:371`) and `tests/fixtures/keys/valid.toml`: the "valid" key
      file binds `quit = ["ctrl-q"]`, which `validate` refuses once `queue` defaults to `ctrl-q`;
-     `print.rs:119`/`:127` likewise. All move to `ctrl-x`.
+     `print.rs:119`/`:127` likewise. All move to `ctrl-x`. (As of T5; since R1 H1 such a file
+     loads and the queue gives `ctrl-q` up, §F-18.)
    - `app/update.rs` gains a unit test as well as the hook.
 7. **The model's types need four small additions to D5's sketch:**
    - `Held` carries a `Hold` (`Budget(BatchStop)`, `BadCap(CapError)`, `ProjectGone`), not a bare
@@ -1296,8 +1297,15 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
     ellipsis** (`cells::clip`), besides the sentence column. The offline message is wider than a
     100-column box; the whole message is on the status line too. (The waiting list leaves its hint
     uncut; MOD-81 owns width rules.)
-18. **Upgrade note for T6: `ctrl-q` is taken.** A `keys.toml` written before M3 that binds `ctrl-q`
-    in `[global]` (e.g. `quit = ["ctrl-q"]`) is now refused at startup (exit 2, "`ctrl-q` is already
-    global.queue (default) in [global]"). Rebind or unbind the queue (`queue = []`) to keep it. T6's
-    documents say so; `tests/keys_file.rs`
-    `a_global_ctrl_q_binding_collides_with_the_queue_until_queue_is_rebound` pins both.
+18. **Upgrade note for T6: `ctrl-q` is the queue's default** (amended by R1 H1, maintainer
+    2026-10-08; T5 as built refused such a file). A `keys.toml` written before M3 that binds
+    `ctrl-q` in `[global]` (e.g. `quit = ["ctrl-q"]`) still loads: the user's entry wins over an
+    action of its own table left at its default. `global.queue` gives `ctrl-q` up and is unbound,
+    htui prints a stderr notice (`htui: PATH:LINE: [global] quit = "ctrl-q" takes "ctrl-q" from
+    global.queue, which is now unbound`) and starts, and `--print-keys` prints
+    `queue = []` with the comment `# queue (unbound by quit)`. To keep the queue, list it with another chord
+    (e.g. `queue = ["ctrl-x"]`). Two entries on `ctrl-q` (`quit` and `queue` both listed) are still
+    refused (exit 2). T6's documents say so; `tests/keys_file.rs`
+    `a_global_ctrl_q_binding_takes_ctrl_q_from_the_queue_with_a_notice`,
+    `two_entries_on_ctrl_q_are_still_refused` and `a_quit_on_ctrl_q_quits_and_leaves_the_queue_unbound`
+    pin it.

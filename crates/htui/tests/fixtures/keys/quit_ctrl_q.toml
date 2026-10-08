@@ -1,0 +1,4 @@
+# MOD-12 M3 R1 H1 fixture: a file written before ctrl-q opened the queue. Quit takes ctrl-q, and
+# the queue, which the file leaves at its default, gives it up.
+[global]
+quit = ["ctrl-q"]
