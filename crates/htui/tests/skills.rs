@@ -1305,7 +1305,10 @@ async fn the_import_report_lists_every_outcome() {
     let frame = harness.render();
     assert!(frame.contains(" import report "), "{frame}");
     assert!(frame.contains(">! "), "the refused file leads: {frame}");
-    assert_eq!(hint(&frame).trim(), "j/k move  r reload  Esc back");
+    assert_eq!(
+        hint(&frame).trim(),
+        "j/k move \u{b7} r reload \u{b7} Esc back"
+    );
     insta::assert_snapshot!("import_report", frame);
 }
 
