@@ -206,9 +206,9 @@ impl Stack<'static> {
 
 /// Every stack the validator walks (ANA-26 §7.3, MOD-67 M2 D8 step 5), each with the phrase its
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
-/// ([`views`](super::views)); M4 the two editor stacks, right after the overlay's (MOD-57 §6.4,
-/// D8.2), so an `[editor]` chord is checked against `global.quit` and `global.help`; M4-M5
-/// append their view stacks.
+/// ([`views`](super::views)). M4 appends the Skills and Requirements stacks and the two editor
+/// stacks (MOD-57 §6.4, D8.2), the editor stacks right after the overlay's, so an `[editor]`
+/// chord is checked against `global.quit` and `global.help`; M5 appends its own.
 pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("on every screen", Stack::BASE),
     ("over an overlay", Stack::OVERLAY),
@@ -216,6 +216,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the in-pane editor", Stack::EDITOR_UNFOCUSED),
     ("in Settings", views::SETTINGS_TAB),
     ("while a field captures keys", views::CAPTURE),
+    ("in Skills", views::SKILLS_TAB),
     ("in Settings > Agents", views::AGENTS_BROWSE),
     ("in the Agents install question", views::AGENTS_CONSENT),
     ("in the Agents login chooser", views::AGENTS_CHOOSER),
@@ -260,6 +261,30 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the workspace switcher", views::SWITCHER),
     ("in the migration prompt", views::MIGRATION),
     ("in the waiting list", views::WAITING_LIST),
+    ("in Skills > Library", views::LIBRARY_BROWSE),
+    (
+        "in a Library name, description or import prompt",
+        views::LIBRARY_PROMPT,
+    ),
+    ("in the Library rename form", views::LIBRARY_INFO),
+    ("in the Library editor", views::LIBRARY_EDITOR),
+    ("in the Library import report", views::LIBRARY_REPORT),
+    ("in Skills > Library > Attachments", views::ATTACH_BROWSE),
+    ("in the Attachments form", views::ATTACH_FORM),
+    ("in the Attachments repo picker", views::ATTACH_PICKER),
+    ("in the Attachments detach question", views::ATTACH_CONFIRM),
+    ("in Skills > Templates", views::TEMPLATES_BROWSE),
+    ("in the Templates name prompt", views::TEMPLATES_PROMPT),
+    ("in the Templates editor", views::TEMPLATES_EDITOR),
+    ("in the agent help prompt", views::HELP_ASKING),
+    ("while the agent help waits", views::HELP_WAITING),
+    ("in the agent help proposal", views::HELP_PROPOSAL),
+    ("in Requirements", views::REQUIREMENTS_BROWSE),
+    ("in a Requirements form", views::REQUIREMENTS_FORM),
+    (
+        "in the Requirements withdraw form",
+        views::REQUIREMENTS_WITHDRAW,
+    ),
 ];
 
 impl Keys {
@@ -347,7 +372,8 @@ mod tests {
             DECLARED[3],
             ("in the in-pane editor", Stack::EDITOR_UNFOCUSED)
         );
-        assert_eq!(DECLARED.len(), 38);
+        assert_eq!(DECLARED[6], ("in Skills", views::SKILLS_TAB));
+        assert_eq!(DECLARED.len(), 57);
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
     }

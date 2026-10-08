@@ -687,7 +687,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::ConfirmNo, Confirm, "no", &["n", "esc"], "no"),
     // [form]: all in capture; every chord is named or ctrl.
     // item_form.rs:613, requirements/forms.rs:306, compose.rs:340. The Settings forms also
-    // take `Down` (agents.rs:2166): `VIEW_DEFAULTS` rows (M3); attach.rs:488 in M4.
+    // take `Down` (agents.rs:2166): `VIEW_DEFAULTS` rows (M3); so do the Library rename form,
+    // the attachment form and the Requirements forms (M4 `VIEW_DEFAULTS` rows).
     capture_row(
         Act::FormNextField,
         Form,
@@ -696,7 +697,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "next field",
     ),
     // item_form.rs:617, requirements/forms.rs:310, compose.rs:344. The Settings forms also
-    // take `Up`: `VIEW_DEFAULTS` rows.
+    // take `Up`: `VIEW_DEFAULTS` rows (M3); so do the M4 forms above.
     capture_row(
         Act::FormPrevField,
         Form,
@@ -1199,6 +1200,15 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
     // migration_prompt.rs:92, :97: the capitals answer too.
     (Context::Migration, Act::ConfirmYes, &["Y"]),
     (Context::Migration, Act::ConfirmNo, &["N"]),
+    // library.rs:1018: the rename form also moves on `Down`/`Up` (MOD-67 M4 §3.3).
+    (SkillsLibrary, Act::FormNextField, &["down"]),
+    (SkillsLibrary, Act::FormPrevField, &["up"]),
+    // attach.rs:487, :488.
+    (SkillsAttach, Act::FormNextField, &["down"]),
+    (SkillsAttach, Act::FormPrevField, &["up"]),
+    // requirements/forms.rs:96: the area form; every Requirements form takes the rows (§1).
+    (Requirements, Act::FormNextField, &["down"]),
+    (Requirements, Act::FormPrevField, &["up"]),
 ];
 
 /// Default pairs in one declared stack where the narrower act always wins (ANA-26 §7.4 step 7,

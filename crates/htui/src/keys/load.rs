@@ -752,6 +752,11 @@ quit = ["x", "shift-a"]
                 13,
                 r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#,
             ),
+            // MOD-67 M4: and `x` detaches in the Library's attachments pane.
+            (
+                13,
+                r#"[global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#,
+            ),
         ]
         .into_iter()
         .map(|(line, message)| (line, message.to_owned()))
@@ -999,6 +1004,32 @@ quit = ["x", "shift-a"]
                 2,
                 "[settings.prompt] probe: no such action; [settings.prompt] may override down, \
                  up, edit, reload, dismiss, next_section, prev_section"
+            )
+        );
+    }
+
+    /// MOD-67 M4 §3.1: `[skills.library]` overrides a `[skills]` verb in the Library alone;
+    /// `[skills.templates]` lists what it has and may override.
+    #[test]
+    fn a_skills_view_table_overrides_its_shared_verbs() {
+        let keys = load_str("[skills.library]\ndiff = \"D\"\n").expect("loads");
+        assert_eq!(
+            keys.actions(views::LIBRARY_BROWSE, chord("D")),
+            [Act::SkillsDiff]
+        );
+        assert_eq!(keys.actions(views::LIBRARY_BROWSE, chord("d")), []);
+        assert_eq!(
+            keys.actions(views::TEMPLATES_BROWSE, chord("d")),
+            [Act::SkillsDiff]
+        );
+        assert_eq!(
+            errors("[skills.templates]\nimport = \"x\"\n"),
+            one(
+                2,
+                "[skills.templates] import: no such action; [skills.templates] has diff_default, \
+                 and may override down, up, scroll_down, scroll_up, page_down, page_up, save, \
+                 external_editor, edit, new, reload, switch_view, prev_version, next_version, \
+                 base, diff, edit_externally, ask_agent"
             )
         );
     }

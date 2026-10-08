@@ -582,19 +582,11 @@ mod tests {
         );
     }
 
-    /// The Templates editor's layers (MOD-67 M4 §4.1 row 13): a `TABS` layer before `MODAL`.
-    const TEMPLATES_EDITOR: Stack<'static> = Stack::new(&[
-        Layer::view(Context::SkillsTemplates, &[]),
-        Layer::only(Context::Skills, &[Act::SkillsAskAgent]),
-        Layer::only(Context::Form, &[Act::FormSave, Act::FormExternalEditor]),
-        Layer::only(Context::Global, &[Act::NextTab, Act::PrevTab]),
-        Layer::modal(Context::Global),
-    ]);
-
     /// MOD-67 M4 PA-2: every global layer of a stack feeds the status line and one `Global:`
     /// line of the `?` box; the closer follows the last (modal) one.
     #[test]
     fn a_tabs_layer_shows_on_the_status_line_and_in_one_global_line() {
+        use views::TEMPLATES_EDITOR;
         let keys = Keys::compiled();
         let tabs = "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help";
         assert_eq!(

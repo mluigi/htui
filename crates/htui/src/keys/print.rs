@@ -134,7 +134,14 @@ close = ["esc"]  # close"#;
         let head: Vec<&str> = printed.lines().take(27).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
         assert!(
-            printed.ends_with("filter   = [\"/\"]  # filter\n"),
+            printed.ends_with(
+                "[requirements]\nnew_area   = [\"a\"]              # new area\n\
+                               amend      = [\"e\"]              # amend\n\
+                               withdraw   = [\"W\"]              # withdraw\n\
+                               filter     = [\"/\"]              # filter\n\
+                               next_field = [\"tab\", \"down\"]    # next field\n\
+                               prev_field = [\"backtab\", \"up\"]  # previous field\n"
+            ),
             "{printed}"
         );
         assert!(!printed.ends_with("\n\n"));

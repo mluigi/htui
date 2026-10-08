@@ -370,6 +370,12 @@ mod tests {
                     r#"[global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
                         .to_owned()
                 ),
+                // MOD-67 M4: the first stack where `esc` goes back and help is unfiltered.
+                (
+                    2,
+                    r#"[global] help = "esc": "esc" is already common.back (default) in the Library import report"#
+                        .to_owned()
+                ),
             ]
         );
         assert_eq!(
@@ -500,10 +506,18 @@ mod tests {
     fn a_global_rebind_onto_a_view_verb_is_refused() {
         assert_eq!(
             errors("[global]\nquit = \"x\"\n"),
-            one(
-                2,
-                r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
-            )
+            [
+                (
+                    2,
+                    r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
+                        .to_owned()
+                ),
+                (
+                    2,
+                    r#"[global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#
+                        .to_owned()
+                ),
+            ]
         );
     }
 
