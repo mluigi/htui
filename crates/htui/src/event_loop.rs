@@ -22,6 +22,15 @@ use crate::terminal::TerminalGuard;
 /// How often the shell wakes up on its own. Every fourth tick refreshes the top bar.
 pub const TICK: Duration = Duration::from_millis(250);
 
+/// MOD-57 R1 M-1: the in-pane editor's channel holds at most this many events (8 KiB of output
+/// each, at most). A child that draws faster than the loop applies waits in its write: the
+/// reader thread blocks on the full channel, not the UI task.
+const PANE_QUEUE: usize = 256;
+
+/// MOD-57 R1 M-1: how many more queued pane events the arm applies after the one it woke for,
+/// before the one dirty draw (a flood is drawn per batch, not per 8 KiB read).
+const PANE_BATCH: usize = 64;
+
 /// Draws the first frame, then runs until `App::should_quit`.
 ///
 /// `io::Result`, not `anyhow`: `anyhow` belongs to `main` (plan Patterns).
@@ -33,7 +42,9 @@ pub async fn run(
     let mut events = crossterm::event::EventStream::new();
     let mut ticker = tokio::time::interval(TICK);
     // MOD-57 P7: the in-pane editor's transport. The loop keeps a sender, so `recv` never ends.
-    let (pane_tx, mut pane_rx) = mpsc::unbounded_channel::<PaneEvent>();
+    // Bounded (R1 M-1): only the pane's std threads send, with `blocking_send`; the loop never
+    // sends on it, so it never waits on them.
+    let (pane_tx, mut pane_rx) = mpsc::channel::<PaneEvent>(PANE_QUEUE);
 
     term.terminal_mut().draw(|frame| app.render(frame))?;
     loop {
@@ -47,7 +58,16 @@ pub async fn run(
                 None => break,
             },
             Some(envelope) = replies.recv() => app.update(Action::Reply(envelope)),
-            Some(event) = pane_rx.recv() => app.on_pane_event(event),
+            Some(event) = pane_rx.recv() => {
+                app.on_pane_event(event);
+                // R1 M-1: what else is queued, up to a batch, before the one draw below.
+                for _ in 0..PANE_BATCH {
+                    let Ok(event) = pane_rx.try_recv() else {
+                        break;
+                    };
+                    app.on_pane_event(event);
+                }
+            }
             _ = ticker.tick() => app.update(Action::Tick),
         }
         if app.should_quit {
@@ -143,6 +163,11 @@ mod tests {
             code.contains("app.on_pane_event("),
             "the pane's transport is an arm"
         );
+        // R1 M-1: bounded, and a burst is applied in batches, one draw per batch.
+        assert!(code.contains("mpsc::channel::<PaneEvent>(PANE_QUEUE)"));
+        assert!(!code.contains("unbounded_channel::<PaneEvent>"));
+        let drain = code.find("pane_rx.try_recv()").expect("the arm drains");
+        assert_eq!((super::PANE_QUEUE, super::PANE_BATCH), (256, 64));
         let open = code.find("app.open_editor(").expect("the pane step");
         let capture = code
             .find("term.set_mouse_capture(app.mouse_capture())?;")
@@ -152,6 +177,10 @@ mod tests {
             .expect("the dirty draw");
         let resize = code.find("app.resize_editor();").expect("the resize step");
         assert!(open < capture && capture < draw && draw < resize);
+        assert!(
+            drain < open,
+            "the drain is in the arm, before the post-steps"
+        );
         assert_eq!(code.matches("EditorMode::resolve(").count(), 1);
         assert_eq!(
             code.matches("std::env::var(").count(),

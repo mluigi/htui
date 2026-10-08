@@ -21,7 +21,10 @@ use htui::editor::{EDITOR_ABORTED, EditorCommand};
 use htui::testkit::Harness;
 use htui_core::store::MemStore;
 use tempfile::TempDir;
-use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self, Receiver, Sender};
+
+/// The event loop's bound on the pane's channel (`event_loop::PANE_QUEUE`, R1 M-1).
+const QUEUE: usize = 256;
 
 /// What a scripted editor prints once it is ready for keys.
 const READY: &str = "pane-ready";
@@ -88,11 +91,7 @@ fn script(dir: &TempDir, body: &str) -> EditorCommand {
 /// The loop's pane step: takes the edit `E` asked for and opens it in the pane with `cmd`,
 /// spawning through [`PtyChild::spawn`] with a clone of `events`. Returns the temp file (the
 /// command's last argument).
-fn open_editor(
-    harness: &mut Harness,
-    cmd: EditorCommand,
-    events: &UnboundedSender<PaneEvent>,
-) -> PathBuf {
+fn open_editor(harness: &mut Harness, cmd: EditorCommand, events: &Sender<PaneEvent>) -> PathBuf {
     let Some((tab, edit)) = harness.app().take_external_edit() else {
         panic!("`E` asked for the editor");
     };
@@ -117,7 +116,7 @@ fn open_editor(
 /// 50 ms when nothing arrives, so `until` can wait on a file as well as on the screen.
 async fn pump(
     harness: &mut Harness,
-    rx: &mut UnboundedReceiver<PaneEvent>,
+    rx: &mut Receiver<PaneEvent>,
     what: &str,
     mut until: impl FnMut(&mut Harness) -> bool,
 ) {
@@ -182,7 +181,7 @@ async fn e_in_templates_edits_in_the_pane_end_to_end() {
     let mut harness = open().await;
     select(&mut harness, "implement");
     harness.key("E");
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(QUEUE);
     let file = open_editor(&mut harness, cmd, &tx);
     assert!(file.exists(), "the temp file is written before the spawn");
 
@@ -244,7 +243,7 @@ async fn ctrl_e_on_a_draft_edits_over_its_claimed_rect() {
         harness.key(key);
     }
     harness.key("ctrl-e");
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(QUEUE);
     let file = open_editor(&mut harness, cmd, &tx);
     assert!(
         std::fs::read_to_string(&file)
@@ -336,7 +335,7 @@ async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
     let mut harness = open().await;
     select(&mut harness, "implement");
     harness.key("E");
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(QUEUE);
     let file = open_editor(&mut harness, cmd, &tx);
     pump(&mut harness, &mut rx, "ready editor", |harness| {
         harness.render().contains(READY)
@@ -377,7 +376,7 @@ async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
     let second_dir = TempDir::new().expect("a temp dir");
     let second = script(&second_dir, "printf second-ready; exec sleep 30");
     harness.key("E");
-    let (second_tx, mut second_rx) = mpsc::unbounded_channel();
+    let (second_tx, mut second_rx) = mpsc::channel(QUEUE);
     open_editor(&mut harness, second, &second_tx);
     pump(
         &mut harness,
@@ -421,7 +420,7 @@ async fn quitting_with_a_live_editor_leaves_no_child() {
     let mut harness = open().await;
     select(&mut harness, "implement");
     harness.key("E");
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::channel(QUEUE);
     open_editor(&mut harness, cmd, &tx);
     pump(&mut harness, &mut rx, "editor pid", |_| {
         read_pid(&pidfile).is_some()

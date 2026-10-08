@@ -3,7 +3,9 @@
 //! What lives here:
 //!
 //! - [`PtyChild`]: a child on a pseudo-terminal and three threads per pane. The **reader**
-//!   (`htui-pane-read`) sends what the child draws as [`PaneEvent::Output`]; the **writer**
+//!   (`htui-pane-read`) sends what the child draws as [`PaneEvent::Output`], on the caller's
+//!   bounded channel (R1 M-1): while it is full the reader waits (`blocking_send`, on its own
+//!   std thread), and so does a child that keeps drawing; the **writer**
 //!   (`htui-pane-write`) writes queued input, so a paste into a stalled child never blocks the
 //!   caller (PD-2); the **wait** thread (`htui-pane-wait`) owns the child, polls it, and sends
 //!   [`PaneEvent::Exited`] once it is reaped.
@@ -49,7 +51,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{Child, MasterPty, PtySize, native_pty_system};
-use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::mpsc::Sender;
 use zeroize::Zeroizing;
 
 /// How often the wait thread polls the child while no kill is asked for, or during the grace.
@@ -215,7 +217,7 @@ impl PtyChild {
         command: portable_pty::CommandBuilder,
         size: PaneSize,
         id: PaneId,
-        events: UnboundedSender<PaneEvent>,
+        events: Sender<PaneEvent>,
     ) -> io::Result<Self> {
         let pair = native_pty_system()
             .openpty(size.pty())
@@ -274,7 +276,10 @@ impl PtyChild {
                                 id,
                                 bytes: buf[..n].to_vec(),
                             };
-                            if events.send(output).is_err() {
+                            // R1 M-1: the channel is bounded, so a flood waits here, and the
+                            // child in its write, until the loop has drawn. A std thread, never
+                            // a runtime's, so blocking is allowed; `Err`: the loop is gone.
+                            if events.blocking_send(output).is_err() {
                                 break;
                             }
                         }
@@ -329,7 +334,7 @@ fn wait_for(
     kill: &mpsc::Receiver<()>,
     id: PaneId,
     started: Instant,
-    events: &UnboundedSender<PaneEvent>,
+    events: &Sender<PaneEvent>,
 ) {
     let status = loop {
         if let Some(status) = ended(&mut *child) {
@@ -340,7 +345,9 @@ fn wait_for(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     };
-    let _ = events.send(PaneEvent::Exited {
+    // The channel is bounded (R1 M-1): this may wait for the loop to catch up. A std thread,
+    // so blocking is allowed; the child is reaped already.
+    let _ = events.blocking_send(PaneEvent::Exited {
         id,
         status,
         elapsed: started.elapsed(),
@@ -1653,9 +1660,12 @@ mod tests {
 
         use portable_pty::CommandBuilder;
         use tempfile::TempDir;
-        use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
+        use tokio::sync::mpsc::{Receiver, channel};
 
         use super::super::*;
+
+        /// The event loop's bound (`event_loop::PANE_QUEUE`).
+        const QUEUE: usize = 256;
 
         /// `body` written to a script in `dir` (as `editor.rs`'s `scripts::script` does) and run
         /// as `sh <script> <file>`: `$1` is `file`. Run through `sh` rather than executed, so a
@@ -1676,14 +1686,14 @@ mod tests {
         /// A spawned pane, the receiving end of its events and the screen they are parsed into.
         struct Pane {
             child: PtyChild,
-            rx: UnboundedReceiver<PaneEvent>,
+            rx: Receiver<PaneEvent>,
             screen: PaneScreen,
             id: PaneId,
         }
 
         impl Pane {
             fn spawn(command: CommandBuilder) -> Self {
-                let (tx, rx) = unbounded_channel();
+                let (tx, rx) = channel(QUEUE);
                 let id = PaneId::next();
                 // The sender moves into the pane: the test keeps none (test 13).
                 let child = PtyChild::spawn(command, PaneSize::DEFAULT, id, tx).expect("spawn");
@@ -2040,6 +2050,62 @@ mod tests {
                     }
                 }
             }
+        }
+
+        #[tokio::test]
+        async fn a_burst_past_the_channel_bound_arrives_whole_and_in_order() {
+            // R1 M-1: the channel is bounded, so a flood waits in the reader thread (and the
+            // child in its write) instead of growing the queue on the UI task's side; nothing is
+            // lost or reordered on the way.
+            let dir = TempDir::new().unwrap();
+            let done = dir.path().join("done");
+            let (tx, mut rx) = channel(2);
+            let id = PaneId::next();
+            let _child = PtyChild::spawn(
+                script(&dir, "stty -onlcr; seq 1 100000; : > \"$1\"", &done),
+                PaneSize::DEFAULT,
+                id,
+                tx,
+            )
+            .expect("spawn");
+            // Nothing read yet: the child is held in its write, well short of the end.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!done.exists(), "the burst did not wait for the reader");
+
+            let mut out = Vec::new();
+            let mut outputs = 0;
+            let mut exits = 0;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(left, rx.recv())
+                    .await
+                    .expect("the burst in time")
+                {
+                    Some(PaneEvent::Output { id: from, bytes }) => {
+                        assert_eq!(from, id);
+                        outputs += 1;
+                        out.extend_from_slice(&bytes);
+                    }
+                    Some(PaneEvent::Exited {
+                        id: from, status, ..
+                    }) => {
+                        assert_eq!(from, id);
+                        assert!(status.expect("reaped").success());
+                        exits += 1;
+                    }
+                    // Every sender is gone: the reader saw EOF and the wait thread ended.
+                    None => break,
+                }
+            }
+            assert!(done.exists());
+            assert_eq!(exits, 1);
+            assert!(outputs > 2, "{outputs} events: the bound was never reached");
+            let text = String::from_utf8(out).expect("seq writes ASCII");
+            let expected: Vec<String> = (1..=100_000).map(|n: u32| n.to_string()).collect();
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(lines.len(), expected.len());
+            assert!(lines.iter().zip(&expected).all(|(line, n)| line == n));
         }
 
         #[tokio::test]
