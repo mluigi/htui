@@ -505,9 +505,27 @@ async fn with_keys_installs_the_keys() {
 /// the chord is `ctrl-l`, which does not cycle either.
 #[tokio::test]
 async fn a_kitty_ctrl_capital_is_the_ctrl_chord() {
-    let chord = KeyChord::from_event(KeyEvent::new(
-        KeyCode::Char('L'),
-        crossterm::event::KeyModifiers::CONTROL,
-    ));
-    assert_eq!(chord, KeyChord::parse("ctrl-l").expect("a chord"));
+    let event = KeyEvent::new(KeyCode::Char('L'), crossterm::event::KeyModifiers::CONTROL);
+    assert_eq!(
+        KeyChord::from_event(event),
+        KeyChord::parse("ctrl-l").expect("a chord")
+    );
+
+    let _keyring = common::mock_keyring().await;
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(ConnectionSection::new()),
+        Box::new(QdrantSection::new()),
+    ])));
+    harness.drive_to_end().await;
+    let on_connection = |frame: &str| frame.contains("Rebuild cache");
+    let frame = harness.render();
+    assert!(on_connection(&frame), "Connection is active: {frame}");
+
+    harness.app().on_key(event);
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        on_connection(&frame),
+        "a kitty ctrl-shift-l did not cycle: {frame}"
+    );
 }

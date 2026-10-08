@@ -492,9 +492,21 @@ mod tests {
             include_str!("../ui/overlay/waiting_list.rs"),
             include_str!("../ui/overlay/workspace_switcher.rs"),
         ];
+        // Production code only: each file up to its test module, its comment lines dropped, so a
+        // stack named only by a test or a doc comment still counts as unnamed.
+        let production: Vec<String> = VIEWS
+            .iter()
+            .map(|source| {
+                let code = source.split("\n#[cfg(test)]").next().unwrap_or(source);
+                code.lines()
+                    .filter(|line| !line.trim_start().starts_with("//"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .collect();
         let named = |name: &str| {
             let wanted = format!("views::{name}");
-            VIEWS.iter().any(|source| {
+            production.iter().any(|source| {
                 source.match_indices(&wanted).any(|(at, _)| {
                     !source[at + wanted.len()..]
                         .starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
