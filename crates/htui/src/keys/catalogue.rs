@@ -1434,13 +1434,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["K"],
         "previous step",
     ),
-    // runs.rs:1580 -> :757.
+    // runs.rs:1580 -> :770.
     row(Act::RunsApprove, BacklogRuns, "approve", &["a"], "approve"),
-    // runs.rs:764.
+    // runs.rs:777.
     row(Act::RunsReject, BacklogRuns, "reject", &["x"], "reject"),
-    // runs.rs:771.
+    // runs.rs:784.
     row(Act::RunsRetry, BacklogRuns, "retry", &["r"], "retry step"),
-    // runs.rs:774.
+    // runs.rs:787.
     row(
         Act::RunsPromote,
         BacklogRuns,
@@ -1448,7 +1448,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["p"],
         "promote to chat",
     ),
-    // runs.rs:777.
+    // runs.rs:790.
     row(
         Act::RunsSelect,
         BacklogRuns,
@@ -1456,7 +1456,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["s"],
         "select winner",
     ),
-    // runs.rs:785.
+    // runs.rs:798.
     row(
         Act::RunsAccept,
         BacklogRuns,
@@ -1464,9 +1464,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["A"],
         "accept output",
     ),
-    // runs.rs:793.
+    // runs.rs:806.
     row(Act::RunsOpen, BacklogRuns, "open", &["o"], "open output"),
-    // runs.rs:738 (`'c'`).
+    // runs.rs:736 (`'c'`).
     row(
         Act::RunsCancelRun,
         BacklogRuns,
@@ -1474,7 +1474,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["c"],
         "cancel run",
     ),
-    // runs.rs:738 (`'T'`).
+    // runs.rs:736 (`'T'`).
     row(
         Act::RunsCleanup,
         BacklogRuns,
@@ -1482,9 +1482,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["T"],
         "retry cleanup",
     ),
-    // runs.rs:712.
+    // runs.rs:716.
     row(Act::RunsUnblock, BacklogRuns, "unblock", &["u"], "unblock"),
-    // runs.rs:717.
+    // runs.rs:721.
     row(
         Act::RunsStartRun,
         BacklogRuns,
@@ -1492,7 +1492,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["R"],
         "start run",
     ),
-    // runs.rs:727.
+    // runs.rs:730.
     row(
         Act::RunsCloseOut,
         BacklogRuns,
