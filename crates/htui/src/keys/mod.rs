@@ -131,7 +131,7 @@ impl Keys {
     /// a printed file reads back unmarked.
     fn derive(&mut self, set_by_file: &[(Context, Act)]) {
         for index in 0..self.rows.len() {
-            let Some(extra) = self.rows[index].extra.clone() else {
+            let Some(extra) = self.rows[index].extra.as_deref() else {
                 continue;
             };
             let act = self.rows[index].act;
@@ -139,7 +139,7 @@ impl Keys {
                 .spec()
                 .map(|spec| self.chords(spec.context, act).to_vec())
                 .unwrap_or_default();
-            for chord in extra {
+            for &chord in extra {
                 if !derived.contains(&chord) {
                     derived.push(chord);
                 }
