@@ -1571,8 +1571,8 @@ impl AgentsSection {
         }
     }
 
-    /// Which key mode is live (MOD-67 M3 L-A §2.1): `on_key`'s order, read by [`stack`] and
-    /// [`hint`], so the keys answered and the keys shown cannot disagree.
+    /// Which key mode is live (MOD-67 M3 L-A §2.1): `on_key` dispatches on it, and [`stack`] and
+    /// [`hint`] read it, so the keys answered and the keys shown cannot disagree.
     ///
     /// [`stack`]: Self::stack
     /// [`hint`]: Self::hint
@@ -2570,32 +2570,27 @@ impl SettingsSection for AgentsSection {
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        // An open registry form answers first (MOD-23 D231). It cannot coexist with either modal
-        // below: it only opens while no install and no login is in flight (D232), and each modal
-        // belongs to one of those. The order only fixes which answers first.
-        if matches!(self.mode, Mode::Editing(_)) {
-            return self.on_editor_key(key, ctx);
+        // One dispatch on `key_mode` (MOD-67 M3 R1), so the keys answered and the hint shown
+        // follow one order by construction.
+        match self.key_mode() {
+            // An open form answers first (MOD-23 D231): the registry form, or the tool-paths form
+            // under the same rule (MOD-66 D10, H-12). Neither can coexist with a modal below: a
+            // form only opens while no install and no login is in flight (D232), and each modal
+            // belongs to one of those. The order only fixes which answers first.
+            KeyMode::Form if matches!(self.mode, Mode::Paths(_)) => self.on_paths_key(key, ctx),
+            KeyMode::Form => self.on_editor_key(key, ctx),
+            // A plan on screen answers first, and answers everything: MOD-20 D19's modality.
+            KeyMode::Consent => self.answer_consent(key, ctx),
+            // Then a method list, for the same reason and with the same limit (MOD-21 D20): the
+            // adapter is spawned and waiting on an answer, and `j`/`k` mean the list rather than
+            // the table for as long as it is up.
+            KeyMode::Chooser => self.answer_chooser(key, ctx),
+            // Then an open paste field (MOD-22 D270), which takes every key but the chords the
+            // modal global layer admits: `q`, `x`, `o`, `?` and the digits are characters of the
+            // address.
+            KeyMode::Paste => self.on_paste_key(key, ctx),
+            KeyMode::Browse => self.on_browse_key(key, ctx),
         }
-        // The tool-paths form, for the same reason and under the same rule (MOD-66 D10, H-12).
-        if matches!(self.mode, Mode::Paths(_)) {
-            return self.on_paths_key(key, ctx);
-        }
-        // A plan on screen answers first, and answers everything: MOD-20 D19's modality.
-        if matches!(self.install, InstallState::Pending { .. }) {
-            return self.answer_consent(key, ctx);
-        }
-        // Then a method list, for the same reason and with the same limit (MOD-21 D20): the
-        // adapter is spawned and waiting on an answer, and `j`/`k` mean the list rather than the
-        // table for as long as it is up.
-        if matches!(self.auth, AuthState::Choosing { .. }) {
-            return self.answer_chooser(key, ctx);
-        }
-        // Then an open paste field (MOD-22 D270), which takes every key but the chords the modal
-        // global layer admits: `q`, `x`, `o`, `?` and the digits are characters of the address.
-        if matches!(self.auth, AuthState::Running { paste: Some(_), .. }) {
-            return self.on_paste_key(key, ctx);
-        }
-        self.on_browse_key(key, ctx)
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
