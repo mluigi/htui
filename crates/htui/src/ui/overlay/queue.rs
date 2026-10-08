@@ -74,6 +74,11 @@ const REFRESHES_PER_RETRY: u32 = 10;
 pub struct QueueOverlay {
     /// The last `QueueOverview`; `None` before the first, and after a failed read.
     overview: Option<QueueOverview>,
+    /// Each row's sentence, in row order, said once per reply that changed the overview rather
+    /// than on every frame (M3 review R1 N1).
+    sentences: Vec<String>,
+    /// The column widths of those rows, measured with the sentences.
+    columns: Columns,
     /// The last failed read's message, shown instead of the rows.
     failure: Option<String>,
     /// The highlighted row's index, the fallback when the anchor's row is gone.
@@ -107,6 +112,8 @@ impl QueueOverlay {
     pub const fn new() -> Self {
         Self {
             overview: None,
+            sentences: Vec::new(),
+            columns: Columns::EMPTY,
             failure: None,
             cursor: 0,
             anchor: None,
@@ -132,6 +139,28 @@ impl QueueOverlay {
     fn put(&mut self, index: usize) {
         self.cursor = index;
         self.anchor = self.rows().get(index).map(|(row, _)| row.entry.item_id);
+    }
+
+    /// A good read: the overview, each row's sentence and the column widths. A reply equal to the
+    /// overview on hand (the common refresh) is neither cloned nor re-said (M3 review R1 N1).
+    fn take(&mut self, overview: &QueueOverview) {
+        if self.overview.as_ref() == Some(overview) {
+            return;
+        }
+        self.sentences = overview
+            .rows
+            .iter()
+            .map(|(_, state)| state.to_string())
+            .collect();
+        self.columns = Columns::of(&overview.rows, &self.sentences);
+        self.overview = Some(overview.clone());
+    }
+
+    /// A failed read: no rows, so nothing to say of them.
+    fn drop_rows(&mut self) {
+        self.overview = None;
+        self.sentences.clear();
+        self.columns = Columns::EMPTY;
     }
 
     /// After a reply: the anchor's row, else the stored index clamped. An empty list keeps both,
@@ -223,7 +252,7 @@ impl QueueOverlay {
                 if overview.rows.is_empty() {
                     lines.push(Line::styled(format!("{NO_CURSOR}{EMPTY}"), theme.dim));
                 } else {
-                    let columns = Columns::of(&overview.rows);
+                    let columns = &self.columns;
                     let text_width = text_width.unwrap_or(columns.text);
                     let at = self.cursor.min(overview.rows.len() - 1);
                     let first = if visible > 0 && at >= visible {
@@ -239,7 +268,16 @@ impl QueueOverlay {
                             .skip(first)
                             .take(visible)
                             .map(|(index, (row, state))| {
-                                row_line(row, state, index == at, &columns, text_width, theme)
+                                let sentence = self.sentences.get(index).map_or("", String::as_str);
+                                row_line(
+                                    row,
+                                    state,
+                                    sentence,
+                                    index == at,
+                                    columns,
+                                    text_width,
+                                    theme,
+                                )
                             }),
                     );
                 }
@@ -293,6 +331,7 @@ fn header(overview: &QueueOverview) -> String {
 }
 
 /// The widths of a row's columns, in cells.
+#[derive(Debug)]
 struct Columns {
     /// The item key: the widest.
     key: usize,
@@ -303,14 +342,26 @@ struct Columns {
 }
 
 impl Columns {
-    fn of(rows: &[(QueueRow, EntryState)]) -> Self {
+    /// No rows.
+    const EMPTY: Self = Self {
+        key: 0,
+        title: 0,
+        text: 0,
+    };
+
+    /// The widths of `rows`, whose sentences are `sentences`.
+    fn of(rows: &[(QueueRow, EntryState)], sentences: &[String]) -> Self {
         let widest = |cell: &dyn Fn(&(QueueRow, EntryState)) -> usize| {
             rows.iter().map(cell).max().unwrap_or(0)
         };
         Self {
             key: widest(&|(row, _)| cell_width(&row.key)),
             title: widest(&|(row, _)| cell_width(&row.title)).min(TITLE_MAX),
-            text: widest(&|(_, state)| cell_width(&state.to_string())),
+            text: sentences
+                .iter()
+                .map(|sentence| cell_width(sentence))
+                .max()
+                .unwrap_or(0),
         }
     }
 
@@ -321,11 +372,12 @@ impl Columns {
 }
 
 /// One row: `{marker}{key}{GAP}{title}{GAP}{sentence}`, the key and title fit to their column and
-/// the sentence clipped to `text_width` with an ellipsis, never wrapped. The selected row is in
-/// the accent style, an escalated one in the warning style.
+/// `sentence` (`state`'s, said on reply) clipped to `text_width` with an ellipsis, never wrapped.
+/// The selected row is in the accent style, an escalated one in the warning style.
 fn row_line(
     row: &QueueRow,
     state: &EntryState,
+    sentence: &str,
     selected: bool,
     columns: &Columns,
     text_width: usize,
@@ -344,7 +396,7 @@ fn row_line(
             "{marker}{}{GAP}{}{GAP}{}",
             cells::fit(&row.key, columns.key),
             cells::fit(&row.title, columns.title),
-            cells::clip(&state.to_string(), text_width),
+            cells::clip(sentence, text_width),
         ),
         style,
     )
@@ -430,7 +482,7 @@ impl Overlay for QueueOverlay {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::QueueOverview(overview) => {
-                self.overview = Some(overview.as_ref().clone());
+                self.take(overview);
                 self.failure = None;
                 self.in_flight = false;
                 self.wait_in = REFRESHES_PER_READ - 1;
@@ -456,7 +508,7 @@ impl Overlay for QueueOverlay {
             }
             StoreReply::Failed { request, message } if *request == OVERVIEW => {
                 // `App::on_reply` already put it on the status line; the box says it too.
-                self.overview = None;
+                self.drop_rows();
                 self.failure = Some(message.clone());
                 self.in_flight = false;
                 self.wait_in = REFRESHES_PER_RETRY - 1;
@@ -484,8 +536,6 @@ impl Overlay for QueueOverlay {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let columns = Columns::of(self.rows());
-
         // The natural size: every row, every sentence whole.
         let natural = self.lines(None, None, usize::MAX, ctx.theme);
         let width = u16::try_from(widest(&natural))
@@ -498,7 +548,7 @@ impl Overlay for QueueOverlay {
             .min(area.height.saturating_sub(2));
 
         let room = usize::from(width.saturating_sub(CHROME));
-        let text_width = room.saturating_sub(columns.prefix());
+        let text_width = room.saturating_sub(self.columns.prefix());
         let visible = usize::from(height.saturating_sub(2)).saturating_sub(self.fixed());
         let lines = self.lines(Some(room), Some(text_width), visible, ctx.theme);
 
@@ -789,6 +839,34 @@ mod tests {
             );
         }
         insta::assert_snapshot!("states", bench.render(&overlay));
+    }
+
+    /// M3 review R1 N1: each row's sentence is worked out once per reply that changed the queue,
+    /// not on every frame; a reply equal to the one on hand is neither cloned nor re-said.
+    #[test]
+    fn a_reply_caches_each_rows_sentence_and_an_unchanged_one_is_kept() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        let first = overview(every_state());
+        bench.feed(&mut overlay, first.clone());
+        let said: Vec<String> = first
+            .rows
+            .iter()
+            .map(|(_, state)| state.to_string())
+            .collect();
+        assert_eq!(overlay.sentences, said);
+
+        let (rows, sentences) = (overlay.rows().as_ptr(), overlay.sentences.as_ptr());
+        bench.feed(&mut overlay, first);
+        assert_eq!(
+            (overlay.rows().as_ptr(), overlay.sentences.as_ptr()),
+            (rows, sentences),
+            "an unchanged reply keeps what is on hand"
+        );
+
+        bench.feed(&mut overlay, overview(abc()));
+        assert_eq!(overlay.sentences, ["next to run"; 3]);
+        assert!(bench.render(&overlay).contains("A-1  t  next to run"));
     }
 
     #[test]
