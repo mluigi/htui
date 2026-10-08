@@ -379,10 +379,6 @@ pub const WAITING_LIST: Stack<'static> = Stack::new(&[
     HELP,
 ]);
 
-/// The Skills tab while its shown view has no stack of its own: the view switch, then global
-/// (MOD-67 M4 D5). `SkillsTab` resolves `skills.switch_view` through it.
-pub const SKILLS_TAB: Stack<'static> = Stack::new(&[SKILLS_SWITCH, GLOBAL]);
-
 /// Skills > Library, browsing (also with a draft handed off to `$EDITOR`).
 pub const LIBRARY_BROWSE: Stack<'static> = Stack::new(&[
     Layer::view(
@@ -598,9 +594,11 @@ mod tests {
     /// MOD-67 M4 §4.2: the Skills and Requirements stacks.
     #[test]
     fn the_skills_and_requirements_stacks_resolve_as_designed() {
-        assert_eq!(resolve(SKILLS_TAB, "l"), [Act::SkillsSwitchView]);
+        assert_eq!(resolve(LIBRARY_BROWSE, "l"), [Act::SkillsSwitchView]);
+        assert_eq!(resolve(TEMPLATES_BROWSE, "l"), [Act::SkillsSwitchView]);
         for spec in ["ctrl-l", "ctrl-h", "alt-l"] {
-            assert_eq!(resolve(SKILLS_TAB, spec), [], "{spec}");
+            assert_eq!(resolve(LIBRARY_BROWSE, spec), [], "{spec}");
+            assert_eq!(resolve(TEMPLATES_BROWSE, spec), [], "{spec}");
         }
         assert_eq!(resolve(LIBRARY_BROWSE, ","), [Act::SkillsPrevVersion]);
         assert_eq!(resolve(LIBRARY_BROWSE, "E"), [Act::SkillsEditExternally]);
@@ -661,7 +659,7 @@ mod tests {
 
     #[test]
     fn every_view_layer_comes_first_and_every_modal_stack_ends_modal() {
-        let views = &DECLARED[7..];
+        let views = &DECLARED[6..];
         assert_eq!(views.len(), 50);
         for &(phrase, stack) in views {
             let first = stack.layers()[0];

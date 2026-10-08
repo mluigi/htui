@@ -366,16 +366,10 @@ impl TemplatesView {
         true
     }
 
-    /// The current mode's stack (MOD-67 M4 D4), for `SkillsTab::key_stack`: always
-    /// [`stack`](Self::stack)'s.
-    pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
-        Some(self.stack())
-    }
-
-    /// The one place a mode maps to its stack (MOD-67 M4 D4, blueprint §6.5): an open agent
-    /// help's, else the mode's (a handed-off draft stays on the browse stack). `on_key`, the hint
-    /// and [`key_stack`](Self::key_stack) read it.
-    fn stack(&self) -> Stack<'static> {
+    /// The one place a mode maps to its stack (MOD-67 M4 D4, blueprint §6.5), always one: an
+    /// open agent help's, else the mode's (a handed-off draft stays on the browse stack).
+    /// `SkillsTab::key_stack`, `on_key` and the hint read it.
+    pub(super) fn key_stack(&self) -> Stack<'static> {
         match &self.mode {
             Mode::Browse => views::TEMPLATES_BROWSE,
             Mode::Naming { .. } => views::TEMPLATES_PROMPT,
@@ -404,7 +398,7 @@ impl TemplatesView {
 
     /// A key the tab did not take for the view switch.
     pub(super) fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let stack = self.stack();
+        let stack = self.key_stack();
         match self.mode {
             Mode::Browse => self.on_browse_key(key, stack, ctx),
             Mode::Naming { .. } => self.on_naming_key(key, stack, ctx),
@@ -562,7 +556,7 @@ impl TemplatesView {
                         let (line, col) = editor.area.cursor_line_col();
                         format!(
                             "{} \u{b7} L{}:C{}",
-                            ctx.keys().hint(self.stack(), EDIT_HINT),
+                            ctx.keys().hint(self.key_stack(), EDIT_HINT),
                             line + 1,
                             col + 1
                         )
@@ -571,15 +565,15 @@ impl TemplatesView {
             }
             (Mode::Browse, Some(editor)) => {
                 self.render_editor(frame, content, editor, ctx);
-                ctx.keys().hint(self.stack(), HANDED_OFF_HINT)
+                ctx.keys().hint(self.key_stack(), HANDED_OFF_HINT)
             }
             (Mode::Naming { .. }, _) => {
                 self.render_browse(frame, content, ctx);
-                ctx.keys().hint(self.stack(), NAMING_HINT)
+                ctx.keys().hint(self.key_stack(), NAMING_HINT)
             }
             (Mode::Browse, None) => {
                 self.render_browse(frame, content, ctx);
-                ctx.keys().hint(self.stack(), BROWSE_HINT)
+                ctx.keys().hint(self.key_stack(), BROWSE_HINT)
             }
         };
         frame.render_widget(

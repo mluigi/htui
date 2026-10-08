@@ -500,13 +500,14 @@ fn prompt_rest(key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
 }
 
 impl LibraryView {
-    /// The current mode's stack (MOD-67 M4 D4): the attachments pane's while it is open, else an
-    /// open agent help's, else the mode's. `SkillsTab::key_stack`, `on_key` and the hint read it.
-    pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
+    /// The current mode's stack (MOD-67 M4 D4), always one: the attachments pane's while it is
+    /// open, else an open agent help's, else the mode's. `SkillsTab::key_stack`, `on_key` and
+    /// the hint read it.
+    pub(super) fn key_stack(&self) -> Stack<'static> {
         if let Some(pane) = &self.attach {
-            return Some(pane.key_stack());
+            return pane.key_stack();
         }
-        Some(match &self.mode {
+        match &self.mode {
             Mode::Browse => views::LIBRARY_BROWSE,
             Mode::Naming { .. } | Mode::Describing { .. } | Mode::ImportPath { .. } => {
                 views::LIBRARY_PROMPT
@@ -517,12 +518,7 @@ impl LibraryView {
                 None => views::LIBRARY_EDITOR,
             },
             Mode::Report { .. } => views::LIBRARY_REPORT,
-        })
-    }
-
-    /// [`key_stack`](Self::key_stack), which always has one: what `render` reads.
-    fn stack(&self) -> Stack<'static> {
-        self.key_stack().unwrap_or(views::LIBRARY_BROWSE)
+        }
     }
 
     /// Whether an editor, a prompt, the rename form, or the attachments pane's form, picker or
@@ -742,7 +738,7 @@ impl LibraryView {
                         let (line, col) = editor.area.cursor_line_col();
                         format!(
                             "{} \u{b7} L{}:C{}",
-                            ctx.keys().hint(self.stack(), EDIT_HINT),
+                            ctx.keys().hint(self.key_stack(), EDIT_HINT),
                             line + 1,
                             col + 1
                         )
@@ -751,11 +747,11 @@ impl LibraryView {
             }
             (_, _, Mode::Browse, Some(editor)) => {
                 self.render_editor(frame, content, editor, ctx);
-                ctx.keys().hint(self.stack(), HANDED_OFF_HINT)
+                ctx.keys().hint(self.key_stack(), HANDED_OFF_HINT)
             }
             (_, _, Mode::Report { outcomes, cursor }, _) => {
                 self.render_report(frame, content, outcomes, *cursor, ctx);
-                ctx.keys().hint(self.stack(), REPORT_HINT)
+                ctx.keys().hint(self.key_stack(), REPORT_HINT)
             }
             (_, _, mode, _) => {
                 self.render_browse(frame, content, ctx);
@@ -765,7 +761,7 @@ impl LibraryView {
                     Mode::ImportPath { .. } => IMPORT_HINT,
                     Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => BROWSE_HINT,
                 };
-                ctx.keys().hint(self.stack(), spec)
+                ctx.keys().hint(self.key_stack(), spec)
             }
         };
         frame.render_widget(

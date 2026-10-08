@@ -216,7 +216,6 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the in-pane editor", Stack::EDITOR_UNFOCUSED),
     ("in Settings", views::SETTINGS_TAB),
     ("while a field captures keys", views::CAPTURE),
-    ("in Skills", views::SKILLS_TAB),
     ("in Settings > Agents", views::AGENTS_BROWSE),
     ("in the Agents install question", views::AGENTS_CONSENT),
     ("in the Agents login chooser", views::AGENTS_CHOOSER),
@@ -328,7 +327,7 @@ mod tests {
     use std::collections::HashSet;
 
     use super::{DECLARED, Layer, Stack};
-    use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, views};
+    use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, load_str, views};
 
     fn chord(spec: &str) -> KeyChord {
         KeyChord::parse_strict(spec).expect("a valid spec")
@@ -372,10 +371,27 @@ mod tests {
             DECLARED[3],
             ("in the in-pane editor", Stack::EDITOR_UNFOCUSED)
         );
-        assert_eq!(DECLARED[6], ("in Skills", views::SKILLS_TAB));
-        assert_eq!(DECLARED.len(), 57);
+        assert_eq!(DECLARED.len(), 56);
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
+    }
+
+    /// MOD-67 M4 R1 L1: `skills.switch_view` is offered only by the Library and Templates
+    /// browse stacks, so a global chord on its `h` is refused naming those views, never a Skills
+    /// stack no view is ever in.
+    #[test]
+    fn a_global_chord_on_the_view_switch_names_the_skills_views() {
+        let messages: Vec<String> = match load_str("[global]\nhelp = [\"?\", \"f1\", \"h\"]\n") {
+            Ok(_) => panic!("`h` is skills.switch_view's"),
+            Err(errors) => errors.into_iter().map(|error| error.message).collect(),
+        };
+        assert_eq!(
+            messages,
+            [
+                r#"[global] help = "h": "h" is already settings.prev_section (default) in Settings"#,
+                r#"[global] help = "h": "h" is already skills.switch_view (default) in Skills > Library"#,
+            ]
+        );
     }
 
     #[test]
