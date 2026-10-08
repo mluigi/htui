@@ -4,8 +4,8 @@
 //! It holds the last [`QueueOverview`] the store worker answered and re-reads it after every queue
 //! write (saying the write's result on the status line, M3 review R1 N2), after a failed queue
 //! write, and on the shell's refresh tick (M3 D9) while no read is in flight: every
-//! [`REFRESHES_PER_READ`]th tick after a good read (M3 review R1 M2), every
-//! [`REFRESHES_PER_RETRY`]th after a failed one.
+//! `REFRESHES_PER_READ`th tick after a good read (M3 review R1 M2), every
+//! `REFRESHES_PER_RETRY`th after a failed one.
 
 use htui_core::model::{
     BatchClose, EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd,
