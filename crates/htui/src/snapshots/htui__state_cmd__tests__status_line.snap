@@ -1,0 +1,5 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: human_status(&body)
+---
+Platform · desk · online · 1 working · 2 waiting

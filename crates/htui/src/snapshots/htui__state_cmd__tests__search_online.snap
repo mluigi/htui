@@ -1,0 +1,32 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: "pretty(&search(IndexAnswer::Hits(two_hits())))"
+---
+{
+  "version": 1,
+  "kind": "search",
+  "store": "online",
+  "index": "online",
+  "query": "closed items",
+  "decisions": false,
+  "hits": [
+    {
+      "key": "ANA-11",
+      "place": "item",
+      "document_kind": null,
+      "resolution": null,
+      "requirement_state": null,
+      "score": 0.731,
+      "snippet": "a decision is a closed item"
+    },
+    {
+      "key": "MOD-34",
+      "place": "document",
+      "document_kind": "prd",
+      "resolution": "done",
+      "requirement_state": null,
+      "score": 0.5,
+      "snippet": "the concepts index"
+    }
+  ]
+}

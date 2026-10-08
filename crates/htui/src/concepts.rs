@@ -93,10 +93,15 @@ pub fn settings_from(
     Ok(QdrantSettings::new(url, api_key)?)
 }
 
+/// The sentence every verb that needs the keyring's DSN refuses with when none is stored.
+pub(crate) const NO_DSN: &str = "no Postgres DSN is stored; run `htui --set-dsn` first";
+
+/// `--index-items`' connect: headless, and the collection created on first use, because it writes
+/// the index by design. `--search-items` does not come here (MOD-92: it reads only).
 async fn open() -> anyhow::Result<(PgStore, QdrantStore<RtenEmbedder>)> {
     let settings = settings_from(secret::get_qdrant_url()?, secret::get_qdrant_api_key()?)?;
     let Some(dsn) = secret::get_dsn()? else {
-        bail!("no Postgres DSN is stored; run `htui --set-dsn` first");
+        bail!("{NO_DSN}");
     };
     let identity = identity::load_or_mint(&identity::config_root()?)?;
     let pg = PgStore::connect_headless(&dsn, &identity, CONNECT_TIMEOUT, PoolSize::TUI)
@@ -154,7 +159,7 @@ fn store_context(err: &StoreError) -> &'static str {
 }
 
 /// Every workspace's projects as scopes, narrowed to one project slug when given.
-async fn scopes(pg: &PgStore, project: Option<&str>) -> anyhow::Result<Vec<Scope>> {
+pub(crate) async fn scopes(pg: &PgStore, project: Option<&str>) -> anyhow::Result<Vec<Scope>> {
     let mut scopes = Vec::new();
     let mut found = project.is_none();
     for ws in pg.workspaces().await? {

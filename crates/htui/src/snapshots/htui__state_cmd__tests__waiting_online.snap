@@ -1,0 +1,96 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: pretty(&answer)
+---
+{
+  "version": 1,
+  "kind": "waiting",
+  "store": "online",
+  "workspace": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "slug": "platform",
+    "name": "Platform"
+  },
+  "projects": [
+    {
+      "id": "00000000-0000-0000-0000-000000000010",
+      "slug": "htui",
+      "name": "htui"
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000011",
+      "slug": "agy",
+      "name": "Antigravity"
+    }
+  ],
+  "working": 1,
+  "permissions_known": true,
+  "rows": [
+    {
+      "reason": "gate",
+      "item_key": "MOD-4",
+      "item_id": "00000000-0000-0000-0000-000000000101",
+      "run_id": "00000000-0000-0000-0000-000000000201",
+      "step_id": "00000000-0000-0000-0000-000000000301",
+      "step": "prd 0.1",
+      "text": "approve the PRD",
+      "since": "2026-09-03T06:00:00Z",
+      "age_seconds": 64800
+    },
+    {
+      "reason": "judge_failed",
+      "item_key": "MOD-5",
+      "item_id": "00000000-0000-0000-0000-000000000102",
+      "run_id": "00000000-0000-0000-0000-000000000202",
+      "step_id": "00000000-0000-0000-0000-000000000302",
+      "step": "research 0.1/j",
+      "text": "no candidate passes - pick a candidate",
+      "since": "2026-09-03T07:00:00Z",
+      "age_seconds": 61200
+    },
+    {
+      "reason": "selection",
+      "item_key": "MOD-6",
+      "item_id": "00000000-0000-0000-0000-000000000103",
+      "run_id": "00000000-0000-0000-0000-000000000203",
+      "step_id": "00000000-0000-0000-0000-000000000303",
+      "step": "research 0.1/1",
+      "text": "awaits selection",
+      "since": "2026-09-03T05:00:00Z",
+      "age_seconds": 68400
+    },
+    {
+      "reason": "unblock",
+      "item_key": "MOD-7",
+      "item_id": "00000000-0000-0000-0000-000000000104",
+      "run_id": null,
+      "step_id": null,
+      "step": null,
+      "text": "blocked, no active run: u reopens it",
+      "since": "2026-09-02T00:00:00Z",
+      "age_seconds": 172800
+    },
+    {
+      "reason": "interrupted",
+      "item_key": "MOD-8",
+      "item_id": "00000000-0000-0000-0000-000000000105",
+      "run_id": "00000000-0000-0000-0000-000000000205",
+      "step_id": "00000000-0000-0000-0000-000000000305",
+      "step": "build 0.2",
+      "text": "interrupted",
+      "since": "2026-09-03T05:00:00Z",
+      "age_seconds": 68400
+    },
+    {
+      "reason": "permission",
+      "item_key": "MOD-9",
+      "item_id": "00000000-0000-0000-0000-000000000106",
+      "run_id": "00000000-0000-0000-0000-000000000206",
+      "step_id": "00000000-0000-0000-0000-000000000306",
+      "step": "prd 0.1",
+      "text": "Bash: cargo test",
+      "since": "2026-09-03T23:58:27Z",
+      "age_seconds": 93
+    }
+  ]
+}

@@ -1,0 +1,13 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: pretty(&offline)
+---
+{
+  "version": 1,
+  "kind": "status",
+  "store": "offline",
+  "error": {
+    "code": "unreachable",
+    "message": "cannot reach Postgres: store unreachable: connection refused"
+  }
+}

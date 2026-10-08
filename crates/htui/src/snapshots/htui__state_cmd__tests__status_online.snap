@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: pretty(&status_answer())
+---
+{
+  "version": 1,
+  "kind": "status",
+  "store": "online",
+  "workspace": {
+    "id": "00000000-0000-0000-0000-000000000001",
+    "slug": "platform",
+    "name": "Platform"
+  },
+  "projects": [
+    {
+      "id": "00000000-0000-0000-0000-000000000010",
+      "slug": "htui",
+      "name": "htui"
+    },
+    {
+      "id": "00000000-0000-0000-0000-000000000011",
+      "slug": "agy",
+      "name": "Antigravity"
+    }
+  ],
+  "box": {
+    "id": "00000000-0000-0000-0000-0000000000b0",
+    "hostname": "desk",
+    "registered": true
+  },
+  "working": 1,
+  "waiting": 2,
+  "permissions_known": true
+}

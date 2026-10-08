@@ -42,6 +42,7 @@ pub(crate) mod secrets;
 pub mod secrets_settings;
 pub mod skill_import;
 pub mod skills;
+pub mod state_cmd;
 pub mod store_worker;
 pub mod templates;
 pub mod terminal;
@@ -77,6 +78,9 @@ use crate::keymap::Keymap;
 /// then the key file (MOD-67), which `--print-keys` prints and exits on, then the backend
 /// (`--demo`'s included), then the worker, then the shell, then the terminal. `htui provision`
 /// (MOD-45) comes right after logging, before the keyring flags; it prints to the shell and exits.
+/// `htui status` and `htui waiting` (MOD-92) come right after it: they read only, print one answer
+/// and exit, and `--search-items` (read-only too since MOD-92) keeps its place after the keyring
+/// flags; all three run before the key file is read.
 /// With `--dsn-stdin`, the session's DSN is read from stdin before the backend starts.
 ///
 /// The backend is always available immediately: `connect::start` opens the local mirror and hands
@@ -109,6 +113,18 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     if let Some(cli::Command::Provision(provision)) = args.command.clone() {
         // MOD-45 D307: after `init_tracing`, so `--log` works the ordinary way.
         return provision::run(provision).await.map_err(anyhow::Error::from);
+    }
+    // MOD-92: the read-only state verbs, after `init_tracing` (a `--log` file, never stdout) and
+    // before anything that writes: the keyring flags, the key file, the cache.
+    if let Some(cli::Command::Status(state)) = args.command.clone() {
+        return state_cmd::run(state_cmd::Verb::Status, state)
+            .await
+            .map_err(anyhow::Error::from);
+    }
+    if let Some(cli::Command::Waiting(state)) = args.command.clone() {
+        return state_cmd::run(state_cmd::Verb::Waiting, state)
+            .await
+            .map_err(anyhow::Error::from);
     }
     if args.set_dsn {
         return set_dsn_from_stdin();
@@ -232,8 +248,15 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
 /// (`htui --print-keys | head`) is not a failure (B-4): `print!` would panic there, exit 101 and
 /// reach Sentry.
 fn print_keys(out: &mut dyn std::io::Write, text: &str) -> anyhow::Result<()> {
-    match out.write_all(text.as_bytes()).and_then(|()| out.flush()) {
-        Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(err.into()),
+    write_out(out, text.as_bytes()).map_err(Into::into)
+}
+
+/// Writes `bytes` and flushes; a reader that closed the pipe early (`| head`) is not a failure
+/// (MOD-67 M2 B-4), any other write error is. `--print-keys` and the state verbs (MOD-92) write
+/// through it.
+pub(crate) fn write_out(out: &mut dyn std::io::Write, bytes: &[u8]) -> std::io::Result<()> {
+    match out.write_all(bytes).and_then(|()| out.flush()) {
+        Err(err) if err.kind() != std::io::ErrorKind::BrokenPipe => Err(err),
         _ => Ok(()),
     }
 }
