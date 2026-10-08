@@ -29,7 +29,7 @@ Complete: sections 0-9.
   T-close drops it, D6); `Enter` is a newline; `Esc` = `Cancel`; `Up`/`Down`/`PgUp`/`PgDn` move;
   `Tab`/`BackTab` pass.
 - Today the browse and report handlers start with `if !plain(&key) { return Handled::Pass }`
-  (`:735`, `:939`), the prompts pass whatever their field passes (`:877`, `:911`), the rename form
+  (`:735`, `:939`), the prompts pass whatever their field passes (`:876`, `:910`), the rename form
   passes CONTROL and swallows the rest (`:1022-1023`), the editor passes what the `TextArea` passes
   (`:1120`).
 - T1 provides: every stack below (`keys/views.rs`), `Scroll::apply(act, len)`,
@@ -38,7 +38,7 @@ Complete: sections 0-9.
 
 ## 1. Library modes and their stacks
 
-| Mode (`enum Mode`, `:221`) | Handler today | captures | Stack |
+| Mode (`enum Mode`, `:230`) | Handler today | captures | Stack |
 |---|---|---|---|
 | `Browse` (also with a handed-off draft, `handed_off()` `:1255`) | `on_browse_key` `:734` | no | `LIBRARY_BROWSE` |
 | `Naming`, `Describing` | `on_naming_key` `:869` | yes | `LIBRARY_PROMPT` |
@@ -97,8 +97,8 @@ is what `on_key` and `render` call.
 | `:843` | `'E'` | `SkillsEditExternally` | |
 | `:854` | `'i'` | `LibraryInfo` | |
 | `:863` | `'a'` | `LibraryAttach` | |
-| `:874-877` | field `Pass → Handled::Pass` (naming) | `LIBRARY_PROMPT`: `NextTab \| PrevTab → Pass`, else `modal_rest` | widget first; `Enter`/`Esc` stay the field's (D10) |
-| `:911` | field `Pass → Handled::Pass` (import) | same | |
+| `:876` | field `Pass → Handled::Pass` (naming) | `LIBRARY_PROMPT`: `NextTab \| PrevTab → Pass`, else `modal_rest` | widget first; `Enter`/`Esc` stay the field's (D10) |
+| `:910` | field `Pass → Handled::Pass` (import) | same | |
 | `:939` | `!plain → Pass` (report) | removed | |
 | `:946` | `Esc` | `Back` (REPORT) | Browse, notice cleared, scroll reset |
 | `:951` | `j`/`Down` | `ListDown` | |
@@ -107,17 +107,17 @@ is what `on_key` and `render` call.
 | `:958` | `r` | `Reload` | |
 | `:959` | `_ → Pass` | loop end `Pass` | |
 | `:990` | `ctrl-s`/`ctrl-S` before the field | removed: widget first, then `FormSave` (INFO) → `save_info` | PA-3; `TextField` passes `ctrl-s` |
-| `:1003` | field `Submit` (`Enter`) | widget-owned, stays | `save_info` |
-| `:1007` | field `Cancel` (`Esc`) | widget-owned, stays | busy notice or close |
+| `:1004` | field `Submit` (`Enter`) | widget-owned, stays | `save_info` |
+| `:1008` | field `Cancel` (`Esc`) | widget-owned, stays | busy notice or close |
 | `:1018` | `Tab`/`BackTab`/`Up`/`Down` toggle | `FormNextField \| FormPrevField` (INFO; `Down`/`Up` are `VIEW_DEFAULTS`) | `form.focus = 1 - form.focus` |
 | `:1022` | CONTROL → `Pass` | removed: `modal_rest(LIBRARY_INFO, chord)` | ALT and `F1` now pass |
 | `:1023` | `_ → Consumed` | `modal_rest` | |
 | `:1074-1079` | help first | unchanged | `help.on_key` → `apply_help` |
 | `:1080` | `ctrl-g`/`ctrl-G` before the area | after the widget: `SkillsAskAgent` (EDITOR) → `open_help` | the area passes chords |
 | `:1084` | `ctrl-e`/`ctrl-E` | after the widget: `FormExternalEditor` → `hand_off` | |
-| `:1091` | `TextArea::on_key` | widget first, stays | `Consumed` keeps the edit tracking |
-| `:1099` | `Submit` (`ctrl-s`) | stays until T-close (then unreachable; T-close fixes the comment) | `save_editor` |
-| `:1103` | `Cancel` (`Esc`) | widget-owned, stays | busy / `esc_armed` |
+| `:1094` | `TextArea::on_key` | widget first, stays | `Consumed` keeps the edit tracking |
+| `:1102` | `Submit` (`ctrl-s`) | stays until T-close (then unreachable; T-close fixes the comment) | `save_editor` |
+| `:1106` | `Cancel` (`Esc`) | widget-owned, stays | busy / `esc_armed` |
 | `:1120` | `Pass → Handled::Pass` | `LIBRARY_EDITOR`: `FormSave` → `save_editor`; `SkillsAskAgent` → `open_help`; `FormExternalEditor` → `hand_off`; `NextTab \| PrevTab` → `Pass`; else `modal_rest` | PA-2: `Tab` keeps the draft and switches tabs |
 | `:1272-1278` | busy + form + `Esc` → in-flight notice | **stays**: the form's own `Esc` (widget-owned, D10) | keep `key.code == KeyCode::Esc`, comment it as the form's cancel key |
 
@@ -257,7 +257,7 @@ Prose left for M6: the question notice `:390` ("y detaches, any other key keeps 
 
 ### 6.1 States and stacks
 
-| State (`:120`) | Stack |
+| State (`:124`) | Stack |
 |---|---|
 | `Asking` | `HELP_ASKING` |
 | `Starting`, `Streaming`, `Cancelling` | `HELP_WAITING` |
@@ -275,10 +275,10 @@ while the help is open is `self.target`'s: `HelpTarget::Skill { .. }` → `views
 | `:263-269` | CONTROL `s/e/g` → `Note(HELP_OPEN)`, other CONTROL → `Pass` | first step: `ctx.keys().actions(editor_stack, chord)` holds `FormSave`, `FormExternalEditor` or `SkillsAskAgent` → `Note(HELP_OPEN)` (a rebound one too); other chords fall to the state | the refused verbs stay out of the help's own stacks (M3 Rule 9: the `?` box lists no dead key) |
 | `:273` | `Starting`: `Esc` → cancel flag + `CANCELLING` | `SkillsHelpCancel` (WAITING) | else `modal_rest` → `Consumed`/`Pass` |
 | `:280` | `Streaming`: `Esc` → `ChatCancel`, `Cancelling` | `SkillsHelpCancel` | |
-| `:286` | `Cancelling` → `Consumed` | `SkillsHelpCancel` → `Consumed`; else `modal_rest` | |
+| `:287` | `Cancelling` → `Consumed` | `SkillsHelpCancel` → `Consumed`; else `modal_rest` | |
 | `:294` | `Proposal`: `Enter`/`y` (plain) → accept (masked: arm first) | `SkillsHelpAccept` (PROPOSAL) | `ctrl-y`/`alt-y` accept nothing |
 | `:302` | `Proposal`: `Esc`/`n` → `Close(DISCARDED)` | `ConfirmNo` | |
-| `:304` | `_ → scroll_key` | pane acts → `self.scroll.apply(act, self.rows.get())`; else `modal_rest` | `scroll_key` `:317` and `plain` `:236` deleted |
+| `:305`, `:311` | `_ → scroll_key` | pane acts → `self.scroll.apply(act, self.rows.get())`; else `modal_rest` | `scroll_key` `:317` and `plain` `:236` deleted |
 | `:308` | `Answered`: `Esc`/`Enter`/`n` → `Close(None)` | `ConfirmNo \| SkillsHelpAccept` → `Close(None)` | `y` now closes too (§1 item 3) |
 | `:325-345` | `Asking`: `Up`/`Down` cycle, `Enter` ask, `Esc` close, else into the request | request field **first**: `Submit` → `ask`; `Cancel` → `Close(None)`; `Consumed`; on `Pass`: `SkillsHelpPrevAgent`/`NextAgent` cycle (wrap), `NextTab \| PrevTab` → `Pass`, else `modal_rest` | `Enter`/`Esc` are the field's (D10) |
 
