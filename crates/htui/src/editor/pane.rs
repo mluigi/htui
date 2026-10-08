@@ -18,7 +18,9 @@
 //!   (`waitid` with `WNOWAIT`), and the rest of its group gets the same SIGHUP and SIGKILL. Every
 //!   signal is sent before the child is reaped, so its pid, which is the group's id, cannot have
 //!   been reused. On Windows: portable-pty's kill (`TerminateProcess`). No signal is sent from
-//!   the caller's thread.
+//!   the caller's thread, and the master is not closed there either (on Windows that is
+//!   `ClosePseudoConsole`, which can wait): dropping a [`PtyChild`] hands it to a short-lived
+//!   `htui-pane-close` thread.
 //! - [`PaneScreen`]: the VT screen a pane's output is parsed into (`vt100`), and the replies the
 //!   child is owed for its terminal queries (DSR, DA1). The output passes a CSI clamp first
 //!   (`CsiClamp`, R1 H-1): `vt100` repeats ICH, IL and SD as many times as their count asks, on
@@ -189,8 +191,9 @@ pub trait PaneChild: fmt::Debug {
 /// A child on a pseudo-terminal, with its reader, writer and wait threads. Dropping it kills the
 /// child. `Debug` prints the pid only.
 pub struct PtyChild {
-    /// Kept for `resize`. Dropped after the kill request (`Drop` runs before the fields drop).
-    master: Box<dyn MasterPty + Send>,
+    /// Kept for `resize`. `Drop` takes it after the kill request and closes it on a thread of its
+    /// own (R1 L-4); `None` from then on.
+    master: Option<Box<dyn MasterPty + Send>>,
     /// The writer thread's queue; dropping it ends the thread, which drops the PTY writer then
     /// (F-10: that writes a newline and `VEOF`, so it must not happen to a live editor first).
     input: mpsc::Sender<Zeroizing<Vec<u8>>>,
@@ -310,7 +313,7 @@ impl PtyChild {
         #[cfg(not(all(test, unix)))]
         drop(threads);
         Ok(Self {
-            master,
+            master: Some(master),
             input,
             kill: Some(kill_tx),
             pid,
@@ -435,7 +438,10 @@ impl PaneChild for PtyChild {
 
     fn resize(&mut self, size: PaneSize) {
         let size = size.floored();
-        if self.master.resize(size.pty()).is_err() {
+        let Some(master) = self.master.as_ref() else {
+            return;
+        };
+        if master.resize(size.pty()).is_err() {
             tracing::debug!(rows = size.rows, cols = size.cols, "pane resize failed");
         }
     }
@@ -450,6 +456,16 @@ impl PaneChild for PtyChild {
 impl Drop for PtyChild {
     fn drop(&mut self) {
         self.kill();
+        // R1 L-4: on Windows dropping the master is `ClosePseudoConsole`, which can wait until the
+        // console's last output is read: not on the caller's thread (the UI task). A short-lived
+        // thread closes it; if none can be started, `Builder::spawn` drops the closure, and the
+        // master with it, right here. On unix the close is one `close(2)`, and the reader's EOF
+        // comes from the slave side, as before.
+        if let Some(master) = self.master.take() {
+            let _ = thread::Builder::new()
+                .name("htui-pane-close".to_owned())
+                .spawn(move || drop(master));
+        }
     }
 }
 
