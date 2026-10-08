@@ -328,3 +328,27 @@ browse `E`, which claims nothing (F-12); it is committed as `e_in_templates_edit
 (the whole-tab-body path), and `ctrl_e_on_a_draft_edits_over_its_claimed_rect` adds the claimed-rect
 path the plan's T7 Action names (`0bce6b5f`). The docs list `F1` beside `?` under the M1 lock
 (`global.help` binds both).
+
+## Review R1 (2026-10-08)
+
+The rust-reviewer's findings, each confirmed by an independent verifier; the maintainer accepted
+H-1, M-1, L-1, L-3, L-4 and the nits, and deferred L-2. Fixed test-first, one commit per finding.
+
+| # | Finding | Verdict | Fix |
+|---|---|---|---|
+| H-1 | `vt100` 0.16.2 runs ICH (`ESC[n@`, quadratic), IL (`ESC[nL`) and SD (`ESC[nT`) `n` times, uncapped, on the UI task: 0.54 s per `ESC[65535@`; a per-chunk filter is bypassed by a split `ESC[655`/`35@` | CONFIRMED, fixed | `bc52030d`: `CsiClamp`, a stateful filter in `PaneScreen::feed` mirroring `vte`'s transitions across feeds (ESC restarts anywhere, C0 runs in place ahead of the held CSI, CAN/SUB abort, a marker or intermediate passes the CSI through, DEL and high bytes ignored). Parameters are counted as `vte` counts them (saturating `u16`, at most 32), never held as raw digits; a marker-less ICH's first parameter is clamped to the columns, IL's and SD's to the rows, at the final byte |
+| M-1 | Unbounded pane channel and one draw per event: `cat` of 37 MB queued ~79k events, 24.8 s of stale replay | CONFIRMED, fixed | `7e38d49c`: `mpsc::channel::<PaneEvent>(256)`; the reader and wait threads (std threads) `blocking_send`, `Err` ends them; the pane arm applies up to `PANE_BATCH` = 64 more queued events before the one dirty draw. The UI task never sends on the channel, so it never waits on the threads. Blueprint H-16 annotated |
+| L-1 | A failed `wait` after the pane's editor ran was answered with `start_failure`'s "set $VISUAL or $EDITOR" sentence | CONFIRMED, fixed | `c301d2a7`: `pane_lost` ("lost track of `<value>` (<err>); nothing was changed"), temp file dropped; `TempEdit::finish`'s doc says `Err` is the suspended run's "could not start" only; docs table row |
+| L-2 | A reader or writer thread that fails to spawn after `take_writer` drops the PTY writer early, typing a stray `\n` + VEOF into the child before it is killed | CONFIRMED, **deferred** (maintainer) | Known residue: an error path only (thread spawn failure), the child is killed by the wait thread right after; no code change |
+| L-3 | An editor that detaches a helper into its own session keeps the slave, so the reader and the PTY, out of the group kill's reach | CONFIRMED, docs | `79744100`: docs Limits bullet; the "each thread ends on its own" comment qualified |
+| L-4 | On Windows the master's drop is `ClosePseudoConsole`, which can wait, on the UI task | CONFIRMED, fixed | `f28abbf8`: `master: Option<..>`; `Drop` hands it to a short-lived `htui-pane-close` thread (dropped inline if none starts); unix unchanged; Windows compile-checked |
+| nit a | `app/mod.rs` re-exported `EDITOR_LOCKED` (dead) and `MIN_PANE` publicly; `PaneScreen`, `encode_key`, `encode_paste` public with no user outside the crate | fixed | `f2182573`: `#[cfg(test)] pub(crate) use pane::MIN_PANE;` (its only readers outside `app::pane` are tests, so a plain `pub(crate) use` is an unused import in the featureless build), `EDITOR_LOCKED` private; the three items `pub(crate)` |
+| nit b | Docs implied the edited text is zeroized | fixed | `f2182573`: zeroizing covers the input path only; the text also lives in the temp file and the screen grid |
+| nit c | TMUX passthrough | no change | as accepted |
+| nit d | nvim's swap location undocumented | fixed | `f2182573`: `$XDG_STATE_HOME/nvim/swap/` (usually `~/.local/state/nvim/swap/`), named after the file's full path |
+
+**R1 notes.** (1) The clamp re-emits each held parameter in decimal, so a CSI with leading zeros
+or a saturated count reaches `vt100` canonicalised (`ESC[0005m` as `ESC[5m`): the same
+parameters `vte` builds, and byte-for-byte for every sequence without them. (2) L-4 has no new
+test: the close thread only matters on Windows, where ConPTY is not run (MOD-16); the existing
+thread-lifecycle tests cover the unix drop path.
