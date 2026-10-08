@@ -3,14 +3,15 @@
 //! A tab switch lands on the asking tab unfocused, so nano's habitual `ctrl-x` (`editor.abort`'s
 //! default) would kill the edit with no question. So while an editor is alive the abort opens
 //! this box instead (`App::request_abort`), and only `editor.abort` **again** aborts
-//! ([`Action::AbortEdit`]). A `y` cannot confirm it: every other key closes the box, keeps the
+//! ([`Action::AbortEdit`]), on a press: a held abort key's repeats are consumed and leave the
+//! question up. A `y` cannot confirm it: every other key closes the box, keeps the
 //! edit as it was and goes nowhere else, so nano's `ctrl-x`, `y` keeps the edit. `ctrl-c` never
 //! reaches it: the shell's hard quit (C3) runs before any overlay sees a key. An editor that exits
 //! under it takes it along (`App::on_pane_event`).
 //!
 //! Fixed text, shaped like [`QuitConfirm`](super::QuitConfirm): the factory takes no argument.
 
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyEvent, KeyEventKind};
 use htui_core::model::Scope;
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -89,8 +90,12 @@ impl Overlay for AbortConfirm {
             .actions(views::ABORT_CONFIRM, chord)
             .contains(&Act::EditorAbort)
         {
-            // `App::abort_editor` closes this box with the edit.
-            ctx.emit(Action::AbortEdit);
+            // M2 R2 LOW-1: a held abort key repeats the press that opened this box; only a fresh
+            // press confirms, and a repeat leaves the question up.
+            if key.kind == KeyEventKind::Press {
+                // `App::abort_editor` closes this box with the edit.
+                ctx.emit(Action::AbortEdit);
+            }
         } else {
             ctx.emit(Action::Overlay(OverlayAction::Close));
         }

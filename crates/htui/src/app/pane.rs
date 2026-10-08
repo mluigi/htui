@@ -657,7 +657,7 @@ mod tests {
     use std::rc::Rc;
     use std::time::Duration;
 
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ItemId, ProjectRef, RequirementId, Scope, WorkspaceSummary};
     use portable_pty::{CommandBuilder, ExitStatus};
@@ -1781,6 +1781,36 @@ mod tests {
         );
         assert!(benches[1].seen.borrow().heard.is_empty());
         assert_eq!(*log.borrow(), vec![Call::Kill, Call::Dropped]);
+    }
+
+    /// M2 R2 LOW-1: only a press of the abort key confirms. Holding it past the repeat delay sends
+    /// `Repeat`s of the press that opened the question; each is consumed and the question stays.
+    #[test]
+    fn a_held_abort_key_does_not_confirm_the_question() {
+        let (mut app, benches, log) = unfocused_two();
+        abortable(&mut app);
+        app.on_terminal_event(Event::Key(ctrl('x')));
+        assert_eq!(top(&app), Some(AbortConfirm::ID), "asked");
+
+        let held = KeyEvent::new_with_kind(
+            KeyCode::Char('x'),
+            KeyModifiers::CONTROL,
+            KeyEventKind::Repeat,
+        );
+        app.on_terminal_event(Event::Key(held));
+        app.on_terminal_event(Event::Key(held));
+        assert_eq!(top(&app), Some(AbortConfirm::ID), "a repeat leaves it up");
+        assert!(app.editor_open(), "a repeat aborts nothing");
+        assert!(benches[0].seen.borrow().heard.is_empty());
+        assert!(log.borrow().is_empty(), "no kill");
+
+        app.on_terminal_event(Event::Key(ctrl('x')));
+        assert!(!app.editor_open(), "a press aborts");
+        assert!(app.overlays.is_empty());
+        assert_eq!(
+            benches[0].seen.borrow().heard,
+            vec![ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned())]
+        );
     }
 
     /// M2 R1 M-2: every other key closes the question and keeps the edit, unfocused, and is
