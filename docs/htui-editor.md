@@ -59,6 +59,7 @@ every path: saved, unchanged, failed or aborted.
 | exited with a non-zero code, or was killed by a signal | `` `<value>` exited with <code>; nothing was changed `` |
 | could not be found or started | ``could not start `<value>` (…) — set $VISUAL or $EDITOR``, or ``no $VISUAL or $EDITOR is set and `vi` could not start (…)`` |
 | was aborted ([the keys](#the-keys)) | `the editor was aborted; nothing was changed` |
+| in the pane: started, but htui could not wait on it (an operating-system error) | ``lost track of `<value>` (…); nothing was changed`` |
 
 Line endings are normalised to `\n`. In the Backlog item form and the compose box, a field that had
 no final newline does not get the one most editors add on save, and control characters (an escape

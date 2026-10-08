@@ -9,8 +9,8 @@
 //!
 //! - **Transport (P7).** The child's threads send [`PaneEvent`]s on the loop's fourth arm;
 //!   [`App::on_pane_event`] parses `Output` into the [`PaneScreen`] (writing back the replies it
-//!   owes, DSR and DA1) and, on `Exited`, reads the file back through [`TempEdit::finish`] and
-//!   hands the outcome to the asking tab through [`App::finish_external_edit`], so no view's
+//!   owes, DSR and DA1) and, on `Exited`, reads the file back through [`TempEdit::finish`] (a
+//!   failed wait is answered "lost track of `<value>`", R1 L-1) and hands the outcome to the asking tab through [`App::finish_external_edit`], so no view's
 //!   outcome handling changes. Every event carries a [`PaneId`]; an event of an editor already
 //!   finished or aborted is dropped (B4).
 //! - **Keys (P5, P6).** While an editor is alive [`App::on_key`] asks it first. Focused, only
@@ -192,11 +192,16 @@ impl App {
                 let Some(OpenEditor { tab, temp, cmd, .. }) = self.editor.take() else {
                     return;
                 };
-                let outcome = temp.finish(
-                    &cmd,
-                    status.map(|status| EditorExit::from(&status)),
-                    elapsed,
-                );
+                let outcome = match status {
+                    Ok(status) => temp.finish(&cmd, Ok(EditorExit::from(&status)), elapsed),
+                    // R1 L-1: the editor started (the spawn succeeded) and waiting on it failed,
+                    // so `finish`'s "could not start" sentence would be wrong. Nothing is read
+                    // back: the editor may not have finished writing.
+                    Err(err) => {
+                        drop(temp);
+                        ExternalEditOutcome::Failed(pane_lost(&cmd, &err))
+                    }
+                };
                 self.finish_external_edit(tab, outcome);
             }
         }
@@ -459,6 +464,14 @@ fn pane_size(rect: Rect) -> PaneSize {
 /// Why the pane could not start, and the way back to the suspend mode.
 fn pane_failure(err: &io::Error) -> String {
     format!("could not run the editor in a pane ({err}); unset {PANE_VAR} to suspend instead")
+}
+
+/// The editor ran in the pane, and waiting on it failed (R1 L-1): its file is not read back.
+fn pane_lost(cmd: &EditorCommand, err: &io::Error) -> String {
+    format!(
+        "lost track of `{}` ({err}); nothing was changed",
+        cmd.value()
+    )
 }
 
 #[cfg(test)]
@@ -998,6 +1011,29 @@ mod tests {
                 if why.contains("exited with 3")),
             "{heard:?}"
         );
+    }
+
+    /// R1 L-1: the editor ran (the spawn succeeded), and waiting on it failed: the pane's own
+    /// sentence, not the suspend mode's "could not start … set $VISUAL or $EDITOR".
+    #[test]
+    fn a_failed_wait_says_htui_lost_track_and_removes_the_file() {
+        let (mut app, benches, _log) = opened();
+        let file = app.editor_file().expect("a temp file").to_path_buf();
+        std::fs::write(&file, "new\n").expect("the editor writes");
+        let id = app.editor_id().expect("open");
+        app.on_pane_event(PaneEvent::Exited {
+            id,
+            status: Err(io::Error::other("waitid failed")),
+            elapsed: Duration::from_secs(2),
+        });
+        assert_eq!(
+            benches[0].seen.borrow().heard,
+            vec![ExternalEditOutcome::Failed(
+                "lost track of `nvim` (waitid failed); nothing was changed".to_owned()
+            )]
+        );
+        assert!(!file.exists(), "the temp file is removed");
+        assert!(!app.editor_open());
     }
 
     #[test]

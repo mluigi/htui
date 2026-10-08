@@ -379,7 +379,9 @@ impl TempEdit {
 
     /// [`run`]'s second half: how the editor ended, then the file read back (D9, D23, D24).
     ///
-    /// `exit` is `Err` when the editor could not be started at all. A non-zero code or a signal
+    /// `exit` is `Err` when the suspended editor could not be started at all ([`run`]); the
+    /// in-pane editor never passes one, since its start is the spawn and a failed wait after it
+    /// is answered by the pane ("lost track of …", MOD-57 R1 L-1). A non-zero code or a signal
     /// is `Failed`, the platform shell's "could not start" codes with the `$VISUAL`/`$EDITOR`
     /// sentence. Otherwise the file is read back: unreadable or not UTF-8 is `Failed`; equal to
     /// the handed text after [`normalise_newlines`] on both sides is `Unchanged` (`quick` when
