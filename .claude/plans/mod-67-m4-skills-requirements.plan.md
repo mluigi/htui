@@ -12,7 +12,7 @@ Sandbox run (`HR_SANDBOX=1`, branch `hr/MOD-67`, base `46b570c1`).
 M5 and M6 are later runs.
 **Complexity**: Large (7 source files to convert, ~214 `KeyCode` mentions, 24 hint constants,
 24 snapshots, plus `keys/` and `text_area.rs`)
-**Status**: confirmed (maintainer, 2026-10-08); blueprint next
+**Status**: confirmed (maintainer, 2026-10-08); blueprint `e829dde7`..`ca6e37f5`, PA-1..PA-4 approved; implementing
 
 ## Summary
 
@@ -107,6 +107,20 @@ inside the help prompt. Prose that names keys (`templates.rs`/`library.rs` notic
     `global.help` in `EDITOR_UNFOCUSED`) refused, and `[global] quit = ["q", "ctrl-x"]` the
     other way; `focus = "ctrl-c"` refused; `--print-keys` round-trips `[editor]`;
   - status line and `?` box for a capturing Templates editor and for the Requirements tree.
+
+## Amendments (maintainer, 2026-10-08, from blueprint §1)
+
+PA-1..PA-4 (`.claude/plans/mod-67-m4-skills-requirements.blueprint.md` §1) approved as written:
+T1 also converts `skills/mod.rs` and `skills/agent_help.rs`, adds the `LibraryView`/`TemplatesView`
+`key_stack` stubs and `Scroll::apply` in `backlog/detail/mod.rs`, and re-baselines the three
+agent-help snapshots, so L-A is `library.rs` + `attach.rs` and no snapshot is shared between lanes
+(PA-1); the Skills editors, prompts and agent help keep passing `Tab` through a `TABS` layer before
+`MODAL` (PA-2); the widget sees a key before `form.save` resolves, Requirements keeps chords away
+from its widgets (PA-3, D6 amended); the editor stacks join `DECLARED` under two phrases and
+`[global] quit = ["ctrl-x"]` is refused, the tree's four uses moving to `ctrl-y` (PA-4). The
+blueprint's "user-visible beyond D9" list is accepted whole: trimmed Library/Templates browse
+hints, `Tab/Down field` on the attach form, agent help `n/Esc discard` and `y` closing an empty
+answer, `Down`/`Up` moving focus on the Requirements Priority and Deciding fields.
 
 ## Patterns to Mirror
 
@@ -235,7 +249,7 @@ Postgres suites (`*_pg.rs`) once on the fully merged tree (sandbox DB on 5439).
 | 6 | The Skills view switch ignores modifiers (`ctrl-l` switches) | **true** | `skills/mod.rs` `SkillsTab::on_key`: `matches!(key.code, Char('h'\|'l'\|'['\|']') \| Left \| Right)`, no modifier test |
 | 7 | No Skills/Requirements view declares a stack yet | **true** | `fn key_stack` hits: registry, settings, overlays only |
 | 8 | `Tab::key_stack` and `Harness::with_keys` exist (M3) | **true** | `ui/tabs/registry.rs:79`; `testkit.rs:185`, `:703` |
-| 9 | Boxes and personas resolve `form.save` before their `TextArea` | **true** | `boxes.rs:571`, `personas.rs:1675` |
+| 9 | Boxes and personas resolve `form.save` before their `TextArea` | **false → amended (PA-3)** | they feed the `TextArea` first and resolve `form.save` on its `Pass` (`boxes.rs:533-575`, `personas.rs:1670-1678`); found by the architect |
 | 10 | Library and Templates editors save only through `TextArea`'s `Submit` (`ctrl-s`) | **true** | `library.rs:1069` and `templates.rs:729` docs ("`Ctrl+S` (the area's `Submit`)"), `Submit` arms `library.rs:1102`, `templates.rs:764` |
 | 11 | Requirements checks `ctrl-s` itself before its widgets | **true** | `requirements/mod.rs:23` doc, `:233` `Char('s' \| 'S')` with CONTROL |
 | 12 | Backlog `TextArea` owners check `ctrl-s` themselves, so D6 does not break them | **true** | `item_form.rs:8`, `:272-275` (A6 "Ctrl+S is checked before a chord passes"); `compose.rs:6`, `:316` |
@@ -246,6 +260,6 @@ Postgres suites (`*_pg.rs`) once on the fully merged tree (sandbox DB on 5439).
 | 17 | `ctrl-c` is refused in every table, `[editor]` included | **true** | `load.rs:241` `chord_of` is the only chord parse for entries (`:409`), table-agnostic |
 | 18 | `editor.focus` is `in_capture` (printable refused already) | **true** | `catalogue.rs` `capture_row(Act::EditorFocus, Editor, "focus", &["ctrl-4"], …)` |
 | 19 | `--print-keys` and table names already cover `Editor` | **true** | `print.rs:27` iterates `Context::ALL` (includes `Editor`, `catalogue.rs:97`); `load.rs:462` `TABLES` names `editor` |
-| 20 | Lane source sets are pairwise disjoint | **true** | Files to Change: each tab file in exactly one lane; T1 touches only `keys/` and `tests/keys*.rs` |
+| 20 | Lane source sets are pairwise disjoint | **true as files, false as a build boundary → amended (PA-1)** | Files to Change: each tab file in exactly one lane; T1 touches only `keys/` and `tests/keys*.rs` |
 | 21 | Lane test/snapshot sets are disjoint by construction | **false → amended** | `agent_help.rs` (L-A) renders in `templates__agent_help_*` (L-B); `tests/{concepts_search,personas,reveal,settings}.rs` reference the Skills/Requirements tabs or hints. Ownership + worktrees + T-close re-baseline replace the claim |
 | 22 | Repo disk has room for three worktree targets | **true** | `df -h .`: 2.9 T free on `/dev/sda`; `target/` 2.9 G; 12 cores |
