@@ -388,7 +388,8 @@ it cannot be undone.
 | `claude-cli` | Claude Code through its command-line JSON stream. A fallback for when the ACP adapter can't be installed. |
 | `agy` | Google Antigravity, through Google's ACP server. |
 
-Check **Settings › Agents** to see which ones work on this machine.
+Check **Settings › Agents** to see which ones work on this machine. `n` adds an agent and `e`
+edits the selected one.
 
 ### Installing an adapter
 
@@ -432,6 +433,26 @@ Use `claude` when you can. `claude-cli` uses the same Claude Code login but has 
   transcript. See [`docs/htui-mcp.md`](docs/htui-mcp.md#permission-prompts-for-claude-cli).
 - It shows edits as the tool calls that made them, not as diffs you can review.
 - It doesn't produce plans.
+- With [`mods (y/n)`](#your-claude-code-mods-hooks-and-skills) at `n`, a `--settings` in the
+  agent's `settings.cli.extra_args` would replace the one `htui` passes to keep your hooks off, so
+  the session refuses to start unless that value is inline JSON setting `"disableAllHooks": true`.
+  Add that key, or set `mods (y/n)` to `y`.
+
+### Your Claude Code mods, hooks and skills
+
+A Claude Code session that `htui` starts leaves out your own mods, the hooks in your
+`settings.json` files, and your skills and slash commands, so that nothing approves a tool call
+before `htui` is asked. Your plugins' agents and MCP servers, your own MCP servers and the
+repository's `CLAUDE.md` still load.
+
+The agent form's `mods (y/n)` field turns this off for one agent. It defaults to `n`. Set it to `y`
+to load your mods, settings hooks and skills in that agent's sessions again, as before. It only
+matters for Claude Code agents (`claude` and `claude-cli`), and it applies to sessions started
+after you save. A new agent starts at `n`, even when it copies the settings of an agent set to `y`.
+
+Every session `htui` starts has `HTUI_SESSION=1` in its environment, so a mod you let back in can
+tell it is running under `htui`. See
+[`docs/htui-mcp.md`](docs/htui-mcp.md#isolation-from-your-claude-code-setup).
 
 ### Spending limits
 
