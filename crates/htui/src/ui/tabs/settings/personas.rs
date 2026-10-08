@@ -538,7 +538,7 @@ impl PersonasSection {
             Act::Edit => (Mode::Editing(Editor::edit(row)), None),
             Act::PersonasBody => (Mode::Body(BodyEditor::edit(row)), None),
             Act::PersonasRules => (Mode::Rules(RulesEditor::edit(row)), None),
-            _ => (
+            Act::Delete => (
                 Mode::Deleting {
                     id: row.id,
                     name: row.name.clone(),
@@ -546,6 +546,9 @@ impl PersonasSection {
                 },
                 Some(Notice::Info(delete_question(&row.name))),
             ),
+            // `on_key` hands over only the six writing acts; any other opens nothing rather than
+            // the delete question.
+            _ => return,
         };
         self.mode = mode;
         self.notice = notice;
