@@ -134,6 +134,34 @@ close = ["esc"]  # close"#;
         assert_eq!(printed.matches("(changed)").count(), 3);
     }
 
+    /// MOD-12 M3 R1 H1: a row that gave a chord to an entry is marked with the entry's action,
+    /// not `(changed)`: the file never named it. The print reads back to the same keys, with the
+    /// row now an entry of its own.
+    #[test]
+    fn a_row_that_gave_way_names_the_entry_that_took_its_chord() {
+        let keys = load_str("[global]\nquit = [\"ctrl-q\"]\n\n[list]\ntop = [\"j\"]\n")
+            .expect("the file loads");
+        let printed = print(&keys);
+        let line = |name: &str| {
+            printed
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("no {name} row in {printed}"))
+        };
+        assert!(line("queue").contains("= []"), "{printed}");
+        assert!(line("queue").ends_with("# queue (unbound by quit)"), "{printed}");
+        assert!(line("down").contains(r#"= ["down"]"#), "{printed}");
+        assert!(line("down").ends_with(r#"# down (lost "j" to top)"#), "{printed}");
+        assert!(line("quit").ends_with("# quit (changed)"), "{printed}");
+        assert!(line("top").ends_with("# top (changed)"), "{printed}");
+        assert_eq!(printed.matches("(changed)").count(), 2);
+
+        let reloaded = load_str(&printed).expect("the print loads");
+        assert_eq!(reloaded, keys);
+        assert!(!print(&reloaded).contains("unbound by"));
+        assert!(!print(&reloaded).contains("lost \""));
+    }
+
     #[test]
     fn quote_escapes_what_toml_needs() {
         assert_eq!(quote("\\"), r#""\\""#);
