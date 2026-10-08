@@ -1,0 +1,29 @@
+---
+source: crates/htui/tests/state_cli_pg.rs
+expression: run.pretty()
+---
+{
+  "version": 1,
+  "kind": "status",
+  "store": "online",
+  "workspace": {
+    "id": "01a06490-bfb9-7000-8000-000000000301",
+    "slug": "graphics",
+    "name": "Graphics"
+  },
+  "projects": [
+    {
+      "id": "01a06490-c3a2-7000-8000-000000000402",
+      "slug": "vulkan-tutorials",
+      "name": "Vulkan Tutorials"
+    }
+  ],
+  "box": {
+    "id": "01a06490-bbd0-7000-8000-000000000200",
+    "hostname": "DESKTOP-HTUI",
+    "registered": true
+  },
+  "working": 0,
+  "waiting": 0,
+  "permissions_known": true
+}

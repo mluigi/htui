@@ -1,0 +1,13 @@
+---
+source: crates/htui/tests/state_cli_pg.rs
+expression: run.pretty()
+---
+{
+  "version": 1,
+  "kind": "waiting",
+  "store": "refused",
+  "error": {
+    "code": "unknown_project",
+    "message": "no project with slug `nope`"
+  }
+}
