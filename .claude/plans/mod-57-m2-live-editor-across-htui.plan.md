@@ -173,3 +173,15 @@ Step 3.5, 2026-10-08. Loader claims by a compile probe (a throwaway `keys::probe
 | README needs no change | TRUE | `README.md:614` lists `docs/htui-editor.md` only; the M1 lock lives in `docs/htui-editor.md` (§ "While the editor is open (the M1 lock)", key table rows `:122-140`) |
 | `app/snapshots` and `ui/overlay/snapshots` exist | TRUE | directory listing |
 | T1 ∩ T2 = ∅ after T0; T3 after both | TRUE | Independence table; the only shared files (`stack.rs`, `views.rs`, `ui/overlay/mod.rs`) are T0's |
+
+## Blueprint amendments (2026-10-08)
+
+Blueprint `.claude/plans/mod-57-m2-live-editor-across-htui.blueprint.md` (`e6d83478`). The maintainer
+accepted PD-M2-1 (the quit confirm's question is fixed: overlay factories take no argument),
+PD-M2-2 (the `?` box lists the editor keys that act where the user is: `EDITOR_OPEN`'s on the asking
+tab, `editor.focus` elsewhere, none under a modal overlay) and PD-M2-3 (file sets widened: T1 also
+owns `stack.rs`'s `DECLARED` line and count, `tests/keys_file.rs` and `tests/fixtures/keys/valid.toml`;
+T0 rewrites the `DECLARED` view-layer test pins, F-M2-1; the README example becomes T4's). The
+fixtures' and README's `quit = "ctrl-x"` move to **`ctrl-g`**. E5 stays as written: every
+`SetScope` is refused during an edit, Settings > Hierarchy's own scope refreshes included
+(documented in `docs/htui-editor.md`).
