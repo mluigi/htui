@@ -1,0 +1,1 @@
+{"name":"mod91-probe","owner":{"name":"mod91"},"plugins":[{"name":"probe-user","source":"./plugins/probe-user","description":"MOD-91 isolation probe"}]}
