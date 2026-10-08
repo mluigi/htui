@@ -28,7 +28,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
-use crate::keys::Act;
+use crate::keys::{Act, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
@@ -129,6 +129,14 @@ pub trait DetailTab {
     /// [`RunsTab`] answers; the default ignores it. Called after the item change, so it survives
     /// `on_item_change`'s reset.
     fn focus(&mut self, _run: Option<RunId>, _step: Option<StepId>, _ctx: &Ctx<'_>) {}
+
+    /// The stack of this sub-tab's current mode (MOD-67 M5 D4): what the Backlog tab resolves
+    /// keys through and what the status line and `?` box show while it is the active pane. The
+    /// default is Body's browse stack, [`views::BACKLOG_BODY`]: the pane's own verbs none, the
+    /// Backlog's and the list's all. A converted pane returns its mode's stack.
+    fn key_stack(&self) -> Stack<'static> {
+        views::BACKLOG_BODY
+    }
 }
 
 /// The sub-tabs of the detail pane, in registration order, plus which one is active.
@@ -186,6 +194,13 @@ impl DetailRegistry {
     #[must_use]
     pub fn active_id(&self) -> Option<DetailId> {
         self.active().map(DetailTab::id)
+    }
+
+    /// The active sub-tab's stack, or [`views::BACKLOG_BODY`] while the registry is empty.
+    #[must_use]
+    pub fn key_stack(&self) -> Stack<'static> {
+        self.active()
+            .map_or(views::BACKLOG_BODY, DetailTab::key_stack)
     }
 
     /// Activates the sub-tab at `idx`. `false` (and no change) when the index is out of range.
@@ -479,10 +494,14 @@ impl Scroll {
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use htui_core::model::ItemId;
+    use ratatui::Frame;
+    use ratatui::layout::Rect;
 
-    use super::Scroll;
-    use crate::app::Handled;
-    use crate::keys::Act;
+    use super::{DetailId, DetailRegistry, DetailTab, Scroll};
+    use crate::app::{Ctx, Handled};
+    use crate::keys::{Act, Stack, views};
+    use crate::store_worker::StoreReply;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -523,5 +542,72 @@ mod tests {
         assert_eq!(scroll.apply(Act::Edit, 5), Handled::Pass);
         assert_eq!(scroll.apply(Act::ListDown, 5), Handled::Pass);
         assert_eq!(scroll, Scroll::at(2), "a passed act moves nothing");
+    }
+
+    /// A sub-tab that keeps every default, `key_stack` included.
+    struct Plain;
+
+    /// A sub-tab in a mode of its own: it reports the Runs browse stack.
+    struct Converted;
+
+    impl DetailTab for Plain {
+        fn id(&self) -> DetailId {
+            DetailId("plain")
+        }
+        fn title(&self) -> &str {
+            "Plain"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    impl DetailTab for Converted {
+        fn id(&self) -> DetailId {
+            DetailId("converted")
+        }
+        fn title(&self) -> &str {
+            "Converted"
+        }
+        fn on_item_change(&mut self, _item: Option<ItemId>) {}
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+        fn key_stack(&self) -> Stack<'static> {
+            views::RUNS_BROWSE
+        }
+    }
+
+    /// MOD-67 M5 D4 (blueprint T-D1): the registry reports the active sub-tab's stack, and Body's
+    /// browse stack while nothing is registered or the sub-tab keeps the default.
+    #[test]
+    fn the_registry_reports_the_active_panes_stack() {
+        let mut registry = DetailRegistry::new();
+        assert_eq!(
+            registry.key_stack(),
+            views::BACKLOG_BODY,
+            "an empty registry"
+        );
+
+        registry.register(Box::new(Converted));
+        registry.register(Box::new(Plain));
+        assert_eq!(registry.active_id(), Some(DetailId("converted")));
+        assert_eq!(registry.key_stack(), views::RUNS_BROWSE, "the override");
+
+        registry.cycle_next();
+        assert_eq!(registry.active_id(), Some(DetailId("plain")));
+        assert_eq!(registry.key_stack(), views::BACKLOG_BODY, "the default");
+
+        registry.cycle_next();
+        assert_eq!(
+            registry.key_stack(),
+            views::RUNS_BROWSE,
+            "back on the override"
+        );
     }
 }

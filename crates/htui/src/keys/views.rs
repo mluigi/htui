@@ -1196,11 +1196,9 @@ mod tests {
             include_str!("../ui/tabs/backlog/detail/runs.rs"),
             include_str!("../ui/tabs/chat/mod.rs"),
         ];
-        /// MOD-67 M5: the stacks T1 declares before any view names them. T1c names
-        /// `BACKLOG_BODY` (`detail/mod.rs`), the lanes name the rest (blueprint §4.1);
-        /// T-close empties the list.
+        /// MOD-67 M5: the lanes name these; T-close empties the list. `BACKLOG_BODY` is named
+        /// by T1c's `detail/mod.rs` (blueprint §4.1).
         const PENDING: &[&str] = &[
-            "BACKLOG_BODY",
             "RUNS_BROWSE",
             "RUNS_CONFIRM",
             "RUNS_COUNTING",
