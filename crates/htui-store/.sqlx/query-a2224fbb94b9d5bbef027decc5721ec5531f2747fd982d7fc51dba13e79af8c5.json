@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT item_id FROM queue_entry WHERE box_id = $1 FOR UPDATE",
+  "query": "SELECT item_id FROM queue_entry WHERE box_id = $1 ORDER BY item_id FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "96542ed0b380900bc8c7f2cd470e5cd77e51fc731c4bf6960d94a265dc02a955"
+  "hash": "a2224fbb94b9d5bbef027decc5721ec5531f2747fd982d7fc51dba13e79af8c5"
 }

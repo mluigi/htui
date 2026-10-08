@@ -18,6 +18,8 @@
 //! what pins it. Nor does any statement write `updated_at` on an update path - the `BEFORE UPDATE`
 //! trigger of the migration owns it, and `RETURNING` sees the trigger-modified row.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use htui_core::model::{
@@ -7944,10 +7946,15 @@ impl PgStore {
     /// `box_id`'s queue or is already at that end. Never touches `item.priority`.
     ///
     /// One transaction, three statements (blueprint §B.3.3, §F-12):
-    /// 1. lock the box's entries, **without** `ORDER BY`: under `READ COMMITTED` a locking select
-    ///    that waited on a concurrent move may return its rows in their pre-wait order;
+    /// 1. lock the box's entries in `item_id` order (review R1 L1), the order
+    ///    [`prune_finished_entries`](PgStore::prune_finished_entries) locks in too, so a move and
+    ///    a prune never wait on each other in a cycle. The rows it answers are only the locked
+    ///    set: under `READ COMMITTED` a locking select that waited on a concurrent move may
+    ///    answer pre-wait values, so the order is not read here;
     /// 2. re-read them in D2 order with [`queue_entries`](PgStore::queue_entries)' literal, byte
-    ///    for byte; a later statement, its snapshot sees every commit the lock waited for;
+    ///    for byte; a later statement, its snapshot sees every commit the lock waited for. An
+    ///    entry the lock did not take (queued since) is left out, so the write below never waits
+    ///    on a row lock out of order;
     /// 3. write the moved order as `position = 1..n` in one `UNNEST` update.
     ///
     /// A concurrent `queue_item` inserts `NULL`, which sorts after the written positions; a
@@ -7963,13 +7970,15 @@ impl PgStore {
         to: QueueMove,
     ) -> Result<bool> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
-        sqlx::query_scalar!(
-            "SELECT item_id FROM queue_entry WHERE box_id = $1 FOR UPDATE",
+        let locked: BTreeSet<Uuid> = sqlx::query_scalar!(
+            "SELECT item_id FROM queue_entry WHERE box_id = $1 ORDER BY item_id FOR UPDATE",
             box_id.as_uuid(),
         )
         .fetch_all(&mut *tx)
         .await
-        .map_err(map_sqlx)?;
+        .map_err(map_sqlx)?
+        .into_iter()
+        .collect();
         let entries = sqlx::query_as!(
             QueueEntry,
             r#"
@@ -7988,7 +7997,11 @@ impl PgStore {
         .fetch_all(&mut *tx)
         .await
         .map_err(map_sqlx)?;
-        let order: Vec<ItemId> = entries.iter().map(|entry| entry.item_id).collect();
+        let order: Vec<ItemId> = entries
+            .iter()
+            .map(|entry| entry.item_id)
+            .filter(|id| locked.contains(&id.as_uuid()))
+            .collect();
         let Some(moved) = moved_order(&order, item, to) else {
             return Ok(false); // the dropped `tx` rolls back: nothing was written
         };
@@ -8172,15 +8185,26 @@ impl PgStore {
 
     /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
     ///
+    /// The rows are locked in `item_id` order first (review R1 L1), the order
+    /// [`move_queue_entry`](PgStore::move_queue_entry) locks in, so the runner's prune and a
+    /// user's move never deadlock. A bare `DELETE … USING item` would lock in whatever order its
+    /// plan visits the rows.
+    ///
     /// # Errors
     ///
     /// Whatever the driver reports, through [`map_sqlx`].
     pub async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
         Ok(sqlx::query!(
             r#"
+            WITH doomed AS (
+                SELECT e.item_id
+                  FROM queue_entry e JOIN item i ON i.id = e.item_id
+                 WHERE e.box_id = $1 AND i.status IN ('done', 'closed')
+                 ORDER BY e.item_id
+                   FOR UPDATE OF e)
             DELETE FROM queue_entry e
-             USING item i
-             WHERE e.item_id = i.id AND e.box_id = $1 AND i.status IN ('done', 'closed')
+             USING doomed d
+             WHERE e.item_id = d.item_id
             "#,
             box_id.as_uuid(),
         )
