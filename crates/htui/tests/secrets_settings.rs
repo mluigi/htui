@@ -2828,6 +2828,171 @@ async fn the_product_registers_secrets_last() {
 }
 
 // ---------------------------------------------------------------------------------------------
+// MOD-67 M3: keys through the context stacks
+// ---------------------------------------------------------------------------------------------
+
+/// [`loaded`] with a bench handing the section the keys `file` loads to.
+async fn loaded_with_keys(file: &str, keyring_reply: StoreReply) -> (SectionBench, SecretsSection) {
+    let keys = htui::keys::load_str(file).expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = SecretsSection::new();
+    let tree = graphics(&MemStore::demo()).await;
+    bench.reply(&mut section, &keyring_reply);
+    bench.reply(&mut section, &tree_reply(&tree));
+    let _ = bench.drained();
+    (bench, section)
+}
+
+/// D14 (L-D Q10): the Browse arms were modifier-blind, so `ctrl-t` sent a provider check (a
+/// login that can latch). A chord is its modifiers too: `ctrl-t` goes to the shell, `t` checks.
+#[tokio::test]
+async fn ctrl_t_in_browse_sends_no_check() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_HEALTH);
+    let before = frame(&bench, &section);
+
+    for chord in ["ctrl-t", "alt-t"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+        assert!(bench.drained().is_empty(), "{chord} sends no check");
+        assert_eq!(frame(&bench, &section), before, "{chord} changes nothing");
+    }
+
+    bench.key(&mut section, "t");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::CheckSecretProvider]
+    ));
+}
+
+/// D14 (L-D Q10): `ctrl-e`, `alt-c` and the other modified Browse letters open nothing and pass.
+#[tokio::test]
+async fn ctrl_e_and_alt_c_in_browse_open_nothing() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_URL);
+    let before = frame(&bench, &section);
+
+    for chord in ["ctrl-e", "alt-e", "alt-c", "ctrl-r", "ctrl-j", "alt-down"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+        assert!(!section.captures_input(), "{chord} opens nothing");
+        assert!(bench.drained().is_empty(), "{chord} emits nothing");
+        assert_eq!(frame(&bench, &section), before, "{chord} changes nothing");
+    }
+
+    bench.key(&mut section, "c");
+    assert!(section.captures_input(), "`c` still asks");
+}
+
+/// D14: `alt-y` and `alt-n` do not answer a question; `y` does.
+#[tokio::test]
+async fn alt_y_at_a_question_clears_nothing() {
+    let (bench, mut section, _) = loaded(configured()).await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "c");
+    let asked = frame(&bench, &section);
+    assert!(asked.contains("y confirm \u{b7} n/Esc cancel"), "{asked}");
+
+    for chord in ["alt-y", "alt-n", "alt-esc"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+        assert!(section.captures_input(), "{chord}: still asking");
+    }
+    assert_eq!(bench.key(&mut section, "x"), Handled::Consumed);
+    assert!(bench.drained().is_empty(), "nothing was cleared");
+
+    bench.key(&mut section, "y");
+    assert!(matches!(
+        requests(&bench).as_slice(),
+        [StoreRequest::ClearMachineIdentity]
+    ));
+}
+
+/// `common.dismiss` declines while there is no notice: `Esc` goes to the shell. With a notice it
+/// dismisses it.
+#[tokio::test]
+async fn esc_with_no_notice_passes() {
+    let (bench, mut section, _) = loaded(demo_keyring()).await;
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Pass);
+
+    go_to(&bench, &mut section, ROW_HEALTH);
+    bench.key(&mut section, "t");
+    let refused = "a demo session has no secret provider to check";
+    assert!(frame(&bench, &section).contains(refused));
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Consumed);
+    assert!(!frame(&bench, &section).contains(refused), "dismissed");
+    assert_eq!(bench.key(&mut section, "esc"), Handled::Pass);
+}
+
+/// PA-1, L-D Q2: `VIEW_DEFAULTS` rows are extra chords on top of the shared row in force. With
+/// `[form] next_field = ["ctrl-n"]` the identity form moves on `ctrl-n` and `Down`, no longer on
+/// `Tab`, and the hint says `Ctrl+n`.
+#[tokio::test]
+async fn a_shared_next_field_rebind_reaches_the_identity_form_and_keeps_down() {
+    let (bench, mut section) = loaded_with_keys(
+        "version = 1\n[form]\nnext_field = [\"ctrl-n\"]\n",
+        not_configured(),
+    )
+    .await;
+    go_to(&bench, &mut section, ROW_IDENTITY);
+    bench.key(&mut section, "e");
+    let opened = frame(&bench, &section);
+    assert!(
+        opened.contains("Ctrl+n next field \u{b7} Enter store"),
+        "{opened}"
+    );
+
+    type_text(&bench, &mut section, "a");
+    assert_eq!(bench.key(&mut section, "tab"), Handled::Consumed);
+    type_text(&bench, &mut section, "b");
+    assert_eq!(bench.key(&mut section, "ctrl-n"), Handled::Consumed);
+    type_text(&bench, &mut section, "s");
+    assert_eq!(bench.key(&mut section, "down"), Handled::Consumed);
+    type_text(&bench, &mut section, "d");
+    bench.key(&mut section, "enter");
+
+    match requests(&bench).as_slice() {
+        [StoreRequest::SetMachineIdentity(entry)] => {
+            assert_eq!(entry.client_id(), "abd", "Tab stayed, Down came back");
+            assert_eq!(entry.expose_client_secret(), "s", "ctrl-n moved");
+        }
+        other => panic!("exactly one identity write, got {other:?}"),
+    }
+}
+
+/// D14: one rebinding through the shell. `[settings.secrets] check = ["T"]`: the hint shows
+/// `T check`, `t` does nothing, and `T` reaches the check (refused by name in a demo).
+#[tokio::test]
+async fn a_rebound_check_runs_on_its_new_chord_only() {
+    let keys = htui::keys::load_str("version = 1\n[settings.secrets]\ncheck = [\"T\"]\n")
+        .expect("the key file loads");
+    let mut harness = Harness::demo().with_keys(keys);
+    htui::app::register_all(harness.app());
+    harness.settle().await;
+    harness.key("4");
+    harness.settle().await;
+    for _ in 0..8 {
+        harness.key("l");
+    }
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("e edit \u{b7} c clear \u{b7} T check \u{b7} r reload \u{b7} j/k rows"),
+        "{frame}"
+    );
+    let refused = "a demo session has no secret provider to check";
+    harness.key("t");
+    harness.settle().await;
+    assert!(
+        !harness.render().contains(refused),
+        "`t` is no longer check"
+    );
+
+    harness.key("T");
+    harness.settle().await;
+    let checked = harness.render();
+    assert!(checked.contains(refused), "`T` checks: {checked}");
+}
+
+// ---------------------------------------------------------------------------------------------
 // Snapshots (D.4 #31)
 // ---------------------------------------------------------------------------------------------
 
