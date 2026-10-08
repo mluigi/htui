@@ -1,7 +1,8 @@
 //! The `R-STO-5` confirmation: pending migrations are never applied without a human (plan D11).
 //!
 //! The shell opens this overlay when a [`StoreReply::StoreState`] carries a pending count; `y`
-//! applies, `n` and `Esc` leave the schema alone and the shell reading from the local mirror. It
+//! (`confirm.yes`) applies, `n` and `Esc` (`confirm.no`) leave the schema alone and the shell
+//! reading from the local mirror. It
 //! holds no store handle and no channel: the count arrives through `on_reply`, the decision leaves
 //! through `Ctx` (`R-NF-3`).
 //!
@@ -15,15 +16,19 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{Action, Ctx, Handled, OverlayAction};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
-/// The line under the question. `Esc` is the wildcard overlay binding; `y` and `n` are handled
-/// here.
-const HINT: &str = "y apply · n / Esc stay offline";
+/// The line under the question (MOD-67 D9): `confirm.yes` and `confirm.no` are handled here,
+/// `overlay.close` (the same effect as `no`) by the shell.
+const HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "apply"),
+    Hint::Pair(Act::ConfirmNo, Act::OverlayClose, "stay offline"),
+];
 
 /// Left border, right border and one column of right padding.
 const CHROME: u16 = 3;
@@ -48,12 +53,12 @@ impl MigrationPrompt {
         Self::default()
     }
 
-    /// The box's contents: the question, a blank line, then the hint.
-    fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+    /// The box's contents: the question, a blank line, then `hint` (the rendered [`HINT`]).
+    fn lines(&self, hint: String, theme: &Theme) -> Vec<Line<'static>> {
         vec![
             Line::styled(self.question(), theme.base),
             Line::raw(""),
-            Line::styled(HINT, theme.dim),
+            Line::styled(hint, theme.dim),
         ]
     }
 
@@ -81,6 +86,10 @@ impl Overlay for MigrationPrompt {
         true
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(views::MIGRATION)
+    }
+
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
         // How the count reaches the overlay: the factory signature is `Fn() -> Box<dyn Overlay>`
         // and must stay that way, so the shell cannot hand it a constructor argument.
@@ -88,21 +97,27 @@ impl Overlay for MigrationPrompt {
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        match key.code {
-            KeyCode::Char('y' | 'Y') => {
-                ctx.emit(Action::Store(StoreRequest::ApplyMigrations));
-                ctx.emit(Action::Overlay(OverlayAction::Close));
-                Handled::Consumed
+        // `y`/`Y` and `n`/`Esc`/`N` are the derived `[migration]` rows (MOD-67 PA-1): `Esc` is
+        // `confirm.no` first, then `overlay.close` (`SHADOWING`); both close, nothing applied.
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::MIGRATION, chord) {
+            match act {
+                Act::ConfirmYes => {
+                    ctx.emit(Action::Store(StoreRequest::ApplyMigrations));
+                    ctx.emit(Action::Overlay(OverlayAction::Close));
+                    return Handled::Consumed;
+                }
+                Act::ConfirmNo => {
+                    // The backend stays as it is: schema pending, no refresher, reads from the
+                    // mirror.
+                    ctx.emit(Action::Overlay(OverlayAction::Close));
+                    return Handled::Consumed;
+                }
+                _ => continue, // `overlay.close` or `global.help`: the shell's
             }
-            KeyCode::Char('n' | 'N') => {
-                // The backend stays as it is: schema pending, no refresher, reads from the mirror.
-                ctx.emit(Action::Overlay(OverlayAction::Close));
-                Handled::Consumed
-            }
-            // `Esc` falls through to the wildcard overlay binding, which closes it — the same
-            // effect as `n`. Everything else is swallowed by `is_modal`.
-            _ => Handled::Pass,
         }
+        // Everything else is swallowed by `is_modal`: `ctrl-y` applies nothing.
+        Handled::Pass
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
@@ -116,7 +131,7 @@ impl Overlay for MigrationPrompt {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let lines = self.lines(ctx.theme);
+        let lines = self.lines(ctx.keys().hint(views::MIGRATION, HINT), ctx.theme);
         let widest = lines.iter().map(Line::width).max().unwrap_or(0);
         let width = u16::try_from(widest)
             .unwrap_or(u16::MAX)

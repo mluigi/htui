@@ -31,4 +31,4 @@ no workspace · no box · memory · 0 working · 0 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+Ctrl+c quit · ? help

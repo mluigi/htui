@@ -13,12 +13,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 /// Marker in front of the row the cursor is on (the switcher's, `workspace_switcher.rs`): a
 /// snapshot records symbols and not styles.
@@ -33,8 +34,13 @@ const GAP: &str = "  ";
 /// Left border, right border and one column of right padding.
 const CHROME: u16 = 3;
 
-/// The line under the list. `Esc` is the wildcard overlay binding, `j`/`k`/`Enter` are handled here.
-const HINT: &str = "j/k move · Enter open · Esc close";
+/// The line under the list (MOD-67 D9): `list.down`/`list.up` and `waiting.open` are handled
+/// here, `overlay.close` by the shell.
+const HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::WaitingOpen, "open"),
+    Hint::One(Act::OverlayClose, "close"),
+];
 
 /// What a reply with no row says.
 const EMPTY: &str = "nothing is waiting on you";
@@ -126,7 +132,8 @@ impl WaitingList {
     }
 
     /// The box's contents: the visible rows (or the empty or reading line), the offline or
-    /// unreadable line when permissions are unknown, a blank line, then the hint.
+    /// unreadable line when permissions are unknown, a blank line, then `hint` (the rendered
+    /// [`HINT`]).
     ///
     /// `text_width` is the room the text column gets; `None` is its widest text, unclipped.
     /// `visible` is how many rows fit: the window always holds the cursor.
@@ -135,6 +142,7 @@ impl WaitingList {
         waiting: Option<&WaitingView>,
         text_width: Option<usize>,
         visible: usize,
+        hint: &str,
         theme: &Theme,
     ) -> Vec<Line<'static>> {
         let mut lines = match waiting {
@@ -165,7 +173,7 @@ impl WaitingList {
             lines.push(Line::styled(format!("{NO_CURSOR}{why}"), theme.dim));
         }
         lines.push(Line::raw(""));
-        lines.push(Line::styled(format!("{NO_CURSOR}{HINT}"), theme.dim));
+        lines.push(Line::styled(format!("{NO_CURSOR}{hint}"), theme.dim));
         lines
     }
 }
@@ -258,6 +266,10 @@ impl Overlay for WaitingList {
         true
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(views::WAITING_LIST)
+    }
+
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
         // Plan D6, blueprint E13: nothing on open; the shell's tick re-reads the list.
         Vec::new()
@@ -270,25 +282,29 @@ impl Overlay for WaitingList {
             .as_ref()
             .map_or(&[][..], |view| view.rows.as_slice());
         let len = rows.len();
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                let next = self.at(rows).map_or(0, |at| (at + 1).min(len - 1));
-                self.put(rows, next);
-                Handled::Consumed
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::WAITING_LIST, chord) {
+            match act {
+                Act::ListDown => {
+                    let next = self.at(rows).map_or(0, |at| (at + 1).min(len - 1));
+                    self.put(rows, next);
+                    return Handled::Consumed;
+                }
+                Act::ListUp => {
+                    let next = self.at(rows).map_or(0, |at| at.saturating_sub(1));
+                    self.put(rows, next);
+                    return Handled::Consumed;
+                }
+                Act::WaitingOpen => {
+                    self.enter(rows, ctx);
+                    return Handled::Consumed;
+                }
+                _ => continue, // `overlay.close` or `global.help`: the shell's
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                let next = self.at(rows).map_or(0, |at| at.saturating_sub(1));
-                self.put(rows, next);
-                Handled::Consumed
-            }
-            KeyCode::Enter => {
-                self.enter(rows, ctx);
-                Handled::Consumed
-            }
-            // `Esc` falls through to the wildcard overlay binding; the rest is swallowed by
-            // `is_modal`, so a stray key never reaches the tab underneath.
-            _ => Handled::Pass,
         }
+        // The shell's overlay step closes on `overlay.close`; the rest is swallowed by
+        // `is_modal`, so a stray key never reaches the tab underneath.
+        Handled::Pass
     }
 
     fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {
@@ -303,7 +319,8 @@ impl Overlay for WaitingList {
         let fixed = 2 + usize::from(waiting.is_some_and(|view| !view.permissions_known));
 
         // The natural size: every row, every text whole.
-        let natural = self.lines(waiting, None, usize::MAX, ctx.theme);
+        let hint = ctx.keys().hint(views::WAITING_LIST, HINT);
+        let natural = self.lines(waiting, None, usize::MAX, &hint, ctx.theme);
         let width = u16::try_from(widest(&natural))
             .unwrap_or(u16::MAX)
             .saturating_add(CHROME)
@@ -316,7 +333,7 @@ impl Overlay for WaitingList {
         let room = usize::from(width.saturating_sub(CHROME));
         let text_width = room.saturating_sub(columns.prefix());
         let visible = usize::from(height.saturating_sub(2)).saturating_sub(fixed);
-        let lines = self.lines(waiting, Some(text_width), visible, ctx.theme);
+        let lines = self.lines(waiting, Some(text_width), visible, &hint, ctx.theme);
 
         let box_area = centered(area, width, height);
         frame.render_widget(Clear, box_area);
@@ -336,9 +353,10 @@ mod tests {
     use super::*;
     use crate::app::{Action, Emit, OverlayAction, RevealTarget, TopBarState};
     use crate::keymap::Keymap;
+    use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::cells::cell_width;
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ItemId, ProjectRef, RunId, StepId, WorkspaceId};
     use htui_worker::WaitingReason;
@@ -450,6 +468,11 @@ mod tests {
             permissions_known: true,
             offline: false,
         }
+    }
+
+    /// The hint rendered with the compiled keys.
+    fn hint() -> String {
+        Keys::compiled().hint(views::WAITING_LIST, HINT)
     }
 
     fn texts(lines: &[Line<'_>]) -> Vec<String> {
@@ -623,6 +646,29 @@ mod tests {
         assert_eq!(bench.code(&mut list, KeyCode::Esc), Handled::Pass);
     }
 
+    /// MOD-67 M3 (D6): the list moves and opens through `list.down`/`list.up`/`waiting.open`,
+    /// and chord equality includes modifiers, so `ctrl-j`, `alt-k` and `ctrl-enter` are not
+    /// theirs: they pass and the modal overlay swallows them.
+    #[test]
+    fn a_chord_with_a_modifier_neither_moves_nor_opens() {
+        let rows = vec![
+            gate("ANA-2", ids::HTUI_ANA_2),
+            reopen("FEAT-2", ids::HTUI_FEAT_2),
+        ];
+        let bench = Bench::over(Some(view(rows.clone())));
+        let mut list = WaitingList::new();
+        for (code, mods) in [
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Char('k'), KeyModifiers::ALT),
+            (KeyCode::Enter, KeyModifiers::CONTROL),
+        ] {
+            let handled = list.on_key(KeyEvent::new(code, mods), &mut bench.ctx());
+            assert_eq!(handled, Handled::Pass, "{code:?} {mods:?}");
+        }
+        assert!(bench.emit.is_empty(), "nothing opened");
+        assert_eq!(list.at(&rows), Some(0), "the cursor did not move");
+    }
+
     #[test]
     fn enter_on_an_empty_list_emits_nothing() {
         for waiting in [None, Some(view(Vec::new()))] {
@@ -644,7 +690,7 @@ mod tests {
             reopen("FEAT-2", ids::HTUI_FEAT_2),
         ]);
         let list = WaitingList::new();
-        let lines = list.lines(Some(&view), None, usize::MAX, &Theme::default());
+        let lines = list.lines(Some(&view), None, usize::MAX, &hint(), &Theme::default());
         assert_eq!(
             texts(&lines),
             vec![
@@ -660,7 +706,7 @@ mod tests {
     #[test]
     fn before_the_first_reply_it_says_reading() {
         let list = WaitingList::new();
-        let lines = list.lines(None, None, usize::MAX, &Theme::default());
+        let lines = list.lines(None, None, usize::MAX, &hint(), &Theme::default());
         assert_eq!(texts(&lines)[0], format!("{NO_CURSOR}{READING}"));
         let rendered = Bench::over(None).render(&list);
         assert!(rendered.contains(READING), "{rendered}");
@@ -680,7 +726,7 @@ mod tests {
         let rendered = bench.render(&list);
         assert!(rendered.contains("> FEAT-35 "), "{rendered}");
         assert!(!rendered.contains("FEAT-1 "), "{rendered}");
-        assert!(rendered.contains(HINT), "{rendered}");
+        assert!(rendered.contains(&hint()), "{rendered}");
     }
 
     #[test]
