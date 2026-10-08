@@ -60,10 +60,12 @@ struct Row {
 }
 
 /// A chord a row left at its default gave to an entry of the file in its context (MOD-12 M3
-/// R1 H1): the user's binding wins.
+/// R1 H1), or, for `editor.abort`, to a global entry (MOD-57 M2 R1 M-1): the user's binding wins.
 #[derive(Debug, Clone, Copy)]
 struct Lost {
     chord: KeyChord,
+    /// The entry's context: the row's own, except where the abort gave way to `[global]`.
+    from: Context,
     /// The entry's action.
     to: Act,
     /// The entry's line.
@@ -274,10 +276,11 @@ impl Keys {
             for lost in &row.lost {
                 let shown = quote(&lost.chord.spec());
                 let taker = lost.to.spec().map_or("", |spec| spec.name);
+                let from = lost.from.table();
                 out.push(KeyFileError {
                     line: lost.line,
                     message: format!(
-                        "[{table}] {taker} = {shown} takes {shown} from {table}.{name}, {left}"
+                        "[{from}] {taker} = {shown} takes {shown} from {table}.{name}, {left}"
                     ),
                 });
             }

@@ -66,7 +66,8 @@ pub fn print(keys: &Keys) -> String {
 }
 
 /// What follows a row's help: ` (changed)` for the file's change, ` (unbound by quit)` or
-/// ` (lost "j" to top)` for a default that gave way to the file's entries, else nothing.
+/// ` (lost "j" to top)` for a default that gave way to the file's entries (` (unbound by
+/// global.quit)` for a taker in another table), else nothing.
 fn mark(row: &Row) -> String {
     if row.line.is_some() {
         return " (changed)".to_owned();
@@ -74,9 +75,17 @@ fn mark(row: &Row) -> String {
     if row.lost.is_empty() {
         return String::new();
     }
-    let name = |lost: &super::Lost| lost.to.spec().map_or("", |spec| spec.name);
+    // A taker from another table (the abort's, MOD-57 M2 R1 M-1) is named with its table.
+    let name = |lost: &super::Lost| {
+        let name = lost.to.spec().map_or("", |spec| spec.name);
+        if lost.from == row.context {
+            name.to_owned()
+        } else {
+            format!("{}.{name}", lost.from.table())
+        }
+    };
     if row.chords.is_empty() {
-        let mut takers: Vec<&str> = Vec::new();
+        let mut takers: Vec<String> = Vec::new();
         for lost in &row.lost {
             if !takers.contains(&name(lost)) {
                 takers.push(name(lost));
@@ -216,6 +225,24 @@ close = ["esc"]  # close"#;
         assert_eq!(reloaded, keys);
         assert!(!print(&reloaded).contains("unbound by"));
         assert!(!print(&reloaded).contains("lost \""));
+    }
+
+    /// MOD-57 M2 R1 M-1: a default that gave its chord to another table's entry names the
+    /// taker with its table.
+    #[test]
+    fn the_abort_row_names_the_global_entry_that_took_its_chord() {
+        let keys = load_str("[global]\nquit = [\"ctrl-x\"]\n").expect("the abort gives way");
+        let printed = print(&keys);
+        let abort = printed
+            .lines()
+            .find(|line| line.starts_with("abort "))
+            .unwrap_or_else(|| panic!("no abort row in {printed}"));
+        assert!(abort.contains("= []"), "{printed}");
+        assert!(
+            abort.ends_with("# abort edit (unbound by global.quit)"),
+            "{printed}"
+        );
+        assert_eq!(load_str(&print(&keys)).as_ref(), Ok(&keys));
     }
 
     #[test]

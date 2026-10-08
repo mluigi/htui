@@ -1,0 +1,10 @@
+# MOD-57 M2 R1 M-1 fixture: the README's example before MOD-57 M2, written before ctrl-x aborted
+# an open edit. Quit takes ctrl-x, and editor.abort, which the file leaves at its default, gives
+# it up.
+version = 1
+
+[global]
+quit = ["ctrl-x"]
+
+[overlay]
+close = ["esc", "f2"]

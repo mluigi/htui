@@ -9,9 +9,10 @@
 //! set is reported as the shared row it follows, on the user's line.
 //!
 //! MOD-57 M2 (E9): `editor.focus` never gives way, and no other action may share its chord in any
-//! context: while an edit is open it acts ahead of every view.
+//! context: while an edit is open it acts ahead of every view. `editor.abort` left at its default
+//! gives way to a global entry too (M2 R1 M-1): a file that binds `ctrl-x` in `[global]` loads.
 
-use super::stack::WHILE_EDITING;
+use super::stack::{Stack, WHILE_EDITING};
 use super::{
     Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING, STATE_GUARDED,
     quote,
@@ -23,17 +24,24 @@ use super::{
 /// [`STATE_GUARDED`] pair that shares the chord by default keeps sharing it, and
 /// `overlay.close` and `editor.focus` never give way (each must keep a chord).
 ///
-/// Across contexts nothing gives way, and [`validate`]'s stack rules stand: two entries on one
-/// chord are an error, and so is a chord an entry shares with another context's default only
-/// where a [`DECLARED`] stack makes both candidates (today the overlay stack: `[global] help`
-/// against `overlay.close`, either way). A context no declared stack composes with the entry's
-/// is not compared: `[global] quit = ["j"]` loads, and `list.down` keeps `j`.
+/// One default gives way across contexts (MOD-57 M2 R1 M-1): `editor.abort` gives its chord to
+/// an entry of a context [`Stack::EDITOR_OPEN`] composes with `[editor]` (today `[global]`), so
+/// `[global] quit = ["ctrl-x"]`, the README's example before M2, loads with a notice and leaves
+/// the abort unbound. The abort may end unbound: only the asking tab offers it (E2), and the
+/// editor still ends with the program's own keys.
+///
+/// Otherwise nothing gives way across contexts, and [`validate`]'s stack rules stand: two entries
+/// on one chord are an error, and so is a chord an entry shares with another context's default
+/// only where a [`DECLARED`] stack makes both candidates (the overlay stack: `[global] help`
+/// against `overlay.close`, either way; any context against `editor.focus`; an `[editor] abort`
+/// entry against a global default). A context no declared stack composes with the entry's is
+/// not compared: `[global] quit = ["j"]` loads, and `list.down` keeps `j`.
 pub(super) fn give_way(keys: &mut Keys) {
     let mut taken: Vec<(usize, Lost)> = Vec::new();
     for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
         for (index, default) in keys.rows.iter().enumerate() {
             if default.entry.is_some()
-                || default.context != entry.context
+                || !(default.context == entry.context || abort_gives_way(entry, default))
                 || matches!(default.act, Act::OverlayClose | Act::EditorFocus)
             {
                 continue;
@@ -44,6 +52,7 @@ pub(super) fn give_way(keys: &mut Keys) {
                         index,
                         Lost {
                             chord,
+                            from: entry.context,
                             to: entry.act,
                             line: entry.entry.unwrap_or(0),
                         },
@@ -59,12 +68,27 @@ pub(super) fn give_way(keys: &mut Keys) {
     }
 }
 
+/// Whether `default`, in another context than `entry`, still gives way to it (MOD-57 M2 R1 M-1):
+/// it is `editor.abort`, and `entry`'s action is in a wider layer of [`Stack::EDITOR_OPEN`].
+fn abort_gives_way(entry: &Row, default: &Row) -> bool {
+    let layers = Stack::EDITOR_OPEN.layers();
+    default.act == Act::EditorAbort
+        && default.context == Context::Editor
+        && layers
+            .iter()
+            .skip(1)
+            .any(|layer| layer.context() == entry.context && layer.admits(entry.act))
+}
+
 /// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
 /// The compiled defaults give none (`the_compiled_defaults_validate`).
 ///
 /// Four passes, in this order: two actions sharing a chord in one shared or global context; two
 /// candidates for one chord in a [`DECLARED`] stack; a chord shared with `editor.focus` in any
-/// context (MOD-57 M2 E9 (d)); a printable chord on an `in_capture` action. A pair and chord
+/// context (MOD-57 M2 E9 (d)); a printable chord on an `in_capture` action. [`give_way`] ran
+/// first, so a default that gave its chord away (the abort's to a global entry, M2 R1 M-1) is
+/// no collision; a focus chord shared with anything, and an `[editor] abort` entry on a global
+/// default, still are. A pair and chord
 /// seen by two passes is reported once. A [`STATE_GUARDED`] pair may
 /// share a chord only when it is a catalogue default of both actions (PA-2), and so may a
 /// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
@@ -322,17 +346,74 @@ mod tests {
         );
     }
 
-    /// E9 (c): `Stack::EDITOR_OPEN` stacks `[editor]` over every global action, so a global
-    /// entry on an editor default is refused there.
+    /// M2 R1 M-1: the README's example before MOD-57 M2 (`[global] quit = ["ctrl-x"]`) still
+    /// loads. `Stack::EDITOR_OPEN` stacks `[editor]` over every global action, so the global
+    /// entry takes `ctrl-x` from `editor.abort` (left at its default) across the two contexts,
+    /// with the usual notice; the abort is unbound (E2 confines it to the asking tab).
     #[test]
-    fn a_global_chord_of_the_editors_is_refused_while_an_edit_is_open() {
+    fn a_global_entry_takes_ctrl_x_from_the_abort_with_a_notice() {
+        let readme = "version = 1\n\n[global]\nquit = [\"ctrl-x\"]\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n";
+        let keys = load_str(readme).expect("the abort gives way");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("ctrl-x")]);
+        assert!(keys.chords(Context::Editor, Act::EditorAbort).is_empty());
+        assert_eq!(keys.line(Context::Editor, Act::EditorAbort), None);
+        let notices: Vec<(usize, String)> = keys
+            .notices()
+            .into_iter()
+            .map(|notice| (notice.line, notice.message))
+            .collect();
         assert_eq!(
-            errors("[global]\nquit = \"ctrl-x\"\n"),
+            notices,
             one(
-                2,
-                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (default) while an edit is open"#
+                4,
+                r#"[global] quit = "ctrl-x" takes "ctrl-x" from editor.abort, which is now unbound"#
             )
         );
+    }
+
+    /// M2 R1 M-1: only the abort gives way across contexts, and only to a context
+    /// `Stack::EDITOR_OPEN` composes with `[editor]`: an overlay entry on `ctrl-x` never meets
+    /// the abort, so the abort keeps it and nothing is noticed.
+    #[test]
+    fn the_abort_keeps_ctrl_x_from_a_context_it_never_meets() {
+        let keys = load_str("[overlay]\nclose = [\"esc\", \"ctrl-x\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::Editor, Act::EditorAbort),
+            [chord("ctrl-x")]
+        );
+        assert!(keys.notices().is_empty());
+    }
+
+    /// M2 R1 M-1: an `[editor] abort` entry is the user's, so it takes nothing across contexts:
+    /// a chord another context's default holds while an edit is open is still refused.
+    #[test]
+    fn an_abort_entry_on_a_global_default_is_still_refused() {
+        assert_eq!(
+            errors("[editor]\nabort = \"ctrl-q\"\n"),
+            one(
+                2,
+                r#"[editor] abort = "ctrl-q": "ctrl-q" is already global.queue (default) while an edit is open"#
+            )
+        );
+    }
+
+    /// M2 R1 M-1: a global entry on the abort's chord that the file also sets is two entries on
+    /// one chord: still refused.
+    #[test]
+    fn a_global_entry_on_an_abort_entrys_chord_is_still_refused() {
+        assert_eq!(
+            errors("[editor]\nabort = \"ctrl-x\"\n[global]\nquit = \"ctrl-x\"\n"),
+            one(
+                4,
+                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (line 2) while an edit is open"#
+            )
+        );
+    }
+
+    /// E9 (c): `editor.focus` never gives way, so a global entry on its chord is refused while
+    /// an edit is open.
+    #[test]
+    fn a_global_entry_on_the_focus_chord_is_refused_while_an_edit_is_open() {
         assert_eq!(
             errors("[global]\nhelp = [\"?\", \"ctrl-4\"]\n"),
             one(
