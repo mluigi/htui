@@ -630,7 +630,15 @@ answers, choice-field value keys) have no entry: they are not actions.
 3. Check the `version` key, and that every table and key name is in the catalogue.
 4. Parse every chord strictly (§7.1).
 5. Merge: the catalogue defaults, then the file's lists replacing per action and per context.
-   A narrower context's entry for a shared verb creates an override for that view only.
+   A narrower context's entry for a shared verb creates an override for that view only. The
+   user's binding wins (MOD-12 M3 R1 H1, maintainer 2026-10-08): when an entry shares a chord
+   with an action of **the same context** that the file leaves at its default (no entry for it),
+   that action loses the chord, and is unbound if it has no other. A state-guarded pair that
+   shares the chord by default keeps sharing it; `overlay.close` never gives way. htui prints
+   one notice per chord on stderr (`htui: PATH:LINE: [global] quit = "ctrl-q" takes "ctrl-q"
+   from global.queue, which is now unbound`) and starts; `--print-keys` marks the action's line
+   `(unbound by quit)`, or `(lost "j" to top)` when it keeps other chords. An entry that repeats
+   an action's default is still an entry.
 6. Refuse any `ctrl-c` in the file. Add the fixed `ctrl-c`. Require `overlay.close` to be
    non-empty.
 7. For every composed stack, report:
@@ -639,7 +647,9 @@ answers, choice-field value keys) have no entry: they are not actions.
      action always wins: `form.next_field` over `global.next_tab`, the chat permission digits
      over `global.select_tab_*`) and **state-guarded** (the view accepts at most one of the pair
      in any state, and declines the other so it falls through: `list.fold` and
-     `backlog.runs.replay` on Enter). A pair a user creates is always an error;
+     `backlog.runs.replay` on Enter). A pair a user creates between two of the file's entries
+     is always an error, and so is a chord an entry shares with another context's default
+     across a stack's layers (step 5 gives way only within one context);
    - an `in_capture` action bound to a printable chord (§6.4).
 8. With any error: write every error to stderr and exit with status 2. Otherwise build the
    immutable `Keys` and pass it to `App::new`. There is no hot reload. Today `main.rs` maps every
