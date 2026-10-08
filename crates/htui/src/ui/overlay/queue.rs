@@ -383,12 +383,18 @@ impl Overlay for QueueOverlay {
             }
             KeyCode::Char('J') => self.request_move(QueueMove::Down, ctx),
             KeyCode::Char('K') => self.request_move(QueueMove::Up, ctx),
+            // M3 review R1 M1: the write names the state the box shows, so a queue that changed
+            // since the last read (a stalled batch the runner closed, L4) refuses it rather than
+            // flipping the other way.
             KeyCode::Char('P') => {
                 if let Some(overview) = &self.overview {
-                    ctx.request(if overview.batch.is_some() {
-                        StoreRequest::PauseQueue
-                    } else {
-                        StoreRequest::ResumeQueue
+                    ctx.request(match &overview.batch {
+                        Some(batch) => StoreRequest::PauseQueue {
+                            expect: Some(batch.id),
+                        },
+                        None => StoreRequest::ResumeQueue {
+                            expect_paused: true,
+                        },
                     });
                 }
             }
@@ -1106,11 +1112,15 @@ mod tests {
         );
         assert!(bench.drained().is_empty(), "nothing before the first reply");
 
-        bench.feed(&mut overlay, overview(abc()));
+        let running = overview(abc());
+        let seen = running.batch.as_ref().map(|batch| batch.id);
+        assert!(seen.is_some());
+        bench.feed(&mut overlay, running);
         bench.code(&mut overlay, KeyCode::Char('P'));
-        assert_one_request(&bench.drained(), |request| {
-            matches!(request, StoreRequest::PauseQueue)
-        });
+        assert_one_request(
+            &bench.drained(),
+            |request| matches!(request, StoreRequest::PauseQueue { expect } if *expect == seen),
+        );
 
         bench.feed(
             &mut overlay,
@@ -1121,7 +1131,12 @@ mod tests {
         );
         bench.code(&mut overlay, KeyCode::Char('P'));
         assert_one_request(&bench.drained(), |request| {
-            matches!(request, StoreRequest::ResumeQueue)
+            matches!(
+                request,
+                StoreRequest::ResumeQueue {
+                    expect_paused: true
+                }
+            )
         });
     }
 
