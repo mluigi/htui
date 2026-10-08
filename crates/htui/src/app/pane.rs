@@ -1918,6 +1918,46 @@ mod tests {
         );
     }
 
+    /// M2 R2 test gap: the question is taken from under another overlay too (`OverlayStack::remove`
+    /// off the top): the overlay above it stays on top, and the asking tab hears the exit.
+    #[test]
+    fn an_editor_that_exits_under_a_covered_abort_question_closes_only_it() {
+        let (mut app, benches, _log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        app.push_overlay(Box::new(Shade));
+        assert_eq!(top(&app), Some(OverlayId("shade")));
+
+        exited(&mut app, 0, Duration::from_secs(2));
+        assert!(!app.editor_open());
+        assert_eq!(
+            top(&app),
+            Some(OverlayId("shade")),
+            "the overlay above stays"
+        );
+        assert_eq!(app.overlays.iter().count(), 1, "the question is gone");
+        let heard = benches[0].seen.borrow().heard.clone();
+        assert_eq!(heard.len(), 1);
+        assert_ne!(
+            heard[0],
+            ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned())
+        );
+    }
+
+    /// M2 R2 test gap: a paste under the abort question is dropped: it reaches neither the editor
+    /// nor any tab, and the question stays.
+    #[test]
+    fn a_paste_under_the_abort_question_is_dropped() {
+        let (mut app, benches, log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        app.on_paste(&Zeroizing::new("p".to_owned()));
+        assert_eq!(top(&app), Some(AbortConfirm::ID), "the question stays");
+        assert!(app.editor_open());
+        assert!(writes(&log).is_empty(), "not the editor's");
+        assert!(benches.iter().all(|b| b.seen.borrow().pastes.is_empty()));
+    }
+
     /// M2 R1 M-2: the question is drawn over the asking tab, its hint generated from the keys;
     /// the `?` box closes when it opens, and the status line says to close it first.
     #[test]

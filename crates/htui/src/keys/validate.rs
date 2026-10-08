@@ -76,7 +76,7 @@ fn abort_gives_way(entry: &Row, default: &Row) -> bool {
         && default.context == Context::Editor
         && layers
             .iter()
-            .skip(1)
+            .filter(|layer| layer.context() != Context::Editor)
             .any(|layer| layer.context() == entry.context && layer.admits(entry.act))
 }
 

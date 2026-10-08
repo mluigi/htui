@@ -6,8 +6,10 @@
 //! ([`Action::AbortEdit`]), on a press: a held abort key's repeats are consumed and leave the
 //! question up. A `y` cannot confirm it: every other key closes the box, keeps the
 //! edit as it was and goes nowhere else, so nano's `ctrl-x`, `y` keeps the edit. `ctrl-c` never
-//! reaches it: the shell's hard quit (C3) runs before any overlay sees a key. An editor that exits
-//! under it takes it along (`App::on_pane_event`).
+//! reaches it: the shell's hard quit (C3) runs before any overlay sees a key. A paste under it
+//! is dropped (it reaches neither the editor nor a tab) and the question stays. An editor that
+//! exits under it takes it along (`App::on_pane_event`), and so does a tab move off the asking
+//! tab (`App::update_tab`).
 //!
 //! Fixed text, shaped like [`QuitConfirm`](super::QuitConfirm): the factory takes no argument.
 
