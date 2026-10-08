@@ -34,9 +34,9 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::Scroll;
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// The save's `StoreRequest::name`, what `busy` holds while it is in flight.
 const SAVE_NAME: &str = REQUEST_NAMES[1];
@@ -97,12 +97,18 @@ const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
 ];
 
-/// The hint row while naming a new template.
-const NAMING_HINT: &str = "Enter create  Esc cancel";
+/// The hint row while naming a new template, through [`views::TEMPLATES_PROMPT`]: `Enter` and
+/// `Esc` are the field's own (MOD-67 M4 D10).
+const NAMING_HINT: HintSpec = &[Hint::Text("Enter create"), Hint::Text("Esc cancel")];
 
-/// The hint row in the editor, before the cursor's `L{line}:C{col}` (D20). `Ctrl+G` is MOD-55's,
-/// hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
-const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
+/// The hint row in the editor, through [`views::TEMPLATES_EDITOR`], before the cursor's
+/// `L{line}:C{col}` (D20). `skills.ask_agent` is MOD-55's `Ctrl+G` (MOD-67 M4 D9).
+const EDIT_HINT: HintSpec = &[
+    Hint::One(Act::FormSave, "save"),
+    Hint::One(Act::SkillsAskAgent, "ask agent"),
+    Hint::One(Act::FormExternalEditor, "$EDITOR"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
 const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
@@ -360,13 +366,17 @@ impl TemplatesView {
         true
     }
 
-    /// The current mode's stack (MOD-67 M4 D4). `SkillsTab::key_stack`, `on_key` and the hint
-    /// read it.
+    /// The current mode's stack (MOD-67 M4 D4): an open agent help's, else the mode's.
+    /// `SkillsTab::key_stack`, `on_key` and the hint read it.
     pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
-        match &self.mode {
-            Mode::Browse => Some(views::TEMPLATES_BROWSE),
-            Mode::Naming { .. } | Mode::Editing(_) => None,
-        }
+        Some(match &self.mode {
+            Mode::Browse => views::TEMPLATES_BROWSE,
+            Mode::Naming { .. } => views::TEMPLATES_PROMPT,
+            Mode::Editing(editor) => editor
+                .help
+                .as_ref()
+                .map_or(views::TEMPLATES_EDITOR, |help| help.key_stack()),
+        })
     }
 
     /// Whether an editor or the name prompt is taking every key.
@@ -389,7 +399,7 @@ impl TemplatesView {
     pub(super) fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
-            Mode::Naming { .. } => self.on_naming_key(key),
+            Mode::Naming { .. } => self.on_naming_key(key, ctx),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
         }
     }
@@ -542,7 +552,12 @@ impl TemplatesView {
                     Some(help) => help.hint(ctx.keys()),
                     None => {
                         let (line, col) = editor.area.cursor_line_col();
-                        format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                        format!(
+                            "{} \u{b7} L{}:C{}",
+                            ctx.keys().hint(views::TEMPLATES_EDITOR, EDIT_HINT),
+                            line + 1,
+                            col + 1
+                        )
                     }
                 }
             }
@@ -552,7 +567,7 @@ impl TemplatesView {
             }
             (Mode::Naming { .. }, _) => {
                 self.render_browse(frame, content, ctx);
-                NAMING_HINT.to_owned()
+                ctx.keys().hint(views::TEMPLATES_PROMPT, NAMING_HINT)
             }
             (Mode::Browse, None) => {
                 self.render_browse(frame, content, ctx);
@@ -712,13 +727,23 @@ impl TemplatesView {
     }
 
     /// The name prompt. A refused name keeps the prompt open, so a typo is one `Backspace` away.
-    fn on_naming_key(&mut self, key: KeyEvent) -> Handled {
+    /// The field answers first; what it passes resolves through [`views::TEMPLATES_PROMPT`]:
+    /// `global.next_tab`/`prev_tab` go to the shell with the prompt kept (MOD-67 M4 PA-2), the
+    /// rest is `modal_rest`'s.
+    fn on_naming_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Mode::Naming { project, field } = &mut self.mode else {
             return Handled::Pass;
         };
         match field.on_key(key) {
             FieldOutcome::Consumed => Handled::Consumed,
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => {
+                let stack = views::TEMPLATES_PROMPT;
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::NextTab | Act::PrevTab) => Handled::Pass,
+                    _ => modal_rest(stack, chord),
+                }
+            }
             FieldOutcome::Cancel => {
                 self.mode = Mode::Browse;
                 self.notice = None;
@@ -754,25 +779,19 @@ impl TemplatesView {
         self.mode = Mode::Editing(Editor::new(project, name, None, None, body));
     }
 
-    /// The editor (plan D11, D13): `Ctrl+S` (the area's `Submit`), `Ctrl+G`, `Ctrl+E` and `Esc`
-    /// are the view's, `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept,
-    /// everything else is text. An open agent help (MOD-55) takes every key first: the draft is
-    /// locked under it, and `Ctrl+S`/`Ctrl+E`/`Ctrl+G` are refused until it closes.
+    /// The editor (plan D11, D13; MOD-67 M4 D6, blueprint §6.2): the area answers first, so
+    /// every letter is text and `Esc` is its `Cancel`; what it passes resolves through
+    /// [`views::TEMPLATES_EDITOR`]: `form.save`, `skills.ask_agent` and `form.external_editor`
+    /// are the view's (PA-3: after the widget), `global.next_tab`/`prev_tab` pass so the shell
+    /// switches tabs with the draft kept (PA-2), the rest is `modal_rest`'s. An open agent help
+    /// (MOD-55) takes every key first: the draft is locked under it, and those three verbs are
+    /// refused until it closes.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if let Mode::Editing(editor) = &mut self.mode
             && let Some(help) = editor.help.as_mut()
         {
             let outcome = help.on_key(key, ctx);
             return self.apply_help(outcome);
-        }
-        let chord = key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL;
-        if chord && matches!(key.code, KeyCode::Char('g' | 'G')) {
-            self.open_help(ctx);
-            return Handled::Consumed;
-        }
-        if chord && matches!(key.code, KeyCode::Char('e' | 'E')) {
-            self.hand_off(ctx);
-            return Handled::Consumed;
         }
         let busy = self.busy;
         let page = self.page.get();
@@ -787,11 +806,13 @@ impl TemplatesView {
                     editor.esc_armed = false;
                     self.notice = None;
                 }
-                Handled::Consumed
+                return Handled::Consumed;
             }
+            // The area's own `ctrl-s`, until MOD-67 M4 T-close drops it (D6); then only
+            // `form.save` below saves.
             FieldOutcome::Submit => {
                 self.save(ctx);
-                Handled::Consumed
+                return Handled::Consumed;
             }
             FieldOutcome::Cancel => {
                 if let Some(busy) = busy {
@@ -805,10 +826,20 @@ impl TemplatesView {
                     editor.esc_armed = true;
                     self.notice = Some(Notice::Info(UNSAVED.to_owned()));
                 }
-                Handled::Consumed
+                return Handled::Consumed;
             }
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => {}
         }
+        let stack = views::TEMPLATES_EDITOR;
+        let chord = KeyChord::from_event(key);
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::FormSave) => self.save(ctx),
+            Some(Act::SkillsAskAgent) => self.open_help(ctx),
+            Some(Act::FormExternalEditor) => self.hand_off(ctx),
+            Some(Act::NextTab | Act::PrevTab) => return Handled::Pass,
+            _ => return modal_rest(stack, chord),
+        }
+        Handled::Consumed
     }
 
     /// `Ctrl+S` (plan D11), first match wins: a write in flight; a `parse` refusal, with the

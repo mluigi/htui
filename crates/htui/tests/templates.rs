@@ -52,6 +52,16 @@ async fn open() -> Harness {
     open_over(MemStore::demo()).await
 }
 
+/// The shell's status line: the frame's last row.
+fn status(frame: &str) -> String {
+    frame
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim_end()
+        .to_owned()
+}
+
 /// The demo world over `store` on the Templates view, with the keys file `toml` (MOD-67 M4: a
 /// rebinding test). `toml` follows `version = 1`.
 async fn open_with_keys(store: MemStore, toml: &str) -> Harness {
@@ -424,7 +434,8 @@ async fn a_refused_save_sends_no_request() {
         "no `Failed` reply landed: {frame}"
     );
     assert!(
-        hint(&frame).ends_with("Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel  L1:C1"),
+        hint(&frame)
+            .ends_with("Ctrl+s save · Ctrl+g ask agent · Ctrl+e $EDITOR · Esc cancel · L1:C1"),
         "the editor is still open, the cursor on the `{{`: {frame}"
     );
 }
@@ -506,7 +517,7 @@ async fn keys_typed_while_a_save_is_in_flight_are_kept() {
         "the later edit is kept: {frame}"
     );
     assert!(
-        hint(&frame).contains("Ctrl+S save"),
+        hint(&frame).contains("Ctrl+s save"),
         "the editor stays open: {frame}"
     );
     assert!(
@@ -521,7 +532,7 @@ async fn keys_typed_while_a_save_is_in_flight_are_kept() {
     let frame = harness.render();
     assert!(notice(&frame).contains("saved v3"), "{frame}");
     assert!(
-        !hint(&frame).contains("Ctrl+S save"),
+        !hint(&frame).contains("Ctrl+s save"),
         "back in Browse: {frame}"
     );
 }
@@ -851,7 +862,7 @@ async fn an_edited_external_result_opens_the_editor_validated() {
     let frame = harness.render();
     assert!(notice(&frame).contains("edited in $EDITOR"), "{frame}");
     assert!(
-        hint(&frame).contains("Ctrl+S save"),
+        hint(&frame).contains("Ctrl+s save"),
         "the editor is open on it: {frame}"
     );
     assert_eq!(
@@ -880,7 +891,7 @@ async fn a_failed_external_result_keeps_the_draft() {
         "the draft is back: {frame}"
     );
     assert!(
-        hint(&frame).contains("Ctrl+S save"),
+        hint(&frame).contains("Ctrl+s save"),
         "in the editor: {frame}"
     );
 }
@@ -899,7 +910,7 @@ async fn an_unchanged_quick_return_names_the_wait_flag() {
     assert!(notice(&frame).contains("no changes"), "{frame}");
     assert!(notice(&frame).contains("code --wait"), "{frame}");
     assert!(
-        !hint(&frame).contains("Ctrl+S save"),
+        !hint(&frame).contains("Ctrl+s save"),
         "back in Browse: {frame}"
     );
 }
@@ -928,7 +939,7 @@ async fn tab_and_digits_while_editing() {
         frame.contains("2You are running"),
         "the draft survived: {frame}"
     );
-    assert!(hint(&frame).contains("Ctrl+S save"), "{frame}");
+    assert!(hint(&frame).contains("Ctrl+s save"), "{frame}");
 }
 
 /// MOD-67 M4 D5 through `TEMPLATES_BROWSE`: the Templates view's own stack offers the switch, so
@@ -1011,6 +1022,129 @@ async fn a_shared_skills_rebind_reaches_templates() {
         !frame.contains("diff v1 \u{2192} v2"),
         "`F6` toggles back: {frame}"
     );
+}
+
+/// MOD-67 M4 D11: the editor's stack drives the shell. The status line is the filtered one with
+/// `Tab` (PA-2); `?` is text; `F1` opens a `?` box with the editor's own lines and one `Global:`
+/// line, closed by `F1` alone, and the draft is untouched.
+#[tokio::test]
+async fn the_templates_editor_status_line_and_help_box() {
+    let mut harness = open().await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    let frame = harness.render();
+    assert!(
+        status(&frame).starts_with(
+            "Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help · Ctrl+f find"
+        ),
+        "{frame}"
+    );
+    harness.key("?");
+    assert!(!harness.app().help_visible, "`?` is text");
+    assert!(
+        harness.render().contains("?You are running"),
+        "`?` is typed into the draft"
+    );
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opens the box");
+    let frame = harness.render();
+    assert!(frame.contains("Skills: Ctrl+g ask agent"), "{frame}");
+    assert!(
+        frame.contains("Form: Ctrl+s save · Ctrl+e $EDITOR"),
+        "{frame}"
+    );
+    let globals: Vec<&str> = frame
+        .lines()
+        .filter(|line| line.contains("Global:"))
+        .collect();
+    assert_eq!(globals.len(), 1, "one `Global:` line: {frame}");
+    assert!(globals[0].contains("Tab next tab"), "{frame}");
+    assert!(frame.contains("F1 closes this box"), "{frame}");
+    assert!(!frame.contains("?/F1 closes this box"), "{frame}");
+    harness.key("f1");
+    assert!(!harness.app().help_visible, "`F1` closes it");
+    let frame = harness.render();
+    assert!(
+        frame.contains("?You are running"),
+        "the draft is unchanged: {frame}"
+    );
+    assert!(!frame.contains("??You are running"), "{frame}");
+}
+
+/// MOD-67 M4 D6 (PA-3): `[form] save` rebound to `F2` saves a Templates draft, once; the hint
+/// follows.
+#[tokio::test]
+async fn a_rebound_save_saves_a_templates_draft() {
+    let store = MemStore::demo();
+    let mut harness = open_with_keys(store.clone(), "[form]\nsave = \"f2\"\n").await;
+    select(&mut harness, "implement");
+    harness.key("e");
+    type_text(&mut harness, "MARKER\n");
+    let frame = harness.render();
+    assert!(hint(&frame).contains("F2 save"), "{frame}");
+    assert!(!hint(&frame).contains("Ctrl+s save"), "{frame}");
+    harness.key("f2");
+    harness.settle().await;
+    let row = head(&store, "implement").await.expect("a head");
+    assert_eq!(row.version, 2, "one save landed");
+    assert!(
+        row.body.starts_with("MARKER\nYou are running"),
+        "{}",
+        row.body
+    );
+    assert!(
+        notice(&harness.render()).contains("saved v2"),
+        "{}",
+        harness.render()
+    );
+}
+
+/// MOD-67 M4 PA-2 for the other two `TABS` stacks: `Tab` leaves the name prompt and the agent
+/// help for the next tab, and both are still open on the way back.
+#[tokio::test]
+async fn tab_leaves_the_name_prompt_and_the_agent_help_with_the_draft() {
+    let (mut harness, _) = open_with_agent(Script::default()).await;
+    let requirements = |harness: &mut Harness| harness.app().tabs.active_id().map(|id| id.0);
+
+    harness.key("n");
+    type_text(&mut harness, "tri");
+    harness.key("tab");
+    assert_eq!(
+        requirements(&mut harness),
+        Some("requirements"),
+        "the prompt passes `Tab`"
+    );
+    harness.key("2");
+    harness.drive().await;
+    assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
+    let frame = harness.render();
+    assert!(
+        frame.contains("new template in"),
+        "the prompt is open: {frame}"
+    );
+    assert!(frame.contains("tri"), "with its text: {frame}");
+    harness.key("esc");
+
+    select(&mut harness, "implement");
+    harness.key("e");
+    harness.key("ctrl-g");
+    harness.drive().await;
+    type_text(&mut harness, "short");
+    harness.key("tab");
+    assert_eq!(
+        requirements(&mut harness),
+        Some("requirements"),
+        "the help passes `Tab`"
+    );
+    harness.key("2");
+    harness.drive().await;
+    assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
+    let frame = harness.render();
+    assert!(
+        frame.contains(" ask an agent "),
+        "the help is open: {frame}"
+    );
+    assert!(frame.contains("ask: short"), "with its request: {frame}");
 }
 
 #[tokio::test]
@@ -1234,7 +1368,7 @@ async fn a_body_holding_a_key_is_not_sent() {
         !frame.contains(" ask an agent "),
         "the help closed: {frame}"
     );
-    assert!(hint(&frame).contains("Ctrl+S save"), "{frame}");
+    assert!(hint(&frame).contains("Ctrl+s save"), "{frame}");
     assert!(harness.chat_steps().is_empty(), "no session started");
     assert_eq!(store.active_runs(&vulkan()).await.expect("count"), active);
 }
