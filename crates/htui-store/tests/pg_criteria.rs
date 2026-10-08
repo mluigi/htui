@@ -8253,13 +8253,13 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
         .await
         .expect("open");
     assert_eq!(
-        pg.close_drained_batch(pg_batch.id, Some(at), later)
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None
     );
     assert_eq!(
-        mem.close_drained_batch(mem_batch.id, Some(at), later)
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None
@@ -8281,14 +8281,14 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
     .await
     .expect("mem admits");
     assert_eq!(
-        pg.close_drained_batch(pg_next.id, Some(at), later)
+        pg.close_drained_batch(pg_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None,
         "a live run of its own keeps it open"
     );
     assert_eq!(
-        mem.close_drained_batch(mem_next.id, Some(at), later)
+        mem.close_drained_batch(mem_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None
@@ -8300,11 +8300,11 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
         .await
         .expect("cancel");
     let (pg_drained, mem_drained) = (
-        pg.close_drained_batch(pg_next.id, Some(at), later)
+        pg.close_drained_batch(pg_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("drained"),
-        mem.close_drained_batch(mem_next.id, Some(at), later)
+        mem.close_drained_batch(mem_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("drained"),
@@ -8329,8 +8329,8 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
     db.drop_db().await;
 }
 
-/// MOD-12 M3 review R1 L2: the drain's close skips a batch whose box has an entry newer than the
-/// newest the runner read (`seen`), any entry when it read none, alike on both stores; the
+/// MOD-12 M3 review R1 L2: the drain's close skips a batch whose box has an entry for an item
+/// outside those the runner read (`seen`), any entry when it read none, alike on both stores; the
 /// entries it did read never keep it open.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
@@ -8340,7 +8340,7 @@ async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
     let pg = &db.store;
     let mem = htui_core::store::MemStore::demo();
     let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
-    let (earlier, later) = (at - TimeDelta::seconds(1), at + TimeDelta::seconds(1));
+    let later = at + TimeDelta::seconds(1);
 
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
@@ -8351,10 +8351,10 @@ async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
         .await
         .expect("queue");
     for (seen, why) in [
-        (None, "an entry after an empty read keeps it open"),
+        (&[][..], "an entry after an empty read keeps it open"),
         (
-            Some(earlier),
-            "an entry newer than the newest read keeps it open",
+            &[ids::HTUI_FEAT_2][..],
+            "an entry for an item it did not read keeps it open",
         ),
     ] {
         assert_eq!(
@@ -8381,11 +8381,11 @@ async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
     );
 
     let (pg_closed, mem_closed) = (
-        pg.close_drained_batch(pg_batch.id, Some(at), later)
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("an entry it read does not keep it open"),
-        mem.close_drained_batch(mem_batch.id, Some(at), later)
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("an entry it read does not keep it open"),
@@ -8421,14 +8421,14 @@ async fn a_drain_skips_a_batch_with_an_unread_entry_stamped_earlier_on_both_stor
             .expect("queue");
     }
     assert_eq!(
-        pg.close_drained_batch(pg_batch.id, Some(at), later)
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None,
         "Postgres: the unread entry keeps it open, however old its instant"
     );
     assert_eq!(
-        mem.close_drained_batch(mem_batch.id, Some(at), later)
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None,
@@ -8461,11 +8461,11 @@ async fn a_stalled_batch_closes_alike_on_both_stores() {
     let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let (pg_closed, mem_closed) = (
-        pg.close_drained_batch(pg_batch.id, Some(at), later)
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("an entry does not keep it open"),
-        mem.close_drained_batch(mem_batch.id, Some(at), later)
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("an entry does not keep it open"),
@@ -8499,14 +8499,14 @@ async fn a_stalled_batch_closes_alike_on_both_stores() {
     .await
     .expect("mem admits");
     assert_eq!(
-        pg.close_drained_batch(pg_next.id, Some(at), later)
+        pg.close_drained_batch(pg_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None,
         "a queued run of its own keeps it open"
     );
     assert_eq!(
-        mem.close_drained_batch(mem_next.id, Some(at), later)
+        mem.close_drained_batch(mem_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None,
@@ -8796,7 +8796,7 @@ async fn a_drain_racing_an_admission_counts_the_admitted_run() {
     lock_waiters(&db.pool, 1).await;
     let drain = tokio::spawn({
         let store = db.store.clone();
-        async move { store.close_drained_batch(batch.id, None, at).await }
+        async move { store.close_drained_batch(batch.id, &[], at).await }
     });
     lock_waiters(&db.pool, 2).await;
     assert!(
@@ -10510,11 +10510,11 @@ async fn last_closed_batch_answers_alike_on_both_stores() {
 
     let pg_second = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
     let mem_second = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
-    pg.close_drained_batch(pg_second.id, None, later)
+    pg.close_drained_batch(pg_second.id, &[], later)
         .await
         .expect("drain")
         .expect("nothing keeps it open");
-    mem.close_drained_batch(mem_second.id, None, later)
+    mem.close_drained_batch(mem_second.id, &[], later)
         .await
         .expect("drain")
         .expect("nothing keeps it open");

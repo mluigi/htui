@@ -890,7 +890,7 @@ impl htui_core::store::WorkerHost for PgStore {
     async fn close_drained_batch(
         &self,
         batch: BatchId,
-        seen: Option<DateTime<Utc>>,
+        seen: &[ItemId],
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         PgStore::close_drained_batch(self, batch, seen, at).await
@@ -1003,7 +1003,7 @@ impl htui_core::store::WorkerHost for Backend {
     async fn close_drained_batch(
         &self,
         batch: BatchId,
-        seen: Option<DateTime<Utc>>,
+        seen: &[ItemId],
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         Backend::close_drained_batch(self, batch, seen, at).await

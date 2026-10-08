@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n            UPDATE queue_batch b\n               SET closed_at = $2, closed_reason = 'drained'\n             WHERE b.id = $1 AND b.closed_at IS NULL\n               AND NOT EXISTS (\n                       SELECT 1 FROM run r\n                        WHERE r.batch_id = b.id\n                          AND r.status IN ('queued', 'running', 'awaiting_approval'))\n               AND NOT EXISTS (\n                       SELECT 1 FROM queue_entry e\n                        WHERE e.box_id = b.box_id\n                          AND ($3::timestamptz IS NULL OR e.queued_at > $3))\n            RETURNING b.id AS \"id: BatchId\", b.box_id AS \"box_id: BoxId\", b.opened_at,\n                      b.opened_by AS \"opened_by: UserId\", b.closed_at,\n                      b.closed_reason AS \"closed_reason: BatchClose\"\n            ",
+  "query": "\n            UPDATE queue_batch b\n               SET closed_at = $2, closed_reason = 'drained'\n             WHERE b.id = $1 AND b.closed_at IS NULL\n               AND NOT EXISTS (\n                       SELECT 1 FROM run r\n                        WHERE r.batch_id = b.id\n                          AND r.status IN ('queued', 'running', 'awaiting_approval'))\n               AND NOT EXISTS (\n                       SELECT 1 FROM queue_entry e\n                        WHERE e.box_id = b.box_id\n                          AND e.item_id <> ALL($3::uuid[]))\n            RETURNING b.id AS \"id: BatchId\", b.box_id AS \"box_id: BoxId\", b.opened_at,\n                      b.opened_by AS \"opened_by: UserId\", b.closed_at,\n                      b.closed_reason AS \"closed_reason: BatchClose\"\n            ",
   "describe": {
     "columns": [
       {
@@ -74,7 +74,7 @@
       "Left": [
         "Uuid",
         "Timestamptz",
-        "Timestamptz"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -86,5 +86,5 @@
       true
     ]
   },
-  "hash": "cb081837299c846473f4b70cab383cc825696b0b59a0941fc835ec65ff10d836"
+  "hash": "67720090cb306b4b4377025c3a4aec06bdfa0d876d5ac9693c88ec1ff7d1e1ee"
 }

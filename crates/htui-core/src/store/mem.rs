@@ -1171,10 +1171,11 @@ impl MemStore {
     /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
     /// open and no run of its own is `queued`, `running` or `awaiting_approval`. The entries the
     /// runner read do not keep it open: it calls this when nothing is admissible (an empty queue,
-    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the newest
-    /// `queued_at` among the entries it read, `None` when it read none, and an entry of the box
-    /// queued after that (any entry, for `None`) means an item may be ready that the runner never
-    /// judged. The re-check is one closure, as `PgStore`'s is the UPDATE's own `WHERE`, so a resume
+    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the items of
+    /// the entries it read (empty when it read none), and an entry of the box for any other item
+    /// means an item may be ready that the runner never judged. The check is by item, not by
+    /// `queued_at`, which is the queuing client's clock and not commit order. The re-check is one
+    /// closure, as `PgStore`'s is the UPDATE's own `WHERE`, so a resume
     /// that opened a new batch after the runner's reads is never closed by it, and a run that
     /// committed before the close keeps the batch open. `None` when it did not close.
     ///
@@ -1183,7 +1184,7 @@ impl MemStore {
     pub async fn close_drained_batch(
         &self,
         batch: BatchId,
-        seen: Option<DateTime<Utc>>,
+        seen: &[ItemId],
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         Ok(self.write(|state| {
@@ -1195,9 +1196,10 @@ impl MemStore {
                     .filter(|(_, of)| **of == batch)
                     .filter_map(|(run, _)| state.runs.get(run))
                     .any(|row| row.status.is_active())
-                || state.queue_entries.values().any(|entry| {
-                    entry.box_id == row.box_id && seen.is_none_or(|seen| entry.queued_at > seen)
-                })
+                || state
+                    .queue_entries
+                    .values()
+                    .any(|entry| entry.box_id == row.box_id && !seen.contains(&entry.item_id))
             {
                 return None;
             }
@@ -14851,7 +14853,7 @@ mod tests {
             .expect("a resume opens a new batch");
         assert_eq!(
             store
-                .close_drained_batch(first.id, None, at)
+                .close_drained_batch(first.id, &[], at)
                 .await
                 .expect("answered"),
             None,
@@ -14877,7 +14879,7 @@ mod tests {
             .expect("an open batch admits");
         assert_eq!(
             store
-                .close_drained_batch(second.id, Some(at), at)
+                .close_drained_batch(second.id, &[ids::HTUI_ANA_2], at)
                 .await
                 .expect("answered"),
             None,
@@ -14888,7 +14890,7 @@ mod tests {
             .await
             .expect("a queued run cancels");
         let closed = store
-            .close_drained_batch(second.id, Some(at), at)
+            .close_drained_batch(second.id, &[ids::HTUI_ANA_2], at)
             .await
             .expect("answered")
             .expect("drained now");
@@ -14908,7 +14910,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .close_drained_batch(crate::model::BatchId::new(), None, at)
+                .close_drained_batch(crate::model::BatchId::new(), &[], at)
                 .await
                 .expect("answered"),
             None,
@@ -14916,7 +14918,7 @@ mod tests {
         );
     }
 
-    /// Review R1 L2: an entry queued after the newest the runner read (`seen`), any entry when
+    /// Review R1 L2: an entry for an item outside those the runner read (`seen`), any entry when
     /// it read none, keeps the batch open; the entries it read do not.
     #[tokio::test]
     async fn close_drained_batch_skips_an_entry_the_runner_never_read() {
@@ -14930,19 +14932,19 @@ mod tests {
             .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
             .await
             .expect("the item queues");
-        for seen in [None, Some(at - TimeDelta::seconds(1))] {
+        for seen in [&[][..], &[ids::HTUI_FEAT_2][..]] {
             assert_eq!(
                 store
                     .close_drained_batch(batch.id, seen, at)
                     .await
                     .expect("answered"),
                 None,
-                "{seen:?}: an entry newer than the read keeps it open"
+                "{seen:?}: an entry for an item the runner did not read keeps it open"
             );
         }
         assert_eq!(
             store
-                .close_drained_batch(batch.id, Some(at), at)
+                .close_drained_batch(batch.id, &[ids::HTUI_ANA_2], at)
                 .await
                 .expect("answered")
                 .map(|closed| closed.id),
@@ -14978,7 +14980,7 @@ mod tests {
             .expect("the item queues");
         assert_eq!(
             store
-                .close_drained_batch(batch.id, Some(at), at)
+                .close_drained_batch(batch.id, &[ids::HTUI_ANA_2], at)
                 .await
                 .expect("answered"),
             None,
@@ -15855,7 +15857,7 @@ mod tests {
             .await
             .expect("a resume opens");
         store
-            .close_drained_batch(second.id, None, later)
+            .close_drained_batch(second.id, &[], later)
             .await
             .expect("the drain answers")
             .expect("nothing keeps it open");

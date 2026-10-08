@@ -777,9 +777,9 @@ impl Backend {
     }
 
     /// MOD-12 D3 (review M1): the runner's close of exactly `batch`, only while it is still
-    /// closable (open, no live run of its own, and no entry queued after `seen`, the newest
-    /// `queued_at` the runner read, any entry for `None`; the entries it read do not count, M3 D4,
-    /// review R1 L2); `None` when it did not close.
+    /// closable (open, no live run of its own, and no entry of the box for an item outside
+    /// `seen`, the items of the entries the runner read, any entry when it is empty; the entries
+    /// it read do not count, M3 D4, review R1 L2); `None` when it did not close.
     ///
     /// # Errors
     ///
@@ -788,7 +788,7 @@ impl Backend {
     pub async fn close_drained_batch(
         &self,
         batch: BatchId,
-        seen: Option<DateTime<Utc>>,
+        seen: &[ItemId],
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         match self {

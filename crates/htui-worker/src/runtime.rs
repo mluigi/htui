@@ -2199,11 +2199,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         }
     };
-    // Review R1 L2: the newest entry this sweep judged; the drain skips its close when the box
-    // has a newer one, queued after this read.
-    let seen = entries.iter().map(|entry| entry.queued_at).max();
+    // Review R1 L2: the items this sweep judged; the drain skips its close when the box has an
+    // entry for any other, queued after this read.
+    let seen: Vec<ItemId> = entries.iter().map(|entry| entry.item_id).collect();
     if entries.is_empty() {
-        drain(ctx, &batch, Drain::Empty, seen).await;
+        drain(ctx, &batch, Drain::Empty, &seen).await;
         return;
     }
     let mut project_ids: Vec<ProjectId> = Vec::new();
@@ -2260,7 +2260,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     if order.is_empty() {
         // L4: nothing is ready (not ready, cancelled in this batch, or escalated).
-        drain(ctx, &batch, Drain::Stalled, seen).await;
+        drain(ctx, &batch, Drain::Stalled, &seen).await;
         return;
     }
     // MOD-12 M2 D4: the batch's spend once per sweep, each entry's project caps live (D2), one
@@ -2317,7 +2317,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     if admissible.is_empty() {
         // L4: a free slot, and every ordered entry stopped by the spend gate, a malformed cap or
         // an absent project.
-        drain(ctx, &batch, Drain::Stalled, seen).await;
+        drain(ctx, &batch, Drain::Stalled, &seen).await;
         return;
     }
     let kit = match Kit::read(&ctx.shared, host, false).await {
@@ -2369,14 +2369,15 @@ enum Drain {
 /// MOD-12 D3, M3 D4 (L4): a batch with nothing admissible (no entry left, or a stalled queue)
 /// closes `drained` once no run of its own is live. The close is of exactly the batch `admit`
 /// read, and re-checks its condition in the same write (review M1), so a pause and a resume
-/// between the reads and the close are never undone. `seen` is the newest `queued_at` among the
-/// entries `admit` read, `None` when it read none: an entry queued after it keeps the batch open
-/// (review R1 L2), as its item may be ready and was never judged.
+/// between the reads and the close are never undone. `seen` is the items of the entries `admit`
+/// read, empty when it read none: an entry for any other item keeps the batch open (review R1
+/// L2), as its item may be ready and was never judged. It is by item, not by `queued_at`, which
+/// is the queuing client's clock and not commit order.
 async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     batch: &htui_core::model::QueueBatch,
     why: Drain,
-    seen: Option<DateTime<Utc>>,
+    seen: &[ItemId],
 ) {
     match ctx
         .host
@@ -4020,7 +4021,7 @@ mod queue_store_errors {
         async fn close_drained_batch(
             &self,
             batch: BatchId,
-            seen: Option<DateTime<Utc>>,
+            seen: &[ItemId],
             at: DateTime<Utc>,
         ) -> Result<Option<QueueBatch>> {
             self.check("close_drained_batch")?;
