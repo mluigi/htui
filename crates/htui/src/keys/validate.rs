@@ -195,8 +195,8 @@ fn subject(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::validate;
-    use crate::keys::{Keys, load_str};
+    use super::{check, validate};
+    use crate::keys::{Keys, SHADOWING, STATE_GUARDED, load_str};
 
     /// `src`'s full error vector as `(line, message)`, or empty when it loads.
     fn errors(src: &str) -> Vec<(usize, String)> {
@@ -338,6 +338,85 @@ mod tests {
         assert_eq!(
             errors("[form]\nsave = [\"alt-s\", \"f2\"]\nnext_field = [\"down\"]\n"),
             []
+        );
+    }
+
+    #[test]
+    fn every_allow_list_entry_is_demanded() {
+        let keys = Keys::compiled();
+        assert_eq!(check(keys, SHADOWING, STATE_GUARDED), []);
+        for entry in SHADOWING {
+            let fewer: Vec<_> = SHADOWING.iter().copied().filter(|e| e != entry).collect();
+            assert!(
+                !check(keys, &fewer, STATE_GUARDED).is_empty(),
+                "SHADOWING {entry:?} is not demanded"
+            );
+        }
+        for entry in STATE_GUARDED {
+            let fewer: Vec<_> = STATE_GUARDED
+                .iter()
+                .copied()
+                .filter(|e| e != entry)
+                .collect();
+            assert!(
+                !check(keys, SHADOWING, &fewer).is_empty(),
+                "STATE_GUARDED {entry:?} is not demanded"
+            );
+        }
+    }
+
+    #[test]
+    fn a_view_rows_never_collide_across_modes() {
+        assert_eq!(errors("[settings.agents]\nyes = \"o\"\n"), []);
+        assert_eq!(
+            errors("[settings.agents]\nprobe = \"down\"\n"),
+            one(
+                2,
+                r#"[settings.agents] probe = "down": "down" is already list.down (default) in Settings > Agents"#
+            )
+        );
+    }
+
+    #[test]
+    fn a_user_chord_shared_with_a_shadowed_act_is_refused() {
+        assert_eq!(
+            errors("[migration]\nyes = [\"y\", \"esc\"]\n"),
+            vec![
+                (
+                    2,
+                    r#"[migration] yes = "esc": "esc" is already migration.no (default) in the migration prompt"#
+                        .to_owned()
+                ),
+                (
+                    2,
+                    r#"[migration] yes = "esc": "esc" is already overlay.close (default) in the migration prompt"#
+                        .to_owned()
+                ),
+            ]
+        );
+        assert_eq!(errors("[settings.boxes]\nexecutor = [\"w\", \"W\"]\n"), []);
+    }
+
+    /// ANA-26 §2.2: a global rebind onto a view's letter would be shadowed there without a word.
+    #[test]
+    fn a_global_rebind_onto_a_view_verb_is_refused() {
+        assert_eq!(
+            errors("[global]\nquit = \"x\"\n"),
+            one(
+                2,
+                r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
+            )
+        );
+    }
+
+    /// A derived view row follows its shared row, so a printable shared chord is reported once,
+    /// on the shared line.
+    #[test]
+    fn a_printable_shared_chord_is_reported_once_on_the_shared_line() {
+        let tail = "is typed text while a field captures: bind a ctrl or alt chord or a named key";
+        assert_eq!(
+            errors("[form]\nnext_field = [\"x\"]\n"),
+            one(2, &format!(r#"[form] next_field = "x": "x" {tail}"#))
         );
     }
 }

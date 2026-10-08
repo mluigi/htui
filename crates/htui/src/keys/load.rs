@@ -392,7 +392,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
-    use crate::keys::{Act, CATALOGUE, Context, KeyChord, Keys};
+    use crate::keys::{Act, CATALOGUE, Context, KeyChord, Keys, views};
 
     /// The full error vector of `src`, as `(line, message)`.
     fn errors(src: &str) -> Vec<(usize, String)> {
@@ -837,5 +837,109 @@ quit = ["x", "shift-a"]
             }
             other => panic!("expected Unreadable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_view_table_overrides_a_shared_verb_it_offers() {
+        let keys = load_str("version = 1\n[settings.boxes]\nreload = \"f5\"\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::SettingsBoxes, Act::Reload),
+            [chord("f5")]
+        );
+        assert_eq!(keys.line(Context::SettingsBoxes, Act::Reload), Some(3));
+        assert_eq!(
+            keys.actions(views::BOXES_BROWSE, chord("f5")),
+            [Act::Reload]
+        );
+        assert_eq!(keys.actions(views::BOXES_BROWSE, chord("r")), []);
+        assert_eq!(
+            keys.actions(views::PROMPT_BROWSE, chord("r")),
+            [Act::Reload]
+        );
+        assert_eq!(keys.actions(views::PROMPT_BROWSE, chord("f5")), []);
+    }
+
+    #[test]
+    fn a_view_table_refuses_what_none_of_its_modes_offer() {
+        let boxes = "has edit_tags, edit_quirks, executor, probe, edit_spec, and may override \
+                     down, up, yes, no, save, reload, dismiss, next_section, prev_section";
+        assert_eq!(
+            errors("[settings.boxes]\nedit = \"E\"\n"),
+            one(
+                2,
+                &format!("[settings.boxes] edit: no such action; [settings.boxes] {boxes}")
+            )
+        );
+        assert_eq!(
+            errors("[settings.boxes]\nquit = \"Q\"\n"),
+            one(
+                2,
+                &format!("[settings.boxes] quit: no such action; [settings.boxes] {boxes}")
+            )
+        );
+        assert_eq!(
+            errors("[switcher]\nclose = \"f2\"\n"),
+            one(
+                2,
+                "[switcher] close: no such action; [switcher] has switch, and may override down, up"
+            )
+        );
+        assert_eq!(
+            errors("[settings.prompt]\nprobe = \"p\"\n"),
+            one(
+                2,
+                "[settings.prompt] probe: no such action; [settings.prompt] may override down, \
+                 up, edit, reload, dismiss, next_section, prev_section"
+            )
+        );
+    }
+
+    #[test]
+    fn a_section_with_no_own_action_has_a_table() {
+        let keys = load_str("[settings.prompt]\nreload = \"f5\"\n").expect("prompt loads");
+        assert_eq!(
+            keys.chords(Context::SettingsPrompt, Act::Reload),
+            [chord("f5")]
+        );
+        let keys = load_str("[settings.queue]\nedit = [\"E\"]\n").expect("queue loads");
+        assert_eq!(keys.chords(Context::SettingsQueue, Act::Edit), [chord("E")]);
+        assert_eq!(keys.actions(views::QUEUE_BROWSE, chord("enter")), []);
+        let keys = load_str("[migration]\nyes = \"a\"\n").expect("migration loads");
+        assert_eq!(
+            keys.chords(Context::Migration, Act::ConfirmYes),
+            [chord("a")]
+        );
+    }
+
+    #[test]
+    fn a_shared_rebind_flows_into_the_view_defaults() {
+        let keys = load_str("[form]\nnext_field = [\"ctrl-n\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::SettingsSecrets, Act::FormNextField),
+            [chord("ctrl-n"), chord("down")]
+        );
+        assert_eq!(
+            keys.line(Context::SettingsSecrets, Act::FormNextField),
+            None
+        );
+        assert_eq!(keys.line(Context::Form, Act::FormNextField), Some(2));
+        let keys = load_str("[settings.secrets]\nnext_field = [\"ctrl-n\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::SettingsSecrets, Act::FormNextField),
+            [chord("ctrl-n")]
+        );
+        assert_eq!(
+            keys.line(Context::SettingsSecrets, Act::FormNextField),
+            Some(2)
+        );
+        assert_eq!(
+            keys.chords(Context::SettingsAgents, Act::FormNextField),
+            [chord("tab"), chord("down")]
+        );
+        let keys = load_str("[confirm]\nno = [\"x\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::Migration, Act::ConfirmNo),
+            [chord("x"), chord("N")]
+        );
     }
 }
