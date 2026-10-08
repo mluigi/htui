@@ -202,6 +202,10 @@ impl Stack<'static> {
     pub const EDITOR_OPEN: Self = Self(&[Layer::all(Context::Editor), Layer::all(Context::Global)]);
 }
 
+/// The phrase of every collision with the editor's keys (MOD-57 M2 E9): `DECLARED`'s entry for
+/// `Stack::EDITOR_OPEN` and `validate`'s focus pass.
+pub(super) const WHILE_EDITING: &str = "while an edit is open";
+
 /// Every stack the validator walks (ANA-26 §7.3, MOD-67 M2 D8 step 5), each with the phrase its
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
 /// ([`views`](super::views)); M4-M5 append theirs.
@@ -255,6 +259,7 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the migration prompt", views::MIGRATION),
     ("in the waiting list", views::WAITING_LIST),
     ("in the quit question", views::QUIT_CONFIRM),
+    (WHILE_EDITING, Stack::EDITOR_OPEN),
 ];
 
 impl Keys {
@@ -297,7 +302,7 @@ impl Keys {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{DECLARED, Layer, Stack};
+    use super::{DECLARED, Layer, Stack, WHILE_EDITING};
     use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, views};
 
     fn chord(spec: &str) -> KeyChord {
@@ -333,7 +338,8 @@ mod tests {
     fn declared_starts_with_base_and_overlay_and_holds_every_view_stack() {
         assert_eq!(DECLARED[0], ("on every screen", Stack::BASE));
         assert_eq!(DECLARED[1], ("over an overlay", Stack::OVERLAY));
-        assert_eq!(DECLARED.len(), 37);
+        assert_eq!(DECLARED.len(), 38);
+        assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
     }

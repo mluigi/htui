@@ -7,7 +7,11 @@
 //! that never meet; the stack pass checks every declared stack), the stack pass allows a
 //! reviewed [`SHADOWING`] pair (D11, PA-2), and a derived `VIEW_DEFAULTS` row the file did not
 //! set is reported as the shared row it follows, on the user's line.
+//!
+//! MOD-57 M2 (E9): `editor.focus` never gives way, and no other action may share its chord in any
+//! context: while an edit is open it acts ahead of every view.
 
+use super::stack::WHILE_EDITING;
 use super::{
     Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING, STATE_GUARDED,
     quote,
@@ -58,9 +62,10 @@ pub(super) fn give_way(keys: &mut Keys) {
 /// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
 /// The compiled defaults give none (`the_compiled_defaults_validate`).
 ///
-/// Three passes, in this order: two actions sharing a chord in one shared or global context; two
-/// candidates for one chord in a [`DECLARED`] stack; a printable chord on an `in_capture`
-/// action. A pair and chord seen by two passes is reported once. A [`STATE_GUARDED`] pair may
+/// Four passes, in this order: two actions sharing a chord in one shared or global context; two
+/// candidates for one chord in a [`DECLARED`] stack; a chord shared with `editor.focus` in any
+/// context (MOD-57 M2 E9 (d)); a printable chord on an `in_capture` action. A pair and chord
+/// seen by two passes is reported once. A [`STATE_GUARDED`] pair may
 /// share a chord only when it is a catalogue default of both actions (PA-2), and so may a
 /// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
 #[must_use]
@@ -119,6 +124,20 @@ fn check(keys: &Keys, shadowing: &[(Act, Act)], guarded: &[(Act, Act)]) -> Vec<K
                         check.report(first, second, chord, phrase);
                     }
                 }
+            }
+        }
+    }
+    // MOD-57 M2 E9 (d): `editor.focus` acts on every screen while an edit is open, ahead of the
+    // view (E1), so no other action may share its chord in any context. `report` dedups a pair the
+    // passes above found (the per-context pass for `[editor]`, the stack pass for `[global]`).
+    if let Some(focus) = keys.row(Context::Editor, Act::EditorFocus) {
+        for row in keys.rows.iter().filter(|row| row.act != Act::EditorFocus) {
+            for &chord in row
+                .chords
+                .iter()
+                .filter(|chord| focus.chords.contains(chord))
+            {
+                check.report(row, focus, chord, WHILE_EDITING);
             }
         }
     }
@@ -300,6 +319,53 @@ mod tests {
         assert_eq!(
             notices,
             [r#"[editor] focus = "ctrl-x" takes "ctrl-x" from editor.abort, which is now unbound"#]
+        );
+    }
+
+    /// E9 (c): `Stack::EDITOR_OPEN` stacks `[editor]` over every global action, so a global
+    /// entry on an editor default is refused there.
+    #[test]
+    fn a_global_chord_of_the_editors_is_refused_while_an_edit_is_open() {
+        assert_eq!(
+            errors("[global]\nquit = \"ctrl-x\"\n"),
+            one(
+                2,
+                r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (default) while an edit is open"#
+            )
+        );
+        assert_eq!(
+            errors("[global]\nhelp = [\"?\", \"ctrl-4\"]\n"),
+            one(
+                2,
+                r#"[global] help = "ctrl-4": "ctrl-4" is already editor.focus (default) while an edit is open"#
+            )
+        );
+    }
+
+    /// E9 (d): `editor.focus` acts on every screen while an edit is open, so its chord is
+    /// refused in every other context, a view table included.
+    #[test]
+    fn the_focus_chord_is_refused_in_every_other_context() {
+        assert_eq!(
+            errors("[list]\ndown = \"ctrl-4\"\n"),
+            one(
+                2,
+                r#"[list] down = "ctrl-4": "ctrl-4" is already editor.focus (default) while an edit is open"#
+            )
+        );
+        assert_eq!(
+            errors("[confirm]\nyes = \"ctrl-4\"\n"),
+            one(
+                2,
+                r#"[confirm] yes = "ctrl-4": "ctrl-4" is already editor.focus (default) while an edit is open"#
+            )
+        );
+        assert_eq!(
+            errors("[settings.agents]\nprobe = \"ctrl-4\"\n"),
+            one(
+                2,
+                r#"[settings.agents] probe = "ctrl-4": "ctrl-4" is already editor.focus (default) while an edit is open"#
+            )
         );
     }
 

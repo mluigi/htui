@@ -82,7 +82,7 @@ mod binary {
         assert_eq!(stderr, "");
         assert_eq!(stdout, print(&load_path(&valid).expect("valid.toml loads")));
         assert!(
-            stdout.contains("quit         = [\"ctrl-x\"]   # quit (changed)\n"),
+            stdout.contains("quit         = [\"ctrl-g\"]   # quit (changed)\n"),
             "{stdout}"
         );
         assert!(
@@ -410,14 +410,14 @@ mod app {
         assert!(!harness.app().should_quit, "`q` no longer quits");
         let frame = harness.render();
         assert!(
-            status_line(&frame).starts_with("Ctrl+x quit · Tab next tab"),
+            status_line(&frame).starts_with("Ctrl+g quit · Tab next tab"),
             "{frame}"
         );
 
         harness.key("?");
         assert!(harness.app().help_visible, "`?` opens the box");
         let frame = harness.render();
-        assert!(frame.contains("Ctrl+x/Ctrl+c quit"), "{frame}");
+        assert!(frame.contains("Ctrl+g/Ctrl+c quit"), "{frame}");
         harness.key("?");
         assert!(!harness.app().help_visible, "`?` closes it");
 
@@ -442,8 +442,8 @@ mod app {
         harness.key("esc");
         assert!(harness.app().overlays.is_empty(), "`Esc` still closes it");
 
-        harness.key("ctrl-x");
-        assert!(harness.app().should_quit, "`Ctrl+x` quits");
+        harness.key("ctrl-g");
+        assert!(harness.app().should_quit, "`Ctrl+g` quits");
     }
 
     /// MOD-12 M3 R1 H1: the shell over a file that gives `ctrl-q` to quit starts, shows quit on

@@ -470,13 +470,14 @@ mod tests {
         }
     }
 
+    /// MOD-57 M2 E9 (c): `Stack::EDITOR_OPEN` stacks `[editor]` over every global action.
     #[test]
-    fn the_editor_keys_do_not_collide_with_quit_or_help() {
-        use super::{Act, Context};
+    fn the_editor_keys_do_not_collide_with_any_global_key() {
         let keys = Keys::compiled();
-        let stacked: Vec<KeyChord> = [Act::Quit, Act::Help]
-            .into_iter()
-            .flat_map(|act| keys.chords(Context::Global, act).to_vec())
+        let stacked: Vec<KeyChord> = CATALOGUE
+            .iter()
+            .filter(|row| row.context == Context::Global)
+            .flat_map(|row| keys.chords(Context::Global, row.act).to_vec())
             .collect();
         for row in CATALOGUE
             .iter()
@@ -485,8 +486,28 @@ mod tests {
             for chord in keys.chords(Context::Editor, row.act) {
                 assert!(
                     !stacked.contains(chord),
-                    "[editor] {} shares {} with global quit/help",
+                    "[editor] {} shares {} with a global key",
                     row.name,
+                    chord.label()
+                );
+            }
+        }
+    }
+
+    /// MOD-57 M2 E9 (d): `editor.focus` acts ahead of every view while an edit is open, so no
+    /// compiled row shares its chords.
+    #[test]
+    fn editor_focus_shares_no_default_chord_with_any_action() {
+        let keys = Keys::compiled();
+        let focus = keys.chords(Context::Editor, Act::EditorFocus);
+        assert!(!focus.is_empty(), "editor.focus is unbound");
+        for row in keys.rows.iter().filter(|row| row.act != Act::EditorFocus) {
+            for chord in &row.chords {
+                assert!(
+                    !focus.contains(chord),
+                    "[{}] {:?} shares {} with editor.focus",
+                    row.context.table(),
+                    row.act,
                     chord.label()
                 );
             }

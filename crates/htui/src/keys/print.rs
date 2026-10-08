@@ -150,7 +150,7 @@ close = ["esc"]  # close"#;
     #[test]
     fn a_changed_table_round_trips_and_keeps_its_marks() {
         let keys = load_str(
-            "[global]\nquit = [\"ctrl-x\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
+            "[global]\nquit = [\"ctrl-g\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
         )
         .expect("the file loads");
         let printed = print(&keys);
@@ -158,13 +158,30 @@ close = ["esc"]  # close"#;
         assert_eq!(reloaded, keys);
         assert_eq!(print(&reloaded), printed);
         for line in [
-            "quit         = [\"ctrl-x\"]   # quit (changed)",
+            "quit         = [\"ctrl-g\"]   # quit (changed)",
             "workspaces   = []           # workspaces (changed)",
             "close = [\"esc\", \"f2\"]  # close (changed)",
         ] {
             assert!(printed.lines().any(|printed| printed == line), "{line}");
         }
         assert_eq!(printed.matches("(changed)").count(), 3);
+    }
+
+    /// MOD-57 M2 E9: an `[editor]` change prints, reads back to the same keys and is marked.
+    #[test]
+    fn a_changed_editor_table_round_trips() {
+        let keys = load_str("[editor]\nfocus = [\"f12\"]\n").expect("the file loads");
+        let printed = print(&keys);
+        let reloaded = load_str(&printed).expect("the print loads");
+        assert_eq!(reloaded, keys);
+        assert_eq!(print(&reloaded), printed);
+        let focus = printed
+            .lines()
+            .find(|line| line.starts_with("focus "))
+            .unwrap_or_else(|| panic!("no focus row in {printed}"));
+        assert!(focus.starts_with(r#"focus = ["f12"]"#), "{focus}");
+        assert!(focus.ends_with("# editor focus (changed)"), "{focus}");
+        assert_eq!(printed.matches("(changed)").count(), 1);
     }
 
     /// MOD-12 M3 R1 H1: a row that gave a chord to an entry is marked with the entry's action,
