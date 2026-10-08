@@ -1193,10 +1193,6 @@ mod tests {
         }
     }
 
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "a row literal, positional for brevity"
-    )]
     fn row(
         n: u128,
         key: &str,

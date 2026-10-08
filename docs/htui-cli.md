@@ -164,7 +164,8 @@ A store with no workspace answers `"workspace": null`, `"projects": []` and zero
   "store": "online",
   "workspace": { "id": "00000000-0000-0000-0000-000000000001", "slug": "platform", "name": "Platform" },
   "projects": [
-    { "id": "00000000-0000-0000-0000-000000000010", "slug": "htui", "name": "htui" }
+    { "id": "00000000-0000-0000-0000-000000000010", "slug": "htui", "name": "htui" },
+    { "id": "00000000-0000-0000-0000-000000000011", "slug": "agy", "name": "Antigravity" }
   ],
   "working": 1,
   "permissions_known": true,
@@ -324,7 +325,7 @@ Every `error.code`, with the `store` it comes with and the exit code:
 | `unreachable` | `offline` | 3 | all | Postgres did not answer: at the connect, or during a later read. |
 | `no_dsn` | `refused` | 2 | all | No Postgres DSN is stored in the OS keyring. Run `htui --set-dsn`. |
 | `keyring_unreadable` | `refused` | 2 | all | The OS keyring could not be read. |
-| `box_identity` | `refused` | 2 | all (search only with `--cwd`) | `box.toml` exists but cannot be read or parsed. |
+| `box_identity` | `refused` | 2 | all (search only with `--cwd`) | `box.toml` exists but cannot be read or parsed. `status` and `waiting` always read it (for `box`), so a malformed `box.toml` refuses them even without `--cwd`, just as the TUI will not start with one. Fix or delete the file. |
 | `migrations_pending` | `refused` | 2 | all | The database has migrations this build has not applied. Start the TUI once to apply them. |
 | `below_target` | `refused` | 2 | all | The database's target version is newer than this build. Update htui. |
 | `store_refused` | `refused` | 2 | all | Postgres answered and refused this htui: a newer or drifted schema, a partial migration, a wrong password, a missing database. |

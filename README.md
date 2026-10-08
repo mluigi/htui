@@ -516,7 +516,8 @@ With `--json`, each prints exactly one JSON document on one line. The exit code 
 | 1 | Any other failure. |
 
 None of them writes anything: the database session is read-only, and nothing is created on this
-machine. An empty standard output means the command failed before it could answer. The documents,
+machine, with one exception: the first `--search-items` on a machine downloads the embedding model
+(about 134 MB) into your user cache directory. An empty standard output means the command failed before it could answer. The documents,
 every field and every error code are described in [`docs/htui-cli.md`](docs/htui-cli.md).
 
 ## Where htui keeps its files

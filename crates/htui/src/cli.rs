@@ -133,8 +133,8 @@ pub enum Command {
     /// versioned document (`docs/htui-cli.md`); exit 3 when the store does not answer, 2 on a refusal.
     Status(StateArgs),
     /// Print what waits on you (`R-TUI-11`): gates, failed judges, selections, Unblock rows, interrupted
-    /// runs and permission requests, oldest reason first as the overlay orders them, with their age.
-    /// Reads only, as `status`.
+    /// runs and permission requests, in the overlay's order (project in scope order, then item key,
+    /// run, step and reason), with their age. Reads only, as `status`.
     Waiting(StateArgs),
     /// Serve htui's MCP tools to one agent session over stdio. Started by the agent htui launched,
     /// never by hand: it reads HTUI_MCP_ADDR and HTUI_MCP_TOKEN, writes only MCP to stdout, and exits
