@@ -859,7 +859,8 @@ impl App {
         let (status, style) = match &self.status {
             Some(message) => (message.clone(), self.theme.error),
             None => (
-                self.keys.status_line(|act| self.action_for(act).is_some()),
+                self.keys
+                    .status_line(Stack::BASE, |act| self.action_for(act).is_some()),
                 self.theme.dim,
             ),
         };
@@ -903,7 +904,7 @@ impl App {
             .flat_map(|line| line.rows(inner))
             .map(|row| Line::styled(row, self.theme.base))
             .collect();
-        if let Some(closer) = self.keys.help_closer() {
+        if let Some(closer) = self.keys.help_closer(Stack::BASE) {
             rows.push(Line::styled(closer, self.theme.dim));
         }
         let height = u16::try_from(rows.len())
