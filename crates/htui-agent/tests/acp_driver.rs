@@ -45,6 +45,7 @@ use std::time::Duration;
 use chrono::Utc;
 use htui_agent::acp::AcpDriver;
 use htui_agent::acp::Handshake;
+use htui_agent::acp::isolation_meta;
 #[cfg(unix)]
 use htui_agent::acp::{
     AcpIo, SESSION_STARTED, SessionOptions, Stamp, TOOL_KIND_DENIED, open_session,
@@ -1965,13 +1966,20 @@ async fn mcp_agent(stream: tokio::io::DuplexStream, seen: oneshot::Sender<Value>
 }
 
 /// Opens a session over [`mcp_agent`] with `mcp` on the spec and answers the `session/new`
-/// params the agent received.
+/// params the agent received. The row's settings are the default, so the session is isolated
+/// (MOD-91 D3).
+#[cfg(unix)]
+async fn session_new_params(mcp: Vec<McpServerSpec>) -> Value {
+    session_new_params_with(mcp, AgentSettings::default()).await
+}
+
+/// [`session_new_params`] under the row settings `settings`: what MOD-91's `_meta` cases vary.
 #[cfg(unix)]
 #[expect(
     clippy::disallowed_methods,
     reason = "test fakes run under no TUI panic hook"
 )]
-async fn session_new_params(mcp: Vec<McpServerSpec>) -> Value {
+async fn session_new_params_with(mcp: Vec<McpServerSpec>, settings: AgentSettings) -> Value {
     let tmp = tempfile::tempdir().expect("temp cwd");
     let (client_end, agent_end) = tokio::io::duplex(DUPLEX_BYTES);
     let (reader, writer) = tokio::io::split(client_end);
@@ -1985,7 +1993,10 @@ async fn session_new_params(mcp: Vec<McpServerSpec>) -> Value {
     let mut spec = spec(tmp.path().to_path_buf());
     spec.mcp = mcp;
 
-    let session = open_session(io, spec, "hi".to_owned(), options(PATIENT_HANDSHAKE))
+    let mut options = options(PATIENT_HANDSHAKE);
+    options.settings = settings;
+
+    let session = open_session(io, spec, "hi".to_owned(), options)
         .await
         .expect("the agent opens a session");
     let params = tokio::time::timeout(EVENT_WINDOW, params)
@@ -2045,4 +2056,54 @@ async fn session_new_carries_the_mcp_server_as_stdio() {
 async fn session_new_without_mcp_sends_an_empty_list() {
     let params = session_new_params(Vec::new()).await;
     assert_eq!(params["mcpServers"], json!([]), "{params}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-91 D5: an isolated session's `_meta.claudeCode.options`
+// ---------------------------------------------------------------------------------------------
+
+/// MOD-91 B1: the one literal pin of the ACP lever, as T2 probed it (plan, "T2 — ACP", case (a)).
+/// Every other case compares against [`isolation_meta`] itself, so a change of lever touches the
+/// function and this case, and nothing else.
+#[test]
+fn isolation_meta_is_the_probed_options() {
+    assert_eq!(
+        Value::Object(isolation_meta()),
+        json!({
+            "claudeCode": {
+                "options": {
+                    "settings": { "disableAllHooks": true },
+                    "extraArgs": { "disable-slash-commands": "" },
+                },
+            },
+        }),
+    );
+}
+
+/// MOD-91 D3/D5: a row that never mentions `user_extensions` is isolated, and its `session/new`
+/// carries the lever as the whole `_meta`.
+#[cfg(unix)]
+#[tokio::test]
+async fn session_new_carries_the_isolation_meta_by_default() {
+    let params = session_new_params(Vec::new()).await;
+    assert_eq!(params["_meta"], Value::Object(isolation_meta()), "{params}");
+}
+
+/// MOD-91 D3: a row that opts back in sends no `claudeCode` key at all, so the adapter loads the
+/// user's extensions exactly as it did before MOD-91. Robust to `_meta` being absent or `null`.
+#[cfg(unix)]
+#[tokio::test]
+async fn session_new_sends_no_claude_code_meta_when_opted_in() {
+    let settings = AgentSettings {
+        user_extensions: true,
+        ..AgentSettings::default()
+    };
+    let params = session_new_params_with(Vec::new(), settings).await;
+    assert!(
+        params
+            .get("_meta")
+            .and_then(|meta| meta.get("claudeCode"))
+            .is_none(),
+        "an opted-in session/new carries no `claudeCode`: {params}"
+    );
 }

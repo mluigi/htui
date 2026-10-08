@@ -31,9 +31,10 @@ use std::time::Duration;
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, EnvVariable, InitializeRequest, LoadSessionRequest,
-    McpServer, McpServerStdio, NewSessionRequest, ReadTextFileResponse, RequestPermissionOutcome,
-    RequestPermissionResponse, ResumeSessionRequest, SelectedPermissionOutcome,
-    SessionConfigOptionValue, SetSessionConfigOptionRequest, WriteTextFileResponse,
+    McpServer, McpServerStdio, Meta, NewSessionRequest, ReadTextFileResponse,
+    RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
+    SelectedPermissionOutcome, SessionConfigOptionValue, SetSessionConfigOptionRequest,
+    WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, RestoredSession, SessionMessage,
@@ -1083,6 +1084,41 @@ enum Step {
     Closed,
 }
 
+/// What an isolated session sends as `_meta` on `session/new`, `session/resume` and
+/// `session/load` (MOD-91 D5, probed in T2 (a)): `claudeCode.options`, which `claude-agent-acp`
+/// spreads over its own SDK options (`acp-agent.js:5931-5936`) and whose `extraArgs` it merges
+/// (`:5974-5977`).
+///
+/// `disableAllHooks` stops settings hooks and plugin mods and leaves the adapter's own
+/// programmatic SDK hooks firing (T2: `current_mode_update` still arrives);
+/// `disable-slash-commands` empties the command list, built-ins included, which costs nothing
+/// because `htui` sends no slash command. Sent from the transport, never on the agent's name
+/// (`R-AGT-5`): ACP requires an agent to ignore `_meta` keys it does not know, which is what
+/// `agy` gets. `options.settings` replaces any adapter-derived settings object (the risk row:
+/// `CLAUDE_MODEL_CONFIG`, which `htui` never sets). The CLI's counterpart is
+/// [`crate::cli::ISOLATION_ARGS`]; this function is the one place the ACP lever lives (blueprint
+/// B1), pinned by one literal test.
+#[must_use]
+pub fn isolation_meta() -> Meta {
+    Meta::from_iter([(
+        "claudeCode".to_owned(),
+        json!({
+            "options": {
+                "settings": { "disableAllHooks": true },
+                "extraArgs": { "disable-slash-commands": "" },
+            },
+        }),
+    )])
+}
+
+/// The `_meta` a session of a row with `settings` sends (MOD-91 D3/D5): `None` when the row opts
+/// back in (`settings.user_extensions`), so the adapter loads the user's extensions exactly as it
+/// did before MOD-91; [`isolation_meta`] otherwise.
+#[must_use]
+pub fn session_meta(settings: &AgentSettings) -> Option<Meta> {
+    (!settings.user_extensions).then(isolation_meta)
+}
+
 /// One of `htui`'s own MCP servers as ACP's stdio entry (MOD-11 D7).
 ///
 /// Stdio is the transport every ACP agent must support (no capability check) and the untagged
@@ -1152,12 +1188,17 @@ async fn session_main(
     // than returning to it ([`ReadyCell`]). `run_session` then answers from the connection's own
     // error, and what it reads here is how it knows which request to name in the failure. A
     // refusal on capabilities or settings sends nothing, so it records no step.
+    //
+    // MOD-91 D5: every one of the three requests carries the row's `_meta` ([`session_meta`]):
+    // the isolation lever, or nothing at all when the row opts back in.
+    let meta = session_meta(&options.settings);
     let mut session = match spec.resume.as_ref() {
         None => {
             at_step(ready, "session/new");
             let new_session = NewSessionRequest::new(spec.cwd.clone())
                 .additional_directories(spec.extra_dirs.clone())
-                .mcp_servers(spec.mcp.iter().map(acp_server).collect());
+                .mcp_servers(spec.mcp.iter().map(acp_server).collect())
+                .meta(meta);
             match cx
                 .build_session_from(new_session)
                 .block_task()
