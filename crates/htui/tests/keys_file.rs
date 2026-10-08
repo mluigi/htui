@@ -112,7 +112,10 @@ mod binary {
                         .to_owned(),
                     r#"6: [list] up: write each chord as a string, such as "q""#.to_owned(),
                     "8: [globl]: no such table; the tables are global, overlay, list, pane, \
-                     confirm, form, common"
+                     confirm, form, common, editor, settings, settings.agents, settings.hierarchy, \
+                     settings.kinds, settings.prompt, settings.connection, settings.qdrant, \
+                     settings.boxes, settings.personas, settings.secrets, settings.queue, \
+                     concepts, switcher, migration, waiting"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
@@ -120,6 +123,8 @@ mod binary {
                      find, waiting"
                         .to_owned(),
                     r#"13: [global] quit = "shift-a": write a shifted letter as "A""#.to_owned(),
+                    r#"13: [global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
+                        .to_owned(),
                 ],
             ),
             (
@@ -144,8 +149,15 @@ mod binary {
                 vec![
                     r#"3: [global] quit = "w": "w" is already global.workspaces (default) in [global]"#
                         .to_owned(),
+                    r#"3: [global] quit = "w": "w" is already settings.boxes.executor (default) in Settings > Boxes"#
+                        .to_owned(),
                     r#"4: [global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
                         .to_owned(),
+                    r#"4: [global] help = "esc": "esc" is already common.dismiss (default) in Settings > Agents"#
+                        .to_owned(),
+                    r#"4: [global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
+                        .to_owned(),
+
                     r#"7: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),
                     r#"10: [list] top = "j": "j" is already list.down (default) in [list]"#

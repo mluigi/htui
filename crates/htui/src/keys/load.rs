@@ -8,7 +8,8 @@ use toml::Spanned;
 use toml::de::{DeString, DeTable, DeValue};
 
 use super::{
-    Act, CATALOGUE, CTRL_C, ChordError, Context, KeyChord, Keys, contexts, quote, validate,
+    Act, ActionSpec, CATALOGUE, CTRL_C, ChordError, Context, DECLARED, KeyChord, Keys, quote,
+    validate,
 };
 
 /// The key file's name under the config root.
@@ -105,13 +106,19 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
         src,
         keys: Keys::defaults(),
         errors: Vec::new(),
+        set: Vec::new(),
     };
     for (key, value) in root.get_ref() {
         loader.top_level(key, value);
     }
     let Loader {
-        keys, mut errors, ..
+        mut keys,
+        mut errors,
+        set,
+        ..
     } = loader;
+    // MOD-67 M3 PA-1: the view defaults follow the shared rows the file just set.
+    keys.derive(&set);
     errors.extend(validate(&keys));
     errors.sort_by_key(|error| error.line);
     if errors.is_empty() {
@@ -180,8 +187,9 @@ fn line_of(src: &str, offset: usize) -> usize {
 
 /// The context whose table is `path` (`global`, `common`, ...).
 fn context_named(path: &str) -> Option<Context> {
-    contexts()
-        .into_iter()
+    Context::ALL
+        .iter()
+        .copied()
         .find(|context| context.table() == path)
 }
 
@@ -201,11 +209,26 @@ fn chord_of(written: &str) -> Result<KeyChord, String> {
     }
 }
 
+/// The shared acts `[context]` may override (MOD-67 M3 D10, PA-3): every shared catalogue row
+/// whose act some declared stack's `context` layer offers, in catalogue order. Empty for a
+/// context that is not a view's.
+fn overridable(context: Context) -> impl Iterator<Item = &'static ActionSpec> {
+    CATALOGUE.iter().filter(move |spec| {
+        context.is_view()
+            && spec.context.is_shared()
+            && DECLARED
+                .iter()
+                .any(|(_, stack)| stack.view_admits(context, spec.act))
+    })
+}
+
 /// One pass over a parsed file: the keys merged so far and every error found.
 struct Loader<'s> {
     src: &'s str,
     keys: Keys,
     errors: Vec<KeyFileError>,
+    /// Every `(context, act)` an entry resolved to: `Keys::derive` keeps these rows as written.
+    set: Vec<(Context, Act)>,
 }
 
 impl Loader<'_> {
@@ -251,7 +274,7 @@ impl Loader<'_> {
             .values()
             .any(|value| !matches!(value.get_ref(), DeValue::Table(_)));
         if context.is_none() && (has_values || table.is_empty()) {
-            let tables = contexts()
+            let tables = Context::ALL
                 .iter()
                 .map(|context| context.table())
                 .collect::<Vec<_>>()
@@ -288,9 +311,11 @@ impl Loader<'_> {
         let name: &str = key.get_ref();
         let table = context.table();
         let key_line = self.line(key.span().start);
+        // The context's own row; else, in a view's table, a shared verb it offers (D10).
         let Some(spec) = CATALOGUE
             .iter()
             .find(|spec| spec.context == context && spec.name == name)
+            .or_else(|| overridable(context).find(|spec| spec.name == name))
         else {
             let names = CATALOGUE
                 .iter()
@@ -298,10 +323,21 @@ impl Loader<'_> {
                 .map(|spec| spec.name)
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.push(
-                key_line,
-                format!("[{table}] {name}: no such action; [{table}] has {names}"),
-            );
+            let shared = overridable(context)
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = match (names.is_empty(), shared.is_empty()) {
+                (_, true) => format!("[{table}] {name}: no such action; [{table}] has {names}"),
+                (true, false) => {
+                    format!("[{table}] {name}: no such action; [{table}] may override {shared}")
+                }
+                (false, false) => format!(
+                    "[{table}] {name}: no such action; [{table}] has {names}, and may override \
+                     {shared}"
+                ),
+            };
+            self.push(key_line, message);
             return;
         };
         let items: Vec<&Spanned<DeValue<'_>>> = match value.get_ref() {
@@ -346,6 +382,7 @@ impl Loader<'_> {
             );
         }
         self.keys.set(context, spec.act, chords, key_line);
+        self.set.push((context, spec.act));
     }
 }
 
@@ -355,7 +392,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     use super::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
-    use crate::keys::{Act, CATALOGUE, Context, KeyChord, Keys};
+    use crate::keys::{Act, CATALOGUE, Context, KeyChord, Keys, views};
 
     /// The full error vector of `src`, as `(line, message)`.
     fn errors(src: &str) -> Vec<(usize, String)> {
@@ -380,7 +417,11 @@ mod tests {
         }
     }
 
-    const TABLES: &str = "the tables are global, overlay, list, pane, confirm, form, common";
+    const TABLES: &str = "the tables are global, overlay, list, pane, confirm, form, common, editor, \
+                          settings, settings.agents, settings.hierarchy, settings.kinds, \
+                          settings.prompt, settings.connection, settings.qdrant, settings.boxes, \
+                          settings.personas, settings.secrets, settings.queue, concepts, \
+                          switcher, migration, waiting";
 
     #[test]
     fn an_empty_file_is_the_defaults() {
@@ -398,7 +439,7 @@ mod tests {
 
     #[test]
     fn a_bom_and_crlf_still_give_the_right_lines() {
-        let src = "\u{feff}version = 1\r\n\r\n[global]\r\nquit = [\r\n  \"x\",\r\n  \"shift-a\",\r\n]\r\n";
+        let src = "\u{feff}version = 1\r\n\r\n[global]\r\nquit = [\r\n  \"z\",\r\n  \"shift-a\",\r\n]\r\n";
         assert_eq!(
             errors(src),
             one(
@@ -410,8 +451,8 @@ mod tests {
 
     #[test]
     fn a_list_replaces_the_defaults_and_a_string_is_a_list_of_one() {
-        let keys = load_str("[global]\nquit = \"x\"\nhelp = [\"f1\"]\n").expect("loads");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("x")]);
+        let keys = load_str("[global]\nquit = \"z\"\nhelp = [\"f1\"]\n").expect("loads");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("z")]);
         assert_eq!(keys.chords(Context::Global, Act::Help), [chord("f1")]);
         assert_eq!(keys.line(Context::Global, Act::Quit), Some(2));
         assert_eq!(keys.line(Context::Global, Act::Help), Some(3));
@@ -471,7 +512,7 @@ mod tests {
     fn an_unknown_table_lists_the_tables() {
         for (src, path) in [
             ("[globl]\nquit = \"x\"\n", "globl"),
-            ("[settings.boxes]\nreload = \"r\"\n", "settings.boxes"),
+            ("[settings.nothing]\nreload = \"r\"\n", "settings.nothing"),
             ("[global.extra]\nx = \"y\"\n", "global.extra"),
             ("[nothing]\n", "nothing"),
         ] {
@@ -502,7 +543,7 @@ mod tests {
         );
         let element = r#"[global] quit: write each chord as a string, such as "q""#;
         assert_eq!(
-            errors("[global]\nquit = [\"x\", 5, [\"y\"]]\n"),
+            errors("[global]\nquit = [\"z\", 5, [\"y\"]]\n"),
             vec![(2, element.to_owned()), (2, element.to_owned())]
         );
         assert_eq!(
@@ -514,8 +555,8 @@ mod tests {
     #[test]
     fn an_inline_table_at_the_top_is_a_context() {
         // B-12: one rule for every table value.
-        let inline = load_str("global = { quit = \"x\" }\n").expect("an inline context loads");
-        assert_eq!(inline.chords(Context::Global, Act::Quit), [chord("x")]);
+        let inline = load_str("global = { quit = \"z\" }\n").expect("an inline context loads");
+        assert_eq!(inline.chords(Context::Global, Act::Quit), [chord("z")]);
     }
 
     #[test]
@@ -631,6 +672,12 @@ quit = ["x", "shift-a"]
                 13,
                 r#"[global] quit = "shift-a": write a shifted letter as "A""#,
             ),
+            // MOD-67 M3: `x` is agents' cancel in Settings > Agents, so the rebound quit would
+            // never reach there (ANA-26 §2.2's silent shadowing, now reported).
+            (
+                13,
+                r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#,
+            ),
         ]
         .into_iter()
         .map(|(line, message)| (line, message.to_owned()))
@@ -735,9 +782,9 @@ quit = ["x", "shift-a"]
     #[test]
     fn a_named_file_is_read_and_a_missing_one_refused() {
         let root = tempfile::tempdir().expect("a temp dir");
-        let named = write(root.path(), "mine.toml", "[global]\nquit = \"x\"\n");
+        let named = write(root.path(), "mine.toml", "[global]\nquit = \"z\"\n");
         let keys = resolve(Some(&named), false, None).expect("a good file loads");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("x")]);
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("z")]);
         assert_eq!(
             load_path(&named).expect("a good file loads"),
             keys,
@@ -790,5 +837,109 @@ quit = ["x", "shift-a"]
             }
             other => panic!("expected Unreadable, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_view_table_overrides_a_shared_verb_it_offers() {
+        let keys = load_str("version = 1\n[settings.boxes]\nreload = \"f5\"\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::SettingsBoxes, Act::Reload),
+            [chord("f5")]
+        );
+        assert_eq!(keys.line(Context::SettingsBoxes, Act::Reload), Some(3));
+        assert_eq!(
+            keys.actions(views::BOXES_BROWSE, chord("f5")),
+            [Act::Reload]
+        );
+        assert_eq!(keys.actions(views::BOXES_BROWSE, chord("r")), []);
+        assert_eq!(
+            keys.actions(views::PROMPT_BROWSE, chord("r")),
+            [Act::Reload]
+        );
+        assert_eq!(keys.actions(views::PROMPT_BROWSE, chord("f5")), []);
+    }
+
+    #[test]
+    fn a_view_table_refuses_what_none_of_its_modes_offer() {
+        let boxes = "has edit_tags, edit_quirks, executor, probe, edit_spec, and may override \
+                     down, up, yes, no, save, reload, dismiss, next_section, prev_section";
+        assert_eq!(
+            errors("[settings.boxes]\nedit = \"E\"\n"),
+            one(
+                2,
+                &format!("[settings.boxes] edit: no such action; [settings.boxes] {boxes}")
+            )
+        );
+        assert_eq!(
+            errors("[settings.boxes]\nquit = \"Q\"\n"),
+            one(
+                2,
+                &format!("[settings.boxes] quit: no such action; [settings.boxes] {boxes}")
+            )
+        );
+        assert_eq!(
+            errors("[switcher]\nclose = \"f2\"\n"),
+            one(
+                2,
+                "[switcher] close: no such action; [switcher] has switch, and may override down, up"
+            )
+        );
+        assert_eq!(
+            errors("[settings.prompt]\nprobe = \"p\"\n"),
+            one(
+                2,
+                "[settings.prompt] probe: no such action; [settings.prompt] may override down, \
+                 up, edit, reload, dismiss, next_section, prev_section"
+            )
+        );
+    }
+
+    #[test]
+    fn a_section_with_no_own_action_has_a_table() {
+        let keys = load_str("[settings.prompt]\nreload = \"f5\"\n").expect("prompt loads");
+        assert_eq!(
+            keys.chords(Context::SettingsPrompt, Act::Reload),
+            [chord("f5")]
+        );
+        let keys = load_str("[settings.queue]\nedit = [\"E\"]\n").expect("queue loads");
+        assert_eq!(keys.chords(Context::SettingsQueue, Act::Edit), [chord("E")]);
+        assert_eq!(keys.actions(views::QUEUE_BROWSE, chord("enter")), []);
+        let keys = load_str("[migration]\nyes = \"a\"\n").expect("migration loads");
+        assert_eq!(
+            keys.chords(Context::Migration, Act::ConfirmYes),
+            [chord("a")]
+        );
+    }
+
+    #[test]
+    fn a_shared_rebind_flows_into_the_view_defaults() {
+        let keys = load_str("[form]\nnext_field = [\"ctrl-n\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::SettingsSecrets, Act::FormNextField),
+            [chord("ctrl-n"), chord("down")]
+        );
+        assert_eq!(
+            keys.line(Context::SettingsSecrets, Act::FormNextField),
+            None
+        );
+        assert_eq!(keys.line(Context::Form, Act::FormNextField), Some(2));
+        let keys = load_str("[settings.secrets]\nnext_field = [\"ctrl-n\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::SettingsSecrets, Act::FormNextField),
+            [chord("ctrl-n")]
+        );
+        assert_eq!(
+            keys.line(Context::SettingsSecrets, Act::FormNextField),
+            Some(2)
+        );
+        assert_eq!(
+            keys.chords(Context::SettingsAgents, Act::FormNextField),
+            [chord("tab"), chord("down")]
+        );
+        let keys = load_str("[confirm]\nno = [\"x\"]\n").expect("loads");
+        assert_eq!(
+            keys.chords(Context::Migration, Act::ConfirmNo),
+            [chord("x"), chord("N")]
+        );
     }
 }

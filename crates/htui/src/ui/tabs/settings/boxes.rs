@@ -30,15 +30,16 @@ use std::collections::BTreeSet;
 
 use crate::app::{Ctx, Handled};
 use crate::box_settings::{BoxesSnapshot, READ_NAME, REQUEST_NAMES, SpecView};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, message, wrapped,
+    is_error, message, modal_rest, wrapped,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use chrono::{DateTime, Utc};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use htui_core::model::BoxEdit;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -59,29 +60,55 @@ const NO_BOXES: &str = "no box is registered for this user yet";
 /// The Browse keys (MOD-51 D6: `s` opens the probe spec editor; `p probe this box` became
 /// `p probe` so the line fits an 80-column terminal, blueprint F-10, and [`THIS_BOX_ONLY`] still
 /// explains `p` on another box).
-const HINT_BROWSE: &str = "j/k move \u{b7} t tags \u{b7} e quirks \u{b7} w executor \u{b7} p probe \
-                           \u{b7} s spec \u{b7} r reload";
+const HINT_BROWSE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::BoxesEditTags, "tags"),
+    Hint::One(Act::BoxesEditQuirks, "quirks"),
+    Hint::One(Act::BoxesExecutor, "executor"),
+    Hint::One(Act::BoxesProbe, "probe"),
+    Hint::One(Act::BoxesEditSpec, "spec"),
+    Hint::One(Act::Reload, "reload"),
+];
 
 /// The Browse keys over a read list with no box in it: the spec is app-wide, so `s` still works
 /// (MOD-51 D6).
-const HINT_NO_LIST: &str = "s spec \u{b7} r reload";
+const HINT_NO_LIST: HintSpec = &[
+    Hint::One(Act::BoxesEditSpec, "spec"),
+    Hint::One(Act::Reload, "reload"),
+];
 
 /// The Browse keys before the first read and over a refused one, where `s` does nothing
 /// (MOD-51 F-3).
-const HINT_RELOAD: &str = "r reload";
+const HINT_RELOAD: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The tag editor's keys.
-const HINT_TAGS: &str = "Enter saves \u{b7} Esc cancels \u{b7} comma-separated";
+/// The tag editor's keys: the field's own (MOD-67 D13).
+const HINT_TAGS: HintSpec = &[
+    Hint::Text("Enter saves"),
+    Hint::Text("Esc cancels"),
+    Hint::Text("comma-separated"),
+];
 
-/// The quirks editor's keys (OQ-16: `Enter` is a line break, so `ctrl-s` saves).
-const HINT_QUIRKS: &str = "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks the line";
+/// The quirks editor's keys (OQ-16: `Enter` is a line break, so `form.save`, `Ctrl+s`, saves).
+const HINT_QUIRKS: HintSpec = &[
+    Hint::One(Act::FormSave, "saves"),
+    Hint::Text("Esc cancels"),
+    Hint::Text("Enter breaks the line"),
+];
 
-/// The executor confirmation's keys (MOD-41 plan D10).
-const HINT_EXECUTOR: &str = "y write \u{b7} n/esc cancel";
+/// The executor confirmation's keys (MOD-41 plan D10): `y write · n/Esc cancel` by default.
+const HINT_EXECUTOR: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "write"),
+    Hint::All(Act::ConfirmNo, "cancel"),
+];
 
-/// The probe spec editor's keys (MOD-51 D6; OQ-16: `Enter` is a line break, so `ctrl-s` saves).
-const HINT_SPEC: &str =
-    "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks the line \u{b7} blank clears";
+/// The probe spec editor's keys (MOD-51 D6; OQ-16: `Enter` is a line break, so `form.save`
+/// saves).
+const HINT_SPEC: HintSpec = &[
+    Hint::One(Act::FormSave, "saves"),
+    Hint::Text("Esc cancels"),
+    Hint::Text("Enter breaks the line"),
+    Hint::Text("blank clears"),
+];
 
 /// The dim line above the probe spec editor: what the text is, and what blank does (MOD-51 D6).
 /// It fits a 78-column body unclipped.
@@ -504,10 +531,14 @@ impl BoxesSection {
         }
     }
 
-    /// One key while an editor is open: the widget answers first, so every letter is text.
+    /// One key while an editor is open: the widget answers first, so every letter is text
+    /// (MOD-67 D6, skeleton (a)).
     ///
-    /// Everything the widget passes on is swallowed rather than offered to the shell, except
-    /// `CONTROL` chords (the kinds rule), so `ctrl-c` still quits.
+    /// The quirks and spec editors then take `form.save` from the resolver: the `TextArea`'s own
+    /// `ctrl-s` already submitted, so this is a rebound chord (D13). Everything else the widget
+    /// passes on is swallowed rather than offered to the shell, except the chords the mode's
+    /// stack passes (CONTROL, ALT, function keys: D5), so `ctrl-c` still quits and `F1` opens
+    /// help.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Browse => return Handled::Pass,
@@ -518,37 +549,48 @@ impl BoxesSection {
             Mode::Spec(editor) => editor.input.on_key(key, SPEC_PAGE),
         };
         match outcome {
-            FieldOutcome::Consumed => Handled::Consumed,
+            FieldOutcome::Consumed => return Handled::Consumed,
+            // `Enter` (tags) or the `TextArea`'s own `ctrl-s` (quirks, spec: D13).
             FieldOutcome::Submit => {
                 self.submit(ctx);
-                Handled::Consumed
+                return Handled::Consumed;
             }
             FieldOutcome::Cancel => {
                 // `busy` stays: a save already sent is still answered, and its reply is what
                 // clears it.
                 self.mode = Mode::Browse;
                 self.notice = None;
-                Handled::Consumed
+                return Handled::Consumed;
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => {}
         }
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
+        // `form.save` is the first layer below the view's, so the first candidate decides; only
+        // the quirks and spec editors' stack offers it.
+        if ctx.keys().actions(stack, chord).first() == Some(&Act::FormSave) {
+            self.submit(ctx);
+            return Handled::Consumed;
+        }
+        modal_rest(stack, chord)
     }
 
-    /// One key over the executor confirmation (MOD-41 plan D10): `y` writes, `n`/`Esc` cancel,
-    /// `CONTROL` chords pass (so `ctrl-c` still quits) and every other key is swallowed.
+    /// One key over the executor confirmation (MOD-41 plan D10; MOD-67 D6, skeleton (b)): `y`
+    /// (`yes`) writes, `n`/`Esc` (`no`) cancel, the chords [`views::BOXES_EXECUTOR`] passes
+    /// (CONTROL, ALT, function keys) go to the shell, so `ctrl-c` still quits, and every other
+    /// key is swallowed. `alt-y` is not `y`.
     fn on_executor_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
-        match key.code {
-            KeyCode::Char('y') => self.submit(ctx),
-            KeyCode::Char('n') | KeyCode::Esc => {
+        let stack = views::BOXES_EXECUTOR;
+        let chord = KeyChord::from_event(key);
+        // The answers' layer comes before the global one, so the first candidate decides.
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes) => self.submit(ctx),
+            Some(Act::ConfirmNo) => {
                 // `busy` stays, as in `on_editor_key`: a write already sent is still answered.
                 self.mode = Mode::Browse;
                 self.notice = None;
             }
-            _ => {}
+            _ => return modal_rest(stack, chord),
         }
         Handled::Consumed
     }
@@ -687,61 +729,41 @@ impl SettingsSection for BoxesSection {
         if !matches!(self.mode, Mode::Browse) {
             return self.on_editor_key(key, ctx);
         }
-        // Browse. `j`, `k`, `t`, `e`, `p`, `r`, `s` are free: the global table binds `q`, `?`, the
-        // digits and `w`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section sees them.
-        // `w` (MOD-41 plan D10) shadows the global workspace switcher only while a box is listed
-        // to act on; over no list it passes, so the switcher is still one key away.
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.move_selection(true);
-                Handled::Consumed
+        // Browse (MOD-67 D6, skeleton (c)): the first candidate this state accepts; a global act
+        // or a declined one is the shell's. `executor` (MOD-41 plan D10) shadows the global
+        // workspace switcher only while a box is listed to act on; over no list it declines, so
+        // the switcher is still one key away (`STATE_GUARDED`). `Ctrl+W` is another chord: the
+        // global waiting list (MOD-69 D7).
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::BOXES_BROWSE, chord) {
+            match act {
+                Act::ListDown => self.move_selection(true),
+                Act::ListUp => self.move_selection(false),
+                Act::BoxesEditTags => self.open_tags(),
+                Act::BoxesEditQuirks => self.open_quirks(),
+                Act::BoxesExecutor
+                    if self.unavailable.is_none() && self.selected_record().is_some() =>
+                {
+                    self.open_executor();
+                }
+                // MOD-51 D6: the probe spec is app-wide, so `s` needs no listed box.
+                Act::BoxesEditSpec => self.open_spec(),
+                Act::BoxesProbe => self.probe(ctx),
+                // Always allowed (the kinds section's reason): re-reading is how a section that
+                // lost a reply recovers, and a read never touches an open editor's token.
+                Act::Reload => ctx.request(StoreRequest::Boxes),
+                // Only when there is something to clear: a section that swallowed every `Esc`
+                // would take the one the shell uses to close an overlay over it.
+                Act::Dismiss if self.notice.is_some() => self.notice = None,
+                _ => continue, // a global act, or one this state declines
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.move_selection(false);
-                Handled::Consumed
-            }
-            KeyCode::Char('t') => {
-                self.open_tags();
-                Handled::Consumed
-            }
-            KeyCode::Char('e') => {
-                self.open_quirks();
-                Handled::Consumed
-            }
-            // MOD-69 D7: `Ctrl+W` is the global waiting list, not this section's executor.
-            KeyCode::Char('w')
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && self.unavailable.is_none()
-                    && self.selected_record().is_some() =>
-            {
-                self.open_executor();
-                Handled::Consumed
-            }
-            // MOD-51 D6: the probe spec is app-wide, so `s` needs no listed box.
-            KeyCode::Char('s') => {
-                self.open_spec();
-                Handled::Consumed
-            }
-            KeyCode::Char('p') => {
-                self.probe(ctx);
-                Handled::Consumed
-            }
-            // Always allowed (the kinds section's reason): re-reading is how a section that lost
-            // a reply recovers, and a read never touches an open editor's token.
-            KeyCode::Char('r') => {
-                ctx.request(StoreRequest::Boxes);
-                Handled::Consumed
-            }
-            // Only when there is something to clear: a section that swallowed every `Esc` would
-            // take the one the shell uses to close an overlay over it.
-            KeyCode::Esc if self.notice.is_some() => {
-                self.notice = None;
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
+            return Handled::Consumed;
         }
+        Handled::Pass
+    }
+
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -849,7 +871,7 @@ impl SettingsSection for BoxesSection {
         }
 
         frame.render_widget(
-            Paragraph::new(Line::styled(self.hint_text(), theme.dim)),
+            Paragraph::new(Line::styled(self.hint_text(ctx.keys()), theme.dim)),
             hint,
         );
         if let Some(text) = &self.notice {
@@ -1064,20 +1086,32 @@ impl BoxesSection {
         lines
     }
 
-    /// The keys this mode binds, plus what is in flight.
-    fn hint_text(&self) -> String {
+    /// The stack of the current mode (MOD-67 D3, D4): the one place a mode maps to its keys, read
+    /// by `key_stack`, the key handlers and the hint.
+    fn stack(&self) -> Stack<'static> {
+        match self.mode {
+            Mode::Browse => views::BOXES_BROWSE,
+            Mode::Tags(_) => views::CAPTURE,
+            Mode::Quirks(_) | Mode::Spec(_) => views::BOXES_EDITOR,
+            Mode::Executor(_) => views::BOXES_EXECUTOR,
+        }
+    }
+
+    /// The keys this mode binds, through its stack (MOD-67 D9), plus what is in flight.
+    fn hint_text(&self, keys: &Keys) -> String {
         // MOD-51 F-3: `s` is offered exactly where it works, a read that was not refused.
         let readable = self.unavailable.is_none() && self.snapshot.is_some();
         let listed = readable && !self.boxes().is_empty();
-        let mut hint = match self.mode {
-            Mode::Browse if listed => HINT_BROWSE.to_owned(),
-            Mode::Browse if readable => HINT_NO_LIST.to_owned(),
-            Mode::Browse => HINT_RELOAD.to_owned(),
-            Mode::Tags(_) => HINT_TAGS.to_owned(),
-            Mode::Quirks(_) => HINT_QUIRKS.to_owned(),
-            Mode::Executor(_) => HINT_EXECUTOR.to_owned(),
-            Mode::Spec(_) => HINT_SPEC.to_owned(),
+        let spec = match self.mode {
+            Mode::Browse if listed => HINT_BROWSE,
+            Mode::Browse if readable => HINT_NO_LIST,
+            Mode::Browse => HINT_RELOAD,
+            Mode::Tags(_) => HINT_TAGS,
+            Mode::Quirks(_) => HINT_QUIRKS,
+            Mode::Executor(_) => HINT_EXECUTOR,
+            Mode::Spec(_) => HINT_SPEC,
         };
+        let mut hint = keys.hint(self.stack(), spec);
         if self.probing {
             hint.push_str(" \u{b7} probing\u{2026}");
         }

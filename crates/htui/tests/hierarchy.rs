@@ -3077,3 +3077,167 @@ async fn the_cursor_row_is_drawn_selected() {
     assert_eq!(second.len(), 1, "{second:?}");
     assert_eq!(second[0].0, first[0].0 + 1, "the cursor moved one row");
 }
+
+// -------------------------------------------------------------------------------------------
+// MOD-67 M3 (lane L-C): Browse dispatches through `views::HIERARCHY_BROWSE`, so a chord matches
+// with its modifiers, and every mode resolves through its own stack.
+// -------------------------------------------------------------------------------------------
+
+/// A bench section over the demo tree, with what the reply emitted drained.
+async fn bench_over_demo(bench: &SectionBench) -> HierarchySection {
+    let mut section = HierarchySection::new();
+    let opened = demo_tree(&demo(), ids::WORKSPACE_GRAPHICS).await;
+    bench.reply(&mut section, &StoreReply::Hierarchy(Some(Box::new(opened))));
+    let _ = bench.drained();
+    section
+}
+
+/// ANA-26 §2.6 defect 1 (MOD-67 D14): `ctrl-d` on a project is not `d`. It used to open the delete
+/// count, because Browse matched `key.code` alone; the other browse letters with `CONTROL` held
+/// open, send or move nothing either.
+#[tokio::test]
+async fn ctrl_d_in_browse_deletes_nothing() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
+
+    assert_eq!(bench.key(&mut section, "ctrl-d"), Handled::Pass);
+    assert!(!section.captures_input(), "no delete was started");
+    assert!(
+        bench.drained().is_empty(),
+        "no `DeleteReach` went out for a `ctrl-d`"
+    );
+    assert!(
+        !bench
+            .render_section(&section, 100)
+            .contains("counting rows"),
+        "the count never started"
+    );
+
+    for chord in ["ctrl-n", "ctrl-e", "ctrl-p", "ctrl-b", "ctrl-r", "ctrl-k"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+        assert!(!section.captures_input(), "{chord} opened nothing");
+        assert!(bench.drained().is_empty(), "{chord} asked nothing");
+    }
+    let rows = selected_rows(&drawn(&bench, &section, 100));
+    assert!(
+        rows.len() == 1 && rows[0].1.contains("vulkan-tutorials"),
+        "`ctrl-k` did not move the cursor off the project: {rows:?}"
+    );
+}
+
+/// ANA-26 §6.6 (MOD-67 D14): `Down` and `Up` move the list, as `j` and `k` do.
+#[tokio::test]
+async fn down_and_up_move_the_list() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    let first = selected_rows(&drawn(&bench, &section, 100));
+
+    assert_eq!(bench.key(&mut section, "down"), Handled::Consumed);
+    let second = selected_rows(&drawn(&bench, &section, 100));
+    assert_eq!(second[0].0, first[0].0 + 1, "`Down` moved one row down");
+    assert!(second[0].1.contains("vulkan-tutorials"), "{second:?}");
+
+    assert_eq!(bench.key(&mut section, "up"), Handled::Consumed);
+    assert_eq!(
+        selected_rows(&drawn(&bench, &section, 100)),
+        first,
+        "`Up` moved back"
+    );
+}
+
+/// MOD-67 M3 `VIEW_DEFAULTS`: the editor moves its focus on `Down` and `Up` as on `Tab` and
+/// `Shift+Tab`, and the field typed into is the focused one.
+#[tokio::test]
+async fn the_editor_moves_focus_on_down_and_up() {
+    let bench = SectionBench::new().await;
+    let mut section = bench_over_demo(&bench).await;
+    bench.key(&mut section, "j");
+    bench.key(&mut section, "n");
+
+    assert_eq!(bench.key(&mut section, "down"), Handled::Consumed);
+    type_at(&bench, &mut section, "git@x");
+    assert_eq!(bench.key(&mut section, "up"), Handled::Consumed);
+    type_at(&bench, &mut section, "alpha");
+
+    let frame = bench.render_section(&section, 100);
+    assert!(frame.contains("name          : alpha"), "{frame}");
+    assert!(frame.contains("remote_url    : git@x"), "{frame}");
+}
+
+/// MOD-67 D5: `F1` reaches help from inside the editor (the modal global layer admits function
+/// keys), while `?` is a letter of the field.
+#[tokio::test]
+async fn f1_opens_help_from_the_editor() {
+    let mut harness = hierarchy_over(MemStore::demo()).await;
+    harness.key("j");
+    harness.key("n");
+    harness.settle().await;
+    harness.key("?");
+    let frame = harness.render();
+    assert!(frame.contains("name          : ?"), "{frame}");
+    assert!(!frame.contains("closes this box"), "{frame}");
+
+    harness.key("f1");
+    let frame = harness.render();
+    assert!(frame.contains("F1 closes this box"), "{frame}");
+    assert!(frame.contains("Hierarchy: Tab/Down next field"), "{frame}");
+}
+
+/// MOD-67 D14, one rebinding per lane: `[settings.hierarchy] infer = "I"` makes `I` infer, leaves
+/// `i` inert, and the hint row follows.
+#[tokio::test]
+async fn a_rebound_infer_acts_on_its_new_chord_and_the_hint_follows() {
+    let keys = || {
+        htui::keys::load_str("version = 1\n[settings.hierarchy]\ninfer = \"I\"\n")
+            .expect("the key file loads")
+    };
+    let mut harness = hierarchy_over(MemStore::demo()).await.with_keys(keys());
+    let frame = harness.render();
+    assert!(
+        frame.contains("b path \u{b7} I infer \u{b7} d delete"),
+        "{frame}"
+    );
+
+    let bench = SectionBench::new().await.with_keys(keys());
+    let mut section = bench_over_demo(&bench).await;
+    assert_eq!(bench.key(&mut section, "i"), Handled::Pass);
+    assert!(bench.drained().is_empty(), "`i` is unbound now");
+    bench.key(&mut section, "I");
+    assert_eq!(
+        inferences(&bench.drained()),
+        vec![ids::WORKSPACE_GRAPHICS],
+        "`I` infers the scope's workspace"
+    );
+}
+
+/// MOD-67 M3 R1 (L2): the warning's own sentence names no key, so a rebound `confirm.yes` cannot
+/// leave it saying `y`; the hint row under it names the chord that continues.
+#[tokio::test]
+async fn a_rebound_yes_is_the_one_key_the_warning_names() {
+    let keys = htui::keys::load_str("version = 1\n[settings.hierarchy]\nyes = \"Y\"\n")
+        .expect("the key file loads");
+    let mut harness = hierarchy_over(MemStore::demo()).await.with_keys(keys);
+    harness.key("j");
+    harness.key("d");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(frame.contains("Nothing here can be undone."), "{frame}");
+    assert!(
+        frame.contains("Y continue"),
+        "the hint names the rebound chord: {frame}"
+    );
+    assert!(
+        !frame.contains("`y` to continue"),
+        "no sentence names the default chord: {frame}"
+    );
+
+    harness.key("Y");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("Enter confirm"),
+        "`Y` continued to the typed stage: {frame}"
+    );
+}

@@ -22,19 +22,38 @@ pub struct KeyChord {
 impl KeyChord {
     /// A normalised chord.
     ///
-    /// Two rules, both forced by how terminals report keys: `Shift+Tab` is `BackTab` without a
-    /// shift flag, and a `Char` already carries its shift in the character itself (`J`, `?`), so
-    /// the flag is dropped there.
+    /// Three rules, all forced by how terminals report keys: `Shift+Tab` is `BackTab` without a
+    /// shift flag; a `Char` already carries its shift in the character itself (`J`, `?`), so
+    /// the flag is dropped there; and CONTROL with an ASCII capital is the lower-case letter,
+    /// since a kitty-protocol terminal reports ctrl-shift-d as `D` and the legacy encoding as
+    /// `d` (MOD-67 M3 PA-6). `parse_strict` still refuses `ctrl-D` (it checks before
+    /// normalising).
     #[must_use]
     pub fn new(code: KeyCode, mods: KeyModifiers) -> Self {
-        let (code, mut mods) = match code {
+        let (mut code, mut mods) = match code {
             KeyCode::Tab if mods.contains(KeyModifiers::SHIFT) => (KeyCode::BackTab, mods),
             other => (other, mods),
         };
         if matches!(code, KeyCode::Char(_) | KeyCode::BackTab) {
             mods.remove(KeyModifiers::SHIFT);
         }
+        if mods.contains(KeyModifiers::CONTROL)
+            && let KeyCode::Char(c) = code
+            && c.is_ascii_uppercase()
+        {
+            code = KeyCode::Char(c.to_ascii_lowercase());
+        }
         Self { code, mods }
+    }
+
+    /// Whether a capturing or confirming mode lets this chord through to the global layer
+    /// (MOD-67 D5): CONTROL or ALT is held, or the key is a function key. `ctrl-c`, `ctrl-f`,
+    /// `alt-x`, `F1` pass; `q`, `?`, `Tab`, `Enter`, `Esc` and arrows do not.
+    #[must_use]
+    pub fn passes_modal(&self) -> bool {
+        self.mods
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            || matches!(self.code, KeyCode::F(_))
     }
 
     /// The chord a terminal event carries.
@@ -929,6 +948,46 @@ mod tests {
         for spec in CANONICAL.into_iter().chain(["alt-x", "shift-up", "f12"]) {
             let parsed = strict(spec).expect("canonical specs parse");
             assert_eq!(strict(&parsed.spec()), Ok(parsed), "{spec}");
+        }
+    }
+
+    /// MOD-67 M3 PA-6: a kitty-protocol terminal reports ctrl-shift-d as `D` with CONTROL; the
+    /// chord is `ctrl-d`. The key file still cannot write `ctrl-D`.
+    #[test]
+    fn ctrl_with_a_capital_is_the_lower_case_chord() {
+        let event = KeyEvent::new(KeyCode::Char('D'), KeyModifiers::CONTROL);
+        assert_eq!(KeyChord::from_event(event), chord("ctrl-d"));
+        assert_eq!(
+            KeyChord::new(
+                KeyCode::Char('X'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT
+            ),
+            chord("ctrl-alt-x")
+        );
+        assert_eq!(
+            KeyChord::new(KeyCode::Char('X'), KeyModifiers::ALT),
+            KeyChord {
+                code: KeyCode::Char('X'),
+                mods: KeyModifiers::ALT
+            }
+        );
+        assert_eq!(
+            strict("ctrl-D"),
+            Err(ChordError::CtrlCapital {
+                suggestion: "ctrl-d".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn passes_modal_is_ctrl_alt_or_a_function_key() {
+        for spec in ["ctrl-c", "ctrl-f", "alt-x", "f1", "shift-f5"] {
+            assert!(chord(spec).passes_modal(), "{spec}");
+        }
+        for spec in [
+            "q", "?", "tab", "backtab", "enter", "esc", "down", "shift-up",
+        ] {
+            assert!(!chord(spec).passes_modal(), "{spec}");
         }
     }
 

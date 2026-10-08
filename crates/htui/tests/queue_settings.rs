@@ -13,7 +13,7 @@
 use std::collections::BTreeSet;
 
 use chrono::Utc;
-use htui::app::Action;
+use htui::app::{Action, Handled};
 use htui::queue_settings::{self, QueueSettingsSnapshot, REQUEST_NAMES};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::SectionBench;
@@ -881,4 +881,31 @@ fn graphics_scope() -> Scope {
         workspace_id: ids::WORKSPACE_GRAPHICS,
         project_ids: vec![ids::PROJECT_VULKAN],
     }
+}
+
+/// MOD-67 M3 (D12): `Enter` opens the editor as `e` does, through the queue's view default on
+/// `common.edit`; a browse key is a chord, so `ctrl-e`, `ctrl-enter` and `ctrl-r` do nothing
+/// (ANA-26 §2.6 defect 1); the open editor passes `F1` and `ctrl-c` and keeps `Tab`.
+#[tokio::test]
+async fn enter_edits_and_modifier_chords_are_not_their_letters_in_queue() {
+    let snapshot = bench_settings(&demo()).await;
+    let (bench, mut section) = bench_from(&snapshot).await;
+    move_to(&bench, &mut section, row::BATCH_CAP);
+
+    for chord in ["ctrl-e", "ctrl-enter", "ctrl-r"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "`{chord}`");
+        assert!(!section.captures_input(), "`{chord}` opens no editor");
+    }
+    assert!(bench.drained().is_empty(), "nothing read");
+
+    assert_eq!(bench.key(&mut section, "enter"), Handled::Consumed);
+    assert!(section.captures_input(), "`Enter` opens the editor");
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass, "help is F1");
+    assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
+    assert_eq!(
+        bench.key(&mut section, "tab"),
+        Handled::Consumed,
+        "the tab stays"
+    );
+    assert!(section.captures_input(), "the editor is still open");
 }

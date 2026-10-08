@@ -1775,6 +1775,31 @@ async fn r_reloads_and_esc_clears_the_notice() {
     assert!(!bench.render_section(&section, 100).contains("nope"));
 }
 
+/// MOD-67 M3 (ANA-26 §2.6 defect 1): a browse key is a chord, modifiers included, so `ctrl-e`
+/// opens no editor and `ctrl-r` reads nothing. The open editor passes CONTROL, ALT and function
+/// keys to the shell (`F1` is help) and swallows every other key it does not use.
+#[tokio::test]
+async fn modifier_chords_are_not_their_letters_in_prompt() {
+    let (bench, mut section, _) = bench_with(&demo()).await;
+
+    assert_eq!(bench.key(&mut section, "ctrl-e"), Handled::Pass);
+    assert!(!section.captures_input(), "`ctrl-e` opens no editor");
+    assert_eq!(bench.key(&mut section, "ctrl-r"), Handled::Pass);
+    assert!(bench.drained().is_empty(), "`ctrl-r` reads nothing");
+
+    move_to(&bench, &mut section, app_row(SettingKey::TokenBudget));
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    assert!(section.captures_input(), "the editor");
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass, "help is F1");
+    assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
+    assert_eq!(
+        bench.key(&mut section, "tab"),
+        Handled::Consumed,
+        "the tab stays"
+    );
+    assert!(section.captures_input(), "the editor is still open");
+}
+
 /// A scope change drops what belongs to the other workspace — the editor included, because its
 /// compare-and-set token is the other workspace's — and keeps the notice.
 #[tokio::test]

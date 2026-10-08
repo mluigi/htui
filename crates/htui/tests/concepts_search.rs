@@ -71,6 +71,11 @@ async fn open(index: Option<Arc<MemIndex>>) -> Harness {
     if let Some(index) = index {
         harness = harness.with_concepts_runtime(ConceptsRuntime::new(index));
     }
+    in_platform(harness).await
+}
+
+/// `harness` with every tab and overlay registered, moved to Platform, on the Backlog.
+async fn in_platform(mut harness: Harness) -> Harness {
     register_all(harness.app());
     harness.drive_to_end().await;
     harness.key("w");
@@ -412,4 +417,80 @@ async fn the_first_search_in_flight_says_it_loads_the_model() {
     let frame = harness.render();
     assert!(frame.contains(LOADING), "{frame}");
     insta::assert_snapshot!("searching", frame);
+}
+
+/// The last non-empty line of a frame: the status line.
+fn status_line(frame: &str) -> &str {
+    frame
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim_end()
+}
+
+/// MOD-67 M3 (D7, D8, L-E Q7): the search's field captures `?`, so the status line, the `?` box
+/// and its closer name only `F1`.
+#[tokio::test]
+async fn the_status_line_and_help_box_over_the_search_name_f1() {
+    let mut harness = open(Some(seeded().await)).await;
+    harness.key("ctrl-f");
+    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · F1 help");
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opens the box");
+    let frame = harness.render();
+    for line in [
+        "Search concepts: Ctrl+d decisions only",
+        "Overlay: Esc close",
+        "Global: Ctrl+c quit · F1 help",
+        "F1 closes this box",
+    ] {
+        assert!(frame.contains(line), "`{line}` is in the box: {frame}");
+    }
+    assert!(!frame.contains("?/F1"), "`?` is query text here: {frame}");
+}
+
+/// MOD-67 M3: the lane's rebinding test. `[concepts] reindex = "f5"` moves the re-index to `F5`:
+/// `Ctrl+R` does nothing (and types nothing), `F5` runs it, and the hint names `F5`.
+#[tokio::test]
+async fn a_rebound_reindex_acts_and_the_old_chord_is_inert() {
+    let keys =
+        htui::keys::load_str("version = 1\n[concepts]\nreindex = \"f5\"\n").expect("the keys load");
+    let mut harness = in_platform(
+        Harness::demo()
+            .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+            .with_concepts_runtime(ConceptsRuntime::new(Arc::new(MemIndex::new())))
+            .with_keys(keys),
+    )
+    .await;
+
+    let (backend, scope) = platform_scope().await;
+    let report = clip(
+        &report_line(&MemIndex::new().seed(&backend, &scope).await),
+        INNER_CELLS,
+    );
+
+    harness.key("ctrl-f");
+    harness.key("x");
+    harness.key("ctrl-r");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(search_is_open(&mut harness));
+    assert!(!frame.contains(&report), "`Ctrl+R` ran nothing: {frame}");
+    assert!(!frame.contains(INDEXING), "{frame}");
+    assert!(
+        frame.contains("query x") && !frame.contains("query xr"),
+        "and typed nothing: {frame}"
+    );
+    assert!(
+        frame.contains("F5 index"),
+        "the hint names the new chord: {frame}"
+    );
+    assert!(!frame.contains("Ctrl+r"), "and not the old one: {frame}");
+
+    harness.key("f5");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains(&report), "`F5` re-indexed: {frame}");
+    assert_eq!(harness.app().status, None);
 }

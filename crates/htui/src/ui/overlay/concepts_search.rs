@@ -12,7 +12,7 @@
 //! `StoreReply::Concepts`, with the error inside (D232): a missing or unreachable Qdrant is a line
 //! in this box and nothing else.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 use htui_core::model::{ProjectId, ProjectRef, Scope};
 use htui_store::vector::{Hit, Owner, SearchQuery};
 use ratatui::Frame;
@@ -24,6 +24,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
 use crate::concepts;
 use crate::concepts_worker::ConceptsReply;
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::layout::centered;
@@ -81,9 +82,16 @@ pub const NO_MATCHES: &str = "no matches — Ctrl+R indexes this scope if the in
 /// After the list, when the query or a toggle moved since it was searched.
 pub const CHANGED: &str = "changed — Enter searches again";
 
-/// The keys, under everything.
-const HINT: &str =
-    "Enter search/open  Up/Dn move  Ctrl+D decisions  Ctrl+P project  Ctrl+R re-index  Esc close";
+/// The keys, under everything (MOD-67 D9). `Enter` is the field's own (D13); the short `scope`
+/// and `index` labels keep the row inside the box at 100 columns (L-E Q5, maintainer 2026-10-08).
+const HINT: HintSpec = &[
+    Hint::Text("Enter search/open"),
+    Hint::Pair(Act::ConceptsUp, Act::ConceptsDown, "move"),
+    Hint::One(Act::ConceptsDecisions, "decisions"),
+    Hint::One(Act::ConceptsProject, "scope"),
+    Hint::One(Act::ConceptsReindex, "index"),
+    Hint::One(Act::OverlayClose, "close"),
+];
 
 /// The concepts search (MOD-64): a query field, a project scope, a decisions toggle and the last
 /// hits, searched off the UI thread through `StoreRequest::SearchConcepts`.
@@ -283,58 +291,48 @@ impl Overlay for ConceptsSearch {
         true
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(views::CONCEPTS_QUERY)
+    }
+
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
         // Nothing on open: the first search loads a model, so only `Enter` asks (D234).
         Vec::new()
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let chord = key.modifiers - KeyModifiers::SHIFT;
-        if chord == KeyModifiers::CONTROL {
-            match key.code {
-                KeyCode::Char('d' | 'D') => {
-                    self.decisions = !self.decisions;
-                    return Handled::Consumed;
-                }
-                KeyCode::Char('p' | 'P') => {
-                    self.cycle_project(ctx.projects);
-                    return Handled::Consumed;
-                }
-                KeyCode::Char('r' | 'R') => {
-                    self.reindex(ctx);
-                    return Handled::Consumed;
-                }
-                _ => {}
+        // The field sees the key first (MOD-67 D13): printable chords, the editing keys, `Enter`
+        // and `Esc` are its own. It passes every CONTROL/ALT chord and the rest.
+        match self.field.on_key(key) {
+            FieldOutcome::Consumed => {
+                self.notice = None;
+                return Handled::Consumed;
             }
-        }
-        // Every other chord is the shell's: `Ctrl+C` quits from here too (D261).
-        if !chord.is_empty() {
-            return Handled::Pass;
-        }
-        match key.code {
-            KeyCode::Up => {
-                self.cursor = self.cursor.saturating_sub(1);
-                Handled::Consumed
+            FieldOutcome::Submit => {
+                self.enter(ctx);
+                return Handled::Consumed;
             }
-            KeyCode::Down => {
+            // `Esc`: the shell's `overlay.close` closes the box.
+            FieldOutcome::Cancel => return Handled::Pass,
+            FieldOutcome::Pass => {}
+        }
+        // Only the first candidate counts: an own act acts; `overlay.close` and `global.help`
+        // (`F1`) are the shell's, `Ctrl+C` too (D261); `Tab` and the rest are swallowed by
+        // `is_modal`.
+        let chord = KeyChord::from_event(key);
+        match ctx.keys().actions(views::CONCEPTS_QUERY, chord).first() {
+            Some(Act::ConceptsDecisions) => self.decisions = !self.decisions,
+            Some(Act::ConceptsProject) => self.cycle_project(ctx.projects),
+            Some(Act::ConceptsReindex) => self.reindex(ctx),
+            Some(Act::ConceptsUp) => self.cursor = self.cursor.saturating_sub(1),
+            Some(Act::ConceptsDown) => {
                 if self.cursor + 1 < self.hits.len() {
                     self.cursor += 1;
                 }
-                Handled::Consumed
             }
-            _ => match self.field.on_key(key) {
-                FieldOutcome::Consumed => {
-                    self.notice = None;
-                    Handled::Consumed
-                }
-                FieldOutcome::Submit => {
-                    self.enter(ctx);
-                    Handled::Consumed
-                }
-                // `Esc` reaches the wildcard close; `Tab` and the rest are swallowed by `is_modal`.
-                FieldOutcome::Cancel | FieldOutcome::Pass => Handled::Pass,
-            },
+            _ => return Handled::Pass,
         }
+        Handled::Consumed
     }
 
     /// MOD-22 review M-1: a bracketed paste is query text, as typing it would be.
@@ -454,7 +452,8 @@ impl Overlay for ConceptsSearch {
 
         frame.render_widget(row(&status_text, status_style), status);
         frame.render_widget(row(&index_text, index_style), index);
-        frame.render_widget(row(HINT, theme.dim), hint);
+        let keys = ctx.keys().hint(views::CONCEPTS_QUERY, HINT);
+        frame.render_widget(row(&keys, theme.dim), hint);
     }
 }
 
@@ -521,6 +520,7 @@ mod tests {
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ProjectRef, WorkspaceId};
     use htui_store::vector::{Owner, PointType};
@@ -845,6 +845,23 @@ mod tests {
             assert_eq!(sent.len(), 1, "{header}");
             assert_eq!(sent[0].projects, projects, "{header}");
         }
+    }
+
+    /// MOD-67 M3 (PA-6): a kitty-protocol terminal reports ctrl-shift-d as `D`+CONTROL; the
+    /// chord folds to `ctrl-d`, so it still toggles. `Shift+Down` is not `concepts.down`
+    /// (accepted, L-E §1): it passes, and the modal box swallows it.
+    #[test]
+    fn a_ctrl_capital_toggles_and_shift_down_does_not_move() {
+        let bench = Bench::platform();
+        let mut search = ConceptsSearch::new();
+        assert_eq!(bench.ctrl(&mut search, 'D'), Handled::Consumed);
+        assert!(search.decisions);
+        search.hits = vec![item_hit(), item_hit()];
+        let shift_down = KeyEvent::new(KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(bench.key(&mut search, shift_down), Handled::Pass);
+        assert_eq!(search.cursor, 0);
+        assert_eq!(bench.code(&mut search, KeyCode::Down), Handled::Consumed);
+        assert_eq!(search.cursor, 1);
     }
 
     #[test]

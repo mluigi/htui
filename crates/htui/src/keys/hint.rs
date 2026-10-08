@@ -4,6 +4,10 @@
 //! D8). A hint row and the status line take the first chord of each action; a `?` box line lists
 //! all of them. Rows sharing a help label (the nine `select_tab_*`) collapse into one entry, and
 //! an unbound action drops out, except `global.quit`, which always ends with the fixed `Ctrl+c`.
+//!
+//! MOD-67 M3: every label goes through the layer that resolves it, so a modal layer's filtered
+//! chords never show (D5). The status line, the `?` box and its closer render a stack (D7, D8):
+//! `Stack::BASE` gives today's text, a view's stack its own.
 
 use crossterm::event::KeyCode;
 use unicode_width::UnicodeWidthStr;
@@ -20,10 +24,16 @@ const INDENT: &str = "  ";
 /// One element of a hint spec (ANA-26 §7.6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Hint {
-    /// `"{label} {text}"`, e.g. `e edit DSN`.
+    /// `"{label} {text}"`, e.g. `e edit DSN`; the label alone when `text` is empty.
     One(Act, &'static str),
-    /// `"{label}/{label} {text}"`, e.g. `j/k rows`; one side unbound renders the other alone.
+    /// `"{label}/{label} {text}"`, e.g. `j/k rows`; one side unbound renders the other alone,
+    /// and an empty `text` renders the labels alone (`j/k`).
     Pair(Act, Act, &'static str),
+    /// Every admitted chord of the act, joined by `/`, then `text`: `n/Esc cancel` (MOD-67 D9).
+    All(Act, &'static str),
+    /// Fixed text: a widget's own key (`Enter store`, `Esc cancel`) or a note (`typed text is
+    /// never shown`). Never dropped, unless it is empty.
+    Text(&'static str),
 }
 
 /// A view's hint row, as data: `const BROWSE: HintSpec = &[...]`.
@@ -79,31 +89,47 @@ impl HelpLine {
 }
 
 impl Keys {
-    /// The first chord of `act` through `stack`, as `KeyChord::label` writes it; `None` when it
-    /// is unbound. Prose such as `format!("press {}", …)` uses it from M3 on.
+    /// The first chord of `act` through `stack` that its layer admits (`Layer::admits_chord`),
+    /// as `KeyChord::label` writes it; `None` when there is none. Prose such as
+    /// `format!("press {}", …)` uses it from M3 on.
     #[must_use]
     pub fn label(&self, stack: Stack<'_>, act: Act) -> Option<String> {
-        self.resolve_row(stack, act)?
-            .chords
-            .first()
-            .map(KeyChord::label)
+        self.labels(stack, act).into_iter().next()
     }
 
-    /// A view's hint row: each element through `stack`, first chord only, unbound dropped,
-    /// joined by ` · ` (ANA-26 §7.6).
+    /// Every chord of `act` through `stack` that its layer admits, as labels (MOD-67 D9).
+    #[must_use]
+    pub fn labels(&self, stack: Stack<'_>, act: Act) -> Vec<String> {
+        self.resolve_row(stack, act)
+            .map(|(layer, row)| {
+                row.chords
+                    .iter()
+                    .filter(|chord| layer.admits_chord(**chord))
+                    .map(KeyChord::label)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// A view's hint row: each element through `stack`, unbound ones dropped, joined by ` · `
+    /// (ANA-26 §7.6). `One` and `Pair` take the first admitted chord, `All` every one; `Text`
+    /// is written as is.
     #[must_use]
     pub fn hint(&self, stack: Stack<'_>, spec: HintSpec) -> String {
+        let labelled = |labels: Vec<String>, text: &str| {
+            (!labels.is_empty()).then(|| with_text(&labels.join("/"), text))
+        };
         let element = |hint: &Hint| match *hint {
-            Hint::One(act, text) => self
-                .label(stack, act)
-                .map(|label| format!("{label} {text}")),
-            Hint::Pair(first, second, text) => {
-                let labels: Vec<String> = [first, second]
+            Hint::One(act, text) => labelled(self.label(stack, act).into_iter().collect(), text),
+            Hint::Pair(first, second, text) => labelled(
+                [first, second]
                     .into_iter()
                     .filter_map(|act| self.label(stack, act))
-                    .collect();
-                (!labels.is_empty()).then(|| format!("{} {text}", labels.join("/")))
-            }
+                    .collect(),
+                text,
+            ),
+            Hint::All(act, text) => labelled(self.labels(stack, act), text),
+            Hint::Text(text) => (!text.is_empty()).then(|| text.to_owned()),
         };
         spec.iter()
             .filter_map(element)
@@ -111,28 +137,108 @@ impl Keys {
             .join(SEP)
     }
 
-    /// The status line (D7): the `Global` rows that are `offered` and bound, in catalogue order,
-    /// the first chord of each, rows sharing a help label collapsed to the first (the digits),
-    /// joined by ` · `.
+    /// The status line (D7, MOD-67 M3 PA-9) from `stack`'s global layer: quit first, always,
+    /// as its first admitted chord, else `Ctrl+c`; then every other `Global` row the layer
+    /// admits that is `offered` and has an admitted chord, in catalogue order, its first
+    /// admitted chord, rows sharing a help label collapsed to the first (the digits), joined by
+    /// ` · `. `Stack::BASE` gives the M1 line.
     #[must_use]
-    pub fn status_line(&self, offered: impl Fn(Act) -> bool) -> String {
-        let mut shown: Vec<&str> = Vec::new();
-        let mut entries = Vec::new();
-        for row in self
+    pub fn status_line(&self, stack: Stack<'_>, offered: impl Fn(Act) -> bool) -> String {
+        let global = stack.global();
+        let admitted = |row: &&super::Row| {
+            row.context == Context::Global
+                && global.is_some_and(|(index, _)| stack.admits(index, row.act))
+        };
+        let first_chord = |row: &super::Row| {
+            global.and_then(|(_, layer)| {
+                row.chords
+                    .iter()
+                    .copied()
+                    .find(|chord| layer.admits_chord(*chord))
+            })
+        };
+        let quit = self
             .rows
             .iter()
-            .filter(|row| row.context == Context::Global)
-        {
-            let Some(first) = row.chords.first() else {
-                continue;
-            };
-            if !offered(row.act) || shown.contains(&row.help) {
+            .filter(admitted)
+            .find(|row| row.act == Act::Quit)
+            .and_then(first_chord)
+            .unwrap_or(CTRL_C);
+        let quit_help = Act::Quit.spec().map_or("quit", |spec| spec.help);
+        let mut shown: Vec<&str> = vec![quit_help];
+        let mut entries = vec![format!("{} {quit_help}", quit.label())];
+        for row in self.rows.iter().filter(admitted) {
+            if row.act == Act::Quit || !offered(row.act) || shown.contains(&row.help) {
                 continue;
             }
+            let Some(first) = first_chord(row) else {
+                continue;
+            };
             shown.push(row.help);
             entries.push(format!("{} {}", first.label(), row.help));
         }
         entries.join(SEP)
+    }
+
+    /// The `?` box (D8, MOD-67 M3): one line per layer of `stack`, narrowest first, under the
+    /// layer's `Context::heading`. A row is listed under the first layer that admits it and has
+    /// a row for it (the `actions` shadowing rule, L-B Q6), with every chord that layer admits;
+    /// rows sharing a help label merge, and a row with no admitted chord drops. `offered` is
+    /// consulted for `Global` rows only. The global layer always lists quit: its admitted
+    /// chords (none when the layer does not admit `Quit`) and the fixed `Ctrl+c`. A layer that
+    /// lists nothing has no line.
+    #[must_use]
+    pub fn help_lines(&self, stack: Stack<'_>, offered: impl Fn(Act) -> bool) -> Vec<HelpLine> {
+        let mut seen: Vec<Act> = Vec::new();
+        let mut lines = Vec::new();
+        let global = stack.global().map(|(index, _)| index);
+        for (index, layer) in stack.layers().iter().enumerate() {
+            let mut here = Vec::new();
+            let mut merged: Vec<(&str, Vec<KeyChord>)> = Vec::new();
+            if global == Some(index) {
+                let help = Act::Quit.spec().map_or("quit", |spec| spec.help);
+                merged.push((help, Vec::new()));
+            }
+            let rows = self
+                .rows
+                .iter()
+                .filter(|row| row.context == layer.context() && stack.admits(index, row.act));
+            for row in rows {
+                if seen.contains(&row.act) {
+                    continue; // shadowed by a narrower layer
+                }
+                here.push(row.act);
+                if row.context == Context::Global && row.act != Act::Quit && !offered(row.act) {
+                    continue;
+                }
+                let chords: Vec<KeyChord> = row
+                    .chords
+                    .iter()
+                    .copied()
+                    .filter(|chord| layer.admits_chord(*chord))
+                    .collect();
+                match merged.iter_mut().find(|(help, _)| *help == row.help) {
+                    Some((_, known)) => known.extend(chords),
+                    None => merged.push((row.help, chords)),
+                }
+            }
+            seen.extend(here);
+            if global == Some(index)
+                && let Some((_, quit)) = merged.first_mut()
+                && !quit.contains(&CTRL_C)
+            {
+                quit.push(CTRL_C);
+            }
+            let entries: Vec<String> = merged
+                .iter()
+                .filter(|(_, chords)| !chords.is_empty())
+                .map(|(help, chords)| format!("{} {help}", chord_list(chords)))
+                .collect();
+            if !entries.is_empty() {
+                lines.push(HelpLine::new(layer.context().heading(), entries));
+            }
+        }
+        lines
     }
 
     /// One `?` box line for `context` (D8): every offered and bound action, all its chords
@@ -168,12 +274,31 @@ impl Keys {
         Some(HelpLine::new(context.heading(), entries))
     }
 
-    /// The box's last line, from `global.help`'s chords: `"?/F1 closes this box"`; `None` if
-    /// help is unbound.
+    /// The box's last line, from the `global.help` chords that `stack`'s global layer admits:
+    /// `"?/F1 closes this box"` on `Stack::BASE`, `"F1 closes this box"` in a modal stack;
+    /// `None` if there is none (help unbound, filtered out, or no global layer).
     #[must_use]
-    pub fn help_closer(&self) -> Option<String> {
-        let chords = self.chords(Context::Global, Act::Help);
-        (!chords.is_empty()).then(|| format!("{} closes this box", chord_list(chords)))
+    pub fn help_closer(&self, stack: Stack<'_>) -> Option<String> {
+        let (index, layer) = stack.global()?;
+        if !stack.admits(index, Act::Help) {
+            return None;
+        }
+        let chords: Vec<KeyChord> = self
+            .chords(Context::Global, Act::Help)
+            .iter()
+            .copied()
+            .filter(|chord| layer.admits_chord(*chord))
+            .collect();
+        (!chords.is_empty()).then(|| format!("{} closes this box", chord_list(&chords)))
+    }
+}
+
+/// `"{labels} {text}"`, or the labels alone when `text` is empty (MOD-67 M3, L-B Q3).
+fn with_text(labels: &str, text: &str) -> String {
+    if text.is_empty() {
+        labels.to_owned()
+    } else {
+        format!("{labels} {text}")
     }
 }
 
@@ -206,7 +331,7 @@ fn chord_list(chords: &[KeyChord]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{HelpLine, Hint};
-    use crate::keys::{Act, Context, Keys, Layer, Stack};
+    use crate::keys::{Act, Context, Keys, Layer, Stack, views};
 
     const BARE: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help";
     const FULL: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help \
@@ -229,18 +354,22 @@ mod tests {
 
     #[test]
     fn the_status_line_without_register_all_is_todays() {
-        assert_eq!(Keys::compiled().status_line(bare), BARE);
+        assert_eq!(Keys::compiled().status_line(Stack::BASE, bare), BARE);
     }
 
     #[test]
     fn the_status_line_with_every_global_offered() {
-        assert_eq!(Keys::compiled().status_line(all), FULL);
+        assert_eq!(Keys::compiled().status_line(Stack::BASE, all), FULL);
     }
 
     #[test]
     fn an_unbound_action_drops_out_of_the_status_line_and_a_hint() {
         let keys = Keys::defaults().with_chords(Context::Global, Act::Quit, &[]);
-        assert!(keys.status_line(all).starts_with("Tab next tab"));
+        // PA-9: quit always leads the status line, as `Ctrl+c` once its own chords are gone.
+        assert!(
+            keys.status_line(Stack::BASE, all)
+                .starts_with("Ctrl+c quit · Tab next tab")
+        );
         let spec = &[Hint::One(Act::Quit, "quit"), Hint::One(Act::Help, "help")];
         assert_eq!(keys.hint(Stack::BASE, spec), "? help");
     }
@@ -287,7 +416,10 @@ mod tests {
                 .as_deref(),
             Some("Overlay: Esc close")
         );
-        assert_eq!(keys.help_closer().as_deref(), Some("?/F1 closes this box"));
+        assert_eq!(
+            keys.help_closer(Stack::BASE).as_deref(),
+            Some("?/F1 closes this box")
+        );
     }
 
     #[test]
@@ -326,5 +458,130 @@ mod tests {
                 "  ?/F1 help · w workspaces · Ctrl+f find · Ctrl+w waiting",
             ]
         );
+    }
+
+    #[test]
+    fn an_empty_text_renders_the_labels_alone() {
+        let layers = [Layer::all(Context::Common), Layer::all(Context::List)];
+        let spec = &[
+            Hint::Pair(Act::ListDown, Act::ListUp, ""),
+            Hint::One(Act::Edit, "edit"),
+            Hint::One(Act::Reload, ""),
+        ];
+        assert_eq!(
+            Keys::compiled().hint(Stack::new(&layers), spec),
+            "j/k · e edit · r"
+        );
+    }
+
+    #[test]
+    fn all_lists_every_admitted_chord_and_text_is_fixed() {
+        let keys = Keys::compiled();
+        let layers = [Layer::all(Context::Confirm)];
+        let spec = &[
+            Hint::All(Act::ConfirmNo, "cancel"),
+            Hint::Text("Enter store"),
+            Hint::Text(""),
+        ];
+        assert_eq!(
+            keys.hint(Stack::new(&layers), spec),
+            "n/Esc cancel · Enter store"
+        );
+        let spec = &[Hint::All(Act::Help, "help"), Hint::All(Act::Quit, "quit")];
+        assert_eq!(keys.hint(views::CAPTURE, spec), "F1 help");
+        assert_eq!(keys.hint(Stack::BASE, spec), "?/F1 help · q quit");
+        assert_eq!(keys.labels(views::CAPTURE, Act::Help), ["F1".to_owned()]);
+        assert_eq!(keys.label(views::CAPTURE, Act::Help).as_deref(), Some("F1"));
+    }
+
+    #[test]
+    fn the_status_line_follows_the_stacks_global_layer() {
+        let keys = Keys::compiled();
+        assert_eq!(keys.status_line(views::AGENTS_BROWSE, bare), BARE);
+        assert_eq!(keys.status_line(views::AGENTS_BROWSE, all), FULL);
+        let modal_all = "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting";
+        for stack in [views::AGENTS_FORM, views::CAPTURE, views::KINDS_CONFIRM] {
+            assert_eq!(keys.status_line(stack, all), modal_all);
+            assert_eq!(keys.status_line(stack, bare), "Ctrl+c quit · F1 help");
+        }
+        for stack in [views::SWITCHER, views::WAITING_LIST, views::MIGRATION] {
+            assert_eq!(keys.status_line(stack, all), "Ctrl+c quit · ? help");
+            assert_eq!(keys.status_line(stack, bare), "Ctrl+c quit · ? help");
+        }
+        assert_eq!(
+            keys.status_line(views::CONCEPTS_QUERY, all),
+            "Ctrl+c quit · F1 help"
+        );
+    }
+
+    fn texts(lines: Vec<HelpLine>) -> Vec<String> {
+        lines.iter().map(HelpLine::text).collect()
+    }
+
+    #[test]
+    fn the_help_lines_list_an_act_under_its_narrowest_layer() {
+        let keys = Keys::compiled();
+        assert_eq!(
+            texts(keys.help_lines(views::QUEUE_BROWSE, bare)),
+            [
+                "Queue: e/Enter edit",
+                "Settings: l/]/Right next section · h/[/Left previous section",
+                "Common: r reload · Esc dismiss",
+                "List: j/Down down · k/Up up",
+                "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
+                 · ?/F1 help",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::SWITCHER, all)),
+            [
+                "Workspaces: Enter switch workspace",
+                "List: j/Down down · k/Up up",
+                "Overlay: Esc close",
+                "Global: Ctrl+c quit · ?/F1 help",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::MIGRATION, all)),
+            [
+                "Schema: y/Y yes · n/Esc/N no",
+                "Overlay: Esc close",
+                "Global: Ctrl+c quit · ?/F1 help",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::AGENTS_FORM, bare)),
+            [
+                "Agents: Tab/Down next field · Shift+Tab/Up previous field",
+                "Global: Ctrl+c quit · F1 help",
+            ]
+        );
+        assert_eq!(
+            texts(keys.help_lines(views::CAPTURE, all)),
+            ["Global: Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting"]
+        );
+    }
+
+    #[test]
+    fn the_closer_follows_the_global_layer() {
+        let keys = Keys::compiled();
+        assert_eq!(
+            keys.help_closer(Stack::BASE).as_deref(),
+            Some("?/F1 closes this box")
+        );
+        assert_eq!(
+            keys.help_closer(views::SWITCHER).as_deref(),
+            Some("?/F1 closes this box")
+        );
+        for stack in [views::CONCEPTS_QUERY, views::CAPTURE] {
+            assert_eq!(
+                keys.help_closer(stack).as_deref(),
+                Some("F1 closes this box")
+            );
+        }
+        let unbound = Keys::defaults().with_chords(Context::Global, Act::Help, &[]);
+        assert_eq!(unbound.help_closer(Stack::BASE), None);
+        let question_only = Keys::defaults().with_chords(Context::Global, Act::Help, &["?"]);
+        assert_eq!(question_only.help_closer(views::CAPTURE), None);
     }
 }

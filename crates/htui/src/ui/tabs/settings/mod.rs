@@ -32,11 +32,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
+use crate::keys::{Act, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
 use crate::ui::tabs::registry::{Tab, TabId};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 pub use agents::AgentsSection;
 pub use boxes::BoxesSection;
@@ -77,6 +78,19 @@ pub(crate) fn yes_or_no(text: &str) -> Option<bool> {
 /// is gone — and all of them draw them the same way (M4 D14).
 pub(crate) fn is_error(notice: &str) -> bool {
     notice.starts_with("changed elsewhere") || notice.starts_with("deleted elsewhere")
+}
+
+/// What a modal mode answers for a `chord` none of its own acts took (MOD-67 M3 PA-5): `Pass`
+/// for the chords `stack`'s global layer lets through (CONTROL, ALT, function keys), so `ctrl-c`
+/// quits and `F1` opens help; `Consumed` for every other, so a `q` or a `Tab` goes nowhere.
+///
+/// One copy for every section's modes, so the pass rule cannot drift between them.
+pub(crate) fn modal_rest(stack: Stack<'_>, chord: KeyChord) -> Handled {
+    if stack.passes(chord) {
+        Handled::Pass
+    } else {
+        Handled::Consumed
+    }
 }
 
 /// `text` in rows of at most `width` cells, its whitespace collapsed: words joined by one space,
@@ -152,6 +166,13 @@ pub trait SettingsSection {
     }
     /// A key the tab did not use for section navigation.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled;
+    /// This section's key stack in its current mode (MOD-67 D4), or `None` while the section is
+    /// not converted: the shell then keeps today's status line, `?` box and `Stack::BASE`
+    /// dispatch, and the tab cycles through `views::SETTINGS_TAB`. Defaulted, so no section
+    /// changes until its lane converts it.
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        None
+    }
     /// Whether a bracketed paste is offered to this section now. Defaulted to
     /// [`captures_input`](SettingsSection::captures_input); a section that opens its own field for
     /// a paste — the login pane's redirect (MOD-22 review R2-L3) — says so here without claiming
@@ -334,6 +355,15 @@ impl Tab for SettingsTab {
         }
     }
 
+    /// The active section's stack (MOD-67 D4): `None` while it is unconverted.
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        self.sections.active().and_then(SettingsSection::key_stack)
+    }
+
+    /// Section cycling through `settings.next_section`/`prev_section` (MOD-67 M3, L-B Q10):
+    /// resolved through the active section's stack, else `views::SETTINGS_TAB`. Chord equality
+    /// includes modifiers, so `ctrl-l`, `ctrl-h` or `shift-right` no longer cycle (ANA-26 §2.6
+    /// defect 1). Every other key goes to the active section.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // A section that is taking typed text answers first: `l` is a letter there, not a cycle.
         if self
@@ -343,18 +373,22 @@ impl Tab for SettingsTab {
         {
             return self.delegate(key, ctx);
         }
-        match key.code {
-            KeyCode::Char('l') | KeyCode::Char(']') | KeyCode::Right => {
+        let stack = self
+            .sections
+            .active()
+            .and_then(SettingsSection::key_stack)
+            .unwrap_or(views::SETTINGS_TAB);
+        match ctx.keys().actions(stack, KeyChord::from_event(key)).first() {
+            Some(Act::NextSection) => {
                 self.sections.cycle_next();
-                return Handled::Consumed;
+                Handled::Consumed
             }
-            KeyCode::Char('h') | KeyCode::Char('[') | KeyCode::Left => {
+            Some(Act::PrevSection) => {
                 self.sections.cycle_prev();
-                return Handled::Consumed;
+                Handled::Consumed
             }
-            _ => {}
+            _ => self.delegate(key, ctx),
         }
-        self.delegate(key, ctx)
     }
 
     /// Only to a section that is taking text (MOD-22 review M-1); anywhere else a paste is not

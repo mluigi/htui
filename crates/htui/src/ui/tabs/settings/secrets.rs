@@ -37,6 +37,7 @@ use zeroize::Zeroizing;
 
 use crate::app::{Action, Ctx, Handled};
 use crate::hierarchy::{HierarchySnapshot, ProjectEntry, ScopeWrite};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::secrets_settings::{
     CHECK_SECRET_PROVIDER, CHECK_SECRET_SCOPE, IdentityEntry, IdentityState, READ_NAME,
     REQUEST_NAMES, Redacted, SET_PROJECT_SECRET_SCOPE, SecretCheck, SecretsSnapshot, UrlState,
@@ -48,7 +49,7 @@ use crate::ui::tabs::settings::{
     wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// What a keyring row says before the first reply.
 const NOT_READ: &str = "not read yet";
@@ -126,19 +127,36 @@ const IDENTITY_LABELS: [&str; 2] = ["client ID: ", "client secret: "];
 /// The scope form's labels.
 const SCOPE_LABELS: [&str; 3] = ["project ID: ", "environment: ", "path: "];
 
-/// Browse's keys, with something to browse.
-const HINT_BROWSE: &str = "e edit \u{b7} c clear \u{b7} t check \u{b7} r reload \u{b7} j/k rows";
-/// Browse's keys with nothing read, or the read refused.
-const HINT_NO_SNAPSHOT: &str = "r reload";
-/// The URL form's keys.
-const HINT_URL: &str = "Enter store \u{b7} Esc cancel";
+/// Browse's keys, with something to browse: `e edit · c clear · t check · r reload · j/k rows`.
+const HINT_BROWSE: HintSpec = &[
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::Clear, "clear"),
+    Hint::One(Act::SecretsCheck, "check"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "rows"),
+];
+/// Browse's keys with nothing read, or the read refused: `r reload`.
+const HINT_NO_SNAPSHOT: HintSpec = &[Hint::One(Act::Reload, "reload")];
+/// The URL form's keys, the field's own: `Enter store · Esc cancel`.
+const HINT_URL: HintSpec = &[Hint::Text("Enter store"), Hint::Text("Esc cancel")];
 /// The identity form's keys, and the promise the mask is.
-const HINT_IDENTITY: &str =
-    "Tab next field \u{b7} Enter store \u{b7} Esc cancel \u{b7} the secret is never shown";
-/// The scope form's keys.
-const HINT_SCOPE: &str = "Tab next field \u{b7} Enter save \u{b7} Esc cancel";
-/// Every question's keys.
-const HINT_CONFIRM: &str = "y confirm \u{b7} n / Esc cancel";
+const HINT_IDENTITY: HintSpec = &[
+    Hint::One(Act::FormNextField, "next field"),
+    Hint::Text("Enter store"),
+    Hint::Text("Esc cancel"),
+    Hint::Text("the secret is never shown"),
+];
+/// The scope form's keys: `Tab next field · Enter save · Esc cancel`.
+const HINT_SCOPE: HintSpec = &[
+    Hint::One(Act::FormNextField, "next field"),
+    Hint::Text("Enter save"),
+    Hint::Text("Esc cancel"),
+];
+/// Every question's keys: `y confirm · n/Esc cancel`.
+const HINT_CONFIRM: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "confirm"),
+    Hint::All(Act::ConfirmNo, "cancel"),
+];
 
 /// The width the four fixed labels pad to.
 const FIXED_LABEL_WIDTH: usize = 8;
@@ -639,9 +657,24 @@ impl SecretsSection {
         }
     }
 
-    /// One key while a form is open. The focused field answers first; `Tab`/`Down` and
-    /// `BackTab`/`Up` move between fields; everything else it passes is swallowed, `CONTROL`
-    /// chords excepted so `ctrl-c` still quits.
+    /// The stack of the current mode (MOD-67 D3): the only place a mode maps to its keys;
+    /// `key_stack`, the key handlers and the hint all read it. The URL form is one field, so it
+    /// captures (`Tab` there is swallowed, as the old no-op focus cycle swallowed it).
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
+            Mode::Browse => views::SECRETS_BROWSE,
+            Mode::EditingUrl(_) => views::CAPTURE,
+            Mode::EditingIdentity { .. } | Mode::EditingScope { .. } => views::SECRETS_FORM,
+            Mode::ConfirmClearUrl | Mode::ConfirmClearIdentity | Mode::ConfirmClearScope { .. } => {
+                views::SECRETS_CONFIRM
+            }
+        }
+    }
+
+    /// One key while a form is open. The focused field answers first; then the mode's stack:
+    /// `form.next_field` (`Tab`, and `Down` as a view default) and `form.prev_field` (`BackTab`,
+    /// `Up`) move between fields; a chord a modal mode passes (CONTROL, ALT, function keys) goes
+    /// to the shell, so `ctrl-c` still quits and `F1` helps; everything else is swallowed.
     fn on_form_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::EditingUrl(field) => field.on_key(key),
@@ -667,14 +700,16 @@ impl SecretsSection {
                 self.mode = Mode::Browse;
                 self.notice = None;
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Handled::Pass;
+            FieldOutcome::Pass => {
+                let stack = self.stack();
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::FormNextField) => self.cycle_focus(true),
+                    Some(Act::FormPrevField) => self.cycle_focus(false),
+                    _ if stack.passes(chord) => return Handled::Pass,
+                    _ => {}
+                }
             }
-            FieldOutcome::Pass => match key.code {
-                KeyCode::Tab | KeyCode::Down => self.cycle_focus(true),
-                KeyCode::BackTab | KeyCode::Up => self.cycle_focus(false),
-                _ => {}
-            },
         }
         Handled::Consumed
     }
@@ -790,14 +825,16 @@ impl SecretsSection {
         }
     }
 
-    /// One key while a question is on screen.
+    /// One key while a question is on screen, through `SECRETS_CONFIRM`: `confirm.yes` clears,
+    /// `confirm.no` closes. A chord a modal mode passes (CONTROL, ALT, function keys) goes to the
+    /// shell, so `alt-y` answers nothing; everything else is swallowed.
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
-        match key.code {
-            KeyCode::Char('y') if self.closed_if_gone() => {}
-            KeyCode::Char('y') => match core::mem::take(&mut self.mode) {
+        let stack = views::SECRETS_CONFIRM;
+        let chord = KeyChord::from_event(key);
+        // The narrowest candidate decides: a global act is the pass rule's.
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes) if self.closed_if_gone() => {}
+            Some(Act::ConfirmYes) => match core::mem::take(&mut self.mode) {
                 Mode::ConfirmClearUrl => {
                     self.send(Write::ClearUrl, StoreRequest::ClearInfisicalUrl, ctx);
                 }
@@ -824,7 +861,8 @@ impl SecretsSection {
                 ),
                 other => self.mode = other,
             },
-            KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
+            Some(Act::ConfirmNo) => self.mode = Mode::Browse,
+            _ if stack.passes(chord) => return Handled::Pass,
             _ => {}
         }
         Handled::Consumed
@@ -1056,8 +1094,8 @@ impl SecretsSection {
 
     /// The one line under the pane: the keys this mode binds, then (in Browse) the last outcome,
     /// which wins the line when both do not fit (Connection's MOD-60 rule).
-    fn hint(&self, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text();
+    fn hint(&self, width: u16, theme: &Theme, keys: &Keys) -> Line<'static> {
+        let keys = self.hint_text(keys);
         let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
             return Line::styled(keys, theme.dim);
         };
@@ -1076,9 +1114,10 @@ impl SecretsSection {
         ])
     }
 
-    /// The keys half of the hint line, plus a write in flight in Browse.
-    fn hint_text(&self) -> String {
-        let keys = match self.mode {
+    /// The keys half of the hint line, rendered through the mode's stack with the keys in force,
+    /// plus a write in flight in Browse.
+    fn hint_text(&self, keys: &Keys) -> String {
+        let spec = match self.mode {
             Mode::EditingUrl(_) => HINT_URL,
             Mode::EditingIdentity { .. } => HINT_IDENTITY,
             Mode::EditingScope { .. } => HINT_SCOPE,
@@ -1093,11 +1132,12 @@ impl SecretsSection {
                 }
             }
         };
+        let keys = keys.hint(self.stack(), spec);
         match self.busy {
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
                 format!("{keys} \u{b7} {} in flight", busy.name())
             }
-            _ => keys.to_owned(),
+            _ => keys,
         }
     }
 
@@ -1373,6 +1413,11 @@ impl SettingsSection for SecretsSection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// The current mode's stack (MOD-67 D4).
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
     /// A bracketed paste into the focused field; a masked one takes it whole or refuses by name.
     fn on_paste(&mut self, text: &str, ctx: &mut Ctx<'_>) -> Handled {
         let field = match &mut self.mode {
@@ -1409,22 +1454,28 @@ impl SettingsSection for SecretsSection {
             }
             Mode::Browse => {}
         }
-        // Browse. `t` is unbound globally and in Settings (plan, verified).
-        match key.code {
-            KeyCode::Char('e') => self.edit(),
-            KeyCode::Char('c') => self.clear(),
-            KeyCode::Char('t') => self.test(ctx),
-            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(true),
-            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(false),
-            // Never refused: re-reading is how a section that lost a reply recovers.
-            KeyCode::Char('r') => {
-                ctx.request(StoreRequest::SecretsInfo);
-                ctx.request(StoreRequest::SecretsTree(ctx.scope.workspace_id));
+        // Browse, through `SECRETS_BROWSE`. Chord equality includes modifiers: `ctrl-t` is not
+        // `t` (a provider check is a login that can latch), `ctrl-e` is not `e`.
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::SECRETS_BROWSE, chord) {
+            match act {
+                Act::Edit => self.edit(),
+                Act::Clear => self.clear(),
+                Act::SecretsCheck => self.test(ctx),
+                Act::ListDown => self.move_cursor(true),
+                Act::ListUp => self.move_cursor(false),
+                // Never refused: re-reading is how a section that lost a reply recovers.
+                Act::Reload => {
+                    ctx.request(StoreRequest::SecretsInfo);
+                    ctx.request(StoreRequest::SecretsTree(ctx.scope.workspace_id));
+                }
+                // Declined with no notice: `Esc` is then the next candidate's, or the shell's.
+                Act::Dismiss if self.notice.is_some() => self.notice = None,
+                _ => continue, // a global act, or one this state declines
             }
-            KeyCode::Esc if self.notice.is_some() => self.notice = None,
-            _ => return Handled::Pass,
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -1480,7 +1531,10 @@ impl SettingsSection for SecretsSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
+        frame.render_widget(
+            Paragraph::new(self.hint(area.width, ctx.theme, ctx.keys())),
+            hint,
+        );
     }
 }
 
@@ -1555,20 +1609,56 @@ fn question(text: &str, room: usize, theme: &Theme) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
 
-    /// The bordered section is 98 cells at 100 columns (H-16).
+    /// The bordered section is 98 cells at 100 columns (H-16), each hint rendered through the
+    /// stack its mode resolves with the default keys.
     #[test]
     fn every_hint_fits_the_section() {
-        for hint in [
-            HINT_BROWSE,
-            HINT_NO_SNAPSHOT,
-            HINT_URL,
-            HINT_IDENTITY,
-            HINT_SCOPE,
-            HINT_CONFIRM,
+        let keys = Keys::compiled();
+        for (stack, spec) in [
+            (views::SECRETS_BROWSE, HINT_BROWSE),
+            (views::SECRETS_BROWSE, HINT_NO_SNAPSHOT),
+            (views::CAPTURE, HINT_URL),
+            (views::SECRETS_FORM, HINT_IDENTITY),
+            (views::SECRETS_FORM, HINT_SCOPE),
+            (views::SECRETS_CONFIRM, HINT_CONFIRM),
         ] {
-            assert!(cell_width(hint) <= 98, "{hint}");
+            let hint = keys.hint(stack, spec);
+            assert!(!hint.is_empty(), "{spec:?}");
+            assert!(cell_width(&hint) <= 98, "{hint}");
         }
+    }
+
+    /// The default rendering of every hint: unchanged text, but `n / Esc` reads `n/Esc` (D9).
+    #[test]
+    fn the_hints_render_todays_text_with_the_default_keys() {
+        let keys = Keys::compiled();
+        let rendered = |stack, spec| keys.hint(stack, spec);
+        assert_eq!(
+            rendered(views::SECRETS_BROWSE, HINT_BROWSE),
+            "e edit \u{b7} c clear \u{b7} t check \u{b7} r reload \u{b7} j/k rows"
+        );
+        assert_eq!(
+            rendered(views::SECRETS_BROWSE, HINT_NO_SNAPSHOT),
+            "r reload"
+        );
+        assert_eq!(
+            rendered(views::CAPTURE, HINT_URL),
+            "Enter store \u{b7} Esc cancel"
+        );
+        assert_eq!(
+            rendered(views::SECRETS_FORM, HINT_IDENTITY),
+            "Tab next field \u{b7} Enter store \u{b7} Esc cancel \u{b7} the secret is never shown"
+        );
+        assert_eq!(
+            rendered(views::SECRETS_FORM, HINT_SCOPE),
+            "Tab next field \u{b7} Enter save \u{b7} Esc cancel"
+        );
+        assert_eq!(
+            rendered(views::SECRETS_CONFIRM, HINT_CONFIRM),
+            "y confirm \u{b7} n/Esc cancel"
+        );
     }
 
     /// MOD-60: the notice is measured in cells and takes the line alone when both do not fit.
@@ -1580,12 +1670,13 @@ mod tests {
             notice: Some(Notice::Error(notice.clone())),
             ..SecretsSection::new()
         };
-        let keys = section.hint_text();
+        let keys = section.hint_text(Keys::compiled());
         let width = cell_width(&keys) + k + 3;
 
         let line = section.hint(
             u16::try_from(width).expect("a hint this narrow fits u16"),
             &Theme::default(),
+            Keys::compiled(),
         );
 
         assert_eq!(line.spans.len(), 1, "{line:?} against {width}");

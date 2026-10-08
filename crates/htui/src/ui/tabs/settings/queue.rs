@@ -24,28 +24,38 @@ use ratatui::widgets::{Paragraph, Wrap};
 use serde_json::{Value, json};
 
 use crate::app::{Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::queue_settings::{QueueProjectEntry, QueueSettingsSnapshot, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, wrapped,
+    message, modal_rest, wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// The help line under the rows (plan risk row 2): a cap guards only what an agent reports.
 pub const UNKNOWN_COST: &str =
     "a run whose agent reports no USD cost is never capped (unknown is unbounded)";
 
-/// Browse's keys, with something to browse.
-pub const HINT_BROWSE: &str = "j/k \u{b7} e edit \u{b7} r reload";
+/// Browse's keys, with something to browse: `j/k · e edit · r reload` by default (`Enter` edits
+/// too, through the queue's view default on `common.edit`; the hint names the first chord).
+pub const HINT_BROWSE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::Reload, "reload"),
+];
 
 /// Browse's keys with nothing read, or the read refused.
-const HINT_NO_SNAPSHOT: &str = "r reload";
+const HINT_NO_SNAPSHOT: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// An open editor's keys.
-pub const HINT_EDITING: &str = "Enter save \u{b7} Esc cancel \u{b7} empty clears";
+/// An open editor's keys: the field's own (MOD-67 D13).
+pub const HINT_EDITING: HintSpec = &[
+    Hint::Text("Enter save"),
+    Hint::Text("Esc cancel"),
+    Hint::Text("empty clears"),
+];
 
 /// What the rows pane says before any settings have arrived.
 pub const NOT_READ: &str = "queue settings not read yet";
@@ -356,7 +366,9 @@ impl QueueSection {
         ctx.request(request);
     }
 
-    /// One key while an editor is open: the field answers first.
+    /// One key while an editor is open: the field answers first. What it passes on is swallowed,
+    /// except the chords [`views::CAPTURE`] passes (CONTROL, ALT, function keys: MOD-67 D5), so
+    /// `ctrl-c` still quits and `F1` opens help.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Editing(editor) => editor.input.on_key(key),
@@ -373,8 +385,7 @@ impl QueueSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
         }
     }
 
@@ -524,8 +535,8 @@ impl QueueSection {
     }
 
     /// The keys this mode binds, then the last outcome; the outcome wins when both do not fit.
-    fn hint(&self, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text();
+    fn hint(&self, bound: &Keys, width: u16, theme: &Theme) -> Line<'static> {
+        let keys = self.hint_text(bound);
         let Some(notice) = &self.notice else {
             return Line::styled(keys, theme.dim);
         };
@@ -543,20 +554,31 @@ impl QueueSection {
         ])
     }
 
-    /// The keys half of the hint line, plus a write in flight.
-    fn hint_text(&self) -> String {
-        let keys = match self.mode {
+    /// The stack of the current mode (MOD-67 D3, D4): the one place a mode maps to its keys, read
+    /// by `key_stack`, the key handler and the hint.
+    fn stack(&self) -> Stack<'static> {
+        match self.mode {
+            Mode::Browse => views::QUEUE_BROWSE,
+            Mode::Editing(_) => views::CAPTURE,
+        }
+    }
+
+    /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus a write in
+    /// flight.
+    fn hint_text(&self, bound: &Keys) -> String {
+        let spec = match self.mode {
             Mode::Editing(_) => HINT_EDITING,
             Mode::Browse if self.unavailable.is_some() || self.snapshot.is_none() => {
                 HINT_NO_SNAPSHOT
             }
             Mode::Browse => HINT_BROWSE,
         };
+        let keys = bound.hint(self.stack(), spec);
         match self.busy {
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
                 format!("{keys} \u{b7} {busy} in flight")
             }
-            _ => keys.to_owned(),
+            _ => keys,
         }
     }
 
@@ -613,35 +635,36 @@ impl SettingsSection for QueueSection {
         if matches!(self.mode, Mode::Editing(_)) {
             return self.on_editor_key(key, ctx);
         }
-        match key.code {
-            KeyCode::Char('e') | KeyCode::Enter => {
-                if !self.blocked()
-                    && let Some(row) = self.selected()
-                {
-                    self.open_edit(row);
+        // Browse (MOD-67 D6, skeleton (c)): the first candidate this state accepts. `edit` is `e`
+        // and `Enter` here (the queue's view default, D12); a global act or a declined one is the
+        // shell's.
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::QUEUE_BROWSE, chord) {
+            match act {
+                Act::Edit => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_edit(row);
+                    }
                 }
-                Handled::Consumed
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.move_cursor(true);
-                Handled::Consumed
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.move_cursor(false);
-                Handled::Consumed
-            }
-            KeyCode::Char('r') => {
-                for request in self.wants_requests(ctx.scope) {
-                    ctx.request(request);
+                Act::ListDown => self.move_cursor(true),
+                Act::ListUp => self.move_cursor(false),
+                Act::Reload => {
+                    for request in self.wants_requests(ctx.scope) {
+                        ctx.request(request);
+                    }
                 }
-                Handled::Consumed
+                Act::Dismiss if self.notice.is_some() => self.notice = None,
+                _ => continue, // a global act, or one this state declines
             }
-            KeyCode::Esc if self.notice.is_some() => {
-                self.notice = None;
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
+            return Handled::Consumed;
         }
+        Handled::Pass
+    }
+
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
@@ -706,7 +729,10 @@ impl SettingsSection for QueueSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
+        frame.render_widget(
+            Paragraph::new(self.hint(ctx.keys(), area.width, ctx.theme)),
+            hint,
+        );
     }
 }
 

@@ -16,6 +16,12 @@
 //! A phase's persona (MOD-26 milestone 2, D23) is picked the way a kind's graph is: by typing its
 //! name into the phase editor's seventh field, resolved against the persona list the catalogue
 //! carries and refused before anything is sent when the list does not hold it.
+//!
+//! Every mode resolves its keys through its own stack in [`views`] (MOD-67 M3), so a chord
+//! matches with its modifiers (`ctrl-d` is not `d`) and a rebound key acts under its new chord;
+//! the hint row, and the delete question's own keys, are rendered from the same stack. A
+//! capturing or confirming mode swallows what it does not bind, except the chords its modal global
+//! layer admits (`CONTROL`, `ALT`, a function key), so `ctrl-c` quits and `F1` opens help.
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -33,14 +39,15 @@ use crate::catalogue::{
     CatalogueSnapshot, GraphEntry, PersonaSummary, ProjectCatalogue, REQUEST_NAMES,
 };
 use crate::hierarchy::MirrorAfterDelete;
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, wrapped,
+    message, modal_rest, wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// What the rows pane says before any catalogue has arrived.
 const NO_WORKSPACE: &str = "no workspace: nothing to list";
@@ -55,20 +62,35 @@ const UNAVAILABLE: &str = "catalogue unavailable";
 const GRAPH_MISSING: &str = "graph missing";
 
 /// Browse's keys.
-const HINT_BROWSE: &str = "j/k \u{b7} n kind/phase \u{b7} N graph \u{b7} e edit \u{b7} g graph \u{b7} d delete kind \u{b7} r reload";
+const HINT_BROWSE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
+    Hint::One(Act::New, "kind/phase"),
+    Hint::One(Act::KindsNewGraph, "graph"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::KindsGraph, "graph"),
+    Hint::One(Act::Delete, "delete kind"),
+    Hint::One(Act::Reload, "reload"),
+];
 
 /// Browse's keys with nothing to list: the only offer is to ask again.
-const HINT_NO_WORKSPACE: &str = "r reload";
+const HINT_NO_WORKSPACE: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
 /// Browse's keys with the read refused: nothing here can be written against a store that did not
 /// answer.
-const HINT_UNAVAILABLE: &str = "r reload";
+const HINT_UNAVAILABLE: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// An open editor's keys.
-const HINT_EDITING: &str = "Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc cancel";
+/// An open editor's keys: the form's own, then the field's fixed `Enter` and `Esc` (D13).
+const HINT_EDITING: HintSpec = &[
+    Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
+    Hint::Text("Enter save"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The prefix warning's keys (D10).
-const HINT_CONFIRM_PREFIX: &str = "y write \u{b7} n/Esc back to the editor";
+const HINT_CONFIRM_PREFIX: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "write"),
+    Hint::All(Act::ConfirmNo, "back to the editor"),
+];
 
 /// What `e`, `d` and `g` say on a project row: this section owns what is inside a project, and the
 /// hierarchy section owns the project (B-13).
@@ -89,8 +111,11 @@ const BUDGET_IS_A_NUMBER: &str = "`token_budget` is a whole number or empty";
 /// What the phase editor says when `gate_hard` is neither `y` nor `n` (B-10).
 const GATE_IS_Y_OR_N: &str = "`gate_hard (y/n)` is y or n";
 
-/// The delete confirmation's keys (D11).
-const HINT_DELETING: &str = "y delete \u{b7} n/Esc stop";
+/// The delete confirmation's keys (D11), on the hint row and at the end of the question.
+const HINT_DELETING: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "delete"),
+    Hint::All(Act::ConfirmNo, "stop"),
+];
 
 /// What `d` says on a graph or a phase row: the seam has `delete_item_kind` and nothing else in
 /// this area, and this milestone adds no method to it (D5).
@@ -700,36 +725,39 @@ impl KindsSection {
     /// One key while a kind delete is being confirmed.
     ///
     /// Modal over the shell as well as over the tree, as the prefix warning is: an unlisted key is
-    /// swallowed so a `q` at the question does not quit the application, with `CONTROL` chords
-    /// excepted so `ctrl-c` still does.
+    /// swallowed so a `q` at the question does not quit the application, with the chords the
+    /// modal global layer admits excepted, so `ctrl-c` still quits and `F1` opens help (MOD-67
+    /// D5). Both stages answer through `views::KINDS_CONFIRM`; in flight an answer is a no-op.
     fn on_deleting_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
+        let stack = views::KINDS_CONFIRM;
+        let chord = KeyChord::from_event(key);
+        let answer = ctx.keys().actions(stack, chord).first().copied();
         let Mode::Deleting { id, stage, .. } = &mut self.mode else {
             return Handled::Pass;
         };
         let id = *id;
-        match stage {
-            DeleteStage::Asking => match key.code {
-                KeyCode::Char('y') => {
-                    *stage = DeleteStage::InFlight;
-                    self.notice = None;
-                    self.send(
-                        StoreRequest::DeleteKind {
-                            scope: ctx.scope.clone(),
-                            id,
-                        },
-                        ctx,
-                    );
-                }
-                KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
-                _ => {}
-            },
-            // Nothing to answer: the row is already going.
-            DeleteStage::InFlight => {}
+        match (answer, stage) {
+            (Some(Act::ConfirmYes), stage @ DeleteStage::Asking) => {
+                *stage = DeleteStage::InFlight;
+                self.notice = None;
+                self.send(
+                    StoreRequest::DeleteKind {
+                        scope: ctx.scope.clone(),
+                        id,
+                    },
+                    ctx,
+                );
+                Handled::Consumed
+            }
+            (Some(Act::ConfirmNo), DeleteStage::Asking) => {
+                self.mode = Mode::Browse;
+                Handled::Consumed
+            }
+            // Nothing to answer: the row is already going (blueprint L-C Q8).
+            (Some(Act::ConfirmYes | Act::ConfirmNo), DeleteStage::InFlight) => Handled::Consumed,
+            // A global act, or nothing.
+            _ => modal_rest(stack, chord),
         }
-        Handled::Consumed
     }
 
     /// Sends one write and remembers its name until the reply.
@@ -740,10 +768,13 @@ impl KindsSection {
 
     /// One key while an editor is open.
     ///
-    /// The focused field answers first, so `l`, `q` and the digits are letters here; what it passes
-    /// on is the form's own navigation, and everything left over is swallowed rather than offered
-    /// to the shell — with `CONTROL` chords excepted, so `ctrl-c` still quits.
+    /// The focused field answers first, so `l`, `q` and the digits are letters here (D13); what it
+    /// passes on is the form's own navigation (`form.next_field`/`prev_field` through
+    /// `views::KINDS_EDITOR`, `Down`/`Up` included), and everything left over is swallowed rather
+    /// than offered to the shell — with the chords the modal global layer admits excepted, so
+    /// `ctrl-c` still quits and `F1` opens help (MOD-67 D5).
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let stack = views::KINDS_EDITOR;
         let outcome = match &mut self.mode {
             Mode::Editing(editor) => match editor.fields.get_mut(editor.focus) {
                 Some(field) => field.input.on_key(key),
@@ -765,21 +796,22 @@ impl KindsSection {
                 Handled::Consumed
             }
             FieldOutcome::Pass => {
+                let chord = KeyChord::from_event(key);
                 let Mode::Editing(editor) = &mut self.mode else {
                     return Handled::Pass;
                 };
                 let len = editor.fields.len().max(1);
-                match key.code {
-                    KeyCode::Tab | KeyCode::Down => {
+                match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::FormNextField) => {
                         editor.focus = (editor.focus + 1) % len;
                         Handled::Consumed
                     }
-                    KeyCode::BackTab | KeyCode::Up => {
+                    Some(Act::FormPrevField) => {
                         editor.focus = (editor.focus + len - 1) % len;
                         Handled::Consumed
                     }
-                    _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-                    _ => Handled::Consumed,
+                    // A global act, or nothing.
+                    _ => modal_rest(stack, chord),
                 }
             }
         }
@@ -837,14 +869,15 @@ impl KindsSection {
     /// One key while the prefix warning is up (D10).
     ///
     /// Modal over the shell as well as over the tree: every key that is not listed is swallowed, so
-    /// a `q` typed at the warning does not quit the application (H-10). A `CONTROL` chord is the
-    /// carve-out, so `ctrl-c` still does.
+    /// a `q` typed at the warning does not quit the application (H-10). A chord the modal global
+    /// layer admits (`CONTROL`, `ALT`, a function key) is the carve-out, so `ctrl-c` still quits
+    /// and `F1` opens help (MOD-67 D5). The answers are `confirm.*` through
+    /// `views::KINDS_CONFIRM`.
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
-        match key.code {
-            KeyCode::Char('y') => {
+        let stack = views::KINDS_CONFIRM;
+        let chord = KeyChord::from_event(key);
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes) => {
                 let Mode::ConfirmPrefix { editor, .. } = core::mem::take(&mut self.mode) else {
                     return Handled::Consumed;
                 };
@@ -862,16 +895,18 @@ impl KindsSection {
                     }
                     Err(why) => self.refuse(why),
                 }
+                Handled::Consumed
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            Some(Act::ConfirmNo) => {
                 let Mode::ConfirmPrefix { editor, .. } = core::mem::take(&mut self.mode) else {
                     return Handled::Consumed;
                 };
                 self.mode = Mode::Editing(editor);
+                Handled::Consumed
             }
-            _ => {}
+            // A global act, or nothing.
+            _ => modal_rest(stack, chord),
         }
-        Handled::Consumed
     }
 
     /// The request one editor stands for, or the sentence that says why there is none.
@@ -1256,8 +1291,8 @@ impl KindsSection {
     /// Two spans rather than one string: a compare-and-set miss is reported here and D8 asks for it
     /// in `theme.error`, because "someone else wrote to this row" is the one notice a user has to
     /// act on rather than read.
-    fn hint(&self, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text();
+    fn hint(&self, width: u16, theme: &Theme, keys: &Keys) -> Line<'static> {
+        let keys = self.hint_text(keys);
         let Some(notice) = &self.notice else {
             return Line::styled(keys, theme.dim);
         };
@@ -1279,9 +1314,10 @@ impl KindsSection {
         ])
     }
 
-    /// The keys half of the hint line, plus what a write in flight adds to it.
-    fn hint_text(&self) -> String {
-        let keys = match &self.mode {
+    /// The keys half of the hint line, plus what a write in flight adds to it. Rendered through
+    /// the mode's own stack, so a rebound key shows its new chord.
+    fn hint_text(&self, keys: &Keys) -> String {
+        let spec = match &self.mode {
             Mode::Editing(_) => HINT_EDITING,
             Mode::ConfirmPrefix { .. } => HINT_CONFIRM_PREFIX,
             Mode::Deleting { .. } => HINT_DELETING,
@@ -1299,14 +1335,87 @@ impl KindsSection {
                 }
             }
         };
+        let keys = keys.hint(self.stack(), spec);
         match self.busy {
             // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
             // is why `Enter` is not answering.
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
                 format!("{keys} \u{b7} {busy} in flight")
             }
-            _ => keys.to_owned(),
+            _ => keys,
         }
+    }
+
+    /// The stack of the current mode (MOD-67 M3), as `key_stack` reports it. Each `on_*_key`
+    /// handler names its own mode's constant, which is this one whenever it runs.
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
+            Mode::Browse => views::KINDS_BROWSE,
+            Mode::Editing(_) => views::KINDS_EDITOR,
+            Mode::ConfirmPrefix { .. } | Mode::Deleting { .. } => views::KINDS_CONFIRM,
+        }
+    }
+
+    /// One key in Browse, through `views::KINDS_BROWSE` (MOD-67 M3). A chord matches with its
+    /// modifiers, so `ctrl-d` is not `d` (ANA-26 §2.6 defect 1), and `g` is this view's own
+    /// `settings.kinds.graph`, never `list.top` (D2). The tab took `settings.*` before offering
+    /// the key; a global act, or one this state declines, is the shell's (`Pass`).
+    fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::KINDS_BROWSE, chord) {
+            match act {
+                Act::New => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_new_child(row);
+                    }
+                }
+                Act::KindsNewGraph => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_new_graph(row);
+                    }
+                }
+                Act::Edit => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_edit(row);
+                    }
+                }
+                Act::KindsGraph => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_graph(row);
+                    }
+                }
+                Act::Delete => {
+                    if !self.blocked()
+                        && let Some(row) = self.selected()
+                    {
+                        self.begin_delete(row);
+                    }
+                }
+                Act::ListDown => self.move_cursor(true),
+                Act::ListUp => self.move_cursor(false),
+                // Allowed whatever else is going on: re-reading is how a section that lost a reply
+                // recovers, and a read cannot lose a write's reply — the staleness index is keyed
+                // by request kind. What it *can* do is be mistaken for one, because a `Catalogue`
+                // says nothing about which request it answers; that trade is argued where the
+                // mistake is made, in `on_catalogue` (H-9).
+                Act::Reload => ctx.request(StoreRequest::Catalogue(ctx.scope.clone())),
+                // Only when there is something to clear: a section that swallowed every `Esc`
+                // would take the one the shell uses to close an overlay over it.
+                Act::Dismiss if self.notice.is_some() => self.notice = None,
+                // A global act, or one this state declines.
+                _ => continue,
+            }
+            return Handled::Consumed;
+        }
+        Handled::Pass
     }
 
     /// The pane under the rows: the open editor, the question being answered, or nothing at all in
@@ -1314,7 +1423,7 @@ impl KindsSection {
     ///
     /// Takes the width because both questions are sentences rather than rows and have to wrap
     /// inside the pane they are measured for — the layout needs the height first.
-    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
         match &self.mode {
             Mode::Browse => Vec::new(),
             Mode::Editing(editor) => editor.lines(width, theme),
@@ -1325,11 +1434,14 @@ impl KindsSection {
                 stage,
                 ..
             } => {
-                let mut lines: Vec<Line<'static>> =
-                    wrapped(&delete_question(name, prefix), usize::from(width).max(1))
-                        .into_iter()
-                        .map(|line| Line::styled(line, theme.error))
-                        .collect();
+                let answers = keys.hint(views::KINDS_CONFIRM, HINT_DELETING);
+                let mut lines: Vec<Line<'static>> = wrapped(
+                    &delete_question(name, prefix, &answers),
+                    usize::from(width).max(1),
+                )
+                .into_iter()
+                .map(|line| Line::styled(line, theme.error))
+                .collect();
                 if matches!(stage, DeleteStage::InFlight) {
                     lines.push(Line::styled("delete_kind in flight".to_owned(), theme.dim));
                 }
@@ -1423,6 +1535,10 @@ impl SettingsSection for KindsSection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
     /// MOD-22 review M-1: a bracketed paste into the open form's focused field. A delete question
     /// is not a field: a paste there is dropped, so its `y` confirms nothing.
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
@@ -1445,75 +1561,7 @@ impl SettingsSection for KindsSection {
         if matches!(self.mode, Mode::Deleting { .. }) {
             return self.on_deleting_key(key, ctx);
         }
-        // Browse. `j`, `k`, `n`, `N`, `e`, `g`, `r` are free: the global table binds `q`, `?`, the
-        // digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section is
-        // offered the key.
-        match key.code {
-            KeyCode::Char('n') => {
-                if !self.blocked()
-                    && let Some(row) = self.selected()
-                {
-                    self.open_new_child(row);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('N') => {
-                if !self.blocked()
-                    && let Some(row) = self.selected()
-                {
-                    self.open_new_graph(row);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('e') => {
-                if !self.blocked()
-                    && let Some(row) = self.selected()
-                {
-                    self.open_edit(row);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('g') => {
-                if !self.blocked()
-                    && let Some(row) = self.selected()
-                {
-                    self.open_graph(row);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('d') => {
-                if !self.blocked()
-                    && let Some(row) = self.selected()
-                {
-                    self.begin_delete(row);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.move_cursor(true);
-                Handled::Consumed
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.move_cursor(false);
-                Handled::Consumed
-            }
-            // Allowed whatever else is going on: re-reading is how a section that lost a reply
-            // recovers, and a read cannot lose a write's reply — the staleness index is keyed by
-            // request kind. What it *can* do is be mistaken for one, because a `Catalogue` says
-            // nothing about which request it answers; that trade is argued where the mistake is
-            // made, in `on_catalogue` (H-9).
-            KeyCode::Char('r') => {
-                ctx.request(StoreRequest::Catalogue(ctx.scope.clone()));
-                Handled::Consumed
-            }
-            // Only when there is something to clear: a section that swallowed every `Esc` would
-            // take the one the shell uses to close an overlay over it.
-            KeyCode::Esc if self.notice.is_some() => {
-                self.notice = None;
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
-        }
+        self.on_browse_key(key, ctx)
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -1548,7 +1596,7 @@ impl SettingsSection for KindsSection {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme);
+        let pane = self.pane(area.width, ctx.theme, ctx.keys());
         let [rows, pane_area, hint] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
@@ -1587,7 +1635,10 @@ impl SettingsSection for KindsSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
+        frame.render_widget(
+            Paragraph::new(self.hint(area.width, ctx.theme, ctx.keys())),
+            hint,
+        );
     }
 }
 
@@ -1901,12 +1952,11 @@ fn prefix_warning(old: &str, new: &str) -> String {
     )
 }
 
-/// D11's question, verbatim: what is being deleted, and the one refusal the store may answer with.
-fn delete_question(name: &str, prefix: &str) -> String {
-    format!(
-        "delete kind {name} ({prefix})? a kind any item uses is refused. y delete \u{b7} n/Esc \
-         stop"
-    )
+/// D11's question, verbatim: what is being deleted, the one refusal the store may answer with,
+/// then `answers`, the keys that answer it as the hint row renders them (MOD-67 M3, blueprint L-C
+/// Q6), so the question cannot name a key a rebinding moved.
+fn delete_question(name: &str, prefix: &str, answers: &str) -> String {
+    format!("delete kind {name} ({prefix})? a kind any item uses is refused. {answers}")
 }
 
 /// What a delete that happened reports, mirror included (D12).
@@ -2042,12 +2092,13 @@ mod tests {
             notice: Some(Notice::Error(notice.clone())),
             ..KindsSection::new()
         };
-        let keys = section.hint_text();
+        let keys = section.hint_text(Keys::compiled());
         let width = cell_width(&keys) + k + 3;
 
         let line = section.hint(
             u16::try_from(width).expect("a hint this narrow fits u16"),
             &Theme::default(),
+            Keys::compiled(),
         );
 
         assert_eq!(line.spans.len(), 1, "{line:?} against {width}");

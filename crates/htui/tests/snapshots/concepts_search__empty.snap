@@ -24,11 +24,11 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │ │                                                                                              │ │
 │ │type a query; Enter searches                                                                  │ │
 │ │                                                                                              │ │
-│ │Enter search/open  Up/Dn move  Ctrl+D decisions  Ctrl+P project  Ctrl+R re-index  Esc close   │ │
+│ │Enter search/open · Up/Down move · Ctrl+d decisions · Ctrl+p scope · Ctrl+r index · Esc close │ │
 │ └──────────────────────────────────────────────────────────────────────────────────────────────┘ │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+Ctrl+c quit · F1 help

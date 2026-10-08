@@ -11,22 +11,37 @@
 //!   absent from the status line and the `?` box.
 //! - The status line is byte-identical to the one the snapshots pin (D7); the `?` box follows D8.
 //!
-//! Every case goes through [`Harness`]; the one that stores a DSN takes `common::mock_keyring()`
-//! as its first statement (`tests/connection.rs`'s header rule).
+//! MOD-67 M3 (T1): the Settings tab cycles sections through `settings.next_section`/
+//! `prev_section`, so `ctrl-l`/`ctrl-h` no longer cycle (defect 1); a view with a key stack drives
+//! the status line, the `?` box and its closer (D7, D8), filtered in a capturing mode (D5); and
+//! `Harness::with_keys` installs a rebound table. No real view has a stack yet: the doubles
+//! `StackProbe` (a capturing Settings section) and `OverlayProbe` (a converted overlay) stand in.
+//!
+//! Every case goes through [`Harness`]; the ones that may read or store a DSN take
+//! `common::mock_keyring()` as their first statement (`tests/connection.rs`'s header rule).
 #![cfg(feature = "testkit")]
 
 use chrono::Utc;
+use crossterm::event::{KeyCode, KeyEvent};
 use htui::agent_worker::AgentRuntime;
-use htui::app::{Action, TabAction, register_all};
+use htui::app::{Action, Ctx, Handled, TabAction, register_all};
+use htui::keys::{KeyChord, Stack, load_str, views};
+use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::overlay::{
-    ConceptsSearch, MigrationPrompt, OverlayId, WaitingList, WorkspaceSwitcher,
+    ConceptsSearch, MigrationPrompt, Overlay, OverlayId, WaitingList, WorkspaceSwitcher,
 };
 use htui::ui::tabs::BacklogTab;
-use htui::ui::tabs::settings::{ConnectionSection, QdrantSection, SettingsTab};
+use htui::ui::tabs::settings::{
+    ConnectionSection, QdrantSection, SectionId, SettingsSection, SettingsTab,
+};
 use htui_agent::registry::DriverFactory;
+use htui_core::model::Scope;
 use htui_store::testkit as common;
 use htui_store::{Backend, CacheStore, PgStore, secret};
+use ratatui::Frame;
+use ratatui::layout::Rect;
+use ratatui::widgets::Paragraph;
 
 /// A DSN that parses and names a port nothing listens on (`tests/connection.rs`'s).
 const DEAD_DSN: &str = "postgres://htui:s3cret@127.0.0.1:1/htui?sslmode=disable";
@@ -311,4 +326,206 @@ async fn the_status_line_is_todays_in_both_harnesses() {
 
     let mut full = shell(true).await;
     assert_eq!(status_line(&full.render()), FULL_STATUS_CUT);
+}
+
+/// A capturing Settings section on the agents form's stack: it types every printable chord and
+/// passes what the stack lets through (MOD-67 M3 PA-5), as a converted form will.
+struct StackProbe;
+
+impl SettingsSection for StackProbe {
+    fn id(&self) -> SectionId {
+        SectionId("stack-probe")
+    }
+    fn title(&self) -> &str {
+        "Probe"
+    }
+    fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+        Vec::new()
+    }
+    fn on_scope_change(&mut self, _scope: &Scope) {}
+    fn captures_input(&self) -> bool {
+        true
+    }
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(views::AGENTS_FORM)
+    }
+    fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        if chord.is_printable() || !views::AGENTS_FORM.passes(chord) {
+            Handled::Consumed
+        } else {
+            Handled::Pass
+        }
+    }
+    fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, _ctx: &Ctx<'_>) {
+        frame.render_widget(Paragraph::new("stack probe"), area);
+    }
+}
+
+/// A modal overlay on the concepts search's stack that passes every key to the shell.
+struct OverlayProbe;
+
+impl Overlay for OverlayProbe {
+    fn id(&self) -> OverlayId {
+        OverlayId("overlay-probe")
+    }
+    fn title(&self) -> &str {
+        "Probe"
+    }
+    fn is_modal(&self) -> bool {
+        true
+    }
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(views::CONCEPTS_QUERY)
+    }
+    fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+        Vec::new()
+    }
+    fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+        Handled::Pass
+    }
+    fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+    fn render(&self, frame: &mut Frame<'_>, area: Rect, _ctx: &Ctx<'_>) {
+        frame.render_widget(Paragraph::new("overlay probe"), area);
+    }
+}
+
+/// D14 pin (ANA-26 §2.6 defect 1): section cycling compares whole chords, modifiers included.
+#[tokio::test]
+async fn ctrl_l_and_ctrl_h_do_not_cycle_sections() {
+    let _keyring = common::mock_keyring().await;
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(ConnectionSection::new()),
+        Box::new(QdrantSection::new()),
+    ])));
+    harness.drive_to_end().await;
+    let on_connection = |frame: &str| frame.contains("Rebuild cache");
+    let frame = harness.render();
+    assert!(on_connection(&frame), "Connection is active: {frame}");
+
+    for key in ["ctrl-l", "ctrl-h", "shift-right", "alt-["] {
+        harness.key(key);
+        harness.drive_to_end().await;
+        let frame = harness.render();
+        assert!(on_connection(&frame), "`{key}` did not cycle: {frame}");
+    }
+
+    harness.key("l");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(!on_connection(&frame), "`l` moved to Qdrant: {frame}");
+    harness.key("h");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(on_connection(&frame), "`h` moved back: {frame}");
+}
+
+#[tokio::test]
+async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
+    let mut harness =
+        Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+            StackProbe,
+        )])));
+    harness.drive_to_end().await;
+    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · F1 help");
+
+    harness.key("?");
+    assert!(!harness.app().help_visible, "the probe typed `?`");
+    harness.key("tab");
+    assert!(!harness.app().help_visible);
+
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` passes the field to help");
+    let frame = harness.render();
+    assert!(
+        frame.contains("Agents: Tab/Down next field · Shift+Tab/Up previous field"),
+        "{frame}"
+    );
+    assert!(frame.contains("Global: Ctrl+c quit · F1 help"), "{frame}");
+    assert!(frame.contains("F1 closes this box"), "{frame}");
+    assert!(!frame.contains(CLOSER), "{frame}");
+    harness.key("f1");
+    assert!(!harness.app().help_visible, "`F1` closes it");
+
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "`ctrl-c` still quits");
+}
+
+#[tokio::test]
+async fn an_overlay_with_a_stack_drives_the_status_line_and_box() {
+    let mut harness = Harness::demo()
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_overlay(Box::new(OverlayProbe));
+    register_all(harness.app());
+    harness.drive_to_end().await;
+    assert_eq!(top(&mut harness), Some(OverlayId("overlay-probe")));
+    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · F1 help");
+
+    harness.key("?");
+    assert!(
+        !harness.app().help_visible,
+        "`?` is filtered out over the probe"
+    );
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opens the box");
+    let frame = harness.render();
+    assert!(frame.contains("Overlay: Esc close"), "{frame}");
+    assert!(frame.contains("Global: Ctrl+c quit · F1 help"), "{frame}");
+    assert!(frame.contains("F1 closes this box"), "{frame}");
+    assert!(!frame.contains("Backlog:"), "no legacy tab line: {frame}");
+    harness.key("f1");
+    assert!(!harness.app().help_visible);
+
+    harness.key("esc");
+    assert!(harness.app().overlays.is_empty(), "`Esc` closes the probe");
+    assert_eq!(status_line(&harness.render()), FULL_STATUS_CUT);
+}
+
+#[tokio::test]
+async fn with_keys_installs_the_keys() {
+    let keys = load_str("version = 1\n[global]\nquit = \"f10\"\n").expect("the keys load");
+    let mut harness = Harness::demo()
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_keys(keys);
+    harness.drive_to_end().await;
+    assert!(
+        status_line(&harness.render()).starts_with("F10 quit · Tab next tab"),
+        "{}",
+        harness.render()
+    );
+    harness.key("q");
+    assert!(!harness.app().should_quit, "`q` no longer quits");
+    harness.key("f10");
+    assert!(harness.app().should_quit, "`F10` quits");
+}
+
+/// A raw `Char('L')` with CONTROL, as a kitty-protocol terminal reports ctrl-shift-l (PA-6):
+/// the chord is `ctrl-l`, which does not cycle either.
+#[tokio::test]
+async fn a_kitty_ctrl_capital_is_the_ctrl_chord() {
+    let event = KeyEvent::new(KeyCode::Char('L'), crossterm::event::KeyModifiers::CONTROL);
+    assert_eq!(
+        KeyChord::from_event(event),
+        KeyChord::parse("ctrl-l").expect("a chord")
+    );
+
+    let _keyring = common::mock_keyring().await;
+    let mut harness = Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![
+        Box::new(ConnectionSection::new()),
+        Box::new(QdrantSection::new()),
+    ])));
+    harness.drive_to_end().await;
+    let on_connection = |frame: &str| frame.contains("Rebuild cache");
+    let frame = harness.render();
+    assert!(on_connection(&frame), "Connection is active: {frame}");
+
+    harness.app().on_key(event);
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        on_connection(&frame),
+        "a kitty ctrl-shift-l did not cycle: {frame}"
+    );
 }

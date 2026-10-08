@@ -36,11 +36,12 @@ use zeroize::Zeroizing;
 
 use crate::app::{Ctx, Handled};
 use crate::connection::{AttemptOutcome, ConnectionSnapshot, DsnState, READ_NAME, REQUEST_NAMES};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// What a row's value column says before the first reply.
 const NOT_READ: &str = "not read yet";
@@ -48,21 +49,33 @@ const NOT_READ: &str = "not read yet";
 /// What the pane says when the read itself was refused; the seam's sentence follows it.
 const UNAVAILABLE: &str = "connection info is unavailable";
 
-/// Browse's keys, with something to browse.
-const HINT_BROWSE: &str =
-    "e edit DSN \u{b7} c clear DSN \u{b7} R rebuild cache \u{b7} r reload \u{b7} j/k rows";
+/// Browse's keys, with something to browse (ANA-26 §7.6's example, verbatim with defaults).
+const HINT_BROWSE: HintSpec = &[
+    Hint::One(Act::Edit, "edit DSN"),
+    Hint::One(Act::Clear, "clear DSN"),
+    Hint::One(Act::ConnectionRebuild, "rebuild cache"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "rows"),
+];
 
 /// Browse's keys with nothing read, or the read refused: the only offer is to ask again.
 ///
 /// [`PromptSection`](super::PromptSection)'s rule, one section across: offering `e` over rows
 /// nobody can see would be offering a key that is about to refuse.
-const HINT_NO_SNAPSHOT: &str = "r reload";
+const HINT_NO_SNAPSHOT: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The open field's keys, and the promise the mask is.
-const HINT_EDITING: &str = "Enter store \u{b7} Esc cancel \u{b7} typed text is never shown";
+/// The open field's keys (the widget's own, MOD-67 D13), and the promise the mask is.
+const HINT_EDITING: HintSpec = &[
+    Hint::Text("Enter store"),
+    Hint::Text("Esc cancel"),
+    Hint::Text("typed text is never shown"),
+];
 
-/// Either confirmation's keys.
-const HINT_CONFIRM: &str = "y confirm \u{b7} n / Esc cancel";
+/// Either confirmation's keys: `y confirm · n/Esc cancel` with the defaults.
+const HINT_CONFIRM: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "confirm"),
+    Hint::All(Act::ConfirmNo, "cancel"),
+];
 
 /// What a stored DSN's row leads with, and what a plain `SetDsn` reports.
 const STORED: &str = "stored";
@@ -406,8 +419,9 @@ impl ConnectionSection {
     /// One key while the field is open.
     ///
     /// The field answers first, so `l`, `h`, `[`, `]`, `q` and the digits are characters here;
-    /// everything it passes on is swallowed rather than offered to the shell — with `CONTROL`
-    /// chords excepted, so `ctrl-c` still quits.
+    /// everything it passes on is swallowed rather than offered to the shell — except the chords
+    /// [`views::CAPTURE`] passes (CONTROL, ALT, function keys: MOD-67 D5), so `ctrl-c` still
+    /// quits and `F1` opens help.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Editing(editor) => editor.input.on_key(key),
@@ -425,8 +439,7 @@ impl ConnectionSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
         }
     }
 
@@ -469,38 +482,54 @@ impl ConnectionSection {
         }
     }
 
-    /// One key while either question is on screen.
+    /// One key while either question is on screen (MOD-67 D6, skeleton (b)).
     ///
     /// Modal over the shell as well as over the rows, as the kinds section's delete is: an
-    /// unlisted key is swallowed so a `q` at the question does not quit the application, with
-    /// `CONTROL` chords excepted so `ctrl-c` still does.
+    /// unlisted key is swallowed so a `q` at the question does not quit the application, except
+    /// the chords [`views::CONNECTION_CONFIRM`] passes (CONTROL, ALT, function keys), so `ctrl-c`
+    /// still quits and `F1` opens help. `alt-y` is not `y`.
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
-        match &mut self.mode {
-            Mode::ConfirmClear => match key.code {
-                KeyCode::Char('y') => {
-                    self.mode = Mode::Browse;
-                    self.send(StoreRequest::ClearDsn, ctx);
-                }
-                KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
-                _ => {}
-            },
-            Mode::ConfirmRebuild { stage } => match (*stage, key.code) {
-                (ConfirmStage::Asking, KeyCode::Char('y')) => {
-                    *stage = ConfirmStage::InFlight;
-                    self.send(StoreRequest::RebuildCache, ctx);
-                }
-                (ConfirmStage::Asking, KeyCode::Char('n') | KeyCode::Esc) => {
-                    self.mode = Mode::Browse;
-                }
-                // Nothing left to answer: the rebuild is already out.
-                _ => {}
-            },
-            Mode::Browse | Mode::Editing(_) => return Handled::Pass,
+        let stack = views::CONNECTION_CONFIRM;
+        let chord = KeyChord::from_event(key);
+        // The answers' layers come before the global one, so the first candidate decides; a
+        // global act goes to the pass rule below.
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes) => self.answer(true, ctx),
+            Some(Act::ConfirmNo) => self.answer(false, ctx),
+            _ => return modal_rest(stack, chord),
         }
         Handled::Consumed
+    }
+
+    /// `y` (`yes`) or `n`/`Esc` (`no`) at either question. Once a rebuild is out there is
+    /// nothing left to answer: both are taken and do nothing.
+    fn answer(&mut self, yes: bool, ctx: &Ctx<'_>) {
+        match (&self.mode, yes) {
+            (Mode::ConfirmClear, true) => {
+                self.mode = Mode::Browse;
+                self.send(StoreRequest::ClearDsn, ctx);
+            }
+            (
+                Mode::ConfirmRebuild {
+                    stage: ConfirmStage::Asking,
+                },
+                true,
+            ) => {
+                self.mode = Mode::ConfirmRebuild {
+                    stage: ConfirmStage::InFlight,
+                };
+                self.send(StoreRequest::RebuildCache, ctx);
+            }
+            (
+                Mode::ConfirmClear
+                | Mode::ConfirmRebuild {
+                    stage: ConfirmStage::Asking,
+                },
+                false,
+            ) => self.mode = Mode::Browse,
+            // Nothing left to answer: the rebuild is already out.
+            _ => {}
+        }
     }
 
     /// The value column of one row (D16), before wrapping.
@@ -609,8 +638,8 @@ impl ConnectionSection {
     ///
     /// The outcome only appears here in Browse; every other mode already draws it in the pane,
     /// where it is next to what it is about.
-    fn hint(&self, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text();
+    fn hint(&self, bound: &Keys, width: u16, theme: &Theme) -> Line<'static> {
+        let keys = self.hint_text(bound);
         let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
             return Line::styled(keys, theme.dim);
         };
@@ -632,9 +661,10 @@ impl ConnectionSection {
         ])
     }
 
-    /// The keys half of the hint line, plus what a write in flight adds to it.
-    fn hint_text(&self) -> String {
-        let keys = match self.mode {
+    /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus what a write in
+    /// flight adds to it.
+    fn hint_text(&self, bound: &Keys) -> String {
+        let spec = match self.mode {
             Mode::Editing(_) => HINT_EDITING,
             Mode::ConfirmClear | Mode::ConfirmRebuild { .. } => HINT_CONFIRM,
             Mode::Browse => {
@@ -645,13 +675,24 @@ impl ConnectionSection {
                 }
             }
         };
+        let keys = bound.hint(self.stack(), spec);
         match self.busy {
             // Only in Browse: the other modes' hints say what their own key is for, and a write in
             // flight is why that key is not answering.
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
                 format!("{keys} \u{b7} {busy} in flight")
             }
-            _ => keys.to_owned(),
+            _ => keys,
+        }
+    }
+
+    /// The stack of the current mode (MOD-67 D3, D4): the one place a mode maps to its keys, read
+    /// by `key_stack`, the key handlers and the hint.
+    fn stack(&self) -> Stack<'static> {
+        match self.mode {
+            Mode::Browse => views::CONNECTION_BROWSE,
+            Mode::Editing(_) => views::CAPTURE,
+            Mode::ConfirmClear | Mode::ConfirmRebuild { .. } => views::CONNECTION_CONFIRM,
         }
     }
 
@@ -772,65 +813,74 @@ impl SettingsSection for ConnectionSection {
             }
             Mode::Browse => {}
         }
-        // Browse. `e`, `c`, `R`, `r`, `j`, `k` are free: the global table binds `q`, `?`, the
-        // digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows before a section
-        // is offered the key.
-        match key.code {
-            KeyCode::Char('e') => {
-                if !self.blocked() {
-                    self.open_edit();
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('c') => {
-                if !self.blocked() {
-                    if self.dsn_state().is_some_and(DsnState::is_stored) {
-                        self.notice = None;
-                        self.mode = Mode::ConfirmClear;
-                    } else {
-                        // The other three: there is no keyring entry to remove, there is no
-                        // keyring at all in a demo session, and over an unreadable one there is
-                        // nothing *known* to clear — a delete there would be a guess at a store
-                        // that has not answered.
-                        self.refuse(self.dsn_row_refusal());
+        // Browse (MOD-67 D6, skeleton (c)): the first candidate this state accepts. Section
+        // cycling never reaches here (the tab takes `settings.*` first), and a global act or a
+        // declined one is the shell's.
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::CONNECTION_BROWSE, chord) {
+            match act {
+                Act::Edit => {
+                    if !self.blocked() {
+                        self.open_edit();
                     }
+                    return Handled::Consumed;
                 }
-                Handled::Consumed
+                Act::Clear => {
+                    if !self.blocked() {
+                        if self.dsn_state().is_some_and(DsnState::is_stored) {
+                            self.notice = None;
+                            self.mode = Mode::ConfirmClear;
+                        } else {
+                            // The other three: there is no keyring entry to remove, there is no
+                            // keyring at all in a demo session, and over an unreadable one there
+                            // is nothing *known* to clear — a delete there would be a guess at a
+                            // store that has not answered.
+                            self.refuse(self.dsn_row_refusal());
+                        }
+                    }
+                    return Handled::Consumed;
+                }
+                // Upper case on purpose (D16): `r` is the shipped re-read on every section, and a
+                // destructive action must not sit one shift away from a reflex.
+                Act::ConnectionRebuild => {
+                    self.rebuild();
+                    return Handled::Consumed;
+                }
+                // B-9: the Rebuild row is an action row, so the key that runs actions runs it.
+                // Off that row `Enter` is not this section's.
+                Act::ConnectionActivate if self.row() == Row::Rebuild => {
+                    self.rebuild();
+                    return Handled::Consumed;
+                }
+                Act::ListDown => {
+                    self.move_cursor(true);
+                    return Handled::Consumed;
+                }
+                Act::ListUp => {
+                    self.move_cursor(false);
+                    return Handled::Consumed;
+                }
+                // Allowed whatever else is going on: re-reading is how a section that lost a reply
+                // recovers, and a read cannot lose a write's reply — the staleness index is keyed
+                // by request kind.
+                Act::Reload => {
+                    ctx.request(StoreRequest::ConnectionInfo);
+                    return Handled::Consumed;
+                }
+                // Only when there is something to clear: a section that swallowed every `Esc`
+                // would take the one the shell uses to close an overlay over it.
+                Act::Dismiss if self.notice.is_some() => {
+                    self.notice = None;
+                    return Handled::Consumed;
+                }
+                _ => continue, // a global act, or one this state declines
             }
-            // Upper case on purpose (D16): `r` is the shipped re-read on every section, and a
-            // destructive action must not sit one shift away from a reflex.
-            KeyCode::Char('R') => {
-                self.rebuild();
-                Handled::Consumed
-            }
-            // B-9: the Rebuild row is an action row, so the key that runs actions runs it.
-            KeyCode::Enter if self.row() == Row::Rebuild => {
-                self.rebuild();
-                Handled::Consumed
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.move_cursor(true);
-                Handled::Consumed
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.move_cursor(false);
-                Handled::Consumed
-            }
-            // Allowed whatever else is going on: re-reading is how a section that lost a reply
-            // recovers, and a read cannot lose a write's reply — the staleness index is keyed by
-            // request kind.
-            KeyCode::Char('r') => {
-                ctx.request(StoreRequest::ConnectionInfo);
-                Handled::Consumed
-            }
-            // Only when there is something to clear: a section that swallowed every `Esc` would
-            // take the one the shell uses to close an overlay over it.
-            KeyCode::Esc if self.notice.is_some() => {
-                self.notice = None;
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
         }
+        Handled::Pass
+    }
+
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
@@ -881,7 +931,10 @@ impl SettingsSection for ConnectionSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
+        frame.render_widget(
+            Paragraph::new(self.hint(ctx.keys(), area.width, ctx.theme)),
+            hint,
+        );
     }
 }
 
@@ -943,6 +996,7 @@ fn in_flight(busy: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::event::KeyCode;
 
     /// The hard rule reaches the *mode* as well as the editor: [`ConnectionSection`] derives
     /// `Debug` through [`Mode`], so a variant that printed its own field's text would put a DSN
@@ -1031,10 +1085,11 @@ mod tests {
             notice: Some(Notice::Error(notice.clone())),
             ..ConnectionSection::new()
         };
-        let keys = section.hint_text();
+        let keys = section.hint_text(Keys::compiled());
         let width = cell_width(&keys) + k + 3;
 
         let line = section.hint(
+            Keys::compiled(),
             u16::try_from(width).expect("a hint this narrow fits u16"),
             &Theme::default(),
         );

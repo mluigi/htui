@@ -11,8 +11,7 @@ use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::{Harness, SectionBench};
 use htui::ui::Theme;
 use htui::ui::tabs::settings::personas::{
-    COMMAND_RUN_IS_Y_OR_N, ENTER_A_PATH, HINT_BROWSE, HINT_DELETING, HINT_EDITOR, HINT_FORM_EDIT,
-    HINT_REPORT, IMPORTING, UNCHANGED, UNSAVED,
+    COMMAND_RUN_IS_Y_OR_N, ENTER_A_PATH, IMPORTING, UNCHANGED, UNSAVED,
 };
 use htui::ui::tabs::settings::{PersonasSection, SettingsSection, SettingsTab};
 use htui_core::fixtures::ids;
@@ -30,6 +29,25 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
 use ratatui::{Terminal, TerminalOptions, Viewport};
+
+/// The Browse hint with the default keys (MOD-67 M3: the section's hint constants are hint specs
+/// now, rendered through the keys in force, so the text is pinned here).
+const BROWSE_KEYS: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} b body \u{b7} r rules \u{b7} d delete \u{b7} I import";
+
+/// The edit form's hint with the default keys.
+const FORM_EDIT_KEYS: &str = "Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc cancel";
+
+/// The body (edit) and rules editors' hint with the default keys: `form.save`'s label.
+const EDITOR_KEYS: &str = "Ctrl+s save \u{b7} Esc cancel \u{b7} Enter breaks the line";
+
+/// The delete question's hint with the default keys.
+const DELETING_KEYS: &str = "y delete \u{b7} n/Esc stop";
+
+/// The import path's hint (the field's own `Enter` and `Esc`).
+const IMPORT_KEYS: &str = "Enter import \u{b7} Esc cancel";
+
+/// The import report's hint with the default keys.
+const REPORT_KEYS: &str = "j/k scroll \u{b7} Esc close";
 
 /// What a compare-and-set miss says under an open form (`settings/mod.rs`, private there).
 const CHANGED_ELSEWHERE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Enter retries against the current row";
@@ -198,7 +216,7 @@ async fn the_registry_lists_one_line_per_persona() {
         "the detail line sits under the cursor row: {frame}"
     );
     assert!(lines[2].starts_with("reviewer \u{b7} Reviews"), "{frame}");
-    assert!(frame.contains(HINT_BROWSE), "{frame}");
+    assert!(frame.contains(BROWSE_KEYS), "{frame}");
     insta::assert_snapshot!("browse", frame);
 }
 
@@ -421,7 +439,7 @@ async fn e_opens_the_prefilled_form() {
             "{line}: {frame}"
         );
     }
-    assert!(frame.contains(HINT_FORM_EDIT), "{frame}");
+    assert!(frame.contains(FORM_EDIT_KEYS), "{frame}");
     insta::assert_snapshot!("form", frame);
 }
 
@@ -455,7 +473,7 @@ async fn an_unchanged_form_sends_nothing() {
     assert!(!section.captures_input(), "the form closed");
     let frame = frame(&bench, &section);
     assert!(frame.contains(UNCHANGED), "{frame}");
-    assert!(frame.contains(HINT_BROWSE), "{frame}");
+    assert!(frame.contains(BROWSE_KEYS), "{frame}");
 }
 
 fn one_rule() -> PersonaRule {
@@ -553,7 +571,7 @@ async fn b_opens_the_body_and_ctrl_s_sends_the_body_only() {
 
     let opened = frame(&bench, &section);
     assert!(opened.contains("body of `architect`"), "{opened}");
-    assert!(opened.contains(HINT_EDITOR), "{opened}");
+    assert!(opened.contains(EDITOR_KEYS), "{opened}");
     insta::assert_snapshot!("body", opened);
 
     type_text(&bench, &mut section, "Extra.");
@@ -1009,7 +1027,7 @@ async fn d_asks_and_y_sends_delete_persona() {
         asked.contains("delete persona `reviewer`? a persona bound to a phase is refused."),
         "{asked}"
     );
-    assert!(asked.contains(HINT_DELETING), "{asked}");
+    assert!(asked.contains(DELETING_KEYS), "{asked}");
     insta::assert_snapshot!("delete_ask", asked);
 
     bench.key(&mut section, "y");
@@ -1029,7 +1047,7 @@ async fn n_or_esc_at_the_question_sends_nothing() {
     for stop in ["n", "esc"] {
         keys(&bench, &mut section, &["d", stop]);
         assert!(!section.captures_input(), "{stop}: back to Browse");
-        assert!(frame(&bench, &section).contains(HINT_BROWSE), "{stop}");
+        assert!(frame(&bench, &section).contains(BROWSE_KEYS), "{stop}");
     }
     assert!(bench.drained().is_empty(), "nothing at all was emitted");
 }
@@ -1199,7 +1217,7 @@ async fn an_import_with_a_refusal_or_a_drop_opens_the_report() {
         report.starts_with("imported 1 \u{b7} refused 2 \u{b7} skipped 1"),
         "{report}"
     );
-    assert!(report.contains(HINT_REPORT), "{report}");
+    assert!(report.contains(REPORT_KEYS), "{report}");
     insta::assert_snapshot!("import_report", report);
 
     bench.key(&mut section, "j");
@@ -1212,7 +1230,7 @@ async fn an_import_with_a_refusal_or_a_drop_opens_the_report() {
 
     bench.key(&mut section, "esc");
     assert!(!section.captures_input(), "back to Browse");
-    assert!(frame(&bench, &section).contains(HINT_BROWSE));
+    assert!(frame(&bench, &section).contains(BROWSE_KEYS));
 }
 
 #[tokio::test]
@@ -1255,11 +1273,11 @@ async fn an_import_landing_over_an_editor_says_the_counts() {
         "{report}"
     );
     assert!(report.contains("gortex-search.md"), "{report}");
-    assert!(report.contains(HINT_REPORT), "{report}");
+    assert!(report.contains(REPORT_KEYS), "{report}");
 
     bench.key(&mut section, "esc");
     assert!(!section.captures_input(), "back to Browse");
-    assert!(frame(&bench, &section).contains(HINT_BROWSE));
+    assert!(frame(&bench, &section).contains(BROWSE_KEYS));
 }
 
 /// R1 M-1 (OQ-7, R-13: every drop is named): an import whose only issue is dropped `mcp__`
@@ -1294,7 +1312,7 @@ async fn an_import_with_only_drops_landing_over_an_editor_keeps_its_report() {
     bench.key(&mut section, "esc");
     let report = frame(&bench, &section);
     assert!(section.captures_input(), "the report opened: {report}");
-    assert!(report.contains(HINT_REPORT), "{report}");
+    assert!(report.contains(REPORT_KEYS), "{report}");
     assert!(
         shows(&report, "dropped from `tools`: `mcp__gortex__search`"),
         "the drop is named: {report}"
@@ -1366,7 +1384,7 @@ async fn offline_the_section_says_unavailable_and_offers_no_keys() {
         "{frame}"
     );
     assert!(shows(&frame, DATABASE_UNREACHABLE), "{frame}");
-    assert!(!frame.contains(HINT_BROWSE), "no keys are offered: {frame}");
+    assert!(!frame.contains(BROWSE_KEYS), "no keys are offered: {frame}");
 
     // The last line is the shell's: the refused read's status gives way to the key help on the
     // first key, so the section's rows are what must not move.
@@ -1409,7 +1427,7 @@ async fn the_product_registers_personas_last() {
     assert!(frame.contains("architect \u{b7} "), "{frame}");
     assert!(frame.contains("reviewer \u{b7} "), "{frame}");
     assert!(
-        frame.contains(HINT_BROWSE),
+        frame.contains(BROWSE_KEYS),
         "the active section is Personas: {frame}"
     );
 }
@@ -1451,4 +1469,179 @@ async fn the_cursor_row_is_drawn_selected() {
     let second = selected_rows(&drawn(&bench, &section));
     assert_eq!(second.len(), 1, "{second:?}");
     assert!(second[0].1.starts_with("reviewer"), "{second:?}");
+}
+
+// ---- MOD-67 M3: keys through the context stacks ------------------------------------------------
+
+/// A bench handing the section `keys` instead of the compiled defaults, the demo registry
+/// delivered.
+async fn bench_with_keys(file: &str) -> (SectionBench, PersonasSection) {
+    let keys = htui::keys::load_str(file).expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = PersonasSection::new();
+    bench.reply(&mut section, &StoreReply::Personas(demo_rows().await));
+    let _ = bench.drained();
+    (bench, section)
+}
+
+/// D14 (L-D Q10): `alt-y` is not `y`. The question stays, nothing is sent, and the chord goes to
+/// the shell (a modal mode passes ALT); `y` then deletes.
+#[tokio::test]
+async fn alt_y_at_the_delete_question_deletes_nothing() {
+    let (bench, mut section) = bench_with_demo().await;
+    keys(&bench, &mut section, &["j", "d"]);
+
+    for chord in ["alt-y", "alt-n", "alt-esc"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+        assert!(section.captures_input(), "{chord}: still asking");
+    }
+    assert!(requests(&bench).is_empty(), "no chord sent the delete");
+    assert!(frame(&bench, &section).contains(DELETING_KEYS));
+
+    bench.key(&mut section, "y");
+    assert!(
+        matches!(
+            requests(&bench).as_slice(),
+            [StoreRequest::DeletePersona { id }] if *id == ids::PERSONA_REVIEWER
+        ),
+        "`y` still deletes"
+    );
+}
+
+/// D5: the import report scrolls and closes on its own chords only; `alt-esc`, `alt-enter` and
+/// `alt-j` leave it where it was, and `Enter` (a view default of `common.back`) closes it.
+#[tokio::test]
+async fn alt_enter_and_alt_esc_keep_the_report_open() {
+    let (bench, mut section) = bench_with_demo().await;
+    start_import(&bench, &mut section);
+    let _ = requests(&bench);
+    bench.reply(
+        &mut section,
+        &StoreReply::PersonaImports(Box::new(PersonaImports {
+            personas: Ok(demo_rows().await),
+            report: mixed_report(),
+        })),
+    );
+    let report = frame(&bench, &section);
+
+    for chord in ["alt-esc", "alt-enter", "alt-j", "ctrl-down"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+        assert!(section.captures_input(), "{chord} leaves the report open");
+        assert_eq!(frame(&bench, &section), report, "{chord} moves nothing");
+    }
+    for chord in ["tab", "q", "x"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Consumed, "{chord}");
+        assert!(
+            section.captures_input(),
+            "{chord} is swallowed by the report"
+        );
+    }
+
+    bench.key(&mut section, "enter");
+    assert!(!section.captures_input(), "Enter closes the report");
+}
+
+/// D5: `F1` (and `ctrl-c`) from the body editor goes to the shell, which opens help; `Tab` is
+/// neither typed nor passed.
+#[tokio::test]
+async fn f1_in_the_body_editor_is_not_typed_and_is_passed() {
+    let (bench, mut section) = bench_with_demo().await;
+    bench.key(&mut section, "b");
+    let opened = frame(&bench, &section);
+
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass);
+    assert_eq!(bench.key(&mut section, "ctrl-c"), Handled::Pass);
+    assert_eq!(bench.key(&mut section, "tab"), Handled::Consumed);
+    assert!(section.captures_input(), "the editor stays open");
+    assert_eq!(frame(&bench, &section), opened, "nothing was typed");
+}
+
+/// D5: the form's focus moves on `Tab`/`Down` and `BackTab`/`Up` only; a modified arrow is a
+/// chord for the shell.
+#[tokio::test]
+async fn ctrl_down_in_the_form_keeps_the_focus() {
+    let rows = demo_rows().await;
+    let row = architect(&rows);
+    let (bench, mut section) = bench_with(rows).await;
+    keys(&bench, &mut section, &["e", "down"]);
+    for chord in ["ctrl-down", "alt-tab", "ctrl-up", "alt-backtab"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
+    }
+    type_text(&bench, &mut section, " More.");
+    bench.key(&mut section, "enter");
+
+    let (_, _, patch) = one_update(requests(&bench));
+    assert_eq!(
+        patch,
+        PersonaPatch {
+            description: Some(format!("{} More.", row.description)),
+            ..PersonaPatch::default()
+        },
+        "the description kept the focus"
+    );
+}
+
+/// D13 and L-D Q3: the editors take `form.save` from the resolver after the `TextArea`, so a
+/// rebound save chord saves too (and the widget's own `Ctrl+s` still does), and the hint shows the
+/// new chord.
+#[tokio::test]
+async fn a_rebound_save_saves_the_body() {
+    let (bench, mut section) =
+        bench_with_keys("version = 1\n[settings.personas]\nsave = [\"f2\"]\n").await;
+    bench.key(&mut section, "b");
+    let opened = frame(&bench, &section);
+    assert!(
+        opened.contains("F2 save \u{b7} Esc cancel \u{b7} Enter breaks the line"),
+        "{opened}"
+    );
+
+    type_text(&bench, &mut section, "Extra.");
+    assert_eq!(bench.key(&mut section, "f2"), Handled::Consumed);
+    let (_, _, patch) = one_update(requests(&bench));
+    assert!(
+        patch
+            .body
+            .as_deref()
+            .is_some_and(|body| body.ends_with("Extra.")),
+        "{patch:?}"
+    );
+}
+
+/// D14: one rebinding through the shell. `[settings.personas] import = ["i"]`: the hint shows
+/// `i import`, `I` does nothing, and `i` opens the path field.
+#[tokio::test]
+async fn a_rebound_import_opens_on_its_new_chord_only() {
+    let keys = htui::keys::load_str("version = 1\n[settings.personas]\nimport = [\"i\"]\n")
+        .expect("the key file loads");
+    let mut harness =
+        Harness::demo()
+            .with_keys(keys)
+            .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+                PersonasSection::new(),
+            )])));
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains(
+            "j/k select \u{b7} n new \u{b7} e edit \u{b7} b body \u{b7} r rules \u{b7} d delete \u{b7} i import"
+        ),
+        "{frame}"
+    );
+    let pane = |frame: &str| -> Vec<String> {
+        let lines: Vec<String> = frame.lines().map(str::to_owned).collect();
+        lines[..lines.len() - 1].to_vec()
+    };
+    harness.key("I");
+    harness.settle().await;
+    assert_eq!(
+        pane(&harness.render()),
+        pane(&frame),
+        "`I` is no longer import"
+    );
+
+    harness.key("i");
+    harness.settle().await;
+    let opened = harness.render();
+    assert!(opened.contains(IMPORT_KEYS), "`i` opens the path: {opened}");
 }

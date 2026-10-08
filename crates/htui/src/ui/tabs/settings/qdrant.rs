@@ -4,13 +4,14 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
 use crate::app::{Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 const NOT_READ: &str = "not read yet";
 const STORED: &str = "stored";
@@ -26,11 +27,28 @@ const UNREADABLE_GUIDE: &str =
     "the keyring could not be read; Enter tries to store a Qdrant URL in it";
 const CONFIRM_CLEAR: &str = "Remove the Qdrant settings from the keyring? y / n";
 
-const HINT_BROWSE: &str = "e edit \u{b7} c clear all \u{b7} r reload · j/k rows";
-const HINT_NO_SNAPSHOT: &str = "r reload · j/k rows";
-const HINT_EDITING: &str = "Enter continue \u{b7} Esc cancel";
-const HINT_EDITING_KEY: &str = "Enter store \u{b7} Esc cancel \u{b7} typed text is never shown";
-const HINT_CONFIRM: &str = "y confirm \u{b7} n / Esc cancel";
+// The hint rows (MOD-67 M3 D9): rendered through the mode's stack, so a rebound key shows its
+// new chord. `Enter`/`Esc` in the editors are the text field's own keys (D13), written as text.
+const HINT_BROWSE: HintSpec = &[
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::Clear, "clear all"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "rows"),
+];
+const HINT_NO_SNAPSHOT: HintSpec = &[
+    Hint::One(Act::Reload, "reload"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "rows"),
+];
+const HINT_EDITING: HintSpec = &[Hint::Text("Enter continue"), Hint::Text("Esc cancel")];
+const HINT_EDITING_KEY: HintSpec = &[
+    Hint::Text("Enter store"),
+    Hint::Text("Esc cancel"),
+    Hint::Text("typed text is never shown"),
+];
+const HINT_CONFIRM: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "confirm"),
+    Hint::All(Act::ConfirmNo, "cancel"),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Row {
@@ -221,26 +239,92 @@ impl QdrantSection {
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass => Handled::Pass,
+            // The field passed it (`Tab`, arrows, a CONTROL chord …): the editor keeps it unless
+            // the modal global layer admits it (MOD-67 D5, PA-5). `Tab` stays here rather than
+            // switching tabs (ANA-26 §2.6 defect 2); `ctrl-c` and `F1` reach the shell.
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
         }
     }
 
+    /// The clear question (MOD-67 M3 §6.4): `confirm.yes` clears, `confirm.no` goes back, a chord
+    /// the modal global layer admits passes, and everything else is swallowed.
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
+        let stack = views::QDRANT_CONFIRM;
+        let chord = KeyChord::from_event(key);
+        // The first candidate decides (MOD-67 M3 §6.4): a global act there is the pass rule's.
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes) => {
+                self.mode = Mode::Browse;
+                self.send(StoreRequest::ClearQdrantSettings, ctx);
+                return Handled::Consumed;
+            }
+            Some(Act::ConfirmNo) => {
+                self.mode = Mode::Browse;
+                return Handled::Consumed;
+            }
+            _ => {}
         }
-        match &mut self.mode {
-            Mode::ConfirmClear => match key.code {
-                KeyCode::Char('y') => {
-                    self.mode = Mode::Browse;
-                    self.send(StoreRequest::ClearQdrantSettings, ctx);
+        modal_rest(stack, chord)
+    }
+
+    /// The stack of the current mode (MOD-67 D4): the one place a mode maps to its keys;
+    /// `key_stack`, the key handlers and the hint all read it.
+    fn stack(&self) -> Stack<'static> {
+        match self.mode {
+            Mode::Browse => views::QDRANT_BROWSE,
+            Mode::ConfirmClear => views::QDRANT_CONFIRM,
+            Mode::EditingUrl(_) | Mode::EditingKey(_) => views::CAPTURE,
+        }
+    }
+
+    /// One key in Browse (MOD-67 M3 §6.2): whole chords through `QDRANT_BROWSE`, so `ctrl-e`
+    /// edits nothing and `ctrl-r` reads nothing (defect 1).
+    fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::QDRANT_BROWSE, chord) {
+            match act {
+                Act::Edit => {
+                    if !self.blocked() {
+                        self.open_edit();
+                    }
+                    return Handled::Consumed;
                 }
-                KeyCode::Char('n') | KeyCode::Esc => self.mode = Mode::Browse,
-                _ => {}
-            },
-            _ => return Handled::Pass,
+                Act::Clear => {
+                    if !self.blocked() {
+                        if matches!(self.state(), Some(QdrantState::Stored))
+                            || matches!(
+                                self.snapshot.as_ref().map(|s| &s.key_state),
+                                Some(QdrantState::Stored)
+                            )
+                        {
+                            self.notice = None;
+                            self.mode = Mode::ConfirmClear;
+                        } else {
+                            self.refuse("qdrant settings unavailable".to_owned());
+                        }
+                    }
+                    return Handled::Consumed;
+                }
+                Act::ListDown => {
+                    self.move_cursor(true);
+                    return Handled::Consumed;
+                }
+                Act::ListUp => {
+                    self.move_cursor(false);
+                    return Handled::Consumed;
+                }
+                // A re-read, never refused: it is how the unavailable state recovers (MOD-63). It
+                // sets no `busy`, like the Connection section's `r`.
+                Act::Reload => {
+                    self.read_out = true;
+                    ctx.request(StoreRequest::QdrantInfo);
+                    return Handled::Consumed;
+                }
+                // A global act: the shell resolves the same stack and applies it.
+                _ => continue,
+            }
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
     /// Sends one write and remembers its name until the reply, so `on_snapshot` can say what it
@@ -256,8 +340,8 @@ impl QdrantSection {
     /// The outcome only appears here in Browse. When both do not fit in `room` cells the outcome
     /// wins the line: the keys are on screen every other frame, and this is the only place the
     /// outcome appears.
-    fn hint(&self, room: usize, theme: &crate::ui::Theme) -> Line<'static> {
-        let keys = self.hint_text();
+    fn hint(&self, keys: &Keys, room: usize, theme: &crate::ui::Theme) -> Line<'static> {
+        let keys = self.hint_text(keys);
         let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
             return Line::styled(keys, theme.dim);
         };
@@ -276,8 +360,8 @@ impl QdrantSection {
         ])
     }
 
-    fn hint_text(&self) -> String {
-        let keys = match self.mode {
+    fn hint_text(&self, keys: &Keys) -> String {
+        let spec = match self.mode {
             Mode::EditingUrl(_) => HINT_EDITING,
             Mode::EditingKey(_) => HINT_EDITING_KEY,
             Mode::ConfirmClear => HINT_CONFIRM,
@@ -289,11 +373,12 @@ impl QdrantSection {
                 }
             }
         };
+        let keys = keys.hint(self.stack(), spec);
         match self.busy {
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
                 format!("{keys} \u{b7} {busy} in flight")
             }
-            _ => keys.to_owned(),
+            _ => keys,
         }
     }
 
@@ -392,51 +477,15 @@ impl SettingsSection for QdrantSection {
         Handled::Consumed
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
-            Mode::EditingUrl(_) | Mode::EditingKey(_) => return self.on_editor_key(key, ctx),
-            Mode::ConfirmClear => return self.on_confirm_key(key, ctx),
-            Mode::Browse => {}
-        }
-        match key.code {
-            KeyCode::Char('e') => {
-                if !self.blocked() {
-                    self.open_edit();
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('c') => {
-                if !self.blocked() {
-                    if matches!(self.state(), Some(QdrantState::Stored))
-                        || matches!(
-                            self.snapshot.as_ref().map(|s| &s.key_state),
-                            Some(QdrantState::Stored)
-                        )
-                    {
-                        self.notice = None;
-                        self.mode = Mode::ConfirmClear;
-                    } else {
-                        self.refuse("qdrant settings unavailable".to_owned());
-                    }
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.move_cursor(true);
-                Handled::Consumed
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.move_cursor(false);
-                Handled::Consumed
-            }
-            // A re-read, never refused: it is how the unavailable state recovers (MOD-63). It sets
-            // no `busy`, like the Connection section's `r`.
-            KeyCode::Char('r') => {
-                self.read_out = true;
-                ctx.request(StoreRequest::QdrantInfo);
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
+            Mode::EditingUrl(_) | Mode::EditingKey(_) => self.on_editor_key(key, ctx),
+            Mode::ConfirmClear => self.on_confirm_key(key, ctx),
+            Mode::Browse => self.on_browse_key(key, ctx),
         }
     }
 
@@ -559,7 +608,7 @@ impl SettingsSection for QdrantSection {
             }
         }
 
-        lines.push(self.hint(room, ctx.theme));
+        lines.push(self.hint(ctx.keys(), room, ctx.theme));
 
         let p = ratatui::widgets::Paragraph::new(lines);
         frame.render_widget(p, area);
@@ -581,10 +630,10 @@ mod tests {
             notice: Some(Notice::Error(notice.clone())),
             ..QdrantSection::new()
         };
-        let keys = section.hint_text();
+        let keys = section.hint_text(Keys::compiled());
         let width = cell_width(&keys) + k + 3;
 
-        let line = section.hint(width, &Theme::default());
+        let line = section.hint(Keys::compiled(), width, &Theme::default());
 
         assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
         assert_eq!(line.spans[0].content, notice);

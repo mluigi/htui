@@ -393,6 +393,17 @@ impl App {
         }
     }
 
+    /// The stack of the view that holds the keyboard (MOD-67 D4, PA-8): the top overlay's when
+    /// an overlay is up, else the active tab's. `None` while that view is unconverted: the
+    /// status line and the `?` box are then today's.
+    #[must_use]
+    pub fn active_stack(&self) -> Option<Stack<'static>> {
+        match self.overlays.top() {
+            Some(top) => top.key_stack(),
+            None => self.tabs.active().and_then(Tab::key_stack),
+        }
+    }
+
     /// D6 steps 2 and 6: the first candidate the shell maps to an action wins. `true` if one did.
     fn apply_keys(&mut self, stack: Stack<'_>, chord: KeyChord) -> bool {
         let action = self
@@ -755,8 +766,9 @@ impl App {
     }
 
     /// The propagation chain (blueprint C.4, MOD-67 D6), stopping at the first consumer: the
-    /// in-pane editor (MOD-57), `ctrl-c`, the top overlay, the overlay stack, the modal swallow,
-    /// the active tab, its legacy rows, the base stack.
+    /// in-pane editor (MOD-57), `ctrl-c`, the top overlay, the overlay's stack (`Stack::OVERLAY`
+    /// while unconverted), the modal swallow, the active tab, its legacy rows, the tab's stack
+    /// (`Stack::BASE` while unconverted).
     ///
     /// `ctrl-c` is checked here only: a bracketed paste has no key table
     /// ([`on_paste`](Self::on_paste)), so a pasted `U+0003` never quits.
@@ -819,7 +831,14 @@ impl App {
             // `Esc` closes; `?`/`F1` toggle help over any overlay, for a key the overlay passed.
             // Before the modal swallow: under a future non-modal overlay, help pre-empts the active
             // tab for a key the overlay passed (D6). The first non-modal overlay revisits this.
-            if self.apply_keys(Stack::OVERLAY, chord) {
+            // A converted overlay resolves through its own stack (MOD-67 M3 D6), which carries
+            // the layer filter.
+            let stack = self
+                .overlays
+                .top()
+                .and_then(Overlay::key_stack)
+                .unwrap_or(Stack::OVERLAY);
+            if self.apply_keys(stack, chord) {
                 return;
             }
             // A modal overlay swallows what it did not handle: the tab below never sees it.
@@ -869,8 +888,14 @@ impl App {
             }
         }
 
-        // The base stack.
-        self.apply_keys(Stack::BASE, chord);
+        // The active tab's stack (MOD-67 M3 D6), else the base stack. The tab's, not
+        // `active_stack()`: a key reaches this step only when no modal overlay swallowed it.
+        let stack = self
+            .tabs
+            .active()
+            .and_then(Tab::key_stack)
+            .unwrap_or(Stack::BASE);
+        self.apply_keys(stack, chord);
     }
 
     /// The context of one view.
@@ -923,8 +948,12 @@ impl App {
         let (status, style) = match &self.status {
             Some(message) => (message.clone(), self.theme.error),
             None => (
-                self.editor_status()
-                    .unwrap_or_else(|| self.keys.status_line(|act| self.action_for(act).is_some())),
+                self.editor_status().unwrap_or_else(|| {
+                    self.keys
+                        .status_line(self.active_stack().unwrap_or(Stack::BASE), |act| {
+                            self.action_for(act).is_some()
+                        })
+                }),
                 self.theme.dim,
             ),
         };
@@ -940,8 +969,10 @@ impl App {
         }
     }
 
-    /// The `?` box (MOD-67 D8), rebuilt from the live state every frame: the overlay context (if
-    /// one is up), the editor context (while an in-pane editor is alive, MOD-57), the active tab's
+    /// The `?` box (MOD-67 D8), rebuilt from the live state every frame. With a converted view
+    /// holding the keyboard ([`App::active_stack`]): one line per layer of its stack, then the
+    /// closing line its global layer admits. Otherwise today's box: the overlay context (if one
+    /// is up), the editor context (while an in-pane editor is alive, MOD-57), the active tab's
     /// legacy rows, the global context, then the closing line.
     ///
     /// Each logical line is packed into rows that fit the box ([`HelpLine::rows`]), so the box is
@@ -951,28 +982,37 @@ impl App {
         let inner = usize::from(box_width.saturating_sub(2));
         let offered = |act| self.action_for(act).is_some();
         let mut lines: Vec<HelpLine> = Vec::new();
-        if !self.overlays.is_empty() {
-            lines.extend(self.keys.help_line(Context::Overlay, offered));
-        }
-        if self.editor.is_some() {
-            lines.extend(self.keys.help_line(Context::Editor, |_| true));
-        }
-        if let Some(tab) = self.tabs.active() {
-            let legacy = self.keymap.help_line(&KeyScope::Tab(tab.id()));
-            if !legacy.is_empty() {
-                lines.push(HelpLine::new(
-                    tab.title(),
-                    legacy.split(" · ").map(str::to_owned).collect(),
-                ));
+        let closer = match self.active_stack() {
+            Some(stack) => {
+                lines = self.keys.help_lines(stack, offered);
+                self.keys.help_closer(stack)
             }
-        }
-        lines.extend(self.keys.help_line(Context::Global, offered));
+            None => {
+                if !self.overlays.is_empty() {
+                    lines.extend(self.keys.help_line(Context::Overlay, offered));
+                }
+                if self.editor.is_some() {
+                    lines.extend(self.keys.help_line(Context::Editor, |_| true));
+                }
+                if let Some(tab) = self.tabs.active() {
+                    let legacy = self.keymap.help_line(&KeyScope::Tab(tab.id()));
+                    if !legacy.is_empty() {
+                        lines.push(HelpLine::new(
+                            tab.title(),
+                            legacy.split(" · ").map(str::to_owned).collect(),
+                        ));
+                    }
+                }
+                lines.extend(self.keys.help_line(Context::Global, offered));
+                self.keys.help_closer(Stack::BASE)
+            }
+        };
         let mut rows: Vec<Line<'_>> = lines
             .iter()
             .flat_map(|line| line.rows(inner))
             .map(|row| Line::styled(row, self.theme.base))
             .collect();
-        if let Some(closer) = self.keys.help_closer() {
+        if let Some(closer) = closer {
             rows.push(Line::styled(closer, self.theme.dim));
         }
         let height = u16::try_from(rows.len())

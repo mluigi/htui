@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Keys, contexts, quote};
+use super::{Context, Keys, quote};
 
 /// The header and `version = 1`. Constant, so the output is the same on every machine (B-13).
 const HEADER: &str = r"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
@@ -14,12 +14,15 @@ version = 1
 ";
 
 /// The keys in force as a complete `keys.toml`: a constant header, `version = 1`, then one table
-/// per context in catalogue order, one padded `name = ["chord", …]  # help` line per action. A
-/// line the file changed ends `(changed)`; an unbound action is `name = []`.
+/// per context in `Context::ALL` order (a context with no row prints nothing), one padded
+/// `name = ["chord", …]  # help` line per action. A view's table lists its own rows, then its
+/// derived `VIEW_DEFAULTS` rows, then its overrides of shared verbs (MOD-67 M3), each under the
+/// shared verb's name. A line the file changed ends `(changed)`; a derived row the file did not
+/// set never does; an unbound action is `name = []`.
 #[must_use]
 pub fn print(keys: &Keys) -> String {
     let mut out = HEADER.to_owned();
-    for context in contexts() {
+    for &context in Context::ALL {
         let rows: Vec<(&str, String, &str, bool)> = keys
             .rows
             .iter()
@@ -99,7 +102,7 @@ close = ["esc"]  # close"#;
         let printed = print(Keys::compiled());
         let head: Vec<&str> = printed.lines().take(26).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
-        assert!(printed.ends_with("dismiss = [\"esc\"]  # dismiss\n"));
+        assert!(printed.ends_with("[waiting]\nopen = [\"enter\"]  # open step\n"));
         assert!(!printed.ends_with("\n\n"));
         assert!(printed.lines().all(|line| line == line.trim_end()));
         assert!(printed.lines().all(|line| line.chars().count() <= 100));
@@ -141,5 +144,45 @@ close = ["esc"]  # close"#;
         assert_eq!(quote("ctrl-f"), "\"ctrl-f\"");
         let keys = load_str("[global]\nquit = [\"\\\\\"]\n").expect("a backslash chord loads");
         assert_eq!(load_str(&print(&keys)), Ok(keys));
+    }
+
+    #[test]
+    fn a_view_override_and_a_derived_row_round_trip() {
+        let keys = load_str("[form]\nnext_field = [\"ctrl-n\"]\n").expect("the file loads");
+        let printed = print(&keys);
+        for line in [
+            "next_field      = [\"ctrl-n\"]   # next field (changed)",
+            "next_field     = [\"ctrl-n\", \"down\"]  # next field",
+        ] {
+            assert!(
+                printed.lines().any(|printed| printed == line),
+                "{line}\n{printed}"
+            );
+        }
+        assert_eq!(printed.matches("(changed)").count(), 1);
+        let reloaded = load_str(&printed).expect("the print loads");
+        assert_eq!(reloaded, keys);
+        assert_eq!(print(&reloaded), printed);
+
+        for (src, value) in [
+            ("[settings.boxes]\nreload = [\"f5\"]\n", "[\"f5\"]"),
+            ("[settings.boxes]\nreload = []\n", "[]"),
+        ] {
+            let keys = load_str(src).expect("the override loads");
+            let printed = print(&keys);
+            let table = printed
+                .split("\n\n")
+                .find(|table| table.starts_with("[settings.boxes]\n"))
+                .expect("a boxes table");
+            let last = table.lines().last().expect("a row");
+            assert!(
+                last.starts_with(&format!("reload      = {value}")),
+                "{last}"
+            );
+            assert!(last.ends_with("# reload (changed)"), "{last}");
+            let reloaded = load_str(&printed).expect("the print loads");
+            assert_eq!(reloaded, keys);
+            assert_eq!(print(&reloaded), printed);
+        }
     }
 }

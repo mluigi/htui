@@ -1,7 +1,9 @@
 //! Named key actions (MOD-67, `docs/ANA-26.md` §7): the compiled-in catalogue, the strict chord
 //! parser, context stacks and the resolver that turns a chord into ordered candidate actions, and
 //! the hints and help generated from them. M2 adds the key file: [`load`] reads `keys.toml` over
-//! the catalogue.
+//! the catalogue. M3 adds the Settings and overlay contexts, their stacks in [`views`], view
+//! layers that inherit shared verbs, modal layers that filter chords, the derived view defaults
+//! (`VIEW_DEFAULTS`) and a view table's overrides of shared verbs.
 //!
 //! D6's dispatch order lives in `App::on_key`. This module only answers "which actions does this
 //! chord name in this stack" and "how is this action labelled".
@@ -13,8 +15,9 @@ pub mod load;
 pub mod print;
 pub mod stack;
 pub mod validate;
+pub mod views;
 
-pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, STATE_GUARDED};
+pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, SHADOWING, STATE_GUARDED, VIEW_DEFAULTS};
 pub use chord::{CTRL_C, ChordError, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
 pub use load::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
@@ -44,6 +47,9 @@ struct Row {
     /// The `keys.toml` line of the entry that set `chords`, or `None` while they equal the
     /// catalogue default (PA-3). Validation reports on it; `--print-keys` marks it `(changed)`.
     line: Option<usize>,
+    /// `Some` for a `VIEW_DEFAULTS` row (MOD-67 M3 PA-1): its extra chords, added to whatever
+    /// the shared row resolves to whenever the row is derived ([`Keys::derive`]).
+    extra: Option<Vec<KeyChord>>,
 }
 
 impl PartialEq for Row {
@@ -67,35 +73,86 @@ impl Keys {
         &COMPILED
     }
 
-    /// A fresh table of the catalogue defaults, each parsed with [`KeyChord::parse_strict`].
+    /// A fresh table of the catalogue defaults, each parsed with [`KeyChord::parse_strict`],
+    /// then one derived row per [`VIEW_DEFAULTS`] entry (MOD-67 M3 PA-1): the shared row's
+    /// chords followed by the view's extra ones.
     ///
     /// # Panics
-    /// If a default does not parse. `every_catalogue_default_parses_strictly` pins that none fails.
+    /// If a default does not parse. `every_catalogue_default_parses_strictly` and
+    /// `every_view_default_is_an_extra_chord_some_stack_offers` pin that none fails.
     #[must_use]
     pub fn defaults() -> Self {
-        let rows = CATALOGUE
-            .iter()
-            .map(|spec| Row {
-                context: spec.context,
-                act: spec.act,
-                help: spec.help,
-                chords: spec
-                    .defaults
-                    .iter()
-                    .map(|written| {
-                        KeyChord::parse_strict(written).unwrap_or_else(|err| {
-                            panic!(
-                                "catalogue default {written:?} of [{}] {}: {err}",
-                                spec.context.table(),
-                                spec.name
-                            )
-                        })
-                    })
-                    .collect(),
-                line: None,
+        let parse = |written: &str, context: Context, name: &str| {
+            KeyChord::parse_strict(written).unwrap_or_else(|err| {
+                panic!(
+                    "catalogue default {written:?} of [{}] {name}: {err}",
+                    context.table()
+                )
             })
-            .collect();
-        Self { rows }
+        };
+        let catalogue = CATALOGUE.iter().map(|spec| Row {
+            context: spec.context,
+            act: spec.act,
+            help: spec.help,
+            chords: spec
+                .defaults
+                .iter()
+                .map(|written| parse(written, spec.context, spec.name))
+                .collect(),
+            line: None,
+            extra: None,
+        });
+        let derived = VIEW_DEFAULTS.iter().map(|&(context, act, extra)| {
+            let name = act.spec().map_or("", |spec| spec.name);
+            Row {
+                context,
+                act,
+                help: act.spec().map_or("", |spec| spec.help),
+                chords: Vec::new(),
+                line: None,
+                extra: Some(
+                    extra
+                        .iter()
+                        .map(|written| parse(written, context, name))
+                        .collect(),
+                ),
+            }
+        });
+        let mut keys = Self {
+            rows: catalogue.chain(derived).collect(),
+        };
+        keys.derive(&[]);
+        keys
+    }
+
+    /// Re-derives every `VIEW_DEFAULTS` row from the shared row in force (MOD-67 M3 PA-1): the
+    /// shared row's chords, then each extra chord not already among them. A row the key file set
+    /// (`set_by_file`) keeps its chords, and loses its line when they equal the derivation, so
+    /// a printed file reads back unmarked.
+    fn derive(&mut self, set_by_file: &[(Context, Act)]) {
+        for index in 0..self.rows.len() {
+            let Some(extra) = self.rows[index].extra.as_deref() else {
+                continue;
+            };
+            let act = self.rows[index].act;
+            let mut derived: Vec<KeyChord> = act
+                .spec()
+                .map(|spec| self.chords(spec.context, act).to_vec())
+                .unwrap_or_default();
+            for &chord in extra {
+                if !derived.contains(&chord) {
+                    derived.push(chord);
+                }
+            }
+            let row = &mut self.rows[index];
+            if set_by_file.contains(&(row.context, row.act)) {
+                if row.chords == derived {
+                    row.line = None;
+                }
+            } else {
+                row.chords = derived;
+            }
+        }
     }
 
     /// The chords of `act` in exactly `context`, or `&[]` if there is no row or it is unbound.
@@ -124,6 +181,7 @@ impl Keys {
                 help: act.spec().map_or("", |spec| spec.help),
                 chords,
                 line: None,
+                extra: None,
             }),
         }
         self
@@ -138,16 +196,30 @@ impl Keys {
 
     /// The loader's merge (MOD-67 M2 D7): replaces the `(context, act)` row's chords and keeps
     /// `line` only when they differ from [`Keys::compiled`]'s for that row (PA-3). A missing row
-    /// is a no-op: the loader resolves names through `CATALOGUE`, so it never happens.
+    /// is a view's override of a shared verb (MOD-67 M3 D10): it is appended, and always keeps
+    /// its line, since the compiled keys have no such row.
     fn set(&mut self, context: Context, act: Act, chords: Vec<KeyChord>, line: usize) {
-        let changed = chords != Self::compiled().chords(context, act);
-        if let Some(row) = self
+        let changed = Self::compiled()
+            .row(context, act)
+            .is_none_or(|compiled| compiled.chords != chords);
+        let line = changed.then_some(line);
+        match self
             .rows
             .iter_mut()
             .find(|row| row.context == context && row.act == act)
         {
-            row.chords = chords;
-            row.line = changed.then_some(line);
+            Some(row) => {
+                row.chords = chords;
+                row.line = line;
+            }
+            None => self.rows.push(Row {
+                context,
+                act,
+                help: act.spec().map_or("", |spec| spec.help),
+                chords,
+                line,
+                extra: None,
+            }),
         }
     }
 
@@ -158,26 +230,16 @@ impl Keys {
             .find(|row| row.context == context && row.act == act)
     }
 
-    /// The row of `act` as the stack sees it: in the first layer that admits `act` and has a
-    /// row for it.
-    fn resolve_row(&self, stack: Stack<'_>, act: Act) -> Option<&Row> {
+    /// The row of `act` as the stack sees it, with its layer: in the first layer that admits
+    /// `act` ([`Stack::admits`], inheritance included) and has a row for it.
+    fn resolve_row(&self, stack: Stack<'_>, act: Act) -> Option<(Layer, &Row)> {
         stack
             .layers()
             .iter()
-            .filter(|layer| layer.admits(act))
-            .find_map(|layer| self.row(layer.context(), act))
+            .enumerate()
+            .filter(|&(index, _)| stack.admits(index, act))
+            .find_map(|(_, &layer)| self.row(layer.context(), act).map(|row| (layer, row)))
     }
-}
-
-/// Every context in catalogue order, once each: the key file's tables (MOD-67 M2).
-fn contexts() -> Vec<Context> {
-    let mut out: Vec<Context> = Vec::new();
-    for spec in CATALOGUE {
-        if !out.contains(&spec.context) {
-            out.push(spec.context);
-        }
-    }
-    out
 }
 
 /// `text` as a TOML basic string: wrapped in `"`, with `\` and `"` escaped and every control
@@ -199,7 +261,7 @@ fn quote(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CATALOGUE, CTRL_C, KeyChord, Keys, STATE_GUARDED};
+    use super::{Act, CATALOGUE, CTRL_C, Context, KeyChord, Keys, STATE_GUARDED, VIEW_DEFAULTS};
 
     /// Every default of `row`, parsed; the message names the row as a key file would.
     fn parsed(row: &super::ActionSpec) -> Vec<KeyChord> {
@@ -275,6 +337,52 @@ mod tests {
             assert_eq!(chords, parsed(row), "{:?}", row.act);
             assert!(!chords.contains(&CTRL_C), "{:?} binds ctrl-c", row.act);
         }
+        for row in &keys.rows {
+            assert!(
+                !row.chords.contains(&CTRL_C),
+                "[{}] {:?} binds ctrl-c",
+                row.context.table(),
+                row.act
+            );
+        }
+        assert_eq!(keys.rows.len(), CATALOGUE.len() + VIEW_DEFAULTS.len());
+    }
+
+    fn chords(specs: &[&str]) -> Vec<KeyChord> {
+        specs
+            .iter()
+            .map(|spec| KeyChord::parse_strict(spec).expect("a valid spec"))
+            .collect()
+    }
+
+    #[test]
+    fn the_compiled_view_defaults_are_derived() {
+        let keys = Keys::compiled();
+        assert_eq!(
+            keys.chords(Context::SettingsAgents, Act::FormNextField),
+            chords(&["tab", "down"])
+        );
+        assert_eq!(
+            keys.chords(Context::SettingsPersonas, Act::Back),
+            chords(&["esc", "enter"])
+        );
+        assert_eq!(
+            keys.chords(Context::Migration, Act::ConfirmNo),
+            chords(&["n", "esc", "N"])
+        );
+        for &(context, act, _) in VIEW_DEFAULTS {
+            assert_eq!(keys.line(context, act), None, "{context:?} {act:?}");
+        }
+    }
+
+    #[test]
+    fn a_derived_row_follows_the_shared_row_and_drops_a_duplicate_extra() {
+        let mut keys = Keys::defaults().with_chords(Context::Form, Act::FormNextField, &["down"]);
+        keys.derive(&[]);
+        assert_eq!(
+            keys.chords(Context::SettingsSecrets, Act::FormNextField),
+            chords(&["down"])
+        );
     }
 
     #[test]

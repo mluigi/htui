@@ -13,6 +13,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
+use crate::keys::Stack;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::tabs::settings::SectionId;
@@ -71,6 +72,12 @@ pub trait Tab {
     /// made one level down.
     fn focus_section(&mut self, _section: SectionId) -> bool {
         false
+    }
+    /// This tab's key stack in its current mode (MOD-67 D4), or `None` while the tab is not
+    /// converted (Backlog, Skills, Requirements, Chat until M4/M5): the shell then keeps today's
+    /// status line, `?` box and `Stack::BASE` dispatch. Defaulted, so no other tab changes.
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        None
     }
     /// The `$EDITOR` handoff this tab asked for came back (MOD-9 D10). Defaulted, the trait's
     /// second default after `focus_section`, so no other tab changes.

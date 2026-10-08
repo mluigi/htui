@@ -222,9 +222,24 @@ htui refuses to start on an invalid file and names every bad line, as in
 `htui --default-keys` starts with the default keys anyway. `ctrl-c` always quits and cannot be
 bound.
 
-Until every screen reads its keys from this file, a key a screen or pop-up handles itself wins
-there: with `[global] quit = ["e"]`, `e` still edits in Settings instead of quitting, and a pop-up
-that handles `Esc` itself still closes on it after `[overlay] close = ["f2"]`.
+A table named after a Settings section or a pop-up changes a shared action there alone:
+`[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every other section keeps `r`.
+`htui --print-keys` prints every table that has keys. To see what a table may change, write a name
+htui does not know in it: the error lists every action that table has and every shared action it
+may override. A line copied from `--print-keys` into such a table, like
+`[settings.agents] next_field`, replaces that row, so it stops following the shared `[form]`,
+`[common]` or `[confirm]` line; delete it to let it follow again.
+
+A global key must not be a key that Settings or a pop-up already uses: `[global] quit = ["x"]` is
+refused, because `x` cancels in **Settings › Agents**. Some Settings forms also move between fields
+with `Down` / `Up`. A `[form] next_field` line changes them too, and they keep `Down`; write
+`[settings.agents] next_field = [...]` to replace it in that form alone. While a text field takes
+typing, the keys the field uses itself (letters, arrows, `Enter`, `Esc`) stay the field's, and in
+the editors that save with `Ctrl+s`, that key keeps saving after `[form] save` is changed.
+
+Backlog, Chat, Skills and Requirements do not read this file yet. There, a key the tab handles
+itself wins over a global key bound to it: with `[global] quit = ["J"]`, `J` still scrolls the
+Backlog detail pane.
 
 ### Backlog
 
