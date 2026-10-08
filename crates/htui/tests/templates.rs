@@ -19,6 +19,7 @@ use std::time::Duration;
 use htui::agent_worker::AgentRuntime;
 use htui::app::register_all;
 use htui::editor::{ExternalEdit, ExternalEditOutcome};
+use htui::keys::load_str;
 use htui::testkit::Harness;
 use htui::ui::tabs::SkillsTab;
 use htui_agent::conformance::{Script, ScriptEvent};
@@ -49,6 +50,20 @@ async fn open_over(store: MemStore) -> Harness {
 /// The demo world on the Templates view.
 async fn open() -> Harness {
     open_over(MemStore::demo()).await
+}
+
+/// The demo world over `store` on the Templates view, with the keys file `toml` (MOD-67 M4: a
+/// rebinding test). `toml` follows `version = 1`.
+async fn open_with_keys(store: MemStore, toml: &str) -> Harness {
+    let keys = load_str(&format!("version = 1\n{toml}"))
+        .unwrap_or_else(|errors| panic!("the keys load: {errors:?}"));
+    let mut harness = Harness::over(store).with_keys(keys);
+    register_all(harness.app());
+    harness.settle().await;
+    harness.key("2");
+    harness.key("l");
+    harness.settle().await;
+    harness
 }
 
 /// Types `text` one key at a time: a space is `space`, a newline `enter`.
@@ -686,7 +701,7 @@ async fn scrolling_reveals_a_hunk_below_the_fold() {
         "the last hunk is below the fold: {frame}"
     );
     assert!(
-        frame.contains("J/K PgUp/PgDn scroll"),
+        frame.contains("J/K scroll · PgUp/PgDn page"),
         "the pane says it scrolls: {frame}"
     );
 
@@ -914,6 +929,88 @@ async fn tab_and_digits_while_editing() {
         "the draft survived: {frame}"
     );
     assert!(hint(&frame).contains("Ctrl+S save"), "{frame}");
+}
+
+/// MOD-67 M4 D5 through `TEMPLATES_BROWSE`: the Templates view's own stack offers the switch, so
+/// `h` shows the Skills view; a CONTROL or ALT `h` is another chord and leaves Templates shown.
+#[tokio::test]
+async fn h_and_l_switch_from_templates_but_ctrl_h_does_not() {
+    let mut harness = open().await;
+    let on_templates = |frame: &str| frame.contains("D default");
+    let frame = harness.render();
+    assert!(on_templates(&frame), "the Templates view: {frame}");
+    for key in ["ctrl-h", "alt-h"] {
+        harness.key(key);
+        harness.settle().await;
+        let frame = harness.render();
+        assert!(on_templates(&frame), "`{key}` did not switch: {frame}");
+    }
+    harness.key("h");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(!on_templates(&frame), "`h` showed the Skills view: {frame}");
+    assert!(frame.contains("I import"), "the Library hint: {frame}");
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(on_templates(&frame), "`l` came back: {frame}");
+}
+
+/// MOD-67 M4 lane rebinding test: `[skills.templates] diff_default` moves the default diff to
+/// `X`; `D` is then inert, and the hint follows.
+#[tokio::test]
+async fn a_rebound_diff_default_diffs_and_capital_d_is_inert() {
+    let mut harness = open_with_keys(
+        MemStore::demo(),
+        "[skills.templates]\ndiff_default = \"X\"\n",
+    )
+    .await;
+    select(&mut harness, "implement");
+    harness.key("D");
+    let frame = harness.render();
+    assert!(!frame.contains("diff default"), "`D` is inert: {frame}");
+    assert!(hint(&frame).contains("X default"), "{frame}");
+    assert!(!hint(&frame).contains("D default"), "{frame}");
+    harness.key("X");
+    let frame = harness.render();
+    assert!(
+        frame.contains("diff default \u{2192} v1"),
+        "`X` diffs against the compiled default: {frame}"
+    );
+    assert!(
+        frame.contains("no differences"),
+        "v1 is the default: {frame}"
+    );
+}
+
+/// MOD-67 M4: a `[skills]` rebind reaches the Templates view (its stack inherits the shared
+/// `skills` verbs): `F6` toggles the diff pane, `d` no longer does.
+#[tokio::test]
+async fn a_shared_skills_rebind_reaches_templates() {
+    let mut harness = open_with_keys(MemStore::demo(), "[skills]\ndiff = \"f6\"\n").await;
+    save_implement_v2(&mut harness, "MARKER").await;
+    let frame = harness.render();
+    assert!(hint(&frame).contains("F6 diff"), "{frame}");
+    assert!(!hint(&frame).contains("d diff"), "{frame}");
+    harness.key("d");
+    let frame = harness.render();
+    assert!(
+        !frame.contains("diff v1 \u{2192} v2"),
+        "`d` is inert: {frame}"
+    );
+    harness.key("f6");
+    let frame = harness.render();
+    assert!(
+        frame.contains("diff v1 \u{2192} v2"),
+        "`F6` shows the diff: {frame}"
+    );
+    assert!(frame.contains("+MARKER"), "{frame}");
+    harness.key("f6");
+    let frame = harness.render();
+    assert!(
+        !frame.contains("diff v1 \u{2192} v2"),
+        "`F6` toggles back: {frame}"
+    );
 }
 
 #[tokio::test]

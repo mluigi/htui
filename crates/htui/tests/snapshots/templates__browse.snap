@@ -30,5 +30,5 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                              ││                                                                  │
 └──────────────────────────────┘└──────────────────────────────────────────────────────────────────┘
 
- j/k move  ,/. version  b base  d diff  D default  e edit  E $EDITOR  n new  r reload  h/l view
+ j/k · ,/. version · b base · d diff · D default · e edit · E $EDITOR · n new · r reload · h view
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
