@@ -77,14 +77,14 @@ impl QueueSetting {
         match self {
             Self::PerTokenCapRun | Self::PerTokenCapBatch => match value.as_i64() {
                 Some(micros) if micros >= 0 => Ok(()),
-                _ => Err(CapError {
-                    key: if self == Self::PerTokenCapRun {
+                _ => Err(CapError::at_key(
+                    if self == Self::PerTokenCapRun {
                         PER_TOKEN_CAP_RUN
                     } else {
                         PER_TOKEN_CAP_BATCH
                     },
-                    found: value.to_string(),
-                }
+                    value.to_string(),
+                )
                 .to_string()),
             },
             // Review R1: the section takes this in dollars, so an integer is read back in dollars

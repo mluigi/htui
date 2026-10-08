@@ -3638,10 +3638,7 @@ mod tests {
             spent: 600,
             cap: 500,
         };
-        let err = CapError {
-            key: PER_TOKEN_CAP_BATCH,
-            found: "\"lots\"".to_owned(),
-        };
+        let err = CapError::at_key(PER_TOKEN_CAP_BATCH, "\"lots\"".to_owned());
         assert!(shared.note_batch_stop(a, ids::HTUI_ANA_2, &stop), "info");
         assert!(
             !shared.note_batch_stop(a, ids::HTUI_FEAT_1, &stop),

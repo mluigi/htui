@@ -300,15 +300,43 @@ pub struct CapError {
     pub key: &'static str,
     /// The offending value as JSON text, so the message names what the operator actually wrote.
     pub found: String,
+    /// Set by [`Self::document`]: the whole `project.settings` document is at fault, so `key`
+    /// names nothing. Private, so a struct literal cannot forget it.
+    document: bool,
 }
 
-/// The [`CapError::key`] sentinel for a `project.settings` document that is not a JSON object:
-/// no single cap key is at fault, the whole document is.
-pub const SETTINGS_DOCUMENT: &str = "";
+impl CapError {
+    /// A cap `key` holding `found`, which is no non-negative integer of USD micros.
+    #[must_use]
+    pub fn at_key(key: &'static str, found: String) -> Self {
+        Self {
+            key,
+            found,
+            document: false,
+        }
+    }
+
+    /// A `project.settings` document that is not a JSON object: no single cap key is at fault.
+    /// `key` is empty.
+    #[must_use]
+    pub fn document(found: String) -> Self {
+        Self {
+            key: "",
+            found,
+            document: true,
+        }
+    }
+
+    /// Whether this is [`Self::document`]'s whole-document refusal rather than a bad cap key.
+    #[must_use]
+    pub fn is_document(&self) -> bool {
+        self.document
+    }
+}
 
 impl core::fmt::Display for CapError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        if self.key == SETTINGS_DOCUMENT {
+        if self.document {
             return write!(
                 f,
                 "project.settings must be a JSON object, got {}",
@@ -327,21 +355,22 @@ impl ProjectCaps {
     /// Reads both cap keys out of a `project.settings` document.
     ///
     /// An absent or `null` document is unbounded; any other non-object (array, string, number,
-    /// bool) is an error keyed [`SETTINGS_DOCUMENT`], since it cannot hold a cap the operator wrote.
-    /// Within an object, absent or `null` is `None` — unbounded. An integer `>= 0` is the cap. Anything else
-    /// (negative, float, string, bool, object) is an **error**, because a cap the operator wrote
-    /// and `htui` silently ignored is the risk table's "wrong by a factor of a million" in the
-    /// other direction. `0` is a real cap: it cancels on the first row that reports any USD cost.
+    /// bool) is a [`CapError::document`] error, since it cannot hold a cap the operator wrote.
+    /// The `null` read is deliberately looser than the writers: `PgStore` and `MemStore` refuse to
+    /// clear a key out of a `null` document (`jsonb_typeof = 'object'`), yet a reader treats it as
+    /// "no caps". Intentional; do not align one side without the other.
+    ///
+    /// Within an object, absent or `null` is `None` — unbounded. An integer `>= 0` is the cap.
+    /// Anything else (negative, float, string, bool, object) is an **error**, because a cap the
+    /// operator wrote and `htui` silently ignored is the risk table's "wrong by a factor of a
+    /// million" in the other direction. `0` is a real cap: it cancels on the first row that reports any USD cost.
     ///
     /// # Errors
     ///
     /// [`CapError`] naming the first offending key, in declaration order.
     pub fn from_settings(settings: &Value) -> Result<Self, CapError> {
         if !settings.is_object() && !settings.is_null() {
-            return Err(CapError {
-                key: SETTINGS_DOCUMENT,
-                found: settings.to_string(),
-            });
+            return Err(CapError::document(settings.to_string()));
         }
         Ok(Self {
             run_micros: cap_at(settings, PER_TOKEN_CAP_RUN)?,
@@ -357,10 +386,7 @@ fn cap_at(settings: &Value, key: &'static str) -> Result<Option<i64>, CapError> 
         None | Some(Value::Null) => Ok(None),
         Some(value) => match value.as_i64() {
             Some(micros) if micros >= 0 => Ok(Some(micros)),
-            _ => Err(CapError {
-                key,
-                found: value.to_string(),
-            }),
+            _ => Err(CapError::at_key(key, value.to_string())),
         },
     }
 }
@@ -930,7 +956,7 @@ mod tests {
         for bad in [json!([]), json!("x"), json!(3)] {
             let error = ProjectCaps::from_settings(&bad)
                 .expect_err("a non-object settings document is refused");
-            assert_eq!(error.key, SETTINGS_DOCUMENT);
+            assert!(error.is_document());
             assert_eq!(error.found, bad.to_string());
             assert_eq!(
                 error.to_string(),
