@@ -3,7 +3,8 @@
 **Source PRD**: `.claude/prds/mod-12-auto-mode-queue-runner.prd.md`
 **Selected Milestone**: 3 — Queue overlay
 **Complexity**: Large
-**Status**: confirmed by the maintainer 2026-10-07 (L4: close a stalled batch); implementation pending
+**Status**: complete on `hr/MOD-12` at `84cfb161` (2026-10-08), review round R1 included (every finding
+applied, maintainer). Blueprint `.claude/plans/mod-12-m3-queue-overlay.blueprint.md` (amendments F-1..F-25).
 **Routing**: plan path (milestone of an existing PRD; C2, C3, C4 fired), ultracode for the
 implementers only (`/handoff-run` verdict 2026-10-07, accepted). Waves below are decided by the file
 sets in "Files to Change", not by prose.

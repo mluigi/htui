@@ -123,7 +123,7 @@ reorder (M3).
 |---|---|---|---|---|
 | 1 | Unattended runs | The maintainer queues items from the Backlog; the box runs them one after another (up to `max_concurrent_items` at once) in queue order, with non-hard gates skipped and recorded as `skipped`, hard gates still parking; pausing stops new admissions without touching running runs | complete | `.claude/plans/mod-12-m1-unattended-runs.plan.md` |
 | 2 | Spend guard | Each queue activation is a batch; once its spend reaches `per_token_cap_batch`, or a run's remaining budget is below one attempt, nothing further is admitted; the Settings tab edits the caps, `max_concurrent_items` and the (unenforced) scheduler window | complete | `.claude/plans/mod-12-m2-spend-guard.plan.md` |
-| 3 | Queue overlay | One overlay shows the queue in order, what is running, and every escalation with its reason (review loop exhausted, judge undecided, missing tags, hard gate parked, blocked, targeted at another box), with pause/resume and reorder | in-progress | `.claude/plans/mod-12-m3-queue-overlay.plan.md` |
+| 3 | Queue overlay | One overlay shows the queue in order, what is running, and every escalation with its reason (review loop exhausted, judge undecided, missing tags, hard gate parked, blocked, targeted at another box), with pause/resume and reorder | complete | `.claude/plans/mod-12-m3-queue-overlay.plan.md` |
 
 ## Open Questions
 
@@ -132,6 +132,9 @@ reorder (M3).
 - [x] Does pausing end the batch? **Yes (maintainer, 2026-10-06):** pause closes the batch and
   resume opens a new one with a fresh cap. Accepted consequence: pause/resume resets the batch cap;
   the per-run cap and `min_budget_for_new_attempt` still bound each run.
+- [x] Does a batch that has stalled stay open (M1 review L4)? **No (maintainer, 2026-10-07):** once
+  no run of it is live and no entry is admissible, it closes `drained`, so a later `Q` never starts
+  spending; `P` does (M3 plan D4).
 
 ## Risks
 
@@ -145,4 +148,5 @@ reorder (M3).
 | Stack headroom in `htui-orch` conformance (`every_case_name_dispatches` near 2 MiB) | Medium | SIGABRT in the gate | Box large engine futures; gate with `--no-fail-fast` and grep for SIGABRT |
 
 ---
-*Status: DRAFT — requirements only. Implementation planning pending via /plan.*
+*Status: delivered — M1, M2 and M3 complete (2026-10-08); write-up `docs/decisions/mod/mod-12.md`. The
+unattended-outcome prototype batch is still owed on the host.*
