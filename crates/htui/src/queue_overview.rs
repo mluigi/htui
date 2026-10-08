@@ -15,9 +15,10 @@ use htui_store::Backend;
 ///
 /// The reads follow `admit` (`htui-worker`'s runtime): the ready set is `ready_items` over the
 /// rows' projects less the batch's cancelled items, and a ready row's project is held when its
-/// caps read absent, do not parse, or `batch_budget` refuses the batch's spend. `missing_tags` is
-/// read once per `open` row that is not ready (D6's accepted N+1); a `NotFound` there (a delete
-/// racing this read) reads as no tags.
+/// caps read absent, do not parse, or `batch_budget` refuses the batch's spend. The `open` rows
+/// that are not ready have their missing tags read in one `missing_tags_of` (M3 review R1 M2; D6's
+/// N+1 was one `missing_tags` per row): an item deleted since `queue_rows` is absent from its
+/// answer, and a `NotFound` (the box gone) reads as no tags, both as the per-row read did.
 ///
 /// # Errors
 /// `NotFound` "this box" before registration; offline, `Unreachable(DATABASE_UNREACHABLE)` from
@@ -61,21 +62,24 @@ pub async fn overview(backend: &Backend) -> Result<QueueOverview> {
         .filter(|item| !cancelled.contains(item))
         .collect();
 
-    let mut missing_tags = HashMap::new();
-    for row in &rows {
-        let item = row.entry.item_id;
-        if row.status != Status::Open || ready.contains(&item) {
-            continue;
-        }
-        let tags = match backend.missing_tags(item, box_id).await {
-            Ok(tags) => tags,
-            Err(StoreError::NotFound { .. }) => Vec::new(),
+    // M3 review R1 M2: one read for every `open` row that is not ready, not one per row.
+    let unready: Vec<ItemId> = rows
+        .iter()
+        .filter(|row| row.status == Status::Open && !ready.contains(&row.entry.item_id))
+        .map(|row| row.entry.item_id)
+        .collect();
+    let missing_tags: HashMap<ItemId, Vec<String>> = if unready.is_empty() {
+        HashMap::new()
+    } else {
+        match backend.missing_tags_of(&unready, box_id).await {
+            Ok(tags) => tags
+                .into_iter()
+                .filter(|(_, tags)| !tags.is_empty())
+                .collect(),
+            Err(StoreError::NotFound { .. }) => HashMap::new(),
             Err(err) => return Err(err),
-        };
-        if !tags.is_empty() {
-            missing_tags.insert(item, tags);
         }
-    }
+    };
 
     let app = backend.app_settings().await?;
     let slots_used = backend.running_runs_on_box(box_id).await?
