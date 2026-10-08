@@ -534,11 +534,11 @@ impl BoxesSection {
     /// One key while an editor is open: the widget answers first, so every letter is text
     /// (MOD-67 D6, skeleton (a)).
     ///
-    /// The quirks and spec editors then take `form.save` from the resolver: the `TextArea`'s own
-    /// `ctrl-s` already submitted, so this is a rebound chord (D13). Everything else the widget
-    /// passes on is swallowed rather than offered to the shell, except the chords the mode's
-    /// stack passes (CONTROL, ALT, function keys: D5), so `ctrl-c` still quits and `F1` opens
-    /// help.
+    /// The quirks and spec editors then take `form.save` from the resolver: a `TextArea` passes
+    /// every chord, `ctrl-s` included (MOD-67 M4 D6), so this is their only save. Everything else
+    /// the widget passes on is swallowed rather than offered to the shell, except the chords the
+    /// mode's stack passes (CONTROL, ALT, function keys: D5), so `ctrl-c` still quits and `F1`
+    /// opens help.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Browse => return Handled::Pass,
@@ -550,7 +550,7 @@ impl BoxesSection {
         };
         match outcome {
             FieldOutcome::Consumed => return Handled::Consumed,
-            // `Enter` (tags) or the `TextArea`'s own `ctrl-s` (quirks, spec: D13).
+            // `Enter` (tags); a `TextArea` (quirks, spec) never submits since MOD-67 M4 D6.
             FieldOutcome::Submit => {
                 self.submit(ctx);
                 return Handled::Consumed;

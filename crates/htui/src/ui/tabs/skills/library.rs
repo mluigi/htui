@@ -1139,9 +1139,8 @@ impl LibraryView {
         );
     }
 
-    /// The editor, widget first (MOD-67 M4 PA-3): the area takes text, `Esc` (its `Cancel`) and,
-    /// until T-close, `ctrl-s` (its `Submit`); what it passes resolves through
-    /// `views::LIBRARY_EDITOR`: `form.save` saves, `skills.ask_agent` opens the agent help,
+    /// The editor, widget first (MOD-67 M4 PA-3): the area takes text and `Esc` (its `Cancel`);
+    /// every chord it passes, `ctrl-s` included (D6), resolves through `views::LIBRARY_EDITOR`: `form.save` saves, `skills.ask_agent` opens the agent help,
     /// `form.external_editor` hands the draft to `$EDITOR`, and `global.next_tab`/`prev_tab` pass
     /// so the shell switches tabs with the draft kept (PA-2). Any other key is `modal_rest`'s. An
     /// open agent help (MOD-55) takes every key first: the draft is locked under it, and the
@@ -1167,11 +1166,6 @@ impl LibraryView {
                 }
                 Handled::Consumed
             }
-            // The area's own `ctrl-s` until T-close drops it (D6); then only `form.save` saves.
-            FieldOutcome::Submit => {
-                self.save_editor(ctx);
-                Handled::Consumed
-            }
             FieldOutcome::Cancel => {
                 if let Some(busy) = busy {
                     // The save's reply closes the editor or keeps it; leaving now would leave the
@@ -1186,7 +1180,9 @@ impl LibraryView {
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass => {
+            // A `TextArea` never submits since MOD-67 M4 D6: `ctrl-s` passes, and only
+            // `form.save` below saves.
+            FieldOutcome::Submit | FieldOutcome::Pass => {
                 let chord = KeyChord::from_event(key);
                 match ctx.keys().actions(views::LIBRARY_EDITOR, chord).first() {
                     Some(Act::FormSave) => self.save_editor(ctx),

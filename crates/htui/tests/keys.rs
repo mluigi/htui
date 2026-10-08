@@ -33,7 +33,8 @@ use htui::ui::overlay::{
     WorkspaceSwitcher,
 };
 use htui::ui::tabs::settings::{
-    ConnectionSection, QdrantSection, SectionId, SettingsSection, SettingsTab,
+    BoxesSection, ConnectionSection, PersonasSection, QdrantSection, SectionId, SettingsSection,
+    SettingsTab,
 };
 use htui::ui::tabs::{BacklogTab, SkillsTab};
 use htui_agent::registry::DriverFactory;
@@ -613,4 +614,130 @@ async fn a_kitty_ctrl_capital_is_the_ctrl_chord() {
         on_connection(&frame),
         "a kitty ctrl-shift-l did not cycle: {frame}"
     );
+}
+
+/// The five `TextArea` editors outside the Backlog (MOD-67 M4 D6).
+#[derive(Clone, Copy, Debug)]
+enum TextAreaEditor {
+    Library,
+    Templates,
+    RequirementsMint,
+    BoxesQuirks,
+    PersonasBody,
+}
+
+impl TextAreaEditor {
+    const ALL: [Self; 5] = [
+        Self::Library,
+        Self::Templates,
+        Self::RequirementsMint,
+        Self::BoxesQuirks,
+        Self::PersonasBody,
+    ];
+}
+
+/// Moves a Skills view's tree onto `name`: to the top, then down until the body pane is titled
+/// with it (`tests/templates.rs`' `select`).
+fn select_skills_row(harness: &mut Harness, name: &str) {
+    for _ in 0..20 {
+        harness.key("k");
+    }
+    let title = format!("\u{250c} {name} v");
+    for _ in 0..20 {
+        if harness.render().contains(&title) {
+            return;
+        }
+        harness.key("j");
+    }
+    panic!("`{name}` is not in the tree:\n{}", harness.render());
+}
+
+/// A settled demo shell with `keys` installed (the defaults when `None`), `editor` open on it and
+/// `DRAFTED` typed into it, nothing queued.
+async fn open_text_area_editor(editor: TextAreaEditor, keys: Option<&str>) -> Harness {
+    let mut harness = Harness::over(htui_core::store::MemStore::demo());
+    if let Some(file) = keys {
+        harness = harness.with_keys(load_str(file).expect("the keys load"));
+    }
+    match editor {
+        TextAreaEditor::Library | TextAreaEditor::Templates => {
+            register_all(harness.app());
+            harness.settle().await;
+            harness.key("2");
+            harness.settle().await;
+            if matches!(editor, TextAreaEditor::Library) {
+                select_skills_row(&mut harness, "tests");
+            } else {
+                harness.key("l");
+                harness.settle().await;
+                select_skills_row(&mut harness, "implement");
+            }
+            harness.key("e");
+        }
+        TextAreaEditor::RequirementsMint => {
+            register_all(harness.app());
+            harness.settle().await;
+            harness.key("w");
+            harness.settle().await;
+            harness.key("j");
+            harness.key("enter");
+            harness.settle().await;
+            harness.key("3");
+            harness.settle().await;
+            harness.key("n");
+        }
+        TextAreaEditor::BoxesQuirks | TextAreaEditor::PersonasBody => {
+            let (section, open): (Box<dyn SettingsSection>, &str) = match editor {
+                TextAreaEditor::BoxesQuirks => (Box::new(BoxesSection::new()), "e"),
+                _ => (Box::new(PersonasSection::new()), "b"),
+            };
+            harness = harness.with_tab(Box::new(SettingsTab::with_sections(vec![section])));
+            harness.settle().await;
+            harness.key(open);
+        }
+    }
+    harness.settle().await;
+    for c in DRAFTED.chars() {
+        harness.key(&c.to_string());
+    }
+    assert!(
+        harness.render().contains(DRAFTED),
+        "{editor:?}: the draft is typed: {}",
+        harness.render()
+    );
+    assert_eq!(harness.queued(), 0, "{editor:?}: nothing sent yet");
+    harness
+}
+
+/// What the D6 pin types into each editor.
+const DRAFTED: &str = "Drafted";
+
+/// MOD-67 M4 D6: a `TextArea` no longer saves on its own `ctrl-s`, so with `[form] save = "f2"`
+/// every `TextArea` editor outside the Backlog saves on `F2` (one write request) and `ctrl-s`
+/// does nothing there (no request, the frame unchanged: nothing typed, the draft kept); with the
+/// defaults `ctrl-s` saves each, through `form.save`.
+#[tokio::test]
+async fn a_rebound_save_is_the_only_save_in_every_text_area_editor() {
+    for editor in TextAreaEditor::ALL {
+        let mut harness =
+            open_text_area_editor(editor, Some("version = 1\n[form]\nsave = \"f2\"\n")).await;
+        let before = harness.render();
+        harness.key("ctrl-s");
+        assert_eq!(harness.queued(), 0, "{editor:?}: `ctrl-s` sends nothing");
+        assert_eq!(
+            harness.render(),
+            before,
+            "{editor:?}: `ctrl-s` changed nothing"
+        );
+        harness.key("f2");
+        assert_eq!(harness.queued(), 1, "{editor:?}: `F2` sends one write");
+
+        let mut harness = open_text_area_editor(editor, None).await;
+        harness.key("ctrl-s");
+        assert_eq!(
+            harness.queued(),
+            1,
+            "{editor:?}: with the defaults `ctrl-s` sends one write"
+        );
+    }
 }

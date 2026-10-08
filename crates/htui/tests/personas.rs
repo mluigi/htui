@@ -1582,8 +1582,8 @@ async fn ctrl_down_in_the_form_keeps_the_focus() {
 }
 
 /// D13 and L-D Q3: the editors take `form.save` from the resolver after the `TextArea`, so a
-/// rebound save chord saves too (and the widget's own `Ctrl+s` still does), and the hint shows the
-/// new chord.
+/// rebound save chord saves (the only save: since MOD-67 M4 D6 the widget passes `Ctrl+s` like
+/// every chord), and the hint shows the new chord.
 #[tokio::test]
 async fn a_rebound_save_saves_the_body() {
     let (bench, mut section) =

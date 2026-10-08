@@ -780,7 +780,8 @@ impl TemplatesView {
     }
 
     /// The editor (plan D11, D13; MOD-67 M4 D6, blueprint §6.2): the area answers first, so
-    /// every letter is text and `Esc` is its `Cancel`; what it passes resolves through
+    /// every letter is text and `Esc` is its `Cancel`; every chord it passes, `ctrl-s` included
+    /// (D6), resolves through
     /// [`views::TEMPLATES_EDITOR`]: `form.save`, `skills.ask_agent` and `form.external_editor`
     /// are the view's (PA-3: after the widget), `global.next_tab`/`prev_tab` pass so the shell
     /// switches tabs with the draft kept (PA-2), the rest is `modal_rest`'s. An open agent help
@@ -808,12 +809,6 @@ impl TemplatesView {
                 }
                 return Handled::Consumed;
             }
-            // The area's own `ctrl-s`, until MOD-67 M4 T-close drops it (D6); then only
-            // `form.save` below saves.
-            FieldOutcome::Submit => {
-                self.save(ctx);
-                return Handled::Consumed;
-            }
             FieldOutcome::Cancel => {
                 if let Some(busy) = busy {
                     // The save's reply closes the editor or keeps it; leaving now would leave the
@@ -828,7 +823,9 @@ impl TemplatesView {
                 }
                 return Handled::Consumed;
             }
-            FieldOutcome::Pass => {}
+            // A `TextArea` never submits since MOD-67 M4 D6: `ctrl-s` passes, and only
+            // `form.save` below saves.
+            FieldOutcome::Submit | FieldOutcome::Pass => {}
         }
         let stack = views::TEMPLATES_EDITOR;
         let chord = KeyChord::from_event(key);
