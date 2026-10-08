@@ -8,6 +8,7 @@
 #![cfg(feature = "testkit")]
 
 use htui::agent_worker::AgentRuntime;
+use htui::keys::load_str;
 use htui::testkit::Harness;
 use htui::ui::tabs::settings::{AgentsSection, SettingsTab};
 use htui_core::fixtures::edit_agent;
@@ -151,5 +152,40 @@ async fn a_harness_without_a_runtime_clears_the_probing_state_on_the_refusal() {
         harness.app().status.as_deref(),
         Some("probe_agents: no agent runtime in this harness"),
         "and the status line names the request that was refused"
+    );
+}
+
+/// MOD-67 M3 D14, L-A's rebinding test: with `[settings.agents] probe = ["P"]`, `P` probes, `r`
+/// does nothing, and the hint row names the new chord.
+#[tokio::test]
+async fn a_rebound_probe_key_probes_and_the_old_one_is_inert() {
+    let store = unresolvable_registry().await;
+    let keys =
+        load_str("version = 1\n[settings.agents]\nprobe = [\"P\"]\n").expect("the key file loads");
+    let mut harness =
+        Harness::over(store)
+            .with_keys(keys)
+            .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+                AgentsSection::new(),
+            )])));
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        frame.contains("P probe") && !frame.contains("r probe"),
+        "the hint shows the rebound chord: {frame}"
+    );
+
+    let before = harness.app().status.clone();
+    harness.key("r");
+    let frame = harness.render();
+    assert!(!frame.contains("probing"), "`r` is inert now: {frame}");
+    assert_eq!(harness.app().status, before, "and refuses nothing");
+
+    harness.key("P");
+    let frame = harness.render();
+    assert!(
+        frame.contains("probing\u{2026}"),
+        "`P` sends the probe: {frame}"
     );
 }
