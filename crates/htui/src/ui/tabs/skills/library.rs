@@ -503,8 +503,8 @@ impl LibraryView {
     /// The current mode's stack (MOD-67 M4 D4): the attachments pane's while it is open, else an
     /// open agent help's, else the mode's. `SkillsTab::key_stack`, `on_key` and the hint read it.
     pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
-        if self.attach.is_some() {
-            return None;
+        if let Some(pane) = &self.attach {
+            return Some(pane.key_stack());
         }
         Some(match &self.mode {
             Mode::Browse => views::LIBRARY_BROWSE,
@@ -733,9 +733,7 @@ impl LibraryView {
         ])
         .areas(area);
         let hint = match (&self.attach, &self.snapshot, &self.mode, self.handed_off()) {
-            (Some(pane), Some(snapshot), _, _) => {
-                pane.render(frame, content, snapshot, ctx).to_owned()
-            }
+            (Some(pane), Some(snapshot), _, _) => pane.render(frame, content, snapshot, ctx),
             (_, _, Mode::Editing(editor), _) => {
                 self.render_editor(frame, content, editor, ctx);
                 match &editor.help {
@@ -1350,7 +1348,8 @@ impl LibraryView {
             return Handled::Pass;
         };
         // The form's save is in flight: its reply closes the form or keeps it, so `Esc` waits for
-        // it, as the editor's does.
+        // it, as the editor's does. `Esc` is the form's own cancel key (widget-owned, MOD-67 M4
+        // D10), not a resolved act.
         if let Some(busy) = self.busy
             && pane.in_form()
             && key.code == KeyCode::Esc
