@@ -29,14 +29,14 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
-use crate::keys::Stack;
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::Scroll;
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// The save's `StoreRequest::name`, what `busy` holds while it is in flight.
 const SAVE_NAME: &str = REQUEST_NAMES[1];
@@ -75,22 +75,43 @@ const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 /// A save went out.
 const SAVING: &str = "saving\u{2026}";
 
-/// The hint row in Browse (plan D13).
-const BROWSE_HINT: &str = "j/k move  ,/. version  b base  d diff  D default  e edit  E $EDITOR  \
-                           n new  r reload  h/l view";
+/// The hint row in Browse (plan D13; MOD-67 M4 D9), through [`views::TEMPLATES_BROWSE`]. `move`
+/// after `j/k` is dropped: the row would be 102 cells with ` · ` separators (blueprint §1 item 1).
+const BROWSE_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
+    Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
+    Hint::One(Act::SkillsBase, "base"),
+    Hint::One(Act::SkillsDiff, "diff"),
+    Hint::One(Act::TemplatesDiffDefault, "default"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::SkillsEditExternally, "$EDITOR"),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::Reload, "reload"),
+    Hint::One(Act::SkillsSwitchView, "view"),
+];
 
-/// The pane's bottom border while its lines overflow it.
-const SCROLL_HINT: &str = " J/K PgUp/PgDn scroll ";
+/// The pane's bottom border while its lines overflow it, through [`views::TEMPLATES_BROWSE`],
+/// drawn ` {hint} `.
+const SCROLL_HINT: HintSpec = &[
+    Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
+    Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
+];
 
-/// The hint row while naming a new template.
-const NAMING_HINT: &str = "Enter create  Esc cancel";
+/// The hint row while naming a new template, through [`views::TEMPLATES_PROMPT`]: `Enter` and
+/// `Esc` are the field's own (MOD-67 M4 D10).
+const NAMING_HINT: HintSpec = &[Hint::Text("Enter create"), Hint::Text("Esc cancel")];
 
-/// The hint row in the editor, before the cursor's `L{line}:C{col}` (D20). `Ctrl+G` is MOD-55's,
-/// hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
-const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
+/// The hint row in the editor, through [`views::TEMPLATES_EDITOR`], before the cursor's
+/// `L{line}:C{col}` (D20). `skills.ask_agent` is MOD-55's `Ctrl+G` (MOD-67 M4 D9).
+const EDIT_HINT: HintSpec = &[
+    Hint::One(Act::FormSave, "save"),
+    Hint::One(Act::SkillsAskAgent, "ask agent"),
+    Hint::One(Act::FormExternalEditor, "$EDITOR"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
-const HANDED_OFF_HINT: &str = "the draft is in $EDITOR";
+const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
 
 /// The review phase's wire contract, the one a reviewer's output is parsed by (ANA-5 `:1323-1331`).
 const REVIEW_WIRE: &str = "wire: first 3 lines `---` / `verdict: approve|request-changes` / `---`";
@@ -320,11 +341,6 @@ fn error_at(err: &TemplateError) -> Option<usize> {
     }
 }
 
-/// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
-fn plain(key: &KeyEvent) -> bool {
-    (key.modifiers - KeyModifiers::SHIFT).is_empty()
-}
-
 impl TemplatesView {
     /// A bracketed paste into the name prompt or the editor (MOD-22 review M-1); `false` when
     /// nothing here is taking text.
@@ -350,9 +366,17 @@ impl TemplatesView {
         true
     }
 
-    /// The current mode's stack (MOD-67 M4); filled by lane L-B.
+    /// The current mode's stack (MOD-67 M4 D4): an open agent help's, else the mode's.
+    /// `SkillsTab::key_stack`, `on_key` and the hint read it.
     pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
-        None
+        Some(match &self.mode {
+            Mode::Browse => views::TEMPLATES_BROWSE,
+            Mode::Naming { .. } => views::TEMPLATES_PROMPT,
+            Mode::Editing(editor) => editor
+                .help
+                .as_ref()
+                .map_or(views::TEMPLATES_EDITOR, |help| help.key_stack()),
+        })
     }
 
     /// Whether an editor or the name prompt is taking every key.
@@ -375,7 +399,7 @@ impl TemplatesView {
     pub(super) fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
-            Mode::Naming { .. } => self.on_naming_key(key),
+            Mode::Naming { .. } => self.on_naming_key(key, ctx),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
         }
     }
@@ -528,21 +552,26 @@ impl TemplatesView {
                     Some(help) => help.hint(ctx.keys()),
                     None => {
                         let (line, col) = editor.area.cursor_line_col();
-                        format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                        format!(
+                            "{} \u{b7} L{}:C{}",
+                            ctx.keys().hint(views::TEMPLATES_EDITOR, EDIT_HINT),
+                            line + 1,
+                            col + 1
+                        )
                     }
                 }
             }
             (Mode::Browse, Some(editor)) => {
                 self.render_editor(frame, content, editor, ctx);
-                HANDED_OFF_HINT.to_owned()
+                ctx.keys().hint(views::TEMPLATES_BROWSE, HANDED_OFF_HINT)
             }
             (Mode::Naming { .. }, _) => {
                 self.render_browse(frame, content, ctx);
-                NAMING_HINT.to_owned()
+                ctx.keys().hint(views::TEMPLATES_PROMPT, NAMING_HINT)
             }
             (Mode::Browse, None) => {
                 self.render_browse(frame, content, ctx);
-                BROWSE_HINT.to_owned()
+                ctx.keys().hint(views::TEMPLATES_BROWSE, BROWSE_HINT)
             }
         };
         frame.render_widget(
@@ -562,40 +591,48 @@ impl TemplatesView {
 
     // --- keys ----------------------------------------------------------------------------------
 
-    /// Browse (plan D13). Every key here misses the global table: `q`, `Tab`, `Shift+Tab`, the
-    /// digits, `?` and `w` are not among them, and the tab took `h`/`l`/`[`/`]`/arrows first.
+    /// Browse (plan D13; MOD-67 M4, blueprint §6.1): the first candidate through
+    /// [`views::TEMPLATES_BROWSE`] this view acts on; a global act is the shell's. The tab took
+    /// `skills.switch_view` first.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if !plain(&key) {
-            return Handled::Pass;
-        }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.move_cursor(true),
-            KeyCode::Char('k') | KeyCode::Up => self.move_cursor(false),
-            KeyCode::Char('r') => {
-                self.notice = None;
-                ctx.request(StoreRequest::Templates(ctx.scope.clone()));
-            }
-            KeyCode::Char('n') => self.open_naming(),
-            KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
-                return self.scroll.on_key(key, self.pane_rows.get());
-            }
-            KeyCode::Char(c @ (',' | '.' | 'b' | 'd' | 'D' | 'e' | 'E')) => {
-                self.notice = None;
-                match self.selected_template() {
-                    Some((project, name)) => self.on_template_key(c, project, name, ctx),
-                    None if !self.rows().is_empty() => {
-                        self.notice = Some(Notice::Info(SELECT_A_TEMPLATE.to_owned()));
-                    }
-                    None => {}
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::TEMPLATES_BROWSE, chord) {
+            match act {
+                Act::ListDown => self.move_cursor(true),
+                Act::ListUp => self.move_cursor(false),
+                Act::Reload => {
+                    self.notice = None;
+                    ctx.request(StoreRequest::Templates(ctx.scope.clone()));
                 }
+                Act::New => self.open_naming(),
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.pane_rows.get());
+                }
+                Act::SkillsPrevVersion
+                | Act::SkillsNextVersion
+                | Act::SkillsBase
+                | Act::SkillsDiff
+                | Act::TemplatesDiffDefault
+                | Act::Edit
+                | Act::SkillsEditExternally => {
+                    self.notice = None;
+                    match self.selected_template() {
+                        Some((project, name)) => self.on_template_key(act, project, name, ctx),
+                        None if !self.rows().is_empty() => {
+                            self.notice = Some(Notice::Info(SELECT_A_TEMPLATE.to_owned()));
+                        }
+                        None => {}
+                    }
+                }
+                _ => continue, // a global act
             }
-            _ => return Handled::Pass,
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
-    /// A version, diff or edit key with a template under the cursor.
-    fn on_template_key(&mut self, key: char, project: ProjectId, name: String, ctx: &Ctx<'_>) {
+    /// A version, diff or edit act with a template under the cursor.
+    fn on_template_key(&mut self, act: Act, project: ProjectId, name: String, ctx: &Ctx<'_>) {
         let Some(snapshot) = &self.snapshot else {
             return;
         };
@@ -618,9 +655,9 @@ impl TemplatesView {
             .position(|row| row.version == shown_version)
             .unwrap_or(0);
         let has_earlier = versions.iter().any(|row| row.version == shown_version - 1);
-        match key {
-            ',' | '.' => {
-                let index = if key == ',' {
+        match act {
+            Act::SkillsPrevVersion | Act::SkillsNextVersion => {
+                let index = if act == Act::SkillsPrevVersion {
                     index.saturating_sub(1)
                 } else {
                     (index + 1).min(versions.len().saturating_sub(1))
@@ -629,11 +666,11 @@ impl TemplatesView {
                 self.shown = (version != head).then_some(version);
                 self.scroll.reset();
             }
-            'b' => {
+            Act::SkillsBase => {
                 self.base = Some(DiffBase::Version(shown_version));
                 self.notice = Some(Notice::Info(format!("base v{shown_version}")));
             }
-            'd' => {
+            Act::SkillsDiff => {
                 if self.pane == Pane::Diff {
                     self.pane = Pane::Body;
                     self.scroll.reset();
@@ -646,7 +683,7 @@ impl TemplatesView {
                     self.scroll.reset();
                 }
             }
-            'D' => {
+            Act::TemplatesDiffDefault => {
                 if body_of(&name).is_some() {
                     self.base = Some(DiffBase::Default);
                     self.pane = Pane::Diff;
@@ -655,12 +692,12 @@ impl TemplatesView {
                     self.notice = Some(Notice::Info(format!("`{name}` has no compiled default")));
                 }
             }
-            'e' => {
+            Act::Edit => {
                 let editor =
                     Editor::new(project, name, Some(head), Some(shown_version), &shown_body);
                 self.mode = Mode::Editing(editor);
             }
-            'E' => {
+            Act::SkillsEditExternally => {
                 ctx.emit(Action::EditExternally(ExternalEdit {
                     text: shown_body.clone(),
                     stem: name.clone(),
@@ -690,13 +727,23 @@ impl TemplatesView {
     }
 
     /// The name prompt. A refused name keeps the prompt open, so a typo is one `Backspace` away.
-    fn on_naming_key(&mut self, key: KeyEvent) -> Handled {
+    /// The field answers first; what it passes resolves through [`views::TEMPLATES_PROMPT`]:
+    /// `global.next_tab`/`prev_tab` go to the shell with the prompt kept (MOD-67 M4 PA-2), the
+    /// rest is `modal_rest`'s.
+    fn on_naming_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Mode::Naming { project, field } = &mut self.mode else {
             return Handled::Pass;
         };
         match field.on_key(key) {
             FieldOutcome::Consumed => Handled::Consumed,
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => {
+                let stack = views::TEMPLATES_PROMPT;
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::NextTab | Act::PrevTab) => Handled::Pass,
+                    _ => modal_rest(stack, chord),
+                }
+            }
             FieldOutcome::Cancel => {
                 self.mode = Mode::Browse;
                 self.notice = None;
@@ -732,25 +779,19 @@ impl TemplatesView {
         self.mode = Mode::Editing(Editor::new(project, name, None, None, body));
     }
 
-    /// The editor (plan D11, D13): `Ctrl+S` (the area's `Submit`), `Ctrl+G`, `Ctrl+E` and `Esc`
-    /// are the view's, `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept,
-    /// everything else is text. An open agent help (MOD-55) takes every key first: the draft is
-    /// locked under it, and `Ctrl+S`/`Ctrl+E`/`Ctrl+G` are refused until it closes.
+    /// The editor (plan D11, D13; MOD-67 M4 D6, blueprint §6.2): the area answers first, so
+    /// every letter is text and `Esc` is its `Cancel`; what it passes resolves through
+    /// [`views::TEMPLATES_EDITOR`]: `form.save`, `skills.ask_agent` and `form.external_editor`
+    /// are the view's (PA-3: after the widget), `global.next_tab`/`prev_tab` pass so the shell
+    /// switches tabs with the draft kept (PA-2), the rest is `modal_rest`'s. An open agent help
+    /// (MOD-55) takes every key first: the draft is locked under it, and those three verbs are
+    /// refused until it closes.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if let Mode::Editing(editor) = &mut self.mode
             && let Some(help) = editor.help.as_mut()
         {
             let outcome = help.on_key(key, ctx);
             return self.apply_help(outcome);
-        }
-        let chord = key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL;
-        if chord && matches!(key.code, KeyCode::Char('g' | 'G')) {
-            self.open_help(ctx);
-            return Handled::Consumed;
-        }
-        if chord && matches!(key.code, KeyCode::Char('e' | 'E')) {
-            self.hand_off(ctx);
-            return Handled::Consumed;
         }
         let busy = self.busy;
         let page = self.page.get();
@@ -765,11 +806,13 @@ impl TemplatesView {
                     editor.esc_armed = false;
                     self.notice = None;
                 }
-                Handled::Consumed
+                return Handled::Consumed;
             }
+            // The area's own `ctrl-s`, until MOD-67 M4 T-close drops it (D6); then only
+            // `form.save` below saves.
             FieldOutcome::Submit => {
                 self.save(ctx);
-                Handled::Consumed
+                return Handled::Consumed;
             }
             FieldOutcome::Cancel => {
                 if let Some(busy) = busy {
@@ -783,10 +826,20 @@ impl TemplatesView {
                     editor.esc_armed = true;
                     self.notice = Some(Notice::Info(UNSAVED.to_owned()));
                 }
-                Handled::Consumed
+                return Handled::Consumed;
             }
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => {}
         }
+        let stack = views::TEMPLATES_EDITOR;
+        let chord = KeyChord::from_event(key);
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::FormSave) => self.save(ctx),
+            Some(Act::SkillsAskAgent) => self.open_help(ctx),
+            Some(Act::FormExternalEditor) => self.hand_off(ctx),
+            Some(Act::NextTab | Act::PrevTab) => return Handled::Pass,
+            _ => return modal_rest(stack, chord),
+        }
+        Handled::Consumed
     }
 
     /// `Ctrl+S` (plan D11), first match wins: a write in flight; a `parse` refusal, with the
@@ -1095,7 +1148,9 @@ impl TemplatesView {
         let mut block = Block::new().borders(Borders::ALL).title(title);
         let visible = usize::from(pane_area.height.saturating_sub(2));
         if rows > visible || self.scroll.offset() > 0 {
-            block = block.title_bottom(Line::styled(SCROLL_HINT, theme.dim).right_aligned());
+            let hint = ctx.keys().hint(views::TEMPLATES_BROWSE, SCROLL_HINT);
+            block =
+                block.title_bottom(Line::styled(format!(" {hint} "), theme.dim).right_aligned());
         }
         let inner = block.inner(pane_area);
         frame.render_widget(block, pane_area);
@@ -1470,7 +1525,7 @@ mod tests {
         let title = line(0, 0, claim.right());
         assert!(title.contains("plan \u{b7} editing from v2"), "{title:?}");
         let hint = line(area.bottom() - 1, 0, area.width);
-        assert!(hint.contains(HANDED_OFF_HINT), "{hint:?}");
+        assert!(hint.contains("the draft is in $EDITOR"), "{hint:?}");
 
         // Browse's `E` (F-12) has no draft to draw: the pane takes the tab body.
         let view = TemplatesView {
