@@ -1472,19 +1472,14 @@ mod tests {
         assert!(!tab.writes_allowed(), "the hint dims the write words");
     }
 
-    impl RequirementsTab {
-        /// Whether a form or the filter is taking every key but chords.
-        fn captures_input(&self) -> bool {
-            !matches!(self.mode, Mode::Browse)
-        }
-    }
-
+    /// MOD-67 M4 D4: each mode resolves through its own stack. A form captures `q`, digits and
+    /// `Tab`, and `Esc` brings Browse's stack back with nothing sent.
     #[tokio::test]
-    async fn captures_input_follows_the_mode() {
+    async fn key_stack_follows_the_mode() {
         let (snapshot, projects, scope) = platform().await;
         let bench = Bench::new(scope, projects);
         let mut tab = tab_on(snapshot);
-        assert!(!tab.captures_input());
+        assert_eq!(tab.key_stack(), Some(views::REQUIREMENTS_BROWSE));
         assert_eq!(
             bench.key(&mut tab, KeyCode::Char('q')),
             Handled::Pass,
@@ -1492,8 +1487,17 @@ mod tests {
         );
         assert_eq!(bench.key(&mut tab, KeyCode::Char('3')), Handled::Pass);
 
+        bench.key(&mut tab, KeyCode::Char('/'));
+        assert_eq!(tab.key_stack(), Some(views::CAPTURE), "the filter is open");
+        bench.key(&mut tab, KeyCode::Esc);
+        assert_eq!(tab.key_stack(), Some(views::REQUIREMENTS_BROWSE));
+
         bench.key(&mut tab, KeyCode::Char('n'));
-        assert!(tab.captures_input(), "the mint form is open");
+        assert_eq!(
+            tab.key_stack(),
+            Some(views::REQUIREMENTS_FORM),
+            "the mint form is open"
+        );
         for code in [KeyCode::Char('q'), KeyCode::Char('3'), KeyCode::Tab] {
             assert_eq!(
                 bench.key(&mut tab, code),
@@ -1502,7 +1506,20 @@ mod tests {
             );
         }
         bench.key(&mut tab, KeyCode::Esc);
-        assert!(!tab.captures_input(), "Esc closes the form");
+        assert_eq!(
+            tab.key_stack(),
+            Some(views::REQUIREMENTS_BROWSE),
+            "Esc closes the form"
+        );
+
+        bench.key(&mut tab, KeyCode::Char('W'));
+        assert_eq!(
+            tab.key_stack(),
+            Some(views::REQUIREMENTS_WITHDRAW),
+            "the withdraw form is open"
+        );
+        bench.key(&mut tab, KeyCode::Esc);
+        assert_eq!(tab.key_stack(), Some(views::REQUIREMENTS_BROWSE));
         assert!(bench.emit.take().is_empty(), "and nothing was sent");
     }
 
