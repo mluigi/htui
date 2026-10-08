@@ -123,6 +123,8 @@ mod binary {
                      find, waiting"
                         .to_owned(),
                     r#"13: [global] quit = "shift-a": write a shifted letter as "A""#.to_owned(),
+                    r#"13: [global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
+                        .to_owned(),
                 ],
             ),
             (
@@ -147,7 +149,13 @@ mod binary {
                 vec![
                     r#"3: [global] quit = "w": "w" is already global.workspaces (default) in [global]"#
                         .to_owned(),
+                    r#"3: [global] quit = "w": "w" is already settings.boxes.executor (default) in Settings > Boxes"#
+                        .to_owned(),
                     r#"4: [global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
+                        .to_owned(),
+                    r#"4: [global] help = "esc": "esc" is already common.dismiss (default) in Settings > Agents"#
+                        .to_owned(),
+                    r#"4: [global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
                         .to_owned(),
                     r#"7: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),

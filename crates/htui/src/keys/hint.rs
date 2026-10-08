@@ -83,9 +83,10 @@ impl Keys {
     /// is unbound. Prose such as `format!("press {}", …)` uses it from M3 on.
     #[must_use]
     pub fn label(&self, stack: Stack<'_>, act: Act) -> Option<String> {
-        self.resolve_row(stack, act)?
-            .chords
-            .first()
+        let (layer, row) = self.resolve_row(stack, act)?;
+        row.chords
+            .iter()
+            .find(|chord| layer.admits_chord(**chord))
             .map(KeyChord::label)
     }
 

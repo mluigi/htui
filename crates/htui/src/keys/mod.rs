@@ -13,6 +13,7 @@ pub mod load;
 pub mod print;
 pub mod stack;
 pub mod validate;
+pub mod views;
 
 pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, SHADOWING, STATE_GUARDED, VIEW_DEFAULTS};
 pub use chord::{CTRL_C, ChordError, KeyChord};
@@ -158,14 +159,15 @@ impl Keys {
             .find(|row| row.context == context && row.act == act)
     }
 
-    /// The row of `act` as the stack sees it: in the first layer that admits `act` and has a
-    /// row for it.
-    fn resolve_row(&self, stack: Stack<'_>, act: Act) -> Option<&Row> {
+    /// The row of `act` as the stack sees it, with its layer: in the first layer that admits
+    /// `act` ([`Stack::admits`], inheritance included) and has a row for it.
+    fn resolve_row(&self, stack: Stack<'_>, act: Act) -> Option<(Layer, &Row)> {
         stack
             .layers()
             .iter()
-            .filter(|layer| layer.admits(act))
-            .find_map(|layer| self.row(layer.context(), act))
+            .enumerate()
+            .filter(|&(index, _)| stack.admits(index, act))
+            .find_map(|(_, &layer)| self.row(layer.context(), act).map(|row| (layer, row)))
     }
 }
 

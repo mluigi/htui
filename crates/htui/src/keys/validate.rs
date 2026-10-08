@@ -2,7 +2,9 @@
 //! step 7): collisions in every context and in every declared stack, and printable chords on
 //! actions offered while a field captures.
 
-use super::{Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Row, STATE_GUARDED, quote};
+use super::{
+    Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Row, SHADOWING, STATE_GUARDED, quote,
+};
 
 /// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
 /// The compiled defaults give none (`the_compiled_defaults_validate`).
@@ -30,25 +32,29 @@ pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
     }
     for &(phrase, stack) in DECLARED {
         let mut chords: Vec<KeyChord> = Vec::new();
-        for layer in stack.layers() {
+        for (index, layer) in stack.layers().iter().enumerate() {
             let admitted = keys
                 .rows
                 .iter()
-                .filter(|row| row.context == layer.context() && layer.admits(row.act));
+                .filter(|row| row.context == layer.context() && stack.admits(index, row.act));
             for &chord in admitted.flat_map(|row| &row.chords) {
-                if !chords.contains(&chord) {
+                if layer.admits_chord(chord) && !chords.contains(&chord) {
                     chords.push(chord);
                 }
             }
         }
         for chord in chords {
+            // Narrowest first: `actions` orders its candidates by layer.
             let rows: Vec<&Row> = keys
                 .actions(stack, chord)
                 .into_iter()
-                .filter_map(|act| keys.resolve_row(stack, act))
+                .filter_map(|act| keys.resolve_row(stack, act).map(|(_, row)| row))
                 .collect();
             for (i, first) in rows.iter().enumerate() {
                 for second in &rows[i + 1..] {
+                    if shadows(first, second, chord) {
+                        continue;
+                    }
                     check.report(first, second, chord, phrase);
                 }
             }
@@ -132,6 +138,12 @@ fn allowed(first: &Row, second: &Row, chord: KeyChord) -> bool {
     guarded && !added(first, chord) && !added(second, chord)
 }
 
+/// Whether the narrower `first` may shadow the wider `second` on `chord` (MOD-67 D11, PA-2): the
+/// pair is on [`SHADOWING`] in that order and `chord` is a compiled default of both.
+fn shadows(first: &Row, second: &Row, chord: KeyChord) -> bool {
+    SHADOWING.contains(&(first.act, second.act)) && !added(first, chord) && !added(second, chord)
+}
+
 /// Whether `row` binds `chord` beyond its catalogue defaults: the user added it.
 fn added(row: &Row, chord: KeyChord) -> bool {
     !Keys::compiled()
@@ -198,10 +210,10 @@ mod tests {
     #[test]
     fn two_user_rows_report_on_the_later_line() {
         assert_eq!(
-            errors("[global]\nquit = [\"x\"]\nhelp = [\"x\"]\n"),
+            errors("[global]\nquit = [\"z\"]\nhelp = [\"z\"]\n"),
             one(
                 3,
-                r#"[global] help = "x": "x" is already global.quit (line 2) in [global]"#
+                r#"[global] help = "z": "z" is already global.quit (line 2) in [global]"#
             )
         );
     }
@@ -211,32 +223,51 @@ mod tests {
     #[test]
     fn a_collision_is_reported_where_the_chord_was_added() {
         assert_eq!(
-            errors("[global]\nquit = [\"w\"]\nworkspaces = [\"w\", \"z\"]\n"),
+            errors("[global]\nquit = [\"f1\"]\nhelp = [\"f1\", \"z\"]\n"),
             one(
                 2,
-                r#"[global] quit = "w": "w" is already global.workspaces (line 3) in [global]"#
+                r#"[global] quit = "f1": "f1" is already global.help (line 3) in [global]"#
             )
         );
     }
 
+    /// MOD-67 M3: `esc` also dismisses in the Settings browse stacks and answers no in their
+    /// questions, so those collisions follow, each pair reported once, in `DECLARED` order.
     #[test]
     fn a_collision_over_an_overlay_is_found_in_the_overlay_stack() {
+        let found = errors("[global]\nhelp = [\"esc\"]\n");
         assert_eq!(
-            errors("[global]\nhelp = [\"esc\"]\n"),
-            one(
+            found[0],
+            (
                 2,
                 r#"[global] help = "esc": "esc" is already overlay.close (default) over an overlay"#
+                    .to_owned()
             )
+        );
+        assert_eq!(
+            found[1..],
+            [
+                (
+                    2,
+                    r#"[global] help = "esc": "esc" is already common.dismiss (default) in Settings > Agents"#
+                        .to_owned()
+                ),
+                (
+                    2,
+                    r#"[global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
+                        .to_owned()
+                ),
+            ]
         );
     }
 
     #[test]
     fn a_collision_seen_by_two_checks_is_reported_once() {
         assert_eq!(
-            errors("[global]\nquit = [\"w\"]\n"),
+            errors("[global]\nquit = [\"f1\"]\n"),
             one(
                 2,
-                r#"[global] quit = "w": "w" is already global.workspaces (default) in [global]"#
+                r#"[global] quit = "f1": "f1" is already global.help (default) in [global]"#
             )
         );
     }
@@ -252,10 +283,10 @@ mod tests {
     fn a_state_guarded_pair_is_allowed_only_on_a_chord_both_have_by_default() {
         assert_eq!(errors("[common]\nback = [\"esc\", \"backspace\"]\n"), []);
         assert_eq!(
-            errors("[common]\ndismiss = [\"x\"]\nback = [\"x\"]\n"),
+            errors("[common]\ndismiss = [\"z\"]\nback = [\"z\"]\n"),
             one(
                 3,
-                r#"[common] back = "x": "x" is already common.dismiss (line 2) in [common]"#
+                r#"[common] back = "z": "z" is already common.dismiss (line 2) in [common]"#
             )
         );
     }

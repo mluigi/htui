@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn a_bom_and_crlf_still_give_the_right_lines() {
-        let src = "\u{feff}version = 1\r\n\r\n[global]\r\nquit = [\r\n  \"x\",\r\n  \"shift-a\",\r\n]\r\n";
+        let src = "\u{feff}version = 1\r\n\r\n[global]\r\nquit = [\r\n  \"z\",\r\n  \"shift-a\",\r\n]\r\n";
         assert_eq!(
             errors(src),
             one(
@@ -413,8 +413,8 @@ mod tests {
 
     #[test]
     fn a_list_replaces_the_defaults_and_a_string_is_a_list_of_one() {
-        let keys = load_str("[global]\nquit = \"x\"\nhelp = [\"f1\"]\n").expect("loads");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("x")]);
+        let keys = load_str("[global]\nquit = \"z\"\nhelp = [\"f1\"]\n").expect("loads");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("z")]);
         assert_eq!(keys.chords(Context::Global, Act::Help), [chord("f1")]);
         assert_eq!(keys.line(Context::Global, Act::Quit), Some(2));
         assert_eq!(keys.line(Context::Global, Act::Help), Some(3));
@@ -505,7 +505,7 @@ mod tests {
         );
         let element = r#"[global] quit: write each chord as a string, such as "q""#;
         assert_eq!(
-            errors("[global]\nquit = [\"x\", 5, [\"y\"]]\n"),
+            errors("[global]\nquit = [\"z\", 5, [\"y\"]]\n"),
             vec![(2, element.to_owned()), (2, element.to_owned())]
         );
         assert_eq!(
@@ -517,8 +517,8 @@ mod tests {
     #[test]
     fn an_inline_table_at_the_top_is_a_context() {
         // B-12: one rule for every table value.
-        let inline = load_str("global = { quit = \"x\" }\n").expect("an inline context loads");
-        assert_eq!(inline.chords(Context::Global, Act::Quit), [chord("x")]);
+        let inline = load_str("global = { quit = \"z\" }\n").expect("an inline context loads");
+        assert_eq!(inline.chords(Context::Global, Act::Quit), [chord("z")]);
     }
 
     #[test]
@@ -634,6 +634,12 @@ quit = ["x", "shift-a"]
                 13,
                 r#"[global] quit = "shift-a": write a shifted letter as "A""#,
             ),
+            // MOD-67 M3: `x` is agents' cancel in Settings > Agents, so the rebound quit would
+            // never reach there (ANA-26 §2.2's silent shadowing, now reported).
+            (
+                13,
+                r#"[global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#,
+            ),
         ]
         .into_iter()
         .map(|(line, message)| (line, message.to_owned()))
@@ -738,9 +744,9 @@ quit = ["x", "shift-a"]
     #[test]
     fn a_named_file_is_read_and_a_missing_one_refused() {
         let root = tempfile::tempdir().expect("a temp dir");
-        let named = write(root.path(), "mine.toml", "[global]\nquit = \"x\"\n");
+        let named = write(root.path(), "mine.toml", "[global]\nquit = \"z\"\n");
         let keys = resolve(Some(&named), false, None).expect("a good file loads");
-        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("x")]);
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("z")]);
         assert_eq!(
             load_path(&named).expect("a good file loads"),
             keys,
