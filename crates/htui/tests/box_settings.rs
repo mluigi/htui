@@ -16,7 +16,7 @@ use htui::app::{Action, Handled};
 use htui::box_settings::{self, BoxesSnapshot, REQUEST_NAMES, spec_view};
 use htui::store_worker::{StoreReply, StoreRequest, serve};
 use htui::testkit::{Harness, SectionBench};
-use htui::ui::tabs::settings::{BoxesSection, SettingsSection, SettingsTab};
+use htui::ui::tabs::settings::{BoxesSection, PromptSection, SettingsSection, SettingsTab};
 use htui_agent::box_probe::spec;
 use htui_core::fixtures::{demo_data, ids};
 use htui_core::model::{BoxEdit, BoxId, BoxRecord, Executor, Scope, canonical_declared_tags};
@@ -1169,6 +1169,117 @@ async fn ctrl_c_passes_through_an_open_quirks_editor() {
     assert!(section.captures_input(), "the editor is still open");
 }
 
+/// MOD-67 M3 (D10, D14): `[settings.boxes] reload = "f5"` is a narrower override of the shared
+/// `common.reload`. Boxes reloads on `F5`, not on `r`, and its hint says so; the Prompt section
+/// beside it still reloads on `r`, because the override row lives in boxes' stack alone.
+#[tokio::test]
+async fn a_boxes_reload_override_moves_boxes_alone() {
+    let keys = htui::keys::load_str("version = 1\n[settings.boxes]\nreload = \"f5\"\n")
+        .expect("the key file loads");
+    let mut harness = Harness::over(MemStore::demo())
+        .with_keys(keys)
+        .with_tab(Box::new(SettingsTab::with_sections(vec![
+            Box::new(BoxesSection::new()),
+            Box::new(PromptSection::new()),
+        ])));
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(frame.contains(" Boxes "), "{frame}");
+    assert!(
+        frame.contains("\u{b7} F5 reload"),
+        "the hint names F5: {frame}"
+    );
+    assert!(!frame.contains("r reload"), "{frame}");
+
+    harness.key("r");
+    assert_eq!(harness.queued(), 0, "`r` is not boxes' reload any more");
+    harness.key("f5");
+    assert_eq!(harness.queued(), 1, "`F5` reads the boxes");
+    harness.settle().await;
+
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("e edit \u{b7} r reload"),
+        "Prompt's hint is unchanged: {frame}"
+    );
+    harness.key("f5");
+    assert_eq!(harness.queued(), 0, "`F5` is boxes' alone");
+    harness.key("r");
+    assert_eq!(harness.queued(), 1, "Prompt still reloads on `r`");
+}
+
+/// MOD-67 M3 (D13): a rebound `form.save` saves the quirks editor under its new chord and the
+/// hint names it; the `TextArea`'s own `ctrl-s` still saves too, until M4 moves it.
+#[tokio::test]
+async fn a_rebound_save_saves_the_quirks_editor_and_ctrl_s_still_does() {
+    let keys = htui::keys::load_str("version = 1\n[form]\nsave = \"ctrl-x\"\n")
+        .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = BoxesSection::new();
+    feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+
+    bench.key(&mut section, "e");
+    let frame = bench.render_section(&section, 100);
+    assert!(
+        frame.contains("Ctrl+x saves \u{b7} Esc cancels \u{b7} Enter breaks the line"),
+        "{frame}"
+    );
+    type_at(&bench, &mut section, "x");
+    assert_eq!(bench.key(&mut section, "ctrl-x"), Handled::Consumed);
+    only_edit(&requests(&bench));
+
+    let (bench, mut section) = bench_with(&snap_of(MemStore::demo()).await).await;
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "x");
+    bench.key(&mut section, "ctrl-s");
+    only_edit(&requests(&bench));
+}
+
+/// MOD-67 M3 (ANA-26 §2.6 defect 1): a browse key is a chord, modifiers included, so `ctrl-s`
+/// opens no spec editor and `ctrl-t`, `ctrl-e`, `ctrl-p`, `ctrl-r` do nothing; at the executor
+/// question `alt-y` writes nothing. A modal mode passes CONTROL, ALT and function keys to the
+/// shell (`F1` is help) and swallows every other unused key.
+#[tokio::test]
+async fn modifier_chords_are_not_their_letters_in_boxes() {
+    let (bench, mut section) = bench_with(&demo_at_version(3).await).await;
+
+    for chord in ["ctrl-s", "ctrl-t", "ctrl-e", "alt-w", "ctrl-p", "ctrl-r"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "`{chord}`");
+        assert!(!section.captures_input(), "`{chord}` opens nothing");
+    }
+    assert!(bench.drained().is_empty(), "nothing probed or read");
+
+    assert_eq!(bench.key(&mut section, "w"), Handled::Consumed);
+    assert_eq!(bench.key(&mut section, "alt-y"), Handled::Pass);
+    assert!(section.captures_input(), "`alt-y` answers nothing");
+    assert!(requests(&bench).is_empty(), "and writes nothing");
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass, "help is F1");
+    assert_eq!(
+        bench.key(&mut section, "q"),
+        Handled::Consumed,
+        "`q` is swallowed"
+    );
+    assert_eq!(bench.key(&mut section, "n"), Handled::Consumed);
+    assert!(!section.captures_input(), "`n` closed the question");
+
+    bench.key(&mut section, "e");
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass, "help is F1");
+    assert!(section.captures_input(), "the quirks editor is still open");
+    bench.key(&mut section, "esc");
+
+    bench.key(&mut section, "t");
+    assert_eq!(
+        bench.key(&mut section, "tab"),
+        Handled::Consumed,
+        "the tab stays"
+    );
+    assert_eq!(bench.key(&mut section, "f1"), Handled::Pass, "help is F1");
+    assert!(section.captures_input(), "the tags editor is still open");
+}
+
 /// MOD-41 plan D10: the detail pane shows the selected box's executor: `tui` when the key is
 /// missing, `worker` as written, and an unknown value as its text.
 #[tokio::test]
@@ -1217,7 +1328,7 @@ async fn w_flips_the_executor_after_confirmation() {
         words(&frame).contains("executor of `DESKTOP-HTUI`: `tui` \u{2192} `worker`?"),
         "{frame}"
     );
-    assert!(frame.contains("y write \u{b7} n/esc cancel"), "{frame}");
+    assert!(frame.contains("y write \u{b7} n/Esc cancel"), "{frame}");
 
     assert_eq!(bench.key(&mut section, "y"), Handled::Consumed);
     let (box_id, expected, edit) = only_edit(&requests(&bench));
@@ -1471,7 +1582,7 @@ async fn s_opens_the_spec_editor_over_the_pretty_printed_overlay() {
     }
     assert_eq!(
         last_line(&frame).trim_end_matches(' '),
-        "ctrl-s saves \u{b7} Esc cancels \u{b7} Enter breaks the line \u{b7} blank clears",
+        "Ctrl+s saves \u{b7} Esc cancels \u{b7} Enter breaks the line \u{b7} blank clears",
         "{frame}"
     );
     assert!(requests(&bench).is_empty(), "opening sends nothing");
@@ -2044,7 +2155,7 @@ async fn the_quirks_editor_renders() {
     let frame = bench.render_section(&section, 100);
     assert!(frame.contains("no admin rights"), "{frame}");
     assert!(frame.contains("use the D: drive"), "{frame}");
-    assert!(frame.contains("ctrl-s saves"), "{frame}");
+    assert!(frame.contains("Ctrl+s saves"), "{frame}");
 
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("quirks_editor", frame);
@@ -2087,7 +2198,7 @@ async fn the_executor_confirmation_renders() {
         ),
         "{frame}"
     );
-    assert!(frame.contains("y write \u{b7} n/esc cancel"), "{frame}");
+    assert!(frame.contains("y write \u{b7} n/Esc cancel"), "{frame}");
 
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("executor_confirm", frame);
