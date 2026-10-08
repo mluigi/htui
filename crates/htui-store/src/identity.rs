@@ -81,31 +81,48 @@ pub fn config_root() -> Result<PathBuf> {
 /// [`StoreError::Backend`] when the file exists but cannot be read or parsed, or when a mint
 /// cannot be written.
 pub fn load_or_mint(root: &Path) -> Result<Identity> {
-    let path = root.join(BOX_FILE);
     let hostname = hostname();
-
-    match std::fs::read_to_string(&path) {
-        Ok(text) => {
-            let parsed = parse_toml(&text).map_err(|e| {
-                StoreError::Backend(format!("{} is not valid box.toml: {e}", path.display()))
-            })?;
-            let identity = Identity {
-                box_id: BoxId::from_uuid(parsed.box_id),
-                hostname,
-            };
-            if parsed.hostname != identity.hostname {
-                store(root, &identity)?;
-            }
-            Ok(identity)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let identity = Identity {
-                box_id: BoxId::new(),
-                hostname,
-            };
+    if let Some(parsed) = read_box_toml(&root.join(BOX_FILE))? {
+        let identity = Identity {
+            box_id: BoxId::from_uuid(parsed.box_id),
+            hostname,
+        };
+        if parsed.hostname != identity.hostname {
             store(root, &identity)?;
-            Ok(identity)
         }
+        return Ok(identity);
+    }
+    let identity = Identity {
+        box_id: BoxId::new(),
+        hostname,
+    };
+    store(root, &identity)?;
+    Ok(identity)
+}
+
+/// Reads `<root>/box.toml` and never writes (MOD-92 G2): `Ok(None)` when there is no file (and
+/// when `root` itself does not exist). The identity carries this machine's current hostname, as
+/// [`load_or_mint`] returns it, but a changed hostname is **not** written back.
+///
+/// # Errors
+///
+/// [`StoreError::Backend`] when the file exists but cannot be read or parsed; the sentence names
+/// the path, as [`load_or_mint`]'s does.
+pub fn load(root: &Path) -> Result<Option<Identity>> {
+    Ok(read_box_toml(&root.join(BOX_FILE))?.map(|parsed| Identity {
+        box_id: BoxId::from_uuid(parsed.box_id),
+        hostname: hostname(),
+    }))
+}
+
+/// `box.toml` at `path`, or `None` when there is no such file; the read and parse sentences name
+/// the path. Shared by [`load_or_mint`] and [`load`].
+fn read_box_toml(path: &Path) -> Result<Option<BoxToml>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => parse_toml(&text).map(Some).map_err(|e| {
+            StoreError::Backend(format!("{} is not valid box.toml: {e}", path.display()))
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(StoreError::Backend(format!(
             "cannot read {}: {e}",
             path.display()
@@ -376,8 +393,9 @@ fn hostname() -> String {
 mod tests {
     use super::{
         BOX_FILE, Fingerprint, Identity, config_root_path, db_fingerprint, ioreg_platform_uuid,
-        load_or_mint, machine_id_under, parse_box_toml, store,
+        load, load_or_mint, machine_id_under, parse_box_toml, store,
     };
+    use htui_core::store::StoreError;
     use htui_core::model::BoxId;
 
     /// A synthetic machine identity: 32 hex characters, never this machine's.
@@ -584,6 +602,68 @@ mod tests {
             "names the root: {err}"
         );
         assert!(err.contains("is not valid box.toml"), "{err}");
+    }
+
+    /// `load` never mints (MOD-92 G2): a missing file is `None` and nothing is written, and a
+    /// missing root is not created either (A-4).
+    #[test]
+    fn load_on_a_missing_file_is_none_and_writes_nothing() {
+        let root = tempfile::tempdir().expect("temp root");
+        assert_eq!(load(root.path()).expect("load"), None);
+        assert_eq!(
+            std::fs::read_dir(root.path()).expect("list").count(),
+            0,
+            "nothing written"
+        );
+
+        let missing = root.path().join("not-here");
+        assert_eq!(load(&missing).expect("load"), None);
+        assert!(!missing.exists(), "the root is not created");
+    }
+
+    /// `load` answers this machine's hostname, as `load_or_mint` does, but never writes it back.
+    #[test]
+    fn load_returns_the_id_and_this_hostname_without_rewriting() {
+        let root = tempfile::tempdir().expect("temp root");
+        let box_id = BoxId::new();
+        store(
+            root.path(),
+            &Identity {
+                box_id,
+                hostname: "old-host".to_owned(),
+            },
+        )
+        .expect("write");
+        let before = std::fs::read(root.path().join(BOX_FILE)).expect("bytes");
+
+        assert_eq!(
+            load(root.path()).expect("load"),
+            Some(Identity {
+                box_id,
+                hostname: super::hostname(),
+            })
+        );
+        assert_eq!(
+            std::fs::read(root.path().join(BOX_FILE)).expect("bytes"),
+            before,
+            "box.toml is not rewritten"
+        );
+    }
+
+    #[test]
+    fn load_names_the_path_of_a_malformed_file() {
+        let root = tempfile::tempdir().expect("temp root");
+        std::fs::write(root.path().join(BOX_FILE), "not = [toml\n").expect("write");
+        match load(root.path()) {
+            Err(StoreError::Backend(m)) => {
+                assert!(
+                    m.contains(&root.path().display().to_string()),
+                    "names the path: {m}"
+                );
+                assert!(m.contains("is not valid box.toml"), "{m}");
+            }
+            other => panic!("expected a Backend refusal, got {other:?}"),
+        }
     }
 
     #[test]
