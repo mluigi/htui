@@ -106,6 +106,9 @@ htui
   stale value cannot override it).
 - What comes back is read the same way ([What comes back](#what-comes-back)): the view cannot tell
   the two modes apart.
+- A paste, like all input queued on its way to the editor, is zeroized in htui's memory once
+  written (a paste may be a credential). That covers the input path only: the text you edit also
+  sits in the temporary file and in the pane's screen grid, neither of which is zeroized.
 - One editor at a time. A second `E`/`Ctrl+E` while one is open (from a view a reply opened, say)
   is answered `an editor is already open: return to it or abort it first`.
 
@@ -190,7 +193,9 @@ the terminal resizes the editor (it gets `SIGWINCH`) right after the next frame.
 - **Abort and quit leave the editor's recovery files.** An abort or quit hangs the editor up
   (`SIGHUP`, then `SIGKILL` to its process group after a short grace). nano saves a modified
   buffer to `htui-*.md.save` and vim keeps its swap file `.htui-*.md.swp`, both in the temp
-  directory. htui does not delete them: they hold your text.
+  directory; nvim keeps its swap under `$XDG_STATE_HOME/nvim/swap/` (usually
+  `~/.local/state/nvim/swap/`), named after the file's full path. htui does not delete them: they
+  hold your text.
 - **A fast quit** may leave an editor that ignores `SIGHUP` running, if htui exits within the
   grace before `SIGKILL`.
 - **An editor that exits while you abort** loses the race: the abort wins, and what it saved is

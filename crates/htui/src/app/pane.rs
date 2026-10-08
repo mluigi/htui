@@ -64,7 +64,7 @@ pub const MIN_PANE: Size = Size {
 };
 
 /// The head of the refusal while an editor is alive and unfocused (MOD-57 P6).
-pub const EDITOR_LOCKED: &str = "the editor is open";
+const EDITOR_LOCKED: &str = "the editor is open";
 
 /// The refusal's tail and the status line while a modal overlay is over the editor (R0 F3): its
 /// keys are the prompt's, so none of the editor's is offered.

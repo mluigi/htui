@@ -21,12 +21,12 @@
 //!   the caller's thread, and the master is not closed there either (on Windows that is
 //!   `ClosePseudoConsole`, which can wait): dropping a [`PtyChild`] hands it to a short-lived
 //!   `htui-pane-close` thread.
-//! - [`PaneScreen`]: the VT screen a pane's output is parsed into (`vt100`), and the replies the
-//!   child is owed for its terminal queries (DSR, DA1). The output passes a CSI clamp first
-//!   (`CsiClamp`, R1 H-1): `vt100` repeats ICH, IL and SD as many times as their count asks, on
-//!   the UI task, so their counts are held to the screen's size.
-//! - [`encode_key`] and [`encode_paste`]: crossterm's keys and pastes as the bytes a legacy xterm
-//!   sends (no kitty protocol, PRD Q4).
+//! - `PaneScreen` (crate-private): the VT screen a pane's output is parsed into (`vt100`), and
+//!   the replies the child is owed for its terminal queries (DSR, DA1). The output passes a CSI
+//!   clamp first (`CsiClamp`, R1 H-1): `vt100` repeats ICH, IL and SD as many times as their
+//!   count asks, on the UI task, so their counts are held to the screen's size.
+//! - `encode_key` and `encode_paste` (crate-private): crossterm's keys and pastes as the bytes a
+//!   legacy xterm sends (no kitty protocol, PRD Q4).
 //! - [`PaneId`], [`PaneSize`], [`PaneEvent`]: what the shell and the pane's threads exchange.
 //!
 //! Nothing here blocks the caller: `write` queues, `resize` is one ioctl, `kill` sends on a
@@ -37,9 +37,6 @@
 //! [`PaneEvent::Output`]: crate::editor::pane::PaneEvent::Output
 //! [`PaneEvent::Exited`]: crate::editor::pane::PaneEvent::Exited
 //! [`PaneChild::kill`]: crate::editor::pane::PaneChild::kill
-//! [`PaneScreen`]: crate::editor::pane::PaneScreen
-//! [`encode_key`]: crate::editor::pane::encode_key
-//! [`encode_paste`]: crate::editor::pane::encode_paste
 //! [`PaneId`]: crate::editor::pane::PaneId
 //! [`PaneSize`]: crate::editor::pane::PaneSize
 //! [`PaneEvent`]: crate::editor::pane::PaneEvent
@@ -483,7 +480,7 @@ impl fmt::Debug for PtyChild {
 }
 
 /// The VT screen of a pane and the replies it owes the child (DSR, DA1). `Debug` prints the size.
-pub struct PaneScreen {
+pub(crate) struct PaneScreen {
     /// The grid, its modes, and the replies queued while parsing.
     parser: vt100::Parser<Replies>,
     /// What the child's bytes go through before the parser (R1 H-1).
@@ -822,7 +819,7 @@ fn alt_prefixed(alt: bool, body: &[u8]) -> Vec<u8> {
 /// switch to SS3 in application-cursor mode (DECCKM) when unmodified; any modifier gives the
 /// `CSI 1;m` form, `m` being `1 + shift + 2·alt + 4·ctrl`.
 #[must_use]
-pub fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
+pub(crate) fn encode_key(key: KeyEvent, application_cursor: bool) -> Option<Vec<u8>> {
     let modifiers = key.modifiers;
     let alt = modifiers.contains(KeyModifiers::ALT);
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
@@ -918,7 +915,7 @@ fn without_paste_end(bytes: &[u8]) -> Zeroizing<Vec<u8>> {
 /// become `\r` (what a terminal sends for a pasted newline; a raw `\n` is `ctrl-j`), and, when
 /// the child asked for bracketed paste, the result is wrapped in `ESC [200~` … `ESC [201~`.
 #[must_use]
-pub fn encode_paste(text: &str, bracketed: bool) -> Zeroizing<Vec<u8>> {
+pub(crate) fn encode_paste(text: &str, bracketed: bool) -> Zeroizing<Vec<u8>> {
     let mut stripped = without_paste_end(text.as_bytes());
     while stripped
         .windows(PASTE_END.len())
