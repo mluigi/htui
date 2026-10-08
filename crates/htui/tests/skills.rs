@@ -1900,3 +1900,22 @@ async fn ctrl_chords_open_nothing_in_library_browse_or_the_pane() {
         "`y` after `ctrl-x` answers nothing"
     );
 }
+
+/// MOD-67 M4 D11, the lane's rebinding test: `[skills.library] import = "M"` opens the import form
+/// on `M`, `I` opens nothing, and the browse hint names the new key.
+#[tokio::test]
+async fn a_rebound_library_import_opens_the_form_and_i_is_inert() {
+    let mut harness = open_with_keys(MemStore::demo(), "[skills.library]\nimport = \"M\"\n").await;
+    let frame = harness.render();
+    assert!(hint(&frame).contains("M import"), "{frame}");
+    assert!(!hint(&frame).contains("I import"), "{frame}");
+    harness.key("I");
+    let frame = harness.render();
+    assert!(!frame.contains(" import skills "), "`I` is inert: {frame}");
+    harness.key("M");
+    let frame = harness.render();
+    assert!(
+        frame.contains(" import skills "),
+        "`M` opens the form: {frame}"
+    );
+}
