@@ -116,8 +116,9 @@ const HINT_TYPED: HintSpec = &[Hint::Text("Enter confirm"), Hint::Text("Esc stop
 const HINT_DELETING: HintSpec = &[Hint::Text("deleting\u{2026}")];
 
 /// The second line of every warning: the one sentence PRD D13 asks to be in front of a user before
-/// anything is removed.
-const NOT_UNDONE: &str = "Nothing here can be undone. `y` to continue, `n` or `Esc` to stop.";
+/// anything is removed. It names no key: the hint row under it does, from the live keys, in every
+/// stage (MOD-67 M3 R1), so a rebound `confirm.yes` cannot leave this line saying `y`.
+const NOT_UNDONE: &str = "Nothing here can be undone.";
 
 /// What a second confirmation that did not match says. The stage stays where it was.
 const WRONG_SLUG: &str = "that is not the slug; nothing was deleted";

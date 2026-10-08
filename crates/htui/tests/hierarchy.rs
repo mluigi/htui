@@ -3210,3 +3210,34 @@ async fn a_rebound_infer_acts_on_its_new_chord_and_the_hint_follows() {
         "`I` infers the scope's workspace"
     );
 }
+
+/// MOD-67 M3 R1 (L2): the warning's own sentence names no key, so a rebound `confirm.yes` cannot
+/// leave it saying `y`; the hint row under it names the chord that continues.
+#[tokio::test]
+async fn a_rebound_yes_is_the_one_key_the_warning_names() {
+    let keys = htui::keys::load_str("version = 1\n[settings.hierarchy]\nyes = \"Y\"\n")
+        .expect("the key file loads");
+    let mut harness = hierarchy_over(MemStore::demo()).await.with_keys(keys);
+    harness.key("j");
+    harness.key("d");
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(frame.contains("Nothing here can be undone."), "{frame}");
+    assert!(
+        frame.contains("Y continue"),
+        "the hint names the rebound chord: {frame}"
+    );
+    assert!(
+        !frame.contains("`y` to continue"),
+        "no sentence names the default chord: {frame}"
+    );
+
+    harness.key("Y");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("Enter confirm"),
+        "`Y` continued to the typed stage: {frame}"
+    );
+}

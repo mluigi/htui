@@ -27,7 +27,7 @@ Graphics · DESKTOP-HTUI · memory · 0 working · 0 waiting
 │                                                                                                  │
 │This deletes project `vulkan-tutorials` and its entire history. Gone for good: 1 workspace links, │
 │2 items, 2 key counters, 5 kinds, 5 graphs, 15 phases, 10 templates, 2 revisions, 1 links.        │
-│Nothing here can be undone. `y` to continue, `n` or `Esc` to stop.                                │
+│Nothing here can be undone.                                                                       │
 │Type `vulkan-tutorials` to confirm:                                                               │
 │Enter confirm · Esc stop                                                                          │
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
