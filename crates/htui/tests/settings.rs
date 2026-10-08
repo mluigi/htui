@@ -5889,3 +5889,153 @@ async fn qdrant_demo_section_offers_no_edit() {
         "`r` still re-reads in a demo"
     );
 }
+
+// -------------------------------------------------------------------------------------------
+// MOD-67 M3 L-A: Agents and Qdrant dispatch through their key stacks (D6, D14)
+// -------------------------------------------------------------------------------------------
+
+/// D14 pin (ANA-26 §2.6 defect 2), section level: the URL and key editors keep every key the
+/// field passes on, except what the modal global layer admits (CONTROL, ALT, function keys).
+/// `Tab` no longer leaves the field for the tab bar.
+#[tokio::test]
+async fn the_qdrant_editors_keep_tab_and_pass_only_ctrl_alt_and_function_keys() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    let _ = bench.drained();
+
+    // The URL row, then the key row.
+    for opening in [&["e"][..], &["j", "e"][..]] {
+        for chord in opening {
+            assert_eq!(bench.key(&mut section, chord), Handled::Consumed);
+        }
+        assert!(section.captures_input(), "{opening:?} opens an editor");
+        for chord in ["tab", "backtab", "down", "up", "pageup"] {
+            assert_eq!(
+                bench.key(&mut section, chord),
+                Handled::Consumed,
+                "`{chord}` stays in the editor ({opening:?})"
+            );
+        }
+        for chord in ["ctrl-c", "f1", "alt-x"] {
+            assert_eq!(
+                bench.key(&mut section, chord),
+                Handled::Pass,
+                "`{chord}` passes the modal global layer ({opening:?})"
+            );
+        }
+        assert!(section.captures_input(), "the editor is still open");
+        assert!(requests_of(&bench).is_empty());
+        assert_eq!(bench.key(&mut section, "Esc"), Handled::Consumed);
+        assert!(!section.captures_input(), "`Esc` is the field's cancel");
+    }
+}
+
+/// D14 pin, App level: `Tab` and `Shift+Tab` in the Qdrant URL editor keep the Settings tab and
+/// the open field (today the field passed them, and the shell switched tabs). An offline backend
+/// over the fake keyring answers `NotStored`, which opens the URL editor by itself.
+#[tokio::test]
+async fn tab_in_the_qdrant_editor_keeps_the_settings_tab() {
+    let _keyring = htui_store::testkit::mock_keyring().await;
+    let root = tempfile::tempdir().expect("a throwaway config root");
+    let cache = htui_store::CacheStore::open(
+        root.path(),
+        "qdrant-tab",
+        htui_store::PgStore::schema_version(),
+    )
+    .await
+    .expect("a fresh mirror");
+    let mut harness = Harness::over_backend(Backend::Offline {
+        cache: cache.clone(),
+        since: Some(chrono::Utc::now()),
+    })
+    .with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+        QdrantSection::new(),
+    )])))
+    .with_tab(Box::new(htui::ui::tabs::BacklogTab::new()));
+    harness.drive_to_end().await;
+    assert_eq!(harness.app().tabs.active_id(), Some(SettingsTab::ID));
+    let frame = harness.render();
+    assert!(frame.contains("URL:"), "the editor is open: {frame}");
+
+    for chord in ["tab", "backtab"] {
+        harness.key(chord);
+        harness.drive_to_end().await;
+        assert_eq!(
+            harness.app().tabs.active_id(),
+            Some(SettingsTab::ID),
+            "`{chord}` keeps the Settings tab"
+        );
+        let frame = harness.render();
+        assert!(
+            frame.contains("URL:"),
+            "`{chord}` keeps the editor: {frame}"
+        );
+    }
+
+    cache.close().await;
+    drop(root);
+}
+
+/// D14 pin (defect 1, L-A's case): Qdrant's browse arms compare whole chords, so `ctrl-e`
+/// opens no editor and `ctrl-r` re-reads nothing; both reach the shell.
+#[tokio::test]
+async fn ctrl_e_and_ctrl_r_in_qdrant_browse_do_nothing() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    let _ = bench.drained();
+
+    for chord in ["ctrl-e", "ctrl-r", "ctrl-c", "ctrl-j"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "`{chord}`");
+        assert!(!section.captures_input(), "`{chord}` opens nothing");
+        assert!(requests_of(&bench).is_empty(), "`{chord}` asks nothing");
+    }
+    assert_eq!(bench.key(&mut section, "e"), Handled::Consumed);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("URL:"),
+        "`ctrl-j` did not move the cursor, so `e` edits the URL row: {rendered}"
+    );
+}
+
+/// The clear question answers `y` and `n`/`Esc`, swallows the rest, and passes what the modal
+/// global layer admits; its hint lists both cancel chords (D9: `n/Esc cancel`).
+#[tokio::test]
+async fn the_qdrant_clear_question_answers_y_and_n_and_passes_ctrl() {
+    let bench = SectionBench::new().await;
+    let mut section = QdrantSection::new();
+    bench.reply(&mut section, &StoreReply::Qdrant(qdrant_stored()));
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(
+        rendered.contains("y confirm \u{b7} n/Esc cancel"),
+        "{rendered}"
+    );
+    for chord in ["j", "q", "tab", "?"] {
+        assert_eq!(
+            bench.key(&mut section, chord),
+            Handled::Consumed,
+            "`{chord}`"
+        );
+    }
+    for chord in ["ctrl-y", "ctrl-c", "f1", "alt-y"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "`{chord}`");
+    }
+    assert!(requests_of(&bench).is_empty(), "nothing answered yes");
+    assert!(section.captures_input(), "the question is still up");
+
+    assert_eq!(bench.key(&mut section, "Esc"), Handled::Consumed);
+    assert!(!section.captures_input(), "`Esc` cancels");
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    assert_eq!(bench.key(&mut section, "y"), Handled::Consumed);
+    assert!(
+        matches!(
+            requests_of(&bench).as_slice(),
+            [StoreRequest::ClearQdrantSettings]
+        ),
+        "`y` clears"
+    );
+}
