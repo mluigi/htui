@@ -1605,7 +1605,7 @@ async fn a_proposal_accepted_saves_as_the_next_version() {
         "the added line: {frame}"
     );
     assert!(
-        hint(&frame).ends_with("Enter accept  Esc discard  J/K PgUp/PgDn scroll"),
+        hint(&frame).ends_with("Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page"),
         "{frame}"
     );
     insta::assert_snapshot!("agent_help_proposal", frame);

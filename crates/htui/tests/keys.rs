@@ -452,6 +452,60 @@ async fn ctrl_l_and_ctrl_h_do_not_switch_skills_views() {
     assert!(on_library(&frame), "`h` went back: {frame}");
 }
 
+/// MOD-67 M4 PA-2 pin at the shell: a capturing Skills mode offers no view switch (`l` is typed)
+/// and still hands `Tab` to the shell, the draft kept; the agent help over it too.
+#[tokio::test]
+async fn a_capturing_skills_view_keeps_tab_and_offers_no_switch() {
+    let mut harness = shell(true).await;
+    harness.key("2");
+    harness.key("l");
+    harness.drive_to_end().await;
+    for _ in 0..20 {
+        harness.key("k");
+    }
+    for _ in 0..20 {
+        if harness.render().contains("\u{250c} implement v") {
+            break;
+        }
+        harness.key("j");
+    }
+    harness.key("e");
+    harness.key("l");
+    let frame = harness.render();
+    assert!(frame.contains("lYou are running"), "`l` is typed: {frame}");
+    let skills_then_requirements = |harness: &mut Harness| {
+        harness.key("tab");
+        assert_eq!(
+            harness.app().tabs.active_id().map(|id| id.0),
+            Some("requirements"),
+            "`Tab` passes to the shell"
+        );
+        harness.key("2");
+        assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
+    };
+    skills_then_requirements(&mut harness);
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("lYou are running"),
+        "the draft survived: {frame}"
+    );
+
+    harness.key("ctrl-g");
+    harness.drive_to_end().await;
+    harness.key("l");
+    let frame = harness.render();
+    assert!(
+        frame.contains("ask: l"),
+        "`l` is typed into the request: {frame}"
+    );
+    skills_then_requirements(&mut harness);
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("ask: l"), "the help survived: {frame}");
+    assert!(frame.contains("lYou are running"), "and the draft: {frame}");
+}
+
 #[tokio::test]
 async fn a_capturing_section_shows_the_filtered_status_line_and_box() {
     let mut harness =

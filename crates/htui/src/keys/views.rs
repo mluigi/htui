@@ -790,14 +790,11 @@ mod tests {
             include_str!("../ui/tabs/requirements/mod.rs"),
             include_str!("../ui/tabs/requirements/forms.rs"),
         ];
-        /// MOD-67 M4: the lanes name these; T-close empties the list. Until T1g converts
-        /// `agent_help.rs`, the stacks it names (`HELP_*`, and the two editors it checks) wait
-        /// here too.
+        /// MOD-67 M4: the lanes name these; T-close empties the list.
         const PENDING: &[&str] = &[
             "LIBRARY_BROWSE",
             "LIBRARY_PROMPT",
             "LIBRARY_INFO",
-            "LIBRARY_EDITOR",
             "LIBRARY_REPORT",
             "ATTACH_BROWSE",
             "ATTACH_FORM",
@@ -805,10 +802,6 @@ mod tests {
             "ATTACH_CONFIRM",
             "TEMPLATES_BROWSE",
             "TEMPLATES_PROMPT",
-            "TEMPLATES_EDITOR",
-            "HELP_ASKING",
-            "HELP_WAITING",
-            "HELP_PROPOSAL",
             "REQUIREMENTS_BROWSE",
             "REQUIREMENTS_FORM",
             "REQUIREMENTS_WITHDRAW",

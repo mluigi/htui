@@ -692,7 +692,7 @@ impl LibraryView {
             (_, _, Mode::Editing(editor), _) => {
                 self.render_editor(frame, content, editor, ctx);
                 match &editor.help {
-                    Some(help) => help.hint().to_owned(),
+                    Some(help) => help.hint(ctx.keys()),
                     None => {
                         let (line, col) = editor.area.cursor_line_col();
                         format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)

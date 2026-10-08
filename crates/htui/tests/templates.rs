@@ -1035,7 +1035,7 @@ async fn ctrl_g_proposal_accept_and_save() {
         "a removed line: {frame}"
     );
     assert!(
-        hint(&frame).ends_with("Enter accept  Esc discard  J/K PgUp/PgDn scroll"),
+        hint(&frame).ends_with("Enter accept · n/Esc discard · J/K scroll · PgUp/PgDn page"),
         "{frame}"
     );
     insta::assert_snapshot!("agent_help_proposal", frame);
@@ -1108,7 +1108,7 @@ async fn the_asking_panel() {
     assert!(frame.contains("agent: scripted"), "{frame}");
     assert!(frame.contains(" phase placeholders "), "{frame}");
     assert!(
-        hint(&frame).ends_with("Enter ask  Up/Down agent  Esc back"),
+        hint(&frame).ends_with("Enter ask · Up/Down agent · Esc back"),
         "{frame}"
     );
     insta::assert_snapshot!("agent_help_asking", frame);
