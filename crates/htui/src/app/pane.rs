@@ -183,21 +183,23 @@ impl App {
     }
 
     /// One transport event (P7): `Output` of the open editor is parsed and its replies written
-    /// back; `Exited` reads the file back ([`TempEdit::finish`]) and hands the outcome to the tab
-    /// that asked ([`finish_external_edit`](Self::finish_external_edit)). An event of any other
-    /// id is dropped (B4).
+    /// back, and asks for a frame only while the editor's tab is on screen (M2 R1 L-3); `Exited`
+    /// reads the file back ([`TempEdit::finish`]) and hands the outcome to the tab that asked
+    /// ([`finish_external_edit`](Self::finish_external_edit)). An event of any other id is
+    /// dropped (B4).
     pub fn on_pane_event(&mut self, event: PaneEvent) {
         if self.editor_id() != Some(event.id()) {
             return;
         }
         match event {
             PaneEvent::Output { bytes, .. } => {
+                let visible = self.editor_visible();
                 if let Some(editor) = self.editor.as_mut() {
                     let replies = editor.screen.feed(&bytes);
                     if !replies.is_empty() {
                         editor.child.write(&replies);
                     }
-                    self.dirty = true;
+                    self.dirty |= visible;
                 }
             }
             PaneEvent::Exited {
@@ -1746,6 +1748,27 @@ mod tests {
         output(&mut app, b"\x1b[?1h");
         app.on_key(press(KeyCode::Up, KeyModifiers::NONE));
         assert_eq!(writes(&log).last(), Some(&b"\x1bOA".to_vec()));
+    }
+
+    /// M2 R1 L-3: output while the editor's tab is not on screen still reaches the screen (and
+    /// its replies go back) but asks for no frame; the way back draws it.
+    #[test]
+    fn off_screen_output_feeds_the_screen_without_a_frame() {
+        let (mut app, _benches, log) = unfocused_two();
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.dirty = false;
+        output(&mut app, b"hidden-text\x1b[6n");
+        assert!(!app.dirty, "nothing on screen changed");
+        assert_eq!(
+            writes(&log),
+            vec![b"\x1b[1;12R".to_vec()],
+            "the reply goes back"
+        );
+
+        app.on_key(plain('1'));
+        assert!(app.dirty);
+        let term = draw(&mut app, 100, 30);
+        assert!(text(term.backend().buffer()).contains("hidden-text"));
     }
 
     #[test]
