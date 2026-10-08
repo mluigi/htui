@@ -6,7 +6,8 @@
 //! [`Stack::EDITOR_UNFOCUSED`]. A row for an act in a narrower layer shadows that act in every
 //! wider layer, bound or not (blueprint B6): that is how M2's narrower overrides and
 //! `reject = []` work. [`DECLARED`] lists every stack the key file's validator walks (MOD-67 M2 D8
-//! step 5); M3 adds every Settings and overlay mode's stack from [`views`](super::views).
+//! step 5); M3 adds every Settings and overlay mode's stack from [`views`](super::views), M4 the
+//! Skills and Requirements ones, M5 the Backlog and Chat ones.
 //!
 //! M3 adds two layer kinds. A **view** layer ([`Layer::view`], PA-3) offers the mode's own acts
 //! plus every shared act a wider layer of the same stack offers, so a view's override and
@@ -208,7 +209,8 @@ impl Stack<'static> {
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
 /// ([`views`](super::views)). M4 appends the Skills and Requirements stacks and the two editor
 /// stacks (MOD-57 §6.4, D8.2), the editor stacks right after the overlay's, so an `[editor]`
-/// chord is checked against `global.quit` and `global.help`; M5 appends its own.
+/// chord is checked against `global.quit` and `global.help`. M5 appends the Backlog and Chat
+/// stacks (in strip order), after M4's.
 pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("on every screen", Stack::BASE),
     ("over an overlay", Stack::OVERLAY),
@@ -284,6 +286,27 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
         "in the Requirements withdraw form",
         views::REQUIREMENTS_WITHDRAW,
     ),
+    // MOD-67 M5: the Backlog and Chat stacks, in strip order, after M4's (blueprint §4.3).
+    ("in Backlog > Body", views::BACKLOG_BODY),
+    ("in Backlog > Runs", views::RUNS_BROWSE),
+    ("in a Runs question", views::RUNS_CONFIRM),
+    ("while the Runs close-out counts", views::RUNS_COUNTING),
+    ("in the Runs document view", views::RUNS_ARTIFACT),
+    ("in Backlog > Graph", views::BACKLOG_GRAPH),
+    ("in Backlog > Docs", views::BACKLOG_DOCS),
+    ("in the Docs compose area", views::DOCS_COMPOSE),
+    ("in Backlog > Notes", views::BACKLOG_NOTES),
+    ("in the Notes compose area", views::NOTES_COMPOSE),
+    ("in Backlog > Prompt", views::BACKLOG_PROMPT),
+    ("in Backlog > Reqs", views::BACKLOG_REQS),
+    ("in the Reqs requirement picker", views::REQS_PICK),
+    ("in the Reqs citation kind question", views::REQS_KIND),
+    ("in the Reqs uncite question", views::REQS_CONFIRM),
+    ("in the Backlog filter form", views::BACKLOG_FILTER),
+    ("in the item form", views::ITEM_FORM),
+    ("in the item divergence view", views::ITEM_DIVERGENCE),
+    ("in Chat", views::CHAT_LIVE),
+    ("in a Chat replay", views::CHAT_REPLAY),
 ];
 
 impl Keys {
@@ -371,7 +394,7 @@ mod tests {
             DECLARED[3],
             ("in the in-pane editor", Stack::EDITOR_UNFOCUSED)
         );
-        assert_eq!(DECLARED.len(), 56);
+        assert_eq!(DECLARED.len(), 76);
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
     }
@@ -390,6 +413,8 @@ mod tests {
             [
                 r#"[global] help = "h": "h" is already settings.prev_section (default) in Settings"#,
                 r#"[global] help = "h": "h" is already skills.switch_view (default) in Skills > Library"#,
+                // MOD-67 M5: and the Backlog's sub-tab cycling.
+                r#"[global] help = "h": "h" is already pane.prev_subtab (default) in Backlog > Body"#,
             ]
         );
     }

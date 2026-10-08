@@ -131,6 +131,8 @@ mod binary {
                         .to_owned(),
                     r#"13: [global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#
                         .to_owned(),
+                    r#"13: [global] quit = "x": "x" is already backlog.runs.reject (default) in Backlog > Runs"#
+                        .to_owned(),
                 ],
             ),
             (
@@ -164,6 +166,8 @@ mod binary {
                     r#"6: [global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
                         .to_owned(),
                     r#"6: [global] help = "esc": "esc" is already common.back (default) in the Library import report"#
+                        .to_owned(),
+                    r#"6: [global] help = "esc": "esc" is already chat.end (default) in Chat"#
                         .to_owned(),
                     r#"9: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),

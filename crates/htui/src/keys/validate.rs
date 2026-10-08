@@ -376,6 +376,12 @@ mod tests {
                     r#"[global] help = "esc": "esc" is already common.back (default) in the Library import report"#
                         .to_owned()
                 ),
+                // MOD-67 M5: and `esc` ends a chat (the Chat replay's `common.back` is reported).
+                (
+                    2,
+                    r#"[global] help = "esc": "esc" is already chat.end (default) in Chat"#
+                        .to_owned()
+                ),
             ]
         );
         assert_eq!(
@@ -517,6 +523,12 @@ mod tests {
                     r#"[global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#
                         .to_owned()
                 ),
+                // MOD-67 M5: and `x` rejects a step in the Backlog's Runs pane.
+                (
+                    2,
+                    r#"[global] quit = "x": "x" is already backlog.runs.reject (default) in Backlog > Runs"#
+                        .to_owned()
+                ),
             ]
         );
     }
@@ -561,7 +573,16 @@ mod tests {
         let tail = "is typed text while a field captures: bind a ctrl or alt chord or a named key";
         assert_eq!(
             errors("[form]\nnext_field = [\"x\"]\n"),
-            one(2, &format!(r#"[form] next_field = "x": "x" {tail}"#))
+            [
+                // MOD-67 M5: the Backlog filter form offers `form.next_field` beside its own
+                // `x` (clear), so the chord also collides there, once.
+                (
+                    2,
+                    r#"[form] next_field = "x": "x" is already backlog.filter_form.clear (default) in the Backlog filter form"#
+                        .to_owned()
+                ),
+                (2, format!(r#"[form] next_field = "x": "x" {tail}"#)),
+            ]
         );
     }
 }

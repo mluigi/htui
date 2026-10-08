@@ -1759,6 +1759,19 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
     // requirements/forms.rs:96: the area form; every Requirements form takes the rows (§1).
     (Requirements, Act::FormNextField, &["down"]),
     (Requirements, Act::FormPrevField, &["up"]),
+    // runs.rs:658, :659: the document view maps `j`/`k` to `J`/`K` (only `RUNS_ARTIFACT` offers
+    // the scroll acts, so `J`/`K` stay the step cursor in browse; MOD-67 M5 §3.3).
+    (BacklogRuns, Act::PaneScrollDown, &["j"]),
+    (BacklogRuns, Act::PaneScrollUp, &["k"]),
+    // compose.rs:358, :357: the kind and title rows pass `Down`/`Up`.
+    (BacklogDocs, Act::FormNextField, &["down"]),
+    (BacklogDocs, Act::FormPrevField, &["up"]),
+    // filter.rs:239, :250 and :238, :251.
+    (BacklogFilter, Act::FormNextField, &["down"]),
+    (BacklogFilter, Act::FormPrevField, &["up"]),
+    // item_form.rs:637, :723 and :636, :724.
+    (BacklogItem, Act::FormNextField, &["down"]),
+    (BacklogItem, Act::FormPrevField, &["up"]),
 ];
 
 /// Default pairs in one declared stack where the narrower act always wins (ANA-26 §7.4 step 7,
@@ -1769,6 +1782,9 @@ pub static SHADOWING: &[(Act, Act)] = &[
     // migration_prompt.rs:97 + VIEW_DEFAULTS: `[migration] no` derives ["n", "esc", "N"], and
     // `Esc` is also overlay.close below it. Both close the prompt, nothing applied.
     (Act::ConfirmNo, Act::OverlayClose),
+    // graph.rs:680-686: the Graph pane answers `Enter` itself (re-root), always; the Backlog's
+    // replay miss never fires there (MOD-67 M5 PA-2).
+    (Act::GraphReroot, Act::BacklogReplay),
 ];
 
 /// Default pairs that share a chord in one context or stack because a view accepts at most one
@@ -1779,6 +1795,12 @@ pub static STATE_GUARDED: &[(Act, Act)] = &[
     // boxes.rs:712-721: the executor question opens only over a listed box with a readable
     // list; otherwise `w` declines and falls through to the switcher (box_settings.rs:1356).
     (Act::BoxesExecutor, Act::Workspaces),
+    // backlog/mod.rs:791-797, ANA-26 §7.4: a project header folds; on an item row the fold
+    // declines and the pane (Runs replays) or the miss answers. The tab tries the fold first
+    // (MOD-67 M5 PA-2).
+    (Act::ListFold, Act::BacklogReplay),
+    // On a header the Graph has no item; on an item row the fold declines.
+    (Act::ListFold, Act::GraphReroot),
 ];
 
 #[cfg(test)]
