@@ -194,7 +194,7 @@ review: 2993 passed, 0 failed, 3 ignored. Maintainer decisions:
 | # | Finding | Decision |
 |---|---|---|
 | M-1 | E9 (c) refuses an existing `[global] quit = "ctrl-x"` (the README example since `665b9cf1`): exit 2 at startup even with the pane mode off | **Fix**: a non-editor entry takes an `editor.abort` default chord through the give-way notice (abort may end unbound; E2 confines it to the asking tab); only `editor.focus` collisions stay errors. README example moves to `ctrl-g` (T4) |
-| M-2 | A tab switch lands on the asking tab unfocused, so nano's habitual `ctrl-x` aborts the edit with no question | **Fix**: abort asks first (shape below) |
+| M-2 | A tab switch lands on the asking tab unfocused, so nano's habitual `ctrl-x` aborts the edit with no question | **Fix**: abort asks first, confirmed by **pressing `editor.abort` again** ("Abort the edit and lose it? <abort> again aborts · any other key keeps editing"; key label generated). A `y` cannot confirm it, so nano's `ctrl-x`, `y` keeps the edit (maintainer, 2026-10-08) |
 | M-3 | No test of an offered global opened from the asking tab, of the switcher pick refused with scope unchanged, or of an e2e key reaching the other tab | **Fix**: tests |
 | L-1 | Under any modal overlay on the asking tab the status line says "answer or close the prompt first" | **Fix**: neutral sentence |
 | L-2 | "Ctrl+4 back" offered while a focused editor lacks the keys (first `ctrl-4` swallowed) | **Fix** |
