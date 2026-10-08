@@ -332,6 +332,12 @@ pub enum EntryState {
         status: RunStatus,
     },
     /// Ready and admissible: the runner admits it at the next free slot.
+    ///
+    /// M3 review R1 L3, a known limit: the overlay reads only stored state, so an entry whose
+    /// admission the runner's enqueue refused without changing any (the refusal never closes the
+    /// batch, by design) still reads `Next`, and keeps the batch open, until the refusal's cause
+    /// changes. The runner keeps no record of that refusal for the overview to read; surfacing it
+    /// needs runner shared state, left to a follow-up (noted in ANA-2 §4.10 at close-out).
     Next,
     /// Ready, but this batch will not admit it.
     Held(Hold),
@@ -583,6 +589,8 @@ impl core::fmt::Display for EntryState {
                     write!(f, "running on {host}")
                 }
             }
+            // M3 review R1 L3: also what an entry reads whose enqueue was refused with no
+            // state change (see `Next`): the overview cannot tell the two apart.
             Self::Next => f.write_str("next to run"),
             Self::Held(hold) => write!(f, "held: {hold}"),
             Self::Waiting(wait) => write!(f, "{wait}"),

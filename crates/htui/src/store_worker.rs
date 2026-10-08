@@ -2390,8 +2390,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
     })
 }
 
-/// MOD-12 D9, M3 D3: the six queue writes and reads over `backend`'s inherent queue methods. This box is
-/// `box_info()`'s, the author `this_user()`, every time `Utc::now()` truncated to the microsecond.
+/// MOD-12 D9, M3 D3: the five queue writes (`QueueItem`, `DequeueItem`, `ResumeQueue`,
+/// `PauseQueue`, `MoveQueueEntry`) and the one read (`QueueState`) over `backend`'s inherent queue
+/// methods; the overlay's `QueueOverview` is served beside them in `try_serve` (M3 review R1 N3).
+/// This box is `box_info()`'s, the author `this_user()`, every time `Utc::now()` truncated to the
+/// microsecond.
+///
+/// A `PauseQueue` naming a batch that is no longer the open one, and a `ResumeQueue` expecting a
+/// paused queue that is running, write nothing and answer [`QueueWrite::Stale`] (M3 review R1 M1).
 ///
 /// Memory serves them (blueprint deviation 6: `--demo` writes the rows, and its runtime never
 /// admits); offline every queue method answers `DATABASE_UNREACHABLE`. The box is read first, so
