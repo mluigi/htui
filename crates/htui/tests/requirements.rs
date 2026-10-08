@@ -571,3 +571,58 @@ async fn a_write_in_flight_swallows_keys_but_save_says_so() {
     harness.key("ctrl-c");
     assert!(harness.app().should_quit, "`ctrl-c` still quits");
 }
+
+/// MOD-67 M4 (D11): browsing the tree, the status line is today's and the `?` box renders
+/// `REQUIREMENTS_BROWSE`, one line per layer.
+#[tokio::test]
+async fn the_requirements_tree_status_line_and_help_box() {
+    let mut harness = open().await;
+    let frame = harness.render();
+    assert_eq!(
+        status(&frame),
+        "q quit \u{b7} Tab next tab \u{b7} Shift+Tab previous tab \u{b7} 1 select tab \u{b7} ? help \
+         \u{b7} w workspaces \u{b7} Ctrl+f find",
+        "{frame}"
+    );
+    assert_eq!(
+        hint(&frame),
+        " j/k move \u{b7} Enter fold \u{b7} / filter \u{b7} a area \u{b7} n new \u{b7} e amend \
+         \u{b7} W withdraw \u{b7} r reload",
+        "{frame}"
+    );
+    harness.key("?");
+    assert!(harness.app().help_visible);
+    let frame = harness.render();
+    for line in [
+        "Requirements: a new area \u{b7} e amend \u{b7} W withdraw \u{b7} / filter",
+        "Common: n new \u{b7} r reload \u{b7} Esc back",
+        "List: j/Down down \u{b7} k/Up up \u{b7} g/Home top \u{b7} G/End bottom \u{b7} Enter fold",
+        "Pane: J scroll down \u{b7} K scroll up \u{b7} PgDn page down \u{b7} PgUp page up",
+        "Global: ",
+        "?/F1 closes this box",
+    ] {
+        assert!(frame.contains(line), "`{line}` is in the box: {frame}");
+    }
+    assert!(
+        !frame.contains("Requirements: j/k"),
+        "no legacy tab line: {frame}"
+    );
+}
+
+/// MOD-67 M4: the filter's stack (`CAPTURE`) offers no `form.save`, so `ctrl-s` there sends
+/// nothing, and a chord never types into the field.
+#[tokio::test]
+async fn ctrl_s_on_the_filter_saves_nothing_and_types_nothing() {
+    let mut harness = open().await;
+    harness.key("/");
+    type_text(&mut harness, "ST");
+    harness.key("ctrl-s");
+    assert_eq!(harness.queued(), 0, "nothing was sent");
+    let frame = harness.render();
+    assert!(hint(&frame).starts_with(" /ST"), "{frame}");
+    assert!(!hint(&frame).starts_with(" /STs"), "{frame}");
+    assert!(
+        hint(&frame).ends_with("  Enter apply \u{b7} Esc clear"),
+        "{frame}"
+    );
+}
