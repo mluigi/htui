@@ -295,3 +295,49 @@ async fn ctrl_c_quits_from_the_modal_switcher() {
     harness.key("ctrl-c");
     assert!(harness.app().should_quit, "`ctrl-c` quits from it");
 }
+
+/// The last non-empty line of a frame: the status line.
+fn status_line(frame: &str) -> &str {
+    frame
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .unwrap_or_default()
+        .trim_end()
+}
+
+/// MOD-67 M3 (D14): the switcher moves on `list.down`, and chord equality includes modifiers, so
+/// `ctrl-j` no longer moves it.
+#[tokio::test]
+async fn ctrl_j_does_not_move_the_switcher() {
+    let mut harness = open_over_demo().await;
+    harness.key("ctrl-j");
+    let frame = harness.render();
+    assert!(
+        frame.contains("> Graphics") && !frame.contains("> Platform"),
+        "`ctrl-j` left the cursor alone: {frame}"
+    );
+    harness.key("j");
+    assert!(harness.render().contains("> Platform"), "`j` still moves");
+}
+
+/// MOD-67 M3 (D7, D8): over the switcher the status line and the `?` box render the switcher's
+/// stack, one line per layer, and drop the tab's legacy line.
+#[tokio::test]
+async fn the_status_line_and_help_box_over_the_switcher() {
+    let mut harness = open_over_demo().await;
+    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · ? help");
+    harness.key("?");
+    assert!(harness.app().help_visible);
+    let frame = harness.render();
+    for line in [
+        "Workspaces: Enter switch workspace",
+        "List: j/Down down · k/Up up",
+        "Overlay: Esc close",
+        "Global: Ctrl+c quit · ?/F1 help",
+        "?/F1 closes this box",
+    ] {
+        assert!(frame.contains(line), "`{line}` is in the box: {frame}");
+    }
+    assert!(!frame.contains("Backlog: "), "no legacy tab line: {frame}");
+}

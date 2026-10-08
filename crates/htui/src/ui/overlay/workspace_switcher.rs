@@ -14,12 +14,13 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{Action, Ctx, Handled, OverlayAction};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 /// Marker in front of the row the cursor is on. Selection is also styled, but the marker is what
 /// makes it visible in a snapshot, which records symbols and not styles.
@@ -28,8 +29,13 @@ const CURSOR: &str = "> ";
 /// The marker's width, in front of every other row, so names stay in one column.
 const NO_CURSOR: &str = "  ";
 
-/// The line under the list. `Esc` is the wildcard overlay binding, `j`/`k`/`Enter` are handled here.
-const HINT: &str = "j/k move · Enter switch · Esc close";
+/// The line under the list (MOD-67 D9): `list.down`/`list.up` and `switcher.switch` are handled
+/// here, `overlay.close` by the shell.
+const HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::SwitcherSwitch, "switch"),
+    Hint::One(Act::OverlayClose, "close"),
+];
 
 /// Gap between a workspace's name and its project count.
 const GAP: &str = "  ";
@@ -85,8 +91,9 @@ impl WorkspaceSwitcher {
         Handled::Consumed
     }
 
-    /// The box's contents: one line per workspace, a blank line, then the hint.
-    fn lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+    /// The box's contents: one line per workspace, a blank line, then `hint` (the rendered
+    /// [`HINT`]).
+    fn lines(&self, hint: &str, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = if self.workspaces.is_empty() {
             vec![Line::styled(
                 format!("{NO_CURSOR}{}", self.empty_text()),
@@ -106,7 +113,7 @@ impl WorkspaceSwitcher {
                 .collect()
         };
         lines.push(Line::raw(""));
-        lines.push(Line::styled(format!("{NO_CURSOR}{HINT}"), theme.dim));
+        lines.push(Line::styled(format!("{NO_CURSOR}{hint}"), theme.dim));
         lines
     }
 
@@ -153,26 +160,34 @@ impl Overlay for WorkspaceSwitcher {
         true
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(views::SWITCHER)
+    }
+
     fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
         // Every workspace, not just the one in scope: switching out of the scope is the point.
         vec![StoreRequest::Workspaces]
     }
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                self.down();
-                Handled::Consumed
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::SWITCHER, chord) {
+            match act {
+                Act::ListDown => {
+                    self.down();
+                    return Handled::Consumed;
+                }
+                Act::ListUp => {
+                    self.up();
+                    return Handled::Consumed;
+                }
+                Act::SwitcherSwitch => return self.enter(ctx),
+                _ => continue, // `overlay.close` or `global.help`: the shell's
             }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.up();
-                Handled::Consumed
-            }
-            KeyCode::Enter => self.enter(ctx),
-            // `Esc` falls through to the wildcard overlay binding; the rest is swallowed by
-            // `is_modal`, so a stray key never reaches the tab underneath.
-            _ => Handled::Pass,
         }
+        // The shell's overlay step closes on `overlay.close`; the rest is swallowed by
+        // `is_modal`, so a stray key never reaches the tab underneath.
+        Handled::Pass
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -190,7 +205,7 @@ impl Overlay for WorkspaceSwitcher {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let lines = self.lines(ctx.theme);
+        let lines = self.lines(&ctx.keys().hint(views::SWITCHER, HINT), ctx.theme);
         let widest = widest(&lines);
         let width = u16::try_from(widest)
             .unwrap_or(u16::MAX)
@@ -242,6 +257,12 @@ mod tests {
     use htui_core::model::WorkspaceId;
 
     use super::*;
+    use crate::keys::Keys;
+
+    /// The hint rendered with the compiled keys.
+    fn hint() -> String {
+        Keys::compiled().hint(views::SWITCHER, HINT)
+    }
 
     fn workspace(name: &str) -> WorkspaceSummary {
         WorkspaceSummary {
@@ -261,7 +282,7 @@ mod tests {
             selected: 0,
             loaded: true,
         };
-        let lines = switcher.lines(&Theme::default());
+        let lines = switcher.lines(&hint(), &Theme::default());
         let first: Vec<usize> = lines[..2]
             .iter()
             .map(|line| cell_width(&line.spans[0].content))
@@ -283,7 +304,7 @@ mod tests {
             selected: 0,
             loaded: true,
         };
-        let lines = switcher.lines(&Theme::default());
+        let lines = switcher.lines(&hint(), &Theme::default());
         let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 3));
         let ends: Vec<u16> = (0u16..3)
             .map(|y| buffer.set_line(0, y, &lines[usize::from(y)], 80).0)
@@ -301,7 +322,7 @@ mod tests {
             selected: 0,
             loaded: true,
         };
-        let lines = switcher.lines(&Theme::default());
+        let lines = switcher.lines(&hint(), &Theme::default());
         let row: String = lines[0]
             .spans
             .iter()
