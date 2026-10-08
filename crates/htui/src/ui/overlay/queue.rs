@@ -519,8 +519,9 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
-        ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId, Wait, WorkspaceId,
+        BatchClose, BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold,
+        PER_TOKEN_CAP_BATCH, ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId,
+        Wait, WorkspaceId,
     };
     use htui_core::store::StoreError;
     use htui_store::DATABASE_UNREACHABLE;
@@ -650,6 +651,7 @@ mod tests {
         QueueOverview {
             box_id: ids::BOX,
             batch: Some(running_batch()),
+            last_close: None,
             slots_used: 1,
             slots_limit: 2,
             rows,
@@ -824,6 +826,54 @@ mod tests {
         let rendered = bench.render(&overlay);
         assert!(rendered.contains("queue: paused · 0/2 slots"), "{rendered}");
         insta::assert_snapshot!("header_paused", rendered);
+    }
+
+    /// M3 review R1 L4: a paused header says why: `P` paused it, or the runner closed the batch
+    /// as drained (a stall and an emptied queue record the same reason, so it says only that
+    /// nothing was admissible). Before any batch closed it says nothing more.
+    #[test]
+    fn the_header_says_why_the_queue_is_paused() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        let paused = |last_close| QueueOverview {
+            batch: None,
+            last_close,
+            slots_used: 0,
+            ..overview(abc())
+        };
+
+        bench.feed(&mut overlay, paused(Some(BatchClose::Drained)));
+        let rendered = bench.render(&overlay);
+        assert!(
+            rendered
+                .contains("queue: paused (the last batch drained: nothing admissible) · 0/2 slots"),
+            "{rendered}"
+        );
+        insta::assert_snapshot!("header_drained", rendered);
+
+        bench.feed(&mut overlay, paused(Some(BatchClose::Paused)));
+        let rendered = bench.render(&overlay);
+        assert!(
+            rendered.contains("queue: paused (by a user) · 0/2 slots"),
+            "{rendered}"
+        );
+
+        bench.feed(&mut overlay, paused(None));
+        let rendered = bench.render(&overlay);
+        assert!(rendered.contains("queue: paused · 0/2 slots"), "{rendered}");
+
+        bench.feed(
+            &mut overlay,
+            QueueOverview {
+                demo: true,
+                ..paused(Some(BatchClose::Paused))
+            },
+        );
+        let rendered = bench.render(&overlay);
+        assert!(
+            rendered.contains("queue: paused (by a user) · demo: nothing is admitted"),
+            "{rendered}"
+        );
     }
 
     #[test]

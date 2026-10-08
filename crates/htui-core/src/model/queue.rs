@@ -404,6 +404,10 @@ pub struct QueueOverview {
     pub box_id: BoxId,
     /// The open batch; `None` is paused.
     pub batch: Option<BatchFigures>,
+    /// M3 review R1 L4: how this box's last batch closed (`last_closed_batch`), read only while
+    /// none is open, so the header says why the queue is paused; `None` while a batch is open or
+    /// before any closed. A stall and an emptied queue both close [`BatchClose::Drained`].
+    pub last_close: Option<BatchClose>,
     /// `running` runs on the box plus `queued` runs targeted at it ([`free_slots`]' inputs).
     pub slots_used: usize,
     /// [`admission_limit`].

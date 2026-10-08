@@ -136,6 +136,7 @@ pub async fn overview(backend: &Backend) -> Result<QueueOverview> {
     Ok(QueueOverview {
         box_id,
         batch: figures,
+        last_close: None,
         slots_used,
         slots_limit,
         rows,
@@ -150,10 +151,10 @@ mod tests {
     use chrono::Utc;
     use htui_core::fixtures::{DemoData, demo_at, demo_data, ids};
     use htui_core::model::{
-        BatchStop, BoxId, EntryState, Escalation, GraphSnapshot, Hold, ItemId, ItemLink, LinkKind,
-        NewRun, NewRunStep, Note, NoteId, PER_TOKEN_CAP_BATCH, ProjectId, QueueMove, QueueOverview,
-        RunId, RunMode, RunStatus, Scope, Status, StepId, StepStatus, Wait, WorkspaceId,
-        admission_order,
+        BatchClose, BatchStop, BoxId, EntryState, Escalation, GraphSnapshot, Hold, ItemId,
+        ItemLink, LinkKind, NewRun, NewRunStep, Note, NoteId, PER_TOKEN_CAP_BATCH, ProjectId,
+        QueueMove, QueueOverview, RunId, RunMode, RunStatus, Scope, Status, StepId, StepStatus,
+        Wait, WorkspaceId, admission_order,
     };
     use htui_core::store::{MemStore, StepFence, WriteStore as _};
     use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE};
@@ -819,6 +820,34 @@ mod tests {
             (batch.id, batch.opened_at, None),
             "no step reported a cost"
         );
+    }
+
+    /// M3 review R1 L4: a paused queue says how its last batch closed, so the header can say
+    /// why: none before any batch, `Paused` after `P`, `Drained` after the runner's close (a
+    /// stall or an emptied queue alike); an open batch reads none.
+    #[tokio::test]
+    async fn a_paused_queue_says_how_its_last_batch_closed() {
+        let store = MemStore::demo();
+        queue(&store, &[ids::HTUI_ANA_2]).await;
+        let backend = Backend::memory(store.clone());
+        assert_eq!(served(&backend).await.last_close, None, "no batch yet");
+
+        resume(&store).await;
+        assert_eq!(served(&backend).await.last_close, None, "a batch is open");
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
+            .await
+            .expect("the batch closes");
+        assert_eq!(served(&backend).await.last_close, Some(BatchClose::Paused));
+
+        let stalled = resume(&store).await;
+        assert_eq!(served(&backend).await.last_close, None, "a batch is open");
+        store
+            .close_drained_batch(stalled, &[ids::HTUI_ANA_2], Utc::now())
+            .await
+            .expect("the store answers")
+            .expect("the stalled batch closed");
+        assert_eq!(served(&backend).await.last_close, Some(BatchClose::Drained));
     }
 
     /// MOD-12 M3 D7 (M1 review L3): the memory backend, `htui --demo`, says so.
