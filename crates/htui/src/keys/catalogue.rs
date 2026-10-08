@@ -706,9 +706,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "previous field",
     ),
     // text_area.rs:194, item_form.rs:275, requirements/mod.rs:233, attach.rs:477,
-    // library.rs:990. Every site also accepts `ctrl-S` (blueprint F-7, M4). The Library,
-    // Templates and Requirements editors resolve it after their widget passes the chord (MOD-67
-    // M4 PA-3).
+    // library.rs:990. Every site also accepts `ctrl-S` (blueprint F-7, M4). The Library and
+    // Templates editors resolve it after their widget passes the chord; Requirements sends every
+    // chord straight to the resolver, so its widgets never see it (MOD-67 M4 PA-3).
     capture_row(Act::FormSave, Form, "save", &["ctrl-s"], "save"),
     // item_form.rs:281 (label at :63), library.rs:1021, templates.rs:689. Same `E` alias.
     capture_row(

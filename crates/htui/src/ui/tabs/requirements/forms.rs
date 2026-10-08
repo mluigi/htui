@@ -314,9 +314,10 @@ impl RequirementForm {
                 };
                 match area.on_key(key, PAGE) {
                     FieldOutcome::Cancel => FormOutcome::Cancel,
-                    FieldOutcome::Submit => FormOutcome::Submit,
                     FieldOutcome::Consumed => FormOutcome::Stay,
-                    FieldOutcome::Pass => FormOutcome::Pass,
+                    // A `TextArea` never submits since MOD-67 M4 D6: `ctrl-s` passes, and only
+                    // `form.save` saves.
+                    FieldOutcome::Submit | FieldOutcome::Pass => FormOutcome::Pass,
                 }
             }
             FormFocus::Priority => {

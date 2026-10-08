@@ -93,9 +93,10 @@ const PROPOSAL_HINT: HintSpec = &[
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
 ];
 
-/// The hint over an answer with nothing to accept.
+/// The hint over an answer with nothing to accept: `skills.help.accept` closes it too.
 const ANSWERED_HINT: HintSpec = &[
     Hint::Text("nothing to accept"),
+    Hint::One(Act::SkillsHelpAccept, "close"),
     Hint::All(Act::ConfirmNo, "close"),
     Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
 ];
@@ -804,7 +805,7 @@ mod tests {
     use super::*;
     use crate::app::{Action, Emit, TopBarState};
     use crate::keymap::Keymap;
-    use crate::keys::{Keys, load_str, views};
+    use crate::keys::{Context, Keys, load_str, views};
     use crate::store_worker::Origin;
     use crate::ui::tabs::SkillsTab;
 
@@ -1084,7 +1085,13 @@ mod tests {
         );
         assert_eq!(
             help.hint(Keys::compiled()),
-            "nothing to accept \u{b7} n/Esc close \u{b7} J/K scroll"
+            "nothing to accept \u{b7} Enter close \u{b7} n/Esc close \u{b7} J/K scroll"
+        );
+        // MOD-67 M4 R1: `skills.help.accept` closes an answer too, and its hint follows a rebind.
+        let keys = Keys::defaults().with_chords(Context::SkillsHelp, Act::SkillsHelpAccept, &["a"]);
+        assert_eq!(
+            help.hint(&keys),
+            "nothing to accept \u{b7} a close \u{b7} n/Esc close \u{b7} J/K scroll"
         );
 
         let help = answered(&bench, "old\n", "Unchanged:\n```\nold\n```\n");
