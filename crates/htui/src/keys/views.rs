@@ -354,6 +354,12 @@ mod tests {
         assert_eq!(resolve(HIERARCHY_BROWSE, "down"), [Act::ListDown]);
         assert_eq!(resolve(HIERARCHY_BROWSE, "tab"), [Act::NextTab]);
         assert_eq!(resolve(AGENTS_FORM, "tab"), [Act::FormNextField]);
+        assert_eq!(resolve(AGENTS_FORM, "down"), [Act::FormNextField]);
+        assert_eq!(resolve(QUEUE_BROWSE, "enter"), [Act::Edit]);
+        assert_eq!(resolve(MIGRATION, "Y"), [Act::ConfirmYes]);
+        assert_eq!(resolve(MIGRATION, "N"), [Act::ConfirmNo]);
+        assert_eq!(resolve(PERSONAS_REPORT, "enter"), [Act::Back]);
+        assert_eq!(resolve(PERSONAS_BROWSE, "enter"), []);
         assert_eq!(resolve(AGENTS_FORM, "q"), []);
         assert_eq!(resolve(AGENTS_FORM, "f1"), [Act::Help]);
         assert_eq!(resolve(CAPTURE, "tab"), []);

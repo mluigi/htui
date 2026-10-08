@@ -7,7 +7,10 @@ use std::path::{Path, PathBuf};
 use toml::Spanned;
 use toml::de::{DeString, DeTable, DeValue};
 
-use super::{Act, CATALOGUE, CTRL_C, ChordError, Context, KeyChord, Keys, quote, validate};
+use super::{
+    Act, ActionSpec, CATALOGUE, CTRL_C, ChordError, Context, DECLARED, KeyChord, Keys, quote,
+    validate,
+};
 
 /// The key file's name under the config root.
 pub const FILE_NAME: &str = "keys.toml";
@@ -103,13 +106,19 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
         src,
         keys: Keys::defaults(),
         errors: Vec::new(),
+        set: Vec::new(),
     };
     for (key, value) in root.get_ref() {
         loader.top_level(key, value);
     }
     let Loader {
-        keys, mut errors, ..
+        mut keys,
+        mut errors,
+        set,
+        ..
     } = loader;
+    // MOD-67 M3 PA-1: the view defaults follow the shared rows the file just set.
+    keys.derive(&set);
     errors.extend(validate(&keys));
     errors.sort_by_key(|error| error.line);
     if errors.is_empty() {
@@ -200,11 +209,26 @@ fn chord_of(written: &str) -> Result<KeyChord, String> {
     }
 }
 
+/// The shared acts `[context]` may override (MOD-67 M3 D10, PA-3): every shared catalogue row
+/// whose act some declared stack's `context` layer offers, in catalogue order. Empty for a
+/// context that is not a view's.
+fn overridable(context: Context) -> impl Iterator<Item = &'static ActionSpec> {
+    CATALOGUE.iter().filter(move |spec| {
+        context.is_view()
+            && spec.context.is_shared()
+            && DECLARED
+                .iter()
+                .any(|(_, stack)| stack.view_admits(context, spec.act))
+    })
+}
+
 /// One pass over a parsed file: the keys merged so far and every error found.
 struct Loader<'s> {
     src: &'s str,
     keys: Keys,
     errors: Vec<KeyFileError>,
+    /// Every `(context, act)` an entry resolved to: `Keys::derive` keeps these rows as written.
+    set: Vec<(Context, Act)>,
 }
 
 impl Loader<'_> {
@@ -287,9 +311,11 @@ impl Loader<'_> {
         let name: &str = key.get_ref();
         let table = context.table();
         let key_line = self.line(key.span().start);
+        // The context's own row; else, in a view's table, a shared verb it offers (D10).
         let Some(spec) = CATALOGUE
             .iter()
             .find(|spec| spec.context == context && spec.name == name)
+            .or_else(|| overridable(context).find(|spec| spec.name == name))
         else {
             let names = CATALOGUE
                 .iter()
@@ -297,10 +323,21 @@ impl Loader<'_> {
                 .map(|spec| spec.name)
                 .collect::<Vec<_>>()
                 .join(", ");
-            self.push(
-                key_line,
-                format!("[{table}] {name}: no such action; [{table}] has {names}"),
-            );
+            let shared = overridable(context)
+                .map(|spec| spec.name)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let message = match (names.is_empty(), shared.is_empty()) {
+                (_, true) => format!("[{table}] {name}: no such action; [{table}] has {names}"),
+                (true, false) => {
+                    format!("[{table}] {name}: no such action; [{table}] may override {shared}")
+                }
+                (false, false) => format!(
+                    "[{table}] {name}: no such action; [{table}] has {names}, and may override \
+                     {shared}"
+                ),
+            };
+            self.push(key_line, message);
             return;
         };
         let items: Vec<&Spanned<DeValue<'_>>> = match value.get_ref() {
@@ -345,6 +382,7 @@ impl Loader<'_> {
             );
         }
         self.keys.set(context, spec.act, chords, key_line);
+        self.set.push((context, spec.act));
     }
 }
 

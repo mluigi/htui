@@ -157,6 +157,7 @@ mod binary {
                         .to_owned(),
                     r#"4: [global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
                         .to_owned(),
+
                     r#"7: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),
                     r#"10: [list] top = "j": "j" is already list.down (default) in [list]"#

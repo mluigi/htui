@@ -1,6 +1,11 @@
 //! The key file's semantic checks over the merged keys (MOD-67 M2 D8 steps 5-6; ANA-26 §7.4
 //! step 7): collisions in every context and in every declared stack, and printable chords on
 //! actions offered while a field captures.
+//!
+//! MOD-67 M3: the per-context pass skips view contexts (PA-4: a view context holds rows of modes
+//! that never meet; the stack pass checks every declared stack), the stack pass allows a
+//! reviewed [`SHADOWING`] pair (D11, PA-2), and a derived `VIEW_DEFAULTS` row the file did not
+//! set is reported as the shared row it follows, on the user's line.
 
 use super::{
     Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Row, SHADOWING, STATE_GUARDED, quote,
@@ -9,17 +14,28 @@ use super::{
 /// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
 /// The compiled defaults give none (`the_compiled_defaults_validate`).
 ///
-/// Three passes, in this order: two actions sharing a chord in one context; two candidates for
-/// one chord in a [`DECLARED`] stack; a printable chord on an `in_capture` action. A pair and
-/// chord seen by two passes is reported once. A [`STATE_GUARDED`] pair may share a chord only
-/// when it is a catalogue default of both actions (PA-2).
+/// Three passes, in this order: two actions sharing a chord in one shared or global context; two
+/// candidates for one chord in a [`DECLARED`] stack; a printable chord on an `in_capture`
+/// action. A pair and chord seen by two passes is reported once. A [`STATE_GUARDED`] pair may
+/// share a chord only when it is a catalogue default of both actions (PA-2), and so may a
+/// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
 #[must_use]
 pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
+    check(keys, SHADOWING, STATE_GUARDED)
+}
+
+/// [`validate`] over explicit allow-lists: the demand tests drop one entry at a time.
+fn check(keys: &Keys, shadowing: &[(Act, Act)], guarded: &[(Act, Act)]) -> Vec<KeyFileError> {
     let mut check = Check {
+        keys,
+        guarded,
         reported: Vec::new(),
         errors: Vec::new(),
     };
     for (i, first) in keys.rows.iter().enumerate() {
+        if first.context.is_view() {
+            continue; // PA-4: the stack pass checks view rows where they meet
+        }
         for second in keys.rows[i + 1..]
             .iter()
             .filter(|second| second.context == first.context)
@@ -52,17 +68,21 @@ pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
                 .collect();
             for (i, first) in rows.iter().enumerate() {
                 for second in &rows[i + 1..] {
-                    if shadows(first, second, chord) {
-                        continue;
+                    let shadowed = shadowing.contains(&(first.act, second.act))
+                        && !added(first, chord)
+                        && !added(second, chord);
+                    if !shadowed {
+                        check.report(first, second, chord, phrase);
                     }
-                    check.report(first, second, chord, phrase);
                 }
             }
         }
     }
     for row in &keys.rows {
-        if !row.act.spec().is_some_and(|spec| spec.in_capture) {
-            continue;
+        if !row.act.spec().is_some_and(|spec| spec.in_capture)
+            || !std::ptr::eq(source(keys, row), row)
+        {
+            continue; // a derived row's chords are its shared row's, reported there
         }
         for chord in row.chords.iter().filter(|chord| chord.is_printable()) {
             let shown = quote(&chord.spec());
@@ -82,27 +102,43 @@ pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
 /// A row's identity: its context and act.
 type Slot = (Context, Act);
 
+/// The row an error about `row` names: `row` itself, or, for a derived `VIEW_DEFAULTS` row the
+/// file did not set (no line), the shared row it follows, since that is what the user wrote.
+fn source<'k>(keys: &'k Keys, row: &'k Row) -> &'k Row {
+    if row.extra.is_none() || row.line.is_some() {
+        return row;
+    }
+    row.act
+        .spec()
+        .and_then(|spec| keys.row(spec.context, row.act))
+        .unwrap_or(row)
+}
+
 /// The validator's state: the pairs already reported and the errors so far.
-struct Check {
-    /// `((context, act), (context, act), chord)` of every reported collision.
+struct Check<'k> {
+    keys: &'k Keys,
+    /// The state-guarded allow-list in force ([`STATE_GUARDED`] outside the demand tests).
+    guarded: &'k [(Act, Act)],
+    /// `((context, act), (context, act), chord)` of every reported collision, by source row.
     reported: Vec<(Slot, Slot, KeyChord)>,
     errors: Vec<KeyFileError>,
 }
 
-impl Check {
+impl Check<'_> {
     /// Reports that `first` and `second` both bind `chord` (`place` ends the message), unless
     /// the pair was reported already or is allowed. The reported row is the one that added
     /// `chord` (it is not that row's catalogue default) when exactly one did (review L1);
     /// otherwise the one with the later line (`None`, a default, before any line), `second` on
-    /// a tie.
+    /// a tie. A derived row is named and placed by its [`source`].
     fn report(&mut self, first: &Row, second: &Row, chord: KeyChord, place: &str) {
-        let a = (first.context, first.act);
-        let b = (second.context, second.act);
+        let (first_source, second_source) = (source(self.keys, first), source(self.keys, second));
+        let a = (first_source.context, first_source.act);
+        let b = (second_source.context, second_source.act);
         if self
             .reported
             .iter()
             .any(|&(x, y, c)| c == chord && ((x, y) == (a, b) || (x, y) == (b, a)))
-            || allowed(first, second, chord)
+            || allowed(self.guarded, first, second, chord)
         {
             return;
         }
@@ -110,41 +146,38 @@ impl Check {
         let (reported, other) = match (added(first, chord), added(second, chord)) {
             (true, false) => (first, second),
             (false, true) => (second, first),
-            _ if first.line > second.line => (first, second),
+            _ if first_source.line > second_source.line => (first, second),
             _ => (second, first),
         };
-        let origin = other
+        let (reported_source, other_source) =
+            (source(self.keys, reported), source(self.keys, other));
+        let origin = other_source
             .line
             .map_or_else(|| "default".to_owned(), |line| format!("line {line}"));
         let shown = quote(&chord.spec());
         let other_name = other.act.spec().map_or("", |spec| spec.name);
         self.errors.push(KeyFileError {
-            line: reported.line.unwrap_or(0),
+            line: reported_source.line.unwrap_or(0),
             message: format!(
                 "{} = {shown}: {shown} is already {}.{other_name} ({origin}) {place}",
-                subject(reported),
+                subject(reported_source),
                 other.context.table(),
             ),
         });
     }
 }
 
-/// Whether `first` and `second` may share `chord` (D8 step 5, PA-2): the pair is on
-/// [`STATE_GUARDED`] and `chord` is a catalogue default of both.
-fn allowed(first: &Row, second: &Row, chord: KeyChord) -> bool {
-    let guarded = STATE_GUARDED
+/// Whether `first` and `second` may share `chord` (D8 step 5, PA-2): the pair is on `guarded`
+/// (either order) and `chord` is a catalogue default of both.
+fn allowed(guarded: &[(Act, Act)], first: &Row, second: &Row, chord: KeyChord) -> bool {
+    let guarded = guarded
         .iter()
         .any(|&pair| pair == (first.act, second.act) || pair == (second.act, first.act));
     guarded && !added(first, chord) && !added(second, chord)
 }
 
-/// Whether the narrower `first` may shadow the wider `second` on `chord` (MOD-67 D11, PA-2): the
-/// pair is on [`SHADOWING`] in that order and `chord` is a compiled default of both.
-fn shadows(first: &Row, second: &Row, chord: KeyChord) -> bool {
-    SHADOWING.contains(&(first.act, second.act)) && !added(first, chord) && !added(second, chord)
-}
-
-/// Whether `row` binds `chord` beyond its catalogue defaults: the user added it.
+/// Whether `row` binds `chord` beyond its compiled defaults (a derived default counts): the
+/// user added it.
 fn added(row: &Row, chord: KeyChord) -> bool {
     !Keys::compiled()
         .chords(row.context, row.act)

@@ -171,10 +171,6 @@ impl<'a> Stack<'a> {
     }
 
     /// Whether this stack has a layer of `context` that admits `act` (the D10 legality test).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the loader's D10 resolution lands in T1f")
-    )]
     pub(crate) fn view_admits(self, context: Context, act: Act) -> bool {
         self.0
             .iter()
