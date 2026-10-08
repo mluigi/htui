@@ -553,6 +553,10 @@ impl CliDriver {
     /// spec's holds what the secret provider produced for this run. The argv is **not** assembled
     /// here — [`argv`] needs the minted session id, which is `start`'s to make.
     ///
+    /// `HTUI_SESSION=1` ([`crate::launch::SESSION_VAR`], MOD-91 D4) goes in after `spec.env`, on
+    /// every session whatever `user_extensions` says. Only `io_in` calls this in production, so it
+    /// marks exactly the sessions; a probe, which spawns through `launch::spawn`, never gets it.
+    ///
     /// # Errors
     /// `crate::launch::launch_from`'s, unchanged; [`DriverError::Transport`] for a prepared
     /// transport, which spawns nothing and so has no launch to describe.
@@ -568,6 +572,7 @@ impl CliDriver {
         };
         let mut resolved = crate::launch::launch_from(launch, recorded.as_ref(), &spec.cwd).await?;
         resolved.env.extend(spec.env.clone());
+        crate::launch::mark_session(&mut resolved.env);
         Ok(resolved)
     }
 

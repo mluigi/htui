@@ -22,12 +22,12 @@ use std::time::Duration;
 #[cfg(unix)]
 use chrono::Utc;
 #[cfg(unix)]
-use htui_agent::cli::ClaudeStreamAdapter;
+use htui_agent::cli::{ClaudeStreamAdapter, CliDriver};
 use htui_agent::cli::{ISOLATION_ARGS, argv, refuse_settings_override, refuse_widening, usd};
 #[cfg(unix)]
 use htui_agent::cli::{McpConfigFile, SessionOptions, open_session};
 #[cfg(unix)]
-use htui_agent::driver::{AgentSession, PermissionAnswer, PermissionRequestId};
+use htui_agent::driver::{AgentSession, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::driver::{
     AgentSessionRef, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure,
 };
@@ -41,7 +41,7 @@ use htui_agent::event::{
 };
 use htui_agent::launch::CliSettings;
 #[cfg(unix)]
-use htui_agent::launch::{AgentSettings, ChildIo};
+use htui_agent::launch::{AgentSettings, ChildIo, SESSION_VAR};
 use htui_agent::prompt_bridge::{PROMPT_TOOL, bridge};
 #[cfg(unix)]
 use htui_agent::prompt_bridge::{PromptAsk, PromptCall, PromptClosed, PromptVerdict};
@@ -2445,6 +2445,83 @@ async fn an_isolated_start_with_an_overriding_settings_is_refused_before_the_spa
             if message.contains("--settings") && !message.contains("/op/settings.json")),
         "{refused:?}"
     );
+}
+
+/// MOD-91 D4: what a session would spawn carries `HTUI_SESSION=1` whether or not the row opts back
+/// in, and neither the row's `launch.env` nor the spec's `env` can set it to anything else: it is
+/// inserted after both.
+#[cfg(unix)]
+#[tokio::test]
+async fn launch_for_marks_the_session_whatever_the_setting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    for user_extensions in [false, true] {
+        for (row_env, spec_env) in [(None, None), (Some("0"), None), (None, Some("0"))] {
+            let env = row_env
+                .map(|value| serde_json::Map::from_iter([(SESSION_VAR.to_owned(), json!(value))]))
+                .unwrap_or_default();
+            let mut row = scripted_row(&dir.path().join("absent"), env);
+            row.settings["user_extensions"] = json!(user_extensions);
+            let driver = CliDriver::from_row(&row, DriverCaps::default()).expect("the row builds");
+            let mut with = spec(dir.path().to_path_buf());
+            if let Some(value) = spec_env {
+                with.env.insert(SESSION_VAR.to_owned(), value.to_owned());
+            }
+
+            let resolved = driver.launch_for(&with).await.expect("the row resolves");
+
+            assert_eq!(
+                resolved.env.get(SESSION_VAR).map(String::as_str),
+                Some("1"),
+                "user_extensions {user_extensions}, row {row_env:?}, spec {spec_env:?}"
+            );
+        }
+    }
+    assert_eq!(SESSION_VAR, "HTUI_SESSION");
+}
+
+/// [`TURN_SCRIPT`], after copying its own `HTUI_SESSION` (or `unset`) to `$HTUI_GO_FILE.session`.
+#[cfg(unix)]
+const SESSION_SCRIPT: &str = r#"#!/bin/sh
+<RECORD>
+printf '%s' "${HTUI_SESSION-unset}" > "$HTUI_GO_FILE.session"
+printf '%s\n' '<INIT>'
+while IFS= read -r line; do
+  printf '%s\n' '<REPLY>'
+  printf '%s\n' '<RESULT>'
+done
+exit 0
+"#;
+
+/// MOD-91 D1–D4 through a real child: an isolated row's process is started with the levers, an
+/// opted-in row's without them, and both see `HTUI_SESSION=1`.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_started_session_spawns_the_levers_and_marks_its_environment() {
+    for user_extensions in [false, true] {
+        let tmp = tempfile::tempdir().expect("temp box");
+        let mut scripted = scripted(tmp.path(), SESSION_SCRIPT);
+        scripted.row.settings["user_extensions"] = json!(user_extensions);
+        let mut session = start(&scripted.row, tmp.path()).await;
+        // The script records before it prints `init`, so both files exist by now.
+        let _ = next(&mut session, "the banner").await;
+
+        let text = std::fs::read_to_string(&scripted.argv).expect("the script recorded its argv");
+        let args: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            args.windows(ISOLATION_ARGS.len())
+                .any(|window| window == ISOLATION_ARGS),
+            !user_extensions,
+            "user_extensions {user_extensions}: {args:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("go.session"))
+                .expect("the script recorded its HTUI_SESSION"),
+            "1",
+            "user_extensions {user_extensions}"
+        );
+
+        session.cancel(Duration::ZERO).await.expect("cancel");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

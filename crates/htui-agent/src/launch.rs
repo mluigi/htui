@@ -602,6 +602,17 @@ async fn resolve_now(launch: &AgentLaunch, cwd: &Path) -> Result<ResolvedLaunch>
     resolve(launch, &tools)
 }
 
+/// The variable every agent session `htui` starts carries, set to `1` (MOD-91 D4): how a mod the
+/// user let back in (`user_extensions`) tells it is running under `htui` and can stand down.
+pub const SESSION_VAR: &str = "HTUI_SESSION";
+
+/// Inserts [`SESSION_VAR`]` = 1` into a session's resolved environment (MOD-91 D4). Called by both
+/// drivers' `launch_for`, **after** `spec.env`, so a row's `launch.env` cannot unset it. Never by
+/// [`spawn`] (which the probes use too) and never into `launch.env` (user data, `R-SEC-2`).
+pub(crate) fn mark_session(env: &mut BTreeMap<String, String>) {
+    env.insert(SESSION_VAR.to_owned(), "1".to_owned());
+}
+
 /// Replaces every `${name}` in one string.
 ///
 /// Hand written rather than a templating crate for the same reason ANA-5 gives for the prompt
