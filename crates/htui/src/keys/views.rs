@@ -790,22 +790,6 @@ mod tests {
             include_str!("../ui/tabs/requirements/mod.rs"),
             include_str!("../ui/tabs/requirements/forms.rs"),
         ];
-        /// MOD-67 M4: the lanes name these; T-close empties the list.
-        const PENDING: &[&str] = &[
-            "LIBRARY_BROWSE",
-            "LIBRARY_PROMPT",
-            "LIBRARY_INFO",
-            "LIBRARY_REPORT",
-            "ATTACH_BROWSE",
-            "ATTACH_FORM",
-            "ATTACH_PICKER",
-            "ATTACH_CONFIRM",
-            "TEMPLATES_BROWSE",
-            "TEMPLATES_PROMPT",
-            "REQUIREMENTS_BROWSE",
-            "REQUIREMENTS_FORM",
-            "REQUIREMENTS_WITHDRAW",
-        ];
         // Production code only: each file up to its test module, its comment lines dropped, so a
         // stack named only by a test or a doc comment still counts as unnamed.
         let production: Vec<String> = VIEWS
@@ -838,17 +822,8 @@ mod tests {
             DECLARED.len() - 4,
             "views.rs stacks vs DECLARED"
         );
-        for pending in PENDING {
-            assert!(
-                declared.contains(pending),
-                "PENDING names no stack: {pending}"
-            );
-        }
         for name in declared {
-            assert!(
-                PENDING.contains(&name) || named(name),
-                "no view names views::{name}"
-            );
+            assert!(named(name), "no view names views::{name}");
         }
     }
 }
