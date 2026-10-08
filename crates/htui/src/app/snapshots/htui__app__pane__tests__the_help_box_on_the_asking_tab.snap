@@ -1,0 +1,34 @@
+---
+source: crates/htui/src/app/pane.rs
+expression: frame
+---
+no workspace · no box ·  · 0 working · 0 waiting
+ 1 asker  2 other
+ nvim · htui has the keys ──────────────────────────────────────────────────────────────────────────
+
+
+
+
+
+
+
+
+
+     ┌ Keys ──────────────────────────────────────────────────────────────────────────────────┐
+     │Editor: Ctrl+4 editor focus · Ctrl+x abort edit                                         │
+     │Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab          │
+     │  ?/F1 help                                                                             │
+     │?/F1 closes this box                                                                    │
+     └────────────────────────────────────────────────────────────────────────────────────────┘
+
+
+
+
+
+
+
+
+
+
+
+Ctrl+4 to the editor · Ctrl+x abort · q quit · ? help

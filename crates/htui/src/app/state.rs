@@ -986,8 +986,13 @@ impl App {
     /// The `?` box (MOD-67 D8), rebuilt from the live state every frame. With a converted view
     /// holding the keyboard ([`App::active_stack`]): one line per layer of its stack, then the
     /// closing line its global layer admits. Otherwise today's box: the overlay context (if one
-    /// is up), the editor context (while an in-pane editor is alive, MOD-57), the active tab's
-    /// legacy rows, the global context, then the closing line.
+    /// is up), the active tab's legacy rows, the global context, then the closing line.
+    ///
+    /// MOD-57 M2 E7 (PD-M2-2): with an in-pane editor alive the box lists the editor keys that
+    /// act where the user is. On the asking tab, [`Stack::EDITOR_OPEN`]'s box (the editor's keys,
+    /// then every global; none of the asking tab's own, which it refuses); on another tab,
+    /// `editor.focus` first, then that view's box; under a modal overlay, the overlay's box with
+    /// no editor key.
     ///
     /// Each logical line is packed into rows that fit the box ([`HelpLine::rows`]), so the box is
     /// exactly as tall as what it shows and no row is clipped.
@@ -995,18 +1000,30 @@ impl App {
         let box_width = area.width.saturating_sub(10).max(20);
         let inner = usize::from(box_width.saturating_sub(2));
         let offered = |act| self.action_for(act).is_some();
+        // MOD-57 M2 E7 (PD-M2-2): the editor keys that act where the user is.
+        let uncovered = self.editor.is_some() && !self.editor_covered();
+        let locked = uncovered && self.editor_visible();
+        let elsewhere = uncovered && !self.editor_visible();
         let mut lines: Vec<HelpLine> = Vec::new();
-        let closer = match self.active_stack() {
+        if elsewhere {
+            lines.extend(
+                self.keys
+                    .help_line(Context::Editor, |act| act == Act::EditorFocus),
+            );
+        }
+        let stack = if locked {
+            Some(Stack::EDITOR_OPEN)
+        } else {
+            self.active_stack()
+        };
+        let closer = match stack {
             Some(stack) => {
-                lines = self.keys.help_lines(stack, offered);
+                lines.extend(self.keys.help_lines(stack, offered));
                 self.keys.help_closer(stack)
             }
             None => {
                 if !self.overlays.is_empty() {
                     lines.extend(self.keys.help_line(Context::Overlay, offered));
-                }
-                if self.editor.is_some() {
-                    lines.extend(self.keys.help_line(Context::Editor, |_| true));
                 }
                 if let Some(tab) = self.tabs.active() {
                     let legacy = self.keymap.help_line(&KeyScope::Tab(tab.id()));

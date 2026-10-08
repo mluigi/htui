@@ -73,6 +73,9 @@ pub const MIN_PANE: Size = Size {
 /// The head of the refusal while an editor is alive and unfocused (MOD-57 P6).
 const EDITOR_LOCKED: &str = "the editor is open";
 
+/// MOD-57 M2 E5: what the asking tab waits for before anything may steer it.
+const FINISH_FIRST: &str = "finish or abort it first";
+
 /// The refusal's tail and the status line while a modal overlay is over the editor (R0 F3): its
 /// keys are the prompt's, so none of the editor's is offered.
 const PROMPT_FIRST: &str = "answer or close the prompt first";
@@ -518,6 +521,14 @@ impl App {
         }
     }
 
+    /// MOD-57 M2 E5: `the editor is open in <Tab>: finish or abort it first` while an editor is
+    /// alive: the refusal of a scope change or of a reveal into the asking tab.
+    #[must_use]
+    pub(super) fn editor_steer_refusal(&self) -> Option<String> {
+        self.editor.as_ref()?;
+        Some(format!("{}: {FINISH_FIRST}", self.editor_place()))
+    }
+
     /// MOD-57 M2 E6: what leads another tab's status line while an editor is alive:
     /// `editing in <Tab> · Ctrl+4 back · `, the way back dropped under a modal overlay (where it
     /// does not act) or when unbound. Always ends with the separator. `None` without an editor
@@ -589,7 +600,8 @@ mod tests {
     use std::time::Duration;
 
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-    use htui_core::model::Scope;
+    use htui_core::fixtures::ids;
+    use htui_core::model::{ItemId, ProjectRef, RequirementId, Scope, WorkspaceSummary};
     use portable_pty::{CommandBuilder, ExitStatus};
     use ratatui::backend::TestBackend;
     use ratatui::buffer::Buffer;
@@ -601,13 +613,13 @@ mod tests {
     use zeroize::Zeroizing;
 
     use super::{EDITOR_LOCKED, MIN_PANE};
-    use crate::app::{Action, App, Ctx, Handled};
+    use crate::app::{Action, App, Ctx, Handled, RevealKind, RevealTarget, TabAction};
     use crate::editor::pane::{PaneChild, PaneEvent, PaneSize};
     use crate::editor::{
         EDITOR_ABORTED, EDITOR_BUSY, EditorCommand, ExternalEdit, ExternalEditOutcome, PANE_VAR,
     };
-    use crate::keymap::Keymap;
-    use crate::keys::{Act, Context, Keys, Stack};
+    use crate::keymap::{Binding, KeyChord, KeyScope, Keymap};
+    use crate::keys::{Act, Context, Keys, Stack, views};
     use crate::store_worker::{StoreReply, StoreRequest};
     use crate::ui::overlay::{Overlay, OverlayId, QuitConfirm};
     use crate::ui::tabs::{Tab, TabId};
@@ -1011,6 +1023,8 @@ mod tests {
     const OFF_SCREEN: &str = "the editor is open in asker: Ctrl+4 back";
     /// MOD-57 M2 E6: the status prefix on another tab.
     const NOTICE: &str = "editing in asker \u{b7} Ctrl+4 back \u{b7} ";
+    /// MOD-57 M2 E5: a steer of the asking tab, refused.
+    const STEER_REFUSAL: &str = "the editor is open in asker: finish or abort it first";
 
     #[test]
     fn a_focused_editor_gets_every_key_ctrl_c_included() {
@@ -1362,6 +1376,179 @@ mod tests {
         assert_eq!(benches[1].seen.borrow().pastes, vec!["x".to_owned()]);
         assert!(writes(&log).is_empty());
         assert!(benches[0].seen.borrow().pastes.is_empty());
+    }
+
+    /// A workspace to enter (as `update.rs`'s test helper builds one).
+    fn workspace(name: &str) -> WorkspaceSummary {
+        WorkspaceSummary {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            slug: name.to_lowercase(),
+            name: name.to_owned(),
+            projects: vec![ProjectRef {
+                project_id: ids::PROJECT_HTUI,
+                slug: "p".to_owned(),
+                name: "P".to_owned(),
+                position: 0,
+            }],
+        }
+    }
+
+    /// MOD-57 M2 E5 (B-M2-6): every scope change is refused while an editor is alive, from any
+    /// tab (`set_scope` resets them all, the asking one included); after the exit it applies.
+    #[test]
+    fn a_scope_change_is_refused_while_an_editor_is_alive() {
+        let (mut app, _benches, _log) = unfocused_two();
+        let scope = app.scope.clone();
+        let name = app.top_bar.workspace.clone();
+        for other in [false, true] {
+            if other {
+                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+            }
+            app.update(Action::SetScope {
+                workspace: workspace("Platform"),
+            });
+            assert_eq!(app.status.as_deref(), Some(STEER_REFUSAL), "other {other}");
+            assert_eq!(app.scope, scope, "other {other}: the scope stays");
+            assert_eq!(app.top_bar.workspace, name);
+            assert!(app.editor_open());
+        }
+
+        exited(&mut app, 0, Duration::from_secs(2));
+        app.status = None;
+        app.update(Action::SetScope {
+            workspace: workspace("Platform"),
+        });
+        assert_eq!(app.status, None);
+        assert_eq!(app.scope.workspace_id, ids::WORKSPACE_PLATFORM);
+        assert_eq!(app.top_bar.workspace, "Platform");
+    }
+
+    /// MOD-57 M2 E5: a reveal into the asking tab is refused (it would re-select what it waits
+    /// on); one into another tab passes.
+    #[test]
+    fn a_reveal_into_the_asking_tab_is_refused_and_one_elsewhere_passes() {
+        let (mut app, _benches, _log) = unfocused_two();
+        app.reveal_tabs = vec![(RevealKind::Item, ASKER), (RevealKind::Requirement, OTHER)];
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+
+        app.update(Action::Reveal(RevealTarget::Item {
+            id: ItemId::new(),
+            key: "FEAT-1".to_owned(),
+        }));
+        assert_eq!(app.status.as_deref(), Some(STEER_REFUSAL));
+        assert_eq!(
+            app.tabs.active_id(),
+            Some(OTHER),
+            "the asking tab is not focused"
+        );
+
+        app.on_key(plain('1'));
+        assert_eq!(app.tabs.active_id(), Some(ASKER));
+        app.update(Action::Reveal(RevealTarget::Requirement {
+            id: RequirementId::new(),
+            key: "R-STO-1".to_owned(),
+        }));
+        assert_eq!(
+            app.tabs.active_id(),
+            Some(OTHER),
+            "another tab's reveal passes"
+        );
+        assert_eq!(app.status, None);
+        assert!(app.editor_open());
+        // A plain tab switch is not a steer (E3).
+        app.update(Action::Tab(TabAction::Focus(ASKER)));
+        assert_eq!(app.tabs.active_id(), Some(ASKER));
+        assert_eq!(app.status, None);
+    }
+
+    /// MOD-57 M2 E6: another tab's own status line, led by the open edit and the way back; the
+    /// way back follows the keys and is dropped under a modal overlay; an error replaces it all.
+    #[test]
+    fn the_status_line_on_another_tab_carries_the_edit_and_the_way_back() {
+        let (mut app, _benches, _log) = unfocused_two();
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        let term = draw(&mut app, 100, 30);
+        let buffer = term.backend().buffer();
+        assert!(
+            row_from(buffer, 0, 29).starts_with(&format!("{NOTICE}q quit \u{b7} ")),
+            "{}",
+            row_from(buffer, 0, 29)
+        );
+        insta::assert_snapshot!("another_tab_while_editing", text(buffer));
+
+        app.keys = Keys::defaults().with_chords(Context::Editor, Act::EditorFocus, &["f12"]);
+        let term = draw(&mut app, 100, 30);
+        assert!(
+            row_from(term.backend().buffer(), 0, 29)
+                .starts_with("editing in asker \u{b7} F12 back \u{b7} q quit")
+        );
+
+        app.status = Some("boom".to_owned());
+        let term = draw(&mut app, 100, 30);
+        let row = row_from(term.backend().buffer(), 0, 29);
+        assert!(row.starts_with("boom") && !row.contains("editing"), "{row}");
+
+        app.status = None;
+        app.push_overlay(Box::new(Shade));
+        let term = draw(&mut app, 100, 30);
+        let row = row_from(term.backend().buffer(), 0, 29);
+        assert!(
+            row.starts_with("editing in asker \u{b7} q quit") && !row.contains("back"),
+            "{row}"
+        );
+    }
+
+    /// MOD-57 M2 E7 (PD-M2-2): the `?` box lists the editor keys that act where the user is:
+    /// `EDITOR_OPEN`'s on the asking tab (no legacy rows: the asking tab refuses them),
+    /// `editor.focus` first on another tab (converted or not), none under a modal overlay.
+    #[test]
+    fn the_help_box_lists_the_keys_that_act_here() {
+        let (mut app, _benches) = shell_with(&[
+            (ASKER, false, None),
+            (OTHER, false, Some(views::SETTINGS_TAB)),
+        ]);
+        app.keymap.bind(Binding {
+            scope: KeyScope::Tab(ASKER),
+            key: KeyChord::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            action: Action::Tab(TabAction::Focus(ASKER)),
+            help: "asker legacy",
+        });
+        let log = Log::default();
+        open(&mut app, ASKER, &log);
+        app.on_key(ctrl('4'));
+        app.on_key(plain('?'));
+        let term = draw(&mut app, 100, 30);
+        let frame = text(term.backend().buffer());
+        assert!(
+            frame.contains("Editor: Ctrl+4 editor focus \u{b7} Ctrl+x abort edit"),
+            "{frame}"
+        );
+        assert!(frame.contains("Global: q/Ctrl+c quit"), "{frame}");
+        assert!(frame.contains("?/F1 closes this box"), "{frame}");
+        assert!(!frame.contains("asker legacy"), "{frame}");
+        insta::assert_snapshot!("the_help_box_on_the_asking_tab", frame);
+
+        // Another tab, a converted view: the way back first, then its own box.
+        app.on_key(plain('?'));
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(plain('?'));
+        assert!(app.help_visible);
+        let term = draw(&mut app, 100, 30);
+        let frame = text(term.backend().buffer());
+        assert!(frame.contains("Editor: Ctrl+4 editor focus"), "{frame}");
+        assert!(!frame.contains("abort edit"), "{frame}");
+        let editor = frame.find("Editor:").expect("an editor line");
+        let global = frame.find("Global:").expect("its own box");
+        assert!(editor < global, "the way back first: {frame}");
+
+        // Under a modal prompt on the asking tab: its keys, no editor line.
+        let (mut app, _benches, _log) = unfocused_two();
+        app.push_overlay(Box::new(Prompt(Rc::default())));
+        app.help_visible = true;
+        let term = draw(&mut app, 100, 30);
+        let frame = text(term.backend().buffer());
+        assert!(frame.contains("Global:"), "{frame}");
+        assert!(!frame.contains("Editor:"), "{frame}");
     }
 
     #[test]

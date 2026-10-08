@@ -27,7 +27,11 @@ impl App {
             Action::Overlay(overlay) => self.update_overlay(overlay),
             Action::Store(request) => self.dispatch(Origin::App, request),
             Action::Reply(envelope) => self.on_reply(envelope),
-            Action::SetScope { workspace } => self.set_scope(workspace),
+            // MOD-57 M2 E5: `set_scope` resets every tab, the asking one included.
+            Action::SetScope { workspace } => match self.editor_steer_refusal() {
+                Some(refusal) => self.status = Some(refusal),
+                None => self.set_scope(workspace),
+            },
             Action::Replay { step_id } => self.replay(step_id),
             Action::Promote { run, step } => self.promote(run, step),
             Action::Reveal(target) => self.reveal(&target),
@@ -271,7 +275,9 @@ impl App {
     /// Selects an entity in the tab registered for its kind (MOD-64 D235): focus that tab —
     /// which re-sends its `wants_requests` if it was not the active one — then hand it the target
     /// with a `Ctx` of its own, as `finish_external_edit` does, and drain what it emitted. A kind
-    /// nothing is registered for is a no-op, logged.
+    /// nothing is registered for is a no-op, logged. MOD-57 M2 E5: a reveal into the tab an
+    /// in-pane editor is open for is refused on the status line; it would re-select what the
+    /// edit waits on.
     fn reveal(&mut self, target: &RevealTarget) {
         let kind = target.kind();
         let Some(tab) = self
@@ -283,6 +289,12 @@ impl App {
             tracing::debug!(?kind, "no tab reveals this kind");
             return;
         };
+        if self.editor_tab() == Some(tab)
+            && let Some(refusal) = self.editor_steer_refusal()
+        {
+            self.status = Some(refusal);
+            return;
+        }
         self.update_tab(TabAction::Focus(tab));
         let origin = Origin::Tab(tab);
         {
