@@ -328,7 +328,7 @@ Every `error.code`, with the `store` it comes with and the exit code:
 | `box_identity` | `refused` | 2 | all (search only with `--cwd`) | `box.toml` exists but cannot be read or parsed. `status` and `waiting` always read it (for `box`), so a malformed `box.toml` refuses them even without `--cwd`, just as the TUI will not start with one. Fix or delete the file. |
 | `migrations_pending` | `refused` | 2 | all | The database has migrations this build has not applied. Start the TUI once to apply them. |
 | `below_target` | `refused` | 2 | all | The database's target version is newer than this build. Update htui. |
-| `store_refused` | `refused` | 2 | all | Postgres answered and refused this htui: a newer or drifted schema, a partial migration, a wrong password, a missing database. |
+| `store_refused` | `refused` | 2 | all | Postgres answered and refused this htui: a newer or drifted schema, a partial migration, a wrong password, a missing database, a pooler that rejects the read-only session (see [No writes](#no-writes)). |
 | `unknown_project` | `refused` | 2 | all | `--project` names no project. |
 | `cwd_unresolved` | `refused` | 2 | all | `--cwd`'s path cannot be resolved on this machine. |
 | `no_box` | `refused` | 2 | all | `--cwd` was given, but this machine has no `box.toml`. |
@@ -411,9 +411,11 @@ directory if this machine does not have it yet, because it needs the model to tu
 a vector. That is a download cache, not htui's state. Its progress notes go to standard error, never
 standard output.
 
-A connection pooler in transaction mode (such as PgBouncer) may reject the startup parameter that
-makes the session read-only. Every command then ends `store_refused`. Connect these commands to
-Postgres directly.
+A connection pooler such as PgBouncer rejects the startup parameter that makes the session
+read-only (`unsupported startup parameter: options`, SQLSTATE `08P01`). Every command then ends
+with `"store": "refused"`, `error.code` `store_refused` and exit 2, never `offline`: the pooler
+answered, and retrying does not help. Connect these commands to Postgres directly, not through
+the pooler.
 
 ## Credentials and crash reports
 

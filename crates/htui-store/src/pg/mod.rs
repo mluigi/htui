@@ -316,7 +316,8 @@ impl PgStore {
     /// # Errors
     ///
     /// As [`connect_headless`](Self::connect_headless): [`HeadlessError::Store`] (unreachable,
-    /// newer, drifted, partial, malformed target, or any connect refusal such as a failed password),
+    /// newer, drifted, partial, malformed target, or any connect refusal such as a failed password
+    /// or a pooler rejecting the read-only startup parameter with `08P01`, review R1 M1),
     /// [`HeadlessError::MigrationsPending`], [`HeadlessError::BelowTarget`].
     pub async fn connect_read_only(
         dsn: &str,
@@ -839,7 +840,30 @@ async fn open_pool(
         .acquire_timeout(connect_timeout)
         .connect_with(options)
         .await
-        .map_err(map_sqlx)
+        .map_err(|err| match session {
+            Session::ReadWrite => map_sqlx(err),
+            Session::ReadOnly => map_read_only_connect(err),
+        })
+}
+
+/// A read-only pool's connect error (review R1 M1): `08P01` (*protocol violation*) received while
+/// the connection starts is a server that answered and rejected the startup packet - PgBouncer
+/// says `unsupported startup parameter: options` to the `-c default_transaction_read_only=on`
+/// that [`Session::ReadOnly`] sends - so it is a refusal ([`StoreError::Backend`]), not the lost
+/// connection [`is_unreachable`](crate::error::is_unreachable) reads `08P01` as everywhere else.
+/// Retrying cannot help, and "offline" would send a poller waiting forever. Everything else is
+/// [`map_sqlx`]'s.
+fn map_read_only_connect(err: sqlx::Error) -> StoreError {
+    if let sqlx::Error::Database(db) = &err
+        && db.code().as_deref() == Some("08P01")
+    {
+        return StoreError::Backend(format!(
+            "08P01: {}; the server rejected the read-only session's startup parameter, as a \
+             connection pooler such as PgBouncer does: connect to Postgres directly",
+            db.message()
+        ));
+    }
+    map_sqlx(err)
 }
 
 /// Compares `_sqlx_migrations` against the embedded set (ANA-9 §5.0), creating the empty

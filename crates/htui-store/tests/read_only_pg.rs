@@ -4,8 +4,9 @@
 //! so Postgres itself refuses a write whatever code path attempts it.
 //!
 //! Every case creates and drops its own database; with `HTUI_TEST_DATABASE_URL` unset each one
-//! prints `common::SKIP` and passes. `an_unreachable_server_is_unreachable_read_only` needs no
-//! server and therefore never skips.
+//! prints `common::SKIP` and passes. `an_unreachable_server_is_unreachable_read_only` and
+//! `a_pooler_rejecting_the_read_only_parameter_is_a_refusal` need no server and therefore never
+//! skip.
 #![cfg(feature = "test-support")]
 
 use htui_store::testkit as common;
@@ -256,6 +257,127 @@ async fn every_cli_read_answers_on_a_read_only_session() {
     store.repo_paths(ids::BOX).await.expect("repo_paths");
     let project = first.projects.first().expect("a project").project_id;
     store.repos(project).await.expect("repos");
+
+    db.drop_db().await;
+}
+
+/// A one-shot stand-in for a pooler that rejects the read-only startup parameter, as PgBouncer
+/// does (`unsupported startup parameter: options`, SQLSTATE `08P01`, then it hangs up): it reads
+/// each startup packet and answers it with that `ErrorResponse`. Returns the DSN to dial.
+fn startup_rejecting_server() -> String {
+    use std::io::{Read as _, Write as _};
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let port = listener.local_addr().expect("a local address").port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { return };
+            let mut header = [0u8; 8];
+            if stream.read_exact(&mut header).is_err() {
+                continue;
+            }
+            let len = u32::from_be_bytes([header[0], header[1], header[2], header[3]]) as usize;
+            let mut rest = vec![0u8; len.saturating_sub(8)];
+            if stream.read_exact(&mut rest).is_err() {
+                continue;
+            }
+            let mut fields = Vec::new();
+            for (tag, value) in [
+                (b'S', "FATAL"),
+                (b'V', "FATAL"),
+                (b'C', "08P01"),
+                (b'M', "unsupported startup parameter: options"),
+            ] {
+                fields.push(tag);
+                fields.extend_from_slice(value.as_bytes());
+                fields.push(0);
+            }
+            fields.push(0);
+            let mut message = vec![b'E'];
+            let body_len = u32::try_from(fields.len() + 4).expect("a short message");
+            message.extend_from_slice(&body_len.to_be_bytes());
+            message.extend_from_slice(&fields);
+            let _ = stream.write_all(&message);
+        }
+    });
+    format!("postgres://nobody@127.0.0.1:{port}/none?sslmode=disable")
+}
+
+/// Review R1 M1: a pooler that rejects the read-only startup parameter (`08P01` while the
+/// connection starts) answered, so the read-only connect refuses rather than calling the server
+/// unreachable; a script that polls would otherwise read "offline" forever. Only that connect:
+/// the read-write connects keep `08P01` as a lost connection.
+#[tokio::test]
+async fn a_pooler_rejecting_the_read_only_parameter_is_a_refusal() {
+    let dsn = startup_rejecting_server();
+    let refused = PgStore::connect_read_only(&dsn, None, Duration::from_secs(5))
+        .await
+        .expect_err("the startup packet is rejected");
+    let HeadlessError::Store(StoreError::Backend(message)) = &refused else {
+        panic!("expected a Backend refusal, got {refused:?}");
+    };
+    assert!(message.starts_with("08P01: "), "{message}");
+    assert!(
+        message.contains("unsupported startup parameter: options"),
+        "{message}"
+    );
+    assert!(
+        message.contains("PgBouncer"),
+        "names the likely cause: {message}"
+    );
+
+    let headless = PgStore::connect_headless(
+        &dsn,
+        &htui_store::Identity {
+            box_id: BoxId::new(),
+            hostname: "HTUI-TEST".into(),
+        },
+        Duration::from_secs(5),
+        htui_store::pg::PoolSize::WORKER_DEFAULT,
+    )
+    .await
+    .expect_err("the startup packet is rejected");
+    assert!(
+        matches!(headless, HeadlessError::Store(StoreError::Unreachable(_))),
+        "read-write connects keep 08P01 as unreachable: {headless:?}"
+    );
+}
+
+/// Review R1 L6: a DSN that asks for a writable session (`options=-c
+/// default_transaction_read_only=off`) still gets a read-only one: `open_pool` appends `on` after
+/// the DSN's own options, and the last setting wins.
+#[tokio::test]
+async fn a_dsn_asking_for_writes_still_gets_a_read_only_session() {
+    let Some(db) = common::fresh_db().await else {
+        return;
+    };
+    let separator = if db.url.contains('?') { '&' } else { '?' };
+    let dsn = format!(
+        "{}{separator}options=-c%20default_transaction_read_only%3Doff",
+        db.url
+    );
+    let store = PgStore::connect_read_only(&dsn, Some(db.identity.box_id), WAIT)
+        .await
+        .expect("connect read-only");
+    let setting: String = sqlx::query_scalar("SHOW default_transaction_read_only")
+        .fetch_one(store.pool())
+        .await
+        .expect("read the setting");
+    assert_eq!(setting, "on");
+
+    let err = sqlx::query(
+        "INSERT INTO workspace (slug, name, created_by) \
+         SELECT 'read-only-probe', 'probe', id FROM app_user LIMIT 1",
+    )
+    .execute(store.pool())
+    .await
+    .expect_err("a read-only session refuses an INSERT");
+    match err {
+        sqlx::Error::Database(e) => {
+            assert_eq!(e.code().as_deref(), Some(READ_ONLY_SQLSTATE), "{e}");
+        }
+        other => panic!("expected a database refusal, got {other:?}"),
+    }
 
     db.drop_db().await;
 }
