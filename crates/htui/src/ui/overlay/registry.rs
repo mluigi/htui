@@ -8,6 +8,7 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 
 use crate::app::{Ctx, Handled};
+use crate::keys::Stack;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crossterm::event::KeyEvent;
 
@@ -40,6 +41,12 @@ pub trait Overlay {
     fn title(&self) -> &str;
     /// A modal overlay swallows every key it does not handle, so the tab below never sees it.
     fn is_modal(&self) -> bool;
+    /// This overlay's key stack (MOD-67 D4), or `None` while it is not converted: the shell then
+    /// keeps today's status line, `?` box and `Stack::OVERLAY` dispatch. Defaulted, so no
+    /// overlay changes until it converts.
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        None
+    }
     /// Requests the shell issues when this overlay is pushed.
     fn wants_requests(&self, scope: &Scope) -> Vec<StoreRequest>;
     /// A key reached this overlay: it is the first stop of the propagation chain.

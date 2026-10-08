@@ -25,6 +25,7 @@ use crate::agent_worker::{AgentRuntime, ChatTask, Served};
 use crate::app::{Action, App, Ctx, Emit, Handled, TopBarState};
 use crate::concepts_worker::{ConceptsRuntime, ConceptsServed};
 use crate::keymap::{KeyChord, Keymap};
+use crate::keys::Keys;
 use crate::run_worker::{RunRuntime, RunServed, TuiRuns as _};
 use crate::store_worker::{self, Origin, ReplyEnvelope, RequestEnvelope, StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -175,6 +176,14 @@ impl Harness {
     #[must_use]
     pub fn with_concepts_runtime(mut self, runtime: ConceptsRuntime) -> Self {
         self.concepts = Some(runtime);
+        self
+    }
+
+    /// Runs the shell with these keys instead of the compiled defaults (MOD-67 M3): how a test
+    /// rebinds. Build them with [`load_str`](crate::keys::load_str).
+    #[must_use]
+    pub fn with_keys(mut self, keys: Keys) -> Self {
+        self.app.keys = keys;
         self
     }
 
@@ -661,6 +670,9 @@ pub struct SectionBench {
     theme: Theme,
     /// What the section emitted, drained by [`drained`](SectionBench::drained).
     emit: Emit,
+    /// The keys in force: the compiled defaults unless [`with_keys`](SectionBench::with_keys)
+    /// installed others (MOD-67 M3).
+    keys: Keys,
 }
 
 impl SectionBench {
@@ -681,10 +693,19 @@ impl SectionBench {
             keymap: Keymap::default_global(),
             theme: Theme::default(),
             emit: Emit::default(),
+            keys: Keys::compiled().clone(),
         }
     }
 
-    /// A context addressed to the Settings tab, as the shell builds one.
+    /// Hands the section these keys instead of the compiled defaults (MOD-67 M3, L-D Q7). Build
+    /// them with [`load_str`](crate::keys::load_str).
+    #[must_use]
+    pub fn with_keys(mut self, keys: Keys) -> Self {
+        self.keys = keys;
+        self
+    }
+
+    /// A context addressed to the Settings tab, as the shell builds one, with the bench's keys.
     #[must_use]
     pub fn ctx(&self) -> Ctx<'_> {
         Ctx::new(
@@ -696,6 +717,7 @@ impl SectionBench {
             Origin::Tab(SettingsTab::ID),
             &self.emit,
         )
+        .with_keys(&self.keys)
     }
 
     /// Feeds one key to a section, written the way [`KeyChord::parse`] reads it.
