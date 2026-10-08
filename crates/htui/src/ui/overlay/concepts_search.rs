@@ -316,37 +316,23 @@ impl Overlay for ConceptsSearch {
             FieldOutcome::Cancel => return Handled::Pass,
             FieldOutcome::Pass => {}
         }
-        let chord = KeyChord::from_event(key);
-        for act in ctx.keys().actions(views::CONCEPTS_QUERY, chord) {
-            match act {
-                Act::ConceptsDecisions => {
-                    self.decisions = !self.decisions;
-                    return Handled::Consumed;
-                }
-                Act::ConceptsProject => {
-                    self.cycle_project(ctx.projects);
-                    return Handled::Consumed;
-                }
-                Act::ConceptsReindex => {
-                    self.reindex(ctx);
-                    return Handled::Consumed;
-                }
-                Act::ConceptsUp => {
-                    self.cursor = self.cursor.saturating_sub(1);
-                    return Handled::Consumed;
-                }
-                Act::ConceptsDown => {
-                    if self.cursor + 1 < self.hits.len() {
-                        self.cursor += 1;
-                    }
-                    return Handled::Consumed;
-                }
-                _ => break, // `overlay.close` or `global.help`: the shell's
-            }
-        }
-        // `F1` and `Ctrl+C` are the shell's (D261); `Tab` and the rest are swallowed by
+        // Only the first candidate counts: an own act acts; `overlay.close` and `global.help`
+        // (`F1`) are the shell's, `Ctrl+C` too (D261); `Tab` and the rest are swallowed by
         // `is_modal`.
-        Handled::Pass
+        let chord = KeyChord::from_event(key);
+        match ctx.keys().actions(views::CONCEPTS_QUERY, chord).first() {
+            Some(Act::ConceptsDecisions) => self.decisions = !self.decisions,
+            Some(Act::ConceptsProject) => self.cycle_project(ctx.projects),
+            Some(Act::ConceptsReindex) => self.reindex(ctx),
+            Some(Act::ConceptsUp) => self.cursor = self.cursor.saturating_sub(1),
+            Some(Act::ConceptsDown) => {
+                if self.cursor + 1 < self.hits.len() {
+                    self.cursor += 1;
+                }
+            }
+            _ => return Handled::Pass,
+        }
+        Handled::Consumed
     }
 
     /// MOD-22 review M-1: a bracketed paste is query text, as typing it would be.
