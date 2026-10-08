@@ -1007,8 +1007,9 @@ impl Tab for BacklogTab {
 const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
 
 /// MOD-12 D9: the status line after a queue write. `n` is the queue's length after it. In
-/// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3).
-fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
+/// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3). The queue
+/// overlay says its writes with it too (M3 review R1 N2).
+pub(crate) fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
     let n = view.entries.len();
     match *write {
         QueueWrite::Queued { .. } => match (view.open_batch.is_some(), view.demo) {
@@ -1040,8 +1041,8 @@ fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
         QueueWrite::Paused { live, .. } => {
             format!("queue paused \u{2014} {live} runs still running")
         }
-        // MOD-12 M3 D7: the Backlog never sends `MoveQueueEntry` and replies are addressed by
-        // origin, so these exist for exhaustivity; every other sentence is unchanged.
+        // MOD-12 M3 D7: only the queue overlay sends `MoveQueueEntry` (replies are addressed by
+        // origin); it says these through this function (M3 review R1 N2).
         QueueWrite::Moved { moved: true } => format!("queue reordered ({n} in queue)"),
         QueueWrite::Moved { moved: false } => "already at that end of the queue".to_owned(),
         // M3 review R1 M1: `P` sent over a queue that changed since it was read; `view` is the

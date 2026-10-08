@@ -2,7 +2,8 @@
 //! the writes that steer it: reorder, pause/resume, dequeue. `Enter` reveals the row's run or item.
 //!
 //! It holds the last [`QueueOverview`] the store worker answered and re-reads it after every queue
-//! write, after a failed queue write, and on the shell's refresh tick (M3 D9) while no read is in
+//! write (saying the write's result on the status line, M3 review R1 N2), after a failed queue
+//! write, and on the shell's refresh tick (M3 D9) while no read is in
 //! flight. A failed read is asked again only every [`REFRESHES_PER_RETRY`]th refresh tick.
 
 use htui_core::model::{EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd};
@@ -12,11 +13,12 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{Action, Ctx, Handled, OverlayAction, RevealTarget};
-use crate::store_worker::{QUEUE_REQUEST_NAMES, StoreReply, StoreRequest};
+use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::layout::centered;
 use crate::ui::overlay::registry::{Overlay, OverlayId};
+use crate::ui::tabs::backlog::queue_sentence;
 use crossterm::event::{KeyCode, KeyEvent};
 
 /// Marker in front of the row the cursor is on (the waiting list's): a snapshot records symbols
@@ -423,7 +425,23 @@ impl Overlay for QueueOverlay {
                 self.write_failure = None;
                 self.reanchor();
             }
-            StoreReply::QueueWritten { .. } => self.reread(ctx),
+            StoreReply::QueueWritten { write, view } => {
+                // M3 review R1 N2: the status line says what the write did, in the Backlog's
+                // words, before the re-read redraws the box.
+                let key = match write {
+                    QueueWrite::Queued { item } | QueueWrite::Dequeued { item, .. } => self
+                        .rows()
+                        .iter()
+                        .find(|(row, _)| row.entry.item_id == *item)
+                        .map_or_else(|| item.to_string(), |(row, _)| row.key.clone()),
+                    QueueWrite::Resumed { .. }
+                    | QueueWrite::Paused { .. }
+                    | QueueWrite::Moved { .. }
+                    | QueueWrite::Stale { .. } => String::new(),
+                };
+                ctx.emit(Action::Error(queue_sentence(write, &key, view)));
+                self.reread(ctx);
+            }
             StoreReply::Failed { request, message } if *request == OVERVIEW => {
                 // `App::on_reply` already put it on the status line; the box says it too.
                 self.overview = None;
@@ -490,7 +508,7 @@ mod tests {
     use super::*;
     use crate::app::{Emit, TopBarState};
     use crate::keymap::Keymap;
-    use crate::store_worker::{Origin, QueueView, QueueWrite};
+    use crate::store_worker::{Origin, QueueView};
     use chrono::{DateTime, TimeZone, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
