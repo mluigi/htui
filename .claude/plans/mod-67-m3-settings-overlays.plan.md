@@ -124,6 +124,16 @@ rebound key" hole open in Settings, which is what M3 closes. Prose that names ke
     another section still on `r`;
   - status-line and `?` box tests for a capturing Settings editor and for an overlay.
 
+## Amendments (maintainer, 2026-10-08, from blueprint §1)
+
+PA-1..PA-9 (`.claude/plans/mod-67-m3-settings-overlays.blueprint.md` §1) approved as written:
+additive `VIEW_DEFAULTS` (14 rows), `SHADOWING = [(ConfirmNo, OverlayClose)]` only,
+`Layer::view` auto-admitting the stack's shared verbs, the context collision pass skipping view
+contexts, widget-first dispatch with `Stack::passes` for modal modes, ctrl+capital folding in
+`KeyChord::new`, one shared `views::CAPTURE`, `active_stack() -> Option<Stack>`, quit always first
+on the status line. Concepts search hint: short labels (`Ctrl+p scope · Ctrl+r index`,
+`Up/Down`).
+
 ## Patterns to Mirror
 
 | Category | Source | Pattern |
