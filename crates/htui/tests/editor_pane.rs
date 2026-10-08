@@ -1,4 +1,5 @@
 //! MOD-57 M1, T7: the in-pane editor end to end, with a real child on a real pseudo-terminal.
+//! MOD-57 M2, T3: another tab works while the editor waits, and quitting asks first.
 //!
 //! The shell is the Templates harness (as `tests/templates.rs`), and the editor is a scripted
 //! `sh` (the sandbox has no vi). Each case does what the event loop does with
@@ -19,6 +20,7 @@ use htui::app::register_all;
 use htui::editor::pane::{PaneChild, PaneEvent, PtyChild};
 use htui::editor::{EDITOR_ABORTED, EditorCommand};
 use htui::testkit::Harness;
+use htui::ui::overlay::{Overlay, QuitConfirm};
 use htui_core::store::MemStore;
 use tempfile::TempDir;
 use tokio::sync::mpsc::{self, Receiver, Sender};
@@ -316,8 +318,9 @@ async fn ctrl_e_on_a_draft_edits_over_its_claimed_rect() {
 }
 
 /// P5: a focused editor gets `ctrl-c` (the line discipline turns it into its own SIGINT, htui
-/// does not quit); `editor.focus` then `editor.abort` end it, the view hears `EDITOR_ABORTED`,
-/// and the child is gone.
+/// does not quit); after `editor.focus`, `editor.abort` asks first (M2 R1 M-2): nano's `ctrl-x`,
+/// `y` keeps the edit, and `editor.abort` twice ends it, the view hears `EDITOR_ABORTED`, and the
+/// child is gone.
 #[tokio::test]
 async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
     let dir = TempDir::new().expect("a temp dir");
@@ -357,10 +360,21 @@ async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
 
     harness.key("ctrl-4");
     harness.key("ctrl-x");
+    assert!(harness.app().editor_open(), "abort asks first");
+    let frame = harness.render();
     assert!(
-        !harness.app().editor_open(),
-        "abort closes the editor at once"
+        frame.contains("Abort the edit and lose it?")
+            && frame.contains("Ctrl+x again aborts \u{b7} any other key keeps editing"),
+        "the question: {frame}"
     );
+    harness.key("y");
+    assert!(harness.app().editor_open(), "`y` keeps the edit");
+    assert!(harness.app().overlays.is_empty(), "and closes the question");
+    assert!(alive(&pid), "the editor is untouched");
+
+    harness.key("ctrl-x");
+    harness.key("ctrl-x");
+    assert!(!harness.app().editor_open(), "abort again aborts");
     assert!(!harness.app().should_quit);
     let frame = harness.render();
     assert!(
@@ -405,7 +419,8 @@ async fn ctrl_c_reaches_the_editor_and_abort_ends_it() {
     );
 }
 
-/// PRD metric: quitting htui with a live editor leaves no child behind.
+/// PRD metric: quitting htui with a live editor leaves no child behind. MOD-57 M2 E4 (PRD D5):
+/// `q` asks first, the editor still alive under the question; `y` quits.
 #[tokio::test]
 async fn quitting_with_a_live_editor_leaves_no_child() {
     let dir = TempDir::new().expect("a temp dir");
@@ -431,10 +446,158 @@ async fn quitting_with_a_live_editor_leaves_no_child() {
 
     harness.key("ctrl-4");
     harness.key("q");
-    assert!(
-        harness.app().should_quit,
-        "`q` quits at once while htui has the keys"
+    assert!(!harness.app().should_quit, "`q` asks first");
+    assert_eq!(
+        harness.app().overlays.top().map(Overlay::id),
+        Some(QuitConfirm::ID),
+        "the quit question is up"
     );
+    assert!(harness.app().editor_open(), "the editor lives under it");
+    assert!(alive(&pid), "the editor runs under the question");
+    harness.key("y");
+    assert!(harness.app().should_quit, "`y` quits");
+    drop(harness);
+    gone(&pid).await;
+}
+
+/// MOD-57 M2 (PRD D4): with htui holding the keys the user leaves the asking tab, the editor
+/// waits undrawn, the other tab's keys reach it (`j` moves Backlog's selection, M2 R1 M-3), its
+/// status line names the edit and the way back, the `?` box offers
+/// `editor.focus`, and `Ctrl+4` brings the editor back with the keys; its exit still reads the
+/// file back into the asking view.
+#[tokio::test]
+async fn the_editor_waits_while_another_tab_works_and_reads_back_on_return() {
+    let dir = TempDir::new().expect("a temp dir");
+    let cmd = script(
+        &dir,
+        &format!("printf '{READY}\\n'; IFS= read -r line; printf '%s\\n' \"$line\" >> \"$1\""),
+    );
+    let mut harness = open().await;
+    select(&mut harness, "implement");
+    harness.key("E");
+    let (tx, mut rx) = mpsc::channel(QUEUE);
+    let file = open_editor(&mut harness, cmd, &tx);
+    pump(
+        &mut harness,
+        &mut rx,
+        "ready editor with the keys",
+        |harness| {
+            let frame = harness.render();
+            frame.contains(READY) && frame.contains("Ctrl+4 to htui")
+        },
+    )
+    .await;
+
+    harness.key("ctrl-4");
+    harness.key("1");
+    harness.settle().await;
+    assert_eq!(
+        harness
+            .app()
+            .tabs
+            .active()
+            .map(|tab| tab.title().to_owned()),
+        Some("Backlog".to_owned()),
+        "`1` from the asking tab switches"
+    );
+    assert!(harness.app().editor_open(), "the editor waits");
+    let frame = harness.render();
+    assert!(!frame.contains(READY), "and is not drawn: {frame}");
+    let last = frame.lines().last().unwrap_or_default().to_owned();
+    assert!(
+        last.starts_with("editing in Skills \u{b7} Ctrl+4 back"),
+        "the status line names the edit: {frame}"
+    );
+    assert!(
+        frame.contains("\u{250c} FEAT-1 "),
+        "FEAT-1 selected: {frame}"
+    );
+
+    // M2 R1 M-3: a key reaches the other tab while the editor waits.
+    harness.key("j");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("\u{250c} TOOL-1 "),
+        "`j` moved Backlog's selection: {frame}"
+    );
+    assert!(harness.app().editor_open(), "the editor still waits");
+
+    harness.key("?");
+    let frame = harness.render();
+    assert!(
+        frame.contains("Editor: Ctrl+4 editor focus"),
+        "the box offers the way back: {frame}"
+    );
+    assert!(
+        !frame.contains("abort edit"),
+        "abort does not act here: {frame}"
+    );
+    harness.key("?");
+
+    harness.key("ctrl-4");
+    pump(
+        &mut harness,
+        &mut rx,
+        "the editor back with the keys",
+        |harness| {
+            let frame = harness.render();
+            frame.contains(READY) && frame.contains("Ctrl+4 to htui")
+        },
+    )
+    .await;
+    for key in ["x", "y", "z", "enter"] {
+        harness.key(key);
+    }
+    pump(&mut harness, &mut rx, "editor exit", |harness| {
+        !harness.app().editor_open()
+    })
+    .await;
+    harness.settle().await;
+
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("edited in $EDITOR"),
+        "the asking view heard `Edited`: {frame}"
+    );
+    harness.key("ctrl-end");
+    let frame = harness.render();
+    assert!(
+        frame.contains("xyz"),
+        "the typed line is in the draft: {frame}"
+    );
+    assert!(!file.exists(), "the temp file is removed");
+}
+
+/// MOD-57 M2 E4, B-M2-8 (PRD D5's other half): `ctrl-c` with htui holding the keys quits at once,
+/// with no question, and leaves no child.
+#[tokio::test]
+async fn ctrl_c_with_htui_holding_the_keys_quits_at_once_and_leaves_no_child() {
+    let dir = TempDir::new().expect("a temp dir");
+    let pidfile = dir.path().join("pid");
+    let cmd = script(
+        &dir,
+        &format!(
+            "printf '%s' $$ > \"{pid}\"; exec sleep 30",
+            pid = pidfile.display()
+        ),
+    );
+    let mut harness = open().await;
+    select(&mut harness, "implement");
+    harness.key("E");
+    let (tx, mut rx) = mpsc::channel(QUEUE);
+    open_editor(&mut harness, cmd, &tx);
+    pump(&mut harness, &mut rx, "editor pid", |_| {
+        read_pid(&pidfile).is_some()
+    })
+    .await;
+    let pid = read_pid(&pidfile).expect("the pid");
+    assert!(alive(&pid), "the editor runs");
+
+    harness.key("ctrl-4");
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "`ctrl-c` quits at once");
+    assert!(harness.app().overlays.top().is_none(), "no question");
     drop(harness);
     gone(&pid).await;
 }

@@ -141,6 +141,13 @@ impl OverlayStack {
         self.open.pop();
     }
 
+    /// Closes every open overlay `id`, wherever it is. `true` if one was open.
+    pub fn remove(&mut self, id: OverlayId) -> bool {
+        let before = self.open.len();
+        self.open.retain(|open| open.id() != id);
+        self.open.len() != before
+    }
+
     /// Closes every overlay: what a scope change does.
     pub fn clear(&mut self) {
         self.open.clear();

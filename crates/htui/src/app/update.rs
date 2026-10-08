@@ -27,13 +27,18 @@ impl App {
             Action::Overlay(overlay) => self.update_overlay(overlay),
             Action::Store(request) => self.dispatch(Origin::App, request),
             Action::Reply(envelope) => self.on_reply(envelope),
-            Action::SetScope { workspace } => self.set_scope(workspace),
+            // MOD-57 M2 E5: `set_scope` resets every tab, the asking one included.
+            Action::SetScope { workspace } => match self.editor_steer_refusal() {
+                Some(refusal) => self.status = Some(refusal),
+                None => self.set_scope(workspace),
+            },
             Action::Replay { step_id } => self.replay(step_id),
             Action::Promote { run, step } => self.promote(run, step),
             Action::Reveal(target) => self.reveal(&target),
             // The unstamped path (`Origin::App`, or a keymap binding): only a tab can open the
             // editor, because only a tab can be handed the outcome (MOD-9 D10).
             Action::EditExternally(_) => self.status = Some(EDITOR_NEEDS_A_TAB.to_owned()),
+            Action::AbortEdit => self.abort_editor(),
             Action::ToggleHelp => self.help_visible = !self.help_visible,
             Action::Error(message) => self.status = Some(message),
             Action::Tick => {
@@ -70,6 +75,11 @@ impl App {
             }
         }
         if self.tabs.active_id() != before {
+            // MOD-57 M2 R2 LOW-3: the abort question asks on the asking tab only; left up over
+            // another, its `editor.abort` would abort from there (E2).
+            if self.editor_tab().is_some() && self.tabs.active_id() != self.editor_tab() {
+                self.close_abort_question();
+            }
             self.activate_tab();
         }
     }
@@ -98,6 +108,14 @@ impl App {
         };
         self.overlays.pop();
         self.forget_overlay(id);
+    }
+
+    /// Closes the overlay `id` wherever it is in the stack and forgets its requests (D240): the
+    /// abort question when its edit ends (MOD-57 M2 R1 M-2). Nothing if it is not open.
+    pub(super) fn close_overlay(&mut self, id: OverlayId) {
+        if self.overlays.remove(id) {
+            self.forget_overlay(id);
+        }
     }
 
     /// Closes every overlay and forgets their requests (D240): `CloseAll` and a scope change.
@@ -271,7 +289,9 @@ impl App {
     /// Selects an entity in the tab registered for its kind (MOD-64 D235): focus that tab —
     /// which re-sends its `wants_requests` if it was not the active one — then hand it the target
     /// with a `Ctx` of its own, as `finish_external_edit` does, and drain what it emitted. A kind
-    /// nothing is registered for is a no-op, logged.
+    /// nothing is registered for is a no-op, logged. MOD-57 M2 E5: a reveal into the tab an
+    /// in-pane editor is open for is refused on the status line; it would re-select what the
+    /// edit waits on.
     fn reveal(&mut self, target: &RevealTarget) {
         let kind = target.kind();
         let Some(tab) = self
@@ -283,6 +303,10 @@ impl App {
             tracing::debug!(?kind, "no tab reveals this kind");
             return;
         };
+        if self.editor_tab() == Some(tab) {
+            self.status = self.editor_steer_refusal();
+            return;
+        }
         self.update_tab(TabAction::Focus(tab));
         let origin = Origin::Tab(tab);
         {

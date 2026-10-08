@@ -226,6 +226,14 @@ pub struct App {
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
     /// `startup_overlay` is one: the shell must not name a concrete view (MOD-1 blueprint D).
     pub migration_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// The quit question (MOD-57 M2 E4): opened by `global.quit` while an in-pane editor is
+    /// alive. Set by [`register_all`](crate::app::register_all), an id for `migration_overlay`'s
+    /// reason; `None` (a bare shell) quits at once, as M1 did.
+    pub quit_overlay: Option<crate::ui::overlay::OverlayId>,
+    /// The abort question (MOD-57 M2 R1 M-2): opened by `editor.abort` on the asking tab. Set by
+    /// [`register_all`](crate::app::register_all), an id for `migration_overlay`'s reason; `None`
+    /// (a bare shell) aborts at once, as M1 did.
+    pub abort_overlay: Option<crate::ui::overlay::OverlayId>,
     /// Tab that shows a replayed step (MOD-2 D39, `R-HIS-2`).
     ///
     /// Set by [`register_all`](crate::app::register_all), and an id for the same reason
@@ -304,6 +312,8 @@ impl App {
             ticks: 0,
             startup_overlay: None,
             migration_overlay: None,
+            quit_overlay: None,
+            abort_overlay: None,
             replay_tab: None,
             reveal_tabs: Vec::new(),
             migration_prompt_shown: false,
@@ -374,9 +384,10 @@ impl App {
     /// What the shell does for `act`: the fixed mapping, then the offered table. `None` for
     /// everything a view must handle (every shared context) and for an offerable act nobody
     /// offered.
-    fn action_for(&self, act: Act) -> Option<Action> {
+    pub(super) fn action_for(&self, act: Act) -> Option<Action> {
         match act {
-            Act::Quit => Some(Action::Quit),
+            // MOD-57 M2 E4: asks first while an in-pane editor is alive.
+            Act::Quit => Some(self.request_quit()),
             Act::NextTab => Some(Action::Tab(TabAction::Next)),
             Act::PrevTab => Some(Action::Tab(TabAction::Prev)),
             Act::Help => Some(Action::ToggleHelp),
@@ -488,6 +499,15 @@ impl App {
                         }
                         _ => self.update(Action::Error(EDITOR_NEEDS_A_TAB.to_owned())),
                     },
+                    // MOD-57 M2 R2 LOW-2: only the abort question confirms an abort. The bare
+                    // shell's direct abort (no question registered) goes through `update`, not
+                    // here.
+                    Action::AbortEdit => match origin {
+                        Origin::Overlay(id) if self.abort_overlay == Some(*id) => {
+                            self.update(Action::AbortEdit);
+                        }
+                        _ => tracing::warn!(?origin, "AbortEdit from outside the abort question"),
+                    },
                     other => self.update(other),
                 }
             }
@@ -583,8 +603,9 @@ impl App {
     /// field refused says why through the same line.
     ///
     /// MOD-57: while an in-pane editor is alive a paste follows a key's rule (R0 F2): to the
-    /// editor while it has the keys, else swallowed or dropped (the M1 lock), except unfocused
-    /// under a modal overlay, where the overlay's path below has it. It never reaches a view.
+    /// editor while it has the keys, else swallowed (the first that finds it without them) or,
+    /// on the asking tab, dropped; under a modal overlay the overlay's path below has it, and on
+    /// another tab that tab's (M2 E3). It never reaches the asking view.
     pub fn on_paste(&mut self, text: &Zeroizing<String>) {
         self.dirty = true;
         if self.editor.is_some() && self.editor_paste(text) {
@@ -667,11 +688,11 @@ impl App {
     /// click through them would act on what they hide (blueprint E7) — and the active tab must
     /// want it.
     ///
-    /// MOD-57: off while an in-pane editor is alive, so the terminal keeps its own selection over
-    /// the pane; M2 narrows this to a focused pane on screen.
+    /// MOD-57 M2 E8: off while the in-pane editor is on screen (the pane draws over the view, and
+    /// the terminal keeps its own selection over it); on another tab the view decides.
     #[must_use]
     pub fn wants_mouse(&self) -> bool {
-        self.editor.is_none()
+        !self.editor_visible()
             && self.overlays.is_empty()
             && !self.help_visible
             && self.tabs.active().is_some_and(Tab::wants_mouse)
@@ -779,9 +800,10 @@ impl App {
         self.status = None;
         let chord = KeyChord::from_event(key);
 
-        // MOD-57 P5, P6: a live in-pane editor answers first. Focused, it takes every key,
-        // `ctrl-c` included (ANA-26 §6.4's one exception); unfocused, the M1 lock, except under a
-        // modal overlay, whose keys take the path below.
+        // MOD-57 P5, P6, M2 E1-E3: a live in-pane editor answers first. Focused, it takes every
+        // key, `ctrl-c` included (ANA-26 §6.4's one exception); on the asking tab, the editor's and
+        // the global keys only; on another tab, only `editor.focus`. `ctrl-c` and a modal
+        // overlay's keys take the path below.
         if self.editor.is_some() && self.editor_key(key, chord) {
             return;
         }
@@ -949,10 +971,16 @@ impl App {
             Some(message) => (message.clone(), self.theme.error),
             None => (
                 self.editor_status().unwrap_or_else(|| {
-                    self.keys
+                    let line = self
+                        .keys
                         .status_line(self.active_stack().unwrap_or(Stack::BASE), |act| {
                             self.action_for(act).is_some()
-                        })
+                        });
+                    // MOD-57 M2 E6: another tab's line, led by the open edit.
+                    match self.editor_notice() {
+                        Some(notice) => format!("{notice}{line}"),
+                        None => line,
+                    }
                 }),
                 self.theme.dim,
             ),
@@ -972,8 +1000,13 @@ impl App {
     /// The `?` box (MOD-67 D8), rebuilt from the live state every frame. With a converted view
     /// holding the keyboard ([`App::active_stack`]): one line per layer of its stack, then the
     /// closing line its global layer admits. Otherwise today's box: the overlay context (if one
-    /// is up), the editor context (while an in-pane editor is alive, MOD-57), the active tab's
-    /// legacy rows, the global context, then the closing line.
+    /// is up), the active tab's legacy rows, the global context, then the closing line.
+    ///
+    /// MOD-57 M2 E7 (PD-M2-2): with an in-pane editor alive the box lists the editor keys that
+    /// act where the user is. On the asking tab, [`Stack::EDITOR_OPEN`]'s box (the editor's keys,
+    /// then every global; none of the asking tab's own, which it refuses); on another tab,
+    /// `editor.focus` first, then that view's box; under a modal overlay, the overlay's box with
+    /// no editor key.
     ///
     /// Each logical line is packed into rows that fit the box ([`HelpLine::rows`]), so the box is
     /// exactly as tall as what it shows and no row is clipped.
@@ -981,18 +1014,30 @@ impl App {
         let box_width = area.width.saturating_sub(10).max(20);
         let inner = usize::from(box_width.saturating_sub(2));
         let offered = |act| self.action_for(act).is_some();
+        // MOD-57 M2 E7 (PD-M2-2): the editor keys that act where the user is.
+        let uncovered = self.editor.is_some() && !self.editor_covered();
+        let locked = uncovered && self.editor_visible();
+        let elsewhere = uncovered && !self.editor_visible();
         let mut lines: Vec<HelpLine> = Vec::new();
-        let closer = match self.active_stack() {
+        if elsewhere {
+            lines.extend(
+                self.keys
+                    .help_line(Context::Editor, |act| act == Act::EditorFocus),
+            );
+        }
+        let stack = if locked {
+            Some(Stack::EDITOR_OPEN)
+        } else {
+            self.active_stack()
+        };
+        let closer = match stack {
             Some(stack) => {
-                lines = self.keys.help_lines(stack, offered);
+                lines.extend(self.keys.help_lines(stack, offered));
                 self.keys.help_closer(stack)
             }
             None => {
                 if !self.overlays.is_empty() {
                     lines.extend(self.keys.help_line(Context::Overlay, offered));
-                }
-                if self.editor.is_some() {
-                    lines.extend(self.keys.help_line(Context::Editor, |_| true));
                 }
                 if let Some(tab) = self.tabs.active() {
                     let legacy = self.keymap.help_line(&KeyScope::Tab(tab.id()));

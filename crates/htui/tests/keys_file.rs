@@ -4,7 +4,8 @@
 //! - `binary` (Unix): `htui --keys F --print-keys` prints the table (exit 0) or the exact §7.5
 //!   report on stderr (exit 2, nothing on stdout); a bad file stops the TUI before the terminal;
 //!   a missing named file exits 2; clap refuses `--keys` beside `--default-keys`. An entry that
-//!   takes `ctrl-q` from the defaulted queue loads with a notice on stderr (MOD-12 M3 R1 H1).
+//!   takes `ctrl-q` from the defaulted queue loads with a notice on stderr (MOD-12 M3 R1 H1), and
+//!   so does a global one that takes `ctrl-x` from the defaulted editor abort (MOD-57 M2 R1 M-1).
 //! - `default_path` (Linux): the config directory's `keys.toml` is read, a missing one is the
 //!   defaults and creates nothing, `--default-keys` ignores a broken one.
 //! - `app` (`testkit`): a shell whose `app.keys` came from `valid.toml` quits on the rebound chord
@@ -283,6 +284,43 @@ mod binary {
         assert!(row("quit").ends_with("# quit (changed)"), "{stdout}");
     }
 
+    /// MOD-57 M2 R1 M-1: the README's example before M2 binds `ctrl-x` in `[global]`, which
+    /// `editor.abort` holds by default while an edit is open. The file still loads: the global
+    /// entry takes `ctrl-x`, stderr says so, and `--print-keys` marks the abort row with it.
+    #[test]
+    fn a_global_ctrl_x_binding_takes_ctrl_x_from_the_editor_abort_with_a_notice() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = fixture("quit_ctrl_x");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(0), "{stderr}");
+        assert_eq!(
+            stderr,
+            format!(
+                "htui: {}:7: [global] quit = \"ctrl-x\" takes \"ctrl-x\" from editor.abort, which \
+                 is now unbound\n",
+                path.display()
+            )
+        );
+        assert_eq!(stdout, print(&load_path(&path).expect("the file loads")));
+        let row = |name: &str| {
+            stdout
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("no {name} row in {stdout}"))
+                .to_owned()
+        };
+        assert!(row("abort").contains("= []"), "{stdout}");
+        assert!(
+            row("abort").ends_with("# abort edit (unbound by global.quit)"),
+            "{stdout}"
+        );
+        assert!(row("quit").ends_with("# quit (changed)"), "{stdout}");
+    }
+
     /// Two entries of the file on one chord are still refused (MOD-67 M2 D8 step 5), even when
     /// one of them repeats its action's default.
     #[test]
@@ -320,8 +358,8 @@ mod binary {
         let (stdout, stderr) = text(&output);
         assert_eq!(output.status.code(), Some(2), "{stderr}");
         assert_eq!(stdout, "");
-        let line = "2: [editor] focus: must keep at least one chord: the in-pane editor is left \
-                    only through it";
+        let line = "2: [editor] focus: must keep at least one chord: the editor takes every \
+                    other key";
         assert_eq!(stderr, report("editor", &path, &[line.to_owned()]));
     }
 

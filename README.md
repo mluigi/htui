@@ -227,11 +227,13 @@ key to keep it.
 htui refuses to start on an invalid file and names every bad line, as in
 `keys.toml:5: [global] quit = "ctrl-c": ctrl-c always quits and cannot be bound`;
 `htui --default-keys` starts with the default keys anyway. Two actions you list with the same key
-are an error. A default never gives way to a key from another table: a key shared between a
-pop-up's keys and `[global] help` is an error in either direction (such as `esc` for
-`[global] help`, or `f1` for `[overlay] close`). `ctrl-c` always quits and cannot be bound.
-A key the in-pane editor uses (`ctrl-4` to focus it, `ctrl-x` to abort it) is refused for
-`[global] quit` and `help`, and `[editor] focus` must keep a key.
+are an error. A default gives way to a key from another table in one case only: a `[global]` key
+may take the in-pane editor's abort key (`ctrl-x`) from `[editor] abort`, which is then unbound,
+with the same notice. Otherwise a key shared between a pop-up's keys and `[global] help` is an
+error in either direction (such as `esc` for `[global] help`, or `f1` for `[overlay] close`).
+`[editor] focus` must keep a key, and no other action in any table may use it.
+`ctrl-c` always quits and cannot be bound. The `[editor]` rules are in
+[`docs/htui-editor.md`](docs/htui-editor.md#the-editor-keys-in-keystoml).
 
 A table named after a Settings section, a Skills view, `[requirements]` or a pop-up changes a
 shared action there alone: `[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every
@@ -612,4 +614,4 @@ arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 - [`docs/personas.md`](docs/personas.md): agent personas and how they narrow a step.
 - [`docs/htui-mcp.md`](docs/htui-mcp.md): htui's MCP server, the tools every agent session gets.
 - [`docs/htui-secrets.md`](docs/htui-secrets.md): the Infisical secret provider — machine identity, base URL, errors.
-- [`docs/htui-editor.md`](docs/htui-editor.md): `E`/`Ctrl+E`, `$VISUAL`/`$EDITOR`, and the in-pane editor (`HTUI_EDITOR_PANE`).
+- [`docs/htui-editor.md`](docs/htui-editor.md): `E`/`Ctrl+E`, `$VISUAL`/`$EDITOR`, and the in-pane editor (`HTUI_EDITOR_PANE`): working in other tabs while it waits, the quit and abort questions, and the `[editor]` key table.

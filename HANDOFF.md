@@ -14,7 +14,10 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-08):** **ANA-29 is concluded** (`docs/ANA-29.md`,
+**Current status (2026-10-08):** **MOD-57 is done** (`docs/decisions/mod/mod-57.md`): with `HTUI_EDITOR_PANE=1`,
+`E`/`Ctrl+E` run `$VISUAL`/`$EDITOR` inside the asking pane; with focus in htui (`Ctrl+4`) every other tab works
+while the editor waits, and quit and abort ask first. Owed on the host: an nvim run in the pane and the PRD's
+10-edit trial. Before it, **ANA-29 was concluded** (`docs/ANA-29.md`,
 `docs/decisions/ana/ana-29.md`): Claude Code mods (in-process JS/TS handlers shipped in plugins) for
 developing htui and for using it elsewhere. htui-driven `claude -p` sessions load the user's mods and
 settings hooks today, so **MOD-91** isolates them first; dev side gets one committed `htui-dev` mod
@@ -214,7 +217,9 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   isolation flags against a subscription login, MOD-92's `--json` verbs (keyring DSN, exit codes),
   and MOD-93's `htui claude emit` with a `claude plugin marketplace add` of the emitted directory,
   with the mod reaching `htui.exe` through `$.process.run`. Mods themselves are documented with
-  PowerShell setup and `;` path lists, but native Windows behaviour is unconfirmed.
+  PowerShell setup and `;` path lists, but native Windows behaviour is unconfirmed. MOD-57 is done
+  (`docs/decisions/mod/mod-57.md`); its M2 adds to this check: other tabs working while the ConPTY editor
+  waits, and the quit and abort questions killing it.
 
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
@@ -280,34 +285,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   the executing box resolves a project's secrets with the machine identity in its own keyring; a headless worker
   without one refuses, and delivering it is this item's.
 
-- [ ] **MOD-57 - Run the external editor inside the TUI pane** (from MOD-9, `docs/decisions/mod/mod-9.md`;
-  merge of MOD-7 milestone 2, maintainer-decided 2026-09-26). `R-TUI-1`, `R-TUI-7`, `R-NF-1`. Today `E`/`Ctrl+E`
-  in the Templates editor (and any later user of the shared `ui::TextArea`) suspends the whole TUI
-  and runs `$VISUAL`/`$EDITOR` full-screen (`crates/htui/src/editor.rs`). Offer a toggle that runs
-  the editor inside the editing pane instead, with the rest of the TUI still drawn: a pseudo-terminal
-  (`portable-pty`, ConPTY on Windows) feeding a VT parser (`vt100`) drawn by a ratatui widget
-  (`tui-term`), keys forwarded to the child with one reserved chord to leave, resize forwarded,
-  and the file read back through the same `parse` gate on exit. Works for any editor, nvim
-  included. The alternative, nvim's `--embed` RPC UI (`nvim-rs`), is nvim-only and was not
-  preferred. The three crates are not in `Cargo.lock`, so the plan owns that dependency decision.
-  Not blocked. Its in-app widget draws through `ui::cells` (MOD-54, done:
-  `docs/decisions/mod/mod-54.md`), and every other row fits through the same module (MOD-60,
-  done: `docs/decisions/mod/mod-60.md`).
-  **Keys (ANA-26, `R-TUI-10`):** the reserved leave chord is an action in MOD-67's catalogue, never a
-  hard-coded key, and this pane is the one place `ctrl-c` is forwarded instead of quitting; the
-  leave action must stay bound (`docs/ANA-26.md` §6.4).
-  **Phase 1 landed (`1c8c9e3c`..`a464ac21`, 2026-10-08):** the editor in the pane, opt-in with
-  `HTUI_EDITOR_PANE=1` (user guide `docs/htui-editor.md`). `portable-pty` 0.9 and `vt100` 0.16 with
-  htui's own widget (not `tui-term`), plus unix-only `rustix` for a process-group kill (PD-10). The
-  pane draws over the asking view's editing area, or the tab body below 40x8. Catalogue context
-  `editor`: `editor.focus` (`ctrl-4`, which `Ctrl+\` sends on unix) and `editor.abort` (`ctrl-x`).
-  Focused, every key goes to the editor, `ctrl-c` included; unfocused, the M1 lock (focus, abort,
-  quit, help; a modal prompt takes the keys after one swallowed key). Review R1 fixed a `vt100`
-  ICH/IL/SD stall on the UI task (stateful CSI clamp) and added back-pressure (bounded channel,
-  time-boxed drain). Residue: R1 L-2 (stray keystrokes on a thread-spawn failure); the nvim run is
-  owed on the host; the Windows half is MOD-16's. Plan `.claude/plans/mod-57-m1-editor-in-pane.plan.md`.
-  **Remaining: M2** - htui usable while an edit is open (tabs, the quit confirm), then close-out.
-
 - [ ] **MOD-67 - Configurable hotkeys: named actions, `keys.toml`, generated hints** (from ANA-26,
   `docs/ANA-26.md`, `docs/decisions/ana/ana-26.md`). `R-TUI-10`, `R-TUI-1`, `R-STO-1`, `R-NF-1`.
   Every key outside text entry becomes a named action in one compiled-in catalogue (about 100
@@ -354,11 +331,12 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `NO_MATCHES` `Ctrl+R`, `RELOADED` "press p again", `NOT_A_VALUE_ROW` "`e` edits"); a `picker`
   context for the hierarchy directory picker (L-C Q3)
   (`.claude/plans/mod-67-m3-settings-overlays.plan.md`, "Review gate").
-  **MOD-57 M1 appended (2026-10-08)** `Context::Editor` (`editor.focus` `ctrl-4`, `editor.abort`
-  `ctrl-x`) and `Stack::EDITOR_FOCUSED`/`EDITOR_UNFOCUSED` to the catalogue. Whichever of MOD-57 and
-  M2 lands second: the loader keeps `editor.focus` bound beside `overlay.close`, refuses `ctrl-c` in
-  `[editor]`, gains the `Context::Editor` arm, and checks `[editor]` chords against `global.quit`
-  and `global.help` (`.claude/plans/mod-57-m1-editor-in-pane.blueprint.md` §6.4).
+  **MOD-57 (done, `docs/decisions/mod/mod-57.md`)** added `Context::Editor` (`editor.focus` `ctrl-4`,
+  `editor.abort` `ctrl-x`), `Stack::EDITOR_FOCUSED`/`EDITOR_OPEN` and `views::QUIT_CONFIRM`/`ABORT_CONFIRM`
+  (`DECLARED` 39). Its M2 landed the loader follow-ups: `editor.focus` must keep a chord and never gives
+  way, its chord is refused in every other table, `[editor]` is checked against every global "while an
+  edit is open", and a `[global]` entry may take `editor.abort`'s default chord (give-way across tables,
+  that one case only).
   **MOD-12 M3 changed one M2 rule (2026-10-08, `docs/decisions/mod/mod-12.md`, review R1 H1):** within one
   table a user's entry takes a chord from an action left at its default (that action loses it, with a stderr
   notice and a `--print-keys` mark); two user entries on one chord stay an error. It also added the global

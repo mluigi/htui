@@ -230,6 +230,12 @@ impl TabRegistry {
         }
     }
 
+    /// The title of the tab with this id; `None` when it is not registered.
+    #[must_use]
+    pub fn title(&self, id: TabId) -> Option<&str> {
+        self.tabs.iter().find(|t| t.id() == id).map(|t| t.title())
+    }
+
     /// The tab strip's input: every tab's id and title in registration order.
     #[must_use]
     pub fn titles(&self) -> Vec<(TabId, &str)> {

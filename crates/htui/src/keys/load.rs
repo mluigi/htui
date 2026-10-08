@@ -415,22 +415,26 @@ impl Loader<'_> {
                 Ok(chord) => chords.push(chord),
             }
         }
-        if items.is_empty() {
-            // The two acts nothing else replaces (MOD-67 M2 D8; M4 D8.1, MOD-57 §6.4).
-            let why = match spec.act {
-                Act::OverlayClose => Some("overlays swallow every other key"),
-                Act::EditorFocus => Some("the in-pane editor is left only through it"),
-                _ => None,
-            };
-            if let Some(why) = why {
-                self.push(
-                    key_line,
-                    format!("[{table}] {name}: must keep at least one chord: {why}"),
-                );
-            }
+        if items.is_empty()
+            && let Some(reason) = must_keep(spec.act)
+        {
+            self.push(
+                key_line,
+                format!("[{table}] {name}: must keep at least one chord: {reason}"),
+            );
         }
         self.keys.set(context, spec.act, chords, key_line);
         self.set.push((context, spec.act));
+    }
+}
+
+/// Why `act` must keep at least one chord (ANA-26 §7.4 step 6), or `None`.
+const fn must_keep(act: Act) -> Option<&'static str> {
+    match act {
+        Act::OverlayClose => Some("overlays swallow every other key"),
+        // MOD-57 M2 E9 (a): the one way back from a focused in-pane editor.
+        Act::EditorFocus => Some("the editor takes every other key"),
+        _ => None,
     }
 }
 
@@ -666,6 +670,18 @@ mod tests {
         );
     }
 
+    /// MOD-57 M2 E9 (a): the one way back from a focused in-pane editor.
+    #[test]
+    fn the_editor_focus_must_keep_a_chord() {
+        assert_eq!(
+            errors("[editor]\nfocus = []\n"),
+            one(
+                2,
+                "[editor] focus: must keep at least one chord: the editor takes every other key"
+            )
+        );
+    }
+
     #[test]
     fn overlay_close_must_keep_a_chord() {
         assert_eq!(
@@ -692,8 +708,7 @@ mod tests {
             errors("[editor]\nfocus = []\n"),
             one(
                 2,
-                "[editor] focus: must keep at least one chord: the in-pane editor is left only \
-                 through it"
+                "[editor] focus: must keep at least one chord: the editor takes every other key"
             )
         );
         assert_eq!(

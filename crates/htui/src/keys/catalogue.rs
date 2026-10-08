@@ -744,8 +744,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // `legacy_arrival`; `ctrl-\` itself is refused as indistinguishable). On Windows crossterm
     // delivers `ctrl-\` as `Char('\\')` + CONTROL, so there only a physical `ctrl-4` matches
     // (MOD-16 H-10/H-11, T7's docs). In capture: while the editor is focused every other key,
-    // `ctrl-c` included, is the editor's. The loader refuses a file that unbinds it (MOD-67 M4
-    // D8.1), as it does `overlay.close`.
+    // `ctrl-c` included, is the editor's. The loader refuses a file that unbinds it, as it does
+    // `overlay.close`, and it never gives way (MOD-57 M2 E9 (a), (b)).
     capture_row(
         Act::EditorFocus,
         Editor,
@@ -753,8 +753,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["ctrl-4"],
         "editor focus",
     ),
-    // Offered only while the editor is unfocused (`Stack::EDITOR_UNFOCUSED`): focused, `ctrl-x`
-    // is nano's exit and goes to the editor.
+    // Offered only on the asking tab while the editor is unfocused (`Stack::EDITOR_OPEN`):
+    // focused, `ctrl-x` is nano's exit and goes to the editor.
     row(Act::EditorAbort, Editor, "abort", &["ctrl-x"], "abort edit"),
     // [settings]: the Settings tab's own section cycling (MOD-67 M3 D1). Every non-capturing
     // section stack carries this layer, so a section's view layer may override both.
@@ -1218,7 +1218,8 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
 /// (`every_allow_list_entry_is_demanded`).
 pub static SHADOWING: &[(Act, Act)] = &[
     // migration_prompt.rs:97 + VIEW_DEFAULTS: `[migration] no` derives ["n", "esc", "N"], and
-    // `Esc` is also overlay.close below it. Both close the prompt, nothing applied.
+    // `Esc` is also overlay.close below it. Both close the prompt, nothing applied. And the quit
+    // question (`views::QUIT_CONFIRM`): `Esc` is `confirm.no` there too.
     (Act::ConfirmNo, Act::OverlayClose),
 ];
 

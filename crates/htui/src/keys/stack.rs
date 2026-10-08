@@ -3,7 +3,7 @@
 //! A stack lists the contexts a key reaches, narrowest first (MOD-67 D6). MOD-67 M1 shipped two:
 //! [`Stack::BASE`] (the global layer) and [`Stack::OVERLAY`] (the overlay layer, then only
 //! `global.help`). MOD-57 adds the editor's two: [`Stack::EDITOR_FOCUSED`] and
-//! [`Stack::EDITOR_UNFOCUSED`]. A row for an act in a narrower layer shadows that act in every
+//! [`Stack::EDITOR_OPEN`]. A row for an act in a narrower layer shadows that act in every
 //! wider layer, bound or not (blueprint B6): that is how M2's narrower overrides and
 //! `reject = []` work. [`DECLARED`] lists every stack the key file's validator walks (MOD-67 M2 D8
 //! step 5); M3 adds every Settings and overlay mode's stack from [`views`](super::views).
@@ -195,14 +195,16 @@ impl Stack<'static> {
     /// toggle resolves; every other chord, `ctrl-c` included, is written to the editor.
     pub const EDITOR_FOCUSED: Self = Self(&[Layer::only(Context::Editor, &[Act::EditorFocus])]);
 
-    /// `[editor, global ∩ {quit, help}]`: MOD-57 P6, the M1 lock. With the editor alive and
-    /// unfocused nothing else resolves; `App` refuses every other key on the status line. M2 opens
-    /// the rest of htui.
-    pub const EDITOR_UNFOCUSED: Self = Self(&[
-        Layer::all(Context::Editor),
-        Layer::only(Context::Global, &[Act::Quit, Act::Help]),
-    ]);
+    /// `[editor, global]`: MOD-57 M2 (E3). With the editor alive, unfocused and on screen, a key
+    /// resolves through the editor's two actions, then every global action; `App` refuses what
+    /// nothing resolves, so the asking view never sees it. On any other tab only `editor.focus`
+    /// (`EDITOR_FOCUSED`) is checked ahead of the view (E1).
+    pub const EDITOR_OPEN: Self = Self(&[Layer::all(Context::Editor), Layer::all(Context::Global)]);
 }
+
+/// The phrase of every collision with the editor's keys (MOD-57 M2 E9): `DECLARED`'s entry for
+/// `Stack::EDITOR_OPEN` and `validate`'s focus pass.
+pub(super) const WHILE_EDITING: &str = "while an edit is open";
 
 /// Every stack the validator walks (ANA-26 §7.3, MOD-67 M2 D8 step 5), each with the phrase its
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
@@ -213,7 +215,6 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("on every screen", Stack::BASE),
     ("over an overlay", Stack::OVERLAY),
     ("in the focused in-pane editor", Stack::EDITOR_FOCUSED),
-    ("in the in-pane editor", Stack::EDITOR_UNFOCUSED),
     ("in Settings", views::SETTINGS_TAB),
     ("while a field captures keys", views::CAPTURE),
     ("in Settings > Agents", views::AGENTS_BROWSE),
@@ -284,6 +285,9 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
         "in the Requirements withdraw form",
         views::REQUIREMENTS_WITHDRAW,
     ),
+    ("in the quit question", views::QUIT_CONFIRM),
+    ("in the abort question", views::ABORT_CONFIRM),
+    (WHILE_EDITING, Stack::EDITOR_OPEN),
 ];
 
 impl Keys {
@@ -326,7 +330,7 @@ impl Keys {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{DECLARED, Layer, Stack};
+    use super::{DECLARED, Layer, Stack, WHILE_EDITING};
     use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, load_str, views};
 
     fn chord(spec: &str) -> KeyChord {
@@ -367,11 +371,8 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        assert_eq!(
-            DECLARED[3],
-            ("in the in-pane editor", Stack::EDITOR_UNFOCUSED)
-        );
-        assert_eq!(DECLARED.len(), 56);
+        assert_eq!(DECLARED.len(), 58);
+        assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
     }
@@ -465,7 +466,7 @@ mod tests {
         assert_eq!(keys.actions(Stack::BASE, CTRL_C), []);
         assert_eq!(keys.actions(Stack::OVERLAY, CTRL_C), []);
         assert_eq!(keys.actions(Stack::EDITOR_FOCUSED, CTRL_C), []);
-        assert_eq!(keys.actions(Stack::EDITOR_UNFOCUSED, CTRL_C), []);
+        assert_eq!(keys.actions(Stack::EDITOR_OPEN, CTRL_C), []);
     }
 
     #[test]
@@ -507,8 +508,8 @@ mod tests {
         keys.actions(Stack::EDITOR_FOCUSED, chord(spec))
     }
 
-    fn unfocused(keys: &Keys, spec: &str) -> Vec<Act> {
-        keys.actions(Stack::EDITOR_UNFOCUSED, chord(spec))
+    fn open(keys: &Keys, spec: &str) -> Vec<Act> {
+        keys.actions(Stack::EDITOR_OPEN, chord(spec))
     }
 
     #[test]
@@ -521,15 +522,22 @@ mod tests {
     }
 
     #[test]
-    fn the_unfocused_editor_stack_is_the_m1_lock() {
+    fn the_open_editor_stack_is_the_editor_then_every_global() {
         let keys = Keys::compiled();
-        assert_eq!(unfocused(keys, "ctrl-4"), [Act::EditorFocus]);
-        assert_eq!(unfocused(keys, "ctrl-x"), [Act::EditorAbort]);
-        assert_eq!(unfocused(keys, "q"), [Act::Quit]);
-        assert_eq!(unfocused(keys, "?"), [Act::Help]);
-        assert_eq!(unfocused(keys, "f1"), [Act::Help]);
-        for spec in ["tab", "1", "w", "ctrl-f", "ctrl-w", "esc", "e", "ctrl-s"] {
-            assert_eq!(unfocused(keys, spec), [], "{spec}");
+        assert_eq!(open(keys, "ctrl-4"), [Act::EditorFocus]);
+        assert_eq!(open(keys, "ctrl-x"), [Act::EditorAbort]);
+        assert_eq!(open(keys, "q"), [Act::Quit]);
+        assert_eq!(open(keys, "?"), [Act::Help]);
+        assert_eq!(open(keys, "f1"), [Act::Help]);
+        assert_eq!(open(keys, "tab"), [Act::NextTab]);
+        assert_eq!(open(keys, "shift-tab"), [Act::PrevTab]);
+        assert_eq!(open(keys, "1"), [Act::SelectTab1]);
+        assert_eq!(open(keys, "w"), [Act::Workspaces]);
+        assert_eq!(open(keys, "ctrl-f"), [Act::Find]);
+        assert_eq!(open(keys, "ctrl-w"), [Act::Waiting]);
+        assert_eq!(open(keys, "ctrl-q"), [Act::Queue]);
+        for spec in ["esc", "e", "j", "ctrl-s"] {
+            assert_eq!(open(keys, spec), [], "{spec}");
         }
     }
 
@@ -538,17 +546,14 @@ mod tests {
         let keys = Keys::compiled();
         let label = |stack, act| keys.label(stack, act);
         assert_eq!(
-            label(Stack::EDITOR_UNFOCUSED, Act::EditorFocus).as_deref(),
+            label(Stack::EDITOR_OPEN, Act::EditorFocus).as_deref(),
             Some("Ctrl+4")
         );
         assert_eq!(
-            label(Stack::EDITOR_UNFOCUSED, Act::EditorAbort).as_deref(),
+            label(Stack::EDITOR_OPEN, Act::EditorAbort).as_deref(),
             Some("Ctrl+x")
         );
-        assert_eq!(
-            label(Stack::EDITOR_UNFOCUSED, Act::Quit).as_deref(),
-            Some("q")
-        );
+        assert_eq!(label(Stack::EDITOR_OPEN, Act::Quit).as_deref(), Some("q"));
         assert_eq!(label(Stack::EDITOR_FOCUSED, Act::EditorAbort), None);
     }
 }

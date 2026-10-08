@@ -9,8 +9,8 @@ MOD-9 (the handoff) and MOD-57 (the in-pane editor).
 
 By default htui gives the whole terminal to the editor and takes it back when the editor exits
 ([the suspended editor](#the-suspended-editor)). With `HTUI_EDITOR_PANE` set, the editor runs
-inside htui instead, drawn over the view that asked for it
-([the in-pane editor](#the-in-pane-editor)).
+inside htui instead, drawn over the view that asked for it, and the rest of htui stays usable
+while it waits ([the in-pane editor](#the-in-pane-editor)).
 
 - [Choosing the editor](#choosing-the-editor)
 - [What comes back](#what-comes-back)
@@ -18,7 +18,9 @@ inside htui instead, drawn over the view that asked for it
 - [The suspended editor](#the-suspended-editor)
 - [The in-pane editor](#the-in-pane-editor)
 - [The keys](#the-keys)
-- [While the editor is open (the M1 lock)](#while-the-editor-is-open-the-m1-lock)
+- [While the editor is open](#while-the-editor-is-open)
+- [The quit and abort questions](#the-quit-and-abort-questions)
+- [The editor keys in `keys.toml`](#the-editor-keys-in-keystoml)
 - [Where the pane draws](#where-the-pane-draws)
 - [Limits](#limits)
 - [Windows](#windows)
@@ -109,21 +111,21 @@ htui
 - A paste, like all input queued on its way to the editor, is zeroized in htui's memory once
   written (a paste may be a credential). That covers the input path only: the text you edit also
   sits in the temporary file and in the pane's screen grid, neither of which is zeroized.
-- One editor at a time. A second `E`/`Ctrl+E` while one is open (from a view a reply opened, say)
-  is answered `an editor is already open: return to it or abort it first`.
+- One editor at a time. A second `E`/`Ctrl+E` while one is open (on another tab, say) is
+  answered `an editor is already open: return to it or abort it first`.
 
 If the pane cannot start (no pseudo-terminal available), the view says so and suggests unsetting
 `HTUI_EDITOR_PANE`.
 
 ## The keys
 
-| Key | When | Does |
+| Key | Where | Does |
 |---|---|---|
-| `Ctrl+\`, shown as `Ctrl+4` | always, except under a modal prompt ([below](#while-the-editor-is-open-the-m1-lock)) | gives htui the keys, and back to the editor |
-| `Ctrl+x` | htui has the keys | aborts the edit: the editor is killed, nothing is read back |
-| `q` | htui has the keys | quits htui at once; the editor is killed, the edit is lost |
-| `Ctrl+C` | htui has the keys | quits htui, as everywhere in htui |
-| `?` or `F1` | htui has the keys | the help box |
+| `Ctrl+\`, shown as `Ctrl+4` | every tab, except under a modal pop-up ([below](#while-the-editor-is-open)) | gives htui the keys, and back to the editor; from another tab it brings the editor's tab back with the editor holding the keys |
+| `Ctrl+x` | the editor's tab, htui has the keys | asks first; `Ctrl+x` again aborts the edit: the editor is killed, nothing is read back ([the abort question](#the-abort-question)) |
+| `q` | every tab, htui has the keys | asks first; `y` quits htui, kills the editor and loses the edit ([the quit question](#the-quit-question)) |
+| `Ctrl+C` | every tab, htui has the keys | quits htui at once, as everywhere in htui, under a question too; the editor is killed, the edit is lost |
+| `?` or `F1` | htui has the keys | the help box, with the editor keys that act where you are |
 
 **While the editor has the keys, every key is the editor's**, `Ctrl+C` included (it is the
 editor's own interrupt, as in a terminal: vim cancels, nano shows the cursor position), `Ctrl+x`
@@ -137,34 +139,152 @@ Windows `Ctrl+\` arrives as itself, so there only a physical `Ctrl+4` toggles th
 | | Pane title | Status line |
 |---|---|---|
 | the editor has the keys | `<value> · Ctrl+4 to htui` | `the editor has the keys · Ctrl+4 to htui` |
-| htui has the keys | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · q quit · ? help` |
+| htui has the keys, on the editor's tab | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help` |
+| a modal pop-up over the editor's tab | `<value> · htui has the keys` | `the editor is open: close this first` |
+| on another tab | (the pane is not drawn) | `editing in <Tab> · Ctrl+4 back · `, then that tab's own line |
+
+`<Tab>` is the editor's tab as the tab bar names it: `Skills` for a Templates or Library edit,
+`Backlog` for the item form, Notes and Documents. `Ctrl+4 back` is left out where it would not act:
+under a modal pop-up, and while the next key is about to be swallowed
+([below](#while-the-editor-is-open)). An error on the status line replaces the whole line, as it
+does without an editor.
 
 Both keys are generated from htui's key catalogue (the `editor` context: `editor.focus` and
-`editor.abort`), so the labels follow a rebinding. Rebinding them through `keys.toml` arrives with
-MOD-67's user keymap; `editor.focus` will have to stay bound.
+`editor.abort`), so the labels follow a rebinding in `keys.toml`
+([the editor keys in `keys.toml`](#the-editor-keys-in-keystoml)).
 
-## While the editor is open (the M1 lock)
+## While the editor is open
 
-In this first version, while an editor is open and htui has the keys, htui answers **only** the
-keys in the table above: `Ctrl+4`, `Ctrl+x`, `q`, `?`, `F1` and `Ctrl+C`. Every other key is refused
-with `the editor is open: Ctrl+4 to the editor · Ctrl+x abort`, and nothing in the view, the tab
-bar or an overlay moves. A paste goes to the editor while it has the keys (as a bracketed paste
-when the editor asked for one); while htui has the keys it is dropped, unless a modal prompt is
-open, which takes it as it takes the keys.
+The editor waits in its pane, with the tab that asked for it; the rest of htui keeps working.
 
-- `q` and `Ctrl+C` quit at once, without a confirmation, and kill the editor: an unsaved edit is
-  lost. Leave the editor normally (`:wq`, `Ctrl+X`) to keep it.
-- A modal prompt that a store reply opens during the edit (a migration prompt, say) takes htui's
-  keys: the status line reads `the editor is open: answer or close the prompt first`. Keys and
-  pastes go to the prompt, `Ctrl+4` included (`Ctrl+C` still quits). Answer or close it; then the
-  lock is back. The first key you type for the editor when such a prompt appears is swallowed
-  rather than answering a prompt you had not seen yet.
-- The editor stays with the tab that asked. Should a reply move htui to another tab, the first
-  key typed for the editor is swallowed the same way, and `Ctrl+4` brings the editor's tab back
-  with the keys.
+**The editor's tab stays locked.** On that tab, while htui has the keys, only the editor's keys
+and the global keys act: `Ctrl+4`, `Ctrl+x`, `Tab`/`Shift+Tab` and `1` … `5` (switch tabs), `w`
+(switch workspace), `Ctrl+F` (find), `Ctrl+W` (waiting), `Ctrl+Q` (queue), `q`, `?`/`F1` and
+`Ctrl+C`, or the keys `keys.toml` gives them. Every other key is refused with
+`the editor is open: Ctrl+4 to the editor · Ctrl+x abort` and never reaches the view: a `Ctrl+S`
+there would save the text the editor has not handed back yet. A paste is dropped there; while the
+editor has the keys it goes to the editor (as a bracketed paste when the editor asked for one).
 
-A later milestone (MOD-57 M2) opens the rest of htui while an edit is open: tabs, views and
-overlays, with the editor waiting in its pane.
+**Every other tab is free.** Switch away and that tab works as it does without an editor: its
+keys, pastes, pop-ups and mouse are its own, and `Ctrl+x` is that tab's key, if it has one (the
+abort acts only on the editor's tab). `Ctrl+4` from any tab brings the editor's tab back with the
+editor holding the keys (and closes the `?` box). Switching back by hand (`Tab`, a number key)
+lands on the editor's tab with htui holding the keys; `Ctrl+4` then hands them to the editor.
+
+**Nothing steers the editor's tab.** Two things that would reset or re-select it are refused
+while an edit is open, with `the editor is open in <Tab>: finish or abort it first` on the status
+line (the pop-up that asked closes; nothing else changes):
+
+- a workspace switch: picking a workspace with `w`;
+- opening a result in the editor's tab: `Enter` on an item, document or step in find, the queue
+  or the waiting list, which opens it in Backlog, while the edit is in Backlog. A result that
+  opens in another tab opens as usual.
+
+**Settings › Hierarchy's own scope changes are refused too, and not retried.** Creating or deleting
+a project there, or deleting the workspace htui is in, normally moves htui's scope with it. During
+an edit that move is refused with the same sentence, and nothing repeats it when the edit ends:
+htui stays on the old scope (the other tabs keep the old project list, or the deleted workspace)
+until Settings › Hierarchy next re-reads its tree or you pick a workspace. After the edit, press
+`w` and pick the workspace you are in (or, after deleting it, another one): every tab reloads.
+
+**A modal pop-up over the editor's tab** takes htui's keys, whether a reply opened it (a migration
+prompt, say), you did (find, the queue, the waiting list, the workspace switcher), or it is one of
+the [questions](#the-quit-and-abort-questions). The status line reads
+`the editor is open: close this first`. Keys and pastes go to the pop-up; `Ctrl+4` does not act
+there (under the quit question it says `the editor is open: answer the question first`), and
+`Ctrl+C` still quits. Answer or close it, and the tab is locked as before.
+
+**The first key after a surprise is swallowed.** When a reply opens a modal prompt over the editor
+or moves htui to another tab while the editor has the keys, the first key (or paste) you type for
+the editor is swallowed rather than answering a prompt you had not seen or acting in a tab you did
+not choose; htui has the keys from then on. The status line says
+`the editor is open: close this first` under a prompt, and `the editor is open in <Tab>: Ctrl+4
+back` on another tab, where the next keys are that tab's.
+
+**The `?` box lists the editor keys that act where you are.** On the editor's tab it shows
+`Editor: Ctrl+4 editor focus · Ctrl+x abort edit` and the global keys, and none of the view's (they
+are refused). On another tab it shows `Editor: Ctrl+4 editor focus` above that tab's own keys.
+Under a modal pop-up it shows the pop-up's keys only.
+
+**The mouse** is the view's on every other tab, as without an editor. On the editor's tab htui
+does not capture it ([Limits](#limits)).
+
+## The quit and abort questions
+
+### The quit question
+
+While an editor is open, `q` (`global.quit`) asks first, from any tab:
+
+```text
+An edit is still open in the editor. Quit and lose it?
+y quit · n/Esc keep editing
+```
+
+- `y` quits htui: the editor is killed and the edit is lost (its recovery files stay, see
+  [Limits](#limits)).
+- `n` or `Esc` close the question; the editor keeps waiting as it was.
+- Any other key does nothing (a second `q` opens no second box); `Ctrl+4` says
+  `the editor is open: answer the question first`.
+- `Ctrl+C` quits at once, without asking, also while the question is up.
+- An editor that exits while the question is up leaves it up: `y` still quits, `n` closes it.
+
+Without an editor `q` quits at once, as always. To keep an edit, leave the editor normally (`:wq`,
+nano's `Ctrl+X`) and save the view with `Ctrl+S`.
+
+### The abort question
+
+`Ctrl+x` (`editor.abort`) acts only on the editor's tab, and asks first:
+
+```text
+Abort the edit and lose it?
+Ctrl+x again aborts · any other key keeps editing
+```
+
+- `Ctrl+x` again aborts: the editor is killed, nothing is read back, and the view says
+  `the editor was aborted; nothing was changed`.
+- Any other key (`y`, `Esc`, `?`, …) closes the question and keeps the edit; that key does nothing
+  else. A `y` cannot confirm the abort, so nano's habit, `Ctrl+X` then `y`, typed while htui has the
+  keys keeps the edit: press `Ctrl+4` and leave nano again.
+- Holding `Ctrl+x` down does not confirm it: the key's auto-repeat is ignored, and only a fresh
+  press aborts. A paste is dropped and leaves the question up.
+- The question closes by itself when the editor exits or its tab leaves the screen.
+- `Ctrl+C` quits at once, also while the question is up.
+
+## The editor keys in `keys.toml`
+
+The `[editor]` table of `keys.toml` rebinds the two keys (see the README's
+[Changing keys](../README.md#changing-keys)); `htui --print-keys` prints it with the other tables:
+
+```toml
+[editor]
+focus = ["f12"]
+```
+
+The pane's title, the status line and the `?` box then name `F12`. Because the editor takes every
+other key while it has them, and `editor.focus` acts on every tab while an edit is open, the file
+is held to these rules:
+
+- **`focus` must keep a key.** `[editor] focus = []` is refused:
+  `[editor] focus: must keep at least one chord: the editor takes every other key`.
+- **`focus`'s key is its alone, in every table.** It never gives its key up, and no other action
+  may use it anywhere: `[list] down = "ctrl-4"` is refused with
+  `[list] down = "ctrl-4": "ctrl-4" is already editor.focus (default) while an edit is open`, and
+  `[editor] abort = "ctrl-4"` with
+  `[editor] abort = "ctrl-4": "ctrl-4" is already editor.focus (default) in [editor]`. The other
+  way round is allowed: `[editor] focus = ["ctrl-x"]` takes `ctrl-x` from `abort`, which is then
+  unbound, with the notice below.
+- **`ctrl-c` cannot be bound**, here as in every table:
+  `[editor] focus = "ctrl-c": ctrl-c always quits and cannot be bound`.
+- **A `[global]` key may take `abort`'s default.** The global keys act beside the editor's on the
+  editor's tab, so a global key on an editor key is a collision, with one exception: `abort` left
+  at its default gives its key up. `[global] quit = ["ctrl-x"]` loads, and `editor.abort` is then
+  unbound. htui starts and says so on stderr, with the file's
+  path and line: `[global] quit = "ctrl-x" takes "ctrl-x" from editor.abort, which is now unbound`;
+  `htui --print-keys` prints `abort = []` marked `(unbound by global.quit)`. List
+  `[editor] abort` with another key to keep an abort.
+- **An `abort` you set yourself takes nothing.** On a global key it is an error:
+  `[editor] abort = "ctrl-q": "ctrl-q" is already global.queue (default) while an edit is open`;
+  so is a `[global]` entry on the key your `abort` lists.
 
 ## Where the pane draws
 
@@ -182,8 +302,9 @@ the terminal resizes the editor (it gets `SIGWINCH`) right after the next frame.
 
 ## Limits
 
-- **Mouse.** While an editor is open htui does not capture the mouse, so the terminal's own
-  selection works (over the whole screen, not only the pane); the editor gets no mouse events.
+- **Mouse.** While the editor's tab is on screen htui does not capture the mouse, so the
+  terminal's own selection works (over the whole screen, not only the pane); the editor gets no
+  mouse events. On another tab the mouse is that tab's, as without an editor.
 - **No scrollback.** The pane shows the editor's current screen only.
 - **The cursor's shape and the window title** are the terminal's: the editor's cursor-shape and
   title sequences are not passed on. The cursor shows only while the editor has the keys.
@@ -205,13 +326,19 @@ the terminal resizes the editor (it gets `SIGWINCH`) right after the next frame.
   `SIGHUP` and `SIGKILL`. The pane still closes when the editor exits, and the file is read back,
   but htui keeps one idle reader thread and the pseudo-terminal open until the helper exits or
   htui quits.
+- **Owed on a real terminal.** htui's tests drive the pane with scripted editors. A run of nvim in
+  the pane, and the trial of ten real edits in the in-pane mode (none lost or different from what
+  the editor saved, leaving the editor to work elsewhere and coming back), are still owed on the
+  maintainer's machine.
 
 ## Windows
 
 The in-pane editor compiles for Windows (ConPTY), and htui's checks cross-compile it, but it has
-not been run on Windows yet; that verification belongs to MOD-16. Known differences:
+not been run on Windows yet; that verification belongs to MOD-16, and covers the other tabs, the
+quit question and the abort question too. Known differences:
 
-- Only a physical `Ctrl+4` toggles the focus; `Ctrl+\` is not an alias there.
+- Only a physical `Ctrl+4` toggles the focus and brings the editor back from another tab:
+  `Ctrl+\` arrives there as itself (`ctrl-\`), not as `Ctrl+4`, so it is not an alias.
 - The editor runs as `cmd /S /C "<value> <file name>"` from the temp directory. A value that
   holds a `"` is not expected to work.
 - `cmd` has no `exec`: aborting or quitting ends `cmd`, and whether the editor it started ends with
