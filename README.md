@@ -26,6 +26,7 @@ It runs on Windows 10+, Linux and macOS.
 - [Using htui](#using-htui)
 - [Setting up agents](#setting-up-agents)
 - [Search](#search)
+- [Scripting htui](#scripting-htui)
 - [Where htui keeps its files](#where-htui-keeps-its-files)
 - [Troubleshooting](#troubleshooting)
 - [Development](#development)
@@ -97,13 +98,17 @@ checkable is the one everybody actually builds with. Keep all three in step when
 | `--default-keys` | Ignore `keys.toml` for this run and use the default keys. |
 | `--print-keys` | Print every key binding in force as a commented `keys.toml` and exit. With an invalid file, print its errors and exit with status 2. |
 | `--index-items` | Update the search index from the database, then exit. See [Search](#search). |
-| `--search-items <QUERY>` | Search items, their documents and requirements, print the results and exit. |
-| `--project <SLUG>` | With `--index-items` or `--search-items`: only this project. |
+| `--search-items <QUERY>` | Search items, their documents and requirements, print the results and exit. Exits 3 when the database or the search index cannot be reached, 2 on a refusal (for example no index address or connection string saved) and 1 on any other failure. |
+| `--project <SLUG>` | With `--index-items` or `--search-items`: only this project. `status` and `waiting` take their own `--project`, after the subcommand. |
 | `--decisions` | With `--search-items`: only decisions, meaning items closed as done, concluded or rejected, and their documents. |
 | `--limit <N>` | With `--search-items`: how many results to print, from 1 to 1000 (default 10). |
+| `--json` | With `--search-items`: print one JSON document instead of lines. See [Scripting htui](#scripting-htui). |
+| `--cwd <PATH>` | With `--search-items`: only the project whose repository, registered on this machine, contains `PATH`. Cannot be combined with `--project`. |
 | `--log <PATH>` | Append logs to a file. Also read from `HTUI_LOG`; `HTUI_LOG_FILTER` changes the level (default `info`). Logs never go to the terminal, since the terminal is the app (`htui worker`, which has none, logs to standard error without it). |
 | `worker [--pool-size N] [--dsn-stdin] [--log PATH]` | Run this machine's runs with no terminal, so they outlive the TUI: `htui worker`. Needs the box's executor set to `worker` in **Settings › Boxes**; no other option may be given beside it, and `--log` goes after `worker`. See [`docs/htui-worker.md`](docs/htui-worker.md). |
 | `provision <DESTINATION> [--dsn-stdin] [--replace-credential] [--log PATH]` | Install this build as the `htui-worker` service on another Linux machine over `ssh`, with the DSN encrypted there by `systemd-creds`, and set that box's executor to `worker`. See [`docs/htui-worker.md`](docs/htui-worker.md#provisioning-a-remote-box). |
+| `status [--json] [--project SLUG \| --cwd PATH] [--log PATH]` | Print the top bar's facts and exit: the workspace, this machine, and how many runs are working and how many things wait on you. Reads only. See [Scripting htui](#scripting-htui). |
+| `waiting [--json] [--project SLUG \| --cwd PATH] [--log PATH]` | Print what waits on you, as the waiting-on-you list shows it, with how long each has waited, and exit. Reads only. See [Scripting htui](#scripting-htui). |
 | `--help`, `--version` | Print usage or the version and exit. |
 
 ## Connecting to your database
@@ -486,6 +491,34 @@ If a later htui embeds with another model, it refuses the old index and says so;
 `curl -X DELETE http://localhost:6333/collections/htui_concepts_v2` and run `htui --index-items`
 again.
 
+## Scripting htui
+
+Three commands read htui's state without starting the app, for scripts, status bars and other
+tools. Each prints one answer and exits:
+
+```
+htui status --json
+htui waiting --json --cwd .
+htui --search-items "retry after timeout" --json
+```
+
+`status` and `waiting` read the first workspace by default (the one the app opens on); `--project
+<SLUG>` reads one project, and `--cwd <PATH>` reads the project whose repository on this machine
+contains `PATH`. `--search-items` still searches every workspace unless you narrow it.
+
+With `--json`, each prints exactly one JSON document on one line. The exit code says how it ended:
+
+| Exit | Meaning |
+|---|---|
+| 0 | Answered. |
+| 3 | The database (or, for a search, the search index) could not be reached. |
+| 2 | Refused, for example no connection string saved or an unknown project. |
+| 1 | Any other failure. |
+
+None of them writes anything: the database session is read-only, and nothing is created on this
+machine. An empty standard output means the command failed before it could answer. The documents,
+every field and every error code are described in [`docs/htui-cli.md`](docs/htui-cli.md).
+
 ## Where htui keeps its files
 
 Everything local lives in your user configuration directory: `~/.config/htui` on Linux,
@@ -613,5 +646,6 @@ arguments. See [`docs/hr-sandbox.md`](docs/hr-sandbox.md).
 - [`docs/REQUIREMENTS.md`](docs/REQUIREMENTS.md): the full requirements.
 - [`docs/personas.md`](docs/personas.md): agent personas and how they narrow a step.
 - [`docs/htui-mcp.md`](docs/htui-mcp.md): htui's MCP server, the tools every agent session gets.
+- [`docs/htui-cli.md`](docs/htui-cli.md): `htui status`, `htui waiting` and `--search-items --json` for scripts: every JSON document, the exit codes and the versioning rule.
 - [`docs/htui-secrets.md`](docs/htui-secrets.md): the Infisical secret provider — machine identity, base URL, errors.
 - [`docs/htui-editor.md`](docs/htui-editor.md): `E`/`Ctrl+E`, `$VISUAL`/`$EDITOR`, and the in-pane editor (`HTUI_EDITOR_PANE`): working in other tabs while it waits, the quit and abort questions, and the `[editor]` key table.
