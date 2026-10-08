@@ -994,6 +994,51 @@ async fn a_rebound_diff_default_diffs_and_capital_d_is_inert() {
     );
 }
 
+/// MOD-67 M4 (L-B review low 2): `[skills.templates] switch_view` overrides the view switch in
+/// Templates alone: `F6` leaves Templates and `h`/`l` no longer do, while the Library still
+/// switches on `l` (its stack keeps the shared `skills` row).
+#[tokio::test]
+async fn a_templates_switch_view_rebind_is_templates_only() {
+    let mut harness = open_with_keys(
+        MemStore::demo(),
+        "[skills.templates]\nswitch_view = [\"f6\"]\n",
+    )
+    .await;
+    let on_library = |frame: &str| hint(frame).contains("I import");
+    let frame = harness.render();
+    assert!(
+        !on_library(&frame),
+        "the Library still switches on `l`: {frame}"
+    );
+    assert!(hint(&frame).contains("default"), "on Templates: {frame}");
+
+    for key in ["h", "l"] {
+        harness.key(key);
+        harness.settle().await;
+        let frame = harness.render();
+        assert!(
+            !on_library(&frame),
+            "`{key}` no longer leaves Templates: {frame}"
+        );
+    }
+    harness.key("f6");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(on_library(&frame), "`F6` leaves Templates: {frame}");
+
+    harness.key("f6");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(on_library(&frame), "`F6` is Templates' alone: {frame}");
+    harness.key("l");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        !on_library(&frame),
+        "`l` still switches from the Library: {frame}"
+    );
+}
+
 /// MOD-67 M4: a `[skills]` rebind reaches the Templates view (its stack inherits the shared
 /// `skills` verbs): `F6` toggles the diff pane, `d` no longer does.
 #[tokio::test]

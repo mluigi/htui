@@ -366,17 +366,24 @@ impl TemplatesView {
         true
     }
 
-    /// The current mode's stack (MOD-67 M4 D4): an open agent help's, else the mode's.
-    /// `SkillsTab::key_stack`, `on_key` and the hint read it.
+    /// The current mode's stack (MOD-67 M4 D4), for `SkillsTab::key_stack`: always
+    /// [`stack`](Self::stack)'s.
     pub(super) fn key_stack(&self) -> Option<Stack<'static>> {
-        Some(match &self.mode {
+        Some(self.stack())
+    }
+
+    /// The one place a mode maps to its stack (MOD-67 M4 D4, blueprint §6.5): an open agent
+    /// help's, else the mode's (a handed-off draft stays on the browse stack). `on_key`, the hint
+    /// and [`key_stack`](Self::key_stack) read it.
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
             Mode::Browse => views::TEMPLATES_BROWSE,
             Mode::Naming { .. } => views::TEMPLATES_PROMPT,
             Mode::Editing(editor) => editor
                 .help
                 .as_ref()
                 .map_or(views::TEMPLATES_EDITOR, |help| help.key_stack()),
-        })
+        }
     }
 
     /// Whether an editor or the name prompt is taking every key.
@@ -397,10 +404,11 @@ impl TemplatesView {
 
     /// A key the tab did not take for the view switch.
     pub(super) fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let stack = self.stack();
         match self.mode {
-            Mode::Browse => self.on_browse_key(key, ctx),
-            Mode::Naming { .. } => self.on_naming_key(key, ctx),
-            Mode::Editing(_) => self.on_editor_key(key, ctx),
+            Mode::Browse => self.on_browse_key(key, stack, ctx),
+            Mode::Naming { .. } => self.on_naming_key(key, stack, ctx),
+            Mode::Editing(_) => self.on_editor_key(key, stack, ctx),
         }
     }
 
@@ -554,7 +562,7 @@ impl TemplatesView {
                         let (line, col) = editor.area.cursor_line_col();
                         format!(
                             "{} \u{b7} L{}:C{}",
-                            ctx.keys().hint(views::TEMPLATES_EDITOR, EDIT_HINT),
+                            ctx.keys().hint(self.stack(), EDIT_HINT),
                             line + 1,
                             col + 1
                         )
@@ -563,15 +571,15 @@ impl TemplatesView {
             }
             (Mode::Browse, Some(editor)) => {
                 self.render_editor(frame, content, editor, ctx);
-                ctx.keys().hint(views::TEMPLATES_BROWSE, HANDED_OFF_HINT)
+                ctx.keys().hint(self.stack(), HANDED_OFF_HINT)
             }
             (Mode::Naming { .. }, _) => {
                 self.render_browse(frame, content, ctx);
-                ctx.keys().hint(views::TEMPLATES_PROMPT, NAMING_HINT)
+                ctx.keys().hint(self.stack(), NAMING_HINT)
             }
             (Mode::Browse, None) => {
                 self.render_browse(frame, content, ctx);
-                ctx.keys().hint(views::TEMPLATES_BROWSE, BROWSE_HINT)
+                ctx.keys().hint(self.stack(), BROWSE_HINT)
             }
         };
         frame.render_widget(
@@ -594,9 +602,14 @@ impl TemplatesView {
     /// Browse (plan D13; MOD-67 M4, blueprint §6.1): the first candidate through
     /// [`views::TEMPLATES_BROWSE`] this view acts on; a global act is the shell's. The tab took
     /// `skills.switch_view` first.
-    fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+    fn on_browse_key(
+        &mut self,
+        key: KeyEvent,
+        stack: Stack<'static>,
+        ctx: &mut Ctx<'_>,
+    ) -> Handled {
         let chord = KeyChord::from_event(key);
-        for act in ctx.keys().actions(views::TEMPLATES_BROWSE, chord) {
+        for act in ctx.keys().actions(stack, chord) {
             match act {
                 Act::ListDown => self.move_cursor(true),
                 Act::ListUp => self.move_cursor(false),
@@ -730,14 +743,13 @@ impl TemplatesView {
     /// The field answers first; what it passes resolves through [`views::TEMPLATES_PROMPT`]:
     /// `global.next_tab`/`prev_tab` go to the shell with the prompt kept (MOD-67 M4 PA-2), the
     /// rest is `modal_rest`'s.
-    fn on_naming_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+    fn on_naming_key(&mut self, key: KeyEvent, stack: Stack<'static>, ctx: &Ctx<'_>) -> Handled {
         let Mode::Naming { project, field } = &mut self.mode else {
             return Handled::Pass;
         };
         match field.on_key(key) {
             FieldOutcome::Consumed => Handled::Consumed,
             FieldOutcome::Pass => {
-                let stack = views::TEMPLATES_PROMPT;
                 let chord = KeyChord::from_event(key);
                 match ctx.keys().actions(stack, chord).first() {
                     Some(Act::NextTab | Act::PrevTab) => Handled::Pass,
@@ -787,7 +799,12 @@ impl TemplatesView {
     /// switches tabs with the draft kept (PA-2), the rest is `modal_rest`'s. An open agent help
     /// (MOD-55) takes every key first: the draft is locked under it, and those three verbs are
     /// refused until it closes.
-    fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+    fn on_editor_key(
+        &mut self,
+        key: KeyEvent,
+        stack: Stack<'static>,
+        ctx: &mut Ctx<'_>,
+    ) -> Handled {
         if let Mode::Editing(editor) = &mut self.mode
             && let Some(help) = editor.help.as_mut()
         {
@@ -827,7 +844,6 @@ impl TemplatesView {
             // `form.save` below saves.
             FieldOutcome::Submit | FieldOutcome::Pass => {}
         }
-        let stack = views::TEMPLATES_EDITOR;
         let chord = KeyChord::from_event(key);
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::FormSave) => self.save(ctx),

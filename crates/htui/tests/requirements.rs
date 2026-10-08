@@ -456,6 +456,10 @@ async fn the_priority_field_keeps_its_value_keys_and_ignores_chords() {
     assert!(harness.render().contains("[later]"), "`space` toggles");
     harness.key("left");
     assert!(harness.render().contains("[must]"), "`left` toggles");
+    harness.key("right");
+    assert!(harness.render().contains("[later]"), "`right` toggles");
+    harness.key("right");
+    assert!(harness.render().contains("[must]"), "`right` toggles back");
     harness.key("ctrl-l");
     assert!(harness.render().contains("[must]"), "`ctrl-l` is not `l`");
     harness.key("l");
@@ -466,6 +470,34 @@ async fn the_priority_field_keeps_its_value_keys_and_ignores_chords() {
         frame.contains(" New requirement in ENT "),
         "the form is still open: {frame}"
     );
+}
+
+/// MOD-67 M4 (D5; L-C §2.3 (b), review low 2): an ALT chord from a Requirements form passes to
+/// the shell, which resolves it through the form's stack: with `[global] quit` also on `alt-q`,
+/// `alt-q` quits from the body (a `TextArea`) and from Priority, where a plain `q` stays the
+/// form's.
+#[tokio::test]
+async fn an_alt_chord_from_a_form_reaches_the_shell() {
+    for field_tabs in [0, 2] {
+        let mut harness =
+            open_with_keys("version = 1\n[global]\nquit = [\"q\", \"alt-q\"]\n").await;
+        harness.key("n");
+        for _ in 0..field_tabs {
+            harness.key("tab");
+        }
+        let before = harness.render();
+        assert!(
+            before.contains(" New requirement in ENT "),
+            "the form is open: {before}"
+        );
+        harness.key("q");
+        assert!(!harness.app().should_quit, "`q` stays the form's");
+        harness.key("alt-q");
+        assert!(
+            harness.app().should_quit,
+            "`alt-q` passed to the shell from field {field_tabs}"
+        );
+    }
 }
 
 /// MOD-67 M4 (§1 item 4, pinned on purpose): `form.next_field`/`prev_field` move the focus,
