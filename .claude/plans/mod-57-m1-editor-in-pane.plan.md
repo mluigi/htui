@@ -352,3 +352,13 @@ or a saturated count reaches `vt100` canonicalised (`ESC[0005m` as `ESC[5m`): th
 parameters `vte` builds, and byte-for-byte for every sequence without them. (2) L-4 has no new
 test: the close thread only matters on Windows, where ConPTY is not run (MOD-16); the existing
 thread-lifecycle tests cover the unix drop path.
+
+**R1 verify round 1.** (1) A 156-column line in `app/pane.rs`'s module doc, left by the L-1
+edit, was rewrapped (`55e121ae`). (2) Clamped to the columns, `vt100`'s ICH still costs
+O(cols^2) per sequence (one cell inserted at a time), about 4.9 ms per 8 KiB read at 80 columns
+and 129 ms at 500 (release). The M-1 batch of the woken event plus 64 more had no time limit, so
+it could hold the UI task for seconds at a wide terminal. `6b81b973` time-boxes it:
+`drain_batch` checks a deadline, `PANE_BUDGET` = 16 ms from the woken event, before each
+`try_recv`. Anything left stays queued for the next turn of `select!`. Known residue: one 8 KiB
+read of clamped ICH at a very wide terminal still costs its own time. This was true before R1
+too, and the clamp only bounds it to a screen.
