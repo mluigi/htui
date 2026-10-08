@@ -1,4 +1,4 @@
-//! MOD-57 M1: the external editor in the TUI pane, as the shell sees it.
+//! MOD-57 M1, M2: the external editor in the TUI pane, as the shell sees it.
 //!
 //! With `HTUI_EDITOR_PANE` set, the event loop's `$EDITOR` step does not suspend the terminal: it
 //! calls [`App::open_editor`], which writes the temp file ([`TempEdit`]), spawns the editor on a
@@ -14,17 +14,23 @@
 //!   asking tab through [`App::finish_external_edit`], so no view's outcome handling changes.
 //!   Every event carries a [`PaneId`]; an event of an editor already finished or aborted is
 //!   dropped (B4).
-//! - **Keys (P5, P6).** While an editor is alive [`App::on_key`] asks it first. Focused, only
-//!   `editor.focus` ([`Stack::EDITOR_FOCUSED`]) is htui's; every other key, `ctrl-c` included,
-//!   is encoded ([`encode_key`]) and written. Unfocused is the M1 lock
-//!   ([`Stack::EDITOR_OPEN`]): `ctrl-c` and `global.quit` quit, `global.help` toggles the
-//!   `?` box, `editor.focus` refocuses (bringing the asking tab back, B16), `editor.abort` kills
-//!   the editor and answers [`EDITOR_ABORTED`]; anything else is refused on the status line. The
-//!   editor has the keys only while focused, on screen and under no modal overlay or `?` box
-//!   (`editor_has_keys`, the one rule keys, pastes, the title, the status line and the cursor
-//!   read); the first key or paste that finds a focused editor without them (typed for the
-//!   editor) is swallowed with the refusal and unfocuses it, rather than run through the lock or
-//!   answer a prompt. Unfocused under a modal overlay, keys and pastes take the overlay's path.
+//! - **Keys (P5, P6, M2 E1-E3).** While an editor is alive [`App::on_key`] asks it first.
+//!   Focused, only `editor.focus` ([`Stack::EDITOR_FOCUSED`]) is htui's; every other key,
+//!   `ctrl-c` included, is encoded ([`encode_key`]) and written. The editor has the keys only
+//!   while focused, on screen and under no modal overlay or `?` box (`editor_has_keys`, the one
+//!   rule keys, pastes, the title, the status line and the cursor read); the first key or paste
+//!   that finds a focused editor without them (typed for the editor) is swallowed with the
+//!   refusal and unfocuses it, rather than run as a command or answer a prompt. With htui
+//!   holding the keys, `ctrl-c` quits at `on_key`'s one C3 site and a modal overlay's keys are
+//!   the overlay's. On the asking tab a key resolves through [`Stack::EDITOR_OPEN`]:
+//!   `editor.focus` refocuses, `editor.abort` kills the editor and answers [`EDITOR_ABORTED`],
+//!   every global the shell maps acts (tab switches included); anything else is refused, so
+//!   nothing reaches the asking view. On any other tab only `editor.focus` is checked (it brings
+//!   the asking tab back, B16) and every other key and paste is that tab's.
+//! - **M2 (PRD D4, D5).** E4: `global.quit` asks first (`App::request_quit`); `ctrl-c` quits
+//!   at once. E5: nothing steers the asking tab (a scope change, a reveal into it). E6: another
+//!   tab's status line is led by the open edit and the way back. E7: the `?` box lists the
+//!   editor keys that act where the user is. E8: the mouse is the view's on another tab.
 //! - **Where it draws (P2).** The active tab names its editing rect through
 //!   [`Ctx::claim_editor_area`](crate::app::Ctx::claim_editor_area) during its render; the pane
 //!   goes there when the claim is at least [`MIN_PANE`] inside the body, else over the whole
@@ -87,6 +93,9 @@ const LOCK_HINT: HintSpec = &[
     Hint::One(Act::EditorFocus, "to the editor"),
     Hint::One(Act::EditorAbort, "abort"),
 ];
+
+/// MOD-57 M2 E1, E6: the way back from another tab.
+const BACK_HINT: HintSpec = &[Hint::One(Act::EditorFocus, "back")];
 
 /// One live in-pane editor. Field order is drop order: the child (kill requested) before the temp
 /// file (removed). `Debug`: id, tab, focus, size, child, temp; never the screen.
@@ -247,14 +256,42 @@ impl App {
     }
 
     /// Whether the editor's tab is the one on screen.
-    fn editor_visible(&self) -> bool {
+    pub(super) fn editor_visible(&self) -> bool {
         self.editor
             .as_ref()
             .is_some_and(|editor| self.tabs.active_id() == Some(editor.tab))
     }
 
+    /// The asking tab's id while an editor is alive.
+    pub(super) fn editor_tab(&self) -> Option<TabId> {
+        self.editor.as_ref().map(|editor| editor.tab)
+    }
+
+    /// The asking tab's title (as the tab strip shows it), else its id.
+    fn editor_title(&self) -> String {
+        let Some(tab) = self.editor_tab() else {
+            return String::new();
+        };
+        self.tabs
+            .titles()
+            .into_iter()
+            .find(|(id, _)| *id == tab)
+            .map_or_else(|| tab.to_string(), |(_, title)| title.to_owned())
+    }
+
+    /// `the editor is open in <Tab>`: the head of every sentence said away from the asking tab.
+    fn editor_place(&self) -> String {
+        format!("{EDITOR_LOCKED} in {}", self.editor_title())
+    }
+
+    /// MOD-57 M2 E1: `editor.focus`'s way back from another tab (`Ctrl+4 back`); empty when it
+    /// is unbound.
+    fn editor_back(&self) -> String {
+        self.keys.hint(Stack::EDITOR_FOCUSED, BACK_HINT)
+    }
+
     /// Whether a modal overlay is up over the editor: its keys take `on_key`'s overlay path.
-    fn editor_covered(&self) -> bool {
+    pub(super) fn editor_covered(&self) -> bool {
         self.overlays.top().is_some_and(Overlay::is_modal)
     }
 
@@ -269,10 +306,18 @@ impl App {
             && !self.help_visible
     }
 
-    /// The lock's refusal: the editor's keys, or under a modal overlay [`PROMPT_FIRST`].
+    /// The lock's refusal: under a modal overlay [`PROMPT_FIRST`]; on another tab the way back
+    /// (MOD-57 M2, B-M2-9: `the editor is open in Skills: Ctrl+4 back`, `editor.abort` does not
+    /// act there); on the asking tab the editor's keys.
     fn lock_refusal(&self) -> String {
         if self.editor_covered() {
             format!("{EDITOR_LOCKED}: {PROMPT_FIRST}")
+        } else if !self.editor_visible() {
+            let place = self.editor_place();
+            match self.editor_back() {
+                back if back.is_empty() => place,
+                back => format!("{place}: {back}"),
+            }
         } else {
             format!(
                 "{EDITOR_LOCKED}: {}",
@@ -298,11 +343,20 @@ impl App {
         true
     }
 
-    /// A key while an editor is alive (P5, P6): with the keys, the editor's unless it is the focus
-    /// toggle; unfocused, the M1 lock. `false` hands the key back to [`App::on_key`]'s overlay
-    /// path: only while unfocused under a modal overlay, which a reply can open over the editor
-    /// (the migration prompt) and which never reaches the asking tab. Otherwise nothing reaches
-    /// an overlay, a tab or a keymap.
+    /// A key while an editor is alive (P5, P6, MOD-57 M2 E1-E3); `false` hands it to the rest of
+    /// [`App::on_key`]'s chain. In order, the first that applies:
+    ///
+    /// 1. The first key that finds a focused editor without the keys is swallowed and unfocuses
+    ///    it ([`editor_lost_keys`](Self::editor_lost_keys)).
+    /// 2. With the keys, the editor's, unless it is the focus toggle.
+    /// 3. `ctrl-c`: `false`, so `on_key`'s one ANA-26 C3 site quits.
+    /// 4. Under a modal overlay (a reply's prompt, the quit question): `false`, the overlay's
+    ///    keys; `editor.focus` does not act there.
+    /// 5. On another tab: `editor.focus` ([`Stack::EDITOR_FOCUSED`]) refocuses and brings the
+    ///    asking tab back (B16); anything else is `false`, as if no editor were alive.
+    /// 6. On the asking tab: the first candidate of [`Stack::EDITOR_OPEN`] that maps
+    ///    (`editor.focus`, `editor.abort`, then every global the shell maps); a key nothing maps
+    ///    is refused on the status line. Nothing reaches the asking view.
     pub(super) fn editor_key(&mut self, key: KeyEvent, chord: KeyChord) -> bool {
         if self.editor_lost_keys() {
             return true;
@@ -328,48 +382,62 @@ impl App {
             return true;
         }
 
-        // Unfocused under a modal overlay: the overlay's key, through `on_key`'s own path (C3,
-        // the overlay, `Esc`/help, the modal swallow).
-        if covered {
+        // ANA-26 C3 holds while htui has the keys, at `on_key`'s own site (B-M2-7); under a modal
+        // overlay its keys take the path below (C3, the overlay, `Esc`/help, the modal swallow).
+        if chord == CTRL_C || covered {
             return false;
         }
-        // ANA-26 C3 holds while htui has the keys.
-        if chord == CTRL_C {
-            self.update(Action::Quit);
+        let tab = editor.tab;
+        if !visible {
+            // E1: the way back, ahead of the view; E2: `editor.abort` is not checked here.
+            if !self
+                .keys
+                .actions(Stack::EDITOR_FOCUSED, chord)
+                .contains(&Act::EditorFocus)
+            {
+                return false;
+            }
+            editor.focused = true;
+            self.help_visible = false;
+            self.update(Action::Tab(TabAction::Focus(tab)));
             return true;
         }
-        let tab = editor.tab;
-        match self
-            .keys
-            .actions(Stack::EDITOR_OPEN, chord)
-            .first()
-            .copied()
-        {
-            Some(Act::EditorFocus) => {
-                editor.focused = true;
-                self.help_visible = false;
-                if !visible {
-                    self.update(Action::Tab(TabAction::Focus(tab)));
+        for act in self.keys.actions(Stack::EDITOR_OPEN, chord) {
+            match act {
+                Act::EditorFocus => {
+                    if let Some(editor) = self.editor.as_mut() {
+                        editor.focused = true;
+                    }
+                    self.help_visible = false;
+                    return true;
+                }
+                Act::EditorAbort => {
+                    self.abort_editor();
+                    return true;
+                }
+                other => {
+                    if let Some(action) = self.action_for(other) {
+                        self.update(action);
+                        return true;
+                    }
                 }
             }
-            Some(Act::EditorAbort) => self.abort_editor(),
-            // M1: no confirm; the editor is killed when `App` drops (`lib.rs`).
-            Some(Act::Quit) => self.update(Action::Quit),
-            Some(Act::Help) => self.update(Action::ToggleHelp),
-            _ => self.status = Some(self.lock_refusal()),
         }
+        self.status = Some(self.lock_refusal());
         true
     }
 
     /// A paste while an editor is alive, by a key's rule (R0 F2): with the keys, to the editor
     /// (bracketed if it asked); the first that finds a focused editor without them is swallowed
-    /// ([`editor_lost_keys`](Self::editor_lost_keys)); unfocused, dropped (the lock; a paste is
-    /// never a key). `false` hands it to [`App::on_paste`]'s overlay path: only while unfocused
-    /// under a modal overlay, which never passes it to the asking tab.
+    /// ([`editor_lost_keys`](Self::editor_lost_keys)); on the asking tab, unfocused, dropped (a
+    /// paste is never a key). `false` hands it to [`App::on_paste`]'s own path: under a modal
+    /// overlay (which never passes it to the asking tab) and on another tab, whose paste it is
+    /// (MOD-57 M2 E3).
     pub(super) fn editor_paste(&mut self, text: &Zeroizing<String>) -> bool {
         if self.editor_lost_keys() {
             return true;
         }
+        let visible = self.editor_visible();
         let covered = self.editor_covered();
         let Some(editor) = self.editor.as_mut() else {
             return false;
@@ -379,7 +447,7 @@ impl App {
             editor.child.write(&bytes);
             return true;
         }
-        !covered
+        visible && !covered
     }
 
     /// Records where the active tab's pane goes this frame (`editor_rect`, pane or not, so the
@@ -417,12 +485,16 @@ impl App {
         );
     }
 
-    /// The status line while an editor is alive and no error is up; `None` without one. A focused
-    /// editor without the keys ([`editor_has_keys`](Self::editor_has_keys): off screen, under a
-    /// modal overlay or the `?` box) reads as unfocused; under a modal overlay, whose keys are
-    /// the prompt's, the line offers no editor key and says the prompt comes first (R0 F3).
+    /// The status line while an editor is alive on the active tab and no error is up; `None`
+    /// without one or on another tab ([`editor_notice`](Self::editor_notice) leads that tab's own
+    /// line, MOD-57 M2 E6). A focused editor without the keys
+    /// ([`editor_has_keys`](Self::editor_has_keys): under a modal overlay or the `?` box) reads
+    /// as unfocused; under a modal overlay, whose keys are the prompt's, the line offers no
+    /// editor key and says the prompt comes first (R0 F3).
     pub(super) fn editor_status(&self) -> Option<String> {
-        self.editor.as_ref()?;
+        if !self.editor_visible() {
+            return None;
+        }
         Some(if self.editor_has_keys() {
             format!(
                 "the editor has the keys \u{b7} {}",
@@ -432,6 +504,28 @@ impl App {
             format!("{EDITOR_LOCKED}: {PROMPT_FIRST}")
         } else {
             self.keys.hint(Stack::EDITOR_OPEN, UNFOCUSED_HINT)
+        })
+    }
+
+    /// MOD-57 M2 E6: what leads another tab's status line while an editor is alive:
+    /// `editing in <Tab> · Ctrl+4 back · `, the way back dropped under a modal overlay (where it
+    /// does not act) or when unbound. Always ends with the separator. `None` without an editor
+    /// and on the asking tab.
+    #[must_use]
+    pub(super) fn editor_notice(&self) -> Option<String> {
+        if self.editor.is_none() || self.editor_visible() {
+            return None;
+        }
+        let head = format!("editing in {}", self.editor_title());
+        let back = if self.editor_covered() {
+            String::new()
+        } else {
+            self.editor_back()
+        };
+        Some(if back.is_empty() {
+            format!("{head} \u{b7} ")
+        } else {
+            format!("{head} \u{b7} {back} \u{b7} ")
         })
     }
 
@@ -477,7 +571,7 @@ fn pane_lost(cmd: &EditorCommand, err: &io::Error) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::io;
     use std::path::PathBuf;
     use std::rc::Rc;
@@ -502,7 +596,7 @@ mod tests {
         EDITOR_ABORTED, EDITOR_BUSY, EditorCommand, ExternalEdit, ExternalEditOutcome, PANE_VAR,
     };
     use crate::keymap::Keymap;
-    use crate::keys::{Act, Context, Keys};
+    use crate::keys::{Act, Context, Keys, Stack};
     use crate::store_worker::{StoreReply, StoreRequest};
     use crate::ui::overlay::{Overlay, OverlayId};
     use crate::ui::tabs::{Tab, TabId};
@@ -558,12 +652,15 @@ mod tests {
     type Shared = Rc<RefCell<Seen>>;
 
     /// A tab that asks for the editor on `e`, records everything, draws `VIEW` over its area and
-    /// claims `claim` for the editor.
+    /// claims `claim` for the editor. `stack` is its key stack (`None`: unconverted); `lost`
+    /// counts the mouse losses it was told of.
     struct Editing {
         id: TabId,
         seen: Shared,
         claim: Rc<RefCell<Option<Rect>>>,
         mouse: bool,
+        stack: Option<Stack<'static>>,
+        lost: Rc<Cell<u32>>,
     }
 
     impl Tab for Editing {
@@ -611,6 +708,12 @@ mod tests {
         }
         fn wants_mouse(&self) -> bool {
             self.mouse
+        }
+        fn on_mouse_lost(&mut self) {
+            self.lost.set(self.lost.get() + 1);
+        }
+        fn key_stack(&self) -> Option<Stack<'static>> {
+            self.stack
         }
     }
 
@@ -712,29 +815,64 @@ mod tests {
     struct Bench {
         seen: Shared,
         claim: Rc<RefCell<Option<Rect>>>,
+        lost: Rc<Cell<u32>>,
     }
 
-    /// A shell with `ids` registered as [`Editing`] tabs, the first one active.
+    /// One tab of [`shell_with`]: its id, whether it wants the mouse, and its key stack.
+    type Spec = (TabId, bool, Option<Stack<'static>>);
+
+    /// A shell with `ids` registered as [`Editing`] tabs, the first one active: no mouse, no
+    /// stack.
     fn shell(ids: &[TabId]) -> (App, Vec<Bench>) {
+        let specs: Vec<Spec> = ids.iter().map(|id| (*id, false, None)).collect();
+        shell_with(&specs)
+    }
+
+    /// A shell with `specs` registered as [`Editing`] tabs, the first one active.
+    fn shell_with(specs: &[Spec]) -> (App, Vec<Bench>) {
         let (tx, _rx) = mpsc::unbounded_channel();
         let mut app = App::new(tx, Keymap::new());
-        let benches = ids
+        let benches = specs
             .iter()
-            .map(|id| {
+            .map(|&(id, mouse, stack)| {
                 let bench = Bench {
                     seen: Shared::default(),
                     claim: Rc::default(),
+                    lost: Rc::default(),
                 };
                 app.register_tab(Box::new(Editing {
-                    id: *id,
+                    id,
                     seen: Rc::clone(&bench.seen),
                     claim: Rc::clone(&bench.claim),
-                    mouse: false,
+                    mouse,
+                    stack,
+                    lost: Rc::clone(&bench.lost),
                 }));
                 bench
             })
             .collect();
         (app, benches)
+    }
+
+    /// A shell with [`ASKER`] and [`OTHER`], an editor open for `ASKER` and unfocused (htui has
+    /// the keys, on the asking tab).
+    fn unfocused_two() -> (App, Vec<Bench>, Log) {
+        let (mut app, benches) = shell(&[ASKER, OTHER]);
+        let log = Log::default();
+        open(&mut app, ASKER, &log);
+        app.on_key(ctrl('4'));
+        (app, benches, log)
+    }
+
+    /// The keys `bench`'s tab saw, as chords' codes.
+    fn codes(bench: &Bench) -> Vec<KeyCode> {
+        bench
+            .seen
+            .borrow()
+            .keys
+            .iter()
+            .map(|key| key.code)
+            .collect()
     }
 
     /// What the fake spawn was handed.
@@ -841,6 +979,10 @@ mod tests {
     const UNFOCUSED_STATUS: &str = "Ctrl+4 to the editor · Ctrl+x abort · q quit · ? help";
     const REFUSAL: &str = "the editor is open: Ctrl+4 to the editor · Ctrl+x abort";
     const COVERED: &str = "the editor is open: answer or close the prompt first";
+    /// MOD-57 M2 (B-M2-9): the swallow's sentence off screen.
+    const OFF_SCREEN: &str = "the editor is open in asker: Ctrl+4 back";
+    /// MOD-57 M2 E6: the status prefix on another tab.
+    const NOTICE: &str = "editing in asker \u{b7} Ctrl+4 back \u{b7} ";
 
     #[test]
     fn a_focused_editor_gets_every_key_ctrl_c_included() {
@@ -915,12 +1057,47 @@ mod tests {
         }
     }
 
+    /// MOD-57 M2 E3: on the asking tab, unfocused, every global acts: a tab switch leaves the
+    /// editor running and undrawn, and the asking tab never sees the key.
     #[test]
-    fn unfocused_every_other_key_is_refused_and_nothing_moves() {
-        let (mut app, benches) = shell(&[ASKER, OTHER]);
-        let log = Log::default();
-        open(&mut app, ASKER, &log);
-        app.on_key(ctrl('4'));
+    fn on_the_asking_tab_every_global_acts_and_tabs_switch() {
+        let (mut app, benches, log) = unfocused_two();
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(app.tabs.active_id(), Some(OTHER), "`Tab` switches");
+        assert!(app.editor_open(), "the editor keeps running");
+        let term = draw(&mut app, 100, 30);
+        assert!(
+            !text(term.backend().buffer()).contains(" nvim \u{b7} "),
+            "and is not drawn"
+        );
+        assert!(writes(&log).is_empty());
+        assert!(
+            benches[0].seen.borrow().keys.is_empty(),
+            "the asker saw nothing"
+        );
+
+        app.on_key(plain('1'));
+        assert_eq!(app.tabs.active_id(), Some(ASKER), "`1` from the other tab");
+        assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
+
+        app.on_key(plain('2'));
+        assert_eq!(app.tabs.active_id(), Some(OTHER), "`2` from the asking tab");
+        app.on_key(press(KeyCode::BackTab, KeyModifiers::SHIFT));
+        assert_eq!(app.tabs.active_id(), Some(ASKER));
+        assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
+        assert!(
+            benches[0].seen.borrow().keys.is_empty(),
+            "the asker saw nothing"
+        );
+        assert!(writes(&log).is_empty());
+        assert!(app.status.is_none(), "nothing was refused");
+    }
+
+    /// MOD-57 M2 E3 (rewrites M1's `unfocused_every_other_key_is_refused_and_nothing_moves`):
+    /// a key nothing global resolves is refused on the asking tab and never reaches it.
+    #[test]
+    fn on_the_asking_tab_a_non_global_key_is_refused_and_never_reaches_it() {
+        let (mut app, benches, log) = unfocused_two();
 
         app.on_key(plain('?'));
         assert!(app.help_visible, "`?` toggles help");
@@ -929,8 +1106,7 @@ mod tests {
 
         for key in [
             plain('j'),
-            plain('1'),
-            press(KeyCode::Tab, KeyModifiers::NONE),
+            // Not offered in a bare shell: nothing maps it.
             plain('w'),
             plain('e'),
             ctrl('s'),
@@ -951,6 +1127,105 @@ mod tests {
             app.take_external_edit().is_none(),
             "no view asked for anything"
         );
+    }
+
+    /// MOD-57 M2 E3: on another tab its keys reach it, as if no editor were alive.
+    #[test]
+    fn on_another_tab_keys_reach_that_tab() {
+        let (mut app, benches, log) = unfocused_two();
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        for key in [
+            plain('j'),
+            plain('x'),
+            press(KeyCode::Esc, KeyModifiers::NONE),
+        ] {
+            app.on_key(key);
+            assert_eq!(app.status, None, "{key:?} is not refused");
+        }
+        assert_eq!(
+            codes(&benches[1]),
+            vec![KeyCode::Char('j'), KeyCode::Char('x'), KeyCode::Esc]
+        );
+        assert!(benches[0].seen.borrow().keys.is_empty());
+        assert!(writes(&log).is_empty());
+        assert_eq!(app.tabs.active_id(), Some(OTHER));
+    }
+
+    /// MOD-57 M2 E1: `editor.focus` acts from another tab (ahead of the view, which never sees
+    /// it), brings the asking tab back focused (B16) and closes the `?` box.
+    #[test]
+    fn the_focus_key_from_another_tab_brings_the_editor_back_focused() {
+        let (mut app, benches, log) = unfocused_two();
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(plain('?'));
+        assert!(app.help_visible);
+
+        app.on_key(ctrl('4'));
+        assert_eq!(app.tabs.active_id(), Some(ASKER));
+        assert_eq!(app.editor_status().as_deref(), Some(FOCUSED_STATUS));
+        assert!(!app.help_visible, "the box closes");
+        assert!(writes(&log).is_empty(), "the toggle is never written");
+        assert_eq!(codes(&benches[1]), vec![KeyCode::Char('?')], "no `Ctrl+4`");
+        app.on_key(plain('a'));
+        assert_eq!(writes(&log), vec![b"a".to_vec()], "the editor has the keys");
+    }
+
+    /// MOD-57 M2 E2: `editor.abort` is the asking tab's only; elsewhere its chord is the view's.
+    #[test]
+    fn abort_acts_only_on_the_asking_tab() {
+        let (mut app, benches, _log) = unfocused_two();
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(ctrl('x'));
+        assert!(app.editor_open(), "not on another tab");
+        assert_eq!(
+            benches[1].seen.borrow().keys.last().map(|key| key.code),
+            Some(KeyCode::Char('x')),
+            "the view had it"
+        );
+        assert!(benches[0].seen.borrow().heard.is_empty());
+
+        app.on_key(plain('1'));
+        app.on_key(ctrl('x'));
+        assert!(!app.editor_open(), "on the asking tab it aborts");
+        assert_eq!(
+            benches[0].seen.borrow().heard,
+            vec![ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned())]
+        );
+        assert!(benches[1].seen.borrow().heard.is_empty());
+    }
+
+    /// MOD-57 M2 (PD-8 across tabs): another tab may ask for the editor; it is answered
+    /// `EDITOR_BUSY` and the open edit is untouched.
+    #[test]
+    fn a_second_edit_from_another_tab_is_answered_editor_busy() {
+        let (mut app, benches, _log) = unfocused_two();
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_key(plain('e'));
+        assert!(app.take_external_edit().is_none());
+        assert_eq!(
+            benches[1].seen.borrow().heard,
+            vec![ExternalEditOutcome::Failed(EDITOR_BUSY.to_owned())]
+        );
+        assert!(benches[0].seen.borrow().heard.is_empty());
+        assert!(app.editor_open());
+    }
+
+    /// MOD-57 M2: a paste on another tab is that tab's; on the asking tab, unfocused, dropped.
+    #[test]
+    fn on_another_tab_a_paste_reaches_that_tab() {
+        let (mut app, benches, log) = unfocused_two();
+        app.on_paste(&Zeroizing::new("d".to_owned()));
+        assert!(writes(&log).is_empty());
+        assert!(
+            benches[0].seen.borrow().pastes.is_empty(),
+            "the asker: dropped"
+        );
+
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        app.on_paste(&Zeroizing::new("x".to_owned()));
+        assert_eq!(benches[1].seen.borrow().pastes, vec!["x".to_owned()]);
+        assert!(writes(&log).is_empty());
+        assert!(benches[0].seen.borrow().pastes.is_empty());
     }
 
     #[test]
@@ -1174,7 +1449,7 @@ mod tests {
 
     #[test]
     fn the_pane_is_drawn_only_in_its_tab_and_refocus_brings_it_back() {
-        let (mut app, _benches) = shell(&[ASKER, OTHER]);
+        let (mut app, benches) = shell(&[ASKER, OTHER]);
         let log = Log::default();
         open(&mut app, ASKER, &log);
         assert!(app.tabs.focus(OTHER));
@@ -1184,16 +1459,18 @@ mod tests {
             "no pane"
         );
         assert!(!term.backend().cursor_visible(), "no cursor");
-        // Still focused, but off screen: the status line says htui has the keys (it has).
-        assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
-        assert!(row_from(term.backend().buffer(), 0, 29).starts_with(UNFOCUSED_STATUS));
+        // Still focused, but off screen: the other tab's own line, led by the open edit and the
+        // way back (MOD-57 M2 E6).
+        assert_eq!(app.editor_status(), None);
+        assert!(row_from(term.backend().buffer(), 0, 29).starts_with(NOTICE));
 
         app.on_key(plain('a'));
         assert!(
             writes(&log).is_empty(),
             "the editor is not on screen: htui has the keys"
         );
-        assert_eq!(app.status.as_deref(), Some(REFUSAL));
+        assert_eq!(app.status.as_deref(), Some(OFF_SCREEN));
+        assert!(benches[1].seen.borrow().keys.is_empty(), "swallowed");
 
         app.on_key(ctrl('4'));
         assert_eq!(
@@ -1222,12 +1499,16 @@ mod tests {
                 writes(&log).is_empty(),
                 "{key:?} is not the editor's either"
             );
-            assert_eq!(app.status.as_deref(), Some(REFUSAL), "{key:?}");
+            assert_eq!(app.status.as_deref(), Some(OFF_SCREEN), "{key:?}");
             assert_eq!(app.tabs.active_id(), Some(OTHER), "{key:?} moves nothing");
             assert!(benches[1].seen.borrow().keys.is_empty());
-            assert_eq!(app.editor_status().as_deref(), Some(UNFOCUSED_STATUS));
+            assert_eq!(app.editor_status(), None, "off screen: the tab's own line");
 
-            // From here on the M1 lock holds.
+            // From here on htui has the keys, and the other tab is free (MOD-57 M2 E3).
+            app.on_key(plain('j'));
+            assert_eq!(app.status, None, "{key:?}: the next key is not refused");
+            assert_eq!(codes(&benches[1]), vec![KeyCode::Char('j')], "{key:?}");
+            assert!(writes(&log).is_empty());
             app.on_key(ctrl('c'));
             assert!(app.should_quit, "the next ctrl-c is htui's");
         }
@@ -1298,13 +1579,17 @@ mod tests {
 
         app.on_paste(&Zeroizing::new("x".to_owned()));
         assert!(writes(&log).is_empty());
-        assert_eq!(app.status.as_deref(), Some(REFUSAL));
+        assert_eq!(app.status.as_deref(), Some(OFF_SCREEN));
         assert!(
             benches
                 .iter()
                 .all(|bench| bench.seen.borrow().pastes.is_empty())
         );
-        // The paste unfocused it: the M1 lock holds, and the next `ctrl-c` is htui's.
+        // The paste unfocused it: htui has the keys, the other tab the next paste (MOD-57 M2),
+        // and the next `ctrl-c` is htui's.
+        app.on_paste(&Zeroizing::new("y".to_owned()));
+        assert_eq!(benches[1].seen.borrow().pastes, vec!["y".to_owned()]);
+        assert!(writes(&log).is_empty());
         app.on_key(ctrl('c'));
         assert!(app.should_quit);
     }
@@ -1444,22 +1729,39 @@ mod tests {
         assert!(app.dirty);
     }
 
+    /// MOD-57 M2 E8 (rewrites M1's `mouse_capture_is_off_while_an_editor_is_open`): capture is
+    /// off while the pane is on screen, and the view's to decide on another tab.
     #[test]
-    fn mouse_capture_is_off_while_an_editor_is_open() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut app = App::new(tx, Keymap::new());
-        app.register_tab(Box::new(Editing {
-            id: ASKER,
-            seen: Shared::default(),
-            claim: Rc::default(),
-            mouse: true,
-        }));
+    fn mouse_capture_follows_the_pane_on_screen() {
+        // The asking tab wants the mouse: off while its pane is drawn, back after the exit.
+        let (mut app, _benches) = shell_with(&[(ASKER, true, None)]);
         assert!(app.mouse_capture());
         let log = Log::default();
         open(&mut app, ASKER, &log);
-        assert!(!app.mouse_capture(), "off while the editor is alive");
+        assert!(!app.mouse_capture(), "off while the pane is on screen");
         exited(&mut app, 0, Duration::from_secs(2));
         assert!(app.mouse_capture(), "back after it exits");
+
+        // Another tab wants it: on there while the editor waits.
+        let (mut app, benches) = shell_with(&[(ASKER, false, None), (OTHER, true, None)]);
+        let log = Log::default();
+        open(&mut app, ASKER, &log);
+        assert!(!app.mouse_capture(), "on the asking tab: off");
+        app.on_key(ctrl('4'));
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.mouse_capture(), "on the other tab: the view's");
+        assert_eq!(benches[1].lost.get(), 0);
+
+        app.on_key(ctrl('4'));
+        assert_eq!(app.tabs.active_id(), Some(ASKER));
+        assert!(!app.mouse_capture(), "back on the pane: off");
+        assert_eq!(benches[1].lost.get(), 1, "the other tab is told (MOD-74)");
+
+        app.on_key(ctrl('4'));
+        app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(app.mouse_capture());
+        exited(&mut app, 0, Duration::from_secs(2));
+        assert!(app.mouse_capture(), "still on after the exit");
     }
 
     #[test]

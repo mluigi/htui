@@ -374,7 +374,7 @@ impl App {
     /// What the shell does for `act`: the fixed mapping, then the offered table. `None` for
     /// everything a view must handle (every shared context) and for an offerable act nobody
     /// offered.
-    fn action_for(&self, act: Act) -> Option<Action> {
+    pub(super) fn action_for(&self, act: Act) -> Option<Action> {
         match act {
             Act::Quit => Some(Action::Quit),
             Act::NextTab => Some(Action::Tab(TabAction::Next)),
@@ -583,8 +583,9 @@ impl App {
     /// field refused says why through the same line.
     ///
     /// MOD-57: while an in-pane editor is alive a paste follows a key's rule (R0 F2): to the
-    /// editor while it has the keys, else swallowed or dropped (the M1 lock), except unfocused
-    /// under a modal overlay, where the overlay's path below has it. It never reaches a view.
+    /// editor while it has the keys, else swallowed (the first that finds it without them) or,
+    /// on the asking tab, dropped; under a modal overlay the overlay's path below has it, and on
+    /// another tab that tab's (M2 E3). It never reaches the asking view.
     pub fn on_paste(&mut self, text: &Zeroizing<String>) {
         self.dirty = true;
         if self.editor.is_some() && self.editor_paste(text) {
@@ -667,11 +668,11 @@ impl App {
     /// click through them would act on what they hide (blueprint E7) — and the active tab must
     /// want it.
     ///
-    /// MOD-57: off while an in-pane editor is alive, so the terminal keeps its own selection over
-    /// the pane; M2 narrows this to a focused pane on screen.
+    /// MOD-57 M2 E8: off while the in-pane editor is on screen (the pane draws over the view, and
+    /// the terminal keeps its own selection over it); on another tab the view decides.
     #[must_use]
     pub fn wants_mouse(&self) -> bool {
-        self.editor.is_none()
+        !self.editor_visible()
             && self.overlays.is_empty()
             && !self.help_visible
             && self.tabs.active().is_some_and(Tab::wants_mouse)
@@ -779,9 +780,10 @@ impl App {
         self.status = None;
         let chord = KeyChord::from_event(key);
 
-        // MOD-57 P5, P6: a live in-pane editor answers first. Focused, it takes every key,
-        // `ctrl-c` included (ANA-26 §6.4's one exception); unfocused, the M1 lock, except under a
-        // modal overlay, whose keys take the path below.
+        // MOD-57 P5, P6, M2 E1-E3: a live in-pane editor answers first. Focused, it takes every
+        // key, `ctrl-c` included (ANA-26 §6.4's one exception); on the asking tab, the editor's and
+        // the global keys only; on another tab, only `editor.focus`. `ctrl-c` and a modal
+        // overlay's keys take the path below.
         if self.editor.is_some() && self.editor_key(key, chord) {
             return;
         }
@@ -949,10 +951,16 @@ impl App {
             Some(message) => (message.clone(), self.theme.error),
             None => (
                 self.editor_status().unwrap_or_else(|| {
-                    self.keys
+                    let line = self
+                        .keys
                         .status_line(self.active_stack().unwrap_or(Stack::BASE), |act| {
                             self.action_for(act).is_some()
-                        })
+                        });
+                    // MOD-57 M2 E6: another tab's line, led by the open edit.
+                    match self.editor_notice() {
+                        Some(notice) => format!("{notice}{line}"),
+                        None => line,
+                    }
                 }),
                 self.theme.dim,
             ),
