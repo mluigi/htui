@@ -666,20 +666,63 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         embedder: E,
         collection: &str,
     ) -> Result<Self, StoreError> {
+        let store = Self::new(settings, embedder, collection)?;
+        store.ensure_collection().await?;
+        Ok(store)
+    }
+
+    /// Opens [`COLLECTION`] for reading only (MOD-92 G8): `Ok(None)` when it does not exist.
+    /// Creates no collection, no payload index, and stamps nothing: an unstamped collection of the
+    /// right width is searched as it is (what `connect` would have stamped). The width and embedder
+    /// check is `connect`'s own.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] when Qdrant cannot be reached, and `embedder mismatch`
+    /// ([`is_embedder_mismatch`]) for another width or another embedder's vectors.
+    pub async fn open_existing(
+        settings: &QdrantSettings,
+        embedder: E,
+    ) -> Result<Option<Self>, StoreError> {
+        Self::open_existing_to(settings, embedder, COLLECTION).await
+    }
+
+    /// As [`open_existing`](Self::open_existing), on a named collection (tests use a throwaway one).
+    ///
+    /// # Errors
+    /// As [`open_existing`](Self::open_existing).
+    pub async fn open_existing_to(
+        settings: &QdrantSettings,
+        embedder: E,
+        collection: &str,
+    ) -> Result<Option<Self>, StoreError> {
+        let store = Self::new(settings, embedder, collection)?;
+        let exists = store
+            .client
+            .collection_exists(&store.collection)
+            .await
+            .map_err(|e| backend("collection exists", e))?;
+        if !exists {
+            return Ok(None);
+        }
+        // `Matches` and `Stamp` both pass: only `check_collection` writes the stamp.
+        store.existing().await?;
+        Ok(Some(store))
+    }
+
+    /// The client and the store, before any call to Qdrant.
+    fn new(settings: &QdrantSettings, embedder: E, collection: &str) -> Result<Self, StoreError> {
         // No compatibility check: it prints to stdout (which `--search-items` owns) and blocks on
-        // its own health probe; `ensure_collection` fails fast on a bad server anyway.
+        // its own health probe; the first call fails fast on a bad server anyway.
         let mut builder = Qdrant::from_url(&settings.url).skip_compatibility_check();
         if let Some(key) = &settings.api_key {
             builder = builder.api_key(key.as_str());
         }
         let client = builder.build().map_err(|e| backend("client", e))?;
-        let store = Self {
+        Ok(Self {
             client,
             embedder,
             collection: collection.to_owned(),
-        };
-        store.ensure_collection().await?;
-        Ok(store)
+        })
     }
 
     /// Drops the collection. For tests and for a deliberate rebuild.
@@ -723,29 +766,10 @@ impl<E: DenseEmbedder> QdrantStore<E> {
     /// Refuses an existing collection of another width or another embedder, and records this
     /// embedder in one that records none (MOD-68 D8).
     async fn check_collection(&self) -> Result<(), StoreError> {
-        let info = self
-            .client
-            .collection_info(&self.collection)
-            .await
-            .map_err(|e| backend("collection info", e))?
-            .result
-            .ok_or_else(|| backend("collection info", "no result"))?;
-        let stored = info
-            .config
-            .as_ref()
-            .and_then(|c| c.metadata.get(EMBEDDER_KEY))
-            .cloned()
-            .map(serde_json::Value::from);
-        let mine = self.embedder.identity();
-        match check_existing(
-            &self.collection,
-            dense_size(&info),
-            stored,
-            &mine,
-            self.embedder.dim(),
-        )? {
+        match self.existing().await? {
             Existing::Matches => {}
             Existing::Stamp => {
+                let mine = self.embedder.identity();
                 // Qdrant merges an update's metadata into the collection's: the stamp adds its key
                 // and leaves any other (observed on 1.19.1 over gRPC and REST; `qdrant_live`'s
                 // `stamping_keeps_the_collections_other_metadata`). Two processes stamping at once
@@ -773,6 +797,31 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             }
         }
         Ok(())
+    }
+
+    /// What an existing collection is to this embedder, read and never written: refuses another
+    /// width or another embedder (MOD-68 D8). Shared by `check_collection` and `open_existing_to`.
+    async fn existing(&self) -> Result<Existing, StoreError> {
+        let info = self
+            .client
+            .collection_info(&self.collection)
+            .await
+            .map_err(|e| backend("collection info", e))?
+            .result
+            .ok_or_else(|| backend("collection info", "no result"))?;
+        let stored = info
+            .config
+            .as_ref()
+            .and_then(|c| c.metadata.get(EMBEDDER_KEY))
+            .cloned()
+            .map(serde_json::Value::from);
+        check_existing(
+            &self.collection,
+            dense_size(&info),
+            stored,
+            &self.embedder.identity(),
+            self.embedder.dim(),
+        )
     }
 
     /// Whether the collection now records an embedder. A Qdrant that predates collection
