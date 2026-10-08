@@ -9,7 +9,7 @@ C2, the same call as M1/M2). Ultracode for **implement** (C4) and **review** (on
 reviewer finding); `rust-reviewer` stays the gate.
 **Selected milestone**: M3 only. M4-M6 are later runs.
 **Complexity**: Large (~24 source files, ~65 hint constants, up to ~80 snapshots)
-**Status**: confirmed (maintainer, 2026-10-07)
+**Status**: done (M3 landed 2026-10-08, `55064b73`..`4ae61bf9`); M4-M6 are later runs
 
 ## Summary
 
@@ -265,6 +265,26 @@ Postgres-backed suites (`*_pg.rs`) run once on the fully merged tree (sandbox DB
 - [ ] `[settings.boxes] reload = ["f5"]` loads and works; shadowing allow-list in the validator
 - [ ] Validation passes on the merged tree; snapshot diffs are hint/status text only
 - [ ] Patterns mirrored, not reinvented
+
+## Review gate (2026-10-08)
+
+`rust-reviewer`: approve with changes; 0 CRITICAL/HIGH, 2 MEDIUM, 4 LOW, 5 NIT. One adversarial
+verifier per finding (Workflow `wf_1f2287d8-2b6`), fixes in R1 (`efcfbf7d`..`4ae61bf9`, verified
+clean by two lenses).
+
+- **Applied**: M2 (one shared `settings::modal_rest`, downgraded to nit), L1 (README on
+  `--print-keys`), L2 (hierarchy's delete warning names no key; test
+  `a_rebound_yes_is_the_one_key_the_warning_names`), L4 (personas `open()` names `Delete`), and the
+  nits: the kitty `ctrl-L` test drives the harness, the stack-reachability test reads production
+  code only, `Keys::derive` borrows, agents' `on_key` dispatches on `key_mode()`.
+- **Refuted, documented**: M1 (a printed view row pins the row): PA-1/blueprint §3.9 behaviour, and
+  the next `--print-keys` marks it `(changed)`; README now says to delete such a line.
+- **Carried**: L3 (key prose) to M6, listed in the HANDOFF phase note; two T1 lows (the
+  `(changed)` mark and the collision line of a view row pinned to its compiled derivation while its
+  shared row is rebound); long `on_browse_key` arms split if M4 adds to them.
+- **Process**: T1 then five worktree lanes (Workflows, implement + conformance/adversarial
+  verify); merged `--no-ff` with no conflict; merged-tree gate 2807, after R1 2809 passed,
+  Postgres included; snapshot drift only the hint/status rows the blueprint listed.
 
 ## Verified claims (plan fact-check, 2026-10-07)
 

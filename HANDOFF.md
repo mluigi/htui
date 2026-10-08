@@ -372,6 +372,17 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   still matches itself wins until M3-M5 (README "Changing keys"). The narrower-context override of a
   shared verb and the shadowing allow-list kind land with M3's first view context
   (`.claude/plans/mod-67-m2-keys-file.plan.md`, "Review gate").
+  **Phase M3 landed (`55064b73`..`4ae61bf9`, 2026-10-08):** all ten Settings sections, the
+  Settings tab and the four overlays dispatch through declared context stacks (`keys/views.rs`, 36
+  declared), their 65 hint constants are generated, and the status line and `?` box follow the
+  active stack. Fixed and pinned: modifier-blind arms (`ctrl-d` deletes in hierarchy/kinds,
+  `ctrl-l` cycles sections, `ctrl-t` checks secrets, `alt-y`/`ctrl-y` answer questions and apply
+  migrations) and the Qdrant editor passing `Tab`. A view table may override a shared verb
+  (`[settings.boxes] reload`), and a global rebind onto a Settings or overlay key is refused.
+  Carried: `TextArea`'s own `ctrl-s` to M4; hard-coded key prose to M6 (`Ctrl+S retries`,
+  `NO_MATCHES` `Ctrl+R`, `RELOADED` "press p again", `NOT_A_VALUE_ROW` "`e` edits"); a `picker`
+  context for the hierarchy directory picker (L-C Q3)
+  (`.claude/plans/mod-67-m3-settings-overlays.plan.md`, "Review gate").
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,
