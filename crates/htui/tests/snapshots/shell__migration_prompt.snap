@@ -18,7 +18,7 @@ Graphics · DESKTOP-HTUI · online · 0 working · 0 waiting
 │                        ┌ Schema ─────────────────────────────────────────┐                       │
 │                        │3 schema migrations are pending. Apply them now? │                       │
 │                        │                                                 │                       │
-│                        │y apply · n / Esc stay offline                   │                       │
+│                        │y apply · n/Esc stay offline                     │                       │
 │                        └─────────────────────────────────────────────────┘                       │
 │                                                     ││                                           │
 │                                                     ││                                           │
@@ -31,4 +31,4 @@ Graphics · DESKTOP-HTUI · online · 0 working · 0 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+Ctrl+c quit · ? help

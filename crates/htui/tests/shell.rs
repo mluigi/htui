@@ -278,7 +278,7 @@ async fn esc_answers_the_prompt_like_n() {
     harness.drive_to_end().await;
     assert!(
         harness.app().overlays.is_empty(),
-        "`Esc` falls through to the wildcard overlay binding"
+        "`Esc` is `[migration] no` (and `overlay.close` below it)"
     );
 }
 
@@ -304,6 +304,96 @@ fn status_line(frame: &str) -> &str {
         .find(|line| !line.trim().is_empty())
         .unwrap_or_default()
         .trim_end()
+}
+
+/// MOD-67 M3 (D14): the prompt answers through `confirm.yes`/`confirm.no`, and chord equality
+/// includes modifiers, so `ctrl-y` (an irreversible schema write nobody advertised) and `alt-n`
+/// are swallowed by the modal prompt instead of answering it.
+#[tokio::test]
+async fn ctrl_y_and_alt_n_do_not_answer_the_migration_prompt() {
+    let mut harness = shell_reporting("online", Some(3)).await;
+    harness.key("ctrl-y");
+    harness.key("alt-n");
+    harness.drive_to_end().await;
+    assert_eq!(
+        harness.app().overlays.iter().count(),
+        1,
+        "the prompt is still up"
+    );
+    assert_eq!(
+        harness.app().status,
+        None,
+        "nothing was applied: no `applied 0 migration(s)`"
+    );
+}
+
+/// MOD-67 M3 (PA-1): the `[migration]` view defaults add `Y` and `N` to the shared `y` and `n`.
+#[tokio::test]
+async fn capital_y_applies_and_capital_n_declines() {
+    let mut harness = shell_reporting("online", Some(3)).await;
+    harness.key("Y");
+    harness.drive_to_end().await;
+    assert!(harness.app().overlays.is_empty(), "`Y` closes the prompt");
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("applied 0 migration(s)"),
+        "`Y` applies"
+    );
+
+    let mut harness = shell_reporting("online", Some(3)).await;
+    harness.key("N");
+    harness.drive_to_end().await;
+    assert!(harness.app().overlays.is_empty(), "`N` closes the prompt");
+    assert_eq!(harness.app().status, None, "`N` applies nothing");
+}
+
+/// MOD-67 M3 (D10 over a D12 row): `[migration] yes` replaces the derived `y`/`Y` row, so the
+/// old chords are inert and the hint names the new one.
+#[tokio::test]
+async fn a_migration_override_rebinds_yes() {
+    let keys =
+        htui::keys::load_str("version = 1\n[migration]\nyes = \"a\"\n").expect("the keys load");
+    let mut harness = Harness::demo()
+        .with_store_state("online", Some(3))
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_keys(keys);
+    register_all(harness.app());
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("a apply · n/Esc stay offline"), "{frame}");
+
+    harness.key("y");
+    harness.key("Y");
+    harness.drive_to_end().await;
+    assert_eq!(
+        harness.app().overlays.iter().count(),
+        1,
+        "`y`/`Y` are inert"
+    );
+    assert_eq!(harness.app().status, None);
+
+    harness.key("a");
+    harness.drive_to_end().await;
+    assert!(harness.app().overlays.is_empty(), "`a` closes the prompt");
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("applied 0 migration(s)"),
+        "`a` applies"
+    );
+}
+
+/// MOD-67 M3 (D7, D8): over the prompt the status line and the `?` box render its stack; `Esc`
+/// is the derived `[migration] no` row's (PA-1, `SHADOWING`), so it is listed there.
+#[tokio::test]
+async fn the_status_line_and_help_box_over_the_migration_prompt() {
+    let mut harness = shell_reporting("online", Some(3)).await;
+    assert_eq!(status_line(&harness.render()), "Ctrl+c quit · ? help");
+    harness.key("?");
+    assert!(harness.app().help_visible);
+    let frame = harness.render();
+    assert!(frame.contains("Schema: y/Y yes · n/Esc/N no"), "{frame}");
+    assert!(frame.contains("Global: Ctrl+c quit · ?/F1 help"), "{frame}");
+    assert!(frame.contains("?/F1 closes this box"), "{frame}");
 }
 
 /// MOD-67 M3 (D14): the switcher moves on `list.down`, and chord equality includes modifiers, so
