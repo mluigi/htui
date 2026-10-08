@@ -1,7 +1,7 @@
 # Blueprint: MOD-67 milestone 4, "Skills and Requirements dispatch through context stacks"
 
-**Status**: proposed (2026-10-08). Plan amendments PA-1 to PA-4 (§1) need the maintainer; the rest
-of this file builds the confirmed plan as written. D1-D11 stand except where §1 amends them.
+**Status**: built (2026-10-08). PA-1 to PA-4 (§1) approved by the maintainer; R1 removed
+`SKILLS_TAB` (§4.1, plan "Review gate"); the rest of this file builds the confirmed plan as written. D1-D11 stand except where §1 amends them.
 
 **Plan**: `.claude/plans/mod-67-m4-skills-requirements.plan.md` (confirmed 2026-10-08, commit
 `329a9440`).

@@ -363,6 +363,21 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   table a user's entry takes a chord from an action left at its default (that action loses it, with a stderr
   notice and a `--print-keys` mark); two user entries on one chord stay an error. It also added the global
   `queue` action on `ctrl-q` (ANA-26 §7.4 amended).
+  **Phase M4 landed (`ba082c94`..`4802a157`, 2026-10-08):** the Skills tab (view switch, Library,
+  Templates, the attachments pane, the editors' agent help) and the Requirements tab dispatch
+  through declared stacks (`keys/views.rs`, 18 more; 6 contexts and 22 actions), and their 24 hint
+  constants are generated. Fixed and pinned: the Skills `h`/`l` modifier blindness (`ctrl-l`
+  switched views) and `alt-y` detaching an attachment. `TextArea` no longer claims `ctrl-s`: every
+  editor outside Backlog saves on `form.save` only (M3's carry closed). Skills editors still pass
+  `Tab` with the draft kept. The MOD-57 `[editor]` follow-up is closed: `editor.focus` must keep a
+  chord, and the editor stacks join `DECLARED`, so an `[editor]` chord on `global.quit`/`help` is
+  refused either way (`[global] quit = ["ctrl-x"]` now is). Hint changes accepted at the gate:
+  trimmed Library and Templates browse rows, `Tab/Down field`, agent help `n/Esc discard`. Carried:
+  key prose to M6 (`Ctrl+S saves it`, `Esc again discards`, `y detaches, any other key keeps it`),
+  and the hierarchy `picker` context (M3 L-C Q3). Pre-existing, seen here: full test runs leave an
+  empty `~/.config/htui/trees` (the worker's default scratch root)
+  (`.claude/plans/mod-67-m4-skills-requirements.plan.md`, "Review gate"). **Remaining: M5** Backlog
+  and Chat, **M6** close-out.
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,

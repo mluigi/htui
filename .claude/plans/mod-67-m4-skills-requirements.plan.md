@@ -12,7 +12,7 @@ Sandbox run (`HR_SANDBOX=1`, branch `hr/MOD-67`, base `46b570c1`).
 M5 and M6 are later runs.
 **Complexity**: Large (7 source files to convert, ~214 `KeyCode` mentions, 24 hint constants,
 24 snapshots, plus `keys/` and `text_area.rs`)
-**Status**: confirmed (maintainer, 2026-10-08); blueprint `e829dde7`..`ca6e37f5`, PA-1..PA-4 approved; implementing
+**Status**: done (M4 landed 2026-10-08, `ba082c94`..`4802a157`); M5-M6 are later runs
 
 ## Summary
 
@@ -236,6 +236,35 @@ Postgres suites (`*_pg.rs`) once on the fully merged tree (sandbox DB on 5439).
 - [ ] `[editor]` loader rules (D8) in place and tested
 - [ ] Validation passes on the merged tree; snapshot diffs are hint/status text only
 - [ ] Patterns mirrored, not reinvented
+
+## Review gate (2026-10-08)
+
+`rust-reviewer` over `b8d5faaf..ef746383`: approve with changes; 0 CRITICAL/HIGH/MEDIUM, 4 LOW,
+5 NIT. Fixed in R1 (`572e0a21`..`4802a157`, one implement/verify workflow, verified clean).
+
+- **Applied**: L1 `SKILLS_TAB` was unreachable once both Skills views always returned a stack, and
+  its `DECLARED` entry named a mode no user is in ("in Skills"); removed (maintainer), the views'
+  `key_stack` return `Stack`, `DECLARED` 57 → 56, pinned by
+  `a_global_chord_on_the_view_switch_names_the_skills_views`. L2 the Templates browse hint is
+  `h/l view` again (maintainer), through a new `Hint::Two` (first two admitted chords). L3 the
+  Requirements test pins `key_stack` per mode instead of a test-only helper. L4 the HANDOFF M4 note.
+  NITs: the unreachable `Submit` in `requirements/forms.rs`, the `form.save` catalogue comment, README
+  names `[requirements]`, the agent help Answered hint gains `Enter close`.
+- **Carried**: `Ctrl+S`/key prose in Library, Templates, agent help and Requirements messages (M6,
+  D10).
+- **Deviations recorded during implementation**: agent help resolves its own state's acts before it
+  refuses the editor's verbs (blueprint L-A §6.2 had the refusal first; equal under the defaults,
+  and a legal `[form] save = "enter"` no longer blocks the help's accept, PA-3's reasoning);
+  `VIEW_DEFAULTS` rows landed with the stacks (T1d), not with the acts (T1a); L-B touched
+  `tests/editor_pane.rs` (two `Ctrl+S save` assertions) and L-C `tests/reveal.rs` (one hint-text
+  check), both flagged and merged without conflict; the README Backlog example became
+  `[global] quit = ["f"]`, pinned by `the_readme_backlog_example_loads_and_f_stays_the_backlogs`.
+- **Process**: T1 in two workflows (keys half, views half), three worktree lanes as concurrent
+  workflows, merged `--no-ff` with no conflict, T-close and R1 workflows; every verify round 1 had 0
+  blocking findings, lows fixed by hand or in T-close. Merged-tree gate with Postgres green; after
+  R1 3007 htui tests serial. Pre-existing: full runs leave an empty `~/.config/htui/trees` (the
+  worker runtime's default scratch root, `htui-worker/src/runtime.rs` `Shared::singletons`, used by
+  a test that sets no `with_scratch_root`); removed after each run, not fixed here.
 
 ## Verified claims (plan fact-check, 2026-10-08)
 
