@@ -2335,7 +2335,7 @@ pub const BOX_SETTINGS_NOT_AN_OBJECT: &str = "box.settings is not a JSON object"
 /// array and answer `Applied` with a key nothing reads.
 #[must_use]
 pub fn project_settings_not_an_object(id: ProjectId, key: impl core::fmt::Display) -> String {
-    format!("project.settings of `{id}` is not a JSON object, so `{key}` cannot be merged into it")
+    format!("project.settings of `{id}` is not a JSON object, so `{key}` cannot be changed in it")
 }
 
 /// MOD-51 D2: [`WriteStore::set_box_probe_spec`]'s refusal of an overlay that is not a JSON
