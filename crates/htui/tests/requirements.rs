@@ -626,3 +626,22 @@ async fn ctrl_s_on_the_filter_saves_nothing_and_types_nothing() {
         "{frame}"
     );
 }
+
+/// MOD-67 M4 (lane rebinding test): `[requirements] amend = "E"` moves the amend to `E`; `e`
+/// opens nothing and the browse hint names the new chord.
+#[tokio::test]
+async fn a_rebound_amend_amends_and_e_is_inert() {
+    let mut harness = open_with_keys("version = 1\n[requirements]\namend = \"E\"\n").await;
+    let frame = harness.render();
+    assert!(hint(&frame).contains("E amend"), "{frame}");
+    assert!(!hint(&frame).contains("e amend"), "{frame}");
+    harness.key("e");
+    let frame = harness.render();
+    assert!(
+        !frame.contains(" Amend R-ENT-1"),
+        "`e` opens nothing: {frame}"
+    );
+    harness.key("E");
+    let frame = harness.render();
+    assert!(frame.contains(" Amend R-ENT-1 (v2) "), "{frame}");
+}
