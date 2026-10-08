@@ -17,7 +17,7 @@ use super::{
 /// shares a chord with an action in **its own context** that the file leaves at its default
 /// takes the chord, and that action loses it (unbound when it has no other). A
 /// [`STATE_GUARDED`] pair that shares the chord by default keeps sharing it, and
-/// `overlay.close` never gives way (it must keep a chord).
+/// `overlay.close` and `editor.focus` never give way (each must keep a chord).
 ///
 /// Across contexts nothing gives way, and [`validate`]'s stack rules stand: two entries on one
 /// chord are an error, and so is a chord an entry shares with another context's default only
@@ -30,7 +30,7 @@ pub(super) fn give_way(keys: &mut Keys) {
         for (index, default) in keys.rows.iter().enumerate() {
             if default.entry.is_some()
                 || default.context != entry.context
-                || default.act == Act::OverlayClose
+                || matches!(default.act, Act::OverlayClose | Act::EditorFocus)
             {
                 continue;
             }
@@ -265,6 +265,53 @@ mod tests {
     #[test]
     fn the_compiled_defaults_validate() {
         assert_eq!(validate(Keys::compiled()), []);
+    }
+
+    // MOD-57 M2 E9: the editor's keys.
+
+    /// E9 (b): `editor.focus` never gives way, so an `[editor]` entry on its chord collides in
+    /// `[editor]`, and focus keeps it.
+    #[test]
+    fn the_abort_cannot_take_the_focus_chord() {
+        assert_eq!(
+            errors("[editor]\nabort = \"ctrl-4\"\n"),
+            one(
+                2,
+                r#"[editor] abort = "ctrl-4": "ctrl-4" is already editor.focus (default) in [editor]"#
+            )
+        );
+    }
+
+    /// The other direction is allowed: `abort` need not stay bound, so it gives `ctrl-x` to
+    /// `focus` with the usual notice.
+    #[test]
+    fn the_focus_may_take_ctrl_x_from_abort() {
+        let keys = load_str("[editor]\nfocus = \"ctrl-x\"\n").expect("abort gives way");
+        assert_eq!(
+            keys.chords(Context::Editor, Act::EditorFocus),
+            [chord("ctrl-x")]
+        );
+        assert!(keys.chords(Context::Editor, Act::EditorAbort).is_empty());
+        let notices: Vec<String> = keys
+            .notices()
+            .into_iter()
+            .map(|notice| notice.message)
+            .collect();
+        assert_eq!(
+            notices,
+            [r#"[editor] focus = "ctrl-x" takes "ctrl-x" from editor.abort, which is now unbound"#]
+        );
+    }
+
+    #[test]
+    fn ctrl_c_is_refused_in_the_editor_table() {
+        assert_eq!(
+            errors("[editor]\nfocus = \"ctrl-c\"\n"),
+            one(
+                2,
+                r#"[editor] focus = "ctrl-c": ctrl-c always quits and cannot be bound"#
+            )
+        );
     }
 
     #[test]

@@ -647,8 +647,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // `legacy_arrival`; `ctrl-\` itself is refused as indistinguishable). On Windows crossterm
     // delivers `ctrl-\` as `Char('\\')` + CONTROL, so there only a physical `ctrl-4` matches
     // (MOD-16 H-10/H-11, T7's docs). In capture: while the editor is focused every other key,
-    // `ctrl-c` included, is the editor's. MOD-67 M2's loader must refuse a file that unbinds it,
-    // as it does `overlay.close`.
+    // `ctrl-c` included, is the editor's. The loader refuses a file that unbinds it, as it does
+    // `overlay.close`, and it never gives way (MOD-57 M2 E9 (a), (b)).
     capture_row(
         Act::EditorFocus,
         Editor,
