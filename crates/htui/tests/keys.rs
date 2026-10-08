@@ -741,3 +741,24 @@ async fn a_rebound_save_is_the_only_save_in_every_text_area_editor() {
         );
     }
 }
+
+/// MOD-67 M4 (README "Changing keys"): the example of a Backlog key winning over a global one
+/// loads, and `f` stays the Backlog's (the Backlog does not read the file yet).
+#[tokio::test]
+async fn the_readme_backlog_example_loads_and_f_stays_the_backlogs() {
+    let keys =
+        load_str("version = 1\n\n[global]\nquit = [\"f\"]\n").expect("the README example loads");
+    let mut harness = Harness::demo()
+        .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_keys(keys);
+    harness.drive_to_end().await;
+    assert!(!harness.render().contains(" Filter "));
+    harness.key("f");
+    assert!(
+        !harness.app().should_quit,
+        "`f` does not quit on the Backlog"
+    );
+    let frame = harness.render();
+    assert!(frame.contains(" Filter "), "`f` opened the filter: {frame}");
+}
