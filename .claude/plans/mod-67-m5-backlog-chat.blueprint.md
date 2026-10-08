@@ -573,7 +573,7 @@ cargo test -p htui --lib ui::tabs::backlog::detail
 env -u HTUI_TEST_DATABASE_URL cargo test -p htui --features testkit \
   --test keys --test keys_file --test backlog_keys -- --test-threads=1
 cargo insta test -p htui --all-features --check     # nothing pending: T1 moves no snapshot
-env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features -- --test-threads=1 --no-fail-fast
+env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features --no-fail-fast -- --test-threads=1
 ```
 The last line once before the lanes fork; grep its output for `SIGABRT` (memory: engine stack
 headroom) and check for orphaned test processes.
@@ -894,7 +894,7 @@ cargo test -p htui --lib <ui::tabs::backlog | ui::tabs::backlog::detail::runs | 
 env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features \
   --test backlog --test backlog_keys --test replay --test chat --test reveal -- --test-threads=1
 cargo insta test -p htui --all-features --check     # after accepting the lane's own snapshots
-env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features -- --test-threads=1 --no-fail-fast
+env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features --no-fail-fast -- --test-threads=1
 ```
 
 ---

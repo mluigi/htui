@@ -151,6 +151,19 @@ every Backlog/Chat capturing mode, the Runs hint row's height, `J/K scroll` and 
 spellings, the Notes/Docs notice clearing on Backlog keys, the per-layer `?` box). Claims 3 and 5
 and D6's "tests unchanged" amended per blueprint §2.
 
+## Deviations recorded during implementation
+
+- T1a/T1b (`850d4bee`, `de94f61a`): the filter form's TOML table is `[backlog.filter_form]`, not
+  `[backlog.filter]` (D1): `[backlog] filter = …` and a `[backlog.filter]` table are the same TOML
+  key, and the default `--print-keys` no longer read back. Pinned by
+  `no_act_name_is_a_nested_table`. Rust `Context::BacklogFilter`, heading `Filter` unchanged.
+- T1c (`c357723e`) moved `detail/mod.rs` by 15 lines, so the `[pane]` rows in `keys/catalogue.rs`
+  cite stale lines (`:447`-`:450` → the `Scroll::on_key` arms): fixed in T-close.
+- Blueprint §5.6 whole-suite command had `--no-fail-fast` after `--` (libtest refuses it, no test
+  runs); corrected in the blueprint before the lanes.
+- T1b: `[form] next_field = ["x"]` also collides with `backlog.filter_form.clear` now (a real
+  collision; `validate.rs` expectation grown).
+
 ## Patterns to Mirror
 
 | Category | Source | Pattern |
@@ -269,7 +282,7 @@ crates' checks only show there).
 | Snapshot churn hides a behaviour change | Medium | D9: only hint, status and the new hint rows move; full insta run per merge; app-level ones in T-close |
 | A pane's verb collides with a Backlog or list key once in one stack | Medium | the validator walks every new stack (`the_compiled_defaults_validate`); `Enter` takes the shadowing allow-list kind |
 | Deleting the legacy rows loses a `?` line or the miss | Low | D6 test of the miss; the `?` box for Backlog is pinned (D12) |
-| A user file that loads today is refused after M5 (D10) | Low | Only global keys on a Backlog/Chat letter; the error names the line and the Backlog; README says so |
+| A user file that loads today is refused after M5 (D10) | Low | Global keys on a Backlog/Chat key, and shared-table rebinds that collide in a new stack (`[pane] next_subtab = "tab"`, `[common] edit = "f"`, `[list] down = "G"`; T1 verifier's differential probe, 2026-10-08); each is a real collision, the error names the line and the stack; README says so without claiming "global only" |
 | Lane disk/CPU (4 worktrees) | Low | ~10 GB `target` each; 2.9 TB free, 12 cores |
 
 ## Acceptance
