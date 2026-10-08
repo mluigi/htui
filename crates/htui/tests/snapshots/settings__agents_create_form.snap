@@ -20,7 +20,6 @@ beta         acp       subscription 0      —                     yes     —  
 
 
 
-
 new agent · settings from alpha
 name         : gamma
 transport    : acp
@@ -30,4 +29,5 @@ models       :
 default model:
 billing      : subscription
 enabled (y/n): y
+mods (y/n)   : n
 Tab next field · Enter saves · Esc cancels

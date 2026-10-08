@@ -2053,8 +2053,10 @@ impl AgentsSection {
 }
 
 impl Editor {
-    /// The create form (plan D231): all eight fields, with `transport`, `billing` and `enabled`
+    /// The create form (plan D231): all nine fields, with `transport`, `billing` and `enabled`
     /// holding the values a new row most often wants, so a literal `command` is all it needs.
+    /// `mods` starts at `n` even when `settings_from` names a row that opted in (MOD-91 D6,
+    /// blueprint B7): the copy is the isolated side.
     fn create(settings_from: Option<(AgentId, String)>) -> Self {
         let texts = [
             "",
@@ -2065,6 +2067,7 @@ impl Editor {
             "",
             htui_core::model::Billing::Subscription.as_str(),
             "y",
+            "n",
         ];
         Self {
             target: Target::Create { settings_from },
@@ -2166,6 +2169,7 @@ impl Editor {
             default_model: self.text(FIELD_LABELS[5]),
             billing: self.text(FIELD_LABELS[6]),
             enabled: self.text(FIELD_LABELS[7]),
+            user_extensions: self.text(FIELD_LABELS[8]),
         });
         match &mut self.target {
             Target::Create { settings_from } => {
@@ -2448,7 +2452,7 @@ fn clash_notice(clashes: &[&str]) -> String {
 
 /// The edit form's text for `draft`, in `FIELD_LABELS[1..]` order: what the form prefills, and
 /// what a `Stale` rebase compares against (review M-1).
-fn prefill(draft: &AgentDraft) -> [String; 7] {
+fn prefill(draft: &AgentDraft) -> [String; 8] {
     [
         draft.transport.as_str().to_owned(),
         draft.command.clone(),
@@ -2457,6 +2461,7 @@ fn prefill(draft: &AgentDraft) -> [String; 7] {
         draft.default_model.clone().unwrap_or_default(),
         draft.billing.as_str().to_owned(),
         if draft.enabled { "y" } else { "n" }.to_owned(),
+        if draft.user_extensions { "y" } else { "n" }.to_owned(),
     ]
 }
 

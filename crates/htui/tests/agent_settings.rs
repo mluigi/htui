@@ -35,6 +35,7 @@ fn draft() -> AgentDraft {
         default_model: Some("m1".to_owned()),
         billing: Billing::Subscription,
         enabled: true,
+        user_extensions: false,
     }
 }
 
@@ -333,6 +334,121 @@ async fn edit_agent_applies_and_keeps_name_env_discovery_and_settings() {
     assert_eq!(after.default_model, edit.default_model);
     assert_eq!(after.billing, Billing::PerToken);
     assert!(after.updated_at > before.updated_at, "the store stamped it");
+}
+
+/// `settings` without `user_extensions`, for "every other key is kept".
+fn without_user_extensions(settings: &serde_json::Value) -> serde_json::Value {
+    let mut rest = settings.clone();
+    rest.as_object_mut()
+        .expect("an object")
+        .remove("user_extensions");
+    rest
+}
+
+/// MOD-91 D6: `mods (y/n)` writes `settings.user_extensions` and nothing else of `settings`;
+/// setting it back to `n` stores `false`.
+#[tokio::test]
+async fn edit_agent_writes_user_extensions_and_keeps_the_other_settings_keys() {
+    let backend = demo();
+    let before = row(&registry(&backend).await, ids::AGENT_CLAUDE_CLI)
+        .agent
+        .clone();
+    assert!(
+        before.settings.get("user_extensions").is_none(),
+        "the demo row has not opted in"
+    );
+
+    let mut on = agent_settings::draft_of(&before);
+    assert!(!on.user_extensions);
+    on.user_extensions = true;
+    let (agents, outcome) = written(
+        serve(
+            &backend,
+            &StoreRequest::EditAgent {
+                agent_id: ids::AGENT_CLAUDE_CLI,
+                expected: before.updated_at,
+                draft: on,
+            },
+        )
+        .await,
+    );
+    assert!(matches!(outcome, AgentWrite::Edited { .. }), "{outcome:?}");
+    let after = row(&agents, ids::AGENT_CLAUDE_CLI).agent.clone();
+    assert_eq!(after.settings["user_extensions"], json!(true));
+    assert_eq!(without_user_extensions(&after.settings), before.settings);
+    assert!(agent_settings::draft_of(&after).user_extensions);
+
+    let off = agent_settings::draft_of(&before);
+    let (agents, outcome) = written(
+        serve(
+            &backend,
+            &StoreRequest::EditAgent {
+                agent_id: ids::AGENT_CLAUDE_CLI,
+                expected: after.updated_at,
+                draft: off,
+            },
+        )
+        .await,
+    );
+    assert!(matches!(outcome, AgentWrite::Edited { .. }), "{outcome:?}");
+    let again = &row(&agents, ids::AGENT_CLAUDE_CLI).agent;
+    assert_eq!(again.settings["user_extensions"], json!(false));
+    assert_eq!(without_user_extensions(&again.settings), before.settings);
+}
+
+/// MOD-91 D6, blueprint B7: a create merges the form's `mods (y/n)` into the source row's
+/// `settings`, both ways.
+#[tokio::test]
+async fn create_agent_merges_user_extensions_into_the_source_settings() {
+    let backend = demo();
+    let source = row(&registry(&backend).await, ids::AGENT_CLAUDE_CLI)
+        .agent
+        .settings
+        .clone();
+
+    let on = AgentDraft {
+        user_extensions: true,
+        ..draft()
+    };
+    let (agents, outcome) = written(
+        serve(
+            &backend,
+            &StoreRequest::CreateAgent {
+                name: "agent-x".to_owned(),
+                draft: on,
+                settings_from: Some(ids::AGENT_CLAUDE_CLI),
+            },
+        )
+        .await,
+    );
+    let AgentWrite::Created { id, .. } = outcome else {
+        panic!("a create answers Created: {outcome:?}");
+    };
+    let created = &row(&agents, id).agent;
+    assert_eq!(created.settings["user_extensions"], json!(true));
+    assert_eq!(without_user_extensions(&created.settings), source);
+
+    let (agents, outcome) = written(
+        serve(
+            &backend,
+            &StoreRequest::CreateAgent {
+                name: "agent-y".to_owned(),
+                draft: draft(),
+                settings_from: Some(id),
+            },
+        )
+        .await,
+    );
+    let AgentWrite::Created { id, .. } = outcome else {
+        panic!("a create answers Created: {outcome:?}");
+    };
+    let copied = &row(&agents, id).agent;
+    assert_eq!(
+        copied.settings["user_extensions"],
+        json!(false),
+        "an `n` over an opted-in source stores false"
+    );
+    assert_eq!(without_user_extensions(&copied.settings), source);
 }
 
 /// MOD-40 D5: a second edit on the first edit's token is `Stale` and writes nothing.
