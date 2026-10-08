@@ -648,8 +648,12 @@ answers, choice-field value keys) have no entry: they are not actions.
      over `global.select_tab_*`) and **state-guarded** (the view accepts at most one of the pair
      in any state, and declines the other so it falls through: `list.fold` and
      `backlog.runs.replay` on Enter). A pair a user creates between two of the file's entries
-     is always an error, and so is a chord an entry shares with another context's default
-     across a stack's layers (step 5 gives way only within one context);
+     is always an error. Across contexts nothing gives way (step 5 acts within one context)
+     and these stack rules stand: a chord an entry shares with another context's default is an
+     error where a declared stack makes both candidates (`[global] help = ["esc"]` against
+     `overlay.close`, or `[overlay] close = ["esc", "f1"]` against `global.help`), and is not
+     compared where no declared stack composes the two (`[global] quit = ["j"]` loads, and
+     `list.down` keeps `j`);
    - an `in_capture` action bound to a printable chord (§6.4).
 8. With any error: write every error to stderr and exit with status 2. Otherwise build the
    immutable `Keys` and pass it to `App::new`. There is no hot reload. Today `main.rs` maps every

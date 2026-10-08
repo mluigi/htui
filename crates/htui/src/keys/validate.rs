@@ -13,8 +13,11 @@ use super::{
 /// [`STATE_GUARDED`] pair that shares the chord by default keeps sharing it, and
 /// `overlay.close` never gives way (it must keep a chord).
 ///
-/// Nothing else changes: two entries on one chord, and a chord shared across the layers of a
-/// declared stack (another context's default included), are still [`validate`]'s errors.
+/// Across contexts nothing gives way, and [`validate`]'s stack rules stand: two entries on one
+/// chord are an error, and so is a chord an entry shares with another context's default only
+/// where a [`DECLARED`] stack makes both candidates (today the overlay stack: `[global] help`
+/// against `overlay.close`, either way). A context no declared stack composes with the entry's
+/// is not compared: `[global] quit = ["j"]` loads, and `list.down` keeps `j`.
 pub(super) fn give_way(keys: &mut Keys) {
     let mut taken: Vec<(usize, Lost)> = Vec::new();
     for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
@@ -294,8 +297,9 @@ mod tests {
         );
     }
 
-    /// A default only gives way in its own table (MOD-12 M3 R1 H1): across the layers of a
-    /// stack, a chord the user adds onto another table's default is still refused, either way.
+    /// A default only gives way in its own table (MOD-12 M3 R1 H1): where a declared stack
+    /// makes both candidates, a chord the user adds onto another table's default is still
+    /// refused, either way.
     #[test]
     fn a_collision_over_an_overlay_is_found_in_the_overlay_stack() {
         assert_eq!(
@@ -312,6 +316,20 @@ mod tests {
                 r#"[overlay] close = "f1": "f1" is already global.help (default) over an overlay"#
             )
         );
+    }
+
+    /// MOD-12 M3 R1 H1 review: across contexts nothing gives way, and only a declared stack
+    /// compares two contexts. No declared stack composes `[list]` with `[global]`, so a global
+    /// entry on a list default loads with no notice, and the list action keeps its chord.
+    #[test]
+    fn a_global_entry_on_a_list_default_loads_and_the_list_action_keeps_it() {
+        let keys = load_str("[global]\nquit = [\"j\"]\n").expect("no declared stack compares them");
+        assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("j")]);
+        assert_eq!(
+            keys.chords(Context::List, Act::ListDown),
+            [chord("j"), chord("down")]
+        );
+        assert!(keys.notices().is_empty());
     }
 
     #[test]
