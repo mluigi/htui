@@ -685,6 +685,8 @@ fn project_settings(project: &Project) -> ProjectSettings {
                 _ => false,
             };
             if !empty {
+                // Not deduped: the file keeps no process-wide state, and a once-set would need a
+                // global lock for a line that only fires on an already-malformed document.
                 tracing::warn!(
                     project = %project.id,
                     %err,

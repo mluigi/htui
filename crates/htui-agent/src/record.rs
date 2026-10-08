@@ -1701,6 +1701,9 @@ impl<'a, S: htui_core::store::RecorderStore> Recorder<'a, S> {
         breach: CapBreach,
         transport_done: Option<DriverEnvelope>,
     ) -> Result<(), RecordError> {
+        // A breach is only reported against a cap, so `run_cap` is always set here; the `Run`
+        // fallback keeps release builds answering rather than panicking.
+        debug_assert!(self.run_cap.is_some(), "a cap breach implies a run cap");
         let remainder_of = match self.run_cap.map_or(CapBasis::Run, |cap| cap.basis) {
             CapBasis::Run => format!("project.settings.{PER_TOKEN_CAP_RUN}"),
             CapBasis::Batch(id) => format!("batch {id}'s {PER_TOKEN_CAP_BATCH}"),

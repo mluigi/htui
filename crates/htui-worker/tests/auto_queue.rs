@@ -1942,7 +1942,8 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
         spent - CAP
     );
 
-    // The batch must still be open, so the next sweep declining to admit is the cap, not a closed batch.
+    // The batch must still be open, so the next sweep declining to admit is the cap, not a
+    // closed batch.
     let closed: Option<String> =
         sqlx::query_scalar("SELECT closed_reason FROM queue_batch WHERE id = $1")
             .bind(batch.as_uuid())

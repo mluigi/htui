@@ -3150,13 +3150,23 @@ where
         .await
         {
             Ok(live) => live,
+            Err(err @ ResolveError::ProjectCaps { .. }) => {
+                // A malformed cap would otherwise add an item note on every resume; the run keeps
+                // walking its snapshot, and the cause is logged instead.
+                tracing::warn!(
+                    %run,
+                    project = %item.project_id,
+                    %err,
+                    "live graph not comparable: the project caps do not resolve; walking the snapshot"
+                );
+                return Ok(None);
+            }
             Err(
                 err @ (ResolveError::FanOutCap { .. }
                 | ResolveError::AgentCap { .. }
                 | ResolveError::ReviewFanOut { .. }
                 | ResolveError::LocalFanOut { .. }
                 | ResolveError::NoCandidate { .. }
-                | ResolveError::ProjectCaps { .. }
                 | ResolveError::UnknownTouchedRepo { .. }),
             ) => {
                 let body = format!(
