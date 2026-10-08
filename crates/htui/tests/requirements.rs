@@ -400,3 +400,248 @@ async fn a_stale_amend_keeps_the_form() {
     assert_eq!(head.version, 4);
     assert!(head.body.ends_with("Mine."), "{}", head.body);
 }
+
+/// The hint row: the frame's line above the status line.
+fn hint(frame: &str) -> String {
+    let lines: Vec<&str> = frame.lines().collect();
+    lines[lines.len() - 2].to_owned()
+}
+
+/// The demo on the Requirements tab with `file` as the keys file (MOD-67 M4).
+async fn open_with_keys(file: &str) -> Harness {
+    let keys = htui::keys::load_str(file).expect("the keys load");
+    open_platform_in(Harness::over(MemStore::demo()).with_keys(keys)).await
+}
+
+/// MOD-67 M4 (D6, PA-3): a rebound `form.save` saves a mint from the body, the form hint names
+/// it, and `ctrl-s` (a chord, which never reaches the `TextArea`) no longer saves.
+#[tokio::test]
+async fn a_rebound_save_saves_a_requirements_draft() {
+    let mut harness = open_with_keys("version = 1\n[form]\nsave = \"f2\"\n").await;
+    harness.key("n");
+    type_text(&mut harness, "Every item has a title.");
+    let frame = harness.render();
+    assert_eq!(
+        hint(&frame),
+        " Tab field \u{b7} F2 save \u{b7} Esc cancel",
+        "{frame}"
+    );
+    harness.key("ctrl-s");
+    assert_eq!(harness.queued(), 0, "`ctrl-s` sends nothing");
+    assert!(
+        harness.render().contains("Every item has a title."),
+        "the draft is kept"
+    );
+    harness.key("f2");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(notice(&frame).contains("minted R-ENT-3"), "{frame}");
+}
+
+/// MOD-67 M4 (D10, risk 6): Priority's value keys stay the field's, and a chord never reaches it.
+#[tokio::test]
+async fn the_priority_field_keeps_its_value_keys_and_ignores_chords() {
+    let mut harness = open().await;
+    harness.key("n");
+    harness.key("tab");
+    harness.key("tab");
+    let frame = harness.render();
+    assert!(frame.contains("[must]"), "{frame}");
+    assert!(hint(&frame).ends_with(" \u{b7} m/l priority"), "{frame}");
+    harness.key("l");
+    assert!(harness.render().contains("[later]"), "`l` is later");
+    harness.key("m");
+    assert!(harness.render().contains("[must]"), "`m` is must");
+    harness.key("space");
+    assert!(harness.render().contains("[later]"), "`space` toggles");
+    harness.key("left");
+    assert!(harness.render().contains("[must]"), "`left` toggles");
+    harness.key("ctrl-l");
+    assert!(harness.render().contains("[must]"), "`ctrl-l` is not `l`");
+    harness.key("l");
+    harness.key("alt-m");
+    let frame = harness.render();
+    assert!(frame.contains("[later]"), "`alt-m` is not `m`: {frame}");
+    assert!(
+        frame.contains(" New requirement in ENT "),
+        "the form is still open: {frame}"
+    );
+}
+
+/// MOD-67 M4 (§1 item 4, pinned on purpose): `form.next_field`/`prev_field` move the focus,
+/// `Down`/`Up` included (the `requirements` view defaults), on every Requirements form; the
+/// `TextArea` fields keep `Up`/`Down` for themselves.
+#[tokio::test]
+async fn tab_and_down_move_the_form_focus() {
+    let mut harness = open().await;
+    harness.key("a");
+    type_text(&mut harness, "AB");
+    harness.key("tab");
+    type_text(&mut harness, "T1");
+    harness.key("backtab");
+    type_text(&mut harness, "C");
+    harness.key("down");
+    type_text(&mut harness, "2");
+    harness.key("up");
+    type_text(&mut harness, "D");
+    let frame = harness.render();
+    assert!(frame.contains("ABCD"), "the code took A, B, C, D: {frame}");
+    assert!(frame.contains("T12"), "the title took T, 1, 2: {frame}");
+    harness.key("esc");
+
+    // The mint form: Body → Rationale → Priority, and `Down` on Priority wraps to the body.
+    harness.key("n");
+    type_text(&mut harness, "b");
+    harness.key("tab");
+    type_text(&mut harness, "r");
+    harness.key("tab");
+    harness.key("l");
+    assert!(harness.render().contains("[later]"), "on Priority");
+    harness.key("down");
+    type_text(&mut harness, "x");
+    // The body's `TextArea` keeps `Up` (a line up); `Shift+Tab` wraps back to Priority.
+    harness.key("up");
+    harness.key("backtab");
+    harness.key("m");
+    let frame = harness.render();
+    assert!(
+        frame.contains("bx"),
+        "`down` on Priority moved to the body: {frame}"
+    );
+    assert!(
+        frame.contains("[must]"),
+        "`backtab` on the body moved to Priority: {frame}"
+    );
+    harness.key("esc");
+
+    // The amend form: `Down` on Priority moves to the deciding item, `Up` back.
+    harness.key("e");
+    harness.key("tab");
+    harness.key("tab");
+    harness.key("down");
+    type_text(&mut harness, "ANA-9");
+    harness.key("up");
+    harness.key("l");
+    let frame = harness.render();
+    assert!(
+        frame.contains("ANA-9"),
+        "the deciding item took it: {frame}"
+    );
+    assert!(
+        frame.contains("[later]"),
+        "`up` moved back to Priority: {frame}"
+    );
+}
+
+/// MOD-67 M4 (D5): `F1` opens the `?` box over a form and closes it; the form keeps its text.
+#[tokio::test]
+async fn f1_opens_help_from_a_form_and_the_form_stays() {
+    let mut harness = open().await;
+    harness.key("n");
+    type_text(&mut harness, "hello");
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opens the box");
+    let frame = harness.render();
+    assert!(frame.contains("Requirements: "), "{frame}");
+    assert!(frame.contains("Form: "), "{frame}");
+    assert!(frame.contains("F1 closes this box"), "{frame}");
+    harness.key("f1");
+    assert!(!harness.app().help_visible, "`F1` closes it");
+    let frame = harness.render();
+    assert!(frame.contains(" New requirement in ENT "), "{frame}");
+    assert!(frame.contains("hello"), "{frame}");
+}
+
+/// MOD-67 M4: while a write is in flight a form swallows plain keys, `form.save` says the write is
+/// in flight, and `ctrl-c` still quits.
+#[tokio::test]
+async fn a_write_in_flight_swallows_keys_but_save_says_so() {
+    let mut harness = open().await;
+    harness.key("n");
+    type_text(&mut harness, "Body");
+    harness.key("ctrl-s");
+    assert_eq!(harness.queued(), 1, "the mint is in flight");
+    harness.key("x");
+    let frame = harness.render();
+    assert!(!frame.contains("Bodyx"), "`x` was swallowed: {frame}");
+    harness.key("ctrl-s");
+    let frame = harness.render();
+    assert!(notice(&frame).contains("is still in flight"), "{frame}");
+    assert_eq!(harness.queued(), 1, "nothing more was sent");
+    harness.key("ctrl-c");
+    assert!(harness.app().should_quit, "`ctrl-c` still quits");
+}
+
+/// MOD-67 M4 (D11): browsing the tree, the status line is today's and the `?` box renders
+/// `REQUIREMENTS_BROWSE`, one line per layer.
+#[tokio::test]
+async fn the_requirements_tree_status_line_and_help_box() {
+    let mut harness = open().await;
+    let frame = harness.render();
+    assert_eq!(
+        status(&frame),
+        "q quit \u{b7} Tab next tab \u{b7} Shift+Tab previous tab \u{b7} 1 select tab \u{b7} ? help \
+         \u{b7} w workspaces \u{b7} Ctrl+f find",
+        "{frame}"
+    );
+    assert_eq!(
+        hint(&frame),
+        " j/k move \u{b7} Enter fold \u{b7} / filter \u{b7} a area \u{b7} n new \u{b7} e amend \
+         \u{b7} W withdraw \u{b7} r reload",
+        "{frame}"
+    );
+    harness.key("?");
+    assert!(harness.app().help_visible);
+    let frame = harness.render();
+    for line in [
+        "Requirements: a new area \u{b7} e amend \u{b7} W withdraw \u{b7} / filter",
+        "Common: n new \u{b7} r reload \u{b7} Esc back",
+        "List: j/Down down \u{b7} k/Up up \u{b7} g/Home top \u{b7} G/End bottom \u{b7} Enter fold",
+        "Pane: J scroll down \u{b7} K scroll up \u{b7} PgDn page down \u{b7} PgUp page up",
+        "Global: ",
+        "?/F1 closes this box",
+    ] {
+        assert!(frame.contains(line), "`{line}` is in the box: {frame}");
+    }
+    assert!(
+        !frame.contains("Requirements: j/k"),
+        "no legacy tab line: {frame}"
+    );
+}
+
+/// MOD-67 M4: the filter's stack (`CAPTURE`) offers no `form.save`, so `ctrl-s` there sends
+/// nothing, and a chord never types into the field.
+#[tokio::test]
+async fn ctrl_s_on_the_filter_saves_nothing_and_types_nothing() {
+    let mut harness = open().await;
+    harness.key("/");
+    type_text(&mut harness, "ST");
+    harness.key("ctrl-s");
+    assert_eq!(harness.queued(), 0, "nothing was sent");
+    let frame = harness.render();
+    assert!(hint(&frame).starts_with(" /ST"), "{frame}");
+    assert!(!hint(&frame).starts_with(" /STs"), "{frame}");
+    assert!(
+        hint(&frame).ends_with("  Enter apply \u{b7} Esc clear"),
+        "{frame}"
+    );
+}
+
+/// MOD-67 M4 (lane rebinding test): `[requirements] amend = "E"` moves the amend to `E`; `e`
+/// opens nothing and the browse hint names the new chord.
+#[tokio::test]
+async fn a_rebound_amend_amends_and_e_is_inert() {
+    let mut harness = open_with_keys("version = 1\n[requirements]\namend = \"E\"\n").await;
+    let frame = harness.render();
+    assert!(hint(&frame).contains("E amend"), "{frame}");
+    assert!(!hint(&frame).contains("e amend"), "{frame}");
+    harness.key("e");
+    let frame = harness.render();
+    assert!(
+        !frame.contains(" Amend R-ENT-1"),
+        "`e` opens nothing: {frame}"
+    );
+    harness.key("E");
+    let frame = harness.render();
+    assert!(frame.contains(" Amend R-ENT-1 (v2) "), "{frame}");
+}

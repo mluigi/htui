@@ -39,6 +39,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::requirements::{
     BLANK_AREA_TITLE, BLANK_BODY, DECIDING_KEY_NEEDED, DETAIL_NAME, MINT_NAME, READ_NAME,
     RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot, is_tab_write,
@@ -48,9 +49,9 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::Scroll;
 use crate::ui::tabs::backlog::list::window;
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyEvent, KeyModifiers};
 
 use forms::{AreaForm, FormFocus, FormOutcome, FormTarget, RequirementForm, WithdrawForm};
 use tree::{Fold, Row, TreeView};
@@ -88,29 +89,42 @@ const SELECT_A_REQUIREMENT: &str = "select a requirement first";
 /// The withdraw's typed-back key did not match.
 const NOT_THE_REQUIREMENT_KEY: &str = "that is not the requirement's key";
 
-/// The hint row's words before the write keys.
-const HINT_MOVE: &str = "j/k move  Enter fold  / filter  ";
+/// The hint row's words before the write keys (MOD-67 M4 D9).
+const HINT_MOVE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::ListFold, "fold"),
+    Hint::One(Act::RequirementsFilter, "filter"),
+];
 
 /// The four write keys, dimmed when the selected project refuses them.
-const HINT_WRITES: &str = "a area  n new  e amend  W withdraw";
+const HINT_WRITES: HintSpec = &[
+    Hint::One(Act::RequirementsNewArea, "area"),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::RequirementsAmend, "amend"),
+    Hint::One(Act::RequirementsWithdraw, "withdraw"),
+];
 
 /// The hint row's words after the write keys.
-const HINT_RELOAD: &str = "  r reload";
+const HINT_RELOAD: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The hint row on the filter, after the field.
-const FILTER_HINT: &str = "  Enter apply  Esc clear";
+/// The hint row on the filter, after the field: the field's own keys.
+const FILTER_HINT: HintSpec = &[Hint::Text("Enter apply"), Hint::Text("Esc clear")];
 
 /// The filter field's width on the hint row.
 const FILTER_WIDTH: u16 = 30;
 
-/// The hint row on the area and requirement forms.
-const FORM_HINT: &str = "Tab field  Ctrl+S save  Esc cancel";
+/// The hint row on the area and requirement forms (MOD-67 M4 D9).
+const FORM_HINT: HintSpec = &[
+    Hint::One(Act::FormNextField, "field"),
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+];
 
-/// Added to [`FORM_HINT`] on the priority field.
-const PRIORITY_HINT: &str = "  m/l priority";
+/// Added to [`FORM_HINT`] on the priority field: the choice's own value keys (D10).
+const PRIORITY_HINT: HintSpec = &[Hint::Text("m/l priority")];
 
-/// The hint row on the withdraw form.
-const WITHDRAW_HINT: &str = "Enter next  Esc cancel";
+/// The hint row on the withdraw form: its field's own keys.
+const WITHDRAW_HINT: HintSpec = &[Hint::Text("Enter next"), Hint::Text("Esc cancel")];
 
 /// A key while a write is in flight: one at a time (the Skills tab's rule).
 fn in_flight(busy: &str) -> String {
@@ -227,12 +241,6 @@ fn plain(key: &KeyEvent) -> bool {
     (key.modifiers - KeyModifiers::SHIFT).is_empty()
 }
 
-/// `Ctrl+S`.
-fn ctrl_s(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
-        && matches!(key.code, KeyCode::Char('s' | 'S'))
-}
-
 impl RequirementsTab {
     /// Identity of the Requirements tab.
     pub const ID: TabId = TabId("requirements");
@@ -243,9 +251,14 @@ impl RequirementsTab {
         Self::default()
     }
 
-    /// Whether a form or the filter is taking every key but `CONTROL` chords.
-    fn captures_input(&self) -> bool {
-        !matches!(self.mode, Mode::Browse)
+    /// The current mode's stack (MOD-67 M4 D4): the only place a mode maps to its keys.
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
+            Mode::Browse => views::REQUIREMENTS_BROWSE,
+            Mode::Filter { .. } => views::CAPTURE,
+            Mode::NewArea(_) | Mode::Requirement(_) => views::REQUIREMENTS_FORM,
+            Mode::Withdraw(_) => views::REQUIREMENTS_WITHDRAW,
+        }
     }
 
     /// The visible rows under the current filter and folds.
@@ -342,9 +355,11 @@ impl RequirementsTab {
                 .is_some_and(|entry| entry.maintainer)
     }
 
-    /// `a`, `n`, `e` or `W` (blueprint §4.4), checked in order: a write in flight; offline; not
-    /// the maintainer; a withdrawn requirement for `e`/`W`. None of these sends anything.
-    fn write_key(&mut self, key: char, ctx: &Ctx<'_>) {
+    /// `requirements.new_area`, `common.new`, `requirements.amend` or `requirements.withdraw`
+    /// (`a`, `n`, `e`, `W` by default; blueprint §4.4), checked in order: a write in flight;
+    /// offline; not the maintainer; a withdrawn requirement for an amend or withdraw. None of
+    /// these sends anything.
+    fn write_key(&mut self, act: Act, ctx: &Ctx<'_>) {
         let (Some(snapshot), Some(row)) = (&self.snapshot, self.selected) else {
             return;
         };
@@ -366,19 +381,19 @@ impl RequirementsTab {
             ctx.emit(Action::Error(not_the_maintainer(&slug(ctx, project))));
             return;
         }
-        let mode = match (key, row) {
-            ('a', _) => Mode::NewArea(AreaForm::new(project)),
-            ('n', Row::Project(_)) => {
+        let mode = match (act, row) {
+            (Act::RequirementsNewArea, _) => Mode::NewArea(AreaForm::new(project)),
+            (Act::New, Row::Project(_)) => {
                 self.notice = Some(Notice::Info(SELECT_AN_AREA.to_owned()));
                 return;
             }
-            ('n', Row::Area(id)) => {
+            (Act::New, Row::Area(id)) => {
                 let Some(area) = snapshot.area(id) else {
                     return;
                 };
                 Mode::Requirement(RequirementForm::mint(project, id, area.code.clone()))
             }
-            ('n', Row::Requirement(id)) => {
+            (Act::New, Row::Requirement(id)) => {
                 let Some(requirement) = snapshot.requirement(id) else {
                     return;
                 };
@@ -388,7 +403,7 @@ impl RequirementsTab {
                     requirement.area_code.clone(),
                 ))
             }
-            ('e' | 'W', Row::Requirement(id)) => {
+            (Act::RequirementsAmend | Act::RequirementsWithdraw, Row::Requirement(id)) => {
                 let Some(requirement) = snapshot.requirement(id) else {
                     return;
                 };
@@ -396,7 +411,7 @@ impl RequirementsTab {
                     ctx.emit(Action::Error(requirement_withdrawn(&requirement.key)));
                     return;
                 }
-                if key == 'e' {
+                if act == Act::RequirementsAmend {
                     Mode::Requirement(RequirementForm::amend(
                         id,
                         requirement.key.clone(),
@@ -413,7 +428,7 @@ impl RequirementsTab {
                     ))
                 }
             }
-            ('e' | 'W', _) => {
+            (Act::RequirementsAmend | Act::RequirementsWithdraw, _) => {
                 self.notice = Some(Notice::Info(SELECT_A_REQUIREMENT.to_owned()));
                 return;
             }
@@ -423,44 +438,61 @@ impl RequirementsTab {
         self.mode = mode;
     }
 
-    /// Browse (blueprint §4.4). `CONTROL`/`ALT` chords, digits, `q`, `w`, `?` and `Tab` pass to
-    /// the shell.
+    /// Browse (blueprint §4.4; MOD-67 M4 D6): the first candidate of the browse stack this state
+    /// accepts. A global act, or one this state declines (`list.fold` on a requirement row,
+    /// `common.back` with no filter), is the shell's, through the same stack.
     fn on_browse_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.step(1, ctx),
-            KeyCode::Char('k') | KeyCode::Up => self.step(-1, ctx),
-            KeyCode::Char('g') | KeyCode::Home => self.jump(false, ctx),
-            KeyCode::Char('G') | KeyCode::End => self.jump(true, ctx),
-            KeyCode::Enter => return self.fold(),
-            KeyCode::Char('J' | 'K') | KeyCode::PageDown | KeyCode::PageUp => {
-                return self.scroll.on_key(key, self.pane_rows.get());
-            }
-            KeyCode::Char('/') => {
-                self.notice = None;
-                self.mode = Mode::Filter {
-                    field: TextField::with_text(&self.filter),
-                };
-            }
-            KeyCode::Esc if !self.filter.is_empty() => {
-                self.filter.clear();
-                self.reselect(ctx);
-            }
-            KeyCode::Char(c @ ('a' | 'n' | 'e' | 'W')) => self.write_key(c, ctx),
-            KeyCode::Char('r') => {
-                self.notice = None;
-                ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
-                if let Some(Row::Requirement(id)) = self.selected {
-                    ctx.request(StoreRequest::RequirementDetail(id));
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::REQUIREMENTS_BROWSE, chord) {
+            match act {
+                Act::ListDown => self.step(1, ctx),
+                Act::ListUp => self.step(-1, ctx),
+                Act::ListTop => self.jump(false, ctx),
+                Act::ListBottom => self.jump(true, ctx),
+                // A requirement row has nothing to fold.
+                Act::ListFold => {
+                    if self.fold() == Handled::Pass {
+                        continue;
+                    }
                 }
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.pane_rows.get());
+                }
+                Act::RequirementsFilter => {
+                    self.notice = None;
+                    self.mode = Mode::Filter {
+                        field: TextField::with_text(&self.filter),
+                    };
+                }
+                // Only with a filter to clear: otherwise `Esc` is the shell's.
+                Act::Back if !self.filter.is_empty() => {
+                    self.filter.clear();
+                    self.reselect(ctx);
+                }
+                Act::RequirementsNewArea
+                | Act::New
+                | Act::RequirementsAmend
+                | Act::RequirementsWithdraw => self.write_key(act, ctx),
+                Act::Reload => {
+                    self.notice = None;
+                    ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
+                    if let Some(Row::Requirement(id)) = self.selected {
+                        ctx.request(StoreRequest::RequirementDetail(id));
+                    }
+                }
+                _ => continue, // a global act, or one this state declines
             }
-            _ => return Handled::Pass,
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
     /// The filter: every key updates `filter` and sends nothing (F-13); `Enter` applies and
-    /// re-selects, `Esc` clears and re-selects.
+    /// re-selects, `Esc` clears and re-selects (the field's own keys, MOD-67 M4 D10). A key the
+    /// field passes is swallowed but for the chords its stack passes (`ctrl-c`, `F1`); the stack
+    /// offers no `form.save`, so `ctrl-s` saves nothing here.
     fn on_filter_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let stack = self.stack();
         let Mode::Filter { field } = &mut self.mode else {
             return Handled::Pass;
         };
@@ -480,22 +512,41 @@ impl RequirementsTab {
                 self.mode = Mode::Browse;
                 self.reselect(ctx);
             }
-            FieldOutcome::Pass => {}
+            FieldOutcome::Pass => return modal_rest(stack, KeyChord::from_event(key)),
         }
         Handled::Consumed
     }
 
-    /// A key on an open form. While a write is in flight every key is swallowed: the reply closes
-    /// the form or keeps it, and a form closed now would leave it nothing to land on.
+    /// A key on an open form (MOD-67 M4 D6, PA-3). A plain key goes to the focused widget first;
+    /// a chord never reaches a widget, so `ctrl-m` sets no priority and the `TextArea` never sees
+    /// `ctrl-s`. What the widget passes, and every chord, is resolved through the form's stack:
+    /// `form.save` saves, `form.next_field`/`prev_field` move the focus, and the rest is swallowed
+    /// but for the chords the stack passes (CONTROL, ALT, function keys: `ctrl-c`, `F1`).
+    ///
+    /// While a write is in flight the reply closes the form or keeps it, and a form closed now
+    /// would leave it nothing to land on: `form.save` says the write is in flight, a chord the
+    /// stack passes still reaches the shell, everything else is swallowed.
     fn on_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
         if self.busy.is_some() {
-            return Handled::Consumed;
+            return match ctx.keys().actions(stack, chord).first() {
+                Some(Act::FormSave) => {
+                    self.save(ctx);
+                    Handled::Consumed
+                }
+                _ => modal_rest(stack, chord),
+            };
         }
-        let outcome = match &mut self.mode {
-            Mode::NewArea(form) => form.on_key(key),
-            Mode::Requirement(form) => form.on_key(key),
-            Mode::Withdraw(form) => form.on_key(key),
-            Mode::Browse | Mode::Filter { .. } => return Handled::Pass,
+        let outcome = if plain(&key) {
+            match &mut self.mode {
+                Mode::NewArea(form) => form.on_key(key),
+                Mode::Requirement(form) => form.on_key(key),
+                Mode::Withdraw(form) => form.on_key(key),
+                Mode::Browse | Mode::Filter { .. } => return Handled::Pass,
+            }
+        } else {
+            FormOutcome::Pass
         };
         match outcome {
             FormOutcome::Stay => {}
@@ -504,8 +555,24 @@ impl RequirementsTab {
                 self.notice = None;
             }
             FormOutcome::Submit => self.save(ctx),
+            FormOutcome::Pass => match ctx.keys().actions(stack, chord).first() {
+                Some(Act::FormSave) => self.save(ctx),
+                Some(Act::FormNextField) => self.focus_step(true),
+                Some(Act::FormPrevField) => self.focus_step(false),
+                _ => return modal_rest(stack, chord),
+            },
         }
         Handled::Consumed
+    }
+
+    /// `form.next_field` (`forward`) or `form.prev_field`: the area form's other field, or the
+    /// requirement form's next or previous one, wrapping. The withdraw form has one field.
+    fn focus_step(&mut self, forward: bool) {
+        match &mut self.mode {
+            Mode::NewArea(form) => form.toggle(),
+            Mode::Requirement(form) => form.cycle(forward),
+            Mode::Browse | Mode::Filter { .. } | Mode::Withdraw(_) => {}
+        }
     }
 
     /// `Ctrl+S`, or `Enter` where it submits: validate, then send; a withdraw's first stage moves
@@ -961,8 +1028,8 @@ impl RequirementsTab {
         );
     }
 
-    /// The hint row for the current mode.
-    fn hint(&self, theme: &Theme) -> Line<'static> {
+    /// The hint row for the current mode, through its stack and `keys` (MOD-67 M4 D9).
+    fn hint(&self, keys: &Keys, theme: &Theme) -> Line<'static> {
         match &self.mode {
             Mode::Browse => {
                 let writes = if self.writes_allowed() {
@@ -970,28 +1037,51 @@ impl RequirementsTab {
                 } else {
                     theme.dim
                 };
-                Line::from(vec![
-                    Span::styled(format!(" {HINT_MOVE}"), theme.base),
-                    Span::styled(HINT_WRITES, writes),
-                    Span::styled(HINT_RELOAD, theme.base),
-                ])
+                // Three groups, the writes in their own style; an unbound group drops out with
+                // its separator.
+                let stack = self.stack();
+                let mut spans = vec![Span::styled(" ", theme.base)];
+                for (spec, style) in [
+                    (HINT_MOVE, theme.base),
+                    (HINT_WRITES, writes),
+                    (HINT_RELOAD, theme.base),
+                ] {
+                    let text = keys.hint(stack, spec);
+                    if text.is_empty() {
+                        continue;
+                    }
+                    if spans.len() > 1 {
+                        spans.push(Span::styled(" \u{b7} ", theme.base));
+                    }
+                    spans.push(Span::styled(text, style));
+                }
+                Line::from(spans)
             }
             Mode::Filter { field } => {
                 let mut spans = vec![Span::styled(" /", theme.accent)];
                 spans.extend(field.line(FILTER_WIDTH, true, theme).spans);
-                spans.push(Span::styled(FILTER_HINT, theme.dim));
+                spans.push(Span::styled(
+                    format!("  {}", keys.hint(self.stack(), FILTER_HINT)),
+                    theme.dim,
+                ));
                 Line::from(spans)
             }
-            Mode::NewArea(_) => Line::styled(format!(" {FORM_HINT}"), theme.dim),
+            Mode::NewArea(_) => Line::styled(
+                format!(" {}", keys.hint(self.stack(), FORM_HINT)),
+                theme.dim,
+            ),
             Mode::Requirement(form) => {
-                let extra = if form.focus == FormFocus::Priority {
-                    PRIORITY_HINT
-                } else {
-                    ""
-                };
-                Line::styled(format!(" {FORM_HINT}{extra}"), theme.dim)
+                let mut text = keys.hint(self.stack(), FORM_HINT);
+                if form.focus == FormFocus::Priority {
+                    text.push_str(" \u{b7} ");
+                    text.push_str(&keys.hint(self.stack(), PRIORITY_HINT));
+                }
+                Line::styled(format!(" {text}"), theme.dim)
             }
-            Mode::Withdraw(_) => Line::styled(format!(" {WITHDRAW_HINT}"), theme.dim),
+            Mode::Withdraw(_) => Line::styled(
+                format!(" {}", keys.hint(self.stack(), WITHDRAW_HINT)),
+                theme.dim,
+            ),
         }
     }
 }
@@ -1015,17 +1105,15 @@ impl Tab for RequirementsTab {
         *self = Self::default();
     }
 
-    /// A form or the filter captures every key but `CONTROL`/`ALT` chords, so digits, `q` and
-    /// `Tab` are text there; `Ctrl+S` saves a form.
+    /// The current mode's stack (MOD-67 M4 D4).
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
+    /// Each mode resolves through its stack (MOD-67 M4 D4, D6). A form or the filter captures
+    /// every key but the chords its stack passes, so digits, `q` and `Tab` are text or field moves
+    /// there; `form.save` (`Ctrl+S`) saves a form.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        // `save` does nothing on the filter, which has nothing to save.
-        if self.captures_input() && ctrl_s(&key) {
-            self.save(ctx);
-            return Handled::Consumed;
-        }
-        if !plain(&key) {
-            return Handled::Pass;
-        }
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
             Mode::Filter { .. } => self.on_filter_key(key, ctx),
@@ -1179,7 +1267,7 @@ impl Tab for RequirementsTab {
             ),
             notice_row,
         );
-        frame.render_widget(Paragraph::new(self.hint(ctx.theme)), hint_row);
+        frame.render_widget(Paragraph::new(self.hint(ctx.keys(), ctx.theme)), hint_row);
     }
 
     fn reveal(&mut self, target: &RevealTarget, ctx: &mut Ctx<'_>) -> bool {
@@ -1213,6 +1301,7 @@ mod tests {
     use super::{HINT_WRITES, Mode, Notice, RequirementsTab, Row, SAVING};
     use crate::app::{Action, Ctx, Emit, Handled, TopBarState};
     use crate::keymap::Keymap;
+    use crate::keys::{Keys, views};
     use crate::requirements::{
         self, READ_NAME, RequirementWrite, RequirementsSnapshot, not_the_maintainer,
     };
@@ -1383,6 +1472,13 @@ mod tests {
         assert!(!tab.writes_allowed(), "the hint dims the write words");
     }
 
+    impl RequirementsTab {
+        /// Whether a form or the filter is taking every key but chords.
+        fn captures_input(&self) -> bool {
+            !matches!(self.mode, Mode::Browse)
+        }
+    }
+
     #[tokio::test]
     async fn captures_input_follows_the_mode() {
         let (snapshot, projects, scope) = platform().await;
@@ -1412,10 +1508,11 @@ mod tests {
 
     /// The style the Browse hint draws the four write words in.
     fn write_words_style(tab: &RequirementsTab, theme: &Theme) -> Style {
-        tab.hint(theme)
+        let writes = Keys::compiled().hint(views::REQUIREMENTS_BROWSE, HINT_WRITES);
+        tab.hint(Keys::compiled(), theme)
             .spans
             .iter()
-            .find(|span| span.content == HINT_WRITES)
+            .find(|span| span.content == writes)
             .expect("the hint names the write keys")
             .style
     }
