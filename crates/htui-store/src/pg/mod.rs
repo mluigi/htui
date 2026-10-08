@@ -1,4 +1,5 @@
-//! The Postgres store: connect, schema check, seed, box registration (ANA-9 §5.0, §5.10, plan D4-D6).
+//! The Postgres store: connect, schema check, seed, box registration (ANA-9 §5.0, §5.10, plan D4-D6),
+//! and the read-only connect of the `--json` verbs (MOD-92 D2).
 //!
 //! `PgStore` is the only `WriteStore` in the product (ANA-9 §6.1); MOD-6 T2 adds the read and
 //! write impls on top of what this module builds.
@@ -246,7 +247,7 @@ impl PgStore {
         identity: &Identity,
         connect_timeout: Duration,
     ) -> Result<Connected> {
-        let pool = open_pool(dsn, connect_timeout, PoolSize::TUI).await?;
+        let pool = open_pool(dsn, connect_timeout, PoolSize::TUI, Session::ReadWrite).await?;
 
         let migrations = schema_state(&pool).await?;
         let mut store = Self {
@@ -288,31 +289,8 @@ impl PgStore {
         connect_timeout: Duration,
         pool: PoolSize,
     ) -> core::result::Result<Self, HeadlessError> {
-        let pool = open_pool(dsn, connect_timeout, pool).await?;
-        let mut conn = pool.acquire().await.map_err(map_sqlx)?;
-        let migrations = if migrations_table_exists(&mut conn).await? {
-            applied_state(&mut conn).await?
-        } else {
-            MigrationState::Pending(embedded_migrations())
-        };
-        drop(conn);
-        if let MigrationState::Pending(n) = migrations {
-            return Err(HeadlessError::MigrationsPending(n));
-        }
-        if let Some(stored) = stored_target(&pool).await? {
-            let target = parse_target(&stored).map_err(|text| {
-                StoreError::Backend(format!(
-                    "app_setting.{TARGET_VERSION_KEY} holds {text}, which is not a version; a \
-                     headless process does not guess"
-                ))
-            })?;
-            if this_version() < target {
-                return Err(HeadlessError::BelowTarget {
-                    ours: HTUI_VERSION.to_owned(),
-                    target: target.to_string(),
-                });
-            }
-        }
+        let pool = open_pool(dsn, connect_timeout, pool, Session::ReadWrite).await?;
+        headless_checks(&pool).await?;
         let mut store = Self {
             pool,
             identity: identity.clone(),
@@ -323,6 +301,48 @@ impl PgStore {
         };
         store.bootstrap().await?;
         Ok(store)
+    }
+
+    /// Connects for a read-only verb (MOD-92 D2): `htui status`, `htui waiting`, `--search-items`.
+    ///
+    /// [`connect_headless`](Self::connect_headless)'s pool and refusals, then **no** bootstrap:
+    /// nothing is seeded and no box is registered. Every session of the pool starts with
+    /// `default_transaction_read_only = on`, so Postgres itself refuses a write, whatever code path
+    /// attempts it. `this_box` is `box_id` as `box.toml` records it, or nil; it is never checked
+    /// against the `box` table (a copied `box.toml` is not detected, MOD-7 D3, because that check
+    /// registers). `this_user` is nil. `identity()` carries `box_id` and an empty hostname: a
+    /// read-only store has no identity to persist. The pool holds [`PoolSize::MIN`] connections.
+    ///
+    /// # Errors
+    ///
+    /// As [`connect_headless`](Self::connect_headless): [`HeadlessError::Store`] (unreachable,
+    /// newer, drifted, partial, malformed target, or any connect refusal such as a failed password),
+    /// [`HeadlessError::MigrationsPending`], [`HeadlessError::BelowTarget`].
+    pub async fn connect_read_only(
+        dsn: &str,
+        box_id: Option<BoxId>,
+        connect_timeout: Duration,
+    ) -> core::result::Result<Self, HeadlessError> {
+        let pool = open_pool(
+            dsn,
+            connect_timeout,
+            PoolSize(PoolSize::MIN),
+            Session::ReadOnly,
+        )
+        .await?;
+        headless_checks(&pool).await?;
+        let box_id = box_id.unwrap_or_default();
+        Ok(Self {
+            pool,
+            identity: Identity {
+                box_id,
+                hostname: String::new(),
+            },
+            this_box: box_id,
+            this_user: UserId::default(),
+            registration: None,
+            below_target: None,
+        })
     }
 
     /// A store over a pool that has **never** connected, for tests that need an `Online`
@@ -788,9 +808,32 @@ impl NewBoxRow<'_> {
     }
 }
 
-/// The pool both connects open: `pool` connections, `connect_timeout` to acquire one.
-async fn open_pool(dsn: &str, connect_timeout: Duration, pool: PoolSize) -> Result<PgPool> {
+/// How a pool's sessions start (MOD-92 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Session {
+    /// The TUI's and the headless processes' sessions.
+    ReadWrite,
+    /// `default_transaction_read_only = on`, sent in the startup packet: Postgres refuses every
+    /// write, temporary tables included (`25006`).
+    ReadOnly,
+}
+
+/// The pool every connect opens: `pool` connections, `connect_timeout` to acquire one, and
+/// sessions that start as `session` says.
+///
+/// [`Session::ReadOnly`] appends its `-c default_transaction_read_only=on` after any `options=`
+/// the DSN carries, so it is the last setting of that name and wins.
+async fn open_pool(
+    dsn: &str,
+    connect_timeout: Duration,
+    pool: PoolSize,
+    session: Session,
+) -> Result<PgPool> {
     let options = PgConnectOptions::from_str(dsn).map_err(map_sqlx)?;
+    let options = match session {
+        Session::ReadWrite => options,
+        Session::ReadOnly => options.options([("default_transaction_read_only", "on")]),
+    };
     PgPoolOptions::new()
         .max_connections(pool.get())
         .acquire_timeout(connect_timeout)
@@ -863,6 +906,38 @@ async fn migrations_table_exists(conn: &mut PgConnection) -> Result<bool> {
     .fetch_one(conn)
     .await
     .map_err(map_sqlx)
+}
+
+/// The refusals of a process with no one to ask (MOD-40 blueprint B19), every one a read:
+/// a pending schema (without creating the migrations table), a dirty, newer or drifted one, a
+/// malformed target, a build below the target. Shared by `connect_headless` and
+/// `connect_read_only` (MOD-92 D2), so the two cannot disagree.
+async fn headless_checks(pool: &PgPool) -> core::result::Result<(), HeadlessError> {
+    let mut conn = pool.acquire().await.map_err(map_sqlx)?;
+    let migrations = if migrations_table_exists(&mut conn).await? {
+        applied_state(&mut conn).await?
+    } else {
+        MigrationState::Pending(embedded_migrations())
+    };
+    drop(conn);
+    if let MigrationState::Pending(n) = migrations {
+        return Err(HeadlessError::MigrationsPending(n));
+    }
+    if let Some(stored) = stored_target(pool).await? {
+        let target = parse_target(&stored).map_err(|text| {
+            StoreError::Backend(format!(
+                "app_setting.{TARGET_VERSION_KEY} holds {text}, which is not a version; a \
+                 headless process does not guess"
+            ))
+        })?;
+        if this_version() < target {
+            return Err(HeadlessError::BelowTarget {
+                ours: HTUI_VERSION.to_owned(),
+                target: target.to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// How many embedded up-migrations there are: a database with no migrations table has all of
