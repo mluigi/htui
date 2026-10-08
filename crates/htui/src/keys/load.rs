@@ -7,9 +7,7 @@ use std::path::{Path, PathBuf};
 use toml::Spanned;
 use toml::de::{DeString, DeTable, DeValue};
 
-use super::{
-    Act, CATALOGUE, CTRL_C, ChordError, Context, KeyChord, Keys, contexts, quote, validate,
-};
+use super::{Act, CATALOGUE, CTRL_C, ChordError, Context, KeyChord, Keys, quote, validate};
 
 /// The key file's name under the config root.
 pub const FILE_NAME: &str = "keys.toml";
@@ -180,8 +178,9 @@ fn line_of(src: &str, offset: usize) -> usize {
 
 /// The context whose table is `path` (`global`, `common`, ...).
 fn context_named(path: &str) -> Option<Context> {
-    contexts()
-        .into_iter()
+    Context::ALL
+        .iter()
+        .copied()
         .find(|context| context.table() == path)
 }
 
@@ -251,7 +250,7 @@ impl Loader<'_> {
             .values()
             .any(|value| !matches!(value.get_ref(), DeValue::Table(_)));
         if context.is_none() && (has_values || table.is_empty()) {
-            let tables = contexts()
+            let tables = Context::ALL
                 .iter()
                 .map(|context| context.table())
                 .collect::<Vec<_>>()
@@ -380,7 +379,11 @@ mod tests {
         }
     }
 
-    const TABLES: &str = "the tables are global, overlay, list, pane, confirm, form, common";
+    const TABLES: &str = "the tables are global, overlay, list, pane, confirm, form, common, \
+                          settings, settings.agents, settings.hierarchy, settings.kinds, \
+                          settings.prompt, settings.connection, settings.qdrant, settings.boxes, \
+                          settings.personas, settings.secrets, settings.queue, concepts, \
+                          switcher, migration, waiting";
 
     #[test]
     fn an_empty_file_is_the_defaults() {
@@ -471,7 +474,7 @@ mod tests {
     fn an_unknown_table_lists_the_tables() {
         for (src, path) in [
             ("[globl]\nquit = \"x\"\n", "globl"),
-            ("[settings.boxes]\nreload = \"r\"\n", "settings.boxes"),
+            ("[settings.nothing]\nreload = \"r\"\n", "settings.nothing"),
             ("[global.extra]\nx = \"y\"\n", "global.extra"),
             ("[nothing]\n", "nothing"),
         ] {

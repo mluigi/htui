@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Keys, contexts, quote};
+use super::{Context, Keys, quote};
 
 /// The header and `version = 1`. Constant, so the output is the same on every machine (B-13).
 const HEADER: &str = r"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
@@ -19,7 +19,7 @@ version = 1
 #[must_use]
 pub fn print(keys: &Keys) -> String {
     let mut out = HEADER.to_owned();
-    for context in contexts() {
+    for &context in Context::ALL {
         let rows: Vec<(&str, String, &str, bool)> = keys
             .rows
             .iter()
@@ -99,7 +99,7 @@ close = ["esc"]  # close"#;
         let printed = print(Keys::compiled());
         let head: Vec<&str> = printed.lines().take(26).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
-        assert!(printed.ends_with("dismiss = [\"esc\"]  # dismiss\n"));
+        assert!(printed.ends_with("[waiting]\nopen = [\"enter\"]  # open step\n"));
         assert!(!printed.ends_with("\n\n"));
         assert!(printed.lines().all(|line| line == line.trim_end()));
         assert!(printed.lines().all(|line| line.chars().count() <= 100));

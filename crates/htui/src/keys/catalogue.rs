@@ -17,12 +17,21 @@
 //! capturing mode (M3) the global layer is filtered chord by chord, and printable chords drop
 //! out. So `global.help` (`?`, `f1`) reaches help through `f1` while a field types `?`, and
 //! `global.quit` (`q`) is unreachable there. `ctrl-c` quits regardless.
+//!
+//! MOD-67 M3 appends the Settings tab's context, one context per Settings section and one per
+//! overlay, in strip order (plan D1). A view context holds the view's own verbs; the shared verbs
+//! it inherits through `Layer::view` may be overridden per view (D10), and [`VIEW_DEFAULTS`] adds
+//! the extra chords a view takes today on a shared act (D12 as amended by PA-1).
 
-use Context::{Common, Confirm, Form, Global, List, Overlay, Pane};
+use Context::{
+    Common, Concepts, Confirm, Form, Global, List, Overlay, Pane, Settings, SettingsAgents,
+    SettingsBoxes, SettingsConnection, SettingsHierarchy, SettingsKinds, SettingsPersonas,
+    SettingsSecrets, Switcher, Waiting,
+};
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
-/// M1 has the global, overlay and shared contexts; M3-M5 append view contexts (`SettingsAgents`,
-/// `BacklogRuns`, ...), each in its own block.
+/// M1 has the global, overlay and shared contexts; M3 appends the Settings and overlay view
+/// contexts; M4-M5 append theirs (`BacklogRuns`, ...), each in its own block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Context {
     /// `[global]`: reachable from every screen, checked last.
@@ -39,10 +48,67 @@ pub enum Context {
     Form,
     /// `[common]`: verbs every view that offers them shares (edit, new, delete, ...).
     Common,
+    /// `[settings]`: the Settings tab's own keys (section cycling).
+    Settings,
+    /// `[settings.agents]`: the Agents section.
+    SettingsAgents,
+    /// `[settings.hierarchy]`: the Hierarchy section.
+    SettingsHierarchy,
+    /// `[settings.kinds]`: the Kinds section.
+    SettingsKinds,
+    /// `[settings.prompt]`: the Prompt section (no own action; overrides only).
+    SettingsPrompt,
+    /// `[settings.connection]`: the Connection section.
+    SettingsConnection,
+    /// `[settings.qdrant]`: the Qdrant section (no own action; overrides only).
+    SettingsQdrant,
+    /// `[settings.boxes]`: the Boxes section.
+    SettingsBoxes,
+    /// `[settings.personas]`: the Personas section.
+    SettingsPersonas,
+    /// `[settings.secrets]`: the Secrets section.
+    SettingsSecrets,
+    /// `[settings.queue]`: the Queue section (no own action; overrides and view defaults).
+    SettingsQueue,
+    /// `[concepts]`: the concepts search overlay.
+    Concepts,
+    /// `[switcher]`: the workspace switcher overlay.
+    Switcher,
+    /// `[migration]`: the schema migration prompt (no own action; view defaults only).
+    Migration,
+    /// `[waiting]`: the waiting list overlay.
+    Waiting,
 }
 
 impl Context {
-    /// The TOML table name: `global`, `overlay`, `list`, `pane`, `confirm`, `form`, `common`.
+    /// Every context in table order: the key file's tables and `--print-keys`' order (MOD-67
+    /// M3, L-B Q5). The catalogue's blocks follow it.
+    pub const ALL: &'static [Self] = &[
+        Self::Global,
+        Self::Overlay,
+        Self::List,
+        Self::Pane,
+        Self::Confirm,
+        Self::Form,
+        Self::Common,
+        Self::Settings,
+        Self::SettingsAgents,
+        Self::SettingsHierarchy,
+        Self::SettingsKinds,
+        Self::SettingsPrompt,
+        Self::SettingsConnection,
+        Self::SettingsQdrant,
+        Self::SettingsBoxes,
+        Self::SettingsPersonas,
+        Self::SettingsSecrets,
+        Self::SettingsQueue,
+        Self::Concepts,
+        Self::Switcher,
+        Self::Migration,
+        Self::Waiting,
+    ];
+
+    /// The TOML table name: `global`, `overlay`, `list`, ..., `settings.agents`, `concepts`.
     #[must_use]
     pub const fn table(self) -> &'static str {
         match self {
@@ -53,10 +119,26 @@ impl Context {
             Self::Confirm => "confirm",
             Self::Form => "form",
             Self::Common => "common",
+            Self::Settings => "settings",
+            Self::SettingsAgents => "settings.agents",
+            Self::SettingsHierarchy => "settings.hierarchy",
+            Self::SettingsKinds => "settings.kinds",
+            Self::SettingsPrompt => "settings.prompt",
+            Self::SettingsConnection => "settings.connection",
+            Self::SettingsQdrant => "settings.qdrant",
+            Self::SettingsBoxes => "settings.boxes",
+            Self::SettingsPersonas => "settings.personas",
+            Self::SettingsSecrets => "settings.secrets",
+            Self::SettingsQueue => "settings.queue",
+            Self::Concepts => "concepts",
+            Self::Switcher => "switcher",
+            Self::Migration => "migration",
+            Self::Waiting => "waiting",
         }
     }
 
-    /// The `?` box heading: `Global`, `Overlay`, `List`, `Pane`, `Confirm`, `Form`, `Common`.
+    /// The `?` box heading: `Global`, `Overlay`, ..., a section's or an overlay's title
+    /// (`Connection`, `Workspaces`, `Waiting on you`).
     #[must_use]
     pub const fn heading(self) -> &'static str {
         match self {
@@ -67,7 +149,55 @@ impl Context {
             Self::Confirm => "Confirm",
             Self::Form => "Form",
             Self::Common => "Common",
+            Self::Settings => "Settings",
+            Self::SettingsAgents => "Agents",
+            Self::SettingsHierarchy => "Hierarchy",
+            Self::SettingsKinds => "Kinds",
+            Self::SettingsPrompt => "Prompt",
+            Self::SettingsConnection => "Connection",
+            Self::SettingsQdrant => "Qdrant",
+            Self::SettingsBoxes => "Boxes",
+            Self::SettingsPersonas => "Personas",
+            Self::SettingsSecrets => "Secrets",
+            Self::SettingsQueue => "Queue",
+            Self::Concepts => "Search concepts",
+            Self::Switcher => "Workspaces",
+            Self::Migration => "Schema",
+            Self::Waiting => "Waiting on you",
         }
+    }
+
+    /// A view's own context (a Settings section or an overlay): hosts view verbs, D10 overrides
+    /// and [`VIEW_DEFAULTS`]; skipped by the validator's per-context pass (MOD-67 M3 PA-4).
+    #[must_use]
+    pub const fn is_view(self) -> bool {
+        matches!(
+            self,
+            Self::SettingsAgents
+                | Self::SettingsHierarchy
+                | Self::SettingsKinds
+                | Self::SettingsPrompt
+                | Self::SettingsConnection
+                | Self::SettingsQdrant
+                | Self::SettingsBoxes
+                | Self::SettingsPersonas
+                | Self::SettingsSecrets
+                | Self::SettingsQueue
+                | Self::Concepts
+                | Self::Switcher
+                | Self::Migration
+                | Self::Waiting
+        )
+    }
+
+    /// A shared context a view layer may inherit and override (MOD-67 D10, PA-3): `list`,
+    /// `pane`, `confirm`, `form`, `common`, `settings`.
+    #[must_use]
+    pub const fn is_shared(self) -> bool {
+        matches!(
+            self,
+            Self::List | Self::Pane | Self::Confirm | Self::Form | Self::Common | Self::Settings
+        )
     }
 }
 
@@ -157,6 +287,76 @@ pub enum Act {
     Back,
     /// `common.dismiss`: clear the notice.
     Dismiss,
+    /// `settings.next_section`: the next Settings section.
+    NextSection,
+    /// `settings.prev_section`: the previous Settings section.
+    PrevSection,
+    /// `settings.agents.probe`: probe the selected agent's CLI.
+    AgentsProbe,
+    /// `settings.agents.install`: install the selected agent's CLI.
+    AgentsInstall,
+    /// `settings.agents.authenticate`: log the selected agent in.
+    AgentsAuthenticate,
+    /// `settings.agents.switch_box`: switch the agent's install target to this box.
+    AgentsSwitchBox,
+    /// `settings.agents.edit_paths`: edit the agent's paths.
+    AgentsEditPaths,
+    /// `settings.agents.open_link`: open the login link.
+    AgentsOpenLink,
+    /// `settings.agents.paste_redirect`: paste the login redirect.
+    AgentsPasteRedirect,
+    /// `settings.agents.cancel`: cancel the running install or login.
+    AgentsCancel,
+    /// `settings.agents.choose`: select the highlighted login method.
+    AgentsChoose,
+    /// `settings.hierarchy.new_workspace`: create a workspace.
+    HierarchyNewWorkspace,
+    /// `settings.hierarchy.primary`: make the selected checkout primary.
+    HierarchyPrimary,
+    /// `settings.hierarchy.choose_path`: choose a path with the picker.
+    HierarchyChoosePath,
+    /// `settings.hierarchy.infer`: infer the workspace's paths.
+    HierarchyInfer,
+    /// `settings.kinds.new_graph`: create a graph.
+    KindsNewGraph,
+    /// `settings.kinds.graph`: edit the selected kind's graph.
+    KindsGraph,
+    /// `settings.connection.rebuild`: rebuild the cache.
+    ConnectionRebuild,
+    /// `settings.connection.activate`: run the selected row's action (the Rebuild row).
+    ConnectionActivate,
+    /// `settings.boxes.edit_tags`: edit the box's tags.
+    BoxesEditTags,
+    /// `settings.boxes.edit_quirks`: edit the box's quirks.
+    BoxesEditQuirks,
+    /// `settings.boxes.executor`: set the box as the workspace executor.
+    BoxesExecutor,
+    /// `settings.boxes.probe`: probe the box.
+    BoxesProbe,
+    /// `settings.boxes.edit_spec`: edit the box's probe spec.
+    BoxesEditSpec,
+    /// `settings.personas.body`: edit the persona's body.
+    PersonasBody,
+    /// `settings.personas.rules`: edit the persona's rules.
+    PersonasRules,
+    /// `settings.personas.import`: import personas from a path.
+    PersonasImport,
+    /// `settings.secrets.check`: check the secrets backend.
+    SecretsCheck,
+    /// `concepts.decisions`: search decisions only.
+    ConceptsDecisions,
+    /// `concepts.project`: cycle the project scope.
+    ConceptsProject,
+    /// `concepts.reindex`: re-index the scope.
+    ConceptsReindex,
+    /// `concepts.up`: the previous hit.
+    ConceptsUp,
+    /// `concepts.down`: the next hit.
+    ConceptsDown,
+    /// `switcher.switch`: switch to the selected workspace.
+    SwitcherSwitch,
+    /// `waiting.open`: open the selected waiting step.
+    WaitingOpen,
 }
 
 impl Act {
@@ -325,7 +525,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // [list]
     // backlog/mod.rs:655, requirements/mod.rs:430, connection.rs:811, kinds.rs:1492,
     // qdrant.rs:404, workspace_switcher.rs:163, waiting_list.rs:274. agents.rs:2420 and
-    // hierarchy.rs:1211 take `j` only (ANA §6.6 adds `down`).
+    // hierarchy.rs:1212 take `j` only (ANA §6.6 adds `down`, M3).
     row(Act::ListDown, List, "down", &["j", "down"], "down"),
     // backlog/mod.rs:656, requirements/mod.rs:431, connection.rs:815, kinds.rs:1496,
     // boxes.rs:699, library.rs:689.
@@ -353,7 +553,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::PanePageDown, Pane, "page_down", &["pgdn"], "page down"),
     // backlog/detail/mod.rs:450.
     row(Act::PanePageUp, Pane, "page_up", &["pgup"], "page up"),
-    // backlog/mod.rs:659. settings/mod.rs:340 binds the same chords to sections (M3).
+    // backlog/mod.rs:659. Settings cycles sections through `settings.next_section` (M3).
     row(
         Act::PaneNextSubtab,
         Pane,
@@ -361,7 +561,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["l", "]", "right"],
         "next sub-tab",
     ),
-    // backlog/mod.rs:660. settings/mod.rs:344 (sections).
+    // backlog/mod.rs:660. Settings: `settings.prev_section` (M3).
     row(
         Act::PanePrevSubtab,
         Pane,
@@ -372,15 +572,15 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // [confirm]
     // connection.rs:483, qdrant.rs:214, kinds.rs:715, hierarchy.rs:769, personas.rs:785,
     // boxes.rs:545, runs.rs:583, detail/requirements.rs:306. migration_prompt.rs:92 also
-    // takes `Y`.
+    // takes `Y`: a `VIEW_DEFAULTS` row.
     row(Act::ConfirmYes, Confirm, "yes", &["y"], "yes"),
     // connection.rs:487, qdrant.rs:218, kinds.rs:726, agents.rs:1161, boxes.rs:546,
     // personas.rs:791, runs.rs:587, detail/requirements.rs:317, hierarchy.rs:761.
-    // migration_prompt.rs:97 also takes `N`.
+    // migration_prompt.rs:97 also takes `N`: a `VIEW_DEFAULTS` row.
     row(Act::ConfirmNo, Confirm, "no", &["n", "esc"], "no"),
     // [form]: all in capture; every chord is named or ctrl.
-    // item_form.rs:613, requirements/forms.rs:306, compose.rs:340. The Settings and attach
-    // forms also take `Down` (agents.rs:2170, attach.rs:488), added per view in M3/M4.
+    // item_form.rs:613, requirements/forms.rs:306, compose.rs:340. The Settings forms also
+    // take `Down` (agents.rs:2166): `VIEW_DEFAULTS` rows (M3); attach.rs:488 in M4.
     capture_row(
         Act::FormNextField,
         Form,
@@ -388,7 +588,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["tab"],
         "next field",
     ),
-    // item_form.rs:617, requirements/forms.rs:310, compose.rs:344.
+    // item_form.rs:617, requirements/forms.rs:310, compose.rs:344. The Settings forms also
+    // take `Up`: `VIEW_DEFAULTS` rows.
     capture_row(
         Act::FormPrevField,
         Form,
@@ -414,31 +615,402 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // kinds.rs:1452, hierarchy.rs:1233, agents.rs:2395, library.rs:694, templates.rs:527.
     // backlog/mod.rs:679 uses `N`.
     row(Act::New, Common, "new", &["n"], "new"),
-    // hierarchy.rs:1278, kinds.rs:1484.
+    // hierarchy.rs:1279, kinds.rs:1484.
     row(Act::Delete, Common, "delete", &["d"], "delete"),
     // connection.rs:785, qdrant.rs:388. detail/requirements.rs:481 `c` is the cite picker.
     row(Act::Clear, Common, "clear", &["c"], "clear"),
-    // connection.rs:822, qdrant.rs:414, kinds.rs:1505, hierarchy.rs:1288, prompt.rs:869,
+    // connection.rs:822, qdrant.rs:414, kinds.rs:1505, hierarchy.rs:1289, prompt.rs:869,
     // boxes.rs:733, requirements/mod.rs:449, library.rs:690, templates.rs:523, attach.rs:398.
     // agents.rs:2495 `r` probes (a view verb).
     row(Act::Reload, Common, "reload", &["r"], "reload"),
-    // divergence.rs:245, library.rs:895, chat/mod.rs:233. personas.rs:841 also takes `Enter`.
+    // divergence.rs:245, library.rs:895, chat/mod.rs:233. personas.rs:841 also takes `Enter`:
+    // a `VIEW_DEFAULTS` row.
     row(Act::Back, Common, "back", &["esc"], "back"),
-    // connection.rs:828, boxes.rs:739, hierarchy.rs:1294, kinds.rs:1511, prompt.rs:875.
+    // connection.rs:828, boxes.rs:739, hierarchy.rs:1295, kinds.rs:1511, prompt.rs:875.
     // Shares `Esc` with `back`: `STATE_GUARDED`.
     row(Act::Dismiss, Common, "dismiss", &["esc"], "dismiss"),
+    // [settings]: the Settings tab's own section cycling (MOD-67 M3 D1). Every non-capturing
+    // section stack carries this layer, so a section's view layer may override both.
+    // settings/mod.rs:347.
+    row(
+        Act::NextSection,
+        Settings,
+        "next_section",
+        &["l", "]", "right"],
+        "next section",
+    ),
+    // settings/mod.rs:351.
+    row(
+        Act::PrevSection,
+        Settings,
+        "prev_section",
+        &["h", "[", "left"],
+        "previous section",
+    ),
+    // [settings.agents]
+    // agents.rs:2479-2498 (`r` probes; not `common.reload`).
+    row(Act::AgentsProbe, SettingsAgents, "probe", &["r"], "probe"),
+    // agents.rs:2428.
+    row(
+        Act::AgentsInstall,
+        SettingsAgents,
+        "install",
+        &["i"],
+        "install",
+    ),
+    // agents.rs:2432.
+    row(
+        Act::AgentsAuthenticate,
+        SettingsAgents,
+        "authenticate",
+        &["a"],
+        "authenticate",
+    ),
+    // agents.rs:2407.
+    row(
+        Act::AgentsSwitchBox,
+        SettingsAgents,
+        "switch_box",
+        &["t"],
+        "this box",
+    ),
+    // agents.rs:2414.
+    row(
+        Act::AgentsEditPaths,
+        SettingsAgents,
+        "edit_paths",
+        &["m"],
+        "paths",
+    ),
+    // agents.rs:2438.
+    row(
+        Act::AgentsOpenLink,
+        SettingsAgents,
+        "open_link",
+        &["o"],
+        "open link",
+    ),
+    // agents.rs:2444.
+    row(
+        Act::AgentsPasteRedirect,
+        SettingsAgents,
+        "paste_redirect",
+        &["p"],
+        "paste redirect",
+    ),
+    // agents.rs:2454 (install), :2468 (login): one verb for both (L-A Q9).
+    row(
+        Act::AgentsCancel,
+        SettingsAgents,
+        "cancel",
+        &["x"],
+        "cancel",
+    ),
+    // agents.rs:640: the login chooser's `Enter` (L-A Q10).
+    row(
+        Act::AgentsChoose,
+        SettingsAgents,
+        "choose",
+        &["enter"],
+        "select",
+    ),
+    // [settings.hierarchy]
+    // hierarchy.rs:1220.
+    row(
+        Act::HierarchyNewWorkspace,
+        SettingsHierarchy,
+        "new_workspace",
+        &["N"],
+        "new workspace",
+    ),
+    // hierarchy.rs:1250.
+    row(
+        Act::HierarchyPrimary,
+        SettingsHierarchy,
+        "primary",
+        &["p"],
+        "make primary",
+    ),
+    // hierarchy.rs:1258.
+    row(
+        Act::HierarchyChoosePath,
+        SettingsHierarchy,
+        "choose_path",
+        &["b"],
+        "choose path",
+    ),
+    // hierarchy.rs:1268.
+    row(
+        Act::HierarchyInfer,
+        SettingsHierarchy,
+        "infer",
+        &["i"],
+        "infer paths",
+    ),
+    // [settings.kinds]
+    // kinds.rs:1460.
+    row(
+        Act::KindsNewGraph,
+        SettingsKinds,
+        "new_graph",
+        &["N"],
+        "new graph",
+    ),
+    // kinds.rs:1476: a view verb, not `list.top` (D2).
+    row(
+        Act::KindsGraph,
+        SettingsKinds,
+        "graph",
+        &["g"],
+        "edit graph",
+    ),
+    // [settings.connection]
+    // connection.rs:802.
+    row(
+        Act::ConnectionRebuild,
+        SettingsConnection,
+        "rebuild",
+        &["R"],
+        "rebuild cache",
+    ),
+    // connection.rs:807: `Enter` runs the Rebuild row; declined on every other row (L-B Q8).
+    row(
+        Act::ConnectionActivate,
+        SettingsConnection,
+        "activate",
+        &["enter"],
+        "run row",
+    ),
+    // [settings.boxes]
+    // boxes.rs:703.
+    row(
+        Act::BoxesEditTags,
+        SettingsBoxes,
+        "edit_tags",
+        &["t"],
+        "edit tags",
+    ),
+    // boxes.rs:707.
+    row(
+        Act::BoxesEditQuirks,
+        SettingsBoxes,
+        "edit_quirks",
+        &["e"],
+        "edit quirks",
+    ),
+    // boxes.rs:712-721: shares `w` with `global.workspaces` (`STATE_GUARDED`).
+    row(
+        Act::BoxesExecutor,
+        SettingsBoxes,
+        "executor",
+        &["w"],
+        "executor",
+    ),
+    // boxes.rs:727.
+    row(Act::BoxesProbe, SettingsBoxes, "probe", &["p"], "probe"),
+    // boxes.rs:723.
+    row(
+        Act::BoxesEditSpec,
+        SettingsBoxes,
+        "edit_spec",
+        &["s"],
+        "edit probe spec",
+    ),
+    // [settings.personas]
+    // personas.rs:444 `'b'`.
+    row(
+        Act::PersonasBody,
+        SettingsPersonas,
+        "body",
+        &["b"],
+        "edit body",
+    ),
+    // personas.rs:444 `'r'`.
+    row(
+        Act::PersonasRules,
+        SettingsPersonas,
+        "rules",
+        &["r"],
+        "edit rules",
+    ),
+    // personas.rs:444 `'I'`.
+    row(
+        Act::PersonasImport,
+        SettingsPersonas,
+        "import",
+        &["I"],
+        "import",
+    ),
+    // [settings.secrets]
+    // secrets.rs:1416.
+    row(Act::SecretsCheck, SettingsSecrets, "check", &["t"], "check"),
+    // [concepts]: all in capture, the query field types every printable chord.
+    // concepts_search.rs:295.
+    capture_row(
+        Act::ConceptsDecisions,
+        Concepts,
+        "decisions",
+        &["ctrl-d"],
+        "decisions only",
+    ),
+    // concepts_search.rs:299.
+    capture_row(
+        Act::ConceptsProject,
+        Concepts,
+        "project",
+        &["ctrl-p"],
+        "cycle project scope",
+    ),
+    // concepts_search.rs:303.
+    capture_row(
+        Act::ConceptsReindex,
+        Concepts,
+        "reindex",
+        &["ctrl-r"],
+        "re-index scope",
+    ),
+    // concepts_search.rs:315.
+    capture_row(Act::ConceptsUp, Concepts, "up", &["up"], "previous hit"),
+    // concepts_search.rs:319.
+    capture_row(Act::ConceptsDown, Concepts, "down", &["down"], "next hit"),
+    // [switcher]
+    // workspace_switcher.rs:171.
+    row(
+        Act::SwitcherSwitch,
+        Switcher,
+        "switch",
+        &["enter"],
+        "switch workspace",
+    ),
+    // [waiting]
+    // waiting_list.rs:284.
+    row(Act::WaitingOpen, Waiting, "open", &["enter"], "open step"),
 ];
 
-/// Default pairs that share a chord in one context because a view accepts at most one of them
-/// in any state and declines the other (ANA-26 §7.4 step 7, "state-guarded"). It starts M2's
-/// reviewed allow-list.
-pub static STATE_GUARDED: &[(Act, Act)] = &[(Act::Back, Act::Dismiss)];
+/// Extra default chords a view adds to a shared act, on top of whatever the shared row resolves
+/// to (MOD-67 M3 PA-1). `Keys` derives the view's row after the key file is merged; an explicit
+/// `[<view>] <name>` line replaces it. Order: `Context::ALL`, then `Act` order. Each row cites
+/// the arm it mirrors.
+pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
+    // agents.rs:2166, :2170: the create/edit and paths forms also move on `Down`/`Up`.
+    (SettingsAgents, Act::FormNextField, &["down"]),
+    (SettingsAgents, Act::FormPrevField, &["up"]),
+    // hierarchy.rs:866, :870.
+    (SettingsHierarchy, Act::FormNextField, &["down"]),
+    (SettingsHierarchy, Act::FormPrevField, &["up"]),
+    // kinds.rs:773, :777.
+    (SettingsKinds, Act::FormNextField, &["down"]),
+    (SettingsKinds, Act::FormPrevField, &["up"]),
+    // personas.rs:1576, :1580.
+    (SettingsPersonas, Act::FormNextField, &["down"]),
+    (SettingsPersonas, Act::FormPrevField, &["up"]),
+    // personas.rs:841: the import report also closes on `Enter`.
+    (SettingsPersonas, Act::Back, &["enter"]),
+    // secrets.rs:674, :675.
+    (SettingsSecrets, Act::FormNextField, &["down"]),
+    (SettingsSecrets, Act::FormPrevField, &["up"]),
+    // queue.rs:617: `Enter` edits too.
+    (Context::SettingsQueue, Act::Edit, &["enter"]),
+    // migration_prompt.rs:92, :97: the capitals answer too.
+    (Context::Migration, Act::ConfirmYes, &["Y"]),
+    (Context::Migration, Act::ConfirmNo, &["N"]),
+];
+
+/// Default pairs in one declared stack where the narrower act always wins (ANA-26 §7.4 step 7,
+/// "shadowing"; MOD-67 D11 as amended by PA-2): allowed only for a chord that is a default of
+/// both, with the first act's layer narrower. Each entry is demanded by the compiled defaults
+/// (`every_allow_list_entry_is_demanded`).
+pub static SHADOWING: &[(Act, Act)] = &[
+    // migration_prompt.rs:97 + VIEW_DEFAULTS: `[migration] no` derives ["n", "esc", "N"], and
+    // `Esc` is also overlay.close below it. Both close the prompt, nothing applied.
+    (Act::ConfirmNo, Act::OverlayClose),
+];
+
+/// Default pairs that share a chord in one context or stack because a view accepts at most one
+/// of them in any state and declines the other (ANA-26 §7.4 step 7, "state-guarded"). M2's
+/// reviewed allow-list; each entry is demanded by the compiled defaults.
+pub static STATE_GUARDED: &[(Act, Act)] = &[
+    (Act::Back, Act::Dismiss),
+    // boxes.rs:712-721: the executor question opens only over a listed box with a readable
+    // list; otherwise `w` declines and falls through to the switcher (box_settings.rs:1356).
+    (Act::BoxesExecutor, Act::Workspaces),
+];
 
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
     use super::{Act, CATALOGUE, Context, STATE_GUARDED};
+
+    /// `context`'s index in [`Context::ALL`]. No wildcard arm: a new context fails to compile
+    /// here until it is listed, and then in `ALL` too, or `every_context_is_listed_once_in_all`
+    /// fails.
+    const fn context_position(context: Context) -> usize {
+        match context {
+            Context::Global => 0,
+            Context::Overlay => 1,
+            Context::List => 2,
+            Context::Pane => 3,
+            Context::Confirm => 4,
+            Context::Form => 5,
+            Context::Common => 6,
+            Context::Settings => 7,
+            Context::SettingsAgents => 8,
+            Context::SettingsHierarchy => 9,
+            Context::SettingsKinds => 10,
+            Context::SettingsPrompt => 11,
+            Context::SettingsConnection => 12,
+            Context::SettingsQdrant => 13,
+            Context::SettingsBoxes => 14,
+            Context::SettingsPersonas => 15,
+            Context::SettingsSecrets => 16,
+            Context::SettingsQueue => 17,
+            Context::Concepts => 18,
+            Context::Switcher => 19,
+            Context::Migration => 20,
+            Context::Waiting => 21,
+        }
+    }
+
+    #[test]
+    fn every_context_is_listed_once_in_all() {
+        assert_eq!(Context::ALL.len(), 22);
+        for (index, context) in Context::ALL.iter().enumerate() {
+            assert_eq!(
+                context_position(*context),
+                index,
+                "{context:?} is out of place in Context::ALL"
+            );
+        }
+        let unique: HashSet<Context> = Context::ALL.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            Context::ALL.len(),
+            "a context is listed twice"
+        );
+    }
+
+    #[test]
+    fn catalogue_blocks_follow_context_all() {
+        let mut last = 0;
+        for row in CATALOGUE {
+            let here = context_position(row.context);
+            assert!(here >= last, "{:?} is out of its context's block", row.act);
+            last = here;
+        }
+    }
+
+    #[test]
+    fn shared_names_are_unique_across_shared_contexts() {
+        let mut seen = HashSet::new();
+        for row in CATALOGUE.iter().filter(|row| row.context.is_shared()) {
+            assert!(
+                seen.insert(row.name),
+                "{} is a name in two shared contexts",
+                row.name
+            );
+        }
+    }
 
     /// Every [`Act`], in declaration order. [`position`] keeps it complete.
     const ALL: &[Act] = &[
@@ -483,6 +1055,41 @@ mod tests {
         Act::Reload,
         Act::Back,
         Act::Dismiss,
+        Act::NextSection,
+        Act::PrevSection,
+        Act::AgentsProbe,
+        Act::AgentsInstall,
+        Act::AgentsAuthenticate,
+        Act::AgentsSwitchBox,
+        Act::AgentsEditPaths,
+        Act::AgentsOpenLink,
+        Act::AgentsPasteRedirect,
+        Act::AgentsCancel,
+        Act::AgentsChoose,
+        Act::HierarchyNewWorkspace,
+        Act::HierarchyPrimary,
+        Act::HierarchyChoosePath,
+        Act::HierarchyInfer,
+        Act::KindsNewGraph,
+        Act::KindsGraph,
+        Act::ConnectionRebuild,
+        Act::ConnectionActivate,
+        Act::BoxesEditTags,
+        Act::BoxesEditQuirks,
+        Act::BoxesExecutor,
+        Act::BoxesProbe,
+        Act::BoxesEditSpec,
+        Act::PersonasBody,
+        Act::PersonasRules,
+        Act::PersonasImport,
+        Act::SecretsCheck,
+        Act::ConceptsDecisions,
+        Act::ConceptsProject,
+        Act::ConceptsReindex,
+        Act::ConceptsUp,
+        Act::ConceptsDown,
+        Act::SwitcherSwitch,
+        Act::WaitingOpen,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -530,6 +1137,41 @@ mod tests {
             Act::Reload => 38,
             Act::Back => 39,
             Act::Dismiss => 40,
+            Act::NextSection => 41,
+            Act::PrevSection => 42,
+            Act::AgentsProbe => 43,
+            Act::AgentsInstall => 44,
+            Act::AgentsAuthenticate => 45,
+            Act::AgentsSwitchBox => 46,
+            Act::AgentsEditPaths => 47,
+            Act::AgentsOpenLink => 48,
+            Act::AgentsPasteRedirect => 49,
+            Act::AgentsCancel => 50,
+            Act::AgentsChoose => 51,
+            Act::HierarchyNewWorkspace => 52,
+            Act::HierarchyPrimary => 53,
+            Act::HierarchyChoosePath => 54,
+            Act::HierarchyInfer => 55,
+            Act::KindsNewGraph => 56,
+            Act::KindsGraph => 57,
+            Act::ConnectionRebuild => 58,
+            Act::ConnectionActivate => 59,
+            Act::BoxesEditTags => 60,
+            Act::BoxesEditQuirks => 61,
+            Act::BoxesExecutor => 62,
+            Act::BoxesProbe => 63,
+            Act::BoxesEditSpec => 64,
+            Act::PersonasBody => 65,
+            Act::PersonasRules => 66,
+            Act::PersonasImport => 67,
+            Act::SecretsCheck => 68,
+            Act::ConceptsDecisions => 69,
+            Act::ConceptsProject => 70,
+            Act::ConceptsReindex => 71,
+            Act::ConceptsUp => 72,
+            Act::ConceptsDown => 73,
+            Act::SwitcherSwitch => 74,
+            Act::WaitingOpen => 75,
         }
     }
 
@@ -554,7 +1196,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 41);
+        assert_eq!(CATALOGUE.len(), 76);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -671,10 +1313,40 @@ mod tests {
             (Context::Confirm, "confirm", "Confirm"),
             (Context::Form, "form", "Form"),
             (Context::Common, "common", "Common"),
+            (Context::Settings, "settings", "Settings"),
+            (Context::SettingsAgents, "settings.agents", "Agents"),
+            (
+                Context::SettingsHierarchy,
+                "settings.hierarchy",
+                "Hierarchy",
+            ),
+            (Context::SettingsKinds, "settings.kinds", "Kinds"),
+            (Context::SettingsPrompt, "settings.prompt", "Prompt"),
+            (
+                Context::SettingsConnection,
+                "settings.connection",
+                "Connection",
+            ),
+            (Context::SettingsQdrant, "settings.qdrant", "Qdrant"),
+            (Context::SettingsBoxes, "settings.boxes", "Boxes"),
+            (Context::SettingsPersonas, "settings.personas", "Personas"),
+            (Context::SettingsSecrets, "settings.secrets", "Secrets"),
+            (Context::SettingsQueue, "settings.queue", "Queue"),
+            (Context::Concepts, "concepts", "Search concepts"),
+            (Context::Switcher, "switcher", "Workspaces"),
+            (Context::Migration, "migration", "Schema"),
+            (Context::Waiting, "waiting", "Waiting on you"),
         ];
+        assert_eq!(table.len(), Context::ALL.len());
         for (context, name, heading) in table {
             assert_eq!(context.table(), name);
             assert_eq!(context.heading(), heading);
+        }
+        for context in Context::ALL {
+            assert!(
+                !(context.is_view() && context.is_shared()),
+                "{context:?} is both a view and a shared context"
+            );
         }
     }
 
@@ -703,7 +1375,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_form_and_overlay_close_are_in_capture() {
+    fn in_capture_acts_are_the_form_overlay_close_and_concepts() {
         let captured: HashSet<Act> = CATALOGUE
             .iter()
             .filter(|row| row.in_capture)
@@ -717,6 +1389,11 @@ mod tests {
                 Act::FormSave,
                 Act::FormExternalEditor,
                 Act::OverlayClose,
+                Act::ConceptsDecisions,
+                Act::ConceptsProject,
+                Act::ConceptsReindex,
+                Act::ConceptsUp,
+                Act::ConceptsDown,
             ])
         );
     }

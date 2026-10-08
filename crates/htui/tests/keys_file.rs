@@ -112,7 +112,10 @@ mod binary {
                         .to_owned(),
                     r#"6: [list] up: write each chord as a string, such as "q""#.to_owned(),
                     "8: [globl]: no such table; the tables are global, overlay, list, pane, \
-                     confirm, form, common"
+                     confirm, form, common, settings, settings.agents, settings.hierarchy, \
+                     settings.kinds, settings.prompt, settings.connection, settings.qdrant, \
+                     settings.boxes, settings.personas, settings.secrets, settings.queue, \
+                     concepts, switcher, migration, waiting"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \

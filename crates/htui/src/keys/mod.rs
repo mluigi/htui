@@ -14,7 +14,7 @@ pub mod print;
 pub mod stack;
 pub mod validate;
 
-pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, STATE_GUARDED};
+pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, SHADOWING, STATE_GUARDED, VIEW_DEFAULTS};
 pub use chord::{CTRL_C, ChordError, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
 pub use load::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
@@ -167,17 +167,6 @@ impl Keys {
             .filter(|layer| layer.admits(act))
             .find_map(|layer| self.row(layer.context(), act))
     }
-}
-
-/// Every context in catalogue order, once each: the key file's tables (MOD-67 M2).
-fn contexts() -> Vec<Context> {
-    let mut out: Vec<Context> = Vec::new();
-    for spec in CATALOGUE {
-        if !out.contains(&spec.context) {
-            out.push(spec.context);
-        }
-    }
-    out
 }
 
 /// `text` as a TOML basic string: wrapped in `"`, with `\` and `"` escaped and every control
