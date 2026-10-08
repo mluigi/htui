@@ -4,7 +4,7 @@
 **Selected Milestone**: 1 — Editor in the pane
 **Complexity**: Large
 **Routing**: PRD path, ultracode for implement and review (`/handoff-run MOD-57`, accepted 2026-10-07).
-**Status**: DRAFT — fact-checked, awaiting CONFIRM.
+**Status**: DONE (2026-10-08) — confirmed 2026-10-07; implemented `1c8c9e3c`..`a464ac21`; review R1 applied.
 
 ## Summary
 

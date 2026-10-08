@@ -93,7 +93,7 @@ macOS are built and tested here; Windows (ConPTY) compiles and passes the cross-
 
 | # | Milestone | Outcome | Status | Plan |
 |---|---|---|---|---|
-| 1 | Editor in the pane | With the preference on, `E`/`Ctrl+E` open the editor in the requesting pane with htui drawn around it: keys and `ctrl-c` forwarded, resizes forwarded, leave and refocus within the view, abort, and the file read back through the same gate. Dependencies decided and in `Cargo.lock`. | in-progress | `.claude/plans/mod-57-m1-editor-in-pane.plan.md` |
+| 1 | Editor in the pane | With the preference on, `E`/`Ctrl+E` open the editor in the requesting pane with htui drawn around it: keys and `ctrl-c` forwarded, resizes forwarded, leave and refocus within the view, abort, and the file read back through the same gate. Dependencies decided and in `Cargo.lock`. | complete | `.claude/plans/mod-57-m1-editor-in-pane.plan.md` |
 | 2 | Live editor across htui, close-out | With focus in htui, tabs switch and work while the editor stays alive; status-line notice; a second edit refused; quit confirms and kills; no child left behind; help, docs and the MOD-16 Windows entry; decision record. | pending | — |
 
 ## Open Questions
