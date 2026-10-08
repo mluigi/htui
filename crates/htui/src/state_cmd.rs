@@ -160,11 +160,25 @@ pub(crate) fn read_identity() -> Result<Option<Identity>, Failure> {
     identity::load(&root).map_err(|err| Failure::refused(ErrorCode::BoxIdentity, err.to_string()))
 }
 
-/// The answer to `verb` over `ctx`. Never fails: a failure is an [`Answer`] too.
+/// The answer to `verb` over `ctx`. Never fails: a failure is an [`Answer`] too. The pool is closed
+/// before it returns, whatever the reads answered (review R1 L9).
 pub async fn answer(verb: Verb, args: &cli::StateArgs, ctx: &Context<'_>) -> Answer {
-    let outcome = answer_online(verb, args, ctx)
-        .await
-        .unwrap_or_else(Outcome::Failed);
+    let outcome = match PgStore::connect_read_only(
+        ctx.dsn,
+        ctx.identity.map(|identity| identity.box_id),
+        ctx.connect_timeout,
+    )
+    .await
+    {
+        Err(err) => Outcome::Failed(Failure::from_connect(err)),
+        Ok(pg) => {
+            let outcome = answer_online(&pg, verb, args, ctx)
+                .await
+                .unwrap_or_else(Outcome::Failed);
+            pg.close().await;
+            outcome
+        }
+    };
     Answer {
         kind: verb.kind(),
         outcome,
@@ -173,20 +187,14 @@ pub async fn answer(verb: Verb, args: &cli::StateArgs, ctx: &Context<'_>) -> Ans
 
 /// [`answer`]'s reads, `serve_waiting`'s (`store_worker.rs`) on a read-only session.
 async fn answer_online(
+    pg: &PgStore,
     verb: Verb,
     args: &cli::StateArgs,
     ctx: &Context<'_>,
 ) -> Result<Outcome, Failure> {
-    let pg = PgStore::connect_read_only(
-        ctx.dsn,
-        ctx.identity.map(|identity| identity.box_id),
-        ctx.connect_timeout,
-    )
-    .await
-    .map_err(Failure::from_connect)?;
     let read = |err: StoreError| Failure::from_read(&err);
     let workspaces = pg.workspaces().await.map_err(read)?;
-    let target = state_target(&pg, &workspaces, args, ctx.identity).await?;
+    let target = state_target(pg, &workspaces, args, ctx.identity).await?;
     let active = pg.active_runs(&target.scope).await.map_err(read)?;
     let candidates = pg.waiting_candidates(&target.scope).await.map_err(read)?;
     let permissions =
@@ -332,7 +340,8 @@ fn cwd_unmatched(cwd: &Path) -> Failure {
 /// Writes `answer`: under `json` one compact document and a newline, else the human text; a reader
 /// that closed the pipe is not an error (`write_out`). Then the exit: `Ok` for 0, else the
 /// [`StateExit`] carrying the human sentence (`main` prints it on stderr; nothing here prints to
-/// stderr but search's "no matches" / "the index is empty" notes).
+/// stderr but the note [`human_text`] returns beside the text: search's "no matches" / "the index
+/// is empty").
 ///
 /// # Errors
 /// [`StateExit`] for exit 1-3; [`StateExit::Failed`] when stdout fails with anything but
@@ -343,7 +352,11 @@ pub fn emit(out: &mut dyn Write, answer: &Answer, json: bool) -> Result<(), Stat
         text.push('\n');
         text
     } else {
-        human_text(answer)
+        let (text, note) = human_text(answer);
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
+        text
     };
     if !text.is_empty() {
         crate::write_out(out, text.as_bytes())
@@ -390,29 +403,33 @@ fn envelope_text(answer: &Answer, pretty: bool) -> String {
     }
 }
 
-/// `answer` as a person reads it.
-fn human_text(answer: &Answer) -> String {
+/// `answer` as a person reads it: the text for stdout, and the note for stderr, if any (review R1
+/// L10: printing is [`emit`]'s).
+fn human_text(answer: &Answer) -> (String, Option<&'static str>) {
     match &answer.outcome {
-        Outcome::Status(body) => format!("{}\n", human_status(body)),
-        Outcome::Waiting(body) => human_waiting(body),
+        Outcome::Status(body) => (format!("{}\n", human_status(body)), None),
+        Outcome::Waiting(body) => (human_waiting(body), None),
         Outcome::Search(search) => match &search.index {
-            IndexAnswer::Hits(hits) if hits.is_empty() => {
-                eprintln!("no matches (run `htui --index-items` if the index is empty)");
-                String::new()
-            }
-            IndexAnswer::Hits(hits) => hits
-                .iter()
-                .map(|hit| format!("{}\n", concepts::format_hit(hit)))
-                .collect(),
-            IndexAnswer::Empty => {
-                eprintln!("the index is empty; run `htui --index-items`");
-                String::new()
-            }
-            IndexAnswer::Offline(_) | IndexAnswer::Refused(_) | IndexAnswer::Failed(_) => {
-                String::new()
-            }
+            IndexAnswer::Hits(hits) if hits.is_empty() => (
+                String::new(),
+                Some("no matches (run `htui --index-items` if the index is empty)"),
+            ),
+            IndexAnswer::Hits(hits) => (
+                hits.iter()
+                    .map(|hit| format!("{}\n", concepts::format_hit(hit)))
+                    .collect(),
+                None,
+            ),
+            IndexAnswer::Empty => (
+                String::new(),
+                Some("the index is empty; run `htui --index-items`"),
+            ),
+            IndexAnswer::Offline(_)
+            | IndexAnswer::Refused(_)
+            | IndexAnswer::AccessRefused(_)
+            | IndexAnswer::Failed(_) => (String::new(), None),
         },
-        Outcome::Failed(_) => String::new(),
+        Outcome::Failed(_) => (String::new(), None),
     }
 }
 
@@ -452,7 +469,7 @@ impl Answer {
             Outcome::Search(search) => match search.index {
                 IndexAnswer::Hits(_) | IndexAnswer::Empty => 0,
                 IndexAnswer::Offline(_) => 3,
-                IndexAnswer::Refused(_) => 2,
+                IndexAnswer::Refused(_) | IndexAnswer::AccessRefused(_) => 2,
                 IndexAnswer::Failed(_) => 1,
             },
         }
@@ -466,6 +483,7 @@ impl Answer {
                 index:
                     IndexAnswer::Offline(message)
                     | IndexAnswer::Refused(message)
+                    | IndexAnswer::AccessRefused(message)
                     | IndexAnswer::Failed(message),
                 ..
             }) => message.clone(),
@@ -570,7 +588,11 @@ pub enum IndexAnswer {
     Offline(String),
     /// Qdrant holds another embedder's vectors (`refused`, exit 2); the sentence.
     Refused(String),
-    /// The embedding model could not be fetched or loaded (`error`, exit 1); the sentence.
+    /// Qdrant answered and refused the API key (`refused`, exit 2, `qdrant_refused`, review R1
+    /// M2); the sentence.
+    AccessRefused(String),
+    /// The embedding model could not be fetched or loaded, or failed on the query (`error`, exit
+    /// 1); the sentence.
     Failed(String),
 }
 
@@ -610,9 +632,9 @@ pub enum IndexState {
     Empty,
     /// Qdrant did not answer.
     Offline,
-    /// Qdrant holds another embedder's vectors.
+    /// Qdrant holds another embedder's vectors, or refused the API key.
     Refused,
-    /// The embedding model could not load.
+    /// The embedding model could not load, or failed on the query.
     Error,
 }
 
@@ -655,7 +677,9 @@ pub enum ErrorCode {
     QdrantUnreachable,
     /// The collection holds another embedder's vectors (2).
     EmbedderMismatch,
-    /// The embedding model could not be fetched or loaded (1).
+    /// Qdrant answered and refused the API key (2, review R1 M2).
+    QdrantRefused,
+    /// The embedding model could not be fetched or loaded, or failed on the query (1).
     ModelUnavailable,
 }
 
@@ -905,6 +929,11 @@ fn search_doc(search: &SearchAnswer) -> SearchDoc {
             None,
             failed(ErrorCode::EmbedderMismatch, message),
         ),
+        IndexAnswer::AccessRefused(message) => (
+            IndexState::Refused,
+            None,
+            failed(ErrorCode::QdrantRefused, message),
+        ),
         IndexAnswer::Failed(message) => (
             IndexState::Error,
             None,
@@ -1137,7 +1166,7 @@ mod tests {
     use super::*;
     use htui_core::fixtures::demo_at;
     use htui_core::model::{DocumentId, Resolution};
-    use htui_store::vector::{EMBEDDER_MISMATCH, Owner, PointType};
+    use htui_store::vector::{EMBEDDER_MISMATCH, Owner, PointType, QDRANT_REFUSED};
     use uuid::Uuid;
 
     /// A writer whose every write fails with `kind` (`lib.rs`' `Failing`).
@@ -1450,6 +1479,14 @@ mod tests {
                 "{EMBEDDER_MISMATCH}: collection `htui_concepts` holds vectors from hash/384"
             ))))
         );
+        insta::assert_snapshot!(
+            "search_index_qdrant_refused",
+            pretty(&search(IndexAnswer::AccessRefused(format!(
+                "{QDRANT_REFUSED}: collection exists: Error in the response: The request does not \
+                 have valid authentication credentials Invalid api-key; check the Qdrant API key \
+                 in Settings > Qdrant"
+            ))))
+        );
     }
 
     #[test]
@@ -1467,6 +1504,10 @@ mod tests {
         assert_eq!(search(IndexAnswer::Empty).exit_code(), 0);
         assert_eq!(search(IndexAnswer::Offline("o".into())).exit_code(), 3);
         assert_eq!(search(IndexAnswer::Refused("r".into())).exit_code(), 2);
+        assert_eq!(
+            search(IndexAnswer::AccessRefused("a".into())).exit_code(),
+            2
+        );
         assert_eq!(search(IndexAnswer::Failed("f".into())).exit_code(), 1);
         assert_eq!(StateExit::Offline(String::new()).code(), 3);
         assert_eq!(StateExit::Refused(String::new()).code(), 2);
@@ -1555,6 +1596,24 @@ mod tests {
         };
         assert!(out.is_empty(), "{out:?}");
         assert!(sentence.starts_with("cannot reach Postgres"), "{sentence}");
+    }
+
+    /// Review R1 L10: the text is pure; the notes come back beside it for the caller's stderr.
+    #[test]
+    fn human_text_returns_its_notes_and_prints_nothing() {
+        let (text, note) = human_text(&search(IndexAnswer::Hits(Vec::new())));
+        assert_eq!(text, "");
+        assert_eq!(
+            note,
+            Some("no matches (run `htui --index-items` if the index is empty)")
+        );
+        let (text, note) = human_text(&search(IndexAnswer::Empty));
+        assert_eq!(text, "");
+        assert_eq!(note, Some("the index is empty; run `htui --index-items`"));
+        let (text, note) = human_text(&search(IndexAnswer::Hits(two_hits())));
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert_eq!(note, None);
+        assert_eq!(human_text(&status_answer()).1, None);
     }
 
     #[test]

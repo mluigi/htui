@@ -1,0 +1,16 @@
+---
+source: crates/htui/src/state_cmd.rs
+expression: "pretty(&search(IndexAnswer::AccessRefused(format!(\"{QDRANT_REFUSED}: collection exists: Error in the response: The request does not \\\n                 have valid authentication credentials Invalid api-key; check the Qdrant API key \\\n                 in Settings > Qdrant\"))))"
+---
+{
+  "version": 1,
+  "kind": "search",
+  "store": "online",
+  "index": "refused",
+  "query": "closed items",
+  "decisions": false,
+  "error": {
+    "code": "qdrant_refused",
+    "message": "qdrant: access refused: collection exists: Error in the response: The request does not have valid authentication credentials Invalid api-key; check the Qdrant API key in Settings > Qdrant"
+  }
+}

@@ -331,7 +331,11 @@ impl PgStore {
             Session::ReadOnly,
         )
         .await?;
-        headless_checks(&pool).await?;
+        if let Err(refusal) = headless_checks(&pool).await {
+            // A refusal ends the verb: say goodbye to the server rather than drop the socket.
+            pool.close().await;
+            return Err(refusal);
+        }
         let box_id = box_id.unwrap_or_default();
         Ok(Self {
             pool,
@@ -702,6 +706,15 @@ impl PgStore {
     #[must_use]
     pub const fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Closes the pool, waiting for every connection to end with a `Terminate` rather than a
+    /// dropped socket, which the server logs as `unexpected EOF on client connection`. The
+    /// one-shot read-only verbs call it before they return (MOD-92 review R1 L9), so a script
+    /// polling `htui status` leaves no such line per run. Every clone of this store shares the
+    /// pool and is closed with it.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     /// The highest version in the embedded set.

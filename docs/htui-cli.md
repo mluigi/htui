@@ -280,7 +280,8 @@ off by the difference; an age that would be negative is reported as `0`.
 | `empty` | There is no index yet. It is not created; run `htui --index-items`. | `[]` | no `error` | 0 |
 | `offline` | Qdrant could not be reached, or the search failed. | no `hits` | `qdrant_unreachable` | 3 |
 | `refused` | The index holds another embedding model's vectors. | no `hits` | `embedder_mismatch` | 2 |
-| `error` | The embedding model could not be downloaded or loaded. | no `hits` | `model_unavailable` | 1 |
+| `refused` | Qdrant answered and refused the API key (missing, wrong or without access). Fix it in **Settings › Qdrant**. | no `hits` | `qdrant_refused` | 2 |
+| `error` | The embedding model could not be downloaded or loaded, or failed to turn the query into a vector. | no `hits` | `model_unavailable` | 1 |
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -339,14 +340,17 @@ Every `error.code`, with the `store` it comes with and the exit code:
 | `qdrant_url_unusable` | `refused` | 2 | search | The stored Qdrant URL cannot be used. |
 | `qdrant_unreachable` | `online` | 3 | search | Inside a search document: Qdrant did not answer (`index: "offline"`). |
 | `embedder_mismatch` | `online` | 2 | search | Inside a search document: the index holds another model's vectors (`index: "refused"`). |
-| `model_unavailable` | `online` | 1 | search | Inside a search document: the embedding model could not load (`index: "error"`). |
+| `qdrant_refused` | `online` | 2 | search | Inside a search document: Qdrant refused the API key (`index: "refused"`). |
+| `model_unavailable` | `online` | 1 | search | Inside a search document: the embedding model could not load, or failed on the query (`index: "error"`). |
 
 The checks run in this order, and the first one that fails decides the document:
 
 - `status` and `waiting`: the DSN, `box.toml`, the connect, the scope, then the reads.
 - `--search-items`: the Qdrant URL, the DSN, `box.toml` (only with `--cwd`), the connect, the
-  scope, the embedding model, then the index. The Qdrant URL is checked first, so a box without
-  one is refused before Postgres is contacted.
+  scope, the index (whether Qdrant answers and the collection exists), the embedding model, then
+  the search. The Qdrant URL is checked first, so a box without one is refused before Postgres is
+  contacted; and the model is loaded only when there is a collection to search, so a Qdrant that
+  does not answer, refuses the API key or holds no index is answered without it.
 
 ## Exit codes
 
@@ -354,8 +358,8 @@ The checks run in this order, and the first one that fails decides the document:
 |---|---|---|---|
 | 0 | Answered. For a search, the index answered or is empty. | `online` | yes |
 | 3 | Postgres did not answer; for a search, Qdrant did not answer. | `offline`, or `online` with `index: "offline"` | yes |
-| 2 | Refused: no DSN, the keyring, `box.toml`, the schema, the scope, an embedder mismatch. | `refused`, or `online` with `index: "refused"` | yes |
-| 1 | Failed: a read failed after the connect, or the embedding model could not load. | `error`, or `online` with `index: "error"` | yes |
+| 2 | Refused: no DSN, the keyring, `box.toml`, the schema, the scope, an embedder mismatch, a refused Qdrant API key. | `refused`, or `online` with `index: "refused"` | yes |
+| 1 | Failed: a read failed after the connect, or the embedding model could not load or failed on the query. | `error`, or `online` with `index: "error"` | yes |
 
 An offline store is reported as offline: htui never answers from its local cache here, so a
 document is never stale data presented as live.
@@ -407,8 +411,8 @@ The three commands read only. This is enforced, not just intended:
 - **`--log`** writes only the file you name.
 
 One exception: `--search-items` downloads the embedding model (about 134 MB) into your user cache
-directory if this machine does not have it yet, because it needs the model to turn the query into
-a vector. That is a download cache, not htui's state. Its progress notes go to standard error, never
+directory if this machine does not have it yet and there is an index to search, because it needs
+the model to turn the query into a vector. That is a download cache, not htui's state. Its progress notes go to standard error, never
 standard output.
 
 A connection pooler such as PgBouncer rejects the startup parameter that makes the session

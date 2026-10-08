@@ -8,17 +8,29 @@
 //! and exit 3 or 2. Every case runs over `testkit::demo_db()` (fixed ids and stamps) but the two
 //! that need no database; each prints `testkit::SKIP` and returns with `HTUI_TEST_DATABASE_URL`
 //! unset, and panics instead when `CI` is set, like every other Postgres-backed suite.
+//!
+//! `--search-items` runs through its own seam, `concepts::search_answer_with` (review R1 M4), with
+//! `HashEmbedder` behind a counting loader, so no model is downloaded and the cases can say when
+//! the model is loaded at all. The cases that need an index are gated on `HTUI_TEST_QDRANT_URL`
+//! too and own a throwaway collection.
 #![cfg(feature = "testkit")]
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use htui::cli::StateArgs;
-use htui::state_cmd::{self, Answer, Context, Outcome, StateExit, Verb};
+use htui::concepts::{self, SearchContext, SearchOptions};
+use htui::state_cmd::{self, Answer, Context, Kind, Outcome, StateExit, Verb};
 use htui_core::fixtures::ids;
-use htui_core::model::{BoxId, NewRepo, RepoBoxPath, RepoId, Scope};
+use htui_core::model::{BoxId, ItemFilter, NewRepo, RepoBoxPath, RepoId, Scope};
 use htui_core::store::{ReadStore as _, WriteStore as _};
+use htui_store::embed::{DENSE_DIM, HashEmbedder};
+use htui_store::qdrant_settings::QdrantSettings;
+use htui_store::vector::QdrantStore;
 use htui_store::{Identity, testkit};
 use serde_json::Value;
 
@@ -454,4 +466,384 @@ async fn the_read_only_session_is_what_answers() {
         insta::assert_snapshot!("status_unregistered_box", run.pretty());
     });
     db.drop_db().await;
+}
+
+// --- `--search-items` (review R1 M4) ---
+
+/// Nothing listens on port 1: a Qdrant that does not answer.
+const QDRANT_DOWN: &str = "http://127.0.0.1:1";
+
+fn search_options(query: &str) -> SearchOptions {
+    SearchOptions {
+        query: query.into(),
+        project: None,
+        decisions: false,
+        limit: concepts::DEFAULT_LIMIT,
+        cwd: None,
+        json: true,
+    }
+}
+
+/// A model loader that counts its calls and hands out `HashEmbedder`.
+#[derive(Clone, Default)]
+struct Loads(Arc<AtomicUsize>);
+
+impl Loads {
+    fn count(&self) -> usize {
+        self.0.load(Ordering::SeqCst)
+    }
+
+    fn loader(&self) -> impl FnOnce() -> std::future::Ready<anyhow::Result<HashEmbedder>> + use<> {
+        let loads = Arc::clone(&self.0);
+        move || {
+            loads.fetch_add(1, Ordering::SeqCst);
+            std::future::ready(Ok(HashEmbedder::new(DENSE_DIM)))
+        }
+    }
+}
+
+/// `search_answer_with`, then `emit --json` into a buffer: what `search_items` writes to stdout.
+async fn searched(
+    settings: &QdrantSettings,
+    collection: &str,
+    dsn: &str,
+    identity: Option<&Identity>,
+    options: &SearchOptions,
+    loads: &Loads,
+) -> Ran {
+    let ctx = SearchContext {
+        settings,
+        collection,
+        dsn,
+        identity,
+        connect_timeout: WAIT,
+    };
+    let answer = concepts::search_answer_with(&ctx, options, loads.loader()).await;
+    let mut out = Vec::new();
+    let exit = state_cmd::emit(&mut out, &answer, true);
+    let text = String::from_utf8(out).expect("UTF-8");
+    assert_eq!(text.matches('\n').count(), 1, "one line: {text}");
+    let document = serde_json::from_str(&text).expect("one JSON document");
+    assert_eq!(document, state_cmd::document(&answer));
+    Ran {
+        answer,
+        exit,
+        document,
+    }
+}
+
+fn qdrant(url: &str) -> QdrantSettings {
+    QdrantSettings::new(url.to_owned(), None).expect("a valid URL")
+}
+
+/// The test Qdrant's URL, or the skip line.
+fn test_qdrant() -> Option<String> {
+    let url = std::env::var("HTUI_TEST_QDRANT_URL").ok();
+    if url.is_none() {
+        eprintln!("skipped: HTUI_TEST_QDRANT_URL not set");
+    }
+    url
+}
+
+fn fresh_collection() -> String {
+    format!("htui_test_{}", uuid::Uuid::now_v7().simple())
+}
+
+/// Needs no database: never skips. A box with no Qdrant URL is refused before Postgres is asked.
+#[tokio::test]
+async fn a_search_without_a_qdrant_url_is_refused() {
+    let failure =
+        concepts::qdrant_settings(None, Some("a-key".into())).expect_err("no URL, no settings");
+    let answer = Answer {
+        kind: Kind::Search,
+        outcome: Outcome::Failed(failure),
+    };
+    assert_eq!(answer.exit_code(), 2);
+    let document = state_cmd::document(&answer);
+    assert_eq!(document["store"], "refused");
+    assert_eq!(document["error"]["code"], "no_qdrant_url");
+    let unusable = concepts::qdrant_settings(Some("localhost:6334".into()), None)
+        .expect_err("a URL without a scheme");
+    assert_eq!(unusable.error.code, state_cmd::ErrorCode::QdrantUrlUnusable);
+}
+
+/// Qdrant down: Postgres answered (`store` online), the index is `offline`/3, and the model was
+/// never loaded (review R1 M3).
+#[tokio::test]
+async fn a_search_with_qdrant_down_is_offline_and_loads_no_model() {
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    let loads = Loads::default();
+    let run = searched(
+        &qdrant(QDRANT_DOWN),
+        "htui_concepts_v2",
+        &db.url,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 3, "{}", run.pretty());
+    assert_eq!(run.document["store"], "online");
+    assert_eq!(run.document["index"], "offline");
+    assert_eq!(run.error_code(), "qdrant_unreachable");
+    assert!(
+        matches!(run.exit, Err(StateExit::Offline(_))),
+        "{:?}",
+        run.exit
+    );
+    assert_eq!(
+        loads.count(),
+        0,
+        "no model for a Qdrant that does not answer"
+    );
+    db.drop_db().await;
+}
+
+/// The scope refusals come before Qdrant and the model: an unknown `--project`, and a `--cwd`
+/// in no registered checkout.
+#[tokio::test]
+async fn a_search_scope_refusal_comes_before_the_index() {
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    let loads = Loads::default();
+    let unknown = SearchOptions {
+        project: Some("nope".into()),
+        ..search_options("anything")
+    };
+    let run = searched(&qdrant(QDRANT_DOWN), "c", &db.url, None, &unknown, &loads).await;
+    assert_eq!(run.code(), 2, "{}", run.pretty());
+    assert_eq!(run.document["store"], "refused");
+    assert_eq!(run.error_code(), "unknown_project");
+
+    let elsewhere = tempfile::tempdir().expect("a directory");
+    let unmatched = SearchOptions {
+        cwd: Some(elsewhere.path().to_path_buf()),
+        ..search_options("anything")
+    };
+    let identity = fixture_identity();
+    let run = searched(
+        &qdrant(QDRANT_DOWN),
+        "c",
+        &db.url,
+        Some(&identity),
+        &unmatched,
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 2, "{}", run.pretty());
+    assert_eq!(run.error_code(), "cwd_unmatched");
+    assert_eq!(loads.count(), 0);
+    db.drop_db().await;
+}
+
+/// No collection: `empty`/0 with `hits: []`, nothing created, and no model loaded (review R1 M3).
+#[tokio::test]
+async fn a_search_without_a_collection_is_empty_and_loads_no_model() {
+    let Some(url) = test_qdrant() else {
+        return;
+    };
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    let loads = Loads::default();
+    let name = fresh_collection();
+    let run = searched(
+        &qdrant(&url),
+        &name,
+        &db.url,
+        None,
+        &search_options("closed items"),
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 0, "{}", run.pretty());
+    assert_eq!(run.document["index"], "empty");
+    assert_eq!(run.document["hits"], serde_json::json!([]));
+    assert_eq!(loads.count(), 0, "no model for a missing index");
+    let exists = QdrantStore::open_existing_to(&qdrant(&url), HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers")
+        .is_some();
+    assert!(!exists, "the search created no collection");
+    db.drop_db().await;
+}
+
+/// Over an index of the demo: the model loads once, `--project` and `--cwd` narrow the search to
+/// one project, and a model that fails, at load or on the query, is `model_unavailable`/1.
+#[tokio::test]
+async fn a_search_over_an_index_answers_in_scope() {
+    let Some(url) = test_qdrant() else {
+        return;
+    };
+    let Some(db) = testkit::demo_db().await else {
+        return;
+    };
+    let name = fresh_collection();
+    let index = QdrantStore::connect_to(&qdrant(&url), HashEmbedder::new(DENSE_DIM), &name)
+        .await
+        .expect("Qdrant answers");
+    concepts::index_cycle(&db.store, &index).await;
+    let workspaces = db.store.workspaces().await.expect("workspaces");
+    let keys_of = |project| {
+        let workspace_id = workspaces
+            .iter()
+            .find(|ws| ws.projects.iter().any(|p| p.project_id == project))
+            .expect("a workspace lists the project")
+            .workspace_id;
+        let store = &db.store;
+        async move {
+            store
+                .items(
+                    &Scope {
+                        workspace_id,
+                        project_ids: vec![project],
+                    },
+                    &ItemFilter::default(),
+                )
+                .await
+                .expect("items")
+                .into_iter()
+                .map(|item| item.key)
+                .collect::<Vec<_>>()
+        }
+    };
+    // Keys are per project: one only htui holds, so agy's scope cannot find it.
+    let agy_keys = keys_of(ids::PROJECT_AGY).await;
+    let key = keys_of(ids::PROJECT_HTUI)
+        .await
+        .into_iter()
+        .find(|key| !agy_keys.contains(key))
+        .expect("a key only htui holds");
+    let keys = |run: &Ran| -> Vec<String> {
+        run.document["hits"]
+            .as_array()
+            .map(|hits| {
+                hits.iter()
+                    .map(|hit| hit["key"].as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let settings = qdrant(&url);
+    let loads = Loads::default();
+
+    let everywhere = searched(
+        &settings,
+        &name,
+        &db.url,
+        None,
+        &search_options(&key),
+        &loads,
+    )
+    .await;
+    assert_eq!(everywhere.code(), 0, "{}", everywhere.pretty());
+    assert_eq!(everywhere.document["index"], "online");
+    assert!(keys(&everywhere).contains(&key), "{}", everywhere.pretty());
+    assert_eq!(loads.count(), 1, "one load per search");
+
+    let htui = SearchOptions {
+        project: Some("htui".into()),
+        ..search_options(&key)
+    };
+    let run = searched(&settings, &name, &db.url, None, &htui, &loads).await;
+    assert!(keys(&run).contains(&key), "{}", run.pretty());
+    let agy = SearchOptions {
+        project: Some("agy".into()),
+        ..search_options(&key)
+    };
+    let run = searched(&settings, &name, &db.url, None, &agy, &loads).await;
+    assert_eq!(run.code(), 0, "{}", run.pretty());
+    assert!(!keys(&run).contains(&key), "agy's scope: {}", run.pretty());
+
+    // `--cwd` inside htui's checkout on this box is `--project htui`.
+    let checkout = tempfile::tempdir().expect("a checkout");
+    let repo = db
+        .store
+        .create_repo(NewRepo {
+            id: RepoId::new(),
+            project_id: ids::PROJECT_HTUI,
+            name: "r1-search-cwd".into(),
+            remote_url: None,
+            default_branch: "main".into(),
+            is_primary: false,
+        })
+        .await
+        .expect("a repo");
+    db.store
+        .upsert_repo_box_path(&RepoBoxPath {
+            repo_id: repo.id,
+            box_id: ids::BOX,
+            local_path: std::fs::canonicalize(checkout.path())
+                .expect("canonical")
+                .display()
+                .to_string(),
+            updated_at: Utc::now(),
+        })
+        .await
+        .expect("this box's checkout");
+    let identity = fixture_identity();
+    let in_checkout = SearchOptions {
+        cwd: Some(checkout.path().to_path_buf()),
+        ..search_options(&key)
+    };
+    let run = searched(
+        &settings,
+        &name,
+        &db.url,
+        Some(&identity),
+        &in_checkout,
+        &loads,
+    )
+    .await;
+    assert_eq!(run.code(), 0, "{}", run.pretty());
+    assert!(keys(&run).contains(&key), "{}", run.pretty());
+
+    // A model that cannot load, and one that fails on the query: the model's failure, not Qdrant's.
+    let ctx = SearchContext {
+        settings: &settings,
+        collection: &name,
+        dsn: &db.url,
+        identity: None,
+        connect_timeout: WAIT,
+    };
+    let no_model = concepts::search_answer_with(&ctx, &search_options(&key), || {
+        std::future::ready(Err::<HashEmbedder, _>(anyhow::anyhow!("no model here")))
+    })
+    .await;
+    let broken = concepts::search_answer_with(&ctx, &search_options(&key), || {
+        std::future::ready(Ok(Broken))
+    })
+    .await;
+    index.drop_collection().await.expect("drop");
+    for answer in [no_model, broken] {
+        assert_eq!(answer.exit_code(), 1, "{answer:?}");
+        let document = state_cmd::document(&answer);
+        assert_eq!(document["store"], "online");
+        assert_eq!(document["index"], "error");
+        assert_eq!(document["error"]["code"], "model_unavailable", "{document}");
+    }
+    db.drop_db().await;
+}
+
+/// `HashEmbedder`'s identity and width, and an error for every query.
+#[derive(Debug, Clone)]
+struct Broken;
+
+impl htui_store::embed::DenseEmbedder for Broken {
+    fn dim(&self) -> usize {
+        DENSE_DIM
+    }
+
+    fn identity(&self) -> htui_store::embed::EmbedderIdentity {
+        htui_store::embed::EmbedderIdentity::hash(DENSE_DIM)
+    }
+
+    async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, htui_core::store::StoreError> {
+        Err(htui_core::store::StoreError::Backend(
+            "the model's session failed".into(),
+        ))
+    }
 }
