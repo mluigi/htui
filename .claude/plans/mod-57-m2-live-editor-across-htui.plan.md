@@ -185,3 +185,19 @@ T0 rewrites the `DECLARED` view-layer test pins, F-M2-1; the README example beco
 fixtures' and README's `quit = "ctrl-x"` move to **`ctrl-g`**. E5 stays as written: every
 `SetScope` is refused during an edit, Settings > Hierarchy's own scope refreshes included
 (documented in `docs/htui-editor.md`).
+
+## Review R1 (2026-10-08)
+
+`rust-reviewer` over `0aea5312..7b57be39`: approve with changes, no CRITICAL/HIGH. Serial gate before
+review: 2993 passed, 0 failed, 3 ignored. Maintainer decisions:
+
+| # | Finding | Decision |
+|---|---|---|
+| M-1 | E9 (c) refuses an existing `[global] quit = "ctrl-x"` (the README example since `665b9cf1`): exit 2 at startup even with the pane mode off | **Fix**: a non-editor entry takes an `editor.abort` default chord through the give-way notice (abort may end unbound; E2 confines it to the asking tab); only `editor.focus` collisions stay errors. README example moves to `ctrl-g` (T4) |
+| M-2 | A tab switch lands on the asking tab unfocused, so nano's habitual `ctrl-x` aborts the edit with no question | **Fix**: abort asks first (shape below) |
+| M-3 | No test of an offered global opened from the asking tab, of the switcher pick refused with scope unchanged, or of an e2e key reaching the other tab | **Fix**: tests |
+| L-1 | Under any modal overlay on the asking tab the status line says "answer or close the prompt first" | **Fix**: neutral sentence |
+| L-2 | "Ctrl+4 back" offered while a focused editor lacks the keys (first `ctrl-4` swallowed) | **Fix** |
+| L-3 | Off-screen editor output sets `dirty` | **Fix**: dirty only when visible |
+| L-4 | Hierarchy's refused scope refreshes are not retried after the edit | **Docs** (T4) |
+| nits | redundant check (`update.rs:292`), `editor_key` > 50 lines, constant-only test, `titles()` Vec per frame, `ctrl-4` silent under the question, asking tab's status line silent on tab switching | **Fix** all |
