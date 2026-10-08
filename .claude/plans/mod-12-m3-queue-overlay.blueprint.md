@@ -1309,3 +1309,83 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
     `a_global_ctrl_q_binding_takes_ctrl_q_from_the_queue_with_a_notice`,
     `two_entries_on_ctrl_q_are_still_refused` and `a_quit_on_ctrl_q_quits_and_leaves_the_queue_unbound`
     pin it.
+19. **R1 L1 (lane R-B): every Pg lock of `queue_entry` rows is taken in `item_id` order.** This
+    amends §F-12's "locks without `ORDER BY`". `move_queue_entry` locks
+    `… WHERE box_id = $1 ORDER BY item_id FOR UPDATE` and only reads the order afterwards, in the
+    same transaction, with `queue_entries`' literal. An entry queued since the lock (one the lock
+    did not take) is left out of the permutation, so the write never waits on a row out of order.
+    `prune_finished_entries` locks its rows (`done`/`closed` items) in a CTE,
+    `ORDER BY e.item_id FOR UPDATE OF e`, before it deletes them. The rule: **any new statement
+    that locks several `queue_entry` rows locks them in `item_id` order**, so the runner's prune
+    and a user's move never wait on each other in a cycle.
+20. **R1 L2 (lane R-B): `close_drained_batch(batch: BatchId, seen: &[ItemId], at)`.** `seen` is
+    the items of the entries `admit` read. The close is skipped while the box has an entry for an
+    item outside `seen`, and while it has any entry at all when `seen` is empty. This restores M1's
+    empty-queue protection for an entry queued between admit's read and the close. The entries
+    admit read still do not count (M3 D4, L4). `queued_at` is not used, because it is the queuing
+    client's clock and not commit order (Mem, Pg, `Backend`, and the runner's call, `.sqlx`
+    re-prepared).
+21. **R1 M2 / L4 reads (lane R-B), both refused offline (`DATABASE_UNREACHABLE`):**
+    - `Backend::missing_tags_of(&self, items: &[ItemId], box_id: BoxId) -> Result<BTreeMap<ItemId, Vec<String>>>`:
+      one statement. Each known item maps to what `missing_tags` answers for it, empty lists
+      included. An unknown item is absent. An unknown box is `NotFound`.
+    - `Backend::last_closed_batch(&self, box_id: BoxId) -> Result<Option<QueueBatch>>`: the box's
+      latest closed batch by `(closed_at, id)`, whatever is open now. Both store closes record
+      `drained`: a stall (L4) and an emptied queue (M1).
+
+    `queue_overview::overview` (lane R-C) reads every `open`, unready row's tags in one
+    `missing_tags_of`. It skips the call when there is no such row, and drops empty lists. As
+    before, a `NotFound` reads as no tags and so does an absent item, so classification is
+    unchanged (§B.4.2 step 5's per-row N+1 is gone). While no batch is open it reads
+    `last_closed_batch` (after `open_batch_of`; offline still fails first at `queue_rows`).
+22. **R1 M1 (lane R-C): `P` names the state its sender saw, and a stale one is refused.**
+    - `StoreRequest::PauseQueue { expect: Option<BatchId> }`. When `expect` is `Some` and the
+      open batch is not that batch (the runner closed it as stalled, or another view paused it
+      and a batch opened since), nothing is written.
+    - `StoreRequest::ResumeQueue { expect_paused: bool }`. When `expect_paused` is set and a
+      batch is open, nothing is written and no batch opens.
+    - Either refusal answers `QueueWritten { write: QueueWrite::Stale { pause }, view }`, with
+      `view` the queue now, so the sender redraws.
+    - `expect: None` and `expect_paused: false` are the old unconditional, idempotent writes. The
+      pause's check and close are two statements; a batch opened between them can only come from a
+      person's resume, and closing it is what the pause asked for.
+    - Both senders send what their read saw: the overlay from its last `QueueOverview`, and the
+      Backlog from the `QueueState` read its `P` triggers. A `ResumeQueue` served `Ok` still
+      sweeps at once (D8), a `Stale` refusal included; that sweep is harmless, since a batch is
+      open.
+    - The Backlog's `queue_sentence` (now `pub(crate)`) says the refusal:
+      - `Stale { pause: true }` over a paused queue: "queue already paused: its batch closed
+        before P reached it";
+      - `Stale { pause: true }` over a running queue: "queue not paused: it was resumed since it
+        was read; P again pauses it";
+      - `Stale { pause: false }` over a running queue: "queue already running: it was resumed
+        since it was read";
+      - otherwise: "queue not resumed: it changed since it was read".
+
+    Request names and `QUEUE_REQUEST_NAMES` are unchanged.
+23. **R1 M2, N1, N2 (lane R-C): the overlay's cadence and caching.**
+    - After a good read, `refresh` asks again only every `REFRESHES_PER_READ` (3) refresh ticks,
+      about 3 s. It was every tick. After a failed read the back-off is still
+      `REFRESHES_PER_RETRY` (10, §F-16). One counter (`wait_in`) serves both.
+    - A write's reply still re-reads at once, and first puts `queue_sentence(write, key, view)` on
+      the status line (`Action::Error`, as the Backlog does): "already at that end of the queue"
+      for an end move, and the row's key for a dequeue.
+    - Each row's sentence and the column widths are cached on a reply that changed the overview.
+      A reply equal to the one on hand is compared, not deep-cloned, and render no longer calls
+      `to_string()` per row per frame.
+24. **R1 L4 (lane R-C): a paused header says why.** `QueueOverview` gains
+    `last_close: Option<BatchClose>`: `last_closed_batch`'s reason, read only while no batch is
+    open, and `None` while one runs or before any closed. The header's state word becomes:
+    - `paused (by a user)` for `Paused`;
+    - `paused (the last batch drained: nothing admissible)` for `Drained` (a stall and an emptied
+      queue record the same reason, so it says only what both mean);
+    - `paused` alone before any close.
+
+    The demo tail is kept. New snapshot `header_drained`; the existing header snapshots are
+    unchanged.
+25. **R1 L3, recorded, not fixed (lane R-C):** an entry whose enqueue the runner refused without
+    changing any state still reads `next to run`, and keeps the batch open, because the overview
+    reads stored state only. Surfacing it needs runner shared state, which this round does not
+    add. A doc comment at `EntryState::Next` and its `Display` arm records the limit. T6's ANA-2
+    §4.10 note says it at close-out. **R1 N3:** `serve_queue`'s doc counts five writes and one read
+    (`QueueOverview` is served in `try_serve`).
