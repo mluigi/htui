@@ -140,6 +140,11 @@ pub const UNPARSED: &str = "<unparsed>";
 ///    in place of the allow-list and `--strict-mcp-config`, while 3, 6¼ and 6⅓ emit nothing — no
 ///    permission mode, no server (the operator's own included), no prompt tool. [`refuse_widening`]
 ///    is what keeps 7 from undoing it;
+///
+///    6⅞. the isolation levers [`ISOLATION_ARGS`] unless the row opts back in
+///    (`settings.user_extensions`, MOD-91 D1–D3): after the narrowing, on **every** session —
+///    tool-less help turns and resumes included — and before 7, so the operator's `extra_args`
+///    still win;
 /// 7. `settings.cli.extra_args` **last**, so an operator's repeated flag is the one the CLI keeps.
 ///
 /// **The budget flag is omitted at zero, and that is a measurement, not a nicety** (plan F-10):
@@ -152,6 +157,7 @@ pub fn argv(
     spec: &SessionSpec,
     session_id: &str,
     mcp_config: Option<&Path>,
+    user_extensions: bool,
 ) -> Vec<String> {
     let mut args: Vec<String> = row_args.to_vec();
     // `--verbose` is what makes `stream-json` emit every envelope rather than the terminal
@@ -230,9 +236,26 @@ pub fn argv(
         args.push(format!("--disallowedTools={}", denied.join(",")));
     }
 
+    // MOD-91 D1, D2: after the narrowing and before `extra_args`, on every session.
+    if !user_extensions {
+        args.extend(ISOLATION_ARGS.map(ToOwned::to_owned));
+    }
+
     args.extend(cli.extra_args.iter().cloned());
     args
 }
+
+/// The isolation levers (MOD-91 D1, probed in T1 case 1): `disableAllHooks` stops settings hooks
+/// and every plugin's mods (user-scope and skills-directory), `--disable-slash-commands` drops
+/// skills and slash commands. Auth, `htui`'s `--mcp-config` server and `--permission-prompt-tool`
+/// keep working under both. `--settings` takes one value, so the pair is spaced, as probed.
+/// Plugin agents and plugin MCP servers survive (T1 case 5, D7). Changing this changes
+/// `isolation_args_are_the_probed_levers` and, if `disableAllHooks` goes, D8's check.
+pub const ISOLATION_ARGS: [&str; 3] = [
+    "--settings",
+    r#"{"disableAllHooks":true}"#,
+    "--disable-slash-commands",
+];
 
 /// The `extra_args` flags that would widen a tool-less session back: they come last on [`argv`],
 /// so the CLI keeps them over `--tools=` and `--strict-mcp-config` (MOD-55 review M1).
@@ -575,6 +598,7 @@ impl CliDriver {
                     spec,
                     session_id,
                     config.as_ref().map(McpConfigFile::path),
+                    self.settings.user_extensions,
                 );
                 let spawned = crate::launch::spawn(&resolved, &spec.cwd).await?;
                 Ok((ChildIo::from_spawned(spawned)?, config))

@@ -296,6 +296,13 @@ pub struct AgentSettings {
     pub quota: QuotaSettings,
     /// What the `usage` payload's numbers mean on the CLI path.
     pub usage: UsageSettings,
+    /// Whether this row lets the user's own Claude Code extensions — plugins and their mods,
+    /// settings hooks, skills and slash commands — into the sessions `htui` drives (MOD-91 D3).
+    /// `false`, the default and every pre-MOD-91 row's value, isolates: the CLI gets
+    /// `cli::ISOLATION_ARGS`, an ACP session gets `acp::isolation_meta()`. Top-level rather than
+    /// under `cli` because it applies to both transports. An unreadable settings document falls
+    /// back to `default()`, the isolated side.
+    pub user_extensions: bool,
 }
 
 /// `agent.settings.acp` (§5.2).

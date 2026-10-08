@@ -339,6 +339,10 @@ fn empty_settings_document_yields_every_documented_default() {
     );
     assert_eq!(settings.permission, htui_agent::PermissionPolicy::default());
     assert_eq!(settings.quota.source, QuotaSource::None);
+    assert!(
+        !settings.user_extensions,
+        "an absent opt-in isolates (MOD-91 D3)"
+    );
     assert_eq!(settings, AgentSettings::default());
 }
 
@@ -357,6 +361,35 @@ fn claude_settings_round_trip() {
         serde_json::from_str(&serde_json::to_string(&settings).expect("settings serialise"))
             .expect("serialised settings parse");
     assert_eq!(reparsed, settings);
+}
+
+/// MOD-91 D3: `user_extensions` is a top-level key beside `cli`, not inside it, because it applies
+/// to both transports. Read as written, absent as `false` (the isolated side), and kept by a
+/// serialise → parse round trip, which is what the Settings > Agents form writes back through.
+#[test]
+fn user_extensions_is_read_from_the_settings_document() {
+    let settings: AgentSettings = serde_json::from_str(
+        r#"{
+          "user_extensions": true,
+          "cli": { "stream": "claude_stream_json", "permission_mode": "acceptEdits",
+                   "extra_args": ["--x"] }
+        }"#,
+    )
+    .expect("an opted-in row parses");
+    assert!(settings.user_extensions);
+    let cli = settings.cli.as_ref().expect("the cli block is intact");
+    assert_eq!(cli.stream, "claude_stream_json");
+    assert_eq!(cli.permission_mode, "acceptEdits");
+    assert_eq!(cli.extra_args, ["--x"]);
+
+    let absent: AgentSettings = serde_json::from_str("{}").expect("`{}` is a valid settings row");
+    assert!(!absent.user_extensions, "an absent key isolates");
+
+    let reparsed: AgentSettings =
+        serde_json::from_str(&serde_json::to_string(&settings).expect("settings serialise"))
+            .expect("serialised settings parse");
+    assert_eq!(reparsed, settings);
+    assert!(reparsed.user_extensions, "the round trip keeps the opt-in");
 }
 
 #[test]
