@@ -397,7 +397,7 @@ cargo test -p htui --lib ui::tabs::backlog app
 env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features \
   --test backlog --test backlog_keys --test replay --test reveal --test keys -- --test-threads=1
 cargo insta test -p htui --all-features --check
-env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features -- --test-threads=1 --no-fail-fast
+env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features --no-fail-fast -- --test-threads=1
 ```
 (`tests/keys.rs` is not edited but drives the Backlog: `f1_opens_and_closes_help_on_the_backlog`,
 `the_status_line_is_todays_in_both_harnesses`, `the_help_box_lists_ctrl_w_waiting_only_with_

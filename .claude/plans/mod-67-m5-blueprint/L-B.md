@@ -242,7 +242,7 @@ cargo test -p htui --lib ui::tabs::backlog::detail::runs
 env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features \
   --test backlog --test backlog_keys --test replay --test chat --test waiting -- --test-threads=1
 cargo insta test -p htui --all-features --check
-env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features -- --test-threads=1 --no-fail-fast
+env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features --no-fail-fast -- --test-threads=1
 ```
 (`tests/chat.rs` drives the Runs pane's `p`/`a` through promotion; `tests/waiting.rs` reveals a
 step into the Runs pane. Memory: grep the full run for `SIGABRT`.)

@@ -167,5 +167,5 @@ cargo test -p htui --lib ui::tabs::chat
 env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features \
   --test chat --test chat_offline --test replay -- --test-threads=1
 cargo insta test -p htui --all-features --check     # nothing pending
-env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features -- --test-threads=1 --no-fail-fast
+env -u HTUI_TEST_DATABASE_URL cargo test -p htui --all-features --no-fail-fast -- --test-threads=1
 ```
