@@ -1,7 +1,8 @@
 //! Every converted view mode's context stack (MOD-67 D3): views import them, never declare one.
 //!
 //! Each stack opens with the view's own layer ([`Layer::view`]: the mode's own acts plus the
-//! shared acts a wider layer offers, PA-3), and ends with the global layer: unfiltered in a
+//! shared acts a wider layer offers, PA-3), except [`SETTINGS_TAB`], [`CAPTURE`] and
+//! [`QUIT_CONFIRM`], which have none, and ends with the global layer: unfiltered in a
 //! browse mode, [`Layer::modal`] in a capturing or confirming one (D5). Layer order is fixed:
 //! view, `settings`, `confirm`, `form`, `common`, `list`, `overlay`, `global` (only the layers
 //! present). `keys::DECLARED` lists every one of them with the phrase its collision errors end
@@ -323,6 +324,11 @@ pub const SWITCHER: Stack<'static> = Stack::new(&[
 pub const MIGRATION: Stack<'static> =
     Stack::new(&[Layer::view(Context::Migration, &[]), CONFIRM, OVERLAY, HELP]);
 
+/// The quit question (MOD-57 M2 E4): `confirm.yes` quits, `confirm.no` and `overlay.close` keep
+/// the edit, `global.help` toggles the box. No view layer: the question has no keys of its own,
+/// so `[confirm]`, `[overlay]` and `[global] help` rebind it, and no `[quit]` table exists.
+pub const QUIT_CONFIRM: Stack<'static> = Stack::new(&[CONFIRM, OVERLAY, HELP]);
+
 /// The waiting list overlay.
 pub const WAITING_LIST: Stack<'static> = Stack::new(&[
     Layer::view(Context::Waiting, &[Act::WaitingOpen]),
@@ -337,6 +343,19 @@ mod tests {
 
     use super::*;
     use crate::keys::{CATALOGUE, DECLARED, KeyChord, Keys, VIEW_DEFAULTS};
+
+    /// `DECLARED` entries this module does not declare: the shell's own stacks.
+    const SHELL: &[Stack<'static>] = &[Stack::BASE, Stack::OVERLAY, Stack::EDITOR_OPEN];
+
+    /// `DECLARED` entries that do not open with a view layer.
+    const NOT_VIEW_LED: &[Stack<'static>] = &[
+        Stack::BASE,
+        Stack::OVERLAY,
+        Stack::EDITOR_OPEN,
+        SETTINGS_TAB,
+        CAPTURE,
+        QUIT_CONFIRM,
+    ];
 
     fn chord(spec: &str) -> KeyChord {
         KeyChord::parse_strict(spec).expect("a valid spec")
@@ -386,13 +405,27 @@ mod tests {
         );
         assert_eq!(resolve(SWITCHER, "enter"), [Act::SwitcherSwitch]);
         assert_eq!(resolve(SWITCHER, "2"), []);
+        assert_eq!(resolve(QUIT_CONFIRM, "y"), [Act::ConfirmYes]);
+        assert_eq!(resolve(QUIT_CONFIRM, "n"), [Act::ConfirmNo]);
+        assert_eq!(
+            resolve(QUIT_CONFIRM, "esc"),
+            [Act::ConfirmNo, Act::OverlayClose]
+        );
+        assert_eq!(resolve(QUIT_CONFIRM, "?"), [Act::Help]);
+        assert_eq!(resolve(QUIT_CONFIRM, "f1"), [Act::Help]);
+        for spec in ["q", "Y", "enter"] {
+            assert_eq!(resolve(QUIT_CONFIRM, spec), [], "{spec}");
+        }
     }
 
     #[test]
     fn every_view_layer_comes_first_and_every_modal_stack_ends_modal() {
-        let views = &DECLARED[4..];
+        let views: Vec<_> = DECLARED
+            .iter()
+            .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
+            .collect();
         assert_eq!(views.len(), 32);
-        for &(phrase, stack) in views {
+        for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");
             assert!(first.context().is_view(), "{phrase}");
@@ -471,7 +504,7 @@ mod tests {
     }
 
     /// MOD-67 M3 T7: every view stack this module declares is the stack of some view. The
-    /// shell's own `BASE` and `OVERLAY` are not declared here; a stack nothing names would be
+    /// shell's own stacks (`SHELL`) are not declared here; a stack nothing names would be
     /// validated (and refuse key files) for a mode no view is ever in.
     #[test]
     fn every_view_stack_is_named_by_a_view() {
@@ -489,6 +522,7 @@ mod tests {
             include_str!("../ui/tabs/settings/secrets.rs"),
             include_str!("../ui/overlay/concepts_search.rs"),
             include_str!("../ui/overlay/migration_prompt.rs"),
+            include_str!("../ui/overlay/quit_confirm.rs"),
             include_str!("../ui/overlay/waiting_list.rs"),
             include_str!("../ui/overlay/workspace_switcher.rs"),
         ];
@@ -520,7 +554,10 @@ mod tests {
             .collect();
         assert_eq!(
             declared.len(),
-            DECLARED.len() - 2,
+            DECLARED
+                .iter()
+                .filter(|(_, stack)| !SHELL.contains(stack))
+                .count(),
             "views.rs stacks vs DECLARED"
         );
         for name in declared {

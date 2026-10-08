@@ -17,7 +17,7 @@
 //! - **Keys (P5, P6).** While an editor is alive [`App::on_key`] asks it first. Focused, only
 //!   `editor.focus` ([`Stack::EDITOR_FOCUSED`]) is htui's; every other key, `ctrl-c` included,
 //!   is encoded ([`encode_key`]) and written. Unfocused is the M1 lock
-//!   ([`Stack::EDITOR_UNFOCUSED`]): `ctrl-c` and `global.quit` quit, `global.help` toggles the
+//!   ([`Stack::EDITOR_OPEN`]): `ctrl-c` and `global.quit` quit, `global.help` toggles the
 //!   `?` box, `editor.focus` refocuses (bringing the asking tab back, B16), `editor.abort` kills
 //!   the editor and answers [`EDITOR_ABORTED`]; anything else is refused on the status line. The
 //!   editor has the keys only while focused, on screen and under no modal overlay or `?` box
@@ -276,7 +276,7 @@ impl App {
         } else {
             format!(
                 "{EDITOR_LOCKED}: {}",
-                self.keys.hint(Stack::EDITOR_UNFOCUSED, LOCK_HINT)
+                self.keys.hint(Stack::EDITOR_OPEN, LOCK_HINT)
             )
         }
     }
@@ -341,7 +341,7 @@ impl App {
         let tab = editor.tab;
         match self
             .keys
-            .actions(Stack::EDITOR_UNFOCUSED, chord)
+            .actions(Stack::EDITOR_OPEN, chord)
             .first()
             .copied()
         {
@@ -431,7 +431,7 @@ impl App {
         } else if self.editor_covered() {
             format!("{EDITOR_LOCKED}: {PROMPT_FIRST}")
         } else {
-            self.keys.hint(Stack::EDITOR_UNFOCUSED, UNFOCUSED_HINT)
+            self.keys.hint(Stack::EDITOR_OPEN, UNFOCUSED_HINT)
         })
     }
 
