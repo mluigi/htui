@@ -8,7 +8,7 @@
 //! through `App::mouse_capture`, which tells the tabs when it goes off (MOD-74 D1); then the dirty
 //! draw; then the pane resize (MOD-57 PD-1), which needs the rect the draw just claimed.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -30,6 +30,31 @@ const PANE_QUEUE: usize = 256;
 /// MOD-57 R1 M-1: how many more queued pane events the arm applies after the one it woke for,
 /// before the one dirty draw (a flood is drawn per batch, not per 8 KiB read).
 const PANE_BATCH: usize = 64;
+
+/// R1 verify 1: how long the arm keeps applying queued pane events, counted from the one it woke
+/// for. Clamped, a wide terminal's ICH still costs O(cols^2) per sequence (`vt100` inserts one
+/// cell at a time), so a batch is cut by time as well as by count: what is left waits in the
+/// channel while the key and tick arms get their turn.
+const PANE_BUDGET: Duration = Duration::from_millis(16);
+
+/// Applies up to `max` events already queued on `rx`, in order, checking `deadline` before each;
+/// stops at the first empty or closed `try_recv`. Never waits.
+fn drain_batch<T>(
+    rx: &mut mpsc::Receiver<T>,
+    max: usize,
+    deadline: Instant,
+    mut apply: impl FnMut(T),
+) {
+    for _ in 0..max {
+        if Instant::now() >= deadline {
+            break;
+        }
+        let Ok(event) = rx.try_recv() else {
+            break;
+        };
+        apply(event);
+    }
+}
 
 /// Draws the first frame, then runs until `App::should_quit`.
 ///
@@ -59,14 +84,11 @@ pub async fn run(
             },
             Some(envelope) = replies.recv() => app.update(Action::Reply(envelope)),
             Some(event) = pane_rx.recv() => {
+                let deadline = Instant::now() + PANE_BUDGET;
                 app.on_pane_event(event);
-                // R1 M-1: what else is queued, up to a batch, before the one draw below.
-                for _ in 0..PANE_BATCH {
-                    let Ok(event) = pane_rx.try_recv() else {
-                        break;
-                    };
-                    app.on_pane_event(event);
-                }
+                // R1 M-1: what else is queued, up to a batch and within the budget, before the
+                // one draw below.
+                drain_batch(&mut pane_rx, PANE_BATCH, deadline, |event| app.on_pane_event(event));
             }
             _ = ticker.tick() => app.update(Action::Tick),
         }
@@ -166,7 +188,9 @@ mod tests {
         // R1 M-1: bounded, and a burst is applied in batches, one draw per batch.
         assert!(code.contains("mpsc::channel::<PaneEvent>(PANE_QUEUE)"));
         assert!(!code.contains("unbounded_channel::<PaneEvent>"));
-        let drain = code.find("pane_rx.try_recv()").expect("the arm drains");
+        let drain = code
+            .find("drain_batch(&mut pane_rx")
+            .expect("the arm drains");
         assert_eq!((super::PANE_QUEUE, super::PANE_BATCH), (256, 64));
         let open = code.find("app.open_editor(").expect("the pane step");
         let capture = code
@@ -188,5 +212,74 @@ mod tests {
             "one lookup per edit"
         );
         assert!(!code.contains("EditorCommand::from_env()"));
+    }
+
+    /// R1 verify 1: the arm's batch is time-boxed. The clamp leaves a wide terminal's ICH at
+    /// O(cols^2) per sequence, so 65 events of it could hold the UI task for seconds; once the
+    /// budget is spent, what is left waits in the channel for the next turn of `select!`.
+    #[test]
+    fn the_pane_batch_is_time_boxed() {
+        let code = code();
+        assert!(code.contains("let deadline = Instant::now() + PANE_BUDGET;"));
+        assert!(code.contains(
+            "drain_batch(&mut pane_rx, PANE_BATCH, deadline, |event| app.on_pane_event(event))"
+        ));
+        assert_eq!(super::PANE_BUDGET, std::time::Duration::from_millis(16));
+    }
+
+    fn queued(n: usize) -> tokio::sync::mpsc::Receiver<usize> {
+        let (tx, rx) = tokio::sync::mpsc::channel(n.max(1));
+        for i in 0..n {
+            tx.try_send(i).expect("room");
+        }
+        rx
+    }
+
+    fn left(mut rx: tokio::sync::mpsc::Receiver<usize>) -> Vec<usize> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    /// Fast events: at most `max`, in order; the rest stays queued, in order.
+    #[test]
+    fn a_batch_applies_at_most_its_count_in_order() {
+        let mut rx = queued(10);
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        super::drain_batch(&mut rx, 4, deadline, |i| seen.push(i));
+        assert_eq!(seen, [0, 1, 2, 3]);
+        assert_eq!(left(rx), [4, 5, 6, 7, 8, 9]);
+    }
+
+    /// Slow events: the batch stops at the deadline, well short of its count, and loses nothing.
+    #[test]
+    fn a_batch_stops_at_its_deadline() {
+        let step = std::time::Duration::from_millis(20);
+        let mut rx = queued(64);
+        let mut seen = Vec::new();
+        let deadline = std::time::Instant::now() + step * 2;
+        super::drain_batch(&mut rx, 64, deadline, |i| {
+            std::thread::sleep(step);
+            seen.push(i);
+        });
+        assert!(seen.len() <= 2, "{} events past the deadline", seen.len());
+        let mut all = seen.clone();
+        all.extend(left(rx));
+        assert_eq!(
+            all,
+            (0..64).collect::<Vec<_>>(),
+            "nothing lost or reordered"
+        );
+    }
+
+    /// A deadline already past applies nothing more (the event the arm woke for spent it).
+    #[test]
+    fn a_spent_budget_drains_nothing() {
+        let mut rx = queued(3);
+        let mut seen = Vec::new();
+        super::drain_batch(&mut rx, 64, std::time::Instant::now(), |i: usize| {
+            seen.push(i)
+        });
+        assert!(seen.is_empty());
+        assert_eq!(left(rx), [0, 1, 2]);
     }
 }
