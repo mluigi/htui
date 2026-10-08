@@ -395,8 +395,8 @@ mod tests {
         BOX_FILE, Fingerprint, Identity, config_root_path, db_fingerprint, ioreg_platform_uuid,
         load, load_or_mint, machine_id_under, parse_box_toml, store,
     };
-    use htui_core::store::StoreError;
     use htui_core::model::BoxId;
+    use htui_core::store::StoreError;
 
     /// A synthetic machine identity: 32 hex characters, never this machine's.
     const SYNTHETIC: &str = "0123456789abcdef0123456789abcdef";

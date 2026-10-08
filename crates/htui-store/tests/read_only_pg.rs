@@ -50,7 +50,11 @@ async fn a_read_only_session_answers_reads() {
     let anonymous = PgStore::connect_read_only(&db.url, None, WAIT)
         .await
         .expect("no box.toml connects too");
-    assert_eq!(anonymous.this_box(), BoxId::default(), "nil without box.toml");
+    assert_eq!(
+        anonymous.this_box(),
+        BoxId::default(),
+        "nil without box.toml"
+    );
 
     db.drop_db().await;
 }
