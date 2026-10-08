@@ -2171,6 +2171,59 @@ impl PgStore {
         Ok(missing)
     }
 
+    /// MOD-12 M3 review R1 M2: [`missing_tags`](PgStore::missing_tags) for many items in one
+    /// statement, keyed by item, so the queue overlay's refresh costs one round trip, not one per
+    /// row. Each known item maps to exactly what `missing_tags` answers for it: the same predicate
+    /// and `COLLATE "C"` order, per item in an `ARRAY` subquery (empty when the box covers every
+    /// tag). An unknown item, which `missing_tags` refuses, is left out, so one item deleted under
+    /// the overlay costs only its own row. The box probe runs only when the statement returns no
+    /// row, which an unknown box always does.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "box" }` for an unknown box; otherwise whatever the
+    /// driver reports, through [`map_sqlx`].
+    pub async fn missing_tags_of(
+        &self,
+        items: &[ItemId],
+        box_id: BoxId,
+    ) -> Result<BTreeMap<ItemId, Vec<String>>> {
+        let ids: Vec<Uuid> = items.iter().map(|item| item.as_uuid()).collect();
+        let rows = sqlx::query!(
+            r#"
+            SELECT i.id AS "item_id!: ItemId",
+                   ARRAY(SELECT DISTINCT t COLLATE "C"
+                           FROM UNNEST(i.required_tags) t
+                          WHERE t <> ALL (b.probed_tags || b.declared_tags)
+                          ORDER BY 1) AS "tags!"
+              FROM item i CROSS JOIN box b
+             WHERE i.id = ANY($1) AND b.id = $2
+            "#,
+            &ids[..],
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        if rows.is_empty()
+            && sqlx::query_scalar!("SELECT 1 FROM box WHERE id = $1", box_id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .is_none()
+        {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: box_id.to_string(),
+            });
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.item_id, row.tags))
+            .collect())
+    }
+
     /// How many runs hold a slot on one box: §4.7's admission count, which is `running` **and**
     /// `awaiting_approval` and not `queued` - a queued run occupies nothing yet.
     ///

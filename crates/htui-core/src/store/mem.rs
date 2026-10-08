@@ -871,6 +871,35 @@ impl MemStore {
         })
     }
 
+    /// MOD-12 M3 review R1 M2: [`missing_tags`](MemStore::missing_tags) for many items in one
+    /// read, keyed by item: each known item maps to exactly what `missing_tags` answers for it
+    /// (empty when the box covers every tag). An unknown item, which `missing_tags` refuses, is
+    /// left out, so one item deleted under the queue overlay costs only its own row.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] `{ entity: "box" }` for an unknown box.
+    pub async fn missing_tags_of(
+        &self,
+        items: &[ItemId],
+        box_id: BoxId,
+    ) -> Result<BTreeMap<ItemId, Vec<String>>> {
+        self.read(|state| {
+            if !state.boxes.contains_key(&box_id) {
+                return Err(StoreError::NotFound {
+                    entity: "box",
+                    id: box_id.to_string(),
+                });
+            }
+            Ok(items
+                .iter()
+                .filter_map(|id| {
+                    let item = state.items.get(id)?;
+                    Some((*id, state.missing_for(&item.required_tags, box_id)))
+                })
+                .collect())
+        })
+    }
+
     /// How many runs hold a slot on one box: §4.7's admission count, which is `running` and
     /// `awaiting_approval` and **not** `queued` — a queued run occupies nothing yet.
     ///
@@ -15674,5 +15703,69 @@ mod tests {
         );
         assert_eq!(queued_ids(&store, ids::BOX).await, [b, a]);
         assert_eq!((before(a).await, before(b).await), (a_before, b_before));
+    }
+
+    // ---- MOD-12 M3 review R1: the overlay's batched tag read and its last close ------------
+
+    /// Review R1 M2: `missing_tags_of` answers, for every known item, exactly `missing_tags`'
+    /// answer; an unknown item is left out, and an unknown box is refused as `missing_tags`
+    /// refuses it.
+    #[tokio::test]
+    async fn missing_tags_of_answers_missing_tags_per_item() {
+        let store = MemStore::demo();
+        let (tagged, covered) = (ItemId::new(), ItemId::new());
+        for (id, tags) in [
+            (
+                tagged,
+                ["zeta", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
+            ),
+            (covered, ["gpu", "rust"].as_slice()),
+        ] {
+            store
+                .mint_item(NewItem {
+                    id,
+                    project_id: ids::PROJECT_HTUI,
+                    kind_id: ids::KIND_HTUI_FEAT,
+                    title: "tagged".to_owned(),
+                    body: String::new(),
+                    required_tags: tags.iter().map(|&tag| tag.to_owned()).collect(),
+                    touched_paths: Vec::new(),
+                    priority: 0,
+                    step_graph_id: None,
+                    created_by: ids::USER,
+                    box_id: Some(ids::BOX),
+                })
+                .await
+                .expect("the mint lands");
+        }
+        let unknown = ItemId::new();
+        let items = [tagged, covered, ids::HTUI_ANA_2, unknown, tagged];
+        let batched = store
+            .missing_tags_of(&items, ids::BOX)
+            .await
+            .expect("the read answers");
+        for item in items {
+            match store.missing_tags(item, ids::BOX).await {
+                Ok(tags) => assert_eq!(batched.get(&item), Some(&tags), "{item}"),
+                Err(StoreError::NotFound { entity: "item", .. }) => {
+                    assert!(!batched.contains_key(&item), "{item} is unknown");
+                }
+                Err(err) => panic!("missing_tags({item}): {err}"),
+            }
+        }
+        assert_eq!(batched.len(), 3);
+        assert_eq!(batched[&tagged], ["Alpha", "cuda", "zeta"]);
+        assert!(batched[&covered].is_empty());
+        assert!(
+            store
+                .missing_tags_of(&[], ids::BOX)
+                .await
+                .expect("the read answers")
+                .is_empty()
+        );
+        assert!(matches!(
+            store.missing_tags_of(&items, BoxId::new()).await,
+            Err(StoreError::NotFound { entity: "box", .. })
+        ));
     }
 }

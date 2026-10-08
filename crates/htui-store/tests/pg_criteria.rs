@@ -10330,3 +10330,94 @@ async fn concurrent_moves_and_prunes_never_deadlock() {
 
     db.drop_db().await;
 }
+
+// ---- MOD-12 M3 review R1: the overlay's batched tag read (M2) and its last close (L4) ----------
+
+/// Review R1 M2: `missing_tags_of` answers alike on both stores, and for every known item exactly
+/// what `missing_tags` answers for it; an unknown item is left out, and an unknown box is refused
+/// as `missing_tags` refuses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_tags_of_answers_missing_tags_per_item_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (tagged, covered) = (ItemId::new(), ItemId::new());
+    for (id, tags) in [
+        (
+            tagged,
+            ["zeta", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
+        ),
+        (covered, ["gpu", "rust"].as_slice()),
+    ] {
+        let new = NewItem {
+            id,
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: "tagged".to_owned(),
+            body: String::new(),
+            required_tags: tags.iter().map(|&tag| tag.to_owned()).collect(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        };
+        pg.mint_item(new.clone()).await.expect("mint on Postgres");
+        mem.mint_item(new).await.expect("mint on MemStore");
+    }
+    let unknown = ItemId::new();
+    let items = [
+        tagged,
+        covered,
+        ids::HTUI_ANA_2,
+        ids::HTUI_TOOL_1,
+        unknown,
+        tagged,
+    ];
+    let batched = pg
+        .missing_tags_of(&items, ids::BOX)
+        .await
+        .expect("the Postgres read");
+    assert_eq!(
+        batched,
+        mem.missing_tags_of(&items, ids::BOX)
+            .await
+            .expect("the MemStore read"),
+        "same answer on both stores"
+    );
+    for item in items {
+        match pg.missing_tags(item, ids::BOX).await {
+            Ok(tags) => assert_eq!(batched.get(&item), Some(&tags), "{item}"),
+            Err(htui_core::store::StoreError::NotFound { entity: "item", .. }) => {
+                assert!(!batched.contains_key(&item), "{item} is unknown");
+            }
+            Err(err) => panic!("missing_tags({item}): {err}"),
+        }
+    }
+    assert_eq!(batched.len(), 4);
+    assert_eq!(
+        batched[&tagged],
+        ["Alpha", "cuda", "zeta"],
+        "bytes order, deduplicated"
+    );
+    assert!(batched[&covered].is_empty());
+    for answer in [
+        pg.missing_tags_of(&[], ids::BOX).await,
+        mem.missing_tags_of(&[], ids::BOX).await,
+    ] {
+        assert!(answer.expect("the read answers").is_empty());
+    }
+    for answer in [
+        pg.missing_tags_of(&items, BoxId::new()).await,
+        mem.missing_tags_of(&items, BoxId::new()).await,
+    ] {
+        assert!(matches!(
+            answer,
+            Err(htui_core::store::StoreError::NotFound { entity: "box", .. })
+        ));
+    }
+
+    db.drop_db().await;
+}

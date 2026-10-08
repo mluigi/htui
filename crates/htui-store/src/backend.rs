@@ -561,6 +561,25 @@ impl Backend {
         }
     }
 
+    /// MOD-12 M3 review R1 M2: `missing_tags` for many items in one read, keyed by item; an
+    /// unknown item is left out.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the arm's store reports, [`StoreError::NotFound`] for an unknown box included;
+    /// offline, [`StoreError::Unreachable`] with [`DATABASE_UNREACHABLE`].
+    pub async fn missing_tags_of(
+        &self,
+        items: &[ItemId],
+        box_id: BoxId,
+    ) -> Result<BTreeMap<ItemId, Vec<String>>> {
+        match self {
+            Self::Memory(store) => store.missing_tags_of(items, box_id).await,
+            Self::Online { pg, .. } => pg.missing_tags_of(items, box_id).await,
+            Self::Offline { .. } => Err(orchestration_offline()),
+        }
+    }
+
     /// How many runs hold a slot on one box: §4.7's admission count.
     ///
     /// # Errors
@@ -1187,8 +1206,8 @@ mod tests {
         cache.close().await;
     }
 
-    /// MOD-12 M3 D3, D6: the queue overlay's read and its move are orchestration, refused offline
-    /// rather than answered from the mirror.
+    /// MOD-12 M3 D3, D6: the queue overlay's reads and its move are orchestration, refused
+    /// offline rather than answered from the mirror; review R1 M2's batched tag read too.
     #[tokio::test]
     async fn an_offline_backend_refuses_the_queue_rows_and_the_move() {
         use htui_core::fixtures::ids;
@@ -1209,6 +1228,10 @@ mod tests {
             offline
                 .move_queue_entry(ids::BOX, ids::HTUI_ANA_2, QueueMove::Up)
                 .await,
+            Err(StoreError::Unreachable(_))
+        ));
+        assert!(matches!(
+            offline.missing_tags_of(&[ids::HTUI_ANA_2], ids::BOX).await,
             Err(StoreError::Unreachable(_))
         ));
         cache.close().await;
