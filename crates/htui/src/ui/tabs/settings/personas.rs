@@ -33,6 +33,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::persona_import::PersonaOutcome;
 use crate::persona_settings::{IMPORT_NAME, PersonaWrite, READ_NAME, REQUEST_NAMES};
 use crate::store_worker::{StoreReply, StoreRequest};
@@ -42,37 +43,70 @@ use crate::ui::tabs::settings::{
     is_error, wrapped, yes_or_no,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
-/// The Browse keys over a readable registry with rows.
-pub const HINT_BROWSE: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} b body \u{b7} r rules \u{b7} d delete \u{b7} I import";
+/// The Browse keys over a readable registry with rows: `j/k select · n new · e edit · b body ·
+/// r rules · d delete · I import` with the default keys.
+pub const HINT_BROWSE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "select"),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::PersonasBody, "body"),
+    Hint::One(Act::PersonasRules, "rules"),
+    Hint::One(Act::Delete, "delete"),
+    Hint::One(Act::PersonasImport, "import"),
+];
 
-/// The Browse keys over an empty, readable registry.
-pub const HINT_EMPTY: &str = "n new \u{b7} I import";
+/// The Browse keys over an empty, readable registry: `n new · I import`.
+pub const HINT_EMPTY: HintSpec = &[
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::PersonasImport, "import"),
+];
 
 /// The Browse keys while the registry is unavailable: none but navigation.
-pub const HINT_UNAVAILABLE: &str = "";
+pub const HINT_UNAVAILABLE: HintSpec = &[];
 
-/// The create form's keys.
-pub const HINT_FORM_NEW: &str = "Tab/Shift+Tab field \u{b7} Enter body \u{b7} Esc cancel";
+/// The create form's keys: `Tab/Shift+Tab field · Enter body · Esc cancel`.
+pub const HINT_FORM_NEW: HintSpec = &[
+    Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
+    Hint::Text("Enter body"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The edit form's keys.
-pub const HINT_FORM_EDIT: &str = "Tab/Shift+Tab field \u{b7} Enter save \u{b7} Esc cancel";
+/// The edit form's keys: `Tab/Shift+Tab field · Enter save · Esc cancel`.
+pub const HINT_FORM_EDIT: HintSpec = &[
+    Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
+    Hint::Text("Enter save"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The new persona's body editor keys.
-pub const HINT_BODY_NEW: &str = "Ctrl+S create \u{b7} Esc back to the fields";
+/// The new persona's body editor keys: `Ctrl+s create · Esc back to the fields`.
+pub const HINT_BODY_NEW: HintSpec = &[
+    Hint::One(Act::FormSave, "create"),
+    Hint::Text("Esc back to the fields"),
+];
 
-/// The body (edit) and rules editors' keys.
-pub const HINT_EDITOR: &str = "Ctrl+S save \u{b7} Esc cancel \u{b7} Enter breaks the line";
+/// The body (edit) and rules editors' keys: `Ctrl+s save · Esc cancel · Enter breaks the line`.
+pub const HINT_EDITOR: HintSpec = &[
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+    Hint::Text("Enter breaks the line"),
+];
 
-/// The delete question's keys.
-pub const HINT_DELETING: &str = "y delete \u{b7} n/Esc stop";
+/// The delete question's keys: `y delete · n/Esc stop`.
+pub const HINT_DELETING: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "delete"),
+    Hint::All(Act::ConfirmNo, "stop"),
+];
 
-/// The import path's keys.
-pub const HINT_IMPORT: &str = "Enter import \u{b7} Esc cancel";
+/// The import path's keys, the field's own: `Enter import · Esc cancel`.
+pub const HINT_IMPORT: HintSpec = &[Hint::Text("Enter import"), Hint::Text("Esc cancel")];
 
-/// The import report's keys.
-pub const HINT_REPORT: &str = "j/k scroll \u{b7} Esc close";
+/// The import report's keys: `j/k scroll · Esc close`.
+pub const HINT_REPORT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "scroll"),
+    Hint::One(Act::Back, "close"),
+];
 
 /// `Enter` on an empty import path.
 pub const ENTER_A_PATH: &str = "type a path to a persona `.md` file or a directory of them";
@@ -422,79 +456,104 @@ impl PersonasSection {
         ctx.request(request);
     }
 
-    /// One key in Browse (B-12): `j k ↓ ↑ n e b r d I`; everything else passes.
-    fn on_browse_key(&mut self, key: KeyEvent) -> Handled {
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return Handled::Pass;
-        }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.cursor + 1 < self.personas.len() {
-                    self.cursor += 1;
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.cursor = self.cursor.saturating_sub(1);
-                Handled::Consumed
-            }
-            KeyCode::Char(c @ ('n' | 'e' | 'b' | 'r' | 'd' | 'I')) => {
-                if self.unavailable.is_some() {
-                    return Handled::Consumed;
-                }
-                // `d` and `I` send at once; the editors send only on their own save, which the
-                // import in flight still refuses.
-                let busy = if matches!(c, 'd' | 'I') {
-                    self.busy
-                } else {
-                    self.own_write()
-                };
-                if let Some(busy) = busy {
-                    self.notice = Some(Notice::Error(in_flight(busy)));
-                    return Handled::Consumed;
-                }
-                if c == 'n' {
-                    self.mode = Mode::Editing(Editor::create());
-                    self.notice = None;
-                    return Handled::Consumed;
-                }
-                if c == 'I' {
-                    self.mode = Mode::ImportPath {
-                        field: TextField::new(),
-                    };
-                    self.notice = None;
-                    return Handled::Consumed;
-                }
-                let Some(row) = self.selected() else {
-                    self.notice = Some(Notice::Error(NO_ROW.to_owned()));
-                    return Handled::Consumed;
-                };
-                let (mode, notice) = match c {
-                    'e' => (Mode::Editing(Editor::edit(row)), None),
-                    'b' => (Mode::Body(BodyEditor::edit(row)), None),
-                    'r' => (Mode::Rules(RulesEditor::edit(row)), None),
-                    _ => (
-                        Mode::Deleting {
-                            id: row.id,
-                            name: row.name.clone(),
-                            stage: DeleteStage::Asking,
-                        },
-                        Some(Notice::Info(delete_question(&row.name))),
-                    ),
-                };
-                self.mode = mode;
-                self.notice = notice;
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
+    /// The stack of the current mode (MOD-67 D3): the only place a mode maps to its keys;
+    /// `key_stack`, `on_key` and the hint all read it.
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
+            Mode::Browse => views::PERSONAS_BROWSE,
+            Mode::Editing(_) => views::PERSONAS_FORM,
+            Mode::Body(_) | Mode::Rules(_) => views::PERSONAS_EDITOR,
+            Mode::Deleting { .. } => views::PERSONAS_DELETE,
+            Mode::ImportPath { .. } => views::CAPTURE,
+            Mode::Report { .. } => views::PERSONAS_REPORT,
         }
     }
 
+    /// One key in Browse (B-12), through `PERSONAS_BROWSE`: `list.down/up`, `common.new/edit/
+    /// delete` and `settings.personas.body/rules/import`. Every other chord, a global act among
+    /// them, passes; chord equality includes modifiers, so `ctrl-d` is not `d`.
+    fn on_browse_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::PERSONAS_BROWSE, chord) {
+            match act {
+                Act::ListDown => {
+                    if self.cursor + 1 < self.personas.len() {
+                        self.cursor += 1;
+                    }
+                    return Handled::Consumed;
+                }
+                Act::ListUp => {
+                    self.cursor = self.cursor.saturating_sub(1);
+                    return Handled::Consumed;
+                }
+                Act::New
+                | Act::Edit
+                | Act::PersonasBody
+                | Act::PersonasRules
+                | Act::Delete
+                | Act::PersonasImport => {
+                    self.open(act);
+                    return Handled::Consumed;
+                }
+                _ => continue, // a global act (or `settings.*`, which the tab took first)
+            }
+        }
+        Handled::Pass
+    }
+
+    /// One of Browse's writing keys: `new`, `edit`, `body`, `rules`, `delete` or `import`. Every
+    /// refusal (unavailable, busy, no row) is accept-and-say, never a fall-through.
+    fn open(&mut self, act: Act) {
+        if self.unavailable.is_some() {
+            return;
+        }
+        // `delete` and `import` send at once; the editors send only on their own save, which the
+        // import in flight still refuses.
+        let busy = if matches!(act, Act::Delete | Act::PersonasImport) {
+            self.busy
+        } else {
+            self.own_write()
+        };
+        if let Some(busy) = busy {
+            self.notice = Some(Notice::Error(in_flight(busy)));
+            return;
+        }
+        if act == Act::New {
+            self.mode = Mode::Editing(Editor::create());
+            self.notice = None;
+            return;
+        }
+        if act == Act::PersonasImport {
+            self.mode = Mode::ImportPath {
+                field: TextField::new(),
+            };
+            self.notice = None;
+            return;
+        }
+        let Some(row) = self.selected() else {
+            self.notice = Some(Notice::Error(NO_ROW.to_owned()));
+            return;
+        };
+        let (mode, notice) = match act {
+            Act::Edit => (Mode::Editing(Editor::edit(row)), None),
+            Act::PersonasBody => (Mode::Body(BodyEditor::edit(row)), None),
+            Act::PersonasRules => (Mode::Rules(RulesEditor::edit(row)), None),
+            _ => (
+                Mode::Deleting {
+                    id: row.id,
+                    name: row.name.clone(),
+                    stage: DeleteStage::Asking,
+                },
+                Some(Notice::Info(delete_question(&row.name))),
+            ),
+        };
+        self.mode = mode;
+        self.notice = notice;
+    }
+
     /// One key while the fields form is open: the focused field first, then the form's own
-    /// navigation; everything else is swallowed but `CONTROL` chords.
+    /// navigation through `PERSONAS_FORM`; everything else is swallowed but the chords a modal
+    /// mode passes (CONTROL, ALT, function keys).
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
@@ -514,7 +573,12 @@ impl PersonasSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => form_navigation(key, &mut editor.focus, editor.fields.len()),
+            FieldOutcome::Pass => form_navigation(
+                ctx.keys(),
+                KeyChord::from_event(key),
+                &mut editor.focus,
+                editor.fields.len(),
+            ),
         }
     }
 
@@ -565,7 +629,8 @@ impl PersonasSection {
         }
     }
 
-    /// One key while the body editor is open.
+    /// One key while the body editor is open: the `TextArea` first (its own `Ctrl+s` submits,
+    /// D13), then `form.save` through `PERSONAS_EDITOR` for a rebound chord.
     fn on_body_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Mode::Body(editor) = &mut self.mode else {
             return Handled::Pass;
@@ -586,8 +651,13 @@ impl PersonasSection {
                 self.cancel_body();
                 Handled::Consumed
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => match editor_act(ctx.keys(), key) {
+                Ok(()) => {
+                    self.save_body(ctx);
+                    Handled::Consumed
+                }
+                Err(handled) => handled,
+            },
         }
     }
 
@@ -689,7 +759,7 @@ impl PersonasSection {
         self.send(request, ctx);
     }
 
-    /// One key while the rules editor is open.
+    /// One key while the rules editor is open: as the body editor.
     fn on_rules_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let own = self.own_write();
         let Mode::Rules(editor) = &mut self.mode else {
@@ -719,8 +789,13 @@ impl PersonasSection {
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => match editor_act(ctx.keys(), key) {
+                Ok(()) => {
+                    self.save_rules(ctx);
+                    Handled::Consumed
+                }
+                Err(handled) => handled,
+            },
         }
     }
 
@@ -769,35 +844,37 @@ impl PersonasSection {
         self.send(request, ctx);
     }
 
-    /// One key over the delete question: `y` sends, `n`/`Esc` close; once sent, every key but a
-    /// `CONTROL` chord is swallowed until the answer.
+    /// One key over the delete question, through `PERSONAS_DELETE`: `confirm.yes` sends,
+    /// `confirm.no` closes; once sent, both are swallowed until the answer. A chord a modal mode
+    /// passes (CONTROL, ALT, function keys) goes to the shell; everything else is swallowed.
     fn on_delete_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
+        let stack = views::PERSONAS_DELETE;
+        let chord = KeyChord::from_event(key);
         let Mode::Deleting { id, stage, .. } = &mut self.mode else {
             return Handled::Pass;
         };
-        if *stage == DeleteStage::InFlight {
-            return Handled::Consumed;
-        }
-        match key.code {
-            KeyCode::Char('y') => {
+        // The narrowest candidate decides: a global act is the pass rule's.
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes | Act::ConfirmNo) if *stage == DeleteStage::InFlight => {
+                Handled::Consumed
+            }
+            Some(Act::ConfirmYes) => {
                 *stage = DeleteStage::InFlight;
                 let request = StoreRequest::DeletePersona { id: *id };
                 self.notice = None;
                 self.send(request, ctx);
+                Handled::Consumed
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
+            Some(Act::ConfirmNo) => {
                 self.mode = Mode::Browse;
                 self.notice = None;
+                Handled::Consumed
             }
-            _ => {}
+            _ => modal_rest(stack, chord),
         }
-        Handled::Consumed
     }
 
-    /// One key in the import path field.
+    /// One key in the import path field (`views::CAPTURE`): the field, then the pass rule.
     fn on_import_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Mode::ImportPath { field } = &mut self.mode else {
             return Handled::Pass;
@@ -822,24 +899,24 @@ impl PersonasSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
         }
     }
 
-    /// One key over the import report: `j`/`k` scroll a line, `Esc`/`Enter` close.
-    fn on_report_key(&mut self, key: KeyEvent) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
+    /// One key over the import report, through `PERSONAS_REPORT`: `list.down`/`up` scroll a
+    /// line, `common.back` (`Esc`, and `Enter` as a view default) closes. The report stays modal
+    /// (L-D Q8): a chord a modal mode passes goes to the shell, everything else is swallowed.
+    fn on_report_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let stack = views::PERSONAS_REPORT;
+        let chord = KeyChord::from_event(key);
         let Mode::Report { top, max_top, .. } = &mut self.mode else {
             return Handled::Pass;
         };
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => *top = (*top + 1).min(max_top.get()),
-            KeyCode::Char('k') | KeyCode::Up => *top = top.saturating_sub(1),
-            KeyCode::Esc | KeyCode::Enter => self.mode = Mode::Browse,
-            _ => {}
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ListDown) => *top = (*top + 1).min(max_top.get()),
+            Some(Act::ListUp) => *top = top.saturating_sub(1),
+            Some(Act::Back) => self.mode = Mode::Browse,
+            _ => return modal_rest(stack, chord),
         }
         Handled::Consumed
     }
@@ -1169,8 +1246,13 @@ impl PersonasSection {
         lines
     }
 
-    /// The key line for the mode.
-    fn hint(&self) -> &'static str {
+    /// The key line for the mode, rendered through the mode's stack with the keys in force.
+    fn hint(&self, keys: &Keys) -> String {
+        keys.hint(self.stack(), self.hint_spec())
+    }
+
+    /// The hint spec for the mode.
+    fn hint_spec(&self) -> HintSpec {
         match &self.mode {
             Mode::Browse if self.unavailable.is_some() => HINT_UNAVAILABLE,
             Mode::Browse if self.read && self.personas.is_empty() => HINT_EMPTY,
@@ -1567,22 +1649,40 @@ fn detail_line(row: &Persona) -> String {
     )
 }
 
-/// What a form does with a key its focused field passed on: `Tab`/`Down` and `BackTab`/`Up` move
-/// the focus with a wrap, a `CONTROL` chord passes so `ctrl-c` still quits, and everything else
-/// is swallowed rather than offered to the shell.
-fn form_navigation(key: KeyEvent, focus: &mut usize, fields: usize) -> Handled {
+/// What a form does with a chord its focused field passed on, through `PERSONAS_FORM`:
+/// `form.next_field` (`Tab`, and `Down` as a view default) and `form.prev_field` (`BackTab`,
+/// `Up`) move the focus with a wrap; then [`modal_rest`].
+fn form_navigation(keys: &Keys, chord: KeyChord, focus: &mut usize, fields: usize) -> Handled {
+    let stack = views::PERSONAS_FORM;
     let len = fields.max(1);
-    match key.code {
-        KeyCode::Tab | KeyCode::Down => {
-            *focus = (*focus + 1) % len;
-            Handled::Consumed
-        }
-        KeyCode::BackTab | KeyCode::Up => {
-            *focus = (*focus + len - 1) % len;
-            Handled::Consumed
-        }
-        _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-        _ => Handled::Consumed,
+    match keys.actions(stack, chord).first() {
+        Some(Act::FormNextField) => *focus = (*focus + 1) % len,
+        Some(Act::FormPrevField) => *focus = (*focus + len - 1) % len,
+        _ => return modal_rest(stack, chord),
+    }
+    Handled::Consumed
+}
+
+/// What the body and rules editors do with a key their `TextArea` passed on: `Ok` for
+/// `form.save` through `PERSONAS_EDITOR` (a rebound save chord; the widget's own `Ctrl+s` never
+/// gets here, D13), else `Err` with [`modal_rest`]'s answer.
+fn editor_act(keys: &Keys, key: KeyEvent) -> Result<(), Handled> {
+    let stack = views::PERSONAS_EDITOR;
+    let chord = KeyChord::from_event(key);
+    if keys.actions(stack, chord).first() == Some(&Act::FormSave) {
+        return Ok(());
+    }
+    Err(modal_rest(stack, chord))
+}
+
+/// A modal mode's answer to a chord none of its own acts took (MOD-67 M3 PA-5): `Pass` for what
+/// the stack's global layer lets through (CONTROL, ALT, function keys: `ctrl-c` quits, `F1`
+/// helps), else `Consumed`, so `q`, `Tab` and digits never leave a capturing mode.
+fn modal_rest(stack: Stack<'_>, chord: KeyChord) -> Handled {
+    if stack.passes(chord) {
+        Handled::Pass
+    } else {
+        Handled::Consumed
     }
 }
 
@@ -1740,6 +1840,11 @@ impl SettingsSection for PersonasSection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    /// The current mode's stack (MOD-67 D4).
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
         match &mut self.mode {
             Mode::Editing(editor) => {
@@ -1774,13 +1879,13 @@ impl SettingsSection for PersonasSection {
 
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let handled = match self.mode {
-            Mode::Browse => self.on_browse_key(key),
+            Mode::Browse => self.on_browse_key(key, ctx),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
             Mode::Body(_) => self.on_body_key(key, ctx),
             Mode::Rules(_) => self.on_rules_key(key, ctx),
             Mode::Deleting { .. } => self.on_delete_key(key, ctx),
             Mode::ImportPath { .. } => self.on_import_key(key, ctx),
-            Mode::Report { .. } => self.on_report_key(key),
+            Mode::Report { .. } => self.on_report_key(key, ctx),
         };
         self.open_pending_report();
         handled
@@ -1860,6 +1965,9 @@ impl SettingsSection for PersonasSection {
             frame.render_widget(Paragraph::new(notice), notice_area);
         }
         let hint: Style = ctx.theme.dim;
-        frame.render_widget(Paragraph::new(Line::styled(self.hint(), hint)), hint_area);
+        frame.render_widget(
+            Paragraph::new(Line::styled(self.hint(ctx.keys()), hint)),
+            hint_area,
+        );
     }
 }
