@@ -400,7 +400,8 @@ and the call would then never reach htui's policy or its record.
 **Still on:**
 
 - agents and MCP servers that come with your installed plugins;
-- the MCP servers you configured for Claude Code yourself;
+- the MCP servers you configured for Claude Code yourself, and the prompts they offer as
+  commands;
 - the repository's `CLAUDE.md`;
 - Claude Code's built-in mods, which it loads whatever the settings say;
 - htui's own `htui` server and its `permission_prompt` tool.
