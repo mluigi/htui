@@ -77,8 +77,10 @@ const EDITOR_LOCKED: &str = "the editor is open";
 const FINISH_FIRST: &str = "finish or abort it first";
 
 /// The refusal's tail and the status line while a modal overlay is over the editor (R0 F3): its
-/// keys are the prompt's, so none of the editor's is offered.
-const PROMPT_FIRST: &str = "answer or close the prompt first";
+/// keys are the overlay's, so none of the editor's is offered. Neutral (M2 R1 L-1): it fits a
+/// reply's prompt, an offered view (find, the queue, the waiting list, the switcher) and the quit
+/// question alike.
+const COVERED_FIRST: &str = "close this first";
 
 /// The focused pane's title and status hint.
 const FOCUSED_HINT: HintSpec = &[Hint::One(Act::EditorFocus, "to htui")];
@@ -309,12 +311,12 @@ impl App {
             && !self.help_visible
     }
 
-    /// The lock's refusal: under a modal overlay [`PROMPT_FIRST`]; on another tab the way back
+    /// The lock's refusal: under a modal overlay [`COVERED_FIRST`]; on another tab the way back
     /// (MOD-57 M2, B-M2-9: `the editor is open in Skills: Ctrl+4 back`, `editor.abort` does not
     /// act there); on the asking tab the editor's keys.
     fn lock_refusal(&self) -> String {
         if self.editor_covered() {
-            format!("{EDITOR_LOCKED}: {PROMPT_FIRST}")
+            format!("{EDITOR_LOCKED}: {COVERED_FIRST}")
         } else if !self.editor_visible() {
             let place = self.editor_place();
             match self.editor_back() {
@@ -492,8 +494,8 @@ impl App {
     /// without one or on another tab ([`editor_notice`](Self::editor_notice) leads that tab's own
     /// line, MOD-57 M2 E6). A focused editor without the keys
     /// ([`editor_has_keys`](Self::editor_has_keys): under a modal overlay or the `?` box) reads
-    /// as unfocused; under a modal overlay, whose keys are the prompt's, the line offers no
-    /// editor key and says the prompt comes first (R0 F3).
+    /// as unfocused; under a modal overlay, whose keys are the overlay's, the line offers no
+    /// editor key and says to close it first (R0 F3, M2 R1 L-1).
     pub(super) fn editor_status(&self) -> Option<String> {
         if !self.editor_visible() {
             return None;
@@ -504,7 +506,7 @@ impl App {
                 self.keys.hint(Stack::EDITOR_FOCUSED, FOCUSED_HINT)
             )
         } else if self.editor_covered() {
-            format!("{EDITOR_LOCKED}: {PROMPT_FIRST}")
+            format!("{EDITOR_LOCKED}: {COVERED_FIRST}")
         } else {
             self.keys.hint(Stack::EDITOR_OPEN, UNFOCUSED_HINT)
         })
@@ -1054,7 +1056,9 @@ mod tests {
     const FOCUSED_STATUS: &str = "the editor has the keys · Ctrl+4 to htui";
     const UNFOCUSED_STATUS: &str = "Ctrl+4 to the editor · Ctrl+x abort · q quit · ? help";
     const REFUSAL: &str = "the editor is open: Ctrl+4 to the editor · Ctrl+x abort";
-    const COVERED: &str = "the editor is open: answer or close the prompt first";
+    /// R0 F3, M2 R1 L-1: under any modal overlay, a prompt or a view (find, the queue, the quit
+    /// question), on the asking tab.
+    const COVERED: &str = "the editor is open: close this first";
     /// MOD-57 M2 (B-M2-9): the swallow's sentence off screen.
     const OFF_SCREEN: &str = "the editor is open in asker: Ctrl+4 back";
     /// MOD-57 M2 E6: the status prefix on another tab.
@@ -1187,6 +1191,21 @@ mod tests {
             drop(app);
             assert_eq!(log.borrow().last(), Some(&Call::Dropped), "{from_other}");
         }
+    }
+
+    /// M2 R1 L-1: the covered sentence fits every modal overlay on the asking tab, the quit
+    /// question and an offered view included, and a refused key says it too.
+    #[test]
+    fn under_any_modal_overlay_the_asking_tab_says_close_this_first() {
+        let (mut app, _benches, _log) = unfocused_two();
+        confirmable(&mut app);
+        app.on_key(plain('q'));
+        assert_eq!(top(&app), Some(QuitConfirm::ID));
+        assert_eq!(app.editor_status().as_deref(), Some(COVERED));
+        app.on_key(press(KeyCode::Esc, KeyModifiers::NONE));
+
+        app.push_overlay(Box::new(Shade));
+        assert_eq!(app.editor_status().as_deref(), Some(COVERED));
     }
 
     /// ANA-26 C3 with an editor alive: `ctrl-c` quits at once on the asking tab, on another, and

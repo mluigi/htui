@@ -155,7 +155,7 @@ open, which takes it as it takes the keys.
 - `q` and `Ctrl+C` quit at once, without a confirmation, and kill the editor: an unsaved edit is
   lost. Leave the editor normally (`:wq`, `Ctrl+X`) to keep it.
 - A modal prompt that a store reply opens during the edit (a migration prompt, say) takes htui's
-  keys: the status line reads `the editor is open: answer or close the prompt first`. Keys and
+  keys: the status line reads `the editor is open: close this first`. Keys and
   pastes go to the prompt, `Ctrl+4` included (`Ctrl+C` still quits). Answer or close it; then the
   lock is back. The first key you type for the editor when such a prompt appears is swallowed
   rather than answering a prompt you had not seen yet.
