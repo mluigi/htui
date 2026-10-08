@@ -82,7 +82,7 @@ mod binary {
         assert_eq!(stderr, "");
         assert_eq!(stdout, print(&load_path(&valid).expect("valid.toml loads")));
         assert!(
-            stdout.contains("quit         = [\"ctrl-x\"]   # quit (changed)\n"),
+            stdout.contains("quit         = [\"ctrl-y\"]   # quit (changed)\n"),
             "{stdout}"
         );
         assert!(
@@ -302,6 +302,25 @@ mod binary {
         assert_eq!(stderr, report("both", &path, &[line.to_owned()]));
     }
 
+    /// MOD-67 M4 D8.1 end to end: a file that leaves the in-pane editor no way out is refused
+    /// before anything starts, on the entry's line.
+    #[test]
+    fn an_editor_file_that_unbinds_focus_exits_2() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        let path = home.path().join("editor.toml");
+        std::fs::write(&path, "[editor]\nfocus = []\n").expect("the file is written");
+        let output = run(
+            &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+            home.path(),
+        );
+        let (stdout, stderr) = text(&output);
+        assert_eq!(output.status.code(), Some(2), "{stderr}");
+        assert_eq!(stdout, "");
+        let line = "2: [editor] focus: must keep at least one chord: the in-pane editor is left \
+                    only through it";
+        assert_eq!(stderr, report("editor", &path, &[line.to_owned()]));
+    }
+
     #[test]
     fn keys_and_default_keys_are_refused_together() {
         let home = tempfile::tempdir().expect("a throwaway home");
@@ -411,14 +430,14 @@ mod app {
         assert!(!harness.app().should_quit, "`q` no longer quits");
         let frame = harness.render();
         assert!(
-            status_line(&frame).starts_with("Ctrl+x quit · Tab next tab"),
+            status_line(&frame).starts_with("Ctrl+y quit · Tab next tab"),
             "{frame}"
         );
 
         harness.key("?");
         assert!(harness.app().help_visible, "`?` opens the box");
         let frame = harness.render();
-        assert!(frame.contains("Ctrl+x/Ctrl+c quit"), "{frame}");
+        assert!(frame.contains("Ctrl+y/Ctrl+c quit"), "{frame}");
         harness.key("?");
         assert!(!harness.app().help_visible, "`?` closes it");
 
@@ -443,8 +462,8 @@ mod app {
         harness.key("esc");
         assert!(harness.app().overlays.is_empty(), "`Esc` still closes it");
 
-        harness.key("ctrl-x");
-        assert!(harness.app().should_quit, "`Ctrl+x` quits");
+        harness.key("ctrl-y");
+        assert!(harness.app().should_quit, "`Ctrl+y` quits");
     }
 
     /// MOD-12 M3 R1 H1: the shell over a file that gives `ctrl-q` to quit starts, shows quit on

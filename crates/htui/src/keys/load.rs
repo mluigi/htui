@@ -415,13 +415,19 @@ impl Loader<'_> {
                 Ok(chord) => chords.push(chord),
             }
         }
-        if spec.act == Act::OverlayClose && items.is_empty() {
-            self.push(
-                key_line,
-                format!(
-                    "[{table}] {name}: must keep at least one chord: overlays swallow every other key"
-                ),
-            );
+        if items.is_empty() {
+            // The two acts nothing else replaces (MOD-67 M2 D8; M4 D8.1, MOD-57 §6.4).
+            let why = match spec.act {
+                Act::OverlayClose => Some("overlays swallow every other key"),
+                Act::EditorFocus => Some("the in-pane editor is left only through it"),
+                _ => None,
+            };
+            if let Some(why) = why {
+                self.push(
+                    key_line,
+                    format!("[{table}] {name}: must keep at least one chord: {why}"),
+                );
+            }
         }
         self.keys.set(context, spec.act, chords, key_line);
         self.set.push((context, spec.act));
@@ -675,6 +681,31 @@ mod tests {
                 2,
                 r#"[overlay] close = "ctrl-c": ctrl-c always quits and cannot be bound"#
             )
+        );
+    }
+
+    /// MOD-67 M4 D8.1, D8.3: `editor.focus` must keep a chord, and `ctrl-c` is refused in
+    /// `[editor]` as everywhere.
+    #[test]
+    fn editor_focus_must_keep_a_chord() {
+        assert_eq!(
+            errors("[editor]\nfocus = []\n"),
+            one(
+                2,
+                "[editor] focus: must keep at least one chord: the in-pane editor is left only \
+                 through it"
+            )
+        );
+        assert_eq!(
+            errors("[editor]\nfocus = \"ctrl-c\"\n"),
+            one(
+                2,
+                r#"[editor] focus = "ctrl-c": ctrl-c always quits and cannot be bound"#
+            )
+        );
+        assert!(
+            load_str("[editor]\nabort = []\n").is_ok(),
+            "abort may be unbound"
         );
     }
 

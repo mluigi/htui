@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn every_view_layer_comes_first_and_every_modal_stack_ends_modal() {
-        let views = &DECLARED[4..];
+        let views = &DECLARED[6..];
         assert_eq!(views.len(), 32);
         for &(phrase, stack) in views {
             let first = stack.layers()[0];
@@ -471,7 +471,7 @@ mod tests {
     }
 
     /// MOD-67 M3 T7: every view stack this module declares is the stack of some view. The
-    /// shell's own `BASE` and `OVERLAY` are not declared here; a stack nothing names would be
+    /// shell's own `BASE`, `OVERLAY` and editor stacks are not declared here; a stack nothing names would be
     /// validated (and refuse key files) for a mode no view is ever in.
     #[test]
     fn every_view_stack_is_named_by_a_view() {
@@ -518,9 +518,10 @@ mod tests {
             .filter_map(|line| line.strip_prefix("pub const "))
             .filter_map(|rest| rest.split_once(": Stack<'static>").map(|(name, _)| name))
             .collect();
+        // `BASE`, `OVERLAY` and the two editor stacks live in `stack.rs`.
         assert_eq!(
             declared.len(),
-            DECLARED.len() - 2,
+            DECLARED.len() - 4,
             "views.rs stacks vs DECLARED"
         );
         for name in declared {

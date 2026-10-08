@@ -206,10 +206,14 @@ impl Stack<'static> {
 
 /// Every stack the validator walks (ANA-26 §7.3, MOD-67 M2 D8 step 5), each with the phrase its
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
-/// ([`views`](super::views)); M4-M5 append theirs.
+/// ([`views`](super::views)); M4 the two editor stacks, right after the overlay's (MOD-57 §6.4,
+/// D8.2), so an `[editor]` chord is checked against `global.quit` and `global.help`; M4-M5
+/// append their view stacks.
 pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("on every screen", Stack::BASE),
     ("over an overlay", Stack::OVERLAY),
+    ("in the focused in-pane editor", Stack::EDITOR_FOCUSED),
+    ("in the in-pane editor", Stack::EDITOR_UNFOCUSED),
     ("in Settings", views::SETTINGS_TAB),
     ("while a field captures keys", views::CAPTURE),
     ("in Settings > Agents", views::AGENTS_BROWSE),
@@ -334,7 +338,16 @@ mod tests {
     fn declared_starts_with_base_and_overlay_and_holds_every_view_stack() {
         assert_eq!(DECLARED[0], ("on every screen", Stack::BASE));
         assert_eq!(DECLARED[1], ("over an overlay", Stack::OVERLAY));
-        assert_eq!(DECLARED.len(), 36);
+        // MOD-67 M4 D8.2 (PA-4): the in-pane editor's two stacks, one phrase each.
+        assert_eq!(
+            DECLARED[2],
+            ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
+        );
+        assert_eq!(
+            DECLARED[3],
+            ("in the in-pane editor", Stack::EDITOR_UNFOCUSED)
+        );
+        assert_eq!(DECLARED.len(), 38);
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
     }

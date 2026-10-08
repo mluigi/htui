@@ -211,7 +211,7 @@ start from it, and run it again to check your file.
 version = 1
 
 [global]
-quit = ["ctrl-x"]
+quit = ["ctrl-y"]
 
 [overlay]
 close = ["esc", "f2"]
@@ -230,6 +230,8 @@ htui refuses to start on an invalid file and names every bad line, as in
 are an error. A default never gives way to a key from another table: a key shared between a
 pop-up's keys and `[global] help` is an error in either direction (such as `esc` for
 `[global] help`, or `f1` for `[overlay] close`). `ctrl-c` always quits and cannot be bound.
+A key the in-pane editor uses (`ctrl-4` to focus it, `ctrl-x` to abort it) is refused for
+`[global] quit` and `help`, and `[editor] focus` must keep a key.
 
 A table named after a Settings section or a pop-up changes a shared action there alone:
 `[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every other section keeps `r`.
