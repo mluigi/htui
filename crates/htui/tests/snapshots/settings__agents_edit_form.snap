@@ -21,7 +21,6 @@ agent-b      acp       subscription 11     gemini-3.7-flash-high yes     —    
 
 
 
-
 edit agent-b
 transport    : acp
 command      : ${demo_server}
@@ -30,4 +29,5 @@ models       : …gemini-3.6-flash-medium, gemini-3.6-flash-low, gemini-pro-agen
 default model: gemini-3.7-flash-high
 billing      : subscription
 enabled (y/n): y
+mods (y/n)   : n
 Tab next field · Enter saves · Esc cancels
