@@ -14,16 +14,16 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-07):** **MOD-90 and CLEAN-8 are done** (`docs/decisions/mod/mod-90.md`,
-`docs/decisions/clean/clean-8.md`), run together on `hr/MOD-90`. A fourth keyring entry, `htui/infisical-write-mark`,
-is replaced by every Settings > Secrets URL or identity write, so an `htui worker` sharing the keyring drops a refused
-login when the same identity is entered again; a refused mark write shows a line in Settings. CLEAN-8 wiped the
-Infisical body buffer, typed the half-stored identity, guarded Settings > Qdrant in `--demo` and applied the M4 nits.
-No migration. Before them, **MOD-86 and MOD-87** (`docs/decisions/mod/mod-86.md`, `docs/decisions/mod/mod-87.md`):
+**Current status (2026-10-08):** **CLEAN-9 is done** (`docs/decisions/clean/clean-9.md`), on `hr/CLEAN-9`. The
+recorder's `cap_exceeded` row names the session allowance and whether the run or the batch bound it; a malformed
+unrelated project key no longer drops the spend caps (a malformed cap key refuses the enqueue); Pg `clear_setting`
+and `clear_queue_setting` refuse a non-object `project.settings` as Mem does. No migration. Filed **CLEAN-11** for the
+leftovers. Before it, **MOD-90 and CLEAN-8** (`docs/decisions/mod/mod-90.md`, `docs/decisions/clean/clean-8.md`): a
+fourth keyring entry, `htui/infisical-write-mark`, is replaced by every Settings > Secrets URL or identity write, so an
+`htui worker` sharing the keyring drops a refused login when the same identity is entered again.
+Before those, **MOD-86 and MOD-87** (`docs/decisions/mod/mod-86.md`, `docs/decisions/mod/mod-87.md`):
 every chat text is masked before a driver, row or tab frame sees it, and a chat serves commands while it streams
-(`Esc Esc` cuts the turn). Before those, **MOD-10 is done** (`docs/decisions/mod/mod-10.md`): a project's secrets come
-from a self-hosted Infisical, reach the agent only through `SessionSpec.env`, and are masked by the same map in what a
-run stores; it also filed **MOD-89** (`.env` in a worktree).
+(`Esc Esc` cuts the turn).
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -452,28 +452,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 ### Deferred backlog
 
-- [ ] **CLEAN-9 - MOD-12 M2 review residuals** (from MOD-12 M2, plan
-  `.claude/plans/mod-12-m2-spend-guard.plan.md`). `R-AGT-7`, `R-TUI-8`.
-  - **Recorder error-row wording.** Since M2's D6 the recorder's `RunCap.micros` is the session's
-    remaining allowance, the smaller of run cap minus run spend and batch cap minus batch spend. The
-    `cap_exceeded` row in `crates/htui-agent/src/record.rs` still says
-    `project.settings.per_token_cap_run = <n> micros`, which is wrong whenever an earlier step spent
-    anything or the batch term binds. The row shows in the transcript and may be carried forward as
-    cached transcript. The item note and `run.failure` are correct. Fix: give `RunCap` a basis (run
-    remainder, or batch `<id>` remainder) and word the row as "session allowance reached".
-  - **One malformed project key uncaps the engine** (plan D11, review M3). `graph.rs` and
-    `Engine::project_settings` decode `project.settings` with `unwrap_or_default()`, so one bad
-    unrelated key (`"keep_raw_events": "yes"`) drops both caps from the snapshot and the recorder. The
-    runner (`ProjectCaps::from_settings`) still admits the run. Read the caps through
-    `ProjectCaps::from_settings` at snapshot time, and fail or note a malformed blob instead of
-    defaulting it.
-  - **Non-object `project.settings` gaps that only raw SQL can reach.** The Pg clear statements
-    (`pg/write.rs`, `settings - key`) apply on an array blob and raise 22023 on a scalar where Mem
-    refuses. `ProjectCaps::from_settings` reads a non-object blob as "no caps".
-  - **Test hardening.** `a_batch_overshoots_its_cap_by_at_most_one_attempt_pg` should also assert that
-    the batch is still open before the second sweep. The once-per-batch log levels (`info`, then
-    `debug`) are not pinned.
-  Not blocked.
 - [ ] **CLEAN-10 - `cargo doc` fails on private intra-doc links** (found at MOD-12 M2's gate).
   `cargo doc --workspace --no-deps --all-features` stops with 17 errors in `htui-core` and
   `htui-store`. They are public docs linking to private items (`close_batch` →
@@ -481,6 +459,18 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   `write_step_document`/`propose_link`/`add_step_note`/`withdraw_link` → `step_scope`, …) and one
   unresolved `ensure_model`. All of them predate M2. Point those links at public items, or turn them
   into plain code spans. Not blocked.
+- [ ] **CLEAN-11 - CLEAN-9 deferred review residuals** (from CLEAN-9, `docs/decisions/clean/clean-9.md`).
+  `R-AGT-7`.
+  - **Pin the once-per-batch log levels.** `note_batch_stop` logs `info` for a batch's first stop and
+    `debug` after (`htui-worker/src/runtime.rs`). Only the returned `bool` is pinned, because `htui-worker`
+    has no tracing capture. Needs a capture layer as a dev-dependency (`tracing-subscriber` is already a
+    workspace dependency used by `htui`).
+  - **Dedupe the project-settings decode warn.** `graph.rs` `project_settings` warns on every resolve for a
+    non-cap key that does not decode; the file has no process-wide once-set pattern to reuse.
+  - **`null` project settings read and clear disagree.** A `null` blob reads as "no caps"; `clear_setting`
+    refuses it in Pg and Mem (`jsonb_typeof = 'object'`). Intentional and documented on
+    `ProjectCaps::from_settings`; decide whether `null` should be a refusal everywhere.
+  Not blocked.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -500,5 +490,5 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-29 Claude Code mods) |
 | MOD-N   | 21 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-9 MOD-12 M2 review residuals, CLEAN-10 `cargo doc` private links) |
+| CLEAN-N | 2 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals) |
 | TOOL-N  | 0 |

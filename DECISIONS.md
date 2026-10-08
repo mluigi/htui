@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[CLEAN-9](docs/decisions/clean/clean-9.md)** - MOD-12 M2 review residuals (done, 2026-10-08)
 - **[CLEAN-8](docs/decisions/clean/clean-8.md)** - MOD-10 M4 review residuals (done, 2026-10-07)
 - **[MOD-90](docs/decisions/mod/mod-90.md)** - Clear a refused Infisical login in `htui worker` when the same identity is re-entered (done, 2026-10-07)
 - **[MOD-87](docs/decisions/mod/mod-87.md)** - Chat cancel answered late or dropped during an unparked turn (done, 2026-10-07)
