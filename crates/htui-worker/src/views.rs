@@ -533,6 +533,12 @@ pub struct WaitingRow {
     pub reason: WaitingReason,
     /// The reason's text: a gate or judge note, the tool, or the Unblock case's sentence.
     pub text: String,
+    /// When the row began waiting, as the store last stamped it (MOD-92 D5): the parked step's
+    /// `updated_at` for a gate, the judge's for a failed judge, the run's for a selection, an
+    /// interrupted run and an Unblock row over a run, the item's for a Reopen row, and the request's
+    /// `created_at` for a permission. The store's clock (`set_updated_at()`'s `clock_timestamp()`); a
+    /// later edit of that row moves it. The overlay does not show it; `htui waiting --json` does.
+    pub since: DateTime<Utc>,
 }
 
 /// The waiting-on-you list and the top bar's two counts (MOD-69 plan D5, D6).
@@ -585,7 +591,8 @@ const INTERRUPTED_TEXT: &str = "interrupted";
 /// approve/accept/open, plan D3) decides a slot's `select`, one `unblock_case` per candidate the
 /// item's `u`, step status a gate, and a parked run none of them lists is an Interrupted row
 /// (review H1). `permissions` is `None` offline or when the permission read failed (review L4).
-/// `active` is `Backend::active_runs` over the same scope.
+/// `active` is `Backend::active_runs` over the same scope. Each row's [`WaitingRow::since`] is the
+/// stamp of the row its reason waits on (MOD-92 D5).
 #[must_use]
 pub fn waiting(
     scope: &Scope,
@@ -609,7 +616,8 @@ pub fn waiting(
                    step: Option<&RunStep>,
                    step_label: String,
                    reason: WaitingReason,
-                   text: String| {
+                   text: String,
+                   since: DateTime<Utc>| {
             let key = RowKey {
                 project: project_at(item.project_id),
                 key_prefix: item.key_prefix.as_str(),
@@ -629,6 +637,7 @@ pub fn waiting(
                 step_label,
                 reason,
                 text,
+                since,
             };
             (key, row)
         };
@@ -651,6 +660,7 @@ pub fn waiting(
                     label_of(step, steps),
                     WaitingReason::Gate,
                     text,
+                    step.updated_at,
                 ));
             }
             if run.status != RunStatus::AwaitingApproval || !parked.is_empty() {
@@ -676,6 +686,7 @@ pub fn waiting(
                         label_of(judge, steps),
                         WaitingReason::JudgeFailed,
                         note,
+                        judge.updated_at,
                     ));
                 } else if let Some(first) = group_at(steps, position, attempt).first() {
                     keyed.push(row(
@@ -684,6 +695,7 @@ pub fn waiting(
                         label_of(first, steps),
                         WaitingReason::Selection,
                         SELECTION_TEXT.to_owned(),
+                        run.updated_at,
                     ));
                 }
             }
@@ -709,6 +721,7 @@ pub fn waiting(
                 String::new(),
                 WaitingReason::Unblock,
                 text.to_owned(),
+                run.map_or(item.updated_at, |run| run.updated_at),
             ));
         }
 
@@ -740,6 +753,7 @@ pub fn waiting(
                 rest.map_or_else(String::new, |step| label_of(step, steps)),
                 WaitingReason::Interrupted,
                 text,
+                run.updated_at,
             ));
         }
     }
@@ -776,6 +790,7 @@ pub fn waiting(
             ),
             reason: WaitingReason::Permission,
             text,
+            since: p.permission.created_at,
         };
         keyed.push((key, row));
     }
@@ -997,7 +1012,7 @@ impl AgentDriver for RefusedDriver {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
+    use chrono::{DateTime, Duration, Utc};
     use htui_core::fixtures::{demo_at, demo_data, ids};
     use htui_core::model::{
         GateOutcome, GraphSnapshot, Item, ItemId, PermissionId, PermissionStatus, ProjectId,
@@ -1084,7 +1099,7 @@ mod tests {
                 body: "authored".to_owned(),
                 produced_by_step_id: Some(step.id),
                 created_by: ids::USER,
-                created_at: chrono::Utc::now(),
+                created_at: Utc::now(),
             })
         }
     }
@@ -1450,6 +1465,43 @@ mod tests {
             step_label: step_label.to_owned(),
             reason,
             text: text.to_owned(),
+            since: expected_since(candidate, run, step, reason),
+        }
+    }
+
+    /// MOD-92 D5's `since` for a row of `candidate` that is not a permission, read from the run
+    /// and step the row names. The per-reason `*_is_since_*` cases pin the rule independently.
+    fn expected_since(
+        candidate: &WaitingCandidate,
+        run: Option<RunId>,
+        step: Option<StepId>,
+        reason: WaitingReason,
+    ) -> DateTime<Utc> {
+        let run = run.map(|id| {
+            candidate
+                .runs
+                .iter()
+                .map(|(run, _)| run)
+                .find(|run| run.id == id)
+                .expect("the row's run is the candidate's")
+        });
+        let step = step.map(|id| {
+            candidate
+                .runs
+                .iter()
+                .flat_map(|(_, steps)| steps)
+                .find(|step| step.id == id)
+                .expect("the row's step is the candidate's")
+        });
+        match (reason, run, step) {
+            (WaitingReason::Gate | WaitingReason::JudgeFailed, _, Some(step)) => step.updated_at,
+            (
+                WaitingReason::Selection | WaitingReason::Unblock | WaitingReason::Interrupted,
+                Some(run),
+                _,
+            ) => run.updated_at,
+            (WaitingReason::Unblock, None, _) => candidate.item.updated_at,
+            _ => panic!("no D5 rule for a {reason:?} row over {run:?} and {step:?}"),
         }
     }
 
@@ -1848,6 +1900,158 @@ mod tests {
         );
     }
 
+    // MOD-92 D5: each reason's `since` reads one row's stamp. `stamped` gives the item, the run,
+    // the steps and the judge distinct stamps, so each case pins its own source.
+
+    /// `candidate` with distinct stamps: the item at day 1 00:00, every run at day 2 05:00, every
+    /// step at 06:00 and a judge at 07:00.
+    fn stamped(mut candidate: WaitingCandidate) -> WaitingCandidate {
+        candidate.item.updated_at = demo_at(1, 0);
+        for (run, steps) in &mut candidate.runs {
+            run.updated_at = demo_at(2, 5);
+            for step in steps {
+                step.updated_at = if step.fanout_index == -1 {
+                    demo_at(2, 7)
+                } else {
+                    demo_at(2, 6)
+                };
+            }
+        }
+        candidate
+    }
+
+    /// Each row of `candidate`'s list as its reason, text and `since`.
+    fn sinces(candidate: &WaitingCandidate) -> Vec<(WaitingReason, String, DateTime<Utc>)> {
+        one(candidate)
+            .rows
+            .into_iter()
+            .map(|row| (row.reason, row.text, row.since))
+            .collect()
+    }
+
+    #[test]
+    fn a_gate_row_is_since_its_steps_last_change() {
+        let gate = stamped(over_a_gate(Status::AwaitingApproval));
+
+        assert_eq!(
+            sinces(&gate),
+            [(WaitingReason::Gate, GATE_TEXT.to_owned(), demo_at(2, 6))]
+        );
+    }
+
+    #[test]
+    fn a_judge_failed_row_is_since_the_judges_last_change() {
+        let slot = stamped(slot(Some((Some(GateOutcome::Rejected), "judge: tie"))));
+
+        assert_eq!(
+            sinces(&slot),
+            [(
+                WaitingReason::JudgeFailed,
+                "judge: tie - pick a candidate".to_owned(),
+                demo_at(2, 7)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_selection_row_is_since_its_runs_last_change() {
+        let slot = stamped(slot(None));
+
+        assert_eq!(
+            sinces(&slot),
+            [(
+                WaitingReason::Selection,
+                SELECTION_TEXT.to_owned(),
+                demo_at(2, 5)
+            )]
+        );
+    }
+
+    #[test]
+    fn an_unblock_row_over_a_run_is_since_the_runs_last_change() {
+        let follow = stamped(escalation());
+        assert_eq!(
+            sinces(&follow),
+            [(
+                WaitingReason::Unblock,
+                FOLLOW_TEXT.to_owned(),
+                demo_at(2, 5)
+            )]
+        );
+
+        let resume = stamped(crashed_rejection());
+        assert_eq!(
+            sinces(&resume),
+            [(
+                WaitingReason::Unblock,
+                RESUME_TEXT.to_owned(),
+                demo_at(2, 5)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_reopen_row_is_since_the_items_last_change() {
+        let reopen = stamped(reopen());
+
+        assert_eq!(
+            sinces(&reopen),
+            [(
+                WaitingReason::Unblock,
+                REOPEN_TEXT.to_owned(),
+                demo_at(1, 0)
+            )]
+        );
+    }
+
+    #[test]
+    fn an_interrupted_row_is_since_its_runs_last_change() {
+        let rested = stamped(interrupted_park(Some("interrupted")));
+        let view = one(&rested);
+        assert!(view.rows[0].step.is_some(), "the row sits on the rest step");
+        assert_eq!(
+            sinces(&rested),
+            [(
+                WaitingReason::Interrupted,
+                "interrupted".to_owned(),
+                demo_at(2, 5)
+            )]
+        );
+
+        let unrested = stamped(undecodable(|run| {
+            vec![
+                step(1, run, (0, 1, 0), StepStatus::Done),
+                step(2, run, (1, 1, 0), StepStatus::Failed),
+            ]
+        }));
+        assert_eq!(one(&unrested).rows[0].step, None, "no rest step");
+        assert_eq!(
+            sinces(&unrested),
+            [(
+                WaitingReason::Interrupted,
+                super::INTERRUPTED_TEXT.to_owned(),
+                demo_at(2, 5)
+            )]
+        );
+    }
+
+    #[test]
+    fn a_permission_row_is_since_the_request_was_opened() {
+        let mut item = item("FEAT", 1, ids::PROJECT_HTUI, Status::InProgress);
+        item.updated_at = demo_at(1, 0);
+        let mut run = run(1, &item, RunStatus::Running, Some(snapshot(1)), 1);
+        run.updated_at = demo_at(2, 5);
+        let mut live = step(1, &run, (0, 1, 0), StepStatus::Running);
+        live.updated_at = demo_at(2, 6);
+        let asked = permission(&item, &run, &live, Some("edit"), 30);
+
+        let view = waiting(&scope(&[ids::PROJECT_HTUI]), 1, &[], Some(&[asked]));
+
+        assert_eq!(view.rows.len(), 1);
+        assert_eq!(view.rows[0].reason, WaitingReason::Permission);
+        assert_eq!(view.rows[0].since, demo_at(2, 0) + Duration::minutes(30));
+    }
+
     /// MOD-69 review H1's invariant over every fixture: an active run parked at
     /// `awaiting_approval` always owns at least one row, so the top bar never counts it working.
     #[test]
@@ -1920,7 +2124,7 @@ mod tests {
         let scope = scope(&[ids::PROJECT_HTUI]);
 
         let online = waiting(&scope, 1, &[], Some(&perms));
-        let expected = |text: &str| WaitingRow {
+        let expected = |text: &str, since: DateTime<Utc>| WaitingRow {
             item: item.id,
             item_key: "FEAT-1".to_owned(),
             run: Some(run.id),
@@ -1928,10 +2132,14 @@ mod tests {
             step_label: "prd 0.1".to_owned(),
             reason: WaitingReason::Permission,
             text: text.to_owned(),
+            since,
         };
         assert_eq!(
             online.rows,
-            [expected("edit: src/main.rs"), expected(PERMISSION_TEXT)]
+            [
+                expected("edit: src/main.rs", perms[1].permission.created_at),
+                expected(PERMISSION_TEXT, perms[0].permission.created_at),
+            ]
         );
         assert!(online.permissions_known);
         assert_eq!(online.working, 0);
