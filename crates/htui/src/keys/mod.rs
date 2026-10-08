@@ -1,7 +1,9 @@
 //! Named key actions (MOD-67, `docs/ANA-26.md` §7): the compiled-in catalogue, the strict chord
 //! parser, context stacks and the resolver that turns a chord into ordered candidate actions, and
 //! the hints and help generated from them. M2 adds the key file: [`load`] reads `keys.toml` over
-//! the catalogue.
+//! the catalogue. M3 adds the Settings and overlay contexts, their stacks in [`views`], view
+//! layers that inherit shared verbs, modal layers that filter chords, the derived view defaults
+//! (`VIEW_DEFAULTS`) and a view table's overrides of shared verbs.
 //!
 //! D6's dispatch order lives in `App::on_key`. This module only answers "which actions does this
 //! chord name in this stack" and "how is this action labelled".
