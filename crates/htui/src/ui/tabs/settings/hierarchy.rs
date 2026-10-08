@@ -12,7 +12,12 @@
 //! a flag of its own (D2): in `Browse` the tab still cycles on `h`/`l` and the global table still
 //! owns `q`, `?`, `Tab` and the digits; while an editor, a delete confirmation or the picker is
 //! open those letters are text (or the picker's own keys) and are swallowed, with one carve-out —
-//! a chord carrying `CONTROL` always passes, so `ctrl-c` quits from inside a half-typed slug.
+//! a chord the mode's modal global layer admits (`CONTROL`, `ALT`, a function key) passes, so
+//! `ctrl-c` quits from inside a half-typed slug and `F1` opens help.
+//!
+//! Every mode resolves its keys through its own stack in [`views`] (MOD-67 M3), so a chord
+//! matches with its modifiers (`ctrl-d` is not `d`) and a rebound key acts under its new chord;
+//! the hint row is rendered from the same stack.
 
 use chrono::{DateTime, Utc};
 use htui_core::model::{
@@ -30,12 +35,13 @@ use crate::hierarchy::{
     HierarchySnapshot, InferOutcome, InferReport, MirrorAfterDelete, ProjectEntry, REQUEST_NAMES,
     RepoEntry, reach_parts, reach_totals,
 };
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::path_picker::{PathPicker, PickerOutcome, start_dir};
 use crate::ui::tabs::settings::{SectionId, SettingsSection, message, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// What the rows pane says when the scope is a workspace that does not exist — the nil startup
 /// scope, or the last workspace after it was deleted (D9's "stranded shell" row).
@@ -46,20 +52,38 @@ const NO_WORKSPACE: &str = "no workspace — `N` creates one";
 const UNAVAILABLE: &str = "hierarchy needs Postgres";
 
 /// Browse's keys.
-const HINT_BROWSE: &str = "j/k \u{b7} N workspace \u{b7} n project/repo \u{b7} e edit \u{b7} p primary \u{b7} b path \u{b7} i infer \u{b7} d delete \u{b7} r reload";
+const HINT_BROWSE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, ""),
+    Hint::One(Act::HierarchyNewWorkspace, "workspace"),
+    Hint::One(Act::New, "project/repo"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::HierarchyPrimary, "primary"),
+    Hint::One(Act::HierarchyChoosePath, "path"),
+    Hint::One(Act::HierarchyInfer, "infer"),
+    Hint::One(Act::Delete, "delete"),
+    Hint::One(Act::Reload, "reload"),
+];
 
 /// Browse's keys with nothing read: only the two that do not need a tree.
-const HINT_NO_WORKSPACE: &str = "N workspace · r reload";
+const HINT_NO_WORKSPACE: HintSpec = &[
+    Hint::One(Act::HierarchyNewWorkspace, "workspace"),
+    Hint::One(Act::Reload, "reload"),
+];
 
 /// Browse's keys with the read refused: nothing here can be created against a store that did not
 /// answer, so the only offer is to ask again.
-const HINT_UNAVAILABLE: &str = "r reload";
+const HINT_UNAVAILABLE: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// An open editor's keys.
-const HINT_EDITING: &str = "Tab/Shift+Tab field · Enter save · Esc cancel";
+/// An open editor's keys: the form's own, then the field's fixed `Enter` and `Esc` (D13).
+const HINT_EDITING: HintSpec = &[
+    Hint::Pair(Act::FormNextField, Act::FormPrevField, "field"),
+    Hint::Text("Enter save"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list.
-const HINT_PICKING: &str = "choosing a directory \u{b7} Esc cancel";
+/// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list, and the
+/// picker's keys are its own in M3 (blueprint L-C Q3).
+const HINT_PICKING: HintSpec = &[Hint::Text("choosing a directory"), Hint::Text("Esc cancel")];
 
 /// What a CAS miss says while an editor is open (D7, PRD D8): the text is kept, the token is not,
 /// and the retry is the user's.
@@ -72,17 +96,24 @@ const DELETED_ELSEWHERE: &str = "deleted elsewhere while you were editing";
 /// What a CAS miss says with no editor open — `p` is the one write that has none (D12).
 const RELOADED: &str = "reloaded; press p again";
 
-/// The hint line while `delete_reach` is being counted.
-const HINT_COUNTING: &str = "counting rows\u{2026} \u{b7} Esc stop";
+/// The hint line while `delete_reach` is being counted: every chord that stops it (MOD-67 M3,
+/// blueprint L-C Q7: the arm always stopped on `n` too).
+const HINT_COUNTING: HintSpec = &[
+    Hint::Text("counting rows\u{2026}"),
+    Hint::All(Act::ConfirmNo, "stop"),
+];
 
 /// The hint line of the first confirmation.
-const HINT_WARN: &str = "y continue \u{b7} n/Esc stop";
+const HINT_WARN: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "continue"),
+    Hint::All(Act::ConfirmNo, "stop"),
+];
 
-/// The hint line of the second, typed confirmation.
-const HINT_TYPED: &str = "Enter confirm \u{b7} Esc stop";
+/// The hint line of the second, typed confirmation: the field's own keys (D13).
+const HINT_TYPED: HintSpec = &[Hint::Text("Enter confirm"), Hint::Text("Esc stop")];
 
 /// The hint line while the delete is in flight.
-const HINT_DELETING: &str = "deleting\u{2026}";
+const HINT_DELETING: HintSpec = &[Hint::Text("deleting\u{2026}")];
 
 /// The second line of every warning: the one sentence PRD D13 asks to be in front of a user before
 /// anything is removed.
@@ -416,8 +447,8 @@ impl HierarchySection {
     /// Two spans rather than one string: a CAS miss is reported here and D7 asks for it in
     /// `theme.error`, because "someone else wrote to this row" is the one notice a user has to act
     /// on rather than read.
-    fn hint(&self, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text();
+    fn hint(&self, width: u16, theme: &Theme, keys: &Keys) -> Line<'static> {
+        let keys = self.hint_text(keys);
         let Some(notice) = &self.notice else {
             return Line::styled(keys, theme.dim);
         };
@@ -440,9 +471,10 @@ impl HierarchySection {
         ])
     }
 
-    /// The keys half of the hint line, plus what a write in flight adds to it.
-    fn hint_text(&self) -> String {
-        let keys = match &self.mode {
+    /// The keys half of the hint line, plus what a write in flight adds to it. Rendered through
+    /// the mode's own stack, so a rebound key shows its new chord.
+    fn hint_text(&self, keys: &Keys) -> String {
+        let spec = match &self.mode {
             Mode::Browse => {
                 if self.unavailable.is_some() {
                     HINT_UNAVAILABLE
@@ -461,14 +493,115 @@ impl HierarchySection {
                 DeleteStage::InFlight(_) => HINT_DELETING,
             },
         };
+        let keys = keys.hint(self.stack(), spec);
         match self.busy {
             // Only in Browse: an editor's own hint says what `Enter` is for, and a write in flight
             // is why `Enter` is not answering.
             Some(busy) if matches!(self.mode, Mode::Browse) && self.notice.is_none() => {
                 format!("{keys} \u{b7} {busy} in flight")
             }
-            _ => keys.to_owned(),
+            _ => keys,
         }
+    }
+
+    /// The stack of the current mode (MOD-67 M3): the only place a mode maps to its keys —
+    /// `key_stack`, every `on_*_key` and the hint row read it. The typed confirmation, the delete
+    /// in flight and the picker are a field or a widget and nothing else ([`views::CAPTURE`]).
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
+            Mode::Browse => views::HIERARCHY_BROWSE,
+            Mode::Editing(_) => views::HIERARCHY_EDITOR,
+            Mode::Picking { .. } => views::CAPTURE,
+            Mode::Deleting { stage, .. } => match stage {
+                DeleteStage::Counting => views::HIERARCHY_DELETE_COUNTING,
+                DeleteStage::Warn(_) => views::HIERARCHY_DELETE_WARN,
+                DeleteStage::Typed { .. } | DeleteStage::InFlight(_) => views::CAPTURE,
+            },
+        }
+    }
+
+    /// One key in Browse, through `views::HIERARCHY_BROWSE` (MOD-67 M3). A chord matches with its
+    /// modifiers, so `ctrl-d` is not `d` (ANA-26 §2.6 defect 1). The tab took `settings.*` before
+    /// offering the key; a global act, or one this state declines, is the shell's (`Pass`).
+    fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::HIERARCHY_BROWSE, chord) {
+            match act {
+                Act::ListDown => self.move_cursor(true),
+                Act::ListUp => self.move_cursor(false),
+                Act::HierarchyNewWorkspace => {
+                    if !self.refuse(act) {
+                        self.open(
+                            EditorKind::NewWorkspace,
+                            vec![
+                                Field::required("slug", ""),
+                                Field::required("name", ""),
+                                Field::optional("description", ""),
+                            ],
+                            None,
+                        );
+                    }
+                }
+                Act::New => {
+                    if !self.refuse(act)
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_new_child(row);
+                    }
+                }
+                Act::Edit => {
+                    if !self.refuse(act)
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_edit(row);
+                    }
+                }
+                Act::HierarchyPrimary => {
+                    if !self.refuse(act)
+                        && let Some(row) = self.selected()
+                    {
+                        self.move_primary(row, ctx);
+                    }
+                }
+                Act::HierarchyChoosePath => {
+                    if !self.refuse(act)
+                        && let Some(row) = self.selected()
+                    {
+                        self.open_path(row, ctx);
+                    }
+                }
+                // MOD-7 milestone 4 (D114): infer this box's repo paths under the workspace root.
+                // A write, so it is refused while another is in flight, as the other writes are.
+                Act::HierarchyInfer => {
+                    if !self.refuse(act)
+                        && let Some(snapshot) = &self.snapshot
+                    {
+                        let request = StoreRequest::InferRepoPaths(snapshot.workspace.id);
+                        self.notice = None;
+                        self.carried = None;
+                        self.send(request, ctx);
+                    }
+                }
+                Act::Delete => {
+                    if !self.refuse(act)
+                        && let Some(row) = self.selected()
+                    {
+                        self.begin_delete(row, ctx);
+                    }
+                }
+                // Allowed while `busy`: re-reading is how a section that lost a reply recovers,
+                // and a read cannot lose a write's reply — the staleness index is keyed by request
+                // kind.
+                Act::Reload => ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id)),
+                // Only when there is something to clear: a section that swallowed every `Esc`
+                // would take the one the shell uses to close an overlay over it.
+                Act::Dismiss if self.notice.is_some() => self.notice = None,
+                // A global act, or one this state declines.
+                _ => continue,
+            }
+            return Handled::Consumed;
+        }
+        Handled::Pass
     }
 
     /// Whether a key that opens an editor is refused right now, with the notice that says why.
@@ -476,7 +609,7 @@ impl HierarchySection {
     /// Two refusals, in this order: a write in flight (a second one of the same kind would lose a
     /// reply), then a tree that is not there to edit. `r` is deliberately **not** on this path —
     /// re-reading is how a section that lost a reply recovers.
-    fn refuse(&mut self, key: char) -> bool {
+    fn refuse(&mut self, act: Act) -> bool {
         if self.in_flight() {
             return true;
         }
@@ -486,7 +619,7 @@ impl HierarchySection {
             self.notice = Some(format!("{UNAVAILABLE}: {why}"));
             return true;
         }
-        if self.snapshot.is_none() && key != 'N' {
+        if self.snapshot.is_none() && act != Act::HierarchyNewWorkspace {
             self.notice = Some(NO_WORKSPACE.to_owned());
             return true;
         }
@@ -744,11 +877,15 @@ impl HierarchySection {
     ///
     /// Modal over the shell as well as over the tree: a key that is not listed is **swallowed**,
     /// because the second confirmation is a typed slug and a `q` in the middle of one must not quit
-    /// the application. A `CONTROL` chord is the carve-out, so `ctrl-c` still does.
+    /// the application. A chord the stage's modal global layer admits (`CONTROL`, `ALT`, a function
+    /// key) is the carve-out, so `ctrl-c` still quits and `F1` opens help (MOD-67 D5).
+    ///
+    /// The count and the warning answer through their stacks (`confirm.no`, and `confirm.yes` at
+    /// the warning); the typed slug is its field's, which sees every key first (D13).
     fn on_deleting_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
-        }
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
+        let answer = ctx.keys().actions(stack, chord).first().copied();
         let Mode::Deleting {
             target,
             slug,
@@ -758,22 +895,23 @@ impl HierarchySection {
             return Handled::Pass;
         };
         let target = *target;
-        let stop = matches!(key.code, KeyCode::Esc | KeyCode::Char('n'));
         match stage {
-            DeleteStage::Counting => {
-                if stop {
+            DeleteStage::Counting | DeleteStage::Warn(_) => match answer {
+                Some(Act::ConfirmYes) => {
+                    if let DeleteStage::Warn(reach) = stage {
+                        *stage = DeleteStage::Typed {
+                            reach: reach.clone(),
+                            field: TextField::new(),
+                        };
+                    }
+                    return Handled::Consumed;
+                }
+                Some(Act::ConfirmNo) => {
                     self.mode = Mode::Browse;
+                    return Handled::Consumed;
                 }
-            }
-            DeleteStage::Warn(reach) => match key.code {
-                KeyCode::Char('y') => {
-                    *stage = DeleteStage::Typed {
-                        reach: reach.clone(),
-                        field: TextField::new(),
-                    };
-                }
-                _ if stop => self.mode = Mode::Browse,
-                _ => {}
+                // A global act, or nothing.
+                _ => return unused(stack, chord),
             },
             DeleteStage::Typed { reach, field } => match field.on_key(key) {
                 FieldOutcome::Submit => {
@@ -794,11 +932,12 @@ impl HierarchySection {
                     self.mode = Mode::Browse;
                     self.notice = None;
                 }
-                // Typed, or swallowed: `n` is a letter of a slug here, not an answer.
-                FieldOutcome::Consumed | FieldOutcome::Pass => {}
+                // Typed: `n` is a letter of a slug here, not an answer.
+                FieldOutcome::Consumed => {}
+                FieldOutcome::Pass => return unused(stack, chord),
             },
             // Nothing to answer: the rows are already going.
-            DeleteStage::InFlight(_) => {}
+            DeleteStage::InFlight(_) => return unused(stack, chord),
         }
         Handled::Consumed
     }
@@ -835,10 +974,13 @@ impl HierarchySection {
 
     /// One key while an editor is open (D13).
     ///
-    /// The focused field answers first, so `l`, `q` and the digits are letters here; what it passes
-    /// on is the form's own navigation, and everything left over is swallowed rather than offered
-    /// to the shell — with `CONTROL` chords excepted, so `ctrl-c` still quits.
+    /// The focused field answers first, so `l`, `q` and the digits are letters here (D13); what it
+    /// passes on is the form's own navigation (`form.next_field`/`prev_field` through
+    /// `views::HIERARCHY_EDITOR`, `Down`/`Up` included), and everything left over is swallowed
+    /// rather than offered to the shell — with the chords the modal global layer admits excepted,
+    /// so `ctrl-c` still quits and `F1` opens help (MOD-67 D5).
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let stack = views::HIERARCHY_EDITOR;
         let outcome = match &mut self.mode {
             Mode::Editing(editor) => match editor.fields.get_mut(editor.focus) {
                 Some(field) => field.input.on_key(key),
@@ -858,21 +1000,22 @@ impl HierarchySection {
                 Handled::Consumed
             }
             FieldOutcome::Pass => {
+                let chord = KeyChord::from_event(key);
                 let Mode::Editing(editor) = &mut self.mode else {
                     return Handled::Pass;
                 };
                 let len = editor.fields.len().max(1);
-                match key.code {
-                    KeyCode::Tab | KeyCode::Down => {
+                match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::FormNextField) => {
                         editor.focus = (editor.focus + 1) % len;
                         Handled::Consumed
                     }
-                    KeyCode::BackTab | KeyCode::Up => {
+                    Some(Act::FormPrevField) => {
                         editor.focus = (editor.focus + len - 1) % len;
                         Handled::Consumed
                     }
-                    _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-                    _ => Handled::Consumed,
+                    // A global act, or nothing.
+                    _ => unused(stack, chord),
                 }
             }
         }
@@ -880,11 +1023,14 @@ impl HierarchySection {
 
     /// One key while the picker is open (MOD-49 P8, blueprint H-4, D15).
     ///
-    /// A `CONTROL` chord passes first, so `ctrl-c` still quits; every other key is the picker's,
-    /// and one it does not bind is swallowed, so `q` can't quit mid-pick. A choice is a write:
-    /// refused while another is in flight, and the picker stays open until its reply (D8).
+    /// A chord the modal global layer admits (`CONTROL`, `ALT`, a function key) passes first, so
+    /// `ctrl-c` still quits and `F1` opens help (MOD-67 D5, blueprint skeleton b′: the picker never
+    /// sees one); every other key is the picker's, and one it does not bind is swallowed, so `q`
+    /// can't quit mid-pick. A choice is a write: refused while another is in flight, and the
+    /// picker stays open until its reply (D8).
     fn on_picker_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // `views::CAPTURE` offers no view act, so nothing resolves here before the pass rule.
+        if self.stack().passes(KeyChord::from_event(key)) {
             return Handled::Pass;
         }
         let Mode::Picking { picker, .. } = &mut self.mode else {
@@ -1168,6 +1314,10 @@ impl SettingsSection for HierarchySection {
         !matches!(self.mode, Mode::Browse)
     }
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
     /// MOD-22 review M-1: a bracketed paste into the open form's focused field, or into the
     /// typed-slug confirmation. The warning before it is not a field: a paste there is dropped, so
     /// its `y` advances nothing.
@@ -1205,99 +1355,7 @@ impl SettingsSection for HierarchySection {
         if matches!(self.mode, Mode::Deleting { .. }) {
             return self.on_deleting_key(key, ctx);
         }
-        // Browse. `j`, `k`, `N`, `n`, `e`, `p`, `b`, `i`, `d` and `r` are free: the global table binds
-        // `q`, `?`, the digits, `ctrl-c` and `-`, and the tab consumes `h`/`l`/`[`/`]`/arrows
-        // before a section is offered the key.
-        match key.code {
-            KeyCode::Char('j') => {
-                self.move_cursor(true);
-                Handled::Consumed
-            }
-            KeyCode::Char('k') => {
-                self.move_cursor(false);
-                Handled::Consumed
-            }
-            KeyCode::Char('N') => {
-                if !self.refuse('N') {
-                    self.open(
-                        EditorKind::NewWorkspace,
-                        vec![
-                            Field::required("slug", ""),
-                            Field::required("name", ""),
-                            Field::optional("description", ""),
-                        ],
-                        None,
-                    );
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('n') => {
-                if !self.refuse('n')
-                    && let Some(row) = self.selected()
-                {
-                    self.open_new_child(row);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('e') => {
-                if !self.refuse('e')
-                    && let Some(row) = self.selected()
-                {
-                    self.open_edit(row);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('p') => {
-                if !self.refuse('p')
-                    && let Some(row) = self.selected()
-                {
-                    self.move_primary(row, ctx);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('b') => {
-                if !self.refuse('b')
-                    && let Some(row) = self.selected()
-                {
-                    self.open_path(row, ctx);
-                }
-                Handled::Consumed
-            }
-            // MOD-7 milestone 4 (D114): infer this box's repo paths under the workspace root. A
-            // write, so it is refused while another is in flight, as the other write keys are.
-            KeyCode::Char('i') => {
-                if !self.refuse('i')
-                    && let Some(snapshot) = &self.snapshot
-                {
-                    let request = StoreRequest::InferRepoPaths(snapshot.workspace.id);
-                    self.notice = None;
-                    self.carried = None;
-                    self.send(request, ctx);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('d') => {
-                if !self.refuse('d')
-                    && let Some(row) = self.selected()
-                {
-                    self.begin_delete(row, ctx);
-                }
-                Handled::Consumed
-            }
-            // Allowed while `busy`: re-reading is how a section that lost a reply recovers, and a
-            // read cannot lose a write's reply — the staleness index is keyed by request kind.
-            KeyCode::Char('r') => {
-                ctx.request(StoreRequest::Hierarchy(ctx.scope.workspace_id));
-                Handled::Consumed
-            }
-            // Only when there is something to clear: a section that swallowed every `Esc` would
-            // take the one the shell uses to close an overlay over it.
-            KeyCode::Esc if self.notice.is_some() => {
-                self.notice = None;
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
-        }
+        self.on_browse_key(key, ctx)
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -1450,7 +1508,10 @@ impl SettingsSection for HierarchySection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(Paragraph::new(self.hint(area.width, ctx.theme)), hint);
+        frame.render_widget(
+            Paragraph::new(self.hint(area.width, ctx.theme, ctx.keys())),
+            hint,
+        );
         // MOD-49 P2: the popup draws over the whole section, not in the pane.
         if let Mode::Picking { picker, .. } = &self.mode {
             picker.render(frame, area, ctx.theme);
@@ -1708,6 +1769,17 @@ fn delete_pane(
     lines
 }
 
+/// What a modal mode answers for a chord none of its own acts took (MOD-67 M3 PA-5): `Pass` when
+/// the stack's global layer admits its shape (`CONTROL`, `ALT`, a function key), so the shell
+/// quits, opens help or finds; otherwise it is swallowed, so a `q` mid-slug does not quit.
+fn unused(stack: Stack<'_>, chord: KeyChord) -> Handled {
+    if stack.passes(chord) {
+        Handled::Pass
+    } else {
+        Handled::Consumed
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1753,12 +1825,13 @@ mod tests {
             notice: Some(notice.clone()),
             ..HierarchySection::new()
         };
-        let keys = section.hint_text();
+        let keys = section.hint_text(Keys::compiled());
         let width = cell_width(&keys) + k + 3;
 
         let line = section.hint(
             u16::try_from(width).expect("a hint this narrow fits u16"),
             &Theme::default(),
+            Keys::compiled(),
         );
 
         assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
