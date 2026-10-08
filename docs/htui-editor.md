@@ -137,7 +137,7 @@ Windows `Ctrl+\` arrives as itself, so there only a physical `Ctrl+4` toggles th
 | | Pane title | Status line |
 |---|---|---|
 | the editor has the keys | `<value> · Ctrl+4 to htui` | `the editor has the keys · Ctrl+4 to htui` |
-| htui has the keys | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · q quit · ? help` |
+| htui has the keys | `<value> · htui has the keys` | `Ctrl+4 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help` |
 
 Both keys are generated from htui's key catalogue (the `editor` context: `editor.focus` and
 `editor.abort`), so the labels follow a rebinding. Rebinding them through `keys.toml` arrives with

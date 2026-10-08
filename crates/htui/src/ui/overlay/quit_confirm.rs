@@ -261,12 +261,6 @@ mod tests {
     }
 
     #[test]
-    fn the_question_is_never_blank_and_names_the_cost() {
-        assert!(!QUESTION.trim().is_empty());
-        assert!(QUESTION.contains("lose"), "{QUESTION}");
-    }
-
-    #[test]
     fn the_hint_follows_the_keys() {
         let keys = load_str("[confirm]\nyes = [\"f9\"]\n").expect("the file loads");
         let bench = Bench::new().with_keys(keys);

@@ -76,6 +76,9 @@ const EDITOR_LOCKED: &str = "the editor is open";
 /// MOD-57 M2 E5: what the asking tab waits for before anything may steer it.
 const FINISH_FIRST: &str = "finish or abort it first";
 
+/// M2 R1 nit: what `editor.focus` under the quit question says.
+const ANSWER_FIRST: &str = "answer the question first";
+
 /// The refusal's tail and the status line while a modal overlay is over the editor (R0 F3): its
 /// keys are the overlay's, so none of the editor's is offered. Neutral (M2 R1 L-1): it fits a
 /// reply's prompt, an offered view (find, the queue, the waiting list, the switcher) and the quit
@@ -89,6 +92,8 @@ const FOCUSED_HINT: HintSpec = &[Hint::One(Act::EditorFocus, "to htui")];
 const UNFOCUSED_HINT: HintSpec = &[
     Hint::One(Act::EditorFocus, "to the editor"),
     Hint::One(Act::EditorAbort, "abort"),
+    // M2 R1 nit: tabs switch from the asking tab (E3).
+    Hint::Pair(Act::NextTab, Act::PrevTab, "switch tabs"),
     Hint::One(Act::Quit, "quit"),
     Hint::One(Act::Help, "help"),
 ];
@@ -274,16 +279,12 @@ impl App {
         self.editor.as_ref().map(|editor| editor.tab)
     }
 
-    /// The asking tab's title (as the tab strip shows it), else its id.
-    fn editor_title(&self) -> String {
+    /// The asking tab's title (as the tab strip shows it), else its id; empty without an editor.
+    fn editor_title(&self) -> &str {
         let Some(tab) = self.editor_tab() else {
-            return String::new();
+            return "";
         };
-        self.tabs
-            .titles()
-            .into_iter()
-            .find(|(id, _)| *id == tab)
-            .map_or_else(|| tab.to_string(), |(_, title)| title.to_owned())
+        self.tabs.title(tab).unwrap_or(tab.0)
     }
 
     /// `the editor is open in <Tab>`: the head of every sentence said away from the asking tab.
@@ -358,57 +359,81 @@ impl App {
     /// 2. With the keys, the editor's, unless it is the focus toggle.
     /// 3. `ctrl-c`: `false`, so `on_key`'s one ANA-26 C3 site quits.
     /// 4. Under a modal overlay (a reply's prompt, the quit question): `false`, the overlay's
-    ///    keys; `editor.focus` does not act there.
+    ///    keys; `editor.focus` does not act there, and under the quit question says so
+    ///    ([`focus_under_the_question`](Self::focus_under_the_question)).
     /// 5. On another tab: `editor.focus` ([`Stack::EDITOR_FOCUSED`]) refocuses and brings the
-    ///    asking tab back (B16); anything else is `false`, as if no editor were alive.
-    /// 6. On the asking tab: the first candidate of [`Stack::EDITOR_OPEN`] that maps
-    ///    (`editor.focus`, `editor.abort`, then every global the shell maps); a key nothing maps
-    ///    is refused on the status line. Nothing reaches the asking view.
+    ///    asking tab back (B16, [`focus_from_another_tab`](Self::focus_from_another_tab));
+    ///    anything else is `false`, as if no editor were alive.
+    /// 6. On the asking tab ([`asking_tab_key`](Self::asking_tab_key)): the first candidate of
+    ///    [`Stack::EDITOR_OPEN`] that maps (`editor.focus`, `editor.abort`, then every global the
+    ///    shell maps); a key nothing maps is refused on the status line. Nothing reaches the
+    ///    asking view.
     pub(super) fn editor_key(&mut self, key: KeyEvent, chord: KeyChord) -> bool {
         if self.editor_lost_keys() {
             return true;
         }
-        let visible = self.editor_visible();
-        let covered = self.editor_covered();
+        let focus = self
+            .keys
+            .actions(Stack::EDITOR_FOCUSED, chord)
+            .contains(&Act::EditorFocus);
         let Some(editor) = self.editor.as_mut() else {
             return false;
         };
         if editor.focused {
-            if self
-                .keys
-                .actions(Stack::EDITOR_FOCUSED, chord)
-                .contains(&Act::EditorFocus)
-            {
+            if focus {
                 editor.focused = false;
-                return true;
-            }
-            let application_cursor = editor.screen.screen().application_cursor();
-            if let Some(bytes) = encode_key(key, application_cursor) {
-                editor.child.write(&bytes);
+            } else {
+                let application_cursor = editor.screen.screen().application_cursor();
+                if let Some(bytes) = encode_key(key, application_cursor) {
+                    editor.child.write(&bytes);
+                }
             }
             return true;
         }
-
         // ANA-26 C3 holds while htui has the keys, at `on_key`'s own site (B-M2-7); under a modal
         // overlay its keys take the path below (C3, the overlay, `Esc`/help, the modal swallow).
-        if chord == CTRL_C || covered {
+        if chord == CTRL_C {
             return false;
         }
-        let tab = editor.tab;
-        if !visible {
-            // E1: the way back, ahead of the view; E2: `editor.abort` is not checked here.
-            if !self
-                .keys
-                .actions(Stack::EDITOR_FOCUSED, chord)
-                .contains(&Act::EditorFocus)
-            {
-                return false;
-            }
-            editor.focused = true;
-            self.help_visible = false;
-            self.update(Action::Tab(TabAction::Focus(tab)));
-            return true;
+        if self.editor_covered() {
+            return focus && self.focus_under_the_question();
         }
+        if !self.editor_visible() {
+            // E1: the way back, ahead of the view; E2: `editor.abort` is not checked here.
+            return focus && self.focus_from_another_tab();
+        }
+        self.asking_tab_key(chord)
+    }
+
+    /// `editor.focus` under a modal overlay (`editor_key` step 4): the quit question has no use
+    /// for it, so the status line says to answer the question first rather than swallow it
+    /// silently (M2 R1 nit), and `true`. Under any other overlay `false`: the overlay's key.
+    fn focus_under_the_question(&mut self) -> bool {
+        let question = self.quit_overlay.is_some()
+            && self.overlays.top().map(Overlay::id) == self.quit_overlay;
+        if question {
+            self.status = Some(format!("{EDITOR_LOCKED}: {ANSWER_FIRST}"));
+        }
+        question
+    }
+
+    /// `editor.focus` on another tab (`editor_key` step 5, E1): refocuses, closes the `?` box and
+    /// brings the asking tab back (B16). Always `true`.
+    fn focus_from_another_tab(&mut self) -> bool {
+        let Some(editor) = self.editor.as_mut() else {
+            return false;
+        };
+        editor.focused = true;
+        let tab = editor.tab;
+        self.help_visible = false;
+        self.update(Action::Tab(TabAction::Focus(tab)));
+        true
+    }
+
+    /// A key on the asking tab, unfocused, under no modal overlay (`editor_key` step 6, E3): the
+    /// first candidate of [`Stack::EDITOR_OPEN`] that maps; a key nothing maps is refused on the
+    /// status line. Always `true`: nothing reaches the asking view.
+    fn asking_tab_key(&mut self, chord: KeyChord) -> bool {
         for act in self.keys.actions(Stack::EDITOR_OPEN, chord) {
             match act {
                 Act::EditorFocus => {
@@ -1058,7 +1083,8 @@ mod tests {
     const FOCUSED_TITLE: &str = " nvim · Ctrl+4 to htui ";
     const UNFOCUSED_TITLE: &str = " nvim · htui has the keys ";
     const FOCUSED_STATUS: &str = "the editor has the keys · Ctrl+4 to htui";
-    const UNFOCUSED_STATUS: &str = "Ctrl+4 to the editor · Ctrl+x abort · q quit · ? help";
+    const UNFOCUSED_STATUS: &str =
+        "Ctrl+4 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help";
     const REFUSAL: &str = "the editor is open: Ctrl+4 to the editor · Ctrl+x abort";
     /// R0 F3, M2 R1 L-1: under any modal overlay, a prompt or a view (find, the queue, the quit
     /// question), on the asking tab.
@@ -1243,6 +1269,34 @@ mod tests {
         assert!(!app.should_quit);
         assert!(app.editor_open());
         assert!(benches[0].seen.borrow().keys.is_empty());
+    }
+
+    /// M2 R1 nit: `editor.focus` under the quit question, from the asking tab or another, is not
+    /// swallowed silently: the status line says to answer it first. The question stays up.
+    #[test]
+    fn the_focus_key_under_the_question_says_answer_it_first() {
+        for from_other in [false, true] {
+            let (mut app, benches, log) = unfocused_two();
+            confirmable(&mut app);
+            if from_other {
+                app.on_key(press(KeyCode::Tab, KeyModifiers::NONE));
+            }
+            app.on_key(plain('q'));
+            app.on_key(ctrl('4'));
+            assert_eq!(
+                app.status.as_deref(),
+                Some("the editor is open: answer the question first"),
+                "{from_other}"
+            );
+            assert_eq!(top(&app), Some(QuitConfirm::ID), "{from_other}");
+            assert!(!focused(&app), "{from_other}");
+            assert!(writes(&log).is_empty());
+            assert!(benches[0].seen.borrow().keys.is_empty());
+            assert!(
+                !codes(&benches[1]).contains(&KeyCode::Char('4')),
+                "{from_other}: no view had it"
+            );
+        }
     }
 
     /// B-M2-5: an editor that exits under the question leaves it up; `y` still quits, `n` closes.
@@ -2260,7 +2314,7 @@ mod tests {
         app.on_key(press(KeyCode::F(12), KeyModifiers::NONE));
         assert_eq!(
             app.editor_status().as_deref(),
-            Some("F12 to the editor · Ctrl+x abort · q quit · ? help")
+            Some("F12 to the editor · Ctrl+x abort · Tab/Shift+Tab switch tabs · q quit · ? help")
         );
         app.on_key(plain('j'));
         assert_eq!(

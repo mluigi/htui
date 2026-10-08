@@ -289,10 +289,8 @@ impl App {
             tracing::debug!(?kind, "no tab reveals this kind");
             return;
         };
-        if self.editor_tab() == Some(tab)
-            && let Some(refusal) = self.editor_steer_refusal()
-        {
-            self.status = Some(refusal);
+        if self.editor_tab() == Some(tab) {
+            self.status = self.editor_steer_refusal();
             return;
         }
         self.update_tab(TabAction::Focus(tab));
