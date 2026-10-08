@@ -2226,7 +2226,7 @@ async fn a_methods_frame_renders_the_chooser_with_names_descriptions_logout_and_
         "the cell says what the pane is waiting for"
     );
     assert!(
-        rendered.contains("j/k choose \u{b7} Enter select \u{b7} Esc cancel"),
+        rendered.contains("j/k choose \u{b7} Enter select \u{b7} n/Esc cancel"),
         "and the hint says which keys answer it: {rendered}"
     );
 
@@ -6037,5 +6037,133 @@ async fn the_qdrant_clear_question_answers_y_and_n_and_passes_ctrl() {
             [StoreRequest::ClearQdrantSettings]
         ),
         "`y` clears"
+    );
+}
+
+/// D14 pin (ANA-26 §6.6): `Down`/`Up` move the agents table as `j`/`k` do.
+#[tokio::test]
+async fn down_and_up_move_the_agents_list() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(
+        &bench,
+        vec![registry_row("declared", true), registry_row("second", true)],
+    );
+    let _ = bench.drained();
+
+    assert_eq!(bench.key(&mut section, "down"), Handled::Consumed);
+    assert!(
+        accented_lines(&section, &bench.ctx())[0].starts_with("second"),
+        "`Down` moves to the second row"
+    );
+    assert_eq!(bench.key(&mut section, "up"), Handled::Consumed);
+    assert!(
+        accented_lines(&section, &bench.ctx())[0].starts_with("declared"),
+        "`Up` moves back"
+    );
+}
+
+/// The login chooser takes `Down`/`Up` too (L-A Q4).
+#[tokio::test]
+async fn down_and_up_move_the_login_chooser() {
+    let bench = SectionBench::new().await;
+    let mut section = chooser_over(&bench, true, 0);
+
+    assert_eq!(bench.key(&mut section, "down"), Handled::Consumed);
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("Two")),
+        "`Down` moves down the list"
+    );
+    assert_eq!(bench.key(&mut section, "up"), Handled::Consumed);
+    assert!(
+        accented_lines(&section, &bench.ctx())
+            .iter()
+            .any(|line| line.starts_with("One")),
+        "`Up` moves back"
+    );
+    assert!(bench.drained().is_empty(), "moving sends nothing");
+}
+
+/// D14 pin (defect 1, L-A's case): the install question compares whole chords, so `ctrl-y`
+/// installs nothing and `ctrl-n` declines nothing; both reach the shell.
+#[tokio::test]
+async fn ctrl_y_and_ctrl_n_at_the_install_question_do_nothing() {
+    let bench = SectionBench::new().await;
+    let row = registry_row("declared", true);
+    let agent_id = row.agent.id;
+    let mut section = section_over(&bench, vec![row]);
+    bench.reply(
+        &mut section,
+        &StoreReply::Install(InstallFrame::Plan(Box::new(demo_plan(
+            agent_id, "declared", None,
+        )))),
+    );
+    let _ = bench.drained();
+
+    for chord in ["ctrl-y", "ctrl-n"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "`{chord}`");
+        assert!(bench.drained().is_empty(), "`{chord}` asks nothing");
+        let rendered = render_section(&section, &bench.ctx());
+        assert!(
+            rendered.contains("install Demo 1.2.3"),
+            "`{chord}` leaves the plan up: {rendered}"
+        );
+    }
+    // `Down`/`Up` are swallowed with `j`/`k`: the cursor decides what is being consented to.
+    for chord in ["down", "up"] {
+        assert_eq!(
+            bench.key(&mut section, chord),
+            Handled::Consumed,
+            "`{chord}`"
+        );
+    }
+}
+
+/// D14 pin (defect 1, L-A's case): `ctrl-r` in agents browse probes nothing, and `ctrl-a`,
+/// `ctrl-n`, `ctrl-x` do nothing either.
+#[tokio::test]
+async fn ctrl_letters_in_agents_browse_do_nothing() {
+    let bench = SectionBench::new().await;
+    let mut section = section_over(&bench, vec![registry_row("declared", true)]);
+    let _ = bench.drained();
+
+    for chord in ["ctrl-r", "ctrl-a", "ctrl-n", "ctrl-e", "ctrl-t", "ctrl-x"] {
+        assert_eq!(bench.key(&mut section, chord), Handled::Pass, "`{chord}`");
+        assert!(bench.drained().is_empty(), "`{chord}` asks nothing");
+        assert!(!section.captures_input(), "`{chord}` opens nothing");
+    }
+    let rendered = render_section(&section, &bench.ctx());
+    assert!(!rendered.contains("probing"), "{rendered}");
+}
+
+/// D14 pin: `F1` from the agents create form opens the `?` box (the modal global layer admits
+/// function keys), and the form is still open when it closes. The status line is the modal one.
+#[tokio::test]
+async fn f1_from_the_agents_form_opens_help_and_keeps_the_form() {
+    let mut harness =
+        Harness::demo().with_tab(Box::new(SettingsTab::with_sections(vec![Box::new(
+            AgentsSection::new(),
+        )])));
+    harness.settle().await;
+    harness.key("n");
+    let frame = harness.render();
+    assert!(
+        frame.contains("Tab next field"),
+        "the form is open: {frame}"
+    );
+    assert!(
+        frame.contains("Ctrl+c quit \u{b7} F1 help"),
+        "the status line is the capturing one: {frame}"
+    );
+
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opens help from the form");
+    harness.key("f1");
+    assert!(!harness.app().help_visible, "and closes it");
+    let frame = harness.render();
+    assert!(
+        frame.contains("Tab next field"),
+        "the form stayed open: {frame}"
     );
 }
