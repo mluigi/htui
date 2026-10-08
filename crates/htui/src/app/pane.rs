@@ -533,15 +533,17 @@ impl App {
 
     /// MOD-57 M2 E6: what leads another tab's status line while an editor is alive:
     /// `editing in <Tab> · Ctrl+4 back · `, the way back dropped under a modal overlay (where it
-    /// does not act) or when unbound. Always ends with the separator. `None` without an editor
-    /// and on the asking tab.
+    /// does not act), while the editor is still focused (a reply moved the tab: the next key,
+    /// that `Ctrl+4` too, is swallowed and its refusal offers the way back, M2 R1 L-2) or when
+    /// unbound. Always ends with the separator. `None` without an editor and on the asking tab.
     #[must_use]
     pub(super) fn editor_notice(&self) -> Option<String> {
-        if self.editor.is_none() || self.editor_visible() {
+        let editor = self.editor.as_ref()?;
+        if self.editor_visible() {
             return None;
         }
         let head = format!("editing in {}", self.editor_title());
-        let back = if self.editor_covered() {
+        let back = if self.editor_covered() || editor.focused {
             String::new()
         } else {
             self.editor_back()
@@ -1880,10 +1882,12 @@ mod tests {
             "no pane"
         );
         assert!(!term.backend().cursor_visible(), "no cursor");
-        // Still focused, but off screen: the other tab's own line, led by the open edit and the
-        // way back (MOD-57 M2 E6).
+        // Still focused, but off screen: the other tab's own line, led by the open edit (MOD-57
+        // M2 E6); not the way back, since the next key is swallowed (M2 R1 L-2).
         assert_eq!(app.editor_status(), None);
-        assert!(row_from(term.backend().buffer(), 0, 29).starts_with(NOTICE));
+        let status = row_from(term.backend().buffer(), 0, 29);
+        assert!(status.starts_with("editing in asker \u{b7} "), "{status}");
+        assert!(!status.contains("back"), "{status}");
 
         app.on_key(plain('a'));
         assert!(
@@ -1912,8 +1916,15 @@ mod tests {
             open(&mut app, ASKER, &log);
             // A reply moved the active tab while the user typed into the editor.
             assert!(app.tabs.focus(OTHER));
+            // M2 R1 L-2: the next key is swallowed, so the way back is not offered yet.
+            assert_eq!(
+                app.editor_notice().as_deref(),
+                Some("editing in asker \u{b7} "),
+                "{key:?}"
+            );
 
             app.on_key(key);
+            assert_eq!(app.editor_notice().as_deref(), Some(NOTICE), "{key:?}");
             assert!(!app.should_quit, "{key:?} meant for the editor never quits");
             assert!(app.editor_open(), "{key:?} never aborts");
             assert!(
