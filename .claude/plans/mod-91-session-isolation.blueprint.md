@@ -299,7 +299,7 @@ both clippy runs.
 
 ---
 
-## T5 — Settings > Agents `user extensions (y/n)`
+## T5 — Settings > Agents `mods (y/n)`
 
 ### Files written
 
@@ -319,12 +319,12 @@ both clippy runs.
 
 `crates/htui/src/agent_settings.rs`
 
-- `FIELD_LABELS: [&str; 9]` — append `"user extensions (y/n)"` (index 8). Doc: MOD-91 D6.
+- `FIELD_LABELS: [&str; 9]` — append `"mods (y/n)"` (index 8). Doc: MOD-91 D6.
 - `const USER_EXTENSIONS: &str = FIELD_LABELS[8];`
 - `AgentDraft` — `pub user_extensions: bool` after `enabled`, doc ``settings.user_extensions``
   (MOD-91 D6): the one key of `settings` the form edits. Update the struct doc ("everything but
   `name`, `settings` …" → "… `settings` other than `user_extensions` …").
-- `DraftFields` — `pub user_extensions: &'a str` (doc: `user extensions (y/n)`).
+- `DraftFields` — `pub user_extensions: &'a str` (doc: `mods (y/n)`).
 - NEW `pub fn parse_user_extensions(text: &str) -> Result<bool, Refusal>` —
   `yes_or_no(text).ok_or_else(|| Refusal::new(USER_EXTENSIONS, "is y or n"))`, as `parse_enabled`.
 - `draft_from_fields` — `let user_extensions = parse_user_extensions(fields.user_extensions)?;`
@@ -355,8 +355,8 @@ both clippy runs.
   equality covers the new field, and `relaunch` reads only transport/command/args.
 - `prefill` — `-> [String; 8]`, appending `if draft.user_extensions { "y" } else { "n" }`; the
   `Stale` rebase picks the field up through it.
-- `Editor::lines` doc — the label column is now 21 wide (`user extensions (y/n)`), leaving 75
-  columns of text at the bordered 98.
+- `Editor::lines` doc and `settings.rs` `LABEL_WIDTH` — **unchanged**: the label `mods (y/n)` (10
+  columns) fits today's 13-column label column (F6, resolved).
 
 ### Tests (TDD order)
 
@@ -373,7 +373,7 @@ Inline `crates/htui/src/agent_settings.rs` `mod tests` (where the parser tests l
 5. NEW `merge_settings_leaves_the_document_untouched_when_the_value_is_unchanged` — `{}`+false,
    `{"user_extensions":true}`+true, `json!([])`+false: each `== stored`.
 6. NEW `merge_settings_refuses_a_non_object_it_would_have_to_change` — `json!([])`+true → refusal
-   field `user extensions (y/n)`.
+   field `mods (y/n)`.
 7. NEW `apply_draft_sets_user_extensions_and_keeps_every_other_settings_key` — and setting it back
    to `n` stores `false`.
 8. NEW `new_agent_writes_user_extensions_into_the_given_settings` — `true` over `{cli:…}`; `false`
@@ -406,9 +406,9 @@ Unchanged under B5 (they pin `settings` unchanged with a `false` draft):
 
 17. Changed: `LABEL_WIDTH` 13 → 21 (and its doc), `VALID_CREATE: [&str; 9]` ending `"n"`, the
     `AgentDraft` literal at `:3823` gains `user_extensions: false`.
-18. Changed: `a_bad_field_is_refused_locally_by_name_and_sends_nothing` — add `(8, "maybe", "user extensions (y/n)")`.
+18. Changed: `a_bad_field_is_refused_locally_by_name_and_sends_nothing` — add `(8, "maybe", "mods (y/n)")`.
 19. Changed: `n_opens_the_create_form_and_captures_input` — field reads `n`;
-    `e_prefills_the_highlighted_row_without_a_name_field_and_sends_its_token` — list gains `("user extensions (y/n)", "n")`.
+    `e_prefills_the_highlighted_row_without_a_name_field_and_sends_its_token` — list gains `("mods (y/n)", "n")`.
 20. NEW `e_prefills_user_extensions_from_settings_and_sends_that_change` — row with
     `settings.user_extensions = true` prefills `y`; changing it to `n` sends `EditAgent` with
     `draft.user_extensions == false` and no relaunch.
@@ -446,7 +446,7 @@ accepted file.
   back in), and D8 (an `extra_args` `--settings` must set `"disableAllHooks": true` or the row
   must opt in; a `--settings` in the row's launch `args` comes before htui's and is replaced by it).
   Fix line 34: `--mcp-config=<json>` → `--mcp-config=<path>`, a private `0600` file (MOD-79).
-- `README.md`: in "Setting up agents", the `user extensions (y/n)` field: default `n`, only
+- `README.md`: in "Setting up agents", the `mods (y/n)` field: default `n`, only
   matters for Claude Code rows, takes effect for sessions started after the save, a new row
   copied from an opted-in row still starts at `n`. In "Claude Code without ACP", one bullet on D8.
 
@@ -565,10 +565,12 @@ argv/`_meta`; `chat_live` needs Node and the adapter (F13). Then the full gate, 
   `crates/htui/tests/settings.rs` (T5: `LABEL_WIDTH`, `VALID_CREATE`, a literal, the refusal grid)
   and the inline `mod tests` of `crates/htui/src/agent_settings.rs`. The last one holds most of
   the parser and merge tests, including `every_refusal_names_a_form_label`.
-- **F6** The label `user extensions (y/n)` is 21 columns wide against today's 13. So both form
+- **F6** The label `mods (y/n)` is 21 columns wide against today's 13. So both form
   snapshots change on every line, not by "a line". `Editor::lines`' doc (13 wide, 83 columns of
   text) and `settings.rs` `LABEL_WIDTH` both change, and the form's text room drops from 83 to 75
-  columns. D6 fixes the label, so the blueprint keeps it. A shorter label is the maintainer's call.
+  columns. **Resolved (maintainer, 2026-10-08): the label is `mods (y/n)`.** It is 10 columns, fits the
+  existing 13-column label column, and only the added line moves in the two form snapshots. The
+  README says the field covers mods, settings hooks and skills.
 - **F7** "`apply_draft` sets `settings.user_extensions`" collides with seven existing pins of
   `settings` being unchanged:
   - `tests/agent_settings.rs:130`, `:164`, `:186` and `:320`;

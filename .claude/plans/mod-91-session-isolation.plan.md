@@ -54,7 +54,7 @@ back in can stand down.
   (b) `settingSources:["project","local"]` plus `extraArgs`. The deciding probe is that the
   adapter's own **programmatic** SDK hooks (`PostToolUse`, `Stop`, `TaskCreated`, …,
   `:5979-6060`) keep firing. If `disableAllHooks` kills them, (a) is out.
-- **D6 — The form.** Add a ninth Settings > Agents form field, `user extensions (y/n)`, default `n`.
+- **D6 — The form.** Add a ninth Settings > Agents form field, `mods (y/n)` (label chosen by the maintainer after blueprint F6: it fits the 13-column label column), default `n`.
   It writes only `settings.user_extensions` and leaves every other settings key untouched. It
   appears for every row, because nothing branches on name or transport. The README says it only
   matters for Claude Code rows. No new table column.
@@ -65,7 +65,7 @@ back in can stand down.
   `"disableAllHooks": true`. A path value is refused, because htui does not read the operator's
   file.
   - The message names both fixes: add `"disableAllHooks":true` to that value, or set
-    `user extensions = y`.
+    `mods = y`.
   - The error is `DriverError::Transport`, never `Spawn`. This is `refuse_widening`'s shape: it
     never rewrites operator arguments.
   - A row that opts back in is never checked.
