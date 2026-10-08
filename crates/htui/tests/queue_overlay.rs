@@ -180,11 +180,12 @@ async fn p_resumes_and_pauses_from_the_overlay() {
         harness.render()
     );
 
+    // M3 review R1 L4: once a batch closed, the header says why it is paused.
     harness.key("P");
     harness.drive_to_end().await;
     assert_eq!(store.open_batch_of(ids::BOX).await.expect("reads"), None);
     assert!(
-        header(&mut harness).contains("queue: paused · demo: nothing is admitted"),
+        header(&mut harness).contains("queue: paused (by a user) · demo: nothing is admitted"),
         "{}",
         harness.render()
     );
@@ -283,8 +284,8 @@ async fn p_over_a_batch_the_runner_closed_is_refused_and_opens_nothing() {
         Some("queue already paused: its batch closed before P reached it")
     );
     assert!(
-        header(&mut harness).contains("queue: paused"),
-        "the box re-read the queue: {}",
+        header(&mut harness).contains("queue: paused (the last batch drained: nothing admissible)"),
+        "the box re-read the queue, and says why it is paused (L4): {}",
         harness.render()
     );
 }

@@ -20,6 +20,8 @@ use htui_store::Backend;
 /// N+1 was one `missing_tags` per row): an item deleted since `queue_rows` is absent from its
 /// answer, and a `NotFound` (the box gone) reads as no tags, both as the per-row read did.
 ///
+/// With no batch open, `last_closed_batch` says how the last one closed (M3 review R1 L4).
+///
 /// # Errors
 /// `NotFound` "this box" before registration; offline, `Unreachable(DATABASE_UNREACHABLE)` from
 /// `queue_rows`, the first queue read; otherwise whatever a read reports.
@@ -41,6 +43,14 @@ pub async fn overview(backend: &Backend) -> Result<QueueOverview> {
             .into_iter()
             .collect(),
         None => HashSet::new(),
+    };
+    // M3 review R1 L4: why a paused queue is paused, for the header; not read while one runs.
+    let last_close = match &batch {
+        Some(_) => None,
+        None => backend
+            .last_closed_batch(box_id)
+            .await?
+            .and_then(|closed| closed.closed_reason),
     };
 
     // The runner's placeholder scope: the entries' projects, first-seen order.
@@ -136,7 +146,7 @@ pub async fn overview(backend: &Backend) -> Result<QueueOverview> {
     Ok(QueueOverview {
         box_id,
         batch: figures,
-        last_close: None,
+        last_close,
         slots_used,
         slots_limit,
         rows,

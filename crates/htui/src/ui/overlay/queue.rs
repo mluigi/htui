@@ -7,7 +7,9 @@
 //! [`REFRESHES_PER_READ`]th tick after a good read (M3 review R1 M2), every
 //! [`REFRESHES_PER_RETRY`]th after a failed one.
 
-use htui_core::model::{EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd};
+use htui_core::model::{
+    BatchClose, EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd,
+};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
@@ -261,12 +263,15 @@ impl QueueOverlay {
 
 /// The header (M3 D8): running or paused, then the batch's figures and the slots, or the demo's
 /// note. The batch time is UTC, as the Connection section formats one, so it reads alike on every
-/// host.
+/// host. A paused queue says why when a batch closed before (M3 review R1 L4): `P` paused it, or
+/// the runner drained it. A stall and an emptied queue both close `drained`, so the drained
+/// reason says only what both mean: nothing was admissible.
 fn header(overview: &QueueOverview) -> String {
-    let state = if overview.batch.is_some() {
-        "running"
-    } else {
-        "paused"
+    let state = match (&overview.batch, overview.last_close) {
+        (Some(_), _) => "running",
+        (None, Some(BatchClose::Paused)) => "paused (by a user)",
+        (None, Some(BatchClose::Drained)) => "paused (the last batch drained: nothing admissible)",
+        (None, None) => "paused",
     };
     if overview.demo {
         return format!("queue: {state} · {DEMO_NOTHING_ADMITTED}");
@@ -283,7 +288,7 @@ fn header(overview: &QueueOverview) -> String {
                 batch.opened_at.format("%H:%M")
             )
         }
-        None => format!("queue: paused · {slots}"),
+        None => format!("queue: {state} · {slots}"),
     }
 }
 
@@ -519,9 +524,8 @@ mod tests {
     use chrono::{DateTime, TimeZone, Utc};
     use htui_core::fixtures::ids;
     use htui_core::model::{
-        BatchClose, BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold,
-        PER_TOKEN_CAP_BATCH, ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId,
-        Wait, WorkspaceId,
+        BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
+        ProjectId, ProjectRef, QueueEntry, RunId, RunStatus, Status, StepId, Wait, WorkspaceId,
     };
     use htui_core::store::StoreError;
     use htui_store::DATABASE_UNREACHABLE;
