@@ -258,7 +258,7 @@ See §Verified claims.
 | 5 | `AgentSettings` is `#[serde(default)]` over `JSONB NOT NULL DEFAULT '{}'`, so a new bool needs no migration | ✓ | `launch.rs:283-286` |
 | 6 | An unparsable settings document falls back to the default (isolated) | ✓ | production `CliDriver::from_row_with_probe` (`cli/mod.rs:471`) and `AcpDriver::from_row_with_probe` (`acp/mod.rs:270`): `serde_json::from_value(…).unwrap_or_default()` |
 | 7 | `claude-agent-acp` 0.75.0 loads user settings and plugins, and `_meta.claudeCode.options` overrides `settingSources` and adds `extraArgs` | ✓ | npm tarball `dist/acp-agent.js:5830-5831` (`sessionMeta`), `:5931-5936` (`settingSources:["user","project","local"]`, then `...userProvidedOptions`), `:5974-5977` (`extraArgs`) |
-| 8 | The adapter re-reads `_meta` on resume and load (so htui must send it there too) | ✓ (partly) | `resumeSession`/`loadSession` → `getOrCreateSession(params)` (`:975-997`); the `createSession` param flow is to be confirmed in T2 |
+| 8 | The adapter re-reads `_meta` on resume and load (so htui must send it there too) | ✓ | `resumeSession`/`loadSession` → `getOrCreateSession(params)` (`:975-997`); the `createSession` param flow is to be confirmed in T2 |
 | 9 | The ACP Rust crate can set `_meta` on `session/new` | ✓ | `agent-client-protocol-schema` 1.7.0 `v1/agent.rs:114` `pub fn meta(…)`; workspace pins `agent-client-protocol = "=2.1.0"` |
 | 10 | The adapter passes `process.env` through, so `HTUI_SESSION` reaches the CLI it spawns | ✓ | `acp-agent.js:5915-5925` (`env = {...process.env, …}`) |
 | 11 | The Settings > Agents form has 8 fields and never edits `settings` today | ✓ | `agent_settings.rs:28-37` (`FIELD_LABELS`), `:55-56` doc ("everything but `name`, `settings` …") |
@@ -272,8 +272,8 @@ See §Verified claims.
 | 19 | Only `cli_driver.rs` and `cli_live.rs` assert the argv's fixed flags | ✓ | `grep -rl '"--include-partial-messages"' crates`: `cli/mod.rs`, `tests/cli_driver.rs`, `tests/cli_live.rs` |
 | 20 | `acp_driver.rs` already captures `session/new` params for assertions | ✓ | `session_new_carries_the_mcp_server_as_stdio` (`acp_driver.rs:2024-2040`) |
 | 21 | T4 and T5 touch disjoint files | ✓ | §Independence |
-| 22 | `disableAllHooks` stops installed, skills-directory and `--plugin-dir` mods | **open → T1** | ANA-29 §5.5 marks it UNVERIFIED |
-| 23 | `disableAllHooks` leaves the adapter's programmatic SDK hooks running | **open → T2** | Not documented. The probe decides D5 |
+| 22 | `disableAllHooks` stops installed and skills-directory mods | ✓ (T1) | §Probe results T1 case 1 (`--plugin-dir` not probed: htui never passes it) |
+| 23 | `disableAllHooks` leaves the adapter's programmatic SDK hooks running | ✓ (T2) | §Probe results T2 (a): `current_mode_update: plan` still arrives |
 
 ## Probe results
 
@@ -305,6 +305,35 @@ Notes:
   user's installed plugins, so per D7 no follow-up lever is adopted, and none is filed.
 - **Case 1a amends the plan's risk row.** An operator `--settings` in `extra_args` silently undoes
   isolation. See D8.
+
+### T2 — ACP (2026-10-08, `claude-agent-acp` 0.75.0 on Node 22.23.3 in `/tmp`, same scratch config and mods)
+
+The client is a JSON-RPC stdio driver: `initialize`, then `session/new` with htui's stub server as a
+stdio `mcpServers` entry, then one prompt ("call EnterPlanMode, then reply DONE"). Every permission
+request is allowed. `--debug-file` travels in `_meta.claudeCode.options.extraArgs`.
+
+| Case | `_meta.claudeCode.options` | Turn | htui MCP | Mods | Settings hook | Commands/skills | Adapter SDK hook (`PostToolUse` → `current_mode_update: plan`) |
+|---|---|---|---|---|---|---|---|
+| baseline | debug-file only | `end_turn` | connected | **both loaded** | **fired** | 73 commands incl. `probe-uskill`, `probe-skill` | fired |
+| (a) | `{settings:{disableAllHooks:true}, extraArgs:{"disable-slash-commands":""}}` | `end_turn` | connected | **both not loaded** | not fired | **0** | **still fires** |
+
+- **D5 resolves to candidate (a).** `disableAllHooks` stops settings hooks and plugin mods but not
+  the adapter's programmatic SDK callbacks, so (b) (`settingSources`) is not needed.
+- `session/resume` and `session/load` reach `createSession` through `getOrCreateSession`, which
+  forwards `params._meta` (`acp-agent.js:5699-5720`). htui must send the same `_meta` on those
+  routes, as T4 planned (claim 8 now ✓).
+- Over ACP, `--disable-slash-commands` empties the whole `available_commands_update` list, built-in
+  commands included. htui sends no slash command (claim 15), so nothing is lost.
+
+### Amendment: where `isolation_live.rs` lands
+
+T1 and T2 ran as an exploratory shell and Python harness under `/tmp/mod91`, because a Rust test
+written before T3/T4 would pin the probe's argv rather than the shipped one. The committed
+`#[ignore]` test `crates/htui-agent/tests/isolation_live.rs` moves to **T6**. It drives the shipped
+levers: `cli::argv` with the real `AgentSettings`, and the ACP driver's `_meta`. It uses the same
+scratch-config method (credentials without `refreshToken`, a scratch marketplace, a skills-directory
+plugin), the same stub `permission_prompt` server, and asserts this section's rows 0, 1 and 1a
+(refused by D8) and T2's (a).
 
 ## Acceptance
 
