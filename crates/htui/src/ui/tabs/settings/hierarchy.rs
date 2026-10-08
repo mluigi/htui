@@ -39,7 +39,7 @@ use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::path_picker::{PathPicker, PickerOutcome, start_dir};
-use crate::ui::tabs::settings::{SectionId, SettingsSection, message, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, message, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
@@ -912,7 +912,7 @@ impl HierarchySection {
                     return Handled::Consumed;
                 }
                 // A global act, or nothing.
-                _ => return unused(stack, chord),
+                _ => return modal_rest(stack, chord),
             },
             DeleteStage::Typed { reach, field } => match field.on_key(key) {
                 FieldOutcome::Submit => {
@@ -935,10 +935,10 @@ impl HierarchySection {
                 }
                 // Typed: `n` is a letter of a slug here, not an answer.
                 FieldOutcome::Consumed => {}
-                FieldOutcome::Pass => return unused(stack, chord),
+                FieldOutcome::Pass => return modal_rest(stack, chord),
             },
             // Nothing to answer: the rows are already going.
-            DeleteStage::InFlight(_) => return unused(stack, chord),
+            DeleteStage::InFlight(_) => return modal_rest(stack, chord),
         }
         Handled::Consumed
     }
@@ -1016,7 +1016,7 @@ impl HierarchySection {
                         Handled::Consumed
                     }
                     // A global act, or nothing.
-                    _ => unused(stack, chord),
+                    _ => modal_rest(stack, chord),
                 }
             }
         }
@@ -1768,17 +1768,6 @@ fn delete_pane(
         lines.push(Line::from(spans));
     }
     lines
-}
-
-/// What a modal mode answers for a chord none of its own acts took (MOD-67 M3 PA-5): `Pass` when
-/// the stack's global layer admits its shape (`CONTROL`, `ALT`, a function key), so the shell
-/// quits, opens help or finds; otherwise it is swallowed, so a `q` mid-slug does not quit.
-fn unused(stack: Stack<'_>, chord: KeyChord) -> Handled {
-    if stack.passes(chord) {
-        Handled::Pass
-    } else {
-        Handled::Consumed
-    }
 }
 
 #[cfg(test)]

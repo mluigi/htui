@@ -47,7 +47,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, wrapped,
+    message, modal_rest, wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use chrono::{DateTime, Utc};
@@ -504,8 +504,7 @@ impl PromptSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass if views::CAPTURE.passes(KeyChord::from_event(key)) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
         }
     }
 

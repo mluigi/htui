@@ -92,7 +92,7 @@ use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, message,
+    is_error, message, modal_rest,
 };
 use crate::ui::text_field::PASTE_DOES_NOT_FIT;
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -880,13 +880,7 @@ impl AgentsSection {
                 *paste = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => {
-                if views::CAPTURE.passes(KeyChord::from_event(key)) {
-                    Handled::Pass
-                } else {
-                    Handled::Consumed
-                }
-            }
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
             FieldOutcome::Submit => {
                 let url = RedirectUrl::new(field.take());
                 match advertised
@@ -2377,11 +2371,7 @@ fn form_navigation(key: KeyEvent, keys: &Keys, focus: &mut usize, fields: usize)
         }
         _ => {}
     }
-    if stack.passes(chord) {
-        Handled::Pass
-    } else {
-        Handled::Consumed
-    }
+    modal_rest(stack, chord)
 }
 
 /// What the install question or the login chooser does with a key none of its own acts took

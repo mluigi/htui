@@ -80,6 +80,19 @@ pub(crate) fn is_error(notice: &str) -> bool {
     notice.starts_with("changed elsewhere") || notice.starts_with("deleted elsewhere")
 }
 
+/// What a modal mode answers for a `chord` none of its own acts took (MOD-67 M3 PA-5): `Pass`
+/// for the chords `stack`'s global layer lets through (CONTROL, ALT, function keys), so `ctrl-c`
+/// quits and `F1` opens help; `Consumed` for every other, so a `q` or a `Tab` goes nowhere.
+///
+/// One copy for every section's modes, so the pass rule cannot drift between them.
+pub(crate) fn modal_rest(stack: Stack<'_>, chord: KeyChord) -> Handled {
+    if stack.passes(chord) {
+        Handled::Pass
+    } else {
+        Handled::Consumed
+    }
+}
+
 /// `text` in rows of at most `width` cells, its whitespace collapsed: words joined by one space,
 /// a word wider than `width` broken by grapheme (MOD-60 D5, OQ-1) and the next word joining its
 /// last piece when it fits (B7); a control character draws as one blank cell (D3). Text with no

@@ -9,7 +9,7 @@ use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField};
 use crossterm::event::KeyEvent;
 
@@ -242,13 +242,7 @@ impl QdrantSection {
             // The field passed it (`Tab`, arrows, a CONTROL chord …): the editor keeps it unless
             // the modal global layer admits it (MOD-67 D5, PA-5). `Tab` stays here rather than
             // switching tabs (ANA-26 §2.6 defect 2); `ctrl-c` and `F1` reach the shell.
-            FieldOutcome::Pass => {
-                if views::CAPTURE.passes(KeyChord::from_event(key)) {
-                    Handled::Pass
-                } else {
-                    Handled::Consumed
-                }
-            }
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
         }
     }
 
@@ -270,11 +264,7 @@ impl QdrantSection {
             }
             _ => {}
         }
-        if stack.passes(chord) {
-            Handled::Pass
-        } else {
-            Handled::Consumed
-        }
+        modal_rest(stack, chord)
     }
 
     /// The stack of the current mode (MOD-67 D4): the one place a mode maps to its keys;

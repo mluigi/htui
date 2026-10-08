@@ -44,7 +44,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    message, wrapped,
+    message, modal_rest, wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -756,7 +756,7 @@ impl KindsSection {
             // Nothing to answer: the row is already going (blueprint L-C Q8).
             (Some(Act::ConfirmYes | Act::ConfirmNo), DeleteStage::InFlight) => Handled::Consumed,
             // A global act, or nothing.
-            _ => unused(stack, chord),
+            _ => modal_rest(stack, chord),
         }
     }
 
@@ -811,7 +811,7 @@ impl KindsSection {
                         Handled::Consumed
                     }
                     // A global act, or nothing.
-                    _ => unused(stack, chord),
+                    _ => modal_rest(stack, chord),
                 }
             }
         }
@@ -905,7 +905,7 @@ impl KindsSection {
                 Handled::Consumed
             }
             // A global act, or nothing.
-            _ => unused(stack, chord),
+            _ => modal_rest(stack, chord),
         }
     }
 
@@ -2039,17 +2039,6 @@ fn detail_lines(phase: &StepGraphPhase, width: u16, theme: &Theme) -> Vec<Line<'
         .into_iter()
         .map(|line| Line::styled(format!("      {line}"), theme.dim))
         .collect()
-}
-
-/// What a modal mode answers for a chord none of its own acts took (MOD-67 M3 PA-5): `Pass` when
-/// the stack's global layer admits its shape (`CONTROL`, `ALT`, a function key), so the shell
-/// quits, opens help or finds; otherwise it is swallowed, so a `q` at a question does not quit.
-fn unused(stack: Stack<'_>, chord: KeyChord) -> Handled {
-    if stack.passes(chord) {
-        Handled::Pass
-    } else {
-        Handled::Consumed
-    }
 }
 
 #[cfg(test)]

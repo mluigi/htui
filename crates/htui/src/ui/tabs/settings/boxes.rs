@@ -35,7 +35,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, message, wrapped,
+    is_error, message, modal_rest, wrapped,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use chrono::{DateTime, Utc};
@@ -572,7 +572,7 @@ impl BoxesSection {
             self.submit(ctx);
             return Handled::Consumed;
         }
-        passed(stack, chord)
+        modal_rest(stack, chord)
     }
 
     /// One key over the executor confirmation (MOD-41 plan D10; MOD-67 D6, skeleton (b)): `y`
@@ -590,7 +590,7 @@ impl BoxesSection {
                 self.mode = Mode::Browse;
                 self.notice = None;
             }
-            _ => return passed(stack, chord),
+            _ => return modal_rest(stack, chord),
         }
         Handled::Consumed
     }
@@ -1119,17 +1119,6 @@ impl BoxesSection {
             hint.push_str(" \u{b7} saving\u{2026}");
         }
         hint
-    }
-}
-
-/// What a modal mode answers for a `chord` it did not use (MOD-67 M3 PA-5): `Pass` for the
-/// chords `stack`'s global layer lets through (CONTROL, ALT, function keys), so `ctrl-c` quits
-/// and `F1` opens help; `Consumed` for every other, so a `q` or a `Tab` goes nowhere.
-fn passed(stack: Stack<'_>, chord: KeyChord) -> Handled {
-    if stack.passes(chord) {
-        Handled::Pass
-    } else {
-        Handled::Consumed
     }
 }
 

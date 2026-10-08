@@ -39,7 +39,7 @@ use crate::connection::{AttemptOutcome, ConnectionSnapshot, DsnState, READ_NAME,
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
@@ -439,7 +439,7 @@ impl ConnectionSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => passed(views::CAPTURE, KeyChord::from_event(key)),
+            FieldOutcome::Pass => modal_rest(views::CAPTURE, KeyChord::from_event(key)),
         }
     }
 
@@ -496,7 +496,7 @@ impl ConnectionSection {
         match ctx.keys().actions(stack, chord).first() {
             Some(Act::ConfirmYes) => self.answer(true, ctx),
             Some(Act::ConfirmNo) => self.answer(false, ctx),
-            _ => return passed(stack, chord),
+            _ => return modal_rest(stack, chord),
         }
         Handled::Consumed
     }
@@ -935,17 +935,6 @@ impl SettingsSection for ConnectionSection {
             Paragraph::new(self.hint(ctx.keys(), area.width, ctx.theme)),
             hint,
         );
-    }
-}
-
-/// What a modal mode answers for a `chord` it did not use (MOD-67 M3 PA-5): `Pass` for the
-/// chords `stack`'s global layer lets through (CONTROL, ALT, function keys), so `ctrl-c` quits
-/// and `F1` opens help; `Consumed` for every other, so a `q` or a `Tab` goes nowhere.
-fn passed(stack: Stack<'_>, chord: KeyChord) -> Handled {
-    if stack.passes(chord) {
-        Handled::Pass
-    } else {
-        Handled::Consumed
     }
 }
 

@@ -40,7 +40,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    is_error, wrapped, yes_or_no,
+    is_error, modal_rest, wrapped, yes_or_no,
 };
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -1673,17 +1673,6 @@ fn editor_act(keys: &Keys, key: KeyEvent) -> Result<(), Handled> {
         return Ok(());
     }
     Err(modal_rest(stack, chord))
-}
-
-/// A modal mode's answer to a chord none of its own acts took (MOD-67 M3 PA-5): `Pass` for what
-/// the stack's global layer lets through (CONTROL, ALT, function keys: `ctrl-c` quits, `F1`
-/// helps), else `Consumed`, so `q`, `Tab` and digits never leave a capturing mode.
-fn modal_rest(stack: Stack<'_>, chord: KeyChord) -> Handled {
-    if stack.passes(chord) {
-        Handled::Pass
-    } else {
-        Handled::Consumed
-    }
 }
 
 /// [`CHANGED_ON_BOTH_SIDES`] with the clashing labels in form order, as many as fit
