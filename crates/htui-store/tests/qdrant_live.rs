@@ -17,8 +17,8 @@ use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 use htui_store::embed::{DENSE_DIM, DenseEmbedder, EmbedderIdentity, HashEmbedder};
 use htui_store::qdrant_settings::QdrantSettings;
 use htui_store::vector::{
-    DENSE, EMBEDDER_KEY, Owner, PointType, QdrantStore, SPARSE, SearchQuery, VectorStore as _,
-    is_embedder_mismatch,
+    DENSE, EMBEDDER_KEY, ExistingCollection, Owner, PointType, QdrantStore, SPARSE, SearchQuery,
+    VectorStore as _, is_embedder_mismatch,
 };
 use htui_store::vector_sync::Indexer;
 use qdrant_client::Qdrant;
@@ -623,6 +623,35 @@ async fn open_existing_refuses_another_width() {
     let refused = open_existing(&url, HashEmbedder::new(DENSE_DIM), &name).await;
     client.delete_collection(&name).await.expect("drop");
     let err = refused.expect_err("another width is refused");
+    assert!(is_embedder_mismatch(&err), "{err}");
+}
+
+/// Review R1 M3: whether the collection exists is answered before any embedder exists, so
+/// `--search-items` never loads the model for a missing index; the embedder check follows on
+/// `open`, as `open_existing` runs it.
+#[tokio::test]
+async fn an_existing_collection_is_found_before_the_embedder_and_checked_after() {
+    let Some(url) = qdrant_url() else {
+        return;
+    };
+    let settings = QdrantSettings::new(url.clone(), None).expect("valid URL");
+    let missing = ExistingCollection::find_in(&settings, &fresh_name())
+        .await
+        .expect("Qdrant answers");
+    assert!(missing.is_none(), "a missing collection, and no embedder");
+
+    let name = fresh_name();
+    let client = raw(&url);
+    create_bare(&client, &name, DENSE_DIM as u64 + 1).await;
+    let found = ExistingCollection::find_in(&settings, &name).await;
+    let opened = match found {
+        Ok(Some(found)) => Some(found.open(HashEmbedder::new(DENSE_DIM)).await),
+        _ => None,
+    };
+    client.delete_collection(&name).await.expect("drop");
+    let err = opened
+        .expect("found")
+        .expect_err("another width is refused on open");
     assert!(is_embedder_mismatch(&err), "{err}");
 }
 

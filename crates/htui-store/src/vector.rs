@@ -16,7 +16,6 @@ use htui_core::model::{
     Resolution, Status,
 };
 use htui_core::store::StoreError;
-use qdrant_client::Qdrant;
 use qdrant_client::qdrant::{
     CollectionInfo, Condition, CreateCollectionBuilder, CreateFieldIndexCollectionBuilder,
     DeletePointsBuilder, Distance, FieldType, Filter, Fusion, Modifier, NamedVectors, PointId,
@@ -25,6 +24,7 @@ use qdrant_client::qdrant::{
     UpsertPointsBuilder, Value, VectorParamsBuilder, VectorsConfigBuilder,
     point_id::PointIdOptions, vectors_config,
 };
+use qdrant_client::{Qdrant, QdrantError};
 use serde::Deserialize as _;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -47,6 +47,14 @@ pub const EMBEDDER_KEY: &str = "embedder";
 /// wrong with which collection and how to rebuild it (MOD-68 D8, review L3). The one spelling
 /// [`is_embedder_mismatch`] reads.
 pub const EMBEDDER_MISMATCH: &str = "qdrant: embedder mismatch";
+/// How the message begins when Qdrant answered and refused this client's credentials (gRPC
+/// `UNAUTHENTICATED` or `PERMISSION_DENIED`, review R1 M2): Qdrant is there, so it is not "cannot
+/// reach", and only another API key clears it. The one spelling [`is_qdrant_refused`] reads.
+pub const QDRANT_REFUSED: &str = "qdrant: access refused";
+/// How the message begins when [`QdrantStore`]'s search could not turn the query into a vector
+/// (review R1 M2): the embedding model failed, not Qdrant. The one spelling
+/// [`is_query_embed_failure`] reads.
+pub const QUERY_EMBED_FAILED: &str = "qdrant: cannot embed the query";
 /// Longest snippet a point carries in its payload, in characters.
 pub const SNIPPET_CHARS: usize = 280;
 
@@ -365,6 +373,42 @@ fn backend(context: &str, e: impl std::fmt::Display) -> StoreError {
     StoreError::Backend(format!("qdrant: {context}: {e}"))
 }
 
+/// gRPC `PERMISSION_DENIED` (7) and `UNAUTHENTICATED` (16): Qdrant's answers to a missing or
+/// wrong API key.
+const REFUSING_GRPC_CODES: [i32; 2] = [7, 16];
+
+/// A failed call to Qdrant: [`QDRANT_REFUSED`] when Qdrant answered and refused the credentials,
+/// [`backend`]'s text otherwise.
+fn qdrant(context: &str, e: QdrantError) -> StoreError {
+    let grpc_code = match &e {
+        QdrantError::ResponseError { status } => Some(i32::from(status.code())),
+        _ => None,
+    };
+    qdrant_with_code(context, grpc_code, e)
+}
+
+/// [`qdrant`] once the gRPC code is read (`tonic::Status` is not constructible here, so the tests
+/// come in at this level).
+fn qdrant_with_code(
+    context: &str,
+    grpc_code: Option<i32>,
+    e: impl std::fmt::Display,
+) -> StoreError {
+    if grpc_code.is_some_and(|code| REFUSING_GRPC_CODES.contains(&code)) {
+        StoreError::Backend(format!(
+            "{QDRANT_REFUSED}: {context}: {e}; check the Qdrant API key in Settings > Qdrant"
+        ))
+    } else {
+        backend(context, e)
+    }
+}
+
+/// Whether `err` is a [`StoreError::Backend`] whose message is `prefix`, `: ` and the rest.
+fn prefixed(err: &StoreError, prefix: &str) -> bool {
+    matches!(err, StoreError::Backend(message)
+        if message.strip_prefix(prefix).is_some_and(|rest| rest.starts_with(": ")))
+}
+
 /// Whether `err` is [`QdrantStore::connect`]'s refusal of a collection holding another width or
 /// another embedder's vectors (review L3): Qdrant answered, so it is not "cannot reach", and only
 /// rebuilding the collection clears it, so retrying sooner does not help.
@@ -374,8 +418,21 @@ fn backend(context: &str, e: impl std::fmt::Display) -> StoreError {
 /// apart. [`EMBEDDER_MISMATCH`] is the single spelling both sides use.
 #[must_use]
 pub fn is_embedder_mismatch(err: &StoreError) -> bool {
-    matches!(err, StoreError::Backend(message)
-        if message.strip_prefix(EMBEDDER_MISMATCH).is_some_and(|rest| rest.starts_with(": ")))
+    prefixed(err, EMBEDDER_MISMATCH)
+}
+
+/// Whether `err` is Qdrant refusing this client's credentials ([`QDRANT_REFUSED`], review R1 M2):
+/// Qdrant answered, so it is not "cannot reach", and retrying with the same key does not help.
+#[must_use]
+pub fn is_qdrant_refused(err: &StoreError) -> bool {
+    prefixed(err, QDRANT_REFUSED)
+}
+
+/// Whether `err` is a search's embedder failing on the query ([`QUERY_EMBED_FAILED`], review R1
+/// M2): the model's failure, not Qdrant's.
+#[must_use]
+pub fn is_query_embed_failure(err: &StoreError) -> bool {
+    prefixed(err, QUERY_EMBED_FAILED)
 }
 
 /// Set once the process has warned that its Qdrant keeps no collection metadata, so that warning
@@ -695,31 +752,16 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         embedder: E,
         collection: &str,
     ) -> Result<Option<Self>, StoreError> {
-        let store = Self::new(settings, embedder, collection)?;
-        let exists = store
-            .client
-            .collection_exists(&store.collection)
-            .await
-            .map_err(|e| backend("collection exists", e))?;
-        if !exists {
-            return Ok(None);
+        match ExistingCollection::find_in(settings, collection).await? {
+            Some(found) => found.open(embedder).await.map(Some),
+            None => Ok(None),
         }
-        // `Matches` and `Stamp` both pass: only `check_collection` writes the stamp.
-        store.existing().await?;
-        Ok(Some(store))
     }
 
     /// The client and the store, before any call to Qdrant.
     fn new(settings: &QdrantSettings, embedder: E, collection: &str) -> Result<Self, StoreError> {
-        // No compatibility check: it prints to stdout (which `--search-items` owns) and blocks on
-        // its own health probe; the first call fails fast on a bad server anyway.
-        let mut builder = Qdrant::from_url(&settings.url).skip_compatibility_check();
-        if let Some(key) = &settings.api_key {
-            builder = builder.api_key(key.as_str());
-        }
-        let client = builder.build().map_err(|e| backend("client", e))?;
         Ok(Self {
-            client,
+            client: client(settings)?,
             embedder,
             collection: collection.to_owned(),
         })
@@ -730,7 +772,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
         self.client
             .delete_collection(&self.collection)
             .await
-            .map_err(|e| backend("delete collection", e))?;
+            .map_err(|e| qdrant("delete collection", e))?;
         Ok(())
     }
 
@@ -739,7 +781,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .client
             .collection_exists(&self.collection)
             .await
-            .map_err(|e| backend("collection exists", e))?;
+            .map_err(|e| qdrant("collection exists", e))?;
         if exists {
             self.check_collection().await?;
         } else {
@@ -758,7 +800,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
                     .wait(true),
                 )
                 .await
-                .map_err(|e| backend("create payload index", e))?;
+                .map_err(|e| qdrant("create payload index", e))?;
         }
         Ok(())
     }
@@ -779,7 +821,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
                         UpdateCollectionBuilder::new(&self.collection).metadata(self.metadata()?),
                     )
                     .await
-                    .map_err(|e| backend("stamp embedder", e))?;
+                    .map_err(|e| qdrant("stamp embedder", e))?;
                 if self.stamp_reads_back().await {
                     tracing::info!(
                         collection = %self.collection,
@@ -806,7 +848,7 @@ impl<E: DenseEmbedder> QdrantStore<E> {
             .client
             .collection_info(&self.collection)
             .await
-            .map_err(|e| backend("collection info", e))?
+            .map_err(|e| qdrant("collection info", e))?
             .result
             .ok_or_else(|| backend("collection info", "no result"))?;
         let stored = info
@@ -861,8 +903,83 @@ impl<E: DenseEmbedder> QdrantStore<E> {
                     .metadata(self.metadata()?),
             )
             .await
-            .map_err(|e| backend("create collection", e))?;
+            .map_err(|e| qdrant("create collection", e))?;
         Ok(())
+    }
+}
+
+/// The client [`QdrantStore`] and [`ExistingCollection`] call Qdrant through, before any call.
+fn client(settings: &QdrantSettings) -> Result<Qdrant, StoreError> {
+    // No compatibility check: it prints to stdout (which `--search-items` owns) and blocks on its
+    // own health probe; the first call fails fast on a bad server anyway.
+    let mut builder = Qdrant::from_url(&settings.url).skip_compatibility_check();
+    if let Some(key) = &settings.api_key {
+        builder = builder.api_key(key.as_str());
+    }
+    builder.build().map_err(|e| backend("client", e))
+}
+
+/// A collection Qdrant said exists, before any embedder is loaded (review R1 M3):
+/// [`QdrantStore::open_existing`] in two halves, so `--search-items` asks Qdrant first and loads
+/// the 133 MB model only when there is a collection to search. Read-only, as `open_existing`.
+pub struct ExistingCollection {
+    client: Qdrant,
+    collection: String,
+}
+
+impl std::fmt::Debug for ExistingCollection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExistingCollection")
+            .field("collection", &self.collection)
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExistingCollection {
+    /// [`COLLECTION`], when it exists; `Ok(None)` when it does not. Creates nothing.
+    ///
+    /// # Errors
+    /// [`StoreError::Backend`] when Qdrant cannot be reached, and [`QDRANT_REFUSED`]
+    /// ([`is_qdrant_refused`]) when it refuses the API key.
+    pub async fn find(settings: &QdrantSettings) -> Result<Option<Self>, StoreError> {
+        Self::find_in(settings, COLLECTION).await
+    }
+
+    /// As [`find`](Self::find), for a named collection (tests use a throwaway one).
+    ///
+    /// # Errors
+    /// As [`find`](Self::find).
+    pub async fn find_in(
+        settings: &QdrantSettings,
+        collection: &str,
+    ) -> Result<Option<Self>, StoreError> {
+        let client = client(settings)?;
+        let exists = client
+            .collection_exists(collection)
+            .await
+            .map_err(|e| qdrant("collection exists", e))?;
+        Ok(exists.then(|| Self {
+            client,
+            collection: collection.to_owned(),
+        }))
+    }
+
+    /// The store over this collection once `embedder` passes `connect`'s width and embedder
+    /// check (MOD-68 D8). Stamps nothing: an unstamped collection of the right width is searched
+    /// as it is.
+    ///
+    /// # Errors
+    /// `embedder mismatch` ([`is_embedder_mismatch`]) for another width or another embedder's
+    /// vectors; [`StoreError::Backend`] (or [`QDRANT_REFUSED`]) when the collection cannot be read.
+    pub async fn open<E: DenseEmbedder>(self, embedder: E) -> Result<QdrantStore<E>, StoreError> {
+        let store = QdrantStore {
+            client: self.client,
+            embedder,
+            collection: self.collection,
+        };
+        // `Matches` and `Stamp` both pass: only `check_collection` writes the stamp.
+        store.existing().await?;
+        Ok(store)
     }
 }
 
@@ -888,7 +1005,7 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
         self.client
             .upsert_points(UpsertPointsBuilder::new(&self.collection, structs).wait(true))
             .await
-            .map_err(|e| backend("upsert", e))?;
+            .map_err(|e| qdrant("upsert", e))?;
         Ok(())
     }
 
@@ -904,7 +1021,7 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
                     .wait(true),
             )
             .await
-            .map_err(|e| backend("delete", e))?;
+            .map_err(|e| qdrant("delete", e))?;
         Ok(())
     }
 
@@ -925,7 +1042,7 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
                 .client
                 .scroll(request)
                 .await
-                .map_err(|e| backend("scroll", e))?;
+                .map_err(|e| qdrant("scroll", e))?;
             out.extend(
                 page.result
                     .iter()
@@ -943,12 +1060,15 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
         if query.projects.is_empty() || query.limit == 0 {
             return Ok(Vec::new());
         }
+        let embed_failed =
+            |e: &dyn std::fmt::Display| StoreError::Backend(format!("{QUERY_EMBED_FAILED}: {e}"));
         let dense = self
             .embedder
             .embed(vec![query.text.clone()])
-            .await?
+            .await
+            .map_err(|e| embed_failed(&e))?
             .pop()
-            .ok_or_else(|| backend("embed", "no vector for the query"))?;
+            .ok_or_else(|| embed_failed(&"no vector for the query"))?;
         let sparse = sparse_pairs(&bm25::query_vector(&query.text));
         let filter = search_filter(query);
         // Each arm fetches more than the final limit so the fusion has overlap to work with.
@@ -978,7 +1098,7 @@ impl<E: DenseEmbedder> VectorStore for QdrantStore<E> {
             .client
             .query(request)
             .await
-            .map_err(|e| backend("query", e))?;
+            .map_err(|e| qdrant("query", e))?;
         Ok(response
             .result
             .iter()
@@ -1497,6 +1617,70 @@ mod tests {
         .to_string();
         assert_names_the_remedy(&err);
         assert!(err.contains("holds vectors from \"garbage\""), "{err}");
+    }
+
+    /// Review R1 M2: Qdrant answering `PERMISSION_DENIED` (7) or `UNAUTHENTICATED` (16) refused
+    /// this client's API key; every other answer, and no answer, is what it was.
+    #[test]
+    fn an_auth_answer_is_qdrant_refused_and_nothing_else_is() {
+        for code in [7, 16] {
+            let err = qdrant_with_code("collection exists", Some(code), "Invalid api-key");
+            assert!(is_qdrant_refused(&err), "{err}");
+            assert!(!is_embedder_mismatch(&err), "{err}");
+            assert!(
+                err.to_string().contains("API key"),
+                "names the remedy: {err}"
+            );
+        }
+        for code in [None, Some(14), Some(2), Some(5)] {
+            let err = qdrant_with_code("collection exists", code, "transport error");
+            assert!(!is_qdrant_refused(&err), "{code:?}: {err}");
+            assert_eq!(err, backend("collection exists", "transport error"));
+        }
+        assert!(!is_qdrant_refused(&StoreError::Unreachable(format!(
+            "{QDRANT_REFUSED}: not a backend error"
+        ))));
+    }
+
+    /// An embedder that never answers with a vector.
+    #[derive(Debug, Clone)]
+    struct Broken;
+
+    impl DenseEmbedder for Broken {
+        fn dim(&self) -> usize {
+            384
+        }
+
+        fn identity(&self) -> EmbedderIdentity {
+            EmbedderIdentity::hash(384)
+        }
+
+        async fn embed(&self, _: Vec<String>) -> Result<Vec<Vec<f32>>, StoreError> {
+            Err(StoreError::Backend("the model's session failed".into()))
+        }
+    }
+
+    /// Review R1 M2: a query the embedder cannot turn into a vector is the model's failure, told
+    /// apart from Qdrant's; the search fails before any call to Qdrant (nothing listens on port 1).
+    #[tokio::test]
+    async fn a_query_the_embedder_fails_is_a_query_embed_failure() {
+        let settings =
+            QdrantSettings::new("http://127.0.0.1:1".to_owned(), None).expect("a valid URL");
+        let store = QdrantStore::new(&settings, Broken, C).expect("no call yet");
+        let err = store
+            .search(&scoped("anything"))
+            .await
+            .expect_err("no vector");
+        assert!(is_query_embed_failure(&err), "{err}");
+        assert!(
+            err.to_string().contains("the model's session failed"),
+            "{err}"
+        );
+        assert!(!is_query_embed_failure(&backend(
+            "query",
+            "transport error"
+        )));
+        assert!(!is_qdrant_refused(&err) && !is_embedder_mismatch(&err));
     }
 
     #[test]
