@@ -136,6 +136,21 @@ app-level snapshots show the Backlog tab (`shell__` 4, `integration__`, `replay_
   - (c) No new row in M5: the Runs pane's browse hint and the `?` box only; finding 3 goes to M6
     or MOD-82.
 
+## Amendments (maintainer, 2026-10-08, from blueprint §1)
+
+PA-1..PA-6 (`.claude/plans/mod-67-m5-backlog-chat.blueprint.md` §1) approved as written: Prompt's
+`n`/`p` are view verbs (`backlog.prompt`), Body gets `backlog.body` and `BACKLOG_BROWSE` becomes
+`BACKLOG_BODY` (PA-1); `Enter` is state-guarded fold/replay, Graph's re-root its own act, the fold
+tried before the pane (PA-2); six legacy-help/spacing assertions in `tests/backlog.rs` and
+`tests/replay.rs` move to the `?` box as flagged L-A edits, `e edit item` → `e edit` (PA-3); Chat
+has three stacks, the composer on `CAPTURE` (PA-4); the Q1(a) list hint is
+`j/k move · h/l sub-tab · f filter · N new · e edit`, queue left to the `?` box (PA-5, maintainer
+choice); L-B accepts `replay__runs_step_selected` (PA-6). The blueprint's "user-visible beyond D9"
+list is accepted whole (modifier-blind Body/Prompt scroll and template keys fixed, `F1` help in
+every Backlog/Chat capturing mode, the Runs hint row's height, `J/K scroll` and `Tab row`
+spellings, the Notes/Docs notice clearing on Backlog keys, the per-layer `?` box). Claims 3 and 5
+and D6's "tests unchanged" amended per blueprint §2.
+
 ## Patterns to Mirror
 
 | Category | Source | Pattern |
