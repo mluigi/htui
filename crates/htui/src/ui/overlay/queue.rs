@@ -3,8 +3,9 @@
 //!
 //! It holds the last [`QueueOverview`] the store worker answered and re-reads it after every queue
 //! write (saying the write's result on the status line, M3 review R1 N2), after a failed queue
-//! write, and on the shell's refresh tick (M3 D9) while no read is in
-//! flight. A failed read is asked again only every [`REFRESHES_PER_RETRY`]th refresh tick.
+//! write, and on the shell's refresh tick (M3 D9) while no read is in flight: every
+//! [`REFRESHES_PER_READ`]th tick after a good read (M3 review R1 M2), every
+//! [`REFRESHES_PER_RETRY`]th after a failed one.
 
 use htui_core::model::{EntryState, ItemId, QueueMove, QueueOverview, QueueRow, Scope, format_usd};
 use ratatui::Frame;
@@ -80,8 +81,9 @@ pub struct QueueOverlay {
     /// A `QueueOverview` is in flight: `refresh` asks for none. `true` from `new`, because the
     /// shell sends `wants_requests`' read as it pushes the overlay.
     in_flight: bool,
-    /// Refresh ticks `refresh` still lets pass before it asks again after a failed read.
-    retry_in: u32,
+    /// Refresh ticks `refresh` still lets pass before it reads again: [`REFRESHES_PER_READ`] − 1
+    /// after a good read, [`REFRESHES_PER_RETRY`] − 1 after a failed one.
+    wait_in: u32,
     /// A refused queue write's status line (`"{request}: {message}"`) while its re-read is in
     /// flight: if that read fails too, its failure would replace the write's on the status line,
     /// so the overlay posts the write's again.
@@ -107,7 +109,7 @@ impl QueueOverlay {
             cursor: 0,
             anchor: None,
             in_flight: true,
-            retry_in: 0,
+            wait_in: 0,
             write_failure: None,
         }
     }
@@ -426,7 +428,7 @@ impl Overlay for QueueOverlay {
                 self.overview = Some(overview.as_ref().clone());
                 self.failure = None;
                 self.in_flight = false;
-                self.retry_in = 0;
+                self.wait_in = REFRESHES_PER_READ - 1;
                 self.write_failure = None;
                 self.reanchor();
             }
@@ -452,7 +454,7 @@ impl Overlay for QueueOverlay {
                 self.overview = None;
                 self.failure = Some(message.clone());
                 self.in_flight = false;
-                self.retry_in = REFRESHES_PER_RETRY - 1;
+                self.wait_in = REFRESHES_PER_RETRY - 1;
                 if let Some(write) = self.write_failure.take() {
                     ctx.emit(Action::Error(write));
                 }
@@ -469,8 +471,8 @@ impl Overlay for QueueOverlay {
         if self.in_flight {
             return;
         }
-        if self.retry_in > 0 {
-            self.retry_in -= 1;
+        if self.wait_in > 0 {
+            self.wait_in -= 1;
             return;
         }
         self.reread(ctx);
