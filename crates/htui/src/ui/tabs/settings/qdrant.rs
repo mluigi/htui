@@ -257,19 +257,18 @@ impl QdrantSection {
     fn on_confirm_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = views::QDRANT_CONFIRM;
         let chord = KeyChord::from_event(key);
-        for act in ctx.keys().actions(stack, chord) {
-            match act {
-                Act::ConfirmYes => {
-                    self.mode = Mode::Browse;
-                    self.send(StoreRequest::ClearQdrantSettings, ctx);
-                    return Handled::Consumed;
-                }
-                Act::ConfirmNo => {
-                    self.mode = Mode::Browse;
-                    return Handled::Consumed;
-                }
-                _ => break,
+        // The first candidate decides (MOD-67 M3 §6.4): a global act there is the pass rule's.
+        match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmYes) => {
+                self.mode = Mode::Browse;
+                self.send(StoreRequest::ClearQdrantSettings, ctx);
+                return Handled::Consumed;
             }
+            Some(Act::ConfirmNo) => {
+                self.mode = Mode::Browse;
+                return Handled::Consumed;
+            }
+            _ => {}
         }
         if stack.passes(chord) {
             Handled::Pass
