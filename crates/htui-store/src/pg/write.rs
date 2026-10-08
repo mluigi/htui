@@ -8126,11 +8126,14 @@ impl PgStore {
     }
 
     /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
-    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. Entries do not
-    /// keep it open: the runner calls it when nothing is admissible (an empty queue, or a stalled
-    /// one). The re-check is the UPDATE's own `WHERE`, so a resume that opened a new batch after
-    /// the runner's reads is never closed by it, and a run that committed before the statement
-    /// keeps the batch open. `None` when the batch did not close.
+    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. The entries the
+    /// runner read do not keep it open: it calls this when nothing is admissible (an empty queue,
+    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the newest
+    /// `queued_at` among the entries it read, `None` when it read none, and an entry of the box
+    /// queued after that (any entry, for `None`) means an item may be ready that the runner never
+    /// judged. The re-check is the UPDATE's own `WHERE`, so a resume that opened a new batch after
+    /// the runner's reads is never closed by it, and a run or an entry that committed before the
+    /// statement keeps the batch open. `None` when the batch did not close.
     ///
     /// An admission in flight (`create_run` past its `FOR SHARE` on the batch, not yet committed)
     /// is waited for first, by a `FOR UPDATE` on the batch row in a statement of its own. Without
@@ -8146,6 +8149,7 @@ impl PgStore {
     pub async fn close_drained_batch(
         &self,
         batch: BatchId,
+        seen: Option<DateTime<Utc>>,
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
@@ -8169,12 +8173,17 @@ impl PgStore {
                        SELECT 1 FROM run r
                         WHERE r.batch_id = b.id
                           AND r.status IN ('queued', 'running', 'awaiting_approval'))
+               AND NOT EXISTS (
+                       SELECT 1 FROM queue_entry e
+                        WHERE e.box_id = b.box_id
+                          AND ($3::timestamptz IS NULL OR e.queued_at > $3))
             RETURNING b.id AS "id: BatchId", b.box_id AS "box_id: BoxId", b.opened_at,
                       b.opened_by AS "opened_by: UserId", b.closed_at,
                       b.closed_reason AS "closed_reason: BatchClose"
             "#,
             batch.as_uuid(),
             at,
+            seen,
         )
         .fetch_optional(&mut *tx)
         .await

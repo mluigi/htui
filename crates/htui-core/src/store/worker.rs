@@ -575,10 +575,12 @@ pub trait WorkerHost: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<Vec<ItemId>>> + Send;
     /// `Backend::prune_finished_entries`.
     fn prune_finished_entries(&self, box_id: BoxId) -> impl Future<Output = Result<u64>> + Send;
-    /// `Backend::close_drained_batch` (the drain, D3; review M1).
+    /// `Backend::close_drained_batch` (the drain, D3; review M1): `seen` is the newest
+    /// `queued_at` among the entries the runner read, `None` when it read none (review R1 L2).
     fn close_drained_batch(
         &self,
         batch: BatchId,
+        seen: Option<DateTime<Utc>>,
         at: DateTime<Utc>,
     ) -> impl Future<Output = Result<Option<QueueBatch>>> + Send;
 

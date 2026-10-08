@@ -743,8 +743,9 @@ impl Backend {
     }
 
     /// MOD-12 D3 (review M1): the runner's close of exactly `batch`, only while it is still
-    /// closable (open, no live run of its own; entries do not count, M3 D4); `None` when it did
-    /// not close.
+    /// closable (open, no live run of its own, and no entry queued after `seen`, the newest
+    /// `queued_at` the runner read, any entry for `None`; the entries it read do not count, M3 D4,
+    /// review R1 L2); `None` when it did not close.
     ///
     /// # Errors
     ///
@@ -753,11 +754,12 @@ impl Backend {
     pub async fn close_drained_batch(
         &self,
         batch: BatchId,
+        seen: Option<DateTime<Utc>>,
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         match self {
-            Self::Memory(store) => store.close_drained_batch(batch, at).await,
-            Self::Online { pg, .. } => pg.close_drained_batch(batch, at).await,
+            Self::Memory(store) => store.close_drained_batch(batch, seen, at).await,
+            Self::Online { pg, .. } => pg.close_drained_batch(batch, seen, at).await,
             Self::Offline { .. } => Err(orchestration_offline()),
         }
     }

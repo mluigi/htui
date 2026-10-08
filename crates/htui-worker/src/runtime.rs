@@ -2199,8 +2199,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         }
     };
+    // Review R1 L2: the newest entry this sweep judged; the drain skips its close when the box
+    // has a newer one, queued after this read.
+    let seen = entries.iter().map(|entry| entry.queued_at).max();
     if entries.is_empty() {
-        drain(ctx, &batch, Drain::Empty).await;
+        drain(ctx, &batch, Drain::Empty, seen).await;
         return;
     }
     let mut project_ids: Vec<ProjectId> = Vec::new();
@@ -2257,7 +2260,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     if order.is_empty() {
         // L4: nothing is ready (not ready, cancelled in this batch, or escalated).
-        drain(ctx, &batch, Drain::Stalled).await;
+        drain(ctx, &batch, Drain::Stalled, seen).await;
         return;
     }
     // MOD-12 M2 D4: the batch's spend once per sweep, each entry's project caps live (D2), one
@@ -2314,7 +2317,7 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     if admissible.is_empty() {
         // L4: a free slot, and every ordered entry stopped by the spend gate, a malformed cap or
         // an absent project.
-        drain(ctx, &batch, Drain::Stalled).await;
+        drain(ctx, &batch, Drain::Stalled, seen).await;
         return;
     }
     let kit = match Kit::read(&ctx.shared, host, false).await {
@@ -2366,15 +2369,18 @@ enum Drain {
 /// MOD-12 D3, M3 D4 (L4): a batch with nothing admissible (no entry left, or a stalled queue)
 /// closes `drained` once no run of its own is live. The close is of exactly the batch `admit`
 /// read, and re-checks its condition in the same write (review M1), so a pause and a resume
-/// between the reads and the close are never undone.
+/// between the reads and the close are never undone. `seen` is the newest `queued_at` among the
+/// entries `admit` read, `None` when it read none: an entry queued after it keeps the batch open
+/// (review R1 L2), as its item may be ready and was never judged.
 async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     batch: &htui_core::model::QueueBatch,
     why: Drain,
+    seen: Option<DateTime<Utc>>,
 ) {
     match ctx
         .host
-        .close_drained_batch(batch.id, ctx.shared.clock.now())
+        .close_drained_batch(batch.id, seen, ctx.shared.clock.now())
         .await
     {
         Ok(closed) => {
@@ -4011,6 +4017,7 @@ mod queue_store_errors {
         async fn close_drained_batch(
             &self,
             batch: BatchId,
+            seen: Option<DateTime<Utc>>,
             at: DateTime<Utc>,
         ) -> Result<Option<QueueBatch>> {
             self.check("close_drained_batch")?;
@@ -4024,7 +4031,7 @@ mod queue_store_errors {
                     .queue_item(item, ids::BOX, ids::USER, queued_at)
                     .await?;
             }
-            WorkerHost::close_drained_batch(&self.inner, batch, at).await
+            WorkerHost::close_drained_batch(&self.inner, batch, seen, at).await
         }
         async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
             self.check("batch_spend")?;
