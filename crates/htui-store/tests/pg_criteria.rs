@@ -10082,3 +10082,184 @@ async fn move_queue_entry_answers_alike_on_both_stores() {
 
     db.drop_db().await;
 }
+
+// ---- MOD-12 M3 R1 L1: the queue's writers lock its entries in `item_id` order --------------------
+
+/// Three fresh FEATs queued on `ids::BOX`, their heap order the reverse of their `item_id` order
+/// (the highest id is queued first), answered as `[lowest, middle, highest]`. A writer that locks
+/// in heap order takes the highest first; one that locks in `item_id` order, the lowest.
+async fn queued_against_id_order(db: &common::TestDb) -> [ItemId; 3] {
+    let mut items = [ItemId::new(), ItemId::new(), ItemId::new()];
+    items.sort();
+    let at = Utc::now();
+    for &item in items.iter().rev() {
+        queue_feat(&db.store, item, 0).await;
+        db.store
+            .queue_item(item, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+    }
+    items
+}
+
+/// Whether `item`'s entry can be locked right now, from a transaction of its own (`NOWAIT`, so a
+/// lock another transaction holds answers `false` at once).
+async fn entry_lockable(pool: &PgPool, item: ItemId) -> bool {
+    let mut probe = pool.begin().await.expect("begin the probe");
+    let locked = sqlx::query("SELECT 1 FROM queue_entry WHERE item_id = $1 FOR UPDATE NOWAIT")
+        .bind(item.as_uuid())
+        .execute(&mut *probe)
+        .await;
+    probe.rollback().await.expect("release the probe");
+    match locked {
+        Ok(_) => true,
+        Err(sqlx::Error::Database(err)) if err.code().as_deref() == Some("55P03") => false,
+        Err(err) => panic!("the probe failed: {err}"),
+    }
+}
+
+/// A transaction holding `item`'s entry row lock until it is rolled back.
+async fn hold_entry(pool: &PgPool, item: ItemId) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut holder = pool.begin().await.expect("begin the holder");
+    sqlx::query("SELECT 1 FROM queue_entry WHERE item_id = $1 FOR UPDATE")
+        .bind(item.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("lock the entry");
+    holder
+}
+
+/// MOD-12 M3 R1 L1 (Postgres only): `move_queue_entry` locks the box's entries in `item_id`
+/// order. With the lowest id's entry held elsewhere, the move waits on it holding nothing, so the
+/// highest id's entry is still free; a move locking in heap order would already hold it.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_queue_entry_locks_the_entries_in_item_id_order() {
+    use htui_core::model::QueueMove;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let [lowest, middle, highest] = queued_against_id_order(&db).await;
+    let holder = hold_entry(&db.pool, lowest).await;
+    let mover = tokio::spawn({
+        let store = db.store.clone();
+        async move {
+            store
+                .move_queue_entry(ids::BOX, middle, QueueMove::Up)
+                .await
+        }
+    });
+    lock_waiters(&db.pool, 1).await;
+    let free = entry_lockable(&db.pool, highest).await;
+    holder.rollback().await.expect("release the lowest entry");
+
+    assert!(
+        mover.await.expect("the move task").expect("the move"),
+        "the move lands once the lowest entry is released"
+    );
+    assert!(
+        free,
+        "the move waits on the lowest id before it locks any higher one"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 R1 L1 (Postgres only): `prune_finished_entries` locks the entries it deletes in
+/// `item_id` order, as `move_queue_entry` does, so the two never wait on each other in a cycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_finished_entries_locks_the_entries_in_item_id_order() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let items = queued_against_id_order(&db).await;
+    let [lowest, _, highest] = items;
+    // The fixture's own finished entries are pruned first, so only the three are left to delete.
+    db.store
+        .prune_finished_entries(ids::BOX)
+        .await
+        .expect("prune");
+    let finished: Vec<uuid::Uuid> = items.iter().map(|item| item.as_uuid()).collect();
+    sqlx::query("UPDATE item SET status = 'done' WHERE id = ANY($1)")
+        .bind(&finished[..])
+        .execute(&db.pool)
+        .await
+        .expect("finish the three items");
+    let holder = hold_entry(&db.pool, lowest).await;
+    let pruner = tokio::spawn({
+        let store = db.store.clone();
+        async move { store.prune_finished_entries(ids::BOX).await }
+    });
+    lock_waiters(&db.pool, 1).await;
+    let free = entry_lockable(&db.pool, highest).await;
+    holder.rollback().await.expect("release the lowest entry");
+
+    assert_eq!(
+        pruner.await.expect("the prune task").expect("the prune"),
+        3,
+        "the prune deletes all three once the lowest entry is released"
+    );
+    assert!(
+        free,
+        "the prune waits on the lowest id before it locks any higher one"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 R1 L1 (Postgres only): moves and prunes racing on one box's queue all answer; none
+/// is aborted as a deadlock victim (40P01). Each round re-queues six items, half of them
+/// finished, and runs four moves and two prunes at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_moves_and_prunes_never_deadlock() {
+    use htui_core::model::QueueMove;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut items: Vec<ItemId> = (0..6).map(|_| ItemId::new()).collect();
+    items.sort();
+    for &item in items.iter().rev() {
+        queue_feat(&db.store, item, 0).await;
+    }
+    let finished: Vec<uuid::Uuid> = items.iter().step_by(2).map(|item| item.as_uuid()).collect();
+    for round in 0..20 {
+        sqlx::query("UPDATE item SET status = 'open' WHERE id = ANY($1)")
+            .bind(&finished[..])
+            .execute(&db.pool)
+            .await
+            .expect("reopen the finished items");
+        for &item in items.iter().rev() {
+            db.store
+                .queue_item(item, ids::BOX, ids::USER, Utc::now())
+                .await
+                .expect("the item queues");
+        }
+        sqlx::query("UPDATE item SET status = 'done' WHERE id = ANY($1)")
+            .bind(&finished[..])
+            .execute(&db.pool)
+            .await
+            .expect("finish half the items");
+        let moves = (0..4).map(|n| {
+            let store = db.store.clone();
+            let item = items[(round + n) % items.len()];
+            let to = if n % 2 == 0 {
+                QueueMove::Up
+            } else {
+                QueueMove::Down
+            };
+            tokio::spawn(async move { store.move_queue_entry(ids::BOX, item, to).await.map(drop) })
+        });
+        let prunes = (0..2).map(|_| {
+            let store = db.store.clone();
+            tokio::spawn(async move { store.prune_finished_entries(ids::BOX).await.map(drop) })
+        });
+        for answer in join_all(moves.chain(prunes).collect::<Vec<_>>()).await {
+            answer
+                .expect("the task")
+                .unwrap_or_else(|err| panic!("round {round}: a racing queue write failed: {err}"));
+        }
+    }
+
+    db.drop_db().await;
+}
