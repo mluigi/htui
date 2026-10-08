@@ -10,9 +10,10 @@
 //! - **Transport (P7).** The child's threads send [`PaneEvent`]s on the loop's fourth arm;
 //!   [`App::on_pane_event`] parses `Output` into the [`PaneScreen`] (writing back the replies it
 //!   owes, DSR and DA1) and, on `Exited`, reads the file back through [`TempEdit::finish`] (a
-//!   failed wait is answered "lost track of `<value>`", R1 L-1) and hands the outcome to the asking tab through [`App::finish_external_edit`], so no view's
-//!   outcome handling changes. Every event carries a [`PaneId`]; an event of an editor already
-//!   finished or aborted is dropped (B4).
+//!   failed wait is answered "lost track of `<value>`", R1 L-1) and hands the outcome to the
+//!   asking tab through [`App::finish_external_edit`], so no view's outcome handling changes.
+//!   Every event carries a [`PaneId`]; an event of an editor already finished or aborted is
+//!   dropped (B4).
 //! - **Keys (P5, P6).** While an editor is alive [`App::on_key`] asks it first. Focused, only
 //!   `editor.focus` ([`Stack::EDITOR_FOCUSED`]) is htui's; every other key, `ctrl-c` included,
 //!   is encoded ([`encode_key`]) and written. Unfocused is the M1 lock
