@@ -75,6 +75,11 @@ impl App {
             }
         }
         if self.tabs.active_id() != before {
+            // MOD-57 M2 R2 LOW-3: the abort question asks on the asking tab only; left up over
+            // another, its `editor.abort` would abort from there (E2).
+            if self.editor_tab().is_some() && self.tabs.active_id() != self.editor_tab() {
+                self.close_abort_question();
+            }
             self.activate_tab();
         }
     }

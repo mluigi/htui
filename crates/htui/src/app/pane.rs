@@ -614,8 +614,9 @@ impl App {
         self.finish_external_edit(tab, ExternalEditOutcome::Failed(EDITOR_ABORTED.to_owned()));
     }
 
-    /// Closes the abort question if it is open (M2 R1 M-2): the edit it asks about has ended.
-    fn close_abort_question(&mut self) {
+    /// Closes the abort question if it is open: the edit it asks about has ended (M2 R1 M-2), or
+    /// the asking tab is no longer on screen (R2 LOW-3).
+    pub(super) fn close_abort_question(&mut self) {
         if let Some(id) = self.abort_overlay {
             self.close_overlay(id);
         }
@@ -1863,6 +1864,30 @@ mod tests {
             assert!(benches.iter().all(|b| b.seen.borrow().keys.is_empty()));
             assert!(writes(&log).is_empty(), "{key:?}");
         }
+    }
+
+    /// M2 R2 LOW-3: a tab move under the abort question (a reply's focus; keys cannot move it)
+    /// takes the question along, so `ctrl-x` on the other tab is that tab's (E2); the edit stays.
+    #[test]
+    fn a_tab_move_under_the_abort_question_closes_it() {
+        let (mut app, benches, log) = unfocused_two();
+        abortable(&mut app);
+        app.on_key(ctrl('x'));
+        assert_eq!(top(&app), Some(AbortConfirm::ID), "asked");
+
+        app.update(Action::Tab(TabAction::Focus(OTHER)));
+        assert_eq!(app.tabs.active_id(), Some(OTHER));
+        assert!(app.overlays.is_empty(), "the question went with the move");
+        assert!(app.editor_open(), "the edit stays");
+        assert!(log.borrow().is_empty(), "no kill");
+
+        app.on_key(ctrl('x'));
+        assert!(
+            app.editor_open(),
+            "on the other tab the chord is the view's"
+        );
+        assert_eq!(codes(&benches[1]), vec![KeyCode::Char('x')]);
+        assert!(benches.iter().all(|b| b.seen.borrow().heard.is_empty()));
     }
 
     /// M2 R1 M-2: `ctrl-c` under the abort question quits at once (ANA-26 C3).
