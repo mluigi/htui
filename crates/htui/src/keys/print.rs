@@ -135,12 +135,12 @@ close = ["esc"]  # close"#;
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
         assert!(
             printed.ends_with(
-                "[requirements]\nnew_area   = [\"a\"]              # new area\n\
-                               amend      = [\"e\"]              # amend\n\
-                               withdraw   = [\"W\"]              # withdraw\n\
-                               filter     = [\"/\"]              # filter\n\
-                               next_field = [\"tab\", \"down\"]    # next field\n\
-                               prev_field = [\"backtab\", \"up\"]  # previous field\n"
+                "[chat]\ncompose    = [\"i\", \"enter\"]  # compose\n\
+                       next_agent = [\"a\"]           # next agent\n\
+                       end        = [\"esc\"]         # end chat (twice)\n\
+                       thoughts   = [\"t\"]           # thoughts\n\
+                       top        = [\"g\"]           # top\n\
+                       bottom     = [\"G\"]           # bottom\n"
             ),
             "{printed}"
         );

@@ -26,18 +26,25 @@
 //! MOD-67 M4 appends the Skills and Requirements contexts (plan D1): `skills`, a shared context
 //! holding the verbs Library and Templates share (the view switch, the version cursor, base,
 //! diff, `E`, `ctrl-g`), then one view context per Skills view or pane and `requirements`.
+//!
+//! MOD-67 M5 appends the Backlog and Chat contexts (plan D1, blueprint PA-1): `backlog`, a shared
+//! context holding the Backlog tab's own verbs (filter, new item, queue, the replay miss, ...),
+//! then one view context per Backlog sub-tab in strip order, the filter and item forms, and
+//! `chat`. Every chord is today's: no default changes.
 
 use Context::{
-    Common, Concepts, Confirm, Editor, Form, Global, List, Overlay, Pane, Requirements, Settings,
-    SettingsAgents, SettingsBoxes, SettingsConnection, SettingsHierarchy, SettingsKinds,
-    SettingsPersonas, SettingsSecrets, Skills, SkillsAttach, SkillsHelp, SkillsLibrary,
-    SkillsTemplates, Switcher, Waiting,
+    Backlog, BacklogDocs, BacklogFilter, BacklogGraph, BacklogItem, BacklogNotes, BacklogPrompt,
+    BacklogReqs, BacklogRuns, Chat, Common, Concepts, Confirm, Editor, Form, Global, List, Overlay,
+    Pane, Requirements, Settings, SettingsAgents, SettingsBoxes, SettingsConnection,
+    SettingsHierarchy, SettingsKinds, SettingsPersonas, SettingsSecrets, Skills, SkillsAttach,
+    SkillsHelp, SkillsLibrary, SkillsTemplates, Switcher, Waiting,
 };
 
 /// A key context: a TOML table of `keys.toml` and a layer of a context stack (ANA-26 §7.2-§7.3).
 /// M1 has the global, overlay and shared contexts; M3 appends the Settings and overlay view
-/// contexts; M4 the Skills and Requirements ones; M5 appends its own (`BacklogRuns`, ...), each in
-/// its own block.
+/// contexts; M4 the Skills and Requirements ones. M5 appends the Backlog and Chat contexts:
+/// `backlog` (shared), one view context per Backlog sub-tab, the filter and item forms, and
+/// `chat`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Context {
     /// `[global]`: reachable from every screen, checked last.
@@ -100,6 +107,31 @@ pub enum Context {
     SkillsHelp,
     /// `[requirements]`: the Requirements tab.
     Requirements,
+    /// `[backlog]`: the Backlog tab's own verbs (MOD-67 M5 D1); a shared context, like `settings`
+    /// and `skills`, so each sub-tab's table may override them.
+    Backlog,
+    /// `[backlog.body]`: the Backlog's Body sub-tab (no own action; overrides only, M5 PA-1).
+    BacklogBody,
+    /// `[backlog.runs]`: the Backlog's Runs sub-tab.
+    BacklogRuns,
+    /// `[backlog.graph]`: the Backlog's Graph sub-tab.
+    BacklogGraph,
+    /// `[backlog.docs]`: the Backlog's Docs sub-tab and its compose area.
+    BacklogDocs,
+    /// `[backlog.notes]`: the Backlog's Notes sub-tab and its compose area.
+    BacklogNotes,
+    /// `[backlog.prompt]`: the Backlog's Prompt sub-tab (M5 PA-1).
+    BacklogPrompt,
+    /// `[backlog.reqs]`: the Backlog's Reqs sub-tab, its picker and questions.
+    BacklogReqs,
+    /// `[backlog.filter_form]`: the Backlog's filter form. Not `backlog.filter`: that is the
+    /// `[backlog]` verb `filter`, and one TOML key cannot be both a value and a table
+    /// (`no_act_name_is_a_nested_table`).
+    BacklogFilter,
+    /// `[backlog.item]`: the Backlog's item form and its divergence view.
+    BacklogItem,
+    /// `[chat]`: the Chat tab (live, parked, ended, replay).
+    Chat,
 }
 
 impl Context {
@@ -135,6 +167,17 @@ impl Context {
         Self::SkillsAttach,
         Self::SkillsHelp,
         Self::Requirements,
+        Self::Backlog,
+        Self::BacklogBody,
+        Self::BacklogRuns,
+        Self::BacklogGraph,
+        Self::BacklogDocs,
+        Self::BacklogNotes,
+        Self::BacklogPrompt,
+        Self::BacklogReqs,
+        Self::BacklogFilter,
+        Self::BacklogItem,
+        Self::Chat,
     ];
 
     /// The TOML table name: `global`, `overlay`, `list`, ..., `settings.agents`, `concepts`.
@@ -170,6 +213,17 @@ impl Context {
             Self::SkillsAttach => "skills.attach",
             Self::SkillsHelp => "skills.help",
             Self::Requirements => "requirements",
+            Self::Backlog => "backlog",
+            Self::BacklogBody => "backlog.body",
+            Self::BacklogRuns => "backlog.runs",
+            Self::BacklogGraph => "backlog.graph",
+            Self::BacklogDocs => "backlog.docs",
+            Self::BacklogNotes => "backlog.notes",
+            Self::BacklogPrompt => "backlog.prompt",
+            Self::BacklogReqs => "backlog.reqs",
+            Self::BacklogFilter => "backlog.filter_form",
+            Self::BacklogItem => "backlog.item",
+            Self::Chat => "chat",
         }
     }
 
@@ -207,12 +261,24 @@ impl Context {
             Self::SkillsAttach => "Attachments",
             Self::SkillsHelp => "Agent help",
             Self::Requirements => "Requirements",
+            Self::Backlog => "Backlog",
+            Self::BacklogBody => "Body",
+            Self::BacklogRuns => "Runs",
+            Self::BacklogGraph => "Graph",
+            Self::BacklogDocs => "Docs",
+            Self::BacklogNotes => "Notes",
+            Self::BacklogPrompt => "Prompt",
+            Self::BacklogReqs => "Reqs",
+            Self::BacklogFilter => "Filter",
+            Self::BacklogItem => "Item",
+            Self::Chat => "Chat",
         }
     }
 
     /// A view's own context (a Settings section, an overlay, a Skills view or pane, the
-    /// Requirements tab): hosts view verbs, D10 overrides and [`VIEW_DEFAULTS`]; skipped by the
-    /// validator's per-context pass (MOD-67 M3 PA-4).
+    /// Requirements tab, a Backlog sub-tab or form, the Chat tab): hosts view verbs, D10
+    /// overrides and [`VIEW_DEFAULTS`]; skipped by the validator's per-context pass (MOD-67 M3
+    /// PA-4).
     #[must_use]
     pub const fn is_view(self) -> bool {
         matches!(
@@ -236,11 +302,21 @@ impl Context {
                 | Self::SkillsAttach
                 | Self::SkillsHelp
                 | Self::Requirements
+                | Self::BacklogBody
+                | Self::BacklogRuns
+                | Self::BacklogGraph
+                | Self::BacklogDocs
+                | Self::BacklogNotes
+                | Self::BacklogPrompt
+                | Self::BacklogReqs
+                | Self::BacklogFilter
+                | Self::BacklogItem
+                | Self::Chat
         )
     }
 
     /// A shared context a view layer may inherit and override (MOD-67 D10, PA-3): `list`,
-    /// `pane`, `confirm`, `form`, `common`, `settings`, `skills` (M4).
+    /// `pane`, `confirm`, `form`, `common`, `settings`, `skills` (M4), `backlog` (M5).
     #[must_use]
     pub const fn is_shared(self) -> bool {
         matches!(
@@ -252,6 +328,7 @@ impl Context {
                 | Self::Common
                 | Self::Settings
                 | Self::Skills
+                | Self::Backlog
         )
     }
 }
@@ -462,6 +539,123 @@ pub enum Act {
     RequirementsWithdraw,
     /// `requirements.filter`: filter the tree.
     RequirementsFilter,
+    /// `backlog.replay`: replay the step under the Runs cursor, or say how to select one (the
+    /// miss).
+    BacklogReplay,
+    /// `backlog.open_graph`: open the Graph sub-tab.
+    BacklogOpenGraph,
+    /// `backlog.filter`: open the filter form.
+    BacklogOpenFilter,
+    /// `backlog.clear_filter`: clear the filter.
+    BacklogClearFilter,
+    /// `backlog.new_item`: create an item.
+    BacklogNewItem,
+    /// `backlog.queue`: queue or dequeue the selected item.
+    BacklogQueue,
+    /// `backlog.pause_queue`: pause or resume the queue.
+    BacklogPauseQueue,
+    /// `backlog.runs.next_step`: the next step.
+    RunsNextStep,
+    /// `backlog.runs.prev_step`: the previous step.
+    RunsPrevStep,
+    /// `backlog.runs.approve`: approve the step.
+    RunsApprove,
+    /// `backlog.runs.reject`: reject the step with a note.
+    RunsReject,
+    /// `backlog.runs.retry`: retry the step.
+    RunsRetry,
+    /// `backlog.runs.promote`: promote the step to a chat.
+    RunsPromote,
+    /// `backlog.runs.select`: select the winning candidate.
+    RunsSelect,
+    /// `backlog.runs.accept`: accept the step's output.
+    RunsAccept,
+    /// `backlog.runs.open`: open the step's output.
+    RunsOpen,
+    /// `backlog.runs.cancel_run`: cancel the run.
+    RunsCancelRun,
+    /// `backlog.runs.cleanup`: retry the run's cleanup.
+    RunsCleanup,
+    /// `backlog.runs.unblock`: unblock the item.
+    RunsUnblock,
+    /// `backlog.runs.start_run`: start a run.
+    RunsStartRun,
+    /// `backlog.runs.close_out`: close the item out.
+    RunsCloseOut,
+    /// `backlog.runs.follow_up`: send a follow-up.
+    RunsFollowUp,
+    /// `backlog.runs.toggle_view`: toggle between the run list and the flow.
+    RunsToggleView,
+    /// `backlog.runs.zoom_in`: zoom the flow in.
+    RunsZoomIn,
+    /// `backlog.runs.zoom_out`: zoom the flow out.
+    RunsZoomOut,
+    /// `backlog.runs.zoom_fit`: fit the run in the flow.
+    RunsZoomFit,
+    /// `backlog.graph.next_row`: the next graph row.
+    GraphNextRow,
+    /// `backlog.graph.prev_row`: the previous graph row.
+    GraphPrevRow,
+    /// `backlog.graph.deeper`: one level deeper.
+    GraphDeeper,
+    /// `backlog.graph.shallower`: one level shallower.
+    GraphShallower,
+    /// `backlog.graph.reroot`: re-root the graph at the row under the cursor.
+    GraphReroot,
+    /// `backlog.docs.next_row`: the next document.
+    DocsNextRow,
+    /// `backlog.docs.prev_row`: the previous document.
+    DocsPrevRow,
+    /// `backlog.docs.add`: add a document.
+    DocsAdd,
+    /// `backlog.docs.new_version`: add a version of the selected document.
+    DocsNewVersion,
+    /// `backlog.notes.add`: add a note.
+    NotesAdd,
+    /// `backlog.prompt.next_template`: the next prompt template.
+    PromptNextTemplate,
+    /// `backlog.prompt.prev_template`: the previous prompt template.
+    PromptPrevTemplate,
+    /// `backlog.reqs.next_row`: the next requirement row.
+    ReqsNextRow,
+    /// `backlog.reqs.prev_row`: the previous requirement row.
+    ReqsPrevRow,
+    /// `backlog.reqs.reconfirm`: reconfirm the selected citation.
+    ReqsReconfirm,
+    /// `backlog.reqs.cite`: open the requirement picker to cite one.
+    ReqsCite,
+    /// `backlog.reqs.uncite`: uncite the selected requirement.
+    ReqsUncite,
+    /// `backlog.reqs.pick`: pick the requirement under the picker's cursor.
+    ReqsPick,
+    /// `backlog.reqs.addresses`: cite as addressing the requirement.
+    ReqsAddresses,
+    /// `backlog.reqs.reserves`: cite as reserving the requirement.
+    ReqsReserves,
+    /// `backlog.filter_form.next_row`: the filter form's next row.
+    FilterNextRow,
+    /// `backlog.filter_form.prev_row`: the filter form's previous row.
+    FilterPrevRow,
+    /// `backlog.filter_form.clear`: clear the filter draft.
+    FilterClear,
+    /// `backlog.item.theirs`: resolve the divergence with their version.
+    ItemTheirs,
+    /// `backlog.item.mine`: resolve the divergence with my version.
+    ItemMine,
+    /// `backlog.item.switch_diff`: switch the divergence diff between body and paths.
+    ItemSwitchDiff,
+    /// `chat.compose`: open the composer.
+    ChatCompose,
+    /// `chat.next_agent`: the next agent.
+    ChatNextAgent,
+    /// `chat.end`: end the chat (pressed twice).
+    ChatEnd,
+    /// `chat.thoughts`: show or hide the agent's thoughts.
+    ChatThoughts,
+    /// `chat.top`: the transcript's top.
+    ChatTop,
+    /// `chat.bottom`: the transcript's bottom.
+    ChatBottom,
 }
 
 impl Act {
@@ -630,23 +824,25 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
     capture_row(Act::OverlayClose, Overlay, "close", &["esc"], "close"),
     // [list]
-    // backlog/mod.rs:655, requirements/mod.rs:430, connection.rs:811, kinds.rs:1492,
+    // backlog/mod.rs:754, requirements/mod.rs:430, connection.rs:811, kinds.rs:1492,
     // qdrant.rs:404, workspace_switcher.rs:163, waiting_list.rs:274. agents.rs:2420 and
     // hierarchy.rs:1212 take `j` only (ANA §6.6 adds `down`, M3).
     row(Act::ListDown, List, "down", &["j", "down"], "down"),
-    // backlog/mod.rs:656, requirements/mod.rs:431, connection.rs:815, kinds.rs:1496,
+    // backlog/mod.rs:755, requirements/mod.rs:431, connection.rs:815, kinds.rs:1496,
     // boxes.rs:699, library.rs:689.
     row(Act::ListUp, List, "up", &["k", "up"], "up"),
-    // backlog/mod.rs:657, requirements/mod.rs:432. kinds.rs:1476 binds `g` to open graph (M3).
+    // backlog/mod.rs:756, requirements/mod.rs:432. kinds.rs:1476 binds `g` to open graph (M3).
     row(Act::ListTop, List, "top", &["g", "home"], "top"),
-    // backlog/mod.rs:658, requirements/mod.rs:433.
+    // backlog/mod.rs:757, requirements/mod.rs:433.
     row(Act::ListBottom, List, "bottom", &["G", "end"], "bottom"),
-    // backlog/mod.rs:684-689 (fold, else the detail pane), requirements/mod.rs:434. Elsewhere
-    // `Enter` is a view verb (connection.rs:807, workspace_switcher.rs:171).
+    // backlog/mod.rs:791-797 (fold, else the detail pane; the Backlog tries it before the pane,
+    // MOD-67 M5 PA-2), requirements/mod.rs:434. Elsewhere `Enter` is a view verb
+    // (connection.rs:807, workspace_switcher.rs:171).
     row(Act::ListFold, List, "fold", &["enter"], "fold"),
     // [pane]
     // backlog/detail/mod.rs:447 (`Scroll::on_key`), requirements/mod.rs:435, library.rs:708,
-    // templates.rs:528. runs.rs:1434 `J` is next step (a view verb, ANA §6.2).
+    // templates.rs:528. runs.rs:1546 `J` is next step (a view verb, ANA §6.2:
+    // `backlog.runs.next_step`).
     row(
         Act::PaneScrollDown,
         Pane,
@@ -660,7 +856,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
     row(Act::PanePageDown, Pane, "page_down", &["pgdn"], "page down"),
     // backlog/detail/mod.rs:450.
     row(Act::PanePageUp, Pane, "page_up", &["pgup"], "page up"),
-    // backlog/mod.rs:659. Settings cycles sections through `settings.next_section` (M3).
+    // backlog/mod.rs:758. Settings cycles sections through `settings.next_section` (M3).
     row(
         Act::PaneNextSubtab,
         Pane,
@@ -668,7 +864,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["l", "]", "right"],
         "next sub-tab",
     ),
-    // backlog/mod.rs:660. Settings: `settings.prev_section` (M3).
+    // backlog/mod.rs:759. Settings: `settings.prev_section` (M3).
     row(
         Act::PanePrevSubtab,
         Pane,
@@ -678,17 +874,18 @@ pub static CATALOGUE: &[ActionSpec] = &[
     ),
     // [confirm]
     // connection.rs:483, qdrant.rs:214, kinds.rs:715, hierarchy.rs:769, personas.rs:785,
-    // boxes.rs:545, runs.rs:583, detail/requirements.rs:306. migration_prompt.rs:92 also
+    // boxes.rs:545, runs.rs:640, detail/requirements.rs:306. migration_prompt.rs:92 also
     // takes `Y`: a `VIEW_DEFAULTS` row.
     row(Act::ConfirmYes, Confirm, "yes", &["y"], "yes"),
     // connection.rs:487, qdrant.rs:218, kinds.rs:726, agents.rs:1161, boxes.rs:546,
-    // personas.rs:791, runs.rs:587, detail/requirements.rs:317, hierarchy.rs:761.
+    // personas.rs:791, runs.rs:644, detail/requirements.rs:317, hierarchy.rs:761.
     // migration_prompt.rs:97 also takes `N`: a `VIEW_DEFAULTS` row.
     row(Act::ConfirmNo, Confirm, "no", &["n", "esc"], "no"),
     // [form]: all in capture; every chord is named or ctrl.
     // item_form.rs:613, requirements/forms.rs:306, compose.rs:340. The Settings forms also
     // take `Down` (agents.rs:2166): `VIEW_DEFAULTS` rows (M3); so do the Library rename form,
-    // the attachment form and the Requirements forms (M4 `VIEW_DEFAULTS` rows).
+    // the attachment form and the Requirements forms (M4 `VIEW_DEFAULTS` rows), and the item
+    // form, the Docs compose area and the filter form (M5 `VIEW_DEFAULTS` rows).
     capture_row(
         Act::FormNextField,
         Form,
@@ -697,7 +894,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "next field",
     ),
     // item_form.rs:617, requirements/forms.rs:310, compose.rs:344. The Settings forms also
-    // take `Up`: `VIEW_DEFAULTS` rows (M3); so do the M4 forms above.
+    // take `Up`: `VIEW_DEFAULTS` rows (M3); so do the M4 and M5 forms above.
     capture_row(
         Act::FormPrevField,
         Form,
@@ -709,7 +906,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // library.rs:990. Every site also accepts `ctrl-S` (blueprint F-7, M4). The Library and
     // Templates editors resolve it after their widget passes the chord; Requirements sends a
     // modified chord (`ctrl-s` by default) straight to the resolver and a plain one (a rebound
-    // `f2`) to its widget first (MOD-67 M4 PA-3).
+    // `f2`) to its widget first (MOD-67 M4 PA-3). The Backlog's item form and Notes/Docs compose
+    // areas resolve it after their widgets (MOD-67 M5 D8).
     capture_row(Act::FormSave, Form, "save", &["ctrl-s"], "save"),
     // item_form.rs:281 (label at :63), library.rs:1021, templates.rs:689. Same `E` alias.
     capture_row(
@@ -721,10 +919,10 @@ pub static CATALOGUE: &[ActionSpec] = &[
     ),
     // [common]
     // connection.rs:779, qdrant.rs:382, kinds.rs:1468, hierarchy.rs:1241, prompt.rs:849,
-    // agents.rs:2401, backlog/mod.rs:680. boxes.rs:707 `e` edits quirks (a view verb).
+    // agents.rs:2401, backlog/mod.rs:779. boxes.rs:707 `e` edits quirks (a view verb).
     row(Act::Edit, Common, "edit", &["e"], "edit"),
     // kinds.rs:1452, hierarchy.rs:1233, agents.rs:2395, library.rs:694, templates.rs:527.
-    // backlog/mod.rs:679 uses `N`.
+    // The Backlog's `N` is `backlog.new_item`.
     row(Act::New, Common, "new", &["n"], "new"),
     // hierarchy.rs:1279, kinds.rs:1484.
     row(Act::Delete, Common, "delete", &["d"], "delete"),
@@ -1172,6 +1370,357 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["/"],
         "filter",
     ),
+    // [backlog]: the Backlog tab's own verbs (MOD-67 M5 D1), one row each, so each sub-tab's
+    // table may override them; every Backlog browse stack carries this layer.
+    // backlog/mod.rs:791-797 (the pane's `Enter`), app/mod.rs:143-148 (the miss row, MOD-67 M5 D6):
+    // offered on every sub-tab, so the miss fires from each.
+    row(
+        Act::BacklogReplay,
+        Backlog,
+        "replay",
+        &["enter"],
+        "replay step",
+    ),
+    // backlog/mod.rs:762, app/mod.rs:152.
+    row(
+        Act::BacklogOpenGraph,
+        Backlog,
+        "open_graph",
+        &["m"],
+        "open graph",
+    ),
+    // backlog/mod.rs:767.
+    row(Act::BacklogOpenFilter, Backlog, "filter", &["f"], "filter"),
+    // backlog/mod.rs:770.
+    row(
+        Act::BacklogClearFilter,
+        Backlog,
+        "clear_filter",
+        &["F"],
+        "clear filter",
+    ),
+    // backlog/mod.rs:778: `N`, not `common.new`'s `n` (MOD-67 M5 D2).
+    row(Act::BacklogNewItem, Backlog, "new_item", &["N"], "new item"),
+    // backlog/mod.rs:783.
+    row(
+        Act::BacklogQueue,
+        Backlog,
+        "queue",
+        &["Q"],
+        "queue / dequeue",
+    ),
+    // backlog/mod.rs:784.
+    row(
+        Act::BacklogPauseQueue,
+        Backlog,
+        "pause_queue",
+        &["P"],
+        "pause / resume queue",
+    ),
+    // [backlog.runs]
+    // runs.rs:1546 (ANA-26 §6.2: `J` is the step cursor here, not `pane.scroll_down`).
+    row(
+        Act::RunsNextStep,
+        BacklogRuns,
+        "next_step",
+        &["J"],
+        "next step",
+    ),
+    // runs.rs:1550.
+    row(
+        Act::RunsPrevStep,
+        BacklogRuns,
+        "prev_step",
+        &["K"],
+        "previous step",
+    ),
+    // runs.rs:1580 -> :757.
+    row(Act::RunsApprove, BacklogRuns, "approve", &["a"], "approve"),
+    // runs.rs:764.
+    row(Act::RunsReject, BacklogRuns, "reject", &["x"], "reject"),
+    // runs.rs:771.
+    row(Act::RunsRetry, BacklogRuns, "retry", &["r"], "retry step"),
+    // runs.rs:774.
+    row(
+        Act::RunsPromote,
+        BacklogRuns,
+        "promote",
+        &["p"],
+        "promote to chat",
+    ),
+    // runs.rs:777.
+    row(
+        Act::RunsSelect,
+        BacklogRuns,
+        "select",
+        &["s"],
+        "select winner",
+    ),
+    // runs.rs:785.
+    row(
+        Act::RunsAccept,
+        BacklogRuns,
+        "accept",
+        &["A"],
+        "accept output",
+    ),
+    // runs.rs:793.
+    row(Act::RunsOpen, BacklogRuns, "open", &["o"], "open output"),
+    // runs.rs:738 (`'c'`).
+    row(
+        Act::RunsCancelRun,
+        BacklogRuns,
+        "cancel_run",
+        &["c"],
+        "cancel run",
+    ),
+    // runs.rs:738 (`'T'`).
+    row(
+        Act::RunsCleanup,
+        BacklogRuns,
+        "cleanup",
+        &["T"],
+        "retry cleanup",
+    ),
+    // runs.rs:712.
+    row(Act::RunsUnblock, BacklogRuns, "unblock", &["u"], "unblock"),
+    // runs.rs:717.
+    row(
+        Act::RunsStartRun,
+        BacklogRuns,
+        "start_run",
+        &["R"],
+        "start run",
+    ),
+    // runs.rs:727.
+    row(
+        Act::RunsCloseOut,
+        BacklogRuns,
+        "close_out",
+        &["C"],
+        "close out",
+    ),
+    // runs.rs:708.
+    row(
+        Act::RunsFollowUp,
+        BacklogRuns,
+        "follow_up",
+        &["i"],
+        "follow up",
+    ),
+    // runs.rs:1560.
+    row(
+        Act::RunsToggleView,
+        BacklogRuns,
+        "toggle_view",
+        &["v"],
+        "list / flow",
+    ),
+    // runs.rs:1575.
+    row(Act::RunsZoomIn, BacklogRuns, "zoom_in", &["+"], "zoom in"),
+    // runs.rs:1576.
+    row(
+        Act::RunsZoomOut,
+        BacklogRuns,
+        "zoom_out",
+        &["-"],
+        "zoom out",
+    ),
+    // runs.rs:1577.
+    row(
+        Act::RunsZoomFit,
+        BacklogRuns,
+        "zoom_fit",
+        &["="],
+        "fit the run",
+    ),
+    // [backlog.graph]
+    // graph.rs:695.
+    row(
+        Act::GraphNextRow,
+        BacklogGraph,
+        "next_row",
+        &["J"],
+        "next row",
+    ),
+    // graph.rs:696.
+    row(
+        Act::GraphPrevRow,
+        BacklogGraph,
+        "prev_row",
+        &["K"],
+        "previous row",
+    ),
+    // graph.rs:699.
+    row(Act::GraphDeeper, BacklogGraph, "deeper", &["+"], "deeper"),
+    // graph.rs:700.
+    row(
+        Act::GraphShallower,
+        BacklogGraph,
+        "shallower",
+        &["-"],
+        "shallower",
+    ),
+    // graph.rs:701 (MOD-67 M5 PA-2): always consumes `Enter`, so it shadows
+    // `backlog.replay` (`SHADOWING`).
+    row(
+        Act::GraphReroot,
+        BacklogGraph,
+        "reroot",
+        &["enter"],
+        "re-root",
+    ),
+    // [backlog.docs]
+    // documents.rs:461.
+    row(
+        Act::DocsNextRow,
+        BacklogDocs,
+        "next_row",
+        &["J"],
+        "next row",
+    ),
+    // documents.rs:465.
+    row(
+        Act::DocsPrevRow,
+        BacklogDocs,
+        "prev_row",
+        &["K"],
+        "previous row",
+    ),
+    // documents.rs:469.
+    row(Act::DocsAdd, BacklogDocs, "add", &["a"], "new document"),
+    // documents.rs:473.
+    row(
+        Act::DocsNewVersion,
+        BacklogDocs,
+        "new_version",
+        &["v"],
+        "new version",
+    ),
+    // [backlog.notes]
+    // notes.rs:303.
+    row(Act::NotesAdd, BacklogNotes, "add", &["a"], "add note"),
+    // [backlog.prompt]
+    // prompt.rs:329 (MOD-67 M5 PA-1).
+    row(
+        Act::PromptNextTemplate,
+        BacklogPrompt,
+        "next_template",
+        &["n"],
+        "next template",
+    ),
+    // prompt.rs:330.
+    row(
+        Act::PromptPrevTemplate,
+        BacklogPrompt,
+        "prev_template",
+        &["p"],
+        "previous template",
+    ),
+    // [backlog.reqs]
+    // detail/requirements.rs:478, :328 (the picker's `J`).
+    row(
+        Act::ReqsNextRow,
+        BacklogReqs,
+        "next_row",
+        &["J"],
+        "next row",
+    ),
+    // detail/requirements.rs:479, :331.
+    row(
+        Act::ReqsPrevRow,
+        BacklogReqs,
+        "prev_row",
+        &["K"],
+        "previous row",
+    ),
+    // detail/requirements.rs:480.
+    row(
+        Act::ReqsReconfirm,
+        BacklogReqs,
+        "reconfirm",
+        &["r"],
+        "reconfirm",
+    ),
+    // detail/requirements.rs:481.
+    row(Act::ReqsCite, BacklogReqs, "cite", &["c"], "cite"),
+    // detail/requirements.rs:482.
+    row(Act::ReqsUncite, BacklogReqs, "uncite", &["u"], "uncite"),
+    // detail/requirements.rs:334.
+    row(Act::ReqsPick, BacklogReqs, "pick", &["enter"], "pick"),
+    // detail/requirements.rs:280.
+    row(
+        Act::ReqsAddresses,
+        BacklogReqs,
+        "addresses",
+        &["a"],
+        "addresses",
+    ),
+    // detail/requirements.rs:281.
+    row(
+        Act::ReqsReserves,
+        BacklogReqs,
+        "reserves",
+        &["v"],
+        "reserves",
+    ),
+    // [backlog.filter_form]
+    // filter.rs:250 (`'j'`; `Down` and `Tab` are `form.next_field`, `VIEW_DEFAULTS`).
+    row(
+        Act::FilterNextRow,
+        BacklogFilter,
+        "next_row",
+        &["j"],
+        "next row",
+    ),
+    // filter.rs:251.
+    row(
+        Act::FilterPrevRow,
+        BacklogFilter,
+        "prev_row",
+        &["k"],
+        "previous row",
+    ),
+    // filter.rs:255: clears the whole draft (a form verb, not an option's value).
+    row(Act::FilterClear, BacklogFilter, "clear", &["x"], "clear"),
+    // [backlog.item]
+    // divergence.rs:247.
+    row(
+        Act::ItemTheirs,
+        BacklogItem,
+        "theirs",
+        &["t", "T"],
+        "theirs wins",
+    ),
+    // divergence.rs:248.
+    row(Act::ItemMine, BacklogItem, "mine", &["m", "M"], "mine wins"),
+    // divergence.rs:249.
+    row(
+        Act::ItemSwitchDiff,
+        BacklogItem,
+        "switch_diff",
+        &["tab", "backtab"],
+        "body/paths",
+    ),
+    // [chat]
+    // chat/mod.rs:498.
+    row(
+        Act::ChatCompose,
+        Chat,
+        "compose",
+        &["i", "enter"],
+        "compose",
+    ),
+    // chat/mod.rs:502.
+    row(Act::ChatNextAgent, Chat, "next_agent", &["a"], "next agent"),
+    // chat/mod.rs:506.
+    row(Act::ChatEnd, Chat, "end", &["esc"], "end chat (twice)"),
+    // transcript.rs:491.
+    row(Act::ChatThoughts, Chat, "thoughts", &["t"], "thoughts"),
+    // transcript.rs:483: no Chat stack offers `list.top`, so the name is the view's.
+    row(Act::ChatTop, Chat, "top", &["g"], "top"),
+    // transcript.rs:487.
+    row(Act::ChatBottom, Chat, "bottom", &["G"], "bottom"),
 ];
 
 /// Extra default chords a view adds to a shared act, on top of whatever the shared row resolves
@@ -1272,12 +1821,23 @@ mod tests {
             Context::SkillsAttach => 26,
             Context::SkillsHelp => 27,
             Context::Requirements => 28,
+            Context::Backlog => 29,
+            Context::BacklogBody => 30,
+            Context::BacklogRuns => 31,
+            Context::BacklogGraph => 32,
+            Context::BacklogDocs => 33,
+            Context::BacklogNotes => 34,
+            Context::BacklogPrompt => 35,
+            Context::BacklogReqs => 36,
+            Context::BacklogFilter => 37,
+            Context::BacklogItem => 38,
+            Context::Chat => 39,
         }
     }
 
     #[test]
     fn every_context_is_listed_once_in_all() {
-        assert_eq!(Context::ALL.len(), 29);
+        assert_eq!(Context::ALL.len(), 40);
         for (index, context) in Context::ALL.iter().enumerate() {
             assert_eq!(
                 context_position(*context),
@@ -1418,6 +1978,64 @@ mod tests {
         Act::RequirementsAmend,
         Act::RequirementsWithdraw,
         Act::RequirementsFilter,
+        Act::BacklogReplay,
+        Act::BacklogOpenGraph,
+        Act::BacklogOpenFilter,
+        Act::BacklogClearFilter,
+        Act::BacklogNewItem,
+        Act::BacklogQueue,
+        Act::BacklogPauseQueue,
+        Act::RunsNextStep,
+        Act::RunsPrevStep,
+        Act::RunsApprove,
+        Act::RunsReject,
+        Act::RunsRetry,
+        Act::RunsPromote,
+        Act::RunsSelect,
+        Act::RunsAccept,
+        Act::RunsOpen,
+        Act::RunsCancelRun,
+        Act::RunsCleanup,
+        Act::RunsUnblock,
+        Act::RunsStartRun,
+        Act::RunsCloseOut,
+        Act::RunsFollowUp,
+        Act::RunsToggleView,
+        Act::RunsZoomIn,
+        Act::RunsZoomOut,
+        Act::RunsZoomFit,
+        Act::GraphNextRow,
+        Act::GraphPrevRow,
+        Act::GraphDeeper,
+        Act::GraphShallower,
+        Act::GraphReroot,
+        Act::DocsNextRow,
+        Act::DocsPrevRow,
+        Act::DocsAdd,
+        Act::DocsNewVersion,
+        Act::NotesAdd,
+        Act::PromptNextTemplate,
+        Act::PromptPrevTemplate,
+        Act::ReqsNextRow,
+        Act::ReqsPrevRow,
+        Act::ReqsReconfirm,
+        Act::ReqsCite,
+        Act::ReqsUncite,
+        Act::ReqsPick,
+        Act::ReqsAddresses,
+        Act::ReqsReserves,
+        Act::FilterNextRow,
+        Act::FilterPrevRow,
+        Act::FilterClear,
+        Act::ItemTheirs,
+        Act::ItemMine,
+        Act::ItemSwitchDiff,
+        Act::ChatCompose,
+        Act::ChatNextAgent,
+        Act::ChatEnd,
+        Act::ChatThoughts,
+        Act::ChatTop,
+        Act::ChatBottom,
     ];
 
     /// `act`'s index in [`ALL`]. No wildcard arm: a new variant fails to compile here until it is
@@ -1525,6 +2143,64 @@ mod tests {
             Act::RequirementsAmend => 98,
             Act::RequirementsWithdraw => 99,
             Act::RequirementsFilter => 100,
+            Act::BacklogReplay => 101,
+            Act::BacklogOpenGraph => 102,
+            Act::BacklogOpenFilter => 103,
+            Act::BacklogClearFilter => 104,
+            Act::BacklogNewItem => 105,
+            Act::BacklogQueue => 106,
+            Act::BacklogPauseQueue => 107,
+            Act::RunsNextStep => 108,
+            Act::RunsPrevStep => 109,
+            Act::RunsApprove => 110,
+            Act::RunsReject => 111,
+            Act::RunsRetry => 112,
+            Act::RunsPromote => 113,
+            Act::RunsSelect => 114,
+            Act::RunsAccept => 115,
+            Act::RunsOpen => 116,
+            Act::RunsCancelRun => 117,
+            Act::RunsCleanup => 118,
+            Act::RunsUnblock => 119,
+            Act::RunsStartRun => 120,
+            Act::RunsCloseOut => 121,
+            Act::RunsFollowUp => 122,
+            Act::RunsToggleView => 123,
+            Act::RunsZoomIn => 124,
+            Act::RunsZoomOut => 125,
+            Act::RunsZoomFit => 126,
+            Act::GraphNextRow => 127,
+            Act::GraphPrevRow => 128,
+            Act::GraphDeeper => 129,
+            Act::GraphShallower => 130,
+            Act::GraphReroot => 131,
+            Act::DocsNextRow => 132,
+            Act::DocsPrevRow => 133,
+            Act::DocsAdd => 134,
+            Act::DocsNewVersion => 135,
+            Act::NotesAdd => 136,
+            Act::PromptNextTemplate => 137,
+            Act::PromptPrevTemplate => 138,
+            Act::ReqsNextRow => 139,
+            Act::ReqsPrevRow => 140,
+            Act::ReqsReconfirm => 141,
+            Act::ReqsCite => 142,
+            Act::ReqsUncite => 143,
+            Act::ReqsPick => 144,
+            Act::ReqsAddresses => 145,
+            Act::ReqsReserves => 146,
+            Act::FilterNextRow => 147,
+            Act::FilterPrevRow => 148,
+            Act::FilterClear => 149,
+            Act::ItemTheirs => 150,
+            Act::ItemMine => 151,
+            Act::ItemSwitchDiff => 152,
+            Act::ChatCompose => 153,
+            Act::ChatNextAgent => 154,
+            Act::ChatEnd => 155,
+            Act::ChatThoughts => 156,
+            Act::ChatTop => 157,
+            Act::ChatBottom => 158,
         }
     }
 
@@ -1549,7 +2225,7 @@ mod tests {
 
     #[test]
     fn every_act_has_exactly_one_row() {
-        assert_eq!(CATALOGUE.len(), 101);
+        assert_eq!(CATALOGUE.len(), 159);
         let acts: HashSet<Act> = CATALOGUE.iter().map(|row| row.act).collect();
         assert_eq!(acts.len(), CATALOGUE.len(), "an act has two rows");
         for row in CATALOGUE {
@@ -1703,6 +2379,17 @@ mod tests {
             (Context::SkillsAttach, "skills.attach", "Attachments"),
             (Context::SkillsHelp, "skills.help", "Agent help"),
             (Context::Requirements, "requirements", "Requirements"),
+            (Context::Backlog, "backlog", "Backlog"),
+            (Context::BacklogBody, "backlog.body", "Body"),
+            (Context::BacklogRuns, "backlog.runs", "Runs"),
+            (Context::BacklogGraph, "backlog.graph", "Graph"),
+            (Context::BacklogDocs, "backlog.docs", "Docs"),
+            (Context::BacklogNotes, "backlog.notes", "Notes"),
+            (Context::BacklogPrompt, "backlog.prompt", "Prompt"),
+            (Context::BacklogReqs, "backlog.reqs", "Reqs"),
+            (Context::BacklogFilter, "backlog.filter_form", "Filter"),
+            (Context::BacklogItem, "backlog.item", "Item"),
+            (Context::Chat, "chat", "Chat"),
         ];
         assert_eq!(table.len(), Context::ALL.len());
         for (context, name, heading) in table {
@@ -1725,6 +2412,38 @@ mod tests {
             Context::Requirements,
         ] {
             assert!(context.is_view() && !context.is_shared(), "{context:?}");
+        }
+        // MOD-67 M5 §3.1: `backlog` is shared (every Backlog sub-tab inherits it), the rest views.
+        assert!(Context::Backlog.is_shared() && !Context::Backlog.is_view());
+        for context in [
+            Context::BacklogBody,
+            Context::BacklogRuns,
+            Context::BacklogGraph,
+            Context::BacklogDocs,
+            Context::BacklogNotes,
+            Context::BacklogPrompt,
+            Context::BacklogReqs,
+            Context::BacklogFilter,
+            Context::BacklogItem,
+            Context::Chat,
+        ] {
+            assert!(context.is_view() && !context.is_shared(), "{context:?}");
+        }
+    }
+
+    /// A key file nests a context's table under its parent's (`[backlog.runs]` is `runs` in
+    /// `[backlog]`), so an act named like a nested context would be one TOML key twice: the
+    /// default print would not read back (MOD-67 M5).
+    #[test]
+    fn no_act_name_is_a_nested_table() {
+        for row in CATALOGUE {
+            let nested = format!("{}.{}", row.context.table(), row.name);
+            assert!(
+                Context::ALL.iter().all(|context| context.table() != nested),
+                "[{}] {} is also the table [{nested}]",
+                row.context.table(),
+                row.name
+            );
         }
     }
 
