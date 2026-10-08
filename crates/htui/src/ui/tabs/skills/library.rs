@@ -46,9 +46,9 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::TemplateBody;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::Scroll;
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme, diff};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 
 /// How many rows the notice may wrap to before it is cut; one when it fits.
 const NOTICE_LINES: usize = 2;
@@ -121,16 +121,23 @@ const SCROLL_HINT: HintSpec = &[
     Hint::Pair(Act::PanePageUp, Act::PanePageDown, "page"),
 ];
 
-/// The hint row while naming or describing a new skill.
-const NAMING_HINT: &str = "Enter next  Esc cancel";
+/// The hint row while naming or describing a new skill: `Enter` and `Esc` are the field's.
+const NAMING_HINT: HintSpec = &[Hint::Text("Enter next"), Hint::Text("Esc cancel")];
 
-/// The hint row on the rename form.
-const INFO_HINT: &str = "Tab field  Ctrl+S save  Esc cancel";
+/// The hint row on the rename form (`Esc` is the field's).
+const INFO_HINT: HintSpec = &[
+    Hint::One(Act::FormNextField, "field"),
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The hint row in the editor, before the cursor's `L{line}:C{col}`.
-///
-/// `Ctrl+G` is MOD-55's, hard-coded beside `Ctrl+S`/`Ctrl+E` (plan P10).
-const EDIT_HINT: &str = "Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel";
+/// The hint row in the editor, before the cursor's `L{line}:C{col}` (`Esc` is the area's).
+const EDIT_HINT: HintSpec = &[
+    Hint::One(Act::FormSave, "save"),
+    Hint::One(Act::SkillsAskAgent, "ask agent"),
+    Hint::One(Act::FormExternalEditor, "$EDITOR"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The hint row while a `Ctrl+E` handoff holds the draft: `$EDITOR` has the keys.
 const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
@@ -139,8 +146,8 @@ const HANDED_OFF_HINT: HintSpec = &[Hint::Text("the draft is in $EDITOR")];
 /// belongs to a project.
 const NO_PROJECT: &str = "no project in this workspace \u{2014} agent help records its run in one";
 
-/// The hint row on the import form.
-const IMPORT_HINT: &str = "Enter import  Esc cancel";
+/// The hint row on the import form: `Enter` and `Esc` are the field's.
+const IMPORT_HINT: HintSpec = &[Hint::Text("Enter import"), Hint::Text("Esc cancel")];
 
 /// The hint row on the import report.
 const REPORT_HINT: HintSpec = &[
@@ -481,9 +488,15 @@ fn outcome_row(outcome: &ImportOutcome) -> (char, String, bool) {
     }
 }
 
-/// A `CONTROL` chord (`SHIFT` allowed).
-fn chord(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
+/// A prompt's key its field passed (MOD-67 M4 PA-2): `global.next_tab`/`prev_tab` pass, so the
+/// shell switches tabs with the prompt kept; anything else is `modal_rest`'s through
+/// `views::LIBRARY_PROMPT`.
+fn prompt_rest(key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+    let chord = KeyChord::from_event(key);
+    match ctx.keys().actions(views::LIBRARY_PROMPT, chord).first() {
+        Some(Act::NextTab | Act::PrevTab) => Handled::Pass,
+        _ => modal_rest(views::LIBRARY_PROMPT, chord),
+    }
 }
 
 impl LibraryView {
@@ -493,11 +506,18 @@ impl LibraryView {
         if self.attach.is_some() {
             return None;
         }
-        match &self.mode {
-            Mode::Browse => Some(views::LIBRARY_BROWSE),
-            Mode::Report { .. } => Some(views::LIBRARY_REPORT),
-            _ => None,
-        }
+        Some(match &self.mode {
+            Mode::Browse => views::LIBRARY_BROWSE,
+            Mode::Naming { .. } | Mode::Describing { .. } | Mode::ImportPath { .. } => {
+                views::LIBRARY_PROMPT
+            }
+            Mode::Info(_) => views::LIBRARY_INFO,
+            Mode::Editing(editor) => match &editor.help {
+                Some(help) => help.key_stack(),
+                None => views::LIBRARY_EDITOR,
+            },
+            Mode::Report { .. } => views::LIBRARY_REPORT,
+        })
     }
 
     /// [`key_stack`](Self::key_stack), which always has one: what `render` reads.
@@ -566,7 +586,7 @@ impl LibraryView {
         }
         match self.mode {
             Mode::Browse => self.on_browse_key(key, ctx),
-            Mode::Naming { .. } | Mode::Describing { .. } => self.on_naming_key(key),
+            Mode::Naming { .. } | Mode::Describing { .. } => self.on_naming_key(key, ctx),
             Mode::Info(_) => self.on_info_key(key, ctx),
             Mode::Editing(_) => self.on_editor_key(key, ctx),
             Mode::ImportPath { .. } => self.on_import_key(key, ctx),
@@ -722,7 +742,12 @@ impl LibraryView {
                     Some(help) => help.hint(ctx.keys()),
                     None => {
                         let (line, col) = editor.area.cursor_line_col();
-                        format!("{EDIT_HINT}  L{}:C{}", line + 1, col + 1)
+                        format!(
+                            "{} \u{b7} L{}:C{}",
+                            ctx.keys().hint(self.stack(), EDIT_HINT),
+                            line + 1,
+                            col + 1
+                        )
                     }
                 }
             }
@@ -736,14 +761,13 @@ impl LibraryView {
             }
             (_, _, mode, _) => {
                 self.render_browse(frame, content, ctx);
-                match mode {
-                    Mode::Naming { .. } | Mode::Describing { .. } => NAMING_HINT.to_owned(),
-                    Mode::Info(_) => INFO_HINT.to_owned(),
-                    Mode::ImportPath { .. } => IMPORT_HINT.to_owned(),
-                    Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => {
-                        ctx.keys().hint(self.stack(), BROWSE_HINT)
-                    }
-                }
+                let spec = match mode {
+                    Mode::Naming { .. } | Mode::Describing { .. } => NAMING_HINT,
+                    Mode::Info(_) => INFO_HINT,
+                    Mode::ImportPath { .. } => IMPORT_HINT,
+                    Mode::Browse | Mode::Editing(_) | Mode::Report { .. } => BROWSE_HINT,
+                };
+                ctx.keys().hint(self.stack(), spec)
             }
         };
         frame.render_widget(
@@ -910,14 +934,16 @@ impl LibraryView {
     }
 
     /// `n`'s two prompts. A refused name keeps the prompt open, so a typo is one `Backspace` away.
-    fn on_naming_key(&mut self, key: KeyEvent) -> Handled {
+    /// The field sees a key first (`Enter` and `Esc` are its own); what it passes goes to
+    /// [`prompt_rest`].
+    fn on_naming_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let outcome = match &mut self.mode {
             Mode::Naming { field } | Mode::Describing { field, .. } => field.on_key(key),
             _ => return Handled::Pass,
         };
         match outcome {
             FieldOutcome::Consumed => Handled::Consumed,
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => prompt_rest(key, ctx),
             FieldOutcome::Cancel => {
                 self.mode = Mode::Browse;
                 self.notice = None;
@@ -951,7 +977,7 @@ impl LibraryView {
         };
         match field.on_key(key) {
             FieldOutcome::Consumed => Handled::Consumed,
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => prompt_rest(key, ctx),
             FieldOutcome::Cancel => {
                 self.mode = Mode::Browse;
                 self.notice = None;
@@ -1029,12 +1055,11 @@ impl LibraryView {
         };
     }
 
-    /// The rename form: `Tab`/`Shift+Tab`/arrows move, `Enter` or `Ctrl+S` save, `Esc` closes.
+    /// The rename form, widget first (MOD-67 M4 PA-3): the focused field's `Enter` saves and its
+    /// `Esc` closes; what it passes resolves through `views::LIBRARY_INFO`, where
+    /// `form.next_field`/`prev_field` (`Tab`, `Shift+Tab`, `Down`, `Up`) move and `form.save`
+    /// (`Ctrl+s`) saves. Any other key is `modal_rest`'s.
     fn on_info_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if chord(&key) && matches!(key.code, KeyCode::Char('s' | 'S')) {
-            self.save_info(ctx);
-            return Handled::Consumed;
-        }
         let Mode::Info(form) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -1058,14 +1083,20 @@ impl LibraryView {
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass => match key.code {
-                KeyCode::Tab | KeyCode::BackTab | KeyCode::Up | KeyCode::Down => {
-                    form.focus = 1 - form.focus;
-                    Handled::Consumed
+            FieldOutcome::Pass => {
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(views::LIBRARY_INFO, chord).first() {
+                    Some(Act::FormNextField | Act::FormPrevField) => {
+                        form.focus = 1 - form.focus;
+                        Handled::Consumed
+                    }
+                    Some(Act::FormSave) => {
+                        self.save_info(ctx);
+                        Handled::Consumed
+                    }
+                    _ => modal_rest(views::LIBRARY_INFO, chord),
                 }
-                _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-                _ => Handled::Consumed,
-            },
+            }
         }
     }
 
@@ -1110,24 +1141,19 @@ impl LibraryView {
         );
     }
 
-    /// The editor: `Ctrl+S` (the area's `Submit`), `Ctrl+G`, `Ctrl+E` and `Esc` are the view's;
-    /// `Tab` and `Shift+Tab` pass so the shell switches tabs with the draft kept; everything else
-    /// is text. An open agent help (MOD-55) takes every key first: the draft is locked under it,
-    /// and `Ctrl+S`/`Ctrl+E`/`Ctrl+G` are refused until it closes.
+    /// The editor, widget first (MOD-67 M4 PA-3): the area takes text, `Esc` (its `Cancel`) and,
+    /// until T-close, `ctrl-s` (its `Submit`); what it passes resolves through
+    /// `views::LIBRARY_EDITOR`: `form.save` saves, `skills.ask_agent` opens the agent help,
+    /// `form.external_editor` hands the draft to `$EDITOR`, and `global.next_tab`/`prev_tab` pass
+    /// so the shell switches tabs with the draft kept (PA-2). Any other key is `modal_rest`'s. An
+    /// open agent help (MOD-55) takes every key first: the draft is locked under it, and the
+    /// editor's verbs are refused until it closes.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if let Mode::Editing(editor) = &mut self.mode
             && let Some(help) = editor.help.as_mut()
         {
             let outcome = help.on_key(key, ctx);
             return self.apply_help(outcome);
-        }
-        if chord(&key) && matches!(key.code, KeyCode::Char('g' | 'G')) {
-            self.open_help(ctx);
-            return Handled::Consumed;
-        }
-        if chord(&key) && matches!(key.code, KeyCode::Char('e' | 'E')) {
-            self.hand_off(ctx);
-            return Handled::Consumed;
         }
         let busy = self.busy;
         let page = self.page.get();
@@ -1143,6 +1169,7 @@ impl LibraryView {
                 }
                 Handled::Consumed
             }
+            // The area's own `ctrl-s` until T-close drops it (D6); then only `form.save` saves.
             FieldOutcome::Submit => {
                 self.save_editor(ctx);
                 Handled::Consumed
@@ -1161,7 +1188,17 @@ impl LibraryView {
                 }
                 Handled::Consumed
             }
-            FieldOutcome::Pass => Handled::Pass,
+            FieldOutcome::Pass => {
+                let chord = KeyChord::from_event(key);
+                match ctx.keys().actions(views::LIBRARY_EDITOR, chord).first() {
+                    Some(Act::FormSave) => self.save_editor(ctx),
+                    Some(Act::SkillsAskAgent) => self.open_help(ctx),
+                    Some(Act::FormExternalEditor) => self.hand_off(ctx),
+                    Some(Act::NextTab | Act::PrevTab) => return Handled::Pass,
+                    _ => return modal_rest(views::LIBRARY_EDITOR, chord),
+                }
+                Handled::Consumed
+            }
         }
     }
 
@@ -1906,6 +1943,7 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::TimeDelta;
+    use crossterm::event::KeyModifiers;
     use htui_core::clock::{TestClock, epoch};
     use htui_core::fixtures::ids;
     use htui_core::model::{Attachment, ProjectRef, Scope, SkillBindingKey, StepId};

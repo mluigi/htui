@@ -278,7 +278,7 @@ async fn the_editor_opens_on_the_shown_version() {
     harness.key("e");
     harness.key("Z");
     let frame = harness.render();
-    assert!(hint(&frame).contains("Ctrl+S save"), "{frame}");
+    assert!(hint(&frame).contains("Ctrl+s save"), "{frame}");
     assert!(
         frame.contains("rust-style \u{b7} editing from v2, saves v3"),
         "the editor's title: {frame}"
@@ -456,7 +456,7 @@ async fn a_save_over_a_moved_head_keeps_the_draft() {
         "the stale notice: {frame}"
     );
     assert!(
-        hint(&frame).contains("Ctrl+S save"),
+        hint(&frame).contains("Ctrl+s save"),
         "still editing: {frame}"
     );
     assert!(frame.contains("XPrefer"), "the draft is kept: {frame}");
@@ -541,7 +541,7 @@ async fn a_new_skill_needs_a_valid_name_and_a_body() {
         "the cursor is on the new skill: {frame}"
     );
     assert!(
-        !hint(&frame).contains("Ctrl+S save"),
+        !hint(&frame).contains("Ctrl+s save"),
         "back in Browse: {frame}"
     );
 }
@@ -1006,7 +1006,7 @@ async fn tab_and_digits_still_switch_tabs_with_a_draft_open() {
     assert_eq!(harness.app().tabs.active_id(), Some(SkillsTab::ID));
     let frame = harness.render();
     assert!(frame.contains("2Prefer"), "the draft survived: {frame}");
-    assert!(hint(&frame).contains("Ctrl+S save"), "{frame}");
+    assert!(hint(&frame).contains("Ctrl+s save"), "{frame}");
 }
 
 #[tokio::test]
@@ -1083,7 +1083,7 @@ async fn capital_i_opens_a_path_form_and_enter_imports_the_path() {
     harness.settle().await;
     let frame = harness.render();
     assert!(frame.contains(" import skills "), "the form:\n{frame}");
-    assert_eq!(hint(&frame).trim(), "Enter import  Esc cancel");
+    assert_eq!(hint(&frame).trim(), "Enter import \u{b7} Esc cancel");
 
     submit_path(&mut harness, &path).await;
 
@@ -1620,7 +1620,9 @@ async fn a_proposal_accepted_saves_as_the_next_version() {
         "{frame}"
     );
     assert!(
-        hint(&frame).contains("Ctrl+S save  Ctrl+G ask agent  Ctrl+E $EDITOR  Esc cancel"),
+        hint(&frame).contains(
+            "Ctrl+s save \u{b7} Ctrl+g ask agent \u{b7} Ctrl+e $EDITOR \u{b7} Esc cancel"
+        ),
         "the editor is back: {frame}"
     );
     harness.key("ctrl-s");
@@ -1672,12 +1674,99 @@ async fn a_blank_proposal_still_meets_the_save_gate() {
     let frame = harness.render();
     assert!(notice(&frame).contains(BLANK_SKILL_BODY), "{frame}");
     assert!(
-        hint(&frame).contains("Ctrl+S save"),
+        hint(&frame).contains("Ctrl+s save"),
         "the editor stays: {frame}"
     );
     assert_eq!(
         versions(&store, "rust-style").await.len(),
         2,
         "nothing saved"
+    );
+}
+
+// --- MOD-67 M4: the Library and the attachments pane on their key stacks ----------------------
+
+/// The shell's status row: the frame's last line.
+fn status(frame: &str) -> String {
+    frame.lines().last().unwrap_or_default().to_owned()
+}
+
+/// The Skills view over `store` with `keys` (a key file's text) instead of the defaults.
+async fn open_with_keys(store: MemStore, keys: &str) -> Harness {
+    let keys = htui::keys::load_str(keys).expect("the key file loads");
+    let mut harness = Harness::over(store).with_keys(keys);
+    register_all(harness.app());
+    harness.settle().await;
+    harness.key("2");
+    harness.settle().await;
+    harness
+}
+
+/// MOD-67 M4 D6 (PA-3), D11: a rebound `form.save` saves the Library editor and the rename form,
+/// each with one write, and their hints name it.
+#[tokio::test]
+async fn a_rebound_save_saves_the_library_editor_rename_and_attach_form() {
+    let store = MemStore::demo();
+    let mut harness = open_with_keys(store.clone(), "[form]\nsave = \"f2\"\n").await;
+    select(&mut harness, "tests");
+
+    harness.key("e");
+    type_text(&mut harness, "Always name the case. ");
+    let frame = harness.render();
+    assert!(hint(&frame).contains("F2 save"), "{frame}");
+    harness.key("f2");
+    assert_eq!(harness.queued(), 1, "one SaveSkillVersion");
+    harness.settle().await;
+    assert_eq!(versions(&store, "tests").await.len(), 2, "v2 was saved");
+
+    harness.key("i");
+    let frame = harness.render();
+    assert!(hint(&frame).contains("F2 save"), "{frame}");
+    type_text(&mut harness, "-x");
+    harness.key("f2");
+    assert_eq!(harness.queued(), 1, "one EditSkill");
+    harness.settle().await;
+    let names: Vec<String> = store
+        .skills()
+        .await
+        .expect("the library read")
+        .into_iter()
+        .map(|skill| skill.name)
+        .collect();
+    assert_eq!(names, ["rust-style", "tests-x"]);
+}
+
+/// MOD-67 M4 D11: a rebound `skills.ask_agent` opens the agent help from the Library editor;
+/// `ctrl-g` no longer does, and the hint names the new key.
+#[tokio::test]
+async fn a_rebound_ask_agent_opens_help_from_the_library_editor() {
+    let mut harness = open_with_keys(MemStore::demo(), "[skills]\nask_agent = \"f3\"\n").await;
+    select(&mut harness, "rust-style");
+    harness.key("e");
+    let frame = harness.render();
+    assert!(hint(&frame).contains("F3 ask agent"), "{frame}");
+    harness.key("ctrl-g");
+    assert_eq!(harness.queued(), 0, "`ctrl-g` asks for no agents");
+    assert!(!harness.render().contains(" ask an agent "), "no help");
+    harness.key("f3");
+    assert_eq!(harness.queued(), 1, "the help asks for the agents");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains(" ask an agent "),
+        "the help is open: {frame}"
+    );
+}
+
+/// MOD-67 M4 PA-2: the Library editor hands `Tab` to the shell, and its status line says so.
+#[tokio::test]
+async fn the_library_editor_status_line_keeps_tab() {
+    let mut harness = open().await;
+    select(&mut harness, "rust-style");
+    harness.key("e");
+    let frame = harness.render();
+    assert!(
+        status(&frame).starts_with("Ctrl+c quit · Tab next tab · Shift+Tab previous tab · F1 help"),
+        "{frame}"
     );
 }
