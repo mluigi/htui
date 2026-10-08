@@ -310,6 +310,11 @@ impl PtyChild {
 
         let threads = vec![waiting, reading, writing];
         // Detached outside tests: each thread ends on its own (EOF, a closed queue, a reap).
+        // The reader's EOF needs every holder of the slave gone: a helper the editor detached
+        // into a session of its own (gvim without `-f`, a daemonising wrapper) is out of the
+        // group's SIGHUP and SIGKILL, and keeps the reader idle, and the PTY open, until it
+        // exits or htui does (R1 L-3, docs/htui-editor.md "Limits"). The pane itself still
+        // closes when the editor exits.
         #[cfg(not(all(test, unix)))]
         drop(threads);
         Ok(Self {

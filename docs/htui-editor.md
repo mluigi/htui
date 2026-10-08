@@ -195,6 +195,11 @@ the terminal resizes the editor (it gets `SIGWINCH`) right after the next frame.
   grace before `SIGKILL`.
 - **An editor that exits while you abort** loses the race: the abort wins, and what it saved is
   not read back.
+- **An editor that detaches a helper** into a session of its own (gvim without `-f`, a wrapper
+  that daemonises) and leaves it on the terminal puts that helper out of reach of the pane's
+  `SIGHUP` and `SIGKILL`. The pane still closes when the editor exits, and the file is read back,
+  but htui keeps one idle reader thread and the pseudo-terminal open until the helper exits or
+  htui quits.
 
 ## Windows
 
