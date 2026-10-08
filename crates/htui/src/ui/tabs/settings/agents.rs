@@ -87,6 +87,7 @@ use crate::agent_settings::{
 };
 use crate::agent_worker::{AUTH_ALREADY_CHOSEN, LOGIN_ENDED, NO_LOGIN_RUNNING};
 use crate::app::{Action, Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{AuthFrame, InstallFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::{
@@ -95,7 +96,7 @@ use crate::ui::tabs::settings::{
 };
 use crate::ui::text_field::PASTE_DOES_NOT_FIT;
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// What the `on this box` column reads while this box has no `agent_box` row for the agent.
 const NOT_PROBED: &str = "not probed";
@@ -121,7 +122,20 @@ const NEARLY_FULL: f64 = 99.0;
 /// in for a help entry: a Settings section has no [`KeyScope`](crate::keymap::KeyScope) of its own
 /// (MOD-20 D19), so the keys are written where they are pressed. `m` sits with the other write
 /// keys (MOD-66 B9).
-const HINT_IDLE: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} m paths \u{b7} t this box \u{b7} r probe \u{b7} i install \u{b7} a authenticate";
+///
+/// A hint spec since MOD-67 M3 (D9): rendered through `AGENTS_BROWSE`, so a rebound key shows its
+/// new chord. With the default keys it reads `j/k select · n new · e edit · m paths · t this box ·
+/// r probe · i install · a authenticate`.
+const HINT_IDLE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "select"),
+    Hint::One(Act::New, "new"),
+    Hint::One(Act::Edit, "edit"),
+    Hint::One(Act::AgentsEditPaths, "paths"),
+    Hint::One(Act::AgentsSwitchBox, "this box"),
+    Hint::One(Act::AgentsProbe, "probe"),
+    Hint::One(Act::AgentsInstall, "install"),
+    Hint::One(Act::AgentsAuthenticate, "authenticate"),
+];
 
 /// What the note line says when there is no notice and the section is idle: the one limit of this
 /// section that is not a key (MOD-2 D73).
@@ -135,8 +149,13 @@ const HINT_IDLE: &str = "j/k select \u{b7} n new \u{b7} e edit \u{b7} m paths \u
 /// section **rests** in, which is the line a limit is read from.
 const QUOTA_NOTE: &str = "quota latches per chat, r cannot refresh it";
 
-/// The keys line while a registry form is open (MOD-23 D245).
-const HINT_EDITING: &str = "Tab next field \u{b7} Enter saves \u{b7} Esc cancels";
+/// The keys line while a registry form is open (MOD-23 D245). `Enter` and `Esc` are the focused
+/// field's own keys (MOD-67 D13), so they are fixed text.
+const HINT_EDITING: HintSpec = &[
+    Hint::One(Act::FormNextField, "next field"),
+    Hint::Text("Enter saves"),
+    Hint::Text("Esc cancels"),
+];
 
 /// What the `on this box` column reads for a row the human switched off on this box (MOD-23 D244).
 /// Twelve characters, inside the 13-wide column.
@@ -184,22 +203,60 @@ const NOTE_WIDTH: usize = 98;
 const REPROBES: &str = " \u{b7} the next chat re-probes; r probes now";
 
 /// The hint line while a plan waits for an answer.
-const HINT_PENDING: &str = "y install \u{b7} n cancel";
+const HINT_PENDING: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "install"),
+    Hint::One(Act::ConfirmNo, "cancel"),
+];
 
 /// The hint line while an install streams.
-const HINT_RUNNING: &str = "x cancel install";
+const HINT_RUNNING: HintSpec = &[Hint::One(Act::AgentsCancel, "cancel install")];
 
 /// The hint line while the manual steps are up.
-const HINT_MANUAL: &str = "Esc close";
+const HINT_MANUAL: HintSpec = &[Hint::One(Act::Dismiss, "close")];
 
-/// The hint line while the login chooser is waiting for a method (MOD-21 D20).
-const HINT_CHOOSING: &str = "j/k choose \u{b7} Enter select \u{b7} Esc cancel";
+/// The hint line while the login chooser is waiting for a method (MOD-21 D20). Every chord of
+/// `confirm.no` is listed (`n/Esc cancel`, MOD-67 M3 L-A Q5): `One` would drop the `Esc` users know.
+const HINT_CHOOSING: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "choose"),
+    Hint::One(Act::AgentsChoose, "select"),
+    Hint::All(Act::ConfirmNo, "cancel"),
+];
 
 /// The hint line while a login is spawning or running (MOD-22 D270: 41 of the 98 columns).
-const HINT_AUTH_RUNNING: &str = "o open link \u{b7} p paste redirect \u{b7} x cancel";
+const HINT_AUTH_RUNNING: HintSpec = &[
+    Hint::One(Act::AgentsOpenLink, "open link"),
+    Hint::One(Act::AgentsPasteRedirect, "paste redirect"),
+    Hint::One(Act::AgentsCancel, "cancel"),
+];
 
-/// The hint line while the paste field is open (MOD-22 D270).
-const HINT_PASTING: &str = "Enter sends \u{b7} Esc cancels";
+/// The hint line while the paste field is open (MOD-22 D270): the field's own keys (MOD-67 D13).
+const HINT_PASTING: HintSpec = &[Hint::Text("Enter sends"), Hint::Text("Esc cancels")];
+
+/// What the install question swallows rather than passes (MOD-20 D19, MOD-67 M3 L-A Q2): the
+/// section's own keys, resolved through `AGENTS_BROWSE` so a rebound one is swallowed under its
+/// new chord. Kept out of `AGENTS_CONSENT` so the `?` box lists no dead key under the question.
+const CONSENT_SWALLOWS: &[Act] = &[
+    Act::ListDown,
+    Act::ListUp,
+    Act::AgentsInstall,
+    Act::AgentsProbe,
+    Act::AgentsCancel,
+];
+
+/// What the login chooser swallows rather than passes (MOD-21 D20, MOD-67 M3 L-A Q2), for
+/// [`CONSENT_SWALLOWS`]' reason.
+const CHOOSER_SWALLOWS: &[Act] = &[Act::AgentsAuthenticate, Act::AgentsCancel];
+
+/// Which of the section's key modes is live (MOD-67 M3 L-A §2.1), in the order `on_key` answers
+/// them: a form, the install question, the login chooser, the paste field, else browse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyMode {
+    Form,
+    Consent,
+    Chooser,
+    Paste,
+    Browse,
+}
 
 /// What `p` says while the login is being cancelled (MOD-22 D282).
 const PASTE_CANCELLING: &str = "this login is being cancelled; there is nothing to paste into";
@@ -628,34 +685,25 @@ impl AgentsSection {
     /// tab-switches dead for as long as a human is reading a method list — which is why the choice
     /// is `Enter` and not a digit in the first place.
     fn answer_chooser(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        match key.code {
-            KeyCode::Char('j') => {
-                self.move_choice(true);
-                Handled::Consumed
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::AGENTS_CHOOSER, chord) {
+            match act {
+                Act::ListDown => self.move_choice(true),
+                Act::ListUp => self.move_choice(false),
+                Act::AgentsChoose => self.send_choice(ctx),
+                // Not "close the pane": the adapter is spawned and waiting on this answer, and only
+                // the runtime can kill it. The cell reads `cancelling…` until the flow's own last
+                // frame.
+                Act::ConfirmNo => self.begin_auth_cancel(ctx),
+                Act::AgentsProbe | Act::AgentsInstall => self.refuse_during_login(act, ctx),
+                // A global act: the shell applies it.
+                _ => continue,
             }
-            KeyCode::Char('k') => {
-                self.move_choice(false);
-                Handled::Consumed
-            }
-            KeyCode::Enter => {
-                self.send_choice(ctx);
-                Handled::Consumed
-            }
-            // Not "close the pane": the adapter is spawned and waiting on this answer, and only the
-            // runtime can kill it. The cell reads `cancelling…` until the flow's own last frame.
-            KeyCode::Char('n') | KeyCode::Esc => {
-                self.begin_auth_cancel(ctx);
-                Handled::Consumed
-            }
-            KeyCode::Char('r' | 'i') => {
-                self.refuse_during_login(key, ctx);
-                Handled::Consumed
-            }
-            // The section's own keys, swallowed so a cursor move cannot change the row under a
-            // choice the user has not made yet.
-            KeyCode::Char('a' | 'x') => Handled::Consumed,
-            _ => Handled::Pass,
+            return Handled::Consumed;
         }
+        // The section's own keys, swallowed so a cursor move cannot change the row under a
+        // choice the user has not made yet.
+        swallows(ctx.keys(), chord, CHOOSER_SWALLOWS)
     }
 
     /// Moves the chooser's cursor one row and stops at the end it reaches.
@@ -743,8 +791,8 @@ impl AgentsSection {
 
     /// `r` and `i` while a login runs: the flow ends by re-probing and writing the row, and either
     /// of the other two would be racing it for that row (MOD-21 D19).
-    fn refuse_during_login(&self, key: KeyEvent, ctx: &mut Ctx<'_>) {
-        let what = if key.code == KeyCode::Char('r') {
+    fn refuse_during_login(&self, act: Act, ctx: &mut Ctx<'_>) {
+        let what = if act == Act::AgentsProbe {
             "probe"
         } else {
             "install"
@@ -803,8 +851,9 @@ impl AgentsSection {
     /// One key while the paste field is open: `connection.rs`'s editor shape (MOD-22 D270).
     ///
     /// The field answers first, so the section's letters, the shell's `q`, `?` and digits and the
-    /// tab's `h`/`l` are characters of the address; everything it passes on is swallowed, with
-    /// `CONTROL` chords excepted so `ctrl-c` still quits.
+    /// tab's `h`/`l` are characters of the address; everything it passes on is swallowed, except
+    /// what the modal global layer admits (CONTROL, ALT, function keys: MOD-67 D5), so `ctrl-c`
+    /// still quits and `F1` opens help.
     ///
     /// `Enter` **moves** the buffer into a [`RedirectUrl`], so there is one copy of what was pasted
     /// and it is wiped when the request that carries it is dropped. The local check is a courtesy
@@ -831,8 +880,13 @@ impl AgentsSection {
                 *paste = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-            FieldOutcome::Pass => Handled::Consumed,
+            FieldOutcome::Pass => {
+                if views::CAPTURE.passes(KeyChord::from_event(key)) {
+                    Handled::Pass
+                } else {
+                    Handled::Consumed
+                }
+            }
             FieldOutcome::Submit => {
                 let url = RedirectUrl::new(field.take());
                 match advertised
@@ -1141,38 +1195,40 @@ impl AgentsSection {
     /// Modality, local and sufficient (MOD-20 D19): the tab consumes `h`/`l`/`[`/`]`/arrows before
     /// the section is offered a key, so the strip still works and a plan waits rather than traps.
     fn answer_consent(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        match key.code {
-            KeyCode::Char('y') => {
-                if let InstallState::Pending { plan } =
-                    core::mem::replace(&mut self.install, InstallState::Idle)
-                {
-                    self.install = InstallState::Running {
-                        agent_id: plan.agent_id,
-                        phase: InstallPhase::Planning,
-                        done: 0,
-                        total: None,
-                        cancelling: false,
-                    };
-                    self.notice = None;
-                    ctx.request(StoreRequest::InstallConfirm { plan });
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::AGENTS_CONSENT, chord) {
+            match act {
+                Act::ConfirmYes => {
+                    if let InstallState::Pending { plan } =
+                        core::mem::replace(&mut self.install, InstallState::Idle)
+                    {
+                        self.install = InstallState::Running {
+                            agent_id: plan.agent_id,
+                            phase: InstallPhase::Planning,
+                            done: 0,
+                            total: None,
+                            cancelling: false,
+                        };
+                        self.notice = None;
+                        ctx.request(StoreRequest::InstallConfirm { plan });
+                    }
                 }
-                Handled::Consumed
+                Act::ConfirmNo => {
+                    self.install = InstallState::Idle;
+                    self.notice = Some(DECLINED.to_owned());
+                }
+                // A global act: the shell applies it.
+                _ => continue,
             }
-            KeyCode::Char('n') | KeyCode::Esc => {
-                self.install = InstallState::Idle;
-                self.notice = Some(DECLINED.to_owned());
-                Handled::Consumed
-            }
-            // Swallowed rather than passed on: below this pane is a table whose cursor decides
-            // what `i` installs, and a key that moved it would move what the user is consenting to.
-            // **Only this section's own keys**, though. `App::on_key` (`app/state.rs:380-421`)
-            // offers the active tab the key *before* the `Tab` and `Global` keymaps and returns on
-            // `Consumed`, so a blanket `_ => Consumed` here makes `q`, `?`, `Tab` and the digit
-            // tab-switches dead for as long as the pane is open — the user cannot even quit. The
-            // pane is modal over the table beneath it, not over the application.
-            KeyCode::Char('j' | 'k' | 'i' | 'r' | 'x') => Handled::Consumed,
-            _ => Handled::Pass,
+            return Handled::Consumed;
         }
+        // Swallowed rather than passed on: below this pane is a table whose cursor decides what
+        // `i` installs, and a key that moved it would move what the user is consenting to.
+        // **Only this section's own keys**, though. `App::on_key` offers the active tab the key
+        // first and returns on `Consumed`, so a blanket `Consumed` here would make `q`, `?`, `Tab`
+        // and the digit tab-switches dead for as long as the pane is open — the user could not
+        // even quit. The pane is modal over the table beneath it, not over the application.
+        swallows(ctx.keys(), chord, CONSENT_SWALLOWS)
     }
 
     /// One frame of an install stream (MOD-20 D18).
@@ -1379,26 +1435,29 @@ impl AgentsSection {
     /// already 95 of the 98 columns together. A `None` note still takes its line, so the layout
     /// never changes height with it. While a `manual` row is listed, the idle note ends in
     /// [`MANUAL_NOTE`], the key to the cell's `*` (MOD-66).
-    fn hint(&self) -> (&'static str, Option<String>) {
-        let keys = match (&self.mode, &self.install) {
-            (Mode::Editing(_) | Mode::Paths(_), _) => HINT_EDITING,
-            // With no install in flight the login owns the line, because it is the only other
-            // thing here that binds keys of its own.
-            (Mode::Browse, InstallState::Idle) => match &self.auth {
-                AuthState::Idle => HINT_IDLE,
-                AuthState::Choosing { .. } => HINT_CHOOSING,
-                AuthState::Running { paste: Some(_), .. } => HINT_PASTING,
-                AuthState::Starting { .. } | AuthState::Running { .. } => HINT_AUTH_RUNNING,
+    ///
+    /// The keys line follows the live key mode first (MOD-67 M3 L-A Q6), so it always names the
+    /// keys `on_key` answers: a login chooser or paste field opened over an install's manual steps
+    /// shows its own keys, not `Esc close`.
+    fn hint(&self, keys: &Keys) -> (String, Option<String>) {
+        let spec = match self.key_mode() {
+            KeyMode::Form => HINT_EDITING,
+            KeyMode::Consent => HINT_PENDING,
+            KeyMode::Chooser => HINT_CHOOSING,
+            KeyMode::Paste => HINT_PASTING,
+            KeyMode::Browse => match (&self.install, &self.auth) {
+                // A pre-flight is one registry read and one `HEAD`, so this is usually gone before
+                // it is read — but `x` is offered here too, because a plan task that ends without a
+                // frame would otherwise leave no way out of this state (review finding, MOD-20 T8).
+                (InstallState::Planning { .. } | InstallState::Running { .. }, _) => HINT_RUNNING,
+                (InstallState::Manual { .. }, _) => HINT_MANUAL,
+                // With no install in flight the login owns the line, because it is the only other
+                // thing here that binds keys of its own.
+                (_, AuthState::Idle) => HINT_IDLE,
+                (_, _) => HINT_AUTH_RUNNING,
             },
-            // A pre-flight is one registry read and one `HEAD`, so this is usually gone before it
-            // is read — but `x` is offered here too, because a plan task that ends without a frame
-            // would otherwise leave no way out of this state (review finding, MOD-20 T8).
-            (Mode::Browse, InstallState::Planning { .. } | InstallState::Running { .. }) => {
-                HINT_RUNNING
-            }
-            (Mode::Browse, InstallState::Pending { .. }) => HINT_PENDING,
-            (Mode::Browse, InstallState::Manual { .. }) => HINT_MANUAL,
         };
+        let keys = keys.hint(self.stack(), spec);
         let idle = matches!(self.mode, Mode::Browse)
             && matches!(self.install, InstallState::Idle)
             && matches!(self.auth, AuthState::Idle);
@@ -1412,6 +1471,141 @@ impl AgentsSection {
             })
         });
         (keys, note)
+    }
+
+    /// One key with no form, question, chooser or paste field up (MOD-67 M3 §6.2): whole chords
+    /// through `AGENTS_BROWSE`, so `ctrl-r` probes nothing and `ctrl-n` opens nothing (defect 1),
+    /// and `Down`/`Up` move the table as `j`/`k` do (ANA-26 §6.6).
+    ///
+    /// The section's keys are free of the shell's: the global layer binds `q`, `Tab`/`BackTab`,
+    /// the digits, `?`, `F1`, `w`, `ctrl-f` and `ctrl-w`, and the tab takes `settings.*` (`h`/`l`/
+    /// `[`/`]`/arrows) before a section is offered the key. `n` is also the consent and chooser
+    /// modals' "no", and they answer before this. An act this state declines (`o`, `p`, `x`, `Esc`
+    /// with nothing to act on) falls through to the next candidate, and finally to the shell.
+    fn on_browse_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(views::AGENTS_BROWSE, chord) {
+            match act {
+                // MOD-23 D232 and blueprint F-20: one registry write at a time, and none of the
+                // three flows that write this box's `agent_box` row beside it.
+                Act::AgentsProbe | Act::AgentsInstall | Act::AgentsAuthenticate
+                    if self.busy.is_some() =>
+                {
+                    if let Some(busy) = self.busy {
+                        ctx.emit(Action::Error(in_flight(busy)));
+                    }
+                }
+                Act::New => {
+                    if !self.refuse_write(ctx) {
+                        self.open_create();
+                    }
+                }
+                Act::Edit => {
+                    if !self.refuse_write(ctx) {
+                        self.open_edit(ctx);
+                    }
+                }
+                Act::AgentsSwitchBox => {
+                    if !self.refuse_write(ctx) {
+                        self.switch_this_box(ctx);
+                    }
+                }
+                // MOD-66 D10: refused as `n`, `e` and `t` are, because it writes this box's row too.
+                Act::AgentsEditPaths => {
+                    if !self.refuse_write(ctx) {
+                        self.open_paths(ctx);
+                    }
+                }
+                Act::ListDown => self.move_cursor(true),
+                Act::ListUp => self.move_cursor(false),
+                Act::AgentsInstall => self.begin_install(ctx),
+                Act::AgentsAuthenticate => self.begin_auth(ctx),
+                // `o` is bound only while a flow is running: it is otherwise a free letter, and a
+                // section that swallowed it everywhere would be claiming a key it does nothing with.
+                Act::AgentsOpenLink if self.auth_in_flight() => self.open_link(ctx),
+                // `o`'s kind of key (MOD-22 D282): bound while a flow is in flight, and a refusal
+                // names itself rather than the key doing nothing.
+                Act::AgentsPasteRedirect if self.auth_in_flight() => self.open_paste(ctx),
+                // `x` cancels a running install **and** a pre-flight. Planning is one `GET` and one
+                // `HEAD`, so it is usually over before a key lands — but if the plan task ends
+                // without a frame (a panic inside it is caught by `tokio::spawn` and swept by
+                // `is_finished`), `Planning` would otherwise be a state with no way out but a
+                // restart. The runtime serves a cancel during planning and answers
+                // `Failed { "install_cancel" }` for a task already swept, and both land on `Idle`.
+                Act::AgentsCancel
+                    if matches!(
+                        self.install,
+                        InstallState::Running { .. } | InstallState::Planning { .. }
+                    ) =>
+                {
+                    if let InstallState::Running { cancelling, .. } = &mut self.install {
+                        *cancelling = true;
+                    }
+                    ctx.request(StoreRequest::InstallCancel);
+                }
+                // The same key for the other stream: `x` stops a login wherever it has got to, and
+                // the cell reads `cancelling…` until the flow's own last frame says it stopped.
+                Act::AgentsCancel if self.auth_in_flight() => self.begin_auth_cancel(ctx),
+                Act::Dismiss if matches!(self.install, InstallState::Manual { .. }) => {
+                    self.install = InstallState::Idle;
+                }
+                Act::AgentsProbe => self.probe(ctx),
+                // A global act, or one this state declines: the next candidate.
+                _ => continue,
+            }
+            return Handled::Consumed;
+        }
+        Handled::Pass
+    }
+
+    /// `r` in browse: refused while an install or a login runs, or while a probe already does.
+    fn probe(&mut self, ctx: &mut Ctx<'_>) {
+        // Before the other checks: an install is about to spawn a process of its own, and a probe
+        // that spawned one per agent beside it would be racing it for the same `agent_box` row.
+        if self.install_in_flight() {
+            ctx.emit(Action::Error(
+                "an install is running; probe afterwards".to_owned(),
+            ));
+        // And the same for a login, which ends by re-probing the very row `r` would re-probe.
+        } else if self.auth_in_flight() {
+            self.refuse_during_login(Act::AgentsProbe, ctx);
+        } else if !self.probing {
+            self.probing = true;
+            ctx.request(StoreRequest::ProbeAgents);
+        } else {
+            ctx.emit(Action::Error("a probe is already running".to_owned()));
+        }
+    }
+
+    /// Which key mode is live (MOD-67 M3 L-A §2.1): `on_key`'s order, read by [`stack`] and
+    /// [`hint`], so the keys answered and the keys shown cannot disagree.
+    ///
+    /// [`stack`]: Self::stack
+    /// [`hint`]: Self::hint
+    fn key_mode(&self) -> KeyMode {
+        if matches!(self.mode, Mode::Editing(_) | Mode::Paths(_)) {
+            KeyMode::Form
+        } else if matches!(self.install, InstallState::Pending { .. }) {
+            KeyMode::Consent
+        } else if matches!(self.auth, AuthState::Choosing { .. }) {
+            KeyMode::Chooser
+        } else if matches!(self.auth, AuthState::Running { paste: Some(_), .. }) {
+            KeyMode::Paste
+        } else {
+            KeyMode::Browse
+        }
+    }
+
+    /// The stack of the live key mode (MOD-67 D4): `key_stack`, the key handlers and the hint
+    /// all read it.
+    fn stack(&self) -> Stack<'static> {
+        match self.key_mode() {
+            KeyMode::Form => views::AGENTS_FORM,
+            KeyMode::Consent => views::AGENTS_CONSENT,
+            KeyMode::Chooser => views::AGENTS_CHOOSER,
+            KeyMode::Paste => views::CAPTURE,
+            KeyMode::Browse => views::AGENTS_BROWSE,
+        }
     }
 
     /// Whether `n`, `e`, `m` or `t` is refused right now, with the status-line sentence that says
@@ -1502,7 +1696,8 @@ impl AgentsSection {
     ///
     /// The focused field answers first, so `l`, `q`, `n` and the digits are letters here; what it
     /// passes on is the form's own navigation, and everything left over is swallowed rather than
-    /// offered to the shell — with `CONTROL` chords excepted, so `ctrl-c` still quits.
+    /// offered to the shell — except what the modal global layer admits (CONTROL, ALT, function
+    /// keys: MOD-67 D5), so `ctrl-c` still quits and `F1` opens help.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
@@ -1522,7 +1717,9 @@ impl AgentsSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => form_navigation(key, &mut editor.focus, editor.fields.len()),
+            FieldOutcome::Pass => {
+                form_navigation(key, ctx.keys(), &mut editor.focus, editor.fields.len())
+            }
         }
     }
 
@@ -1549,7 +1746,9 @@ impl AgentsSection {
                 self.notice = None;
                 Handled::Consumed
             }
-            FieldOutcome::Pass => form_navigation(key, &mut form.focus, form.fields.len()),
+            FieldOutcome::Pass => {
+                form_navigation(key, ctx.keys(), &mut form.focus, form.fields.len())
+            }
         }
     }
 
@@ -2157,22 +2356,46 @@ impl PathsForm {
     }
 }
 
-/// What a form does with a key its focused field passed on (plan D231): `Tab`/`Down` and
-/// `BackTab`/`Up` move the focus with a wrap, a `CONTROL` chord passes so `ctrl-c` still quits,
-/// and everything else is swallowed rather than offered to the shell.
-fn form_navigation(key: KeyEvent, focus: &mut usize, fields: usize) -> Handled {
+/// What a form does with a key its focused field passed on (plan D231): `form.next_field` and
+/// `form.prev_field` (`Tab`/`Down` and `BackTab`/`Up` by default, the `Down`/`Up` from
+/// `VIEW_DEFAULTS`) move the focus with a wrap; a chord the modal global layer admits passes, so
+/// `ctrl-c` still quits and `F1` opens help (MOD-67 D5); everything else is swallowed rather than
+/// offered to the shell.
+fn form_navigation(key: KeyEvent, keys: &Keys, focus: &mut usize, fields: usize) -> Handled {
     let len = fields.max(1);
-    match key.code {
-        KeyCode::Tab | KeyCode::Down => {
+    let stack = views::AGENTS_FORM;
+    let chord = KeyChord::from_event(key);
+    // The first candidate decides (MOD-67 M3 §6.3): a global act there is the pass rule's.
+    match keys.actions(stack, chord).first() {
+        Some(Act::FormNextField) => {
             *focus = (*focus + 1) % len;
-            Handled::Consumed
+            return Handled::Consumed;
         }
-        KeyCode::BackTab | KeyCode::Up => {
+        Some(Act::FormPrevField) => {
             *focus = (*focus + len - 1) % len;
-            Handled::Consumed
+            return Handled::Consumed;
         }
-        _ if key.modifiers.contains(KeyModifiers::CONTROL) => Handled::Pass,
-        _ => Handled::Consumed,
+        _ => {}
+    }
+    if stack.passes(chord) {
+        Handled::Pass
+    } else {
+        Handled::Consumed
+    }
+}
+
+/// What the install question or the login chooser does with a key none of its own acts took
+/// (MOD-67 M3 L-A Q2): swallowed when it is one of the section's `swallowed` browse keys, so the
+/// row under the pane cannot move; otherwise passed on to the shell.
+fn swallows(keys: &Keys, chord: KeyChord, swallowed: &[Act]) -> Handled {
+    if keys
+        .actions(views::AGENTS_BROWSE, chord)
+        .iter()
+        .any(|act| swallowed.contains(act))
+    {
+        Handled::Consumed
+    } else {
+        Handled::Pass
     }
 }
 
@@ -2352,6 +2575,10 @@ impl SettingsSection for AgentsSection {
 
     fn on_scope_change(&mut self, _scope: &Scope) {}
 
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        Some(self.stack())
+    }
+
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // An open registry form answers first (MOD-23 D231). It cannot coexist with either modal
         // below: it only opens while no install and no login is in flight (D232), and each modal
@@ -2373,131 +2600,12 @@ impl SettingsSection for AgentsSection {
         if matches!(self.auth, AuthState::Choosing { .. }) {
             return self.answer_chooser(key, ctx);
         }
-        // Then an open paste field (MOD-22 D270), which takes every key but a `CONTROL` chord:
-        // `q`, `x`, `o`, `?` and the digits are characters of the address being pasted.
+        // Then an open paste field (MOD-22 D270), which takes every key but the chords the modal
+        // global layer admits: `q`, `x`, `o`, `?` and the digits are characters of the address.
         if matches!(self.auth, AuthState::Running { paste: Some(_), .. }) {
             return self.on_paste_key(key, ctx);
         }
-        // `a`, `e`, `i`, `j`, `k`, `m`, `n`, `o`, `p`, `r`, `t` and `x` are free: the global keymap
-        // binds `q`, `Tab`/`BackTab`, the digits, `?`, `ctrl-c` and `w`, and the tab itself
-        // consumes `h`/`l`/`[`/`]`/arrows before a section is offered the key (only the Backlog tab
-        // binds `m`, MOD-66 D10). `n` is also the consent and chooser modals' "no", and they
-        // answer above, before this match.
-        match key.code {
-            // MOD-23 D232 and blueprint F-20: one registry write at a time, and none of the three
-            // flows that write this box's `agent_box` row beside it.
-            KeyCode::Char('r' | 'i' | 'a') if self.busy.is_some() => {
-                if let Some(busy) = self.busy {
-                    ctx.emit(Action::Error(in_flight(busy)));
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('n') => {
-                if !self.refuse_write(ctx) {
-                    self.open_create();
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('e') => {
-                if !self.refuse_write(ctx) {
-                    self.open_edit(ctx);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('t') => {
-                if !self.refuse_write(ctx) {
-                    self.switch_this_box(ctx);
-                }
-                Handled::Consumed
-            }
-            // MOD-66 D10: refused as `n`, `e` and `t` are, because it writes this box's row too.
-            KeyCode::Char('m') => {
-                if !self.refuse_write(ctx) {
-                    self.open_paths(ctx);
-                }
-                Handled::Consumed
-            }
-            KeyCode::Char('j') => {
-                self.move_cursor(true);
-                Handled::Consumed
-            }
-            KeyCode::Char('k') => {
-                self.move_cursor(false);
-                Handled::Consumed
-            }
-            KeyCode::Char('i') => {
-                self.begin_install(ctx);
-                Handled::Consumed
-            }
-            KeyCode::Char('a') => {
-                self.begin_auth(ctx);
-                Handled::Consumed
-            }
-            // `o` is bound only while a flow is running: it is otherwise a free letter, and a
-            // section that swallowed it everywhere would be claiming a key it does nothing with.
-            KeyCode::Char('o') if self.auth_in_flight() => {
-                self.open_link(ctx);
-                Handled::Consumed
-            }
-            // `o`'s kind of key (MOD-22 D282): bound while a flow is in flight, and a refusal names
-            // itself rather than the key doing nothing.
-            KeyCode::Char('p') if self.auth_in_flight() => {
-                self.open_paste(ctx);
-                Handled::Consumed
-            }
-            // `x` cancels a running install **and** a pre-flight. Planning is one `GET` and one
-            // `HEAD`, so it is usually over before a key lands — but if the plan task ends without
-            // a frame (a panic inside it is caught by `tokio::spawn` and swept by `is_finished`),
-            // `Planning` would otherwise be a state with no way out but a restart. The runtime
-            // serves a cancel during planning and answers `Failed { "install_cancel" }` for a task
-            // already swept, and both land on `Idle`.
-            KeyCode::Char('x')
-                if matches!(
-                    self.install,
-                    InstallState::Running { .. } | InstallState::Planning { .. }
-                ) =>
-            {
-                if let InstallState::Running { cancelling, .. } = &mut self.install {
-                    *cancelling = true;
-                }
-                ctx.request(StoreRequest::InstallCancel);
-                Handled::Consumed
-            }
-            // The same key for the other stream: `x` stops a login wherever it has got to, and the
-            // cell reads `cancelling…` until the flow's own last frame says it stopped.
-            KeyCode::Char('x') if self.auth_in_flight() => {
-                self.begin_auth_cancel(ctx);
-                Handled::Consumed
-            }
-            KeyCode::Esc if matches!(self.install, InstallState::Manual { .. }) => {
-                self.install = InstallState::Idle;
-                Handled::Consumed
-            }
-            // Before the two `r` arms below: an install is about to spawn a process of its own,
-            // and a probe that spawned one per agent beside it would be racing it for the same
-            // `agent_box` row.
-            KeyCode::Char('r') if self.install_in_flight() => {
-                ctx.emit(Action::Error(
-                    "an install is running; probe afterwards".to_owned(),
-                ));
-                Handled::Consumed
-            }
-            // And the same for a login, which ends by re-probing the very row `r` would re-probe.
-            KeyCode::Char('r') if self.auth_in_flight() => {
-                self.refuse_during_login(key, ctx);
-                Handled::Consumed
-            }
-            KeyCode::Char('r') if !self.probing => {
-                self.probing = true;
-                ctx.request(StoreRequest::ProbeAgents);
-                Handled::Consumed
-            }
-            KeyCode::Char('r') => {
-                ctx.emit(Action::Error("a probe is already running".to_owned()));
-                Handled::Consumed
-            }
-            _ => Handled::Pass,
-        }
+        self.on_browse_key(key, ctx)
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -2638,7 +2746,7 @@ impl SettingsSection for AgentsSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), consent);
         }
-        let (keys, note) = self.hint();
+        let (keys, note) = self.hint(ctx.keys());
         frame.render_widget(Paragraph::new(Line::styled(keys, ctx.theme.dim)), keys_area);
         if let Some(note) = note {
             // `settings/mod.rs`'s rule: a compare-and-set miss is the one notice to act on.
