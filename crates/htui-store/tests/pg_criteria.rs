@@ -8396,6 +8396,48 @@ async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
     db.drop_db().await;
 }
 
+/// MOD-12 M3 review R1 L2 (verify): `queued_at` is the queuing client's clock, not commit order,
+/// so an entry the runner never read can be stamped before every entry it did read; it keeps the
+/// batch open all the same, alike on both stores.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_skips_a_batch_with_an_unread_entry_stamped_earlier_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let (earlier, later) = (at - TimeDelta::seconds(1), at + TimeDelta::seconds(1));
+
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    // The runner reads ANA_2; FEAT_2 commits after its read, stamped by a clock behind.
+    for (item, stamp) in [(ids::HTUI_ANA_2, at), (ids::HTUI_FEAT_2, earlier)] {
+        pg.queue_item(item, ids::BOX, ids::USER, stamp)
+            .await
+            .expect("queue");
+        mem.queue_item(item, ids::BOX, ids::USER, stamp)
+            .await
+            .expect("queue");
+    }
+    assert_eq!(
+        pg.close_drained_batch(pg_batch.id, Some(at), later)
+            .await
+            .expect("close"),
+        None,
+        "Postgres: the unread entry keeps it open, however old its instant"
+    );
+    assert_eq!(
+        mem.close_drained_batch(mem_batch.id, Some(at), later)
+            .await
+            .expect("close"),
+        None,
+        "MemStore: the unread entry keeps it open, however old its instant"
+    );
+
+    db.drop_db().await;
+}
+
 /// MOD-12 M3 D4 (L4): a stalled batch, open with an entry and no run of its own live, closes
 /// `drained` alike on both stores; a `queued` run of its own keeps the next one open on both.
 #[tokio::test(flavor = "multi_thread")]

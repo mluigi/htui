@@ -14951,6 +14951,41 @@ mod tests {
         );
     }
 
+    /// Review R1 L2 (verify): an entry the runner did not read keeps the batch open even when
+    /// its `queued_at` (the queuing client's clock, not commit order) is older than every entry
+    /// it read.
+    #[tokio::test]
+    async fn close_drained_batch_skips_an_unread_entry_with_an_older_instant() {
+        let store = MemStore::demo();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        // Queued after the runner read only ANA_2, stamped by a clock behind the first queuer's.
+        store
+            .queue_item(
+                ids::HTUI_FEAT_2,
+                ids::BOX,
+                ids::USER,
+                at - TimeDelta::seconds(1),
+            )
+            .await
+            .expect("the item queues");
+        assert_eq!(
+            store
+                .close_drained_batch(batch.id, Some(at), at)
+                .await
+                .expect("answered"),
+            None,
+            "the entry the runner never read keeps it open, however old its instant"
+        );
+    }
+
     /// MOD-12 D3: only `done` and `closed` items leave the queue.
     #[tokio::test]
     async fn prune_finished_entries_drops_done_and_closed_items_only() {

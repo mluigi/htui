@@ -4291,6 +4291,52 @@ mod queue_store_errors {
             "a sweep that read every entry and admits none closes it (CLOSE 3)"
         );
     }
+
+    /// Review R1 L2 (verify): `queued_at` is the queuing client's clock, not commit order, so
+    /// an entry the read missed can carry an instant at or before every entry it read (a skewed
+    /// clock, or a queuer that stamped first and committed last). It keeps the batch open all
+    /// the same: the close knows which entries were read, not how new they are.
+    #[tokio::test]
+    async fn an_entry_queued_after_the_read_with_an_older_instant_keeps_the_batch_open() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store.clone());
+        // Its project reads as absent: nothing is admissible, and the queue stalls.
+        host.no_project.store(true, Ordering::SeqCst);
+        *host
+            .queue_before_close
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((ids::HTUI_FEAT_2, at - chrono::TimeDelta::seconds(1)));
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers")
+                .map(|open| open.id),
+            Some(batch.id),
+            "the entry the read missed keeps the stalled batch open, however old its instant"
+        );
+
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers"),
+            None,
+            "a sweep that read every entry and admits none closes it (CLOSE 3)"
+        );
+    }
 }
 
 /// MOD-41 I-1, OQ-2, OQ-5, OQ-6: the role gate over `Backend::memory`, role [`Role::Worker`]. The
