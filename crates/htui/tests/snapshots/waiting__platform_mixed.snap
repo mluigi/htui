@@ -31,4 +31,4 @@ Platform · DESKTOP-HTUI · memory · 1 working · 3 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
-q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help · w workspaces · Ctrl+f find
+Ctrl+c quit · ? help
