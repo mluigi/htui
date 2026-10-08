@@ -21,7 +21,6 @@ use htui_agent::auth::{AuthCall, AuthChoice, AuthMethodInfo};
 use htui_agent::driver::{AgentSessionRef, DriverCaps, PermissionAnswer, PermissionRequestId};
 use htui_agent::event::{DriverEnvelope, StopReason};
 use htui_agent::probe::ProbeStatus;
-use htui_core::model::QueueSetting;
 use htui_core::model::{
     AgentId, AgentSummary, AnswerOutcome, BatchClose, BatchId, BindingChange, BoxEdit, BoxId,
     BoxInfo, CitationKind, Document, DocumentHead, DocumentId, EditReason, FollowUpRequest,
@@ -33,6 +32,7 @@ use htui_core::model::{
     TIMESTAMPTZ_DIGITS, ToolCallCount, WaitingPermission, WorkspaceId, WorkspacePatch,
     WorkspaceSummary,
 };
+use htui_core::model::{QueueMove, QueueOverview, QueueSetting};
 use htui_core::prompt::SettingKey;
 use htui_core::root_path::{DirListing, RootRefusal, list_dirs};
 use htui_core::secret::{SecretScope, SecretSource};
@@ -62,6 +62,7 @@ use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
 use crate::persona_import::PersonaImports;
 use crate::persona_settings::{self, PersonaWrite};
 use crate::prompt_settings::{self, SettingsSnapshot};
+use crate::queue_overview;
 use crate::queue_settings::{self, QueueSettingsSnapshot};
 use crate::requirements::{
     self, ItemCitations, RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot,
@@ -91,14 +92,16 @@ pub const PROMPT_PREVIEW: &str = "prompt_preview";
 /// of the thirteen offline refusals, and the Hierarchy section matches its `Failed` by this name.
 pub const LIST_DIR: &str = "list_dir";
 
-/// [`StoreRequest::name`] of the five queue requests (MOD-12 D9), in variant order: the Backlog
-/// matches a queue request's `Failed` by these.
-pub const QUEUE_REQUEST_NAMES: [&str; 5] = [
+/// [`StoreRequest::name`] of the seven queue requests (MOD-12 D9, M3 D7), in variant order: the
+/// Backlog matches a queue request's `Failed` by these, and the queue overlay by its two.
+pub const QUEUE_REQUEST_NAMES: [&str; 7] = [
     "queue_state",
     "queue_item",
     "dequeue_item",
     "resume_queue",
     "pause_queue",
+    "queue_overview",
+    "move_queue_entry",
 ];
 
 /// The most entries one [`StoreReply::DirListing`] carries; the rest is its `more` (MOD-49 P4).
@@ -376,10 +379,40 @@ pub enum StoreRequest {
         /// The item.
         item: ItemId,
     },
-    /// MOD-12 D2, D9: resume — open a batch on this box (idempotent); the loop sweeps at once (D8).
-    ResumeQueue,
+    /// MOD-12 D2, D9: resume — open a batch on this box; the loop sweeps at once (D8). Answered
+    /// with [`StoreReply::QueueWritten`] (`Resumed`).
+    ///
+    /// M3 review R1 M1: a view that showed the queue paused says so with `expect_paused`, and a
+    /// batch open by the time the request is served refuses it: nothing is written and the answer
+    /// is [`QueueWrite::Stale`] with the queue as it is now. `expect_paused: false` is the
+    /// unconditional, idempotent resume (`Resumed { already }`).
+    ResumeQueue {
+        /// The sender saw no open batch.
+        expect_paused: bool,
+    },
     /// MOD-12 D2, D9: pause — close this box's open batch `paused`; running runs continue.
-    PauseQueue,
+    /// Answered with [`StoreReply::QueueWritten`] (`Paused`).
+    ///
+    /// M3 review R1 M1: a view that showed a running queue names the batch it saw in `expect`.
+    /// When that batch is no longer the open one (the runner closed it as stalled, L4, or another
+    /// view paused it and a batch opened since) nothing is written and the answer is
+    /// [`QueueWrite::Stale`] with the queue as it is now. `None` pauses whatever is open,
+    /// idempotently (`Paused { already }`).
+    PauseQueue {
+        /// The open batch the sender saw.
+        expect: Option<BatchId>,
+    },
+    /// MOD-12 M3 D7: this box's queue with every entry's state, for the queue overlay. Answered
+    /// with [`StoreReply::QueueOverview`]; offline `DATABASE_UNREACHABLE`.
+    QueueOverview,
+    /// MOD-12 M3 D3: move `item` one place `to` in this box's queue (`queue_entry.position`; the
+    /// item's priority is untouched). Answered with [`StoreReply::QueueWritten`] (`Moved`).
+    MoveQueueEntry {
+        /// The item.
+        item: ItemId,
+        /// Which way.
+        to: QueueMove,
+    },
     /// The persona registry by name (MOD-26 M2 D21). Served by [`persona_settings::serve`]
     /// through the writer: personas are not mirrored, so offline it is refused with
     /// `DATABASE_UNREACHABLE`. Answered with [`StoreReply::Personas`].
@@ -1172,12 +1205,14 @@ impl StoreRequest {
             Self::SetAgentOnBox { .. } => "set_agent_on_box",
             // Served by the agent runtime, not `agent_settings::serve` (MOD-66 D7).
             Self::SetToolPaths { .. } => agent_settings::SET_TOOL_PATHS,
-            // The five of `QUEUE_REQUEST_NAMES`, in that order (MOD-12 D9).
+            // The seven of `QUEUE_REQUEST_NAMES`, in that order (MOD-12 D9, M3 D7).
             Self::QueueState => "queue_state",
             Self::QueueItem { .. } => "queue_item",
             Self::DequeueItem { .. } => "dequeue_item",
-            Self::ResumeQueue => "resume_queue",
-            Self::PauseQueue => "pause_queue",
+            Self::ResumeQueue { .. } => "resume_queue",
+            Self::PauseQueue { .. } => "pause_queue",
+            Self::QueueOverview => "queue_overview",
+            Self::MoveQueueEntry { .. } => "move_queue_entry",
             // The five of `persona_settings::REQUEST_NAMES`, in that order (MOD-26 M2 D21).
             Self::Personas => "personas",
             Self::CreatePersona { .. } => "create_persona",
@@ -1585,13 +1620,16 @@ pub enum StoreReply {
     },
     /// Answer to [`StoreRequest::QueueState`].
     Queue(QueueView),
-    /// Answer to the four queue writes: what was done, and the queue after it.
+    /// Answer to the five queue writes: what was done, and the queue after it.
     QueueWritten {
         /// The write.
         write: QueueWrite,
         /// The queue after it.
         view: QueueView,
     },
+    /// Answer to [`StoreRequest::QueueOverview`] (MOD-12 M3 D7). Boxed, as
+    /// [`StoreReply::QueueSettings`] is: the rows can be long.
+    QueueOverview(Box<QueueOverview>),
     /// The registry after an import, and what happened to every file (D20). Boxed: the report
     /// can be long.
     PersonaImports(Box<PersonaImports>),
@@ -1703,7 +1741,8 @@ pub enum StoreReply {
 /// MOD-12 D9: this box's queue as the Backlog needs it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueView {
-    /// The queued items, `position NULLS LAST, queued_at, item_id`.
+    /// The queued items in queue order (M3 D2): `position NULLS LAST, priority DESC, created_at,
+    /// id`.
     pub entries: Vec<ItemId>,
     /// The open batch; `None` = paused (D2).
     pub open_batch: Option<BatchId>,
@@ -1740,6 +1779,19 @@ pub enum QueueWrite {
         live: usize,
         /// Whether no batch was open, so nothing closed.
         already: bool,
+    },
+    /// MOD-12 M3 D3: a move; `moved` is `false` when the entry was already at that end or not in
+    /// this box's queue, and nothing was written.
+    Moved {
+        /// Whether the order changed.
+        moved: bool,
+    },
+    /// MOD-12 M3 review R1 M1: a pause or resume sent over a state the queue has left (its
+    /// `expect` batch is not the open one, or a batch opened since a paused view); nothing was
+    /// written. The reply's view is the queue as it is now, so the sender redraws it.
+    Stale {
+        /// The refused request was a `PauseQueue` (`false`: a `ResumeQueue`).
+        pause: bool,
     },
 }
 
@@ -2287,13 +2339,19 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
                 },
             }
         }
-        // The five queue requests, or-ed for the reason the arms above are: a guard does not
-        // count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan F-12, MOD-12 D9).
+        // The six queue requests `serve_queue` answers, or-ed for the reason the arms above are: a
+        // guard does not count towards exhaustivity in a wildcard-free `match` (MOD-15 M3 plan
+        // F-12, MOD-12 D9, M3 D7).
         StoreRequest::QueueState
         | StoreRequest::QueueItem { .. }
         | StoreRequest::DequeueItem { .. }
-        | StoreRequest::ResumeQueue
-        | StoreRequest::PauseQueue => serve_queue(backend, request).await?,
+        | StoreRequest::ResumeQueue { .. }
+        | StoreRequest::PauseQueue { .. }
+        | StoreRequest::MoveQueueEntry { .. } => serve_queue(backend, request).await?,
+        // MOD-12 M3 D7: the overlay's read composes the runner's own reads (`queue_overview`).
+        StoreRequest::QueueOverview => {
+            StoreReply::QueueOverview(Box::new(queue_overview::overview(backend).await?))
+        }
         // MOD-70 D3, D13: refused offline before anything is sent; a refusal is its sentence.
         StoreRequest::FollowUp { step, text } => {
             let writer = backend
@@ -2332,8 +2390,14 @@ async fn try_serve(backend: &Backend, request: &StoreRequest) -> StoreResult<Sto
     })
 }
 
-/// MOD-12 D9: the five queue requests over `backend`'s inherent queue methods. This box is
-/// `box_info()`'s, the author `this_user()`, every time `Utc::now()` truncated to the microsecond.
+/// MOD-12 D9, M3 D3: the five queue writes (`QueueItem`, `DequeueItem`, `ResumeQueue`,
+/// `PauseQueue`, `MoveQueueEntry`) and the one read (`QueueState`) over `backend`'s inherent queue
+/// methods; the overlay's `QueueOverview` is served beside them in `try_serve` (M3 review R1 N3).
+/// This box is `box_info()`'s, the author `this_user()`, every time `Utc::now()` truncated to the
+/// microsecond.
+///
+/// A `PauseQueue` naming a batch that is no longer the open one, and a `ResumeQueue` expecting a
+/// paused queue that is running, write nothing and answer [`QueueWrite::Stale`] (M3 review R1 M1).
 ///
 /// Memory serves them (blueprint deviation 6: `--demo` writes the rows, and its runtime never
 /// admits); offline every queue method answers `DATABASE_UNREACHABLE`. The box is read first, so
@@ -2370,32 +2434,53 @@ async fn serve_queue(backend: &Backend, request: &StoreRequest) -> StoreResult<S
             item: *item,
             was_queued: backend.dequeue_item(*item).await?,
         },
-        StoreRequest::ResumeQueue => {
+        StoreRequest::ResumeQueue { expect_paused } => {
             let already = backend.open_batch_of(box_id).await?.is_some();
-            let user = backend.this_user().await?;
-            backend.open_batch(box_id, user, now()).await?;
-            QueueWrite::Resumed { already }
-        }
-        StoreRequest::PauseQueue => {
-            match backend
-                .close_batch(box_id, BatchClose::Paused, now())
-                .await?
-            {
-                Some(closed) => QueueWrite::Paused {
-                    live: backend
-                        .batch_runs(closed.id)
-                        .await?
-                        .iter()
-                        .filter(|(_, status)| *status == RunStatus::Running)
-                        .count(),
-                    already: false,
-                },
-                None => QueueWrite::Paused {
-                    live: 0,
-                    already: true,
-                },
+            if already && *expect_paused {
+                // M3 review R1 M1: the sender saw it paused; a batch opened since.
+                QueueWrite::Stale { pause: false }
+            } else {
+                let user = backend.this_user().await?;
+                backend.open_batch(box_id, user, now()).await?;
+                QueueWrite::Resumed { already }
             }
         }
+        StoreRequest::PauseQueue { expect } => {
+            // M3 review R1 M1: the batch the sender saw must still be the open one. The check and
+            // the close are two statements; a batch that opens between them is one only a
+            // person's resume opens, and closing it is still what this pause asked for.
+            let stale = match expect {
+                Some(seen) => {
+                    backend.open_batch_of(box_id).await?.map(|open| open.id) != Some(*seen)
+                }
+                None => false,
+            };
+            if stale {
+                QueueWrite::Stale { pause: true }
+            } else {
+                match backend
+                    .close_batch(box_id, BatchClose::Paused, now())
+                    .await?
+                {
+                    Some(closed) => QueueWrite::Paused {
+                        live: backend
+                            .batch_runs(closed.id)
+                            .await?
+                            .iter()
+                            .filter(|(_, status)| *status == RunStatus::Running)
+                            .count(),
+                        already: false,
+                    },
+                    None => QueueWrite::Paused {
+                        live: 0,
+                        already: true,
+                    },
+                }
+            }
+        }
+        StoreRequest::MoveQueueEntry { item, to } => QueueWrite::Moved {
+            moved: backend.move_queue_entry(box_id, *item, *to).await?,
+        },
         other => {
             return Ok(StoreReply::Failed {
                 request: other.name(),
@@ -3085,7 +3170,7 @@ pub(crate) fn spawn_with_concepts(
                         }
                         other => {
                             let served = try_serve(&backend, other).await;
-                            if matches!(other, StoreRequest::ResumeQueue) && served.is_ok() {
+                            if matches!(other, StoreRequest::ResumeQueue { .. }) && served.is_ok() {
                                 // MOD-12 D8: a resumed queue is admitted at the next sweep, which
                                 // is now.
                                 runs.sweep(&backend, &tx);
@@ -5123,7 +5208,7 @@ mod tests {
         );
     }
 
-    /// The five queue requests are named exactly as `QUEUE_REQUEST_NAMES` lists them, so the
+    /// The seven queue requests are named exactly as `QUEUE_REQUEST_NAMES` lists them, so the
     /// Backlog's `Failed` match and the worker cannot drift apart (MOD-12 D9).
     #[test]
     fn queue_requests_are_named_as_queue_request_names_lists_them() {
@@ -5138,8 +5223,17 @@ mod tests {
                     item: ids::HTUI_ANA_2,
                 }
                 .name(),
-                StoreRequest::ResumeQueue.name(),
-                StoreRequest::PauseQueue.name(),
+                StoreRequest::ResumeQueue {
+                    expect_paused: true,
+                }
+                .name(),
+                StoreRequest::PauseQueue { expect: None }.name(),
+                StoreRequest::QueueOverview.name(),
+                StoreRequest::MoveQueueEntry {
+                    item: ids::HTUI_ANA_2,
+                    to: QueueMove::Up,
+                }
+                .name(),
             ],
             QUEUE_REQUEST_NAMES
         );
@@ -5208,7 +5302,7 @@ mod tests {
     /// MOD-12 D9: a pause with no open batch writes nothing and says so.
     #[tokio::test]
     async fn pause_on_a_paused_box_says_already() {
-        match serve(&demo(), &StoreRequest::PauseQueue).await {
+        match serve(&demo(), &StoreRequest::PauseQueue { expect: None }).await {
             StoreReply::QueueWritten { write, view } => {
                 assert_eq!(
                     write,
@@ -5221,6 +5315,143 @@ mod tests {
             }
             other => panic!("a pause answers `QueueWritten`: {other:?}"),
         }
+    }
+
+    /// One queue write through `serve`: what it wrote and the queue it answered.
+    async fn written(backend: &Backend, request: StoreRequest) -> (QueueWrite, QueueView) {
+        match serve(backend, &request).await {
+            StoreReply::QueueWritten { write, view } => (write, view),
+            other => panic!("{request:?} answers `QueueWritten`: {other:?}"),
+        }
+    }
+
+    /// MOD-12 M3 review R1 M1: a pause names the batch its sender saw open. When that batch closed
+    /// since (a stalled batch closes on its own, L4) nothing is written and nothing opens: the
+    /// answer is `Stale` with the queue as it is now, so the sender redraws it.
+    #[tokio::test]
+    async fn a_pause_naming_a_batch_that_closed_is_refused_with_the_queue_now() {
+        let store = MemStore::demo();
+        let backend = Backend::memory(store.clone());
+        let seen = store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens")
+            .id;
+        store
+            .close_drained_batch(seen, &[], Utc::now())
+            .await
+            .expect("the store answers")
+            .expect("the stalled batch closed");
+
+        let (write, view) =
+            written(&backend, StoreRequest::PauseQueue { expect: Some(seen) }).await;
+
+        assert_eq!(write, QueueWrite::Stale { pause: true });
+        assert_eq!(view.open_batch, None, "the queue as it is now");
+        assert_eq!(
+            store.open_batch_of(ids::BOX).await.expect("reads"),
+            None,
+            "nothing opened"
+        );
+        let last = store
+            .last_closed_batch(ids::BOX)
+            .await
+            .expect("reads")
+            .expect("a batch closed");
+        assert_eq!(
+            (last.id, last.closed_reason),
+            (seen, Some(BatchClose::Drained)),
+            "the close is the runner's, not a pause"
+        );
+    }
+
+    /// MOD-12 M3 review R1 M1: a pause naming a batch that is no longer the open one leaves the
+    /// open one (a resume since) running; a pause naming the open one closes it as before.
+    #[tokio::test]
+    async fn a_pause_closes_only_the_batch_its_sender_saw() {
+        let store = MemStore::demo();
+        let backend = Backend::memory(store.clone());
+        let seen = store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens")
+            .id;
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
+            .await
+            .expect("the batch closes");
+        let now = store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("another opens")
+            .id;
+
+        let (write, view) =
+            written(&backend, StoreRequest::PauseQueue { expect: Some(seen) }).await;
+        assert_eq!(write, QueueWrite::Stale { pause: true });
+        assert_eq!(
+            view.open_batch,
+            Some(now),
+            "the resumed batch is left running"
+        );
+
+        let (write, view) = written(&backend, StoreRequest::PauseQueue { expect: Some(now) }).await;
+        assert_eq!(
+            write,
+            QueueWrite::Paused {
+                live: 0,
+                already: false
+            }
+        );
+        assert_eq!(view.open_batch, None);
+    }
+
+    /// MOD-12 M3 review R1 M1: a resume from a view that saw the queue paused is refused when a
+    /// batch is open by the time it arrives; nothing new opens. Over a paused queue it resumes.
+    #[tokio::test]
+    async fn a_resume_expecting_a_paused_queue_is_refused_over_a_running_one() {
+        let store = MemStore::demo();
+        let backend = Backend::memory(store.clone());
+        let open = store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens")
+            .id;
+
+        let (write, view) = written(
+            &backend,
+            StoreRequest::ResumeQueue {
+                expect_paused: true,
+            },
+        )
+        .await;
+        assert_eq!(write, QueueWrite::Stale { pause: false });
+        assert_eq!(view.open_batch, Some(open), "the same batch, none new");
+
+        // Unconditional, as before M3 R1: idempotent.
+        let (write, view) = written(
+            &backend,
+            StoreRequest::ResumeQueue {
+                expect_paused: false,
+            },
+        )
+        .await;
+        assert_eq!(write, QueueWrite::Resumed { already: true });
+        assert_eq!(view.open_batch, Some(open));
+
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, Utc::now())
+            .await
+            .expect("the batch closes");
+        let (write, view) = written(
+            &backend,
+            StoreRequest::ResumeQueue {
+                expect_paused: true,
+            },
+        )
+        .await;
+        assert_eq!(write, QueueWrite::Resumed { already: false });
+        assert!(view.open_batch.is_some_and(|batch| batch != open));
     }
 
     /// MOD-12 D9 (review L1): an item queued on another box stays there (one box per item, D1),

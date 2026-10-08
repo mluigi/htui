@@ -14,16 +14,15 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-08):** **CLEAN-9 is done** (`docs/decisions/clean/clean-9.md`), on `hr/CLEAN-9`. The
-recorder's `cap_exceeded` row names the session allowance and whether the run or the batch bound it; a malformed
-unrelated project key no longer drops the spend caps (a malformed cap key refuses the enqueue); Pg `clear_setting`
-and `clear_queue_setting` refuse a non-object `project.settings` as Mem does. No migration. Filed **CLEAN-11** for the
-leftovers. Before it, **MOD-90 and CLEAN-8** (`docs/decisions/mod/mod-90.md`, `docs/decisions/clean/clean-8.md`): a
-fourth keyring entry, `htui/infisical-write-mark`, is replaced by every Settings > Secrets URL or identity write, so an
-`htui worker` sharing the keyring drops a refused login when the same identity is entered again.
-Before those, **MOD-86 and MOD-87** (`docs/decisions/mod/mod-86.md`, `docs/decisions/mod/mod-87.md`):
-every chat text is masked before a driver, row or tab frame sees it, and a chat serves commands while it streams
-(`Esc Esc` cuts the turn).
+**Current status (2026-10-08):** **MOD-12 is done** (`docs/decisions/mod/mod-12.md`): auto mode runs
+explicitly queued items unattended, holds each batch to its spend cap, and `ctrl-q` opens the queue overlay
+(order, escalations with reasons, reorder, pause/resume); a stalled batch closes, so a later `Q` never starts
+spending. A user's `keys.toml` entry now takes a chord from an action left at its default, with a notice. Owed on
+the host: the Postgres gate and the PRD's prototype batch. Before it, **CLEAN-9** (`docs/decisions/clean/clean-9.md`):
+the recorder's `cap_exceeded` row names the session allowance and what bound it, and a malformed cap key refuses the
+enqueue. Filed **CLEAN-11** for the leftovers. Before that, **MOD-90 and CLEAN-8** (`docs/decisions/mod/mod-90.md`,
+`docs/decisions/clean/clean-8.md`): a fourth keyring entry, `htui/infisical-write-mark`, is replaced by every
+Settings > Secrets URL or identity write. No migration.
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -116,51 +115,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   attempt, fanout_index)`; crash recovery of a child under ANA-2 §4.9; and whether graph steps deny
   the harness's own subagent tool, whose sessions htui never sees. Cites `R-MCP-2`, which already
   lists the tool.
-- [ ] **MOD-12 - Auto mode queue runner** (from ANA-2). `R-ORCH-6`, `R-ORCH-9`, `R-ORCH-2` hard
-  gates, `R-AGT-7..8` caps, `R-TUI-8`. Ready-item selection, capability filter, concurrency with
-  overlap rule, queue overlay, escalation, Settings tab caps and scheduler window section. The
-  `queue` action of `R-TUI-2`. Target box stored, local execution only. Design concluded in
-  `docs/ANA-2.md` (§4.10, §9): `ready_items` per ANA-9 §7.4 in full, the same `claim_run`
-  admission as MOD-4, batch caps as `SUM(run_step.usage)`, escalations in the queue overlay, the
-  `scheduler_window` key stored but not enforced; a graph with a `gate_hard` phase is never fully
-  unattended, so `FIX`/`CLEAN`/`TOOL` are the first targets. ANA-10's SQLite rewrite of
-  `ready_items` (`docs/ANA-10.md` §4.8) is withdrawn with its verdict (MOD-25,
-  `docs/decisions/mod/mod-25.md`): the SQLite cache is a read mirror, so `ready_items` is written for
-  `PgStore` and `MemStore` only.
-  **Not blocked**: MOD-4 is done (`docs/decisions/mod/mod-4.md`); `claim_run`'s admission, the
-  overlap predicate, the lease, the sweep and `run_worker.rs` are there to reuse. **MOD-7 is done**
-  (`docs/decisions/mod/mod-7.md`) and supplies what the capability filter needs: real
-  `probed_tags`/`declared_tags`, `repo_box_path` rows by inference, and the `R-ORCH-10` refusal at
-  enqueue and at claim (`Claim::MissingTags`), so auto mode reuses them rather than adding a check.
-  **Relates to ANA-16** (`docs/ANA-16.md` §8): target-box selection in auto mode is MOD-43's, which
-  depends on this item for its auto-mode half.
-  **Phase 1 landed (`48ff0811`..`d19767df`, 2026-10-07):** unattended runs. Migration
-  `0016_auto_queue` (`queue_entry`, one item on one box; `queue_batch`, at most one open per box;
-  `run.batch_id`); `ready_items` in `priority DESC, created_at, id` order; the auto-mode gate
-  downgrade at snapshot time (`effective_gate`); the queue store surface on `MemStore`/`PgStore`/
-  `Backend` and the runner's `WorkerHost` methods; `Engine::enqueue_in_batch`; admission, prune and
-  drain in `sweep_once` (only the box's executing process, slots counted on running runs, a cancel
-  sticks for its batch, a pause cancels the batch's still-queued runs, the drain closes only the batch
-  it checked) with walk-end and resume wake-ups; Backlog `Q` (queue/dequeue) and `P` (resume/pause).
-  ANA-2 criteria 22, 23, 24 (by construction, resume pinned), 26 and 27's pause half have tests.
-  PRD `.claude/prds/mod-12-auto-mode-queue-runner.prd.md`, plan
-  `.claude/plans/mod-12-m1-unattended-runs.plan.md`.
-  **Phase 2 landed (`961e4f40`..`8b3aed9f`, 2026-10-07):** spend guard.
-  - The batch spend is the sum of its runs' integer `cost_micros`, never stored.
-  - Each run is held to its own project's `per_token_cap_batch` against the whole batch's spend, at
-    three points:
-    - the runner's admission (a stopped batch stays open);
-    - the candidate walk (`BatchCapReached` / `BatchBudget`, the item goes `blocked`);
-    - the session allowance `min(run cap - run spend, batch cap - batch spend)`, from the snapshot.
-      This also fixes the run cap being applied per step.
-  - Settings > Queue edits the two caps (in USD), `min_budget_for_new_attempt`, the app-wide and
-    per-box `max_concurrent_items`, and the stored-only `scheduler_window`.
-  - The PRD overshoot metric is amended to one attempt per open session. Review R1 is applied
-    (`docs/ANA-2.md` §4.10 and §5.4 as-built notes); its residuals are CLEAN-9.
-  - Plan `.claude/plans/mod-12-m2-spend-guard.plan.md`.
-
-  Remaining: M3 queue overlay (escalations including a capped batch, reorder, off-box runs, the
-  open-batch-on-`Q` question of M1 review L4).
 - [ ] **MOD-16 - Windows runtime verification of the agent driver** (from MOD-2). `R-AGT-1`,
   `R-NF-3`, `R-HIS-1`. **This is now the only Windows check** (TOOL-3 decided 2026-09-28,
   `docs/decisions/tool/tool-3.md`): the maintainer accepted that
@@ -265,7 +219,8 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
   until its worker claims it; the Runs view follows `session_event` by `seq` with `LISTEN`/`NOTIFY`
-  hints and a poll backstop, and shows worker liveness. Blocked on MOD-12 for auto mode only
+  hints and a poll backstop, and shows worker liveness. Its auto-mode half builds on MOD-12, now done
+  (`docs/decisions/mod/mod-12.md`: the queue runs on the local box only and reports a run live elsewhere)
   (MOD-42 is done: `docs/decisions/mod/mod-42.md`; its relay answers within a 1 s poll, which a
   `NOTIFY` hint would shorten).
   **ANA-27 note (2026-10-01, `docs/ANA-27.md` §5.1 T3):** the liveness the Runs view shows is
@@ -404,6 +359,10 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   M2 lands second: the loader keeps `editor.focus` bound beside `overlay.close`, refuses `ctrl-c` in
   `[editor]`, gains the `Context::Editor` arm, and checks `[editor]` chords against `global.quit`
   and `global.help` (`.claude/plans/mod-57-m1-editor-in-pane.blueprint.md` §6.4).
+  **MOD-12 M3 changed one M2 rule (2026-10-08, `docs/decisions/mod/mod-12.md`, review R1 H1):** within one
+  table a user's entry takes a chord from an action left at its default (that action loses it, with a stderr
+  notice and a `--print-keys` mark); two user entries on one chord stay an error. It also added the global
+  `queue` action on `ctrl-q` (ANA-26 §7.4 amended).
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,
@@ -521,6 +480,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-29 Claude Code mods) |
-| MOD-N   | 21 (MOD-12 auto mode, MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 2 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals) |
 | TOOL-N  | 0 |

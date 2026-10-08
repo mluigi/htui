@@ -132,6 +132,7 @@ impl App {
                 self.dispatch(Origin::App, StoreRequest::Waiting { scope });
             }
             self.refresh_active_tab();
+            self.refresh_top_overlay();
             self.dirty = true;
         }
     }
@@ -169,6 +170,43 @@ impl App {
             )
             .with_keys(keys);
             view.on_refresh(&mut ctx);
+        }
+        self.drain(&origin);
+    }
+
+    /// MOD-12 M3 D9: the top overlay's refresh hook, with a [`Ctx`] addressed as that overlay, then
+    /// what it emitted drained. Overlays below the top are not ticked.
+    fn refresh_top_overlay(&mut self) {
+        let Some(id) = self.overlays.top().map(Overlay::id) else {
+            return;
+        };
+        let origin = Origin::Overlay(id);
+        {
+            let Self {
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                keys,
+                theme,
+                emit,
+                overlays,
+                ..
+            } = self;
+            let Some(top) = overlays.top_mut() else {
+                return;
+            };
+            let mut ctx = Ctx::new(
+                scope,
+                projects,
+                top_bar,
+                keymap,
+                theme,
+                origin.clone(),
+                emit,
+            )
+            .with_keys(keys);
+            top.refresh(&mut ctx);
         }
         self.drain(&origin);
     }
@@ -870,6 +908,62 @@ mod tests {
         assert_eq!(requests.len(), 2, "one refresh per second, not per tick");
         assert!(matches!(requests[0].request, StoreRequest::StoreState));
         assert!(matches!(requests[1].request, StoreRequest::Waiting { .. }));
+    }
+
+    /// An overlay that counts the refresh ticks it is handed (MOD-12 M3 D9).
+    struct Ticked {
+        id: OverlayId,
+        refreshed: Rc<Cell<usize>>,
+    }
+
+    impl Overlay for Ticked {
+        fn id(&self) -> OverlayId {
+            self.id
+        }
+        fn title(&self) -> &str {
+            self.id.0
+        }
+        fn is_modal(&self) -> bool {
+            true
+        }
+        fn wants_requests(&self, _scope: &Scope) -> Vec<StoreRequest> {
+            Vec::new()
+        }
+        fn on_key(&mut self, _key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
+            Handled::Pass
+        }
+        fn on_reply(&mut self, _reply: &StoreReply, _ctx: &mut Ctx<'_>) {}
+        fn refresh(&mut self, ctx: &mut Ctx<'_>) {
+            self.refreshed.set(self.refreshed.get() + 1);
+            ctx.request(StoreRequest::QueueOverview);
+        }
+        fn render(&self, _frame: &mut Frame<'_>, _area: Rect, _ctx: &Ctx<'_>) {}
+    }
+
+    /// MOD-12 M3 D9: the refresh tick reaches the top overlay once a second, and only the top
+    /// one; what it requests leaves addressed to it.
+    #[test]
+    fn the_refresh_tick_refreshes_the_top_overlay_only() {
+        let (mut app, mut rx, _seen) = shell();
+        let (lower, top) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+        app.push_overlay(Box::new(Ticked {
+            id: OverlayId("lower"),
+            refreshed: Rc::clone(&lower),
+        }));
+        app.push_overlay(Box::new(Ticked {
+            id: OverlayId("top"),
+            refreshed: Rc::clone(&top),
+        }));
+        while rx.try_recv().is_ok() {}
+        for _ in 0..TICKS_PER_REFRESH {
+            app.update(Action::Tick);
+        }
+        assert_eq!((lower.get(), top.get()), (0, 1));
+        let asked: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|envelope| matches!(envelope.request, StoreRequest::QueueOverview))
+            .collect();
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].origin, Origin::Overlay(OverlayId("top")));
     }
 
     #[test]

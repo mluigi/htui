@@ -7742,7 +7742,11 @@ async fn queue_surface_answers_alike_on_both_stores() {
         "same entries, same order"
     );
     assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].item_id, ids::HTUI_ANA_2, "queued_at first");
+    assert_eq!(
+        entries[0].item_id,
+        ids::HTUI_ANA_1,
+        "priority, then created_at (M3 D2)"
+    );
 
     assert!(matches!(
         pg.queue_item(ItemId::new(), ids::BOX, ids::USER, at).await,
@@ -8195,7 +8199,8 @@ async fn create_run_round_trips_its_batch() {
 
 /// Review H2, M1: on both stores a close cancels the batch's runs still `queued` (item back to
 /// `open`, entry kept) and nothing else, `batch_cancelled_items` names their items, and the
-/// drain's close is of exactly the drained batch it names.
+/// drain's close is of exactly the batch it names, held open only by a live run of its own: an
+/// entry does not keep it open (MOD-12 M3 D4, L4).
 #[tokio::test(flavor = "multi_thread")]
 async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch() {
     use htui_core::model::BatchClose;
@@ -8328,13 +8333,13 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
         .await
         .expect("open");
     assert_eq!(
-        pg.close_drained_batch(pg_batch.id, later)
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None
     );
     assert_eq!(
-        mem.close_drained_batch(mem_batch.id, later)
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None
@@ -8347,21 +8352,6 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
         Some(pg_next.id),
         "the resume's batch survives the old batch's drain"
     );
-    assert_eq!(
-        pg.close_drained_batch(pg_next.id, later)
-            .await
-            .expect("close"),
-        None,
-        "an entry keeps it open"
-    );
-    assert_eq!(
-        mem.close_drained_batch(mem_next.id, later)
-            .await
-            .expect("close"),
-        None
-    );
-    assert!(pg.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
-    assert!(mem.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
     let live = batch_run(ids::HTUI_ANA_2, Some(pg_next.id));
     pg.create_run(live.clone()).await.expect("pg admits");
     mem.create_run(NewRun {
@@ -8371,14 +8361,14 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
     .await
     .expect("mem admits");
     assert_eq!(
-        pg.close_drained_batch(pg_next.id, later)
+        pg.close_drained_batch(pg_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None,
         "a live run of its own keeps it open"
     );
     assert_eq!(
-        mem.close_drained_batch(mem_next.id, later)
+        mem.close_drained_batch(mem_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close"),
         None
@@ -8390,11 +8380,11 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
         .await
         .expect("cancel");
     let (pg_drained, mem_drained) = (
-        pg.close_drained_batch(pg_next.id, later)
+        pg.close_drained_batch(pg_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("drained"),
-        mem.close_drained_batch(mem_next.id, later)
+        mem.close_drained_batch(mem_next.id, &[ids::HTUI_ANA_2], later)
             .await
             .expect("close")
             .expect("drained"),
@@ -8402,6 +8392,223 @@ async fn close_batch_cancels_its_queued_runs_and_the_drain_closes_only_its_batch
     assert_eq!(pg_drained.id, pg_next.id);
     assert_eq!(batch_shape(&pg_drained), batch_shape(&mem_drained));
     assert_eq!(pg_drained.closed_reason, Some(BatchClose::Drained));
+    let pg_entries = pg.queue_entries(ids::BOX).await.expect("read");
+    assert_eq!(
+        pg_entries,
+        mem.queue_entries(ids::BOX).await.expect("read"),
+        "the drain closed over the entry on both, and kept it"
+    );
+    assert_eq!(
+        pg_entries
+            .iter()
+            .map(|entry| entry.item_id)
+            .collect::<Vec<_>>(),
+        [ids::HTUI_ANA_2]
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 review R1 L2: the drain's close skips a batch whose box has an entry for an item
+/// outside those the runner read (`seen`), any entry when it read none, alike on both stores; the
+/// entries it did read never keep it open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_skips_a_batch_with_an_entry_it_never_read_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    for (seen, why) in [
+        (&[][..], "an entry after an empty read keeps it open"),
+        (
+            &[ids::HTUI_FEAT_2][..],
+            "an entry for an item it did not read keeps it open",
+        ),
+    ] {
+        assert_eq!(
+            pg.close_drained_batch(pg_batch.id, seen, later)
+                .await
+                .expect("close"),
+            None,
+            "Postgres: {why}"
+        );
+        assert_eq!(
+            mem.close_drained_batch(mem_batch.id, seen, later)
+                .await
+                .expect("close"),
+            None,
+            "MemStore: {why}"
+        );
+    }
+    assert_eq!(
+        pg.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| open.id),
+        Some(pg_batch.id)
+    );
+
+    let (pg_closed, mem_closed) = (
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close")
+            .expect("an entry it read does not keep it open"),
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close")
+            .expect("an entry it read does not keep it open"),
+    );
+    assert_eq!(pg_closed.id, pg_batch.id);
+    assert_eq!(batch_shape(&pg_closed), batch_shape(&mem_closed));
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 review R1 L2 (verify): `queued_at` is the queuing client's clock, not commit order,
+/// so an entry the runner never read can be stamped before every entry it did read; it keeps the
+/// batch open all the same, alike on both stores.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_skips_a_batch_with_an_unread_entry_stamped_earlier_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let (earlier, later) = (at - TimeDelta::seconds(1), at + TimeDelta::seconds(1));
+
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    // The runner reads ANA_2; FEAT_2 commits after its read, stamped by a clock behind.
+    for (item, stamp) in [(ids::HTUI_ANA_2, at), (ids::HTUI_FEAT_2, earlier)] {
+        pg.queue_item(item, ids::BOX, ids::USER, stamp)
+            .await
+            .expect("queue");
+        mem.queue_item(item, ids::BOX, ids::USER, stamp)
+            .await
+            .expect("queue");
+    }
+    assert_eq!(
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close"),
+        None,
+        "Postgres: the unread entry keeps it open, however old its instant"
+    );
+    assert_eq!(
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close"),
+        None,
+        "MemStore: the unread entry keeps it open, however old its instant"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 D4 (L4): a stalled batch, open with an entry and no run of its own live, closes
+/// `drained` alike on both stores; a `queued` run of its own keeps the next one open on both.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_batch_closes_alike_on_both_stores() {
+    use htui_core::model::BatchClose;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+
+    pg.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    mem.queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue");
+    let pg_batch = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_batch = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let (pg_closed, mem_closed) = (
+        pg.close_drained_batch(pg_batch.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close")
+            .expect("an entry does not keep it open"),
+        mem.close_drained_batch(mem_batch.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close")
+            .expect("an entry does not keep it open"),
+    );
+    assert_eq!(pg_closed.id, pg_batch.id);
+    assert_eq!(batch_shape(&pg_closed), batch_shape(&mem_closed));
+    assert_eq!(pg_closed.closed_reason, Some(BatchClose::Drained));
+    assert_eq!(pg_closed.closed_at, Some(later));
+    assert_eq!(pg.open_batch_of(ids::BOX).await.expect("read"), None);
+    assert_eq!(mem.open_batch_of(ids::BOX).await.expect("read"), None);
+    assert_eq!(
+        pg.queue_entries(ids::BOX).await.expect("read"),
+        mem.queue_entries(ids::BOX).await.expect("read"),
+        "the entry stays on both"
+    );
+
+    let pg_next = pg
+        .open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    let mem_next = mem
+        .open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    let live = batch_run(ids::HTUI_ANA_2, Some(pg_next.id));
+    pg.create_run(live.clone()).await.expect("pg admits");
+    mem.create_run(NewRun {
+        batch_id: Some(mem_next.id),
+        ..live.clone()
+    })
+    .await
+    .expect("mem admits");
+    assert_eq!(
+        pg.close_drained_batch(pg_next.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close"),
+        None,
+        "a queued run of its own keeps it open"
+    );
+    assert_eq!(
+        mem.close_drained_batch(mem_next.id, &[ids::HTUI_ANA_2], later)
+            .await
+            .expect("close"),
+        None,
+        "a queued run of its own keeps it open"
+    );
+    assert_eq!(
+        pg.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| batch_shape(&open)),
+        mem.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| batch_shape(&open)),
+    );
+    assert_eq!(
+        pg.open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| open.id),
+        Some(pg_next.id)
+    );
 
     db.drop_db().await;
 }
@@ -8630,6 +8837,77 @@ async fn a_pause_and_an_admission_serialise_on_the_batch_row() {
         "an admission after the close is refused: {late:?}"
     );
     assert_eq!(db.store.batch_runs(batch.id).await.expect("read").len(), 1);
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 D4 (L4, Postgres only): the runner's drain and another runner's admission into the
+/// same batch serialise on the batch row, and the drain counts the admitted run.
+///
+/// Since an entry no longer keeps a batch open, only a live run of its own does; so an admission
+/// in flight - `create_run` held after its `FOR SHARE` on the batch, blocked on the box row's
+/// foreign-key lock a third transaction holds - must keep a `close_drained_batch` issued then
+/// from closing the batch over the run it is about to commit. A drain that waited on the lock and
+/// then judged "no live run" by its statement's start would close a batch that owns a `queued`
+/// auto run: no pause would cancel it, and no later batch would count it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_drain_racing_an_admission_counts_the_admitted_run() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let at = Utc::now();
+    let batch = db
+        .store
+        .open_batch(ids::BOX, ids::USER, at)
+        .await
+        .expect("open");
+
+    let mut holder = db.pool.begin().await.expect("begin the box holder");
+    sqlx::query("SELECT 1 FROM box WHERE id = $1 FOR UPDATE")
+        .bind(ids::BOX.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("lock the box row");
+    let admit = tokio::spawn({
+        let store = db.store.clone();
+        let run = batch_run(ids::HTUI_ANA_2, Some(batch.id));
+        async move { store.create_run(run).await }
+    });
+    lock_waiters(&db.pool, 1).await;
+    let drain = tokio::spawn({
+        let store = db.store.clone();
+        async move { store.close_drained_batch(batch.id, &[], at).await }
+    });
+    lock_waiters(&db.pool, 2).await;
+    assert!(
+        !drain.is_finished(),
+        "the drain waits on the admission's FOR SHARE"
+    );
+    holder.rollback().await.expect("release the box row");
+
+    let run = admit
+        .await
+        .expect("the admission task")
+        .expect("the batch was open when the run was inserted");
+    assert_eq!(
+        drain.await.expect("the drain task").expect("close"),
+        None,
+        "the run committed while the drain waited keeps the batch open"
+    );
+    assert_eq!(
+        db.store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("read")
+            .map(|open| open.id),
+        Some(batch.id),
+        "the batch is still open"
+    );
+    assert_eq!(
+        db.store.batch_runs(batch.id).await.expect("read"),
+        [(run.id, RunStatus::Queued)],
+        "and owns its queued run"
+    );
 
     db.drop_db().await;
 }
@@ -9506,6 +9784,849 @@ async fn an_unknown_actor_on_a_follow_up_is_refused_before_the_status() {
         common::count(&db.pool, "run_command").await,
         0,
         "nothing was written"
+    );
+
+    db.drop_db().await;
+}
+
+// ---- MOD-12 M3: D2 order, queue_rows, move_queue_entry (blueprint §C.3) ------------------------
+
+/// A ready, untagged `htui` FEAT at `priority` under the id `id`, minted on `store`.
+async fn queue_feat<S: htui_core::store::WriteStore>(store: &S, id: ItemId, priority: i16) {
+    store
+        .mint_item(NewItem {
+            id,
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: format!("queue order at priority {priority}"),
+            body: String::new(),
+            required_tags: Vec::new(),
+            touched_paths: Vec::new(),
+            priority,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        })
+        .await
+        .expect("the mint lands");
+}
+
+/// `box_id`'s queue on Postgres and on `mem`, asserted equal (positions included), as item ids.
+async fn queue_alike(pg: &PgStore, mem: &htui_core::store::MemStore, box_id: BoxId) -> Vec<ItemId> {
+    let entries = pg.queue_entries(box_id).await.expect("queue_entries");
+    assert_eq!(
+        entries,
+        mem.queue_entries(box_id).await.expect("queue_entries"),
+        "same entries, same order, same positions"
+    );
+    entries.into_iter().map(|entry| entry.item_id).collect()
+}
+
+/// MOD-12 M3 D2: both stores read one queue order, `position NULLS LAST, priority DESC,
+/// created_at, id`: priorities 0/2/1 queued in that order read 2, 1, then the fixture's priority-0
+/// `ANA-1` and `ANA-2` by `created_at`, then the minted priority-0 FEAT.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_entries_follow_one_order_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (p0, p2, p1) = (ItemId::new(), ItemId::new(), ItemId::new());
+    for (id, priority) in [(p0, 0), (p2, 2), (p1, 1)] {
+        queue_feat(pg, id, priority).await;
+        queue_feat(&mem, id, priority).await;
+    }
+    let at = Utc::now();
+    for (seconds, item) in [p0, p2, p1, ids::HTUI_ANA_2, ids::HTUI_ANA_1]
+        .into_iter()
+        .enumerate()
+    {
+        let when = at + TimeDelta::seconds(i64::try_from(seconds).expect("small"));
+        pg.queue_item(item, ids::BOX, ids::USER, when)
+            .await
+            .expect("queue on Postgres");
+        mem.queue_item(item, ids::BOX, ids::USER, when)
+            .await
+            .expect("queue on MemStore");
+    }
+
+    assert_eq!(
+        queue_alike(pg, &mem, ids::BOX).await,
+        [p2, p1, ids::HTUI_ANA_1, ids::HTUI_ANA_2, p0],
+        "priority, then created_at; never queued_at"
+    );
+
+    db.drop_db().await;
+}
+
+/// The ids and instant [`plant_queue_facts`] writes under, shared by both stores.
+struct QueueFacts {
+    at: DateTime<Utc>,
+    laptop: BoxId,
+    cancelled: RunId,
+    latest: RunId,
+    chat: RunId,
+    laptop_run: RunId,
+    steps: [StepId; 3],
+    notes: [htui_core::model::NoteId; 2],
+}
+
+impl QueueFacts {
+    fn new() -> Self {
+        Self {
+            at: Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS),
+            laptop: BoxId::new(),
+            cancelled: RunId::new(),
+            latest: RunId::new(),
+            chat: RunId::new(),
+            laptop_run: RunId::new(),
+            steps: [StepId::new(), StepId::new(), StepId::new()],
+            notes: [
+                htui_core::model::NoteId::new(),
+                htui_core::model::NoteId::new(),
+            ],
+        }
+    }
+}
+
+/// The edges out of `HTUI_ANA_2` both stores plant: `(to, kind, tombstoned)`. `TOOL-1` (awaiting
+/// approval) and `FEAT-1` (in progress) are its open blockers, and so is `agy` `FEAT-1` (open):
+/// another project's item with the same key, which lists `FEAT-1` once, not twice. `ANA-1` is
+/// done, the `FEAT-3` edge is tombstoned and `FEAT-2`'s is `relates`.
+const QUEUE_EDGES: [(ItemId, htui_core::model::LinkKind, bool); 6] = [
+    (
+        ids::HTUI_TOOL_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::HTUI_FEAT_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::AGY_FEAT_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::HTUI_ANA_1,
+        htui_core::model::LinkKind::BlockedBy,
+        false,
+    ),
+    (
+        ids::HTUI_FEAT_3,
+        htui_core::model::LinkKind::BlockedBy,
+        true,
+    ),
+    (ids::HTUI_FEAT_2, htui_core::model::LinkKind::Relates, false),
+];
+
+/// `MemStore::demo()` plus `facts.laptop` (`LAPTOP-B`), [`QUEUE_EDGES`] and `facts.chat`: a chat
+/// run on `HTUI_ANA_2` queued after every graph run [`plant_queue_facts`] writes, which
+/// `queue_rows` must not take for the latest run. `NewRun` has no kind, so it is planted here,
+/// already `done`: an active run would hold the item `queued` and refuse the next `create_run`.
+fn queue_facts_mem(facts: &QueueFacts) -> htui_core::store::MemStore {
+    let mut data = htui_core::fixtures::demo_data();
+    let mut laptop = data
+        .boxes
+        .iter()
+        .find(|row| row.id == ids::BOX)
+        .expect("the demo box")
+        .clone();
+    laptop.id = facts.laptop;
+    laptop.hostname = "LAPTOP-B".to_owned();
+    data.boxes.push(laptop);
+    for (to, kind, tombstoned) in QUEUE_EDGES {
+        data.links.push(htui_core::model::ItemLink {
+            from_item_id: ids::HTUI_ANA_2,
+            to_item_id: to,
+            kind,
+            proposed_by_step_id: None,
+            created_at: facts.at,
+            updated_at: facts.at,
+            deleted_at: tombstoned.then_some(facts.at),
+        });
+    }
+    let chat_at = facts.at + TimeDelta::seconds(2);
+    data.runs.push(htui_core::model::Run {
+        id: facts.chat,
+        project_id: ids::PROJECT_HTUI,
+        item_id: Some(ids::HTUI_ANA_2),
+        kind: htui_core::model::RunKind::Chat,
+        mode: RunMode::Manual,
+        status: RunStatus::Done,
+        target_box_id: ids::BOX,
+        executing_box_id: None,
+        graph_snapshot: None,
+        started_by: ids::USER,
+        queued_at: chat_at,
+        started_at: Some(chat_at),
+        finished_at: Some(chat_at),
+        failure: None,
+        repo_scope: Vec::new(),
+        lease_box_id: None,
+        lease_expires_at: None,
+        updated_at: chat_at,
+    });
+    htui_core::store::MemStore::from_demo(data)
+}
+
+/// The Postgres twin of [`queue_facts_mem`]'s additions, by raw inserts.
+async fn queue_facts_pg(pool: &PgPool, facts: &QueueFacts) {
+    sqlx::query(
+        "INSERT INTO box (id, user_id, hostname, os_family, os_version, arch, htui_version) \
+         VALUES ($1, $2, 'LAPTOP-B', 'linux', '', 'x86_64', '0.0.0')",
+    )
+    .bind(facts.laptop.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .execute(pool)
+    .await
+    .expect("plant LAPTOP-B");
+    for (to, kind, tombstoned) in QUEUE_EDGES {
+        sqlx::query(
+            "INSERT INTO item_link (from_item_id, to_item_id, kind, created_at, updated_at, \
+             deleted_at) VALUES ($1, $2, $3, $4, $4, $5)",
+        )
+        .bind(ids::HTUI_ANA_2.as_uuid())
+        .bind(to.as_uuid())
+        .bind(kind.as_str())
+        .bind(facts.at)
+        .bind(tombstoned.then_some(facts.at))
+        .execute(pool)
+        .await
+        .expect("plant an edge");
+    }
+    sqlx::query(
+        "INSERT INTO run (id, project_id, item_id, kind, mode, status, target_box_id, \
+         graph_snapshot, started_by, queued_at, started_at, finished_at, updated_at) \
+         VALUES ($1, $2, $3, 'chat', 'manual', 'done', $4, NULL, $5, $6, $6, $6, $6)",
+    )
+    .bind(facts.chat.as_uuid())
+    .bind(ids::PROJECT_HTUI.as_uuid())
+    .bind(ids::HTUI_ANA_2.as_uuid())
+    .bind(ids::BOX.as_uuid())
+    .bind(ids::USER.as_uuid())
+    .bind(facts.at + TimeDelta::seconds(2))
+    .execute(pool)
+    .await
+    .expect("plant the chat run");
+}
+
+/// The runs, steps and notes `queue_rows` reads, through the trait so both stores take the same
+/// ids and instants: on `HTUI_ANA_2` a cancelled graph run then a later queued one, and two
+/// notes; on `AGY_FIX_1` a run targeted at `LAPTOP-B` with steps at positions 0 (pending), 2 and 1
+/// (both parked).
+async fn plant_queue_facts<S: htui_core::store::WriteStore>(store: &S, facts: &QueueFacts) {
+    use htui_core::model::{NewNote, NewRunStep, StepStatus};
+
+    let at = facts.at;
+    store
+        .create_run(NewRun {
+            id: facts.cancelled,
+            queued_at: at,
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("the first run");
+    store
+        .finish_run(facts.cancelled, RunStatus::Cancelled, None, at)
+        .await
+        .expect("cancel it");
+    store
+        .create_run(NewRun {
+            id: facts.latest,
+            queued_at: at + TimeDelta::seconds(1),
+            ..race_run(ids::HTUI_ANA_2)
+        })
+        .await
+        .expect("the latest run");
+    for (index, (id, body)) in facts
+        .notes
+        .into_iter()
+        .zip(["the earlier note", "the later note"])
+        .enumerate()
+    {
+        store
+            .add_note(NewNote {
+                id,
+                item_id: ids::HTUI_ANA_2,
+                body: body.to_owned(),
+                created_by: ids::USER,
+                box_id: None,
+                via_step_id: None,
+                created_at: at + TimeDelta::seconds(i64::try_from(index).expect("small")),
+            })
+            .await
+            .expect("the note lands");
+    }
+    store
+        .create_run(NewRun {
+            id: facts.laptop_run,
+            project_id: ids::PROJECT_AGY,
+            target_box_id: facts.laptop,
+            queued_at: at,
+            ..race_run(ids::AGY_FIX_1)
+        })
+        .await
+        .expect("the LAPTOP-B run");
+    for (step, (position, park)) in facts
+        .steps
+        .into_iter()
+        .zip([(0, false), (2, true), (1, true)])
+    {
+        store
+            .create_step(NewRunStep {
+                id: step,
+                run_id: facts.laptop_run,
+                position,
+                attempt: 1,
+                fanout_index: 0,
+                phase_name: "implement".to_owned(),
+                agent_id: None,
+                model: None,
+            })
+            .await
+            .expect("the step");
+        if park {
+            for (from, to) in [
+                (StepStatus::Pending, StepStatus::Running),
+                (StepStatus::Running, StepStatus::AwaitingApproval),
+            ] {
+                assert!(
+                    store
+                        .transition_step(step, from, to, at)
+                        .await
+                        .expect("the step moves")
+                );
+            }
+        }
+    }
+}
+
+/// MOD-12 M3 D6: the same planted runs, steps, notes and edges answer the same `queue_rows` on
+/// both stores, fixture rows included: the latest graph run with its target hostname and first
+/// parked step, the latest note, the open blockers in byte order, all in D2 order.
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_rows_answer_alike_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let facts = QueueFacts::new();
+    let mem = queue_facts_mem(&facts);
+    queue_facts_pg(&db.pool, &facts).await;
+    plant_queue_facts(pg, &facts).await;
+    plant_queue_facts(&mem, &facts).await;
+    for item in [
+        ids::HTUI_ANA_2,
+        ids::AGY_FIX_1,
+        ids::HTUI_FEAT_2,
+        ids::HTUI_FEAT_1,
+        ids::HTUI_FEAT_3,
+        ids::HTUI_CLEAN_1,
+    ] {
+        pg.queue_item(item, ids::BOX, ids::USER, facts.at)
+            .await
+            .expect("queue on Postgres");
+        mem.queue_item(item, ids::BOX, ids::USER, facts.at)
+            .await
+            .expect("queue on MemStore");
+    }
+
+    let rows = pg
+        .queue_rows(ids::BOX)
+        .await
+        .expect("queue_rows on Postgres");
+    assert_eq!(
+        rows,
+        mem.queue_rows(ids::BOX)
+            .await
+            .expect("queue_rows on MemStore"),
+        "one answer, both stores"
+    );
+    assert_eq!(
+        rows.iter().map(|row| row.entry.item_id).collect::<Vec<_>>(),
+        [
+            ids::HTUI_FEAT_1,
+            ids::HTUI_FEAT_3,
+            ids::HTUI_ANA_2,
+            ids::HTUI_FEAT_2,
+            ids::HTUI_CLEAN_1,
+            ids::AGY_FIX_1,
+        ],
+        "priority 2, 1, then created_at"
+    );
+    let ana = &rows[2];
+    assert_eq!(
+        ana.latest_run.as_ref().map(|run| (run.id, run.status)),
+        Some((facts.latest, RunStatus::Queued)),
+        "the latest graph run, not the later chat run"
+    );
+    assert_eq!(ana.latest_note.as_deref(), Some("the later note"));
+    assert_eq!(
+        ana.open_blockers,
+        ["FEAT-1", "TOOL-1"],
+        "`htui` and `agy` `FEAT-1` list one key"
+    );
+    assert_eq!(
+        rows[3].open_blockers,
+        ["FEAT-1"],
+        "the fixture's FEAT-2 edge"
+    );
+    let laptop = rows[5].latest_run.as_ref().expect("the LAPTOP-B run");
+    assert_eq!(
+        (
+            laptop.target_box_id,
+            laptop.target_hostname.as_deref(),
+            laptop.parked_step
+        ),
+        (facts.laptop, Some("LAPTOP-B"), Some(facts.steps[2]))
+    );
+    assert!(
+        pg.queue_rows(facts.laptop)
+            .await
+            .expect("an empty queue")
+            .is_empty()
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 D3: the same moves answer the same booleans and leave the same queue, positions
+/// included, on both stores; an entry queued after the moves goes last.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_queue_entry_answers_alike_on_both_stores() {
+    use htui_core::model::QueueMove;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now();
+    // Priority 0 each: created_at decides, ANA-2, FEAT-2, CLEAN-1.
+    let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+    for item in [c, b, a] {
+        pg.queue_item(item, ids::BOX, ids::USER, at)
+            .await
+            .expect("queue on Postgres");
+        mem.queue_item(item, ids::BOX, ids::USER, at)
+            .await
+            .expect("queue on MemStore");
+    }
+
+    for (item, to, moved, order) in [
+        (a, QueueMove::Up, false, [a, b, c]),
+        (c, QueueMove::Down, false, [a, b, c]),
+        (ids::HTUI_FIX_1, QueueMove::Up, false, [a, b, c]),
+        (b, QueueMove::Up, true, [b, a, c]),
+        (b, QueueMove::Up, false, [b, a, c]),
+        (a, QueueMove::Down, true, [b, c, a]),
+    ] {
+        let on_pg = pg
+            .move_queue_entry(ids::BOX, item, to)
+            .await
+            .expect("the Postgres move");
+        let on_mem = mem
+            .move_queue_entry(ids::BOX, item, to)
+            .await
+            .expect("the MemStore move");
+        assert_eq!((on_pg, on_mem), (moved, moved), "{item} {to:?}");
+        assert_eq!(queue_alike(pg, &mem, ids::BOX).await, order);
+    }
+    let positions: Vec<Option<i32>> = pg
+        .queue_entries(ids::BOX)
+        .await
+        .expect("read")
+        .into_iter()
+        .map(|entry| entry.position)
+        .collect();
+    assert_eq!(positions, [Some(1), Some(2), Some(3)]);
+
+    let d = ItemId::new();
+    queue_feat(pg, d, 9).await;
+    queue_feat(&mem, d, 9).await;
+    pg.queue_item(d, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue on Postgres");
+    mem.queue_item(d, ids::BOX, ids::USER, at)
+        .await
+        .expect("queue on MemStore");
+    assert_eq!(
+        queue_alike(pg, &mem, ids::BOX).await,
+        [b, c, a, d],
+        "an entry queued after a move goes last, whatever its priority"
+    );
+    let item = pg.item(b).await.expect("read").expect("FEAT-2");
+    assert_eq!(
+        (item.priority, item.version),
+        {
+            let mem_item = mem.item(b).await.expect("read").expect("FEAT-2");
+            (mem_item.priority, mem_item.version)
+        },
+        "a move never touches the item"
+    );
+
+    db.drop_db().await;
+}
+
+// ---- MOD-12 M3 R1 L1: the queue's writers lock its entries in `item_id` order --------------------
+
+/// Three fresh FEATs queued on `ids::BOX`, their heap order the reverse of their `item_id` order
+/// (the highest id is queued first), answered as `[lowest, middle, highest]`. A writer that locks
+/// in heap order takes the highest first; one that locks in `item_id` order, the lowest.
+async fn queued_against_id_order(db: &common::TestDb) -> [ItemId; 3] {
+    let mut items = [ItemId::new(), ItemId::new(), ItemId::new()];
+    items.sort();
+    let at = Utc::now();
+    for &item in items.iter().rev() {
+        queue_feat(&db.store, item, 0).await;
+        db.store
+            .queue_item(item, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+    }
+    items
+}
+
+/// Whether `item`'s entry can be locked right now, from a transaction of its own (`NOWAIT`, so a
+/// lock another transaction holds answers `false` at once).
+async fn entry_lockable(pool: &PgPool, item: ItemId) -> bool {
+    let mut probe = pool.begin().await.expect("begin the probe");
+    let locked = sqlx::query("SELECT 1 FROM queue_entry WHERE item_id = $1 FOR UPDATE NOWAIT")
+        .bind(item.as_uuid())
+        .execute(&mut *probe)
+        .await;
+    probe.rollback().await.expect("release the probe");
+    match locked {
+        Ok(_) => true,
+        Err(sqlx::Error::Database(err)) if err.code().as_deref() == Some("55P03") => false,
+        Err(err) => panic!("the probe failed: {err}"),
+    }
+}
+
+/// A transaction holding `item`'s entry row lock until it is rolled back.
+async fn hold_entry(pool: &PgPool, item: ItemId) -> sqlx::Transaction<'static, sqlx::Postgres> {
+    let mut holder = pool.begin().await.expect("begin the holder");
+    sqlx::query("SELECT 1 FROM queue_entry WHERE item_id = $1 FOR UPDATE")
+        .bind(item.as_uuid())
+        .execute(&mut *holder)
+        .await
+        .expect("lock the entry");
+    holder
+}
+
+/// MOD-12 M3 R1 L1 (Postgres only): `move_queue_entry` locks the box's entries in `item_id`
+/// order. With the lowest id's entry held elsewhere, the move waits on it holding nothing, so the
+/// highest id's entry is still free; a move locking in heap order would already hold it.
+#[tokio::test(flavor = "multi_thread")]
+async fn move_queue_entry_locks_the_entries_in_item_id_order() {
+    use htui_core::model::QueueMove;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let [lowest, middle, highest] = queued_against_id_order(&db).await;
+    let holder = hold_entry(&db.pool, lowest).await;
+    let mover = tokio::spawn({
+        let store = db.store.clone();
+        async move {
+            store
+                .move_queue_entry(ids::BOX, middle, QueueMove::Up)
+                .await
+        }
+    });
+    lock_waiters(&db.pool, 1).await;
+    let free = entry_lockable(&db.pool, highest).await;
+    holder.rollback().await.expect("release the lowest entry");
+
+    assert!(
+        mover.await.expect("the move task").expect("the move"),
+        "the move lands once the lowest entry is released"
+    );
+    assert!(
+        free,
+        "the move waits on the lowest id before it locks any higher one"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 R1 L1 (Postgres only): `prune_finished_entries` locks the entries it deletes in
+/// `item_id` order, as `move_queue_entry` does, so the two never wait on each other in a cycle.
+#[tokio::test(flavor = "multi_thread")]
+async fn prune_finished_entries_locks_the_entries_in_item_id_order() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let items = queued_against_id_order(&db).await;
+    let [lowest, _, highest] = items;
+    // The fixture's own finished entries are pruned first, so only the three are left to delete.
+    db.store
+        .prune_finished_entries(ids::BOX)
+        .await
+        .expect("prune");
+    let finished: Vec<uuid::Uuid> = items.iter().map(|item| item.as_uuid()).collect();
+    sqlx::query("UPDATE item SET status = 'done' WHERE id = ANY($1)")
+        .bind(&finished[..])
+        .execute(&db.pool)
+        .await
+        .expect("finish the three items");
+    let holder = hold_entry(&db.pool, lowest).await;
+    let pruner = tokio::spawn({
+        let store = db.store.clone();
+        async move { store.prune_finished_entries(ids::BOX).await }
+    });
+    lock_waiters(&db.pool, 1).await;
+    let free = entry_lockable(&db.pool, highest).await;
+    holder.rollback().await.expect("release the lowest entry");
+
+    assert_eq!(
+        pruner.await.expect("the prune task").expect("the prune"),
+        3,
+        "the prune deletes all three once the lowest entry is released"
+    );
+    assert!(
+        free,
+        "the prune waits on the lowest id before it locks any higher one"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-12 M3 R1 L1 (Postgres only): moves and prunes racing on one box's queue all answer; none
+/// is aborted as a deadlock victim (40P01). Each round re-queues six items, half of them
+/// finished, and runs four moves and two prunes at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_moves_and_prunes_never_deadlock() {
+    use htui_core::model::QueueMove;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let mut items: Vec<ItemId> = (0..6).map(|_| ItemId::new()).collect();
+    items.sort();
+    for &item in items.iter().rev() {
+        queue_feat(&db.store, item, 0).await;
+    }
+    let finished: Vec<uuid::Uuid> = items.iter().step_by(2).map(|item| item.as_uuid()).collect();
+    for round in 0..20 {
+        sqlx::query("UPDATE item SET status = 'open' WHERE id = ANY($1)")
+            .bind(&finished[..])
+            .execute(&db.pool)
+            .await
+            .expect("reopen the finished items");
+        for &item in items.iter().rev() {
+            db.store
+                .queue_item(item, ids::BOX, ids::USER, Utc::now())
+                .await
+                .expect("the item queues");
+        }
+        sqlx::query("UPDATE item SET status = 'done' WHERE id = ANY($1)")
+            .bind(&finished[..])
+            .execute(&db.pool)
+            .await
+            .expect("finish half the items");
+        let moves = (0..4).map(|n| {
+            let store = db.store.clone();
+            let item = items[(round + n) % items.len()];
+            let to = if n % 2 == 0 {
+                QueueMove::Up
+            } else {
+                QueueMove::Down
+            };
+            tokio::spawn(async move { store.move_queue_entry(ids::BOX, item, to).await.map(drop) })
+        });
+        let prunes = (0..2).map(|_| {
+            let store = db.store.clone();
+            tokio::spawn(async move { store.prune_finished_entries(ids::BOX).await.map(drop) })
+        });
+        for answer in join_all(moves.chain(prunes).collect::<Vec<_>>()).await {
+            answer
+                .expect("the task")
+                .unwrap_or_else(|err| panic!("round {round}: a racing queue write failed: {err}"));
+        }
+    }
+
+    db.drop_db().await;
+}
+
+// ---- MOD-12 M3 review R1: the overlay's batched tag read (M2) and its last close (L4) ----------
+
+/// Review R1 M2: `missing_tags_of` answers alike on both stores, and for every known item exactly
+/// what `missing_tags` answers for it; an unknown item is left out, and an unknown box is refused
+/// as `missing_tags` refuses it.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_tags_of_answers_missing_tags_per_item_on_both_stores() {
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let (tagged, covered) = (ItemId::new(), ItemId::new());
+    for (id, tags) in [
+        (
+            tagged,
+            ["zulu", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
+        ),
+        (covered, ["gpu", "rust"].as_slice()),
+    ] {
+        let new = NewItem {
+            id,
+            project_id: ids::PROJECT_HTUI,
+            kind_id: ids::KIND_HTUI_FEAT,
+            title: "tagged".to_owned(),
+            body: String::new(),
+            required_tags: tags.iter().map(|&tag| tag.to_owned()).collect(),
+            touched_paths: Vec::new(),
+            priority: 0,
+            step_graph_id: None,
+            created_by: ids::USER,
+            box_id: Some(ids::BOX),
+        };
+        pg.mint_item(new.clone()).await.expect("mint on Postgres");
+        mem.mint_item(new).await.expect("mint on MemStore");
+    }
+    let unknown = ItemId::new();
+    let items = [
+        tagged,
+        covered,
+        ids::HTUI_ANA_2,
+        ids::HTUI_TOOL_1,
+        unknown,
+        tagged,
+    ];
+    let batched = pg
+        .missing_tags_of(&items, ids::BOX)
+        .await
+        .expect("the Postgres read");
+    assert_eq!(
+        batched,
+        mem.missing_tags_of(&items, ids::BOX)
+            .await
+            .expect("the MemStore read"),
+        "same answer on both stores"
+    );
+    for item in items {
+        match pg.missing_tags(item, ids::BOX).await {
+            Ok(tags) => assert_eq!(batched.get(&item), Some(&tags), "{item}"),
+            Err(htui_core::store::StoreError::NotFound { entity: "item", .. }) => {
+                assert!(!batched.contains_key(&item), "{item} is unknown");
+            }
+            Err(err) => panic!("missing_tags({item}): {err}"),
+        }
+    }
+    assert_eq!(batched.len(), 4);
+    assert_eq!(
+        batched[&tagged],
+        ["Alpha", "cuda", "zulu"],
+        "bytes order, deduplicated"
+    );
+    assert!(batched[&covered].is_empty());
+    for answer in [
+        pg.missing_tags_of(&[], ids::BOX).await,
+        mem.missing_tags_of(&[], ids::BOX).await,
+    ] {
+        assert!(answer.expect("the read answers").is_empty());
+    }
+    for answer in [
+        pg.missing_tags_of(&items, BoxId::new()).await,
+        mem.missing_tags_of(&items, BoxId::new()).await,
+    ] {
+        assert!(matches!(
+            answer,
+            Err(htui_core::store::StoreError::NotFound { entity: "box", .. })
+        ));
+    }
+
+    db.drop_db().await;
+}
+
+/// Review R1 L4: `last_closed_batch` answers the box's most recently closed batch alike on both
+/// stores (its close reason and instant are what the overlay's header shows), whatever is open
+/// now; `None` before any batch closed.
+#[tokio::test(flavor = "multi_thread")]
+async fn last_closed_batch_answers_alike_on_both_stores() {
+    use htui_core::model::BatchClose;
+
+    let Some(db) = common::demo_db().await else {
+        return;
+    };
+    let pg = &db.store;
+    let mem = htui_core::store::MemStore::demo();
+    let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+    let later = at + TimeDelta::seconds(1);
+
+    assert_eq!(pg.last_closed_batch(ids::BOX).await.expect("read"), None);
+    assert_eq!(mem.last_closed_batch(ids::BOX).await.expect("read"), None);
+    let pg_first = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    assert_eq!(
+        pg.last_closed_batch(ids::BOX).await.expect("read"),
+        None,
+        "an open batch is not closed"
+    );
+    pg.close_batch(ids::BOX, BatchClose::Paused, at)
+        .await
+        .expect("pause");
+    mem.close_batch(ids::BOX, BatchClose::Paused, at)
+        .await
+        .expect("pause");
+    let (pg_paused, mem_paused) = (
+        pg.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("one closed"),
+        mem.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("one closed"),
+    );
+    assert_eq!(pg_paused.id, pg_first.id);
+    assert_eq!(batch_shape(&pg_paused), batch_shape(&mem_paused));
+    assert_eq!(pg_paused.closed_reason, Some(BatchClose::Paused));
+
+    let pg_second = pg.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    let mem_second = mem.open_batch(ids::BOX, ids::USER, at).await.expect("open");
+    pg.close_drained_batch(pg_second.id, &[], later)
+        .await
+        .expect("drain")
+        .expect("nothing keeps it open");
+    mem.close_drained_batch(mem_second.id, &[], later)
+        .await
+        .expect("drain")
+        .expect("nothing keeps it open");
+    pg.open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    mem.open_batch(ids::BOX, ids::USER, later)
+        .await
+        .expect("open");
+    let (pg_drained, mem_drained) = (
+        pg.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("two closed"),
+        mem.last_closed_batch(ids::BOX)
+            .await
+            .expect("read")
+            .expect("two closed"),
+    );
+    assert_eq!(
+        pg_drained.id, pg_second.id,
+        "the latest close, a third batch open"
+    );
+    assert_eq!(batch_shape(&pg_drained), batch_shape(&mem_drained));
+    assert_eq!(
+        (pg_drained.closed_reason, pg_drained.closed_at),
+        (Some(BatchClose::Drained), Some(later))
+    );
+    assert_eq!(
+        pg.last_closed_batch(BoxId::new()).await.expect("read"),
+        None,
+        "another box has none"
     );
 
     db.drop_db().await;

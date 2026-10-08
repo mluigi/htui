@@ -18,6 +18,8 @@
 //! what pins it. Nor does any statement write `updated_at` on an update path - the `BEFORE UPDATE`
 //! trigger of the migration owns it, and `RETURNING` sees the trigger-modified row.
 
+use std::collections::BTreeSet;
+
 use chrono::{DateTime, TimeDelta, Utc};
 use htui_core::model::link::{ItemLink, LinkKind, ProposeLink, WithdrawLink};
 use htui_core::model::{
@@ -31,17 +33,17 @@ use htui_core::model::{
     NewRunStep, NewSkill, NewSkillVersion, NewStepGraph, NewWorkspace, Note, OpenPermission,
     PermissionChoice, PermissionId, PermissionStatus, Persona, PersonaId, PersonaPatch,
     PersonaPermission, PersonaTools, PhaseAgent, PhaseId, PhasePatch, Priority, Project, ProjectId,
-    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueSetting,
-    QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement,
-    RequirementArea, RequirementAreaId, RequirementId, RequirementPatch, RequirementRevision,
-    RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run, RunCommand,
-    RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId,
-    SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph, StepGraphId,
-    StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission, StepStatus,
-    UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
-    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, overlaps,
-    scope_of,
+    ProjectPatch, PromptTemplate, PromptTemplateId, QueueBatch, QueueEntry, QueueMove,
+    QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId, RepoPatch,
+    Requirement, RequirementArea, RequirementAreaId, RequirementId, RequirementPatch,
+    RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate, Resolution, Run,
+    RunCommand, RunCommandId, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep,
+    RunStepCommit, RunStepTree, Scope, SessionEvent, SettleOutcome, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status, StepGraph,
+    StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome, StepPermission,
+    StepStatus, UserId, VerifyOutcome, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId,
+    WorkspacePatch, WorkspaceProject, canonical_declared_tags, missing_tags_failure, moved_order,
+    overlaps, scope_of,
 };
 use htui_core::prompt::settings::{SettingKey, rung_refusal, validate};
 use htui_core::prompt::{DEFAULT_TEMPLATES, TemplateRole};
@@ -7956,6 +7958,91 @@ impl PgStore {
         Ok(gone == 1)
     }
 
+    /// MOD-12 M3 D3: moves `item` one place `to` in `box_id`'s queue, atomically. The first move
+    /// of a queue writes `position = 1..n` over every entry in the current D2 order, so an entry
+    /// queued later (`NULL`) goes after them. `false`, writing nothing, when `item` is not in
+    /// `box_id`'s queue or is already at that end. Never touches `item.priority`.
+    ///
+    /// One transaction, three statements (blueprint §B.3.3, §F-12):
+    /// 1. lock the box's entries in `item_id` order (review R1 L1), the order
+    ///    [`prune_finished_entries`](PgStore::prune_finished_entries) locks in too, so a move and
+    ///    a prune never wait on each other in a cycle. The rows it answers are only the locked
+    ///    set: under `READ COMMITTED` a locking select that waited on a concurrent move may
+    ///    answer pre-wait values, so the order is not read here;
+    /// 2. re-read them in D2 order with [`queue_entries`](PgStore::queue_entries)' literal, byte
+    ///    for byte; a later statement, its snapshot sees every commit the lock waited for. An
+    ///    entry the lock did not take (queued since) is left out, so the write below never waits
+    ///    on a row lock out of order;
+    /// 3. write the moved order as `position = 1..n` in one `UNNEST` update.
+    ///
+    /// A concurrent `queue_item` inserts `NULL`, which sorts after the written positions; a
+    /// concurrent `dequeue_item` waits on the row lock.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn move_queue_entry(
+        &self,
+        box_id: BoxId,
+        item: ItemId,
+        to: QueueMove,
+    ) -> Result<bool> {
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let locked: BTreeSet<Uuid> = sqlx::query_scalar!(
+            "SELECT item_id FROM queue_entry WHERE box_id = $1 ORDER BY item_id FOR UPDATE",
+            box_id.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?
+        .into_iter()
+        .collect();
+        let entries = sqlx::query_as!(
+            QueueEntry,
+            r#"
+            SELECT e.item_id    AS "item_id: ItemId",
+                   i.project_id AS "project_id: ProjectId",
+                   e.box_id     AS "box_id: BoxId",
+                   e.position,
+                   e.queued_at,
+                   e.queued_by  AS "queued_by: UserId"
+              FROM queue_entry e JOIN item i ON i.id = e.item_id
+             WHERE e.box_id = $1
+             ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        let order: Vec<ItemId> = entries
+            .iter()
+            .map(|entry| entry.item_id)
+            .filter(|id| locked.contains(&id.as_uuid()))
+            .collect();
+        let Some(moved) = moved_order(&order, item, to) else {
+            return Ok(false); // the dropped `tx` rolls back: nothing was written
+        };
+        let items: Vec<Uuid> = moved.iter().map(|id| id.as_uuid()).collect();
+        let positions: Vec<i32> = (1..).take(items.len()).collect();
+        sqlx::query!(
+            r#"
+            UPDATE queue_entry e
+               SET position = v.position
+              FROM UNNEST($2::uuid[], $3::int4[]) AS v(item_id, position)
+             WHERE e.box_id = $1 AND e.item_id = v.item_id
+            "#,
+            box_id.as_uuid(),
+            &items[..],
+            &positions[..],
+        )
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(true)
+    }
+
     /// MOD-12 D2: resume — the open batch of `box_id`, opened now under a fresh [`BatchId`]
     /// unless one is already open. Idempotent: `uq_queue_batch_open` turns the second of two
     /// racing inserts into a no-op, and both answer the row that won. A close that slips between
@@ -8056,11 +8143,25 @@ impl PgStore {
         Ok(closed)
     }
 
-    /// MOD-12 D3 (review M1): the drain's close, of exactly `batch` and only while it is still
-    /// drained: open, its box with no queue entry, and no run of its own `queued`, `running` or
-    /// `awaiting_approval`. The re-check is the UPDATE's own `WHERE`, so a resume that opened a
-    /// new batch after the drain's reads is never closed by it, and an entry or a run that
-    /// committed before the statement keeps the batch open. `None` when the batch did not close.
+    /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
+    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. The entries the
+    /// runner read do not keep it open: it calls this when nothing is admissible (an empty queue,
+    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the items of
+    /// the entries it read (empty when it read none), and an entry of the box for any other item
+    /// means an item may be ready that the runner never judged. The check is by item, not by
+    /// `queued_at`: that is the queuing client's clock, not commit order, so a skewed clock or a
+    /// queuer that stamped first and committed last could date an unread entry before every
+    /// entry read. The re-check is the UPDATE's own `WHERE`, so a resume that opened a new batch
+    /// after the runner's reads is never closed by it, and a run or an entry that committed before
+    /// the statement keeps the batch open. `None` when the batch did not close.
+    ///
+    /// An admission in flight (`create_run` past its `FOR SHARE` on the batch, not yet committed)
+    /// is waited for first, by a `FOR UPDATE` on the batch row in a statement of its own. Without
+    /// it the UPDATE would wait on the share lock and then, the row being only locked and not
+    /// updated, go ahead on its statement-start snapshot, which never sees the admitted run; with
+    /// no entry clause left to cover that window (L4) the batch would close over a `queued` run.
+    /// Under `READ COMMITTED` the UPDATE, a later statement, sees every admission that held the
+    /// share lock, and none can take it again until this transaction ends.
     ///
     /// # Errors
     ///
@@ -8068,32 +8169,56 @@ impl PgStore {
     pub async fn close_drained_batch(
         &self,
         batch: BatchId,
+        seen: &[ItemId],
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
-        sqlx::query_as!(
+        let seen: Vec<Uuid> = seen.iter().map(|item| item.as_uuid()).collect();
+        let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let open = sqlx::query_scalar!(
+            r#"SELECT 1 AS "one!" FROM queue_batch WHERE id = $1 AND closed_at IS NULL FOR UPDATE"#,
+            batch.as_uuid(),
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
+        if open.is_none() {
+            return Ok(None);
+        }
+        let closed = sqlx::query_as!(
             QueueBatch,
             r#"
             UPDATE queue_batch b
                SET closed_at = $2, closed_reason = 'drained'
              WHERE b.id = $1 AND b.closed_at IS NULL
-               AND NOT EXISTS (SELECT 1 FROM queue_entry e WHERE e.box_id = b.box_id)
                AND NOT EXISTS (
                        SELECT 1 FROM run r
                         WHERE r.batch_id = b.id
                           AND r.status IN ('queued', 'running', 'awaiting_approval'))
+               AND NOT EXISTS (
+                       SELECT 1 FROM queue_entry e
+                        WHERE e.box_id = b.box_id
+                          AND e.item_id <> ALL($3::uuid[]))
             RETURNING b.id AS "id: BatchId", b.box_id AS "box_id: BoxId", b.opened_at,
                       b.opened_by AS "opened_by: UserId", b.closed_at,
                       b.closed_reason AS "closed_reason: BatchClose"
             "#,
             batch.as_uuid(),
             at,
+            &seen,
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
-        .map_err(map_sqlx)
+        .map_err(map_sqlx)?;
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(closed)
     }
 
     /// MOD-12 D3: drop `box_id`'s entries whose item is `done` or `closed`; how many went.
+    ///
+    /// The rows are locked in `item_id` order first (review R1 L1), the order
+    /// [`move_queue_entry`](PgStore::move_queue_entry) locks in, so the runner's prune and a
+    /// user's move never deadlock. A bare `DELETE … USING item` would lock in whatever order its
+    /// plan visits the rows.
     ///
     /// # Errors
     ///
@@ -8101,9 +8226,15 @@ impl PgStore {
     pub async fn prune_finished_entries(&self, box_id: BoxId) -> Result<u64> {
         Ok(sqlx::query!(
             r#"
+            WITH doomed AS (
+                SELECT e.item_id
+                  FROM queue_entry e JOIN item i ON i.id = e.item_id
+                 WHERE e.box_id = $1 AND i.status IN ('done', 'closed')
+                 ORDER BY e.item_id
+                   FOR UPDATE OF e)
             DELETE FROM queue_entry e
-             USING item i
-             WHERE e.item_id = i.id AND e.box_id = $1 AND i.status IN ('done', 'closed')
+             USING doomed d
+             WHERE e.item_id = d.item_id
             "#,
             box_id.as_uuid(),
         )

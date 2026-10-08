@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Context, Keys, quote};
+use super::{Context, Keys, Row, quote};
 
 /// The header and `version = 1`. Constant, so the output is the same on every machine (B-13).
 const HEADER: &str = r"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
@@ -18,12 +18,14 @@ version = 1
 /// `name = ["chord", …]  # help` line per action. A view's table lists its own rows, then its
 /// derived `VIEW_DEFAULTS` rows, then its overrides of shared verbs (MOD-67 M3), each under the
 /// shared verb's name. A line the file changed ends `(changed)`; a derived row the file did not
-/// set never does; an unbound action is `name = []`.
+/// set never does; an unbound action is `name = []`. A line left at its default that gave chords
+/// to the file's entries (MOD-12 M3 R1 H1) ends `(unbound by quit)` when it has none left, else
+/// `(lost "j" to top)`.
 #[must_use]
 pub fn print(keys: &Keys) -> String {
     let mut out = HEADER.to_owned();
     for &context in Context::ALL {
-        let rows: Vec<(&str, String, &str, bool)> = keys
+        let rows: Vec<(&str, String, &str, String)> = keys
             .rows
             .iter()
             .filter(|row| row.context == context)
@@ -35,7 +37,7 @@ pub fn print(keys: &Keys) -> String {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let name = row.act.spec().map_or("", |spec| spec.name);
-                (name, format!("[{value}]"), row.help, row.line.is_some())
+                (name, format!("[{value}]"), row.help, mark(row))
             })
             .collect();
         if rows.is_empty() {
@@ -56,12 +58,40 @@ pub fn print(keys: &Keys) -> String {
             .max()
             .unwrap_or(0);
         let _ = write!(out, "\n[{}]\n", context.table());
-        for (left, (_, _, help, changed)) in lefts.iter().zip(&rows) {
-            let mark = if *changed { " (changed)" } else { "" };
+        for (left, (_, _, help, mark)) in lefts.iter().zip(&rows) {
             let _ = writeln!(out, "{left:<left_width$}  # {help}{mark}");
         }
     }
     out
+}
+
+/// What follows a row's help: ` (changed)` for the file's change, ` (unbound by quit)` or
+/// ` (lost "j" to top)` for a default that gave way to the file's entries, else nothing.
+fn mark(row: &Row) -> String {
+    if row.line.is_some() {
+        return " (changed)".to_owned();
+    }
+    if row.lost.is_empty() {
+        return String::new();
+    }
+    let name = |lost: &super::Lost| lost.to.spec().map_or("", |spec| spec.name);
+    if row.chords.is_empty() {
+        let mut takers: Vec<&str> = Vec::new();
+        for lost in &row.lost {
+            if !takers.contains(&name(lost)) {
+                takers.push(name(lost));
+            }
+        }
+        format!(" (unbound by {})", takers.join(", "))
+    } else {
+        let taken = row
+            .lost
+            .iter()
+            .map(|lost| format!("{} to {}", quote(&lost.chord.spec()), name(lost)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" (lost {taken})")
+    }
 }
 
 #[cfg(test)]
@@ -69,7 +99,7 @@ mod tests {
     use super::print;
     use crate::keys::{Keys, load_str, quote};
 
-    /// Blueprint §4's lines 1-26 of the default print.
+    /// Blueprint §4's lines 1-26 of the default print, and the queue row (MOD-12 M3 D8): 27.
     const DEFAULT_HEAD: &str = r#"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
 # directory: ~/.config/htui on Linux, ~/Library/Application Support/htui on macOS, %APPDATA%\htui
 # on Windows. List only what you change: a list replaces that action's chords, [] unbinds it.
@@ -93,6 +123,7 @@ help         = ["?", "f1"]  # help
 workspaces   = ["w"]        # workspaces
 find         = ["ctrl-f"]   # find
 waiting      = ["ctrl-w"]   # waiting
+queue        = ["ctrl-q"]   # queue
 
 [overlay]
 close = ["esc"]  # close"#;
@@ -100,7 +131,7 @@ close = ["esc"]  # close"#;
     #[test]
     fn the_default_print_starts_with_the_header_global_and_overlay() {
         let printed = print(Keys::compiled());
-        let head: Vec<&str> = printed.lines().take(26).collect();
+        let head: Vec<&str> = printed.lines().take(27).collect();
         assert_eq!(head, DEFAULT_HEAD.lines().collect::<Vec<_>>());
         assert!(printed.ends_with("[waiting]\nopen = [\"enter\"]  # open step\n"));
         assert!(!printed.ends_with("\n\n"));
@@ -119,7 +150,7 @@ close = ["esc"]  # close"#;
     #[test]
     fn a_changed_table_round_trips_and_keeps_its_marks() {
         let keys = load_str(
-            "[global]\nquit = [\"ctrl-q\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
+            "[global]\nquit = [\"ctrl-x\"]\nworkspaces = []\n\n[overlay]\nclose = [\"esc\", \"f2\"]\n",
         )
         .expect("the file loads");
         let printed = print(&keys);
@@ -127,13 +158,47 @@ close = ["esc"]  # close"#;
         assert_eq!(reloaded, keys);
         assert_eq!(print(&reloaded), printed);
         for line in [
-            "quit         = [\"ctrl-q\"]   # quit (changed)",
+            "quit         = [\"ctrl-x\"]   # quit (changed)",
             "workspaces   = []           # workspaces (changed)",
             "close = [\"esc\", \"f2\"]  # close (changed)",
         ] {
             assert!(printed.lines().any(|printed| printed == line), "{line}");
         }
         assert_eq!(printed.matches("(changed)").count(), 3);
+    }
+
+    /// MOD-12 M3 R1 H1: a row that gave a chord to an entry is marked with the entry's action,
+    /// not `(changed)`: the file never named it. The print reads back to the same keys, with the
+    /// row now an entry of its own.
+    #[test]
+    fn a_row_that_gave_way_names_the_entry_that_took_its_chord() {
+        let keys = load_str("[global]\nquit = [\"ctrl-q\"]\n\n[list]\ntop = [\"j\"]\n")
+            .expect("the file loads");
+        let printed = print(&keys);
+        let line = |name: &str| {
+            printed
+                .lines()
+                .find(|line| line.starts_with(&format!("{name} ")))
+                .unwrap_or_else(|| panic!("no {name} row in {printed}"))
+        };
+        assert!(line("queue").contains("= []"), "{printed}");
+        assert!(
+            line("queue").ends_with("# queue (unbound by quit)"),
+            "{printed}"
+        );
+        assert!(line("down").contains(r#"= ["down"]"#), "{printed}");
+        assert!(
+            line("down").ends_with(r#"# down (lost "j" to top)"#),
+            "{printed}"
+        );
+        assert!(line("quit").ends_with("# quit (changed)"), "{printed}");
+        assert!(line("top").ends_with("# top (changed)"), "{printed}");
+        assert_eq!(printed.matches("(changed)").count(), 2);
+
+        let reloaded = load_str(&printed).expect("the print loads");
+        assert_eq!(reloaded, keys);
+        assert!(!print(&reloaded).contains("unbound by"));
+        assert!(!print(&reloaded).contains("lost \""));
     }
 
     #[test]

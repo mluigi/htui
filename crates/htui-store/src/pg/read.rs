@@ -20,14 +20,14 @@ use htui_core::model::{
     DocumentHead, DocumentId, Gate, GateOutcome, Isolation, Item, ItemCitation, ItemFilter, ItemId,
     ItemKind, ItemKindId, ItemSummary, LinkEdge, LinkGraph, LinkKind, Note, Persona, PersonaId,
     PersonaPermission, PersonaTools, PhaseAgent, PhaseId, Priority, Project, ProjectId, ProjectRef,
-    PromptScope, PromptTemplate, QueueBatch, QueueEntry, Repo, RepoBoxPath, RepoId, Requirement,
-    RequirementArea, RequirementAreaId, RequirementFilter, RequirementId, RequirementRevision,
-    RequirementSpec, RequirementState, Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase,
-    Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree,
-    RunSummary, Scope, SessionEvent, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
-    SkillVersion, Status, StepGraph, StepGraphId, StepGraphPhase, StepId, StepStatus,
-    ToolCallCount, UpstreamEntry, UserId, VerifyOutcome, WaitingCandidate, Workspace,
-    WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
+    PromptScope, PromptTemplate, QueueBatch, QueueEntry, QueueRow, QueueRunFact, Repo, RepoBoxPath,
+    RepoId, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
+    RequirementRevision, RequirementSpec, RequirementState, Resolution, ResolvedGraph,
+    ResolvedInput, ResolvedPhase, Run, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
+    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, Skill, SkillBinding,
+    SkillBindingId, SkillBindingKey, SkillId, SkillVersion, Status, StepGraph, StepGraphId,
+    StepGraphPhase, StepId, StepStatus, ToolCallCount, UpstreamEntry, UserId, VerifyOutcome,
+    WaitingCandidate, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspaceProject, WorkspaceSummary,
 };
 use htui_core::prompt::settings::SettingKey;
 use htui_core::store::{ReadStore, Result, SettingRung, StoreError, StoredSetting};
@@ -2171,6 +2171,59 @@ impl PgStore {
         Ok(missing)
     }
 
+    /// MOD-12 M3 review R1 M2: [`missing_tags`](PgStore::missing_tags) for many items in one
+    /// statement, keyed by item, so the queue overlay's refresh costs one round trip, not one per
+    /// row. Each known item maps to exactly what `missing_tags` answers for it: the same predicate
+    /// and `COLLATE "C"` order, per item in an `ARRAY` subquery (empty when the box covers every
+    /// tag). An unknown item, which `missing_tags` refuses, is left out, so one item deleted under
+    /// the overlay costs only its own row. The box probe runs only when the statement returns no
+    /// row, which an unknown box always does.
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::NotFound`] `{ entity: "box" }` for an unknown box; otherwise whatever the
+    /// driver reports, through [`map_sqlx`].
+    pub async fn missing_tags_of(
+        &self,
+        items: &[ItemId],
+        box_id: BoxId,
+    ) -> Result<BTreeMap<ItemId, Vec<String>>> {
+        let ids: Vec<Uuid> = items.iter().map(|item| item.as_uuid()).collect();
+        let rows = sqlx::query!(
+            r#"
+            SELECT i.id AS "item_id!: ItemId",
+                   ARRAY(SELECT DISTINCT t COLLATE "C"
+                           FROM UNNEST(i.required_tags) t
+                          WHERE t <> ALL (b.probed_tags || b.declared_tags)
+                          ORDER BY 1) AS "tags!"
+              FROM item i CROSS JOIN box b
+             WHERE i.id = ANY($1) AND b.id = $2
+            "#,
+            &ids[..],
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+
+        if rows.is_empty()
+            && sqlx::query_scalar!("SELECT 1 FROM box WHERE id = $1", box_id.as_uuid())
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?
+                .is_none()
+        {
+            return Err(StoreError::NotFound {
+                entity: "box",
+                id: box_id.to_string(),
+            });
+        }
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.item_id, row.tags))
+            .collect())
+    }
+
     /// How many runs hold a slot on one box: §4.7's admission count, which is `running` **and**
     /// `awaiting_approval` and not `queued` - a queued run occupies nothing yet.
     ///
@@ -2221,8 +2274,10 @@ impl PgStore {
             .collect())
     }
 
-    /// MOD-12 D4: `box_id`'s queue entries, `position NULLS LAST, queued_at, item_id`, each with
-    /// its item's project (D5).
+    /// MOD-12 D4, M3 D2: `box_id`'s queue entries in queue order, `position NULLS LAST, priority
+    /// DESC, created_at, id`: `admission_order`'s order over every entry, ready or not. Each
+    /// carries its item's project (D5). [`PgStore::move_queue_entry`] re-reads with this literal,
+    /// byte for byte, so the two share one `.sqlx` entry.
     ///
     /// # Errors
     ///
@@ -2239,13 +2294,123 @@ impl PgStore {
                    e.queued_by  AS "queued_by: UserId"
               FROM queue_entry e JOIN item i ON i.id = e.item_id
              WHERE e.box_id = $1
-             ORDER BY e.position NULLS LAST, e.queued_at, e.item_id
+             ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id
             "#,
             box_id.as_uuid(),
         )
         .fetch_all(&self.pool)
         .await
         .map_err(map_sqlx)
+    }
+
+    /// MOD-12 M3 D6: `box_id`'s entries in queue order (D2), each with its item's key, title,
+    /// status, priority and `created_at`, its latest graph run (target hostname, parked step), its
+    /// latest note and its open `blocked_by` keys. One statement.
+    ///
+    /// The latest run is the latest `kind = 'graph'` run by `(queued_at, id)`; its parked step is
+    /// its first `awaiting_approval` step by `(position, attempt, fanout_index)`. The blocker
+    /// clause is [`ready_items`](PgStore::ready_items)' verbatim, so "open blocker" and "not ready
+    /// for a blocker" are one rule; `COLLATE "C"` is `MemStore`'s byte order. Keys are unique only
+    /// per project and a link may cross projects, so the keys are `DISTINCT`: two open blockers
+    /// keyed `FEAT-1` list it once, as `MemStore`'s set does.
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn queue_rows(&self, box_id: BoxId) -> Result<Vec<QueueRow>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT e.item_id         AS "item_id: ItemId",
+                   i.project_id      AS "project_id: ProjectId",
+                   e.box_id          AS "box_id: BoxId",
+                   e.position,
+                   e.queued_at,
+                   e.queued_by       AS "queued_by: UserId",
+                   i.key             AS "key!",
+                   i.title,
+                   i.status          AS "status: Status",
+                   i.priority,
+                   i.created_at,
+                   lr.id             AS "run_id?: RunId",
+                   lr.status         AS "run_status?: RunStatus",
+                   lr.mode           AS "run_mode?: RunMode",
+                   lr.target_box_id  AS "run_target?: BoxId",
+                   lr.hostname       AS "run_hostname?",
+                   lr.failure        AS "run_failure?",
+                   lr.parked_step    AS "run_parked_step?: StepId",
+                   ln.body           AS "note?",
+                   COALESCE(ob.keys, '{}'::text[]) AS "blockers!"
+              FROM queue_entry e
+              JOIN item i ON i.id = e.item_id
+              LEFT JOIN LATERAL (
+                    SELECT r.id, r.status, r.mode, r.target_box_id, tb.hostname, r.failure,
+                           (SELECT s.id FROM run_step s
+                             WHERE s.run_id = r.id AND s.status = 'awaiting_approval'
+                             ORDER BY s.position, s.attempt, s.fanout_index
+                             LIMIT 1) AS parked_step
+                      FROM run r
+                      LEFT JOIN box tb ON tb.id = r.target_box_id
+                     WHERE r.item_id = i.id AND r.kind = 'graph'
+                     ORDER BY r.queued_at DESC, r.id DESC
+                     LIMIT 1
+                   ) lr ON true
+              LEFT JOIN LATERAL (
+                    SELECT n.body FROM item_note n
+                     WHERE n.item_id = i.id
+                     ORDER BY n.created_at DESC, n.id DESC
+                     LIMIT 1
+                   ) ln ON true
+              LEFT JOIN LATERAL (
+                    SELECT array_agg(DISTINCT t.key COLLATE "C" ORDER BY t.key COLLATE "C") AS keys
+                      FROM item_link l JOIN item t ON t.id = l.to_item_id
+                     WHERE l.from_item_id = i.id AND l.kind = 'blocked_by'
+                       AND l.deleted_at IS NULL AND t.status NOT IN ('done','closed')
+                   ) ob ON true
+             WHERE e.box_id = $1
+             ORDER BY e.position NULLS LAST, i.priority DESC, i.created_at, i.id
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(map_sqlx)?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let latest_run = match (row.run_id, row.run_status, row.run_mode, row.run_target) {
+                    (Some(id), Some(status), Some(mode), Some(target_box_id)) => {
+                        Some(QueueRunFact {
+                            id,
+                            status,
+                            mode,
+                            target_box_id,
+                            target_hostname: row.run_hostname,
+                            failure: row.run_failure,
+                            parked_step: row.run_parked_step,
+                        })
+                    }
+                    _ => None,
+                };
+                QueueRow {
+                    entry: QueueEntry {
+                        item_id: row.item_id,
+                        project_id: row.project_id,
+                        box_id: row.box_id,
+                        position: row.position,
+                        queued_at: row.queued_at,
+                        queued_by: row.queued_by,
+                    },
+                    key: row.key,
+                    title: row.title,
+                    status: row.status,
+                    priority: row.priority,
+                    created_at: row.created_at,
+                    latest_run,
+                    latest_note: row.note,
+                    open_blockers: row.blockers,
+                }
+            })
+            .collect())
     }
 
     /// MOD-12 D2: `box_id`'s open batch, if any: whether its queue runs. `uq_queue_batch_open`
@@ -2266,6 +2431,35 @@ impl PgStore {
                    closed_reason AS "closed_reason: BatchClose"
               FROM queue_batch
              WHERE box_id = $1 AND closed_at IS NULL
+            "#,
+            box_id.as_uuid(),
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(map_sqlx)
+    }
+
+    /// MOD-12 M3 review R1 L4: `box_id`'s most recently closed batch, by `closed_at DESC, id
+    /// DESC`, whatever is open now; `None` before any closed. Its `closed_reason` tells the queue
+    /// overlay's header why a queue the user resumed reads paused again (a stall's drain).
+    ///
+    /// # Errors
+    ///
+    /// Whatever the driver reports, through [`map_sqlx`].
+    pub async fn last_closed_batch(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        sqlx::query_as!(
+            QueueBatch,
+            r#"
+            SELECT id            AS "id: BatchId",
+                   box_id        AS "box_id: BoxId",
+                   opened_at,
+                   opened_by     AS "opened_by: UserId",
+                   closed_at,
+                   closed_reason AS "closed_reason: BatchClose"
+              FROM queue_batch
+             WHERE box_id = $1 AND closed_at IS NOT NULL
+             ORDER BY closed_at DESC, id DESC
+             LIMIT 1
             "#,
             box_id.as_uuid(),
         )

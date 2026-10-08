@@ -211,16 +211,25 @@ start from it, and run it again to check your file.
 version = 1
 
 [global]
-quit = ["ctrl-q"]
+quit = ["ctrl-x"]
 
 [overlay]
 close = ["esc", "f2"]
 ```
 
+Within one table, your keys win over the defaults you leave alone: if a key you list is the
+default of another action in the same table, that action gives it up, and is unbound if it had
+no other key. htui starts anyway and says so on stderr, with the file's path and line, as in
+`[global] quit = "ctrl-q" takes "ctrl-q" from global.queue, which is now unbound`;
+`htui --print-keys` marks that action's line `(unbound by quit)`. List the action with another
+key to keep it.
+
 htui refuses to start on an invalid file and names every bad line, as in
 `keys.toml:5: [global] quit = "ctrl-c": ctrl-c always quits and cannot be bound`;
-`htui --default-keys` starts with the default keys anyway. `ctrl-c` always quits and cannot be
-bound.
+`htui --default-keys` starts with the default keys anyway. Two actions you list with the same key
+are an error. A default never gives way to a key from another table: a key shared between a
+pop-up's keys and `[global] help` is an error in either direction (such as `esc` for
+`[global] help`, or `f1` for `[overlay] close`). `ctrl-c` always quits and cannot be bound.
 
 A table named after a Settings section or a pop-up changes a shared action there alone:
 `[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every other section keeps `r`.

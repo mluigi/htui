@@ -2162,10 +2162,14 @@ async fn sweep_once<H: htui_core::store::WorkerHost, P: ReplySink>(ctx: TaskCtx<
 /// Before the `Kit`, the D3 spend gate (MOD-12 M2 D4): the batch's spend is read once per sweep
 /// and each ordered entry is held to its own project's `per_token_cap_batch` (read live, D2) and
 /// `min_budget_for_new_attempt` through [`batch_budget`]. A stopped entry is skipped and the next
-/// tried, since another project may have no cap; a malformed cap fails its entries closed. A batch
-/// whose every entry is stopped stays open and admits nothing (no `drain`); a pause and a resume
-/// open a fresh one. The first stop and the first malformed cap of a batch are logged once
-/// ([`Shared::note_batch_stop`], [`Shared::note_bad_cap`]).
+/// tried, since another project may have no cap; a malformed cap fails its entries closed. The
+/// first stop and the first malformed cap of a batch are logged once ([`Shared::note_batch_stop`],
+/// [`Shared::note_bad_cap`]).
+///
+/// MOD-12 M3 D4 (L4): when the tick has a free slot and nothing is admissible (no entry ready, or
+/// every ready entry stopped by the spend gate), the batch closes `drained` like an empty one,
+/// unless a run of its own is live; a later `Q` then waits for `P`. A tick with no free slot, a
+/// failed read and an enqueue refusal never close.
 async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     box_id: BoxId,
@@ -2195,8 +2199,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
             return;
         }
     };
+    // Review R1 L2: the items this sweep judged; the drain skips its close when the box has an
+    // entry for any other, queued after this read.
+    let seen: Vec<ItemId> = entries.iter().map(|entry| entry.item_id).collect();
     if entries.is_empty() {
-        drain(ctx, &batch).await;
+        drain(ctx, &batch, Drain::Empty, &seen).await;
         return;
     }
     let mut project_ids: Vec<ProjectId> = Vec::new();
@@ -2231,10 +2238,8 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
         .filter(|item| cancelled.binary_search(&item.id).is_err())
         .collect();
     let order = admission_order(&entries, &ready);
-    if order.is_empty() {
-        shared.queue_reads_ok();
-        return;
-    }
+    // MOD-12 M3 D4: the slots before the stall check, so a tick with no free slot (one may be
+    // held by a manual run) never closes the batch, whatever `order` holds.
     let slots = async {
         let running = host.running_runs_on_box(box_id).await?;
         let queued = host.queued_runs_on_box(box_id).await?.len();
@@ -2251,6 +2256,11 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     };
     if free == 0 {
         shared.queue_reads_ok();
+        return;
+    }
+    if order.is_empty() {
+        // L4: nothing is ready (not ready, cancelled in this batch, or escalated).
+        drain(ctx, &batch, Drain::Stalled, &seen).await;
         return;
     }
     // MOD-12 M2 D4: the batch's spend once per sweep, each entry's project caps live (D2), one
@@ -2305,6 +2315,9 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
     shared.queue_reads_ok();
     if admissible.is_empty() {
+        // L4: a free slot, and every ordered entry stopped by the spend gate, a malformed cap or
+        // an absent project.
+        drain(ctx, &batch, Drain::Stalled, &seen).await;
         return;
     }
     let kit = match Kit::read(&ctx.shared, host, false).await {
@@ -2344,22 +2357,43 @@ async fn admit<H: htui_core::store::WorkerHost, P: ReplySink>(
     }
 }
 
-/// MOD-12 D3: a batch with no entry left closes `drained` once no run of its own is live. The
-/// close is of exactly the batch `admit` read, and re-checks both conditions in the same write
-/// (review M1), so a pause and a resume between the reads and the close are never undone.
+/// Why `admit` closes its batch (MOD-12 M3 D4). Log text only: the store's predicate is one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Drain {
+    /// No entry is left (M1 D3).
+    Empty,
+    /// Entries are left, but none is admissible this tick (L4).
+    Stalled,
+}
+
+/// MOD-12 D3, M3 D4 (L4): a batch with nothing admissible (no entry left, or a stalled queue)
+/// closes `drained` once no run of its own is live. The close is of exactly the batch `admit`
+/// read, and re-checks its condition in the same write (review M1), so a pause and a resume
+/// between the reads and the close are never undone. `seen` is the items of the entries `admit`
+/// read, empty when it read none: an entry for any other item keeps the batch open (review R1
+/// L2), as its item may be ready and was never judged. It is by item, not by `queued_at`, which
+/// is the queuing client's clock and not commit order.
 async fn drain<H: htui_core::store::WorkerHost, P: ReplySink>(
     ctx: &TaskCtx<H, P>,
     batch: &htui_core::model::QueueBatch,
+    why: Drain,
+    seen: &[ItemId],
 ) {
     match ctx
         .host
-        .close_drained_batch(batch.id, ctx.shared.clock.now())
+        .close_drained_batch(batch.id, seen, ctx.shared.clock.now())
         .await
     {
         Ok(closed) => {
             ctx.shared.queue_reads_ok();
             if closed.is_some() {
-                tracing::info!(batch = %batch.id, "the queue drained");
+                match why {
+                    Drain::Empty => tracing::info!(batch = %batch.id, "the queue drained"),
+                    Drain::Stalled => tracing::info!(
+                        batch = %batch.id,
+                        "the queue stalled with nothing admissible; its batch closed"
+                    ),
+                }
             }
         }
         Err(err) => {
@@ -3833,6 +3867,9 @@ mod queue_store_errors {
         fn send(&self, _: &u64, _: RunReply) {}
     }
 
+    /// An item and the instant it is queued at, by [`Failing::queue_before_close`].
+    type LateEntry = (ItemId, DateTime<Utc>);
+
     /// `Backend::memory`, but the call named in `fail` answers an error. Each failing call
     /// records its name and whether a streak stood when it was made.
     #[derive(Clone)]
@@ -3842,6 +3879,9 @@ mod queue_store_errors {
         /// Review R1 L3: `project_settings` answers `Ok(None)`, as for a project deleted between
         /// the entry read and the cap read.
         no_project: Arc<AtomicBool>,
+        /// Review R1 L2: an item queued (at that instant) just before `close_drained_batch`
+        /// runs, as by a `queue_item` that commits between `admit`'s entry read and its close.
+        queue_before_close: Arc<StdMutex<Option<LateEntry>>>,
         seen: Arc<StdMutex<Vec<(&'static str, bool)>>>,
         shared: Arc<OnceLock<Arc<Shared<Quiet>>>>,
     }
@@ -3978,10 +4018,21 @@ mod queue_store_errors {
         async fn close_drained_batch(
             &self,
             batch: BatchId,
+            seen: &[ItemId],
             at: DateTime<Utc>,
         ) -> Result<Option<QueueBatch>> {
             self.check("close_drained_batch")?;
-            WorkerHost::close_drained_batch(&self.inner, batch, at).await
+            let late = self
+                .queue_before_close
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some((item, queued_at)) = late {
+                self.inner
+                    .queue_item(item, ids::BOX, ids::USER, queued_at)
+                    .await?;
+            }
+            WorkerHost::close_drained_batch(&self.inner, batch, seen, at).await
         }
         async fn batch_spend(&self, batch: BatchId) -> Result<Option<i64>> {
             self.check("batch_spend")?;
@@ -4005,6 +4056,7 @@ mod queue_store_errors {
             inner: Backend::memory(store),
             fail: Arc::default(),
             no_project: Arc::default(),
+            queue_before_close: Arc::default(),
             seen: Arc::default(),
             shared: Arc::default(),
         };
@@ -4094,7 +4146,9 @@ mod queue_store_errors {
     /// sweep) has no caps to read, so it fails closed: the engine is never asked to enqueue it,
     /// and that is no store failure. Once its project reads again the engine is asked; the demo
     /// has no agent for `research`, so that enqueue is refused and blocks the item, which is
-    /// what tells the two sweeps apart.
+    /// what tells the two sweeps apart. MOD-12 M3 D4 (L4): with its only entry refused, the
+    /// first sweep had a free slot and nothing admissible, so it closed the batch; a resume opens
+    /// the second sweep's.
     #[tokio::test]
     async fn an_entry_whose_project_is_gone_is_not_admitted() {
         let store = MemStore::demo();
@@ -4127,6 +4181,18 @@ mod queue_store_errors {
             !ctx.shared.queue_failing.load(Ordering::SeqCst),
             "an absent project is not a failing store"
         );
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers"),
+            None,
+            "an absent project stalls the batch, which closes (CLOSE 3)"
+        );
+        store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("a resume opens a new batch");
 
         host.no_project.store(false, Ordering::SeqCst);
         admit(&ctx, ids::BOX, &json!({})).await;
@@ -4134,6 +4200,139 @@ mod queue_store_errors {
             status().await,
             Status::Blocked,
             "with its project read, the entry reaches the engine (whose enqueue blocks it)"
+        );
+    }
+
+    /// Review R1 L2: an entry queued after `admit` read the (empty) queue, committed before its
+    /// close, keeps the batch open: the item was ready before the close, so a drain over it would
+    /// leave it waiting for a resume.
+    #[tokio::test]
+    async fn an_entry_queued_after_an_empty_read_keeps_the_batch_open() {
+        let store = MemStore::demo();
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, Utc::now())
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store.clone());
+        *host
+            .queue_before_close
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((ids::HTUI_ANA_2, Utc::now()));
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers")
+                .map(|open| open.id),
+            Some(batch.id),
+            "the entry queued after the read keeps the batch open"
+        );
+        assert!(
+            !ctx.shared.queue_failing.load(Ordering::SeqCst),
+            "a close skipped is no store failure"
+        );
+
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_ne!(
+            store
+                .item(ids::HTUI_ANA_2)
+                .await
+                .expect("the read answers")
+                .expect("the fixture item")
+                .status,
+            Status::Open,
+            "the next sweep reads the entry and admits it"
+        );
+    }
+
+    /// Review R1 L2: a stalled queue's close is skipped as well when an entry newer than every
+    /// entry `admit` read is queued before the close.
+    #[tokio::test]
+    async fn an_entry_queued_after_a_stalled_read_keeps_the_batch_open() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store.clone());
+        // Its project reads as absent: nothing is admissible, and the queue stalls.
+        host.no_project.store(true, Ordering::SeqCst);
+        *host
+            .queue_before_close
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((ids::HTUI_FEAT_2, at + chrono::TimeDelta::seconds(1)));
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers")
+                .map(|open| open.id),
+            Some(batch.id),
+            "the entry queued after the read keeps the stalled batch open"
+        );
+
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers"),
+            None,
+            "a sweep that read every entry and admits none closes it (CLOSE 3)"
+        );
+    }
+
+    /// Review R1 L2 (verify): `queued_at` is the queuing client's clock, not commit order, so
+    /// an entry the read missed can carry an instant at or before every entry it read (a skewed
+    /// clock, or a queuer that stamped first and committed last). It keeps the batch open all
+    /// the same: the close knows which entries were read, not how new they are.
+    #[tokio::test]
+    async fn an_entry_queued_after_the_read_with_an_older_instant_keeps_the_batch_open() {
+        let store = MemStore::demo();
+        let at = Utc::now();
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        let (_runtime, host, ctx) = sweep_over(store.clone());
+        // Its project reads as absent: nothing is admissible, and the queue stalls.
+        host.no_project.store(true, Ordering::SeqCst);
+        *host
+            .queue_before_close
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) =
+            Some((ids::HTUI_FEAT_2, at - chrono::TimeDelta::seconds(1)));
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers")
+                .map(|open| open.id),
+            Some(batch.id),
+            "the entry the read missed keeps the stalled batch open, however old its instant"
+        );
+
+        admit(&ctx, ids::BOX, &json!({})).await;
+        assert_eq!(
+            store
+                .open_batch_of(ids::BOX)
+                .await
+                .expect("the read answers"),
+            None,
+            "a sweep that read every entry and admits none closes it (CLOSE 3)"
         );
     }
 }

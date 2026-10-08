@@ -465,8 +465,16 @@ impl BacklogTab {
                 self.queue_writing = Some((id, key));
                 request
             }
-            QueueIntent::Pause if view.open_batch.is_some() => StoreRequest::PauseQueue,
-            QueueIntent::Pause => StoreRequest::ResumeQueue,
+            // M3 review R1 M1: the write carries the state this read saw, so a queue that
+            // changed between the read and the write refuses it rather than flipping the other way.
+            QueueIntent::Pause => match view.open_batch {
+                Some(batch) => StoreRequest::PauseQueue {
+                    expect: Some(batch),
+                },
+                None => StoreRequest::ResumeQueue {
+                    expect_paused: true,
+                },
+            },
         };
         ctx.request(request);
     }
@@ -485,7 +493,10 @@ impl BacklogTab {
                         .map_or_else(|| item.to_string(), |row| row.key.clone()),
                 }
             }
-            QueueWrite::Resumed { .. } | QueueWrite::Paused { .. } => String::new(),
+            QueueWrite::Resumed { .. }
+            | QueueWrite::Paused { .. }
+            | QueueWrite::Moved { .. }
+            | QueueWrite::Stale { .. } => String::new(),
         };
         ctx.emit(Action::Error(queue_sentence(write, &key, view)));
     }
@@ -996,8 +1007,9 @@ impl Tab for BacklogTab {
 const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
 
 /// MOD-12 D9: the status line after a queue write. `n` is the queue's length after it. In
-/// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3).
-fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
+/// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3). The queue
+/// overlay says its writes with it too (M3 review R1 N2).
+pub(crate) fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
     let n = view.entries.len();
     match *write {
         QueueWrite::Queued { .. } => match (view.open_batch.is_some(), view.demo) {
@@ -1028,6 +1040,24 @@ fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
         }
         QueueWrite::Paused { live, .. } => {
             format!("queue paused \u{2014} {live} runs still running")
+        }
+        // MOD-12 M3 D7: only the queue overlay sends `MoveQueueEntry` (replies are addressed by
+        // origin); it says these through this function (M3 review R1 N2).
+        QueueWrite::Moved { moved: true } => format!("queue reordered ({n} in queue)"),
+        QueueWrite::Moved { moved: false } => "already at that end of the queue".to_owned(),
+        // M3 review R1 M1: `P` sent over a queue that changed since it was read; `view` is the
+        // queue now.
+        QueueWrite::Stale { pause: true } if view.open_batch.is_none() => {
+            "queue already paused: its batch closed before P reached it".to_owned()
+        }
+        QueueWrite::Stale { pause: true } => {
+            "queue not paused: it was resumed since it was read; P again pauses it".to_owned()
+        }
+        QueueWrite::Stale { pause: false } if view.open_batch.is_some() => {
+            "queue already running: it was resumed since it was read".to_owned()
+        }
+        QueueWrite::Stale { pause: false } => {
+            "queue not resumed: it changed since it was read".to_owned()
         }
     }
 }
@@ -1135,7 +1165,7 @@ mod tests {
             ),
             (
                 QueueWrite::Resumed { already: true },
-                demo(running),
+                demo(running.clone()),
                 "queue already running (demo: nothing is admitted)",
             ),
             (
@@ -1177,6 +1207,38 @@ mod tests {
                 },
                 paused(0),
                 "queue paused \u{2014} 2 runs still running",
+            ),
+            // MOD-12 M3 D7: never sent by the Backlog; the match is exhaustive.
+            (
+                QueueWrite::Moved { moved: true },
+                paused(2),
+                "queue reordered (2 in queue)",
+            ),
+            (
+                QueueWrite::Moved { moved: false },
+                paused(2),
+                "already at that end of the queue",
+            ),
+            // M3 review R1 M1: a pause or resume over a queue that changed since it was read.
+            (
+                QueueWrite::Stale { pause: true },
+                paused(1),
+                "queue already paused: its batch closed before P reached it",
+            ),
+            (
+                QueueWrite::Stale { pause: true },
+                running.clone(),
+                "queue not paused: it was resumed since it was read; P again pauses it",
+            ),
+            (
+                QueueWrite::Stale { pause: false },
+                running.clone(),
+                "queue already running: it was resumed since it was read",
+            ),
+            (
+                QueueWrite::Stale { pause: false },
+                paused(1),
+                "queue not resumed: it changed since it was read",
             ),
         ];
         for (write, view, sentence) in cases {
@@ -1252,6 +1314,63 @@ mod tests {
             queue_requests(&bench.actions()),
             ["resume_queue"],
             "P's read still decides P's write"
+        );
+    }
+
+    /// MOD-12 M3 review R1 M1: `P`'s write names the state its read saw, the open batch or a
+    /// paused queue, and a refusal (`Stale`) puts its sentence on the status line.
+    #[tokio::test]
+    async fn p_sends_the_state_its_read_saw_and_says_a_refusal() {
+        let bench = Bench::new().await;
+        let mut tab = bench.tab();
+        let batch = htui_core::model::BatchId::new();
+        let view = |open_batch| QueueView {
+            entries: Vec::new(),
+            open_batch,
+            demo: false,
+        };
+
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        bench.actions();
+        tab.on_reply(&StoreReply::Queue(view(Some(batch))), &mut bench.ctx());
+        let actions = bench.actions();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::Store(StoreRequest::PauseQueue { expect: Some(seen) })] if *seen == batch
+            ),
+            "{actions:?}"
+        );
+
+        press(&mut tab, &bench, KeyCode::Char('P'));
+        bench.actions();
+        tab.on_reply(&StoreReply::Queue(view(None)), &mut bench.ctx());
+        let actions = bench.actions();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::Store(StoreRequest::ResumeQueue {
+                    expect_paused: true
+                })]
+            ),
+            "{actions:?}"
+        );
+
+        tab.on_reply(
+            &StoreReply::QueueWritten {
+                write: QueueWrite::Stale { pause: true },
+                view: view(None),
+            },
+            &mut bench.ctx(),
+        );
+        let actions = bench.actions();
+        assert!(
+            actions.iter().any(|action| matches!(
+                action,
+                Action::Error(status)
+                    if status == "queue already paused: its batch closed before P reached it"
+            )),
+            "{actions:?}"
         );
     }
 

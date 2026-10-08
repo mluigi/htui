@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            SELECT i.id AS \"item_id!: ItemId\",\n                   ARRAY(SELECT DISTINCT t COLLATE \"C\"\n                           FROM UNNEST(i.required_tags) t\n                          WHERE t <> ALL (b.probed_tags || b.declared_tags)\n                          ORDER BY 1) AS \"tags!\"\n              FROM item i CROSS JOIN box b\n             WHERE i.id = ANY($1) AND b.id = $2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "item_id!: ItemId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "item",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "tags!",
+        "type_info": "TextArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "UuidArray",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "75068473cc56e16b275162a48655b795b88be2e7e2c3fb7b4fc144868fc89722"
+}

@@ -1516,6 +1516,32 @@ box), and a queue activation is a `queue_batch` row whose `id` each auto run rec
 (cancelling the batch's runs still `queued`), and resume opens a new one. Queue order is
 `position NULLS LAST`, then `ready_items` order.
 
+**As built (MOD-12 M3, `.claude/plans/mod-12-m3-queue-overlay.plan.md`).** No migration.
+- **Order.** One queue order everywhere: `position NULLS LAST, priority DESC, created_at, id`.
+  `queue_entries` sorts by it; `admission_order` already did.
+- **Reorder.** `move_queue_entry` moves one entry one step. The first move writes `position = 1..n`
+  for every entry it locked; entries queued later stay `NULL` and sort last. `item.priority` is
+  never touched. Postgres locks a box's entries in `item_id` order in both the move and the prune,
+  so the two cannot deadlock.
+- **Stalled batch (M1 review L4).** A batch closes `drained` once no run of it is `queued`,
+  `running` or `awaiting_approval` and no entry is admissible:
+  - the queue is empty;
+  - nothing is ready (not ready, cancelled in this batch, or escalated);
+  - or every ready entry is held by the batch rule in a tick that had free slots.
+
+  A tick with no free slot never closes, and neither does an enqueue refusal. The close locks the
+  batch row first, so it waits for an in-flight admission. It is skipped while the box holds an
+  entry for an item the runner's read did not see. So a later `Q` never starts spending on its
+  own; `P` opens a fresh batch.
+- **Overlay.** Global `ctrl-q` shows each entry's state: running here or elsewhere, next, held by
+  the batch rule, waiting, or escalated. The escalations are review loop exhausted, judge
+  undecided, hard gate parked, blocked, failed and missing tags. Missing tags, open blockers and
+  the batch hold are computed live from the runner's own reads (`classify_entry`); the other
+  reasons are the item's latest note, shown verbatim.
+  - `P` names the state its sender saw, and a stale toggle is refused rather than flipped.
+  - **Known limit:** an enqueue refusal that changes no state is invisible, and the entry reads
+    "next".
+
 Timer-based auto-approval is rejected. Jules auto-approves a plan on a timer ("if you navigate away,
 Jules will eventually auto-approve the plan, which is set on a timer",
 https://jules.google/docs/review-plan/), which makes `gate_outcome` record a decision nobody made.

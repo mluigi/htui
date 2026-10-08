@@ -1795,7 +1795,12 @@ pub(crate) mod tests {
             .await
             .expect("the item is queued");
 
-        let resume = worker.send(Origin::App, StoreRequest::ResumeQueue);
+        let resume = worker.send(
+            Origin::App,
+            StoreRequest::ResumeQueue {
+                expect_paused: true,
+            },
+        );
         let batch = match worker.reply(resume).await {
             StoreReply::QueueWritten {
                 write: QueueWrite::Resumed { already: false },
@@ -1841,7 +1846,12 @@ pub(crate) mod tests {
             RunStatus::Running,
             "nothing adopted it while it was leased"
         );
-        let resume = worker.send(Origin::App, StoreRequest::ResumeQueue);
+        let resume = worker.send(
+            Origin::App,
+            StoreRequest::ResumeQueue {
+                expect_paused: true,
+            },
+        );
         assert!(
             matches!(
                 worker.reply(resume).await,

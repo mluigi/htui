@@ -20,7 +20,7 @@ pub mod views;
 pub use catalogue::{Act, ActionSpec, CATALOGUE, Context, SHADOWING, STATE_GUARDED, VIEW_DEFAULTS};
 pub use chord::{CTRL_C, ChordError, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
-pub use load::{FILE_NAME, KeyFileError, KeysError, load_path, load_str, resolve};
+pub use load::{FILE_NAME, KeyFileError, KeysError, Resolved, load_path, load_str, resolve};
 pub use print::print;
 pub use stack::{DECLARED, Layer, Stack};
 pub use validate::validate;
@@ -50,6 +50,24 @@ struct Row {
     /// `Some` for a `VIEW_DEFAULTS` row (MOD-67 M3 PA-1): its extra chords, added to whatever
     /// the shared row resolves to whenever the row is derived ([`Keys::derive`]).
     extra: Option<Vec<KeyChord>>,
+    /// The line of the file's entry for this row, even one that repeats the default: the row is
+    /// the user's, and keeps its chords against another entry (MOD-12 M3 R1 H1). `None` while
+    /// the file leaves the row at its default.
+    entry: Option<usize>,
+    /// The chords this row, left at its default, gave to the file's entries (MOD-12 M3 R1 H1):
+    /// the startup notice and the `--print-keys` mark name them.
+    lost: Vec<Lost>,
+}
+
+/// A chord a row left at its default gave to an entry of the file in its context (MOD-12 M3
+/// R1 H1): the user's binding wins.
+#[derive(Debug, Clone, Copy)]
+struct Lost {
+    chord: KeyChord,
+    /// The entry's action.
+    to: Act,
+    /// The entry's line.
+    line: usize,
 }
 
 impl PartialEq for Row {
@@ -101,6 +119,8 @@ impl Keys {
                 .collect(),
             line: None,
             extra: None,
+            entry: None,
+            lost: Vec::new(),
         });
         let derived = VIEW_DEFAULTS.iter().map(|&(context, act, extra)| {
             let name = act.spec().map_or("", |spec| spec.name);
@@ -116,6 +136,8 @@ impl Keys {
                         .map(|written| parse(written, context, name))
                         .collect(),
                 ),
+                entry: None,
+                lost: Vec::new(),
             }
         });
         let mut keys = Self {
@@ -182,6 +204,8 @@ impl Keys {
                 chords,
                 line: None,
                 extra: None,
+                entry: None,
+                lost: Vec::new(),
             }),
         }
         self
@@ -194,14 +218,15 @@ impl Keys {
         self.row(context, act).and_then(|row| row.line)
     }
 
-    /// The loader's merge (MOD-67 M2 D7): replaces the `(context, act)` row's chords and keeps
-    /// `line` only when they differ from [`Keys::compiled`]'s for that row (PA-3). A missing row
-    /// is a view's override of a shared verb (MOD-67 M3 D10): it is appended, and always keeps
-    /// its line, since the compiled keys have no such row.
+    /// The loader's merge (MOD-67 M2 D7): replaces the `(context, act)` row's chords, marks the
+    /// row the user's entry, and keeps `line` only when they differ from [`Keys::compiled`]'s for
+    /// that row (PA-3). A missing row is a view's override of a shared verb (MOD-67 M3 D10): it is
+    /// appended, and always keeps its line, since the compiled keys have no such row.
     fn set(&mut self, context: Context, act: Act, chords: Vec<KeyChord>, line: usize) {
         let changed = Self::compiled()
             .row(context, act)
             .is_none_or(|compiled| compiled.chords != chords);
+        let entry = Some(line);
         let line = changed.then_some(line);
         match self
             .rows
@@ -211,6 +236,7 @@ impl Keys {
             Some(row) => {
                 row.chords = chords;
                 row.line = line;
+                row.entry = entry;
             }
             None => self.rows.push(Row {
                 context,
@@ -219,8 +245,45 @@ impl Keys {
                 chords,
                 line,
                 extra: None,
+                entry,
+                lost: Vec::new(),
             }),
         }
+    }
+
+    /// One notice per chord an entry of the file took from an action it left at its default
+    /// (MOD-12 M3 R1 H1), on the entry's line and sorted by it, e.g. `[global] quit = "ctrl-q"
+    /// takes "ctrl-q" from global.queue, which is now unbound`. Empty for the defaults.
+    #[must_use]
+    pub fn notices(&self) -> Vec<KeyFileError> {
+        let mut out: Vec<KeyFileError> = Vec::new();
+        for row in &self.rows {
+            let table = row.context.table();
+            let name = row.act.spec().map_or("", |spec| spec.name);
+            let left = if row.chords.is_empty() {
+                "which is now unbound".to_owned()
+            } else {
+                let kept = row
+                    .chords
+                    .iter()
+                    .map(|chord| quote(&chord.spec()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("which keeps {kept}")
+            };
+            for lost in &row.lost {
+                let shown = quote(&lost.chord.spec());
+                let taker = lost.to.spec().map_or("", |spec| spec.name);
+                out.push(KeyFileError {
+                    line: lost.line,
+                    message: format!(
+                        "[{table}] {taker} = {shown} takes {shown} from {table}.{name}, {left}"
+                    ),
+                });
+            }
+        }
+        out.sort_by_key(|notice| notice.line);
+        out
     }
 
     /// The row of `act` in exactly `context`.
@@ -395,7 +458,7 @@ mod tests {
 
     #[test]
     fn editor_focus_is_bound_and_not_printable() {
-        let chords = Keys::compiled().chords(super::Context::Editor, super::Act::EditorFocus);
+        let chords = Keys::compiled().chords(Context::Editor, Act::EditorFocus);
         assert!(!chords.is_empty(), "editor.focus is unbound");
         for chord in chords {
             assert!(

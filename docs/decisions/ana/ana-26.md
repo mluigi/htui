@@ -25,7 +25,13 @@ match, and hints were string constants. Addresses `R-TUI-1`, `R-TUI-8`, `R-STO-1
    - unknown names;
    - chords the legacy terminal encoding cannot deliver;
    - duplicate chords on a composed stack (reviewed default pairs are allowed as shadowing or
-     state-guarded);
+     state-guarded). Amended by MOD-12 M3 R1 H1 (2026-10-08): an entry that takes a chord from an
+     action of its own context left at its default wins; that action loses the chord (unbound
+     if it has no other), with a stderr notice and a `--print-keys` mark. Two entries on one
+     chord stay errors. Across contexts nothing gives way and the stack rules stand: a chord
+     shared with another context's default is an error where a declared stack makes both
+     candidates (an overlay over `global.help`), and is not compared where no declared stack
+     composes the two (`[global] quit = ["j"]` loads; `list.down` keeps `j`);
    - printable chords on actions offered while a field captures;
    - `overlay.close` left with no chord.
 

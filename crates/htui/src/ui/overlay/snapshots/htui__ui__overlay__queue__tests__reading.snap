@@ -1,0 +1,22 @@
+---
+source: crates/htui/src/ui/overlay/queue.rs
+expression: rendered
+---
+
+
+
+
+
+
+
+
+
+
+
+
+
+          ┌ Queue ────────────────────────────────────────────────────────────────────────┐
+          │  reading the queue                                                            │
+          │                                                                               │
+          │  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close │
+          └───────────────────────────────────────────────────────────────────────────────┘

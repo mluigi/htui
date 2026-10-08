@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            UPDATE queue_entry e\n               SET position = v.position\n              FROM UNNEST($2::uuid[], $3::int4[]) AS v(item_id, position)\n             WHERE e.box_id = $1 AND e.item_id = v.item_id\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "Int4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b74031b57d3871f814fddfd574243ec415b0c1cd446aa2fe86ed3d9308b60905"
+}

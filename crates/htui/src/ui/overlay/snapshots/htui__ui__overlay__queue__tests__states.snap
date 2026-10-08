@@ -1,0 +1,32 @@
+---
+source: crates/htui/src/ui/overlay/queue.rs
+expression: bench.render(&overlay)
+---
+
+
+
+  ┌ Queue ───────────────────────────────────────────────────────────────────────────────────────┐
+  │  queue: running · batch since 14:02 · $1.20 spent · 1/2 slots                                │
+  │                                                                                              │
+  │> QX-1   entry 1   running here                                                               │
+  │  QX-2   entry 2   admitted, waiting to be claimed                                            │
+  │  QX-3   entry 3   running on LAPTOP-B                                                        │
+  │  QX-4   entry 4   queued for another box                                                     │
+  │  QX-5   entry 5   next to run                                                                │
+  │  QX-6   entry 6   held: batch cap reached (600 of 500 micros)                                │
+  │  QX-7   entry 7   held: batch budget: 100 micros left, 200 required                          │
+  │  QX-8   entry 8   held: project.settings.per_token_cap_batch must be a non-negative integer… │
+  │  QX-9   entry 9   held: its project is gone                                                  │
+  │  QX-10  entry 10  waiting on FEAT-1, FEAT-2                                                  │
+  │  QX-11  entry 11  cancelled in this batch; the next batch runs it                            │
+  │  QX-12  entry 12  queue paused                                                               │
+  │  QX-13  entry 13  not ready: item is in_progress                                             │
+  │  QX-14  entry 14  hard gate parked                                                           │
+  │  QX-15  entry 15  judge undecided (last note: pick a branch)                                 │
+  │  QX-16  entry 16  review loop exhausted                                                      │
+  │  QX-17  entry 17  blocked (last note: pick a branch)                                         │
+  │  QX-18  entry 18  failed: exit 1                                                             │
+  │  QX-19  entry 19  missing tags: gpu                                                          │
+  │                                                                                              │
+  │  j/k move · J/K reorder · P pause/resume · Q dequeue · Enter open · Esc close                │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

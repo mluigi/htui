@@ -1,6 +1,8 @@
 //! `keys.toml` to [`Keys`] (MOD-67 M2; ANA-26 §7.1, §7.4 steps 1-6, §7.5): find the file, parse
 //! it with spans, check names and chords strictly, merge it over the catalogue, and report every
-//! error with its line. [`validate()`] adds the checks over the merged keys.
+//! error with its line. The merge lets an entry take its chord from an action the file leaves at
+//! its default (MOD-12 M3 R1 H1, [`Resolved::notices`]); [`validate()`] adds the checks over the
+//! merged keys.
 
 use std::path::{Path, PathBuf};
 
@@ -9,13 +11,14 @@ use toml::de::{DeString, DeTable, DeValue};
 
 use super::{
     Act, ActionSpec, CATALOGUE, CTRL_C, ChordError, Context, DECLARED, KeyChord, Keys, quote,
-    validate,
+    validate, validate::give_way,
 };
 
 /// The key file's name under the config root.
 pub const FILE_NAME: &str = "keys.toml";
 
-/// One error in a key file: a line and what is wrong there (ANA-26 §7.5).
+/// One error in a key file: a line and what is wrong there (ANA-26 §7.5). [`Keys::notices`]
+/// uses the same shape for a chord an entry took from a default, which is no error.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyFileError {
     /// The 1-based line. `0` only for a fault in the compiled defaults, which the validator's
@@ -119,6 +122,7 @@ pub fn load_str(src: &str) -> Result<Keys, Vec<KeyFileError>> {
     } = loader;
     // MOD-67 M3 PA-1: the view defaults follow the shared rows the file just set.
     keys.derive(&set);
+    give_way(&mut keys);
     errors.extend(validate(&keys));
     errors.sort_by_key(|error| error.line);
     if errors.is_empty() {
@@ -142,6 +146,40 @@ pub fn load_path(path: &Path) -> Result<Keys, KeysError> {
     checked(path.to_owned(), &src)
 }
 
+/// The keys [`resolve`] found, and the file they came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Resolved {
+    /// The keys in force.
+    pub keys: Keys,
+    /// The file read, or `None` for the compiled defaults.
+    pub path: Option<PathBuf>,
+}
+
+impl Resolved {
+    /// The compiled defaults, read from no file.
+    fn defaults() -> Self {
+        Self {
+            keys: Keys::compiled().clone(),
+            path: None,
+        }
+    }
+
+    /// The startup notices (MOD-12 M3 R1 H1): one `PATH:LINE: message` per chord an entry took
+    /// from an action the file leaves at its default ([`Keys::notices`]). `lib::run` prints each
+    /// on stderr after `htui: `. Empty for the defaults.
+    #[must_use]
+    pub fn notices(&self) -> Vec<String> {
+        let Some(path) = &self.path else {
+            return Vec::new();
+        };
+        self.keys
+            .notices()
+            .into_iter()
+            .map(|notice| format!("{}:{}: {}", path.display(), notice.line, notice.message))
+            .collect()
+    }
+}
+
 /// The keys in force (MOD-67 M2 D3): the defaults with `default_keys`; else the file named by
 /// `keys_flag`; else `<root>/keys.toml` when it exists; else the defaults. `root` is `None`
 /// when the platform has no config directory. `default_keys` wins if both are given (clap
@@ -156,20 +194,24 @@ pub fn resolve(
     keys_flag: Option<&Path>,
     default_keys: bool,
     root: Option<&Path>,
-) -> Result<Keys, KeysError> {
+) -> Result<Resolved, KeysError> {
     if default_keys {
-        return Ok(Keys::compiled().clone());
+        return Ok(Resolved::defaults());
     }
+    let read = |path: PathBuf, keys: Keys| Resolved {
+        keys,
+        path: Some(path),
+    };
     if let Some(path) = keys_flag {
-        return load_path(path);
+        return load_path(path).map(|keys| read(path.to_owned(), keys));
     }
     let Some(root) = root else {
-        return Ok(Keys::compiled().clone());
+        return Ok(Resolved::defaults());
     };
     let path = root.join(FILE_NAME);
     match std::fs::read_to_string(&path) {
-        Ok(src) => checked(path, &src),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Keys::compiled().clone()),
+        Ok(src) => checked(path.clone(), &src).map(|keys| read(path, keys)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Resolved::defaults()),
         Err(source) => Err(KeysError::Unreadable { path, source }),
     }
 }
@@ -666,7 +708,7 @@ quit = ["x", "shift-a"]
                 "[global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                  select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
                  select_tab_6, select_tab_7, select_tab_8, select_tab_9, help, workspaces, find, \
-                 waiting",
+                 waiting, queue",
             ),
             (
                 13,
@@ -775,15 +817,18 @@ quit = ["x", "shift-a"]
         let root = tempfile::tempdir().expect("a temp dir");
         let named = write(root.path(), "named.toml", "[globl]\n");
         write(root.path(), FILE_NAME, "[globl]\n");
-        let keys = resolve(Some(&named), true, Some(root.path())).expect("the defaults");
-        assert_eq!(&keys, Keys::compiled());
+        let resolved = resolve(Some(&named), true, Some(root.path())).expect("the defaults");
+        assert_eq!(&resolved.keys, Keys::compiled());
+        assert_eq!(resolved.path, None);
     }
 
     #[test]
     fn a_named_file_is_read_and_a_missing_one_refused() {
         let root = tempfile::tempdir().expect("a temp dir");
         let named = write(root.path(), "mine.toml", "[global]\nquit = \"z\"\n");
-        let keys = resolve(Some(&named), false, None).expect("a good file loads");
+        let resolved = resolve(Some(&named), false, None).expect("a good file loads");
+        assert_eq!(resolved.path.as_deref(), Some(named.as_path()));
+        let keys = resolved.keys;
         assert_eq!(keys.chords(Context::Global, Act::Quit), [chord("z")]);
         assert_eq!(
             load_path(&named).expect("a good file loads"),
@@ -800,10 +845,12 @@ quit = ["x", "shift-a"]
     #[test]
     fn a_missing_root_file_or_root_is_the_defaults() {
         let root = tempfile::tempdir().expect("a temp dir");
-        let keys = resolve(None, false, Some(root.path())).expect("the defaults");
-        assert_eq!(&keys, Keys::compiled());
-        let keys = resolve(None, false, None).expect("the defaults");
-        assert_eq!(&keys, Keys::compiled());
+        let resolved = resolve(None, false, Some(root.path())).expect("the defaults");
+        assert_eq!(&resolved.keys, Keys::compiled());
+        assert_eq!(resolved.path, None);
+        let resolved = resolve(None, false, None).expect("the defaults");
+        assert_eq!(&resolved.keys, Keys::compiled());
+        assert!(resolved.notices().is_empty());
     }
 
     #[test]
@@ -825,6 +872,36 @@ quit = ["x", "shift-a"]
             }
             other => panic!("expected Invalid, got {other:?}"),
         }
+    }
+
+    /// MOD-12 M3 R1 H1: each chord an entry takes from a default is a notice on the entry's
+    /// line, naming the file and what the default keeps; a defaults-only resolve has none.
+    #[test]
+    fn a_chord_taken_from_a_default_is_a_notice_naming_the_file() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let file = write(
+            root.path(),
+            FILE_NAME,
+            "[global]\nquit = [\"ctrl-q\"]\n\n[list]\ntop = [\"j\"]\n",
+        );
+        let resolved = resolve(None, false, Some(root.path())).expect("the file loads");
+        assert_eq!(resolved.path.as_deref(), Some(file.as_path()));
+        assert_eq!(
+            resolved.notices(),
+            [
+                format!(
+                    "{}:2: [global] quit = \"ctrl-q\" takes \"ctrl-q\" from global.queue, which \
+                     is now unbound",
+                    file.display()
+                ),
+                format!(
+                    "{}:5: [list] top = \"j\" takes \"j\" from list.down, which keeps \"down\"",
+                    file.display()
+                ),
+            ]
+        );
+        let resolved = resolve(None, true, Some(root.path())).expect("the defaults");
+        assert!(resolved.notices().is_empty());
     }
 
     #[test]

@@ -335,11 +335,11 @@ mod tests {
 
     const BARE: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help";
     const FULL: &str = "q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help \
-                        · w workspaces · Ctrl+f find · Ctrl+w waiting";
+                        · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
 
-    /// What the shell offers without `register_all`: every act but the three that name a view.
+    /// What the shell offers without `register_all`: every act but the four that name a view.
     fn bare(act: Act) -> bool {
-        !matches!(act, Act::Workspaces | Act::Find | Act::Waiting)
+        !matches!(act, Act::Workspaces | Act::Find | Act::Waiting | Act::Queue)
     }
 
     fn all(_: Act) -> bool {
@@ -408,7 +408,7 @@ mod tests {
         assert_eq!(
             global_line(keys, all),
             "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab \
-             · ?/F1 help · w workspaces · Ctrl+f find · Ctrl+w waiting"
+             · ?/F1 help · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"
         );
         assert_eq!(
             keys.help_line(Context::Overlay, all)
@@ -455,7 +455,7 @@ mod tests {
             global.rows(88),
             [
                 "Global: q/Ctrl+c quit · Tab next tab · Shift+Tab previous tab · 1-9 select tab",
-                "  ?/F1 help · w workspaces · Ctrl+f find · Ctrl+w waiting",
+                "  ?/F1 help · w workspaces · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue",
             ]
         );
     }
@@ -499,7 +499,7 @@ mod tests {
         let keys = Keys::compiled();
         assert_eq!(keys.status_line(views::AGENTS_BROWSE, bare), BARE);
         assert_eq!(keys.status_line(views::AGENTS_BROWSE, all), FULL);
-        let modal_all = "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting";
+        let modal_all = "Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue";
         for stack in [views::AGENTS_FORM, views::CAPTURE, views::KINDS_CONFIRM] {
             assert_eq!(keys.status_line(stack, all), modal_all);
             assert_eq!(keys.status_line(stack, bare), "Ctrl+c quit · F1 help");
@@ -558,7 +558,7 @@ mod tests {
         );
         assert_eq!(
             texts(keys.help_lines(views::CAPTURE, all)),
-            ["Global: Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting"]
+            ["Global: Ctrl+c quit · F1 help · Ctrl+f find · Ctrl+w waiting · Ctrl+q queue"]
         );
     }
 

@@ -1,9 +1,9 @@
-# MOD-67 M2 fixture (tests/keys_file.rs): a valid key file. Quit moves to ctrl-q; F2 also closes
+# MOD-67 M2 fixture (tests/keys_file.rs): a valid key file. Quit moves to ctrl-x; F2 also closes
 # an overlay.
 version = 1
 
 [global]
-quit = ["ctrl-q"]
+quit = ["ctrl-x"]
 
 [overlay]
 close = ["esc", "f2"]

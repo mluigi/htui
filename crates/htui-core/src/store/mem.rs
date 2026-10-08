@@ -37,18 +37,18 @@ use crate::model::{
     NewStepGraph, NewWorkspace, Note, OpenPermission, PermissionChoice, PermissionId,
     PermissionStatus, Persona, PersonaId, PersonaPatch, PhaseAgent, PhaseId, PhasePatch, Project,
     ProjectId, ProjectPatch, ProjectRef, PromptScope, PromptTemplate, PromptTemplateId, QueueBatch,
-    QueueEntry, QueueSetting, QueuedFollowUp, RelaySessionId, RelayView, Repo, RepoBoxPath, RepoId,
-    RepoPatch, Requirement, RequirementArea, RequirementAreaId, RequirementFilter, RequirementId,
-    RequirementPatch, RequirementRevision, RequirementSpec, RequirementState, RequirementUpdate,
-    Resolution, ResolvedGraph, ResolvedInput, ResolvedPhase, Run, RunCommand, RunCommandId,
-    RunCommandKind, RunCommandStatus, RunId, RunKind, RunMode, RunStatus, RunStep, RunStepCommit,
-    RunStepSummary, RunStepTree, RunSummary, Scope, SessionEvent, SettleOutcome, Skill,
-    SkillBinding, SkillBindingId, SkillBindingKey, SkillId, SkillPatch, SkillVersion, Status,
-    StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase, StepId, StepOpening, StepOutcome,
-    StepPermission, StepStatus, TIMESTAMPTZ_DIGITS, ToolCallCount, UpstreamEntry, UserId,
-    WaitingCandidate, WaitingPermission, Workspace, WorkspaceBoxPath, WorkspaceId, WorkspacePatch,
-    WorkspaceProject, WorkspaceSummary, canonical_declared_tags, missing_tags_failure, overlaps,
-    prompt_summary, scope_of,
+    QueueEntry, QueueMove, QueueRow, QueueRunFact, QueueSetting, QueuedFollowUp, RelaySessionId,
+    RelayView, Repo, RepoBoxPath, RepoId, RepoPatch, Requirement, RequirementArea,
+    RequirementAreaId, RequirementFilter, RequirementId, RequirementPatch, RequirementRevision,
+    RequirementSpec, RequirementState, RequirementUpdate, Resolution, ResolvedGraph, ResolvedInput,
+    ResolvedPhase, Run, RunCommand, RunCommandId, RunCommandKind, RunCommandStatus, RunId, RunKind,
+    RunMode, RunStatus, RunStep, RunStepCommit, RunStepSummary, RunStepTree, RunSummary, Scope,
+    SessionEvent, SettleOutcome, Skill, SkillBinding, SkillBindingId, SkillBindingKey, SkillId,
+    SkillPatch, SkillVersion, Status, StepGraph, StepGraphId, StepGraphPatch, StepGraphPhase,
+    StepId, StepOpening, StepOutcome, StepPermission, StepStatus, TIMESTAMPTZ_DIGITS,
+    ToolCallCount, UpstreamEntry, UserId, WaitingCandidate, WaitingPermission, Workspace,
+    WorkspaceBoxPath, WorkspaceId, WorkspacePatch, WorkspaceProject, WorkspaceSummary,
+    canonical_declared_tags, missing_tags_failure, moved_order, overlaps, prompt_summary, scope_of,
 };
 use crate::prompt::DEFAULT_TEMPLATES;
 use crate::prompt::settings::{SettingKey, rung_refusal, validate};
@@ -871,6 +871,35 @@ impl MemStore {
         })
     }
 
+    /// MOD-12 M3 review R1 M2: [`missing_tags`](MemStore::missing_tags) for many items in one
+    /// read, keyed by item: each known item maps to exactly what `missing_tags` answers for it
+    /// (empty when the box covers every tag). An unknown item, which `missing_tags` refuses, is
+    /// left out, so one item deleted under the queue overlay costs only its own row.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] `{ entity: "box" }` for an unknown box.
+    pub async fn missing_tags_of(
+        &self,
+        items: &[ItemId],
+        box_id: BoxId,
+    ) -> Result<BTreeMap<ItemId, Vec<String>>> {
+        self.read(|state| {
+            if !state.boxes.contains_key(&box_id) {
+                return Err(StoreError::NotFound {
+                    entity: "box",
+                    id: box_id.to_string(),
+                });
+            }
+            Ok(items
+                .iter()
+                .filter_map(|id| {
+                    let item = state.items.get(id)?;
+                    Some((*id, state.missing_for(&item.required_tags, box_id)))
+                })
+                .collect())
+        })
+    }
+
     /// How many runs hold a slot on one box: §4.7's admission count, which is `running` and
     /// `awaiting_approval` and **not** `queued` — a queued run occupies nothing yet.
     ///
@@ -961,28 +990,78 @@ impl MemStore {
         Ok(self.write(|state| state.queue_entries.remove(&item).is_some()))
     }
 
-    /// MOD-12 D4: `box_id`'s entries, `position NULLS LAST, queued_at, item_id`. `ItemId`'s `Ord`
-    /// is uuid byte order, which is Postgres' uuid order.
+    /// MOD-12 M3 D3: moves `item` one place `to` in `box_id`'s queue, in one closure. The first
+    /// move of a queue writes `position = 1..n` over every entry in the current D2 order, so an
+    /// entry queued later (`None`) goes after them. `false`, writing nothing, when `item` is not
+    /// in `box_id`'s queue or is already at that end. Never touches `item.priority`.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn move_queue_entry(
+        &self,
+        box_id: BoxId,
+        item: ItemId,
+        to: QueueMove,
+    ) -> Result<bool> {
+        Ok(self.write(|state| {
+            let order: Vec<ItemId> = state
+                .queue_sorted(box_id)
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect();
+            let Some(moved) = moved_order(&order, item, to) else {
+                return false;
+            };
+            for (position, id) in (1..).zip(moved) {
+                if let Some(entry) = state.queue_entries.get_mut(&id) {
+                    entry.position = Some(position);
+                }
+            }
+            true
+        }))
+    }
+
+    /// MOD-12 D4, M3 D2: `box_id`'s queue entries in queue order, `position NULLS LAST, priority
+    /// DESC, created_at, id`: `admission_order`'s order over every entry, ready or not.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn queue_entries(&self, box_id: BoxId) -> Result<Vec<QueueEntry>> {
+        Ok(self.read(|state| state.queue_sorted(box_id)))
+    }
+
+    /// MOD-12 M3 D6: `box_id`'s entries in queue order (D2), each with its item's key, title,
+    /// status, priority and `created_at`, its latest graph run (target hostname, parked step), its
+    /// latest note and its open `blocked_by` keys. An entry whose item is gone is skipped, as
+    /// Postgres' inner join skips it.
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn queue_rows(&self, box_id: BoxId) -> Result<Vec<QueueRow>> {
         Ok(self.read(|state| {
-            let mut rows: Vec<QueueEntry> = state
-                .queue_entries
-                .values()
-                .filter(|entry| entry.box_id == box_id)
-                .cloned()
-                .collect();
-            rows.sort_by_key(|entry| {
-                (
-                    entry.position.is_none(),
-                    entry.position,
-                    entry.queued_at,
-                    entry.item_id,
-                )
-            });
-            rows
+            state
+                .queue_sorted(box_id)
+                .into_iter()
+                .filter_map(|entry| {
+                    let item = state.items.get(&entry.item_id)?;
+                    Some(QueueRow {
+                        key: item.key.clone(),
+                        title: item.title.clone(),
+                        status: item.status,
+                        priority: item.priority,
+                        created_at: item.created_at,
+                        latest_run: state.latest_queue_run(item.id),
+                        latest_note: state
+                            .notes
+                            .iter()
+                            .filter(|note| note.item_id == item.id)
+                            .max_by_key(|note| (note.created_at, note.id))
+                            .map(|note| note.body.clone()),
+                        open_blockers: state.open_blocker_keys(item.id),
+                        entry,
+                    })
+                })
+                .collect()
         }))
     }
 
@@ -1030,10 +1109,28 @@ impl MemStore {
         Ok(self.read(|state| state.open_batch_of(box_id).cloned()))
     }
 
+    /// MOD-12 M3 review R1 L4: `box_id`'s most recently closed batch, by `(closed_at, id)`,
+    /// whatever is open now; `None` before any closed. Its `closed_reason` tells the queue
+    /// overlay's header why a queue the user resumed reads paused again (a stall's drain).
+    ///
+    /// # Errors
+    /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
+    pub async fn last_closed_batch(&self, box_id: BoxId) -> Result<Option<QueueBatch>> {
+        Ok(self.read(|state| {
+            state
+                .queue_batches
+                .values()
+                .filter(|batch| batch.box_id == box_id)
+                .filter_map(|batch| batch.closed_at.map(|closed| (closed, batch)))
+                .max_by_key(|(closed, batch)| (*closed, batch.id))
+                .map(|(_, batch)| batch.clone())
+        }))
+    }
+
     /// MOD-12 D2, D3: close `box_id`'s open batch with `reason`; `None` when none was open.
     ///
     /// In the same closure every run of the batch still `queued` is cancelled through
-    /// [`State::finish_run`], so its item goes back to `open` and its queue entry stays (review
+    /// `State::finish_run`, so its item goes back to `open` and its queue entry stays (review
     /// H2): a pause stops the runs nobody has claimed yet. A `drained` close finds none.
     ///
     /// # Errors
@@ -1071,31 +1168,38 @@ impl MemStore {
         })
     }
 
-    /// MOD-12 D3 (review M1): the drain's close, of exactly `batch` and only while it is still
-    /// drained: open, its box with no queue entry, and no run of its own `queued`, `running` or
-    /// `awaiting_approval`; one closure, as `PgStore`'s one UPDATE. `None` when it did not close.
+    /// MOD-12 D3 (review M1), M3 D4 (L4): the runner's close of exactly `batch`, only while it is
+    /// open and no run of its own is `queued`, `running` or `awaiting_approval`. The entries the
+    /// runner read do not keep it open: it calls this when nothing is admissible (an empty queue,
+    /// or a stalled one). An entry it did not read does (review R1 L2): `seen` is the items of
+    /// the entries it read (empty when it read none), and an entry of the box for any other item
+    /// means an item may be ready that the runner never judged. The check is by item, not by
+    /// `queued_at`, which is the queuing client's clock and not commit order. The re-check is one
+    /// closure, as `PgStore`'s is the UPDATE's own `WHERE`, so a resume
+    /// that opened a new batch after the runner's reads is never closed by it, and a run that
+    /// committed before the close keeps the batch open. `None` when it did not close.
     ///
     /// # Errors
     /// Never; the signature matches `PgStore`'s so `Backend` can dispatch over both.
     pub async fn close_drained_batch(
         &self,
         batch: BatchId,
+        seen: &[ItemId],
         at: DateTime<Utc>,
     ) -> Result<Option<QueueBatch>> {
         Ok(self.write(|state| {
             let row = state.queue_batches.get(&batch)?;
-            let box_id = row.box_id;
             if row.closed_at.is_some()
-                || state
-                    .queue_entries
-                    .values()
-                    .any(|entry| entry.box_id == box_id)
                 || state
                     .run_batches
                     .iter()
                     .filter(|(_, of)| **of == batch)
                     .filter_map(|(run, _)| state.runs.get(run))
                     .any(|row| row.status.is_active())
+                || state
+                    .queue_entries
+                    .values()
+                    .any(|entry| entry.box_id == row.box_id && !seen.contains(&entry.item_id))
             {
                 return None;
             }
@@ -4912,6 +5016,75 @@ impl State {
         self.queue_batches
             .values()
             .find(|batch| batch.box_id == box_id && batch.closed_at.is_none())
+    }
+
+    /// MOD-12 M3 D2: `box_id`'s entries in queue order: `position` first (`None` last), then the
+    /// item's `priority DESC, created_at, id` (`ready_items`' order). `ItemId`'s `Ord` is uuid
+    /// byte order, Postgres' uuid order.
+    fn queue_sorted(&self, box_id: BoxId) -> Vec<QueueEntry> {
+        let mut rows: Vec<QueueEntry> = self
+            .queue_entries
+            .values()
+            .filter(|entry| entry.box_id == box_id)
+            .cloned()
+            .collect();
+        rows.sort_by_cached_key(|entry| {
+            let item = self.items.get(&entry.item_id);
+            (
+                entry.position.is_none(),
+                entry.position,
+                core::cmp::Reverse(item.map_or(0, |item| item.priority)),
+                item.map(|item| item.created_at),
+                entry.item_id,
+            )
+        });
+        rows
+    }
+
+    /// MOD-12 M3 D6: `item`'s latest `kind = 'graph'` run by `(queued_at, id)`, with its target
+    /// box's hostname and its first `awaiting_approval` step by `(position, attempt,
+    /// fanout_index)`.
+    fn latest_queue_run(&self, item: ItemId) -> Option<QueueRunFact> {
+        let run = self
+            .runs
+            .values()
+            .filter(|run| run.item_id == Some(item) && run.kind == RunKind::Graph)
+            .max_by_key(|run| (run.queued_at, run.id))?;
+        Some(QueueRunFact {
+            id: run.id,
+            status: run.status,
+            mode: run.mode,
+            target_box_id: run.target_box_id,
+            target_hostname: self
+                .boxes
+                .get(&run.target_box_id)
+                .map(|row| row.hostname.clone()),
+            failure: run.failure.clone(),
+            parked_step: self
+                .steps
+                .values()
+                .filter(|step| step.run_id == run.id && step.status == StepStatus::AwaitingApproval)
+                .min_by_key(|step| (step.position, step.attempt, step.fanout_index))
+                .map(|step| step.id),
+        })
+    }
+
+    /// MOD-12 M3 D6: the keys of `item`'s live `blocked_by` targets that are not terminal, in
+    /// byte order, once each: [`State::is_ready`]'s blocker rule, named.
+    fn open_blocker_keys(&self, item: ItemId) -> Vec<String> {
+        let keys: BTreeSet<String> = self
+            .links
+            .iter()
+            .filter(|link| {
+                link.deleted_at.is_none()
+                    && link.kind == LinkKind::BlockedBy
+                    && link.from_item_id == item
+            })
+            .filter_map(|link| self.items.get(&link.to_item_id))
+            .filter(|target| !target.status.is_terminal())
+            .map(|target| target.key.clone())
+            .collect();
+        keys.into_iter().collect()
     }
 
     /// [`State::require_run`] for an `item`.
@@ -14658,10 +14831,11 @@ mod tests {
     }
 
     /// Review M1: the drain's close is of exactly the batch it names, and only while that batch
-    /// is still drained, so a pause and a resume between the drain's reads and its close are
-    /// never undone.
+    /// is still open with no live run of its own, so a pause and a resume between the drain's
+    /// reads and its close are never undone. MOD-12 M3 D4 (L4): entries do not keep it open, so
+    /// the runner can close a stalled batch.
     #[tokio::test]
-    async fn close_drained_batch_closes_only_the_drained_batch_it_names() {
+    async fn close_drained_batch_closes_only_its_batch_and_ignores_entries() {
         let store = MemStore::demo();
         let at = Utc::now();
         let first = store
@@ -14679,7 +14853,7 @@ mod tests {
             .expect("a resume opens a new batch");
         assert_eq!(
             store
-                .close_drained_batch(first.id, at)
+                .close_drained_batch(first.id, &[], at)
                 .await
                 .expect("answered"),
             None,
@@ -14699,22 +14873,13 @@ mod tests {
             .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
             .await
             .expect("the item queues");
-        assert_eq!(
-            store
-                .close_drained_batch(second.id, at)
-                .await
-                .expect("answered"),
-            None,
-            "an entry keeps it open"
-        );
-        assert!(store.dequeue_item(ids::HTUI_ANA_2).await.expect("dequeue"));
         let run = store
             .create_run(batch_run(ids::HTUI_ANA_2, Some(second.id)))
             .await
             .expect("an open batch admits");
         assert_eq!(
             store
-                .close_drained_batch(second.id, at)
+                .close_drained_batch(second.id, &[ids::HTUI_ANA_2], at)
                 .await
                 .expect("answered"),
             None,
@@ -14725,7 +14890,7 @@ mod tests {
             .await
             .expect("a queued run cancels");
         let closed = store
-            .close_drained_batch(second.id, at)
+            .close_drained_batch(second.id, &[ids::HTUI_ANA_2], at)
             .await
             .expect("answered")
             .expect("drained now");
@@ -14734,11 +14899,92 @@ mod tests {
         assert_eq!(store.open_batch_of(ids::BOX).await.expect("read"), None);
         assert_eq!(
             store
-                .close_drained_batch(crate::model::BatchId::new(), at)
+                .queue_entries(ids::BOX)
+                .await
+                .expect("read")
+                .iter()
+                .map(|entry| entry.item_id)
+                .collect::<Vec<_>>(),
+            [ids::HTUI_ANA_2],
+            "the entry did not keep it open, and the close left it queued (M3 D4)"
+        );
+        assert_eq!(
+            store
+                .close_drained_batch(crate::model::BatchId::new(), &[], at)
                 .await
                 .expect("answered"),
             None,
             "an unknown batch closes nothing"
+        );
+    }
+
+    /// Review R1 L2: an entry for an item outside those the runner read (`seen`), any entry when
+    /// it read none, keeps the batch open; the entries it read do not.
+    #[tokio::test]
+    async fn close_drained_batch_skips_an_entry_the_runner_never_read() {
+        let store = MemStore::demo();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        for seen in [&[][..], &[ids::HTUI_FEAT_2][..]] {
+            assert_eq!(
+                store
+                    .close_drained_batch(batch.id, seen, at)
+                    .await
+                    .expect("answered"),
+                None,
+                "{seen:?}: an entry for an item the runner did not read keeps it open"
+            );
+        }
+        assert_eq!(
+            store
+                .close_drained_batch(batch.id, &[ids::HTUI_ANA_2], at)
+                .await
+                .expect("answered")
+                .map(|closed| closed.id),
+            Some(batch.id),
+            "the entry the runner read does not"
+        );
+    }
+
+    /// Review R1 L2 (verify): an entry the runner did not read keeps the batch open even when
+    /// its `queued_at` (the queuing client's clock, not commit order) is older than every entry
+    /// it read.
+    #[tokio::test]
+    async fn close_drained_batch_skips_an_unread_entry_with_an_older_instant() {
+        let store = MemStore::demo();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let batch = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        store
+            .queue_item(ids::HTUI_ANA_2, ids::BOX, ids::USER, at)
+            .await
+            .expect("the item queues");
+        // Queued after the runner read only ANA_2, stamped by a clock behind the first queuer's.
+        store
+            .queue_item(
+                ids::HTUI_FEAT_2,
+                ids::BOX,
+                ids::USER,
+                at - TimeDelta::seconds(1),
+            )
+            .await
+            .expect("the item queues");
+        assert_eq!(
+            store
+                .close_drained_batch(batch.id, &[ids::HTUI_ANA_2], at)
+                .await
+                .expect("answered"),
+            None,
+            "the entry the runner never read keeps it open, however old its instant"
         );
     }
 
@@ -15079,6 +15325,559 @@ mod tests {
             store.active_runs_on_box(ids::BOX).await.expect("read"),
             active,
             "active_runs_on_box still counts it"
+        );
+    }
+
+    // ---- MOD-12 M3: D2 order, queue_rows, move_queue_entry (blueprint §C.3) -------------------
+
+    use crate::model::{LinkKind, QueueMove};
+
+    /// `box_id`'s queue as item ids, in `queue_entries`' order.
+    async fn queued_ids(store: &MemStore, box_id: BoxId) -> Vec<ItemId> {
+        store
+            .queue_entries(box_id)
+            .await
+            .expect("the read is total")
+            .into_iter()
+            .map(|entry| entry.item_id)
+            .collect()
+    }
+
+    /// Queues `items` on the demo box in this order, one second apart on `clock`.
+    async fn queue_in_order(store: &MemStore, clock: &TestClock, items: &[ItemId]) {
+        for item in items {
+            store
+                .queue_item(*item, ids::BOX, ids::USER, clock.now())
+                .await
+                .expect("the item queues");
+            clock.advance(TimeDelta::seconds(1));
+        }
+    }
+
+    /// Every entry's `position` on the demo box, in queue order.
+    async fn queued_positions(store: &MemStore) -> Vec<Option<i32>> {
+        store
+            .queue_entries(ids::BOX)
+            .await
+            .expect("the read is total")
+            .into_iter()
+            .map(|entry| entry.position)
+            .collect()
+    }
+
+    /// The demo store plus a second box, `LAPTOP-B`, and five edges out of `HTUI_ANA_2` (which has
+    /// none in the fixture): `blocked_by` to `TOOL-1` (awaiting approval) and `FEAT-1` (in
+    /// progress), the two open blockers; `blocked_by` to `ANA-1` (done) and, tombstoned, to
+    /// `FEAT-3` (queued); `relates` to `FEAT-2` (blocked).
+    fn queue_rows_store() -> (MemStore, BoxId) {
+        let mut data = crate::fixtures::demo_data();
+        let mut laptop = data
+            .boxes
+            .iter()
+            .find(|row| row.id == ids::BOX)
+            .expect("the demo box")
+            .clone();
+        laptop.id = BoxId::new();
+        laptop.hostname = "LAPTOP-B".to_owned();
+        let laptop_id = laptop.id;
+        data.boxes.push(laptop);
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        for (to, kind, tombstoned) in [
+            (ids::HTUI_TOOL_1, LinkKind::BlockedBy, false),
+            (ids::HTUI_FEAT_1, LinkKind::BlockedBy, false),
+            (ids::HTUI_ANA_1, LinkKind::BlockedBy, false),
+            (ids::HTUI_FEAT_3, LinkKind::BlockedBy, true),
+            (ids::HTUI_FEAT_2, LinkKind::Relates, false),
+        ] {
+            data.links.push(crate::model::ItemLink {
+                from_item_id: ids::HTUI_ANA_2,
+                to_item_id: to,
+                kind,
+                proposed_by_step_id: None,
+                created_at: at,
+                updated_at: at,
+                deleted_at: tombstoned.then_some(at),
+            });
+        }
+        (MemStore::from_demo(data), laptop_id)
+    }
+
+    /// MOD-12 M3 D2: `queue_entries` is `position NULLS LAST, priority DESC, created_at, id`, not
+    /// `queued_at`. Priorities 0/2/1 queued in that order read 2, 1, 0; the fixture's `ANA-1` and
+    /// `ANA-2` (priority 0, created before every mint) read by `created_at`, ahead of the minted
+    /// priority-0 item; an entry with a position leads.
+    #[tokio::test]
+    async fn queue_entries_sort_position_then_priority_then_created_at() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let p0 = ready_feat(&store, ItemId::new(), 0).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p2 = ready_feat(&store, ItemId::new(), 2).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p1 = ready_feat(&store, ItemId::new(), 1).await;
+        clock.advance(TimeDelta::seconds(1));
+        queue_in_order(
+            &store,
+            &clock,
+            &[p0, p2, p1, ids::HTUI_ANA_2, ids::HTUI_ANA_1],
+        )
+        .await;
+
+        assert_eq!(
+            queued_ids(&store, ids::BOX).await,
+            [p2, p1, ids::HTUI_ANA_1, ids::HTUI_ANA_2, p0],
+            "priority, then created_at; never queued_at"
+        );
+
+        store.write(|state| {
+            state
+                .queue_entries
+                .get_mut(&p0)
+                .expect("p0 is queued")
+                .position = Some(1);
+        });
+        assert_eq!(
+            queued_ids(&store, ids::BOX).await,
+            [p0, p2, p1, ids::HTUI_ANA_1, ids::HTUI_ANA_2],
+            "a position leads"
+        );
+    }
+
+    /// MOD-12 M3 D2: `admission_order` over `queue_entries` and `ready_items` is `queue_entries`
+    /// filtered to the ready items: the overlay, the move and the runner read one order.
+    #[tokio::test]
+    async fn queue_entries_and_admission_order_agree() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let p0 = ready_feat(&store, ItemId::new(), 0).await;
+        clock.advance(TimeDelta::seconds(1));
+        let p1 = ready_feat(&store, ItemId::new(), 1).await;
+        clock.advance(TimeDelta::seconds(1));
+        queue_in_order(
+            &store,
+            &clock,
+            &[p0, ids::HTUI_FEAT_2, ids::HTUI_ANA_2, ids::HTUI_CLEAN_1, p1],
+        )
+        .await;
+        store.write(|state| {
+            state
+                .queue_entries
+                .get_mut(&ids::HTUI_ANA_2)
+                .expect("ANA-2 is queued")
+                .position = Some(1);
+        });
+
+        let entries = store.queue_entries(ids::BOX).await.expect("read");
+        let scope = Scope {
+            workspace_id: ids::WORKSPACE_PLATFORM,
+            project_ids: vec![ids::PROJECT_HTUI],
+        };
+        let ready = store.ready_items(&scope, ids::BOX).await.expect("read");
+        let ready_ids: std::collections::HashSet<ItemId> =
+            ready.iter().map(|item| item.id).collect();
+        let filtered: Vec<ItemId> = entries
+            .iter()
+            .map(|entry| entry.item_id)
+            .filter(|id| ready_ids.contains(id))
+            .collect();
+
+        assert_eq!(crate::model::admission_order(&entries, &ready), filtered);
+        assert_eq!(filtered, [ids::HTUI_ANA_2, p1, p0]);
+    }
+
+    /// MOD-12 M3 D6: a row carries the item's latest **graph** run by `queued_at` (a chat run of
+    /// the item queued later is not the queue's run), its latest note, and the keys of its live
+    /// `blocked_by` targets that are not `done`/`closed`, in byte order. An entry with none of
+    /// them carries none.
+    #[tokio::test]
+    async fn queue_rows_carry_the_latest_graph_run_note_and_open_blockers() {
+        let (store, _) = queue_rows_store();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let run_at = |seconds: i64| NewRun {
+            queued_at: at + TimeDelta::seconds(seconds),
+            ..graph_run(ids::HTUI_ANA_2, ids::PROJECT_HTUI, Vec::new())
+        };
+        // Created in this order so that each run is the item's only live one when it lands.
+        let first = store.create_run(run_at(0)).await.expect("first run").id;
+        store
+            .finish_run(first, RunStatus::Cancelled, None, at)
+            .await
+            .expect("cancel the first");
+        let chat = store.create_run(run_at(2)).await.expect("the later run").id;
+        store
+            .finish_run(chat, RunStatus::Cancelled, None, at)
+            .await
+            .expect("cancel it");
+        store.write(|state| {
+            state.runs.get_mut(&chat).expect("the run").kind = RunKind::Chat;
+        });
+        let latest = store
+            .create_run(run_at(1))
+            .await
+            .expect("latest graph run")
+            .id;
+        for (seconds, body) in [(1, "the later note"), (0, "the earlier note")] {
+            store
+                .add_note(NewNote {
+                    id: NoteId::new(),
+                    item_id: ids::HTUI_ANA_2,
+                    body: body.to_owned(),
+                    created_by: ids::USER,
+                    box_id: None,
+                    via_step_id: None,
+                    created_at: at + TimeDelta::seconds(seconds),
+                })
+                .await
+                .expect("the note lands");
+        }
+        for item in [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1] {
+            store
+                .queue_item(item, ids::BOX, ids::USER, at)
+                .await
+                .expect("queue");
+        }
+
+        let rows = store.queue_rows(ids::BOX).await.expect("read");
+        assert_eq!(
+            rows.iter().map(|row| row.entry.item_id).collect::<Vec<_>>(),
+            [ids::HTUI_ANA_2, ids::HTUI_CLEAN_1],
+            "queue order (D2)"
+        );
+        let ana = &rows[0];
+        assert_eq!(
+            (ana.key.as_str(), ana.status, ana.priority, ana.entry.box_id),
+            ("ANA-2", Status::Queued, 0, ids::BOX)
+        );
+        assert_eq!(
+            ana.latest_run,
+            Some(crate::model::QueueRunFact {
+                id: latest,
+                status: RunStatus::Queued,
+                mode: RunMode::Manual,
+                target_box_id: ids::BOX,
+                target_hostname: Some("DESKTOP-HTUI".to_owned()),
+                failure: None,
+                parked_step: None,
+            }),
+            "the latest graph run by queued_at; the chat run queued later is not the queue's"
+        );
+        assert_eq!(ana.latest_note.as_deref(), Some("the later note"));
+        assert_eq!(
+            ana.open_blockers,
+            ["FEAT-1", "TOOL-1"],
+            "done, tombstoned and relates edges are not open blockers"
+        );
+
+        let clean = &rows[1];
+        assert_eq!(
+            (
+                clean.key.as_str(),
+                clean.status,
+                &clean.latest_run,
+                &clean.latest_note,
+                clean.open_blockers.is_empty()
+            ),
+            ("CLEAN-1", Status::Failed, &None, &None, true)
+        );
+    }
+
+    /// MOD-12 M3 D6: the latest run names its first parked step by `(position, attempt,
+    /// fanout_index)` and its target box's hostname; a `blocked_by` to a `done` item is no open
+    /// blocker. A box with no entry reads no row.
+    #[tokio::test]
+    async fn queue_rows_name_the_parked_step_and_the_target_hostname() {
+        let (store, laptop) = queue_rows_store();
+        let run = store
+            .create_run(NewRun {
+                target_box_id: laptop,
+                ..graph_run(ids::AGY_FIX_1, ids::PROJECT_AGY, Vec::new())
+            })
+            .await
+            .expect("a run on LAPTOP-B")
+            .id;
+        let at = Utc::now();
+        let mut parked = Vec::new();
+        for (position, park) in [(0, false), (2, true), (1, true)] {
+            let step = store
+                .create_step(new_step(run, position, 1, 0))
+                .await
+                .expect("the step")
+                .id;
+            if park {
+                for (from, to) in [
+                    (StepStatus::Pending, StepStatus::Running),
+                    (StepStatus::Running, StepStatus::AwaitingApproval),
+                ] {
+                    assert!(
+                        store
+                            .transition_step(step, from, to, at)
+                            .await
+                            .expect("the step moves")
+                    );
+                }
+                parked.push(step);
+            }
+        }
+        store
+            .queue_item(ids::AGY_FIX_1, ids::BOX, ids::USER, at)
+            .await
+            .expect("queue");
+
+        let rows = store.queue_rows(ids::BOX).await.expect("read");
+        assert_eq!(rows.len(), 1);
+        let fact = rows[0].latest_run.as_ref().expect("the run");
+        assert_eq!(fact.id, run);
+        assert_eq!(fact.target_box_id, laptop);
+        assert_eq!(fact.target_hostname.as_deref(), Some("LAPTOP-B"));
+        assert_eq!(
+            fact.parked_step,
+            Some(parked[1]),
+            "position 1 parks before position 2"
+        );
+        assert!(
+            rows[0].open_blockers.is_empty(),
+            "AGY ANA-1 is done, so FIX-1 has no open blocker"
+        );
+        assert!(store.queue_rows(laptop).await.expect("read").is_empty());
+    }
+
+    /// MOD-12 M3 D3: the first move writes `position = 1..n` over the current order, then swaps.
+    #[tokio::test]
+    async fn move_queue_entry_writes_every_position_and_swaps() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        // Priority 0 each: created_at decides, ANA-2 (n 1), FEAT-2 (n 3), CLEAN-1 (n 7).
+        let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+        queue_in_order(&store, &clock, &[c, b, a]).await;
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, b, c]);
+
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, b, QueueMove::Up)
+                .await
+                .expect("the move is answered")
+        );
+        assert_eq!(queued_ids(&store, ids::BOX).await, [b, a, c]);
+        assert_eq!(queued_positions(&store).await, [Some(1), Some(2), Some(3)]);
+
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, b, QueueMove::Down)
+                .await
+                .expect("the move is answered")
+        );
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, b, c]);
+        assert_eq!(queued_positions(&store).await, [Some(1), Some(2), Some(3)]);
+    }
+
+    /// MOD-12 M3 D3 (blueprint §F-12): moving the first entry up, the last down, an item not
+    /// queued, or an item queued on another box answers `false` and writes nothing.
+    #[tokio::test]
+    async fn move_queue_entry_at_an_end_or_off_the_queue_writes_nothing() {
+        let (store, laptop) = queue_rows_store();
+        let at = Utc::now();
+        let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+        for item in [a, b, c] {
+            store
+                .queue_item(item, ids::BOX, ids::USER, at)
+                .await
+                .expect("queue");
+        }
+        store
+            .queue_item(ids::AGY_FIX_1, laptop, ids::USER, at)
+            .await
+            .expect("queue on LAPTOP-B");
+
+        for (item, to, why) in [
+            (a, QueueMove::Up, "the first entry up"),
+            (c, QueueMove::Down, "the last entry down"),
+            (ids::HTUI_FIX_1, QueueMove::Up, "an item not queued"),
+            (ids::AGY_FIX_1, QueueMove::Up, "an item on another box"),
+        ] {
+            assert!(
+                !store
+                    .move_queue_entry(ids::BOX, item, to)
+                    .await
+                    .expect("the move is answered"),
+                "{why}"
+            );
+        }
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, b, c]);
+        assert_eq!(queued_positions(&store).await, [None, None, None]);
+        assert_eq!(
+            store.queue_entries(laptop).await.expect("read")[0].position,
+            None
+        );
+    }
+
+    /// MOD-12 M3 D3: an entry queued after a move (`position` NULL) goes after every positioned
+    /// one, whatever its priority.
+    #[tokio::test]
+    async fn an_entry_queued_after_a_move_goes_last() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let (a, b, c) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2, ids::HTUI_CLEAN_1);
+        queue_in_order(&store, &clock, &[a, b, c]).await;
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, c, QueueMove::Up)
+                .await
+                .expect("the move")
+        );
+        let d = ready_feat(&store, ItemId::new(), 9).await;
+        queue_in_order(&store, &clock, &[d]).await;
+
+        assert_eq!(queued_ids(&store, ids::BOX).await, [a, c, b, d]);
+        assert_eq!(
+            queued_positions(&store).await,
+            [Some(1), Some(2), Some(3), None]
+        );
+    }
+
+    /// MOD-12 M3 D3: a move writes `queue_entry.position` only; `item.priority` and the item's
+    /// version (its CAS token) are untouched.
+    #[tokio::test]
+    async fn move_queue_entry_never_touches_priority() {
+        let clock = Arc::new(TestClock::new());
+        let store = MemStore::demo().with_clock(clock.clone());
+        let (a, b) = (ids::HTUI_ANA_2, ids::HTUI_FEAT_2);
+        queue_in_order(&store, &clock, &[a, b]).await;
+        let before = |item| {
+            let store = store.clone();
+            async move {
+                let row = store.item(item).await.expect("read").expect("the item");
+                (row.priority, row.version, row.updated_at)
+            }
+        };
+        let (a_before, b_before) = (before(a).await, before(b).await);
+        assert!(
+            store
+                .move_queue_entry(ids::BOX, b, QueueMove::Up)
+                .await
+                .expect("the move")
+        );
+        assert_eq!(queued_ids(&store, ids::BOX).await, [b, a]);
+        assert_eq!((before(a).await, before(b).await), (a_before, b_before));
+    }
+
+    // ---- MOD-12 M3 review R1: the overlay's batched tag read and its last close ------------
+
+    /// Review R1 M2: `missing_tags_of` answers, for every known item, exactly `missing_tags`'
+    /// answer; an unknown item is left out, and an unknown box is refused as `missing_tags`
+    /// refuses it.
+    #[tokio::test]
+    async fn missing_tags_of_answers_missing_tags_per_item() {
+        let store = MemStore::demo();
+        let (tagged, covered) = (ItemId::new(), ItemId::new());
+        for (id, tags) in [
+            (
+                tagged,
+                ["zulu", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
+            ),
+            (covered, ["gpu", "rust"].as_slice()),
+        ] {
+            store
+                .mint_item(NewItem {
+                    id,
+                    project_id: ids::PROJECT_HTUI,
+                    kind_id: ids::KIND_HTUI_FEAT,
+                    title: "tagged".to_owned(),
+                    body: String::new(),
+                    required_tags: tags.iter().map(|&tag| tag.to_owned()).collect(),
+                    touched_paths: Vec::new(),
+                    priority: 0,
+                    step_graph_id: None,
+                    created_by: ids::USER,
+                    box_id: Some(ids::BOX),
+                })
+                .await
+                .expect("the mint lands");
+        }
+        let unknown = ItemId::new();
+        let items = [tagged, covered, ids::HTUI_ANA_2, unknown, tagged];
+        let batched = store
+            .missing_tags_of(&items, ids::BOX)
+            .await
+            .expect("the read answers");
+        for item in items {
+            match store.missing_tags(item, ids::BOX).await {
+                Ok(tags) => assert_eq!(batched.get(&item), Some(&tags), "{item}"),
+                Err(StoreError::NotFound { entity: "item", .. }) => {
+                    assert!(!batched.contains_key(&item), "{item} is unknown");
+                }
+                Err(err) => panic!("missing_tags({item}): {err}"),
+            }
+        }
+        assert_eq!(batched.len(), 3);
+        assert_eq!(batched[&tagged], ["Alpha", "cuda", "zulu"]);
+        assert!(batched[&covered].is_empty());
+        assert!(
+            store
+                .missing_tags_of(&[], ids::BOX)
+                .await
+                .expect("the read answers")
+                .is_empty()
+        );
+        assert!(matches!(
+            store.missing_tags_of(&items, BoxId::new()).await,
+            Err(StoreError::NotFound { entity: "box", .. })
+        ));
+    }
+
+    /// Review R1 L4: `last_closed_batch` is the box's most recently closed batch, whatever is
+    /// open now; `None` before any batch closed.
+    #[tokio::test]
+    async fn last_closed_batch_is_the_latest_close() {
+        let store = MemStore::demo();
+        let at = Utc::now().trunc_subsecs(TIMESTAMPTZ_DIGITS);
+        let later = at + TimeDelta::seconds(1);
+        let last = || async {
+            store
+                .last_closed_batch(ids::BOX)
+                .await
+                .expect("the read answers")
+        };
+        assert_eq!(last().await, None, "no batch yet");
+        let first = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("the batch opens");
+        assert_eq!(last().await, None, "an open batch is not closed");
+        store
+            .close_batch(ids::BOX, BatchClose::Paused, at)
+            .await
+            .expect("the close answers");
+        let paused = last().await.expect("one closed");
+        assert_eq!(
+            (paused.id, paused.closed_reason, paused.closed_at),
+            (first.id, Some(BatchClose::Paused), Some(at))
+        );
+        let second = store
+            .open_batch(ids::BOX, ids::USER, at)
+            .await
+            .expect("a resume opens");
+        store
+            .close_drained_batch(second.id, &[], later)
+            .await
+            .expect("the drain answers")
+            .expect("nothing keeps it open");
+        store
+            .open_batch(ids::BOX, ids::USER, later)
+            .await
+            .expect("a resume opens");
+        let drained = last().await.expect("two closed");
+        assert_eq!(
+            (drained.id, drained.closed_reason, drained.closed_at),
+            (second.id, Some(BatchClose::Drained), Some(later)),
+            "the latest close, with a third batch open"
+        );
+        assert_eq!(
+            store
+                .last_closed_batch(BoxId::new())
+                .await
+                .expect("the read answers"),
+            None,
+            "another box has none"
         );
     }
 }

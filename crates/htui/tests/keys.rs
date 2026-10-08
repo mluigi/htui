@@ -7,8 +7,8 @@
 //!   step 2). A field that types `?` keeps it as text, and `F1` still reaches help.
 //! - A modal overlay swallows what it and the overlay stack passed (D6 step 3): under the switcher
 //!   a digit or `w` reaches neither the tab strip nor a second switcher.
-//! - `w`, `Ctrl+F` and `Ctrl+W` are offered by `register_all` (D5): without it they are inert and
-//!   absent from the status line and the `?` box.
+//! - `w`, `Ctrl+F`, `Ctrl+W` and `Ctrl+Q` are offered by `register_all` (D5): without it they are
+//!   inert and absent from the status line and the `?` box.
 //! - The status line is byte-identical to the one the snapshots pin (D7); the `?` box follows D8.
 //!
 //! MOD-67 M3 (T1): the Settings tab cycles sections through `settings.next_section`/
@@ -29,7 +29,8 @@ use htui::keys::{KeyChord, Stack, load_str, views};
 use htui::store_worker::{StoreReply, StoreRequest};
 use htui::testkit::Harness;
 use htui::ui::overlay::{
-    ConceptsSearch, MigrationPrompt, Overlay, OverlayId, WaitingList, WorkspaceSwitcher,
+    ConceptsSearch, MigrationPrompt, Overlay, OverlayId, QueueOverlay, WaitingList,
+    WorkspaceSwitcher,
 };
 use htui::ui::tabs::BacklogTab;
 use htui::ui::tabs::settings::{
@@ -156,6 +157,7 @@ async fn ctrl_c_quits_over_every_modal_overlay() {
         ("w", WorkspaceSwitcher::ID),
         ("ctrl-f", ConceptsSearch::ID),
         ("ctrl-w", WaitingList::ID),
+        ("ctrl-q", QueueOverlay::ID),
     ] {
         let mut harness = shell(true).await;
         harness.key(opener);
