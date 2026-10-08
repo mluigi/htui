@@ -1140,11 +1140,12 @@ impl LibraryView {
     }
 
     /// The editor, widget first (MOD-67 M4 PA-3): the area takes text and `Esc` (its `Cancel`);
-    /// every chord it passes, `ctrl-s` included (D6), resolves through `views::LIBRARY_EDITOR`: `form.save` saves, `skills.ask_agent` opens the agent help,
-    /// `form.external_editor` hands the draft to `$EDITOR`, and `global.next_tab`/`prev_tab` pass
-    /// so the shell switches tabs with the draft kept (PA-2). Any other key is `modal_rest`'s. An
-    /// open agent help (MOD-55) takes every key first: the draft is locked under it, and the
-    /// editor's verbs are refused until it closes.
+    /// every chord it passes, `ctrl-s` included (D6), resolves through `views::LIBRARY_EDITOR`:
+    /// `form.save` saves, `skills.ask_agent` opens the agent help, `form.external_editor` hands the
+    /// draft to `$EDITOR`, and `global.next_tab`/`prev_tab` pass so the shell switches tabs with
+    /// the draft kept (PA-2). Any other key is `modal_rest`'s. An open agent help (MOD-55) takes
+    /// every key first: the draft is locked under it, and the editor's verbs are refused until it
+    /// closes.
     fn on_editor_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if let Mode::Editing(editor) = &mut self.mode
             && let Some(help) = editor.help.as_mut()
