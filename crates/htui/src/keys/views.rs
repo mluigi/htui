@@ -762,8 +762,8 @@ mod tests {
     }
 
     /// MOD-67 M3 T7: every view stack this module declares is the stack of some view. The
-    /// shell's own `BASE`, `OVERLAY` and editor stacks are not declared here; a stack nothing names would be
-    /// validated (and refuse key files) for a mode no view is ever in.
+    /// shell's own `BASE`, `OVERLAY` and editor stacks are not declared here; a stack nothing
+    /// names would be validated (and refuse key files) for a mode no view is ever in.
     #[test]
     fn every_view_stack_is_named_by_a_view() {
         const VIEWS: &[&str] = &[
