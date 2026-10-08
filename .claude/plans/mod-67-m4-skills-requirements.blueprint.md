@@ -112,16 +112,16 @@ pre-edit). No default changes: every chord below is today's.
 | # | `Act` | Context | name | defaults | help (`?` box) | kind | mirrors |
 |---|---|---|---|---|---|---|---|
 | 1 | `SkillsSwitchView` | `Skills` | `switch_view` | `["h", "l", "[", "]", "left", "right"]` | `switch view` | row | `skills/mod.rs:111-118` (one toggle, two views: D2) |
-| 2 | `SkillsPrevVersion` | `Skills` | `prev_version` | `[","]` | `older version` | row | `library.rs:762`/`:801`, `templates.rs:576`/`:619` |
+| 2 | `SkillsPrevVersion` | `Skills` | `prev_version` | `[","]` | `older version` | row | `library.rs:762`/`:799`, `templates.rs:576`/`:616` |
 | 3 | `SkillsNextVersion` | `Skills` | `next_version` | `["."]` | `newer version` | row | same arms (`'.'`) |
-| 4 | `SkillsBase` | `Skills` | `base` | `["b"]` | `diff base` | row | `library.rs:814`, `templates.rs:628` |
-| 5 | `SkillsDiff` | `Skills` | `diff` | `["d"]` | `diff` | row | `library.rs:821`, `templates.rs:632` |
-| 6 | `SkillsEditExternally` | `Skills` | `edit_externally` | `["E"]` | `edit in $EDITOR` | row | `library.rs:839`, `templates.rs:656` (browse `E`; the editor's `ctrl-e` is `form.external_editor`) |
+| 4 | `SkillsBase` | `Skills` | `base` | `["b"]` | `diff base` | row | `library.rs:816`, `templates.rs:626` |
+| 5 | `SkillsDiff` | `Skills` | `diff` | `["d"]` | `diff` | row | `library.rs:823`, `templates.rs:630` |
+| 6 | `SkillsEditExternally` | `Skills` | `edit_externally` | `["E"]` | `edit in $EDITOR` | row | `library.rs:843`, `templates.rs:657` (browse `E`; the editor's `ctrl-e` is `form.external_editor`) |
 | 7 | `SkillsAskAgent` | `Skills` | `ask_agent` | `["ctrl-g"]` | `ask agent` | cap | `library.rs:1080`, `templates.rs:741` (MOD-55) |
 | 8 | `LibraryImport` | `SkillsLibrary` | `import` | `["I"]` | `import` | row | `library.rs:753` |
-| 9 | `LibraryInfo` | `SkillsLibrary` | `info` | `["i"]` | `rename` | row | `library.rs:850` (`'i'`) |
-| 10 | `LibraryAttach` | `SkillsLibrary` | `attach` | `["a"]` | `attachments` | row | `library.rs:859` (opens), `attach.rs:399` (`a` closes: the same toggle) |
-| 11 | `TemplatesDiffDefault` | `SkillsTemplates` | `diff_default` | `["D"]` | `diff default` | row | `templates.rs:645` |
+| 9 | `LibraryInfo` | `SkillsLibrary` | `info` | `["i"]` | `rename` | row | `library.rs:854` (`'i'`) |
+| 10 | `LibraryAttach` | `SkillsLibrary` | `attach` | `["a"]` | `attachments` | row | `library.rs:863` (opens), `attach.rs:399` (`a` closes: the same toggle) |
+| 11 | `TemplatesDiffDefault` | `SkillsTemplates` | `diff_default` | `["D"]` | `diff default` | row | `templates.rs:643` |
 | 12 | `AttachChoose` | `SkillsAttach` | `choose` | `["enter"]` | `choose row` | row | `attach.rs:368` (browse: edit the row), `:562` (picker: insert the repo) |
 | 13 | `AttachDetach` | `SkillsAttach` | `detach` | `["x"]` | `detach` | row | `attach.rs:379` |
 | 14 | `AttachRepo` | `SkillsAttach` | `repo` | `["ctrl-r"]` | `repo picker` | cap | `attach.rs:476` |
@@ -590,8 +590,8 @@ README keys, M4`; X7 `docs(mod-67): close-out M4`.
 
 | Lane | Source | Stacks it returns | Snapshots it re-baselines (rows that may move) | Rebinding test |
 |---|---|---|---|---|
-| L-A | `skills/{library,attach}.rs` | `LIBRARY_*`, `ATTACH_*`, `help.key_stack()` | `skills__*` ×9: hint row (all), status row (capturing: `edit`, `changed_elsewhere`, `agent_help_proposal`, `attach_form_effective_globs`, `repo_picker`), the pane's scroll border title where drawn | `[skills.library] import = "M"` |
-| L-B | `skills/templates.rs` | `TEMPLATES_*`, `help.key_stack()` | `templates__*` ×8: hint row, status row (`edit_help`, `changed_elsewhere`, `missing_item_confirm`, `unknown_placeholder_cursor`, `agent_help_asking`, `agent_help_proposal`), scroll border | `[skills.templates] diff_default = "X"` |
+| L-A | `skills/{library,attach}.rs` | `LIBRARY_*`, `ATTACH_*`, `help.key_stack()` | `skills__*` ×9: hint row (all), status row (capturing: `edit`, `changed_elsewhere`, `agent_help_proposal`, `attach_form_effective_globs`, `repo_picker`); the scroll border title is in no snapshot | `[skills.library] import = "M"` |
+| L-B | `skills/templates.rs` | `TEMPLATES_*`, `help.key_stack()` | `templates__*` ×8: hint row, status row (`edit_help`, `changed_elsewhere`, `missing_item_confirm`, `unknown_placeholder_cursor`, `agent_help_asking`, `agent_help_proposal`) | `[skills.templates] diff_default = "X"` |
 | L-C | `requirements/{mod,forms}.rs` | `REQUIREMENTS_*`, `CAPTURE` | `requirements__*` ×7: hint row only | `[requirements] amend = "E"` |
 
 Lane gate (each, in its worktree):
