@@ -134,11 +134,17 @@ pub async fn run(args: cli::Args) -> anyhow::Result<()> {
     // MOD-67 M2 D5: the key file, after every flag that exits without the TUI and before the
     // backend, `--demo` included (ANA-26 §6.3), so a bad file stops htui before the store or the
     // terminal is touched (§7.4 step 8). `--print-keys` ends here.
-    let keys = keys::resolve(
+    let resolved = keys::resolve(
         args.keys.as_deref(),
         args.default_keys,
         identity::config_root_path().ok().as_deref(),
     )?;
+    // MOD-12 M3 R1 H1: a chord the file took from an action it leaves at its default is no
+    // error, but the user is told, before the terminal hides stderr and with `--print-keys` too.
+    for notice in resolved.notices() {
+        eprintln!("htui: {notice}");
+    }
+    let keys = resolved.keys;
     if args.print_keys {
         return print_keys(&mut std::io::stdout().lock(), &keys::print(&keys));
     }

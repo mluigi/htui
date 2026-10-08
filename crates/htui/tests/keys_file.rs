@@ -3,12 +3,13 @@
 //!
 //! - `binary` (Unix): `htui --keys F --print-keys` prints the table (exit 0) or the exact §7.5
 //!   report on stderr (exit 2, nothing on stdout); a bad file stops the TUI before the terminal;
-//!   a missing named file exits 2; clap refuses `--keys` beside `--default-keys`.
+//!   a missing named file exits 2; clap refuses `--keys` beside `--default-keys`. An entry that
+//!   takes `ctrl-q` from the defaulted queue loads with a notice on stderr (MOD-12 M3 R1 H1).
 //! - `default_path` (Linux): the config directory's `keys.toml` is read, a missing one is the
 //!   defaults and creates nothing, `--default-keys` ignores a broken one.
 //! - `app` (`testkit`): a shell whose `app.keys` came from `valid.toml` quits on the rebound chord
 //!   and no longer on `q`, closes an overlay on `F2`, and shows both on the status line and the
-//!   `?` box.
+//!   `?` box; one from `quit_ctrl_q.toml` quits on `ctrl-q` and never opens the queue.
 //!
 //! No case may read the developer's own `keys.toml` (blueprint F-9, H-10): every child runs with
 //! a cleared environment, `HOME` and `XDG_CONFIG_HOME` both set to a temporary directory, and
@@ -258,7 +259,10 @@ mod binary {
                 .to_owned()
         };
         assert!(row("queue").contains("= []"), "{stdout}");
-        assert!(row("queue").ends_with("# queue (unbound by quit)"), "{stdout}");
+        assert!(
+            row("queue").ends_with("# queue (unbound by quit)"),
+            "{stdout}"
+        );
         assert!(row("quit").contains(r#"= ["ctrl-q"]"#), "{stdout}");
         assert!(row("quit").ends_with("# quit (changed)"), "{stdout}");
     }
@@ -269,8 +273,11 @@ mod binary {
     fn two_entries_on_ctrl_q_are_still_refused() {
         let home = tempfile::tempdir().expect("a throwaway home");
         let path = home.path().join("both.toml");
-        std::fs::write(&path, "[global]\nquit = [\"ctrl-q\"]\nqueue = [\"ctrl-q\"]\n")
-            .expect("the file is written");
+        std::fs::write(
+            &path,
+            "[global]\nquit = [\"ctrl-q\"]\nqueue = [\"ctrl-q\"]\n",
+        )
+        .expect("the file is written");
         let output = run(
             &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
             home.path(),
@@ -278,7 +285,8 @@ mod binary {
         let (stdout, stderr) = text(&output);
         assert_eq!(output.status.code(), Some(2), "{stderr}");
         assert_eq!(stdout, "");
-        let line = r#"2: [global] quit = "ctrl-q": "ctrl-q" is already global.queue (line 3) in [global]"#;
+        let line =
+            r#"2: [global] quit = "ctrl-q": "ctrl-q" is already global.queue (line 3) in [global]"#;
         assert_eq!(stderr, report("both", &path, &[line.to_owned()]));
     }
 

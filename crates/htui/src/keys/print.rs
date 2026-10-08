@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use super::{Keys, contexts, quote};
+use super::{Keys, Row, contexts, quote};
 
 /// The header and `version = 1`. Constant, so the output is the same on every machine (B-13).
 const HEADER: &str = r"# htui key bindings, as `htui --print-keys` prints them. htui reads keys.toml in its config
@@ -15,12 +15,14 @@ version = 1
 
 /// The keys in force as a complete `keys.toml`: a constant header, `version = 1`, then one table
 /// per context in catalogue order, one padded `name = ["chord", …]  # help` line per action. A
-/// line the file changed ends `(changed)`; an unbound action is `name = []`.
+/// line the file changed ends `(changed)`; an unbound action is `name = []`. A line left at its
+/// default that gave chords to the file's entries (MOD-12 M3 R1 H1) ends `(unbound by quit)`
+/// when it has none left, else `(lost "j" to top)`.
 #[must_use]
 pub fn print(keys: &Keys) -> String {
     let mut out = HEADER.to_owned();
     for context in contexts() {
-        let rows: Vec<(&str, String, &str, bool)> = keys
+        let rows: Vec<(&str, String, &str, String)> = keys
             .rows
             .iter()
             .filter(|row| row.context == context)
@@ -32,7 +34,7 @@ pub fn print(keys: &Keys) -> String {
                     .collect::<Vec<_>>()
                     .join(", ");
                 let name = row.act.spec().map_or("", |spec| spec.name);
-                (name, format!("[{value}]"), row.help, row.line.is_some())
+                (name, format!("[{value}]"), row.help, mark(row))
             })
             .collect();
         if rows.is_empty() {
@@ -53,12 +55,40 @@ pub fn print(keys: &Keys) -> String {
             .max()
             .unwrap_or(0);
         let _ = write!(out, "\n[{}]\n", context.table());
-        for (left, (_, _, help, changed)) in lefts.iter().zip(&rows) {
-            let mark = if *changed { " (changed)" } else { "" };
+        for (left, (_, _, help, mark)) in lefts.iter().zip(&rows) {
             let _ = writeln!(out, "{left:<left_width$}  # {help}{mark}");
         }
     }
     out
+}
+
+/// What follows a row's help: ` (changed)` for the file's change, ` (unbound by quit)` or
+/// ` (lost "j" to top)` for a default that gave way to the file's entries, else nothing.
+fn mark(row: &Row) -> String {
+    if row.line.is_some() {
+        return " (changed)".to_owned();
+    }
+    if row.lost.is_empty() {
+        return String::new();
+    }
+    let name = |lost: &super::Lost| lost.to.spec().map_or("", |spec| spec.name);
+    if row.chords.is_empty() {
+        let mut takers: Vec<&str> = Vec::new();
+        for lost in &row.lost {
+            if !takers.contains(&name(lost)) {
+                takers.push(name(lost));
+            }
+        }
+        format!(" (unbound by {})", takers.join(", "))
+    } else {
+        let taken = row
+            .lost
+            .iter()
+            .map(|lost| format!("{} to {}", quote(&lost.chord.spec()), name(lost)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(" (lost {taken})")
+    }
 }
 
 #[cfg(test)]
@@ -149,9 +179,15 @@ close = ["esc"]  # close"#;
                 .unwrap_or_else(|| panic!("no {name} row in {printed}"))
         };
         assert!(line("queue").contains("= []"), "{printed}");
-        assert!(line("queue").ends_with("# queue (unbound by quit)"), "{printed}");
+        assert!(
+            line("queue").ends_with("# queue (unbound by quit)"),
+            "{printed}"
+        );
         assert!(line("down").contains(r#"= ["down"]"#), "{printed}");
-        assert!(line("down").ends_with(r#"# down (lost "j" to top)"#), "{printed}");
+        assert!(
+            line("down").ends_with(r#"# down (lost "j" to top)"#),
+            "{printed}"
+        );
         assert!(line("quit").ends_with("# quit (changed)"), "{printed}");
         assert!(line("top").ends_with("# top (changed)"), "{printed}");
         assert_eq!(printed.matches("(changed)").count(), 2);

@@ -1,8 +1,50 @@
 //! The key file's semantic checks over the merged keys (MOD-67 M2 D8 steps 5-6; ANA-26 §7.4
 //! step 7): collisions in every context and in every declared stack, and printable chords on
-//! actions offered while a field captures.
+//! actions offered while a field captures. Before them, [`give_way`] lets an entry of the file
+//! take its chord from an action the file leaves at its default (MOD-12 M3 R1 H1).
 
-use super::{Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Row, STATE_GUARDED, quote};
+use super::{
+    Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Lost, Row, STATE_GUARDED, quote,
+};
+
+/// The user's binding wins (MOD-12 M3 R1 H1, maintainer 2026-10-08): an entry of the file that
+/// shares a chord with an action in **its own context** that the file leaves at its default
+/// takes the chord, and that action loses it (unbound when it has no other). A
+/// [`STATE_GUARDED`] pair that shares the chord by default keeps sharing it, and
+/// `overlay.close` never gives way (it must keep a chord).
+///
+/// Nothing else changes: two entries on one chord, and a chord shared across the layers of a
+/// declared stack (another context's default included), are still [`validate`]'s errors.
+pub(super) fn give_way(keys: &mut Keys) {
+    let mut taken: Vec<(usize, Lost)> = Vec::new();
+    for entry in keys.rows.iter().filter(|row| row.entry.is_some()) {
+        for (index, default) in keys.rows.iter().enumerate() {
+            if default.entry.is_some()
+                || default.context != entry.context
+                || default.act == Act::OverlayClose
+            {
+                continue;
+            }
+            for &chord in entry.chords.iter().filter(|c| default.chords.contains(c)) {
+                if !allowed(entry, default, chord) {
+                    taken.push((
+                        index,
+                        Lost {
+                            chord,
+                            to: entry.act,
+                            line: entry.entry.unwrap_or(0),
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    for (index, lost) in taken {
+        let row = &mut keys.rows[index];
+        row.chords.retain(|&chord| chord != lost.chord);
+        row.lost.push(lost);
+    }
+}
 
 /// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
 /// The compiled defaults give none (`the_compiled_defaults_validate`).
@@ -109,11 +151,12 @@ impl Check {
         };
         let origin = other
             .line
+            .or(other.entry)
             .map_or_else(|| "default".to_owned(), |line| format!("line {line}"));
         let shown = quote(&chord.spec());
         let other_name = other.act.spec().map_or("", |spec| spec.name);
         self.errors.push(KeyFileError {
-            line: reported.line.unwrap_or(0),
+            line: reported.line.or(reported.entry).unwrap_or(0),
             message: format!(
                 "{} = {shown}: {shown} is already {}.{other_name} ({origin}) {place}",
                 subject(reported),
