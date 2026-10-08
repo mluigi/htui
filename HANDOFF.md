@@ -14,15 +14,18 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-08):** **MOD-12 is done** (`docs/decisions/mod/mod-12.md`): auto mode runs
-explicitly queued items unattended, holds each batch to its spend cap, and `ctrl-q` opens the queue overlay
-(order, escalations with reasons, reorder, pause/resume); a stalled batch closes, so a later `Q` never starts
-spending. A user's `keys.toml` entry now takes a chord from an action left at its default, with a notice. Owed on
-the host: the Postgres gate and the PRD's prototype batch. Before it, **CLEAN-9** (`docs/decisions/clean/clean-9.md`):
-the recorder's `cap_exceeded` row names the session allowance and what bound it, and a malformed cap key refuses the
-enqueue. Filed **CLEAN-11** for the leftovers. Before that, **MOD-90 and CLEAN-8** (`docs/decisions/mod/mod-90.md`,
-`docs/decisions/clean/clean-8.md`): a fourth keyring entry, `htui/infisical-write-mark`, is replaced by every
-Settings > Secrets URL or identity write. No migration.
+**Current status (2026-10-08):** **ANA-29 is concluded** (`docs/ANA-29.md`,
+`docs/decisions/ana/ana-29.md`): Claude Code mods (in-process JS/TS handlers shipped in plugins) for
+developing htui and for using it elsewhere. htui-driven `claude -p` sessions load the user's mods and
+settings hooks today, so **MOD-91** isolates them first; dev side gets one committed `htui-dev` mod
+(**TOOL-8**) over a canonical gate script (**TOOL-9**), plus sandbox hardening (**TOOL-10**) and
+**CLEAN-12**; consumer side is a read-only `--json` CLI (**MOD-92**), then a thin emitted `htui` plugin
+(**MOD-93**), with **MOD-94** (permission answers outside the TUI) behind a maintainer decision. Before it,
+**MOD-12 is done** (`docs/decisions/mod/mod-12.md`): auto mode runs explicitly queued items unattended,
+holds each batch to its spend cap, and `ctrl-q` opens the queue overlay; a stalled batch closes. Owed on the
+host: the Postgres gate and the PRD's prototype batch. Before that, **CLEAN-9**
+(`docs/decisions/clean/clean-9.md`): the recorder's `cap_exceeded` row names the session allowance and what
+bound it. Filed **CLEAN-11** for the leftovers.
 Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
 migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
@@ -51,14 +54,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   automatically. The fit is deterministic arithmetic over rows, so it is allowed under `R-ID-6`.
   Judge choice itself is out of scope: ANA-21 §2.2 established the judge is never asked of the
   selector, and MOD-36 owns the judge-identity hardening.
-- [ ] **ANA-29 - Claude Code mods: developing htui, and using htui in other projects.** Research how
-  to build "mods" for Claude Code (plugins, skills, agents, hooks, rules, MCP config, settings) in
-  two directions. (a) Dev-side: what htui's own development should vendor in `.claude/` beyond
-  today's `handoff-*` and `plan*` skills, `code-architect`/`rust-reviewer` agents and Gortex
-  permissions, and what is better packaged as a Claude Code plugin. (b) Consumer-side: what htui
-  ships so other projects can drive it from Claude Code (the `docs/htui-mcp.md` MCP surface, a
-  plugin/skill bundle, install and update path, per-project config). Conclude with a recommended
-  shape, a split between the two, and the MOD items to file. No code before the verdict.
 - [ ] **ANA-28 - `heavy_build`: queue switch vs required box capability** (from MOD-11,
   `docs/decisions/mod/mod-11.md`). `R-MCP-3`, `R-ORCH-10`. R-MCP-3 says an item carrying the
   `heavy_build` tag forces `command_run` on. MOD-11 reads that tag from `item.required_tags`, the only
@@ -215,6 +210,11 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   arrives as `ctrl-\` there, so only a physical `Ctrl+4` reaches `editor.focus`; the kill is
   `TerminateProcess` (no process-group kill); `ClosePseudoConsole` runs on its own thread; and a
   forwarded `Ctrl+C` must reach the editor without ending htui.
+  **ANA-29 note (2026-10-08, `docs/ANA-29.md` §8):** once they land, run on Windows MOD-91's
+  isolation flags against a subscription login, MOD-92's `--json` verbs (keyring DSN, exit codes),
+  and MOD-93's `htui claude emit` with a `claude plugin marketplace add` of the emitted directory,
+  with the mod reaching `htui.exe` through `$.process.run`. Mods themselves are documented with
+  PowerShell setup and `;` path lists, but native Windows behaviour is unconfirmed.
 
 - [ ] **MOD-43 - Remote dispatch in the TUI** (from ANA-16, §8 item 4). `R-ORCH-11`, `R-ORCH-12`,
   `R-TUI-1`, `R-NF-3`. Target box on run start and in auto mode; a non-local target stays `queued`
@@ -441,6 +441,71 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   warn vs refuse (and whether per project), whether a provider-less project is checked too, and where the warning
   shows. Out of MOD-10's MVP by PRD scope. Not blocked.
 
+- [ ] **MOD-91 - Keep the user's mods, settings hooks and skills out of htui-driven sessions**
+  (from ANA-29, `docs/ANA-29.md` §4.4, §5.5). `R-ID-5`, `R-AGT-1`, `R-AGT-4`, `R-TUI-6`, `R-HIS-1`.
+  htui launches `claude -p` without `--bare` (D92: it breaks subscription auth) and with no other
+  isolation flag. Every htui-driven session therefore loads the user's plugins, skills, settings
+  hooks and **mods**. In `local` and `shared_serialized` isolation, from a checkout already
+  trusted interactively, it also loads the managed repo's own `.claude/` hooks and
+  skills-directory plugins; `worktree` and `copy` sessions start in a scratch directory above the
+  repo and do not (`crates/htui-orch/src/isolate/real.rs:692-700`, `:727`, `:862`). A mod can
+  approve a tool call before `mcp__htui__permission_prompt` is asked, and `R-ID-5`'s "system
+  skills disabled" is not enforced on `claude-cli`. First a live probe, shaped like
+  `cli_live.rs` case 1: install a test mod at user scope and put another in a project
+  skills-directory plugin of a checkout that was trusted interactively (or has
+  `hasTrustDialogAccepted` set), and use that checkout as cwd. Confirm both mods load without the
+  flags, then spawn `claude -p` with `--settings '{"disableAllHooks":true}'` and
+  `--disable-slash-commands`, and record that subscription auth still works, that htui's
+  `--mcp-config` server and permission-prompt tool still work, that neither mod loads
+  (`--debug-file`, "hooks module … loaded" absent), and that skills are gone. Record which plugin
+  agents and plugin MCP servers stay loaded (`disableAllHooks` leaves them), and whether another
+  lever, such as `enabledPlugins` overrides in the same `--settings` value, should remove them.
+  Also probe `--safe-mode` and `--setting-sources` for the record. Then make the passing flags the default
+  for every `claude-cli` session htui starts (engine steps, chat, promotion, help turns). Add an
+  agent-row setting to opt back in, shown in Settings > Agents, and set `HTUI_SESSION=1` in the
+  agent's environment. For ACP `claude`, establish whether `claude-agent-acp` loads user plugins
+  (its SDK `settingSources`) and close the gap the same way. User MCP servers stay
+  (`docs/htui-mcp.md:33-35`). Document the change in `docs/htui-mcp.md` and the README. Not
+  blocked.
+
+- [ ] **MOD-92 - Read-only `--json` CLI for htui state** (from ANA-29, `docs/ANA-29.md` §5.3).
+  `R-TUI-11`, `R-ID-2`, `R-ID-6`, `R-STO-1`, `R-NF-2`. Nothing outside the TUI can read htui's
+  state: the CLI has no `status`, `waiting` or `--json`. Add read-only subcommands that print
+  one versioned JSON document and exit: `htui status --json` (store state, box, working and
+  waiting counts, as in the top bar), `htui waiting --json` (`R-TUI-11`'s rows through
+  `waiting_candidates`/`WaitingView`: reason, item key, run, step, age), and `--json` for
+  `--search-items`. Scope is the active workspace, or `--project <slug>`, or the project whose
+  registered repo contains `--cwd <path>`. The DSN comes from the keyring like every other verb.
+  An offline or unreachable store answers a typed `{"store":"offline"}` document and exit status
+  3, never stale data presented as live. No writes. The JSON schema is documented and pinned by
+  tests, because MOD-93 and other agents parse it. Not blocked.
+
+- [ ] **MOD-93 - `htui` Claude Code plugin: one skill, one mod, emitted from the binary** (from
+  ANA-29, `docs/ANA-29.md` §6). `R-ID-4`, `R-ID-6`, `R-STO-1`, `R-TUI-11`, `R-NF-1`. For people
+  working in plain `claude` beside htui. `htui claude emit [--dir PATH]` writes a directory
+  marketplace (default under htui's data directory) holding plugin `htui` with the binary's
+  version, and prints the `claude plugin marketplace add` / `install` commands. It never edits
+  `~/.claude` and never writes into a repo. Contents: a skill `htui` (how to read htui state with
+  MOD-92's verbs and when to hand work to htui, not do it inline), and a mod with (1) a status line
+  or `AbovePrompt` band showing the waiting-on-you count from `htui waiting --json` on a
+  `$.clock.every` timer, (2) a `/htui` pane listing the rows (opened by command, so it places at
+  any width), (3) turnless `/htui status`, `/htui waiting`, `/htui search <q>`, (4) a skew line when
+  `htui --version` differs from the plugin's version, (5) standing down when `HTUI_SESSION` is set.
+  `userConfig`: `panel` (`auto|command|off`), `poll_seconds`. Rules from `docs/ANA-29.md` §6.3:
+  no `$.model`, no DSN, reach limited to processes, `claude plugin validate --strict` and `claude
+  plugin test` in the gate. `emit` omits the mod and says so when `claude --version` is below
+  2.1.287. Blocked on MOD-91 and MOD-92.
+
+- [ ] **MOD-94 - Answer a relayed permission request from outside the TUI** (from ANA-29,
+  `docs/ANA-29.md` §5.1 C3). `R-TUI-4`, `R-TUI-6`, `R-HIS-1`, `R-ID-6`. MOD-42's executor waits for
+  "any store client" to answer a `step_permission` row by compare-and-set
+  (`docs/decisions/mod/mod-42.md:31-32`), but only the TUI answers. Add `htui permission list
+  --json` and `htui permission answer <request-id> <option>`, which run the same compare-and-set,
+  name the request they answer, refuse a request already answered or whose session is gone, and
+  record the answerer as a person on this box (ANA-27 T2). MOD-93's pane then gains one button per
+  option, pressed by a person; no mod or agent answers on its own. **Blocked on a maintainer
+  decision** (`docs/ANA-29.md` §12 Q2) and on MOD-92; the buttons land after MOD-93.
+
 ### Deferred backlog
 
 - [ ] **CLEAN-10 - `cargo doc` fails on private intra-doc links** (found at MOD-12 M2's gate).
@@ -462,6 +527,15 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
     refuses it in Pg and Mem (`jsonb_typeof = 'object'`). Intentional and documented on
     `ProjectCaps::from_settings`; decide whether `null` should be a refusal everywhere.
   Not blocked.
+- [ ] **CLEAN-12 - `.claude/` hygiene found by ANA-29** (from ANA-29, `docs/ANA-29.md` §4.1).
+  Remove the committed `.claude/.headroom_wrap_settings.lock` and ignore it. Decide whether
+  `.claude/skills/generated/` is committed or tool-owned: it is committed, yet `scripts/hr:692`
+  lists it in `TOOL_EXCLUDES` as untracked. Correct `.claude/skills/handoff-run/references/lifecycle.md:98-99` and
+  `install-workflow-hooks.sh:22-23` to what this repo has once TOOL-9 lands (the commit hook via
+  `core.hooksPath`, the `--no-verify` block from TOOL-8). No behaviour change. The lock file and
+  the generated-skills decision are not blocked; the lifecycle text and
+  `install-workflow-hooks.sh` corrections are blocked on TOOL-9, and the `--no-verify` wording on
+  TOOL-8 M1.
 - [ ] **MOD-3 - Diff tab + code explorer.** `R-LATER-1`. Later tier; needs its own ANA first.
 - [ ] **MOD-5 - Issue tracker mirror.** `R-LATER-2`. `IssueSync` trait, OneDev first, downstream
   only. Later tier; needs its own ANA first.
@@ -475,11 +549,53 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 ### Tooling findings
 
+- [ ] **TOOL-8 - `htui-dev` mod: guards, status line and turnless commands** (from ANA-29,
+  `docs/ANA-29.md` §4.2, §6). A skills-directory plugin at `.claude/skills/htui-dev/`
+  (`.claude-plugin/plugin.json`, `hooks/hooks.json` → `register.ts`, `*.test.ts`), loaded in
+  place by every trusted checkout and sandbox clone; develop it with `--plugin-dir`. **M1 guards**,
+  each a `{deny}` with a corrective reason, never a rewrite: `cargo test` of `-p htui` or
+  `--workspace` without `--features testkit`/`--all-features`, and `--features testkit` on crates
+  that call it `test-support`; the substring `zeta` in Edit/Write/MultiEdit content written to
+  `crates/**/*.rs` or `crates/**/*.json`, except `crates/htui-agent/tests/extensibility.rs` (the
+  test's own scope: `tree_files()` and `text.contains("zeta")`); Edit/Write and
+  `git commit|stash|reset|checkout --` from an agent whose spawn prompt declared it read-only (`agent.spawn` records the `agentId`);
+  an `agent.spawn` naming a Fable model (deny, not warn: maintainer, 2026-10-08); `git commit --no-verify`. Guards fail open with a
+  status warning. **M2 status and commands**: a status line from a 60 s timer (item and HANDOFF
+  phase from `HR_ITEM` or the branch, `MERGE_HEAD`, ahead/dirty counts, disk above 90%, Postgres
+  down, last gate result); turnless `/gate` (starts TOOL-9's script detached, polls its status
+  file, toasts the result), `/next`, `/validate` (the existing `.sh`/`.ps1` scripts by platform).
+  Tests with `claude plugin test`; `claude plugin validate --strict` in TOOL-9's gate. Open in the
+  plan: whether `agent.spawn` fires for Workflow-tool agents (D3), and whether a skills-directory
+  mod prompts beyond workspace trust. M1 after MOD-91; M2 after TOOL-9.
+- [ ] **TOOL-9 - Canonical gate script, committed git hooks, DECISIONS merge rule** (from ANA-29,
+  `docs/ANA-29.md` §4.1, §4.2 D5, D7, D8). `scripts/gate.sh` and `scripts/gate.ps1` run the gate the
+  memory notes describe: `cargo fmt --check`, `cargo clippy --workspace --all-features --
+  -D warnings`, featureless `cargo clippy --workspace -- -D warnings`, tests with `--all-features
+  --no-fail-fast -- --test-threads=1`, a grep for `SIGABRT`/`overflowed its stack`, a check that
+  migration numbers under `crates/htui-store/migrations/` are unique and contiguous, the workflow
+  validator, and `claude plugin validate`/`test` for `.claude/skills/htui-dev` when `claude` ≥
+  2.1.287 is present. It can run detached and writes `target/gate/last.json`. Commit
+  `scripts/githooks/` (pre-commit runs `validate-workflow-docs` with `--scope-paths` on staged
+  workflow docs) and set `core.hooksPath` from `install-workflow-hooks.sh`/`.ps1`. Add
+  `.gitattributes` `DECISIONS.md merge=union`. Not blocked.
+- [ ] **TOOL-10 - hr sandbox: stop a run from planting a mod that runs on the host** (from
+  ANA-29, `docs/ANA-29.md` §3.3). `~/.claude` is shared read-write with every run
+  (`docker/hr/compose.hr.yaml:99-114`), and `docs/hr-sandbox.md` already lists "add hooks or
+  settings that execute in your next host Claude session". Mods widen that: a plugin installed,
+  or a `~/.claude/skills/<x>/.claude-plugin` folder written (it loads as `@skills-dir`), inside a
+  sandbox runs **in process** in every later host session, unsandboxed. `~/.claude/dev-mods/` is
+  a lesser risk: a mod there loads only in the session whose ID names its folder, after a
+  hot-reload approval and in a trusted workspace (`mods/create`), so it reaches the host only if
+  that host session is resumed; verify this before deciding whether to mount it read-only. Mount
+  `~/.claude/plugins` (except `plugins/data` and `plugins/store`) and `~/.claude/skills`
+  read-only, or masked, in runs; check that plugin auto-update and `$.store` degrade quietly; and
+  extend the `docs/hr-sandbox.md` table. Not blocked.
+
 ## Summary
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-29 Claude Code mods) |
-| MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 2 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals) |
-| TOOL-N  | 0 |
+| ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
+| MOD-N   | 24 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-57 embedded editor, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-89 `.env` in a worktree, MOD-91 session isolation from user mods, MOD-92 `--json` CLI, MOD-93 consumer Claude Code plugin, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
+| TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |
