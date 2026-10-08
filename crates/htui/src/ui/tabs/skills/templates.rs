@@ -76,7 +76,8 @@ const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
 const SAVING: &str = "saving\u{2026}";
 
 /// The hint row in Browse (plan D13; MOD-67 M4 D9), through [`views::TEMPLATES_BROWSE`]. `move`
-/// after `j/k` is dropped: the row would be 102 cells with ` · ` separators (blueprint §1 item 1).
+/// after `j/k` is dropped: the row would be 104 cells with ` · ` separators (blueprint §1 item 1).
+/// The view switch shows its first two chords, `h/l view` (MOD-67 M4 R1 L2): 99 cells.
 const BROWSE_HINT: HintSpec = &[
     Hint::Pair(Act::ListDown, Act::ListUp, ""),
     Hint::Pair(Act::SkillsPrevVersion, Act::SkillsNextVersion, "version"),
@@ -87,7 +88,7 @@ const BROWSE_HINT: HintSpec = &[
     Hint::One(Act::SkillsEditExternally, "$EDITOR"),
     Hint::One(Act::New, "new"),
     Hint::One(Act::Reload, "reload"),
-    Hint::One(Act::SkillsSwitchView, "view"),
+    Hint::Two(Act::SkillsSwitchView, "view"),
 ];
 
 /// The pane's bottom border while its lines overflow it, through [`views::TEMPLATES_BROWSE`],

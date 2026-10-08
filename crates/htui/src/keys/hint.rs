@@ -31,6 +31,10 @@ pub enum Hint {
     Pair(Act, Act, &'static str),
     /// Every admitted chord of the act, joined by `/`, then `text`: `n/Esc cancel` (MOD-67 D9).
     All(Act, &'static str),
+    /// The act's first two admitted chords, joined by `/`, then `text`: a toggle such as
+    /// `skills.switch_view`, whose six defaults `All` would spell out, reads `h/l view` (MOD-67
+    /// M4 R1). One admitted chord renders alone.
+    Two(Act, &'static str),
     /// Fixed text: a widget's own key (`Enter store`, `Esc cancel`) or a note (`typed text is
     /// never shown`). Never dropped, unless it is empty.
     Text(&'static str),
@@ -112,8 +116,8 @@ impl Keys {
     }
 
     /// A view's hint row: each element through `stack`, unbound ones dropped, joined by ` · `
-    /// (ANA-26 §7.6). `One` and `Pair` take the first admitted chord, `All` every one; `Text`
-    /// is written as is.
+    /// (ANA-26 §7.6). `One` and `Pair` take the first admitted chord, `Two` the first two, `All`
+    /// every one; `Text` is written as is.
     #[must_use]
     pub fn hint(&self, stack: Stack<'_>, spec: HintSpec) -> String {
         let labelled = |labels: Vec<String>, text: &str| {
@@ -128,6 +132,9 @@ impl Keys {
                     .collect(),
                 text,
             ),
+            Hint::Two(act, text) => {
+                labelled(self.labels(stack, act).into_iter().take(2).collect(), text)
+            }
             Hint::All(act, text) => labelled(self.labels(stack, act), text),
             Hint::Text(text) => (!text.is_empty()).then(|| text.to_owned()),
         };
@@ -512,6 +519,33 @@ mod tests {
         assert_eq!(keys.hint(Stack::BASE, spec), "?/F1 help · q quit");
         assert_eq!(keys.labels(views::CAPTURE, Act::Help), ["F1".to_owned()]);
         assert_eq!(keys.label(views::CAPTURE, Act::Help).as_deref(), Some("F1"));
+    }
+
+    /// MOD-67 M4 R1 L2: `Two` shows a toggle's first two admitted chords (`h/l view`), every
+    /// one when it has fewer, and follows a rebind.
+    #[test]
+    fn two_lists_the_first_two_admitted_chords() {
+        let layers = [Layer::all(Context::Skills)];
+        let stack = Stack::new(&layers);
+        let spec = &[Hint::Two(Act::SkillsSwitchView, "view")];
+        assert_eq!(Keys::compiled().hint(stack, spec), "h/l view");
+        let keys = Keys::defaults().with_chords(Context::Skills, Act::SkillsSwitchView, &["v"]);
+        assert_eq!(keys.hint(stack, spec), "v view");
+        let keys = Keys::defaults().with_chords(
+            Context::Skills,
+            Act::SkillsSwitchView,
+            &["right", "left", "v"],
+        );
+        assert_eq!(keys.hint(stack, spec), "Right/Left view");
+        let keys = Keys::defaults().with_chords(Context::Skills, Act::SkillsSwitchView, &[]);
+        assert_eq!(keys.hint(stack, spec), "");
+        let modal = [Layer::modal(Context::Skills)];
+        let keys = Keys::defaults().with_chords(
+            Context::Skills,
+            Act::SkillsSwitchView,
+            &["h", "f2", "l", "f3"],
+        );
+        assert_eq!(keys.hint(Stack::new(&modal), spec), "F2/F3 view");
     }
 
     #[test]
