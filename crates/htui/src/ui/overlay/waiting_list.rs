@@ -356,6 +356,7 @@ mod tests {
     use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::cells::cell_width;
+    use chrono::DateTime;
     use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{ItemId, ProjectRef, RunId, StepId, WorkspaceId};
@@ -438,6 +439,7 @@ mod tests {
             step_label: "prd 0.1".to_owned(),
             reason: WaitingReason::Gate,
             text: "gate".to_owned(),
+            since: DateTime::UNIX_EPOCH,
         }
     }
 
@@ -458,6 +460,7 @@ mod tests {
             step_label: String::new(),
             reason: WaitingReason::Unblock,
             text: "blocked, no active run: u reopens it".to_owned(),
+            since: DateTime::UNIX_EPOCH,
         }
     }
 
