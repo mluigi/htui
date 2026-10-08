@@ -10389,7 +10389,7 @@ async fn missing_tags_of_answers_missing_tags_per_item_on_both_stores() {
     for (id, tags) in [
         (
             tagged,
-            ["zeta", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
+            ["zulu", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
         ),
         (covered, ["gpu", "rust"].as_slice()),
     ] {
@@ -10441,7 +10441,7 @@ async fn missing_tags_of_answers_missing_tags_per_item_on_both_stores() {
     assert_eq!(batched.len(), 4);
     assert_eq!(
         batched[&tagged],
-        ["Alpha", "cuda", "zeta"],
+        ["Alpha", "cuda", "zulu"],
         "bytes order, deduplicated"
     );
     assert!(batched[&covered].is_empty());

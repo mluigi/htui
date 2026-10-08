@@ -15772,7 +15772,7 @@ mod tests {
         for (id, tags) in [
             (
                 tagged,
-                ["zeta", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
+                ["zulu", "cuda", "rust", "gpu", "cuda", "Alpha"].as_slice(),
             ),
             (covered, ["gpu", "rust"].as_slice()),
         ] {
@@ -15809,7 +15809,7 @@ mod tests {
             }
         }
         assert_eq!(batched.len(), 3);
-        assert_eq!(batched[&tagged], ["Alpha", "cuda", "zeta"]);
+        assert_eq!(batched[&tagged], ["Alpha", "cuda", "zulu"]);
         assert!(batched[&covered].is_empty());
         assert!(
             store
