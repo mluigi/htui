@@ -1,6 +1,6 @@
 # Plan: MOD-91 — keep the user's mods, settings hooks and skills out of htui-driven sessions
 
-**Status: CONFIRMED by the maintainer 2026-10-08 (D1–D7 as written).**
+**Status: DONE 2026-10-13 — CONFIRMED 2026-10-08 (D1–D7; D8 added after T1); implemented T1–T6, review R1 applied; write-up `docs/decisions/mod/mod-91.md`.**
 
 **Source**: `HANDOFF.md` MOD-91 (from ANA-29, `docs/ANA-29.md` §4.4, §5.5, §6.1 item 1, §11).
 **Routing**: the decision table gave the PRD path (C3 and C4 fired, at threshold, low confidence).
