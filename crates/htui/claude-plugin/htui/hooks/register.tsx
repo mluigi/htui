@@ -63,6 +63,39 @@ const waitingText = (rows: readonly HtuiRow[]): string =>
     ? 'Nothing waits on you.'
     : rows.map(r => `${r.item_key}  ${label(r.reason)}  ${r.step ?? '-'}  ${age(r.age_seconds)}  ${r.text}`).join('\n')
 
+/** `/htui status`'s text: the top bar's line, a note when permissions are unknown, then the skew line. */
+async function statusText($: EngineInterface): Promise<string> {
+  const ran = await runHtui($, ['htui', 'status', '--json'], 10000)
+  const lines: string[] = []
+  if (ran.ok) {
+    const d = ran.doc
+    lines.push(
+      `${d.workspace?.name ?? 'no workspace'} · ${d.box?.hostname ?? 'no box'} · ${d.store} · ${d.working} working · ${d.waiting} waiting`,
+    )
+    if (d.permissions_known === false) lines.push('permission requests could not be listed; the count may be low')
+  } else {
+    lines.push(ran.line)
+  }
+  const s = await read($, skew)
+  if (s !== null) lines.push(s)
+  return lines.join('\n')
+}
+
+/** `/htui search <query>`'s text, one line per hit. The query rides inside one argument (A-6). */
+async function searchText($: EngineInterface, query: string): Promise<string> {
+  const ran = await runHtui($, ['htui', `--search-items=${query}`, '--json'], 60000)
+  if (!ran.ok) return ran.line
+  if (ran.doc.index === 'empty') return 'No concepts index yet: run htui --index-items.'
+  const hits: any[] = Array.isArray(ran.doc.hits) ? ran.doc.hits.filter((h: unknown) => h !== null && typeof h === 'object') : []
+  if (hits.length === 0) return 'No hits.'
+  return hits
+    .map(
+      h =>
+        `${h.key}  ${h.place}${h.document_kind ? ' ' + h.document_kind : ''}${h.resolution ? ' (' + h.resolution + ')' : ''}  ${h.snippet}`,
+    )
+    .join('\n')
+}
+
 /** `auto`, `command` or `off` (D12), as `register` read it from the options. */
 let panel: 'auto' | 'command' | 'off' = 'auto'
 /** The poll period: `poll_seconds`, at least 5 (A-12). */
@@ -164,6 +197,10 @@ export const register: Register = (on, options) => {
     if (verb === '' || verb === 'waiting') {
       const ran = await runHtui($, ['htui', 'waiting', '--json'], 10000)
       return { text: ran.ok ? waitingText(rowsOf(ran.doc)) : ran.line }
+    }
+    if (verb === 'status') return { text: await statusText($) }
+    if (verb === 'search') {
+      return { text: rest === '' ? 'usage: /htui search <query>' : await searchText($, rest) }
     }
     return { text: 'usage: /htui [status|waiting|search <query>]' }
   })
