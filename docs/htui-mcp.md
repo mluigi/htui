@@ -419,12 +419,13 @@ call would then never reach htui's policy or its record.
 - the plugins enabled in your settings files (`enabledPlugins`), and with them their agents and
   MCP servers: a `claude-cli` session listed only Claude Code's built-in plugins. A plugin loaded
   another way (`--plugin-dir`, `CLAUDE_CODE_PLUGIN_DIRS`) was not tested;
-- the claude.ai connector MCP servers (`claude.ai …`);
 - the MCP servers in the project's `.mcp.json`, which need an `enabledMcpjsonServers` approval
   from a settings file.
 
-The plugin and connector findings were observed on `claude-cli`. An ACP session gets the same
-`settingSources: []`, but they were not checked there.
+The plugin and `.mcp.json` findings were observed on `claude-cli`. An ACP session gets the same
+`settingSources: []`, but they were not checked there. Whether the claude.ai connector MCP servers
+(`claude.ai …`) stay is not settled: one isolated run listed none, another listed them as
+`pending`.
 
 **Still on:**
 

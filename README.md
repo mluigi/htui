@@ -482,8 +482,8 @@ a tool call before `htui` is asked. Your settings files are not read at all, so 
 rules and `defaultMode` no longer settle a call first: `htui` passes the permission mode itself
 (see [the docs](docs/htui-mcp.md#isolation-from-your-claude-code-setup)). The plugins those files
 enable go with them, agents and MCP servers included, and so do the project's `.mcp.json` servers
-and the claude.ai connectors (seen on `claude-cli`). Whether your own MCP servers in
-`~/.claude.json` still load is not verified. The repository's `CLAUDE.md` still loads.
+(seen on `claude-cli`). Whether your own MCP servers in `~/.claude.json` and the claude.ai
+connectors still load is not verified. The repository's `CLAUDE.md` still loads.
 
 The agent form's `mods (y/n)` field turns this off for one agent. It defaults to `n`. Set it to `y`
 to load your mods, settings files (their hooks and permission rules included) and skills in that
