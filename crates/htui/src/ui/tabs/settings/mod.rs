@@ -114,8 +114,9 @@ pub(crate) fn asked(question: &str, answers: &str) -> String {
     }
 }
 
-/// A section's keys as the shell's hint row draws them (MOD-67 M6 T2): `theme.dim`, `None` when
-/// no key of the spec is bound.
+/// A view's keys as the shell's hint row draws them (MOD-67 M6 T2, every tab's
+/// [`Tab::key_hint`](crate::ui::tabs::Tab::key_hint)): `theme.dim`, `None` when no key of the
+/// spec is bound.
 pub(crate) fn key_line(text: String, theme: &Theme) -> Option<Line<'static>> {
     (!text.is_empty()).then(|| Line::styled(text, theme.dim))
 }

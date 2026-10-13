@@ -42,6 +42,7 @@ use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::tabs::settings::key_line;
 use composer::{Composer, ComposerOutcome};
 use crossterm::event::{KeyCode, KeyEvent};
 use permission::PermissionStrip;
@@ -555,7 +556,7 @@ impl Tab for ChatTab {
     /// The current mode's keys (MOD-67 M6 T2): `hint_text`, in `theme.dim`.
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let hint = self.hint_text(ctx.keys());
-        (!hint.is_empty()).then(|| Line::styled(hint, ctx.theme.dim))
+        key_line(hint, ctx.theme)
     }
 
     /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer and the parked

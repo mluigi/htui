@@ -59,7 +59,7 @@ use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{key_line, wrapped};
 use crossterm::event::KeyEvent;
 
 /// Written by a run step.
@@ -609,7 +609,7 @@ impl DetailTab for DocumentsTab {
             None if self.item.is_none() => return None,
             None => keys.hint(views::BACKLOG_DOCS, HINT),
         };
-        (!hint.is_empty()).then(|| Line::styled(hint, theme.dim))
+        key_line(hint, theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

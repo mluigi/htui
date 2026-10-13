@@ -18,12 +18,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width, graphemes};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
 use crate::ui::tabs::backlog::list;
+use crate::ui::tabs::settings::key_line;
 use crossterm::event::KeyEvent;
 
 /// The footer's key half (MOD-67 M5): `+/- depth · Enter re-root` with the defaults, read
@@ -781,12 +782,12 @@ impl DetailTab for GraphTab {
 
     /// `GRAPH_HINT` while the tree is drawn (MOD-67 M6 T2): the footer under it keeps only
     /// `depth d/3`. Nothing while there is no tree to move in.
-    fn key_hint(&self, keys: &crate::keys::Keys, theme: &Theme) -> Option<Line<'static>> {
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         if self.item.is_none() || self.graph.is_none() || self.visible().len() <= 1 {
             return None;
         }
         let hint = keys.hint(views::BACKLOG_GRAPH, GRAPH_HINT);
-        (!hint.is_empty()).then(|| Line::styled(hint, theme.dim))
+        key_line(hint, theme)
     }
 }
 
@@ -800,7 +801,6 @@ mod tests {
 
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keys::Keys;
     use crate::store_worker::Origin;
     use crate::ui::cells::cell_width;
     use crate::ui::tabs::BacklogTab;

@@ -64,7 +64,7 @@ const MAX_WIDTH: u16 = 96;
 pub enum PickerOutcome {
     /// Handled here (moved, typed, or a declined key of the picker's): nothing for the section to
     /// do.
-    None,
+    Stay,
     /// A listing to send through `ctx.request` — a read, never marked busy (P11).
     Request(StoreRequest),
     /// The directory the user chose, as navigated (never canonicalised; the write does that).
@@ -158,16 +158,16 @@ impl PathPicker {
                     let typed = field.text().unwrap_or_default().trim().to_owned();
                     self.goto = None;
                     if typed.is_empty() {
-                        PickerOutcome::None
+                        PickerOutcome::Stay
                     } else {
                         PickerOutcome::Request(self.ask(typed))
                     }
                 }
                 FieldOutcome::Cancel => {
                     self.goto = None;
-                    PickerOutcome::None
+                    PickerOutcome::Stay
                 }
-                FieldOutcome::Consumed | FieldOutcome::Pass => PickerOutcome::None,
+                FieldOutcome::Consumed | FieldOutcome::Pass => PickerOutcome::Stay,
             });
         }
         let chord = KeyChord::from_event(key);
@@ -182,15 +182,15 @@ impl PathPicker {
             Act::ListDown => {
                 let last = self.entry_count().saturating_sub(1);
                 self.cursor = (self.cursor + 1).min(last);
-                PickerOutcome::None
+                PickerOutcome::Stay
             }
             Act::ListUp => {
                 self.cursor = self.cursor.saturating_sub(1);
-                PickerOutcome::None
+                PickerOutcome::Stay
             }
             Act::PickerOpen => match self.highlighted() {
                 Some(next) => PickerOutcome::Request(self.ask(next)),
-                None => PickerOutcome::None,
+                None => PickerOutcome::Stay,
             },
             Act::PickerParent => match parent(&self.path) {
                 Some(up) => {
@@ -203,22 +203,22 @@ impl PathPicker {
                     self.reselect = came_from;
                     PickerOutcome::Request(request)
                 }
-                None => PickerOutcome::None,
+                None => PickerOutcome::Stay,
             },
             Act::PickerChoose => self
                 .highlighted()
-                .map_or(PickerOutcome::None, PickerOutcome::Chosen),
+                .map_or(PickerOutcome::Stay, PickerOutcome::Chosen),
             // A declined `S` (no listing) is still the picker's: consumed, as before.
             Act::PickerChooseDir => {
                 if self.listing.is_some() {
                     PickerOutcome::Chosen(self.path.clone())
                 } else {
-                    PickerOutcome::None
+                    PickerOutcome::Stay
                 }
             }
             Act::PickerGoTo => {
                 self.goto = Some(TextField::with_text("/"));
-                PickerOutcome::None
+                PickerOutcome::Stay
             }
             Act::PickerHidden => {
                 self.show_hidden = !self.show_hidden;
@@ -585,11 +585,11 @@ mod tests {
     }
 
     /// `key` through the picker as Hierarchy feeds it: the compiled keys and the picker stack, a
-    /// key no picker act takes read as swallowed (`None`), as Hierarchy's modal rest does.
+    /// key no picker act takes read as swallowed (`Stay`), as Hierarchy's modal rest does.
     fn press(picker: &mut PathPicker, key: KeyEvent) -> PickerOutcome {
         picker
             .on_key(key, Keys::compiled(), views::HIERARCHY_PICKER)
-            .unwrap_or(PickerOutcome::None)
+            .unwrap_or(PickerOutcome::Stay)
     }
 
     /// Keys loaded from a key file's `[picker]` table.
@@ -632,9 +632,9 @@ mod tests {
         }
     }
 
-    /// Whether an outcome is `None`.
-    fn none(outcome: &PickerOutcome) -> bool {
-        matches!(outcome, PickerOutcome::None)
+    /// Whether an outcome is `Stay`.
+    fn stays(outcome: &PickerOutcome) -> bool {
+        matches!(outcome, PickerOutcome::Stay)
     }
 
     /// A picker opened on `/srv` with `htui/`, `notes/` and `shared@` listed.
@@ -717,7 +717,7 @@ mod tests {
         assert_eq!(picker.path(), "/srv");
         assert!(!render(&picker).contains("stray"));
         assert!(
-            none(&press(&mut picker, ch('s'))),
+            stays(&press(&mut picker, ch('s'))),
             "nothing landed to choose from"
         );
     }
@@ -725,7 +725,7 @@ mod tests {
     #[test]
     fn j_and_k_clamp_at_both_ends() {
         let mut picker = at_srv();
-        assert!(none(&press(&mut picker, ch('k'))));
+        assert!(stays(&press(&mut picker, ch('k'))));
         assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/htui");
         for _ in 0..5 {
             press(&mut picker, ch('j'));
@@ -770,7 +770,7 @@ mod tests {
     fn h_at_the_root_stays_at_the_root() {
         let (mut picker, _) = PathPicker::open("Root", "/".to_owned());
         assert!(picker.on_reply(&dirs("/", &[("srv", false)], 0)));
-        assert!(none(&press(&mut picker, ch('h'))));
+        assert!(stays(&press(&mut picker, ch('h'))));
         assert_eq!(picker.path(), "/");
     }
 
@@ -830,20 +830,20 @@ mod tests {
     #[test]
     fn s_and_capital_s_need_a_listing() {
         let (mut picker, _) = PathPicker::open("Root", "/srv".to_owned());
-        assert!(none(&press(&mut picker, ch('s'))));
-        assert!(none(&press(&mut picker, ch('S'))));
+        assert!(stays(&press(&mut picker, ch('s'))));
+        assert!(stays(&press(&mut picker, ch('S'))));
         assert!(picker.on_reply(&StoreReply::Failed {
             request: LIST_DIR,
             message: "`/srv` does not exist on this box".to_owned(),
         }));
-        assert!(none(&press(&mut picker, ch('s'))));
-        assert!(none(&press(&mut picker, ch('S'))));
+        assert!(stays(&press(&mut picker, ch('s'))));
+        assert!(stays(&press(&mut picker, ch('S'))));
 
         // An empty listing has a directory to choose and no entry to open.
         let (mut picker, _) = PathPicker::open("Root", "/empty".to_owned());
         assert!(picker.on_reply(&dirs("/empty", &[], 0)));
-        assert!(none(&press(&mut picker, ch('s'))));
-        assert!(none(&press(&mut picker, ch('l'))));
+        assert!(stays(&press(&mut picker, ch('s'))));
+        assert!(stays(&press(&mut picker, ch('l'))));
         assert_eq!(chosen(press(&mut picker, ch('S'))), "/empty");
     }
 
@@ -851,11 +851,11 @@ mod tests {
     #[test]
     fn slash_opens_go_to_and_enter_lists_what_was_typed() {
         let mut picker = at_srv();
-        assert!(none(&press(&mut picker, ch('/'))));
+        assert!(stays(&press(&mut picker, ch('/'))));
         assert!(render(&picker).contains("go to: /"));
         for c in "srv/htui".chars() {
             // Bound letters type into go-to instead of acting (`h`, `s`, `j` among them).
-            assert!(none(&press(&mut picker, ch(c))));
+            assert!(stays(&press(&mut picker, ch(c))));
         }
         assert_eq!(
             asked(press(&mut picker, key(KeyCode::Enter))),
@@ -899,7 +899,7 @@ mod tests {
     fn esc_in_go_to_closes_only_go_to() {
         let mut picker = at_srv();
         press(&mut picker, ch('/'));
-        assert!(none(&press(&mut picker, key(KeyCode::Esc))));
+        assert!(stays(&press(&mut picker, key(KeyCode::Esc))));
         assert!(!render(&picker).contains("go to:"));
         assert!(matches!(
             press(&mut picker, key(KeyCode::Esc)),
@@ -949,7 +949,7 @@ mod tests {
         let mut picker = at_srv();
         press(&mut picker, ch('/'));
         press(&mut picker, key(KeyCode::Backspace));
-        assert!(none(&press(&mut picker, key(KeyCode::Enter))));
+        assert!(stays(&press(&mut picker, key(KeyCode::Enter))));
         assert!(!render(&picker).contains("go to:"));
     }
 
@@ -1107,11 +1107,11 @@ mod tests {
     #[test]
     fn the_go_to_field_takes_every_key() {
         let mut picker = at_srv();
-        assert!(none(&press(&mut picker, ch('/'))));
+        assert!(stays(&press(&mut picker, ch('/'))));
         for key in [ch('q'), ch('j'), chord('a', KeyModifiers::CONTROL)] {
             let outcome = picker.on_key(key, Keys::compiled(), views::HIERARCHY_PICKER);
             assert!(
-                matches!(outcome, Some(PickerOutcome::None)),
+                matches!(outcome, Some(PickerOutcome::Stay)),
                 "{key:?}: {outcome:?}"
             );
         }
@@ -1121,7 +1121,7 @@ mod tests {
             render(&picker)
         );
         let closed = picker.on_key(key(KeyCode::Esc), Keys::compiled(), views::HIERARCHY_PICKER);
-        assert!(matches!(closed, Some(PickerOutcome::None)), "{closed:?}");
+        assert!(matches!(closed, Some(PickerOutcome::Stay)), "{closed:?}");
         assert!(!render(&picker).contains("go to:"));
         assert_eq!(
             picker.path(),

@@ -1067,7 +1067,7 @@ impl HierarchySection {
             return modal_rest(stack, chord);
         };
         match outcome {
-            PickerOutcome::None => {}
+            PickerOutcome::Stay => {}
             PickerOutcome::Request(request) => ctx.request(request),
             PickerOutcome::Chosen(path) => {
                 if self.in_flight() {

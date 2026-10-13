@@ -84,7 +84,7 @@ use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
-use crate::ui::tabs::settings::modal_rest;
+use crate::ui::tabs::settings::{key_line, modal_rest};
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
@@ -1926,7 +1926,7 @@ impl DetailTab for RunsTab {
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         self.item?;
         let hint = keys.hint(self.stack(), self.hint_spec());
-        (!hint.is_empty()).then(|| Line::styled(hint, theme.dim))
+        key_line(hint, theme)
     }
 
     /// The footer a modal asks in is drawn whatever the list holds, so the close-out of an item

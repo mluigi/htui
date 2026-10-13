@@ -23,6 +23,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, KeyChord, Stack};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::tabs::registry::{Tab, TabId};
+use crate::ui::tabs::settings::key_line;
 use crossterm::event::KeyEvent;
 
 use library::LibraryView;
@@ -161,7 +162,7 @@ impl Tab for SkillsTab {
             View::Skills => self.library.key_hint(ctx.keys()),
             View::Templates => self.templates.key_hint(ctx.keys()),
         };
-        (!hint.is_empty()).then(|| Line::styled(hint, ctx.theme.dim))
+        key_line(hint, ctx.theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

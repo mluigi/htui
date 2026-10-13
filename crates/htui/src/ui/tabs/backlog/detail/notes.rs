@@ -51,7 +51,7 @@ use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
-use crate::ui::tabs::settings::wrapped;
+use crate::ui::tabs::settings::{key_line, wrapped};
 use crossterm::event::KeyEvent;
 
 /// The browse hint on the pane's last row (D11), through [`views::BACKLOG_NOTES`].
@@ -424,7 +424,7 @@ impl DetailTab for NotesTab {
             None if self.item.is_none() => return None,
             None => keys.hint(views::BACKLOG_NOTES, HINT),
         };
-        (!hint.is_empty()).then(|| Line::styled(hint, theme.dim))
+        key_line(hint, theme)
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

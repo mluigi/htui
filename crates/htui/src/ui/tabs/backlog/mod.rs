@@ -55,7 +55,7 @@ use crate::ui::tabs::backlog::item_form::{
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
-use crate::ui::tabs::settings::modal_rest;
+use crate::ui::tabs::settings::{key_line, modal_rest};
 use crossterm::event::{KeyEvent, MouseEvent};
 
 /// Width of the list pane, as a percentage of the body region.
@@ -876,7 +876,7 @@ impl Tab for BacklogTab {
     /// alone when the pane has none (Body, Prompt).
     fn key_hint(&self, width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let (keys, theme) = (ctx.keys(), ctx.theme);
-        let dim = |text: String| (!text.is_empty()).then(|| Line::styled(text, theme.dim));
+        let dim = |text| key_line(text, theme);
         if let Some(form) = &self.item_form {
             return dim(match form.resolving() {
                 Some(view) => view.hint(keys),
