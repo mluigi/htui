@@ -1375,6 +1375,10 @@ fn old_history() -> Vec<Value> {
 /// Raw newline-delimited JSON-RPC in [`refuse_session_new`]'s style. Notifications from the client
 /// (`session/cancel`) are recorded and get no answer.
 #[cfg(unix)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each is one axis a case varies; a struct would rename the arity without reducing it"
+)]
 async fn restoring_agent(
     stream: tokio::io::DuplexStream,
     caps: Value,
