@@ -43,7 +43,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{
     ADD_NOTE_NAME, HandText, NOTE_FORM_NAME, answered_from_the_mirror, write_refused,
 };
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
@@ -240,7 +240,9 @@ impl NotesTab {
     /// found closes the area and says so (and the thread opens at its bottom, where it is); none
     /// keeps the text and says it was not written, or, read from the mirror, that it could not be
     /// checked (round 1).
-    fn settle_hedge(&mut self, notes: &[Note]) {
+    ///
+    /// The sentence names the save key `keys` binds in the area's stack (MOD-67 M6 D4).
+    fn settle_hedge(&mut self, notes: &[Note], keys: &Keys) {
         let Some(item) = self.item else {
             return;
         };
@@ -260,10 +262,11 @@ impl NotesTab {
             self.notice = Some(NOTE_WRITTEN.to_owned());
             self.follow = true;
         } else if let Some(compose) = self.compose.as_mut() {
+            let save = keys.label(compose.stack(), Act::FormSave);
             compose.settle(Some(if hedged.mirror {
-                could_not_check(&hedged.why, "thread")
+                could_not_check(&hedged.why, "thread", save.as_deref())
             } else {
-                not_written(&hedged.why)
+                not_written(&hedged.why, save.as_deref())
             }));
         }
     }
@@ -356,7 +359,7 @@ impl DetailTab for NotesTab {
         match reply {
             StoreReply::Notes(notes) => {
                 self.notes.clone_from(notes);
-                self.settle_hedge(notes);
+                self.settle_hedge(notes, ctx.keys());
                 // Review L1: the user's own note is the newest, so the thread opens at its
                 // bottom; before a first render there is no height to fit, and it opens at the top.
                 // Round 1: the rows the sentence takes are not the thread's.
@@ -401,7 +404,12 @@ impl DetailTab for NotesTab {
             // Review M1: the check failed too; say so rather than leave the area busy.
             StoreReply::Failed { request, .. } if *request == NOTES_READ => {
                 if let (Some(hedged), Some(compose)) = (self.hedged.take(), self.compose.as_mut()) {
-                    compose.settle(Some(could_not_check(&hedged.why, "thread")));
+                    let save = ctx.keys().label(compose.stack(), Act::FormSave);
+                    compose.settle(Some(could_not_check(
+                        &hedged.why,
+                        "thread",
+                        save.as_deref(),
+                    )));
                 }
             }
             _ => {}
@@ -754,7 +762,7 @@ mod tests {
         pane.on_reply(&StoreReply::Notes(thread), &mut shell.ctx());
         assert_eq!(
             compose(&pane).notice(),
-            Some(not_written(&message).as_str())
+            Some(not_written(&message, Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).body(), "Hi.");
         assert_eq!(compose(&pane).busy(), None);
@@ -780,7 +788,7 @@ mod tests {
         pane.on_reply(&StoreReply::Notes(Vec::new()), &mut shell.ctx());
         assert_eq!(
             compose(&pane).notice(),
-            Some(not_written(&message).as_str())
+            Some(not_written(&message, Some("Ctrl+s")).as_str())
         );
     }
 
@@ -800,7 +808,7 @@ mod tests {
         assert_eq!(compose(&pane).busy(), None);
         assert_eq!(
             compose(&pane).notice(),
-            Some(could_not_check(&message, "thread").as_str())
+            Some(could_not_check(&message, "thread", Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).body(), "Hi.");
     }
@@ -838,7 +846,7 @@ mod tests {
         assert_eq!(compose(&pane).busy(), None);
         assert_eq!(
             compose(&pane).notice(),
-            Some(could_not_check(&message, "thread").as_str())
+            Some(could_not_check(&message, "thread", Some("Ctrl+s")).as_str())
         );
         assert_eq!(compose(&pane).body(), "Hi.");
 
@@ -1139,7 +1147,7 @@ mod tests {
     #[test]
     fn the_hint_renders_through_the_notes_stack() {
         let stack = views::BACKLOG_NOTES;
-        assert_eq!(crate::keys::Keys::compiled().hint(stack, super::HINT), HINT);
+        assert_eq!(Keys::compiled().hint(stack, super::HINT), HINT);
         let keys =
             crate::keys::load_str("version = 1\n[backlog.notes]\nadd = \"A\"\n").expect("loads");
         assert_eq!(keys.hint(stack, super::HINT), "A add note");

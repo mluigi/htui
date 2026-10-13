@@ -538,19 +538,30 @@ pub fn may_have_landed(why: &str, reread: &str) -> String {
 }
 
 /// Review M1: the re-read after [`may_have_landed`] holds no such row, so nothing was written and
-/// a retry writes it once.
+/// a retry writes it once. `save` is `FormSave`'s label through the area's [`Compose::stack`]
+/// (MOD-67 M6 D4); with none bound the clause goes.
 #[must_use]
-pub fn not_written(why: &str) -> String {
-    format!("{why} \u{2014} the re-read shows it was not written; Ctrl+S tries again")
+pub fn not_written(why: &str, save: Option<&str>) -> String {
+    match save {
+        Some(save) => {
+            format!("{why} \u{2014} the re-read shows it was not written; {save} tries again")
+        }
+        None => format!("{why} \u{2014} the re-read shows it was not written"),
+    }
 }
 
 /// Review M1: the re-read after [`may_have_landed`] failed too, so whether it landed is unknown.
+/// `save` is `FormSave`'s label through the area's [`Compose::stack`] (MOD-67 M6 D4); with none
+/// bound the clause goes.
 #[must_use]
-pub fn could_not_check(why: &str, reread: &str) -> String {
-    format!(
-        "{why} \u{2014} it may have been written, and the {reread} could not be re-read to check; \
-         Ctrl+S may write it twice"
-    )
+pub fn could_not_check(why: &str, reread: &str, save: Option<&str>) -> String {
+    let unknown = format!(
+        "{why} \u{2014} it may have been written, and the {reread} could not be re-read to check"
+    );
+    match save {
+        Some(save) => format!("{unknown}; {save} may write it twice"),
+        None => unknown,
+    }
 }
 
 /// Draws the area over the sub-tab's whole content rect (D6): a top rule titled `title`, the
@@ -1369,13 +1380,13 @@ mod tests {
     #[test]
     fn not_written_and_could_not_check_say_what_ctrl_s_does() {
         assert_eq!(
-            not_written("boom"),
-            "boom \u{2014} the re-read shows it was not written; Ctrl+S tries again"
+            not_written("boom", Some("Ctrl+s")),
+            "boom \u{2014} the re-read shows it was not written; Ctrl+s tries again"
         );
-        let unknown = could_not_check("boom", "list");
+        let unknown = could_not_check("boom", "list", Some("Ctrl+s"));
         assert!(unknown.starts_with("boom \u{2014} it may have been written"));
         assert!(unknown.contains("the list could not be re-read"));
-        assert!(unknown.ends_with("Ctrl+S may write it twice"));
+        assert!(unknown.ends_with("Ctrl+s may write it twice"));
     }
 
     /// Review M1: while the re-read checks, the area keeps the write busy: the hedge shows, and
@@ -1402,7 +1413,7 @@ mod tests {
         }
         compose.on_paste("more");
         assert_eq!(compose.body(), "Hi.");
-        compose.settle(Some(not_written("boom")));
+        compose.settle(Some(not_written("boom", Some("Ctrl+s"))));
         assert_eq!(compose.busy(), None);
         assert!(matches!(
             compose.on_key(ctrl('s'), Keys::compiled()),

@@ -660,7 +660,10 @@ impl BacklogTab {
                     form.settle(Some(if refused {
                         message.to_owned()
                     } else {
-                        mint_may_have_landed(message)
+                        mint_may_have_landed(
+                            message,
+                            ctx.keys().label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                        )
                     }));
                 }
                 if !refused {
@@ -3471,7 +3474,10 @@ mod tests {
         assert_eq!(press(&mut tab, &bench, KeyCode::Esc), Handled::Consumed);
         assert!(view(&tab).is_none(), "the view closed");
         assert!(tab.item_form.is_some(), "the form stays");
-        assert_eq!(notice(&tab), Some(divergence::still_behind(2)));
+        assert_eq!(
+            notice(&tab),
+            Some(divergence::still_behind(2, Some("Ctrl+s")))
+        );
 
         let again = saved(&mut tab, &bench);
         assert!(
@@ -3544,7 +3550,10 @@ mod tests {
             Handled::Consumed
         );
         assert!(view(&tab).is_none());
-        assert_eq!(notice(&tab), Some(divergence::rebased_on(2)));
+        assert_eq!(
+            notice(&tab),
+            Some(divergence::rebased_on(2, Some("Ctrl+s")))
+        );
         let request = saved(&mut tab, &bench);
         assert!(
             matches!(
@@ -3697,7 +3706,10 @@ mod tests {
         );
         let form = tab.item_form.as_ref().expect("the form stays");
         assert_eq!(form.busy(), None);
-        assert_eq!(notice(&tab), Some(mint_may_have_landed(&why)));
+        assert_eq!(
+            notice(&tab),
+            Some(mint_may_have_landed(&why, Some("Ctrl+s")))
+        );
         assert!(tab.filter.is_empty(), "the filter is cleared");
         let actions = bench.actions();
         assert_eq!(items_reads(&actions), [(ItemFilter::default(), false)]);
@@ -3769,7 +3781,7 @@ mod tests {
         assert!(sentence.contains("may have been written"), "{sentence:?}");
         // Round 2: nothing is re-read and no form is open, so neither is promised.
         assert!(!sentence.contains("re-read"), "{sentence:?}");
-        assert!(!sentence.contains("Ctrl+S"), "{sentence:?}");
+        assert!(!sentence.contains("Ctrl+s"), "{sentence:?}");
         assert_eq!(*sentence, mint_may_have_landed_in_the_old_scope(&why));
         assert!(tab.item_form.is_none());
     }

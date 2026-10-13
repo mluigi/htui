@@ -345,10 +345,15 @@ impl ItemForm {
     /// D5: the form rebased on the head after `m`/`t`. `opened` holds the head's texts, so A4's
     /// "unchanged keeps the stored value" now means "unchanged from the head"; the widgets hold
     /// `resolved`'s texts; kind and graph are `resolved`'s; the token is `head.version`; the reason
-    /// `DivergenceResolution`; focus Title; the notice `rebased_on(head.version)`. `None` when
-    /// `context.item` is `None` (`open_edit`'s rule).
+    /// `DivergenceResolution`; focus Title; the notice `rebased_on(head.version, save)`, `save` the
+    /// form's save key as `keys` binds it (MOD-67 M6 D4). `None` when `context.item` is `None`
+    /// (`open_edit`'s rule).
     #[must_use]
-    pub fn open_resolution(context: ItemFormContext, resolved: &ItemSpec) -> Option<Self> {
+    pub fn open_resolution(
+        context: ItemFormContext,
+        resolved: &ItemSpec,
+        keys: &Keys,
+    ) -> Option<Self> {
         let head = context.item.as_ref()?;
         let (opened, version) = (Texts::of(&ItemSpec::of(head)), head.version);
         let mut form = Self::build(
@@ -360,7 +365,10 @@ impl ItemForm {
             &Texts::of(resolved),
         );
         form.reason = EditReason::DivergenceResolution;
-        form.notice = Some(rebased_on(version));
+        form.notice = Some(rebased_on(
+            version,
+            keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+        ));
         Some(form)
     }
 
@@ -704,14 +712,17 @@ impl ItemForm {
             ViewOutcome::Stay => ItemFormOutcome::Stay,
             ViewOutcome::Pass => ItemFormOutcome::Pass,
             ViewOutcome::Back => {
-                self.notice = Some(still_behind(view.head_version()));
+                self.notice = Some(still_behind(
+                    view.head_version(),
+                    keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                ));
                 self.resolving = None;
                 ItemFormOutcome::Stay
             }
             ViewOutcome::Resolve(side) => {
                 if let Some(view) = self.resolving.take() {
                     let (context, resolved) = view.resolve(side);
-                    if let Some(form) = Self::open_resolution(context, &resolved) {
+                    if let Some(form) = Self::open_resolution(context, &resolved, keys) {
                         *self = form;
                     }
                 }
@@ -1139,13 +1150,16 @@ pub fn render(
     }
 }
 
-/// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost.
+/// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost. `save` is
+/// `FormSave`'s label through `ITEM_FORM`, the form that stays open (MOD-67 M6 D4); with none
+/// bound the sentence says to look first.
 #[must_use]
-pub fn mint_may_have_landed(why: &str) -> String {
-    format!(
-        "{why} \u{2014} it may have been written; the list is being re-read, look for it before \
-         Ctrl+S"
-    )
+pub fn mint_may_have_landed(why: &str, save: Option<&str>) -> String {
+    let hedge = format!("{why} \u{2014} it may have been written; the list is being re-read");
+    match save {
+        Some(save) => format!("{hedge}, look for it before {save}"),
+        None => format!("{hedge}, look for it first"),
+    }
 }
 
 /// Review L4: the same hedge for a mint whose form a scope change closed. Nothing is re-read and
@@ -1854,7 +1868,7 @@ mod tests {
         type_text(&mut form, "Fresh item");
         let why = "store unreachable: error communicating with database: Connection reset by \
                    peer (os error 104)";
-        let hedge = mint_may_have_landed(why);
+        let hedge = mint_may_have_landed(why, Some("Ctrl+s"));
         form.settle(Some(hedge.clone()));
         let rows = drawn(&form);
         let flowed = rows
@@ -1864,6 +1878,16 @@ mod tests {
             .join(" ");
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{}", rows.join("\n"));
         assert!(flowed.contains(&rendered(HINT_TEXT)), "{}", rows.join("\n"));
+    }
+
+    /// MOD-67 M6 D4: the mint hedge names the save key in force, and says to look first unbound.
+    #[test]
+    fn the_mint_hedge_names_the_save_key_or_none() {
+        assert!(mint_may_have_landed("boom", Some("F2")).ends_with("look for it before F2"));
+        assert_eq!(
+            mint_may_have_landed("boom", None),
+            "boom \u{2014} it may have been written; the list is being re-read, look for it first"
+        );
     }
 
     /// The notice's rows drawn at `size`, joined back into one sentence.
@@ -1885,7 +1909,7 @@ mod tests {
         type_text(&mut form, "Fresh item");
         let why = "store unreachable: error communicating with database: Connection reset by \
                    peer (os error 104)";
-        let hedge = mint_may_have_landed(why);
+        let hedge = mint_may_have_landed(why, Some("Ctrl+s"));
         form.settle(Some(hedge.clone()));
         let (flowed, rows) = flowed_at(&form, (80, 24));
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{rows}");
@@ -1900,8 +1924,8 @@ mod tests {
             "store unreachable: {}",
             "connection reset by peer ".repeat(12)
         );
-        form.settle(Some(mint_may_have_landed(why.trim_end())));
-        let tail = mint_may_have_landed("");
+        form.settle(Some(mint_may_have_landed(why.trim_end(), Some("Ctrl+s"))));
+        let tail = mint_may_have_landed("", Some("Ctrl+s"));
         let (flowed, rows) = flowed_at(&form, (80, 24));
         assert!(flowed.contains(tail.trim_start()), "{tail:?} in\n{rows}");
     }
@@ -2037,18 +2061,26 @@ mod tests {
             title: "Resolved".to_owned(),
             ..ItemSpec::of(&head)
         };
-        let rebased = ItemForm::open_resolution(divergence.context.clone(), &resolved)
-            .expect("a context with an item");
+        let rebased =
+            ItemForm::open_resolution(divergence.context.clone(), &resolved, Keys::compiled())
+                .expect("a context with an item");
         assert_eq!(rebased.token(), Some(head.version));
         assert_eq!(rebased.reason(), EditReason::DivergenceResolution);
-        assert_eq!(rebased.notice(), Some(rebased_on(head.version).as_str()));
+        assert_eq!(
+            rebased.notice(),
+            Some(rebased_on(head.version, Some("Ctrl+s")).as_str())
+        );
         assert_eq!(rebased.opened.title, head.title, "unchanged means the head");
         assert_eq!(rebased.title.text(), Some("Resolved"));
         assert_eq!(rebased.focus(), Field::Title);
         assert!(rebased.resolving().is_none());
 
-        let mut same = ItemForm::open_resolution(divergence.context.clone(), &ItemSpec::of(&head))
-            .expect("a context with an item");
+        let mut same = ItemForm::open_resolution(
+            divergence.context.clone(),
+            &ItemSpec::of(&head),
+            Keys::compiled(),
+        )
+        .expect("a context with an item");
         assert!(matches!(
             same.on_key(ctrl('s'), Keys::compiled()),
             ItemFormOutcome::Stay
@@ -2057,7 +2089,7 @@ mod tests {
 
         let mut new = divergence.context;
         new.item = None;
-        assert!(ItemForm::open_resolution(new, &resolved).is_none());
+        assert!(ItemForm::open_resolution(new, &resolved, Keys::compiled()).is_none());
     }
 
     /// D2, D5: my title wins its conflict, their priority is kept, and the save is a resolution
@@ -2201,7 +2233,10 @@ mod tests {
             "{:?}",
             form.title.text()
         );
-        assert_eq!(form.notice(), Some(still_behind(2).as_str()));
+        assert_eq!(
+            form.notice(),
+            Some(still_behind(2, Some("Ctrl+s")).as_str())
+        );
 
         let (version, changes, reason) = edit_sent(&mut form);
         assert_eq!((version, reason), (1, EditReason::Edited));
