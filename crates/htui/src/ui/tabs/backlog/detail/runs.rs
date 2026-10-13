@@ -153,6 +153,26 @@ const WARN_HINT: HintSpec = &[
     Hint::One(Act::ConfirmNo, "cancel"),
 ];
 
+/// The rejection note's hint: the field's own keys.
+const REJECT_HINT: HintSpec = &[Hint::Text("Enter reject"), Hint::Text("Esc cancel")];
+
+/// The follow-up input's hint: the field's own keys.
+const FOLLOW_UP_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc cancel")];
+
+/// The close-out's typed stage's hint: the field's own keys.
+const TYPED_HINT: HintSpec = &[Hint::Text("Enter close"), Hint::Text("Esc cancel")];
+
+/// What the close-out says while its command is in flight.
+const IN_FLIGHT_HINT: HintSpec = &[Hint::Text("closing\u{2026}")];
+
+/// The document view's hint (`read-only · J/K scroll · Esc close` under the defaults: the first
+/// chords of `pane.scroll_down`/`scroll_up`; `j`/`k` scroll too).
+const ARTIFACT_HINT: HintSpec = &[
+    Hint::Text("read-only"),
+    Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
+    Hint::One(Act::Back, "close"),
+];
+
 /// The width of a detail pane at 100x30, which every step line fills exactly (MOD-4 plan D169,
 /// blueprint D197).
 const PANE: usize = 43;
@@ -670,25 +690,10 @@ impl RunsTab {
     fn modal_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         let stack = self.stack();
         let chord = KeyChord::from_event(key);
-        // The text fields and the document view: a `CONTROL` chord passes, everything else is
-        // the mode's (their stacks follow in C2).
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && !matches!(
-                self.mode,
-                Mode::ConfirmCancel { .. }
-                    | Mode::CloseOut(CloseOutStage::Counting | CloseOutStage::Warn(_))
-            )
-        {
-            return Handled::Pass;
-        }
         let (mode, handled) = match core::mem::take(&mut self.mode) {
             Mode::Browse => (Mode::Browse, Handled::Pass),
-            Mode::RejectNote { run, step, field } => {
-                (reject_key(run, step, field, key, ctx), Handled::Consumed)
-            }
-            Mode::FollowUp { step, field } => {
-                (follow_up_key(step, field, key, ctx), Handled::Consumed)
-            }
+            Mode::RejectNote { run, step, field } => reject_key(run, step, field, key, ctx),
+            Mode::FollowUp { step, field } => follow_up_key(step, field, key, ctx),
             Mode::ConfirmCancel { run } => match ctx.keys().actions(stack, chord).first() {
                 Some(Act::ConfirmYes) => {
                     ctx.request(command(Command::CancelRun { run }));
@@ -707,25 +712,33 @@ impl RunsTab {
                 mut scroll,
                 width,
             } => {
-                let code = match key.code {
-                    KeyCode::Char('j') => KeyCode::Char('J'),
-                    KeyCode::Char('k') => KeyCode::Char('K'),
-                    other => other,
-                };
-                if code == KeyCode::Esc {
+                // `pane.scroll_*` (`J`/`K`, and `j`/`k` by the view's defaults) and
+                // `pane.page_*` scroll the body, `common.back` (`Esc`) closes the view.
+                let act = ctx.keys().actions(stack, chord).first().copied();
+                if act == Some(Act::Back) {
                     (Mode::Browse, Handled::Consumed)
                 } else {
-                    let len = doc
-                        .as_ref()
-                        .map_or(0, |doc| artifact_rows(doc, width.get()).len());
-                    let _ = scroll.on_key(KeyEvent::new(code, KeyModifiers::NONE), len);
+                    let handled = match act {
+                        Some(
+                            act @ (Act::PaneScrollDown
+                            | Act::PaneScrollUp
+                            | Act::PanePageDown
+                            | Act::PanePageUp),
+                        ) => {
+                            let len = doc
+                                .as_ref()
+                                .map_or(0, |doc| artifact_rows(doc, width.get()).len());
+                            scroll.apply(act, len)
+                        }
+                        _ => modal_rest(stack, chord),
+                    };
                     let mode = Mode::Artifact {
                         id,
                         doc,
                         scroll,
                         width,
                     };
-                    (mode, Handled::Consumed)
+                    (mode, handled)
                 }
             }
         };
@@ -913,7 +926,8 @@ fn artifact_rows(doc: &Document, width: u16) -> Vec<(bool, String)> {
     rows
 }
 
-/// Draws the artifact view (D173): the document read-only over the pane, `Esc` to leave.
+/// Draws the artifact view (D173): the document read-only over the pane, `Esc` to leave. Its
+/// hint renders through [`views::RUNS_ARTIFACT`] (MOD-67 M5).
 ///
 /// Records the width it wrapped at in `width`, which is what the next scroll key clamps against.
 fn render_artifact(
@@ -922,6 +936,7 @@ fn render_artifact(
     doc: Option<&Document>,
     scroll: Scroll,
     width: &Cell<u16>,
+    keys: &Keys,
     theme: &Theme,
 ) {
     let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
@@ -943,7 +958,7 @@ fn render_artifact(
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "read-only · j/k scroll · Esc close",
+            keys.hint(views::RUNS_ARTIFACT, ARTIFACT_HINT),
             theme.dim,
         )),
         hint,
@@ -951,53 +966,69 @@ fn render_artifact(
 }
 
 /// A key in [`Mode::RejectNote`]: `Enter` with a note rejects, `Enter` without one says a note is
-/// needed, `Esc` goes back to the list and everything else is typed.
+/// needed, `Esc` goes back to the list and everything else is typed. A key the field does not
+/// use is `modal_rest`'s through [`views::CAPTURE`] (MOD-67 M5): `F1` and the CONTROL/ALT chords
+/// pass, the rest is swallowed.
 fn reject_key(
     run: RunId,
     step: StepId,
     mut field: TextField,
     key: KeyEvent,
     ctx: &Ctx<'_>,
-) -> Mode {
+) -> (Mode, Handled) {
     match field.on_key(key) {
         FieldOutcome::Submit => {
             let note = field.text().unwrap_or_default().trim().to_owned();
             if note.is_empty() {
                 ctx.emit(Action::Error(NOTE_NEEDED.to_owned()));
-                Mode::RejectNote { run, step, field }
+                (Mode::RejectNote { run, step, field }, Handled::Consumed)
             } else {
                 ctx.request(command(Command::AnswerGate {
                     run,
                     step,
                     answer: GateAnswer::Rejected { note },
                 }));
-                Mode::Browse
+                (Mode::Browse, Handled::Consumed)
             }
         }
-        FieldOutcome::Cancel => Mode::Browse,
-        FieldOutcome::Consumed | FieldOutcome::Pass => Mode::RejectNote { run, step, field },
+        FieldOutcome::Cancel => (Mode::Browse, Handled::Consumed),
+        FieldOutcome::Consumed => (Mode::RejectNote { run, step, field }, Handled::Consumed),
+        FieldOutcome::Pass => (
+            Mode::RejectNote { run, step, field },
+            modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+        ),
     }
 }
 
 /// A key in [`Mode::FollowUp`] (MOD-70 D14): `Enter` sends the text when it is a follow-up, and
 /// otherwise says why and stays, so the text can be edited (an empty text and a credential-shaped
-/// one alike, D2); `Esc` goes back to the list and everything else is typed.
-fn follow_up_key(step: StepId, mut field: TextField, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
+/// one alike, D2); `Esc` goes back to the list and everything else is typed. A key the field
+/// does not use is `modal_rest`'s through [`views::CAPTURE`], as the rejection note's.
+fn follow_up_key(
+    step: StepId,
+    mut field: TextField,
+    key: KeyEvent,
+    ctx: &Ctx<'_>,
+) -> (Mode, Handled) {
     match field.on_key(key) {
         FieldOutcome::Submit => {
             match FollowUpText::new(field.text().unwrap_or_default().to_owned()) {
                 Ok(text) => {
                     ctx.request(StoreRequest::FollowUp { step, text });
-                    Mode::Browse
+                    (Mode::Browse, Handled::Consumed)
                 }
                 Err(why) => {
                     ctx.emit(Action::Error(why.to_string()));
-                    Mode::FollowUp { step, field }
+                    (Mode::FollowUp { step, field }, Handled::Consumed)
                 }
             }
         }
-        FieldOutcome::Cancel => Mode::Browse,
-        FieldOutcome::Consumed | FieldOutcome::Pass => Mode::FollowUp { step, field },
+        FieldOutcome::Cancel => (Mode::Browse, Handled::Consumed),
+        FieldOutcome::Consumed => (Mode::FollowUp { step, field }, Handled::Consumed),
+        FieldOutcome::Pass => (
+            Mode::FollowUp { step, field },
+            modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+        ),
     }
 }
 
@@ -1098,11 +1129,13 @@ fn close_out_key(
                 (CloseOutStage::Typed { preview, field }, Handled::Consumed)
             }
             FieldOutcome::Cancel => return (Mode::Browse, Handled::Consumed),
-            FieldOutcome::Consumed | FieldOutcome::Pass => {
-                (CloseOutStage::Typed { preview, field }, Handled::Consumed)
-            }
+            FieldOutcome::Consumed => (CloseOutStage::Typed { preview, field }, Handled::Consumed),
+            FieldOutcome::Pass => (
+                CloseOutStage::Typed { preview, field },
+                modal_rest(stack, chord),
+            ),
         },
-        CloseOutStage::InFlight => (CloseOutStage::InFlight, Handled::Consumed),
+        CloseOutStage::InFlight => (CloseOutStage::InFlight, modal_rest(stack, chord)),
     };
     (Mode::CloseOut(stage), handled)
 }
@@ -1868,7 +1901,15 @@ impl DetailTab for RunsTab {
             doc, scroll, width, ..
         } = &self.mode
         {
-            render_artifact(frame, area, doc.as_deref(), *scroll, width, ctx.theme);
+            render_artifact(
+                frame,
+                area,
+                doc.as_deref(),
+                *scroll,
+                width,
+                ctx.keys(),
+                ctx.theme,
+            );
             return;
         }
 
@@ -2006,19 +2047,18 @@ impl RunsTab {
     /// built from a spec renders through the mode's stack (MOD-67 M5), so a rebound answer shows
     /// its own key.
     fn footer(&self, width: u16, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
-        let hint = |text: &str| Line::styled(text.to_owned(), theme.dim);
         let spec = |spec: HintSpec| Line::styled(keys.hint(self.stack(), spec), theme.dim);
         match &self.mode {
             Mode::Browse | Mode::Artifact { .. } => Vec::new(),
             Mode::RejectNote { field, .. } => vec![
                 Line::styled("reject with a note:", theme.title),
                 field.line(width, true, theme),
-                hint("Enter reject · Esc cancel"),
+                spec(REJECT_HINT),
             ],
             Mode::FollowUp { field, .. } => vec![
                 Line::styled("follow-up for the running step:", theme.title),
                 field.line(width, true, theme),
-                hint("Enter send · Esc cancel"),
+                spec(FOLLOW_UP_HINT),
             ],
             Mode::ConfirmCancel { .. } => vec![
                 Line::styled("cancel this run?", theme.title),
@@ -2045,9 +2085,9 @@ impl RunsTab {
                     width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
                 let mut line = Line::from(Span::styled(prompt, theme.title));
                 line.spans.extend(field.line(room, true, theme).spans);
-                vec![line, hint("Enter close · Esc cancel")]
+                vec![line, spec(TYPED_HINT)]
             }
-            Mode::CloseOut(CloseOutStage::InFlight) => vec![hint("closing\u{2026}")],
+            Mode::CloseOut(CloseOutStage::InFlight) => vec![spec(IN_FLIGHT_HINT)],
         }
     }
 }

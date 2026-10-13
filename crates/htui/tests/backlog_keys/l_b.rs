@@ -291,3 +291,54 @@ async fn the_resolution_keys_stay_fixed_and_plain() {
         "and the Backlog stays on ANA-1's Runs pane"
     );
 }
+
+/// What the rejection note reads: the row under `reject with a note:`, in the Runs pane.
+fn note(frame: &str) -> String {
+    let mut rows = frame.lines();
+    rows.find(|row| row.contains("reject with a note:"))
+        .unwrap_or_else(|| panic!("the note is open:\n{frame}"));
+    let row = rows.next().expect("a row under the prompt");
+    let (_, pane) = row
+        .rsplit_once("││")
+        .unwrap_or_else(|| panic!("the row crosses into the pane: {row:?}"));
+    pane.trim_end_matches('│').trim_end().to_owned()
+}
+
+/// Blueprint §1 item 3: `F1` opens help from the rejection note (it swallowed it) and closes it
+/// again, and the note keeps what was typed. `Tab` is no key of the note's and is swallowed;
+/// `2` is a letter there, typed rather than selecting a tab. The box's content follows the
+/// pane's stack only on the merged tree (main §7 step 2).
+#[tokio::test]
+async fn f1_opens_help_from_the_reject_note_and_the_note_stays() {
+    let mut harness = parked(seeded_store().await).await;
+    harness.key("x");
+    harness.key("n");
+    harness.key("o");
+    assert_eq!(
+        note(&harness.render()),
+        "no",
+        "`x` opened the note and it is typed"
+    );
+
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opens help from the note");
+    harness.key("f1");
+    assert!(!harness.app().help_visible, "`F1` closes it");
+    assert_eq!(note(&harness.render()), "no", "the note stays");
+
+    harness.key("tab");
+    let frame = harness.render();
+    assert_eq!(note(&frame), "no", "`Tab` is swallowed");
+    assert!(
+        frame.contains("┌ ANA-2"),
+        "still on ANA-2's Runs pane:\n{frame}"
+    );
+    harness.key("2");
+    let frame = harness.render();
+    assert_eq!(note(&frame), "no2", "`2` is typed, not a tab select");
+    assert!(
+        frame.contains("┌ ANA-2"),
+        "still on ANA-2's Runs pane:\n{frame}"
+    );
+    assert_eq!(harness.queued(), 0, "and nothing was sent");
+}
