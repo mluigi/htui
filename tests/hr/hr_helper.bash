@@ -157,11 +157,11 @@ EOF
 docker_log() { cat "$HR_TEST_DOCKER_LOG"; }
 
 # compose_config — compose.hr.yaml as `docker compose config --format json` resolves it, with every
-# `${X:?}` set to "/X" (HR_HOME=/HR_HOME, ...). Only the real docker CLI's parser runs: no daemon.
+# `${X:?}` set to "/X" (HR_HOME=/HR_HOME, ...); arguments are extra VAR=value pairs. Only the real docker CLI's parser runs: no daemon.
 compose_config() {
     command -v docker >/dev/null 2>&1 || skip "docker CLI not installed"
     local v
-    local -a e=()
+    local -a e=("$@")   # extra VAR=value pairs, for example HR_HEADROOM=1
     for v in $(grep -oE '\$\{[A-Z_]+:\?\}' "$HR_COMPOSE_FILE" | tr -d '${}:?' | sort -u); do
         case "$v" in
             HR_CLAUDE_PROJECT) e+=("$v=-$v") ;;   # a directory name, not a path

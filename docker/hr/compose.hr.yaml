@@ -53,13 +53,18 @@ services:
     # runtime files live in the per-run volume and outlive the container: after a restart a stale
     # daemon.pid can name a live, unrelated PID, and `gortex mcp` then refuses to spawn ("daemon
     # already running"). Nothing can be running at container start, so clear them (TOOL-7 T2).
-    command: ["bash", "-c", "rm -f \"$$HOME\"/.gortex/cache/daemon.pid \"$$HOME\"/.gortex/cache/daemon.sock \"$$HOME\"/.gortex/cache/daemon.spawn.lock \"$$HOME\"/.gortex/cache/daemon.spawn.fail; test -e \"$$HOME/.claude.json\" || cp /hr-seed/claude.json \"$$HOME/.claude.json\"; exec sleep infinity"]
+    command: ["bash", "-c", "rm -f \"$$HOME\"/.gortex/cache/daemon.pid \"$$HOME\"/.gortex/cache/daemon.sock \"$$HOME\"/.gortex/cache/daemon.spawn.lock \"$$HOME\"/.gortex/cache/daemon.spawn.fail; test -e \"$$HOME/.claude.json\" || cp /hr-seed/claude.json \"$$HOME/.claude.json\"; if [ \"$$HR_HEADROOM\" = 1 ]; then mkdir -p /tmp/headroom && (HEADROOM_WORKSPACE_DIR=/tmp/headroom HEADROOM_BEACON=off setsid nohup headroom proxy --port 8787 >>/tmp/headroom/proxy.out 2>&1 </dev/null &) || true; fi; exec sleep infinity"]
+    # TOOL-11: with `scripts/hr up --headroom` the command above also starts the run's own headroom
+    # proxy on its localhost:8787 (this netns is the run's; no ports:), and attach points Claude at it
+    # once /readyz answers. State and the upload beacon are set on that one process, not in
+    # environment:, so the headroom hooks of an opt-out run keep reading the shared ~/.headroom.
     environment:
       USERNAME: htui-ci
       HTUI_TEST_DATABASE_URL: postgres://postgres@localhost:5439/postgres
       HTUI_TEST_QDRANT_URL: http://localhost:6334
       HR_ITEM: ${HR_ITEM:?}
       HR_SANDBOX: "1"
+      HR_HEADROOM: ${HR_HEADROOM:-0}
       HR_STATE: /hr-state
       # ~/.local/share/uv/tools is read-only, and uvx (serena's MCP entry) writes temp files into its
       # tool dir even for ephemeral tools; a per-container tool dir keeps the host's uv tools untouched (TOOL-7 T2).

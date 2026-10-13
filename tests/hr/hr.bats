@@ -207,6 +207,21 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     grep -qx 'headroom=0' "$(reg_of MOD-5)"
 }
 
+@test "3h. compose: HR_HEADROOM defaults to 0; the proxy starts only behind it, with its state and beacon set inline" {
+    local cfg cmd
+    cfg="$(compose_config)"
+    [[ "$(jq -r '.services.dev.environment.HR_HEADROOM' <<<"$cfg")" == 0 ]]
+    # Off-run containers must see no headroom variable besides the switch: the headroom hooks that
+    # run in every sandbox keep reading the shared ~/.headroom.
+    [[ "$(jq -r '.services.dev.environment | keys[] | select(startswith("HEADROOM_"))' <<<"$cfg")" == '' ]]
+    cmd="$(jq -r '.services.dev.command[2]' <<<"$cfg")"
+    [[ "$cmd" == *'if [ "$$HR_HEADROOM" = 1 ]'* ]]   # $$ = a literal $ for the container's bash
+    [[ "$cmd" == *'HEADROOM_WORKSPACE_DIR=/tmp/headroom HEADROOM_BEACON=off'*'headroom proxy --port 8787'* ]]
+    [[ "$cmd" == *'exec sleep infinity' ]]
+    cfg="$(compose_config HR_HEADROOM=1)"
+    [[ "$(jq -r '.services.dev.environment.HR_HEADROOM' <<<"$cfg")" == 1 ]]
+}
+
 @test "4. up warns on uncommitted workflow files; the clone takes the committed ref" {
     printf 'local edit\n' >>"$HR_HOST_REPO/HANDOFF.md"
     mkdir -p "$HR_HOST_REPO/.claude"
