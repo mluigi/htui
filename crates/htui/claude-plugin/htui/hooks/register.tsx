@@ -23,6 +23,19 @@ const age = (s: number): string =>
 /** A row's reason as the overlay names it: `judge_failed` reads `judge failed`. */
 const label = (reason: string): string => reason.replace(/_/g, ' ')
 
+/** Cuts `s` to `columns` characters, a trailing `…` marking the cut. */
+const fit = (s: string, columns: number): string => {
+  const chars = Array.from(s)
+  return chars.length <= columns ? s : chars.slice(0, Math.max(0, columns - 1)).join('') + '…'
+}
+
+/** One pane row: reason, item, step and age in columns, then the text, cut to the pane's width. */
+const rowLine = (r: HtuiRow, columns: number): string =>
+  fit(
+    `${label(r.reason).padEnd(13)}${r.item_key.padEnd(10)}${(r.step ?? '-').padEnd(16)}${age(r.age_seconds).padStart(4)}  ${r.text}`,
+    columns,
+  )
+
 /** Runs `htui` and reads its JSON answer. Never throws: every failure is a line. */
 async function runHtui($: EngineInterface, argv: readonly string[], timeoutMs: number): Promise<Ran> {
   const started = await $.clock.now()
@@ -54,8 +67,17 @@ async function runHtui($: EngineInterface, argv: readonly string[], timeoutMs: n
   return { ok: true, doc }
 }
 
-/** The rows of a `waiting` document; an entry that is not an object is left out. */
-const rowsOf = (doc: any): HtuiRow[] => (Array.isArray(doc.rows) ? doc.rows.filter((r: unknown) => r !== null && typeof r === 'object') : [])
+/** The rows of a `waiting` document, reduced to the fields the mod reads; an entry that is not an object is left out. */
+const rowsOf = (doc: any): HtuiRow[] =>
+  (Array.isArray(doc.rows) ? doc.rows : [])
+    .filter((r: unknown) => r !== null && typeof r === 'object')
+    .map((r: any) => ({
+      reason: String(r.reason ?? ''),
+      item_key: String(r.item_key ?? ''),
+      step: typeof r.step === 'string' ? r.step : null,
+      text: String(r.text ?? ''),
+      age_seconds: Math.max(0, Math.floor(Number(r.age_seconds) || 0)),
+    }))
 
 /** `/htui waiting`'s text, one line per row. */
 const waitingText = (rows: readonly HtuiRow[]): string =>
@@ -203,5 +225,54 @@ export const register: Register = (on, options) => {
       return { text: rest === '' ? 'usage: /htui search <query>' : await searchText($, rest) }
     }
     return { text: 'usage: /htui [status|waiting|search <query>]' }
+  })
+
+  on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
+    if (panel !== 'auto' || e.props.hasSurvey || !(await read($, active))) return next(e)
+    const w = await read($, waiting)
+    const s = await read($, skew)
+    const n = w?.rows.length ?? 0
+    const error = w?.error ?? null
+    if (n === 0 && error === null && s === null) return next(e)
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box key="htui-band" flexDirection="column">
+        {n > 0 && <Text wrap="truncate">{`htui: ${n} waiting on you`}</Text>}
+        {s !== null && <Text wrap="truncate">{s}</Text>}
+        {error !== null && (
+          <Text dimColor wrap="truncate">
+            {error}
+          </Text>
+        )}
+      </Box>
+    )
+  })
+
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    const w = await read($, waiting)
+    const s = await read($, skew)
+    const columns = e.props.bodyColumns
+    const rows = w?.rows ?? []
+    const { Box, Text } = $.ui.resolve(e)
+    return (
+      <Box key="htui-pane" flexDirection="column">
+        <Text bold wrap="truncate">
+          {w?.workspace ?? 'no workspace'} · {rows.length} waiting
+        </Text>
+        {s !== null && <Text wrap="truncate">{s}</Text>}
+        {w?.error != null && (
+          <Text dimColor wrap="truncate">
+            {w.error}
+          </Text>
+        )}
+        {rows.map((r, i) => (
+          <Box key={`row-${i}`}>
+            <Text wrap="truncate">{rowLine(r, columns)}</Text>
+          </Box>
+        ))}
+        {w === null && <Text dimColor>htui: no answer yet</Text>}
+        {w !== null && w.error === null && rows.length === 0 && <Text dimColor>Nothing waits on you.</Text>}
+      </Box>
+    )
   })
 }

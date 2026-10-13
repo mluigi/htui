@@ -6,6 +6,7 @@ test('auto polls at start and every poll_seconds', async ($, on) => {
   const calls: Call[] = []
   htui(on, { waiting: ok(WAITING) }, calls)
   await start($, on)
+  await clock.settle()
   expect(waitingCalls(calls)).toBe(1)
   expect(calls.find(c => c.argv[1] === 'waiting')).toEqual({ argv: ['htui', 'waiting', '--json'], timeoutMs: 10000 })
   await clock.advance(29999)
@@ -19,6 +20,7 @@ test('poll_seconds below 5 is read as 5', { options: { poll_seconds: 1 } }, asyn
   const calls: Call[] = []
   htui(on, { waiting: ok(WAITING) }, calls)
   await start($, on)
+  await clock.settle()
   expect(waitingCalls(calls)).toBe(1)
   await clock.advance(5000)
   expect(waitingCalls(calls)).toBe(2)
@@ -39,6 +41,7 @@ test('command polls nothing until /htui and stops when the pane closes', { optio
     value: isOpen ? [{ id: 'htui', title: 'htui', isShown: true, isFocused: false, isPlaced: true }] : [],
   }))
   await start($, on)
+  await clock.settle()
   await clock.advance(30000)
   expect(waitingCalls(calls)).toBe(0)
   const r = await $.command.run({ command: 'htui', args: '' } as never)
@@ -63,6 +66,7 @@ test('off never polls and never opens a pane', { options: { panel: 'off' } }, as
     return { value: { isPlaced: true } }
   })
   await start($, on)
+  await clock.settle()
   await clock.advance(60000)
   expect(waitingCalls(calls)).toBe(0)
   const r = await $.command.run({ command: 'htui', args: '' } as never)
@@ -100,6 +104,7 @@ test('a slow poll is not overlapped', { options: { poll_seconds: 5 } }, async ($
   const calls: Call[] = []
   htui(on, { waiting: 'hang' }, calls, clock)
   await start($, on)
+  await clock.settle()
   expect(waitingCalls(calls)).toBe(1)
   await clock.advance(5000)
   expect(waitingCalls(calls)).toBe(1)

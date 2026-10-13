@@ -22,7 +22,7 @@ const run = async ($: Engine, args: string) =>
   (await $.command.run({ command: 'htui', args } as never)).text
 
 test('status prints the top bar\'s line', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   htui(on, { status: ok(STATUS) }, calls)
   expect(await run($, 'status')).toBe('Platform · desk · online · 1 working · 2 waiting')
@@ -30,7 +30,7 @@ test('status prints the top bar\'s line', async ($, on) => {
 })
 
 test('status says when permission requests could not be listed', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const doc = { ...JSON.parse(STATUS), workspace: null, box: null, permissions_known: false }
   htui(on, { status: ok(JSON.stringify(doc)) }, [])
   expect(await run($, 'status')).toBe(
@@ -39,23 +39,25 @@ test('status says when permission requests could not be listed', async ($, on) =
 })
 
 test('status shows the skew line', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   htui(on, { status: ok(STATUS), waiting: ok(WAITING), '--version': ok('htui 9.9.9\n') }, calls)
   await start($, on)
+  await clock.settle()
   expect(calls).toContainEqual({ argv: ['htui', '--version'], timeoutMs: 10000 })
   expect(await run($, 'status')).toBe(`Platform · desk · online · 1 working · 2 waiting\n${SKEW}`)
 })
 
 test('a matching binary shows no skew line', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   htui(on, { status: ok(STATUS), waiting: ok(WAITING), '--version': ok('htui 0.0.0-source\n') }, [])
   await start($, on)
+  await clock.settle()
   expect(await run($, 'status')).toBe('Platform · desk · online · 1 working · 2 waiting')
 })
 
 test('waiting prints one line per row, and a sentence when none', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const answers: Record<string, Answer> = { waiting: ok(WAITING) }
   const calls: Call[] = []
   htui(on, answers, calls)
@@ -68,7 +70,7 @@ test('waiting prints one line per row, and a sentence when none', async ($, on) 
 })
 
 test('waiting names judge_failed with a space', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const doc = JSON.parse(WAITING)
   doc.rows = [{ ...doc.rows[0], reason: 'judge_failed', age_seconds: 42 }]
   htui(on, { waiting: ok(JSON.stringify(doc)) }, [])
@@ -76,7 +78,7 @@ test('waiting names judge_failed with a space', async ($, on) => {
 })
 
 test('search sends the query as one argument with a 60 s bound', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   htui(on, { search: ok(SEARCH) }, calls)
   expect(await run($, '  search   closed items ')).toBe(
@@ -86,7 +88,7 @@ test('search sends the query as one argument with a 60 s bound', async ($, on) =
 })
 
 test('a query that starts with a dash stays one argument', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   htui(on, { search: ok(SEARCH) }, calls)
   await run($, 'search --json')
@@ -94,19 +96,19 @@ test('a query that starts with a dash stays one argument', async ($, on) => {
 })
 
 test('search with no hits says so', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   htui(on, { search: ok(JSON.stringify({ ...JSON.parse(SEARCH), hits: [] })) }, [])
   expect(await run($, 'search closed items')).toBe('No hits.')
 })
 
 test('search on an empty index says so', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   htui(on, { search: ok(SEARCH_EMPTY) }, [])
   expect(await run($, 'search closed items')).toBe('No concepts index yet: run htui --index-items.')
 })
 
 test('search with no query prints usage', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   htui(on, {}, calls)
   expect(await run($, 'search')).toBe('usage: /htui search <query>')
@@ -115,7 +117,7 @@ test('search with no query prints usage', async ($, on) => {
 })
 
 test('an unknown verb prints usage', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const calls: Call[] = []
   htui(on, {}, calls)
   expect(await run($, 'frobnicate')).toBe('usage: /htui [status|waiting|search <query>]')
@@ -123,19 +125,19 @@ test('an unknown verb prints usage', async ($, on) => {
 })
 
 test('an offline store exits 3 and shows its message', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   htui(on, { status: ok(OFFLINE, 3) }, [])
   expect(await run($, 'status')).toBe('htui: cannot reach Postgres: store unreachable: connection refused')
 })
 
 test('a refusal exits 2 and shows its message', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   htui(on, { waiting: ok(NO_DSN, 2) }, [])
   expect(await run($, 'waiting')).toBe('htui: no Postgres DSN is stored; run `htui --set-dsn` first')
 })
 
 test('a missing binary is a line, not a throw', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   htui(on, { status: 'deny' }, [])
   expect(await run($, 'status')).toBe('htui: not found on PATH')
 })
@@ -149,7 +151,7 @@ test('a hung binary is a line, not a throw', async ($, on) => {
 })
 
 test('empty stdout is a failure whatever the exit code', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const answers: Record<string, Answer> = { status: ok('', 0) }
   htui(on, answers, [])
   expect(await run($, 'status')).toBe('htui printed nothing (exit 0)')
@@ -158,7 +160,7 @@ test('empty stdout is a failure whatever the exit code', async ($, on) => {
 })
 
 test('an unreadable or newer answer is a line', async ($, on) => {
-  mock.clock(on)
+  const clock = mock.clock(on)
   const answers: Record<string, Answer> = { status: ok('htui 1.0\n', 0) }
   htui(on, answers, [])
   expect(await run($, 'status')).toBe('htui: unreadable answer (exit 0)')
