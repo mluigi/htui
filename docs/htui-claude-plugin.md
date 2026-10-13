@@ -67,18 +67,27 @@ replaces it.
 | A directory holding anything else | Refused | Refused |
 | A file or a symbolic link | Refused | Refused |
 
-A directory counts as one `emit` wrote when it holds nothing but `.claude-plugin` and `htui`, and
-its `.claude-plugin/marketplace.json` names the marketplace `htui`. A directory with one more
-file, another marketplace, no `marketplace.json`, or a `marketplace.json` that is not JSON is left
-exactly as it is. So `--force` never touches a directory that holds anything beside
-`.claude-plugin` and `htui`. The check looks only at those two top-level names: inside them,
-`--force` replaces everything, so keep nothing of your own there, and never point `--dir` at
-htui's source tree (`crates/htui/claude-plugin` passes the check).
+A directory counts as one `emit` wrote when every file and folder in it is one `emit` writes,
+nothing in it is a symbolic link, its
+`.claude-plugin/marketplace.json` names the marketplace `htui`, and its `plugin.json` does not
+carry the source tree's placeholder version, `0.0.0-source`. The one thing `emit` did not write
+that it may hold is `htui/.claude-plugin/types/`, which Claude Code itself writes into a plugin
+folder it reloads. Anything else is left exactly as it is: one more file or folder anywhere in the
+tree, a link, another marketplace, no `marketplace.json`, a `marketplace.json` that is not JSON,
+or a copy of htui's source tree (`crates/htui/claude-plugin`). So `--force` replaces only what an
+earlier `emit` wrote, and never removes a file of yours.
 
 `emit` writes the new copy into a sibling directory, `<name>.emit-<pid>`, then moves it into
-place. With `--force`, the old copy is first moved aside to `<name>.old-<pid>`, the new copy takes
-its place, and the old one is removed. If the move fails, the old copy is put back. If the old copy
-cannot be removed afterwards, the report names it, and the new plugin is in place.
+place. With `--force`, the target is checked again right before the old copy is moved aside: if
+it no longer holds only an earlier emit, `emit` refuses as above, removes its new copy, and leaves
+the target as it is (if the target is gone or empty by then, it is written as such). Then the old
+copy is moved aside to `<name>.old-<pid>`, the new copy takes its place, and the old one is
+removed. If the move fails, the old copy is put back. If the old copy cannot be removed
+afterwards, the report names it, and the new plugin is in place.
+
+Every path is checked before anything is written and before `emit` runs `claude --version`: a path
+with a `..` is refused rather than resolved, and so is a path that is not valid UTF-8, since Claude
+Code takes the marketplace path as text.
 
 ### What `emit` prints
 
@@ -101,7 +110,14 @@ is one of three (see [Claude Code versions](#claude-code-versions)):
 | No answer | `The mod is included; claude's version could not be checked (no answer from claude --version).` |
 
 The directory in the `marketplace add` line is quoted for the shell when it needs it (a path with
-a space). When the old copy could not be removed after a `--force`, one more line follows:
+a space). The last line names no directory when `emit` wrote the default one, since the bare verb
+writes there; for any other directory it names it again, quoted the same way:
+
+```
+After upgrading htui: htui claude emit --force --dir '/home/you/my plugins/htui', then /reload-plugins in Claude Code.
+```
+
+When the old copy could not be removed after a `--force`, one more line follows:
 `The old copy could not be removed: <path>.`
 
 ### Exit codes
@@ -109,10 +125,12 @@ a space). When the old copy could not be removed after a `--force`, one more lin
 | Exit | Meaning |
 |---|---|
 | 0 | Written. |
-| 2 | Refused: the target holds the htui plugin and `--force` is missing, holds files `emit` did not write, or is a file; or there is no local data directory and no `--dir`. A usage error also exits 2. |
-| 1 | Failed: a directory could not be read, created, moved or replaced, a file could not be written, or the report could not be printed. If moving the new copy into place fails, the old copy is put back. |
+| 2 | Refused: the target holds the htui plugin and `--force` is missing; holds files `emit` did not write (also when found right before an earlier emit is moved aside); or is a file. The path contains `..`, is not valid UTF-8, or names no directory. There is no `--dir` and no local data directory, or the default directory contains `..`. A usage error also exits 2. |
+| 1 | Failed: a directory could not be read, created, removed or moved, a file could not be written, or the report could not be printed. If moving the new copy into place fails, the old copy is put back. A `--log` file that cannot be opened is exit 1 too, before `emit` looks at the target. |
 
-A refusal prints its sentence on standard error, as `htui: <sentence>`, and writes nothing:
+A refusal prints its sentence on standard error, as `htui: <sentence>`. Every refusal comes before
+`emit` runs `claude --version` and writes nothing, but the late `--force` check above, which
+removes its new copy and leaves the target as it is:
 
 | Case | Sentence |
 |---|---|
@@ -120,13 +138,32 @@ A refusal prints its sentence on standard error, as `htui: <sentence>`, and writ
 | Anything else in the directory | `<dir> holds files htui claude emit did not write (<why>); it is left as it is. Choose another --dir.` |
 | A file | `<dir> is a file, not a directory` |
 | A path with no directory name | `<dir> names no directory to write` |
+| A `--dir` with a `..` | `<dir> contains ..; give the path without ..` |
+| A path that is not valid UTF-8 | `<dir> is not valid UTF-8; Claude Code cannot add it` |
 | No local data directory | `this machine has no local data directory; pass --dir PATH` |
+| A default directory with a `..` (from `HOME` or `XDG_DATA_HOME`) | `<dir> (the default directory) contains ..; pass --dir PATH without ..` |
 
-`<why>` names the first thing that is not `emit`'s: a foreign entry, `no marketplace.json`,
-`marketplace.json is not htui's`, or `a symbolic link`.
+`<why>` names the first thing that is not `emit`'s, in name order, by its path inside the target:
 
-No `emit` ending is sent to htui's crash reporter, whatever its code: its sentences carry paths in
-your home directory.
+| What it found | `<why>` |
+|---|---|
+| A file or folder `emit` does not write | Its path, for example `notes.txt`, `htui/tests` or `htui/hooks/extra.ts` |
+| A symbolic link inside the target | `<path>, a symbolic link`, for example `htui/hooks/up, a symbolic link` |
+| The target itself is a symbolic link | `a symbolic link` |
+| No `.claude-plugin/marketplace.json` | `no marketplace.json` |
+| A `marketplace.json` that is not JSON or names another marketplace | `marketplace.json is not htui's` |
+| A copy of htui's source tree | `the plugin source tree, version 0.0.0-source` |
+
+Among the failures (exit 1), three say more than `cannot <do> <path>: <error>`:
+
+| Case | Sentence |
+|---|---|
+| The plugin was written, but stdout failed (a closed pipe is no failure) | `the plugin was written to <dir>; cannot write to stdout: <error>` |
+| The empty target is no longer empty when `emit` removes it to put the new copy there | `cannot remove the empty directory <dir>: <error>` |
+| With `--force`, neither the new copy nor the old one could be moved into place | `cannot move <dir>.emit-<pid> to <dir>: <error>; putting it back failed too (<error>): the previous plugin is at <dir>.old-<pid>` |
+
+No refusal or failure of `emit`'s own is sent to htui's crash reporter, whatever its code: its
+sentences carry paths in your home directory.
 
 ## Install it
 
@@ -146,7 +183,7 @@ not from a copy, so a later `emit --force` and `/reload-plugins` are all an upgr
 | Option | Values | Default | Meaning |
 |---|---|---|---|
 | `panel` | `auto`, `command`, `off` | `auto` | `auto`: a band above the prompt when something waits, and `/htui` opens a pane. `command`: no band, and `/htui` opens the pane. `off`: no band and no pane; `/htui` prints the rows as text. |
-| `poll_seconds` | a number | `30` | Seconds between `htui waiting` polls while the band or the pane shows. Below 5 is read as 5. |
+| `poll_seconds` | a number | `30` | Seconds between `htui waiting` polls while the band or the pane shows, read as 5 to 3600: `0` means the default 30, 1 to 4 and negative numbers read as 5, and anything above 3600 reads as 3600. A value that is not a number is refused by Claude Code itself, before the mod loads. |
 
 Set them in a session with `/plugin configure htui@htui`, or when installing:
 
@@ -162,7 +199,7 @@ query) costs nothing when nothing shows it:
 | `panel` | When it polls |
 |---|---|
 | `auto` | Once when the session starts, then every `poll_seconds` for the session. |
-| `command` | From the first `/htui` until a poll finds the pane closed. |
+| `command` | From the first `/htui` until a poll finds the pane closed. A pane left open across a reload polls again. |
 | `off` | Never. Each `/htui` runs `htui waiting` once. |
 
 A poll that is still running when the next one is due is not overlapped: the next one is skipped.
@@ -175,9 +212,11 @@ The plugin's version is the binary's. After upgrading htui, rewrite the plugin a
 htui claude emit --force
 ```
 
-then `/reload-plugins` in Claude Code. No reinstall is needed.
+then `/reload-plugins` in Claude Code. No reinstall is needed. If you wrote it with `--dir`, give
+the same `--dir` again; the last line `emit` printed is the command to run.
 
-Until then, the mod shows a skew line in the band, in the pane and under `/htui status`:
+Until then, the mod shows a skew line in the pane, under `/htui status`, and, under `panel`
+`auto`, in the band:
 
 ```
 htui 0.2.0 ≠ plugin 0.1.0: run htui claude emit --force, then /reload-plugins
@@ -187,8 +226,8 @@ The mod checks `htui --version` each time the session starts and each time the m
 the line clears after `/reload-plugins`. When `htui --version` gives no answer, there is no skew
 line; the poll reports why.
 
-When `htui` answers with a schema version newer than the plugin reads, every command and the band
-show `htui: answer version <N> is newer than this plugin: run htui claude emit --force, then /reload-plugins`.
+When `htui` answers with a schema version newer than the plugin reads, every command, the pane
+and, under `auto`, the band show `htui: answer version <N> is newer than this plugin: run htui claude emit --force, then /reload-plugins`.
 
 ## What the mod shows
 
@@ -204,7 +243,8 @@ The mod runs these commands, each with a time bound:
 `status` and `waiting` read the first workspace, the one the TUI opens on
 ([`docs/htui-cli.md`](htui-cli.md#scope-what-a-command-reads)). The query rides inside one
 argument after `=`, so a query that starts with `-` is not read as a flag. Control characters are
-removed from htui's stored text before the mod shows it.
+removed from htui's stored text, and from the version `htui --version` prints, before the mod
+shows them.
 
 ### The band
 
@@ -221,12 +261,16 @@ survey, and none under `command` or `off`.
 
 `/htui` opens a pane named `htui` (under `auto` and `command`). It shows:
 
-- a header, `<workspace> · <n> waiting` (`no workspace` when the store has none);
-- the skew line and the last poll's failure line, when present;
-- one line per row: the reason, the item key, the step (`-` when there is none) and the age in
-  columns, then the row's text, cut to the pane's width with a trailing `…`;
-- `Nothing waits on you.` when there are no rows, or `htui: no answer yet` before the first poll
-  answers.
+- a header: `htui` before the first answer or after a failed poll, when no count is known;
+  otherwise `<workspace> · <n> waiting` (`no workspace` when the store has none);
+- the skew line, when present;
+- with the header `htui`, the reason no count is known: `htui: no answer yet` before the first
+  poll answers, or the last poll's failure line;
+- one line per row: the reason, the item key, the step (`-` when there is none) and the age, in
+  columns 13, 10, 16 and 4 characters wide, then the row's text, the whole line cut to the pane's
+  width with a trailing `…`. A value as wide as its column, or wider, is still followed by at
+  least one space, so the columns never run together;
+- `Nothing waits on you.` when a poll answered with no rows.
 
 The reason is written as the TUI's overlay writes it: `judge_failed` reads `judge failed`. The age
 is the largest whole unit: `42s`, `5m`, `3h`, `2d`. When Claude Code cannot place the pane, `/htui`
@@ -267,15 +311,16 @@ MOD-34  document prd (done)  the concepts index
 
 ### When `htui` fails
 
-Every failure is one line in place of the answer; none stops the session. The band shows the last
-poll's line, and the commands print theirs (`/htui status` adds the skew line after it).
+Every failure is one line in place of the answer; none stops the session. The pane and, under
+`auto`, the band show the last poll's line, and the commands print theirs (`/htui status` adds the
+skew line after it).
 
 | What happened | Line |
 |---|---|
 | `htui` is not on `PATH`, or could not start | `htui: not found on PATH` |
 | `htui` ran past its bound | `htui: timed out` |
 | `htui` printed nothing | `htui printed nothing (exit <code>)` |
-| The answer is not a JSON document | `htui: unreadable answer (exit <code>)` |
+| The answer is not a JSON object, a count in it (`working`, `waiting`) is not a whole number of 0 or more, or its `rows` is not a list | `htui: unreadable answer (exit <code>)` |
 | The answer's schema version is newer | `htui: answer version <N> is newer than this plugin: run htui claude emit --force, then /reload-plugins` |
 | A failure document (the store offline, a refusal, a failed read) | `htui: <error.message>`, for example `htui: cannot reach Postgres: store unreachable: connection refused` |
 | Any other non-zero exit | `htui: exit <code>` |
@@ -303,7 +348,9 @@ Every Claude Code session that htui starts has `HTUI_SESSION=1` in its environme
 a session leaves out your mods and skills unless the agent's `mods (y/n)` is `y` (see
 [Your Claude Code mods, hooks and skills](../README.md#your-claude-code-mods-hooks-and-skills)).
 When it is `y`, the mod stands down: with `HTUI_SESSION` set, it registers no `/htui` command,
-starts no poll, runs no `htui`, and draws no band. The stand-down is the mod's; the skill has none.
+starts no poll, runs no `htui`, and draws no band. Should `/htui` reach such a session anyway, it
+runs nothing and answers `htui: stands down in sessions htui drives`. The stand-down is the mod's;
+the skill has none.
 
 ## Claude Code versions
 
@@ -314,33 +361,35 @@ decides what to write:
 - **Below 2.1.287**: the skill alone. The plugin has no `hooks/` and no `types/`, and its
   `plugin.json` has no `types` and no options. The skill works without the mod. After upgrading
   Claude Code, run `htui claude emit --force` and `/reload-plugins` to add the mod.
-- **Not checked** (`claude` is not on `PATH`, or printed no version): the skill and the mod, and the
+- **Not checked** (`claude` is not on `PATH`, printed no version, or did not answer within 15 s): the skill and the mod, and the
   report says the version was not checked. If your Claude Code is older than 2.1.287, run `emit`
   again with `claude` on `PATH`, with `--force`.
 
 ## What it never does
 
 - **`emit` never edits `~/.claude`** and never runs `claude plugin` itself: it prints the commands.
-  It writes nothing outside the target directory and its two siblings, `<name>.emit-<pid>` and
-  `<name>.old-<pid>` (and creates the target's parent directories).
+  It writes nothing outside the target and its two siblings, `<name>.emit-<pid>` and
+  `<name>.old-<pid>` (and the `--log` file when you name one), but the target's missing parent
+  directories, which it creates.
 - **No writes to htui's store.** The mod and the skill read through `htui status`, `htui waiting`
   and `htui --search-items`, which only read (see
   [`docs/htui-cli.md`](htui-cli.md#no-writes)). Neither connects to Postgres or Qdrant, and
   neither reads the DSN.
-- **No model calls.** The mod makes none, and nothing it shows is decided by a model.
+- **No model calls of its own.** The mod makes no `$.model` call. The only model involved is
+  htui's own embedding model, which ranks search hits inside htui when `/htui search` runs
+  `htui --search-items`.
 - **Reach limited to running `htui`.** The mod runs processes (`$.process.run`, only `htui`),
   keeps a timer, reads one environment variable (`HTUI_SESSION`), registers `/htui`, keeps its own
   state and draws its band and pane. It makes no network call, writes no file, and never
   submits a prompt or starts a turn; its only transcript rows are the `/htui` answers above.
-  `claude plugin validate --strict <dir>/htui` lists what it calls:
+  `claude plugin validate --strict <dir>/htui` lists what it calls; an excerpt of its output,
+  three lines in the order it prints them:
 
   ```
-  ./register.tsx calls: $.clock.every, $.clock.now, $.command.register, $.env.get, $.process.run, $.state.get, $.state.set, $.ui.open, $.ui.panes, $.ui.resolve
-  ./register.tsx env reads: HTUI_SESSION
-  ./register.tsx env writes: nothing
+    ❯ ./register.tsx calls: $.clock.every (via startTimer), $.clock.now (via poll, runHtui), $.command.register, $.env.get, $.process.run (via checkVersion, runHtui), $.state.get, $.state.set, $.ui.open, $.ui.panes (via paneOpen), $.ui.resolve
+    ❯ ./register.tsx env writes: nothing
+    ❯ ./register.tsx env reads: HTUI_SESSION
   ```
-
-  (`validate` adds which function makes each call.)
 
 ## Windows
 

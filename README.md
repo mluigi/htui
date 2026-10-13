@@ -558,9 +558,9 @@ claude plugin install htui@htui
 
 `emit` writes under your local data directory (`~/.local/share/htui/claude-plugin` on Linux;
 `--dir PATH` picks another) and prints the two `claude plugin` commands with the directory it
-used. It never edits `~/.claude`. After upgrading htui, run `htui claude emit --force`, then
-`/reload-plugins` in Claude Code. Options, what the mod shows and the Claude Code version it needs
-are in [`docs/htui-claude-plugin.md`](docs/htui-claude-plugin.md).
+used. It never edits `~/.claude`. After upgrading htui, run `htui claude emit --force` (with the
+same `--dir` if you gave one), then `/reload-plugins` in Claude Code. Options, what the mod shows
+and the Claude Code version it needs are in [`docs/htui-claude-plugin.md`](docs/htui-claude-plugin.md).
 
 ## Where htui keeps its files
 
