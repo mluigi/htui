@@ -2199,3 +2199,48 @@ async fn a_chord_does_not_disarm_esc_esc() {
         "`alt-x` did not disarm, so the second `Esc` ended the chat: {frame}"
     );
 }
+
+/// MOD-67 M5 (D7, D9): `[chat] end = "ctrl-e"` arms on the chord the old guard passed and ends
+/// the chat on the second press, the hint doubles the new label, and `Esc` neither arms nor ends.
+/// The armed sentence stays prose until M6 (D11).
+#[tokio::test]
+async fn a_rebound_end_key_arms_and_ends_the_chat() {
+    let keys = htui::keys::load_str("version = 1\n[chat]\nend = \"ctrl-e\"\n")
+        .expect("the key file loads");
+    let (mut harness, _) = harness_over(
+        Script::one_turn(vec![chunk("hello"), done()]),
+        Transport::Acp,
+        |harness| harness.with_keys(keys),
+    )
+    .await;
+    compose(&mut harness, "hi");
+    harness.drive().await;
+    let live = "i compose · Ctrl+e Ctrl+e end · t thoughts · j/k scroll";
+    assert_eq!(hint_row(&harness.render()), live);
+
+    harness.key("esc");
+    harness.key("esc");
+    harness.drive().await;
+    let frame = harness.render();
+    assert_eq!(
+        hint_row(&frame),
+        live,
+        "`Esc` neither arms nor ends: {frame}"
+    );
+
+    harness.key("ctrl-e");
+    let frame = harness.render();
+    assert_eq!(
+        hint_row(&frame),
+        "Esc again ends this chat",
+        "`ctrl-e` arms: {frame}"
+    );
+    harness.key("ctrl-e");
+    harness.drive().await;
+    let frame = harness.render();
+    assert_eq!(
+        hint_row(&frame),
+        "this chat has ended · i compose",
+        "the second `ctrl-e` ended the chat: {frame}"
+    );
+}

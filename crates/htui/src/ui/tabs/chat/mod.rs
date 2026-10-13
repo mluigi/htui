@@ -37,7 +37,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
@@ -61,8 +61,44 @@ const NONE: &str = "\u{2014}";
 /// this is.
 const STEP_TAIL: usize = 8;
 
-/// The last line while a replay is open: the three keys that do anything, and the way out.
-const REPLAY_HINT: &str = "Esc leave replay · t thoughts · j/k scroll";
+/// The last line while a replay is open (`CHAT_REPLAY`): the three keys that do anything, and the
+/// way out.
+const REPLAY_HINT: HintSpec = &[
+    Hint::One(Act::Back, "leave replay"),
+    Hint::One(Act::ChatThoughts, "thoughts"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "scroll"),
+];
+
+/// The open composer's keys (`CAPTURE`): its own, fixed (ANA-26 §6.1).
+const COMPOSE_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc leave")];
+
+/// A parked permission request (`CHAT_LIVE`): the digits are fixed ahead of the resolver (D5).
+const PARKED_HINT: HintSpec = &[
+    Hint::Text("1-9 answer"),
+    Hint::One(Act::ChatCompose, "compose"),
+    Hint::One(Act::ChatThoughts, "thoughts"),
+];
+
+/// A chat that has ended (`CHAT_LIVE`).
+const ENDED_HINT: HintSpec = &[
+    Hint::Text("this chat has ended"),
+    Hint::One(Act::ChatCompose, "compose"),
+];
+
+/// A live chat (`CHAT_LIVE`), before the doubled end key.
+const LIVE_HINT: HintSpec = &[Hint::One(Act::ChatCompose, "compose")];
+
+/// A live chat (`CHAT_LIVE`), after the doubled end key.
+const LIVE_HINT_TAIL: HintSpec = &[
+    Hint::One(Act::ChatThoughts, "thoughts"),
+    Hint::Pair(Act::ListDown, Act::ListUp, "scroll"),
+];
+
+/// No chat yet (`CHAT_LIVE`).
+const IDLE_HINT: HintSpec = &[
+    Hint::One(Act::ChatCompose, "compose the first prompt"),
+    Hint::One(Act::ChatNextAgent, "next agent"),
+];
 
 /// `StoreRequest::name` of a promotion (blueprint D209): its refusal is this tab's to show, since
 /// the shell asked for it on the tab's behalf.
@@ -270,17 +306,33 @@ impl ChatTab {
         }
     }
 
-    /// The replay header: which step is on screen, how much of it there is, and that it is over.
+    /// The replay header: which step is on screen, how much of it there is, and that it is over,
+    /// naming the key that leaves it (`common.back` through `CHAT_REPLAY`; unbound, no key).
     fn replay_header(replay: &ReplayState, ctx: &Ctx<'_>) -> Line<'static> {
         let id = replay.step_id.to_string();
         let step = id.get(id.len().saturating_sub(STEP_TAIL)..).unwrap_or(&id);
+        let leave = ctx.keys().label(views::CHAT_REPLAY, Act::Back).map_or_else(
+            || " · read-only".to_owned(),
+            |label| format!(" · read-only · {label} leave"),
+        );
         Line::from(vec![
             Span::styled(
                 format!("replay · step …{step} · {} rows", replay.transcript.len()),
                 ctx.theme.accent,
             ),
-            Span::styled(" · read-only · Esc leave", ctx.theme.dim),
+            Span::styled(leave, ctx.theme.dim),
         ])
+    }
+
+    /// The current mode's stack, which [`Tab::key_stack`] reports and the hints label through.
+    fn stack(&self) -> Stack<'static> {
+        if self.replay.is_some() {
+            views::CHAT_REPLAY
+        } else if self.composer.is_active() {
+            views::CAPTURE
+        } else {
+            views::CHAT_LIVE
+        }
     }
 
     /// Sends what the composer submitted: the first text starts a chat, later ones are follow-ups.
@@ -424,14 +476,16 @@ impl ChatTab {
         (!missing.is_empty()).then(|| format!("this agent cannot: {}", missing.join(", ")))
     }
 
-    /// The hint under the transcript.
+    /// The hint under the transcript, each key labelled through the current mode's stack (MOD-67
+    /// M5 D9), so a rebound key shows its new chord.
     ///
     /// A refusal takes this line while there is a live conversation to keep on screen, and is
     /// cleared by the next key or the next frame.
-    fn hint(&self) -> String {
+    fn hint(&self, keys: &Keys) -> String {
+        let stack = self.stack();
         // A replay offers three keys and no refusal can apply to it: nothing it can do fails.
         if self.replay.is_some() {
-            return REPLAY_HINT.to_owned();
+            return keys.hint(stack, REPLAY_HINT);
         }
         if let Some(refusal) = &self.refusal
             && self.session.is_some()
@@ -439,18 +493,31 @@ impl ChatTab {
             return refusal.clone();
         }
         if self.composer.is_active() {
-            return "Enter send · Esc leave".to_owned();
+            return keys.hint(stack, COMPOSE_HINT);
         }
         if self.cancel_armed {
+            // Key prose, M6's (MOD-67 D11).
             return "Esc again ends this chat".to_owned();
         }
         if self.transcript.parked().is_some() {
-            return "1-9 answer · i compose · t thoughts".to_owned();
+            return keys.hint(stack, PARKED_HINT);
         }
         match &self.session {
-            Some(state) if state.ended.is_some() => "this chat has ended · i compose".to_owned(),
-            Some(_) => "i compose · Esc Esc end · t thoughts · j/k scroll".to_owned(),
-            None => "i compose the first prompt · a next agent".to_owned(),
+            Some(state) if state.ended.is_some() => keys.hint(stack, ENDED_HINT),
+            // The end key is pressed twice, which no `Hint` element spells: its label is doubled
+            // by hand, and an unbound end drops out like any element.
+            Some(_) => [
+                keys.hint(stack, LIVE_HINT),
+                keys.label(stack, Act::ChatEnd)
+                    .map(|label| format!("{label} {label} end"))
+                    .unwrap_or_default(),
+                keys.hint(stack, LIVE_HINT_TAIL),
+            ]
+            .into_iter()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join(" · "),
+            None => keys.hint(stack, IDLE_HINT),
         }
     }
 }
@@ -479,13 +546,7 @@ impl Tab for ChatTab {
     /// `CAPTURE` while the composer is, else the live view's (idle, live, parked or ended: one key
     /// set, the agent cycle declined once a session exists, the digits fixed ahead of it).
     fn key_stack(&self) -> Option<Stack<'static>> {
-        Some(if self.replay.is_some() {
-            views::CHAT_REPLAY
-        } else if self.composer.is_active() {
-            views::CAPTURE
-        } else {
-            views::CHAT_LIVE
-        })
+        Some(self.stack())
     }
 
     /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the replay's swallow, the open
@@ -792,10 +853,16 @@ impl Tab for ChatTab {
             // Not `Composer::render`: the composer belongs to the live view, and a replay must
             // not show an input line for a step that can take no input.
             Some(_) => frame.render_widget(
-                Paragraph::new(Line::styled(self.hint(), ctx.theme.dim)),
+                Paragraph::new(Line::styled(self.hint(ctx.keys()), ctx.theme.dim)),
                 composer,
             ),
-            None => Composer::render(frame, composer, &self.composer, &self.hint(), ctx.theme),
+            None => Composer::render(
+                frame,
+                composer,
+                &self.composer,
+                &self.hint(ctx.keys()),
+                ctx.theme,
+            ),
         }
     }
 }
@@ -1608,7 +1675,7 @@ mod tests {
             &mut shell.ctx(),
         );
 
-        assert_eq!(tab.hint(), sentence);
+        assert_eq!(tab.hint(Keys::compiled()), sentence);
         assert!(
             tab.session().is_some_and(|session| session.ended.is_none()),
             "the session is still live"
