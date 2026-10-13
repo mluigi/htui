@@ -50,6 +50,10 @@ pub const DEFAULTS: Defaults = Defaults {
 /// Not a field of [`Defaults`], which is the `app_setting` table: no App rung carries the key.
 pub const BOX_HOSTNAME_DEFAULT: bool = true;
 
+/// `project.settings.allow_env_files`'s compiled default: a provider project whose session trees
+/// hold env files is refused (MOD-89 D3, D4). Not a field of [`Defaults`]: no App rung.
+pub const ALLOW_ENV_FILES_DEFAULT: bool = false;
+
 /// §4.3's permitted upstream hop range; a stored value outside it is clamped and noted.
 const HOPS_RANGE: (u8, u8) = (1, 2);
 /// The largest reserve the resolver will honour: half the budget. A row claiming more would leave
@@ -103,6 +107,7 @@ impl Defaults {
     #[must_use]
     pub fn value_of(&self, key: SettingKey) -> Value {
         match key {
+            SettingKey::AllowEnvFiles => Value::Bool(ALLOW_ENV_FILES_DEFAULT),
             SettingKey::BoxHostname => Value::Bool(BOX_HOSTNAME_DEFAULT),
             SettingKey::ExcerptFileLineCap => Value::from(self.excerpt_file_line_cap),
             SettingKey::ExcerptHeadLines => Value::from(self.excerpt_head_lines),
@@ -127,6 +132,7 @@ impl Defaults {
     /// value the reader would have resolved rather than against nothing.
     fn integer(&self, key: SettingKey) -> i64 {
         match key {
+            SettingKey::AllowEnvFiles => i64::from(ALLOW_ENV_FILES_DEFAULT),
             SettingKey::BoxHostname => i64::from(BOX_HOSTNAME_DEFAULT),
             SettingKey::ExcerptFileLineCap => i64::from(self.excerpt_file_line_cap),
             SettingKey::ExcerptHeadLines => i64::from(self.excerpt_head_lines),
@@ -146,43 +152,46 @@ impl Defaults {
     }
 }
 
-/// The eleven keys of the registry — ANA-5 §5.3's ten `app_setting` keys and MOD-33's
-/// project-only `box_hostname` — declared in **key byte order**: the discriminant indexes
-/// [`SPECS`].
+/// The twelve keys of the registry — ANA-5 §5.3's ten `app_setting` keys and two project-only
+/// switches, MOD-33's `box_hostname` and MOD-89's `allow_env_files` — declared in **key byte
+/// order**: the discriminant indexes [`SPECS`].
 ///
 /// A typed key rather than a `&str`, because the writer this exists for is the one place a typo
 /// used to be invisible: `positive_i64` treats an unknown key exactly as it treats a malformed
 /// one, so a misspelled write would show one number in the editor and use another in the prompt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SettingKey {
-    /// `box_hostname`, the one [`SettingKind::Boolean`] and the one key only a project holds
-    /// (MOD-33 D267).
-    BoxHostname = 0,
+    /// `allow_env_files`, MOD-89 D4's project-only switch: on, a provider project whose session
+    /// trees hold env files warns instead of refusing.
+    AllowEnvFiles = 0,
+    /// `box_hostname`, a [`SettingKind::Boolean`] only a project holds (MOD-33 D267).
+    BoxHostname = 1,
     /// `excerpt_file_line_cap`.
-    ExcerptFileLineCap = 1,
+    ExcerptFileLineCap = 2,
     /// `excerpt_head_lines`.
-    ExcerptHeadLines = 2,
+    ExcerptHeadLines = 3,
     /// `excerpt_max_file_bytes`.
-    ExcerptMaxFileBytes = 3,
+    ExcerptMaxFileBytes = 4,
     /// `excerpt_max_files`.
-    ExcerptMaxFiles = 4,
+    ExcerptMaxFiles = 5,
     /// `excerpt_max_scan_files`.
-    ExcerptMaxScanFiles = 5,
+    ExcerptMaxScanFiles = 6,
     /// `excerpt_provider_deadline_ms`.
-    ExcerptProviderDeadlineMs = 6,
+    ExcerptProviderDeadlineMs = 7,
     /// `max_skill_tokens`.
-    MaxSkillTokens = 7,
+    MaxSkillTokens = 8,
     /// `prompt_reserve_fraction`, the one [`SettingKind::Fraction`] of the App keys.
-    PromptReserveFraction = 8,
+    PromptReserveFraction = 9,
     /// `prompt_upstream_hops` on the App rung, `upstream_hops` on a project (flag A).
-    UpstreamHops = 9,
+    UpstreamHops = 10,
     /// `token_budget`, the only key all three rungs accept.
-    TokenBudget = 10,
+    TokenBudget = 11,
 }
 
 impl SettingKey {
     /// Every key, in key byte order. Not the `app_setting` list — that is [`Self::app_keys`].
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
+        Self::AllowEnvFiles,
         Self::BoxHostname,
         Self::ExcerptFileLineCap,
         Self::ExcerptHeadLines,
@@ -217,7 +226,7 @@ impl SettingKey {
         self.spec().key
     }
 
-    /// The reverse of [`Self::key`], `None` for a string outside the eleven.
+    /// The reverse of [`Self::key`], `None` for a string outside the twelve.
     ///
     /// The two MOD-6 cache keys (`cache_refresh_seconds`, `cache_overlap_seconds`) are deliberately
     /// outside: their reader is `connect.rs`'s own `> 0` rule and the `0002` pin asserts exactly
@@ -291,15 +300,15 @@ impl core::fmt::Display for Rungs {
 }
 
 /// How a key's JSON is read (PRD D7's `kind`): nine keys are integers,
-/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and `box_hostname` is a
-/// boolean.
+/// `prompt_reserve_fraction` is a float the reader rounds to basis points, and the two switches,
+/// `allow_env_files` and `box_hostname`, are booleans.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingKind {
     /// Read through `positive_i64` or a narrowing of it.
     Integer,
     /// Read through `as_f64` and rounded once, to basis points.
     Fraction,
-    /// A JSON `true`/`false` (MOD-33 D267). `min` 0 and `max` 1 are nominal: the reader takes the
+    /// A JSON `true`/`false` (MOD-33 D267, MOD-89 D4). `min` 0 and `max` 1 are nominal: the reader takes the
     /// boolean and nothing else, so a number, a string or `null` is refused rather than coerced.
     Boolean,
 }
@@ -341,7 +350,18 @@ pub struct SettingSpec {
 const U32_MAX: i64 = u32::MAX as i64;
 
 /// The registry, indexed by [`SettingKey`]'s discriminant.
-pub const SPECS: [SettingSpec; 11] = [
+pub const SPECS: [SettingSpec; 12] = [
+    SettingSpec {
+        key: "allow_env_files",
+        project_key: Some("allow_env_files"),
+        kind: SettingKind::Boolean,
+        min: 0,
+        max: 1,
+        rungs: Rungs::PROJECT,
+        not_above: None,
+        unit: "on/off",
+        doc: "A provider project whose session trees hold env files warns instead of refusing.",
+    },
     SettingSpec {
         key: "box_hostname",
         project_key: Some("box_hostname"),
@@ -772,6 +792,19 @@ pub fn resolve_box_hostname(project: Option<&Value>) -> bool {
         .unwrap_or(BOX_HOSTNAME_DEFAULT)
 }
 
+/// `project.settings.allow_env_files` (MOD-89 D4): whether a provider project whose session trees
+/// hold env files warns instead of refusing.
+///
+/// The house fall-through rule: absent, `null` or anything but a JSON boolean is not a value, and
+/// [`ALLOW_ENV_FILES_DEFAULT`] (off) answers. Project rung only — there is no `app_setting` row to
+/// fall to. No effect on a provider-less project, which only warns (D3).
+#[must_use]
+pub fn resolve_allow_env_files(project: Option<&Value>) -> bool {
+    project_key(project, "allow_env_files")
+        .and_then(Value::as_bool)
+        .unwrap_or(ALLOW_ENV_FILES_DEFAULT)
+}
+
 /// §5.3's six `excerpt_*` keys: the four caps the audit records, the walk's scan cap, and the
 /// provider deadline (blueprint B.8; T65 deferred this to T66 by name).
 ///
@@ -907,7 +940,7 @@ mod tests {
         }
     }
 
-    /// MOD-33 D267: the one boolean, and the one key only a project holds.
+    /// MOD-33 D267: the first boolean, and the first key only a project holds.
     #[test]
     fn box_hostname_is_a_project_only_boolean() {
         let spec = SettingKey::BoxHostname.spec();
@@ -930,35 +963,70 @@ mod tests {
         assert!(rung_refusal(SettingKey::BoxHostname, Rungs::PHASE).is_some());
         assert_eq!(rung_refusal(SettingKey::BoxHostname, Rungs::PROJECT), None);
         assert_eq!(
-            SettingKey::ALL[0],
+            SettingKey::ALL[1],
             SettingKey::BoxHostname,
-            "`box_hostname` sorts first in key byte order"
+            "`box_hostname` sorts second in key byte order, after `allow_env_files`"
         );
     }
 
-    /// D267: a boolean is read as a boolean — a number, a string or `null` is refused, not coerced.
+    /// MOD-89 D4: the second boolean, and the second key only a project holds.
+    #[test]
+    fn allow_env_files_is_a_project_only_boolean() {
+        let spec = SettingKey::AllowEnvFiles.spec();
+        assert_eq!(
+            *spec,
+            SettingSpec {
+                key: "allow_env_files",
+                project_key: Some("allow_env_files"),
+                kind: SettingKind::Boolean,
+                min: 0,
+                max: 1,
+                rungs: Rungs::PROJECT,
+                not_above: None,
+                unit: "on/off",
+                doc: spec.doc,
+            }
+        );
+        assert!(!spec.doc.is_empty(), "the editor has a line to show");
+        assert!(rung_refusal(SettingKey::AllowEnvFiles, Rungs::APP).is_some());
+        assert!(rung_refusal(SettingKey::AllowEnvFiles, Rungs::PHASE).is_some());
+        assert_eq!(
+            rung_refusal(SettingKey::AllowEnvFiles, Rungs::PROJECT),
+            None
+        );
+        assert_eq!(
+            SettingKey::ALL[0],
+            SettingKey::AllowEnvFiles,
+            "`allow_env_files` sorts first in key byte order"
+        );
+    }
+
+    /// D267, MOD-89 D4: a boolean is read as a boolean — a number, a string or `null` is refused,
+    /// not coerced. Both switches share `validate`'s one kind-driven arm.
     #[test]
     fn validate_takes_a_boolean_and_nothing_else() {
-        for on in [json!(true), json!(false)] {
+        for key in [SettingKey::AllowEnvFiles, SettingKey::BoxHostname] {
+            for on in [json!(true), json!(false)] {
+                assert_eq!(
+                    validate(key, Rungs::PROJECT, &on, None),
+                    Ok(()),
+                    "{on} is a value of the {key} switch"
+                );
+            }
+            for value in [json!(1), json!("on"), Value::Null] {
+                let refused = validate(key, Rungs::PROJECT, &value, None)
+                    .expect_err("only a JSON boolean is a switch");
+                assert!(
+                    refused.starts_with(&format!("`{key}` must be a JSON boolean, got ")),
+                    "the refusal of {value} names the key and the kind, got `{refused}`"
+                );
+            }
             assert_eq!(
-                validate(SettingKey::BoxHostname, Rungs::PROJECT, &on, None),
-                Ok(()),
-                "{on} is a switch value"
+                validate(key, Rungs::APP, &json!(true), None),
+                Err(rung_refusal(key, Rungs::APP).expect("no App rung")),
+                "the rung is checked before the kind for {key}"
             );
         }
-        for value in [json!(1), json!("on"), Value::Null] {
-            let refused = validate(SettingKey::BoxHostname, Rungs::PROJECT, &value, None)
-                .expect_err("only a JSON boolean is a switch");
-            assert!(
-                refused.starts_with("`box_hostname` must be a JSON boolean, got "),
-                "the refusal of {value} names the key and the kind, got `{refused}`"
-            );
-        }
-        assert_eq!(
-            validate(SettingKey::BoxHostname, Rungs::APP, &json!(true), None),
-            Err(rung_refusal(SettingKey::BoxHostname, Rungs::APP).expect("no App rung")),
-            "the rung is checked before the kind"
-        );
     }
 
     /// The house fall-through rule: anything but a JSON boolean is not a value, and on answers.
@@ -981,20 +1049,45 @@ mod tests {
         assert!(resolve_box_hostname(Some(&json!({"box_hostname": true}))));
     }
 
+    /// MOD-89 D4: the same fall-through rule, to off — only a stored JSON `true` lets a provider
+    /// project warn instead of refusing.
+    #[test]
+    fn resolve_allow_env_files_falls_through_to_off() {
+        for project in [
+            json!({}),
+            json!({"allow_env_files": null}),
+            json!({"allow_env_files": 1}),
+            json!({"allow_env_files": "on"}),
+            json!({"allow_env_files": "true"}),
+            json!("not an object"),
+            json!({"allow_env_files": false}),
+        ] {
+            assert!(
+                !resolve_allow_env_files(Some(&project)),
+                "{project} carries no `true`, so the refusal stands"
+            );
+        }
+        assert!(!resolve_allow_env_files(None), "no project blob at all");
+        assert!(resolve_allow_env_files(Some(
+            &json!({"allow_env_files": true})
+        )));
+    }
+
     /// D276: the App group and `as_rows` are the ten `app_setting` keys, never the project-only one.
     #[test]
     fn app_keys_are_the_ten_app_setting_keys_in_byte_order() {
         let app: Vec<SettingKey> = SettingKey::app_keys().collect();
         assert_eq!(app.len(), 10, "migration 0002 seeds ten rows");
         assert_eq!(SettingKey::app_keys().count(), 10);
+        assert!(!app.contains(&SettingKey::AllowEnvFiles));
         assert!(!app.contains(&SettingKey::BoxHostname));
         assert_eq!(
             app,
             SettingKey::ALL
                 .into_iter()
-                .filter(|key| *key != SettingKey::BoxHostname)
+                .filter(|key| !matches!(key, SettingKey::AllowEnvFiles | SettingKey::BoxHostname))
                 .collect::<Vec<_>>(),
-            "`ALL` without the project-only key, in the same order"
+            "`ALL` without the project-only keys, in the same order"
         );
         let keys: Vec<&str> = app.iter().map(|key| key.key()).collect();
         assert!(
@@ -1104,7 +1197,7 @@ mod tests {
         sorted.dedup();
         assert_eq!(
             keys, sorted,
-            "eleven distinct keys, strictly ascending as bytes"
+            "twelve distinct keys, strictly ascending as bytes"
         );
         assert!(
             SettingKey::from_key("cache_refresh_seconds").is_none(),

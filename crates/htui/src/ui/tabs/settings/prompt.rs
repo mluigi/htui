@@ -33,8 +33,8 @@ use ratatui::widgets::{Paragraph, Wrap};
 
 use htui_core::model::Scope;
 use htui_core::prompt::settings::{
-    resolve_box_hostname, resolve_budget, resolve_excerpt_caps, resolve_hops,
-    resolve_max_skill_tokens,
+    resolve_allow_env_files, resolve_box_hostname, resolve_budget, resolve_excerpt_caps,
+    resolve_hops, resolve_max_skill_tokens,
 };
 use htui_core::prompt::{Budget, BudgetSource, SettingKey, SettingKind};
 use htui_core::store::SettingRung;
@@ -974,6 +974,23 @@ fn present_source(project_value: Option<&Value>, app_holds: bool) -> BudgetSourc
     }
 }
 
+/// A [`SettingKind::Boolean`] row's effective column, from its resolver's answer `on` and the row's
+/// own stored value.
+///
+/// Project rung only, so there is no `app_setting` rung to name when it is unset (D276); `number`
+/// is `None`, the fraction key's precedent, so D13's clamp line never reads a switch. The source is
+/// `project` only when the resolver would read the stored value: a non-boolean falls through to
+/// the default, so labelling it `project` would name a rung that answered nothing (MOD-33 review L5).
+fn switch(on: bool, project_value: Option<&Value>) -> (String, Option<i64>, &'static str) {
+    let source = if project_value.and_then(Value::as_bool).is_some() {
+        BudgetSource::Project.as_str()
+    } else {
+        COMPILED_DEFAULT
+    };
+    let text = if on { SWITCH_ON } else { SWITCH_OFF };
+    (text.to_owned(), None, source)
+}
+
 /// What the reader would use for `key`, over the snapshot's own `app_map` and — on a project row —
 /// that project's blob (D6).
 ///
@@ -993,21 +1010,10 @@ fn effective(
     let present = present_source(project_value, app.contains_key(key.key())).as_str();
     let mut notes = Vec::new();
     let (text, number, source) = match key {
-        // Project rung only, so there is no `app_setting` rung to name when it is unset (D276);
-        // `number: None`, the fraction key's precedent, so D13's clamp line never reads a switch.
-        SettingKey::BoxHostname => {
-            let on = resolve_box_hostname(project);
-            // `project` only when the resolver would read the stored value: a non-boolean falls
-            // through to the default, so labelling it `project` would name a rung that answered
-            // nothing.
-            let source = if project_value.and_then(Value::as_bool).is_some() {
-                BudgetSource::Project.as_str()
-            } else {
-                COMPILED_DEFAULT
-            };
-            let text = if on { SWITCH_ON } else { SWITCH_OFF };
-            (text.to_owned(), None, source)
-        }
+        // The two project-only switches (MOD-89 D4, MOD-33 D267): one row shape, each its own
+        // resolver.
+        SettingKey::AllowEnvFiles => switch(resolve_allow_env_files(project), project_value),
+        SettingKey::BoxHostname => switch(resolve_box_hostname(project), project_value),
         // The one key that records its own provenance: the reader's answer is the label (D5).
         SettingKey::TokenBudget => {
             let budget = resolve_budget(None, project, app);
@@ -1276,6 +1282,39 @@ mod tests {
             let row = effective(key, Some(&project), project.get(key.key()), &app);
             assert_eq!(row.text, text, "{stored:?}");
             assert_eq!(row.source, source, "{stored:?}");
+        }
+    }
+
+    /// MOD-89 D4: the env-files switch reads `on` only for a stored JSON `true`, and — the same
+    /// L5 rule as `box_hostname` — says `project` only when the project stores a JSON boolean.
+    /// Anything else falls through to the compiled default, which is off.
+    #[test]
+    fn the_env_files_switch_is_off_unless_a_project_stores_true() {
+        let key = SettingKey::AllowEnvFiles;
+        let app = BTreeMap::new();
+        for (stored, text, source) in [
+            (Some(json!(true)), SWITCH_ON, BudgetSource::Project.as_str()),
+            (
+                Some(json!(false)),
+                SWITCH_OFF,
+                BudgetSource::Project.as_str(),
+            ),
+            (Some(json!("on")), SWITCH_OFF, COMPILED_DEFAULT),
+            (Some(json!(1)), SWITCH_OFF, COMPILED_DEFAULT),
+            (Some(Value::Null), SWITCH_OFF, COMPILED_DEFAULT),
+            (None, SWITCH_OFF, COMPILED_DEFAULT),
+        ] {
+            let project = stored.as_ref().map_or_else(
+                || Value::Object(serde_json::Map::new()),
+                |value| blob(key, value.clone()),
+            );
+            let row = effective(key, Some(&project), project.get(key.key()), &app);
+            assert_eq!(row.text, text, "{stored:?}");
+            assert_eq!(row.source, source, "{stored:?}");
+            assert_eq!(
+                row.number, None,
+                "D13's clamp arithmetic never reads a switch"
+            );
         }
     }
 
