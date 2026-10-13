@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││           │2.1 done          │            │
 │                                                     ││           │implement         │            │
 │                                                     ││           │                  │            │
-│                                                     ││J/K step · +/- zoom · v list · ? keys      │
+│j/k move · h/l sub-tab · f filter · N new · e edit   ││J/K step · +/- zoom · v list · ? keys      │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

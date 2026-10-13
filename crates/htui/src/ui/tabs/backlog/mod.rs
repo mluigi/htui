@@ -77,6 +77,17 @@ const ITEMS_READ: &str = "items";
 /// plan D16, OQ-3).
 const REFRESHES_PER_RUNS_POLL: u32 = 5;
 
+/// The Backlog's own keys under the list (MOD-67 M5 Q1 a, PA-5): `j/k move · h/l sub-tab ·
+/// f filter · N new · e edit` under the defaults, 50 cells of the list pane's 53 at 100 columns.
+/// The queue keys stay in the `?` box.
+const LIST_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::Pair(Act::PanePrevSubtab, Act::PaneNextSubtab, "sub-tab"),
+    Hint::One(Act::BacklogOpenFilter, "filter"),
+    Hint::One(Act::BacklogNewItem, "new"),
+    Hint::One(Act::Edit, "edit"),
+];
+
 /// MOD-12 D9: what `Q` says with the cursor on a project header.
 const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
 
@@ -171,6 +182,16 @@ impl Default for BacklogTab {
 impl BacklogTab {
     /// Identity of the Backlog tab.
     pub const ID: TabId = TabId("backlog");
+
+    /// The list hint row's text (MOD-67 M5 Q1 a), read through the active pane's stack; `None`
+    /// while the filter form, the item form or a sub-tab captures, since a hint for keys a field
+    /// is typing would lie, and when no key of [`LIST_HINT`] is bound.
+    fn list_hint(&self, keys: &Keys) -> Option<String> {
+        if self.form.is_some() || self.item_form.is_some() || self.detail.captures_input() {
+            return None;
+        }
+        Some(keys.hint(self.detail.key_stack(), LIST_HINT)).filter(|hint| !hint.is_empty())
+    }
 
     /// A Backlog tab with the seven detail sub-tabs registered, in blueprint order; Reqs is
     /// MOD-39 plan P12's, after Prompt.
@@ -958,7 +979,8 @@ impl Tab for BacklogTab {
             selected: self.selected,
             filter: summary.as_deref(),
         };
-        list::render(frame, list_area, &view, ctx.theme);
+        let hint = self.list_hint(ctx.keys());
+        list::render(frame, list_area, &view, hint.as_deref(), ctx.theme);
         if let (Some(form), Some(at)) = (&self.form, form_area) {
             filter::render(frame, at, form, ctx.keys(), ctx.theme);
         }
@@ -4217,6 +4239,109 @@ mod tests {
         assert!(
             !tab.detail.captures_input(),
             "no area opened on the hidden Notes pane"
+        );
+    }
+
+    // ---- MOD-67 M5 Q1 (a), PA-5: the list hint row --------------------------------------------
+
+    /// The list hint under the compiled defaults.
+    const DEFAULT_LIST_HINT: &str =
+        "j/k move \u{b7} h/l sub-tab \u{b7} f filter \u{b7} N new \u{b7} e edit";
+
+    /// The list pane's last inner row in `frame`: the row above its bottom border, borders and
+    /// trailing blanks off.
+    fn list_last_row(frame: &str) -> String {
+        let rows: Vec<&str> = frame.lines().collect();
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.starts_with('\u{2514}'))
+            .unwrap_or_else(|| panic!("the list pane has a bottom border:\n{frame}"));
+        let (list, _) = rows[bottom - 1]
+            .split_once("\u{2502}\u{2502}")
+            .unwrap_or_else(|| panic!("the row crosses into the detail pane:\n{frame}"));
+        list.trim_start_matches('\u{2502}').trim_end().to_owned()
+    }
+
+    /// Q1 (a), PA-5: the hint names the Backlog's own keys in the list pane's 53 inner cells at
+    /// 100 columns, and is drawn on the pane's last inner row.
+    #[tokio::test]
+    async fn the_list_hint_fits_the_list_pane_at_100_columns() {
+        let bench = Bench::new().await;
+        let tab = bench.tab();
+        let hint = tab.list_hint(Keys::compiled()).expect("nothing captures");
+        assert_eq!(hint, DEFAULT_LIST_HINT);
+        let [list, _] = panes(Rect::new(0, 0, 100, 30));
+        let inner = usize::from(list.width) - 2;
+        assert_eq!(inner, 53, "the list pane's inner width at 100 columns");
+        assert!(
+            crate::ui::cells::cell_width(&hint) <= inner,
+            "{hint:?} fits {inner} cells"
+        );
+        let frame = drawn(&tab, &bench);
+        assert_eq!(list_last_row(&frame), hint, "drawn last:\n{frame}");
+    }
+
+    /// Q1 (a): a hint for keys a field is typing would lie, so the row is not drawn while the
+    /// filter form, the item form or a sub-tab captures.
+    #[tokio::test]
+    async fn the_list_hint_is_hidden_while_a_form_or_pane_captures() {
+        let bench = Bench::new().await;
+
+        let mut tab = bench.tab();
+        tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
+        assert_eq!(tab.list_hint(Keys::compiled()), None, "the filter form");
+        let frame = drawn(&tab, &bench);
+        assert!(!frame.contains(DEFAULT_LIST_HINT), "filter form:\n{frame}");
+
+        let mut tab = bench.tab();
+        let backend = htui_store::Backend::memory(MemStore::demo());
+        let request = StoreRequest::ItemForm {
+            project: htui_core::fixtures::ids::PROJECT_HTUI,
+            item: None,
+        };
+        let context = match item_writes::serve(&backend, &request).await {
+            Ok(StoreReply::ItemForm(context)) => *context,
+            other => panic!("the form read answered {other:?}"),
+        };
+        tab.item_form = Some(ItemForm::open_new(context, &bench.projects, None));
+        assert_eq!(tab.list_hint(Keys::compiled()), None, "the item form");
+        let frame = drawn(&tab, &bench);
+        assert!(!frame.contains(DEFAULT_LIST_HINT), "item form:\n{frame}");
+
+        let capturing = Rc::new(Cell::new(true));
+        let mut detail = DetailRegistry::new();
+        detail.register(Box::new(CapturingProbe {
+            capturing: Rc::clone(&capturing),
+            seen: Rc::default(),
+        }));
+        let tab = BacklogTab {
+            detail,
+            ..bench.tab()
+        };
+        assert_eq!(tab.list_hint(Keys::compiled()), None, "a capturing pane");
+        let frame = drawn(&tab, &bench);
+        assert!(
+            !frame.contains(DEFAULT_LIST_HINT),
+            "capturing pane:\n{frame}"
+        );
+        capturing.set(false);
+        assert_eq!(
+            tab.list_hint(Keys::compiled()).as_deref(),
+            Some(DEFAULT_LIST_HINT),
+            "back once the pane stops capturing"
+        );
+    }
+
+    /// Q1 (a): the hint is built from the keys in force, so `[backlog] filter = "/"` reads
+    /// `/ filter`.
+    #[tokio::test]
+    async fn the_list_hint_names_a_rebound_key() {
+        let bench = Bench::new().await;
+        let keys = crate::keys::load_str("version = 1\n[backlog]\nfilter = \"/\"\n")
+            .expect("the keys load");
+        assert_eq!(
+            bench.tab().list_hint(&keys).as_deref(),
+            Some("j/k move \u{b7} h/l sub-tab \u{b7} / filter \u{b7} N new \u{b7} e edit")
         );
     }
 }
