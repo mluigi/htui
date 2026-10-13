@@ -556,7 +556,8 @@ impl TemplatesView {
         }
     }
 
-    /// Draws the view below the switch line: the content, the notice row and the hint row.
+    /// Draws the view below the switch line: the content and the notice row. Its keys are
+    /// [`key_hint`](Self::key_hint), the shell's hint row since MOD-67 M6 T2.
     pub(super) fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // The notice wraps rather than clips (at most `NOTICE_LINES`): the stale sentence ends on
         // the version the next `Ctrl+S` writes, which is the one part the user must not lose.
@@ -568,41 +569,14 @@ impl TemplatesView {
         let mut notice = wrapped(notice, usize::from(area.width.saturating_sub(1)).max(1));
         notice.truncate(NOTICE_LINES);
         let notice_height = u16::try_from(notice.len().max(1)).unwrap_or(1);
-        let [content, notice_row, hint_row] = Layout::vertical([
-            Constraint::Min(1),
-            Constraint::Length(notice_height),
-            Constraint::Length(1),
-        ])
-        .areas(area);
-        let hint = match (&self.mode, self.handed_off()) {
-            (Mode::Editing(editor), _) => {
+        let [content, notice_row] =
+            Layout::vertical([Constraint::Min(1), Constraint::Length(notice_height)]).areas(area);
+        match (&self.mode, self.handed_off()) {
+            (Mode::Editing(editor), _) | (Mode::Browse, Some(editor)) => {
                 self.render_editor(frame, content, editor, ctx);
-                match &editor.help {
-                    Some(help) => help.hint(ctx.keys()),
-                    None => {
-                        let (line, col) = editor.area.cursor_line_col();
-                        format!(
-                            "{} \u{b7} L{}:C{}",
-                            ctx.keys().hint(self.key_stack(), EDIT_HINT),
-                            line + 1,
-                            col + 1
-                        )
-                    }
-                }
             }
-            (Mode::Browse, Some(editor)) => {
-                self.render_editor(frame, content, editor, ctx);
-                ctx.keys().hint(self.key_stack(), HANDED_OFF_HINT)
-            }
-            (Mode::Naming { .. }, _) => {
-                self.render_browse(frame, content, ctx);
-                ctx.keys().hint(self.key_stack(), NAMING_HINT)
-            }
-            (Mode::Browse, None) => {
-                self.render_browse(frame, content, ctx);
-                ctx.keys().hint(self.key_stack(), BROWSE_HINT)
-            }
-        };
+            (Mode::Naming { .. } | Mode::Browse, _) => self.render_browse(frame, content, ctx),
+        }
         frame.render_widget(
             Paragraph::new(
                 notice
@@ -612,10 +586,29 @@ impl TemplatesView {
             ),
             notice_row,
         );
-        frame.render_widget(
-            Paragraph::new(Line::styled(format!(" {hint}"), ctx.theme.dim)),
-            hint_row,
-        );
+    }
+
+    /// The keys of the shown mode for the shell's hint row (MOD-67 M6 T2), through
+    /// [`key_stack`](Self::key_stack): an open agent help's, the editor's with the cursor's
+    /// `L:C`, else the mode's.
+    pub(super) fn key_hint(&self, keys: &Keys) -> String {
+        match (&self.mode, self.handed_off()) {
+            (Mode::Editing(editor), _) => match &editor.help {
+                Some(help) => help.hint(keys),
+                None => {
+                    let (line, col) = editor.area.cursor_line_col();
+                    format!(
+                        "{} \u{b7} L{}:C{}",
+                        keys.hint(self.key_stack(), EDIT_HINT),
+                        line + 1,
+                        col + 1
+                    )
+                }
+            },
+            (Mode::Browse, Some(_)) => keys.hint(self.key_stack(), HANDED_OFF_HINT),
+            (Mode::Naming { .. }, _) => keys.hint(self.key_stack(), NAMING_HINT),
+            (Mode::Browse, None) => keys.hint(self.key_stack(), BROWSE_HINT),
+        }
     }
 
     // --- keys ----------------------------------------------------------------------------------
@@ -1554,9 +1547,9 @@ mod tests {
         };
         let (buffer, claim) = drawn(&view);
         let claim = claim.expect("the draft claims its text");
-        // The content above the notice and hint rows, less the placeholder column, inside the
-        // draft's border.
-        assert_eq!(claim, Rect::new(1, 1, 98 - HELP_WIDTH, 24));
+        // The content above the notice row, less the placeholder column, inside the draft's
+        // border (the keys are the shell's hint row since MOD-67 M6 T2).
+        assert_eq!(claim, Rect::new(1, 1, 98 - HELP_WIDTH, 25));
         let row = |y: u16| {
             (claim.x..claim.right())
                 .map(|x| buffer[(x, y)].symbol())
@@ -1605,7 +1598,7 @@ mod tests {
         );
         let title = line(0, 0, claim.right());
         assert!(title.contains("plan \u{b7} editing from v2"), "{title:?}");
-        let hint = line(area.bottom() - 1, 0, area.width);
+        let hint = view.key_hint(ctx.keys());
         assert!(hint.contains("the draft is in $EDITOR"), "{hint:?}");
 
         // Browse's `E` (F-12) has no draft to draw: the pane takes the tab body.

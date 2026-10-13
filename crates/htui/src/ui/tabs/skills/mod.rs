@@ -155,6 +155,15 @@ impl Tab for SkillsTab {
         self.library.on_external_edit(outcome, ctx);
     }
 
+    /// The shown view's keys (MOD-67 M6 T2): its mode's hint through its stack.
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        let hint = match self.view {
+            View::Skills => self.library.key_hint(ctx.keys()),
+            View::Templates => self.templates.key_hint(ctx.keys()),
+        };
+        (!hint.is_empty()).then(|| Line::styled(hint, ctx.theme.dim))
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let [switch, body] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
