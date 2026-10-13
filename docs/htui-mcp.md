@@ -350,31 +350,18 @@ still passes. The list is fixed in this build; it is not a setting.
 ## Permission prompts for `claude-cli`
 
 Claude Code without ACP has no permission channel of its own. When htui hosts the tools, it starts
-`claude-cli` with `--permission-prompt-tool mcp__htui__permission_prompt`, so every tool call the
-CLI's own permission mode does not settle (an isolated session reads no settings file, so that is
-the mode htui passes: the seeded `claude-cli` runs in `default`) is sent to htui as an ordinary
-permission request:
+`claude-cli` with `--permission-prompt-tool mcp__htui__permission_prompt`. An isolated session
+reads no settings file, so the CLI's permission mode is the one htui passes from the row
+([below](#isolation-from-your-claude-code-setup)). The seeded `claude-cli` runs in `acceptEdits`:
+file edits inside the session's directories proceed after the CLI's own safety checks, and shell
+commands ask. Every tool call that mode does not settle is sent to htui as an
+ordinary permission request:
 
 - **In an engine step**, the step's policy answers it first (the agent's rules and the persona's,
   as for ACP); otherwise the step parks and the **Runs** pane asks you, in the TUI or for a worker
   (see [`docs/htui-worker.md`](htui-worker.md#permission-requests-on-worker-steps)).
 - **In a chat**, the chat asks you with the usual `1` … `9`, and no banner says the agent cannot
   ask.
-
-**Edits.** The seeded `claude-cli` row carries one agent rule, `tool_kind: edit` → `allow_once`,
-where it used to run in `acceptEdits`. Edits still proceed without asking you, as they did then,
-but each one now goes through htui's policy and is recorded with the rule's reason. A persona's
-rules are evaluated before the agent's, so a persona can refuse edits. Shell commands that change
-the filesystem (`mkdir`, `mv`), which `acceptEdits` approved by itself, now ask. A row still on
-`acceptEdits` (set by hand) keeps the old behaviour: the CLI approves its edits before htui is
-asked. On an existing install, migration `0018` gives the seeded `claude-cli` row the new mode and
-rule, but only while it still holds the old seed values (`acceptEdits` and no rules); a row you
-edited is left alone.
-
-**With no prompt tool.** When htui hosts no MCP tools, the CLI is started without
-`--permission-prompt-tool`, so nothing reaches htui and the permission mode decides alone. Under
-the seeded `default` the CLI refuses whatever it would ask about, edits included: the edit rule
-cannot help there, and edits that ran under `acceptEdits` are now refused.
 
 **htui's own tools are pre-approved.** On both transports, in a step and in a chat, the session's
 policy answers `allow_once` for every htui tool the session is offered except `command_run` (and
@@ -415,7 +402,8 @@ call would then never reach htui's policy or its record.
   prompt itself, so a session never needs them;
 - your settings files themselves (user, project and local `settings.json`): their `permissions`
   rules and `defaultMode`, and with them `env`, `model`, `apiKeyHelper`, `enabledPlugins`,
-  `enabledMcpjsonServers` and `additionalDirectories`;
+  `enabledMcpjsonServers` and `additionalDirectories`. The `claude` adapter still reads
+  `defaultMode` itself (see the permission mode, below);
 - the plugins enabled in your settings files (`enabledPlugins`), and with them their agents and
   MCP servers: a `claude-cli` session listed only Claude Code's built-in plugins. A plugin loaded
   another way (`--plugin-dir`, `CLAUDE_CODE_PLUGIN_DIRS`) was not tested;
@@ -451,8 +439,8 @@ is lost. Every ACP agent receives the same `_meta`; an agent that does not know 
 key ignores it, as ACP requires. On an isolated ACP session, the `_meta` `settings` block replaces
 the settings the adapter would derive from a `CLAUDE_MODEL_CONFIG` set in the row's launch `env`.
 
-**The permission mode.** With no settings file read, no `defaultMode` picks the mode, so htui
-states it:
+**The permission mode.** htui states the mode rather than leave it to a settings file's
+`defaultMode`:
 
 - **`claude-cli`:** a row's `settings.cli.permission_mode` passes as written, `acceptEdits`
   included. An isolated row that names none gets `--permission-mode default`; left to itself, the
@@ -460,9 +448,17 @@ states it:
   settings files' `defaultMode` applies. A session with no tools passes no mode at all.
 - **`claude` (ACP):** `settings.acp.permission_mode` (seeded `default` on `claude`, absent on
   `agy`) is pinned after `session/new`, `session/resume` and `session/load`: htui sends
-  `session/set_mode` unless the agent already reports that mode as current. The adapter takes its
-  starting mode from the settings files' `defaultMode` itself, which `settingSources` does not
-  reach, so the pin applies whether or not the row has opted back in. No value sends nothing.
+  `session/set_mode` unless the agent already reports that mode as current. The pin is the row's
+  own setting, not an isolation lever, so it applies whether or not the row has opted back in
+  (`mods (y/n)` at `y`). No value sends nothing.
+
+**An ACP row with no pinned mode.** The `claude` adapter reads your settings files' `defaultMode`
+itself, and `settingSources: []` does not reach that read. So an isolated ACP row with no
+`acp.permission_mode` starts in whatever `defaultMode` your settings files name, possibly `auto`,
+and a call that mode settles never reaches htui. htui logs a warning when an isolated ACP session
+starts with no pinned mode. The seeded `claude` row pins `default`. A row you create in
+**Settings › Agents** carries the pin only when it copies the settings of a row that has it;
+otherwise add `"permission_mode": "default"` under `acp` in its `settings` by hand.
 
 An ACP agent that reports no session modes, or none with that id, is refused before the session
 starts, and the error names the mode:
@@ -473,7 +469,15 @@ cannot pin `settings.acp.permission_mode` `default`: the agent offers no such mo
 ```
 
 On an existing install, migration `0018` adds `permission_mode: "default"` to the seeded `claude`
-row only while it still has no `acp.permission_mode`; a row you edited is left alone.
+row, whether or not it has opted back in. A `claude` row whose `acp.permission_mode` is already
+set is left alone. The `claude-cli` row is not touched: it keeps `acceptEdits`.
+
+**Upgrade every box together.** An older `htui` or `htui worker` still running when `0018` is
+applied keeps reading your settings files (it sends no `--setting-sources ""` or
+`settingSources: []`) and pins no mode. An older one started afterwards refuses the database
+("schema is newer than this htui"). Stop every TUI and worker on the database, upgrade them all,
+then migrate from a TUI (see
+[`docs/htui-worker.md`](htui-worker.md#upgrading-migrate-from-a-tui-first)).
 
 **Letting your extensions back in.** In **Settings › Agents**, edit the agent (`e`) and set
 `mods (y/n)` to `y`. That row's sessions then start as they did before: no `--settings`,
@@ -485,7 +489,8 @@ field is stored as `settings.user_extensions`; `n`, or no value, means isolated.
 **Bringing back one setting.** To stay isolated on `claude-cli` but keep something your settings
 files set, such as `env` or `apiKeyHelper`, put an inline `--settings` in the row's
 `settings.cli.extra_args` that sets `"disableAllHooks": true` and the keys you need. htui allows
-that (see below).
+that (see below). Leave out any `permissions` keys (`allow`, `defaultMode`, …): settings passed by
+flag are always applied, so those would settle calls before htui is asked.
 
 **`HTUI_SESSION=1`.** Every agent session htui starts has `HTUI_SESSION=1` in its environment,
 whichever way the field is set, on both transports (the ACP adapter passes it on to the Claude
