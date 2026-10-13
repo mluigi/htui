@@ -18,6 +18,9 @@ const TO_GRAPH: usize = 2;
 /// Steps right of Body to the Prompt sub-tab: Body, Runs, Graph, Docs, Notes, **Prompt**.
 const TO_PROMPT: usize = 5;
 
+/// Steps right of Body to the Reqs sub-tab, registered after Prompt.
+const TO_REQS: usize = 6;
+
 /// Rows down from the arrival row (htui `ANA-1`) to htui `FEAT-1`, the item every sub-tab has
 /// data for (`tests/backlog.rs`).
 const TO_FEAT_1: usize = 3;
@@ -163,4 +166,98 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
         None,
         "the root row's `Enter` says no miss"
     );
+}
+
+/// On htui `FEAT-1`'s Reqs sub-tab, its one citation (`R-STO-1 addresses`) under the cursor.
+async fn on_feat_1_reqs(harness: &mut Harness) {
+    down(harness, TO_FEAT_1).await;
+    sub_tab(harness, TO_REQS);
+    let frame = harness.render();
+    assert!(
+        frame.contains("┌ FEAT-1") && frame.contains("▸ R-STO-1 addresses v1"),
+        "the Reqs on FEAT-1, its citation under the cursor:\n{frame}"
+    );
+}
+
+/// D7, D12: the uncite question resolves through `REQS_CONFIRM`, whose `confirm.yes` is `y`
+/// alone. `alt-y` (which the CONTROL-only pass let through to the mode) sends no
+/// `UnciteRequirement` and leaves the question up; `y` sends one.
+#[tokio::test]
+async fn alt_y_does_not_uncite() {
+    let mut harness = backlog().await;
+    on_feat_1_reqs(&mut harness).await;
+    harness.key("u");
+    let asking = harness.render();
+    assert!(
+        asking.contains("uncite R-STO-1 (addresses)?"),
+        "`u` asks first:\n{asking}"
+    );
+    assert_eq!(harness.queued(), 0, "nothing in flight");
+
+    harness.key("alt-y");
+    assert_eq!(harness.queued(), 0, "`alt-y` sends no UnciteRequirement");
+    let frame = harness.render();
+    assert!(
+        frame.contains("uncite R-STO-1 (addresses)?"),
+        "the question stays:\n{frame}"
+    );
+
+    harness.key("y");
+    assert_eq!(harness.queued(), 1, "`y` sends the UnciteRequirement");
+}
+
+/// Main §1 item 3: the picker is a modal on `REQS_PICK`, whose global layer passes `F1`, so `F1`
+/// opens the help box from it (the picker swallowed it); a second `F1` closes the box and the
+/// picker is still open on the candidate it was on.
+#[tokio::test]
+async fn f1_opens_help_from_the_reqs_picker_and_it_stays() {
+    let mut harness = backlog().await;
+    on_feat_1_reqs(&mut harness).await;
+    harness.key("c");
+    harness.drive_to_end().await;
+    harness.key("j");
+    let frame = harness.render();
+    assert!(
+        frame.contains("▸ R-ENT-2"),
+        "the picker, its cursor on R-ENT-2:\n{frame}"
+    );
+
+    harness.key("f1");
+    assert!(harness.app().help_visible, "`F1` opened the box");
+    harness.key("f1");
+    assert!(!harness.app().help_visible, "`F1` closed it");
+    let frame = harness.render();
+    assert!(
+        frame.contains("▸ R-ENT-2") && frame.contains("Enter pick"),
+        "the picker is still open on R-ENT-2:\n{frame}"
+    );
+}
+
+/// D7: the picker's cursor moves on `backlog.reqs.next_row`/`prev_row` (`J`/`K`, the pane's
+/// cursor verbs) and on `list.down`/`up` (`j`/`k`, `Down`/`Up`): two acts, one move.
+#[tokio::test]
+async fn the_picker_moves_on_j_and_j_capital() {
+    let mut harness = backlog().await;
+    on_feat_1_reqs(&mut harness).await;
+    harness.key("c");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("▸ R-ENT-1"),
+        "the picker opens on its first candidate:\n{frame}"
+    );
+    for (down, up) in [("J", "K"), ("j", "k"), ("down", "up")] {
+        harness.key(down);
+        let frame = harness.render();
+        assert!(
+            frame.contains("▸ R-ENT-2"),
+            "`{down}` moved the picker down:\n{frame}"
+        );
+        harness.key(up);
+        let frame = harness.render();
+        assert!(
+            frame.contains("▸ R-ENT-1"),
+            "`{up}` moved it back:\n{frame}"
+        );
+    }
 }
