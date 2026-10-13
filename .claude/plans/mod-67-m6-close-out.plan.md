@@ -13,6 +13,16 @@ files; two unconverted views; with Q1 (a) every tab's hint line and ~165 TUI sna
 **Status**: confirmed 2026-10-13 (Q1: (a), Q2: (a), the recommended options, taken on a plain
 "confirm")
 
+## Amendments (maintainer, 2026-10-13, from blueprint §1)
+
+PA-1..PA-13 (`.claude/plans/mod-67-m6-close-out.blueprint.md` §1) accepted whole on "accept all":
+D4 covers all 61 key-naming sentences (L-C 53, L-B 6, T-close X-S 2) (PA-1); both D9 lows are
+fixed by one line in `Keys::derive` (PA-2); the `y / n` question tails are label-built (PA-6);
+`Ctrl+s` is the one spelling in prose (PA-7); agent help names the leaving key per state (PA-12);
+D6 dedupes the fixed pass only (PA-13). The trait method is `key_hint` (PA-3), lane-gated tests use
+`PENDING` lists (PA-4), L-C owns the files of blueprint §5.2 (PA-5). Plan claims 16 and 21 amended
+per blueprint §2.
+
 ## Summary
 
 The `Keymap`/`Binding`/`KeyScope` module and the paths that still carry it go: `Ctx::new` takes
