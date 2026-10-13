@@ -102,11 +102,28 @@ empty list is `[]`, and the count of waiting rows is the length of `rows`.
 In `status` and `waiting`, `permissions_known: false` means the open permission requests could not
 be listed, so permission rows are missing.
 
+## Reading search hits
+
+`hits` holds the best hits first. Each hit is one place where the query matched:
+
+- `key`: the item's or requirement's key. Only an item or document hit carries an item key.
+- `place`: what matched: `item`, `document` (one of the item's documents) or `requirement`.
+- `document_kind`: the document's kind, such as `prd`, on a document hit; otherwise `null`.
+- `resolution`: how the item closed (`done`, `concluded`, `rejected`, `withdrawn`, `superseded`,
+  `duplicate`) on an item or document hit of a closed item; otherwise `null`. On an item or
+  document hit, `null` means the item is not closed.
+- `requirement_state`: `active` or `withdrawn` on a requirement hit; otherwise `null`.
+- `score`: the fused rank score. Compare scores within one search only.
+- `snippet`: the start of the indexed text, whitespace folded and control characters removed.
+
 ## Handing work to htui
 
 - When a request matches an open htui item, or belongs in htui's queue, say so and point the
   person at the htui TUI. Name the item by its key when a row (`item_key`) or a search hit
   (`key`) gives one.
+- Name a search hit's item as open only when its `place` is `item` or `document` and its
+  `resolution` is `null`. A hit with a `resolution` is a closed item: say how it closed. A
+  `requirement` hit's `key` is a requirement's key, not an item's.
 - Never work such a request inline in this session.
 - Never try to write htui's store. There is no write command.
 
