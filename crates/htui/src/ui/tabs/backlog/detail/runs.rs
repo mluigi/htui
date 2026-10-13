@@ -77,7 +77,7 @@ use serde_json::Value;
 
 use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
@@ -86,7 +86,7 @@ use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, messa
 use crate::ui::tabs::chat::permission::PermissionStrip;
 use crate::ui::tabs::settings::modal_rest;
 use crate::ui::text_field::{FieldOutcome, TextField};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 /// What an action key says while the verdicts it reads have not arrived.
 pub const NOT_LOADED: &str = "the run actions have not loaded yet";
@@ -1108,18 +1108,6 @@ fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
     legal[next]
 }
 
-/// A key with no CONTROL, ALT, SUPER, META or HYPER: the only kind a fixed key of MOD-67 D5
-/// (the permission digits, the close-out resolution's value keys) answers.
-fn plain(key: &KeyEvent) -> bool {
-    !key.modifiers.intersects(
-        KeyModifiers::CONTROL
-            | KeyModifiers::ALT
-            | KeyModifiers::SUPER
-            | KeyModifiers::META
-            | KeyModifiers::HYPER,
-    )
-}
-
 /// A key in [`Mode::CloseOut`], stage by stage (D167), through the stage's `stack`: the mode it
 /// leaves the pane in, and whether the key was used.
 ///
@@ -1147,7 +1135,7 @@ fn close_out_key(
                 KeyCode::Left | KeyCode::Char('h') => Some(false),
                 _ => None,
             };
-            match forward.filter(|_| plain(&key)) {
+            match forward.filter(|_| is_plain(&key)) {
                 Some(forward) => {
                     preview.resolution = cycle(preview.status, preview.resolution, forward);
                     (CloseOutStage::Warn(preview), Handled::Consumed)
@@ -1689,7 +1677,7 @@ impl DetailTab for RunsTab {
         // MOD-42 D14: while the step under the cursor has a pending request, every plain digit is
         // this pane's, as the chat's parked strip takes them (`chat/mod.rs`); otherwise digits pass
         // to the global tab select. A fixed key of MOD-67 D5, ahead of the resolver.
-        if plain(&key)
+        if is_plain(&key)
             && let KeyCode::Char(digit @ '1'..='9') = key.code
             && let Some(pending) = self.pending_under_cursor()
         {

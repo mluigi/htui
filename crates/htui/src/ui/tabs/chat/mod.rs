@@ -37,13 +37,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
 use crate::run_worker::{OrchReply, Via};
 use crate::store_worker::{ChatFrame, StoreReply, StoreRequest};
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::registry::{Tab, TabId};
 use composer::{Composer, ComposerOutcome};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use permission::PermissionStrip;
 use transcript::{Transcript, TranscriptRow};
 
@@ -103,13 +103,6 @@ const IDLE_HINT: HintSpec = &[
 /// `StoreRequest::name` of a promotion (blueprint D209): its refusal is this tab's to show, since
 /// the shell asked for it on the tab's behalf.
 const PROMOTE_STEP: &str = crate::run_worker::ORCH_NAMES[5];
-
-/// A key with no modifier but `SHIFT`, which is how a terminal reports a capital: the keys the
-/// tab keeps fixed ahead of the resolver (replay's swallow, the parked request's digits, MOD-67
-/// M5 D5) match only these, so a chord passes exactly as the old CONTROL/ALT guard made it.
-fn plain(key: &KeyEvent) -> bool {
-    (key.modifiers - KeyModifiers::SHIFT).is_empty()
-}
 
 /// The live chat, once one has been accepted.
 #[derive(Debug, Clone)]
@@ -301,7 +294,7 @@ impl ChatTab {
             None => Handled::Pass,
         };
         if handled == Handled::Pass
-            && plain(&key)
+            && is_plain(&key)
             && matches!(
                 key.code,
                 KeyCode::Char('1'..='9' | 'i' | 'a') | KeyCode::Enter
@@ -557,8 +550,9 @@ impl Tab for ChatTab {
 
     /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer and the parked
     /// request's digits stay fixed ahead of the resolver (ANA-26 §6.1), and the replay's swallow
-    /// takes what the replay's own acts left (M5 R1 M1), each on plain keys only, so a chord
-    /// passes exactly as the old CONTROL/ALT guard made it.
+    /// takes what the replay's own acts left (M5 R1 M1), each on plain keys only
+    /// (`keys::is_plain`): a chord with any modifier but `SHIFT` passes them by, CONTROL and ALT
+    /// as under the old guard, and SUPER, HYPER and META too.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // A refusal is transient: it says what the last key could not do, and the next one clears
         // it whatever it was.
@@ -590,7 +584,7 @@ impl Tab for ChatTab {
         // A digit answers the parked request, and **every** digit is consumed while one is
         // waiting: a `4` with three options on screen must not fall through to the global
         // tab-select binding and move the user off the conversation the agent is blocked on.
-        if plain(&key)
+        if is_plain(&key)
             && let KeyCode::Char(digit @ '1'..='9') = key.code
             && self.transcript.parked().is_some()
         {
@@ -632,7 +626,7 @@ impl Tab for ChatTab {
         };
         // Any key but the end disarms it; a chord never did (the old guard returned before
         // this), so a rebound `[chat] end = "ctrl-e"` still arms on `ctrl-e`.
-        if first != Some(Act::ChatEnd) && plain(&key) {
+        if first != Some(Act::ChatEnd) && is_plain(&key) {
             self.cancel_armed = false;
         }
         handled
@@ -879,6 +873,7 @@ mod tests {
     use crate::store_worker::Origin;
     use crate::ui::Theme;
     use chrono::{TimeZone as _, Utc};
+    use crossterm::event::KeyModifiers;
     use htui_agent::event::{DriverEnvelope, DriverEvent, TextChunk};
     use htui_core::fixtures::ids;
     use htui_core::model::{

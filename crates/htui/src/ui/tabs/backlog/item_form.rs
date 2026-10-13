@@ -39,13 +39,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
-use super::filter::plain;
 use crate::editor::{
     EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
     without_controls,
 };
 use crate::item_writes::{ItemDivergence, ItemFormContext};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::settings::wrapped;
@@ -734,7 +733,7 @@ impl ItemForm {
     /// form then resolves (`Down`/`Up` are `form.next_field`/`prev_field` by default), so an
     /// `Alt+h` never picks.
     fn on_picker_key(&mut self, key: &KeyEvent) -> Option<ItemFormOutcome> {
-        if !plain(key) {
+        if !is_plain(key) {
             return None;
         }
         Some(match key.code {

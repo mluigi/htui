@@ -134,7 +134,8 @@ pub trait DetailTab {
     /// The stack of this sub-tab's current mode (MOD-67 M5 D4): what the Backlog tab resolves
     /// keys through and what the status line and `?` box show while it is the active pane. The
     /// default is Body's browse stack, [`views::BACKLOG_BODY`]: the pane's own verbs none, the
-    /// Backlog's and the list's all. A converted pane returns its mode's stack.
+    /// Backlog's and the list's all. A pane with modes or verbs of its own returns its mode's
+    /// stack.
     fn key_stack(&self) -> Stack<'static> {
         views::BACKLOG_BODY
     }

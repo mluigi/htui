@@ -85,7 +85,8 @@ const SKILLS_ASK: Layer = Layer::only(Context::Skills, &[Act::SkillsAskAgent]);
 /// `form ∩ {save, external_editor}`: a `TextArea` editor's chords.
 const FORM_EDITOR: Layer = Layer::only(Context::Form, &[Act::FormSave, Act::FormExternalEditor]);
 
-/// `form ∩ {next_field, prev_field, save}`: a multi-field form that saves on a chord.
+/// `form ∩ {next_field, prev_field, save}`: a multi-field form that saves on a chord. Despite
+/// the name, three of the four `form` acts (no `external_editor`); [`FORM`] holds all four.
 const FORM_ALL: Layer = Layer::only(
     Context::Form,
     &[Act::FormNextField, Act::FormPrevField, Act::FormSave],
@@ -125,6 +126,7 @@ const LIST_ALL: Layer = Layer::all(Context::List);
 const NO: Layer = Layer::only(Context::Confirm, &[Act::ConfirmNo]);
 
 /// Every `form` act: a multi-field form with a `TextArea` (the item form, the Docs compose area).
+/// All four, `external_editor` included; [`FORM_ALL`] is the three without it (renamed in M6).
 const FORM: Layer = Layer::all(Context::Form);
 
 /// The Settings tab while its section has no stack of its own: section cycling, then global

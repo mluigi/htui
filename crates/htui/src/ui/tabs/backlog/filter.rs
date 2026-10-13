@@ -14,14 +14,14 @@
 //! (`backlog.filter_form.clear`); an option row's value keys (`h`/`l`/arrows, Space) and its
 //! `Enter`/`Esc` are the form's own, plain keys only.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use htui_core::model::{ItemFilter, ProjectId, ProjectRef, Scope, Status, declared_tags_from_text};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, is_plain, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -48,15 +48,6 @@ pub const HINT_TAGS: HintSpec = &[
 
 /// Width of a row's label column, after the two-cell focus marker.
 const LABEL: usize = 8;
-
-/// The modifiers that make a key a chord aimed elsewhere, not a form key (MOD-13 review L4):
-/// every one but `SHIFT`, which is how a terminal reports a capital. The rule
-/// [`TextField::on_key`] applies, so the form and its tag field agree on what a chord is.
-const CHORD: KeyModifiers = KeyModifiers::CONTROL
-    .union(KeyModifiers::ALT)
-    .union(KeyModifiers::SUPER)
-    .union(KeyModifiers::META)
-    .union(KeyModifiers::HYPER);
 
 /// `declared_tags_from_text`'s refusal, worded for this form (MOD-13 review N2). The rule is the
 /// declared-tag rule (D3), but these are the tags an item *requires*, so the sentence names a
@@ -242,22 +233,21 @@ impl FilterForm {
     /// Feeds one key, resolved through [`views::BACKLOG_FILTER`] (MOD-67 M5).
     ///
     /// On the Tags row every plain character is text (blueprint E7): the field takes the key
-    /// first, and what it passes moves the row on `form.next_field`/`prev_field` (`Tab`/`Down`,
-    /// `BackTab`/`Up`). On the other rows the form's own plain keys come first (`Enter` applies,
+    /// first, and what it passes resolves as on any row, so the row moves on
+    /// `form.next_field`/`prev_field` (`Tab`/`Down`, `BackTab`/`Up`). On the other rows the form's own plain keys come first (`Enter` applies,
     /// `Esc` cancels, `h`/`l`/arrows move the option, Space ticks it), then the acts:
     /// `backlog.filter_form.next_row`/`prev_row` (`j`/`k`) and the field moves, and
     /// `backlog.filter_form.clear` (`x`). Anything else is [`FormOutcome::Pass`]: a chord is never
     /// a form key (MOD-13 review L4), so `Alt+x` clears nothing.
     pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
-        let tags = self.row == FilterRow::Tags;
-        if tags {
+        if self.row == FilterRow::Tags {
             match self.tags.on_key(key) {
                 FieldOutcome::Submit => return self.apply(),
                 FieldOutcome::Cancel => return FormOutcome::Cancel,
                 FieldOutcome::Consumed => return FormOutcome::Stay,
                 FieldOutcome::Pass => {}
             }
-        } else if plain(&key) {
+        } else if is_plain(&key) {
             match key.code {
                 KeyCode::Enter => return self.apply(),
                 KeyCode::Esc => return FormOutcome::Cancel,
@@ -271,11 +261,11 @@ impl FilterForm {
             match act {
                 Act::FormNextField => self.move_row(1),
                 Act::FormPrevField => self.move_row(-1),
-                // On the Tags row the letters are text; a rebound row or clear chord the field
-                // passed still does nothing there, as today's `j`/`k`/`x`.
-                Act::FilterNextRow if !tags => self.move_row(1),
-                Act::FilterPrevRow if !tags => self.move_row(-1),
-                Act::FilterClear if !tags => {
+                // On the Tags row the field took every printable key above (`j`/`k`/`x` are
+                // text there); a chord it passed acts on every row (M5 R1).
+                Act::FilterNextRow => self.move_row(1),
+                Act::FilterPrevRow => self.move_row(-1),
+                Act::FilterClear => {
                     self.draft = BacklogFilter::default();
                     self.tags.clear();
                 }
@@ -416,13 +406,6 @@ impl FilterForm {
     }
 }
 
-/// Whether `key` carries no modifier but `SHIFT` (how a terminal reports a capital): the filter's
-/// option rows and the item form's pickers match their fixed value keys on plain keys only, so
-/// `Alt+l` moves no option (MOD-67 M5 D12).
-pub(super) fn plain(key: &KeyEvent) -> bool {
-    !key.modifiers.intersects(CHORD)
-}
-
 /// Adds `value` when absent, removes it when present.
 fn toggle<T: PartialEq>(values: &mut Vec<T>, value: T) {
     if let Some(at) = values.iter().position(|held| *held == value) {
@@ -473,6 +456,7 @@ mod tests {
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
+    use crossterm::event::KeyModifiers;
     use htui_core::fixtures::ids;
     use htui_core::model::WorkspaceId;
     use ratatui::layout::Rect;
@@ -515,6 +499,28 @@ mod tests {
 
     fn open() -> FilterForm {
         FilterForm::open(&BacklogFilter::default(), &projects())
+    }
+
+    /// MOD-67 M5 R1 NIT 4: a rebound row or clear chord the tag field passes works on the Tags row
+    /// as on the others; a printable one is the field's text (and, onto an option row's key,
+    /// refused by the validator).
+    #[test]
+    fn a_rebound_clear_the_tag_field_passes_clears_on_the_tags_row() {
+        let keys = crate::keys::load_str("[backlog.filter_form]\nclear = \"f2\"\n")
+            .expect("the keys load");
+        let filter = BacklogFilter {
+            statuses: vec![Status::Open],
+            ..BacklogFilter::default()
+        };
+        let mut form = FilterForm::open(&filter, &projects());
+        form.on_key(key(KeyCode::Tab), &keys);
+        form.on_key(key(KeyCode::Tab), &keys);
+        assert_eq!(form.row(), FilterRow::Tags);
+        assert_eq!(form.on_key(key(KeyCode::F(2)), &keys), FormOutcome::Stay);
+        assert_eq!(
+            form.on_key(key(KeyCode::Enter), &keys),
+            FormOutcome::Apply(BacklogFilter::default())
+        );
     }
 
     /// MOD-13 D5: no filter reads exactly what the tab read before MOD-13.

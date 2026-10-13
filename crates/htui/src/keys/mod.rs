@@ -305,6 +305,14 @@ impl Keys {
     }
 }
 
+/// Whether `key` carries no modifier but `SHIFT`, which is how a terminal reports a capital. The
+/// keys a view keeps fixed ahead of the resolver (ANA-26 §6.1, MOD-67 M5 D5: a choice's value
+/// keys, the permission digits, the Chat replay's swallow) match only such a key, so a chord with
+/// CONTROL, ALT, SUPER, HYPER or META passes on to the resolver.
+pub(crate) fn is_plain(key: &crossterm::event::KeyEvent) -> bool {
+    (key.modifiers - crossterm::event::KeyModifiers::SHIFT).is_empty()
+}
+
 /// `text` as a TOML basic string: wrapped in `"`, with `\` and `"` escaped and every control
 /// character as `\uXXXX`. The error report and `--print-keys` both spell chords with it.
 fn quote(text: &str) -> String {
@@ -336,6 +344,29 @@ mod tests {
                 })
             })
             .collect()
+    }
+
+    /// MOD-67 M5 R1 NIT: `SHIFT` alone is how a terminal reports a capital, so a shifted key is
+    /// plain; any other modifier makes a chord.
+    #[test]
+    fn is_plain_admits_shift_alone() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let with = |modifiers| super::is_plain(&KeyEvent::new(KeyCode::Char('l'), modifiers));
+        assert!(with(KeyModifiers::NONE));
+        assert!(with(KeyModifiers::SHIFT));
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::HYPER,
+            KeyModifiers::META,
+        ] {
+            assert!(!with(modifier), "{modifier:?}");
+            assert!(
+                !with(modifier | KeyModifiers::SHIFT),
+                "{modifier:?} + SHIFT"
+            );
+        }
     }
 
     #[test]
