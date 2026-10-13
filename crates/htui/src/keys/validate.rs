@@ -91,7 +91,9 @@ fn abort_gives_way(entry: &Row, default: &Row) -> bool {
 /// bound to a key its view keeps fixed ([`FIXED`], MOD-67 M5 R1 M1). [`give_way`] ran first, so
 /// a default that gave its chord away (the abort's to a global entry, M2 R1 M-1) is no
 /// collision; a focus chord shared with anything, and an `[editor] abort` entry on a global
-/// default, still are. A pair and chord seen by two passes is reported once. A
+/// default, still are. A pair and chord seen by two passes is reported once, and a line's chord
+/// the fixed pass would repeat after a collision or capture error is not reported again (MOD-67
+/// M6 D6). A
 /// [`STATE_GUARDED`] pair may share a chord only when it is a catalogue default of both
 /// actions (PA-2), and so may a
 /// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
@@ -111,6 +113,7 @@ fn check(
         keys,
         guarded,
         reported: Vec::new(),
+        said: Vec::new(),
         errors: Vec::new(),
     };
     for (i, first) in keys.rows.iter().enumerate() {
@@ -179,10 +182,12 @@ fn check(
         {
             continue; // a derived row's chords are its shared row's, reported there
         }
-        for chord in row.chords.iter().filter(|chord| chord.is_printable()) {
+        for &chord in row.chords.iter().filter(|chord| chord.is_printable()) {
             let shown = quote(&chord.spec());
+            let line = row.line.unwrap_or(0);
+            check.said.push((line, chord));
             check.errors.push(KeyFileError {
-                line: row.line.unwrap_or(0),
+                line,
                 message: format!(
                     "{} = {shown}: {shown} is typed text while a field captures: bind a ctrl or \
                      alt chord or a named key",
@@ -227,6 +232,9 @@ struct Check<'k> {
     guarded: &'k [(Act, Act)],
     /// `((context, act), (context, act), chord)` of every reported collision, by source row.
     reported: Vec<(Slot, Slot, KeyChord)>,
+    /// `(line, chord)` of every collision and capture error, so the fixed pass, which runs last,
+    /// does not report a line's chord again (MOD-67 M6 D6, PA-13).
+    said: Vec<(usize, KeyChord)>,
     errors: Vec<KeyFileError>,
 }
 
@@ -234,7 +242,8 @@ impl Check<'_> {
     /// The fixed-key pass (MOD-67 M5 R1 M1): every act a [`Fixed`] entry's stack resolves on one
     /// of its keys or on a named key's SHIFT form, in the layers the keys shadow, unless the
     /// entry shadows that act by design.
-    /// A row and chord are reported once, naming the first stack, on the row's [`source`].
+    /// A row and chord are reported once, naming the first stack, on the row's [`source`]; a
+    /// line's chord an earlier pass reported is skipped (MOD-67 M6 D6: the first pass wins).
     fn fixed(&mut self, table: &[Fixed]) {
         let mut seen: Vec<(Slot, KeyChord)> = Vec::new();
         for entry in table {
@@ -266,13 +275,17 @@ impl Check<'_> {
                     };
                     let row = source(self.keys, row);
                     let slot = (row.context, row.act);
-                    if index < first || seen.contains(&(slot, chord)) {
+                    let line = row.line.or(row.entry).unwrap_or(0);
+                    if index < first
+                        || seen.contains(&(slot, chord))
+                        || self.said.contains(&(line, chord))
+                    {
                         continue;
                     }
                     seen.push((slot, chord));
                     let shown = quote(&chord.spec());
                     self.errors.push(KeyFileError {
-                        line: row.line.or(row.entry).unwrap_or(0),
+                        line,
                         message: format!("{} = {shown}: {shown} is fixed {phrase}", subject(row)),
                     });
                 }
@@ -312,8 +325,10 @@ impl Check<'_> {
             .map_or_else(|| "default".to_owned(), |line| format!("line {line}"));
         let shown = quote(&chord.spec());
         let other_name = other.act.spec().map_or("", |spec| spec.name);
+        let line = reported_source.line.or(reported_source.entry).unwrap_or(0);
+        self.said.push((line, chord));
         self.errors.push(KeyFileError {
-            line: reported_source.line.or(reported_source.entry).unwrap_or(0),
+            line,
             message: format!(
                 "{} = {shown}: {shown} is already {}.{other_name} ({origin}) {place}",
                 subject(reported_source),
@@ -998,6 +1013,36 @@ mod tests {
         assert_eq!(
             errors("[global]\nselect_tab_1 = [\"2\"]\nselect_tab_2 = [\"1\"]\n"),
             []
+        );
+    }
+
+    /// MOD-67 M6 D6 (PA-13): a line's chord that collides and is also fixed in the same stack
+    /// is reported once, by the collision; the fixed pass does not repeat it.
+    #[test]
+    fn a_line_both_colliding_and_fixed_is_reported_once() {
+        assert_eq!(
+            errors("version = 1\n[backlog.runs]\napprove = [\"a\", \"1\"]\n"),
+            one(
+                3,
+                r#"[backlog.runs] approve = "1": "1" is already global.select_tab_1 (default) in Backlog > Runs"#
+            )
+        );
+    }
+
+    /// MOD-67 M6 D9 low 2 (PA-2): a view row the file pins to its compiled derivation while its
+    /// shared row moves is the user's line, so a collision with it names that line, not the
+    /// shared row's.
+    #[test]
+    fn a_collision_names_a_pinned_view_rows_own_line() {
+        assert_eq!(
+            errors(
+                "version = 1\n[form]\nnext_field = [\"ctrl-n\"]\n[settings.agents]\n\
+                 next_field = [\"tab\", \"down\"]\nprev_field = [\"down\"]\n"
+            ),
+            one(
+                6,
+                r#"[settings.agents] prev_field = "down": "down" is already settings.agents.next_field (line 5) in the Agents form"#
+            )
         );
     }
 

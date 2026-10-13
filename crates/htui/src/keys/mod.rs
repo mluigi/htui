@@ -151,8 +151,9 @@ impl Keys {
 
     /// Re-derives every `VIEW_DEFAULTS` row from the shared row in force (MOD-67 M3 PA-1): the
     /// shared row's chords, then each extra chord not already among them. A row the key file set
-    /// (`set_by_file`) keeps its chords, and loses its line when they equal the derivation, so
-    /// a printed file reads back unmarked.
+    /// (`set_by_file`) keeps its chords, keeps the line of its entry while they differ from the
+    /// derivation and loses it when they equal it, so a printed file reads back unmarked and a
+    /// pinned row stays marked.
     fn derive(&mut self, set_by_file: &[(Context, Act)]) {
         for index in 0..self.rows.len() {
             let Some(extra) = self.rows[index].extra.as_deref() else {
@@ -170,9 +171,9 @@ impl Keys {
             }
             let row = &mut self.rows[index];
             if set_by_file.contains(&(row.context, row.act)) {
-                if row.chords == derived {
-                    row.line = None;
-                }
+                // MOD-67 M6 D9: a row the file pins keeps its line while it differs from the
+                // derivation in force, even when it equals the compiled one.
+                row.line = (row.chords != derived).then_some(row.entry).flatten();
             } else {
                 row.chords = derived;
             }
@@ -480,6 +481,24 @@ mod tests {
             keys.chords(Context::SettingsSecrets, Act::FormNextField),
             chords(&["down"])
         );
+    }
+
+    /// MOD-67 M6 D9 (PA-2): a view row the file pins keeps its line while it differs from the
+    /// derivation in force, even when it equals the compiled one; alone, it is no change.
+    #[test]
+    fn a_pinned_view_row_keeps_its_line_while_the_shared_row_moves() {
+        let keys = super::load_str(
+            "version = 1\n[form]\nnext_field = [\"ctrl-n\"]\n[settings.agents]\n\
+             next_field = [\"tab\", \"down\"]\n",
+        )
+        .expect("the file loads");
+        assert_eq!(
+            keys.line(Context::SettingsAgents, Act::FormNextField),
+            Some(5)
+        );
+        let keys = super::load_str("[settings.agents]\nnext_field = [\"tab\", \"down\"]\n")
+            .expect("the file loads");
+        assert_eq!(keys.line(Context::SettingsAgents, Act::FormNextField), None);
     }
 
     #[test]
