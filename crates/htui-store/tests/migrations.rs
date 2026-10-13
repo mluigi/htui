@@ -99,7 +99,9 @@ async fn migrations_apply_on_a_clean_database() {
     assert_eq!(applied, embedded, "every embedded migration is applied");
     assert_eq!(
         applied,
-        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+        vec![
+            1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18
+        ],
         "0001_init.sql, MOD-2 milestone 5's 0002_agent_probe.sql, MOD-4 milestone 1's \
          0003_orchestration.sql, MOD-4 milestone 4's 0004_max_agents_per_run_default.sql, \
          MOD-7 milestone 1's 0005_box_identity.sql, MOD-38's 0006_requirements.sql, MOD-9 \
@@ -107,7 +109,8 @@ async fn migrations_apply_on_a_clean_database() {
          MOD-23's 0009_agent_box_user_off.sql, MOD-33's 0010_prompt_digest_undigested.sql, \
          MOD-42's 0011_permission_relay.sql, MOD-26's 0012_persona.sql, MOD-26 milestone 2's \
          0013_persona_phase_index.sql, MOD-37 milestone 5's 0014_run_step_opening.sql, \
-         MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql and MOD-70's 0017_follow_up.sql, in ordinal order"
+         MOD-11's 0015_command_queue.sql, MOD-12's 0016_auto_queue.sql, MOD-70's 0017_follow_up.sql \
+         and MOD-96's 0018_seed_permission_mode.sql, in ordinal order"
     );
 
     let present: BTreeSet<String> = sqlx::query_scalar(
@@ -1094,6 +1097,207 @@ async fn the_0004_bump_moves_only_an_untouched_six() {
     db.drop_db().await;
 }
 
+/// The `claude-cli` row's one agent rule after MOD-96 (D5, Q2), byte for byte as
+/// `agent_claude_cli.json` and `0018_seed_permission_mode.sql` spell it.
+fn edit_rule() -> serde_json::Value {
+    json!({"match": {"tool_kind": "edit"}, "answer": "allow_once",
+           "reason": "edits are allowed and recorded by htui (MOD-96); a persona rule can refuse them"})
+}
+
+/// The pre-MOD-96 `agent_claude_cli.json` `settings`, verbatim: what a box seeded before 0018
+/// holds.
+fn old_cli_settings() -> serde_json::Value {
+    json!({
+        "cli": { "stream": "claude_stream_json", "permission_mode": "acceptEdits",
+                 "extra_args": [] },
+        "permission": { "default": "ask", "rules": [], "remembered": [] },
+        "quota": { "source": "cli_rate_limit_event" },
+        "usage": { "scope": "model_usage" }
+    })
+}
+
+/// The pre-MOD-96 `agent_claude.json` `settings`, verbatim.
+fn old_acp_settings() -> serde_json::Value {
+    json!({
+        "acp": { "protocol_version": 1,
+                 "client_capabilities": { "fs_read": true, "fs_write": true, "terminal": false,
+                                          "elicitation": false },
+                 "model_config_id": null,
+                 "session": { "load": true, "resume": true } },
+        "permission": { "default": "ask", "rules": [], "remembered": [] },
+        "quota": { "source": "acp_meta_rate_limit" },
+        "usage": { "scope": "model_usage" }
+    })
+}
+
+/// The fixed instant every 0018 case inserts its rows at, so the trigger's bump is visible.
+fn at_2026() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+        .expect("a literal RFC-3339 timestamp")
+        .with_timezone(&chrono::Utc)
+}
+
+/// Inserts one `agent` row by hand (unchecked `sqlx::query`: no `.sqlx` entry), at `at`.
+async fn insert_agent(
+    pool: &sqlx::PgPool,
+    name: &str,
+    transport: &str,
+    settings: serde_json::Value,
+    at: chrono::DateTime<chrono::Utc>,
+) {
+    sqlx::query(
+        "INSERT INTO agent (name, transport, launch, billing, settings, created_at, updated_at) \
+         VALUES ($1, $2, '{}'::jsonb, 'subscription', $3, $4, $4)",
+    )
+    .bind(name)
+    .bind(transport)
+    .bind(settings)
+    .bind(at)
+    .execute(pool)
+    .await
+    .unwrap_or_else(|err| panic!("insert agent `{name}`: {err}"));
+}
+
+/// Every `agent` row's `name`, `settings` and `updated_at`, by name.
+async fn agent_rows(
+    pool: &sqlx::PgPool,
+) -> Vec<(String, serde_json::Value, chrono::DateTime<chrono::Utc>)> {
+    sqlx::query_as("SELECT name, settings, updated_at FROM agent ORDER BY name")
+        .fetch_all(pool)
+        .await
+        .expect("read agent rows")
+}
+
+/// Runs 0018's SQL a second time, outside the migrator (which would refuse to re-apply it).
+async fn rerun_0018(pool: &sqlx::PgPool) {
+    let sql = MIGRATOR
+        .iter()
+        .find(|m| m.version == 18)
+        .expect("0018 is embedded")
+        .sql
+        .as_str()
+        .to_owned();
+    sqlx::raw_sql(sqlx::AssertSqlSafe(sql))
+        .execute(pool)
+        .await
+        .expect("0018 runs again");
+}
+
+/// MOD-96 D5, D6 (Q3 = b): `0018_seed_permission_mode.sql` moves a box seeded before MOD-96 onto
+/// the new seed values — `claude-cli` from `acceptEdits` to `default` plus the edit rule, `claude`
+/// gains `acp.permission_mode: "default"` — and touches nothing else in either row. The trigger
+/// bumps `updated_at` (the migration never sets it), and a second run matches nothing.
+///
+/// Staged at v17 through [`MIGRATOR`] so the rows exist before 0018 runs, as on a real box; the
+/// plain `run` afterwards applies 0018 alone and no seed pass runs.
+#[tokio::test]
+async fn migration_0018_rewrites_the_old_seed_rows_once() {
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(17, &db.pool)
+        .await
+        .expect("apply 0001 through 0017");
+    let at = at_2026();
+    insert_agent(&db.pool, "claude-cli", "cli", old_cli_settings(), at).await;
+    insert_agent(&db.pool, "claude", "acp", old_acp_settings(), at).await;
+
+    MIGRATOR.run(&db.pool).await.expect("apply 0018");
+
+    let mut expected_cli = old_cli_settings();
+    expected_cli["cli"]["permission_mode"] = json!("default");
+    expected_cli["permission"]["rules"] = json!([edit_rule()]);
+    let mut expected_acp = old_acp_settings();
+    expected_acp["acp"]["permission_mode"] = json!("default");
+
+    let after = agent_rows(&db.pool).await;
+    assert_eq!(after.len(), 2, "{after:?}");
+    let (claude, claude_cli) = (&after[0], &after[1]);
+    assert_eq!(claude.0, "claude");
+    assert_eq!(claude_cli.0, "claude-cli");
+    assert_eq!(
+        claude_cli.1, expected_cli,
+        "claude-cli runs in `default` and allows edits by its one rule; every other key is as seeded"
+    );
+    assert_eq!(
+        claude.1, expected_acp,
+        "claude pins `default`; every other key is as seeded"
+    );
+    assert!(
+        claude_cli.2 > at,
+        "the trigger bumps claude-cli's updated_at"
+    );
+    assert!(claude.2 > at, "the trigger bumps claude's updated_at");
+
+    rerun_0018(&db.pool).await;
+    assert_eq!(
+        agent_rows(&db.pool).await,
+        after,
+        "a second run matches nothing: settings and updated_at are unchanged"
+    );
+
+    db.drop_db().await;
+}
+
+/// MOD-96 B6: 0018 is name-, transport- and value-keyed, and strict. An operator's edit (a custom
+/// rule, another mode), a missing key (no `acp` object) and another row holding the old values
+/// under another name are all left alone, `updated_at` included.
+#[tokio::test]
+async fn migration_0018_leaves_edited_and_other_rows_alone() {
+    let at = at_2026();
+
+    // World 1: edited seed rows, and the old values under other names.
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(17, &db.pool)
+        .await
+        .expect("apply 0001 through 0017");
+    let mut custom_rule = old_cli_settings();
+    custom_rule["permission"]["rules"] = json!([{
+        "match": {"command_prefix": "git push"}, "answer": "reject_once", "reason": "mine"
+    }]);
+    insert_agent(&db.pool, "claude-cli", "cli", custom_rule, at).await;
+    let mut plan_mode = old_acp_settings();
+    plan_mode["acp"]["permission_mode"] = json!("plan");
+    insert_agent(&db.pool, "claude", "acp", plan_mode, at).await;
+    insert_agent(&db.pool, "my-cli", "cli", old_cli_settings(), at).await;
+    insert_agent(&db.pool, "agy", "acp", old_acp_settings(), at).await;
+
+    let before = agent_rows(&db.pool).await;
+    MIGRATOR.run(&db.pool).await.expect("apply 0018");
+    assert_eq!(
+        agent_rows(&db.pool).await,
+        before,
+        "an edited seed row and another name's old values are left alone"
+    );
+    db.drop_db().await;
+
+    // World 2: another CLI mode with no rules, and a `claude` row with no `acp` object at all.
+    let Some(db) = common::bare_db().await else {
+        return;
+    };
+    MIGRATOR
+        .run_to(17, &db.pool)
+        .await
+        .expect("apply 0001 through 0017");
+    let mut other_mode = old_cli_settings();
+    other_mode["cli"]["permission_mode"] = json!("plan");
+    insert_agent(&db.pool, "claude-cli", "cli", other_mode, at).await;
+    insert_agent(&db.pool, "claude", "acp", json!({}), at).await;
+
+    let before = agent_rows(&db.pool).await;
+    MIGRATOR.run(&db.pool).await.expect("apply 0018");
+    assert_eq!(
+        agent_rows(&db.pool).await,
+        before,
+        "a mode that is not `acceptEdits` and a missing `acp` object are left alone"
+    );
+    db.drop_db().await;
+}
+
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the
 /// `created_by` the caller names. Returns `(project, kind)`; the kind's prefix is `RES`.
 async fn plant_item_kind(pool: &sqlx::PgPool, user: uuid::Uuid) -> (uuid::Uuid, uuid::Uuid) {
@@ -1278,8 +1482,8 @@ async fn connect_reports_pending_on_a_bare_database() {
 
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(17),
-        "seventeen embedded migrations, none applied (through MOD-70's 0017_follow_up.sql)"
+        MigrationState::Pending(18),
+        "eighteen embedded migrations, none applied (through MOD-96's 0018_seed_permission_mode.sql)"
     );
 
     db.drop_db().await;
@@ -1379,8 +1583,8 @@ async fn a_headless_connect_never_migrates() {
     };
     assert_eq!(
         db.migrations_at_connect,
-        MigrationState::Pending(17),
-        "seventeen embedded migrations, through MOD-70's 0017_follow_up.sql"
+        MigrationState::Pending(18),
+        "eighteen embedded migrations, through MOD-96's 0018_seed_permission_mode.sql"
     );
 
     let refused = PgStore::connect_headless(&db.url, &db.identity, HEADLESS_WAIT, PoolSize::TUI)
@@ -1388,8 +1592,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("a pending schema is refused");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(17),
-        "every one of the seventeen, through MOD-70's 0017_follow_up.sql, is pending"
+        HeadlessError::MigrationsPending(18),
+        "every one of the eighteen, through MOD-96's 0018_seed_permission_mode.sql, is pending"
     );
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
@@ -1411,8 +1615,8 @@ async fn a_headless_connect_never_migrates() {
         .expect_err("no migrations table is every migration pending");
     assert_eq!(
         refused,
-        HeadlessError::MigrationsPending(17),
-        "every one of the seventeen, through MOD-70's 0017_follow_up.sql, is pending"
+        HeadlessError::MigrationsPending(18),
+        "every one of the eighteen, through MOD-96's 0018_seed_permission_mode.sql, is pending"
     );
     let absent: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NULL")
         .fetch_one(&db.pool)
@@ -1563,9 +1767,9 @@ async fn applying_migrations_raises_the_target_and_never_lowers_it() {
 
     assert_eq!(
         common::count(&db.pool, "_sqlx_migrations").await,
-        17,
-        "the later applies migrate nothing: the seventeen embedded migrations (through MOD-70's \
-         0017_follow_up.sql) are applied once"
+        18,
+        "the later applies migrate nothing: the eighteen embedded migrations (through MOD-96's \
+         0018_seed_permission_mode.sql) are applied once"
     );
 
     db.drop_db().await;

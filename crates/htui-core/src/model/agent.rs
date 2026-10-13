@@ -242,6 +242,12 @@ mod tests {
         assert!(rows[0].models.is_empty(), "claude");
         assert_eq!(rows[0].default_model, None, "claude");
         assert_eq!(rows[0].settings["acp"]["model_config_id"], Value::Null);
+        // MOD-96 D6: `claude` pins its ACP session mode; `agy` pins nothing.
+        assert_eq!(rows[0].settings["acp"]["permission_mode"], "default");
+        assert!(
+            rows[1].settings["acp"].get("permission_mode").is_none(),
+            "agy pins nothing"
+        );
 
         // `agy`'s list *is* a live capture (plan D64, MOD-2 T34): `antigravity-acp` 1.1.1 answered
         // `session/new` with a `configOptions` entry `id: "model"` carrying these eleven values
@@ -296,7 +302,13 @@ mod tests {
             Some(1),
         );
         assert_eq!(rows[2].settings["cli"]["stream"], "claude_stream_json");
-        assert_eq!(rows[2].settings["cli"]["permission_mode"], "acceptEdits");
+        assert_eq!(rows[2].settings["cli"]["permission_mode"], "default");
+        // MOD-96 D5 (Q2): edits proceed through htui's policy, recorded, instead of `acceptEdits`.
+        assert_eq!(
+            rows[2].settings["permission"]["rules"],
+            serde_json::json!([{"match": {"tool_kind": "edit"}, "answer": "allow_once",
+             "reason": "edits are allowed and recorded by htui (MOD-96); a persona rule can refuse them"}])
+        );
         // Empty, not `["--bare"]` (plan D92): that flag makes authentication strictly an API key
         // or an `apiKeyHelper` and never reads the login this row is billed against, so a
         // `subscription` row that passed it would contradict itself.

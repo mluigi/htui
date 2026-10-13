@@ -417,6 +417,106 @@ fn acp_permission_mode_is_read_and_round_trips() {
     assert_eq!(reparsed.acp.permission_mode.as_deref(), Some("default"));
 }
 
+/// The one agent rule the `claude-cli` seed carries (MOD-96 D5, Q2), as the seed JSON and
+/// `0018_seed_permission_mode.sql` spell it.
+const EDIT_RULE_REASON: &str =
+    "edits are allowed and recorded by htui (MOD-96); a persona rule can refuse them";
+
+/// MOD-96 D5, D6: the seeded rows, parsed as the driver parses them. `claude-cli` runs in
+/// `default` and lets edits through by its own rule instead of `acceptEdits`, so an edit is
+/// answered by policy (and recorded) while a shell command still asks; `claude` pins its ACP
+/// session mode to `default`; `agy` pins nothing. Parsing the rows as [`AgentSettings`] is what
+/// proves the wire names (`match`, `allow_once`, `acp.permission_mode`).
+#[test]
+fn the_seeded_rows_pin_the_mode_and_allow_edits_by_policy() {
+    use htui_agent::driver::{PermissionMatch, PermissionRule};
+    use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent, ToolKind};
+    use htui_agent::permission::{PolicyStage, evaluate};
+
+    let rows = htui_core::model::agent::seed_rows(
+        chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp"),
+    );
+    let settings_of = |name: &str| -> AgentSettings {
+        let row = rows
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("the seed rows carry `{name}`"));
+        serde_json::from_value(row.settings.clone())
+            .unwrap_or_else(|err| panic!("`{name}`'s settings parse: {err}"))
+    };
+
+    let cli_row = settings_of("claude-cli");
+    let cli = cli_row
+        .cli
+        .as_ref()
+        .expect("claude-cli carries a cli block");
+    assert_eq!(cli.permission_mode, "default");
+    assert_eq!(
+        cli_row.permission.rules,
+        [PermissionRule {
+            matcher: PermissionMatch {
+                tool_kind: Some("edit".to_owned()),
+                ..PermissionMatch::default()
+            },
+            answer: PermissionOptionKind::AllowOnce,
+            reason: EDIT_RULE_REASON.to_owned(),
+        }]
+    );
+
+    // The CLI prompt's two options (`cli/mod.rs`): allow once, reject once.
+    let options = [
+        PermissionOption {
+            id: "allow".to_owned(),
+            label: "Allow".to_owned(),
+            kind: PermissionOptionKind::AllowOnce,
+        },
+        PermissionOption {
+            id: "deny".to_owned(),
+            label: "Deny".to_owned(),
+            kind: PermissionOptionKind::RejectOnce,
+        },
+    ];
+    let call = |kind: ToolKind, title: &str| ToolCallEvent {
+        tool_call_id: "call-1".to_owned(),
+        title: title.to_owned(),
+        tool_kind: kind,
+        input: serde_json::json!({}),
+        locations: Vec::new(),
+    };
+
+    let edit = evaluate(
+        &cli_row.permission,
+        Some(&call(ToolKind::Edit, "Edit")),
+        &options,
+    )
+    .expect("an edit is answered by the seeded rule");
+    assert_eq!(edit.option_id, "allow");
+    assert_eq!(edit.kind, PermissionOptionKind::AllowOnce);
+    assert_eq!(edit.stage, PolicyStage::Rule);
+    assert_eq!(edit.reason, EDIT_RULE_REASON);
+
+    assert_eq!(
+        evaluate(
+            &cli_row.permission,
+            Some(&call(ToolKind::Execute, "Bash")),
+            &options
+        ),
+        None,
+        "a shell command still asks"
+    );
+
+    assert_eq!(
+        settings_of("claude").acp.permission_mode.as_deref(),
+        Some("default"),
+        "claude pins its ACP session mode"
+    );
+    assert_eq!(
+        settings_of("agy").acp.permission_mode,
+        None,
+        "agy pins nothing"
+    );
+}
+
 #[test]
 fn resolve_substitutes_command_args_and_env() {
     let launch: AgentLaunch = serde_json::from_str(CLAUDE_LAUNCH).expect("claude launch parses");
