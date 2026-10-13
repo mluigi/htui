@@ -822,6 +822,10 @@ impl SettingsSection for BoxesSection {
         }
     }
 
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let theme = ctx.theme;
         let notice = self
@@ -829,9 +833,9 @@ impl SettingsSection for BoxesSection {
             .as_deref()
             .map(|text| wrapped(text, usize::from(area.width).max(1)))
             .unwrap_or_default();
-        let [body, hint, notice_area] = Layout::vertical([
+        // MOD-67 M6 T2: the keys row went to the shell's hint row; the body gains it.
+        let [body, notice_area] = Layout::vertical([
             Constraint::Min(3),
-            Constraint::Length(1),
             Constraint::Length(u16::try_from(notice.len()).unwrap_or(u16::MAX)),
         ])
         .areas(area);
@@ -894,10 +898,6 @@ impl SettingsSection for BoxesSection {
             }
         }
 
-        frame.render_widget(
-            Paragraph::new(Line::styled(self.hint_text(ctx.keys()), theme.dim)),
-            hint,
-        );
         if let Some(text) = &self.notice {
             let style = if is_error(text) {
                 theme.error

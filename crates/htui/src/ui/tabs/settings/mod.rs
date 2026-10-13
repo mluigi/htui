@@ -114,6 +114,12 @@ pub(crate) fn asked(question: &str, answers: &str) -> String {
     }
 }
 
+/// A section's keys as the shell's hint row draws them (MOD-67 M6 T2): `theme.dim`, `None` when
+/// no key of the spec is bound.
+pub(crate) fn key_line(text: String, theme: &Theme) -> Option<Line<'static>> {
+    (!text.is_empty()).then(|| Line::styled(text, theme.dim))
+}
+
 /// `text` in rows of at most `width` cells, its whitespace collapsed: words joined by one space,
 /// a word wider than `width` broken by grapheme (MOD-60 D5, OQ-1) and the next word joining its
 /// last piece when it fits (B7); a control character draws as one blank cell (D3). Text with no
@@ -211,6 +217,11 @@ pub trait SettingsSection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws below the section strip.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
+    /// The keys half of this section's hint (its mode's spec through its stack, plus what a write
+    /// in flight adds), for the shell's row (MOD-67 M6 T2). Defaulted to `None`.
+    fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
+        None
+    }
 }
 
 /// The registered sections, in strip order, plus which one is active.
@@ -434,6 +445,13 @@ impl Tab for SettingsTab {
     /// already been handed whatever the tab was handed.
     fn focus_section(&mut self, section: SectionId) -> bool {
         self.sections.focus(section)
+    }
+
+    /// The active section's keys (MOD-67 M6 T2).
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        self.sections
+            .active()
+            .and_then(|section| section.key_hint(ctx.keys(), ctx.theme))
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {

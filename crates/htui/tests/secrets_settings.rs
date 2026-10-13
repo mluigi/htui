@@ -2494,7 +2494,7 @@ async fn a_refused_read_is_unavailable_and_r_recovers() {
         shown.contains("secret settings are unavailable: keyring task failed: boom"),
         "{shown}"
     );
-    assert_eq!(shown.lines().last(), Some("r reload"));
+    assert_eq!(bench.key_hint(&section), "r reload");
 
     bench.key(&mut section, "r");
     assert_eq!(requests(&bench).len(), 2);
@@ -2584,7 +2584,12 @@ async fn a_read_sent_before_a_write_is_not_its_answer() {
     bench.reply(&mut section, &configured());
     let shown = frame(&bench, &section);
     assert!(!shown.contains("identity stored"), "{shown}");
-    assert!(shown.contains("set_machine_identity in flight"), "{shown}");
+    assert!(
+        bench
+            .key_hint(&section)
+            .contains("set_machine_identity in flight"),
+        "{shown}"
+    );
     assert!(shown.contains(latch), "nothing was rebuilt yet: {shown}");
     bench.key(&mut section, "e");
     assert!(!section.captures_input(), "the write is still in flight");
@@ -2889,7 +2894,12 @@ async fn alt_y_at_a_question_clears_nothing() {
     go_to(&bench, &mut section, ROW_IDENTITY);
     bench.key(&mut section, "c");
     let asked = frame(&bench, &section);
-    assert!(asked.contains("y confirm \u{b7} n/Esc cancel"), "{asked}");
+    assert!(
+        bench
+            .key_hint(&section)
+            .contains("y confirm \u{b7} n/Esc cancel"),
+        "{asked}"
+    );
 
     for chord in ["alt-y", "alt-n", "alt-esc"] {
         assert_eq!(bench.key(&mut section, chord), Handled::Pass, "{chord}");
@@ -2935,7 +2945,9 @@ async fn a_shared_next_field_rebind_reaches_the_identity_form_and_keeps_down() {
     bench.key(&mut section, "e");
     let opened = frame(&bench, &section);
     assert!(
-        opened.contains("Ctrl+n next field \u{b7} Enter store"),
+        bench
+            .key_hint(&section)
+            .contains("Ctrl+n next field \u{b7} Enter store"),
         "{opened}"
     );
 

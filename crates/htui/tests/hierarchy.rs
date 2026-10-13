@@ -2539,14 +2539,9 @@ async fn the_report_notice_names_what_was_not_inferred() {
             },
         );
         let frame = bench.render_section(&section, 250);
-        let hint = frame
-            .lines()
-            .find(|row| row.contains("j/k"))
-            .unwrap_or_else(|| panic!("the hint row is drawn: {frame}"));
-        assert!(
-            hint.trim_end().ends_with(&format!("\u{b7} {expected}")),
-            "{report:?} reads `{expected}`: {hint}"
-        );
+        // The section's last row: the notice alone, the keys being the shell's (MOD-67 M6 T2).
+        let notice = frame.lines().nth(29).unwrap_or_default().trim_end();
+        assert_eq!(notice, expected, "{report:?} reads `{expected}`: {frame}");
     }
 }
 

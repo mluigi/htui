@@ -757,6 +757,16 @@ impl SectionBench {
             .collect()
     }
 
+    /// The section's keys as the shell's hint row would show them (MOD-67 M6 T2): its
+    /// [`SettingsSection::key_hint`] through the bench's keys, as plain text; empty for `None`.
+    #[must_use]
+    pub fn key_hint(&self, section: &dyn SettingsSection) -> String {
+        section
+            .key_hint(&self.keys, &self.theme)
+            .map(|line| line.to_string())
+            .unwrap_or_default()
+    }
+
     /// Draws one section into a `width`x30 buffer and returns it as snapshot text.
     ///
     /// The section's own test file keeps its `Buffer`-returning twin: a cursor is a *style*, and

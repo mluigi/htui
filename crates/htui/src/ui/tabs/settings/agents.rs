@@ -1438,18 +1438,13 @@ impl AgentsSection {
         }
     }
 
-    /// The two lines under the pane (MOD-23 D245, blueprint F-12): which keys mean something here,
-    /// then the note — the last outcome, else [`quota_note`] while the section is idle.
+    /// Which keys mean something here (MOD-23 D245, blueprint F-12), for the shell's hint row
+    /// (MOD-67 M6 T2, [`SettingsSection::key_hint`]).
     ///
-    /// Two lines rather than one since MOD-23 added three keys: the idle keys and the note were
-    /// already 95 of the 98 columns together. A `None` note still takes its line, so the layout
-    /// never changes height with it. While a `manual` row is listed, the idle note ends in
-    /// [`MANUAL_NOTE`], the key to the cell's `*` (MOD-66).
-    ///
-    /// The keys line follows the live key mode first (MOD-67 M3 L-A Q6), so it always names the
-    /// keys `on_key` answers: a login chooser or paste field opened over an install's manual steps
-    /// shows its own keys, not `Esc close`.
-    fn hint(&self, keys: &Keys) -> (String, Option<String>) {
+    /// It follows the live key mode first (MOD-67 M3 L-A Q6), so it always names the keys
+    /// `on_key` answers: a login chooser or paste field opened over an install's manual steps shows
+    /// its own keys, not `Esc close`.
+    fn hint_text(&self, keys: &Keys) -> String {
         let spec = match self.key_mode() {
             KeyMode::Form => HINT_EDITING,
             KeyMode::Consent => HINT_PENDING,
@@ -1467,11 +1462,19 @@ impl AgentsSection {
                 (_, _) => HINT_AUTH_RUNNING,
             },
         };
-        let line = keys.hint(self.stack(), spec);
+        keys.hint(self.stack(), spec)
+    }
+
+    /// The line under the pane (MOD-23 D245): the last outcome, else [`quota_note`] while the
+    /// section is idle. A `None` note still takes its line, so the layout never changes height with
+    /// it. While a `manual` row is listed, the idle note ends in [`MANUAL_NOTE`], the key to the
+    /// cell's `*` (MOD-66). The keys that shared the pane with it moved to the shell's hint row
+    /// (MOD-67 M6 T2).
+    fn note(&self, keys: &Keys) -> Option<String> {
         let idle = matches!(self.mode, Mode::Browse)
             && matches!(self.install, InstallState::Idle)
             && matches!(self.auth, AuthState::Idle);
-        let note = self.notice.clone().or_else(|| {
+        self.notice.clone().or_else(|| {
             idle.then(|| {
                 let note = quota_note(
                     keys.label(views::AGENTS_BROWSE, Act::AgentsProbe)
@@ -1483,8 +1486,7 @@ impl AgentsSection {
                     note
                 }
             })
-        });
-        (line, note)
+        })
     }
 
     /// One key with no form, question, chooser or paste field up (MOD-67 M3 §6.2): whole chords
@@ -2748,12 +2750,15 @@ impl SettingsSection for AgentsSection {
         }
     }
 
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let pane = self.pane(area.width, ctx.theme, ctx.keys());
-        let [rows, consent, keys_area, note_area] = Layout::vertical([
+        let [rows, consent, note_area] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
-            Constraint::Length(1),
             Constraint::Length(1),
         ])
         .areas(area);
@@ -2768,9 +2773,7 @@ impl SettingsSection for AgentsSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), consent);
         }
-        let (keys, note) = self.hint(ctx.keys());
-        frame.render_widget(Paragraph::new(Line::styled(keys, ctx.theme.dim)), keys_area);
-        if let Some(note) = note {
+        if let Some(note) = self.note(ctx.keys()) {
             // `settings/mod.rs`'s rule: a compare-and-set miss is the one notice to act on.
             let style = if is_error(&note) {
                 ctx.theme.error

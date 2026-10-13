@@ -70,7 +70,11 @@ mod tests {
         assert_eq!(chrome.status, Rect::new(0, 29, 100, 1));
 
         let small = super::chrome(Rect::new(0, 0, 40, 5));
-        assert_eq!(small.body, Rect::new(0, 2, 40, 1), "a 5-row frame keeps a one-row body");
+        assert_eq!(
+            small.body,
+            Rect::new(0, 2, 40, 1),
+            "a 5-row frame keeps a one-row body"
+        );
         assert_eq!(small.hint, Rect::new(0, 3, 40, 1));
         assert_eq!(small.status, Rect::new(0, 4, 40, 1));
     }

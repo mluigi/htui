@@ -543,24 +543,22 @@ impl QueueSection {
         vec![Line::from(spans)]
     }
 
-    /// The keys this mode binds, then the last outcome; the outcome wins when both do not fit.
-    fn hint(&self, bound: &Keys, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text(bound);
+    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
+    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
+    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
+    /// itself; blank without one.
+    /// Any mode: an editor's outcome is drawn here too.
+    fn notice_line(&self, theme: &Theme) -> Line<'static> {
         let Some(notice) = &self.notice else {
-            return Line::styled(keys, theme.dim);
+            return Line::default();
         };
-        let style = match notice {
-            Notice::Error(_) => theme.error,
-            Notice::Info(_) => theme.dim,
-        };
-        let text = notice.text().to_owned();
-        if cell_width(&keys) + cell_width(&text) + 3 > usize::from(width) {
-            return Line::styled(text, style);
-        }
-        Line::from(vec![
-            Span::styled(format!("{keys} \u{b7} "), theme.dim),
-            Span::styled(text, style),
-        ])
+        Line::styled(
+            notice.text().to_owned(),
+            match notice {
+                Notice::Error(_) => theme.error,
+                Notice::Info(_) => theme.dim,
+            },
+        )
     }
 
     /// The stack of the current mode (MOD-67 D3, D4): the one place a mode maps to its keys, read
@@ -692,6 +690,10 @@ impl SettingsSection for QueueSection {
         }
     }
 
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let showing = self.unavailable.is_none() && self.snapshot.is_some();
         let help = if showing {
@@ -738,10 +740,7 @@ impl SettingsSection for QueueSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(
-            Paragraph::new(self.hint(ctx.keys(), area.width, ctx.theme)),
-            hint,
-        );
+        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
     }
 }
 

@@ -665,31 +665,23 @@ impl ConnectionSection {
         }
     }
 
-    /// The one line under the pane: the keys this mode binds, then the last outcome.
-    ///
-    /// The outcome only appears here in Browse; every other mode already draws it in the pane,
-    /// where it is next to what it is about.
-    fn hint(&self, bound: &Keys, width: u16, theme: &Theme) -> Line<'static> {
-        let keys = self.hint_text(bound);
+    /// The one line under the pane: the last outcome, in `theme.error` when it is one to act on
+    /// rather than read (a compare-and-set miss). The keys this mode binds moved to the shell's
+    /// hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]), so the outcome has the line to
+    /// itself; blank without one.
+    /// Browse only: every other mode draws it in the pane, next to what it is about.
+    fn notice_line(&self, theme: &Theme) -> Line<'static> {
         let (Some(notice), Mode::Browse) = (&self.notice, &self.mode) else {
-            return Line::styled(keys, theme.dim);
+            return Line::default();
         };
-        let style = if notice.is_error() {
-            theme.error
-        } else {
-            theme.dim
-        };
-        let text = notice.text().to_owned();
-        // The outcome wins the line when both do not fit: the keys are on screen every other
-        // frame, and this is the only place the outcome appears.
-        let room = usize::from(width);
-        if cell_width(&keys) + cell_width(&text) + 3 > room {
-            return Line::styled(text, style);
-        }
-        Line::from(vec![
-            Span::styled(format!("{keys} \u{b7} "), theme.dim),
-            Span::styled(text, style),
-        ])
+        Line::styled(
+            notice.text().to_owned(),
+            if notice.is_error() {
+                theme.error
+            } else {
+                theme.dim
+            },
+        )
     }
 
     /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus what a write in
@@ -937,6 +929,10 @@ impl SettingsSection for ConnectionSection {
         }
     }
 
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let pane = self.pane(area.width, ctx.theme, ctx.keys());
         let [rows, pane_area, hint] = Layout::vertical([
@@ -965,10 +961,7 @@ impl SettingsSection for ConnectionSection {
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
         }
-        frame.render_widget(
-            Paragraph::new(self.hint(ctx.keys(), area.width, ctx.theme)),
-            hint,
-        );
+        frame.render_widget(Paragraph::new(self.notice_line(ctx.theme)), hint);
     }
 }
 
@@ -1134,27 +1127,23 @@ mod tests {
         );
     }
 
-    /// MOD-60: the hint line measures the notice in cells, so a CJK notice that fits by `char`
-    /// count but not on screen takes the line alone rather than overrunning it. The same rule
-    /// stands in all five sections' hint checks.
+    /// MOD-67 M6 T2: the row under the pane carries the notice alone, and the keys are the
+    /// section's [`SettingsSection::key_hint`], the shell's row.
     #[test]
-    fn a_wide_notice_takes_the_hint_line_alone() {
-        let k = 10;
-        let notice = "\u{6f22}".repeat(k);
+    fn the_notice_row_carries_the_notice_alone() {
+        let notice = "\u{6f22}".repeat(10);
         let section = ConnectionSection {
             notice: Some(Notice::Error(notice.clone())),
             ..ConnectionSection::new()
         };
-        let keys = section.hint_text(Keys::compiled());
-        let width = cell_width(&keys) + k + 3;
-
-        let line = section.hint(
-            Keys::compiled(),
-            u16::try_from(width).expect("a hint this narrow fits u16"),
-            &Theme::default(),
-        );
-
-        assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
+        let theme = Theme::default();
+        let line = section.notice_line(&theme);
+        assert_eq!(line.spans.len(), 1, "{line:?}");
         assert_eq!(line.spans[0].content, notice);
+        assert_eq!(line.style, theme.error);
+        let keys = section
+            .key_hint(Keys::compiled(), &theme)
+            .expect("the defaults bind the keys");
+        assert_eq!(keys.to_string(), section.hint_text(Keys::compiled()));
     }
 }

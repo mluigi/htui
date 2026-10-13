@@ -28,7 +28,6 @@ use htui_core::model::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
@@ -1266,8 +1265,9 @@ impl PersonasSection {
         lines
     }
 
-    /// The key line for the mode, rendered through the mode's stack with the keys in force.
-    fn hint(&self, keys: &Keys) -> String {
+    /// The key line for the mode, rendered through the mode's stack with the keys in force: the
+    /// shell's hint row (MOD-67 M6 T2, [`SettingsSection::key_hint`]).
+    fn hint_text(&self, keys: &Keys) -> String {
         keys.hint(self.stack(), self.hint_spec())
     }
 
@@ -1958,12 +1958,16 @@ impl SettingsSection for PersonasSection {
         self.open_pending_report();
     }
 
+    fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
+        super::key_line(self.hint_text(keys), theme)
+    }
+
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         let notice = self.notice_lines(area.width, ctx.theme);
-        let [pane, notice_area, hint_area] = Layout::vertical([
+        // MOD-67 M6 T2: the keys row went to the shell's hint row; the pane gains it.
+        let [pane, notice_area] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(notice.len()).unwrap_or(u16::MAX)),
-            Constraint::Length(1),
         ])
         .areas(area);
         frame.render_widget(
@@ -1973,11 +1977,6 @@ impl SettingsSection for PersonasSection {
         if !notice.is_empty() {
             frame.render_widget(Paragraph::new(notice), notice_area);
         }
-        let hint: Style = ctx.theme.dim;
-        frame.render_widget(
-            Paragraph::new(Line::styled(self.hint(ctx.keys()), hint)),
-            hint_area,
-        );
     }
 }
 

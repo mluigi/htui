@@ -2145,11 +2145,12 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&file).expect("the file"), "body\n");
         assert_eq!(size, PaneSize::new(11, 60));
 
-        // Unclaimed: the body (100x27 under the top bar, the strip and the status line).
+        // Unclaimed: the body (100x26 under the top bar and the strip, above the hint row and
+        // the status line, MOD-67 M6 T2).
         let (mut app, _benches) = shell(&[ASKER]);
         draw(&mut app, 100, 30);
         let spawned = open(&mut app, ASKER, &log);
-        assert_eq!(spawned.borrow()[0].1, PaneSize::new(26, 100));
+        assert_eq!(spawned.borrow()[0].1, PaneSize::new(25, 100));
 
         // Never drawn.
         let (mut app, _benches) = shell(&[ASKER]);
@@ -2501,7 +2502,7 @@ mod tests {
         draw(&mut app, 120, 40);
         assert!(!app.dirty);
         app.resize_editor();
-        let size = PaneSize::new(36, 120);
+        let size = PaneSize::new(35, 120);
         assert_eq!(*log.borrow(), vec![Call::Resize(size)]);
         assert_eq!(
             app.editor.as_ref().map(|editor| editor.screen.size()),
