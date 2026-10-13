@@ -1828,4 +1828,71 @@ mod tests {
         assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
         assert_eq!(line.spans[0].content, notice);
     }
+
+    /// MOD-67 M6 D3: the picker resolves its keys through `views::HIERARCHY_PICKER`; its go-to
+    /// field is a text field and nothing else, so the section is on `views::CAPTURE` while it is
+    /// open.
+    #[test]
+    fn the_picker_mode_reports_the_picker_stack() {
+        let (picker, _) = PathPicker::open("Root", "/srv".to_owned());
+        let mut section = HierarchySection {
+            mode: Mode::Picking {
+                target: PathTarget::WorkspaceRoot(WorkspaceId::new()),
+                picker,
+                chosen: None,
+            },
+            ..HierarchySection::new()
+        };
+        assert_eq!(section.key_stack(), Some(views::HIERARCHY_PICKER));
+
+        if let Mode::Picking { picker, .. } = &mut section.mode {
+            picker.on_paste("/opt");
+        }
+        assert_eq!(section.key_stack(), Some(views::CAPTURE));
+    }
+
+    /// MOD-67 M6 D4: each key-naming sentence names the label it is handed, and none when the
+    /// act is unbound.
+    #[test]
+    fn the_prose_names_the_keys_in_force() {
+        assert_eq!(
+            no_workspace(Some("W")),
+            "no workspace \u{2014} `W` creates one"
+        );
+        assert_eq!(no_workspace(None), "no workspace");
+        assert_eq!(reloaded(Some("P")), "reloaded; press P again");
+        assert_eq!(reloaded(None), "reloaded");
+
+        let unmatched = InferReport {
+            root: Some("/work".to_owned()),
+            truncated: false,
+            repos: vec![crate::hierarchy::RepoInference {
+                repo: RepoId::new(),
+                name: "docs".to_owned(),
+                outcome: InferOutcome::NoMatch,
+            }],
+        };
+        assert_eq!(
+            inferred_notice(&unmatched, Some("B")),
+            "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} B on a repo sets it by hand"
+        );
+        assert_eq!(
+            inferred_notice(&unmatched, None),
+            "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} set it by hand on a repo row"
+        );
+
+        let rootless = InferReport {
+            root: None,
+            truncated: false,
+            repos: Vec::new(),
+        };
+        assert_eq!(
+            inferred_notice(&rootless, Some("B")),
+            "no root on this box for this workspace \u{2014} B on the workspace row sets it"
+        );
+        assert_eq!(
+            inferred_notice(&rootless, None),
+            "no root on this box for this workspace \u{2014} set one on the workspace row"
+        );
+    }
 }

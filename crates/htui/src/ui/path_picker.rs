@@ -486,10 +486,11 @@ fn clip_left(text: &str, width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{PathPicker, PickerOutcome, start_dir};
+    use crate::keys::{Keys, load_str, views};
     use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
     use crate::ui::Theme;
     use crate::ui::cells::cell_width;
-    use crossterm::event::{KeyCode, KeyEvent};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use htui_core::root_path::{DirEntry, DirListing};
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -502,6 +503,24 @@ mod tests {
     /// A plain character key.
     fn ch(c: char) -> KeyEvent {
         key(KeyCode::Char(c))
+    }
+
+    /// `c` with `modifiers` held.
+    fn chord(c: char, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), modifiers)
+    }
+
+    /// `key` through the picker as Hierarchy feeds it: the compiled keys and the picker stack, a
+    /// key no picker act takes read as swallowed (`None`), as Hierarchy's modal rest does.
+    fn press(picker: &mut PathPicker, key: KeyEvent) -> PickerOutcome {
+        picker
+            .on_key(key, Keys::compiled(), views::HIERARCHY_PICKER)
+            .unwrap_or(PickerOutcome::None)
+    }
+
+    /// Keys loaded from a key file's `[picker]` table.
+    fn picker_keys(table: &str) -> Keys {
+        load_str(&format!("version = 1\n[picker]\n{table}")).expect("the key file loads")
     }
 
     /// A listing of `path` by hand: `(name, is_link)` per entry.
@@ -562,9 +581,22 @@ mod tests {
 
     /// The popup over a blank `width`×`height` frame, one trimmed line per row.
     fn render_at(picker: &PathPicker, width: u16, height: u16) -> String {
+        render_with(picker, Keys::compiled(), width, height)
+    }
+
+    /// The popup over a blank `width`×`height` frame with `keys`, one trimmed line per row.
+    fn render_with(picker: &PathPicker, keys: &Keys, width: u16, height: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(width, height)).expect("a test backend");
-        term.draw(|frame| picker.render(frame, frame.area(), &Theme::default()))
-            .expect("the picker draws");
+        term.draw(|frame| {
+            picker.render(
+                frame,
+                frame.area(),
+                &Theme::default(),
+                keys,
+                views::HIERARCHY_PICKER,
+            );
+        })
+        .expect("the picker draws");
         let buffer = term.backend().buffer();
         let mut out = String::new();
         for y in 0..buffer.area.height {
@@ -611,7 +643,7 @@ mod tests {
         assert_eq!(picker.path(), "/srv");
         assert!(!render(&picker).contains("stray"));
         assert!(
-            none(&picker.on_key(ch('s'))),
+            none(&press(&mut picker, ch('s'))),
             "nothing landed to choose from"
         );
     }
@@ -619,28 +651,28 @@ mod tests {
     #[test]
     fn j_and_k_clamp_at_both_ends() {
         let mut picker = at_srv();
-        assert!(none(&picker.on_key(ch('k'))));
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/htui");
+        assert!(none(&press(&mut picker, ch('k'))));
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/htui");
         for _ in 0..5 {
-            picker.on_key(ch('j'));
+            press(&mut picker, ch('j'));
         }
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/shared");
-        picker.on_key(key(KeyCode::Up));
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/notes");
-        picker.on_key(key(KeyCode::Down));
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/shared");
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/shared");
+        press(&mut picker, key(KeyCode::Up));
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/notes");
+        press(&mut picker, key(KeyCode::Down));
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/shared");
     }
 
     #[test]
     fn enter_and_l_open_the_highlighted_directory() {
         let mut picker = at_srv();
         assert_eq!(
-            asked(picker.on_key(key(KeyCode::Enter))),
+            asked(press(&mut picker, key(KeyCode::Enter))),
             ("/srv/htui".to_owned(), false)
         );
         let mut picker = at_srv();
         assert_eq!(
-            asked(picker.on_key(ch('l'))),
+            asked(press(&mut picker, ch('l'))),
             ("/srv/htui".to_owned(), false)
         );
     }
@@ -650,13 +682,13 @@ mod tests {
     fn h_and_backspace_go_to_the_lexical_parent() {
         for up in [ch('h'), key(KeyCode::Backspace)] {
             let mut picker = at_srv();
-            picker.on_key(ch('j'));
-            picker.on_key(ch('j'));
-            let (shared, _) = asked(picker.on_key(ch('l')));
+            press(&mut picker, ch('j'));
+            press(&mut picker, ch('j'));
+            let (shared, _) = asked(press(&mut picker, ch('l')));
             assert_eq!(shared, "/srv/shared");
             assert!(picker.on_reply(&dirs("/srv/shared", &[("inside", false)], 0)));
             assert_eq!(picker.path(), "/srv/shared");
-            assert_eq!(asked(picker.on_key(up)), ("/srv".to_owned(), false));
+            assert_eq!(asked(press(&mut picker, up)), ("/srv".to_owned(), false));
         }
     }
 
@@ -664,7 +696,7 @@ mod tests {
     fn h_at_the_root_stays_at_the_root() {
         let (mut picker, _) = PathPicker::open("Root", "/".to_owned());
         assert!(picker.on_reply(&dirs("/", &[("srv", false)], 0)));
-        assert!(none(&picker.on_key(ch('h'))));
+        assert!(none(&press(&mut picker, ch('h'))));
         assert_eq!(picker.path(), "/");
     }
 
@@ -673,13 +705,16 @@ mod tests {
     fn going_up_highlights_the_directory_you_came_from() {
         let (mut picker, _) = PathPicker::open("Root", "/srv/notes".to_owned());
         assert!(picker.on_reply(&dirs("/srv/notes", &[], 0)));
-        assert_eq!(asked(picker.on_key(ch('h'))), ("/srv".to_owned(), false));
+        assert_eq!(
+            asked(press(&mut picker, ch('h'))),
+            ("/srv".to_owned(), false)
+        );
         assert!(picker.on_reply(&dirs(
             "/srv",
             &[("htui", false), ("notes", false), ("shared", true)],
             0
         )));
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/notes");
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/notes");
     }
 
     /// MOD-49 review N-1: the place going up remembers is for the parent it asked for only. A
@@ -689,64 +724,67 @@ mod tests {
     fn a_newer_request_forgets_where_going_up_came_from() {
         let (mut picker, _) = PathPicker::open("Root", "/srv/notes".to_owned());
         assert!(picker.on_reply(&dirs("/srv/notes", &[], 0)));
-        assert_eq!(asked(picker.on_key(ch('h'))), ("/srv".to_owned(), false));
+        assert_eq!(
+            asked(press(&mut picker, ch('h'))),
+            ("/srv".to_owned(), false)
+        );
         picker.on_paste("/opt");
         assert_eq!(
-            asked(picker.on_key(key(KeyCode::Enter))),
+            asked(press(&mut picker, key(KeyCode::Enter))),
             ("/opt".to_owned(), false)
         );
         // `/srv`'s listing was superseded; `/opt` lands holding a `notes` of its own.
         assert!(picker.on_reply(&dirs("/opt", &[("data", false), ("notes", false)], 0)));
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/opt/data");
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/opt/data");
     }
 
     #[test]
     fn s_chooses_the_highlighted_directory() {
         let mut picker = at_srv();
-        picker.on_key(ch('j'));
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/notes");
+        press(&mut picker, ch('j'));
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/notes");
     }
 
     #[test]
     fn capital_s_chooses_the_listed_directory() {
         let mut picker = at_srv();
-        picker.on_key(ch('j'));
-        assert_eq!(chosen(picker.on_key(ch('S'))), "/srv");
+        press(&mut picker, ch('j'));
+        assert_eq!(chosen(press(&mut picker, ch('S'))), "/srv");
     }
 
     /// Blueprint D11: nothing is chosen from a listing that hasn't landed or was refused.
     #[test]
     fn s_and_capital_s_need_a_listing() {
         let (mut picker, _) = PathPicker::open("Root", "/srv".to_owned());
-        assert!(none(&picker.on_key(ch('s'))));
-        assert!(none(&picker.on_key(ch('S'))));
+        assert!(none(&press(&mut picker, ch('s'))));
+        assert!(none(&press(&mut picker, ch('S'))));
         assert!(picker.on_reply(&StoreReply::Failed {
             request: LIST_DIR,
             message: "`/srv` does not exist on this box".to_owned(),
         }));
-        assert!(none(&picker.on_key(ch('s'))));
-        assert!(none(&picker.on_key(ch('S'))));
+        assert!(none(&press(&mut picker, ch('s'))));
+        assert!(none(&press(&mut picker, ch('S'))));
 
         // An empty listing has a directory to choose and no entry to open.
         let (mut picker, _) = PathPicker::open("Root", "/empty".to_owned());
         assert!(picker.on_reply(&dirs("/empty", &[], 0)));
-        assert!(none(&picker.on_key(ch('s'))));
-        assert!(none(&picker.on_key(ch('l'))));
-        assert_eq!(chosen(picker.on_key(ch('S'))), "/empty");
+        assert!(none(&press(&mut picker, ch('s'))));
+        assert!(none(&press(&mut picker, ch('l'))));
+        assert_eq!(chosen(press(&mut picker, ch('S'))), "/empty");
     }
 
     /// P6, blueprint D12: go-to opens holding `/`, so the typed rest is absolute.
     #[test]
     fn slash_opens_go_to_and_enter_lists_what_was_typed() {
         let mut picker = at_srv();
-        assert!(none(&picker.on_key(ch('/'))));
+        assert!(none(&press(&mut picker, ch('/'))));
         assert!(render(&picker).contains("go to: /"));
         for c in "srv/htui".chars() {
             // Bound letters type into go-to instead of acting (`h`, `s`, `j` among them).
-            assert!(none(&picker.on_key(ch(c))));
+            assert!(none(&press(&mut picker, ch(c))));
         }
         assert_eq!(
-            asked(picker.on_key(key(KeyCode::Enter))),
+            asked(press(&mut picker, key(KeyCode::Enter))),
             ("/srv/htui".to_owned(), false)
         );
         assert!(!render(&picker).contains("go to:"), "a submit closes go-to");
@@ -757,7 +795,7 @@ mod tests {
         let mut picker = at_srv();
         picker.on_paste("/srv/htui\n");
         assert_eq!(
-            asked(picker.on_key(key(KeyCode::Enter))),
+            asked(press(&mut picker, key(KeyCode::Enter))),
             ("/srv/htui".to_owned(), false)
         );
     }
@@ -765,20 +803,20 @@ mod tests {
     #[test]
     fn a_paste_into_a_lone_slash_replaces_it() {
         let mut picker = at_srv();
-        picker.on_key(ch('/'));
+        press(&mut picker, ch('/'));
         picker.on_paste("/opt/data");
         assert_eq!(
-            asked(picker.on_key(key(KeyCode::Enter))),
+            asked(press(&mut picker, key(KeyCode::Enter))),
             ("/opt/data".to_owned(), false)
         );
 
         // Anywhere else the paste is inserted at the cursor.
         let mut picker = at_srv();
-        picker.on_key(ch('/'));
-        picker.on_key(ch('o'));
+        press(&mut picker, ch('/'));
+        press(&mut picker, ch('o'));
         picker.on_paste("pt");
         assert_eq!(
-            asked(picker.on_key(key(KeyCode::Enter))),
+            asked(press(&mut picker, key(KeyCode::Enter))),
             ("/opt".to_owned(), false)
         );
     }
@@ -786,11 +824,11 @@ mod tests {
     #[test]
     fn esc_in_go_to_closes_only_go_to() {
         let mut picker = at_srv();
-        picker.on_key(ch('/'));
-        assert!(none(&picker.on_key(key(KeyCode::Esc))));
+        press(&mut picker, ch('/'));
+        assert!(none(&press(&mut picker, key(KeyCode::Esc))));
         assert!(!render(&picker).contains("go to:"));
         assert!(matches!(
-            picker.on_key(key(KeyCode::Esc)),
+            press(&mut picker, key(KeyCode::Esc)),
             PickerOutcome::Cancelled
         ));
     }
@@ -807,12 +845,12 @@ mod tests {
             ("srv/shared/../", "/srv"),
         ] {
             let mut picker = at_srv();
-            picker.on_key(ch('/'));
+            press(&mut picker, ch('/'));
             for c in typed.chars() {
-                picker.on_key(ch(c));
+                press(&mut picker, ch(c));
             }
             assert_eq!(
-                asked(picker.on_key(key(KeyCode::Enter))),
+                asked(press(&mut picker, key(KeyCode::Enter))),
                 (asked_for.to_owned(), false),
                 "`/{typed}`"
             );
@@ -826,7 +864,7 @@ mod tests {
         let mut picker = at_srv();
         picker.on_paste("/srv/htui/");
         assert_eq!(
-            asked(picker.on_key(key(KeyCode::Enter))),
+            asked(press(&mut picker, key(KeyCode::Enter))),
             ("/srv/htui/".to_owned(), false)
         );
     }
@@ -835,9 +873,9 @@ mod tests {
     #[test]
     fn an_empty_go_to_asks_for_nothing() {
         let mut picker = at_srv();
-        picker.on_key(ch('/'));
-        picker.on_key(key(KeyCode::Backspace));
-        assert!(none(&picker.on_key(key(KeyCode::Enter))));
+        press(&mut picker, ch('/'));
+        press(&mut picker, key(KeyCode::Backspace));
+        assert!(none(&press(&mut picker, key(KeyCode::Enter))));
         assert!(!render(&picker).contains("go to:"));
     }
 
@@ -845,20 +883,26 @@ mod tests {
     #[test]
     fn dot_relists_with_hidden_shown() {
         let mut picker = at_srv();
-        assert_eq!(asked(picker.on_key(ch('.'))), ("/srv".to_owned(), true));
+        assert_eq!(
+            asked(press(&mut picker, ch('.'))),
+            ("/srv".to_owned(), true)
+        );
         assert!(picker.on_reply(&dirs("/srv", &[(".git", false), ("htui", false)], 0)));
         assert_eq!(
-            asked(picker.on_key(ch('l'))),
+            asked(press(&mut picker, ch('l'))),
             ("/srv/.git".to_owned(), true)
         );
-        assert_eq!(asked(picker.on_key(ch('.'))), ("/srv".to_owned(), false));
+        assert_eq!(
+            asked(press(&mut picker, ch('.'))),
+            ("/srv".to_owned(), false)
+        );
     }
 
     #[test]
     fn esc_cancels() {
         let mut picker = at_srv();
         assert!(matches!(
-            picker.on_key(key(KeyCode::Esc)),
+            press(&mut picker, key(KeyCode::Esc)),
             PickerOutcome::Cancelled
         ));
     }
@@ -873,7 +917,10 @@ mod tests {
         }));
         assert!(render(&picker).contains("`/srv/gone` does not exist on this box"));
         assert_eq!(picker.path(), "/srv/gone");
-        assert_eq!(asked(picker.on_key(ch('h'))), ("/srv".to_owned(), false));
+        assert_eq!(
+            asked(press(&mut picker, ch('h'))),
+            ("/srv".to_owned(), false)
+        );
     }
 
     /// MOD-49 review L-2: on 80 columns (an inner width of 74) the hint splits onto two lines
@@ -914,14 +961,140 @@ mod tests {
         assert!(!render(&picker).contains("nope"));
     }
 
-    /// Blueprint D15 (H-4): `q` can't quit and `?` can't open help from inside the popup.
+    /// Blueprint D15 (H-4): `q` can't quit and `?` can't open help from inside the popup. No
+    /// picker act takes them, so the picker answers `None` and the owner swallows them (MOD-67 M6).
     #[test]
     fn unbound_keys_are_swallowed() {
         let mut picker = at_srv();
         for c in ['q', '?', '1'] {
-            assert!(none(&picker.on_key(ch(c))));
+            assert!(
+                picker
+                    .on_key(ch(c), Keys::compiled(), views::HIERARCHY_PICKER)
+                    .is_none(),
+                "{c}"
+            );
         }
-        assert_eq!(chosen(picker.on_key(ch('s'))), "/srv/htui");
+        assert_eq!(chosen(press(&mut picker, ch('s'))), "/srv/htui");
+    }
+
+    /// MOD-67 M6 D3: a chord matches with its modifiers, so `ctrl-j`, `alt-l`, `ctrl-s` and a
+    /// SUPER `j` are no picker key: the picker answers `None` and neither moves nor chooses.
+    #[test]
+    fn a_chord_is_no_picker_key() {
+        let mut picker = at_srv();
+        for key in [
+            chord('j', KeyModifiers::CONTROL),
+            chord('l', KeyModifiers::ALT),
+            chord('s', KeyModifiers::CONTROL),
+            chord('j', KeyModifiers::SUPER),
+        ] {
+            assert!(
+                picker
+                    .on_key(key, Keys::compiled(), views::HIERARCHY_PICKER)
+                    .is_none(),
+                "{key:?}"
+            );
+        }
+        assert_eq!(picker.path(), "/srv");
+        assert_eq!(
+            chosen(press(&mut picker, ch('s'))),
+            "/srv/htui",
+            "the cursor did not move"
+        );
+    }
+
+    /// MOD-67 M6 D3: `[picker] open = "o"` opens on `o`, `Enter` is no picker key any more, and
+    /// the popup's hint names `o`.
+    #[test]
+    fn a_rebound_open_key_opens_and_enter_is_inert() {
+        let keys = picker_keys("open = \"o\"\n");
+        let mut picker = at_srv();
+        let opened = picker.on_key(ch('o'), &keys, views::HIERARCHY_PICKER);
+        assert_eq!(
+            asked(opened.expect("`o` is the picker's")),
+            ("/srv/htui".to_owned(), false)
+        );
+
+        let mut picker = at_srv();
+        assert!(
+            picker
+                .on_key(key(KeyCode::Enter), &keys, views::HIERARCHY_PICKER)
+                .is_none()
+        );
+        let frame = render_with(&picker, &keys, 100, 30);
+        assert!(
+            frame.contains("j/k move \u{b7} o open \u{b7} h up"),
+            "{frame}"
+        );
+    }
+
+    /// The go-to field's keys are the field's (ANA-26 §6.1): every key lands in it or edits it,
+    /// and `Esc` closes only the field.
+    #[test]
+    fn the_go_to_field_takes_every_key() {
+        let mut picker = at_srv();
+        assert!(none(&press(&mut picker, ch('/'))));
+        for key in [ch('q'), ch('j'), chord('a', KeyModifiers::CONTROL)] {
+            let outcome = picker.on_key(key, Keys::compiled(), views::HIERARCHY_PICKER);
+            assert!(
+                matches!(outcome, Some(PickerOutcome::None)),
+                "{key:?}: {outcome:?}"
+            );
+        }
+        assert!(
+            render(&picker).contains("go to: /qj"),
+            "{}",
+            render(&picker)
+        );
+        let closed = picker.on_key(key(KeyCode::Esc), Keys::compiled(), views::HIERARCHY_PICKER);
+        assert!(matches!(closed, Some(PickerOutcome::None)), "{closed:?}");
+        assert!(!render(&picker).contains("go to:"));
+        assert_eq!(
+            picker.path(),
+            "/srv",
+            "the picker is still open on its listing"
+        );
+    }
+
+    /// MOD-67 M6 D3: the hint is rendered from its spec through the picker stack, and with the
+    /// defaults it is MOD-49's text byte for byte: one line at 100 columns, two at 80.
+    #[test]
+    fn the_hint_is_the_rendered_spec() {
+        let first = "j/k move \u{b7} Enter open \u{b7} h up \u{b7} s choose \u{b7} S this dir";
+        let second = "/ go to \u{b7} . hidden \u{b7} Esc cancel";
+        let hint_rows = |frame: &str| -> Vec<String> {
+            frame
+                .lines()
+                .map(|row| row.trim_matches(|c: char| c == '\u{2502}' || c.is_whitespace()))
+                .filter(|row| row.contains("move") || row.contains("go to"))
+                .map(str::to_owned)
+                .collect()
+        };
+        let picker = at_srv();
+        assert_eq!(
+            hint_rows(&render(&picker)),
+            [format!("{first} \u{b7} {second}")]
+        );
+        assert_eq!(
+            hint_rows(&render_at(&picker, 80, 24)),
+            [first.to_owned(), second.to_owned()]
+        );
+    }
+
+    /// MOD-67 M6 D4: the empty listing names the hidden key in force, and none when it is unbound.
+    #[test]
+    fn the_empty_listing_names_the_hidden_key() {
+        let (mut picker, _) = PathPicker::open("Root", "/empty".to_owned());
+        assert!(picker.on_reply(&dirs("/empty", &[], 0)));
+
+        let rebound = render_with(&picker, &picker_keys("hidden = \"H\"\n"), 100, 30);
+        assert!(
+            rebound.contains("no directories here \u{b7} H shows hidden"),
+            "{rebound}"
+        );
+        let unbound = render_with(&picker, &picker_keys("hidden = []\n"), 100, 30);
+        assert!(unbound.contains("no directories here"), "{unbound}");
+        assert!(!unbound.contains("shows hidden"), "{unbound}");
     }
 
     /// Blueprint D14: `name/` for a directory, `name@` for a link, `+N more`, the hint.
@@ -952,7 +1125,7 @@ mod tests {
         let (mut picker, _) = PathPicker::open("Root", "/many".to_owned());
         assert!(picker.on_reply(&dirs("/many", &entries, 0)));
         for _ in 0..50 {
-            picker.on_key(ch('j'));
+            press(&mut picker, ch('j'));
         }
         let frame = render(&picker);
         assert!(frame.contains("> d50/"), "{frame}");
@@ -972,8 +1145,8 @@ mod tests {
         assert!(empty.contains("no directories here"), "{empty}");
         assert!(!empty.contains("reading"), "{empty}");
 
-        picker.on_key(ch('l'));
-        let (_, _) = asked(picker.on_key(ch('h')));
+        press(&mut picker, ch('l'));
+        let (_, _) = asked(press(&mut picker, ch('h')));
         assert!(picker.on_reply(&StoreReply::Failed {
             request: LIST_DIR,
             message: "`/` cannot be read on this box".to_owned(),
