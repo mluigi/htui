@@ -891,18 +891,35 @@ if ready; then export ANTHROPIC_BASE_URL="$u"; else echo "hr: headroom is not an
 if [ "$1" = shell ]; then exec bash -l; fi
 exec claude --dangerously-skip-permissions'
 
-# The container's gortex daemon starts with the container and needs about 30 s to answer (longer on a
-# cold index). A session that starts before that finds Gortex unreachable and its hooks block reads, so
-# attach waits for `state ready` first. HR_GORTEX_WAIT (seconds, default 90) bounds the wait; on
-# expiry the session starts anyway. A container without gortex skips it. No single quote may appear in
+# Runs in the container before the session, except for --shell. The gortex daemon is not part of the
+# container start (PID 1 is `sleep infinity`): it appears only when claude starts and `gortex mcp`
+# spawns it, and a session whose first tool calls land before it is ready finds Gortex unreachable and
+# its hooks block native reads. So attach starts it detached (under a lock so concurrent attaches start
+# one; output in /tmp/gortex/daemon.out), then waits for `state ready`; `gortex mcp` adopts the running
+# daemon. The start waits for PID 1 to be in `sleep infinity`: the compose command first removes the
+# stale daemon.pid/daemon.sock, and a daemon started before that loses its socket (verified). A cold
+# start takes 30 to 110 s; HR_GORTEX_WAIT (seconds, default 90) bounds the wait, after which the session
+# starts anyway with a warning. A container without gortex skips all of it. No single quote may appear in
 # the text: it is one single-quoted constant.
-GORTEX_WAIT='command -v gortex >/dev/null 2>&1 || exit 0
-gortex_ready() { gortex daemon status 2>/dev/null | grep -Eq "state +ready"; }
-if ! gortex_ready; then
+GORTEX_GUARD='command -v gortex >/dev/null 2>&1 || exit 0
+up() { gortex daemon status >/dev/null 2>&1; }
+ready() { gortex daemon status 2>/dev/null | grep -Eq "state +ready"; }
+if ! up; then
+    end=$((SECONDS + 15))
+    while [ "$SECONDS" -lt "$end" ] && ! pgrep -fx "sleep infinity" >/dev/null 2>&1; do sleep 0.2; done
+    mkdir -p /tmp/gortex
+    (
+        flock 9
+        if ! up; then
+            setsid nohup gortex daemon start >>/tmp/gortex/daemon.out 2>&1 9>&- </dev/null &
+        fi
+    ) 9>/tmp/gortex/start.lock
+fi
+if ! ready; then
     echo "hr: waiting for the gortex daemon..." >&2
     end=$((SECONDS + ${HR_GORTEX_WAIT:-90}))
-    while [ "$SECONDS" -lt "$end" ] && ! gortex_ready; do sleep 0.5; done
-    gortex_ready || echo "hr: the gortex daemon is not ready; this session starts without it" >&2
+    while [ "$SECONDS" -lt "$end" ] && ! ready; do sleep 0.5; done
+    ready || echo "hr: the gortex daemon is not ready; this session starts without it" >&2
 fi
 exit 0'
 
@@ -940,7 +957,11 @@ cmd_attach() {
         [[ -n "${ANTHROPIC_API_KEY:-}" ]] || die 2 "--api-key needs ANTHROPIC_API_KEY set in the host environment"
         envs+=(-e ANTHROPIC_API_KEY)
     fi
-    [[ "$shell" -eq 1 ]] || "${COMPOSE[@]}" exec "${tty[@]}" dev bash -c "$GORTEX_WAIT" hr-gortex || true
+    if [[ "$shell" -ne 1 ]]; then
+        local -a genv=()
+        [[ -z "${HR_GORTEX_WAIT:-}" ]] || genv=(-e HR_GORTEX_WAIT)
+        "${COMPOSE[@]}" exec "${tty[@]}" "${genv[@]}" dev bash -c "$GORTEX_GUARD" hr-gortex || true
+    fi
     if [[ "${RUN[headroom]:-0}" == 1 ]]; then
         local mode=claude
         [[ "$shell" -eq 1 ]] && mode=shell

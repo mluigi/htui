@@ -291,6 +291,89 @@ guard_run() {
     [[ "$stderr" == *'runs direct'* ]]
 }
 
+# gortex_run [nobin] — run the container-side guard (GORTEX_GUARD in scripts/hr) with a fake gortex,
+# pgrep, setsid and nohup on PATH. Controls, as files in $FB: up (a daemon answers `daemon status`),
+# ready (it reports state ready), works (a started daemon comes up ready). $FB/started counts starts.
+gortex_run() {
+    eval "$(sed -n "/^GORTEX_GUARD='/,/^exit 0'\$/p" "$HR")"
+    [[ -n "${GORTEX_GUARD:-}" ]]
+    FB="$BATS_TEST_TMPDIR/fb"
+    mkdir -p "$FB"
+    cat >"$FB/gortex" <<FAKE
+#!/bin/sh
+if [ "\$1 \$2" = "daemon status" ]; then
+    [ -e "$FB/up" ] || exit 1
+    if [ -e "$FB/ready" ]; then echo " state     ready (warmup 1s)"; else echo " state     warming"; fi
+    exit 0
+fi
+if [ "\$1 \$2" = "daemon start" ]; then
+    echo start >>"$FB/started"
+    [ -e "$FB/works" ] && touch "$FB/up" "$FB/ready"
+    exit 0
+fi
+exit 2
+FAKE
+    printf '#!/bin/sh\n:\n' >"$FB/pgrep"
+    printf '#!/bin/sh\nexec "$@"\n' >"$FB/setsid"
+    cp "$FB/setsid" "$FB/nohup"
+    chmod +x "$FB"/gortex "$FB"/pgrep "$FB"/setsid "$FB"/nohup
+    [[ "${1:-}" == nobin ]] && rm -f "$FB/gortex"
+    run --separate-stderr env PATH="$FB:$PATH" HR_GORTEX_WAIT="${HR_GORTEX_WAIT:-3}" bash -c "$GORTEX_GUARD" hr-gortex
+}
+
+@test "3n. gortex guard: daemon already ready -> nothing started, no warning" {
+    mkdir -p "$BATS_TEST_TMPDIR/fb"; touch "$BATS_TEST_TMPDIR/fb/up" "$BATS_TEST_TMPDIR/fb/ready"
+    gortex_run
+    [[ $status -eq 0 ]]
+    [[ ! -e "$FB/started" ]]
+    [[ -z "$stderr" ]]
+}
+
+@test "3o. gortex guard: no daemon -> started once, waited for until ready" {
+    mkdir -p "$BATS_TEST_TMPDIR/fb"; touch "$BATS_TEST_TMPDIR/fb/works"
+    gortex_run
+    [[ $status -eq 0 ]]
+    [[ "$(wc -l <"$FB/started")" -eq 1 ]]
+    [[ "$stderr" != *'not ready'* ]]
+}
+
+@test "3p. gortex guard: a daemon that answers but is warming up is waited for, not started again" {
+    mkdir -p "$BATS_TEST_TMPDIR/fb"; touch "$BATS_TEST_TMPDIR/fb/up"
+    HR_GORTEX_WAIT=1 gortex_run
+    [[ $status -eq 0 ]]
+    [[ ! -e "$FB/started" ]]
+    [[ "$stderr" == *'the gortex daemon is not ready; this session starts without it'* ]]
+}
+
+@test "3q. gortex guard: daemon never ready, HR_GORTEX_WAIT=1 -> one-line warning, exit 0" {
+    HR_GORTEX_WAIT=1 gortex_run
+    [[ $status -eq 0 ]]
+    [[ "$(grep -c 'not ready' <<<"$stderr")" -eq 1 ]]
+}
+
+@test "3r. gortex guard: gortex not installed -> skipped silently" {
+    gortex_run nobin
+    [[ $status -eq 0 ]]
+    [[ ! -e "$FB/started" ]]
+    [[ -z "$stderr" ]]
+}
+
+@test "3s. attach: the gortex guard runs before claude, forwards HR_GORTEX_WAIT, and --shell skips it" {
+    mk_run MOD-5
+    : >"$HR_TEST_DOCKER_LOG"
+    HR_GORTEX_WAIT=7 HR_TEST_DOCKER_RUNNING=hr-mod-5 run --separate-stderr "$HR" attach MOD-5 </dev/null
+    [[ $status -eq 0 ]]
+    grep -qE -- ' exec (-T )?-e HR_GORTEX_WAIT dev bash -c command -v gortex' "$HR_TEST_DOCKER_LOG"
+    grep -qxF 'exit 0 hr-gortex' "$HR_TEST_DOCKER_LOG"
+    grep -qE -- " exec (-T )?-e TERM -e COLORTERM dev claude --dangerously-skip-permissions$" "$HR_TEST_DOCKER_LOG"
+    [[ "$(grep -nx 'exit 0 hr-gortex' "$HR_TEST_DOCKER_LOG" | cut -d: -f1)" -lt "$(grep -n 'dev claude --dangerously' "$HR_TEST_DOCKER_LOG" | cut -d: -f1)" ]]
+
+    : >"$HR_TEST_DOCKER_LOG"
+    HR_TEST_DOCKER_RUNNING=hr-mod-5 run --separate-stderr "$HR" attach MOD-5 --shell </dev/null
+    [[ $status -eq 0 ]]
+    ! grep -qF 'hr-gortex' "$HR_TEST_DOCKER_LOG" || false
+}
+
 @test "4. up warns on uncommitted workflow files; the clone takes the committed ref" {
     printf 'local edit\n' >>"$HR_HOST_REPO/HANDOFF.md"
     mkdir -p "$HR_HOST_REPO/.claude"
