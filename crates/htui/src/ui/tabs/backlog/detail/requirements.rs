@@ -32,8 +32,8 @@
 //! mode's stack does not pass: a `CONTROL` or `ALT` chord or a function key goes on to the shell,
 //! so `ctrl-c` quits and `F1` opens help (MOD-67 M5 D7, M3's modal rule).
 //!
-//! Every key is resolved through the mode's stack ([`ReqsTab::stack`], MOD-67 M5 D4): the
-//! table above names the default chords.
+//! Every key is resolved through the mode's stack (`ReqsTab::stack`, MOD-67 M5 D4): the table
+//! above names the default chords.
 //!
 //! The cursor follows a citation, not a position: across a reply it stays on the citation it was
 //! on, or lands on the one a cite just made; an uncited row leaves it on the row that took its
@@ -529,7 +529,7 @@ impl DetailTab for ReqsTab {
     }
 
     /// Browsing: whole chords through `BACKLOG_REQS` (MOD-67 M5); a mode's keys go through
-    /// [`ReqsTab::modal_key`]. With no item every key is the tab's.
+    /// `ReqsTab::modal_key`. With no item every key is the tab's.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if !matches!(self.mode, Mode::Browse) {
             return self.modal_key(key, ctx);
