@@ -302,12 +302,12 @@ mod tests {
             Some(1),
         );
         assert_eq!(rows[2].settings["cli"]["stream"], "claude_stream_json");
-        assert_eq!(rows[2].settings["cli"]["permission_mode"], "default");
-        // MOD-96 D5 (Q2): edits proceed through htui's policy, recorded, instead of `acceptEdits`.
+        // MOD-96 review R1: `acceptEdits` stays. It allows an edit only inside the session's
+        // directories and after the CLI's safety checks; an unscoped htui edit rule would not.
+        assert_eq!(rows[2].settings["cli"]["permission_mode"], "acceptEdits");
         assert_eq!(
             rows[2].settings["permission"]["rules"],
-            serde_json::json!([{"match": {"tool_kind": "edit"}, "answer": "allow_once",
-             "reason": "edits are allowed and recorded by htui (MOD-96); a persona rule can refuse them"}])
+            serde_json::json!([])
         );
         // Empty, not `["--bare"]` (plan D92): that flag makes authentication strictly an API key
         // or an `apiKeyHelper` and never reads the login this row is billed against, so a

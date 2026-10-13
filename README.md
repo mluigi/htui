@@ -463,9 +463,8 @@ Use `claude` when you can. `claude-cli` uses the same Claude Code login but has 
 
 - It asks you for permission through htui's own MCP tool (`permission_prompt`), not its own
   channel: whatever its permission mode does not settle reaches you in the Runs pane or the chat.
-  When htui hosts no MCP tools, its permission mode decides alone (the seeded `default` refuses
-  what it would ask, edits included), and refusals show up in the transcript. See
-  [`docs/htui-mcp.md`](docs/htui-mcp.md#permission-prompts-for-claude-cli).
+  When htui hosts no MCP tools, its permission mode decides alone, and refusals show up in the
+  transcript. See [`docs/htui-mcp.md`](docs/htui-mcp.md#permission-prompts-for-claude-cli).
 - It shows edits as the tool calls that made them, not as diffs you can review.
 - It doesn't produce plans.
 - With [`mods (y/n)`](#your-claude-code-mods-hooks-and-skills) at `n`, a `--settings` in the
@@ -479,10 +478,11 @@ Use `claude` when you can. `claude-cli` uses the same Claude Code login but has 
 A Claude Code session that `htui` starts leaves out your own mods, the hooks in your
 `settings.json` files, and your skills and slash commands, so that no mod or settings hook answers
 a tool call before `htui` is asked. Your settings files are not read at all, so their permission
-rules and `defaultMode` no longer settle a call first: `htui` passes the permission mode itself
-(see [the docs](docs/htui-mcp.md#isolation-from-your-claude-code-setup)). The plugins those files
-enable go with them, agents and MCP servers included, and so do the project's `.mcp.json` servers
-(seen on `claude-cli`). Whether your own MCP servers in `~/.claude.json` and the claude.ai
+rules no longer settle a call first. The `claude` adapter still reads their `defaultMode` itself,
+so the seeded `claude` row pins its mode to `default`; an ACP Claude Code agent you add needs the
+same pin (see [the docs](docs/htui-mcp.md#isolation-from-your-claude-code-setup)). The plugins
+those files enable go with them, agents and MCP servers included, and so do the project's
+`.mcp.json` servers (seen on `claude-cli`). Whether your own MCP servers in `~/.claude.json` and the claude.ai
 connectors still load is not verified. The repository's `CLAUDE.md` still loads.
 
 The agent form's `mods (y/n)` field turns this off for one agent. It defaults to `n`. Set it to `y`

@@ -522,9 +522,7 @@ These gaps are real; a persona narrows what htui can see, not everything an agen
   name to `--disallowedTools`.
 - **Persona `rules` and `default` on the CLI.** They apply only to the calls the CLI asks htui
   about through the `permission_prompt` tool. A call its permission mode allows by itself (an edit
-  under `acceptEdits`, which a row may still carry) never reaches them. The seeded `claude-cli`
-  runs in `default` and allows edits by an agent rule instead, and a persona's rules are evaluated
-  before it, so a persona can refuse edits there.
+  under `acceptEdits`, the seeded `claude-cli`'s mode) never reaches them.
 - **MCP tools on the CLI.** `--tools` filters built-in tools only, and `deny_kinds` inverts to
   built-in names only. An MCP tool is removed only by naming it in `disallowed-tools`.
 - **Tool names on ACP.** `allow` and `deny` are stored but no ACP transport enforces them.
