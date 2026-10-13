@@ -22,7 +22,7 @@ pub use chord::{CTRL_C, ChordError, KeyChord};
 pub use hint::{HelpLine, Hint, HintSpec};
 pub use load::{FILE_NAME, KeyFileError, KeysError, Resolved, load_path, load_str, resolve};
 pub use print::print;
-pub use stack::{DECLARED, Layer, Stack};
+pub use stack::{DECLARED, FIXED, Fixed, Layer, Stack};
 pub use validate::validate;
 
 /// The keys in force: every catalogue action's chords per context (MOD-67 D9, D10). Built once

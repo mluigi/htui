@@ -253,7 +253,10 @@ Backlog filter. A shared table is checked the same way on every screen that uses
 forms also move between fields with `Down` / `Up`. A `[form] next_field` line changes them too, and
 they keep `Down`; write `[settings.agents] next_field = [...]` to replace it in that form alone.
 While a text field takes typing, the keys the field uses itself (letters, arrows, `Enter`, `Esc`)
-stay the field's. `Tab` still leaves a Skills editor with the draft kept. In the Backlog's item
+stay the field's. In the same way, keys a screen keeps for itself (a choice's value keys, such as
+`Space` and `h` / `l` on the Backlog filter's rows, or the digits that answer a permission
+request) cannot be given to an action there: `[backlog.filter_form] clear = ["space"]` is refused.
+`Tab` still leaves a Skills editor with the draft kept. In the Backlog's item
 form and the Notes and Docs editors, `[form] save` and `[form] external_editor` replace `Ctrl+s`
 and `Ctrl+e`.
 

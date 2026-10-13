@@ -312,6 +312,43 @@ mod binary {
         assert_eq!(stderr, report("both", &path, &[line.to_owned()]));
     }
 
+    /// MOD-67 M5 R1 M1 end to end: a key the filter form's option rows keep for themselves
+    /// (`Space`, `l`, `Enter`) cannot be given to one of its acts; each file is refused before
+    /// anything starts, on the entry's line, naming the form.
+    #[test]
+    fn a_rebind_onto_a_filter_form_fixed_key_exits_2() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        for (name, entry, line) in [
+            (
+                "space",
+                r#"clear = ["space"]"#,
+                r#"2: [backlog.filter_form] clear = "space": "space" is fixed in the Backlog filter form"#,
+            ),
+            (
+                "ell",
+                r#"next_row = ["l"]"#,
+                r#"2: [backlog.filter_form] next_row = "l": "l" is fixed in the Backlog filter form"#,
+            ),
+            (
+                "enter",
+                r#"clear = ["enter"]"#,
+                r#"2: [backlog.filter_form] clear = "enter": "enter" is fixed in the Backlog filter form"#,
+            ),
+        ] {
+            let path = home.path().join(format!("{name}.toml"));
+            std::fs::write(&path, format!("[backlog.filter_form]\n{entry}\n"))
+                .expect("the file is written");
+            let output = run(
+                &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+                home.path(),
+            );
+            let (stdout, stderr) = text(&output);
+            assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+            assert_eq!(stdout, "", "{name}");
+            assert_eq!(stderr, report(name, &path, &[line.to_owned()]), "{name}");
+        }
+    }
+
     /// MOD-67 M4 D8.1 end to end: a file that leaves the in-pane editor no way out is refused
     /// before anything starts, on the entry's line.
     #[test]

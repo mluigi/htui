@@ -2368,5 +2368,8 @@ async fn a_thoughts_key_rebound_onto_i_folds_in_the_replay() {
     harness.key("i");
     let frame = harness.render();
     assert!(frame.contains("thought  second"), "`i` unfolds: {frame}");
-    assert!(frame.contains("read-only"), "the replay stays open: {frame}");
+    assert!(
+        frame.contains("read-only"),
+        "the replay stays open: {frame}"
+    );
 }

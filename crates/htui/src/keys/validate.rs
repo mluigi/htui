@@ -9,8 +9,8 @@
 //! set is reported as the shared row it follows, on the user's line.
 
 use super::{
-    Act, Context, DECLARED, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING, STATE_GUARDED,
-    quote,
+    Act, Context, DECLARED, FIXED, Fixed, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
+    STATE_GUARDED, Stack, quote,
 };
 
 /// The user's binding wins (MOD-12 M3 R1 H1, maintainer 2026-10-08): an entry of the file that
@@ -58,18 +58,24 @@ pub(super) fn give_way(keys: &mut Keys) {
 /// Every collision and capture error in `keys`, reported on the user's line (D8 steps 5-6).
 /// The compiled defaults give none (`the_compiled_defaults_validate`).
 ///
-/// Three passes, in this order: two actions sharing a chord in one shared or global context; two
+/// Four passes, in this order: two actions sharing a chord in one shared or global context; two
 /// candidates for one chord in a [`DECLARED`] stack; a printable chord on an `in_capture`
-/// action. A pair and chord seen by two passes is reported once. A [`STATE_GUARDED`] pair may
-/// share a chord only when it is a catalogue default of both actions (PA-2), and so may a
+/// action; an act of a stack bound to a key its view keeps fixed ([`FIXED`], MOD-67 M5 R1 M1).
+/// A pair and chord seen by two passes is reported once. A [`STATE_GUARDED`] pair may share a
+/// chord only when it is a catalogue default of both actions (PA-2), and so may a
 /// [`SHADOWING`] pair whose first act's layer is the narrower (MOD-67 D11).
 #[must_use]
 pub fn validate(keys: &Keys) -> Vec<KeyFileError> {
-    check(keys, SHADOWING, STATE_GUARDED)
+    check(keys, SHADOWING, STATE_GUARDED, FIXED)
 }
 
 /// [`validate`] over explicit allow-lists: the demand tests drop one entry at a time.
-fn check(keys: &Keys, shadowing: &[(Act, Act)], guarded: &[(Act, Act)]) -> Vec<KeyFileError> {
+fn check(
+    keys: &Keys,
+    shadowing: &[(Act, Act)],
+    guarded: &[(Act, Act)],
+    fixed: &[Fixed],
+) -> Vec<KeyFileError> {
     let mut check = Check {
         keys,
         guarded,
@@ -140,7 +146,18 @@ fn check(keys: &Keys, shadowing: &[(Act, Act)], guarded: &[(Act, Act)]) -> Vec<K
             });
         }
     }
+    check.fixed(fixed);
     check.errors
+}
+
+/// The layer index and row of `act` as `stack` sees it: [`Keys::resolve_row`], with the index.
+fn resolve_at<'k>(keys: &'k Keys, stack: Stack<'_>, act: Act) -> Option<(usize, &'k Row)> {
+    stack
+        .layers()
+        .iter()
+        .enumerate()
+        .filter(|&(index, _)| stack.admits(index, act))
+        .find_map(|(index, layer)| keys.row(layer.context(), act).map(|row| (index, row)))
 }
 
 /// A row's identity: its context and act.
@@ -169,6 +186,47 @@ struct Check<'k> {
 }
 
 impl Check<'_> {
+    /// The fixed-key pass (MOD-67 M5 R1 M1): every act a [`Fixed`] entry's stack resolves on one
+    /// of its keys, in the layers the keys shadow, unless the entry shadows that act by design.
+    /// A row and chord are reported once, naming the first stack, on the row's [`source`].
+    fn fixed(&mut self, table: &[Fixed]) {
+        let mut seen: Vec<(Slot, KeyChord)> = Vec::new();
+        for entry in table {
+            let phrase = DECLARED
+                .iter()
+                .find(|(_, stack)| *stack == entry.stack)
+                .map_or("", |(phrase, _)| phrase);
+            let first = if entry.only_global {
+                entry.stack.global().map_or(usize::MAX, |(index, _)| index)
+            } else {
+                0
+            };
+            for written in entry.chords {
+                let chord = KeyChord::parse_strict(written)
+                    .unwrap_or_else(|err| panic!("fixed key {written:?}: {err}"));
+                for act in self.keys.actions(entry.stack, chord) {
+                    if entry.shadowed.contains(&act) {
+                        continue;
+                    }
+                    let Some((index, row)) = resolve_at(self.keys, entry.stack, act) else {
+                        continue;
+                    };
+                    let row = source(self.keys, row);
+                    let slot = (row.context, row.act);
+                    if index < first || seen.contains(&(slot, chord)) {
+                        continue;
+                    }
+                    seen.push((slot, chord));
+                    let shown = quote(&chord.spec());
+                    self.errors.push(KeyFileError {
+                        line: row.line.or(row.entry).unwrap_or(0),
+                        message: format!("{} = {shown}: {shown} is fixed {phrase}", subject(row)),
+                    });
+                }
+            }
+        }
+    }
+
     /// Reports that `first` and `second` both bind `chord` (`place` ends the message), unless
     /// the pair was reported already or is allowed. The reported row is the one that added
     /// `chord` (it is not that row's catalogue default) when exactly one did (review L1);
@@ -241,7 +299,9 @@ fn subject(row: &Row) -> String {
 #[cfg(test)]
 mod tests {
     use super::{check, validate};
-    use crate::keys::{Act, Context, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str};
+    use crate::keys::{
+        Act, Context, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str,
+    };
 
     fn chord(spec: &str) -> KeyChord {
         KeyChord::parse_strict(spec).expect("a valid spec")
@@ -460,11 +520,11 @@ mod tests {
     #[test]
     fn every_allow_list_entry_is_demanded() {
         let keys = Keys::compiled();
-        assert_eq!(check(keys, SHADOWING, STATE_GUARDED), []);
+        assert_eq!(check(keys, SHADOWING, STATE_GUARDED, FIXED), []);
         for entry in SHADOWING {
             let fewer: Vec<_> = SHADOWING.iter().copied().filter(|e| e != entry).collect();
             assert!(
-                !check(keys, &fewer, STATE_GUARDED).is_empty(),
+                !check(keys, &fewer, STATE_GUARDED, FIXED).is_empty(),
                 "SHADOWING {entry:?} is not demanded"
             );
         }
@@ -475,9 +535,26 @@ mod tests {
                 .filter(|e| e != entry)
                 .collect();
             assert!(
-                !check(keys, SHADOWING, &fewer).is_empty(),
+                !check(keys, SHADOWING, &fewer, FIXED).is_empty(),
                 "STATE_GUARDED {entry:?} is not demanded"
             );
+        }
+        // MOD-67 M5 R1 M1: each act a `FIXED` entry shadows by design has a default on its keys.
+        for (index, entry) in FIXED.iter().enumerate() {
+            for act in entry.shadowed {
+                let fewer: Vec<Act> = entry
+                    .shadowed
+                    .iter()
+                    .copied()
+                    .filter(|a| a != act)
+                    .collect();
+                let mut table: Vec<Fixed> = FIXED.to_vec();
+                table[index].shadowed = fewer.leak();
+                assert!(
+                    !check(keys, SHADOWING, STATE_GUARDED, &table).is_empty(),
+                    "FIXED[{index}] shadowed {act:?} is not demanded"
+                );
+            }
         }
     }
 
@@ -564,6 +641,92 @@ mod tests {
                 r#"[global] quit = "ctrl-x": "ctrl-x" is already editor.abort (default) in the in-pane editor"#
             )
         );
+    }
+
+    /// MOD-67 M5 R1 M1: a key a view matches ahead of the resolver (`keys::FIXED`) cannot be
+    /// given to an act of its stack. The filter form's option rows keep `Space`, `h`/`l`, the
+    /// arrows, `Enter` and `Esc`.
+    #[test]
+    fn a_rebind_onto_a_filter_form_fixed_key_is_refused() {
+        let fixed = |entry: &str, shown: &str| {
+            one(
+                2,
+                &format!(
+                    r#"[backlog.filter_form] {entry} = "{shown}": "{shown}" is fixed in the Backlog filter form"#
+                ),
+            )
+        };
+        assert_eq!(
+            errors("[backlog.filter_form]\nclear = [\"space\"]\n"),
+            fixed("clear", "space")
+        );
+        assert_eq!(
+            errors("[backlog.filter_form]\nnext_row = [\"l\"]\n"),
+            fixed("next_row", "l")
+        );
+        assert_eq!(
+            errors("[backlog.filter_form]\nclear = [\"enter\"]\n"),
+            fixed("clear", "enter")
+        );
+        assert_eq!(
+            errors("[backlog.filter_form]\nprev_row = [\"k\", \"left\"]\n"),
+            fixed("prev_row", "left")
+        );
+        // A shared act the form offers is refused there too, once, naming the first stack.
+        assert_eq!(
+            errors("[form]\nnext_field = [\"tab\", \"right\"]\n"),
+            one(
+                2,
+                r#"[form] next_field = "right": "right" is fixed in the Backlog filter form"#
+            )
+        );
+    }
+
+    /// MOD-67 M5 R1 M1: the item form's pickers keep `Left`/`Right`, `h`/`l`, `Enter`, `Esc`; the
+    /// Runs close-out warning keeps its resolution keys.
+    #[test]
+    fn a_rebind_onto_an_item_form_or_runs_question_fixed_key_is_refused() {
+        assert_eq!(
+            errors("[form]\nsave = [\"ctrl-s\", \"esc\"]\n"),
+            one(2, r#"[form] save = "esc": "esc" is fixed in the item form"#)
+        );
+        assert_eq!(
+            errors("[backlog.runs]\nyes = [\"y\", \"right\"]\n"),
+            one(
+                2,
+                r#"[backlog.runs] yes = "right": "right" is fixed in a Runs question"#
+            )
+        );
+    }
+
+    /// MOD-67 M5 R1 M1: a parked request takes the plain digits in Backlog > Runs and in Chat; only
+    /// the tab select sits on them by design.
+    #[test]
+    fn a_rebind_onto_a_permission_digit_is_refused() {
+        assert_eq!(
+            errors("[global]\nselect_tab_1 = []\n[backlog.runs]\napprove = [\"a\", \"1\"]\n"),
+            one(
+                4,
+                r#"[backlog.runs] approve = "1": "1" is fixed in Backlog > Runs"#
+            )
+        );
+        assert_eq!(
+            errors("[global]\nselect_tab_1 = []\n[chat]\nthoughts = [\"t\", \"1\"]\n"),
+            one(4, r#"[chat] thoughts = "1": "1" is fixed in Chat"#)
+        );
+        // The tab select may move between digits: the swallow shadows it by design.
+        assert_eq!(
+            errors("[global]\nselect_tab_1 = [\"2\"]\nselect_tab_2 = [\"1\"]\n"),
+            []
+        );
+    }
+
+    /// MOD-67 M5 R1 M1 (a): the Chat replay resolves its own acts before its swallow, so they may
+    /// take `i`; only a global act there is shadowed.
+    #[test]
+    fn the_chat_replays_own_acts_may_take_its_swallowed_keys() {
+        assert_eq!(errors("[common]\nback = [\"i\"]\n"), []);
+        assert_eq!(errors("[chat]\nthoughts = [\"i\"]\n"), []);
     }
 
     /// A derived view row follows its shared row, so a printable shared chord is reported once,
