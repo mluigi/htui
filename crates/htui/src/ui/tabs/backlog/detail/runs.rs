@@ -77,14 +77,16 @@ use serde_json::Value;
 
 use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
+use crate::ui::tabs::settings::modal_rest;
 use crate::ui::text_field::{FieldOutcome, TextField};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
 
 /// What an action key says while the verdicts it reads have not arrived.
 pub const NOT_LOADED: &str = "the run actions have not loaded yet";
@@ -133,6 +135,66 @@ const NO_STEPS_YET: &str = "No steps yet.";
 /// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
 /// call, or the scrubber refused it).
 const NO_SUMMARY: &str = "a permission";
+
+/// The cancel question's hint (MOD-67 M5): `y cancel it · n keep it` under the defaults.
+const CONFIRM_CANCEL_HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "cancel it"),
+    Hint::One(Act::ConfirmNo, "keep it"),
+];
+
+/// What the close-out says while it counts.
+const COUNTING_HINT: HintSpec = &[Hint::Text("counting what the close-out writes\u{2026}")];
+
+/// The close-out warning's hint: the resolution's fixed value keys, then its answers
+/// (`←/→ resolution · y continue · n cancel` under the defaults).
+const WARN_HINT: HintSpec = &[
+    Hint::Text("←/→ resolution"),
+    Hint::One(Act::ConfirmYes, "continue"),
+    Hint::One(Act::ConfirmNo, "cancel"),
+];
+
+/// The browse row under the run list (ANA-26 §8): `J/K step · Enter replay · v flow · ? keys`
+/// under the defaults.
+const RUNS_LIST_HINT: HintSpec = &[
+    Hint::Pair(Act::RunsNextStep, Act::RunsPrevStep, "step"),
+    Hint::One(Act::BacklogReplay, "replay"),
+    Hint::One(Act::RunsToggleView, "flow"),
+    Hint::One(Act::Help, "keys"),
+];
+
+/// The browse row under the flow: `J/K step · +/- zoom · v list · ? keys` under the defaults.
+const RUNS_FLOW_HINT: HintSpec = &[
+    Hint::Pair(Act::RunsNextStep, Act::RunsPrevStep, "step"),
+    Hint::Pair(Act::RunsZoomIn, Act::RunsZoomOut, "zoom"),
+    Hint::One(Act::RunsToggleView, "list"),
+    Hint::One(Act::Help, "keys"),
+];
+
+/// The browse row of an item with no run: `R start run · ? keys` under the defaults.
+const RUNS_EMPTY_HINT: HintSpec = &[
+    Hint::One(Act::RunsStartRun, "start run"),
+    Hint::One(Act::Help, "keys"),
+];
+
+/// The rejection note's hint: the field's own keys.
+const REJECT_HINT: HintSpec = &[Hint::Text("Enter reject"), Hint::Text("Esc cancel")];
+
+/// The follow-up input's hint: the field's own keys.
+const FOLLOW_UP_HINT: HintSpec = &[Hint::Text("Enter send"), Hint::Text("Esc cancel")];
+
+/// The close-out's typed stage's hint: the field's own keys.
+const TYPED_HINT: HintSpec = &[Hint::Text("Enter close"), Hint::Text("Esc cancel")];
+
+/// What the close-out says while its command is in flight.
+const IN_FLIGHT_HINT: HintSpec = &[Hint::Text("closing\u{2026}")];
+
+/// The document view's hint (`read-only · J/K scroll · Esc close` under the defaults: the first
+/// chords of `pane.scroll_down`/`scroll_up`; `j`/`k` scroll too).
+const ARTIFACT_HINT: HintSpec = &[
+    Hint::Text("read-only"),
+    Hint::Pair(Act::PaneScrollDown, Act::PaneScrollUp, "scroll"),
+    Hint::One(Act::Back, "close"),
+];
 
 /// The width of a detail pane at 100x30, which every step line fills exactly (MOD-4 plan D169,
 /// blueprint D197).
@@ -626,27 +688,46 @@ impl RunsTab {
         }
     }
 
-    /// A key while the pane captures (blueprint D201): a `CONTROL` chord passes, so `ctrl-c`
-    /// still quits, and everything else is the mode's, answered or swallowed.
-    fn modal_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
+    /// The current mode's stack (MOD-67 M5 D4): the only place a mode maps to its keys;
+    /// `on_key`, `footer` and the Backlog tab read it.
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
+            Mode::Browse => views::RUNS_BROWSE,
+            Mode::RejectNote { .. }
+            | Mode::FollowUp { .. }
+            | Mode::CloseOut(CloseOutStage::Typed { .. } | CloseOutStage::InFlight) => {
+                views::CAPTURE
+            }
+            Mode::ConfirmCancel { .. } | Mode::CloseOut(CloseOutStage::Warn(_)) => {
+                views::RUNS_CONFIRM
+            }
+            Mode::CloseOut(CloseOutStage::Counting) => views::RUNS_COUNTING,
+            Mode::Artifact { .. } => views::RUNS_ARTIFACT,
         }
-        self.mode = match core::mem::take(&mut self.mode) {
-            Mode::Browse => Mode::Browse,
+    }
+
+    /// A key while the pane captures (blueprint D201), through the mode's stack (MOD-67 M5 D4):
+    /// the mode's acts and widget keys answer, and every other chord is swallowed unless the
+    /// stack's modal global layer lets it through (`modal_rest`: CONTROL, ALT, function keys), so
+    /// `ctrl-c` still quits, `F1` opens help and `alt-y` answers no question (D7).
+    fn modal_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
+        let (mode, handled) = match core::mem::take(&mut self.mode) {
+            Mode::Browse => (Mode::Browse, Handled::Pass),
             Mode::RejectNote { run, step, field } => reject_key(run, step, field, key, ctx),
             Mode::FollowUp { step, field } => follow_up_key(step, field, key, ctx),
-            Mode::ConfirmCancel { run } => match key.code {
-                KeyCode::Char('y') => {
+            Mode::ConfirmCancel { run } => match ctx.keys().actions(stack, chord).first() {
+                Some(Act::ConfirmYes) => {
                     ctx.request(command(Command::CancelRun { run }));
-                    Mode::Browse
+                    (Mode::Browse, Handled::Consumed)
                 }
-                KeyCode::Char('n') | KeyCode::Esc => Mode::Browse,
-                _ => Mode::ConfirmCancel { run },
+                Some(Act::ConfirmNo) => (Mode::Browse, Handled::Consumed),
+                _ => (Mode::ConfirmCancel { run }, modal_rest(stack, chord)),
             },
             Mode::CloseOut(stage) => match self.item {
-                Some(item) => close_out_key(item, stage, key, ctx),
-                None => Mode::Browse,
+                Some(item) => close_out_key(item, stage, key, stack, ctx),
+                None => (Mode::Browse, Handled::Consumed),
             },
             Mode::Artifact {
                 id,
@@ -654,28 +735,56 @@ impl RunsTab {
                 mut scroll,
                 width,
             } => {
-                let code = match key.code {
-                    KeyCode::Char('j') => KeyCode::Char('J'),
-                    KeyCode::Char('k') => KeyCode::Char('K'),
-                    other => other,
-                };
-                if code == KeyCode::Esc {
-                    Mode::Browse
+                // `pane.scroll_*` (`J`/`K`, and `j`/`k` by the view's defaults) and
+                // `pane.page_*` scroll the body, `common.back` (`Esc`) closes the view.
+                let act = ctx.keys().actions(stack, chord).first().copied();
+                if act == Some(Act::Back) {
+                    (Mode::Browse, Handled::Consumed)
                 } else {
-                    let len = doc
-                        .as_ref()
-                        .map_or(0, |doc| artifact_rows(doc, width.get()).len());
-                    let _ = scroll.on_key(KeyEvent::new(code, KeyModifiers::NONE), len);
-                    Mode::Artifact {
+                    let handled = match act {
+                        Some(
+                            act @ (Act::PaneScrollDown
+                            | Act::PaneScrollUp
+                            | Act::PanePageDown
+                            | Act::PanePageUp),
+                        ) => {
+                            let len = doc
+                                .as_ref()
+                                .map_or(0, |doc| artifact_rows(doc, width.get()).len());
+                            scroll.apply(act, len)
+                        }
+                        _ => modal_rest(stack, chord),
+                    };
+                    let mode = Mode::Artifact {
                         id,
                         doc,
                         scroll,
                         width,
-                    }
+                    };
+                    (mode, handled)
                 }
             }
         };
-        Handled::Consumed
+        self.mode = mode;
+        handled
+    }
+
+    /// `backlog.runs.toggle_view` (`v`): the list or the flow of the cursor's run (MOD-28 D1,
+    /// D8).
+    fn toggle_view(&mut self, ctx: &Ctx<'_>) {
+        // MOD-71 D11, MOD-74 D4: the gesture ends with the view.
+        self.end_gesture();
+        self.view = match self.view {
+            View::List => View::Flow,
+            View::Flow => View::List,
+        };
+        // MOD-72 D4: into the flow, the chips are asked for once.
+        if self.view == View::Flow
+            && let Some(item) = self.item
+        {
+            ctx.request(StoreRequest::ToolCalls { item });
+        }
+        self.sync_graph(ctx.theme);
     }
 
     /// A `Document` reply: the artifact view's body, or back to the list when the box does not
@@ -694,17 +803,20 @@ impl RunsTab {
         }
     }
 
-    /// One action key in [`Mode::Browse`] (MOD-4 plan D168, blueprint §9.3).
+    /// One action verb in [`Mode::Browse`] (MOD-4 plan D168, blueprint §9.3): `backlog.runs.*`'s
+    /// `approve`, `reject`, `retry`, `promote`, `select`, `accept` and `open` on the step under
+    /// the cursor, `cancel_run` and `cleanup` on its run, `unblock`, `start_run` and `close_out` on
+    /// the item, and `follow_up` on a running step (MOD-67 M5: acts, not characters).
     ///
-    /// Each key reads its verdict first: none yet says so, a refusal puts the guard's sentence on
-    /// the status line, and only an `Ok` sends. Every request goes through `ctx.request`, so it is
-    /// stamped with the Backlog tab's origin and its reply comes back here.
-    fn action(&mut self, key: char, ctx: &mut Ctx<'_>) -> Handled {
+    /// Each verb reads its verdict first: none yet says so, a refusal puts the guard's sentence
+    /// on the status line, and only an `Ok` sends. Every request goes through `ctx.request`, so it
+    /// is stamped with the Backlog tab's origin and its reply comes back here.
+    fn action(&mut self, act: Act, ctx: &mut Ctx<'_>) -> Handled {
         let Some(item) = self.item else {
             return Handled::Pass;
         };
         // MOD-70 D14: a follow-up has no `RunActions` verdict, so it waits on none.
-        if key == 'i' {
+        if act == Act::RunsFollowUp {
             self.open_follow_up(ctx);
             return Handled::Consumed;
         }
@@ -712,13 +824,13 @@ impl RunsTab {
             ctx.emit(Action::Error(NOT_LOADED.to_owned()));
             return Handled::Consumed;
         };
-        match key {
-            'u' => {
+        match act {
+            Act::RunsUnblock => {
                 if allowed(&actions.unblock, ctx) {
                     ctx.request(command(Command::Unblock { item }));
                 }
             }
-            'R' => {
+            Act::RunsStartRun => {
                 if allowed(&actions.run, ctx) {
                     ctx.request(command(Command::StartRun {
                         item,
@@ -727,13 +839,13 @@ impl RunsTab {
                     }));
                 }
             }
-            'C' => {
+            Act::RunsCloseOut => {
                 if allowed(&actions.close_out, ctx) {
                     ctx.request(StoreRequest::Orch(OrchRequest::CloseOutPreview { item }));
                     self.mode = Mode::CloseOut(CloseOutStage::Counting);
                 }
             }
-            'c' | 'T' => {
+            Act::RunsCancelRun | Act::RunsCleanup => {
                 let Some(run) = self.entry_run().map(|run| run.id) else {
                     ctx.emit(Action::Error(NO_RUN.to_owned()));
                     return Handled::Consumed;
@@ -741,7 +853,7 @@ impl RunsTab {
                 let verdict = actions.runs.get(&run).map_or_else(
                     || Err(NOT_LOADED.to_owned()),
                     |verdicts| {
-                        if key == 'c' {
+                        if act == Act::RunsCancelRun {
                             verdicts.cancel.clone()
                         } else {
                             verdicts.cleanup.clone()
@@ -749,14 +861,20 @@ impl RunsTab {
                     },
                 );
                 if allowed(&verdict, ctx) {
-                    if key == 'c' {
+                    if act == Act::RunsCancelRun {
                         self.mode = Mode::ConfirmCancel { run };
                     } else {
                         ctx.request(StoreRequest::Orch(OrchRequest::Cleanup { run }));
                     }
                 }
             }
-            'a' | 'x' | 'r' | 'p' | 'o' | 's' | 'A' => {
+            Act::RunsApprove
+            | Act::RunsReject
+            | Act::RunsRetry
+            | Act::RunsPromote
+            | Act::RunsOpen
+            | Act::RunsSelect
+            | Act::RunsAccept => {
                 let Some((run, step)) = self.entry_step() else {
                     ctx.emit(Action::Error(NO_STEP.to_owned()));
                     return Handled::Consumed;
@@ -766,28 +884,28 @@ impl RunsTab {
                     return Handled::Consumed;
                 };
                 let (id, position, attempt) = (step.id, step.position, step.attempt);
-                match key {
-                    'a' if allowed(&verdicts.approve, ctx) => {
+                match act {
+                    Act::RunsApprove if allowed(&verdicts.approve, ctx) => {
                         ctx.request(command(Command::AnswerGate {
                             run,
                             step: id,
                             answer: GateAnswer::Approved,
                         }));
                     }
-                    'x' if allowed(&verdicts.reject, ctx) => {
+                    Act::RunsReject if allowed(&verdicts.reject, ctx) => {
                         self.mode = Mode::RejectNote {
                             run,
                             step: id,
                             field: TextField::new(),
                         };
                     }
-                    'r' if allowed(&verdicts.retry, ctx) => {
+                    Act::RunsRetry if allowed(&verdicts.retry, ctx) => {
                         ctx.request(command(Command::RetryStep { run, step: id }));
                     }
-                    'p' if allowed(&verdicts.promote, ctx) => {
+                    Act::RunsPromote if allowed(&verdicts.promote, ctx) => {
                         ctx.emit(Action::Promote { run, step: id });
                     }
-                    's' if allowed(&verdicts.select, ctx) => {
+                    Act::RunsSelect if allowed(&verdicts.select, ctx) => {
                         ctx.request(command(Command::SelectFanout {
                             run,
                             position,
@@ -795,7 +913,7 @@ impl RunsTab {
                             winner: id,
                         }));
                     }
-                    'A' if allowed(&verdicts.accept, ctx) => {
+                    Act::RunsAccept if allowed(&verdicts.accept, ctx) => {
                         // D185: only the worker knows whether a chat is live on the step.
                         ctx.request(command(Command::AcceptArtifact {
                             run,
@@ -803,7 +921,7 @@ impl RunsTab {
                             chat_live: false,
                         }));
                     }
-                    'o' => match &verdicts.open {
+                    Act::RunsOpen => match &verdicts.open {
                         Ok(document) => {
                             ctx.request(StoreRequest::Document(*document));
                             self.mode = Mode::Artifact {
@@ -858,7 +976,8 @@ fn artifact_rows(doc: &Document, width: u16) -> Vec<(bool, String)> {
     rows
 }
 
-/// Draws the artifact view (D173): the document read-only over the pane, `Esc` to leave.
+/// Draws the artifact view (D173): the document read-only over the pane, `Esc` to leave. Its
+/// hint renders through [`views::RUNS_ARTIFACT`] (MOD-67 M5).
 ///
 /// Records the width it wrapped at in `width`, which is what the next scroll key clamps against.
 fn render_artifact(
@@ -867,6 +986,7 @@ fn render_artifact(
     doc: Option<&Document>,
     scroll: Scroll,
     width: &Cell<u16>,
+    keys: &Keys,
     theme: &Theme,
 ) {
     let [body, hint] = Layout::vertical([Constraint::Min(0), Constraint::Length(1)]).areas(area);
@@ -888,7 +1008,7 @@ fn render_artifact(
     );
     frame.render_widget(
         Paragraph::new(Line::styled(
-            "read-only · j/k scroll · Esc close",
+            keys.hint(views::RUNS_ARTIFACT, ARTIFACT_HINT),
             theme.dim,
         )),
         hint,
@@ -896,53 +1016,69 @@ fn render_artifact(
 }
 
 /// A key in [`Mode::RejectNote`]: `Enter` with a note rejects, `Enter` without one says a note is
-/// needed, `Esc` goes back to the list and everything else is typed.
+/// needed, `Esc` goes back to the list and everything else is typed. A key the field does not
+/// use is `modal_rest`'s through [`views::CAPTURE`] (MOD-67 M5): `F1` and the CONTROL/ALT chords
+/// pass, the rest is swallowed.
 fn reject_key(
     run: RunId,
     step: StepId,
     mut field: TextField,
     key: KeyEvent,
     ctx: &Ctx<'_>,
-) -> Mode {
+) -> (Mode, Handled) {
     match field.on_key(key) {
         FieldOutcome::Submit => {
             let note = field.text().unwrap_or_default().trim().to_owned();
             if note.is_empty() {
                 ctx.emit(Action::Error(NOTE_NEEDED.to_owned()));
-                Mode::RejectNote { run, step, field }
+                (Mode::RejectNote { run, step, field }, Handled::Consumed)
             } else {
                 ctx.request(command(Command::AnswerGate {
                     run,
                     step,
                     answer: GateAnswer::Rejected { note },
                 }));
-                Mode::Browse
+                (Mode::Browse, Handled::Consumed)
             }
         }
-        FieldOutcome::Cancel => Mode::Browse,
-        FieldOutcome::Consumed | FieldOutcome::Pass => Mode::RejectNote { run, step, field },
+        FieldOutcome::Cancel => (Mode::Browse, Handled::Consumed),
+        FieldOutcome::Consumed => (Mode::RejectNote { run, step, field }, Handled::Consumed),
+        FieldOutcome::Pass => (
+            Mode::RejectNote { run, step, field },
+            modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+        ),
     }
 }
 
 /// A key in [`Mode::FollowUp`] (MOD-70 D14): `Enter` sends the text when it is a follow-up, and
 /// otherwise says why and stays, so the text can be edited (an empty text and a credential-shaped
-/// one alike, D2); `Esc` goes back to the list and everything else is typed.
-fn follow_up_key(step: StepId, mut field: TextField, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
+/// one alike, D2); `Esc` goes back to the list and everything else is typed. A key the field
+/// does not use is `modal_rest`'s through [`views::CAPTURE`], as the rejection note's.
+fn follow_up_key(
+    step: StepId,
+    mut field: TextField,
+    key: KeyEvent,
+    ctx: &Ctx<'_>,
+) -> (Mode, Handled) {
     match field.on_key(key) {
         FieldOutcome::Submit => {
             match FollowUpText::new(field.text().unwrap_or_default().to_owned()) {
                 Ok(text) => {
                     ctx.request(StoreRequest::FollowUp { step, text });
-                    Mode::Browse
+                    (Mode::Browse, Handled::Consumed)
                 }
                 Err(why) => {
                     ctx.emit(Action::Error(why.to_string()));
-                    Mode::FollowUp { step, field }
+                    (Mode::FollowUp { step, field }, Handled::Consumed)
                 }
             }
         }
-        FieldOutcome::Cancel => Mode::Browse,
-        FieldOutcome::Consumed | FieldOutcome::Pass => Mode::FollowUp { step, field },
+        FieldOutcome::Cancel => (Mode::Browse, Handled::Consumed),
+        FieldOutcome::Consumed => (Mode::FollowUp { step, field }, Handled::Consumed),
+        FieldOutcome::Pass => (
+            Mode::FollowUp { step, field },
+            modal_rest(views::CAPTURE, KeyChord::from_event(key)),
+        ),
     }
 }
 
@@ -972,54 +1108,74 @@ fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
     legal[next]
 }
 
-/// A key in [`Mode::CloseOut`], stage by stage (D167): the mode it leaves the pane in.
+/// A key in [`Mode::CloseOut`], stage by stage (D167), through the stage's `stack`: the mode it
+/// leaves the pane in, and whether the key was used.
 ///
-/// Counting and warning leave on `n`/`Esc`; the warning's `←`/`→` (and `h`/`l`) pick the
-/// resolution (MOD-39 plan P13); the typed stage leaves on `Esc` only, because `n` is a letter
-/// there; in flight, every key waits for the answer.
-fn close_out_key(item: ItemId, stage: CloseOutStage, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
-    let stage = match stage {
-        CloseOutStage::Counting => match key.code {
-            KeyCode::Char('n') | KeyCode::Esc => return Mode::Browse,
-            _ => CloseOutStage::Counting,
+/// Counting and warning leave on `confirm.no` (`n`/`Esc`), the warning goes on with
+/// `confirm.yes` (`y`); the warning's `←`/`→` (and `h`/`l`) pick the resolution (MOD-39 plan
+/// P13), fixed value keys matched on plain keys before the resolver (MOD-67 M5); the typed stage
+/// leaves on `Esc` only, because `n` is a letter there; in flight, every key waits for the
+/// answer. A key no stage used is `modal_rest`'s.
+fn close_out_key(
+    item: ItemId,
+    stage: CloseOutStage,
+    key: KeyEvent,
+    stack: Stack<'_>,
+    ctx: &Ctx<'_>,
+) -> (Mode, Handled) {
+    let chord = KeyChord::from_event(key);
+    let (stage, handled) = match stage {
+        CloseOutStage::Counting => match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
+            _ => (CloseOutStage::Counting, modal_rest(stack, chord)),
         },
-        CloseOutStage::Warn(preview) => match key.code {
-            KeyCode::Char('y') => CloseOutStage::Typed {
-                preview,
-                field: TextField::new(),
-            },
-            KeyCode::Char('n') | KeyCode::Esc => return Mode::Browse,
-            KeyCode::Right | KeyCode::Char('l') => {
-                let mut preview = preview;
-                preview.resolution = cycle(preview.status, preview.resolution, true);
-                CloseOutStage::Warn(preview)
+        CloseOutStage::Warn(mut preview) => {
+            let forward = match key.code {
+                KeyCode::Right | KeyCode::Char('l') => Some(true),
+                KeyCode::Left | KeyCode::Char('h') => Some(false),
+                _ => None,
+            };
+            match forward.filter(|_| is_plain(&key)) {
+                Some(forward) => {
+                    preview.resolution = cycle(preview.status, preview.resolution, forward);
+                    (CloseOutStage::Warn(preview), Handled::Consumed)
+                }
+                None => match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::ConfirmYes) => (
+                        CloseOutStage::Typed {
+                            preview,
+                            field: TextField::new(),
+                        },
+                        Handled::Consumed,
+                    ),
+                    Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
+                    _ => (CloseOutStage::Warn(preview), modal_rest(stack, chord)),
+                },
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                let mut preview = preview;
-                preview.resolution = cycle(preview.status, preview.resolution, false);
-                CloseOutStage::Warn(preview)
-            }
-            _ => CloseOutStage::Warn(preview),
-        },
+        }
         CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
             FieldOutcome::Submit if field.text() == Some(preview.key.as_str()) => {
                 ctx.request(command(Command::CloseOut {
                     item,
                     resolution: preview.resolution,
                 }));
-                CloseOutStage::InFlight
+                (CloseOutStage::InFlight, Handled::Consumed)
             }
             FieldOutcome::Submit => {
                 field.clear();
                 ctx.emit(Action::Error(NOT_THE_KEY.to_owned()));
-                CloseOutStage::Typed { preview, field }
+                (CloseOutStage::Typed { preview, field }, Handled::Consumed)
             }
-            FieldOutcome::Cancel => return Mode::Browse,
-            FieldOutcome::Consumed | FieldOutcome::Pass => CloseOutStage::Typed { preview, field },
+            FieldOutcome::Cancel => return (Mode::Browse, Handled::Consumed),
+            FieldOutcome::Consumed => (CloseOutStage::Typed { preview, field }, Handled::Consumed),
+            FieldOutcome::Pass => (
+                CloseOutStage::Typed { preview, field },
+                modal_rest(stack, chord),
+            ),
         },
-        CloseOutStage::InFlight => CloseOutStage::InFlight,
+        CloseOutStage::InFlight => (CloseOutStage::InFlight, modal_rest(stack, chord)),
     };
-    Mode::CloseOut(stage)
+    (Mode::CloseOut(stage), handled)
 }
 
 /// A verdict's answer: `true` when the action may go, else the guard's sentence is on the status
@@ -1505,27 +1661,24 @@ impl DetailTab for RunsTab {
         }
     }
 
-    /// `J` / `K` move the cursor, `Enter` replays the step under it, the action keys act, and
-    /// everything else is still the shared scroll.
+    /// Browsing resolves through [`views::RUNS_BROWSE`] (MOD-67 M5): `backlog.runs.next_step`/
+    /// `prev_step` (`J`/`K`) move the cursor, `backlog.replay` (`Enter`) replays the step under
+    /// it, the action verbs act, `pane.page_*` walk a long run list, and a chord matches with its
+    /// modifiers (D7: `ctrl-J` is no act).
     ///
-    /// The cursor takes `J` / `K` off [`Scroll::on_key`] on this pane: the steps are the rows a
-    /// reader moves between, and `PageDown` / `PageUp` remain the way to walk a long run list.
-    /// `Enter` with no step under the cursor passes, so the Backlog tab's keymap row is what
-    /// answers it — the pane never consumes a key it cannot act on.
+    /// `backlog.replay` with no step under the cursor declines, so the Backlog tab is what
+    /// answers it with the miss — the pane never consumes a key it cannot act on — and so does
+    /// every act that is the tab's (`list.*`, `pane.*_subtab`, `backlog.*`, `common.edit`) or
+    /// the shell's.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if !matches!(self.mode, Mode::Browse) {
             return self.modal_key(key, ctx);
         }
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return Handled::Pass;
-        }
-        // MOD-42 D14: while the step under the cursor has a pending request, every digit is this
-        // pane's, as the chat's parked strip takes them (`chat/mod.rs`); otherwise digits pass to
-        // the global tab select (`keymap.rs`).
-        if let KeyCode::Char(digit @ '1'..='9') = key.code
+        // MOD-42 D14: while the step under the cursor has a pending request, every plain digit is
+        // this pane's, as the chat's parked strip takes them (`chat/mod.rs`); otherwise digits pass
+        // to the global tab select. A fixed key of MOD-67 D5, ahead of the resolver.
+        if is_plain(&key)
+            && let KeyCode::Char(digit @ '1'..='9') = key.code
             && let Some(pending) = self.pending_under_cursor()
         {
             // One answer per request: a digit while it is in flight is swallowed.
@@ -1542,59 +1695,69 @@ impl DetailTab for RunsTab {
             }
             return Handled::Consumed;
         }
-        match key.code {
-            KeyCode::Char('J') => {
-                self.move_cursor(1);
-                self.sync_graph(ctx.theme);
-            }
-            KeyCode::Char('K') => {
-                self.move_cursor(-1);
-                self.sync_graph(ctx.theme);
-            }
-            KeyCode::Enter => {
-                let Some(step_id) = self.selected_step() else {
-                    return Handled::Pass;
-                };
-                ctx.emit(Action::Replay { step_id });
-            }
-            KeyCode::Char('v') => {
-                // MOD-71 D11, MOD-74 D4: the gesture ends with the view.
-                self.end_gesture();
-                self.view = match self.view {
-                    View::List => View::Flow,
-                    View::Flow => View::List,
-                };
-                // MOD-72 D4: into the flow, the chips are asked for once.
-                if self.view == View::Flow
-                    && let Some(item) = self.item
-                {
-                    ctx.request(StoreRequest::ToolCalls { item });
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(self.stack(), chord) {
+            match act {
+                Act::RunsNextStep => {
+                    self.move_cursor(1);
+                    self.sync_graph(ctx.theme);
                 }
-                self.sync_graph(ctx.theme);
-            }
-            KeyCode::Char('+') if self.view == View::Flow => self.graph.get_mut().zoom_in(),
-            KeyCode::Char('-') if self.view == View::Flow => self.graph.get_mut().zoom_out(),
-            KeyCode::Char('=') if self.view == View::Flow => self.graph.get_mut().fit(),
-            // MOD-28 D8: the list's page keys do nothing in the flow, and leave its scroll alone.
-            KeyCode::PageUp | KeyCode::PageDown if self.view == View::Flow => {}
-            KeyCode::Char(
-                key @ ('a' | 'x' | 'r' | 'p' | 'c' | 'o' | 's' | 'u' | 'i' | 'A' | 'R' | 'C' | 'T'),
-            ) => {
-                let handled = self.action(key, ctx);
-                // MOD-71 D11, MOD-74 D4: a mode that captures input ends a live gesture
-                // (blueprint B-8).
-                if self.captures_input() {
-                    self.end_gesture();
+                Act::RunsPrevStep => {
+                    self.move_cursor(-1);
+                    self.sync_graph(ctx.theme);
                 }
-                return handled;
+                // D6: the pane's half of `Enter`; with no step under the cursor it declines and
+                // the Backlog tab answers with the miss.
+                Act::BacklogReplay => match self.selected_step() {
+                    Some(step_id) => ctx.emit(Action::Replay { step_id }),
+                    None => continue,
+                },
+                Act::RunsToggleView => self.toggle_view(ctx),
+                Act::RunsZoomIn if self.view == View::Flow => self.graph.get_mut().zoom_in(),
+                Act::RunsZoomOut if self.view == View::Flow => self.graph.get_mut().zoom_out(),
+                Act::RunsZoomFit if self.view == View::Flow => self.graph.get_mut().fit(),
+                // MOD-28 D8: the list's page keys do nothing in the flow, and leave its scroll
+                // alone.
+                Act::PanePageUp | Act::PanePageDown if self.view == View::Flow => {}
+                Act::PanePageUp | Act::PanePageDown => {
+                    return self.scroll.apply(act, self.runs.len());
+                }
+                Act::RunsApprove
+                | Act::RunsReject
+                | Act::RunsRetry
+                | Act::RunsPromote
+                | Act::RunsCancelRun
+                | Act::RunsOpen
+                | Act::RunsSelect
+                | Act::RunsUnblock
+                | Act::RunsFollowUp
+                | Act::RunsAccept
+                | Act::RunsStartRun
+                | Act::RunsCloseOut
+                | Act::RunsCleanup => {
+                    let handled = self.action(act, ctx);
+                    // MOD-71 D11, MOD-74 D4: a mode that captures input ends a live gesture
+                    // (blueprint B-8).
+                    if self.captures_input() {
+                        self.end_gesture();
+                    }
+                    return handled;
+                }
+                // `list.*`, `pane.*_subtab`, `backlog.*`, `common.edit`: the tab's; a zoom in
+                // the list; a global act: the shell's.
+                _ => continue,
             }
-            _ => return self.scroll.on_key(key, self.runs.len()),
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
     fn captures_input(&self) -> bool {
         !matches!(self.mode, Mode::Browse)
+    }
+
+    fn key_stack(&self) -> Stack<'static> {
+        self.stack()
     }
 
     /// MOD-22 review M-1: a bracketed paste into the rejection note, the follow-up (MOD-70 D14) or
@@ -1779,11 +1942,19 @@ impl DetailTab for RunsTab {
             doc, scroll, width, ..
         } = &self.mode
         {
-            render_artifact(frame, area, doc.as_deref(), *scroll, width, ctx.theme);
+            render_artifact(
+                frame,
+                area,
+                doc.as_deref(),
+                *scroll,
+                width,
+                ctx.keys(),
+                ctx.theme,
+            );
             return;
         }
 
-        let footer = self.footer(area.width, ctx.theme);
+        let footer = self.footer(area.width, ctx.keys(), ctx.theme);
         let height = footer
             .iter()
             .map(|line| line.width().max(1).div_ceil(usize::from(area.width.max(1))))
@@ -1913,28 +2084,34 @@ impl RunsTab {
         (lines, cursor_end)
     }
 
-    /// What a capturing mode asks, drawn under the run list; nothing while browsing.
-    fn footer(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
-        let hint = |text: &str| Line::styled(text.to_owned(), theme.dim);
+    /// What a capturing mode asks, drawn under the run list, and while browsing the browse row
+    /// (ANA-26 §8: the list's, the flow's, or an item with no run's). Every hint renders its spec
+    /// through the mode's stack (MOD-67 M5), so a rebound key shows its own chord. The document
+    /// view draws its own hint (`render_artifact`).
+    fn footer(&self, width: u16, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
+        let spec = |spec: HintSpec| Line::styled(keys.hint(self.stack(), spec), theme.dim);
         match &self.mode {
-            Mode::Browse | Mode::Artifact { .. } => Vec::new(),
+            Mode::Browse if self.runs.is_empty() => vec![spec(RUNS_EMPTY_HINT)],
+            Mode::Browse => match self.view {
+                View::List => vec![spec(RUNS_LIST_HINT)],
+                View::Flow => vec![spec(RUNS_FLOW_HINT)],
+            },
+            Mode::Artifact { .. } => Vec::new(),
             Mode::RejectNote { field, .. } => vec![
                 Line::styled("reject with a note:", theme.title),
                 field.line(width, true, theme),
-                hint("Enter reject · Esc cancel"),
+                spec(REJECT_HINT),
             ],
             Mode::FollowUp { field, .. } => vec![
                 Line::styled("follow-up for the running step:", theme.title),
                 field.line(width, true, theme),
-                hint("Enter send · Esc cancel"),
+                spec(FOLLOW_UP_HINT),
             ],
             Mode::ConfirmCancel { .. } => vec![
                 Line::styled("cancel this run?", theme.title),
-                hint("y cancel it · n keep it"),
+                spec(CONFIRM_CANCEL_HINT),
             ],
-            Mode::CloseOut(CloseOutStage::Counting) => {
-                vec![hint("counting what the close-out writes\u{2026}")]
-            }
+            Mode::CloseOut(CloseOutStage::Counting) => vec![spec(COUNTING_HINT)],
             Mode::CloseOut(CloseOutStage::Warn(preview)) => vec![
                 Line::styled(
                     format!(
@@ -1947,7 +2124,7 @@ impl RunsTab {
                     ),
                     theme.title,
                 ),
-                hint("←/→ resolution · y continue · n cancel"),
+                spec(WARN_HINT),
             ],
             Mode::CloseOut(CloseOutStage::Typed { preview, field }) => {
                 let prompt = format!("type {} to close it: ", preview.key);
@@ -1955,9 +2132,9 @@ impl RunsTab {
                     width.saturating_sub(u16::try_from(cell_width(&prompt)).unwrap_or(u16::MAX));
                 let mut line = Line::from(Span::styled(prompt, theme.title));
                 line.spans.extend(field.line(room, true, theme).spans);
-                vec![line, hint("Enter close · Esc cancel")]
+                vec![line, spec(TYPED_HINT)]
             }
-            Mode::CloseOut(CloseOutStage::InFlight) => vec![hint("closing\u{2026}")],
+            Mode::CloseOut(CloseOutStage::InFlight) => vec![spec(IN_FLIGHT_HINT)],
         }
     }
 }
@@ -2345,8 +2522,8 @@ mod tests {
         );
         assert_eq!(
             lines.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2,
-            "the header, the run and four two-line steps"
+            2 + 2 + 4 * 2 + 1,
+            "the header, the run, four two-line steps and the browse row (ANA-26 §8)"
         );
     }
 
@@ -2379,8 +2556,8 @@ mod tests {
         );
         assert_eq!(
             lines.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 1,
-            "only the parked step with a note grew"
+            2 + 2 + 4 * 2 + 1 + 1,
+            "only the parked step with a note grew (the last `+ 1` is the browse row)"
         );
     }
 
@@ -2508,8 +2685,9 @@ mod tests {
         assert_eq!(lines[at + 4], "        handoff prompt only");
         assert_eq!(
             lines.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 1 + 2,
-            "only the parked step grew: its reason and its two opening lines; `resumed` adds none"
+            2 + 2 + 4 * 2 + 1 + 2 + 1,
+            "only the parked step grew: its reason and its two opening lines; `resumed` adds none \
+             (the last `+ 1` is the browse row)"
         );
 
         // A step that is done still says how its chat opened. Seventeen lines are more than the
@@ -3437,7 +3615,7 @@ mod tests {
 
     /// The footer the pane draws under its list, as text.
     fn footer(pane: &RunsTab) -> Vec<String> {
-        pane.footer(43, &Theme::default())
+        pane.footer(43, Keys::compiled(), &Theme::default())
             .iter()
             .map(|line| text(line).trim_end().to_owned())
             .collect()
@@ -5654,8 +5832,8 @@ mod tests {
         );
         assert_eq!(
             drawn.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 2,
-            "the header, the run, four two-line steps and the request's two"
+            2 + 2 + 4 * 2 + 2 + 1,
+            "the header, the run, four two-line steps, the request's two and the browse row"
         );
     }
 
@@ -5680,7 +5858,13 @@ mod tests {
             "cancel requested",
             "one more line, under the grid: {after:#?}"
         );
-        assert_eq!(after[5..], before[4..before.len() - 1], "{after:#?}");
+        // The browse row stays on the pane's last row (ANA-26 §8); the list above it moves down.
+        assert_eq!(after.last(), before.last(), "{after:#?}");
+        assert_eq!(
+            after[5..after.len() - 1],
+            before[4..before.len() - 2],
+            "{after:#?}"
+        );
     }
 
     /// R-51: a `Waiting` frame shows the run waiting without a re-read, and the next frame that
@@ -6112,8 +6296,8 @@ mod tests {
         );
         assert_eq!(
             drawn.iter().filter(|line| !line.is_empty()).count(),
-            2 + 2 + 4 * 2 + 1,
-            "only the step with the follow-up grew: {drawn:#?}"
+            2 + 2 + 4 * 2 + 1 + 1,
+            "only the step with the follow-up grew (the last `+ 1` is the browse row): {drawn:#?}"
         );
 
         pane.on_reply(

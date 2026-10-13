@@ -39,7 +39,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, is_plain, views};
 use crate::requirements::{
     BLANK_AREA_TITLE, BLANK_BODY, DECIDING_KEY_NEEDED, DETAIL_NAME, MINT_NAME, READ_NAME,
     RequirementDetail, RequirementText, RequirementWrite, RequirementsSnapshot, is_tab_write,
@@ -51,7 +51,7 @@ use crate::ui::tabs::backlog::list::window;
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
 use crate::ui::tabs::settings::{modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField, Theme};
-use crossterm::event::{KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 use forms::{AreaForm, FormFocus, FormOutcome, FormTarget, RequirementForm, WithdrawForm};
 use tree::{Fold, Row, TreeView};
@@ -234,11 +234,6 @@ fn slug(ctx: &Ctx<'_>, project: ProjectId) -> String {
         .iter()
         .find(|row| row.project_id == project)
         .map_or_else(|| project.to_string(), |row| row.slug.clone())
-}
-
-/// A key with no modifier but `SHIFT`, which is how a terminal reports a capital.
-fn plain(key: &KeyEvent) -> bool {
-    (key.modifiers - KeyModifiers::SHIFT).is_empty()
 }
 
 impl RequirementsTab {
@@ -538,7 +533,7 @@ impl RequirementsTab {
                 _ => modal_rest(stack, chord),
             };
         }
-        let outcome = if plain(&key) {
+        let outcome = if is_plain(&key) {
             match &mut self.mode {
                 Mode::NewArea(form) => form.on_key(key),
                 Mode::Requirement(form) => form.on_key(key),

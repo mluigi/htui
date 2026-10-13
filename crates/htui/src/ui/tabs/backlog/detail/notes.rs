@@ -4,7 +4,9 @@
 //! - **Keys**: `a` sends `NoteForm` (D1, D2: the worker refuses offline, and the App puts that on
 //!   the status line); its answer opens a [`Compose`] area over the pane, which then captures
 //!   every key. Ctrl+S sends `AddNote`, Ctrl+E hands the text to `$EDITOR`, `Esc` drops it. While
-//!   browsing, `J`/`K` and `PgUp`/`PgDn` scroll the thread and every other key passes.
+//!   browsing, `J`/`K` and `PgUp`/`PgDn` scroll the thread and every other key passes. Keys
+//!   resolve through [`views::BACKLOG_NOTES`], the area's through [`views::NOTES_COMPOSE`]
+//!   (MOD-67 M5 D4).
 //! - **Replies** are this pane's own requests for this pane's item: a `NoteForm` opens the area
 //!   only for the `a` that asked, and only while Notes is the active sub-tab (the registry hands
 //!   it to no other, E4), and `NoteAdded` closes it and re-reads the thread.
@@ -41,6 +43,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{
     ADD_NOTE_NAME, HandText, NOTE_FORM_NAME, answered_from_the_mirror, write_refused,
 };
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells;
@@ -49,10 +52,10 @@ use crate::ui::tabs::backlog::detail::compose::{
 };
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::settings::wrapped;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
-/// The browse hint on the pane's last row (D11).
-const HINT: &str = "a add note";
+/// The browse hint on the pane's last row (D11), through [`views::BACKLOG_NOTES`].
+const HINT: HintSpec = &[Hint::One(Act::NotesAdd, "add note")];
 
 /// `StoreRequest::Notes`' name: the `Failed` of the re-read that checks a hedge (review M1).
 const NOTES_READ: &str = "notes";
@@ -178,7 +181,7 @@ impl NotesTab {
     /// A key while the area is open: its outcome, mapped for the Backlog.
     fn on_compose_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Option<Handled> {
         let compose = self.compose.as_mut()?;
-        Some(match compose.on_key(key) {
+        Some(match compose.on_key(key, ctx.keys()) {
             ComposeOutcome::Stay => Handled::Consumed,
             ComposeOutcome::Pass => Handled::Pass,
             ComposeOutcome::Cancel => {
@@ -292,25 +295,40 @@ impl DetailTab for NotesTab {
         if let Some(handled) = self.on_compose_key(key, ctx) {
             return handled;
         }
-        // Review M1: the sentence stays until the next key.
+        // Review M1: the sentence stays until the next key (the Backlog's own keys too, MOD-67
+        // M5: the pane is offered every key first).
         self.notice = None;
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        for act in ctx
+            .keys()
+            .actions(views::BACKLOG_NOTES, KeyChord::from_event(key))
         {
-            return Handled::Pass;
-        }
-        if key.code == KeyCode::Char('a') {
-            let Some(item) = self.item else {
-                return Handled::Pass;
-            };
-            self.opening = Some(item);
-            ctx.request(StoreRequest::NoteForm { item });
+            match act {
+                Act::NotesAdd => {
+                    let Some(item) = self.item else {
+                        continue;
+                    };
+                    self.opening = Some(item);
+                    ctx.request(StoreRequest::NoteForm { item });
+                }
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp => {
+                    // D8, review L1: the rows as wrapped at the last render, not the unwrapped
+                    // lines.
+                    let (width, _) = self.drawn.get();
+                    return self.scroll.apply(act, self.row_count(width));
+                }
+                // The Backlog's and the list's acts, and the global ones: the tab's.
+                _ => continue,
+            }
             return Handled::Consumed;
         }
-        // D8, review L1: the rows as wrapped at the last render, not the unwrapped lines.
-        let (width, _) = self.drawn.get();
-        self.scroll.on_key(key, self.row_count(width))
+        Handled::Pass
+    }
+
+    /// `NOTES_COMPOSE` while the area is open, else `BACKLOG_NOTES` (MOD-67 M5 D4).
+    fn key_stack(&self) -> Stack<'static> {
+        self.compose
+            .as_ref()
+            .map_or(views::BACKLOG_NOTES, Compose::stack)
     }
 
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
@@ -392,7 +410,15 @@ impl DetailTab for NotesTab {
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         if let Some(compose) = &self.compose {
-            let body = compose::render(frame, area, compose, " New note ", None, ctx.theme);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                " New note ",
+                None,
+                ctx.keys(),
+                ctx.theme,
+            );
             ctx.claim_editor_area(body);
             return;
         }
@@ -419,7 +445,13 @@ impl DetailTab for NotesTab {
             below,
         );
         frame.render_widget(
-            Line::styled(cells::clip(HINT, usize::from(hint.width)), ctx.theme.dim),
+            Line::styled(
+                cells::clip(
+                    &ctx.keys().hint(views::BACKLOG_NOTES, HINT),
+                    usize::from(hint.width),
+                ),
+                ctx.theme.dim,
+            ),
             hint,
         );
         if self.notes.is_empty() {
@@ -457,6 +489,9 @@ mod tests {
     use std::cell::Cell;
 
     const ITEM: ItemId = ids::HTUI_FEAT_1;
+
+    /// The browse hint as the default keys draw it (MOD-67 M5: `super::HINT` is a spec).
+    const HINT: &str = "a add note";
 
     /// A request as the bench prints it.
     fn sent(request: &StoreRequest) -> String {
@@ -1095,6 +1130,16 @@ mod tests {
     #[test]
     fn the_hint_fits_the_detail_pane() {
         assert!(cells::cell_width(HINT) <= 43, "{HINT}");
+    }
+
+    /// MOD-67 M5: the spec renders today's text under the default keys, and a rebound `add`.
+    #[test]
+    fn the_hint_renders_through_the_notes_stack() {
+        let stack = views::BACKLOG_NOTES;
+        assert_eq!(crate::keys::Keys::compiled().hint(stack, super::HINT), HINT);
+        let keys =
+            crate::keys::load_str("version = 1\n[backlog.notes]\nadd = \"A\"\n").expect("loads");
+        assert_eq!(keys.hint(stack, super::HINT), "A add note");
     }
 
     /// D11: with an item and no area, the last row is the hint, over a thread or an empty one;

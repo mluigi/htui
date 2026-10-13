@@ -13,9 +13,9 @@ use htui_core::model::SessionEvent;
 use ratatui::text::{Line, Span};
 
 use crate::app::Handled;
+use crate::keys::Act;
 use crate::ui::Theme;
 use crate::ui::diff::diff_style;
-use crossterm::event::{KeyCode, KeyEvent};
 
 /// Where a tool call stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -456,17 +456,18 @@ impl Transcript {
         });
     }
 
-    /// Scrolling and folding.
-    pub fn on_key(&mut self, key: KeyEvent) -> Handled {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+    /// Scrolling and folding: the act the Chat tab resolved through its stack (MOD-67 M5),
+    /// `list.down`/`up`, `chat.top`/`bottom` and `chat.thoughts`; every other act is `Pass`.
+    pub fn on_act(&mut self, act: Act) -> Handled {
+        match act {
+            Act::ListDown => {
                 self.scroll = match self.scroll {
                     Scroll::Tail => Scroll::Tail,
                     Scroll::At(line) => Scroll::At(line + 1),
                 };
                 Handled::Consumed
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Act::ListUp => {
                 self.scroll = match self.scroll {
                     // The tail shows the last `height` lines, so stepping back from it means the
                     // line just above that window — not `rows.len()`, which counts rows.
@@ -480,15 +481,15 @@ impl Transcript {
                 };
                 Handled::Consumed
             }
-            KeyCode::Char('g') => {
+            Act::ChatTop => {
                 self.scroll = Scroll::At(0);
                 Handled::Consumed
             }
-            KeyCode::Char('G') => {
+            Act::ChatBottom => {
                 self.scroll = Scroll::Tail;
                 Handled::Consumed
             }
-            KeyCode::Char('t') => {
+            Act::ChatThoughts => {
                 self.fold_thoughts = !self.fold_thoughts;
                 Handled::Consumed
             }
@@ -958,7 +959,7 @@ mod tests {
         let theme = Theme::default();
         assert_eq!(transcript.lines(20, &theme).len(), 1, "folded");
 
-        transcript.on_key(KeyEvent::from(KeyCode::Char('t')));
+        transcript.on_act(Act::ChatThoughts);
         assert_eq!(transcript.lines(20, &theme).len(), 3, "unfolded");
     }
 
@@ -1041,7 +1042,7 @@ mod tests {
             tail[2].to_string()
         );
 
-        transcript.on_key(KeyEvent::from(KeyCode::Char('g')));
+        transcript.on_act(Act::ChatTop);
         let top = transcript.lines(3, &theme);
         assert!(
             top[0].to_string().contains("end_turn"),

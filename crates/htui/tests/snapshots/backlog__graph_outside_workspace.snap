@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││depth 2/3 · +/- depth · Enter re-root      │
+│j/k move · h/l sub-tab · f filter · N new · e edit   ││depth 2/3 · +/- depth · Enter re-root      │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
 vulkan-tutorials:FEAT-1 is outside this workspace

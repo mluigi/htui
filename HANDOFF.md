@@ -349,8 +349,24 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   key prose to M6 (`Ctrl+S saves it`, `Esc again discards`, `y detaches, any other key keeps it`),
   and the hierarchy `picker` context (M3 L-C Q3). Pre-existing, seen here: full test runs leave an
   empty `~/.config/htui/trees` (the worker's default scratch root)
-  (`.claude/plans/mod-67-m4-skills-requirements.plan.md`, "Review gate"). **Remaining: M5** Backlog
-  and Chat, **M6** close-out.
+  (`.claude/plans/mod-67-m4-skills-requirements.plan.md`, "Review gate").
+  **Phase M5 landed (`850d4bee`..`c65527db`, 2026-10-13):** the Backlog tab (list, filter form,
+  item form and divergence view, all seven sub-tabs, the Notes/Docs compose areas) and the Chat tab
+  dispatch through declared stacks (`keys/views.rs`, 20 more; 11 contexts, 58 actions); every hint
+  is generated, Runs gains a browse hint row and the list pane `j/k move · h/l sub-tab · f filter ·
+  N new · e edit`, and `?` lists every layer of the focused pane. The Backlog `Enter` miss is
+  `backlog.replay` and the eight legacy `Keymap` rows are gone. Fixed and pinned: `alt-y` answering
+  a run cancel or an uncite, modifier-blind Body/Prompt keys (`ctrl-n` cycled the template), `F1`
+  swallowed by Backlog and Chat input modes. `form.save` is the only save chord in every editor.
+  Changed for users: a global key on a Backlog or Chat key is refused (`[global] quit = ["f"]`), so
+  is a shared rebind that collides in a new stack, and (review R1) a rebind onto a key a view keeps
+  for itself (`[backlog.filter_form] clear = ["space"]`); the filter form's table is
+  `[backlog.filter_form]`. Carried to M6: key prose (`Ctrl+S tries again`, `Ctrl+S compares again`,
+  `Esc again ends this chat`, `(t to unfold)`, `no conflicts — m or t continues`), `FIXED` for the
+  M3/M4 forms (Requirements priority keys, the attach form), one report per line and chord across
+  the validator's passes, `Keymap`/`Binding`/`KeyScope` with App's legacy tab paths,
+  `Ctx::new(&Keymap)`, the uniform hint row for every tab, the every-stack reachability test
+  (`.claude/plans/mod-67-m5-backlog-chat.plan.md`, "Review gate"). **Remaining: M6** close-out.
 - [ ] **MOD-85 - Remaining accent (cyan) uses that do not mean focus or selection** (from MOD-80,
   `docs/decisions/mod/mod-80.md` "Carried"; blueprint B-6, review M1/L5). `R-TUI-1`. MOD-80 made
   `accent` mean focus and selection, gave keys, running, warnings and diff-added their own theme roles,

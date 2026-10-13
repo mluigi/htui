@@ -11,9 +11,6 @@ pub use action::{Action, Handled, OverlayAction, RevealKind, RevealTarget, TabAc
 pub(crate) use pane::MIN_PANE;
 pub use state::{App, Ctx, EDITOR_NEEDS_A_TAB, Emit, TopBarState};
 
-use crossterm::event::{KeyCode, KeyModifiers};
-
-use crate::keymap::{Binding, KeyChord, KeyScope};
 use crate::keys::Act;
 use crate::ui::overlay::{
     AbortConfirm, ConceptsSearch, MigrationPrompt, QueueOverlay, QuitConfirm, WaitingList,
@@ -47,24 +44,17 @@ use crate::ui::tabs::{BacklogTab, ChatTab, RequirementsTab, SettingsTab, SkillsT
 /// 4. The migration prompt's factory goes in and it is named as the migration overlay. It has no
 ///    key binding on purpose: it is opened by the shell when a `StoreState` reply reports a
 ///    pending schema, never by the user (`R-STO-5`, plan D11).
-/// 5. The Chat tab is named as the replay tab and the Backlog tab's `Enter` is bound to the
-///    refusal that says how to reach a replay (MOD-2 D39). Both name a concrete view, so both
-///    belong here for the same reason the `w` binding does.
+/// 5. The Chat tab is named as the replay tab (MOD-2 D39); the Backlog answers a missed `Enter`
+///    itself (`backlog.replay`, MOD-67 M5 D6).
 /// 6. The Backlog and Requirements tabs are named as the tabs that reveal items and requirements
 ///    (MOD-64 D235).
 /// 7. The concepts search's factory goes in and global `Ctrl+F` is offered as [`Act::Find`] to
 ///    open it (MOD-64 D236), a chord so no tab's letters and no text field's input can take it.
-/// 8. The Backlog tab's `m` is bound to its `open graph` help text (MOD-14 D8). The tab's own
-///    arm selects the Graph sub-tab; the binding only puts `m open graph` on the help line.
-/// 9. The Backlog tab's `f` and `F` are bound to their `filter` and `clear filter` help texts
-///    (MOD-13 D1), for the same reason: the tab's own arms open and clear the filter.
-/// 10. The Backlog tab's `N` and `e` are bound to their `new item` and `edit item` help texts
-///     (MOD-13 milestone 2 D7), for the same reason: the tab's own arms read the item form.
-/// 11. The waiting list's factory goes in and global `Ctrl+W` is offered as [`Act::Waiting`] to
-///     open it (MOD-69 D7), a chord for `Ctrl+F`'s reason.
-/// 12. The queue overlay's factory goes in and global `Ctrl+Q` is offered as [`Act::Queue`] to
-///     open it (MOD-12 M3 D8), a chord for the same reason.
-/// 13. The quit question's factory goes in and it is named as the quit overlay (MOD-57 M2 E4);
+/// 8. The waiting list's factory goes in and global `Ctrl+W` is offered as [`Act::Waiting`] to
+///    open it (MOD-69 D7), a chord for `Ctrl+F`'s reason.
+/// 9. The queue overlay's factory goes in and global `Ctrl+Q` is offered as [`Act::Queue`] to
+///    open it (MOD-12 M3 D8), a chord for the same reason.
+/// 10. The quit question's factory goes in and it is named as the quit overlay (MOD-57 M2 E4);
 ///     no key opens it but `global.quit` with an in-pane editor alive.
 ///
 /// Calling this twice would stack a second switcher; the shell calls it exactly once, between
@@ -147,55 +137,4 @@ pub fn register_all(app: &mut App) {
         (RevealKind::Item, BacklogTab::ID),
         (RevealKind::Requirement, RequirementsTab::ID),
     ];
-    // The Runs pane consumes `Enter` when it has a step under the cursor and emits
-    // `Action::Replay` with it; the payload is the selection, which a static binding cannot
-    // carry. This row is therefore the *miss*: it fires only when no pane took the key, and then
-    // it says what to press instead. It also puts `Enter replay step` on the Backlog tab's help
-    // line, which is the other half of what a binding is for.
-    app.keymap.bind(Binding {
-        scope: KeyScope::Tab(BacklogTab::ID),
-        key: KeyChord::new(KeyCode::Enter, KeyModifiers::NONE),
-        action: Action::Error("select a step in the Runs pane (J/K) to replay it".to_owned()),
-        help: "replay step",
-    });
-    // MOD-14 D8: `m` opens the Graph sub-tab. The Backlog's own arm does it (no `Action` selects a
-    // sub-tab) and always consumes the key, so this row never fires: it is the help box's half, as
-    // the `Enter` row is. Its action is a no-op focus of the tab that is already active.
-    app.keymap.bind(Binding {
-        scope: KeyScope::Tab(BacklogTab::ID),
-        key: KeyChord::new(KeyCode::Char('m'), KeyModifiers::NONE),
-        action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
-        help: "open graph",
-    });
-    // MOD-13 D1: `f` opens the filter form and `F` clears the filter, in the Backlog's own arms,
-    // which always consume the key; these rows are the help box's half, as the `m` row is.
-    for (key, help) in [('f', "filter"), ('F', "clear filter")] {
-        app.keymap.bind(Binding {
-            scope: KeyScope::Tab(BacklogTab::ID),
-            key: KeyChord::new(KeyCode::Char(key), KeyModifiers::NONE),
-            action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
-            help,
-        });
-    }
-    // MOD-13 milestone 2 D7: `N` opens the new-item form and `e` the edit form, in the Backlog's
-    // own arms, which always consume the key; these rows are the help box's half, as the `f` row
-    // is.
-    for (key, help) in [('N', "new item"), ('e', "edit item")] {
-        app.keymap.bind(Binding {
-            scope: KeyScope::Tab(BacklogTab::ID),
-            key: KeyChord::new(KeyCode::Char(key), KeyModifiers::NONE),
-            action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
-            help,
-        });
-    }
-    // MOD-12 D9: `Q` toggles the cursor item's queue membership and `P` this box's queue, in the
-    // Backlog's own arms, which always consume the key; these rows are the help box's half.
-    for (key, help) in [('Q', "queue / dequeue"), ('P', "pause / resume queue")] {
-        app.keymap.bind(Binding {
-            scope: KeyScope::Tab(BacklogTab::ID),
-            key: KeyChord::new(KeyCode::Char(key), KeyModifiers::NONE),
-            action: Action::Tab(TabAction::Focus(BacklogTab::ID)),
-            help,
-        });
-    }
 }

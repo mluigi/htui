@@ -24,6 +24,10 @@
 //!
 //! Milestone 5: Notes and Docs write through their own compose areas. An `$EDITOR` outcome goes to
 //! the item form when one is open, else to the active sub-tab.
+//!
+//! Keys resolve through the focused pane's stack (MOD-67 M5): a project header folds on `Enter`
+//! first, then the active sub-tab takes its own acts, then the tab answers `list.*`, the sub-tab
+//! cycling, `backlog.*` and `common.edit`, including the replay miss (D6).
 
 pub mod detail;
 pub mod divergence;
@@ -38,6 +42,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
 use crate::item_writes::{self, ItemDivergence, ItemFormContext, ItemWrite};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{QUEUE_REQUEST_NAMES, QueueView, QueueWrite, StoreReply, StoreRequest};
 use crate::ui::tabs::backlog::detail::{
     BodyTab, DetailRegistry, DocumentsTab, GraphTab, NotesTab, PromptTab, ReqsTab, RunsTab,
@@ -48,7 +53,8 @@ use crate::ui::tabs::backlog::item_form::{
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent};
+use crate::ui::tabs::settings::modal_rest;
+use crossterm::event::{KeyEvent, MouseEvent};
 
 /// Width of the list pane, as a percentage of the body region.
 ///
@@ -70,6 +76,17 @@ const ITEMS_READ: &str = "items";
 /// Refreshes between two `Runs` polls: five of the shell's one-second refreshes, so 5 s (MOD-41
 /// plan D16, OQ-3).
 const REFRESHES_PER_RUNS_POLL: u32 = 5;
+
+/// The Backlog's own keys under the list (MOD-67 M5 Q1 a, PA-5): `j/k move · h/l sub-tab ·
+/// f filter · N new · e edit` under the defaults, 50 cells of the list pane's 53 at 100 columns.
+/// The queue keys stay in the `?` box.
+const LIST_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::Pair(Act::PanePrevSubtab, Act::PaneNextSubtab, "sub-tab"),
+    Hint::One(Act::BacklogOpenFilter, "filter"),
+    Hint::One(Act::BacklogNewItem, "new"),
+    Hint::One(Act::Edit, "edit"),
+];
 
 /// MOD-12 D9: what `Q` says with the cursor on a project header.
 const NO_ITEM_TO_QUEUE: &str = "select an item to queue";
@@ -165,6 +182,16 @@ impl Default for BacklogTab {
 impl BacklogTab {
     /// Identity of the Backlog tab.
     pub const ID: TabId = TabId("backlog");
+
+    /// The list hint row's text (MOD-67 M5 Q1 a), read through the active pane's stack; `None`
+    /// while the filter form, the item form or a sub-tab captures, since a hint for keys a field
+    /// is typing would lie, and when no key of [`LIST_HINT`] is bound.
+    fn list_hint(&self, keys: &Keys) -> Option<String> {
+        if self.form.is_some() || self.item_form.is_some() || self.detail.captures_input() {
+            return None;
+        }
+        Some(keys.hint(self.detail.key_stack(), LIST_HINT)).filter(|hint| !hint.is_empty())
+    }
 
     /// A Backlog tab with the seven detail sub-tabs registered, in blueprint order; Reqs is
     /// MOD-39 plan P12's, after Prompt.
@@ -347,19 +374,17 @@ impl BacklogTab {
 
     /// A key while the filter form is open (MOD-13 D1).
     ///
-    /// Every plain key is consumed, used by the form or not: the global keymap resolves only what
-    /// a tab passes, so a passed `q` would quit, a digit or `Tab` switch tabs, `w` open the
-    /// switcher. A chord ([`filter::CHORD`]: any modifier but `SHIFT`) passes, the rule
-    /// `TextField::on_key` applies (review L4), so `ctrl-c` still quits and `Ctrl+F` still
-    /// searches, and an `Alt` chord is never read as its letter.
+    /// Every plain key the form does not use is consumed; CONTROL, ALT and function keys pass
+    /// (`BACKLOG_FILTER`'s modal layer, MOD-67 M5), so `ctrl-c` quits, `Ctrl+f` searches and `F1`
+    /// opens help.
     fn on_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        if key.modifiers.intersects(filter::CHORD) {
-            return Handled::Pass;
-        }
         let Some(form) = self.form.as_mut() else {
             return Handled::Pass;
         };
-        match form.on_key(key) {
+        match form.on_key(key, ctx.keys()) {
+            FormOutcome::Pass => {
+                return modal_rest(views::BACKLOG_FILTER, KeyChord::from_event(key));
+            }
             FormOutcome::Stay => {}
             FormOutcome::Cancel => self.form = None,
             FormOutcome::Refused(sentence) => ctx.emit(Action::Error(sentence)),
@@ -504,13 +529,14 @@ impl BacklogTab {
     /// A key while the item form is open (D8, A7).
     ///
     /// Every plain key is consumed, used by the form or not: a passed `q`, digit, `w`, `?` or
-    /// `Tab` would act globally (blueprint §8). The form itself passes chords but Ctrl+S (A6) and
-    /// Ctrl+E (milestone 4 D1).
+    /// `Tab` would act globally (blueprint §8). The form already applied its stack's pass rule
+    /// (`ITEM_FORM`/`ITEM_DIVERGENCE`, MOD-67 M5): a `Pass` is a CONTROL, ALT or function key it
+    /// did not use.
     fn on_item_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
         let Some(form) = self.item_form.as_mut() else {
             return Handled::Pass;
         };
-        match form.on_key(key) {
+        match form.on_key(key, ctx.keys()) {
             ItemFormOutcome::Pass => return Handled::Pass,
             ItemFormOutcome::Stay => {}
             ItemFormOutcome::Cancel => self.item_form = None,
@@ -744,59 +770,73 @@ impl Tab for BacklogTab {
         if self.detail.captures_input() {
             return self.detail.on_key(key, ctx);
         }
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return self.detail.on_key(key, ctx);
+        // MOD-67 M5 D5: the active pane's browse stack. Chord equality: a CONTROL or ALT chord
+        // is no list or sub-tab act, so `ctrl-l` cycles nothing (D12).
+        let stack = self.detail.key_stack();
+        let acts = ctx.keys().actions(stack, KeyChord::from_event(key));
+        // D6, PA-2: a project header folds before any pane sees `Enter` (the fold's own guard
+        // declines on an item row).
+        if acts.contains(&Act::ListFold) && self.fold(ctx) == Handled::Consumed {
+            return Handled::Consumed;
         }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.step(1, ctx),
-            KeyCode::Char('k') | KeyCode::Up => self.step(-1, ctx),
-            KeyCode::Char('g') | KeyCode::Home => self.jump(false, ctx),
-            KeyCode::Char('G') | KeyCode::End => self.jump(true, ctx),
-            KeyCode::Char('l') | KeyCode::Char(']') | KeyCode::Right => self.detail.cycle_next(),
-            KeyCode::Char('h') | KeyCode::Char('[') | KeyCode::Left => self.detail.cycle_prev(),
-            // MOD-14 D8, `open graph`. Below the capture guard, so an `m` typed into a note stays
-            // the note's.
-            KeyCode::Char('m') => {
-                self.detail.select_id(GraphTab::ID);
-            }
-            // MOD-13 D1: `f` opens the filter form on the active filter, `F` clears it. A
-            // terminal's `F` carries SHIFT; only CONTROL and ALT are diverted above.
-            KeyCode::Char('f') => {
-                self.form = Some(FilterForm::open(&self.filter, ctx.projects));
-            }
-            KeyCode::Char('F') => {
-                if !self.filter.is_empty() {
-                    self.apply(BacklogFilter::default(), ctx);
+        // D5: the pane first; it takes its own acts and declines the rest. The Runs pane replays
+        // the step under its cursor with `Enter` (MOD-2 D39).
+        if self.detail.on_key(key, ctx) == Handled::Consumed {
+            return Handled::Consumed;
+        }
+        for act in acts {
+            match act {
+                Act::ListDown => self.step(1, ctx),
+                Act::ListUp => self.step(-1, ctx),
+                Act::ListTop => self.jump(false, ctx),
+                Act::ListBottom => self.jump(true, ctx),
+                Act::PaneNextSubtab => self.detail.cycle_next(),
+                Act::PanePrevSubtab => self.detail.cycle_prev(),
+                // MOD-14 D8, `open graph`. Below the capture guard, so an `m` typed into a note
+                // stays the note's.
+                Act::BacklogOpenGraph => _ = self.detail.select_id(GraphTab::ID),
+                // MOD-13 D1: `f` opens the filter form on the active filter, `F` clears it
+                // (consumed either way).
+                Act::BacklogOpenFilter => {
+                    self.form = Some(FilterForm::open(&self.filter, ctx.projects));
                 }
+                Act::BacklogClearFilter => {
+                    if !self.filter.is_empty() {
+                        self.apply(BacklogFilter::default(), ctx);
+                    }
+                }
+                // MOD-13 milestone 2 D7: `N` new item, `e` edit the selected one. Each reads the
+                // form's catalogue first (D3); the reply opens the form.
+                Act::BacklogNewItem => self.open_new(ctx),
+                Act::Edit => self.open_edit(ctx),
+                // MOD-12 D9: `Q` toggles the cursor item's queue membership, `P` this box's
+                // queue. Each reads the queue first; the reply decides the write.
+                Act::BacklogQueue => self.toggle_queued(ctx),
+                Act::BacklogPauseQueue => {
+                    self.queue_intent = Some(QueueIntent::Pause);
+                    ctx.request(StoreRequest::QueueState);
+                }
+                // D6: neither the fold nor the pane took `Enter`: the miss, its keys named.
+                Act::BacklogReplay => ctx.emit(Action::Error(replay_miss(ctx.keys()))),
+                // The declined fold, a pane act the pane declined, a global act (the shell's).
+                _ => continue,
             }
-            // MOD-13 milestone 2 D7: `N` new item, `e` edit the selected one. Each reads the
-            // form's catalogue first (D3); the reply opens the form. `N` arrives with or without
-            // SHIFT, both as `Char('N')` here (blueprint E4).
-            KeyCode::Char('N') => self.open_new(ctx),
-            KeyCode::Char('e') => self.open_edit(ctx),
-            // MOD-12 D9: `Q` toggles the cursor item's queue membership, `P` this box's queue.
-            // Each reads the queue first; the reply decides the write (no cached state goes stale
-            // when a worker drains the batch).
-            KeyCode::Char('Q') => self.toggle_queued(ctx),
-            KeyCode::Char('P') => {
-                self.queue_intent = Some(QueueIntent::Pause);
-                ctx.request(StoreRequest::QueueState);
-            }
-            // A project header folds; on an item row there is nothing to fold, and `Enter` is
-            // the detail pane's — the Runs pane replays the step under its cursor with it
-            // (MOD-2 D39). Without this the pane would never see the key at all.
-            KeyCode::Enter => {
-                return match self.fold(ctx) {
-                    Handled::Consumed => Handled::Consumed,
-                    Handled::Pass => self.detail.on_key(key, ctx),
-                };
-            }
-            _ => return self.detail.on_key(key, ctx),
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        // The shell resolves the same stack: `q`, `Tab`, the digits, `?`, `w`, ...
+        Handled::Pass
+    }
+
+    /// The stack of what holds the Backlog's keys (MOD-67 M5 D4): the filter form's, else the
+    /// item form's (its divergence view's while resolving), else the active pane's.
+    fn key_stack(&self) -> Option<Stack<'static>> {
+        if self.form.is_some() {
+            return Some(views::BACKLOG_FILTER);
+        }
+        if let Some(form) = &self.item_form {
+            return Some(form.key_stack());
+        }
+        Some(self.detail.key_stack())
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
@@ -915,7 +955,7 @@ impl Tab for BacklogTab {
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
         // MOD-13 milestone 3 D4: the divergence view takes the whole tab area, list pane included.
         if let Some(view) = self.item_form.as_ref().and_then(ItemForm::resolving) {
-            divergence::render(frame, area, view, ctx.theme);
+            divergence::render(frame, area, view, ctx.keys(), ctx.theme);
             return;
         }
         let [left, right] = panes(area);
@@ -939,13 +979,16 @@ impl Tab for BacklogTab {
             selected: self.selected,
             filter: summary.as_deref(),
         };
-        list::render(frame, list_area, &view, ctx.theme);
+        let hint = self.list_hint(ctx.keys());
+        list::render(frame, list_area, &view, hint.as_deref(), ctx.theme);
         if let (Some(form), Some(at)) = (&self.form, form_area) {
-            filter::render(frame, at, form, ctx.theme);
+            filter::render(frame, at, form, ctx.keys(), ctx.theme);
         }
         // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
         match &self.item_form {
-            Some(form) => ctx.claim_editor_area(item_form::render(frame, right, form, ctx.theme)),
+            Some(form) => {
+                ctx.claim_editor_area(item_form::render(frame, right, form, ctx.keys(), ctx.theme))
+            }
             None => detail::render(
                 frame,
                 right,
@@ -1062,6 +1105,17 @@ pub(crate) fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) ->
     }
 }
 
+/// The D6 miss (MOD-67 M5): "select a step in the Runs pane (J/K) to replay it" under the
+/// defaults, the step keys read through the Runs browse stack, since the miss fires from any
+/// sub-tab.
+fn replay_miss(keys: &Keys) -> String {
+    const STEP_KEYS: HintSpec = &[Hint::Pair(Act::RunsNextStep, Act::RunsPrevStep, "")];
+    match keys.hint(views::RUNS_BROWSE, STEP_KEYS) {
+        moves if moves.is_empty() => "select a step in the Runs pane to replay it".to_owned(),
+        moves => format!("select a step in the Runs pane ({moves}) to replay it"),
+    }
+}
+
 /// Splits the body region into the list pane and the detail pane.
 fn panes(area: Rect) -> [Rect; 2] {
     Layout::horizontal([
@@ -1090,7 +1144,7 @@ mod tests {
     use crate::ui::Theme;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::detail::{DetailId, DetailTab};
-    use crossterm::event::{MouseButton, MouseEventKind};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEventKind};
     use htui_core::model::ItemFilter;
     use htui_core::store::{MemStore, ReadStore as _, WriteStore as _};
 
@@ -1593,7 +1647,13 @@ mod tests {
             Some(first),
             "a sub-tab that stopped capturing gives `j` back to the list"
         );
-        assert_eq!(seen.borrow().len(), keys.len(), "without offering it first");
+        // MOD-67 M5 D5: the pane is offered every key first, and passed `j` to the list.
+        assert_eq!(
+            seen.borrow().len(),
+            keys.len() + 1,
+            "offered first, and passed"
+        );
+        assert_eq!(seen.borrow().last(), Some(&KeyCode::Char('j')));
     }
 
     /// MOD-64 review 6, Requirements' D251 rule: a refused `Items` read disarms a pending reveal,
@@ -1800,7 +1860,12 @@ mod tests {
         capturing.set(false);
         assert_eq!(tab.on_key(m, &mut ctx), Handled::Consumed);
         assert_eq!(tab.detail.active_id(), Some(GraphTab::ID));
-        assert_eq!(seen.borrow().len(), 1, "the probe saw nothing new");
+        // MOD-67 M5 D5: a pane in browse is offered every key first; the probe passed `m`.
+        assert_eq!(
+            seen.borrow().len(),
+            2,
+            "the probe was offered `m`, and passed it"
+        );
     }
 
     // ---- MOD-13 milestone 1: the filter ------------------------------------------------------
@@ -2475,8 +2540,9 @@ mod tests {
         assert!(runs_reads(&actions).is_empty(), "{actions:?}");
     }
 
-    /// MOD-13 review L4: the open form passes every chord but `SHIFT`, as `TextField` does, so an
-    /// `Alt` chord reaches the shell instead of acting as its letter.
+    /// MOD-13 review L4: a chord never acts as its letter in the open form. MOD-67 M5: what passes
+    /// is `BACKLOG_FILTER`'s modal layer's rule (D5), so an `Alt` chord reaches the shell and a
+    /// `Super`, `Meta` or `Hyper` one is swallowed, as in every M3/M4 modal mode.
     #[tokio::test]
     async fn an_alt_chord_passes_through_the_open_form() {
         let bench = Bench::new().await;
@@ -2485,18 +2551,18 @@ mod tests {
             ..bench.tab()
         };
         press(&mut tab, &bench, KeyCode::Char('f'));
-        for modifier in [
-            KeyModifiers::ALT,
-            KeyModifiers::SUPER,
-            KeyModifiers::META,
-            KeyModifiers::HYPER,
+        for (modifier, handled) in [
+            (KeyModifiers::ALT, Handled::Pass),
+            (KeyModifiers::SUPER, Handled::Consumed),
+            (KeyModifiers::META, Handled::Consumed),
+            (KeyModifiers::HYPER, Handled::Consumed),
         ] {
             assert_eq!(
                 tab.on_key(
                     KeyEvent::new(KeyCode::Char('x'), modifier),
                     &mut bench.ctx()
                 ),
-                Handled::Pass,
+                handled,
                 "{modifier:?}"
             );
         }
@@ -2657,7 +2723,7 @@ mod tests {
         let mut form = ItemForm::open_new(context, &bench.projects, None);
         // Title, Priority, Tags, Graph, Paths, Body.
         for _ in 0..5 {
-            let _ = form.on_key(KeyEvent::from(KeyCode::Tab));
+            let _ = form.on_key(KeyEvent::from(KeyCode::Tab), Keys::compiled());
         }
         form.on_paste("First line.");
         tab.item_form = Some(form);
@@ -2674,6 +2740,7 @@ mod tests {
                     frame,
                     right,
                     tab.item_form.as_ref().expect("open"),
+                    Keys::compiled(),
                     &Theme::default(),
                 ));
             })
@@ -2706,10 +2773,13 @@ mod tests {
         let mut form = ItemForm::open_new(context, &bench.projects, None);
         // Title, Priority, Tags, Graph, Paths.
         for _ in 0..4 {
-            let _ = form.on_key(KeyEvent::from(KeyCode::Tab));
+            let _ = form.on_key(KeyEvent::from(KeyCode::Tab), Keys::compiled());
         }
         form.on_paste("src/**");
-        let handed = form.on_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        let handed = form.on_key(
+            KeyEvent::new(KeyCode::Char('e'), KeyModifiers::CONTROL),
+            Keys::compiled(),
+        );
         assert!(
             matches!(&handed, ItemFormOutcome::External(edit) if edit.text == "src/**"),
             "{handed:?}"
@@ -2815,7 +2885,15 @@ mod tests {
             assert_eq!(tab.selected, None, "{code:?} found no row");
         }
         assert!(tab.folded.is_empty(), "`Enter` folded nothing");
-        assert!(bench.actions().is_empty(), "and nothing was read");
+        // MOD-67 M5 D6: the tab answers the missed `Enter` itself (the legacy shell row did).
+        let actions = bench.actions();
+        assert!(
+            matches!(
+                actions.as_slice(),
+                [Action::Error(miss)] if miss == "select a step in the Runs pane (J/K) to replay it"
+            ),
+            "and nothing was read: {actions:?}"
+        );
 
         press(&mut tab, &bench, KeyCode::Char('F'));
         tab.on_reply(&StoreReply::Items(bench.items.clone()), &mut bench.ctx());
@@ -4161,6 +4239,109 @@ mod tests {
         assert!(
             !tab.detail.captures_input(),
             "no area opened on the hidden Notes pane"
+        );
+    }
+
+    // ---- MOD-67 M5 Q1 (a), PA-5: the list hint row --------------------------------------------
+
+    /// The list hint under the compiled defaults.
+    const DEFAULT_LIST_HINT: &str =
+        "j/k move \u{b7} h/l sub-tab \u{b7} f filter \u{b7} N new \u{b7} e edit";
+
+    /// The list pane's last inner row in `frame`: the row above its bottom border, borders and
+    /// trailing blanks off.
+    fn list_last_row(frame: &str) -> String {
+        let rows: Vec<&str> = frame.lines().collect();
+        let bottom = rows
+            .iter()
+            .rposition(|row| row.starts_with('\u{2514}'))
+            .unwrap_or_else(|| panic!("the list pane has a bottom border:\n{frame}"));
+        let (list, _) = rows[bottom - 1]
+            .split_once("\u{2502}\u{2502}")
+            .unwrap_or_else(|| panic!("the row crosses into the detail pane:\n{frame}"));
+        list.trim_start_matches('\u{2502}').trim_end().to_owned()
+    }
+
+    /// Q1 (a), PA-5: the hint names the Backlog's own keys in the list pane's 53 inner cells at
+    /// 100 columns, and is drawn on the pane's last inner row.
+    #[tokio::test]
+    async fn the_list_hint_fits_the_list_pane_at_100_columns() {
+        let bench = Bench::new().await;
+        let tab = bench.tab();
+        let hint = tab.list_hint(Keys::compiled()).expect("nothing captures");
+        assert_eq!(hint, DEFAULT_LIST_HINT);
+        let [list, _] = panes(Rect::new(0, 0, 100, 30));
+        let inner = usize::from(list.width) - 2;
+        assert_eq!(inner, 53, "the list pane's inner width at 100 columns");
+        assert!(
+            crate::ui::cells::cell_width(&hint) <= inner,
+            "{hint:?} fits {inner} cells"
+        );
+        let frame = drawn(&tab, &bench);
+        assert_eq!(list_last_row(&frame), hint, "drawn last:\n{frame}");
+    }
+
+    /// Q1 (a): a hint for keys a field is typing would lie, so the row is not drawn while the
+    /// filter form, the item form or a sub-tab captures.
+    #[tokio::test]
+    async fn the_list_hint_is_hidden_while_a_form_or_pane_captures() {
+        let bench = Bench::new().await;
+
+        let mut tab = bench.tab();
+        tab.form = Some(FilterForm::open(&tab.filter, &bench.projects));
+        assert_eq!(tab.list_hint(Keys::compiled()), None, "the filter form");
+        let frame = drawn(&tab, &bench);
+        assert!(!frame.contains(DEFAULT_LIST_HINT), "filter form:\n{frame}");
+
+        let mut tab = bench.tab();
+        let backend = htui_store::Backend::memory(MemStore::demo());
+        let request = StoreRequest::ItemForm {
+            project: htui_core::fixtures::ids::PROJECT_HTUI,
+            item: None,
+        };
+        let context = match item_writes::serve(&backend, &request).await {
+            Ok(StoreReply::ItemForm(context)) => *context,
+            other => panic!("the form read answered {other:?}"),
+        };
+        tab.item_form = Some(ItemForm::open_new(context, &bench.projects, None));
+        assert_eq!(tab.list_hint(Keys::compiled()), None, "the item form");
+        let frame = drawn(&tab, &bench);
+        assert!(!frame.contains(DEFAULT_LIST_HINT), "item form:\n{frame}");
+
+        let capturing = Rc::new(Cell::new(true));
+        let mut detail = DetailRegistry::new();
+        detail.register(Box::new(CapturingProbe {
+            capturing: Rc::clone(&capturing),
+            seen: Rc::default(),
+        }));
+        let tab = BacklogTab {
+            detail,
+            ..bench.tab()
+        };
+        assert_eq!(tab.list_hint(Keys::compiled()), None, "a capturing pane");
+        let frame = drawn(&tab, &bench);
+        assert!(
+            !frame.contains(DEFAULT_LIST_HINT),
+            "capturing pane:\n{frame}"
+        );
+        capturing.set(false);
+        assert_eq!(
+            tab.list_hint(Keys::compiled()).as_deref(),
+            Some(DEFAULT_LIST_HINT),
+            "back once the pane stops capturing"
+        );
+    }
+
+    /// Q1 (a): the hint is built from the keys in force, so `[backlog] filter = "/"` reads
+    /// `/ filter`.
+    #[tokio::test]
+    async fn the_list_hint_names_a_rebound_key() {
+        let bench = Bench::new().await;
+        let keys = crate::keys::load_str("version = 1\n[backlog]\nfilter = \"/\"\n")
+            .expect("the keys load");
+        assert_eq!(
+            bench.tab().list_hint(&keys).as_deref(),
+            Some("j/k move \u{b7} h/l sub-tab \u{b7} / filter \u{b7} N new \u{b7} e edit")
         );
     }
 }

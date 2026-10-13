@@ -474,7 +474,9 @@ mod tests {
                           settings.prompt, settings.connection, settings.qdrant, settings.boxes, \
                           settings.personas, settings.secrets, settings.queue, concepts, \
                           switcher, migration, waiting, skills, skills.library, \
-                          skills.templates, skills.attach, skills.help, requirements";
+                          skills.templates, skills.attach, skills.help, requirements, backlog, \
+                          backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
+                          backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat";
 
     #[test]
     fn an_empty_file_is_the_defaults() {
@@ -772,6 +774,11 @@ quit = ["x", "shift-a"]
                 13,
                 r#"[global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#,
             ),
+            // MOD-67 M5: and `x` rejects a step in the Backlog's Runs pane.
+            (
+                13,
+                r#"[global] quit = "x": "x" is already backlog.runs.reject (default) in Backlog > Runs"#,
+            ),
         ]
         .into_iter()
         .map(|(line, message)| (line, message.to_owned()))
@@ -1019,6 +1026,48 @@ quit = ["x", "shift-a"]
                 2,
                 "[settings.prompt] probe: no such action; [settings.prompt] may override down, \
                  up, edit, reload, dismiss, next_section, prev_section"
+            )
+        );
+    }
+
+    /// MOD-67 M5 §3.1: `[backlog.runs]` overrides a `[backlog]` verb in the Runs pane alone,
+    /// `[backlog]` moves it on every sub-tab, and `[chat]` lists what it has and may override.
+    #[test]
+    fn a_backlog_pane_table_overrides_a_backlog_verb() {
+        let keys = load_str("[backlog.runs]\nfilter = \"/\"\n").expect("loads");
+        assert_eq!(
+            keys.actions(views::RUNS_BROWSE, chord("/")),
+            [Act::BacklogOpenFilter]
+        );
+        assert_eq!(keys.actions(views::RUNS_BROWSE, chord("f")), []);
+        assert_eq!(
+            keys.actions(views::BACKLOG_BODY, chord("f")),
+            [Act::BacklogOpenFilter]
+        );
+        assert_eq!(keys.actions(views::BACKLOG_BODY, chord("/")), []);
+        let keys = load_str("[backlog]\nfilter = \"/\"\n").expect("loads");
+        for stack in [
+            views::BACKLOG_BODY,
+            views::RUNS_BROWSE,
+            views::BACKLOG_GRAPH,
+            views::BACKLOG_DOCS,
+            views::BACKLOG_NOTES,
+            views::BACKLOG_PROMPT,
+            views::BACKLOG_REQS,
+        ] {
+            assert_eq!(
+                keys.actions(stack, chord("/")),
+                [Act::BacklogOpenFilter],
+                "{stack:?}"
+            );
+            assert_eq!(keys.actions(stack, chord("f")), [], "{stack:?}");
+        }
+        assert_eq!(
+            errors("[chat]\nfilter = \"/\"\n"),
+            one(
+                2,
+                "[chat] filter: no such action; [chat] has compose, next_agent, end, thoughts, \
+                 top, bottom, and may override down, up, back"
             )
         );
     }

@@ -13,6 +13,13 @@
 //! (the attachments pane over the Library), `settings`/`skills`, `confirm`, `form`, `common`,
 //! `list`, `pane`, `overlay`, then the global layers; a capturing Skills mode whose widget passes
 //! `Tab` puts [`TABS`] before [`MODAL`] (PA-2).
+//!
+//! M5 adds the Backlog and Chat stacks. A Backlog browse stack is the pane's view layer, then the
+//! tail every sub-tab shares: `pane` (narrowed per pane), `backlog`, `common ∩ {edit}`, `list`,
+//! global (ANA-26 §7.3); a Backlog capturing or asking mode is its view layer, the shared layers
+//! it offers, `MODAL`. Layer order: view, `pane`, `backlog`, `confirm`, `form`, `common`, `list`,
+//! global. Each browse stack's tail is written out (a `const` slice cannot be concatenated);
+//! `every_backlog_browse_stack_offers_the_tab_and_the_list` pins that all seven share it.
 
 use super::{Act, Context, Layer, Stack};
 
@@ -80,11 +87,49 @@ const SKILLS_ASK: Layer = Layer::only(Context::Skills, &[Act::SkillsAskAgent]);
 /// `form ∩ {save, external_editor}`: a `TextArea` editor's chords.
 const FORM_EDITOR: Layer = Layer::only(Context::Form, &[Act::FormSave, Act::FormExternalEditor]);
 
-/// `form ∩ {next_field, prev_field, save}`: a multi-field form that saves on a chord.
+/// `form ∩ {next_field, prev_field, save}`: a multi-field form that saves on a chord. Despite
+/// the name, three of the four `form` acts (no `external_editor`); [`FORM`] holds all four.
 const FORM_ALL: Layer = Layer::only(
     Context::Form,
     &[Act::FormNextField, Act::FormPrevField, Act::FormSave],
 );
+
+/// Every `pane` act: a sub-tab that scrolls (Body, Notes, Prompt) and cycles sub-tabs.
+const PANE: Layer = Layer::all(Context::Pane);
+
+/// `pane ∩ {page_down, page_up, next_subtab, prev_subtab}`: a sub-tab whose `J`/`K` move a cursor
+/// of its own (Runs, Graph, Docs, Reqs).
+const PANE_PAGE: Layer = Layer::only(
+    Context::Pane,
+    &[
+        Act::PanePageDown,
+        Act::PanePageUp,
+        Act::PaneNextSubtab,
+        Act::PanePrevSubtab,
+    ],
+);
+
+/// `pane ∩ {page_down, page_up}`.
+const PAGES: Layer = Layer::only(Context::Pane, &[Act::PanePageDown, Act::PanePageUp]);
+
+/// The Backlog tab's own verbs (MOD-67 M5 D1), a shared context every Backlog browse stack has.
+const BACKLOG: Layer = Layer::all(Context::Backlog);
+
+/// `common ∩ {edit}`: the Backlog's `e`.
+const EDIT: Layer = Layer::only(Context::Common, &[Act::Edit]);
+
+/// `common ∩ {back}`.
+const BACK: Layer = Layer::only(Context::Common, &[Act::Back]);
+
+/// Every `list` act: the Backlog list's moves and fold.
+const LIST_ALL: Layer = Layer::all(Context::List);
+
+/// `confirm ∩ {no}`: a wait that can only be left.
+const NO: Layer = Layer::only(Context::Confirm, &[Act::ConfirmNo]);
+
+/// Every `form` act: a multi-field form with a `TextArea` (the item form, the Docs compose area).
+/// All four, `external_editor` included; [`FORM_ALL`] is the three without it (renamed in M6).
+const FORM: Layer = Layer::all(Context::Form);
 
 /// The Settings tab while its section has no stack of its own: section cycling, then global
 /// (L-A Q11). `SettingsTab` resolves `settings.next_section`/`prev_section` through it.
@@ -93,7 +138,8 @@ pub const SETTINGS_TAB: Stack<'static> = Stack::new(&[SETTINGS, GLOBAL]);
 /// A mode that is a text field or an opaque widget and nothing else (PA-7): the agents paste
 /// field, the Qdrant URL and key editors, the connection, prompt and queue editors, the boxes
 /// tags editor, hierarchy's typed delete, its in-flight delete and its path picker, the personas
-/// import path and the secrets URL; the Requirements filter (MOD-67 M4).
+/// import path and the secrets URL; the Requirements filter (MOD-67 M4); the Runs note,
+/// follow-up and typed key, a close-out in flight and the chat composer (MOD-67 M5).
 pub const CAPTURE: Stack<'static> = Stack::new(&[MODAL]);
 
 /// Settings > Agents, browsing the agent list.
@@ -546,6 +592,233 @@ pub const REQUIREMENTS_FORM: Stack<'static> =
 pub const REQUIREMENTS_WITHDRAW: Stack<'static> =
     Stack::new(&[Layer::view(Context::Requirements, &[]), FORM_SAVE, MODAL]);
 
+/// The Backlog's Body sub-tab (MOD-67 M5 PA-1), and `DetailTab::key_stack`'s default: no own
+/// verb, the pane's scroll and sub-tab cycling, then the tail every Backlog browse stack shares.
+pub const BACKLOG_BODY: Stack<'static> = Stack::new(&[
+    Layer::view(Context::BacklogBody, &[]),
+    PANE,
+    BACKLOG,
+    EDIT,
+    LIST_ALL,
+    GLOBAL,
+]);
+
+/// Backlog > Runs, browsing (the run list and the flow). `J`/`K` are the step cursor, so the
+/// pane layer offers only paging and sub-tab cycling.
+pub const RUNS_BROWSE: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogRuns,
+        &[
+            Act::RunsNextStep,
+            Act::RunsPrevStep,
+            Act::RunsApprove,
+            Act::RunsReject,
+            Act::RunsRetry,
+            Act::RunsPromote,
+            Act::RunsSelect,
+            Act::RunsAccept,
+            Act::RunsOpen,
+            Act::RunsCancelRun,
+            Act::RunsCleanup,
+            Act::RunsUnblock,
+            Act::RunsStartRun,
+            Act::RunsCloseOut,
+            Act::RunsFollowUp,
+            Act::RunsToggleView,
+            Act::RunsZoomIn,
+            Act::RunsZoomOut,
+            Act::RunsZoomFit,
+        ],
+    ),
+    PANE_PAGE,
+    BACKLOG,
+    EDIT,
+    LIST_ALL,
+    GLOBAL,
+]);
+
+/// Backlog > Runs, the cancel question and the close-out warning.
+pub const RUNS_CONFIRM: Stack<'static> =
+    Stack::new(&[Layer::view(Context::BacklogRuns, &[]), CONFIRM, MODAL]);
+
+/// Backlog > Runs, while the close-out counts (it can only be left).
+pub const RUNS_COUNTING: Stack<'static> =
+    Stack::new(&[Layer::view(Context::BacklogRuns, &[]), NO, MODAL]);
+
+/// Backlog > Runs, the document view (`j`/`k` scroll too: `VIEW_DEFAULTS`).
+pub const RUNS_ARTIFACT: Stack<'static> = Stack::new(&[
+    Layer::view(Context::BacklogRuns, &[]),
+    PANE_SCROLL,
+    BACK,
+    MODAL,
+]);
+
+/// Backlog > Graph.
+pub const BACKLOG_GRAPH: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogGraph,
+        &[
+            Act::GraphNextRow,
+            Act::GraphPrevRow,
+            Act::GraphDeeper,
+            Act::GraphShallower,
+            Act::GraphReroot,
+        ],
+    ),
+    PANE_PAGE,
+    BACKLOG,
+    EDIT,
+    LIST_ALL,
+    GLOBAL,
+]);
+
+/// Backlog > Docs, no compose area open.
+pub const BACKLOG_DOCS: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogDocs,
+        &[
+            Act::DocsNextRow,
+            Act::DocsPrevRow,
+            Act::DocsAdd,
+            Act::DocsNewVersion,
+        ],
+    ),
+    PANE_PAGE,
+    BACKLOG,
+    EDIT,
+    LIST_ALL,
+    GLOBAL,
+]);
+
+/// Backlog > Docs, the compose area (kind, title and body).
+pub const DOCS_COMPOSE: Stack<'static> =
+    Stack::new(&[Layer::view(Context::BacklogDocs, &[]), FORM, MODAL]);
+
+/// Backlog > Notes, no compose area open.
+pub const BACKLOG_NOTES: Stack<'static> = Stack::new(&[
+    Layer::view(Context::BacklogNotes, &[Act::NotesAdd]),
+    PANE,
+    BACKLOG,
+    EDIT,
+    LIST_ALL,
+    GLOBAL,
+]);
+
+/// Backlog > Notes, the compose area (a body only: its `TextArea` takes `Up`/`Down`).
+pub const NOTES_COMPOSE: Stack<'static> =
+    Stack::new(&[Layer::view(Context::BacklogNotes, &[]), FORM_EDITOR, MODAL]);
+
+/// Backlog > Prompt (MOD-67 M5 PA-1).
+pub const BACKLOG_PROMPT: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogPrompt,
+        &[Act::PromptNextTemplate, Act::PromptPrevTemplate],
+    ),
+    PANE,
+    BACKLOG,
+    EDIT,
+    LIST_ALL,
+    GLOBAL,
+]);
+
+/// Backlog > Reqs, browsing the citations.
+pub const BACKLOG_REQS: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogReqs,
+        &[
+            Act::ReqsNextRow,
+            Act::ReqsPrevRow,
+            Act::ReqsReconfirm,
+            Act::ReqsCite,
+            Act::ReqsUncite,
+        ],
+    ),
+    PANE_PAGE,
+    BACKLOG,
+    EDIT,
+    LIST_ALL,
+    GLOBAL,
+]);
+
+/// Backlog > Reqs, the requirement picker.
+pub const REQS_PICK: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogReqs,
+        &[Act::ReqsNextRow, Act::ReqsPrevRow, Act::ReqsPick],
+    ),
+    BACK,
+    LIST,
+    MODAL,
+]);
+
+/// Backlog > Reqs, the citation kind question.
+pub const REQS_KIND: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogReqs,
+        &[Act::ReqsAddresses, Act::ReqsReserves],
+    ),
+    BACK,
+    MODAL,
+]);
+
+/// Backlog > Reqs, the uncite question.
+pub const REQS_CONFIRM: Stack<'static> =
+    Stack::new(&[Layer::view(Context::BacklogReqs, &[]), CONFIRM, MODAL]);
+
+/// The Backlog's filter form (both row kinds).
+pub const BACKLOG_FILTER: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogFilter,
+        &[Act::FilterNextRow, Act::FilterPrevRow, Act::FilterClear],
+    ),
+    FORM_FIELDS,
+    MODAL,
+]);
+
+/// The Backlog's item form (also while it saves).
+pub const ITEM_FORM: Stack<'static> =
+    Stack::new(&[Layer::view(Context::BacklogItem, &[]), FORM, MODAL]);
+
+/// The item form's divergence view.
+pub const ITEM_DIVERGENCE: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::BacklogItem,
+        &[Act::ItemTheirs, Act::ItemMine, Act::ItemSwitchDiff],
+    ),
+    PAGES,
+    BACK,
+    LIST,
+    MODAL,
+]);
+
+/// Chat, idle, live, parked or ended (MOD-67 M5 PA-4: one key arm today).
+pub const CHAT_LIVE: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Chat,
+        &[
+            Act::ChatCompose,
+            Act::ChatNextAgent,
+            Act::ChatEnd,
+            Act::ChatThoughts,
+            Act::ChatTop,
+            Act::ChatBottom,
+        ],
+    ),
+    LIST,
+    GLOBAL,
+]);
+
+/// Chat, replaying a past chat (read-only).
+pub const CHAT_REPLAY: Stack<'static> = Stack::new(&[
+    Layer::view(
+        Context::Chat,
+        &[Act::ChatThoughts, Act::ChatTop, Act::ChatBottom],
+    ),
+    BACK,
+    LIST,
+    GLOBAL,
+]);
+
 #[cfg(test)]
 mod tests {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -678,6 +951,130 @@ mod tests {
         assert_eq!(resolve(REQUIREMENTS_WITHDRAW, "ctrl-s"), [Act::FormSave]);
     }
 
+    /// MOD-67 M5 §4.2: the Backlog and Chat stacks.
+    #[test]
+    fn the_backlog_and_chat_stacks_resolve_as_designed() {
+        assert_eq!(resolve(BACKLOG_BODY, "j"), [Act::ListDown]);
+        assert_eq!(resolve(BACKLOG_BODY, "J"), [Act::PaneScrollDown]);
+        assert_eq!(resolve(BACKLOG_BODY, "l"), [Act::PaneNextSubtab]);
+        assert_eq!(resolve(BACKLOG_BODY, "m"), [Act::BacklogOpenGraph]);
+        assert_eq!(resolve(BACKLOG_BODY, "f"), [Act::BacklogOpenFilter]);
+        assert_eq!(resolve(BACKLOG_BODY, "e"), [Act::Edit]);
+        assert_eq!(
+            resolve(BACKLOG_BODY, "enter"),
+            [Act::BacklogReplay, Act::ListFold]
+        );
+        assert_eq!(resolve(BACKLOG_BODY, "q"), [Act::Quit]);
+        for spec in ["ctrl-l", "alt-j", "ctrl-j"] {
+            assert_eq!(resolve(BACKLOG_BODY, spec), [], "{spec}");
+        }
+        assert_eq!(resolve(RUNS_BROWSE, "J"), [Act::RunsNextStep]);
+        assert_eq!(resolve(RUNS_BROWSE, "x"), [Act::RunsReject]);
+        assert_eq!(resolve(RUNS_BROWSE, "+"), [Act::RunsZoomIn]);
+        assert_eq!(resolve(RUNS_BROWSE, "pgdn"), [Act::PanePageDown]);
+        assert_eq!(
+            resolve(RUNS_BROWSE, "enter"),
+            [Act::BacklogReplay, Act::ListFold]
+        );
+        assert_eq!(resolve(RUNS_BROWSE, "1"), [Act::SelectTab1]);
+        assert_eq!(resolve(RUNS_BROWSE, "j"), [Act::ListDown]);
+        assert_eq!(resolve(RUNS_CONFIRM, "y"), [Act::ConfirmYes]);
+        assert_eq!(resolve(RUNS_CONFIRM, "esc"), [Act::ConfirmNo]);
+        assert_eq!(resolve(RUNS_CONFIRM, "alt-y"), []);
+        assert_eq!(resolve(RUNS_CONFIRM, "q"), []);
+        assert!(!RUNS_CONFIRM.passes(chord("y")));
+        assert!(RUNS_CONFIRM.passes(chord("alt-y")));
+        assert!(RUNS_CONFIRM.passes(chord("f1")));
+        assert_eq!(resolve(RUNS_COUNTING, "y"), []);
+        assert_eq!(resolve(RUNS_COUNTING, "n"), [Act::ConfirmNo]);
+        assert_eq!(resolve(RUNS_ARTIFACT, "j"), [Act::PaneScrollDown]);
+        assert_eq!(resolve(RUNS_ARTIFACT, "J"), [Act::PaneScrollDown]);
+        assert_eq!(resolve(RUNS_ARTIFACT, "esc"), [Act::Back]);
+        assert_eq!(resolve(RUNS_ARTIFACT, "down"), []);
+        assert_eq!(
+            resolve(BACKLOG_GRAPH, "enter"),
+            [Act::GraphReroot, Act::BacklogReplay, Act::ListFold]
+        );
+        assert_eq!(resolve(BACKLOG_GRAPH, "J"), [Act::GraphNextRow]);
+        assert_eq!(resolve(BACKLOG_GRAPH, "pgdn"), [Act::PanePageDown]);
+        assert_eq!(resolve(BACKLOG_DOCS, "v"), [Act::DocsNewVersion]);
+        assert_eq!(resolve(BACKLOG_DOCS, "J"), [Act::DocsNextRow]);
+        assert_eq!(resolve(DOCS_COMPOSE, "down"), [Act::FormNextField]);
+        assert_eq!(resolve(DOCS_COMPOSE, "ctrl-s"), [Act::FormSave]);
+        assert_eq!(resolve(DOCS_COMPOSE, "ctrl-e"), [Act::FormExternalEditor]);
+        assert_eq!(resolve(DOCS_COMPOSE, "q"), []);
+        assert_eq!(resolve(DOCS_COMPOSE, "f1"), [Act::Help]);
+        assert_eq!(resolve(NOTES_COMPOSE, "tab"), []);
+        assert_eq!(resolve(NOTES_COMPOSE, "ctrl-s"), [Act::FormSave]);
+        assert_eq!(resolve(BACKLOG_NOTES, "a"), [Act::NotesAdd]);
+        assert_eq!(resolve(BACKLOG_NOTES, "K"), [Act::PaneScrollUp]);
+        assert_eq!(resolve(BACKLOG_PROMPT, "n"), [Act::PromptNextTemplate]);
+        assert_eq!(resolve(BACKLOG_PROMPT, "ctrl-n"), []);
+        assert_eq!(resolve(BACKLOG_REQS, "c"), [Act::ReqsCite]);
+        assert_eq!(resolve(REQS_PICK, "J"), [Act::ReqsNextRow]);
+        assert_eq!(resolve(REQS_PICK, "j"), [Act::ListDown]);
+        assert_eq!(resolve(REQS_PICK, "enter"), [Act::ReqsPick]);
+        assert_eq!(resolve(REQS_PICK, "esc"), [Act::Back]);
+        assert_eq!(resolve(REQS_KIND, "a"), [Act::ReqsAddresses]);
+        assert_eq!(resolve(REQS_KIND, "esc"), [Act::Back]);
+        assert_eq!(resolve(REQS_CONFIRM, "alt-y"), []);
+        assert_eq!(resolve(BACKLOG_FILTER, "x"), [Act::FilterClear]);
+        assert_eq!(resolve(BACKLOG_FILTER, "j"), [Act::FilterNextRow]);
+        assert_eq!(resolve(BACKLOG_FILTER, "down"), [Act::FormNextField]);
+        assert_eq!(resolve(BACKLOG_FILTER, "tab"), [Act::FormNextField]);
+        assert_eq!(resolve(BACKLOG_FILTER, "q"), []);
+        assert_eq!(resolve(ITEM_FORM, "down"), [Act::FormNextField]);
+        assert_eq!(resolve(ITEM_FORM, "ctrl-s"), [Act::FormSave]);
+        assert_eq!(resolve(ITEM_FORM, "f1"), [Act::Help]);
+        assert_eq!(resolve(ITEM_FORM, "q"), []);
+        assert_eq!(resolve(ITEM_DIVERGENCE, "T"), [Act::ItemTheirs]);
+        assert_eq!(resolve(ITEM_DIVERGENCE, "tab"), [Act::ItemSwitchDiff]);
+        assert_eq!(resolve(ITEM_DIVERGENCE, "j"), [Act::ListDown]);
+        assert_eq!(resolve(ITEM_DIVERGENCE, "esc"), [Act::Back]);
+        assert_eq!(resolve(ITEM_DIVERGENCE, "ctrl-s"), []);
+        assert_eq!(resolve(CHAT_LIVE, "enter"), [Act::ChatCompose]);
+        assert_eq!(resolve(CHAT_LIVE, "esc"), [Act::ChatEnd]);
+        assert_eq!(resolve(CHAT_LIVE, "home"), []);
+        assert_eq!(resolve(CHAT_LIVE, "1"), [Act::SelectTab1]);
+        assert_eq!(resolve(CHAT_LIVE, "q"), [Act::Quit]);
+        assert_eq!(resolve(CHAT_REPLAY, "esc"), [Act::Back]);
+        assert_eq!(resolve(CHAT_REPLAY, "i"), []);
+        assert_eq!(resolve(CHAT_REPLAY, "t"), [Act::ChatThoughts]);
+    }
+
+    /// MOD-67 M5 §4 (D5): every Backlog browse stack ends in the same tail, so the Backlog
+    /// tab's own verbs and the list's resolve on every sub-tab.
+    #[test]
+    fn every_backlog_browse_stack_offers_the_tab_and_the_list() {
+        for (name, stack) in [
+            ("BACKLOG_BODY", BACKLOG_BODY),
+            ("RUNS_BROWSE", RUNS_BROWSE),
+            ("BACKLOG_GRAPH", BACKLOG_GRAPH),
+            ("BACKLOG_DOCS", BACKLOG_DOCS),
+            ("BACKLOG_NOTES", BACKLOG_NOTES),
+            ("BACKLOG_PROMPT", BACKLOG_PROMPT),
+            ("BACKLOG_REQS", BACKLOG_REQS),
+        ] {
+            assert_eq!(resolve(stack, "f"), [Act::BacklogOpenFilter], "{name}");
+            assert_eq!(resolve(stack, "N"), [Act::BacklogNewItem], "{name}");
+            assert_eq!(resolve(stack, "e"), [Act::Edit], "{name}");
+            assert_eq!(resolve(stack, "l"), [Act::PaneNextSubtab], "{name}");
+            assert_eq!(resolve(stack, "G"), [Act::ListBottom], "{name}");
+            let enter = resolve(stack, "enter");
+            assert!(
+                enter.contains(&Act::BacklogReplay) && enter.contains(&Act::ListFold),
+                "{name}: {enter:?}"
+            );
+            assert_eq!(resolve(stack, "q"), [Act::Quit], "{name}");
+            let layers = stack.layers();
+            assert_eq!(
+                layers[layers.len() - 4..],
+                [BACKLOG, EDIT, LIST_ALL, GLOBAL],
+                "{name}"
+            );
+        }
+    }
+
     /// MOD-67 M4 D5: a capturing or confirming mode never offers the Skills view switch, so a
     /// letter it types never switches views.
     #[test]
@@ -706,7 +1103,7 @@ mod tests {
             .iter()
             .filter(|(_, stack)| !NOT_VIEW_LED.contains(stack))
             .collect();
-        assert_eq!(views.len(), 50);
+        assert_eq!(views.len(), 70);
         for &&(phrase, stack) in &views {
             let first = stack.layers()[0];
             assert!(first.inherits(), "{phrase}: layer 0 is not a view layer");
@@ -835,6 +1232,19 @@ mod tests {
             include_str!("../ui/tabs/skills/agent_help.rs"),
             include_str!("../ui/tabs/requirements/mod.rs"),
             include_str!("../ui/tabs/requirements/forms.rs"),
+            include_str!("../ui/tabs/backlog/mod.rs"),
+            include_str!("../ui/tabs/backlog/filter.rs"),
+            include_str!("../ui/tabs/backlog/item_form.rs"),
+            include_str!("../ui/tabs/backlog/divergence.rs"),
+            include_str!("../ui/tabs/backlog/detail/mod.rs"),
+            include_str!("../ui/tabs/backlog/detail/compose.rs"),
+            include_str!("../ui/tabs/backlog/detail/documents.rs"),
+            include_str!("../ui/tabs/backlog/detail/graph.rs"),
+            include_str!("../ui/tabs/backlog/detail/notes.rs"),
+            include_str!("../ui/tabs/backlog/detail/prompt.rs"),
+            include_str!("../ui/tabs/backlog/detail/requirements.rs"),
+            include_str!("../ui/tabs/backlog/detail/runs.rs"),
+            include_str!("../ui/tabs/chat/mod.rs"),
         ];
         // Production code only: each file up to its test module, its comment lines dropped, so a
         // stack named only by a test or a doc comment still counts as unnamed.

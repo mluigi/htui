@@ -12,7 +12,6 @@ use crossterm::event::{MouseButton, MouseEventKind};
 use htui::agent_worker::AgentRuntime;
 use htui::app::{Action, RevealKind};
 use htui::editor::{ExternalEdit, ExternalEditOutcome};
-use htui::keymap::KeyScope;
 use htui::requirements::decision_citation_stays;
 use htui::run_worker::{self, LiveChats, RunRuntime, StepAuthor};
 use htui::store_worker::StoreRequest;
@@ -263,16 +262,15 @@ async fn h_and_l_cycle_the_sub_tabs_both_ways() {
     );
 }
 
-/// MOD-14 D8: `m` opens the Graph from the Backlog's own arm; its binding is the help box's half,
-/// next to the `Enter` row it mirrors.
+/// MOD-14 D8: `m` opens the Graph from the Backlog's own act, listed in the `?` box next to the
+/// `Enter` miss it mirrors (MOD-67 M5 PA-3: the box reads the focused pane's stack, not a legacy
+/// keymap row).
 #[tokio::test]
 async fn m_is_on_the_backlog_help_line() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
-    let help = harness
-        .app()
-        .keymap
-        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    harness.key("?");
+    let help = harness.render();
     assert!(help.contains("m open graph"), "{help}");
     assert!(help.contains("Enter replay step"), "{help}");
 }
@@ -1805,15 +1803,14 @@ async fn shift_f_restores_the_whole_list() {
     assert!(frame.contains("TUI scaffold"), "{frame}");
 }
 
-/// Blueprint E4: `f` and `F` are on the Backlog's help line, next to `m`.
+/// Blueprint E4: `f` and `F` are on the Backlog's help line, next to `m` (MOD-67 M5 PA-3: the
+/// `?` box).
 #[tokio::test]
 async fn f_and_shift_f_are_on_the_backlog_help_line() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
-    let help = harness
-        .app()
-        .keymap
-        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    harness.key("?");
+    let help = harness.render();
     assert!(help.contains("f filter"), "{help}");
     assert!(help.contains("F clear filter"), "{help}");
 }
@@ -2387,17 +2384,16 @@ async fn offline_n_and_e_are_refused_with_the_read_only_notice() {
     assert_eq!(items.len(), 11, "nothing was minted");
 }
 
-/// D8: `N` and `e` are on the Backlog's help line.
+/// D8: `N` and `e` are on the Backlog's help line (MOD-67 M5 PA-3: the `?` box, `e` under
+/// `Common` as `common.edit`).
 #[tokio::test]
 async fn n_and_e_are_on_the_backlog_help_line() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
-    let help = harness
-        .app()
-        .keymap
-        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    harness.key("?");
+    let help = harness.render();
     assert!(help.contains("N new item"), "{help}");
-    assert!(help.contains("e edit item"), "{help}");
+    assert!(help.contains("Common: e edit"), "{help}");
 }
 
 /// D8: the new form in the detail pane, a title typed: the project picker, the hinted kind, the
@@ -2630,7 +2626,8 @@ async fn the_divergence_view_renders_over_the_whole_tab() {
         "--- ancestor v1",
         "+++ theirs v2",
         "+++ mine",
-        "t theirs wins  m mine wins  Esc back",
+        // MOD-67 M5 PA-3, D9: the hint's parts join with ` · `.
+        "t theirs wins · m mine wins · Esc back",
     ] {
         assert!(frame.contains(wanted), "{wanted:?} in the view:\n{frame}");
     }
@@ -3393,15 +3390,13 @@ async fn offline_q_is_refused_with_the_database_sentence() {
     assert!(status.contains(DATABASE_UNREACHABLE), "{status}");
 }
 
-/// D9: `Q` and `P` are on the Backlog's help line.
+/// D9: `Q` and `P` are on the Backlog's help line (MOD-67 M5 PA-3: the `?` box).
 #[tokio::test]
 async fn q_and_p_are_on_the_backlog_help_line() {
     let mut harness = Harness::demo();
     htui::app::register_all(harness.app());
-    let help = harness
-        .app()
-        .keymap
-        .help_line(&KeyScope::Tab(BacklogTab::ID));
+    harness.key("?");
+    let help = harness.render();
     assert!(help.contains("Q queue / dequeue"), "{help}");
     assert!(help.contains("P pause / resume queue"), "{help}");
 }

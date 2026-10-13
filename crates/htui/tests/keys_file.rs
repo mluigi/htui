@@ -118,7 +118,9 @@ mod binary {
                      settings.kinds, settings.prompt, settings.connection, settings.qdrant, \
                      settings.boxes, settings.personas, settings.secrets, settings.queue, \
                      concepts, switcher, migration, waiting, skills, skills.library, \
-                     skills.templates, skills.attach, skills.help, requirements"
+                     skills.templates, skills.attach, skills.help, requirements, backlog, \
+                     backlog.body, backlog.runs, backlog.graph, backlog.docs, backlog.notes, \
+                     backlog.prompt, backlog.reqs, backlog.filter_form, backlog.item, chat"
                         .to_owned(),
                     "12: [global] quitt: no such action; [global] has quit, next_tab, prev_tab, \
                      select_tab_1, select_tab_2, select_tab_3, select_tab_4, select_tab_5, \
@@ -129,6 +131,8 @@ mod binary {
                     r#"13: [global] quit = "x": "x" is already settings.agents.cancel (default) in Settings > Agents"#
                         .to_owned(),
                     r#"13: [global] quit = "x": "x" is already skills.attach.detach (default) in Skills > Library > Attachments"#
+                        .to_owned(),
+                    r#"13: [global] quit = "x": "x" is already backlog.runs.reject (default) in Backlog > Runs"#
                         .to_owned(),
                 ],
             ),
@@ -163,6 +167,8 @@ mod binary {
                     r#"6: [global] help = "esc": "esc" is already confirm.no (default) in the Agents install question"#
                         .to_owned(),
                     r#"6: [global] help = "esc": "esc" is already common.back (default) in the Library import report"#
+                        .to_owned(),
+                    r#"6: [global] help = "esc": "esc" is already chat.end (default) in Chat"#
                         .to_owned(),
                     r#"9: [form] save = "s": "s" is typed text while a field captures: bind a ctrl or alt chord or a named key"#
                         .to_owned(),
@@ -342,6 +348,49 @@ mod binary {
         let line =
             r#"2: [global] quit = "ctrl-q": "ctrl-q" is already global.queue (line 3) in [global]"#;
         assert_eq!(stderr, report("both", &path, &[line.to_owned()]));
+    }
+
+    /// MOD-67 M5 R1 M1 end to end: a key the filter form's option rows keep for themselves
+    /// (`Space`, `l`, `Enter`, `Shift+Left`) cannot be given to one of its acts; each file is
+    /// refused before anything starts, on the entry's line, naming the form.
+    #[test]
+    fn a_rebind_onto_a_filter_form_fixed_key_exits_2() {
+        let home = tempfile::tempdir().expect("a throwaway home");
+        for (name, entry, line) in [
+            (
+                "space",
+                r#"clear = ["space"]"#,
+                r#"2: [backlog.filter_form] clear = "space": "space" is fixed in the Backlog filter form"#,
+            ),
+            (
+                "ell",
+                r#"next_row = ["l"]"#,
+                r#"2: [backlog.filter_form] next_row = "l": "l" is fixed in the Backlog filter form"#,
+            ),
+            (
+                "enter",
+                r#"clear = ["enter"]"#,
+                r#"2: [backlog.filter_form] clear = "enter": "enter" is fixed in the Backlog filter form"#,
+            ),
+            // M5 R1 fix: the option rows take a shifted arrow too (`keys::is_plain`).
+            (
+                "shift-left",
+                r#"clear = ["shift-left"]"#,
+                r#"2: [backlog.filter_form] clear = "shift-left": "shift-left" is fixed in the Backlog filter form"#,
+            ),
+        ] {
+            let path = home.path().join(format!("{name}.toml"));
+            std::fs::write(&path, format!("[backlog.filter_form]\n{entry}\n"))
+                .expect("the file is written");
+            let output = run(
+                &["--keys", path.to_str().expect("UTF-8"), "--print-keys"],
+                home.path(),
+            );
+            let (stdout, stderr) = text(&output);
+            assert_eq!(output.status.code(), Some(2), "{name}: {stderr}");
+            assert_eq!(stdout, "", "{name}");
+            assert_eq!(stderr, report(name, &path, &[line.to_owned()]), "{name}");
+        }
     }
 
     /// MOD-67 M4 D8.1 end to end: a file that leaves the in-pane editor no way out is refused

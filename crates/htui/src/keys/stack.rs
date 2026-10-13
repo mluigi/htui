@@ -6,7 +6,8 @@
 //! [`Stack::EDITOR_OPEN`]. A row for an act in a narrower layer shadows that act in every
 //! wider layer, bound or not (blueprint B6): that is how M2's narrower overrides and
 //! `reject = []` work. [`DECLARED`] lists every stack the key file's validator walks (MOD-67 M2 D8
-//! step 5); M3 adds every Settings and overlay mode's stack from [`views`](super::views).
+//! step 5); M3 adds every Settings and overlay mode's stack from [`views`](super::views), M4 the
+//! Skills and Requirements ones, M5 the Backlog and Chat ones.
 //!
 //! M3 adds two layer kinds. A **view** layer ([`Layer::view`], PA-3) offers the mode's own acts
 //! plus every shared act a wider layer of the same stack offers, so a view's override and
@@ -210,7 +211,8 @@ pub(super) const WHILE_EDITING: &str = "while an edit is open";
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
 /// ([`views`](super::views)). M4 appends the Skills and Requirements stacks and the two editor
 /// stacks (MOD-57 §6.4, D8.2), the editor stacks right after the overlay's, so an `[editor]`
-/// chord is checked against `global.quit` and `global.help`; M5 appends its own.
+/// chord is checked against `global.quit` and `global.help`. M5 appends the Backlog and Chat
+/// stacks (in strip order), after M4's.
 pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("on every screen", Stack::BASE),
     ("over an overlay", Stack::OVERLAY),
@@ -288,6 +290,117 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
     ("in the quit question", views::QUIT_CONFIRM),
     ("in the abort question", views::ABORT_CONFIRM),
     (WHILE_EDITING, Stack::EDITOR_OPEN),
+    // MOD-67 M5: the Backlog and Chat stacks, in strip order, after M4's (blueprint §4.3).
+    ("in Backlog > Body", views::BACKLOG_BODY),
+    ("in Backlog > Runs", views::RUNS_BROWSE),
+    ("in a Runs question", views::RUNS_CONFIRM),
+    ("while the Runs close-out counts", views::RUNS_COUNTING),
+    ("in the Runs document view", views::RUNS_ARTIFACT),
+    ("in Backlog > Graph", views::BACKLOG_GRAPH),
+    ("in Backlog > Docs", views::BACKLOG_DOCS),
+    ("in the Docs compose area", views::DOCS_COMPOSE),
+    ("in Backlog > Notes", views::BACKLOG_NOTES),
+    ("in the Notes compose area", views::NOTES_COMPOSE),
+    ("in Backlog > Prompt", views::BACKLOG_PROMPT),
+    ("in Backlog > Reqs", views::BACKLOG_REQS),
+    ("in the Reqs requirement picker", views::REQS_PICK),
+    ("in the Reqs citation kind question", views::REQS_KIND),
+    ("in the Reqs uncite question", views::REQS_CONFIRM),
+    ("in the Backlog filter form", views::BACKLOG_FILTER),
+    ("in the item form", views::ITEM_FORM),
+    ("in the item divergence view", views::ITEM_DIVERGENCE),
+    ("in Chat", views::CHAT_LIVE),
+    ("in a Chat replay", views::CHAT_REPLAY),
+];
+
+/// Keys a view matches ahead of the resolver in one declared stack (ANA-26 §6.1, MOD-67 M5 D5):
+/// a choice's value keys, a form's own `Enter`/`Esc`, the permission digits. They are not
+/// actions, and no key file moves them, so an act bound to one never hears it there; the
+/// validator refuses such a binding (M5 R1 M1), on the user's line, naming the stack.
+#[derive(Debug, Clone, Copy)]
+pub struct Fixed {
+    /// The stack, one of [`DECLARED`]'s; its phrase names it in the error.
+    pub stack: Stack<'static>,
+    /// The keys, spelled as in a key file, matched on plain keys only (SHIFT aside), so the
+    /// validator also refuses a named key's SHIFT form (`shift-left`); a character has none.
+    pub chords: &'static [&'static str],
+    /// The keys shadow only the stack's global layer: the Chat replay resolves its own acts
+    /// first and swallows what they left (M5 R1 M1 (a)).
+    pub only_global: bool,
+    /// Acts the keys shadow by design, on any of them: the tab select, whose digit must not move
+    /// the user off a parked request or a replay (MOD-42 D14, D40).
+    pub shadowed: &'static [Act],
+}
+
+/// The tab select's acts: the digits a parked request or a replay takes are theirs by default.
+const TAB_SELECT: &[Act] = &[
+    Act::SelectTab1,
+    Act::SelectTab2,
+    Act::SelectTab3,
+    Act::SelectTab4,
+    Act::SelectTab5,
+    Act::SelectTab6,
+    Act::SelectTab7,
+    Act::SelectTab8,
+    Act::SelectTab9,
+];
+
+/// The plain digits a permission request answers on.
+const DIGITS: &[&str] = &["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+/// Every declared stack with keys its view keeps fixed (MOD-67 M5 R1 M1), in [`DECLARED`] order,
+/// each citing the arm that matches them. M5's views only: a Settings, Skills or Requirements
+/// form's choice keys are still unlisted (M6).
+pub static FIXED: &[Fixed] = &[
+    // runs.rs `RunsTab::on_key`: while the step under the cursor has a pending request, every
+    // plain digit answers it (MOD-42 D14).
+    Fixed {
+        stack: views::RUNS_BROWSE,
+        chords: DIGITS,
+        only_global: false,
+        shadowed: TAB_SELECT,
+    },
+    // runs.rs `close_out_key`: the close-out warning's arrows and `h`/`l` pick the resolution
+    // (MOD-39 P13); the cancel question shares the stack.
+    Fixed {
+        stack: views::RUNS_CONFIRM,
+        chords: &["left", "right", "h", "l"],
+        only_global: false,
+        shadowed: &[],
+    },
+    // filter.rs `FilterForm::on_key`: an option row's `Enter` applies, `Esc` cancels, `h`/`l` and
+    // the arrows move the option, `Space` ticks it.
+    Fixed {
+        stack: views::BACKLOG_FILTER,
+        chords: &["enter", "esc", "h", "l", "left", "right", "space"],
+        only_global: false,
+        shadowed: &[],
+    },
+    // item_form.rs `ItemForm::on_picker_key`: a picker's `h`/`l` and arrows choose, `Enter`
+    // moves on, `Esc` cancels.
+    Fixed {
+        stack: views::ITEM_FORM,
+        chords: &["left", "right", "h", "l", "enter", "esc"],
+        only_global: false,
+        shadowed: &[],
+    },
+    // chat/mod.rs `ChatTab::on_key`: a parked request takes every plain digit.
+    Fixed {
+        stack: views::CHAT_LIVE,
+        chords: DIGITS,
+        only_global: false,
+        shadowed: TAB_SELECT,
+    },
+    // chat/mod.rs `ChatTab::on_key_replay`: what the replay's own acts left of the live tab's
+    // keys is swallowed (D40, D41).
+    Fixed {
+        stack: views::CHAT_REPLAY,
+        chords: &[
+            "1", "2", "3", "4", "5", "6", "7", "8", "9", "i", "a", "enter",
+        ],
+        only_global: true,
+        shadowed: TAB_SELECT,
+    },
 ];
 
 impl Keys {
@@ -330,7 +443,7 @@ impl Keys {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{DECLARED, Layer, Stack, WHILE_EDITING};
+    use super::{DECLARED, FIXED, Layer, Stack, WHILE_EDITING};
     use crate::keys::{Act, CTRL_C, Context, KeyChord, Keys, load_str, views};
 
     fn chord(spec: &str) -> KeyChord {
@@ -371,10 +484,32 @@ mod tests {
             DECLARED[2],
             ("in the focused in-pane editor", Stack::EDITOR_FOCUSED)
         );
-        assert_eq!(DECLARED.len(), 58);
+        assert_eq!(DECLARED.len(), 78);
         assert!(DECLARED.contains(&(WHILE_EDITING, Stack::EDITOR_OPEN)));
         let phrases: HashSet<&str> = DECLARED.iter().map(|(phrase, _)| *phrase).collect();
         assert_eq!(phrases.len(), DECLARED.len(), "a phrase is used twice");
+    }
+
+    /// MOD-67 M5 R1 M1: every `FIXED` entry names a declared stack (its phrase is the error's),
+    /// once, and its keys parse.
+    #[test]
+    fn every_fixed_entry_is_a_declared_stack_once() {
+        for (index, entry) in FIXED.iter().enumerate() {
+            assert!(
+                DECLARED.iter().any(|(_, stack)| *stack == entry.stack),
+                "FIXED[{index}] is not declared"
+            );
+            assert!(
+                FIXED[index + 1..]
+                    .iter()
+                    .all(|other| other.stack != entry.stack),
+                "FIXED[{index}] is listed twice"
+            );
+            for written in entry.chords {
+                assert!(KeyChord::parse_strict(written).is_ok(), "{written:?}");
+            }
+            assert!(!entry.only_global || entry.stack.global().is_some());
+        }
     }
 
     /// MOD-67 M4 R1 L1: `skills.switch_view` is offered only by the Library and Templates
@@ -391,6 +526,8 @@ mod tests {
             [
                 r#"[global] help = "h": "h" is already settings.prev_section (default) in Settings"#,
                 r#"[global] help = "h": "h" is already skills.switch_view (default) in Skills > Library"#,
+                // MOD-67 M5: and the Backlog's sub-tab cycling.
+                r#"[global] help = "h": "h" is already pane.prev_subtab (default) in Backlog > Body"#,
             ]
         );
     }

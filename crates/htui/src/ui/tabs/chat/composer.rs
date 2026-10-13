@@ -1,7 +1,9 @@
 //! The one line the user types into (`R-TUI-6`).
 //!
 //! A mode, not a widget with focus: while it is active every printable key is text, which is what
-//! lets the tab's own bindings (`i`, `t`, digits) stay single letters everywhere else.
+//! lets the tab's own bindings (`i`, `t`, digits) stay single letters everywhere else. The tab
+//! offers it only what `CAPTURE` does not pass, so CONTROL, ALT and function keys reach the shell
+//! (MOD-67 M5).
 
 use ratatui::Frame;
 use ratatui::layout::Rect;

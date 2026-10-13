@@ -240,23 +240,32 @@ error in either direction (such as `esc` for `[global] help`, or `f1` for `[over
 `ctrl-c` always quits and cannot be bound. The `[editor]` rules are in
 [`docs/htui-editor.md`](docs/htui-editor.md#the-editor-keys-in-keystoml).
 
-A table named after a Settings section, a Skills view, `[requirements]` or a pop-up changes a
-shared action there alone: `[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every
-other section keeps `r`. `htui --print-keys` prints every table that has keys. To see what a table
-may change, write a name htui does not know in it: the error lists every action that table has and
-every shared action it may override. A line copied from `--print-keys` into such a table, like
+A table named after a Settings section, a Skills view, `[requirements]`, a Backlog sub-tab
+(`[backlog.runs]`, `[backlog.docs]`, …), `[chat]` or a pop-up changes a shared action there alone:
+`[settings.boxes] reload = ["f5"]` reloads Boxes on `F5`, and every other section keeps `r`.
+`[backlog]` holds the Backlog's own keys (filter, new item, queue, …);
+`[backlog.runs] filter = ["/"]` moves the filter key in the Runs sub-tab alone.
+`htui --print-keys` prints every table that has keys. To see what a table may change, write a name
+htui does not know in it: the error lists every action that table has and every shared action it
+may override. A line copied from `--print-keys` into such a table, like
 `[settings.agents] next_field`, replaces that row, so it stops following the shared `[form]`,
 `[common]` or `[confirm]` line; delete it to let it follow again.
 
-A global key must not be a key that Settings, Skills, Requirements or a pop-up already uses:
-`[global] quit = ["x"]` is refused, because `x` cancels in **Settings › Agents**. Some Settings
+A global key must not be a key that Settings, Skills, Requirements, the Backlog, Chat or a pop-up
+already uses: `[global] quit = ["x"]` is refused, because `x` cancels in **Settings › Agents** and
+rejects a step in the Backlog's **Runs**; so is `[global] quit = ["f"]`, because `f` opens the
+Backlog filter. A shared table is checked the same way on every screen that uses it:
+`[list] down = ["G"]` is refused, because `G` jumps to the bottom in Chat, and so is
+`[pane] next_subtab = ["tab"]`, because `Tab` moves to the next tab. Some Settings
 forms also move between fields with `Down` / `Up`. A `[form] next_field` line changes them too, and
 they keep `Down`; write `[settings.agents] next_field = [...]` to replace it in that form alone.
 While a text field takes typing, the keys the field uses itself (letters, arrows, `Enter`, `Esc`)
-stay the field's. `Tab` still leaves a Skills editor with the draft kept.
-
-Backlog and Chat do not read this file yet. There, a key the tab handles itself wins over a global
-key bound to it: with `[global] quit = ["f"]`, `f` still opens the Backlog filter.
+stay the field's. In the same way, keys a screen keeps for itself (a choice's value keys, such as
+`Space` and `h` / `l` on the Backlog filter's rows, or the digits that answer a permission
+request) cannot be given to an action there: `[backlog.filter_form] clear = ["space"]` is refused.
+`Tab` still leaves a Skills editor with the draft kept. In the Backlog's item
+form and the Notes and Docs editors, `[form] save` and `[form] external_editor` replace `Ctrl+s`
+and `Ctrl+e`.
 
 ### Backlog
 
@@ -269,7 +278,15 @@ the item cites).
 | `j` / `k`, `g` / `G` | Move, jump to the first / last row |
 | `Enter` on a project | Fold or unfold the project |
 | `h` / `l` | Previous / next detail sub-tab |
-| `J` / `K`, `PageUp` / `PageDown` | Scroll the detail pane |
+| `J` / `K`, `PageUp` / `PageDown` | Scroll the detail pane; in Runs, Graph, Docs and Reqs `J` / `K` move the pane's cursor, and in Graph `PageUp` / `PageDown` move it a page |
+| `f` / `F` | Filter the list / clear the filter |
+| `N` / `e` | New item / edit the item |
+| `m` | Open the Graph sub-tab |
+| `Q` / `P` | Queue or dequeue the item / pause or resume this box's queue |
+| `?` | Every key of the pane you are in |
+
+The list's last row names the Backlog's own keys, and the Runs sub-tab's last row the keys of the
+view it shows; both follow your `keys.toml`.
 
 **Runs.** The Runs sub-tab lists an item's runs and their steps. Move between steps with `J` / `K`.
 If an action isn't allowed right now, the status line says why and nothing happens.
@@ -302,6 +319,15 @@ open, blocked or failed item starts on `withdrawn` and can also end as rejected,
 duplicate.
 
 Runs need a connection to the database.
+
+**Graph.** The Graph sub-tab draws the items the selected one links to. `J` / `K` and `PageUp` /
+`PageDown` move the cursor, `+` / `-` show more or fewer links deep, and `Enter` re-roots the
+graph on the item under the cursor.
+
+**Docs.** `J` / `K` move between the item's documents, `a` writes a new document and `v` a new
+version of the one under the cursor; `Ctrl+s` saves.
+
+**Notes.** `a` adds a note to the item; `Ctrl+s` saves it.
 
 **Prompt.** The Prompt sub-tab shows exactly what an agent would be sent for this item: the
 assembled text, its token budget, what was trimmed to fit, and which files were picked as
