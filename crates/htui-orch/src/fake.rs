@@ -142,6 +142,9 @@ pub struct FakeIsolator {
     env_file_answers: Mutex<VecDeque<std::result::Result<EnvFiles, IsolateError>>>,
     /// Every [`env_files`](Isolator::env_files) call's `(cwd, extra_dirs)`, in call order.
     env_file_requests: Mutex<Vec<(PathBuf, Vec<PathBuf>)>>,
+    /// MOD-89 review L5: the signal the next [`env_files`](Isolator::env_files) call sends, and
+    /// the grace of the cancel it sends, before it answers. One-shot.
+    cancel_at_env_files: Mutex<Option<(watch::Sender<Signal>, std::time::Duration)>>,
 }
 
 /// One [`diff`](Isolator::diff) call as [`FakeIsolator`] saw it: the `run_step_id` of every tree
@@ -310,6 +313,15 @@ impl FakeIsolator {
             .lock()
             .expect("no panic holds the fake isolator's lock")
             .push_back(Err(IsolateError::Git(reason.to_owned())));
+    }
+
+    /// MOD-89 review L5: the next [`env_files`](Isolator::env_files) call sends
+    /// `Cancel { grace }` on `signal` before it answers, as a cancel landing mid-scan would.
+    fn cancel_at_env_files(&self, signal: watch::Sender<Signal>, grace: std::time::Duration) {
+        *self
+            .cancel_at_env_files
+            .lock()
+            .expect("no panic holds the fake isolator's lock") = Some((signal, grace));
     }
 
     /// MOD-89: every [`env_files`](Isolator::env_files) call so far, as `(cwd, extra_dirs)`,
@@ -716,6 +728,14 @@ impl Isolator for FakeIsolator {
                 .lock()
                 .expect("no panic holds the fake isolator's lock")
                 .push((cwd.to_path_buf(), extra_dirs.to_vec()));
+            let cancel = self
+                .cancel_at_env_files
+                .lock()
+                .expect("no panic holds the fake isolator's lock")
+                .take();
+            if let Some((signal, grace)) = cancel {
+                signal.send_replace(Signal::Cancel { grace });
+            }
             self.env_file_answers
                 .lock()
                 .expect("no panic holds the fake isolator's lock")
@@ -1928,6 +1948,13 @@ impl FakeOrchestrator {
     /// MOD-42 plan D10: every walk of this harness is asked to stop gracefully.
     pub fn cancel_walks(&self, grace: std::time::Duration) {
         self.relays.signal.send_replace(Signal::Cancel { grace });
+    }
+
+    /// MOD-89 review L5: [`cancel_walks`](Self::cancel_walks), sent by the next env-file scan
+    /// while it runs — a cancel that lands mid-scan, after the walk's last check before it.
+    pub fn cancel_walks_during_env_files(&self, grace: std::time::Duration) {
+        self.isolator
+            .cancel_at_env_files(self.relays.signal.clone(), grace);
     }
 
     /// The policy lookup `fake_parts` lends.
