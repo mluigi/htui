@@ -502,8 +502,15 @@ read-only `~/.local/share/uv/tools` mount, so it is the version you have on the 
   shared `~/.headroom` is never written and a run's SQLite store never meets your host's or another
   run's. The cost: a run's savings are not added to your host's totals, and the data is gone when
   the container is. The headroom hooks and CLI in an ordinary run keep using `~/.headroom`.
-- The upload beacon (anonymous session summaries to Headroom Labs, on by default in headroom) is
-  off in a run: `HEADROOM_BEACON=off` on the proxy.
+- No headroom process in **any** run phones home, flag or not: `compose.hr.yaml` sets
+  `HEADROOM_BEACON=off` (the anonymous session-summary upload to Headroom Labs, on by default in
+  headroom), `HEADROOM_TELEMETRY=off`, `HEADROOM_NO_SUBSCRIPTION_TRACKING=1` (the poller of your
+  Anthropic subscription usage) and `DO_NOT_TRACK=1` for the whole container, so a proxy that a
+  settings hook starts is covered too; the `attach` guard repeats them on its own proxy for
+  containers made before they existed. The first `up` or `attach` after this change recreates a
+  stopped run's `dev` container (compose sees a new environment): its `/tmp` is lost, the volumes
+  and the clone are not. Your host's headroom is not touched: the beacon is on there unless you set
+  `HEADROOM_BEACON=off` or `DO_NOT_TRACK=1` in the environment that starts it.
 
 **What headroom sees.** Every request of the run passes through it: all prompts, file contents, tool
 results and the `Authorization` it forwards upstream (the run's login). It rewrites those requests

@@ -60,6 +60,13 @@ services:
       HTUI_TEST_QDRANT_URL: http://localhost:6334
       HR_ITEM: ${HR_ITEM:?}
       HR_SANDBOX: "1"
+      # No headroom process in a run phones home: the upload beacon and usage telemetry off, and no
+      # Anthropic subscription-usage poller. Every headroom process in the container inherits these,
+      # including one a settings hook starts (TOOL-11). An unset variable would leave the beacon on.
+      HEADROOM_BEACON: "off"
+      HEADROOM_TELEMETRY: "off"
+      HEADROOM_NO_SUBSCRIPTION_TRACKING: "1"
+      DO_NOT_TRACK: "1"
       HR_STATE: /hr-state
       # ~/.local/share/uv/tools is read-only, and uvx (serena's MCP entry) writes temp files into its
       # tool dir even for ephemeral tools; a per-container tool dir keeps the host's uv tools untouched (TOOL-7 T2).

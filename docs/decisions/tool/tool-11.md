@@ -18,11 +18,15 @@ default. In (b) the proxy listens on the run's own `localhost:8787`: no publishe
   `up`, upgraded by any `write_reg`. `attach` of a `headroom=1` run execs a guard (`HEADROOM_GUARD`) that
   starts the proxy if none runs (under `flock`, anchored `pgrep -f`), waits up to 30 s for `/readyz`, then sets
   `ANTHROPIC_BASE_URL` for that Claude or shell only. Not ready: one stderr line and a direct session.
-- Proxy state is `HEADROOM_WORKSPACE_DIR=/tmp/headroom` and the upload beacon is `HEADROOM_BEACON=off`, both set on
-  that one process, so the shared `~/.headroom` is never written by a run's proxy.
-- `compose.hr.yaml` is **unchanged**. A first version added an env var and a start command there; review found it
-  changes every existing run's compose config hash (stopped runs would be recreated on `attach`) and left two
-  starters racing for the port, so the guard became the only starter.
+- Proxy state is `HEADROOM_WORKSPACE_DIR=/tmp/headroom`, set on that one process, so the shared `~/.headroom` is
+  never written by a run's proxy.
+- Tracking: `compose.hr.yaml` `dev.environment` sets `HEADROOM_BEACON=off`, `HEADROOM_TELEMETRY=off`,
+  `HEADROOM_NO_SUBSCRIPTION_TRACKING=1` and `DO_NOT_TRACK=1` for every run, flag or not (added after the
+  maintainer saw a proxy log "Anonymous upload beacon: ENABLED"); the guard repeats them inline for containers
+  made earlier. Cost: the next `up`/`attach` recreates a stopped run's container (new compose environment).
+  The host's own headroom is untouched; headroom has no persistent opt-out, only the environment.
+- The compose file carries no proxy start command. A first version added one plus an `HR_HEADROOM` variable;
+  review found it left two starters racing for the port, so the guard became the only starter.
 - Tests: `tests/hr/hr.bats` 3e-3m (flag parsing, conflict, old-registry load and upgrade, tamper cases, compose
   unchanged, attach argv for both modes, guard against fake `curl`/`pgrep`/`headroom`); 95 fast cases green.
 

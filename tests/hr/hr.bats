@@ -205,10 +205,14 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     grep -qx 'headroom=0' "$(reg_of MOD-5)"
 }
 
-@test "3h. compose is unchanged by TOOL-11: no headroom variable or command, so existing runs keep their config hash" {
+@test "3h. compose: every headroom process in a run starts with beacon, telemetry and subscription tracking off" {
     local cfg
     cfg="$(compose_config)"
-    [[ "$(jq -r '.services.dev.environment | keys[] | select(test("HEADROOM"; "i"))' <<<"$cfg")" == '' ]]
+    [[ "$(jq -r '.services.dev.environment.HEADROOM_BEACON' <<<"$cfg")" == off ]]
+    [[ "$(jq -r '.services.dev.environment.HEADROOM_TELEMETRY' <<<"$cfg")" == off ]]
+    [[ "$(jq -r '.services.dev.environment.HEADROOM_NO_SUBSCRIPTION_TRACKING' <<<"$cfg")" == 1 ]]
+    [[ "$(jq -r '.services.dev.environment.DO_NOT_TRACK' <<<"$cfg")" == 1 ]]
+    # The proxy start itself lives in attach, not in the compose command.
     [[ "$(jq -r '.services.dev.command[2]' <<<"$cfg")" != *headroom* ]]
 }
 
@@ -246,7 +250,7 @@ guard_run() {
     mkdir -p "$FB"
     printf '#!/bin/sh\necho "$*" >"%s/curl.args"\n[ -e "%s/up" ]\n' "$FB" "$FB" >"$FB/curl"
     printf '#!/bin/sh\necho "$*" >"%s/pgrep.args"\n[ -e "%s/running" ]\n' "$FB" "$FB" >"$FB/pgrep"
-    printf '#!/bin/sh\necho "WS=$HEADROOM_WORKSPACE_DIR BEACON=$HEADROOM_BEACON ARGS=$*" >>"%s/started"\n[ -e "%s/works" ] && touch "%s/up"\nexit 0\n' "$FB" "$FB" "$FB" >"$FB/headroom"
+    printf '#!/bin/sh\necho "WS=$HEADROOM_WORKSPACE_DIR BEACON=$HEADROOM_BEACON TELEM=$HEADROOM_TELEMETRY NOSUB=$HEADROOM_NO_SUBSCRIPTION_TRACKING DNT=$DO_NOT_TRACK ARGS=$*" >>"%s/started"\n[ -e "%s/works" ] && touch "%s/up"\nexit 0\n' "$FB" "$FB" "$FB" >"$FB/headroom"
     printf '#!/bin/sh\nexec "$@"\n' >"$FB/setsid"
     cp "$FB/setsid" "$FB/nohup"
     printf '#!/bin/sh\necho "BASE=${ANTHROPIC_BASE_URL-unset} ARGS=$*"\n' >"$FB/claude"
@@ -268,7 +272,7 @@ guard_run() {
     [[ $status -eq 0 ]]
     [[ "$output" == 'BASE=http://localhost:8787 ARGS=--dangerously-skip-permissions' ]]
     [[ "$(wc -l <"$FB/started")" -eq 1 ]]
-    [[ "$(cat "$FB/started")" == 'WS=/tmp/headroom BEACON=off ARGS=proxy --port 8787' ]]
+    [[ "$(cat "$FB/started")" == 'WS=/tmp/headroom BEACON=off TELEM=off NOSUB=1 DNT=1 ARGS=proxy --port 8787' ]]
     [[ "$(cat "$FB/curl.args")" == *'http://localhost:8787/readyz'* ]]
     [[ "$(cat "$FB/pgrep.args")" == *'/headroom proxy --port 8787'* ]]
 }

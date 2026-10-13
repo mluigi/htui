@@ -869,7 +869,8 @@ cmd_up() {
 # not recreated). A dead ANTHROPIC_BASE_URL makes claude hang rather than fail, so the variable is set
 # only once the proxy answers /readyz; otherwise the session runs direct. A missing proxy (first attach,
 # a restarted container, a proxy that died) is started under a lock so concurrent attaches start one,
-# with its state off the shared ~/.headroom and the upload beacon off. pgrep -f is anchored on the
+# with its state off the shared ~/.headroom and every tracking switch off (set inline too: a container
+# made before compose.hr.yaml carried them has none). pgrep -f is anchored on the
 # interpreter + script path of the proxy: this script's own command line starts with "bash -c" and
 # cannot match. $1 = claude | shell. HR_HEADROOM_WAIT (seconds, default 30: a cold first start took 6 to 15 s) bounds the readiness wait;
 # tests lower it. No single quote may appear in the text: it is one single-quoted constant.
@@ -880,7 +881,7 @@ if ! ready; then
     (
         flock 9
         if ! pgrep -f "^[^ ]+ [^ ]*/headroom proxy --port 8787" >/dev/null 2>&1; then
-            HEADROOM_WORKSPACE_DIR=/tmp/headroom HEADROOM_BEACON=off setsid nohup headroom proxy --port 8787 >>/tmp/headroom/proxy.out 2>&1 9>&- </dev/null &
+            HEADROOM_WORKSPACE_DIR=/tmp/headroom HEADROOM_BEACON=off HEADROOM_TELEMETRY=off HEADROOM_NO_SUBSCRIPTION_TRACKING=1 DO_NOT_TRACK=1 setsid nohup headroom proxy --port 8787 >>/tmp/headroom/proxy.out 2>&1 9>&- </dev/null &
         fi
     ) 9>/tmp/headroom/start.lock
     end=$((SECONDS + ${HR_HEADROOM_WAIT:-30}))
