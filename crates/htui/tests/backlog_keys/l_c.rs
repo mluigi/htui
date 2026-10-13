@@ -261,3 +261,36 @@ async fn the_picker_moves_on_j_and_j_capital() {
         );
     }
 }
+
+/// The lane's rebinding test (D8): `[backlog.reqs] cite = "C"` moves the picker off `c`. `C`
+/// passes the unconverted Backlog tab and the converted one alike (no `backlog`, `list` or `pane`
+/// act binds it), so the pane resolves it; `c` opens nothing, and the browse hint names `C`.
+#[tokio::test]
+async fn a_rebound_cite_key_opens_the_picker_and_c_is_inert() {
+    let keys =
+        htui::keys::load_str("version = 1\n[backlog.reqs]\ncite = \"C\"\n").expect("the keys load");
+    let mut harness = backlog_with(keys).await;
+    on_feat_1_reqs(&mut harness).await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("J/K move · r reconfirm · C cite · u uncite"),
+        "the browse hint names the rebound key:\n{frame}"
+    );
+
+    harness.key("c");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        !frame.contains("Enter pick") && !frame.contains("▸ R-ENT-1"),
+        "`c` opened nothing:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None, "and said nothing");
+
+    harness.key("C");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("▸ R-ENT-1") && frame.contains("j/k move · Enter pick · Esc back"),
+        "`C` opened the picker:\n{frame}"
+    );
+}
