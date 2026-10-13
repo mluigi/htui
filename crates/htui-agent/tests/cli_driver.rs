@@ -997,9 +997,11 @@ fn a_tool_less_session_is_isolated_too() {
 
 /// MOD-91 D8: a later `--settings` replaces `htui`'s own whole (T1 case 1a), so an isolated row
 /// refuses one in `extra_args` unless its value is inline JSON setting `"disableAllHooks": true`.
-/// Spaced or joined, a path (`htui` does not read the operator's file), `false`, a non-object, a
-/// dangling flag, and one behind an unrelated flag are all refused. The refusal names the flag and
-/// both fixes, and never the value: a settings value can carry an `env` block (`R-SEC-2`).
+/// Spaced or joined, a path (`htui` does not read the operator's file), `false`, the string
+/// `"true"`, a key nested one level down, a non-object or JSON scalar, an empty value, a dangling
+/// flag, one behind an unrelated flag, and a bad value whatever follows it are all refused. The
+/// refusal names the flag and both fixes, and never the value: a settings value can carry an `env`
+/// block (`R-SEC-2`).
 #[test]
 fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
     for extra in [
@@ -1009,6 +1011,11 @@ fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
         &["--settings=/op/settings.json"],
         &["--settings", r#"{"disableAllHooks":false}"#],
         &["--settings", "[1]"],
+        &["--settings", r#"{"x":{"disableAllHooks":true}}"#],
+        &["--settings", r#"{"disableAllHooks":"true"}"#],
+        &["--settings="],
+        &["--settings", "true"],
+        &["--settings", "null"],
         &["--settings"],
         &["--x", "--settings", "/op/settings.json"],
         &[
@@ -1016,6 +1023,12 @@ fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
             r#"{"disableAllHooks":true}"#,
             "--settings",
             "/op/settings.json",
+        ],
+        &[
+            "--settings",
+            "/op/settings.json",
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
         ],
     ] {
         let refused = refuse_settings_override(&cli_settings("acceptEdits", extra), false)
@@ -1025,7 +1038,11 @@ fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
             message.starts_with("agent transport error: "),
             "a transport refusal, never a spawn failure: {refused:?}"
         );
-        for named in ["--settings", "disableAllHooks", "mods"] {
+        for named in [
+            "--settings",
+            "disableAllHooks",
+            "set `mods (y/n)` to `y` in Settings > Agents",
+        ] {
             assert!(
                 message.contains(named),
                 "{extra:?}: names {named}: {message}"

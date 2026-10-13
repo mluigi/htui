@@ -327,6 +327,8 @@ pub fn refuse_settings_override(cli: &CliSettings, user_extensions: bool) -> Res
     if user_extensions {
         return Ok(());
     }
+    // MOD-91 D8: refusing a bad `--settings` that a later good one follows, and reading another
+    // flag's spaced value as the flag, are intentionally conservative: both refuse more, never less.
     let mut args = cli.extra_args.iter().map(String::as_str);
     while let Some(arg) = args.next() {
         let (flag, joined) = arg
@@ -345,7 +347,7 @@ pub fn refuse_settings_override(cli: &CliSettings, user_extensions: bool) -> Res
             return Err(DriverError::Transport(format!(
                 "an isolated session refuses this row's `--settings` extra argument: a later \
                  `--settings` replaces htui's own, so it must set `\"{HOOKS_OFF}\": true` itself, \
-                 or set `mods` to y in Settings > Agents"
+                 or set `mods (y/n)` to `y` in Settings > Agents"
             )));
         }
     }
