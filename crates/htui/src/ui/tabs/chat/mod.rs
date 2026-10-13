@@ -579,15 +579,12 @@ impl Tab for ChatTab {
             if views::CAPTURE.passes(chord) {
                 return Handled::Pass;
             }
-            match self.composer.on_key(key) {
-                ComposerOutcome::Consumed => return Handled::Consumed,
-                ComposerOutcome::Submit(text) => {
-                    self.submit(text, ctx);
-                    return Handled::Consumed;
-                }
-                ComposerOutcome::Leave => return Handled::Consumed,
-                ComposerOutcome::Pass => {}
+            if let ComposerOutcome::Submit(text) = self.composer.on_key(key) {
+                self.submit(text, ctx);
             }
+            // Every other outcome is consumed too: an open composer answers `Pass` for nothing,
+            // and were it to, the key must still not reach the live view below (M5 R1 L3).
+            return Handled::Consumed;
         }
 
         // A digit answers the parked request, and **every** digit is consumed while one is
@@ -1661,6 +1658,41 @@ mod tests {
         }
         assert_eq!(tab.composer.text(), "h", "no chord typed into the composer");
         assert!(tab.composer.is_active(), "and the composer stays open");
+        assert!(shell.emit.is_empty(), "the tab sent nothing");
+    }
+
+    /// MOD-67 M5 R1 L3: an open composer never lets a key on to the live dispatch: the live
+    /// view's letters and a digit are composer text, a named key the composer has no use for is
+    /// swallowed, and nothing folds, scrolls, arms the end or is sent.
+    #[test]
+    fn an_open_composer_never_lets_a_key_reach_the_live_view() {
+        let shell = Shell::new();
+        let mut tab = live(&shell);
+        tab.on_key(key(KeyCode::Char('i')), &mut shell.ctx());
+        assert!(tab.composer.is_active(), "`i` opens the composer");
+        let before = format!("{:?}", tab.transcript);
+        for code in [
+            KeyCode::Char('t'),
+            KeyCode::Char('j'),
+            KeyCode::Char('G'),
+            KeyCode::Char('a'),
+            KeyCode::Char('1'),
+            KeyCode::Down,
+            KeyCode::Home,
+        ] {
+            assert_eq!(
+                tab.on_key(key(code), &mut shell.ctx()),
+                Handled::Consumed,
+                "{code:?} is the composer's"
+            );
+        }
+        assert_eq!(tab.composer.text(), "tjGa1");
+        assert_eq!(
+            format!("{:?}", tab.transcript),
+            before,
+            "nothing folded or scrolled"
+        );
+        assert!(!tab.cancel_armed, "nothing armed the end");
         assert!(shell.emit.is_empty(), "the tab sent nothing");
     }
 
