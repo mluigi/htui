@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-67](docs/decisions/mod/mod-67.md)** - Configurable hotkeys: named actions, `keys.toml`, generated hints (done, 2026-10-14)
 - **[MOD-93](docs/decisions/mod/mod-93.md)** - `htui` Claude Code plugin: one skill, one mod, emitted from the binary (done, 2026-10-13)
 - **[MOD-89](docs/decisions/mod/mod-89.md)** - Warn or refuse when a run's session trees hold env files (done, 2026-10-13)
 - **[MOD-95](docs/decisions/mod/mod-95.md)** - auto_queue overshoot test: the batch closes as drained (done, 2026-10-13)

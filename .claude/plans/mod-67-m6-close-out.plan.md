@@ -10,8 +10,9 @@ agents. Sandbox run (`HR_SANDBOX=1`, branch `hr/MOD-67`, base `8349e793`).
 **Selected milestone**: M6, the last. MOD-67 closes with it (lifecycle P2).
 **Complexity**: Large (the `Ctx::new` change alone is 42 sites in 17 files; ~25 prose sites in ~16
 files; two unconverted views; with Q1 (a) every tab's hint line and ~165 TUI snapshots move)
-**Status**: confirmed 2026-10-13 (Q1: (a), Q2: (a), the recommended options, taken on a plain
-"confirm")
+**Status**: done (M6 landed 2026-10-14, `fcf996b1`..`37326035`; MOD-67 closed,
+`docs/decisions/mod/mod-67.md`). Confirmed 2026-10-13 (Q1: (a), Q2: (a), the recommended options,
+taken on a plain "confirm")
 
 ## Amendments (maintainer, 2026-10-13, from blueprint §1)
 
@@ -257,6 +258,35 @@ Postgres suites once on the merged tree (sandbox DB on 5439); workspace gate at 
 - [ ] Q1 outcome done (fixed row, or MOD-82 carries it)
 - [ ] Validation passes on the merged tree; MOD-67 closed out
 - [ ] Patterns mirrored, not reinvented
+
+## Review gate (2026-10-14)
+
+`rust-reviewer` over `d8171e44..0fd2054c`: approve with changes; 0 CRITICAL/HIGH/MEDIUM, 5 LOW,
+7 NIT. All fixed in R1 (`1996ab0f`..`37326035`, one implement/verify workflow, both lenses clean,
+no snapshot moved).
+
+- **Applied**: LOW-1 private items in public docs written as code spans (7 from T2 and 4
+  pre-existing in `keys/`); LOW-2 docs that still described per-view hint rows (`Tab field` stays
+  out of the item form hint: restoring it would move two compose snapshots); LOW-3 a stale test name;
+  LOW-4 the reachability test checks each stack's acts in that stack's own files (derived from
+  `views::<STACK>` names plus a 24-entry delegate table, no exception list; no unhandled act found);
+  LOW-5 one `line_of` helper for every validator pass; NITs `PickerOutcome::Stay`, one
+  `settings::key_line`, imports, reflowed docs.
+- **Checked by the reviewer and sound**: all 70 production `label(stack, act)` sites name a stack that
+  admits the act; all 161 re-baselined snapshots moved only by the accept list; the user files newly
+  refused are the designed ones.
+- **Deviations recorded during implementation**: commit subjects carry the task prefix
+  (`feat(mod-67): M6 T1c ...` where the blueprint said `fix`/`test`/`docs`); T1 moved one validator
+  test's chord off `backspace` (now `picker.parent`'s default) and pinned the new refusal; T-L1 tests
+  `[picker] cancel` (the blueprint's `[picker] up` is a legal override); the layout test's minimum
+  frame is 5 rows (the blueprint said 6); `PENDING`/`PENDING_ACTS` were deleted rather than emptied;
+  `cells` became `pub(crate)` for `clip_line`; Qdrant's notice line appears only with a notice.
+- **Carried**: MOD-82 (the Prompt header's `n / p` and the Skills pane titles' ` J/K scroll `);
+  CLEAN-10 (5 pre-existing rustdoc private-item links outside `keys/`).
+- **Process**: T0 and T1 serial on the primary tree, one workflow; three worktree lanes as one
+  concurrent workflow, merged `--no-ff` with no conflict; X-S and T2 serial; every task verified clean
+  in round 1 (no repair before review). Merged-tree gates: htui 3272 after the lanes, 3283 after T2,
+  3284 after R1, serial, insta clean.
 
 ## Verified claims (plan fact-check, 2026-10-13)
 
