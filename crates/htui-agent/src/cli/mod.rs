@@ -258,6 +258,10 @@ pub const ISOLATION_ARGS: [&str; 3] = [
     "--disable-slash-commands",
 ];
 
+/// The permission mode an isolated, tool-carrying session gets when its row names none (MOD-96
+/// D3): with no settings file read, the CLI otherwise picks its own, and probe F3 saw `auto`.
+pub const ISOLATED_PERMISSION_MODE: &str = "default";
+
 /// The settings key D8 requires an operator's own `--settings` to set (`true`): a later
 /// `--settings` **replaces** ours rather than merging (T1 case 1a).
 const HOOKS_OFF: &str = "disableAllHooks";

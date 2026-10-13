@@ -23,7 +23,9 @@ use std::time::Duration;
 use chrono::Utc;
 #[cfg(unix)]
 use htui_agent::cli::{ClaudeStreamAdapter, CliDriver};
-use htui_agent::cli::{ISOLATION_ARGS, argv, refuse_settings_override, refuse_widening, usd};
+use htui_agent::cli::{
+    ISOLATED_PERMISSION_MODE, ISOLATION_ARGS, argv, refuse_settings_override, refuse_widening, usd,
+};
 #[cfg(unix)]
 use htui_agent::cli::{McpConfigFile, SessionOptions, open_session};
 #[cfg(unix)]
@@ -187,10 +189,20 @@ fn a_resuming_session_names_the_old_id_and_mints_nothing() {
     );
 }
 
-/// A row that names no permission mode passes no flag: the CLI's own default is a better answer
-/// than a mode `htui` guessed.
+/// Every value `args` passes `--permission-mode`, in order.
+fn permission_modes(args: &[String]) -> Vec<&str> {
+    args.windows(2)
+        .filter(|pair| pair[0] == "--permission-mode")
+        .map(|pair| pair[1].as_str())
+        .collect()
+}
+
+/// MOD-96 D3: an isolated row that names no permission mode says [`ISOLATED_PERMISSION_MODE`]
+/// rather than leave the CLI to pick one: no settings file is read, and the CLI's own default was
+/// `auto` (probe F3). Rule 3's place, unchanged: right after the fixed flags, before the session id.
 #[test]
-fn an_empty_permission_mode_passes_no_flag() {
+fn isolated_session_with_no_mode_says_default() {
+    assert_eq!(ISOLATED_PERMISSION_MODE, "default");
     let args = argv(
         &[],
         &cli_settings("", &[]),
@@ -199,7 +211,72 @@ fn an_empty_permission_mode_passes_no_flag() {
         None,
         false,
     );
+    assert_eq!(
+        permission_modes(&args),
+        [ISOLATED_PERMISSION_MODE],
+        "{args:?}"
+    );
+    let at = args
+        .iter()
+        .position(|arg| arg == "--permission-mode")
+        .expect("the flag is passed");
+    assert_eq!(args[at - 1], "--include-partial-messages", "{args:?}");
+    assert_eq!(args[at + 2], "--session-id", "{args:?}");
+}
+
+/// MOD-96 D3: a row that opts back in and names no mode passes no flag: its settings files are
+/// read, and their `defaultMode` is the operator's answer, not a mode `htui` picked.
+#[test]
+fn opted_in_session_with_no_mode_passes_none() {
+    let args = argv(
+        &[],
+        &cli_settings("", &[]),
+        &spec(PathBuf::from("/scratch")),
+        "minted-id",
+        None,
+        true,
+    );
     assert!(!args.contains(&"--permission-mode".to_owned()), "{args:?}");
+}
+
+/// MOD-55 review M1 survives MOD-96 D3: a tool-less session drops the mode, the substituted one
+/// included, because nothing is left for a mode to approve.
+#[test]
+fn tool_less_session_still_drops_the_mode() {
+    let mut spec = spec(PathBuf::from("/scratch"));
+    spec.tools = tool_less();
+    for mode in ["", "acceptEdits"] {
+        let args = argv(
+            &[],
+            &cli_settings(mode, &[]),
+            &spec,
+            "minted-id",
+            None,
+            false,
+        );
+        assert!(
+            !args.contains(&"--permission-mode".to_owned()),
+            "{mode:?}: {args:?}"
+        );
+    }
+}
+
+/// MOD-96 D3 fills only an empty mode: an operator's own passes as written, once, on an isolated
+/// session too.
+#[test]
+fn an_operators_mode_passes_unchanged() {
+    for mode in ["acceptEdits", "plan"] {
+        let args = argv(
+            &[],
+            &cli_settings(mode, &[]),
+            &spec(PathBuf::from("/scratch")),
+            "minted-id",
+            None,
+            false,
+        );
+        assert_eq!(permission_modes(&args), [mode], "{args:?}");
+        assert!(!args.contains(&"default".to_owned()), "{mode}: {args:?}");
+    }
 }
 
 /// **F-10, and the reason this case exists at all.** `--max-budget-usd 0` is refused *before* the
@@ -295,6 +372,8 @@ fn persona_flags_follow_the_pairs_and_precede_extra_args() {
                 "stream-json",
                 "--verbose",
                 "--include-partial-messages",
+                "--permission-mode",
+                "default",
                 "--session-id",
                 "minted-id",
                 "--tools=Read,Grep",
@@ -854,11 +933,13 @@ fn no_tools_passes_extra_args_that_do_not_widen() {
 #[test]
 fn isolation_args_are_the_probed_levers() {
     assert_eq!(
-        ISOLATION_ARGS,
+        ISOLATION_ARGS[..],
         [
             "--settings",
             r#"{"disableAllHooks":true}"#,
             "--disable-slash-commands",
+            "--setting-sources",
+            "",
         ],
     );
 }
@@ -933,7 +1014,7 @@ fn argv_opt_in_drops_the_levers() {
         let opted = argv(&[], &cli, &spec, "minted-id", config, true);
         let isolated = argv(&[], &cli, &spec, "minted-id", config, false);
 
-        for lever in ["--settings", "--disable-slash-commands"] {
+        for lever in ISOLATION_ARGS.iter().filter(|arg| arg.starts_with("--")) {
             assert!(!opted.iter().any(|arg| arg == lever), "{name}: {opted:?}");
         }
         let at = levers_at(&isolated);
@@ -1058,8 +1139,8 @@ fn an_isolated_row_refuses_a_settings_that_drops_the_hooks_lever() {
 }
 
 /// MOD-91 D8: a `--settings` that keeps the hooks lever passes, spaced, joined or whitespace-laden,
-/// whatever else it sets; so does a row with no `--settings`, and `--setting-sources`, which is a
-/// different flag.
+/// whatever else it sets; so does a row with no `--settings`, and a flag that only shares a prefix
+/// with MOD-96 D2's (the match is exact).
 #[test]
 fn a_settings_that_keeps_the_hooks_lever_passes() {
     for extra in [
@@ -1071,8 +1152,7 @@ fn a_settings_that_keeps_the_hooks_lever_passes() {
         ],
         &[],
         &["--x"],
-        &["--setting-sources", "user"],
-        &["--setting-sources=user,project"],
+        &["--setting-source", "user"],
     ] {
         refuse_settings_override(&cli_settings("acceptEdits", extra), false)
             .unwrap_or_else(|err| panic!("{extra:?} keeps the session isolated: {err}"));
@@ -1084,6 +1164,64 @@ fn a_settings_that_keeps_the_hooks_lever_passes() {
 fn an_opted_in_row_is_never_checked_for_settings() {
     refuse_settings_override(
         &cli_settings("acceptEdits", &["--settings", "/op/settings.json"]),
+        true,
+    )
+    .expect("an opted-in row is not this check's business");
+}
+
+/// MOD-96 D2: the CLI keeps the last `--setting-sources` (probe E1), so any one in an isolated
+/// row's `extra_args` would read the settings files again, and their permission rules would answer
+/// before `htui` is asked. Spaced or joined, with any value, `""` included, none, or behind another
+/// flag, it is refused before its value is read. The refusal names the flag and the fix, and never
+/// the value, nor any source name it could have carried.
+#[test]
+fn an_isolated_row_refuses_a_setting_sources_override() {
+    for extra in [
+        &["--setting-sources", "user"][..],
+        &["--setting-sources=user,project,local"],
+        &["--setting-sources", ""],
+        &["--setting-sources="],
+        &["--setting-sources"],
+        &["--x", "--setting-sources", "project"],
+        &[
+            "--settings",
+            r#"{"disableAllHooks":true}"#,
+            "--setting-sources",
+            "s3cret-source",
+        ],
+        &["--setting-sources", "s3cret-source"],
+    ] {
+        let refused = refuse_settings_override(&cli_settings("acceptEdits", extra), false)
+            .expect_err(&format!("{extra:?} must be refused"));
+        let message = refused.to_string();
+        assert!(
+            message.starts_with("agent transport error: "),
+            "a transport refusal, never a spawn failure: {refused:?}"
+        );
+        for named in [
+            "--setting-sources",
+            "set `mods (y/n)` to `y` in Settings > Agents",
+        ] {
+            assert!(
+                message.contains(named),
+                "{extra:?}: names {named}: {message}"
+            );
+        }
+        for value in ["s3cret", "user", "project", "local"] {
+            assert!(
+                !message.contains(value),
+                "{extra:?}: never quotes the value: {message}"
+            );
+        }
+    }
+}
+
+/// MOD-96 D2: a row that opts back in reads its settings files anyway, so its `--setting-sources`
+/// is not read either.
+#[test]
+fn an_opted_in_row_is_never_checked_for_setting_sources() {
+    refuse_settings_override(
+        &cli_settings("acceptEdits", &["--setting-sources", "user,project,local"]),
         true,
     )
     .expect("an opted-in row is not this check's business");
