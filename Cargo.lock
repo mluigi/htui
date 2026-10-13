@@ -3042,6 +3042,7 @@ dependencies = [
  "chrono",
  "clap",
  "crossterm",
+ "dirs",
  "futures",
  "htui-agent",
  "htui-core",

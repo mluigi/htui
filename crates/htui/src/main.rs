@@ -9,7 +9,8 @@ use std::time::Duration;
 ///
 /// Exit codes: 0 on success; 2 for `htui worker`'s startup refusals, `htui provision`'s
 /// refusals (MOD-45 D292), `htui mcp` without its environment, a key file htui refuses (MOD-67),
-/// a state verb's refusal (MOD-92) and clap's usage errors; 3 for an `htui mcp` the host refused
+/// a state verb's refusal (MOD-92), an `htui claude emit` refusal (MOD-93) and clap's usage
+/// errors; 3 for an `htui mcp` the host refused
 /// (MOD-11 D6) and for a state verb whose store or index did not answer (MOD-92); 1 for every other
 /// failure (MOD-41 plan D14). The error is printed after [`run`](htui::run) has restored the
 /// terminal, so a failure is readable instead of being drawn over the last frame.
@@ -99,7 +100,8 @@ async fn body(args: htui::cli::Args) -> ExitCode {
 /// The exit code `error` ends `body` with: a [`WorkerExit`](htui::worker_cmd::WorkerExit)'s, a
 /// [`ProvisionExit`](htui::provision::ProvisionExit)'s or an [`McpExit`](htui::mcp_cmd::McpExit)'s
 /// own code (MOD-11 B-13: 2, 3 or 1), a [`KeysError`](htui::keys::KeysError)'s (MOD-67 M2 D9:
-/// 2), a [`StateExit`](htui::state_cmd::StateExit)'s (MOD-92: 3, 2 or 1), else 1.
+/// 2), a [`StateExit`](htui::state_cmd::StateExit)'s (MOD-92: 3, 2 or 1), an
+/// [`EmitExit`](htui::claude_emit::EmitExit)'s (MOD-93: 2 or 1), else 1.
 fn exit_code(error: &anyhow::Error) -> u8 {
     error
         .downcast_ref::<htui::worker_cmd::WorkerExit>()
@@ -124,6 +126,11 @@ fn exit_code(error: &anyhow::Error) -> u8 {
                 .downcast_ref::<htui::state_cmd::StateExit>()
                 .map(htui::state_cmd::StateExit::code)
         })
+        .or_else(|| {
+            error
+                .downcast_ref::<htui::claude_emit::EmitExit>()
+                .map(htui::claude_emit::EmitExit::code)
+        })
         .unwrap_or(1)
 }
 
@@ -136,7 +143,8 @@ fn exit_code(error: &anyhow::Error) -> u8 {
 /// relay ending is the session's state, not a crash. MOD-67 M2 D9: no key-file refusal either,
 /// whatever its code: the report carries the user's home path. MOD-92: a state verb whose store
 /// or index did not answer (3) or that refused (2) is a state, not a crash, by its type; its failure
-/// (1) is still reported.
+/// (1) is still reported. MOD-93: no `htui claude emit` end, whatever its code: its sentences carry
+/// home paths.
 fn reports_to_sentry(error: &anyhow::Error, code: u8) -> bool {
     code != 2
         && error
@@ -148,6 +156,9 @@ fn reports_to_sentry(error: &anyhow::Error, code: u8) -> bool {
             error.downcast_ref::<htui::state_cmd::StateExit>(),
             Some(htui::state_cmd::StateExit::Offline(_) | htui::state_cmd::StateExit::Refused(_))
         )
+        && error
+            .downcast_ref::<htui::claude_emit::EmitExit>()
+            .is_none()
 }
 
 #[cfg(test)]
@@ -157,6 +168,7 @@ mod tests {
     use std::time::Duration;
 
     use super::{reports_to_sentry, run_bounded, teardown_grace};
+    use htui::claude_emit::EmitExit;
     use htui::keys::{KeyFileError, KeysError};
     use htui::mcp_cmd::McpExit;
     use htui::provision::ProvisionExit;
@@ -281,6 +293,27 @@ mod tests {
                 reported,
                 "{wrapped:#}"
             );
+        }
+    }
+
+    /// MOD-93 D8: `htui claude emit` exits 2 refused, 1 failed, wrapped or not, and neither
+    /// reaches Sentry, by its type and not only by its code (its sentences carry home paths).
+    #[test]
+    fn emit_exits_are_2_1_and_never_reach_sentry() {
+        assert_eq!(EmitExit::Refused(String::new()).code(), 2);
+        assert_eq!(EmitExit::Failed(String::new()).code(), 1);
+        for exit in [
+            EmitExit::Refused("/home/u/x already holds the htui plugin".into()),
+            EmitExit::Failed("cannot create /home/u/x.emit-1".into()),
+        ] {
+            let expected = exit.code();
+            let error = anyhow::Error::from(exit);
+            assert_eq!(super::exit_code(&error), expected, "{error}");
+            assert!(!reports_to_sentry(&error, expected), "{error}");
+            assert!(!reports_to_sentry(&error, 1), "by type: {error}");
+            let wrapped = error.context("while emitting");
+            assert_eq!(super::exit_code(&wrapped), expected, "{wrapped:#}");
+            assert!(!reports_to_sentry(&wrapped, expected), "{wrapped:#}");
         }
     }
 
