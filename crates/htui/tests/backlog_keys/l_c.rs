@@ -55,7 +55,7 @@ async fn backlog_with(keys: Keys) -> Harness {
 }
 
 /// [`backlog_with`] the compiled defaults.
-async fn backlog() -> Harness {
+pub(super) async fn backlog() -> Harness {
     backlog_with(Keys::defaults()).await
 }
 
@@ -169,7 +169,7 @@ async fn enter_re_roots_the_graph_and_never_says_the_miss() {
 }
 
 /// On htui `FEAT-1`'s Reqs sub-tab, its one citation (`R-STO-1 addresses`) under the cursor.
-async fn on_feat_1_reqs(harness: &mut Harness) {
+pub(super) async fn on_feat_1_reqs(harness: &mut Harness) {
     down(harness, TO_FEAT_1).await;
     sub_tab(harness, TO_REQS);
     let frame = harness.render();

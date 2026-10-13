@@ -70,7 +70,7 @@ impl StepAuthor for Author {
 
 /// The demo with its own agents disabled and one scripted `acp` row ready on the demo box, so a
 /// walk's candidate chain names exactly it (`tests/backlog.rs`'s `seeded_store`).
-async fn seeded_store() -> MemStore {
+pub(super) async fn seeded_store() -> MemStore {
     let store = MemStore::demo();
     for summary in store.agents().await.expect("the fixture's agents") {
         let mut row = summary.agent;
@@ -117,7 +117,7 @@ async fn seeded_store() -> MemStore {
 
 /// A settled Backlog tab over `store`, scoped to `Platform`, with a run runtime whose sessions
 /// each play one `done` turn from `adapter`.
-async fn driving(store: MemStore, adapter: &FakeAdapter) -> Harness {
+pub(super) async fn driving(store: MemStore, adapter: &FakeAdapter) -> Harness {
     let mut factory = DriverFactory::new();
     factory.register("acp", Box::new(adapter.clone()));
     let runtime = RunRuntime::with_parts(
@@ -147,7 +147,7 @@ fn one_turn() -> Script {
 }
 
 /// htui `ANA-2` on the Runs pane over `store`, its run started with `R` and parked at `research`.
-async fn parked(store: MemStore) -> Harness {
+pub(super) async fn parked(store: MemStore) -> Harness {
     let adapter = FakeAdapter::new();
     let mut harness = driving(store, &adapter).await;
     for _ in 0..TO_ANA_2 {
@@ -402,7 +402,7 @@ async fn the_runs_browse_hint_row() {
 
 /// Rows down from the arrival row (htui `ANA-1`) to htui `FEAT-1`, the item with a recorded
 /// step (`tests/replay.rs`).
-const TO_FEAT_1: usize = 3;
+pub(super) const TO_FEAT_1: usize = 3;
 
 /// D6: `Enter` on a step replays it (the registered shell opens the Chat tab, no refusal); on a
 /// Runs pane with no step under the cursor the pane declines and the Backlog answers with the
