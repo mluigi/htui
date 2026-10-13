@@ -52,7 +52,7 @@ const LABEL: usize = 8;
 /// The modifiers that make a key a chord aimed elsewhere, not a form key (MOD-13 review L4):
 /// every one but `SHIFT`, which is how a terminal reports a capital. The rule
 /// [`TextField::on_key`] applies, so the form and its tag field agree on what a chord is.
-pub const CHORD: KeyModifiers = KeyModifiers::CONTROL
+const CHORD: KeyModifiers = KeyModifiers::CONTROL
     .union(KeyModifiers::ALT)
     .union(KeyModifiers::SUPER)
     .union(KeyModifiers::META)
@@ -416,9 +416,10 @@ impl FilterForm {
     }
 }
 
-/// Whether `key` carries no modifier but `SHIFT` (how a terminal reports a capital): the option
-/// rows' fixed keys are plain keys only, so `Alt+l` moves no option (MOD-67 M5 D12).
-fn plain(key: &KeyEvent) -> bool {
+/// Whether `key` carries no modifier but `SHIFT` (how a terminal reports a capital): the filter's
+/// option rows and the item form's pickers match their fixed value keys on plain keys only, so
+/// `Alt+l` moves no option (MOD-67 M5 D12).
+pub(super) fn plain(key: &KeyEvent) -> bool {
     !key.modifiers.intersects(CHORD)
 }
 

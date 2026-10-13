@@ -7,8 +7,9 @@ use htui::app::{Action, register_all};
 use htui::keys::{Keys, load_str};
 use htui::testkit::Harness;
 use htui_agent::registry::DriverFactory;
-use htui_core::model::WorkspaceSummary;
-use htui_core::store::MemStore;
+use htui_core::fixtures::ids;
+use htui_core::model::{ItemId, WorkspaceSummary};
+use htui_core::store::{MemStore, ReadStore as _};
 
 /// The `?` box's closing line.
 const CLOSER: &str = "?/F1 closes this box";
@@ -36,7 +37,13 @@ fn keys(table: &str) -> Keys {
 /// cursor on htui `ANA-1`, Body active. The agent runtime keeps prompt previews off the status
 /// line (`tests/backlog.rs`).
 async fn shell(keys: Option<Keys>) -> Harness {
-    let mut harness = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
+    shell_over(MemStore::demo(), keys).await
+}
+
+/// [`shell`] over `store`, so a test can read what landed.
+async fn shell_over(store: MemStore, keys: Option<Keys>) -> Harness {
+    let mut harness =
+        Harness::over(store).with_agent_runtime(AgentRuntime::new(DriverFactory::new()));
     if let Some(keys) = keys {
         harness = harness.with_keys(keys);
     }
@@ -215,4 +222,181 @@ async fn a_capturing_backlog_form_shows_the_filtered_status_line() {
     press(&mut harness, "f").await;
     assert!(harness.render().contains(" Filter "));
     assert_eq!(status_line(&mut harness), FILTERED, "filter form");
+}
+
+/// Rows down from `ANA-1` to htui `FEAT-1`, the item Notes and Docs have data for.
+const TO_FEAT_1: usize = 3;
+
+/// Sub-tabs right of Body to Docs; Notes is one further.
+const TO_DOCS: usize = 3;
+
+/// Presses each of `chords`, then serves what they asked for.
+async fn presses(harness: &mut Harness, chords: &[&str]) {
+    for chord in chords {
+        harness.key(chord);
+    }
+    harness.drive_to_end().await;
+}
+
+/// Types `text` key by key, a space as `space`.
+fn type_text(harness: &mut Harness, text: &str) {
+    for c in text.chars() {
+        match c {
+            ' ' => harness.key("space"),
+            c => harness.key(&c.to_string()),
+        }
+    }
+}
+
+/// `item`'s head version in `store`.
+async fn version(store: &MemStore, item: ItemId) -> i32 {
+    store
+        .item(item)
+        .await
+        .expect("the memory store never fails")
+        .expect("the demo item exists")
+        .version
+}
+
+/// `FEAT-1`'s note and document counts in `store`.
+async fn written(store: &MemStore) -> (usize, usize) {
+    let notes = store.notes(ids::HTUI_FEAT_1).await.expect("notes").len();
+    let documents = store
+        .documents(ids::HTUI_FEAT_1)
+        .await
+        .expect("documents")
+        .len();
+    (notes, documents)
+}
+
+/// D8, D12: `[form] save = "f2"` saves the item form, a note and a document (`form.save` resolves
+/// after the widget, through `ITEM_FORM`, `NOTES_COMPOSE` and `DOCS_COMPOSE`); the old `Ctrl+S`
+/// saves nothing, types nothing and leaves each open; each hint names `F2 save`.
+#[tokio::test]
+async fn a_rebound_save_saves_the_item_form_a_note_and_a_document() {
+    let store = MemStore::demo();
+    let mut harness = shell_over(store.clone(), Some(keys("[form]\nsave = \"f2\"\n"))).await;
+
+    press(&mut harness, "e").await;
+    type_text(&mut harness, "Z");
+    press(&mut harness, "ctrl-s").await;
+    let frame = harness.render();
+    assert!(frame.contains(" Edit ANA-1 "), "still open:\n{frame}");
+    assert!(
+        frame.contains("Tab field · F2 save · Esc cancel"),
+        "{frame}"
+    );
+    assert!(!frame.contains("Zs"), "`ctrl-s` typed nothing:\n{frame}");
+    assert_eq!(
+        version(&store, ids::HTUI_ANA_1).await,
+        1,
+        "`ctrl-s` saved nothing"
+    );
+    press(&mut harness, "f2").await;
+    assert_eq!(
+        version(&store, ids::HTUI_ANA_1).await,
+        2,
+        "`F2` saved the edit"
+    );
+
+    for _ in 0..TO_FEAT_1 {
+        press(&mut harness, "j").await;
+    }
+    for _ in 0..=TO_DOCS {
+        press(&mut harness, "l").await;
+    }
+    let (notes, documents) = written(&store).await;
+    press(&mut harness, "a").await;
+    harness.paste("A note by hand.");
+    press(&mut harness, "ctrl-s").await;
+    let frame = harness.render();
+    assert!(frame.contains(" New note "), "still open:\n{frame}");
+    assert!(
+        frame.contains("Ctrl+e $EDITOR · F2 save · Esc cancel"),
+        "{frame}"
+    );
+    assert_eq!(
+        written(&store).await,
+        (notes, documents),
+        "`ctrl-s` wrote nothing"
+    );
+    press(&mut harness, "f2").await;
+    assert_eq!(
+        written(&store).await,
+        (notes + 1, documents),
+        "`F2` added the note"
+    );
+
+    press(&mut harness, "h").await;
+    press(&mut harness, "a").await;
+    type_text(&mut harness, "summary");
+    let frame = harness.render();
+    assert!(
+        frame.contains("Tab field · F2 save · Esc cancel"),
+        "{frame}"
+    );
+    presses(&mut harness, &["tab"]).await;
+    type_text(&mut harness, "Summary of FEAT-1");
+    presses(&mut harness, &["tab"]).await;
+    harness.paste("The summary.");
+    press(&mut harness, "ctrl-s").await;
+    let frame = harness.render();
+    assert!(frame.contains(" New document "), "still open:\n{frame}");
+    assert!(
+        frame.contains("Ctrl+e $EDITOR · F2 save · Esc cancel"),
+        "{frame}"
+    );
+    assert_eq!(
+        written(&store).await,
+        (notes + 1, documents),
+        "`ctrl-s` wrote nothing"
+    );
+    press(&mut harness, "f2").await;
+    assert_eq!(
+        written(&store).await,
+        (notes + 1, documents + 1),
+        "`F2` wrote the document"
+    );
+}
+
+/// D12: `[form] external_editor = "f3"` hands the item form's Body and a note's text to
+/// `$EDITOR`; the old `Ctrl+E` asks for nothing.
+#[tokio::test]
+async fn a_rebound_external_editor_hands_the_body_out() {
+    let rebound = || Some(keys("[form]\nexternal_editor = \"f3\"\n"));
+    let mut harness = shell(rebound()).await;
+    press(&mut harness, "e").await;
+    presses(&mut harness, &["tab"; 5]).await;
+    press(&mut harness, "ctrl-e").await;
+    assert!(
+        harness.app().take_external_edit().is_none(),
+        "`ctrl-e` is inert"
+    );
+    press(&mut harness, "f3").await;
+    let (_, edit) = harness
+        .app()
+        .take_external_edit()
+        .expect("`F3` asked for the editor");
+    assert_eq!(edit.stem, "ANA-1-body");
+
+    let mut harness = shell(rebound()).await;
+    for _ in 0..TO_FEAT_1 {
+        press(&mut harness, "j").await;
+    }
+    for _ in 0..=TO_DOCS {
+        press(&mut harness, "l").await;
+    }
+    press(&mut harness, "a").await;
+    harness.paste("A note by hand.");
+    press(&mut harness, "ctrl-e").await;
+    assert!(
+        harness.app().take_external_edit().is_none(),
+        "`ctrl-e` is inert"
+    );
+    press(&mut harness, "f3").await;
+    let (_, edit) = harness
+        .app()
+        .take_external_edit()
+        .expect("`F3` asked for the editor");
+    assert_eq!(edit.text, "A note by hand.");
 }

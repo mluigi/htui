@@ -3,9 +3,12 @@
 //! rect with [`render`], and acts on the [`ComposeOutcome`] each key gives back, as the Backlog
 //! acts on an `ItemFormOutcome`.
 //!
-//! - **Key order** follows the item form's: Ctrl+S saves (swallowed while busy), then Ctrl+E,
-//!   then any other chord passes (`ctrl-c` quits), then, while busy, every other key is
-//!   swallowed, `Esc` included; `Tab`/`BackTab` cycle the parts; the focused part takes the rest.
+//! - **Key order** follows the item form's (MOD-67 M5 D8), through [`Compose::stack`]: while
+//!   busy, Ctrl+S and Ctrl+E are swallowed, what the modal layer admits passes (`ctrl-c` quits)
+//!   and every other key is swallowed, `Esc` included; otherwise the focused part takes the key
+//!   first, then `form.save` (Ctrl+S) saves, `form.external_editor` (Ctrl+E) hands the body out,
+//!   and in a document `form.next_field`/`prev_field` (`Tab`/`BackTab`, `Down`/`Up`) cycle the
+//!   parts. Anything else passes iff the modal layer admits it.
 //! - **Ctrl+E hands the body only** to `$EDITOR` (D6, D7; blueprint E7): on the kind or the title
 //!   it is swallowed, as on the item form's one-line fields.
 //! - **The outcome comes back** through [`Compose::on_external_edit`], with the item form's rules:
@@ -17,7 +20,8 @@
 //! - **Redaction**: `Compose`'s `Debug` prints lengths and the fixed kind, never the title or the
 //!   body.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
+use htui_core::model::item_spec::NOTHING_TO_SAVE;
 use htui_core::model::{Document, ItemId, hand_written};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -29,11 +33,10 @@ use crate::editor::{
     without_controls,
 };
 use crate::hand_written::{ADD_NOTE_NAME, HandText, WRITE_DOCUMENT_NAME};
-use crate::keys::{Keys, Stack, views};
+use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::tabs::backlog::filter::CHORD;
-use crate::ui::tabs::backlog::item_form::{HINT_AREA, HINT_TEXT, PAGE, ctrl_e, ctrl_s, marker};
+use crate::ui::tabs::backlog::item_form::{HINT_AREA, HINT_TEXT, PAGE, marker};
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
@@ -58,7 +61,8 @@ pub enum Part {
 pub enum ComposeOutcome {
     /// Edited, moved, refused or swallowed; nothing to send.
     Stay,
-    /// A chord the area does not own (`ctrl-c`): the pane passes it.
+    /// A key the area did not use that its stack's modal layer lets through (`ctrl-c`, `F1`): the
+    /// pane passes it.
     Pass,
     /// `Esc`: close the area and drop the text.
     Cancel,
@@ -249,9 +253,9 @@ impl Compose {
     /// The plan's maintainer answer to blueprint §6 Q1: whether this is a `v` form whose title and
     /// body, as the store would keep them, equal the version it opened. A note, an `a` form and
     /// `v` on a kind with no rows are never unchanged; a title or body the validator refuses is
-    /// not either (Ctrl+S says why). The Docs pane asks it on Ctrl+S, before
-    /// [`on_key`](Compose::on_key), and refuses with `NOTHING_TO_SAVE` through
-    /// [`settle`](Compose::settle).
+    /// not either (Ctrl+S says why). [`on_key`](Compose::on_key) asks it on `form.save` and
+    /// refuses with `NOTHING_TO_SAVE` through [`settle`](Compose::settle) (MOD-67 M5: moved here
+    /// from the Docs pane).
     #[must_use]
     pub fn unchanged(&self) -> bool {
         let Some((title, body)) = &self.base else {
@@ -324,60 +328,61 @@ impl Compose {
         }
     }
 
-    /// Feeds one key: Ctrl+S, Ctrl+E, any other chord, busy, `Tab`/`BackTab`, then the focused
-    /// part (the module doc's order).
-    pub fn on_key(&mut self, key: KeyEvent) -> ComposeOutcome {
-        if ctrl_s(&key) {
-            return match self.busy {
-                Some(_) => ComposeOutcome::Stay,
-                None => self.save(),
-            };
-        }
-        // Before the chord pass, which would hand it to the pane (the item form's rule).
-        if ctrl_e(&key) {
-            return match (self.busy, self.focus) {
-                (None, Part::Body) => self.hand_off(),
-                // E7: only the body goes out.
-                _ => ComposeOutcome::Stay,
-            };
-        }
-        if key.modifiers.intersects(CHORD) {
-            return ComposeOutcome::Pass;
-        }
+    /// Feeds one key, resolved through [`stack`](Self::stack) (the module doc's order).
+    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> ComposeOutcome {
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
+        let acts = keys.actions(stack, chord);
         if self.busy.is_some() {
-            return ComposeOutcome::Stay;
-        }
-        match key.code {
-            KeyCode::Tab => {
-                self.move_focus(true);
-                return ComposeOutcome::Stay;
-            }
-            KeyCode::BackTab => {
-                self.move_focus(false);
-                return ComposeOutcome::Stay;
-            }
-            _ => {}
+            let swallowed = acts
+                .iter()
+                .any(|act| matches!(act, Act::FormSave | Act::FormExternalEditor));
+            return if !swallowed && stack.passes(chord) {
+                ComposeOutcome::Pass
+            } else {
+                ComposeOutcome::Stay
+            };
         }
         let focus = self.focus;
         if let Some(field) = self.field_mut(focus) {
             match field.on_key(key) {
-                // The item form's D8: `Enter` moves on; only Ctrl+S saves.
-                FieldOutcome::Submit => self.move_focus(true),
+                // The item form's D8: `Enter` moves on; only `form.save` saves.
+                FieldOutcome::Submit => {
+                    self.move_focus(true);
+                    return ComposeOutcome::Stay;
+                }
                 FieldOutcome::Cancel => return ComposeOutcome::Cancel,
-                FieldOutcome::Pass => match key.code {
-                    KeyCode::Up => self.move_focus(false),
-                    KeyCode::Down => self.move_focus(true),
-                    _ => {}
-                },
-                FieldOutcome::Consumed => {}
+                FieldOutcome::Consumed => return ComposeOutcome::Stay,
+                FieldOutcome::Pass => {}
+            }
+        } else {
+            match self.body.on_key(key, PAGE) {
+                FieldOutcome::Cancel => return ComposeOutcome::Cancel,
+                FieldOutcome::Consumed => return ComposeOutcome::Stay,
+                FieldOutcome::Submit | FieldOutcome::Pass => {}
+            }
+        }
+        for act in acts {
+            match act {
+                // The maintainer answer to blueprint §6 Q1: a `v` form saved untouched writes
+                // nothing (never true for a note).
+                Act::FormSave if self.unchanged() => {
+                    self.settle(Some(NOTHING_TO_SAVE.to_owned()));
+                }
+                Act::FormSave => return self.save(),
+                // E7: only the body goes out.
+                Act::FormExternalEditor if self.focus == Part::Body => return self.hand_off(),
+                Act::FormExternalEditor => {}
+                Act::FormNextField => self.move_focus(true),
+                Act::FormPrevField => self.move_focus(false),
+                _ => continue,
             }
             return ComposeOutcome::Stay;
         }
-        match self.body.on_key(key, PAGE) {
-            FieldOutcome::Cancel => ComposeOutcome::Cancel,
-            FieldOutcome::Consumed | FieldOutcome::Submit | FieldOutcome::Pass => {
-                ComposeOutcome::Stay
-            }
+        if stack.passes(chord) {
+            ComposeOutcome::Pass
+        } else {
+            ComposeOutcome::Stay
         }
     }
 
@@ -764,7 +769,7 @@ pub(super) mod bench {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::DocumentId;
 
@@ -804,7 +809,7 @@ mod tests {
     fn type_text(compose: &mut Compose, text: &str) {
         for c in text.chars() {
             assert!(matches!(
-                compose.on_key(key(KeyCode::Char(c))),
+                compose.on_key(key(KeyCode::Char(c)), Keys::compiled()),
                 ComposeOutcome::Stay
             ));
         }
@@ -813,7 +818,10 @@ mod tests {
     #[test]
     fn ctrl_s_on_a_blank_note_refuses_in_the_area_and_sends_nothing() {
         let mut compose = note();
-        assert!(matches!(compose.on_key(ctrl('s')), ComposeOutcome::Stay));
+        assert!(matches!(
+            compose.on_key(ctrl('s'), Keys::compiled()),
+            ComposeOutcome::Stay
+        ));
         assert_eq!(compose.notice(), Some("a note needs text"));
         assert_eq!(compose.busy(), None);
     }
@@ -822,7 +830,7 @@ mod tests {
     fn ctrl_s_sends_add_note_with_the_trimmed_text_and_is_busy() {
         let mut compose = note();
         compose.on_paste("Hi.\n\n");
-        match compose.on_key(ctrl('s')) {
+        match compose.on_key(ctrl('s'), Keys::compiled()) {
             ComposeOutcome::Save(StoreRequest::AddNote { item, body }) => {
                 assert_eq!(item, ids::HTUI_FEAT_1);
                 assert_eq!(body.as_str(), "Hi.");
@@ -835,7 +843,7 @@ mod tests {
     #[test]
     fn esc_cancels() {
         assert!(matches!(
-            note().on_key(key(KeyCode::Esc)),
+            note().on_key(key(KeyCode::Esc), Keys::compiled()),
             ComposeOutcome::Cancel
         ));
     }
@@ -843,16 +851,25 @@ mod tests {
     #[test]
     fn ctrl_c_and_other_chords_pass() {
         let mut compose = note();
-        assert!(matches!(compose.on_key(ctrl('c')), ComposeOutcome::Pass));
+        assert!(matches!(
+            compose.on_key(ctrl('c'), Keys::compiled()),
+            ComposeOutcome::Pass
+        ));
         let alt = KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT);
-        assert!(matches!(compose.on_key(alt), ComposeOutcome::Pass));
+        assert!(matches!(
+            compose.on_key(alt, Keys::compiled()),
+            ComposeOutcome::Pass
+        ));
     }
 
     #[test]
     fn while_busy_every_plain_key_is_swallowed() {
         let mut compose = note();
         compose.on_paste("Hi.\n\n");
-        assert!(matches!(compose.on_key(ctrl('s')), ComposeOutcome::Save(_)));
+        assert!(matches!(
+            compose.on_key(ctrl('s'), Keys::compiled()),
+            ComposeOutcome::Save(_)
+        ));
         for key in [
             key(KeyCode::Char('x')),
             key(KeyCode::Esc),
@@ -860,7 +877,7 @@ mod tests {
             ctrl('e'),
         ] {
             assert!(
-                matches!(compose.on_key(key), ComposeOutcome::Stay),
+                matches!(compose.on_key(key, Keys::compiled()), ComposeOutcome::Stay),
                 "{key:?}"
             );
         }
@@ -874,7 +891,7 @@ mod tests {
     fn ctrl_e_on_the_body_hands_it_out_with_the_note_stem() {
         let mut compose = note();
         compose.on_paste("draft");
-        match compose.on_key(ctrl('e')) {
+        match compose.on_key(ctrl('e'), Keys::compiled()) {
             ComposeOutcome::External(edit) => assert_eq!(
                 edit,
                 ExternalEdit {
@@ -885,7 +902,7 @@ mod tests {
             other => panic!("expected External, got {other:?}"),
         }
         let mut keyless = Compose::note(ids::HTUI_FEAT_1, None);
-        match keyless.on_key(ctrl('e')) {
+        match keyless.on_key(ctrl('e'), Keys::compiled()) {
             ComposeOutcome::External(edit) => assert_eq!(edit.stem, "item-note"),
             other => panic!("expected External, got {other:?}"),
         }
@@ -895,7 +912,7 @@ mod tests {
     fn an_edited_outcome_lands_in_the_body_with_the_cursor_at_the_end() {
         let mut compose = note();
         assert!(matches!(
-            compose.on_key(ctrl('e')),
+            compose.on_key(ctrl('e'), Keys::compiled()),
             ComposeOutcome::External(_)
         ));
         compose.on_external_edit(ExternalEditOutcome::Edited("New.\n".to_owned()));
@@ -904,7 +921,7 @@ mod tests {
         assert_eq!(compose.notice(), Some(EDITED));
 
         assert!(matches!(
-            compose.on_key(ctrl('e')),
+            compose.on_key(ctrl('e'), Keys::compiled()),
             ComposeOutcome::External(_)
         ));
         compose.on_external_edit(ExternalEditOutcome::Edited("New.\n".to_owned()));
@@ -916,7 +933,7 @@ mod tests {
     fn unchanged_and_failed_keep_the_text() {
         let mut compose = note();
         compose.on_paste("kept");
-        let _ = compose.on_key(ctrl('e'));
+        let _ = compose.on_key(ctrl('e'), Keys::compiled());
         compose.on_external_edit(ExternalEditOutcome::Unchanged { quick: true });
         assert_eq!(
             compose.notice(),
@@ -924,7 +941,7 @@ mod tests {
         );
         assert_eq!(compose.body(), "kept");
 
-        let _ = compose.on_key(ctrl('e'));
+        let _ = compose.on_key(ctrl('e'), Keys::compiled());
         compose.on_external_edit(ExternalEditOutcome::Failed("boom".to_owned()));
         assert_eq!(compose.notice(), Some("boom"));
         assert_eq!(compose.body(), "kept");
@@ -939,7 +956,7 @@ mod tests {
         assert_eq!(compose.notice(), None);
 
         // One hand-off, one outcome: a second outcome is ignored.
-        let _ = compose.on_key(ctrl('e'));
+        let _ = compose.on_key(ctrl('e'), Keys::compiled());
         compose.on_external_edit(ExternalEditOutcome::Failed("boom".to_owned()));
         compose.on_external_edit(ExternalEditOutcome::Edited("other".to_owned()));
         assert_eq!(compose.body(), "kept");
@@ -953,18 +970,18 @@ mod tests {
         assert!(compose.kind_is_typed());
         for want in [Part::Title, Part::Body, Part::Kind] {
             assert!(matches!(
-                compose.on_key(key(KeyCode::Tab)),
+                compose.on_key(key(KeyCode::Tab), Keys::compiled()),
                 ComposeOutcome::Stay
             ));
             assert_eq!(compose.focus(), want);
         }
-        let _ = compose.on_key(key(KeyCode::BackTab));
+        let _ = compose.on_key(key(KeyCode::BackTab), Keys::compiled());
         assert_eq!(compose.focus(), Part::Body);
         // Enter on a one-line field moves on; Down too.
-        let _ = compose.on_key(key(KeyCode::Tab));
-        let _ = compose.on_key(key(KeyCode::Enter));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+        let _ = compose.on_key(key(KeyCode::Enter), Keys::compiled());
         assert_eq!(compose.focus(), Part::Title);
-        let _ = compose.on_key(key(KeyCode::Down));
+        let _ = compose.on_key(key(KeyCode::Down), Keys::compiled());
         assert_eq!(compose.focus(), Part::Body);
 
         let base = base();
@@ -980,13 +997,13 @@ mod tests {
         assert_eq!(fixed.title(), Some("Plan"));
         assert_eq!(fixed.body(), "# Plan\n\nBody.");
         for want in [Part::Title, Part::Body, Part::Title] {
-            let _ = fixed.on_key(key(KeyCode::Tab));
+            let _ = fixed.on_key(key(KeyCode::Tab), Keys::compiled());
             assert_eq!(fixed.focus(), want);
         }
 
         // A note has the body alone.
         let mut note = note();
-        let _ = note.on_key(key(KeyCode::Tab));
+        let _ = note.on_key(key(KeyCode::Tab), Keys::compiled());
         assert_eq!(note.focus(), Part::Body);
         assert_eq!(note.title(), None);
         assert_eq!(note.kind(), None);
@@ -996,18 +1013,24 @@ mod tests {
     fn ctrl_e_on_the_kind_or_title_is_swallowed() {
         let mut compose = typed("X");
         type_text(&mut compose, "code review");
-        assert!(matches!(compose.on_key(ctrl('e')), ComposeOutcome::Stay));
-        let _ = compose.on_key(key(KeyCode::Tab));
-        assert!(matches!(compose.on_key(ctrl('e')), ComposeOutcome::Stay));
-        let _ = compose.on_key(key(KeyCode::Tab));
-        match compose.on_key(ctrl('e')) {
+        assert!(matches!(
+            compose.on_key(ctrl('e'), Keys::compiled()),
+            ComposeOutcome::Stay
+        ));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+        assert!(matches!(
+            compose.on_key(ctrl('e'), Keys::compiled()),
+            ComposeOutcome::Stay
+        ));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+        match compose.on_key(ctrl('e'), Keys::compiled()) {
             ComposeOutcome::External(edit) => assert_eq!(edit.stem, "X-code review"),
             other => panic!("expected External, got {other:?}"),
         }
         // A blank kind names the stem `document`.
         let mut blank = typed("X");
-        let _ = blank.on_key(key(KeyCode::BackTab));
-        match blank.on_key(ctrl('e')) {
+        let _ = blank.on_key(key(KeyCode::BackTab), Keys::compiled());
+        match blank.on_key(ctrl('e'), Keys::compiled()) {
             ComposeOutcome::External(edit) => assert_eq!(edit.stem, "X-document"),
             other => panic!("expected External, got {other:?}"),
         }
@@ -1017,26 +1040,32 @@ mod tests {
     fn a_document_refusal_focuses_its_part() {
         let mut compose = typed("FEAT-1");
         type_text(&mut compose, "plan");
-        let _ = compose.on_key(key(KeyCode::Tab));
-        let _ = compose.on_key(key(KeyCode::Tab));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
         compose.on_paste("Body.");
         assert_eq!(compose.focus(), Part::Body);
-        assert!(matches!(compose.on_key(ctrl('s')), ComposeOutcome::Stay));
+        assert!(matches!(
+            compose.on_key(ctrl('s'), Keys::compiled()),
+            ComposeOutcome::Stay
+        ));
         assert_eq!(compose.focus(), Part::Title);
         assert!(compose.notice().is_some_and(|n| n.contains("title")));
         assert_eq!(compose.busy(), None);
 
         // A blank kind is refused first, on the kind.
         let mut blank = typed("FEAT-1");
-        let _ = blank.on_key(key(KeyCode::BackTab));
-        assert!(matches!(blank.on_key(ctrl('s')), ComposeOutcome::Stay));
+        let _ = blank.on_key(key(KeyCode::BackTab), Keys::compiled());
+        assert!(matches!(
+            blank.on_key(ctrl('s'), Keys::compiled()),
+            ComposeOutcome::Stay
+        ));
         assert_eq!(blank.focus(), Part::Kind);
         assert!(blank.notice().is_some_and(|n| n.contains("kind")));
 
         // All three good: the canonical values go out.
         type_text(&mut compose, " Plan ");
-        let _ = compose.on_key(key(KeyCode::Tab));
-        match compose.on_key(ctrl('s')) {
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+        match compose.on_key(ctrl('s'), Keys::compiled()) {
             ComposeOutcome::Save(StoreRequest::WriteDocument {
                 item,
                 kind,
@@ -1060,9 +1089,9 @@ mod tests {
     fn a_paste_goes_to_the_focused_field() {
         let mut compose = typed("FEAT-1");
         compose.on_paste("plan");
-        let _ = compose.on_key(key(KeyCode::Tab));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
         compose.on_paste("Title");
-        let _ = compose.on_key(key(KeyCode::Tab));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
         compose.on_paste("Body\nline");
         assert_eq!(compose.kind(), Some("plan".to_owned()));
         assert_eq!(compose.title(), Some("Title"));
@@ -1087,9 +1116,9 @@ mod tests {
     fn debug_prints_no_text() {
         let mut compose = typed("FEAT-1");
         compose.on_paste("plan");
-        let _ = compose.on_key(key(KeyCode::Tab));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
         compose.on_paste("SECRET title");
-        let _ = compose.on_key(key(KeyCode::Tab));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
         compose.on_paste("SECRET body");
         for shown in [format!("{compose:?}"), format!("{compose:#?}")] {
             assert!(!shown.contains("SECRET"), "{shown}");
@@ -1186,8 +1215,8 @@ mod tests {
         );
 
         let mut compose = typed("FEAT-1");
-        let _ = compose.on_key(key(KeyCode::Tab));
-        let _ = compose.on_key(key(KeyCode::Tab));
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
+        let _ = compose.on_key(key(KeyCode::Tab), Keys::compiled());
         assert_eq!(compose.focus(), Part::Body);
         compose.on_paste("First line.");
         let mut body = None;
@@ -1258,7 +1287,7 @@ mod tests {
 
         let mut retitled =
             Compose::document(ids::HTUI_FEAT_1, None, Some("plan".to_owned()), Some(&base));
-        let _ = retitled.on_key(key(KeyCode::Tab));
+        let _ = retitled.on_key(key(KeyCode::Tab), Keys::compiled());
         type_text(&mut retitled, " 2");
         assert!(!retitled.unchanged());
 
@@ -1334,7 +1363,10 @@ mod tests {
     fn checking_keeps_the_area_busy_with_the_hedge() {
         let mut compose = note();
         compose.on_paste("Hi.");
-        assert!(matches!(compose.on_key(ctrl('s')), ComposeOutcome::Save(_)));
+        assert!(matches!(
+            compose.on_key(ctrl('s'), Keys::compiled()),
+            ComposeOutcome::Save(_)
+        ));
         compose.checking(may_have_landed("boom", "thread"));
         assert_eq!(compose.busy(), Some(ADD_NOTE_NAME));
         assert_eq!(
@@ -1342,12 +1374,18 @@ mod tests {
             Some(may_have_landed("boom", "thread").as_str())
         );
         for key in [ctrl('s'), key(KeyCode::Esc)] {
-            assert!(matches!(compose.on_key(key), ComposeOutcome::Stay));
+            assert!(matches!(
+                compose.on_key(key, Keys::compiled()),
+                ComposeOutcome::Stay
+            ));
         }
         compose.on_paste("more");
         assert_eq!(compose.body(), "Hi.");
         compose.settle(Some(not_written("boom")));
         assert_eq!(compose.busy(), None);
-        assert!(matches!(compose.on_key(ctrl('s')), ComposeOutcome::Save(_)));
+        assert!(matches!(
+            compose.on_key(ctrl('s'), Keys::compiled()),
+            ComposeOutcome::Save(_)
+        ));
     }
 }

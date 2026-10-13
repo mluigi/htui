@@ -27,7 +27,7 @@
 //!
 //! Redaction (blueprint E10): the form's `Debug` prints lengths, never the body or the paths.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use htui_core::model::item_spec::{self, NOTHING_TO_SAVE};
 use htui_core::model::{
     EditReason, ItemId, ItemKindId, ItemSpec, ProjectId, ProjectRef, SpecChanges, SpecError,
@@ -39,6 +39,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
+use super::filter::plain;
 use crate::editor::{
     EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
     without_controls,
@@ -283,26 +284,6 @@ impl Texts {
             body: spec.body.clone(),
         }
     }
-}
-
-/// The modifiers that make a key a chord, not a picker's value key: every one but `SHIFT`, which
-/// is how a terminal reports a capital (MOD-13 review L4).
-const CHORD: KeyModifiers = KeyModifiers::CONTROL
-    .union(KeyModifiers::ALT)
-    .union(KeyModifiers::SUPER)
-    .union(KeyModifiers::META)
-    .union(KeyModifiers::HYPER);
-
-/// Ctrl+S, with or without `SHIFT` (the Requirements tab's rule).
-pub(super) fn ctrl_s(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
-        && matches!(key.code, KeyCode::Char('s' | 'S'))
-}
-
-/// Ctrl+E, with or without `SHIFT` (milestone 4 D1; the Templates editor's rule).
-pub(super) fn ctrl_e(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
-        && matches!(key.code, KeyCode::Char('e' | 'E'))
 }
 
 /// One step through `len` options from `at`, wrapping.
@@ -753,7 +734,7 @@ impl ItemForm {
     /// form then resolves (`Down`/`Up` are `form.next_field`/`prev_field` by default), so an
     /// `Alt+h` never picks.
     fn on_picker_key(&mut self, key: &KeyEvent) -> Option<ItemFormOutcome> {
-        if key.modifiers.intersects(CHORD) {
+        if !plain(key) {
             return None;
         }
         Some(match key.code {
@@ -1184,6 +1165,7 @@ mod tests {
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
+    use crossterm::event::KeyModifiers;
     use htui_core::fixtures::ids;
     use htui_core::model::{ItemPatch, NewItemKind, NewStepGraph};
     use htui_core::store::{MemStore, WriteStore as _};
