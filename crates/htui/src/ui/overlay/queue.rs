@@ -569,9 +569,10 @@ impl Overlay for QueueOverlay {
 mod tests {
     use super::*;
     use crate::app::{Emit, TopBarState};
-    use crate::keys::Keys;
+    use crate::keys::{Keys, load_str, views};
     use crate::store_worker::{Origin, QueueView};
     use chrono::{DateTime, TimeZone, Utc};
+    use crossterm::event::KeyModifiers;
     use htui_core::fixtures::ids;
     use htui_core::model::{
         BatchFigures, BatchId, BatchStop, CapError, Escalation, Hold, PER_TOKEN_CAP_BATCH,
@@ -606,6 +607,13 @@ mod tests {
                 theme: Theme::default(),
                 emit: Emit::default(),
             }
+        }
+
+        /// The bench with these keys instead of the compiled defaults (MOD-67 M6): how a test
+        /// rebinds.
+        fn with_keys(mut self, keys: Keys) -> Self {
+            self.keys = keys;
+            self
         }
 
         fn ctx(&self) -> Ctx<'_> {
@@ -1696,6 +1704,61 @@ mod tests {
         assert_eq!(bench.code(&mut overlay, KeyCode::Char('q')), Handled::Pass);
         assert!(bench.drained().is_empty());
         assert!(overlay.is_modal(), "a passed key is swallowed, never quits");
+    }
+
+    /// MOD-67 M6 (D2): the shell resolves the overlay's keys, its status line and its `?` box
+    /// through the queue's own stack.
+    #[test]
+    fn the_overlay_reports_the_queue_stack() {
+        assert_eq!(QueueOverlay::new().key_stack(), Some(views::QUEUE_OVERLAY));
+    }
+
+    /// MOD-67 M6 (D2): chord equality includes the modifiers, so a held `Ctrl` or `Alt` makes
+    /// none of the queue's keys: each passes (the modal overlay swallows it) and steers nothing.
+    #[test]
+    fn a_chord_is_no_queue_key() {
+        let bench = Bench::new();
+        let mut overlay = QueueOverlay::new();
+        bench.feed(&mut overlay, overview(abc()));
+        for (code, mods) in [
+            (KeyCode::Char('j'), KeyModifiers::CONTROL),
+            (KeyCode::Char('j'), KeyModifiers::ALT),
+            (KeyCode::Char('J'), KeyModifiers::CONTROL),
+            (KeyCode::Char('P'), KeyModifiers::ALT),
+            (KeyCode::Char('q'), KeyModifiers::CONTROL),
+            (KeyCode::Enter, KeyModifiers::ALT),
+        ] {
+            let handled = overlay.on_key(KeyEvent::new(code, mods), &mut bench.ctx());
+            assert_eq!(handled, Handled::Pass, "{code:?} {mods:?}");
+        }
+        assert!(bench.drained().is_empty(), "nothing steered the queue");
+        assert_eq!(overlay.cursor, 0, "the cursor did not move");
+    }
+
+    /// MOD-67 M6: the lane's rebinding test. `[queue] move_down = "D"` moves the reorder down to
+    /// `D`: `D` asks for the move, `J` is inert, and the hint names `D`.
+    #[test]
+    fn a_rebound_key_moves_the_entry_and_the_old_one_is_inert() {
+        let keys = load_str("[queue]\nmove_down = \"D\"\n").expect("the keys load");
+        let bench = Bench::new().with_keys(keys);
+        let mut overlay = QueueOverlay::new();
+        let rows = abc();
+        let a = rows[0].0.entry.item_id;
+        bench.feed(&mut overlay, overview(rows));
+
+        assert_eq!(
+            bench.code(&mut overlay, KeyCode::Char('D')),
+            Handled::Consumed
+        );
+        assert_one_request(
+            &bench.drained(),
+            |request| matches!(request, StoreRequest::MoveQueueEntry { item, to: QueueMove::Down } if *item == a),
+        );
+        assert_eq!(bench.code(&mut overlay, KeyCode::Char('J')), Handled::Pass);
+        assert!(bench.drained().is_empty(), "`J` asks for nothing");
+
+        let rendered = bench.render(&overlay);
+        assert!(rendered.contains("D/K reorder"), "{rendered}");
     }
 
     #[test]
