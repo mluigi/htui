@@ -271,7 +271,7 @@ the item cites).
 | `j` / `k`, `g` / `G` | Move, jump to the first / last row |
 | `Enter` on a project | Fold or unfold the project |
 | `h` / `l` | Previous / next detail sub-tab |
-| `J` / `K`, `PageUp` / `PageDown` | Scroll the detail pane (Body, Notes, Prompt; in Runs, Graph, Docs and Reqs they move the pane's cursor) |
+| `J` / `K`, `PageUp` / `PageDown` | Scroll the detail pane; in Runs, Graph, Docs and Reqs `J` / `K` move the pane's cursor, and in Graph `PageUp` / `PageDown` move it a page |
 | `f` / `F` | Filter the list / clear the filter |
 | `N` / `e` | New item / edit the item |
 | `m` | Open the Graph sub-tab |
