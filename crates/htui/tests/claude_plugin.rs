@@ -3,8 +3,10 @@
 //! temp dir and `claude plugin validate --strict` runs on each marketplace and plugin (and on the
 //! source tree), the mod's reach is read off validate's `calls:` line (ANA-29 §6.3), and `claude
 //! plugin test` runs the kit tests in the source tree. Otherwise one `skip:` line is printed and
-//! the test passes. Every `claude` runs with `CLAUDE_CONFIG_DIR` set to a temp dir, never the
-//! shared `~/.claude`, and nothing is written outside temp dirs.
+//! the test passes. The version check is htui's own probe, `claude --version` run as `htui claude
+//! emit` runs it, with this process's environment. Every `claude plugin` command runs with
+//! `CLAUDE_CONFIG_DIR` set to a temp dir, never the shared `~/.claude`, in its own process group
+//! on unix, which a timeout kills whole. Nothing is written outside temp dirs.
 //!
 //! The skill's frontmatter is checked with no `claude` at all: `validate` never reads it.
 
@@ -59,9 +61,28 @@ struct Ran {
     stderr: String,
 }
 
-/// Runs `claude <args>` in `cwd` with a throwaway config dir. A timeout fails the gate.
+/// Kills the process group `leader` leads: whatever `claude` started that outlived it.
+#[cfg(unix)]
+fn kill_group(leader: Option<u32>) {
+    use rustix::process::{Pid, Signal, kill_process_group};
+
+    if let Some(group) = leader
+        .and_then(|pid| i32::try_from(pid).ok())
+        .and_then(Pid::from_raw)
+    {
+        let _ = kill_process_group(group, Signal::KILL);
+    }
+}
+
+/// Nothing to do: `kill_on_drop` ends the child itself.
+#[cfg(not(unix))]
+fn kill_group(_: Option<u32>) {}
+
+/// Runs `claude <args>` in `cwd` with a throwaway config dir, in its own process group on unix. A
+/// timeout kills the group and fails the gate.
 async fn claude(args: &[&str], config: &Path, cwd: &Path) -> Ran {
-    let child = tokio::process::Command::new("claude")
+    let mut command = tokio::process::Command::new("claude");
+    command
         .args(args)
         .env("CLAUDE_CONFIG_DIR", config)
         .env_remove("CLAUDE_CODE_PLUGIN_DIRS")
@@ -69,12 +90,22 @@ async fn claude(args: &[&str], config: &Path, cwd: &Path) -> Ran {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .output();
-    let output = tokio::time::timeout(CLAUDE_TIMEOUT, child)
-        .await
-        .unwrap_or_else(|_| panic!("`claude {}` timed out", args.join(" ")))
+        .kill_on_drop(true);
+    // Its own group, led by the child: a timeout reaches the `node` it starts too.
+    #[cfg(unix)]
+    command.process_group(0);
+    let child = command
+        .spawn()
         .unwrap_or_else(|error| panic!("`claude {}` did not start: {error}", args.join(" ")));
+    let leader = child.id();
+    let output = match tokio::time::timeout(CLAUDE_TIMEOUT, child.wait_with_output()).await {
+        Ok(output) => output
+            .unwrap_or_else(|error| panic!("`claude {}` did not finish: {error}", args.join(" "))),
+        Err(_) => {
+            kill_group(leader);
+            panic!("`claude {}` timed out", args.join(" "));
+        }
+    };
     Ran {
         status: output.status,
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -143,26 +174,51 @@ fn call_names(calls: &str) -> Vec<String> {
         .collect()
 }
 
-/// The `key: value` lines of `text`'s leading `---` block, each value unquoted.
-fn frontmatter(text: &str) -> Vec<(String, String)> {
+/// The `key: value` lines of `text`'s leading `---` block, each value unquoted. A block scalar
+/// (`>` or `|`) is an error: this reader would take its indicator for the value, and the skill
+/// keeps every field on its one line.
+fn frontmatter(text: &str) -> Result<Vec<(String, String)>, String> {
     let body = text
         .strip_prefix("---\n")
-        .expect("SKILL.md opens with a --- line");
+        .ok_or("SKILL.md does not open with a --- line")?;
     let (block, _) = body
         .split_once("\n---\n")
-        .expect("SKILL.md's frontmatter closes with a --- line");
+        .ok_or("SKILL.md's frontmatter does not close with a --- line")?;
     block
         .lines()
         .filter_map(|line| line.split_once(':'))
         .map(|(key, value)| {
-            let value = value.trim();
+            let (key, value) = (key.trim(), value.trim());
+            if value.starts_with(['>', '|']) {
+                return Err(format!("{key} is a block scalar ({value})"));
+            }
             let value = value
                 .strip_prefix('"')
                 .and_then(|value| value.strip_suffix('"'))
                 .unwrap_or(value);
-            (key.trim().to_owned(), value.to_owned())
+            Ok((key.to_owned(), value.to_owned()))
         })
         .collect()
+}
+
+/// The frontmatter reader refuses what it cannot read: a block scalar, and a missing fence.
+#[test]
+fn the_frontmatter_reader_rejects_a_block_scalar() {
+    assert_eq!(
+        frontmatter("---\nname: htui\ndescription: \"Reads htui.\"\n---\n# htui\n"),
+        Ok(vec![
+            ("name".to_owned(), "htui".to_owned()),
+            ("description".to_owned(), "Reads htui.".to_owned()),
+        ])
+    );
+    for indicator in [">", "|", ">-", "|+"] {
+        let text = format!("---\nname: htui\ndescription: {indicator}\n  Reads htui.\n---\n");
+        assert_eq!(
+            frontmatter(&text),
+            Err(format!("description is a block scalar ({indicator})"))
+        );
+    }
+    assert!(frontmatter("name: htui\n").is_err());
 }
 
 /// T1: `claude plugin validate` never reads the skill's frontmatter, so it is checked here, in
@@ -175,7 +231,7 @@ fn the_emitted_skill_names_itself_htui_and_describes_itself() {
         emit(&dir, variant);
         let skill = std::fs::read_to_string(dir.join("htui/skills/htui/SKILL.md"))
             .expect("the skill is written");
-        let fields = frontmatter(&skill);
+        let fields = frontmatter(&skill).unwrap_or_else(|error| panic!("{folder}: {error}"));
         let field = |key: &str| {
             fields
                 .iter()
@@ -241,6 +297,11 @@ async fn the_emitted_plugin_validates_and_the_mod_tests_pass_under_claude() {
         .iter()
         .find(|(path, _)| *path == full.join("htui"))
         .expect("the full plugin was validated");
+    assert_eq!(
+        plugin["manifest"]["gatingHooks"],
+        Value::Array(Vec::new()),
+        "no gating hook in the manifest: {plugin:#}"
+    );
     for content in plugin["contents"].as_array().expect("contents is an array") {
         assert_eq!(
             content["gatingHooks"],
