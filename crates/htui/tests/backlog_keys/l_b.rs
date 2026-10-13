@@ -6,9 +6,10 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use htui::agent_worker::AgentRuntime;
-use htui::app::Action;
+use htui::app::{Action, register_all};
 use htui::run_worker::{RunRuntime, StepAuthor};
 use htui::testkit::Harness;
+use htui::ui::tabs::ChatTab;
 use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::conformance::{Script, ScriptEvent};
 use htui_agent::event::{DoneEvent, DriverEvent, StopReason};
@@ -341,4 +342,106 @@ async fn f1_opens_help_from_the_reject_note_and_the_note_stays() {
         "still on ANA-2's Runs pane:\n{frame}"
     );
     assert_eq!(harness.queued(), 0, "and nothing was sent");
+}
+
+/// The Runs pane's last row: the one above the detail pane's bottom border.
+fn pane_last_row(frame: &str) -> String {
+    let rows: Vec<&str> = frame.lines().collect();
+    let bottom = rows
+        .iter()
+        .rposition(|row| row.starts_with('└'))
+        .unwrap_or_else(|| panic!("the panes have a bottom border:\n{frame}"));
+    let row = rows[bottom - 1];
+    let (_, pane) = row
+        .rsplit_once("││")
+        .unwrap_or_else(|| panic!("the row crosses into the pane: {row:?}"));
+    pane.trim_end_matches('│').trim_end().to_owned()
+}
+
+/// ANA-26 §8: browsing the Runs pane draws a hint row built from the keys in force, one per
+/// view: the run list, the flow, and an item with no run.
+#[tokio::test]
+async fn the_runs_browse_hint_row() {
+    let adapter = FakeAdapter::new();
+    let mut harness = driving(MemStore::demo(), &adapter).await;
+    harness.key("l");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(frame.contains("▸"), "ANA-1's runs are listed:\n{frame}");
+    assert_eq!(
+        pane_last_row(&frame),
+        "J/K step · Enter replay · v flow · ? keys",
+        "the list's row:\n{frame}"
+    );
+
+    harness.key("v");
+    harness.drive().await;
+    let frame = harness.render();
+    assert_eq!(
+        pane_last_row(&frame),
+        "J/K step · +/- zoom · v list · ? keys",
+        "the flow's row:\n{frame}"
+    );
+    harness.key("v");
+
+    for _ in 0..TO_ANA_2 {
+        harness.key("j");
+        harness.drive().await;
+    }
+    let frame = harness.render();
+    assert!(
+        frame.contains("No runs for this item."),
+        "ANA-2 has no run:\n{frame}"
+    );
+    assert_eq!(
+        pane_last_row(&frame),
+        "R start run · ? keys",
+        "an item with no run:\n{frame}"
+    );
+}
+
+/// Rows down from the arrival row (htui `ANA-1`) to htui `FEAT-1`, the item with a recorded
+/// step (`tests/replay.rs`).
+const TO_FEAT_1: usize = 3;
+
+/// D6: `Enter` on a step replays it (the registered shell opens the Chat tab, no refusal); on a
+/// Runs pane with no step under the cursor the pane declines and the Backlog answers with the
+/// miss (the legacy row on this branch, `backlog.replay` after L-A: the same text).
+#[tokio::test]
+async fn enter_replays_the_step_and_misses_without_one() {
+    let mut harness = Harness::demo();
+    register_all(harness.app());
+    harness.settle().await;
+    harness.app().update(Action::SetScope {
+        workspace: workspace("platform").await,
+    });
+    harness.settle().await;
+    for _ in 0..TO_ANA_2 {
+        harness.key("j");
+        harness.settle().await;
+    }
+    harness.key("l");
+    harness.settle().await;
+    harness.key("enter");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("select a step in the Runs pane (J/K) to replay it"),
+        "no step under the cursor: the miss"
+    );
+    assert_eq!(harness.app().tabs.active_id(), Some(BacklogTab::ID));
+
+    for _ in TO_ANA_2..TO_FEAT_1 {
+        harness.key("j");
+        harness.settle().await;
+    }
+    harness.key("J");
+    harness.key("enter");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().tabs.active_id(),
+        Some(ChatTab::ID),
+        "a step under the cursor replays into the Chat tab"
+    );
+    assert_eq!(harness.app().status, None, "and no refusal was raised");
 }
