@@ -8,7 +8,7 @@
 #   scripts/hr                                   # gum menu (terminal only)
 #   scripts/hr build
 #   scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--headroom|--no-headroom] [--yes]
-#   scripts/hr attach [ITEM] [--shell]
+#   scripts/hr attach [ITEM] [--shell] [--api-key]
 #   scripts/hr ls [--tsv]
 #   scripts/hr collect ITEM [--merge] [--force] [--yes]
 #   scripts/hr down ITEM [--purge] [--force] [--yes]
@@ -105,7 +105,7 @@ usage() {
 Usage: scripts/hr                       (gum menu; terminal only)
        scripts/hr build
        scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--headroom|--no-headroom] [--yes]
-       scripts/hr attach [ITEM] [--shell]
+       scripts/hr attach [ITEM] [--shell] [--api-key]
        scripts/hr ls [--tsv]
        scripts/hr collect ITEM [--merge] [--force] [--yes]
        scripts/hr down ITEM [--purge] [--force] [--yes]
@@ -891,11 +891,27 @@ if ready; then export ANTHROPIC_BASE_URL="$u"; else echo "hr: headroom is not an
 if [ "$1" = shell ]; then exec bash -l; fi
 exec claude --dangerously-skip-permissions'
 
+# The container's gortex daemon starts with the container and needs about 30 s to answer (longer on a
+# cold index). A session that starts before that finds Gortex unreachable and its hooks block reads, so
+# attach waits for `state ready` first. HR_GORTEX_WAIT (seconds, default 90) bounds the wait; on
+# expiry the session starts anyway. A container without gortex skips it. No single quote may appear in
+# the text: it is one single-quoted constant.
+GORTEX_WAIT='command -v gortex >/dev/null 2>&1 || exit 0
+gortex_ready() { gortex daemon status 2>/dev/null | grep -Eq "state +ready"; }
+if ! gortex_ready; then
+    echo "hr: waiting for the gortex daemon..." >&2
+    end=$((SECONDS + ${HR_GORTEX_WAIT:-90}))
+    while [ "$SECONDS" -lt "$end" ] && ! gortex_ready; do sleep 0.5; done
+    gortex_ready || echo "hr: the gortex daemon is not ready; this session starts without it" >&2
+fi
+exit 0'
+
 cmd_attach() {
-    local item='' shell=0
+    local item='' shell=0 apikey=0
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --shell) shell=1; shift ;;
+            --api-key) apikey=1; shift ;;
             -h | --help) usage; exit 0 ;;
             -*) usage_die "unknown option for attach: $1" ;;
             *) [[ -z "$item" ]] || usage_die "attach takes one ITEM"; item="$1"; shift ;;
@@ -916,17 +932,24 @@ cmd_attach() {
         cargo_volume_ok
         spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait || die 3 "docker compose up failed for $PROJECT"
     fi
-    local -a tty=()
+    local -a tty=() envs=(-e TERM -e COLORTERM)
     [[ -t 0 && -t 1 ]] || tty=(-T)
+    # --api-key bills this session to the API: the host's ANTHROPIC_API_KEY is forwarded by name (the
+    # value never lands on a command line). Without it claude uses the shared ~/.claude OAuth login.
+    if [[ "$apikey" -eq 1 ]]; then
+        [[ -n "${ANTHROPIC_API_KEY:-}" ]] || die 2 "--api-key needs ANTHROPIC_API_KEY set in the host environment"
+        envs+=(-e ANTHROPIC_API_KEY)
+    fi
+    [[ "$shell" -eq 1 ]] || "${COMPOSE[@]}" exec "${tty[@]}" dev bash -c "$GORTEX_WAIT" hr-gortex || true
     if [[ "${RUN[headroom]:-0}" == 1 ]]; then
         local mode=claude
         [[ "$shell" -eq 1 ]] && mode=shell
-        exec "${COMPOSE[@]}" exec "${tty[@]}" -e TERM -e COLORTERM dev bash -c "$HEADROOM_GUARD" hr-headroom "$mode"
+        exec "${COMPOSE[@]}" exec "${tty[@]}" "${envs[@]}" dev bash -c "$HEADROOM_GUARD" hr-headroom "$mode"
     fi
     if [[ "$shell" -eq 1 ]]; then
-        exec "${COMPOSE[@]}" exec "${tty[@]}" -e TERM -e COLORTERM dev bash -l
+        exec "${COMPOSE[@]}" exec "${tty[@]}" "${envs[@]}" dev bash -l
     fi
-    exec "${COMPOSE[@]}" exec "${tty[@]}" -e TERM -e COLORTERM dev claude --dangerously-skip-permissions
+    exec "${COMPOSE[@]}" exec "${tty[@]}" "${envs[@]}" dev claude --dangerously-skip-permissions
 }
 
 # ---- ls ----
