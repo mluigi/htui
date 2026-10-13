@@ -75,6 +75,26 @@ From the adapter (`claude-agent-acp` 0.75.0, `dist/acp-agent.js`):
   filters only escalation from repo-committed sources. So `_meta` cannot set the mode, but
   `session/set_mode` can (`setSessionMode`, `:4738`).
 
+### T1 — ACP probe results (run 2026-10-13 after CONFIRM; `claude-agent-acp` 0.75.0 on Node 22.23.3, `claude` 2.1.296)
+
+Each case uses its own scratch config dir and a trusted checkout with project `allow: ["Bash"]`. The
+client advertises no `fs`/terminal capabilities and rejects every `session/request_permission`.
+"MOD-91 `_meta`" is today's `isolation_meta()`; "+ `settingSources`" adds `"settingSources": []` to
+`options`.
+
+| Case | User `settings.json` | `_meta` | `set_mode` | `currentModeId` at `session/new` | Asked? | Result |
+|---|---|---|---|---|---|---|
+| c1 | `{}` | MOD-91 | — | `default` | **no** | Bash ran (positive baseline) |
+| c2 | `{}` | + `settingSources` | — | `default` | yes | denied, no file. **D4's `_meta` lever holds** |
+| c3a | `defaultMode: acceptEdits` | + `settingSources` | — | **`acceptEdits`** | no | Write ran: `_meta` does not reach the adapter's own mode read |
+| c3b | `defaultMode: acceptEdits` | + `settingSources` | `default` | `acceptEdits` → `default` | yes | denied. **D4's `set_mode` pin holds** |
+| c3c | `defaultMode: auto` | + `settingSources` | — | **`auto`** | no | Write ran. This box's user settings say `auto` |
+
+- The adapter's own SDK hooks still fire under `settingSources: []`: c3a's tool call reached
+  `tool_call_update` `completed`, which the adapter's `PostToolUse` hook emits.
+- Every mode list was `default, acceptEdits, plan, auto, bypassPermissions`.
+- D4 stands unamended. The live cases are re-pinned in `isolation_live.rs` on the production code in T5.
+
 ## Questions for the maintainer (defaults assumed below)
 
 - **Q1 — Neutralise, or only show? Default: neutralise** (D1). An isolated session (`mods = n`) no
