@@ -15,15 +15,16 @@
 //!   `ClaudeStreamAdapter`), so D8's refusal, `cli::ISOLATION_ARGS` on the argv, `HTUI_SESSION` in
 //!   the launch environment and the MCP config file are all the shipped code. The row is
 //!   synthetic: its command is `env -u … claude`, which keeps the parent session's `CLAUDE*`
-//!   variables out of the child (argv rule 1 keeps a wrapper's leading arguments first), and its
-//!   `launch.env` carries the scratch `CLAUDE_CONFIG_DIR`. The only flag the test adds is
-//!   `--debug-file`, through `extra_args`.
+//!   variables and every `ANTHROPIC_*` out of the child (argv rule 1 keeps a wrapper's leading
+//!   arguments first), and its `launch.env` carries the scratch `CLAUDE_CONFIG_DIR`. The only flag
+//!   the test adds is `--debug-file`, through `extra_args`.
 //! - **ACP cases** resolve the **seeded `claude` row**'s launch, wrapped in the same `env -u`,
 //!   through `AcpDriver::launch_for` (so `HTUI_SESSION` is the shipped insert), spawn it, and speak
 //!   line JSON-RPC to it from a small client here. `session/new` carries
 //!   `acp::session_meta(&settings)` with one key merged in: `extraArgs["debug-file"]`, the one thing
-//!   the driver path cannot inject. The driver's own `_meta` plumbing on new, resume and load is
-//!   pinned by `tests/acp_driver.rs`.
+//!   the driver path cannot inject. One case resumes a session in a second adapter process with the
+//!   same `_meta`, over `session/resume` (or `session/load` where only that is advertised). The
+//!   driver's own `_meta` plumbing on new, resume and load is pinned by `tests/acp_driver.rs`.
 //!
 //!   Node and the adapter resolve exactly as a chat's do, through the `HTUI_TOOL_*` overrides or
 //!   the discovery tiers. The sandbox has neither on `PATH`, so run with, for example:
@@ -41,9 +42,9 @@
 //! the host (ANA-29 §3.3), and a test mod installed there would load in every host session. Each
 //! case builds its own tempdir:
 //!
-//! - `CLAUDE_CONFIG_DIR`, holding `~/.credentials.json` copied **without**
-//!   `claudeAiOauth.refreshToken`, so a refresh can never rotate the host's token. An expired access
-//!   token fails the auth assertion; it is never refreshed from here;
+//! - `CLAUDE_CONFIG_DIR`, holding a `.credentials.json` that is `{"claudeAiOauth": …}` alone, the
+//!   box's object copied **without** its `refreshToken`, so a refresh can never rotate the host's
+//!   token. An expired access token fails the auth assertion; it is never refreshed from here;
 //! - `.claude.json` with onboarding done and the checkout trusted (Claude Code writes
 //!   `oauthAccount` there itself; the T1 probe did not seed it);
 //! - `settings.json` with a user `SessionStart` hook writing `${HTUI_SESSION-unset}` to a marker;
@@ -96,6 +97,13 @@ const PROBE_SKILLS: [&str; 2] = ["probe-skill", "probe-uskill"];
 /// Variables the child must keep although they start with `CLAUDE`: the row sets them.
 const KEPT: [&str; 2] = ["CLAUDE_CONFIG_DIR", "CLAUDE_CODE_EXECUTABLE"];
 
+/// Whether the child must not inherit `name`: the parent Claude Code session's `CLAUDE*` markers
+/// (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, …), as `/tmp/mod91/cc` scrubbed them, and every
+/// `ANTHROPIC_*`, so an API key or base URL cannot stand in for the subscription OAuth.
+fn scrubbed(name: &str) -> bool {
+    (name.starts_with("CLAUDE") && !KEPT.contains(&name)) || name.starts_with("ANTHROPIC_")
+}
+
 // ---------------------------------------------------------------------------------------------
 // The scratch configuration
 // ---------------------------------------------------------------------------------------------
@@ -128,13 +136,12 @@ fn on_path(name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
-/// `env -u NAME` for every `CLAUDE*` variable this process carries but the child must not inherit:
-/// the parent Claude Code session's markers (`CLAUDECODE`, `CLAUDE_CODE_SESSION_ID`, …), as
-/// `/tmp/mod91/cc` scrubbed them.
+/// `env -u NAME` for every variable this process carries that the child must not inherit
+/// ([`scrubbed`]).
 fn scrub_args() -> Vec<String> {
     let mut names: Vec<String> = std::env::vars_os()
         .filter_map(|(name, _)| name.into_string().ok())
-        .filter(|name| name.starts_with("CLAUDE") && !KEPT.contains(&name.as_str()))
+        .filter(|name| scrubbed(name))
         .collect();
     names.sort();
     names
@@ -165,8 +172,7 @@ fn run(program: &Path, args: &[&str], cwd: &Path, cfg: &Path) {
         .env("CLAUDE_CONFIG_DIR", cfg);
     for (name, _) in std::env::vars_os() {
         if let Some(name) = name.to_str()
-            && name.starts_with("CLAUDE")
-            && !KEPT.contains(&name)
+            && scrubbed(name)
         {
             command.env_remove(name);
         }
@@ -192,19 +198,21 @@ impl Scratch {
         std::fs::create_dir_all(&cfg).expect("cfg dir");
         std::fs::create_dir_all(&checkout).expect("checkout dir");
 
-        // Credentials: read the real file, never write it; drop the refresh token.
+        // Credentials: read the real file, never write it; copy only the subscription OAuth
+        // object, without its refresh token.
         let home = std::env::var_os("HOME").map(PathBuf::from).expect("HOME");
         let real = home.join(".claude/.credentials.json");
         let text = std::fs::read_to_string(&real)
             .unwrap_or_else(|err| panic!("{} is unreadable: {err}", real.display()));
-        let mut creds: Value = serde_json::from_str(&text).expect("credentials parse");
-        let oauth = creds
-            .get_mut("claudeAiOauth")
-            .and_then(Value::as_object_mut)
+        let creds: Value = serde_json::from_str(&text).expect("credentials parse");
+        let mut oauth = creds
+            .get("claudeAiOauth")
+            .and_then(Value::as_object)
+            .cloned()
             .expect("the box holds a subscription OAuth credential");
         oauth.remove("refreshToken");
         let creds_path = cfg.join(".credentials.json");
-        write_private(&creds_path, &creds.to_string());
+        write_private(&creds_path, &json!({ "claudeAiOauth": oauth }).to_string());
 
         let checkout_key = checkout.to_string_lossy().into_owned();
         let claude_json = json!({
@@ -314,7 +322,12 @@ impl Scratch {
 
     /// `(mod id, loaded?)` for each probe mod the debug file mentions.
     fn mods(&self) -> BTreeMap<String, bool> {
-        let debug = Self::read(&self.debug).unwrap_or_default();
+        Self::mods_in(&self.debug)
+    }
+
+    /// [`Self::mods`] for the debug file at `path`.
+    fn mods_in(path: &Path) -> BTreeMap<String, bool> {
+        let debug = Self::read(path).unwrap_or_default();
         let mut mods = BTreeMap::new();
         for line in debug.lines() {
             for id in PROBE_MODS {
@@ -618,7 +631,7 @@ async fn cli_isolated_by_default() {
 /// T1 row 1a, refused by D8: an `extra_args` `--settings` that drops `disableAllHooks` would replace
 /// htui's own, so `start` refuses before anything is spawned. Spends no tokens.
 #[tokio::test]
-#[ignore = "spends model tokens against the credential this box holds"]
+#[ignore = "needs `claude` and this box's credential to build the scratch config"]
 async fn cli_an_overriding_settings_is_refused() {
     let _one = ONE_AT_A_TIME.lock().await;
     let claude = claude_on_path();
@@ -846,11 +859,13 @@ struct AcpTurn {
 const ACP_PROMPT: &str = "Do exactly two things in order: 1) call the EnterPlanMode tool; 2) reply \
                           with the single word DONE. Do not do anything else.";
 
-/// Resolves, spawns and drives one ACP session; `None` (with the reason printed) when the seeded
-/// row does not resolve on this box.
-async fn acp_turn(scratch: &Scratch, user_extensions: bool) -> Option<AcpTurn> {
-    let row = acp_row(scratch, user_extensions);
-    let driver = AcpDriver::from_row(&row, DriverCaps::default()).expect("the row builds");
+/// The cheapest turn: no tool, one word back.
+const ACP_SHORT_PROMPT: &str = "Reply with the single word OK. Do not do anything else.";
+
+/// Resolves and spawns the row's adapter and has it answer `initialize`, returning the client and
+/// that answer; `None` (with the reason printed) when the seeded row does not resolve on this box.
+async fn acp_start(scratch: &Scratch, row: &AgentRow) -> Option<(AcpClient, Value)> {
+    let driver = AcpDriver::from_row(row, DriverCaps::default()).expect("the row builds");
     let spec = scratch.spec();
     let resolved = match driver.launch_for(&spec).await {
         Ok(resolved) => resolved,
@@ -887,20 +902,34 @@ async fn acp_turn(scratch: &Scratch, user_extensions: bool) -> Option<AcpTurn> {
         )
         .await;
     assert!(init.get("result").is_some(), "initialize answers: {init}");
+    Some((client, init))
+}
 
+/// The stub `htui` server as an ACP `mcpServers` list.
+fn acp_servers(scratch: &Scratch) -> Value {
     let stub = scratch.stub_server();
+    json!([{
+        "name": stub.name,
+        "command": stub.command,
+        "args": stub.args,
+        "env": [],
+    }])
+}
+
+/// `session/new` with the row's `_meta` and `debug` as the debug file; the new session's id.
+async fn acp_new(
+    client: &mut AcpClient,
+    scratch: &Scratch,
+    row: &AgentRow,
+    debug: &Path,
+) -> String {
     let new = client
         .request(
             "session/new",
             json!({
                 "cwd": scratch.checkout,
-                "mcpServers": [{
-                    "name": stub.name,
-                    "command": stub.command,
-                    "args": stub.args,
-                    "env": [],
-                }],
-                "_meta": acp_meta(&row, &scratch.debug),
+                "mcpServers": acp_servers(scratch),
+                "_meta": acp_meta(row, debug),
             }),
         )
         .await;
@@ -912,25 +941,34 @@ async fn acp_turn(scratch: &Scratch, user_extensions: bool) -> Option<AcpTurn> {
         })
         .to_owned();
     client.drain(Duration::from_secs(2)).await;
+    session_id
+}
 
+/// One `session/prompt` and its stop reason.
+async fn acp_prompt(client: &mut AcpClient, session_id: &str, text: &str) -> Option<String> {
     let prompt = client
         .request(
             "session/prompt",
-            json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": ACP_PROMPT }] }),
+            json!({ "sessionId": session_id, "prompt": [{ "type": "text", "text": text }] }),
         )
         .await;
     client.drain(Duration::from_secs(2)).await;
-
-    let mut turn = AcpTurn {
-        stop: prompt
-            .pointer("/result/stopReason")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned),
-        ..AcpTurn::default()
-    };
-    if turn.stop.is_none() {
+    let stop = prompt
+        .pointer("/result/stopReason")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    if stop.is_none() {
         println!("  session/prompt answered: {prompt}");
     }
+    stop
+}
+
+/// The commands and mode changes among the updates `client` received, with `stop`.
+fn acp_turn_of(client: &AcpClient, stop: Option<String>) -> AcpTurn {
+    let mut turn = AcpTurn {
+        stop,
+        ..AcpTurn::default()
+    };
     for update in &client.updates {
         match update.get("sessionUpdate").and_then(Value::as_str) {
             Some("available_commands_update") => {
@@ -952,6 +990,17 @@ async fn acp_turn(scratch: &Scratch, user_extensions: bool) -> Option<AcpTurn> {
     }
     turn.commands.sort();
     turn.commands.dedup();
+    turn
+}
+
+/// Resolves, spawns and drives one ACP session; `None` (with the reason printed) when the seeded
+/// row does not resolve on this box.
+async fn acp_turn(scratch: &Scratch, user_extensions: bool) -> Option<AcpTurn> {
+    let row = acp_row(scratch, user_extensions);
+    let (mut client, _) = acp_start(scratch, &row).await?;
+    let session_id = acp_new(&mut client, scratch, &row, &scratch.debug).await;
+    let stop = acp_prompt(&mut client, &session_id, ACP_PROMPT).await;
+    let turn = acp_turn_of(&client, stop);
     client.close().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     Some(turn)
@@ -1050,4 +1099,92 @@ async fn acp_isolated_by_default() {
         turn.modes.iter().any(|mode| mode == "plan"),
         "the adapter's own SDK hook still reports plan mode"
     );
+}
+
+/// The resume route live (D5, plan claim 8): a session made isolated in one adapter process and
+/// resumed in a second, with the same `_meta`, still loads neither mod. The first process runs
+/// `session/new` and one short turn and ends; the second calls `session/resume` (or
+/// `session/load` when only that is advertised, as the driver chooses) with its own debug file,
+/// and runs one short turn.
+#[tokio::test]
+#[ignore = "spends model tokens against the credential this box holds"]
+async fn acp_isolated_on_resume() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let claude = claude_on_path();
+    let scratch = Scratch::new(&claude);
+    let row = acp_row(&scratch, false);
+
+    let Some((mut first, _)) = acp_start(&scratch, &row).await else {
+        return;
+    };
+    let session_id = acp_new(&mut first, &scratch, &row, &scratch.debug).await;
+    let first_stop = acp_prompt(&mut first, &session_id, ACP_SHORT_PROMPT).await;
+    first.close().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let resumed_debug = scratch.debug.with_file_name("debug-resumed.log");
+    let Some((mut second, init)) = acp_start(&scratch, &row).await else {
+        return;
+    };
+    let caps = init
+        .pointer("/result/agentCapabilities")
+        .cloned()
+        .unwrap_or_default();
+    let method = if caps.pointer("/sessionCapabilities/resume").is_some() {
+        "session/resume"
+    } else if caps.get("loadSession").and_then(Value::as_bool) == Some(true) {
+        "session/load"
+    } else {
+        panic!("the adapter advertises neither resume nor load: {caps}")
+    };
+    let resumed = second
+        .request(
+            method,
+            json!({
+                "sessionId": session_id,
+                "cwd": scratch.checkout,
+                "mcpServers": acp_servers(&scratch),
+                "_meta": acp_meta(&row, &resumed_debug),
+            }),
+        )
+        .await;
+    second.drain(Duration::from_secs(2)).await;
+    let resumed_stop = acp_prompt(&mut second, &session_id, ACP_SHORT_PROMPT).await;
+    let turn = acp_turn_of(&second, resumed_stop);
+    second.close().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let resumed_mods = Scratch::mods_in(&resumed_debug);
+    println!("== acp isolated, resumed in a second process over {method}");
+    println!("  first: stop {first_stop:?}, mods {:?}", scratch.mods());
+    println!("  {method} answered: {resumed}");
+    println!("  resumed: stop {:?}, mods {resumed_mods:?}", turn.stop);
+    println!("  commands after resume: {:?}", turn.commands);
+    println!("  settings hook marker: {:?}", scratch.hook_marker());
+
+    assert_eq!(
+        first_stop.as_deref(),
+        Some("end_turn"),
+        "auth and the first turn work"
+    );
+    assert!(
+        resumed.get("result").is_some(),
+        "`{method}` restores the session: {resumed}"
+    );
+    assert_eq!(
+        turn.stop.as_deref(),
+        Some("end_turn"),
+        "the resumed session takes a turn"
+    );
+    assert_eq!(
+        resumed_mods,
+        both_mods(false),
+        "the resumed session's debug file names both mods, and neither loads"
+    );
+    assert_eq!(
+        scratch.hook_marker(),
+        None,
+        "the settings hook fires in neither process"
+    );
+    assert_eq!(turn.commands, Vec::<String>::new(), "no command is listed");
 }
