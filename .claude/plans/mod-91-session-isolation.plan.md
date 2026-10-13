@@ -324,6 +324,8 @@ request is allowed. `--debug-file` travels in `_meta.claudeCode.options.extraArg
   routes, as T4 planned (claim 8 now ✓).
 - Over ACP, `--disable-slash-commands` empties the whole `available_commands_update` list, built-in
   commands included. htui sends no slash command (claim 15), so nothing is lost.
+- `agy`'s handling of the `claudeCode` `_meta` key was not checked live, because `agy` is not
+  installed in the sandbox (blueprint F14).
 
 ### Amendment: where `isolation_live.rs` lands
 
