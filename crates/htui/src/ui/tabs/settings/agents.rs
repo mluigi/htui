@@ -10,8 +10,8 @@
 //! What `r` does **not** do is refresh that column. Quota is latched from the usage a run reports,
 //! never polled: a probe handshake reports no allowance at all, so a re-probe moves every other
 //! column and this one on no row. `docs/ANA-4.md` §7 asks for that limit to be stated rather than
-//! implied, and `QUOTA_NOTE` on the note line is where this section states it. (A code span, not
-//! an intra-doc link: this is the **module**'s documentation and the constant is private, so the
+//! implied, and `quota_note` on the note line is where this section states it. (A code span, not
+//! an intra-doc link: this is the **module**'s documentation and the function is private, so the
 //! link is the one `rustdoc` rejects without `--document-private-items`. The two references further
 //! down are inside private items' own docs and stay links.)
 //!
@@ -140,14 +140,22 @@ const HINT_IDLE: HintSpec = &[
 /// What the note line says when there is no notice and the section is idle: the one limit of this
 /// section that is not a key (MOD-2 D73).
 ///
-/// `r` re-probes every row and moves the `quota` column on none of them, because a probe handshake
+/// The probe key re-probes every row and moves the `quota` column on none of them, because a probe handshake
 /// reports no allowance and the value is latched from what a chat reports instead. `docs/ANA-4.md`
 /// §7 asks for that to be "stated in the UI rather than implied", and this is the statement.
 ///
 /// A notice wins the line: it is the answer to what the user just pressed. Since MOD-23 D245 the
 /// note has a line of its own under the keys, so neither clips the other; it is on the line the
 /// section **rests** in, which is the line a limit is read from.
-const QUOTA_NOTE: &str = "quota latches per chat, r cannot refresh it";
+///
+/// `probe` is `AgentsProbe`'s label through `AGENTS_BROWSE` (MOD-67 M6 D4); with none bound the
+/// sentence says a probe in general.
+fn quota_note(probe: Option<&str>) -> String {
+    match probe {
+        Some(probe) => format!("quota latches per chat, {probe} cannot refresh it"),
+        None => "quota latches per chat; a probe cannot refresh it".to_owned(),
+    }
+}
 
 /// The keys line while a registry form is open (MOD-23 D245). `Enter` and `Esc` are the focused
 /// field's own keys (MOD-67 D13), so they are fixed text.
@@ -171,7 +179,7 @@ const MANUAL_SUFFIX: &str = "*";
 
 /// What the idle note adds while any row's `probe.source` is `manual`: the key to
 /// [`MANUAL_SUFFIX`] (MOD-66, the amendment to blueprint §5). 60 of the 98 columns with
-/// [`QUOTA_NOTE`].
+/// [`quota_note`].
 const MANUAL_NOTE: &str = " \u{b7} * manual path";
 
 /// `m` on a row whose launch does not parse (MOD-66 B14): "literal" would misdescribe it.
@@ -199,8 +207,14 @@ const CHANGED_ON_BOTH_SIDES: &str =
 const NOTE_WIDTH: usize = 98;
 
 /// What `Edited` adds when the save changed what a probe checked (plan D246): the stored verdict is
-/// now older than the row, so the next chat re-probes by itself.
-const REPROBES: &str = " \u{b7} the next chat re-probes; r probes now";
+/// now older than the row, so the next chat re-probes by itself. `probe` is `AgentsProbe`'s label
+/// through `AGENTS_BROWSE` (MOD-67 M6 D4), the clause dropped with none bound.
+fn reprobes(probe: Option<&str>) -> String {
+    match probe {
+        Some(probe) => format!(" \u{b7} the next chat re-probes; {probe} probes now"),
+        None => " \u{b7} the next chat re-probes".to_owned(),
+    }
+}
 
 /// The hint line while a plan waits for an answer.
 const HINT_PENDING: HintSpec = &[
@@ -1057,7 +1071,7 @@ impl AgentsSection {
     /// the redirect line rather than joining it, so the pane is at most six stderr lines, the link
     /// and two more. Every one of them names [`Advertised::target`] and never a pasted byte. It
     /// takes the width because the field draws a window of its dots.
-    fn auth_pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn auth_pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
         match &self.auth {
             AuthState::Choosing {
                 methods,
@@ -1128,13 +1142,15 @@ impl AgentsSection {
                             theme.dim,
                         ));
                     } else {
-                        pane.push(Line::styled(
-                            format!(
-                                "redirect: {target} \u{b7} p pastes the address if the browser \
-                                 cannot reach it"
+                        let paste = keys.label(views::AGENTS_BROWSE, Act::AgentsPasteRedirect);
+                        let line = match paste {
+                            Some(paste) => format!(
+                                "redirect: {target} \u{b7} {paste} pastes the address if the \
+                                 browser cannot reach it"
                             ),
-                            theme.dim,
-                        ));
+                            None => format!("redirect: {target}"),
+                        };
+                        pane.push(Line::styled(line, theme.dim));
                     }
                 }
                 pane
@@ -1386,7 +1402,7 @@ impl AgentsSection {
     /// and no login is in flight, so the one it can cover is a `Manual` pane, which is back the
     /// moment the form closes. It takes the width because its fields draw a window of their text.
     /// The tool-paths form (MOD-66 D10) is drawn the same way and wins for the same reason.
-    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
         match &self.mode {
             Mode::Editing(editor) => {
                 return core::iter::once(Line::styled(editor.header(), theme.base))
@@ -1418,12 +1434,12 @@ impl AgentsSection {
                     )
                     .collect()
             }
-            _ => self.auth_pane(width, theme),
+            _ => self.auth_pane(width, theme, keys),
         }
     }
 
     /// The two lines under the pane (MOD-23 D245, blueprint F-12): which keys mean something here,
-    /// then the note — the last outcome, else [`QUOTA_NOTE`] while the section is idle.
+    /// then the note — the last outcome, else [`quota_note`] while the section is idle.
     ///
     /// Two lines rather than one since MOD-23 added three keys: the idle keys and the note were
     /// already 95 of the 98 columns together. A `None` note still takes its line, so the layout
@@ -1451,20 +1467,24 @@ impl AgentsSection {
                 (_, _) => HINT_AUTH_RUNNING,
             },
         };
-        let keys = keys.hint(self.stack(), spec);
+        let line = keys.hint(self.stack(), spec);
         let idle = matches!(self.mode, Mode::Browse)
             && matches!(self.install, InstallState::Idle)
             && matches!(self.auth, AuthState::Idle);
         let note = self.notice.clone().or_else(|| {
             idle.then(|| {
+                let note = quota_note(
+                    keys.label(views::AGENTS_BROWSE, Act::AgentsProbe)
+                        .as_deref(),
+                );
                 if self.lists_a_manual_row() {
-                    format!("{QUOTA_NOTE}{MANUAL_NOTE}")
+                    format!("{note}{MANUAL_NOTE}")
                 } else {
-                    QUOTA_NOTE.to_owned()
+                    note
                 }
             })
         });
-        (keys, note)
+        (line, note)
     }
 
     /// One key with no form, question, chooser or paste field up (MOD-67 M3 §6.2): whole chords
@@ -1676,6 +1696,10 @@ impl AgentsSection {
                 self.mode = Mode::Paths(form);
                 self.notice = None;
             }
+            // MOD-67 M6 PA-8: the shared refusal names no key; here the edit key is in reach.
+            Err(LITERAL_LAUNCH) => ctx.emit(Action::Error(agent_settings::literal_launch(
+                ctx.keys().label(views::AGENTS_BROWSE, Act::Edit).as_deref(),
+            ))),
             Err(refusal) => ctx.emit(Action::Error(refusal.to_owned())),
         }
     }
@@ -1816,7 +1840,7 @@ impl AgentsSection {
     ///
     /// Every outcome lands here and nowhere else: a plain [`StoreReply::Agents`] never closes the
     /// form or moves its token.
-    fn on_written(&mut self, outcome: &AgentWrite) {
+    fn on_written(&mut self, outcome: &AgentWrite, keys: &Keys) {
         match outcome {
             AgentWrite::Created { id, name } => {
                 if matches!(
@@ -1853,7 +1877,10 @@ impl AgentsSection {
                         ..
                     }) = &self.mode
                     {
-                        notice.push_str(REPROBES);
+                        notice.push_str(&reprobes(
+                            keys.label(views::AGENTS_BROWSE, Act::AgentsProbe)
+                                .as_deref(),
+                        ));
                     }
                     self.mode = Mode::Browse;
                 }
@@ -1916,7 +1943,12 @@ impl AgentsSection {
                 self.notice = Some(if *enabled && probed {
                     format!("`{name}` switched on; the probe's verdict decides")
                 } else if *enabled {
-                    format!("`{name}` switched on; not probed yet \u{b7} r probes")
+                    match keys.label(views::AGENTS_BROWSE, Act::AgentsProbe) {
+                        Some(probe) => {
+                            format!("`{name}` switched on; not probed yet \u{b7} {probe} probes")
+                        }
+                        None => format!("`{name}` switched on; not probed yet"),
+                    }
                 } else {
                     format!("`{name}` switched off on this box")
                 });
@@ -2616,7 +2648,7 @@ impl SettingsSection for AgentsSection {
                 self.unavailable = None;
                 self.busy = None;
                 self.clamp_cursor();
-                self.on_written(outcome);
+                self.on_written(outcome, ctx.keys());
             }
             // A registry write was refused — a taken name, a field the worker refused, this box not
             // registered, or offline. The shell has put `{request}: {message}` on the status line;
@@ -2717,7 +2749,7 @@ impl SettingsSection for AgentsSection {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme);
+        let pane = self.pane(area.width, ctx.theme, ctx.keys());
         let [rows, consent, keys_area, note_area] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
@@ -2774,7 +2806,7 @@ fn declares_a_source(launch: &Value) -> bool {
 /// for is the last of those, and it renders as nothing rather than as a guess.
 ///
 /// Refreshing is deliberately not offered: a probe handshake reports no allowance, so `r` cannot
-/// (§7), and [`QUOTA_NOTE`] says so.
+/// (§7), and [`quota_note`] says so.
 fn quota_cell(summary: &AgentSummary) -> String {
     let Some(quota) = summary.on_box.as_ref().and_then(|row| row.quota.as_ref()) else {
         return NONE.to_owned();
@@ -2965,6 +2997,24 @@ fn human_bytes(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MOD-67 M6 D4: the probe notes name the probe key, and drop it unbound.
+    #[test]
+    fn the_probe_notes_name_the_probe_key_or_none() {
+        assert_eq!(
+            quota_note(Some("r")),
+            "quota latches per chat, r cannot refresh it"
+        );
+        assert_eq!(
+            quota_note(None),
+            "quota latches per chat; a probe cannot refresh it"
+        );
+        assert_eq!(
+            reprobes(Some("r")),
+            " \u{b7} the next chat re-probes; r probes now"
+        );
+        assert_eq!(reprobes(None), " \u{b7} the next chat re-probes");
+    }
 
     /// MOD-60: the tool-name column is measured and cut in cells. A CJK name that fits the
     /// column by `char` count is twice as wide on screen; it is cut with `…` so every label,

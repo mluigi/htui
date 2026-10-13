@@ -554,8 +554,19 @@ pub const SET_TOOL_PATHS: &str = "set_tool_paths";
 
 /// A tool-paths write on a row whose launch declares no tool, no `discovery` or no `tools`
 /// (MOD-66 D10): there is no `${tool}` to give a path. The Agents section's `m` refuses with it,
-/// and so does the worker's `SetToolPaths` (review N4).
-pub const LITERAL_LAUNCH: &str = "this row's launch is literal; e edits its command";
+/// and so does the worker's `SetToolPaths` (review N4). It names no key: the worker has none, and
+/// the Agents section says [`literal_launch`] instead (MOD-67 M6 PA-8).
+pub const LITERAL_LAUNCH: &str = "this row's launch is literal; edit its command";
+
+/// [`LITERAL_LAUNCH`] as the Agents section says it: `edit`, the key that opens the row's editor
+/// there, names the way to change the command (MOD-67 M6 PA-8); with none bound, the constant.
+#[must_use]
+pub fn literal_launch(edit: Option<&str>) -> String {
+    match edit {
+        Some(edit) => format!("this row's launch is literal; {edit} edits its command"),
+        None => LITERAL_LAUNCH.to_owned(),
+    }
+}
 
 /// One manual path as the form and the worker check it (MOD-66 D9, D10): trimmed, non-empty and
 /// absolute. The refusal is one sentence naming the tool, `` `<tool>`: <reason> `` (the
@@ -791,6 +802,20 @@ mod tests {
     use super::*;
     use htui_core::model::agent::seed_rows;
     use serde_json::json;
+
+    /// MOD-67 M6 PA-8: the Agents view names its edit key; the shared refusal names none.
+    #[test]
+    fn literal_launch_names_the_edit_key_or_none() {
+        assert_eq!(
+            literal_launch(Some("e")),
+            "this row's launch is literal; e edits its command"
+        );
+        assert_eq!(literal_launch(None), LITERAL_LAUNCH);
+        assert_eq!(
+            LITERAL_LAUNCH,
+            "this row's launch is literal; edit its command"
+        );
+    }
 
     fn epoch() -> DateTime<Utc> {
         DateTime::from_timestamp(1_700_000_000, 0).expect("a valid instant")

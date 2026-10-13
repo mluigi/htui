@@ -46,7 +46,7 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
 use crate::ui::tabs::settings::{
     CHANGED_ELSEWHERE, CHANGED_ELSEWHERE_CLOSED, DELETED_ELSEWHERE, SectionId, SettingsSection,
-    wrapped,
+    answers, asked, wrapped,
 };
 use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
@@ -90,8 +90,14 @@ const EMPTY_URL: &str = "nothing typed; the stored URL is unchanged";
 const IDENTITY_BLANK: &str = "both the client ID and the client secret are required";
 /// `e` or `c` on the Provider row.
 const PROVIDER_FIXED: &str = "infisical is the only provider this build knows";
-/// `e` or `c` on the Health row.
-const NOTHING_TO_EDIT: &str = "nothing to edit on this row; t checks the provider";
+/// `e` or `c` on the Health row. `check` is `SecretsCheck`'s label through `SECRETS_BROWSE`
+/// (MOD-67 M6 D4); with none bound the clause goes.
+fn nothing_to_edit(check: Option<&str>) -> String {
+    match check {
+        Some(check) => format!("nothing to edit on this row; {check} checks the provider"),
+        None => "nothing to edit on this row".to_owned(),
+    }
+}
 /// `t` on a project with no usable scope: nothing is sent.
 const NO_SCOPE_TO_CHECK: &str = "this project has no secret scope to check";
 /// `c` on a project with no provider column.
@@ -103,16 +109,30 @@ const DEMO_KEYRING: &str = "a demo session never reads or writes the keyring";
 /// `t` in `--demo` (D10, blueprint A-5): the process has no source, so nothing is sent.
 const DEMO_CHECK: &str = "a demo session has no secret provider to check";
 /// The guide under the rows while the cursor is on Health: a check is a login, and can latch.
-const HEALTH_GUIDE: &str = "t logs in afresh: a refused login stops walks, chats and checks from logging in again until the identity is entered again";
+/// `check` is `SecretsCheck`'s label through `SECRETS_BROWSE` (MOD-67 M6 D4); with none bound the
+/// sentence says a check.
+fn health_guide(check: Option<&str>) -> String {
+    let check = check.unwrap_or("a check");
+    format!(
+        "{check} logs in afresh: a refused login stops walks, chats and checks from logging in again until the identity is entered again"
+    )
+}
 /// The line under the rows after a keyring write whose write mark the keyring refused (MOD-90 D3,
 /// R1 M-1). Not a failure: the write landed, and this process rebuilds its provider.
 const MARK_REFUSED: &str = "the keyring refused htui/infisical-write-mark: a running htui worker sees the last write only after a restart if it left the values unchanged (an identity entered again)";
-/// The guide under the rows after a latching refusal (M2 D5).
-const LATCHED: &str = "the last login was refused: walks, chats and checks are refused until the identity is entered again (e on Identity)";
-/// `c` on the URL row.
-const CONFIRM_CLEAR_URL: &str = "Remove the Infisical URL from the keyring? Walks and chats on provider projects are refused until one is stored. y / n";
-/// `c` on the Identity row.
-const CONFIRM_CLEAR_IDENTITY: &str = "Remove the machine identity (both halves) from the keyring? Walks and chats on provider projects are refused until one is stored. y / n";
+/// The guide under the rows after a latching refusal (M2 D5). `edit` is `Edit`'s label through
+/// `SECRETS_BROWSE` (MOD-67 M6 D4); with none bound the parenthesis goes.
+fn latched(edit: Option<&str>) -> String {
+    let refused = "the last login was refused: walks, chats and checks are refused until the identity is entered again";
+    match edit {
+        Some(edit) => format!("{refused} ({edit} on Identity)"),
+        None => refused.to_owned(),
+    }
+}
+/// `c` on the URL row; the answers are appended as the keys bind them (MOD-67 M6 PA-6).
+const CONFIRM_CLEAR_URL: &str = "Remove the Infisical URL from the keyring? Walks and chats on provider projects are refused until one is stored.";
+/// `c` on the Identity row; the answers are appended as the keys bind them (MOD-67 M6 PA-6).
+const CONFIRM_CLEAR_IDENTITY: &str = "Remove the machine identity (both halves) from the keyring? Walks and chats on provider projects are refused until one is stored.";
 /// The URL form's guide.
 const URL_GUIDE: &str =
     "the base URL, e.g. https://infisical.example.com; it is checked before it is stored";
@@ -161,9 +181,12 @@ const HINT_CONFIRM: HintSpec = &[
 /// The width the four fixed labels pad to.
 const FIXED_LABEL_WIDTH: usize = 8;
 
-/// `c` on a scoped project.
-fn confirm_clear_scope(slug: &str) -> String {
-    format!("Remove `{slug}`'s secret scope? Its walks and chats then get no secrets. y / n")
+/// `c` on a scoped project, ended by `answers` ([`answers`], MOD-67 M6 PA-6).
+fn confirm_clear_scope(slug: &str, answers: &str) -> String {
+    asked(
+        &format!("Remove `{slug}`'s secret scope? Its walks and chats then get no secrets."),
+        answers,
+    )
 }
 
 /// What a second write is told while the first is still out.
@@ -397,7 +420,7 @@ pub struct SecretsSection {
     written_generation: u64,
     /// The last landed keyring write's write mark was refused (MOD-90 D3, R1 M-1): a running
     /// `htui worker` misses that write until it restarts if it left the values unchanged, so
-    /// [`MARK_REFUSED`] stays under the rows, as [`LATCHED`] does. Only the next landed keyring
+    /// [`MARK_REFUSED`] stays under the rows, as [`latched`] does. Only the next landed keyring
     /// write changes it, whose stored mark carries every write before it; a re-read cannot tell
     /// whether another process has seen the write, so it keeps the line.
     mark_refused: bool,
@@ -509,10 +532,13 @@ impl SecretsSection {
     }
 
     /// `e`.
-    fn edit(&mut self) {
+    fn edit(&mut self, keys: &Keys) {
         match self.row() {
             Row::Provider => self.refuse(PROVIDER_FIXED.to_owned()),
-            Row::Health => self.refuse(NOTHING_TO_EDIT.to_owned()),
+            Row::Health => self.refuse(nothing_to_edit(
+                keys.label(views::SECRETS_BROWSE, Act::SecretsCheck)
+                    .as_deref(),
+            )),
             Row::Url | Row::Identity if self.keyring_blocked() => {}
             Row::Url | Row::Identity if self.demo() => self.refuse(DEMO_KEYRING.to_owned()),
             Row::Url => {
@@ -564,10 +590,13 @@ impl SecretsSection {
     }
 
     /// `c`.
-    fn clear(&mut self) {
+    fn clear(&mut self, keys: &Keys) {
         match self.row() {
             Row::Provider => self.refuse(PROVIDER_FIXED.to_owned()),
-            Row::Health => self.refuse(NOTHING_TO_EDIT.to_owned()),
+            Row::Health => self.refuse(nothing_to_edit(
+                keys.label(views::SECRETS_BROWSE, Act::SecretsCheck)
+                    .as_deref(),
+            )),
             Row::Url | Row::Identity if self.keyring_blocked() => {}
             Row::Url => {
                 let offered = matches!(
@@ -978,7 +1007,7 @@ impl SecretsSection {
 
     /// The rows: the four fixed ones, the `Projects` line, one per project, then the guide and
     /// [`MARK_REFUSED`] (R1 M-1).
-    fn lines(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn lines(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for (index, row) in Row::FIXED.into_iter().enumerate() {
             push_row(
@@ -993,11 +1022,11 @@ impl SecretsSection {
         lines.push(Line::default());
         self.project_lines(&mut lines, width, theme);
         let room = usize::from(width).saturating_sub(2).max(1);
-        let mark = self.mark_refused.then_some(MARK_REFUSED);
-        for note in [self.guide(), mark].into_iter().flatten() {
+        let mark = self.mark_refused.then(|| MARK_REFUSED.to_owned());
+        for note in [self.guide(keys), mark].into_iter().flatten() {
             lines.push(Line::default());
             lines.extend(
-                wrapped(note, room)
+                wrapped(&note, room)
                     .into_iter()
                     .map(|line| Line::styled(format!("  {line}"), theme.dim)),
             );
@@ -1031,26 +1060,35 @@ impl SecretsSection {
         }
     }
 
-    /// The guide under the rows: [`LATCHED`], else [`HEALTH_GUIDE`] on Health, else none.
-    fn guide(&self) -> Option<&'static str> {
+    /// The guide under the rows: [`latched`], else [`health_guide`] on Health, else none; each
+    /// names its key as `keys` binds it in `SECRETS_BROWSE` (MOD-67 M6 D4).
+    fn guide(&self, keys: &Keys) -> Option<String> {
+        let stack = views::SECRETS_BROWSE;
         if self.latched() {
-            Some(LATCHED)
+            Some(latched(keys.label(stack, Act::Edit).as_deref()))
         } else if self.row() == Row::Health {
-            Some(HEALTH_GUIDE)
+            Some(health_guide(
+                keys.label(stack, Act::SecretsCheck).as_deref(),
+            ))
         } else {
             None
         }
     }
 
     /// The pane under the rows: the form, or the question, or nothing.
-    fn pane(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    fn pane(&self, width: u16, theme: &Theme, keys: &Keys) -> Vec<Line<'static>> {
         let room = usize::from(width).max(1);
+        let answers = answers(keys, views::SECRETS_CONFIRM);
         let (mut lines, guide) = match &self.mode {
             Mode::Browse => return Vec::new(),
-            Mode::ConfirmClearUrl => return question(CONFIRM_CLEAR_URL, room, theme),
-            Mode::ConfirmClearIdentity => return question(CONFIRM_CLEAR_IDENTITY, room, theme),
+            Mode::ConfirmClearUrl => {
+                return question(&asked(CONFIRM_CLEAR_URL, &answers), room, theme);
+            }
+            Mode::ConfirmClearIdentity => {
+                return question(&asked(CONFIRM_CLEAR_IDENTITY, &answers), room, theme);
+            }
             Mode::ConfirmClearScope { slug, .. } => {
-                return question(&confirm_clear_scope(slug), room, theme);
+                return question(&confirm_clear_scope(slug, &answers), room, theme);
             }
             Mode::EditingUrl(field) => (form(&[URL_LABEL], &[field], 0, width, theme), URL_GUIDE),
             Mode::EditingIdentity {
@@ -1459,8 +1497,8 @@ impl SettingsSection for SecretsSection {
         let chord = KeyChord::from_event(key);
         for act in ctx.keys().actions(views::SECRETS_BROWSE, chord) {
             match act {
-                Act::Edit => self.edit(),
-                Act::Clear => self.clear(),
+                Act::Edit => self.edit(ctx.keys()),
+                Act::Clear => self.clear(ctx.keys()),
                 Act::SecretsCheck => self.test(ctx),
                 Act::ListDown => self.move_cursor(true),
                 Act::ListUp => self.move_cursor(false),
@@ -1507,7 +1545,7 @@ impl SettingsSection for SecretsSection {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let pane = self.pane(area.width, ctx.theme);
+        let pane = self.pane(area.width, ctx.theme, ctx.keys());
         let [rows, pane_area, hint] = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(u16::try_from(pane.len()).unwrap_or(u16::MAX)),
@@ -1526,7 +1564,10 @@ impl SettingsSection for SecretsSection {
                 .wrap(Wrap { trim: true }),
                 rows,
             ),
-            None => frame.render_widget(Paragraph::new(self.lines(rows.width, ctx.theme)), rows),
+            None => frame.render_widget(
+                Paragraph::new(self.lines(rows.width, ctx.theme, ctx.keys())),
+                rows,
+            ),
         }
         if !pane.is_empty() {
             frame.render_widget(Paragraph::new(pane), pane_area);
@@ -1611,6 +1652,22 @@ mod tests {
     use super::*;
     use crossterm::event::KeyCode;
 
+    /// MOD-67 M6 D4, PA-6: the Health and latch sentences and the questions, keys unbound.
+    #[test]
+    fn the_secrets_sentences_without_their_keys() {
+        assert_eq!(
+            nothing_to_edit(Some("t")),
+            "nothing to edit on this row; t checks the provider"
+        );
+        assert_eq!(nothing_to_edit(None), "nothing to edit on this row");
+        assert!(health_guide(Some("t")).starts_with("t logs in afresh: a refused login"));
+        assert!(health_guide(None).starts_with("a check logs in afresh: a refused login"));
+        assert!(latched(Some("e")).ends_with(" (e on Identity)"));
+        assert!(latched(None).ends_with("until the identity is entered again"));
+        assert!(confirm_clear_scope("p", "y / n").ends_with("get no secrets. y / n"));
+        assert!(confirm_clear_scope("p", "").ends_with("get no secrets."));
+    }
+
     /// The bordered section is 98 cells at 100 columns (H-16), each hint rendered through the
     /// stack its mode resolves with the default keys.
     #[test]
@@ -1691,7 +1748,7 @@ mod tests {
             mark_refused: true,
             ..SecretsSection::new()
         };
-        let lines = section.lines(100, &theme);
+        let lines = section.lines(100, &theme, Keys::compiled());
         let shown: Vec<&Line<'_>> = lines
             .iter()
             .filter(|line| line.to_string().contains("htui/infisical-write-mark"))
@@ -1700,7 +1757,7 @@ mod tests {
         assert_eq!(shown[0].style, theme.dim);
         assert!(
             !SecretsSection::new()
-                .lines(100, &theme)
+                .lines(100, &theme, Keys::compiled())
                 .iter()
                 .any(|line| line.to_string().contains("write-mark")),
             "no line without a refused mark"

@@ -29,7 +29,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::editor::{
-    EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
+    ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited, strip_added_newline,
     without_controls,
 };
 use crate::hand_written::{ADD_NOTE_NAME, HandText, WRITE_DOCUMENT_NAME};
@@ -471,8 +471,8 @@ impl Compose {
     }
 
     /// D7: the item form's `on_external_edit` rules, for the body. Ignored unless the body was
-    /// handed out.
-    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome) {
+    /// handed out. The edited notice names the save key `keys` binds in [`Compose::stack`].
+    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome, keys: &Keys) {
         if !std::mem::take(&mut self.external) {
             return;
         }
@@ -488,7 +488,7 @@ impl Compose {
                     self.body = TextArea::with_text(text);
                     self.body.set_cursor(usize::MAX);
                     self.focus = Part::Body;
-                    self.notice = Some(EDITED.to_owned());
+                    self.notice = Some(edited(keys.label(self.stack(), Act::FormSave).as_deref()));
                 }
             }
             ExternalEditOutcome::Unchanged { quick } => {
@@ -915,16 +915,22 @@ mod tests {
             compose.on_key(ctrl('e'), Keys::compiled()),
             ComposeOutcome::External(_)
         ));
-        compose.on_external_edit(ExternalEditOutcome::Edited("New.\n".to_owned()));
+        compose.on_external_edit(
+            ExternalEditOutcome::Edited("New.\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(compose.body(), "New.");
         assert_eq!(compose.body.cursor(), 4);
-        assert_eq!(compose.notice(), Some(EDITED));
+        assert_eq!(compose.notice(), Some(edited(Some("Ctrl+s")).as_str()));
 
         assert!(matches!(
             compose.on_key(ctrl('e'), Keys::compiled()),
             ComposeOutcome::External(_)
         ));
-        compose.on_external_edit(ExternalEditOutcome::Edited("New.\n".to_owned()));
+        compose.on_external_edit(
+            ExternalEditOutcome::Edited("New.\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(compose.notice(), Some(NO_CHANGES));
         assert_eq!(compose.body(), "New.");
     }
@@ -934,7 +940,10 @@ mod tests {
         let mut compose = note();
         compose.on_paste("kept");
         let _ = compose.on_key(ctrl('e'), Keys::compiled());
-        compose.on_external_edit(ExternalEditOutcome::Unchanged { quick: true });
+        compose.on_external_edit(
+            ExternalEditOutcome::Unchanged { quick: true },
+            Keys::compiled(),
+        );
         assert_eq!(
             compose.notice(),
             Some(format!("{NO_CHANGES}{WAIT_FLAG}").as_str())
@@ -942,7 +951,10 @@ mod tests {
         assert_eq!(compose.body(), "kept");
 
         let _ = compose.on_key(ctrl('e'), Keys::compiled());
-        compose.on_external_edit(ExternalEditOutcome::Failed("boom".to_owned()));
+        compose.on_external_edit(
+            ExternalEditOutcome::Failed("boom".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(compose.notice(), Some("boom"));
         assert_eq!(compose.body(), "kept");
     }
@@ -951,14 +963,23 @@ mod tests {
     fn an_outcome_with_nothing_handed_out_is_ignored() {
         let mut compose = note();
         compose.on_paste("kept");
-        compose.on_external_edit(ExternalEditOutcome::Edited("other".to_owned()));
+        compose.on_external_edit(
+            ExternalEditOutcome::Edited("other".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(compose.body(), "kept");
         assert_eq!(compose.notice(), None);
 
         // One hand-off, one outcome: a second outcome is ignored.
         let _ = compose.on_key(ctrl('e'), Keys::compiled());
-        compose.on_external_edit(ExternalEditOutcome::Failed("boom".to_owned()));
-        compose.on_external_edit(ExternalEditOutcome::Edited("other".to_owned()));
+        compose.on_external_edit(
+            ExternalEditOutcome::Failed("boom".to_owned()),
+            Keys::compiled(),
+        );
+        compose.on_external_edit(
+            ExternalEditOutcome::Edited("other".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(compose.body(), "kept");
         assert_eq!(compose.notice(), Some("boom"));
     }

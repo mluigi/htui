@@ -40,7 +40,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
 use crate::editor::{
-    EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
+    ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited, strip_added_newline,
     without_controls,
 };
 use crate::item_writes::{ItemDivergence, ItemFormContext};
@@ -504,11 +504,11 @@ impl ItemForm {
 
     /// D4: the `$EDITOR` handoff came back. No field out (`external` is `None`): ignored.
     /// `Edited` replaces only the handed-out field's text (control characters dropped, then D5),
-    /// puts the cursor at its end, focuses it and says `EDITED`;
+    /// puts the cursor at its end, focuses it and says `edited`, naming `keys`' save key (MOD-67 M6);
     /// the token, reason, `opened` and every other field are untouched, so A4's "unchanged" still
     /// compares against what the form opened with. `Unchanged` says `NO_CHANGES` (+ `WAIT_FLAG`
     /// when quick); `Failed` says its sentence; neither touches the text.
-    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome) {
+    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome, keys: &Keys) {
         let Some(field) = self.external.take() else {
             return;
         };
@@ -532,7 +532,9 @@ impl ItemForm {
                     // Review L4: at the end, so a long body's edited tail is what the area shows.
                     area.set_cursor(usize::MAX);
                     self.focus = field;
-                    self.notice = Some(EDITED.to_owned());
+                    self.notice = Some(edited(
+                        keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                    ));
                 }
             }
             ExternalEditOutcome::Unchanged { quick } => {
@@ -2464,7 +2466,10 @@ mod tests {
             form.title.text().map(str::to_owned),
             form.paths.text().to_owned(),
         );
-        form.on_external_edit(ExternalEditOutcome::Edited("New body.\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("New body.\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(
             form.body.text(),
             "New body.",
@@ -2476,7 +2481,7 @@ mod tests {
             "review L4: the cursor ends the text"
         );
         assert_eq!(form.focus(), Field::Body);
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
         assert_eq!(form.title.text().map(str::to_owned), title);
         assert_eq!(form.paths.text(), paths);
         assert_eq!(form.token(), Some(1));
@@ -2502,7 +2507,10 @@ mod tests {
         let body = form.body.text().to_owned();
         focus_on(&mut form, Field::Paths);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.paths.text(), "src/**\nlib/**");
         assert_eq!(
             form.paths.cursor_line_col(),
@@ -2511,7 +2519,7 @@ mod tests {
         );
         assert_eq!(form.body.text(), body);
         assert_eq!(form.focus(), Field::Paths);
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// A4: "unchanged" compares against what the form opened with, not what was handed out.
@@ -2522,8 +2530,11 @@ mod tests {
         focus_on(&mut form, Field::Body);
         type_text(&mut form, "x");
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited(form.opened.body.clone()));
-        assert_eq!(form.notice(), Some(EDITED));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited(form.opened.body.clone()),
+            Keys::compiled(),
+        );
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
         assert!(matches!(
             form.on_key(ctrl('s'), Keys::compiled()),
             ItemFormOutcome::Stay
@@ -2552,7 +2563,7 @@ mod tests {
             ),
         ] {
             handed(&mut form);
-            form.on_external_edit(outcome);
+            form.on_external_edit(outcome, Keys::compiled());
             assert_eq!(form.notice(), Some(notice.as_str()));
             assert_eq!(form.body.text(), body);
             assert_eq!(form.external, None);
@@ -2567,19 +2578,28 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abc\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abc\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some(NO_CHANGES));
         assert_eq!(form.body.text(), "abc");
 
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abd\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abd\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "abd");
 
         form.body = TextArea::with_text("abc\n");
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abc\n\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abc\n\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "abc\n\n");
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// Review L2: a control character from the editor is dropped, as a paste drops one; a `\t`
@@ -2591,11 +2611,12 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited(
-            "a\u{1b}[31mb\u{7}c\u{0}\n\tindented\u{7f}\n".to_owned(),
-        ));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("a\u{1b}[31mb\u{7}c\u{0}\n\tindented\u{7f}\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "a[31mbc\n\tindented");
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// Review L2: the filter runs before D5's compare, so a return that differs only by control
@@ -2607,7 +2628,10 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("a\u{1b}bc\u{0}\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("a\u{1b}bc\u{0}\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some(NO_CHANGES));
         assert_eq!(form.body.text(), "abc");
     }
@@ -2617,14 +2641,23 @@ mod tests {
         let store = MemStore::demo();
         let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
         let body = form.body.text().to_owned();
-        form.on_external_edit(ExternalEditOutcome::Edited("x".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("x".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), body);
         assert_eq!(form.notice(), None);
 
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Failed("one".to_owned()));
-        form.on_external_edit(ExternalEditOutcome::Failed("two".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Failed("one".to_owned()),
+            Keys::compiled(),
+        );
+        form.on_external_edit(
+            ExternalEditOutcome::Failed("two".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some("one"), "the second had no field out");
     }
 

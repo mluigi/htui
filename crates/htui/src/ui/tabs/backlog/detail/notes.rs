@@ -345,9 +345,9 @@ impl DetailTab for NotesTab {
         self.compose.is_some()
     }
 
-    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         match self.compose.as_mut() {
-            Some(compose) => compose.on_external_edit(outcome),
+            Some(compose) => compose.on_external_edit(outcome, ctx.keys()),
             None => tracing::debug!("no note compose area to take the $EDITOR outcome"),
         }
     }
@@ -479,7 +479,7 @@ mod tests {
 
     use super::*;
     use crate::app::Action;
-    use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome};
+    use crate::editor::{ExternalEdit, ExternalEditOutcome, edited};
     use crate::hand_written::{ADD_NOTE_NAME, NOTE_FORM_NAME};
     use crate::store_worker::StoreRequest;
     use crate::ui::tabs::backlog::detail::compose::bench::{Shell, ctrl, drawn, key, row_from};
@@ -922,7 +922,10 @@ mod tests {
             &mut shell.ctx(),
         );
         assert_eq!(compose(&open).body(), "From the editor.");
-        assert_eq!(compose(&open).notice(), Some(EDITED));
+        assert_eq!(
+            compose(&open).notice(),
+            Some(edited(Some("Ctrl+s")).as_str())
+        );
         // With no area open the outcome is dropped.
         let mut closed = pane(&shell).await;
         closed.on_external_edit(

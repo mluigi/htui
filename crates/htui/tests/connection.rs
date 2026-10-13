@@ -2155,3 +2155,28 @@ async fn the_product_registers_connection_after_prompt() {
         "the fifth `l` would wrap; four reach the last section"
     );
 }
+
+/// MOD-67 M6 D4, PA-6: the Rebuild row names the rebuild key in force, and the clear question
+/// ends in the answers in force; the old `y` answers nothing there.
+#[tokio::test]
+async fn a_rebound_answer_ends_the_question() {
+    let keys =
+        htui::keys::load_str("version = 1\n[settings.connection]\nyes = \"Y\"\nrebuild = \"B\"\n")
+            .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = ConnectionSection::new();
+    feed(&bench, &mut section, &stored_snapshot());
+
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(frame.contains("press Enter or B"), "{frame}");
+
+    assert_eq!(bench.key(&mut section, "c"), Handled::Consumed);
+    let frame = flattened(&frame_of(&bench, &section));
+    assert!(
+        frame.contains("the next launch starts offline. Y / n"),
+        "{frame}"
+    );
+    bench.key(&mut section, "y");
+    assert!(section.captures_input(), "`y` is not an answer any more");
+    assert!(bench.drained().is_empty(), "`y` sends nothing");
+}

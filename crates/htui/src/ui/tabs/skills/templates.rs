@@ -28,7 +28,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
 use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use crate::app::{Action, Ctx, Handled};
-use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
+use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
@@ -492,7 +492,7 @@ impl TemplatesView {
 
     /// The `$EDITOR` handoff came back (plan D11, OQ-3). No handoff pending (the scope changed
     /// meanwhile): ignored.
-    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         let Some(Pending { mut editor, resume }) = self.external.take() else {
             return;
         };
@@ -510,7 +510,11 @@ impl TemplatesView {
                         editor.area.set_cursor(error_at(&err).unwrap_or(text.len()));
                         Notice::Error(err.to_string())
                     }
-                    Ok(_) => Notice::Info(EDITED.to_owned()),
+                    Ok(_) => Notice::Info(edited(
+                        ctx.keys()
+                            .label(views::TEMPLATES_EDITOR, Act::FormSave)
+                            .as_deref(),
+                    )),
                 });
                 self.mode = Mode::Editing(editor);
             }

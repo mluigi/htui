@@ -929,7 +929,7 @@ impl Tab for BacklogTab {
     /// key owner is the asker, and the item form owns keys first.
     fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         match self.item_form.as_mut() {
-            Some(form) => form.on_external_edit(outcome),
+            Some(form) => form.on_external_edit(outcome, ctx.keys()),
             None => self.detail.on_external_edit(outcome, ctx),
         }
     }
@@ -4042,7 +4042,10 @@ mod tests {
             ExternalEditOutcome::Edited("New body.".to_owned()),
             &mut bench.ctx(),
         );
-        assert_eq!(notice(&tab).as_deref(), Some(crate::editor::EDITED));
+        assert_eq!(
+            notice(&tab).as_deref(),
+            Some(crate::editor::edited(Some("Ctrl+s")).as_str())
+        );
         let request = saved(&mut tab, &bench);
         assert!(
             matches!(
@@ -4176,7 +4179,10 @@ mod tests {
             ExternalEditOutcome::Edited("New body.".to_owned()),
             &mut bench.ctx(),
         );
-        assert_eq!(notice(&tab).as_deref(), Some(crate::editor::EDITED));
+        assert_eq!(
+            notice(&tab).as_deref(),
+            Some(crate::editor::edited(Some("Ctrl+s")).as_str())
+        );
         assert!(seen.borrow().is_empty());
     }
 

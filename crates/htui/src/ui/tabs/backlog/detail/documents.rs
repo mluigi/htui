@@ -501,9 +501,9 @@ impl DetailTab for DocumentsTab {
         self.compose.is_some()
     }
 
-    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         match self.compose.as_mut() {
-            Some(compose) => compose.on_external_edit(outcome),
+            Some(compose) => compose.on_external_edit(outcome, ctx.keys()),
             None => tracing::debug!("no document compose area to take the $EDITOR outcome"),
         }
     }

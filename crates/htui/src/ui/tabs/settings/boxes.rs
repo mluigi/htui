@@ -145,15 +145,34 @@ const ID_SUFFIX: usize = 8;
 /// F-5): `edit_box in flight` is byte-identical to the sentence before MOD-51.
 const IN_FLIGHT: &str = "in flight";
 
-/// [`CHANGED_ELSEWHERE`] for the two `ctrl-s` editors, quirks and the probe spec (MOD-51 D6),
-/// where `Enter` breaks the line (OQ-16) and `ctrl-s` is the save that retries. Starts
+/// [`CHANGED_ELSEWHERE`] for the two save-key editors, quirks and the probe spec (MOD-51 D6),
+/// where `Enter` breaks the line (OQ-16) and `save`, `FormSave`'s label through `BOXES_EDITOR`
+/// (MOD-67 M6 D4), is the save that retries; with none bound the sentence says a save. Starts
 /// `changed elsewhere`, so `is_error` draws it in `theme.error`.
-const CHANGED_ELSEWHERE_QUIRKS: &str = "changed elsewhere since you opened it \u{2014} reloaded; ctrl-s retries against the current row";
+fn changed_elsewhere_quirks(save: Option<&str>) -> String {
+    match save {
+        Some(save) => format!(
+            "changed elsewhere since you opened it \u{2014} reloaded; {save} retries against the \
+             current row"
+        ),
+        None => "changed elsewhere since you opened it \u{2014} reloaded; save again to retry \
+                 against the current row"
+            .to_owned(),
+    }
+}
 
-/// [`CHANGED_ELSEWHERE`] for the executor confirmation, where `y` is the write that retries
-/// (MOD-41 plan D10). Starts `changed elsewhere`, so `is_error` draws it in `theme.error`.
-const CHANGED_ELSEWHERE_EXECUTOR: &str =
-    "changed elsewhere since you opened it \u{2014} reloaded; y retries against the current row";
+/// [`CHANGED_ELSEWHERE`] for the executor confirmation, where `yes`, `ConfirmYes`'s label through
+/// `BOXES_EXECUTOR` (MOD-67 M6 D4), is the write that retries (MOD-41 plan D10); with none bound
+/// the clause goes. Starts `changed elsewhere`, so `is_error` draws it in `theme.error`.
+fn changed_elsewhere_executor(yes: Option<&str>) -> String {
+    match yes {
+        Some(yes) => format!(
+            "changed elsewhere since you opened it \u{2014} reloaded; {yes} retries against the \
+             current row"
+        ),
+        None => "changed elsewhere since you opened it \u{2014} reloaded".to_owned(),
+    }
+}
 
 /// `p` on a box that is not this one (PRD D4).
 const THIS_BOX_ONLY: &str = "the probe runs on this box only";
@@ -361,8 +380,10 @@ impl BoxesSection {
     }
 
     /// `BoxesStale` (D48): the list is replaced, the editor keeps its text and takes the current
-    /// row's token, and the retry is a second save rather than an automatic write.
-    fn on_stale(&mut self, snapshot: &BoxesSnapshot) {
+    /// row's token, and the retry is a second save rather than an automatic write. The sentence
+    /// names the retry key `keys` binds there (MOD-67 M6 D4).
+    fn on_stale(&mut self, snapshot: &BoxesSnapshot, keys: &Keys) {
+        let save = keys.label(views::BOXES_EDITOR, Act::FormSave);
         self.busy = None;
         self.replace(snapshot);
         // MOD-51 F-6(a): the probe spec editor is over no box, so it is settled before
@@ -370,7 +391,7 @@ impl BoxesSection {
         // when the row is gone (the retry is then an insert).
         if let Mode::Spec(editor) = &mut self.mode {
             editor.expected = snapshot.spec.stored.as_ref().map(|row| row.updated_at);
-            self.notice = Some(CHANGED_ELSEWHERE_QUIRKS.to_owned());
+            self.notice = Some(changed_elsewhere_quirks(save.as_deref()));
             return;
         }
         let Some(box_id) = self.editor_box() else {
@@ -386,23 +407,26 @@ impl BoxesSection {
         let notice = match (now, &mut self.mode) {
             (Some(token), Mode::Tags(editor)) => {
                 editor.expected = token;
-                CHANGED_ELSEWHERE
+                CHANGED_ELSEWHERE.to_owned()
             }
             (Some(token), Mode::Quirks(editor)) => {
                 editor.expected = token;
-                CHANGED_ELSEWHERE_QUIRKS
+                changed_elsewhere_quirks(save.as_deref())
             }
             (Some(token), Mode::Executor(flip)) => {
                 flip.expected = token;
-                CHANGED_ELSEWHERE_EXECUTOR
+                changed_elsewhere_executor(
+                    keys.label(views::BOXES_EXECUTOR, Act::ConfirmYes)
+                        .as_deref(),
+                )
             }
-            (Some(_), Mode::Browse | Mode::Spec(_)) => CHANGED_ELSEWHERE,
+            (Some(_), Mode::Browse | Mode::Spec(_)) => CHANGED_ELSEWHERE.to_owned(),
             (None, _) => {
                 self.mode = Mode::Browse;
-                DELETED_ELSEWHERE
+                DELETED_ELSEWHERE.to_owned()
             }
         };
-        self.notice = Some(notice.to_owned());
+        self.notice = Some(notice);
     }
 
     /// Whether `t`/`e`/`w`/`s` must do nothing: a list the read could not confirm (the body shows
@@ -769,7 +793,7 @@ impl SettingsSection for BoxesSection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Boxes(snapshot) => self.on_boxes(snapshot),
-            StoreReply::BoxesStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::BoxesStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             // The report carries counts, not rows (D49): the list is read again.
             StoreReply::BoxProbed(_) => {
                 self.probing = false;
@@ -1266,6 +1290,30 @@ mod tests {
     use super::*;
 
     use htui_core::model::{BoxRow, OsFamily, UserId};
+
+    /// MOD-67 M6 D4: the stale notices name the retry key, and say a save (or nothing) unbound.
+    #[test]
+    fn the_stale_notices_name_the_retry_key_or_none() {
+        assert_eq!(
+            changed_elsewhere_quirks(Some("Ctrl+s")),
+            "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+s retries against the \
+             current row"
+        );
+        assert_eq!(
+            changed_elsewhere_quirks(None),
+            "changed elsewhere since you opened it \u{2014} reloaded; save again to retry against \
+             the current row"
+        );
+        assert_eq!(
+            changed_elsewhere_executor(Some("y")),
+            "changed elsewhere since you opened it \u{2014} reloaded; y retries against the current \
+             row"
+        );
+        assert_eq!(
+            changed_elsewhere_executor(None),
+            "changed elsewhere since you opened it \u{2014} reloaded"
+        );
+    }
 
     /// A box called `hostname`, every other field a placeholder.
     fn record(hostname: &str) -> BoxRecord {

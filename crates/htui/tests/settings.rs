@@ -6243,3 +6243,38 @@ async fn f1_from_the_agents_form_opens_help_and_keeps_the_form() {
         "the form stayed open: {frame}"
     );
 }
+
+/// MOD-67 M6 D4: a rebound probe key is the one the Agents notes name, the idle note and the
+/// switched-on notice alike.
+#[tokio::test]
+async fn a_rebound_settings_key_is_the_one_the_sentence_names() {
+    let keys = htui::keys::load_str("version = 1\n[settings.agents]\nprobe = \"P\"\n")
+        .expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let row = registry_row("declared", true);
+    let mut section = section_over(&bench, vec![row.clone()]);
+    let rendered = render_section(&section, &bench.ctx());
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(
+        lines[lines.len() - 1],
+        "quota latches per chat, P cannot refresh it",
+        "{rendered}"
+    );
+
+    let _ = bench.drained();
+    bench.reply(
+        &mut section,
+        &written(
+            vec![row.clone()],
+            AgentWrite::Switched {
+                id: row.agent.id,
+                name: "declared".to_owned(),
+                enabled: true,
+            },
+        ),
+    );
+    assert_eq!(
+        note_line(&render_section(&section, &bench.ctx())),
+        "`declared` switched on; not probed yet \u{b7} P probes"
+    );
+}

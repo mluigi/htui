@@ -3090,3 +3090,27 @@ async fn snapshot_demo() {
     let (bench, section, _) = loaded(demo_keyring()).await;
     insta::assert_snapshot!("demo", frame(&bench, &section));
 }
+
+/// MOD-67 M6 D4: a rebound check key is the one Health's guide and refusal name.
+#[tokio::test]
+async fn a_rebound_check_key_is_named_on_health() {
+    let (bench, mut section) = loaded_with_keys(
+        "version = 1\n[settings.secrets]\ncheck = \"T\"\n",
+        configured(),
+    )
+    .await;
+    go_to(&bench, &mut section, ROW_HEALTH);
+    let words = |text: String| text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let guide = words(frame(&bench, &section));
+    assert!(
+        guide.contains("T logs in afresh: a refused login"),
+        "{guide}"
+    );
+
+    bench.key(&mut section, "e");
+    let refused = words(frame(&bench, &section));
+    assert!(
+        refused.contains("nothing to edit on this row; T checks the provider"),
+        "{refused}"
+    );
+}

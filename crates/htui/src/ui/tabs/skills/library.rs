@@ -38,7 +38,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
 use super::attach::{AttachOutcome, AttachPane};
 use crate::app::{Action, Ctx, Handled};
-use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
+use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
 use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::skill_import::ImportOutcome;
 use crate::skills::{READ_NAME, REQUEST_NAMES, SkillWrite, SkillsSnapshot, StaleWhat};
@@ -680,7 +680,7 @@ impl LibraryView {
 
     /// The `$EDITOR` handoff came back. No handoff pending (the scope changed meanwhile, or the
     /// Templates view asked for it): ignored (D100).
-    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         let Some(Pending { mut editor, resume }) = self.external.take() else {
             return;
         };
@@ -690,7 +690,11 @@ impl LibraryView {
                 editor.esc_armed = false;
                 self.notice = Some(match skill_body_refusal(editor.area.text()) {
                     Some(sentence) => Notice::Error(sentence),
-                    None => Notice::Info(EDITED.to_owned()),
+                    None => Notice::Info(edited(
+                        ctx.keys()
+                            .label(views::LIBRARY_EDITOR, Act::FormSave)
+                            .as_deref(),
+                    )),
                 });
                 self.mode = Mode::Editing(editor);
             }
