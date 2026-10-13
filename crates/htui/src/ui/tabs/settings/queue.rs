@@ -6,9 +6,9 @@
 //! [`crate::queue_settings::serve`] to carry out. What is on screen is always the last snapshot the
 //! worker assembled; no row is patched in locally.
 //!
-//! Money is typed and shown in USD and stored as micros ([`parse_usd`], [`format_usd`]); the
-//! window is typed `HH:MM-HH:MM` ([`parse_window`]). Every bound is the key's own validator
-//! ([`QueueSetting::validate`]), checked here before a request is sent and again by the store, and
+//! Money is typed and shown in USD and stored as micros ([`parse_usd`](htui_core::model::parse_usd), [`format_usd`](htui_core::model::format_usd)); the
+//! window is typed `HH:MM-HH:MM` ([`parse_window`](htui_core::model::parse_window)). Every bound is the key's own validator
+//! ([`QueueSetting::validate`](htui_core::model::QueueSetting::validate)), checked here before a request is sent and again by the store, and
 //! its sentence is shown verbatim. Empty clears: a cap becomes unbounded, the box limit inherits
 //! the app default.
 

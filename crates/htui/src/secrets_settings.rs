@@ -105,7 +105,7 @@ pub struct IdentityEntry {
 
 impl IdentityEntry {
     /// Both halves; the section trims them and refuses a blank one before building this.
-    /// [`to_identity`](Self::to_identity) trims again, so a worker write stores the trimmed
+    /// `to_identity` trims again, so a worker write stores the trimmed
     /// halves (CLEAN-8 #4).
     #[must_use]
     pub fn new(client_id: String, client_secret: Redacted) -> Self {

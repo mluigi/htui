@@ -6,7 +6,7 @@
 //! [`Stack::EDITOR_OPEN`]. A row for an act in a narrower layer shadows that act in every
 //! wider layer, bound or not (blueprint B6): that is how M2's narrower overrides and
 //! `reject = []` work. [`DECLARED`] lists every stack the key file's validator walks (MOD-67 M2 D8
-//! step 5); M3 adds every Settings and overlay mode's stack from [`views`](super::views), M4 the
+//! step 5); M3 adds every Settings and overlay mode's stack from [`views`], M4 the
 //! Skills and Requirements ones, M5 the Backlog and Chat ones.
 //!
 //! M3 adds two layer kinds. A **view** layer ([`Layer::view`], PA-3) offers the mode's own acts
@@ -209,7 +209,7 @@ pub(super) const WHILE_EDITING: &str = "while an edit is open";
 
 /// Every stack the validator walks (ANA-26 §7.3, MOD-67 M2 D8 step 5), each with the phrase its
 /// collision errors end with. M3 appends every Settings and overlay mode's stack
-/// ([`views`](super::views)). M4 appends the Skills and Requirements stacks and the two editor
+/// ([`views`]). M4 appends the Skills and Requirements stacks and the two editor
 /// stacks (MOD-57 §6.4, D8.2), the editor stacks right after the overlay's, so an `[editor]`
 /// chord is checked against `global.quit` and `global.help`. M5 appends the Backlog and Chat
 /// stacks (in strip order), after M4's.

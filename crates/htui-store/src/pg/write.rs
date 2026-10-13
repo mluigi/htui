@@ -1425,7 +1425,7 @@ impl WriteStore for PgStore {
     /// `SET` list names neither stamp: `created_at` stays the insert's and the `BEFORE UPDATE`
     /// trigger writes `updated_at`, which `RETURNING` sees. A spent token matches no row, so no
     /// unique check runs and a stale rename is `Stale`, not `Constraint` (blueprint P-7). A miss
-    /// reads the row once ([`cas_miss`]): present is `Stale`, absent is `NotFound`.
+    /// reads the row once (`cas_miss`): present is `Stale`, absent is `NotFound`.
     ///
     /// The insert keeps the caller's stamps at the column's resolution, microseconds; `Applied`
     /// carries them as stored, which is the token the next edit passes.
@@ -3694,7 +3694,7 @@ impl WriteStore for PgStore {
     }
 
     /// D3 before the statement, then one `INSERT … RETURNING`: `persona_pkey` is the id,
-    /// `uq_persona_name` the name ([`persona_insert_refused`], `MemStore`'s order). Both stamps
+    /// `uq_persona_name` the name (`persona_insert_refused`, `MemStore`'s order). Both stamps
     /// are the columns' `now()` defaults.
     async fn create_persona(&self, new: NewPersona) -> Result<Persona> {
         if let Some(refusal) = new_persona_refusal(&new) {
@@ -3804,7 +3804,7 @@ impl WriteStore for PgStore {
     /// persona row through `fk_step_graph_phase_persona`, which `FOR UPDATE` conflicts with: a bind
     /// in flight is waited for and then **seen** by the guarded `DELETE`'s snapshot (zero rows, the
     /// sentence); a bind that arrives after the lock waits behind it and gets `23503`, which
-    /// [`phase_persona_refused`] words as `references_no_row`. Without the lock the deleter itself
+    /// `phase_persona_refused` words as `references_no_row`. Without the lock the deleter itself
     /// would see a raw `23503` (probed, plan "Verified claims"). A guard that fired over holders an
     /// unbind removed before they were read runs again, so the sentence never names zero phases.
     ///
@@ -5655,7 +5655,7 @@ impl WriteStore for PgStore {
     /// per repo in scope.
     ///
     /// An empty slice still runs the existence and fence check (`step_fence`) and writes nothing.
-    /// The fence takes the step's update lock ([`StepLock::Update`], MOD-77 plan D1), because this
+    /// The fence takes the step's update lock (`StepLock::Update`, MOD-77 plan D1), because this
     /// transaction may go on to update `run_step.isolation_path`. It is taken before the run's
     /// share lock, `park_step`'s order.
     ///
@@ -5755,7 +5755,7 @@ impl WriteStore for PgStore {
     /// `before` hash when it takes the tree and the `after` hash when it commits, and a second call
     /// carrying `None` means the step produced no commit after all.
     ///
-    /// The fence key-share-locks the step and then share-locks its run ([`StepLock::KeyShare`],
+    /// The fence key-share-locks the step and then share-locks its run (`StepLock::KeyShare`,
     /// MOD-77 plan D1, review L1): the lock the inserts' foreign keys take on the step anyway.
     ///
     /// # Errors
@@ -5808,7 +5808,7 @@ impl WriteStore for PgStore {
     /// A transaction for one insert, and not the bare `execute` a single statement would allow,
     /// because the step check is a second statement and the contract orders the two: an unknown
     /// step must be [`StoreError::NotFound`] and not the `23503` the insert alone would raise.
-    /// [`step_exists`] is the same check the two batch upserts run, in the same place and for the
+    /// `step_exists` is the same check the two batch upserts run, in the same place and for the
     /// same reason.
     ///
     /// No `RETURNING`: the row has no column the server fills in - `queued_at`'s `DEFAULT now()`
@@ -6444,7 +6444,7 @@ impl WriteStore for PgStore {
     // ---- ANA-11 §5.1 (MOD-38) ----
 
     /// The spec header's compare-and-set (plan D9), one statement per branch plus
-    /// [`cas_miss`]'s follow-up read on a miss.
+    /// `cas_miss`'s follow-up read on a miss.
     ///
     /// `None` is an `INSERT ... ON CONFLICT DO NOTHING`, so a header that already exists is
     /// untouched and answered `Stale`; `Some(v)` is an `UPDATE ... WHERE version = v`, and a miss
@@ -6626,7 +6626,7 @@ impl WriteStore for PgStore {
         })
     }
 
-    /// [`revise_requirement`] with the patch's columns and reason, and an `amends` citation.
+    /// `revise_requirement` with the patch's columns and reason, and an `amends` citation.
     ///
     /// # Errors
     ///
@@ -6659,7 +6659,7 @@ impl WriteStore for PgStore {
         .await
     }
 
-    /// [`revise_requirement`] to `state = withdrawn`, reason `withdrawn`, and a `withdraws`
+    /// `revise_requirement` to `state = withdrawn`, reason `withdrawn`, and a `withdraws`
     /// citation.
     ///
     /// # Errors
@@ -7007,8 +7007,8 @@ impl WriteStore for PgStore {
     // ---- MOD-11 (D13) ----
 
     /// D13: [`write_document`](WriteStore::write_document) for the step's own item, one
-    /// transaction: [`step_scope`] (the step and its run, `FOR SHARE OF s, r`), the own-item
-    /// check, then the item `FOR UPDATE` and [`insert_document`] — `park_step`'s step → run → item
+    /// transaction: `step_scope` (the step and its run, `FOR SHARE OF s, r`), the own-item
+    /// check, then the item `FOR UPDATE` and `insert_document` — `park_step`'s step → run → item
     /// order, so the two never deadlock
     /// (`pg_criteria.rs::a_step_document_racing_a_park_never_deadlocks`).
     ///
@@ -7049,7 +7049,7 @@ impl WriteStore for PgStore {
         Ok(written)
     }
 
-    /// D13: [`add_note`](WriteStore::add_note)'s insert after [`step_scope`] and the own-item
+    /// D13: [`add_note`](WriteStore::add_note)'s insert after `step_scope` and the own-item
     /// check, one transaction. No explicit item lock: the foreign key's `FOR KEY SHARE` on `item`
     /// comes after the run, which keeps the order.
     ///
@@ -7101,7 +7101,7 @@ impl WriteStore for PgStore {
         Ok(row)
     }
 
-    /// D13, B-6: the upsert, one transaction after [`step_scope`], the own-item check and `to`'s
+    /// D13, B-6: the upsert, one transaction after `step_scope`, the own-item check and `to`'s
     /// project. A live row keeps its proposer; a tombstone revives with the step as proposer.
     /// `updated_at` is the `BEFORE UPDATE` trigger's.
     ///
@@ -7166,7 +7166,7 @@ impl WriteStore for PgStore {
     }
 
     /// D13, B-5: tombstones the live link when a step of `link.step`'s run proposed it, one
-    /// transaction after [`step_scope`] and the own-item check; a miss is told apart by one
+    /// transaction after `step_scope` and the own-item check; a miss is told apart by one
     /// re-read of the live row.
     ///
     /// # Errors
@@ -8087,7 +8087,7 @@ impl PgStore {
     /// serialise (H-6).
     ///
     /// In the same transaction, every run of the batch still `queued` is cancelled through
-    /// [`finish_run_on`], so its item goes back to `open` by `finish_run`'s mirror and its queue
+    /// `finish_run_on`, so its item goes back to `open` by `finish_run`'s mirror and its queue
     /// entry stays (review H2): a pause stops the runs no process has claimed yet, not only the
     /// admissions. The runs are locked `FOR UPDATE` after the batch row, so a racing `claim_run`
     /// (which locks the run row first) either claims the run before this reads it - the run is

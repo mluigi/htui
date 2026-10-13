@@ -575,7 +575,7 @@ fn install(prepared: Prepared, variant: Variant, rename: Rename<'_>) -> Result<R
     })
 }
 
-/// Writes the plugin into `dir`: [`prepare`], then [`install`] with `fs::rename`. Nothing outside
+/// Writes the plugin into `dir`: `prepare`, then `install` with `fs::rename`. Nothing outside
 /// `dir`, its siblings `<dir>.emit-<pid>` and `<dir>.old-<pid>`, and `dir`'s missing parents is
 /// written.
 ///

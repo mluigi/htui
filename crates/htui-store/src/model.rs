@@ -5,7 +5,7 @@
 //! that fastembed used to read from the repository's `config.json`, `tokenizer_config.json` and
 //! `special_tokens_map.json`, so neither of those files is needed.
 //!
-//! [`ensure_model`] finds those two files on first use (plan D6): a verified copy in
+//! [`ensure_model`](crate::model::ensure_model) finds those two files on first use (plan D6): a verified copy in
 //! `<cache>/htui/model/`, else a verified copy adopted from fastembed's old cache, else a download
 //! from Hugging Face at the pinned commit, hashed as it arrives and renamed into place only on a
 //! match. Nothing is fetched at build time.

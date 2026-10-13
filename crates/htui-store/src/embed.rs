@@ -3,7 +3,7 @@
 //! [`DenseEmbedder`] is the seam the vector store embeds through. Production uses
 //! `RtenEmbedder` (BGE-small-en-v1.5 on the pure-Rust `rten` runtime, behind the `local-embed`
 //! feature, MOD-68), whose model is fetched, pinned and verified, on first use by `crate::model`;
-//! nothing is downloaded at build time. Tests use [`HashEmbedder`], which needs neither a model
+//! nothing is downloaded at build time. Tests use `HashEmbedder`, which needs neither a model
 //! nor a network. The sparse half of hybrid search is not a model at all: see [`crate::bm25`].
 use htui_core::store::StoreError;
 use std::fmt;
@@ -26,7 +26,7 @@ pub const DENSE_DIM: usize = 384;
 /// whether such a stamp still matches. Neither changes the stored JSON.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct EmbedderIdentity {
-    /// The model's name: a Hugging Face repository, or `hash` for [`HashEmbedder`].
+    /// The model's name: a Hugging Face repository, or `hash` for `HashEmbedder`.
     pub model: String,
     /// The repository's commit the files come from; empty when there is none.
     pub revision: String,
@@ -41,7 +41,7 @@ pub struct EmbedderIdentity {
 }
 
 impl EmbedderIdentity {
-    /// [`HashEmbedder`]'s identity at width `dim`, which reads `hash/<dim>`.
+    /// `HashEmbedder`'s identity at width `dim`, which reads `hash/<dim>`.
     #[must_use]
     pub fn hash(dim: usize) -> Self {
         Self {

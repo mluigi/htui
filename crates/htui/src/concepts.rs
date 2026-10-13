@@ -536,7 +536,7 @@ pub fn qdrant_settings(
 
 /// `--search-items` over `ctx`, with the model from `load` (review R1 M4). Never fails: a failure
 /// is an [`Answer`] too. In A-2's order: the read-only connect, the scope (the pool is closed once
-/// it is read, review R1 L9), then the index ([`search_index`]: Qdrant first, the model only when
+/// it is read, review R1 L9), then the index (`search_index`: Qdrant first, the model only when
 /// there is a collection to search).
 pub async fn search_answer_with<E, F, Fut>(
     ctx: &SearchContext<'_>,

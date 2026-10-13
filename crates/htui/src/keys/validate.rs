@@ -1,7 +1,7 @@
 //! The key file's semantic checks over the merged keys (MOD-67 M2 D8 steps 5-6; ANA-26 §7.4
 //! step 7): collisions in every context and in every declared stack, printable chords on
 //! actions offered while a field captures, and (MOD-67 M5 R1) a user chord on a key a view keeps
-//! for itself ahead of the resolver ([`FIXED`]). Before them, [`give_way`] lets an entry of the
+//! for itself ahead of the resolver ([`FIXED`]). Before them, `give_way` lets an entry of the
 //! file take its chord from an action the file leaves at its default (MOD-12 M3 R1 H1).
 //!
 //! MOD-67 M3: the per-context pass skips view contexts (PA-4: a view context holds rows of modes
@@ -88,7 +88,7 @@ fn abort_gives_way(entry: &Row, default: &Row) -> bool {
 /// Four passes, in this order: two actions sharing a chord in one shared or global context; two
 /// candidates for one chord in a [`DECLARED`] stack; a chord shared with `editor.focus` in any
 /// context (MOD-57 M2 E9 (d)); a printable chord on an `in_capture` action; an act of a stack
-/// bound to a key its view keeps fixed ([`FIXED`], MOD-67 M5 R1 M1). [`give_way`] ran first, so
+/// bound to a key its view keeps fixed ([`FIXED`], MOD-67 M5 R1 M1). `give_way` ran first, so
 /// a default that gave its chord away (the abort's to a global entry, M2 R1 M-1) is no
 /// collision; a focus chord shared with anything, and an `[editor] abort` entry on a global
 /// default, still are. A pair and chord seen by two passes is reported once. A

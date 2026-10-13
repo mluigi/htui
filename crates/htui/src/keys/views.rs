@@ -12,7 +12,7 @@
 //! M4 adds the Skills and Requirements stacks. Layer order: view, a parent view's `only` layer
 //! (the attachments pane over the Library), `settings`/`skills`, `confirm`, `form`, `common`,
 //! `list`, `pane`, `overlay`, then the global layers; a capturing Skills mode whose widget passes
-//! `Tab` puts [`TABS`] before [`MODAL`] (PA-2).
+//! `Tab` puts `TABS` before `MODAL` (PA-2).
 //!
 //! M5 adds the Backlog and Chat stacks. A Backlog browse stack is the pane's view layer, then the
 //! tail every sub-tab shares: `pane` (narrowed per pane), `backlog`, `common ∩ {edit}`, `list`,

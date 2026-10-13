@@ -314,7 +314,7 @@ impl AcpDriver {
     /// `HTUI_SESSION=1` ([`crate::launch::SESSION_VAR`], MOD-91 D4) goes in after `spec.env`, on
     /// every session whatever `user_extensions` says; the adapter passes its `process.env` to the
     /// CLI it spawns (`acp-agent.js:5915-5925`), so the variable reaches Claude Code. Only
-    /// [`io`](Self::io) calls this in production, so it marks exactly the sessions: a login
+    /// `io` calls this in production, so it marks exactly the sessions: a login
     /// resolves through [`launch_in`](Self::launch_in) and a probe through `launch::spawn`, and
     /// neither is a session (blueprint B3).
     ///

@@ -341,7 +341,7 @@ fn cwd_unmatched(cwd: &Path) -> Failure {
 /// Writes `answer`: under `json` one compact document and a newline, else the human text; a reader
 /// that closed the pipe is not an error (`write_out`). Then the exit: `Ok` for 0, else the
 /// [`StateExit`] carrying the human sentence (`main` prints it on stderr; nothing here prints to
-/// stderr but the note [`human_text`] returns beside the text: search's "no matches" / "the index
+/// stderr but the note `human_text` returns beside the text: search's "no matches" / "the index
 /// is empty").
 ///
 /// # Errors

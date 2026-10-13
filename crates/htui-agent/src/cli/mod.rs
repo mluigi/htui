@@ -251,7 +251,7 @@ pub fn argv(
 /// skills and slash commands. Auth, `htui`'s `--mcp-config` server and `--permission-prompt-tool`
 /// keep working under both. `--settings` takes one value, so the pair is spaced, as probed.
 /// Plugin agents and plugin MCP servers survive (T1 case 5, D7). Changing this changes
-/// `isolation_args_are_the_probed_levers` and, if `disableAllHooks` goes, [`HOOKS_OFF`]'s check.
+/// `isolation_args_are_the_probed_levers` and, if `disableAllHooks` goes, `HOOKS_OFF`'s check.
 pub const ISOLATION_ARGS: [&str; 3] = [
     "--settings",
     r#"{"disableAllHooks":true}"#,
