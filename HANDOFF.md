@@ -14,7 +14,9 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-13):** **MOD-93 is done** (`docs/decisions/mod/mod-93.md`): `htui claude emit [--dir]
+**Current status (2026-10-13):** **CLEAN-10 is done** (`docs/decisions/clean/clean-10.md`): `cargo doc --workspace
+--no-deps` passes with and without `--all-features` (docs-only; 33 private or unresolved intra-doc links fixed). Before it,
+**MOD-93 is done** (`docs/decisions/mod/mod-93.md`): `htui claude emit [--dir]
 [--force]` writes a local Claude Code marketplace from files built into the binary, holding plugin `htui` at the
 binary's version: a skill that reads htui through MOD-92's `--json` verbs and hands work to htui, and a mod with a
 waiting-on-you band, a `/htui` pane and turnless `/htui status|waiting|search` (skill-only below Claude Code 2.1.287;
@@ -482,13 +484,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 ### Deferred backlog
 
-- [ ] **CLEAN-10 - `cargo doc` fails on private intra-doc links** (found at MOD-12 M2's gate).
-  `cargo doc --workspace --no-deps --all-features` stops with 17 errors in `htui-core` and
-  `htui-store`. They are public docs linking to private items (`close_batch` →
-  `State::finish_run`/`finish_run_on`, `upsert_agent`/`set_requirement_spec` → `cas_miss`,
-  `write_step_document`/`propose_link`/`add_step_note`/`withdraw_link` → `step_scope`, …) and one
-  unresolved `ensure_model`. All of them predate M2. Point those links at public items, or turn them
-  into plain code spans. Not blocked.
 - [ ] **CLEAN-11 - CLEAN-9 deferred review residuals** (from CLEAN-9, `docs/decisions/clean/clean-9.md`).
   `R-AGT-7`.
   - **Pin the once-per-batch log levels.** `note_batch_stop` logs `info` for a batch's first stop and
@@ -571,5 +566,5 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-30 utility models) |
 | MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
-| CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
+| CLEAN-N | 2 (CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |
