@@ -105,6 +105,20 @@ test('command resumes polling when the pane stayed open across a reload', { opti
   expect(waitingCalls(calls)).toBe(2)
 })
 
+test('a pane that waits undrawn says why', { options: { panel: 'command' } }, async ($, on) => {
+  const clock = mock.clock(on)
+  const calls: Call[] = []
+  htui(on, { waiting: ok(WAITING) }, calls)
+  const reason = 'the terminal is 90 columns wide; the pane is seated from 110'
+  on('ui.open', async () => ({ value: { isPlaced: false, reason } }))
+  await start($, on)
+  await clock.settle()
+  const r = await $.command.run({ command: 'htui', args: '' } as never)
+  expect(r.text).toBe(`htui: the pane waits: ${reason}`)
+  await clock.settle()
+  expect(waitingCalls(calls)).toBe(1)
+})
+
 test('off never polls and never opens a pane', { options: { panel: 'off' } }, async ($, on) => {
   const clock = mock.clock(on)
   const calls: Call[] = []
