@@ -4,7 +4,7 @@
 **Requirements**: `R-TUI-11`, `R-ID-2`, `R-ID-6`, `R-STO-1`, `R-NF-2`
 **Route**: plan path (routing verdict accepted by the maintainer, 2026-10-08)
 **Complexity**: Medium
-**Status**: draft - awaiting CONFIRM
+**Status**: done (2026-10-13) - `docs/decisions/mod/mod-92.md`
 
 ## Summary
 
