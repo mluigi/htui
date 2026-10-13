@@ -523,7 +523,15 @@ impl BacklogTab {
             | QueueWrite::Moved { .. }
             | QueueWrite::Stale { .. } => String::new(),
         };
-        ctx.emit(Action::Error(queue_sentence(write, &key, view)));
+        let pause = ctx
+            .keys()
+            .label(self.detail.key_stack(), Act::BacklogPauseQueue);
+        ctx.emit(Action::Error(queue_sentence(
+            write,
+            &key,
+            view,
+            pause.as_deref(),
+        )));
     }
 
     /// A key while the item form is open (D8, A7).
@@ -1054,8 +1062,15 @@ const DEMO_NOTHING_ADMITTED: &str = "demo: nothing is admitted";
 
 /// MOD-12 D9: the status line after a queue write. `n` is the queue's length after it. In
 /// `htui --demo` (`view.demo`) a running queue says nothing is admitted (review L3). The queue
-/// overlay says its writes with it too (M3 review R1 N2).
-pub(crate) fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) -> String {
+/// overlay says its writes with it too (M3 review R1 N2). `pause` is the label of the key that
+/// pauses on the caller's stack (MOD-67 M6 X-S): a refused pause names it, and drops the clause
+/// that would when none is bound.
+pub(crate) fn queue_sentence(
+    write: &QueueWrite,
+    key: &str,
+    view: &QueueView,
+    pause: Option<&str>,
+) -> String {
     let n = view.entries.len();
     match *write {
         QueueWrite::Queued { .. } => match (view.open_batch.is_some(), view.demo) {
@@ -1093,12 +1108,20 @@ pub(crate) fn queue_sentence(write: &QueueWrite, key: &str, view: &QueueView) ->
         QueueWrite::Moved { moved: false } => "already at that end of the queue".to_owned(),
         // M3 review R1 M1: `P` sent over a queue that changed since it was read; `view` is the
         // queue now.
-        QueueWrite::Stale { pause: true } if view.open_batch.is_none() => {
-            "queue already paused: its batch closed before P reached it".to_owned()
-        }
-        QueueWrite::Stale { pause: true } => {
-            "queue not paused: it was resumed since it was read; P again pauses it".to_owned()
-        }
+        QueueWrite::Stale { pause: true } if view.open_batch.is_none() => match pause {
+            Some(pause) => {
+                format!("queue already paused: its batch closed before {pause} reached it")
+            }
+            None => "queue already paused: its batch closed first".to_owned(),
+        },
+        QueueWrite::Stale { pause: true } => match pause {
+            Some(pause) => {
+                format!(
+                    "queue not paused: it was resumed since it was read; {pause} again pauses it"
+                )
+            }
+            None => "queue not paused: it was resumed since it was read".to_owned(),
+        },
         QueueWrite::Stale { pause: false } if view.open_batch.is_some() => {
             "queue already running: it was resumed since it was read".to_owned()
         }
@@ -1299,7 +1322,56 @@ mod tests {
             ),
         ];
         for (write, view, sentence) in cases {
-            assert_eq!(queue_sentence(&write, "K-1", &view), sentence, "{write:?}");
+            assert_eq!(
+                queue_sentence(&write, "K-1", &view, Some("P")),
+                sentence,
+                "{write:?}"
+            );
+        }
+    }
+
+    /// MOD-67 M6 X-S (PA-5): a refused pause names the key that pauses, the one the caller's
+    /// stack binds; with no key bound the sentence drops the clause that would name one.
+    #[test]
+    fn a_rebound_pause_key_is_the_one_the_stale_sentence_names() {
+        let paused = QueueView {
+            entries: vec![ItemId::new()],
+            open_batch: None,
+            demo: false,
+        };
+        let running = QueueView {
+            open_batch: Some(htui_core::model::BatchId::new()),
+            ..paused.clone()
+        };
+        let stale = QueueWrite::Stale { pause: true };
+        let cases = [
+            (
+                &paused,
+                Some("X"),
+                "queue already paused: its batch closed before X reached it",
+            ),
+            (
+                &running,
+                Some("X"),
+                "queue not paused: it was resumed since it was read; X again pauses it",
+            ),
+            (
+                &paused,
+                None,
+                "queue already paused: its batch closed first",
+            ),
+            (
+                &running,
+                None,
+                "queue not paused: it was resumed since it was read",
+            ),
+        ];
+        for (view, pause, sentence) in cases {
+            assert_eq!(
+                queue_sentence(&stale, "", view, pause),
+                sentence,
+                "{pause:?}"
+            );
         }
     }
 

@@ -314,6 +314,39 @@ async fn p_over_a_batch_the_runner_closed_is_refused_and_opens_nothing() {
     );
 }
 
+/// MOD-67 M6 X-S (PA-5): `[queue] pause = "X"`; the runner closes the batch the box showed, and
+/// the refused pause names `X`, the key that pauses in this box, not the default `P`.
+#[tokio::test]
+async fn a_rebound_pause_key_is_named_after_a_stale_pause() {
+    let store = queued(&[ids::HTUI_ANA_2]).await;
+    let seen = store
+        .open_batch(ids::BOX, ids::USER, Utc::now())
+        .await
+        .expect("the batch opens")
+        .id;
+    let keys = load_str("[queue]\npause = \"X\"\n").expect("the keys load");
+    let mut harness = opened_with(&store, keys).await;
+
+    // The runner's stall close (L4), behind the overlay's back.
+    store
+        .close_drained_batch(seen, &[ids::HTUI_ANA_2], Utc::now())
+        .await
+        .expect("the store answers")
+        .expect("the stalled batch closed");
+
+    harness.key("X");
+    harness.drive_to_end().await;
+    assert_eq!(
+        store.open_batch_of(ids::BOX).await.expect("reads"),
+        None,
+        "no batch opened"
+    );
+    assert_eq!(
+        harness.app().status.as_deref(),
+        Some("queue already paused: its batch closed before X reached it")
+    );
+}
+
 /// MOD-67 M6: the lane's rebinding test, through the store. `[queue] move_down = "D"` and
 /// `move_up = "U"`: `J` is inert, `D` moves the cursor row down in the store, and the hint names
 /// the new chords.

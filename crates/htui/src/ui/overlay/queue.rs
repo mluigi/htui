@@ -526,7 +526,13 @@ impl Overlay for QueueOverlay {
                     | QueueWrite::Moved { .. }
                     | QueueWrite::Stale { .. } => String::new(),
                 };
-                ctx.emit(Action::Error(queue_sentence(write, &key, view)));
+                let pause = ctx.keys().label(views::QUEUE_OVERLAY, Act::QueuePause);
+                ctx.emit(Action::Error(queue_sentence(
+                    write,
+                    &key,
+                    view,
+                    pause.as_deref(),
+                )));
                 self.reread(ctx);
             }
             StoreReply::Failed { request, message } if *request == OVERVIEW => {
