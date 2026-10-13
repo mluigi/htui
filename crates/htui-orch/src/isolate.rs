@@ -19,9 +19,11 @@ use htui_core::model::{Isolation, RepoId, RunId, RunStepCommit, RunStepTree, Ste
 use htui_core::prompt::DiffBlock;
 
 pub mod copy;
+pub mod env_files;
 pub mod git;
 pub mod real;
 
+pub use env_files::EnvFiles;
 pub use htui_core::clock::{Clock, SystemClock};
 pub use real::{GixIsolator, IsolatorConfig, RepoCheckout};
 
