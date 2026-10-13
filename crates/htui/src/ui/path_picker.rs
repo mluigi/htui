@@ -5,16 +5,20 @@
 //! requests leave as [`PickerOutcome::Request`] for the owning section to send (`R-NF-3`).
 //! Navigation is lexical and never canonicalises, so nothing on screen names a link's target (P5,
 //! `R-BOX-4`): the one canonicalisation is the write the section sends on [`PickerOutcome::Chosen`].
+//!
+//! Its keys resolve through the owner's stack (`views::HIERARCHY_PICKER` for Settings ›
+//! Hierarchy, MOD-67 M6); the go-to field's keys are the field's.
 
 use std::path::{Component, Path, PathBuf};
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use htui_core::root_path::DirListing;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack};
 use crate::store_worker::{LIST_DIR, StoreReply, StoreRequest};
 use crate::ui::cells::{cell_width, graphemes};
 use crate::ui::layout::centered;
@@ -26,12 +30,25 @@ const CURSOR: &str = "> ";
 /// The marker's width, in front of every other line, so names stay in one column.
 const NO_CURSOR: &str = "  ";
 
-/// The first half of the hint under the entries: the keys that move and choose (P8). The two
-/// halves share one line when it fits and take one line each when it doesn't (review L-2).
-const HINT_MOVE: &str = "j/k move \u{b7} Enter open \u{b7} h up \u{b7} s choose \u{b7} S this dir";
+/// The first half of the hint under the entries: the keys that move and choose (MOD-49 P8;
+/// MOD-67 M6 D3), through the owner's stack: `j/k move · Enter open · h up · s choose · S this
+/// dir` under the defaults. The two halves share one line when it fits and take one line each when
+/// it doesn't (review L-2).
+const HINT_MOVE: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::PickerOpen, "open"),
+    Hint::One(Act::PickerParent, "up"),
+    Hint::One(Act::PickerChoose, "choose"),
+    Hint::One(Act::PickerChooseDir, "this dir"),
+];
 
-/// The hint's second half: the keys that change what is listed, and the way out.
-const HINT_MORE: &str = "/ go to \u{b7} . hidden \u{b7} Esc cancel";
+/// The hint's second half: the keys that change what is listed, and the way out: `/ go to ·
+/// . hidden · Esc cancel` under the defaults.
+const HINT_MORE: HintSpec = &[
+    Hint::One(Act::PickerGoTo, "go to"),
+    Hint::One(Act::PickerHidden, "hidden"),
+    Hint::One(Act::Back, "cancel"),
+];
 
 /// Between the two halves when they share a line.
 const HINT_GAP: &str = " \u{b7} ";
@@ -45,13 +62,14 @@ const MAX_WIDTH: u16 = 96;
 /// What one key did (MOD-49 P8).
 #[derive(Debug, Clone)]
 pub enum PickerOutcome {
-    /// Handled here (moved, typed, swallowed): nothing for the section to do.
+    /// Handled here (moved, typed, or a declined key of the picker's): nothing for the section to
+    /// do.
     None,
     /// A listing to send through `ctx.request` — a read, never marked busy (P11).
     Request(StoreRequest),
     /// The directory the user chose, as navigated (never canonicalised; the write does that).
     Chosen(String),
-    /// `Esc` outside go-to: close the picker, write nothing.
+    /// `common.back` outside go-to: close the picker, write nothing.
     Cancelled,
 }
 
@@ -117,11 +135,25 @@ impl PathPicker {
         &self.path
     }
 
-    /// One key (P8, blueprint D11, D12, D15). The caller passes `CONTROL` chords on before
-    /// calling this; every key not bound here is swallowed (`PickerOutcome::None`).
-    pub fn on_key(&mut self, key: KeyEvent) -> PickerOutcome {
+    /// Whether the go-to field is open: the owner puts the picker on a capture stack then.
+    #[must_use]
+    pub const fn goto_open(&self) -> bool {
+        self.goto.is_some()
+    }
+
+    /// One key (MOD-49 P8, blueprint D11, D12, D15; MOD-67 M6 D3). While go-to is open the field
+    /// takes it (its keys are the widget's, ANA-26 §6.1) and the answer is always `Some`.
+    /// Otherwise the chord resolves through `stack` (the owner's picker stack) and the first act
+    /// the picker takes wins; a chord equal to no picker act is `None`, for the owner's modal rest
+    /// (`q`, `?`, the digits are swallowed there, `F1` and `ctrl-c` pass).
+    pub fn on_key(
+        &mut self,
+        key: KeyEvent,
+        keys: &Keys,
+        stack: Stack<'_>,
+    ) -> Option<PickerOutcome> {
         if let Some(field) = &mut self.goto {
-            return match field.on_key(key) {
+            return Some(match field.on_key(key) {
                 FieldOutcome::Submit => {
                     let typed = field.text().unwrap_or_default().trim().to_owned();
                     self.goto = None;
@@ -136,23 +168,31 @@ impl PathPicker {
                     PickerOutcome::None
                 }
                 FieldOutcome::Consumed | FieldOutcome::Pass => PickerOutcome::None,
-            };
+            });
         }
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+        let chord = KeyChord::from_event(key);
+        keys.actions(stack, chord)
+            .into_iter()
+            .find_map(|act| self.on_act(act))
+    }
+
+    /// One resolved act; `None` for an act that is not the picker's (a global one).
+    fn on_act(&mut self, act: Act) -> Option<PickerOutcome> {
+        Some(match act {
+            Act::ListDown => {
                 let last = self.entry_count().saturating_sub(1);
                 self.cursor = (self.cursor + 1).min(last);
                 PickerOutcome::None
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            Act::ListUp => {
                 self.cursor = self.cursor.saturating_sub(1);
                 PickerOutcome::None
             }
-            KeyCode::Enter | KeyCode::Char('l') => match self.highlighted() {
+            Act::PickerOpen => match self.highlighted() {
                 Some(next) => PickerOutcome::Request(self.ask(next)),
                 None => PickerOutcome::None,
             },
-            KeyCode::Char('h') | KeyCode::Backspace => match parent(&self.path) {
+            Act::PickerParent => match parent(&self.path) {
                 Some(up) => {
                     let came_from = Path::new(&self.path)
                         .file_name()
@@ -165,24 +205,29 @@ impl PathPicker {
                 }
                 None => PickerOutcome::None,
             },
-            KeyCode::Char('s') => self
+            Act::PickerChoose => self
                 .highlighted()
                 .map_or(PickerOutcome::None, PickerOutcome::Chosen),
-            KeyCode::Char('S') if self.listing.is_some() => {
-                PickerOutcome::Chosen(self.path.clone())
+            // A declined `S` (no listing) is still the picker's: consumed, as before.
+            Act::PickerChooseDir => {
+                if self.listing.is_some() {
+                    PickerOutcome::Chosen(self.path.clone())
+                } else {
+                    PickerOutcome::None
+                }
             }
-            KeyCode::Char('/') => {
+            Act::PickerGoTo => {
                 self.goto = Some(TextField::with_text("/"));
                 PickerOutcome::None
             }
-            KeyCode::Char('.') => {
+            Act::PickerHidden => {
                 self.show_hidden = !self.show_hidden;
                 PickerOutcome::Request(self.ask(self.path.clone()))
             }
-            KeyCode::Esc => PickerOutcome::Cancelled,
-            // Swallowed (D15): `q` must not quit and `?` must not open help mid-pick.
-            _ => PickerOutcome::None,
-        }
+            Act::Back => PickerOutcome::Cancelled,
+            // Not the picker's: the owner's modal rest swallows it or passes it (D15).
+            _ => return None,
+        })
     }
 
     /// A bracketed paste (P6, blueprint D12): into go-to when it is open, opening it otherwise.
@@ -234,8 +279,18 @@ impl PathPicker {
     }
 
     /// The popup, centred over `area` (blueprint D14): a fixed box, because a listing of up to
-    /// `LIST_CAP` entries can't be sized to its content.
-    pub fn render(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+    /// `LIST_CAP` entries can't be sized to its content. Its hint is rendered through `stack`
+    /// with `keys` (MOD-67 M6), so a rebound picker key shows its new chord.
+    pub fn render(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        keys: &Keys,
+        stack: Stack<'_>,
+    ) {
+        let hints = (keys.hint(stack, HINT_MOVE), keys.hint(stack, HINT_MORE));
+        let hidden = keys.label(stack, Act::PickerHidden);
         let box_area = centered(
             area,
             area.width.saturating_sub(4).min(MAX_WIDTH),
@@ -245,6 +300,8 @@ impl PathPicker {
             box_area.width.saturating_sub(2),
             usize::from(box_area.height.saturating_sub(2)),
             theme,
+            (&hints.0, &hints.1),
+            hidden.as_deref(),
         );
         frame.render_widget(Clear, box_area);
         frame.render_widget(
@@ -285,8 +342,17 @@ impl PathPicker {
     }
 
     /// The box's contents for an inner area of `width` × `height`: the header, the entries
-    /// window (or one of the three empty texts), go-to while open, a blank line and the hint.
-    fn lines(&self, width: u16, height: usize, theme: &Theme) -> Vec<Line<'static>> {
+    /// window (or one of the three empty texts), go-to while open, a blank line and the hint's two
+    /// rendered halves (`hints`; an empty one dropped). `hidden` is the label of
+    /// `picker.hidden`, for the empty listing's text.
+    fn lines(
+        &self,
+        width: u16,
+        height: usize,
+        theme: &Theme,
+        hints: (&str, &str),
+        hidden: Option<&str>,
+    ) -> Vec<Line<'static>> {
         let mut footer = Vec::new();
         if let Some(field) = &self.goto {
             let room = width.saturating_sub(u16::try_from(cell_width(GOTO)).unwrap_or(u16::MAX));
@@ -295,12 +361,14 @@ impl PathPicker {
             footer.push(Line::from(spans));
         }
         footer.push(Line::raw(""));
-        let one_line = format!("{NO_CURSOR}{HINT_MOVE}{HINT_GAP}{HINT_MORE}");
-        if cell_width(&one_line) <= usize::from(width) {
+        let (first, second) = hints;
+        let one_line = format!("{NO_CURSOR}{first}{HINT_GAP}{second}");
+        if !first.is_empty() && !second.is_empty() && cell_width(&one_line) <= usize::from(width) {
             footer.push(Line::styled(one_line, theme.dim));
         } else {
-            footer.push(Line::styled(format!("{NO_CURSOR}{HINT_MOVE}"), theme.dim));
-            footer.push(Line::styled(format!("{NO_CURSOR}{HINT_MORE}"), theme.dim));
+            for half in [first, second].into_iter().filter(|half| !half.is_empty()) {
+                footer.push(Line::styled(format!("{NO_CURSOR}{half}"), theme.dim));
+            }
         }
 
         let rows = height.saturating_sub(1 + footer.len());
@@ -308,7 +376,7 @@ impl PathPicker {
             clip_left(&self.path, usize::from(width)),
             theme.accent,
         )];
-        lines.extend(self.body(width, rows, theme));
+        lines.extend(self.body(width, rows, theme, hidden));
         lines.extend(footer);
         lines
     }
@@ -316,8 +384,15 @@ impl PathPicker {
     /// The entries in a window of `rows` lines that always holds the cursor, then `+N more`; or
     /// the error, "reading…", or the empty text — three different screens (the switcher's rule).
     /// The error is wrapped to `width` (review L-2): it names a path, and a long one would push
-    /// the reason off the edge.
-    fn body(&self, width: u16, rows: usize, theme: &Theme) -> Vec<Line<'static>> {
+    /// the reason off the edge. The empty text names `hidden`, the label of `picker.hidden`, and
+    /// no key when it is unbound (MOD-67 M6 D4).
+    fn body(
+        &self,
+        width: u16,
+        rows: usize,
+        theme: &Theme,
+        hidden: Option<&str>,
+    ) -> Vec<Line<'static>> {
         if let Some(error) = &self.error {
             let room = usize::from(width).saturating_sub(cell_width(NO_CURSOR));
             return wrap(error, room)
@@ -332,10 +407,9 @@ impl PathPicker {
             )];
         };
         if listing.entries.is_empty() {
-            let hidden = if self.show_hidden {
-                ""
-            } else {
-                " \u{b7} . shows hidden"
+            let hidden = match hidden {
+                Some(label) if !self.show_hidden => format!(" \u{b7} {label} shows hidden"),
+                _ => String::new(),
             };
             return vec![Line::styled(
                 format!("{NO_CURSOR}no directories here{hidden}"),

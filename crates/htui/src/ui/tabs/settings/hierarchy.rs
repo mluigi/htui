@@ -11,9 +11,9 @@
 //! the mode is what [`captures_input`](SettingsSection::captures_input) is derived from rather than
 //! a flag of its own (D2): in `Browse` the tab still cycles on `h`/`l` and the global table still
 //! owns `q`, `?`, `Tab` and the digits; while an editor, a delete confirmation or the picker is
-//! open those letters are text (or the picker's own keys) and are swallowed, with one carve-out —
-//! a chord the mode's modal global layer admits (`CONTROL`, `ALT`, a function key) passes, so
-//! `ctrl-c` quits from inside a half-typed slug and `F1` opens help.
+//! open those letters are text (or the picker's keys (`[picker]`)) and are swallowed, with one
+//! carve-out — a chord the mode's modal global layer admits (`CONTROL`, `ALT`, a function key)
+//! passes, so `ctrl-c` quits from inside a half-typed slug and `F1` opens help.
 //!
 //! Every mode resolves its keys through its own stack in [`views`] (MOD-67 M3), so a chord
 //! matches with its modifiers (`ctrl-d` is not `d`) and a rebound key acts under its new chord;
@@ -81,9 +81,13 @@ const HINT_EDITING: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list, and the
-/// picker's keys are its own in M3 (blueprint L-C Q3).
-const HINT_PICKING: HintSpec = &[Hint::Text("choosing a directory"), Hint::Text("Esc cancel")];
+/// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list; the
+/// way out goes through the mode's stack (MOD-67 M6), so it drops while the go-to field is open,
+/// where `Esc` closes only the field.
+const HINT_PICKING: HintSpec = &[
+    Hint::Text("choosing a directory"),
+    Hint::One(Act::Back, "cancel"),
+];
 
 /// What a CAS miss says while an editor is open (D7, PRD D8): the text is kept, the token is not,
 /// and the retry is the user's.
@@ -507,13 +511,15 @@ impl HierarchySection {
 
     /// The stack of the current mode (MOD-67 M3), as `key_stack`, the delete and the picker read
     /// it; the browse and editor handlers name their own mode's constant, which is this one
-    /// whenever they run. The typed confirmation, the delete in flight and the picker are a field
-    /// or a widget and nothing else ([`views::CAPTURE`]).
+    /// whenever they run. The typed confirmation and the delete in flight are a field or a
+    /// widget and nothing else ([`views::CAPTURE`]); the picker is on
+    /// [`views::HIERARCHY_PICKER`], its go-to field on [`views::CAPTURE`] (MOD-67 M6).
     fn stack(&self) -> Stack<'static> {
         match &self.mode {
             Mode::Browse => views::HIERARCHY_BROWSE,
             Mode::Editing(_) => views::HIERARCHY_EDITOR,
-            Mode::Picking { .. } => views::CAPTURE,
+            Mode::Picking { picker, .. } if picker.goto_open() => views::CAPTURE,
+            Mode::Picking { .. } => views::HIERARCHY_PICKER,
             Mode::Deleting { stage, .. } => match stage {
                 DeleteStage::Counting => views::HIERARCHY_DELETE_COUNTING,
                 DeleteStage::Warn(_) => views::HIERARCHY_DELETE_WARN,
@@ -1023,22 +1029,26 @@ impl HierarchySection {
         }
     }
 
-    /// One key while the picker is open (MOD-49 P8, blueprint H-4, D15).
+    /// One key while the picker is open (MOD-49 P8, blueprint H-4, D15; MOD-67 M6 D3).
     ///
-    /// A chord the modal global layer admits (`CONTROL`, `ALT`, a function key) passes first, so
-    /// `ctrl-c` still quits and `F1` opens help (MOD-67 D5, blueprint skeleton b′: the picker never
-    /// sees one); every other key is the picker's, and one it does not bind is swallowed, so `q`
-    /// can't quit mid-pick. A choice is a write: refused while another is in flight, and the
-    /// picker stays open until its reply (D8).
+    /// Over the go-to field a chord [`views::CAPTURE`] passes (`CONTROL`, `ALT`, a function key)
+    /// is the shell's, so `ctrl-c` still quits and `F1` opens help; otherwise the picker resolves
+    /// the key through the mode's stack and what it does not take is `modal_rest`'s: `q` can't
+    /// quit mid-pick, `F1` and `ctrl-f` pass. A choice is a write: refused while another is in
+    /// flight, and the picker stays open until its reply (D8).
     fn on_picker_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        // `views::CAPTURE` offers no view act, so nothing resolves here before the pass rule.
-        if self.stack().passes(KeyChord::from_event(key)) {
-            return Handled::Pass;
-        }
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
         let Mode::Picking { picker, .. } = &mut self.mode else {
             return Handled::Pass;
         };
-        match picker.on_key(key) {
+        if picker.goto_open() && stack.passes(chord) {
+            return Handled::Pass;
+        }
+        let Some(outcome) = picker.on_key(key, ctx.keys(), stack) else {
+            return modal_rest(stack, chord);
+        };
+        match outcome {
             PickerOutcome::None => {}
             PickerOutcome::Request(request) => ctx.request(request),
             PickerOutcome::Chosen(path) => {
@@ -1516,7 +1526,8 @@ impl SettingsSection for HierarchySection {
         );
         // MOD-49 P2: the popup draws over the whole section, not in the pane.
         if let Mode::Picking { picker, .. } = &self.mode {
-            picker.render(frame, area, ctx.theme);
+            // Always the browse stack: the popup's hint stays while the go-to field is open.
+            picker.render(frame, area, ctx.theme, ctx.keys(), views::HIERARCHY_PICKER);
         }
     }
 }
