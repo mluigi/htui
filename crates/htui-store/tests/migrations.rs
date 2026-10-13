@@ -1097,15 +1097,8 @@ async fn the_0004_bump_moves_only_an_untouched_six() {
     db.drop_db().await;
 }
 
-/// The `claude-cli` row's one agent rule after MOD-96 (D5, Q2), byte for byte as
-/// `agent_claude_cli.json` and `0018_seed_permission_mode.sql` spell it.
-fn edit_rule() -> serde_json::Value {
-    json!({"match": {"tool_kind": "edit"}, "answer": "allow_once",
-           "reason": "edits are allowed and recorded by htui (MOD-96); a persona rule can refuse them"})
-}
-
-/// The pre-MOD-96 `agent_claude_cli.json` `settings`, verbatim: what a box seeded before 0018
-/// holds.
+/// The `agent_claude_cli.json` `settings`, verbatim: what a box seeded before 0018 holds, and
+/// still the seed after it (MOD-96 review R1 kept `acceptEdits`).
 fn old_cli_settings() -> serde_json::Value {
     json!({
         "cli": { "stream": "claude_stream_json", "permission_mode": "acceptEdits",
@@ -1183,15 +1176,16 @@ async fn rerun_0018(pool: &sqlx::PgPool) {
         .expect("0018 runs again");
 }
 
-/// MOD-96 D5, D6 (Q3 = b): `0018_seed_permission_mode.sql` moves a box seeded before MOD-96 onto
-/// the new seed values — `claude-cli` from `acceptEdits` to `default` plus the edit rule, `claude`
-/// gains `acp.permission_mode: "default"` — and touches nothing else in either row. The trigger
-/// bumps `updated_at` (the migration never sets it), and a second run matches nothing.
+/// MOD-96 D6 (Q3 = b): `0018_seed_permission_mode.sql` pins a `claude` row seeded before MOD-96
+/// to `acp.permission_mode: "default"` and touches nothing else in it. The `claude-cli` row keeps
+/// `acceptEdits` (review R1), so 0018 leaves it byte-identical, `updated_at` included. The
+/// trigger bumps `claude`'s `updated_at` (the migration never sets it), and a second run matches
+/// nothing.
 ///
 /// Staged at v17 through [`MIGRATOR`] so the rows exist before 0018 runs, as on a real box; the
 /// plain `run` afterwards applies 0018 alone and no seed pass runs.
 #[tokio::test]
-async fn migration_0018_rewrites_the_old_seed_rows_once() {
+async fn migration_0018_pins_the_old_claude_row_once() {
     let Some(db) = common::bare_db().await else {
         return;
     };
@@ -1202,12 +1196,10 @@ async fn migration_0018_rewrites_the_old_seed_rows_once() {
     let at = at_2026();
     insert_agent(&db.pool, "claude-cli", "cli", old_cli_settings(), at).await;
     insert_agent(&db.pool, "claude", "acp", old_acp_settings(), at).await;
+    let before = agent_rows(&db.pool).await;
 
     MIGRATOR.run(&db.pool).await.expect("apply 0018");
 
-    let mut expected_cli = old_cli_settings();
-    expected_cli["cli"]["permission_mode"] = json!("default");
-    expected_cli["permission"]["rules"] = json!([edit_rule()]);
     let mut expected_acp = old_acp_settings();
     expected_acp["acp"]["permission_mode"] = json!("default");
 
@@ -1217,16 +1209,12 @@ async fn migration_0018_rewrites_the_old_seed_rows_once() {
     assert_eq!(claude.0, "claude");
     assert_eq!(claude_cli.0, "claude-cli");
     assert_eq!(
-        claude_cli.1, expected_cli,
-        "claude-cli runs in `default` and allows edits by its one rule; every other key is as seeded"
+        claude_cli, &before[1],
+        "claude-cli keeps `acceptEdits` and no rule: settings and updated_at are untouched"
     );
     assert_eq!(
         claude.1, expected_acp,
         "claude pins `default`; every other key is as seeded"
-    );
-    assert!(
-        claude_cli.2 > at,
-        "the trigger bumps claude-cli's updated_at"
     );
     assert!(claude.2 > at, "the trigger bumps claude's updated_at");
 
@@ -1240,62 +1228,50 @@ async fn migration_0018_rewrites_the_old_seed_rows_once() {
     db.drop_db().await;
 }
 
-/// MOD-96 B6: 0018 is name-, transport- and value-keyed, and strict. An operator's edit (a custom
-/// rule, another mode), a missing key (no `acp` object) and another row holding the old values
-/// under another name are all left alone, `updated_at` included.
+/// MOD-96 B6: 0018 is name-, transport- and value-keyed, and strict. A `claude` row whose
+/// `acp.permission_mode` is already set, a `claude` row with no `acp` object, a `claude` row whose
+/// mode is an explicit JSON `null` (review R1 NIT 10: `#>` yields JSON `null`, not SQL `NULL`, so
+/// `IS NULL` does not match it) and the old values under another name are all left alone,
+/// `updated_at` included.
 #[tokio::test]
 async fn migration_0018_leaves_edited_and_other_rows_alone() {
     let at = at_2026();
 
-    // World 1: edited seed rows, and the old values under other names.
-    let Some(db) = common::bare_db().await else {
-        return;
-    };
-    MIGRATOR
-        .run_to(17, &db.pool)
-        .await
-        .expect("apply 0001 through 0017");
-    let mut custom_rule = old_cli_settings();
-    custom_rule["permission"]["rules"] = json!([{
-        "match": {"command_prefix": "git push"}, "answer": "reject_once", "reason": "mine"
-    }]);
-    insert_agent(&db.pool, "claude-cli", "cli", custom_rule, at).await;
+    // One `claude` row per world: the name is unique.
     let mut plan_mode = old_acp_settings();
     plan_mode["acp"]["permission_mode"] = json!("plan");
-    insert_agent(&db.pool, "claude", "acp", plan_mode, at).await;
-    insert_agent(&db.pool, "my-cli", "cli", old_cli_settings(), at).await;
-    insert_agent(&db.pool, "agy", "acp", old_acp_settings(), at).await;
+    let mut null_mode = old_acp_settings();
+    null_mode["acp"]["permission_mode"] = serde_json::Value::Null;
+    let worlds = [
+        (plan_mode, "a `claude` row with a mode already set"),
+        (json!({}), "a `claude` row with no `acp` object"),
+        (
+            null_mode,
+            "a `claude` row whose mode is an explicit JSON null",
+        ),
+    ];
 
-    let before = agent_rows(&db.pool).await;
-    MIGRATOR.run(&db.pool).await.expect("apply 0018");
-    assert_eq!(
-        agent_rows(&db.pool).await,
-        before,
-        "an edited seed row and another name's old values are left alone"
-    );
-    db.drop_db().await;
+    for (claude, what) in worlds {
+        let Some(db) = common::bare_db().await else {
+            return;
+        };
+        MIGRATOR
+            .run_to(17, &db.pool)
+            .await
+            .expect("apply 0001 through 0017");
+        insert_agent(&db.pool, "claude", "acp", claude, at).await;
+        insert_agent(&db.pool, "agy", "acp", old_acp_settings(), at).await;
+        insert_agent(&db.pool, "my-claude", "acp", old_acp_settings(), at).await;
 
-    // World 2: another CLI mode with no rules, and a `claude` row with no `acp` object at all.
-    let Some(db) = common::bare_db().await else {
-        return;
-    };
-    MIGRATOR
-        .run_to(17, &db.pool)
-        .await
-        .expect("apply 0001 through 0017");
-    let mut other_mode = old_cli_settings();
-    other_mode["cli"]["permission_mode"] = json!("plan");
-    insert_agent(&db.pool, "claude-cli", "cli", other_mode, at).await;
-    insert_agent(&db.pool, "claude", "acp", json!({}), at).await;
-
-    let before = agent_rows(&db.pool).await;
-    MIGRATOR.run(&db.pool).await.expect("apply 0018");
-    assert_eq!(
-        agent_rows(&db.pool).await,
-        before,
-        "a mode that is not `acceptEdits` and a missing `acp` object are left alone"
-    );
-    db.drop_db().await;
+        let before = agent_rows(&db.pool).await;
+        MIGRATOR.run(&db.pool).await.expect("apply 0018");
+        assert_eq!(
+            agent_rows(&db.pool).await,
+            before,
+            "{what}, and the old values under other names, are left alone"
+        );
+        db.drop_db().await;
+    }
 }
 
 /// The smallest FK chain an `item` row needs (project -> step_graph -> item_kind), under the

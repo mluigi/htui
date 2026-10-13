@@ -417,21 +417,15 @@ fn acp_permission_mode_is_read_and_round_trips() {
     assert_eq!(reparsed.acp.permission_mode.as_deref(), Some("default"));
 }
 
-/// The one agent rule the `claude-cli` seed carries (MOD-96 D5, Q2), as the seed JSON and
-/// `0018_seed_permission_mode.sql` spell it.
-const EDIT_RULE_REASON: &str =
-    "edits are allowed and recorded by htui (MOD-96); a persona rule can refuse them";
-
-/// MOD-96 D5, D6: the seeded rows, parsed as the driver parses them. `claude-cli` runs in
-/// `default` and lets edits through by its own rule instead of `acceptEdits`, so an edit is
-/// answered by policy (and recorded) while a shell command still asks; `claude` pins its ACP
-/// session mode to `default`; `agy` pins nothing. Parsing the rows as [`AgentSettings`] is what
-/// proves the wire names (`match`, `allow_once`, `acp.permission_mode`).
+/// MOD-96 D6 and review R1: the seeded rows, parsed as the driver parses them. `claude-cli`
+/// keeps `acceptEdits` and no agent rule, so an edit gets no answer from htui's policy: the CLI's
+/// mode settles an in-tree edit, after its own safety checks, and anything else still asks.
+/// `claude` pins its ACP session mode to `default`; `agy` pins nothing. Parsing the rows as
+/// [`AgentSettings`] is what proves the wire name `acp.permission_mode`.
 #[test]
-fn the_seeded_rows_pin_the_mode_and_allow_edits_by_policy() {
-    use htui_agent::driver::{PermissionMatch, PermissionRule};
+fn the_seeded_rows_keep_accept_edits_and_pin_the_acp_mode() {
     use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent, ToolKind};
-    use htui_agent::permission::{PolicyStage, evaluate};
+    use htui_agent::permission::evaluate;
 
     let rows = htui_core::model::agent::seed_rows(
         chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp"),
@@ -450,17 +444,11 @@ fn the_seeded_rows_pin_the_mode_and_allow_edits_by_policy() {
         .cli
         .as_ref()
         .expect("claude-cli carries a cli block");
-    assert_eq!(cli.permission_mode, "default");
-    assert_eq!(
-        cli_row.permission.rules,
-        [PermissionRule {
-            matcher: PermissionMatch {
-                tool_kind: Some("edit".to_owned()),
-                ..PermissionMatch::default()
-            },
-            answer: PermissionOptionKind::AllowOnce,
-            reason: EDIT_RULE_REASON.to_owned(),
-        }]
+    assert_eq!(cli.permission_mode, "acceptEdits");
+    assert!(
+        cli_row.permission.rules.is_empty(),
+        "claude-cli carries no agent rule: {:?}",
+        cli_row.permission.rules
     );
 
     // The CLI prompt's two options (`cli/mod.rs`): allow once, reject once.
@@ -476,33 +464,17 @@ fn the_seeded_rows_pin_the_mode_and_allow_edits_by_policy() {
             kind: PermissionOptionKind::RejectOnce,
         },
     ];
-    let call = |kind: ToolKind, title: &str| ToolCallEvent {
+    let edit = ToolCallEvent {
         tool_call_id: "call-1".to_owned(),
-        title: title.to_owned(),
-        tool_kind: kind,
+        title: "Edit".to_owned(),
+        tool_kind: ToolKind::Edit,
         input: serde_json::json!({}),
         locations: Vec::new(),
     };
-
-    let edit = evaluate(
-        &cli_row.permission,
-        Some(&call(ToolKind::Edit, "Edit")),
-        &options,
-    )
-    .expect("an edit is answered by the seeded rule");
-    assert_eq!(edit.option_id, "allow");
-    assert_eq!(edit.kind, PermissionOptionKind::AllowOnce);
-    assert_eq!(edit.stage, PolicyStage::Rule);
-    assert_eq!(edit.reason, EDIT_RULE_REASON);
-
     assert_eq!(
-        evaluate(
-            &cli_row.permission,
-            Some(&call(ToolKind::Execute, "Bash")),
-            &options
-        ),
+        evaluate(&cli_row.permission, Some(&edit), &options),
         None,
-        "a shell command still asks"
+        "htui's seed policy does not answer an edit: the CLI's `acceptEdits` settles an in-tree one"
     );
 
     assert_eq!(
