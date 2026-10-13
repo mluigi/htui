@@ -25,7 +25,7 @@ use htui::ui::tabs::settings::{
 };
 use htui_core::fixtures::ids;
 use htui_core::model::{ProjectId, Scope, WorkspaceId};
-use htui_core::prompt::settings::resolve_box_hostname;
+use htui_core::prompt::settings::{resolve_allow_env_files, resolve_box_hostname};
 use htui_core::prompt::{DEFAULTS, Rungs, SettingKey};
 use htui_core::store::{MemStore, SettingRung, StoreError};
 use htui_store::{Backend, CacheStore, DATABASE_UNREACHABLE, PgStore};
@@ -148,13 +148,14 @@ fn prompt_settings_names_are_stable() {
 
 /// The shape of one read (D3/D4): ten `App` entries in `SettingKey::app_keys` order, all empty on
 /// a fresh `MemStore` (F-7), and one project entry per scope project carrying exactly the keys the
-/// `Project` rung accepts, in [`project_keys`] order — `box_hostname` first (MOD-33 D276).
+/// `Project` rung accepts, in [`project_keys`] order — `allow_env_files` first (MOD-89 D4), then
+/// `box_hostname` (MOD-33 D276).
 ///
-/// The demo project's own blob already holds `token_budget`, so the third project value is a
+/// The demo project's own blob already holds `token_budget`, so the fourth project value is a
 /// stored number rather than `None` — which is what makes the `project_key` mapping of D2
 /// observable from the first read.
 #[tokio::test]
-async fn the_demo_snapshot_has_ten_app_entries_and_three_keys_per_project() {
+async fn the_demo_snapshot_has_ten_app_entries_and_four_keys_per_project() {
     let snapshot = demo_settings(&demo()).await;
 
     assert_eq!(snapshot.app.len(), 10);
@@ -174,6 +175,7 @@ async fn the_demo_snapshot_has_ten_app_entries_and_three_keys_per_project() {
     assert_eq!(
         value_keys,
         vec![
+            SettingKey::AllowEnvFiles,
             SettingKey::BoxHostname,
             SettingKey::UpstreamHops,
             SettingKey::TokenBudget
@@ -181,7 +183,8 @@ async fn the_demo_snapshot_has_ten_app_entries_and_three_keys_per_project() {
     );
     assert_eq!(project.values[0].value, None);
     assert_eq!(project.values[1].value, None);
-    assert_eq!(project.values[2].value, Some(json!(120_000)));
+    assert_eq!(project.values[2].value, None);
+    assert_eq!(project.values[3].value, Some(json!(120_000)));
 }
 
 /// `app_map` is the shape `Backend::app_settings` hands the resolvers: only the entries that carry
@@ -381,8 +384,8 @@ async fn set_setting_on_project_stores_under_the_project_key_and_keeps_foreign_k
     assert_eq!(blob.get("keep_raw_events"), Some(&json!(false)));
     assert_eq!(blob.get("token_budget"), Some(&json!(120_000)));
 
-    assert_eq!(entry.values[1].key, SettingKey::UpstreamHops);
-    assert_eq!(entry.values[1].value, Some(json!(2)));
+    assert_eq!(entry.values[2].key, SettingKey::UpstreamHops);
+    assert_eq!(entry.values[2].value, Some(json!(2)));
     assert_ne!(
         entry.project.updated_at, token,
         "the project's own token is what a project-rung write moves"
@@ -419,8 +422,8 @@ async fn set_setting_box_hostname_on_a_project_stores_a_boolean_and_keeps_foreig
     assert_eq!(blob.get("keep_raw_events"), Some(&json!(false)));
     assert_eq!(blob.get("token_budget"), Some(&json!(120_000)));
 
-    assert_eq!(entry.values[0].key, SettingKey::BoxHostname);
-    assert_eq!(entry.values[0].value, Some(json!(false)));
+    assert_eq!(entry.values[1].key, SettingKey::BoxHostname);
+    assert_eq!(entry.values[1].value, Some(json!(false)));
     assert!(
         !resolve_box_hostname(Some(blob)),
         "the reader sees the switch off: {blob}"
@@ -428,6 +431,73 @@ async fn set_setting_box_hostname_on_a_project_stores_a_boolean_and_keeps_foreig
     assert_ne!(
         entry.project.updated_at, token,
         "the project's own token is what a project-rung write moves"
+    );
+}
+
+/// MOD-89 D4: `allow_env_files` is a JSON boolean in the project's blob, written through the same
+/// key-level merge as `box_hostname`, and the engine's own resolver takes it.
+#[tokio::test]
+async fn set_setting_allow_env_files_on_a_project_stores_a_boolean_and_keeps_foreign_keys() {
+    let backend = demo();
+
+    let before = demo_settings(&backend).await;
+    let token = before.projects[0].project.updated_at;
+
+    let after = settings(
+        serve(
+            &backend,
+            &StoreRequest::SetSetting {
+                scope: vulkan_scope(),
+                rung: SettingRung::Project(ids::PROJECT_VULKAN),
+                key: SettingKey::AllowEnvFiles,
+                value: json!(true),
+                expected: Some(token),
+            },
+        )
+        .await,
+    );
+
+    let entry = &after.projects[0];
+    let blob = &entry.project.settings;
+    assert_eq!(blob.get("allow_env_files"), Some(&json!(true)));
+    assert_eq!(blob.get("retention_days"), Some(&Value::Null));
+    assert_eq!(blob.get("keep_raw_events"), Some(&json!(false)));
+    assert_eq!(blob.get("token_budget"), Some(&json!(120_000)));
+
+    assert_eq!(entry.values[0].key, SettingKey::AllowEnvFiles);
+    assert_eq!(entry.values[0].value, Some(json!(true)));
+    assert!(
+        resolve_allow_env_files(Some(blob)),
+        "the reader sees the switch on: {blob}"
+    );
+    assert_ne!(
+        entry.project.updated_at, token,
+        "the project's own token is what a project-rung write moves"
+    );
+}
+
+/// MOD-89 D4: the switch is project-only, so the seam refuses it on the App rung with its own
+/// rung sentence — there is no `app_setting` row for a provider-less default to live in.
+#[tokio::test]
+async fn allow_env_files_is_refused_on_the_app_rung() {
+    let (request, message) = refusal(
+        serve(
+            &demo(),
+            &StoreRequest::SetSetting {
+                scope: vulkan_scope(),
+                rung: SettingRung::App,
+                key: SettingKey::AllowEnvFiles,
+                value: json!(true),
+                expected: None,
+            },
+        )
+        .await,
+    );
+
+    assert_eq!(request, "set_setting");
+    assert!(
+        message.contains("`allow_env_files` is not accepted on the app rung"),
+        "the seam's own refusal: {message}"
     );
 }
 
@@ -874,6 +944,10 @@ async fn the_demo_snapshot_renders_the_tree() {
         row_of(&frame, SettingKey::BoxHostname, 0).contains("unset | on (default)"),
         "no `app_setting` row can exist for the switch, so the compiled default answers: {frame}"
     );
+    assert!(
+        row_of(&frame, SettingKey::AllowEnvFiles, 0).contains("unset | off (default)"),
+        "the env-files switch is off until a project turns it on (MOD-89 D4): {frame}"
+    );
 
     insta::assert_snapshot!("demo", frame);
 }
@@ -1069,6 +1143,36 @@ async fn e_then_off_then_enter_sends_set_setting_false_on_the_project_rung() {
     assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
     assert_eq!(*key, SettingKey::BoxHostname);
     assert_eq!(*value, Value::Bool(false));
+    assert_eq!(*expected, Some(project_token(&snapshot)));
+}
+
+/// MOD-89 D4: `on` typed into the env-files switch is a JSON `true` on the project rung, carrying
+/// the project row's token — the same kind-driven parse as `box_hostname`.
+#[tokio::test]
+async fn e_then_on_then_enter_sends_set_setting_true_for_allow_env_files() {
+    let (bench, mut section, snapshot) = bench_with(&demo()).await;
+    move_to(&bench, &mut section, project_row(SettingKey::AllowEnvFiles));
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "on");
+    bench.key(&mut section, "enter");
+
+    let asked = bench.drained();
+    let [
+        Action::Store(StoreRequest::SetSetting {
+            rung,
+            key,
+            value,
+            expected,
+            ..
+        }),
+    ] = asked.as_slice()
+    else {
+        panic!("`Enter` writes once: {asked:?}");
+    };
+    assert_eq!(*rung, SettingRung::Project(ids::PROJECT_VULKAN));
+    assert_eq!(*key, SettingKey::AllowEnvFiles);
+    assert_eq!(*value, Value::Bool(true));
     assert_eq!(*expected, Some(project_token(&snapshot)));
 }
 
