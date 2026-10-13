@@ -3647,3 +3647,23 @@ async fn a_worktree_step_holds_a_committed_env_file() {
 
     assert_eq!(env_files_of(&fix, &prepared).await, ["core/.env"]);
 }
+
+/// MOD-89 T3, the real wiring end to end: a provider-less project's `local` run over a checkout
+/// holding a gitignored `.env` walks to its gate, and the item carries D7's warning once. No `git`
+/// needed under `local` (as [`criterion_12_a_local_step_on_a_dirty_tree`]).
+#[tokio::test]
+async fn a_local_run_over_a_gitignored_env_file_writes_the_warning() {
+    let fix = Fixture::new(Isolation::Local, None).await;
+    ignore_env(&fix);
+
+    let run = fix.start(&fix.orch).await;
+    fix.parked(run).await;
+
+    let warning = "env files in the session's trees: `.env`; the agent can read them";
+    let notes = fix.feat_notes().await;
+    assert_eq!(
+        notes.iter().filter(|body| *body == warning).count(),
+        1,
+        "{notes:?}"
+    );
+}
