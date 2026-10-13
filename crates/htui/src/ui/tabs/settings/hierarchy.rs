@@ -11,9 +11,9 @@
 //! the mode is what [`captures_input`](SettingsSection::captures_input) is derived from rather than
 //! a flag of its own (D2): in `Browse` the tab still cycles on `h`/`l` and the global table still
 //! owns `q`, `?`, `Tab` and the digits; while an editor, a delete confirmation or the picker is
-//! open those letters are text (or the picker's own keys) and are swallowed, with one carve-out —
-//! a chord the mode's modal global layer admits (`CONTROL`, `ALT`, a function key) passes, so
-//! `ctrl-c` quits from inside a half-typed slug and `F1` opens help.
+//! open those letters are text (or the picker's keys (`[picker]`)) and are swallowed, with one
+//! carve-out — a chord the mode's modal global layer admits (`CONTROL`, `ALT`, a function key)
+//! passes, so `ctrl-c` quits from inside a half-typed slug and `F1` opens help.
 //!
 //! Every mode resolves its keys through its own stack in [`views`] (MOD-67 M3), so a chord
 //! matches with its modifiers (`ctrl-d` is not `d`) and a rebound key acts under its new chord;
@@ -44,8 +44,15 @@ use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
 /// What the rows pane says when the scope is a workspace that does not exist — the nil startup
-/// scope, or the last workspace after it was deleted (D9's "stranded shell" row).
-const NO_WORKSPACE: &str = "no workspace — `N` creates one";
+/// scope, or the last workspace after it was deleted (D9's "stranded shell" row). `new` is the
+/// label of `settings.hierarchy.new_workspace` (MOD-67 M6 D4): `` no workspace — `N` creates
+/// one`` under the defaults, and no key named when it is unbound.
+fn no_workspace(new: Option<&str>) -> String {
+    match new {
+        Some(new) => format!("no workspace \u{2014} `{new}` creates one"),
+        None => "no workspace".to_owned(),
+    }
+}
 
 /// What the rows pane says when the read itself was refused: the tree is one `ReadStore` call and
 /// an offline box has no mirror of it.
@@ -81,9 +88,13 @@ const HINT_EDITING: HintSpec = &[
     Hint::Text("Esc cancel"),
 ];
 
-/// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list, and the
-/// picker's keys are its own in M3 (blueprint L-C Q3).
-const HINT_PICKING: HintSpec = &[Hint::Text("choosing a directory"), Hint::Text("Esc cancel")];
+/// The picker's section hint (MOD-49 blueprint D17): the popup carries the full key list; the
+/// way out goes through the mode's stack (MOD-67 M6), so it drops while the go-to field is open,
+/// where `Esc` closes only the field.
+const HINT_PICKING: HintSpec = &[
+    Hint::Text("choosing a directory"),
+    Hint::One(Act::Back, "cancel"),
+];
 
 /// What a CAS miss says while an editor is open (D7, PRD D8): the text is kept, the token is not,
 /// and the retry is the user's.
@@ -93,8 +104,15 @@ const CHANGED_ELSEWHERE: &str =
 /// What a CAS miss says when the row the editor opened on is gone from the reloaded tree.
 const DELETED_ELSEWHERE: &str = "deleted elsewhere while you were editing";
 
-/// What a CAS miss says with no editor open — `p` is the one write that has none (D12).
-const RELOADED: &str = "reloaded; press p again";
+/// What a CAS miss says with no editor open — `p` is the one write that has none (D12). `primary`
+/// is the label of `settings.hierarchy.primary` (MOD-67 M6 D4): `reloaded; press p again` under
+/// the defaults.
+fn reloaded(primary: Option<&str>) -> String {
+    match primary {
+        Some(primary) => format!("reloaded; press {primary} again"),
+        None => "reloaded".to_owned(),
+    }
+}
 
 /// The hint line while `delete_reach` is being counted: every chord that stops it (MOD-67 M3,
 /// blueprint L-C Q7: the arm always stopped on `n` too).
@@ -507,13 +525,15 @@ impl HierarchySection {
 
     /// The stack of the current mode (MOD-67 M3), as `key_stack`, the delete and the picker read
     /// it; the browse and editor handlers name their own mode's constant, which is this one
-    /// whenever they run. The typed confirmation, the delete in flight and the picker are a field
-    /// or a widget and nothing else ([`views::CAPTURE`]).
+    /// whenever they run. The typed confirmation and the delete in flight are a field or a
+    /// widget and nothing else ([`views::CAPTURE`]); the picker is on
+    /// [`views::HIERARCHY_PICKER`], its go-to field on [`views::CAPTURE`] (MOD-67 M6).
     fn stack(&self) -> Stack<'static> {
         match &self.mode {
             Mode::Browse => views::HIERARCHY_BROWSE,
             Mode::Editing(_) => views::HIERARCHY_EDITOR,
-            Mode::Picking { .. } => views::CAPTURE,
+            Mode::Picking { picker, .. } if picker.goto_open() => views::CAPTURE,
+            Mode::Picking { .. } => views::HIERARCHY_PICKER,
             Mode::Deleting { stage, .. } => match stage {
                 DeleteStage::Counting => views::HIERARCHY_DELETE_COUNTING,
                 DeleteStage::Warn(_) => views::HIERARCHY_DELETE_WARN,
@@ -532,7 +552,7 @@ impl HierarchySection {
                 Act::ListDown => self.move_cursor(true),
                 Act::ListUp => self.move_cursor(false),
                 Act::HierarchyNewWorkspace => {
-                    if !self.refuse(act) {
+                    if !self.refuse(act, ctx.keys()) {
                         self.open(
                             EditorKind::NewWorkspace,
                             vec![
@@ -545,28 +565,28 @@ impl HierarchySection {
                     }
                 }
                 Act::New => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_new_child(row);
                     }
                 }
                 Act::Edit => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_edit(row);
                     }
                 }
                 Act::HierarchyPrimary => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.move_primary(row, ctx);
                     }
                 }
                 Act::HierarchyChoosePath => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_path(row, ctx);
@@ -575,7 +595,7 @@ impl HierarchySection {
                 // MOD-7 milestone 4 (D114): infer this box's repo paths under the workspace root.
                 // A write, so it is refused while another is in flight, as the other writes are.
                 Act::HierarchyInfer => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(snapshot) = &self.snapshot
                     {
                         let request = StoreRequest::InferRepoPaths(snapshot.workspace.id);
@@ -585,7 +605,7 @@ impl HierarchySection {
                     }
                 }
                 Act::Delete => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.begin_delete(row, ctx);
@@ -610,8 +630,9 @@ impl HierarchySection {
     ///
     /// Two refusals, in this order: a write in flight (a second one of the same kind would lose a
     /// reply), then a tree that is not there to edit. `r` is deliberately **not** on this path —
-    /// re-reading is how a section that lost a reply recovers.
-    fn refuse(&mut self, act: Act) -> bool {
+    /// re-reading is how a section that lost a reply recovers. `keys` name the key that creates a
+    /// workspace in the no-workspace refusal (MOD-67 M6 D4).
+    fn refuse(&mut self, act: Act, keys: &Keys) -> bool {
         if self.in_flight() {
             return true;
         }
@@ -622,7 +643,8 @@ impl HierarchySection {
             return true;
         }
         if self.snapshot.is_none() && act != Act::HierarchyNewWorkspace {
-            self.notice = Some(NO_WORKSPACE.to_owned());
+            let new = keys.label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace);
+            self.notice = Some(no_workspace(new.as_deref()));
             return true;
         }
         false
@@ -766,7 +788,13 @@ impl HierarchySection {
                 None,
             ),
             Row::Project { .. } => {
-                self.notice = Some("`b` wants the workspace or a repo row".to_owned());
+                let choose = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
+                self.notice = Some(match choose {
+                    Some(choose) => format!("`{choose}` wants the workspace or a repo row"),
+                    None => "pick a path on the workspace or a repo row".to_owned(),
+                });
                 return;
             }
             Row::Repo { project, index } => {
@@ -831,7 +859,13 @@ impl HierarchySection {
                 self.send(request, ctx);
             }
             Row::Workspace | Row::Project { .. } => {
-                self.notice = Some("`p` wants a repo row".to_owned());
+                let primary = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyPrimary);
+                self.notice = Some(match primary {
+                    Some(primary) => format!("`{primary}` wants a repo row"),
+                    None => "only a repo row can be made primary".to_owned(),
+                });
             }
         }
     }
@@ -1023,22 +1057,26 @@ impl HierarchySection {
         }
     }
 
-    /// One key while the picker is open (MOD-49 P8, blueprint H-4, D15).
+    /// One key while the picker is open (MOD-49 P8, blueprint H-4, D15; MOD-67 M6 D3).
     ///
-    /// A chord the modal global layer admits (`CONTROL`, `ALT`, a function key) passes first, so
-    /// `ctrl-c` still quits and `F1` opens help (MOD-67 D5, blueprint skeleton b′: the picker never
-    /// sees one); every other key is the picker's, and one it does not bind is swallowed, so `q`
-    /// can't quit mid-pick. A choice is a write: refused while another is in flight, and the
-    /// picker stays open until its reply (D8).
+    /// Over the go-to field a chord [`views::CAPTURE`] passes (`CONTROL`, `ALT`, a function key)
+    /// is the shell's, so `ctrl-c` still quits and `F1` opens help; otherwise the picker resolves
+    /// the key through the mode's stack and what it does not take is `modal_rest`'s: `q` can't
+    /// quit mid-pick, `F1` and `ctrl-f` pass. A choice is a write: refused while another is in
+    /// flight, and the picker stays open until its reply (D8).
     fn on_picker_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        // `views::CAPTURE` offers no view act, so nothing resolves here before the pass rule.
-        if self.stack().passes(KeyChord::from_event(key)) {
-            return Handled::Pass;
-        }
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
         let Mode::Picking { picker, .. } = &mut self.mode else {
             return Handled::Pass;
         };
-        match picker.on_key(key) {
+        if picker.goto_open() && stack.passes(chord) {
+            return Handled::Pass;
+        }
+        let Some(outcome) = picker.on_key(key, ctx.keys(), stack) else {
+            return modal_rest(stack, chord);
+        };
+        match outcome {
             PickerOutcome::None => {}
             PickerOutcome::Request(request) => ctx.request(request),
             PickerOutcome::Chosen(path) => {
@@ -1257,10 +1295,11 @@ impl HierarchySection {
     }
 
     /// A CAS miss (D7): the tree is replaced, the editor keeps its text and takes the current row's
-    /// token, and the retry is a second `Enter` rather than an automatic write.
-    fn on_stale(&mut self, snapshot: &HierarchySnapshot) {
+    /// token, and the retry is a second `Enter` rather than an automatic write. `keys` name the
+    /// key a `p` retries on (MOD-67 M6 D4).
+    fn on_stale(&mut self, snapshot: &HierarchySnapshot, keys: &Keys) {
         self.busy = None;
-        let reloaded = match &self.mode {
+        let refreshed = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
             // MOD-49 blueprint D19: unreachable — path writes are upserts and never answer
             // `HierarchyStale` — and harmless if it ever were: the picker keeps its place.
@@ -1270,9 +1309,12 @@ impl HierarchySection {
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
-        match reloaded {
+        match refreshed {
             // No editor: `p` is the only write that gets here, and its retry is the key again.
-            None => self.notice = Some(RELOADED.to_owned()),
+            None => {
+                let primary = keys.label(views::HIERARCHY_BROWSE, Act::HierarchyPrimary);
+                self.notice = Some(reloaded(primary.as_deref()));
+            }
             Some(Reload::Gone) => {
                 self.mode = Mode::Browse;
                 self.notice = Some(DELETED_ELSEWHERE.to_owned());
@@ -1372,14 +1414,17 @@ impl SettingsSection for HierarchySection {
                 self.mode = Mode::Browse;
                 self.clamp_cursor();
             }
-            StoreReply::HierarchyStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::HierarchyStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             // MOD-7 milestone 4 (D117): a tree like any other, then what the pass did. A notice a
             // write left (`stored as …`, a follow-up's cause) is kept in front of the report; a
             // refusal shown during the walk is not, since the walk it waited for is over.
             StoreReply::RepoPathsInferred { tree, report } => {
                 let before = self.carried.take();
                 self.on_tree(tree, ctx);
-                let report = inferred_notice(report);
+                let choose = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
+                let report = inferred_notice(report, choose.as_deref());
                 self.notice = Some(match before {
                     Some(before) => format!("{before} \u{b7} {report}"),
                     None => report,
@@ -1503,7 +1548,10 @@ impl SettingsSection for HierarchySection {
         if self.unavailable.is_some() {
             message(frame, rows, UNAVAILABLE, ctx.theme);
         } else if self.snapshot.is_none() {
-            message(frame, rows, NO_WORKSPACE, ctx.theme);
+            let new = ctx
+                .keys()
+                .label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace);
+            message(frame, rows, &no_workspace(new.as_deref()), ctx.theme);
         } else {
             frame.render_widget(Paragraph::new(self.lines(ctx.theme)), rows);
         }
@@ -1516,7 +1564,8 @@ impl SettingsSection for HierarchySection {
         );
         // MOD-49 P2: the popup draws over the whole section, not in the pane.
         if let Mode::Picking { picker, .. } = &self.mode {
-            picker.render(frame, area, ctx.theme);
+            // Always the browse stack: the popup's hint stays while the go-to field is open.
+            picker.render(frame, area, ctx.theme, ctx.keys(), views::HIERARCHY_PICKER);
         }
     }
 }
@@ -1633,10 +1682,18 @@ fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
 /// truncated scan, a workspace without a repo — and otherwise `inferred {n} of {m}`, where `m`
 /// counts every repo that had no row before the pass, followed by what was not inferred. A refused
 /// repo is named, not explained: its sentence may name a path, and the notice is one line.
-pub(crate) fn inferred_notice(report: &InferReport) -> String {
+///
+/// `choose` is the label of `settings.hierarchy.choose_path` (MOD-67 M6 D4), the key the notice
+/// sends the user to (`b` under the defaults); unbound, the notice names no key.
+pub(crate) fn inferred_notice(report: &InferReport, choose: Option<&str>) -> String {
     if report.root.is_none() {
-        return "no root on this box for this workspace \u{2014} b on the workspace row sets it"
-            .to_owned();
+        return match choose {
+            Some(choose) => format!(
+                "no root on this box for this workspace \u{2014} {choose} on the workspace row sets it"
+            ),
+            None => "no root on this box for this workspace \u{2014} set one on the workspace row"
+                .to_owned(),
+        };
     }
     if report.truncated {
         return format!(
@@ -1683,7 +1740,12 @@ pub(crate) fn inferred_notice(report: &InferReport) -> String {
     }
     let mut notice = parts.join(" \u{b7} ");
     if !(unmatched.is_empty() && ambiguous.is_empty() && refused.is_empty()) {
-        notice.push_str(" \u{2014} b on a repo sets it by hand");
+        match choose {
+            Some(choose) => {
+                notice.push_str(&format!(" \u{2014} {choose} on a repo sets it by hand"))
+            }
+            None => notice.push_str(" \u{2014} set it by hand on a repo row"),
+        }
     }
     notice
 }
@@ -1827,5 +1889,72 @@ mod tests {
 
         assert_eq!(line.spans.len(), 1, "{line:?} against {width}");
         assert_eq!(line.spans[0].content, notice);
+    }
+
+    /// MOD-67 M6 D3: the picker resolves its keys through `views::HIERARCHY_PICKER`; its go-to
+    /// field is a text field and nothing else, so the section is on `views::CAPTURE` while it is
+    /// open.
+    #[test]
+    fn the_picker_mode_reports_the_picker_stack() {
+        let (picker, _) = PathPicker::open("Root", "/srv".to_owned());
+        let mut section = HierarchySection {
+            mode: Mode::Picking {
+                target: PathTarget::WorkspaceRoot(WorkspaceId::new()),
+                picker,
+                chosen: None,
+            },
+            ..HierarchySection::new()
+        };
+        assert_eq!(section.key_stack(), Some(views::HIERARCHY_PICKER));
+
+        if let Mode::Picking { picker, .. } = &mut section.mode {
+            picker.on_paste("/opt");
+        }
+        assert_eq!(section.key_stack(), Some(views::CAPTURE));
+    }
+
+    /// MOD-67 M6 D4: each key-naming sentence names the label it is handed, and none when the
+    /// act is unbound.
+    #[test]
+    fn the_prose_names_the_keys_in_force() {
+        assert_eq!(
+            no_workspace(Some("W")),
+            "no workspace \u{2014} `W` creates one"
+        );
+        assert_eq!(no_workspace(None), "no workspace");
+        assert_eq!(reloaded(Some("P")), "reloaded; press P again");
+        assert_eq!(reloaded(None), "reloaded");
+
+        let unmatched = InferReport {
+            root: Some("/work".to_owned()),
+            truncated: false,
+            repos: vec![crate::hierarchy::RepoInference {
+                repo: RepoId::new(),
+                name: "docs".to_owned(),
+                outcome: InferOutcome::NoMatch,
+            }],
+        };
+        assert_eq!(
+            inferred_notice(&unmatched, Some("B")),
+            "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} B on a repo sets it by hand"
+        );
+        assert_eq!(
+            inferred_notice(&unmatched, None),
+            "inferred 0 of 1 \u{b7} no checkout: docs \u{2014} set it by hand on a repo row"
+        );
+
+        let rootless = InferReport {
+            root: None,
+            truncated: false,
+            repos: Vec::new(),
+        };
+        assert_eq!(
+            inferred_notice(&rootless, Some("B")),
+            "no root on this box for this workspace \u{2014} B on the workspace row sets it"
+        );
+        assert_eq!(
+            inferred_notice(&rootless, None),
+            "no root on this box for this workspace \u{2014} set one on the workspace row"
+        );
     }
 }
