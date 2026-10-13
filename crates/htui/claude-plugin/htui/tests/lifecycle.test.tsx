@@ -37,23 +37,38 @@ test('command polls nothing until /htui and stops when the pane closes', { optio
     isOpen = true
     return { value: { isPlaced: true } }
   })
-  on('ui.panes', async () => ({
-    value: isOpen ? [{ id: 'htui', title: 'htui', isShown: true, isFocused: false, isPlaced: true }] : [],
-  }))
+  let panes = 0
+  on('ui.panes', async () => {
+    panes += 1
+    return { value: isOpen ? [{ id: 'htui', title: 'htui', isShown: true, isFocused: false, isPlaced: true }] : [] }
+  })
   await start($, on)
   await clock.settle()
   await clock.advance(30000)
   expect(waitingCalls(calls)).toBe(0)
+  expect(panes).toBe(0)
   const r = await $.command.run({ command: 'htui', args: '' } as never)
   expect(r.text).toBeUndefined()
   await clock.settle()
   expect(waitingCalls(calls)).toBe(1)
   await clock.advance(30000)
   expect(waitingCalls(calls)).toBe(2)
+  expect(panes).toBe(1)
   isOpen = false
+  // The first tick after the close finds the pane gone and cancels the timer: no tick follows.
+  await clock.advance(30000)
+  expect(panes).toBe(2)
   await clock.advance(30000)
   await clock.advance(30000)
+  expect(panes).toBe(2)
   expect(waitingCalls(calls)).toBe(2)
+  // /htui again starts a new timer.
+  await $.command.run({ command: 'htui', args: '' } as never)
+  await clock.settle()
+  expect(waitingCalls(calls)).toBe(3)
+  await clock.advance(30000)
+  expect(panes).toBe(3)
+  expect(waitingCalls(calls)).toBe(4)
 })
 
 test('off never polls and never opens a pane', { options: { panel: 'off' } }, async ($, on) => {
