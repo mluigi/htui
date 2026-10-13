@@ -44,8 +44,15 @@ use crate::ui::{FieldOutcome, TextField, Theme};
 use crossterm::event::KeyEvent;
 
 /// What the rows pane says when the scope is a workspace that does not exist — the nil startup
-/// scope, or the last workspace after it was deleted (D9's "stranded shell" row).
-const NO_WORKSPACE: &str = "no workspace — `N` creates one";
+/// scope, or the last workspace after it was deleted (D9's "stranded shell" row). `new` is the
+/// label of `settings.hierarchy.new_workspace` (MOD-67 M6 D4): `` no workspace — `N` creates
+/// one`` under the defaults, and no key named when it is unbound.
+fn no_workspace(new: Option<&str>) -> String {
+    match new {
+        Some(new) => format!("no workspace \u{2014} `{new}` creates one"),
+        None => "no workspace".to_owned(),
+    }
+}
 
 /// What the rows pane says when the read itself was refused: the tree is one `ReadStore` call and
 /// an offline box has no mirror of it.
@@ -97,8 +104,15 @@ const CHANGED_ELSEWHERE: &str =
 /// What a CAS miss says when the row the editor opened on is gone from the reloaded tree.
 const DELETED_ELSEWHERE: &str = "deleted elsewhere while you were editing";
 
-/// What a CAS miss says with no editor open — `p` is the one write that has none (D12).
-const RELOADED: &str = "reloaded; press p again";
+/// What a CAS miss says with no editor open — `p` is the one write that has none (D12). `primary`
+/// is the label of `settings.hierarchy.primary` (MOD-67 M6 D4): `reloaded; press p again` under
+/// the defaults.
+fn reloaded(primary: Option<&str>) -> String {
+    match primary {
+        Some(primary) => format!("reloaded; press {primary} again"),
+        None => "reloaded".to_owned(),
+    }
+}
 
 /// The hint line while `delete_reach` is being counted: every chord that stops it (MOD-67 M3,
 /// blueprint L-C Q7: the arm always stopped on `n` too).
@@ -538,7 +552,7 @@ impl HierarchySection {
                 Act::ListDown => self.move_cursor(true),
                 Act::ListUp => self.move_cursor(false),
                 Act::HierarchyNewWorkspace => {
-                    if !self.refuse(act) {
+                    if !self.refuse(act, ctx.keys()) {
                         self.open(
                             EditorKind::NewWorkspace,
                             vec![
@@ -551,28 +565,28 @@ impl HierarchySection {
                     }
                 }
                 Act::New => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_new_child(row);
                     }
                 }
                 Act::Edit => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_edit(row);
                     }
                 }
                 Act::HierarchyPrimary => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.move_primary(row, ctx);
                     }
                 }
                 Act::HierarchyChoosePath => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.open_path(row, ctx);
@@ -581,7 +595,7 @@ impl HierarchySection {
                 // MOD-7 milestone 4 (D114): infer this box's repo paths under the workspace root.
                 // A write, so it is refused while another is in flight, as the other writes are.
                 Act::HierarchyInfer => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(snapshot) = &self.snapshot
                     {
                         let request = StoreRequest::InferRepoPaths(snapshot.workspace.id);
@@ -591,7 +605,7 @@ impl HierarchySection {
                     }
                 }
                 Act::Delete => {
-                    if !self.refuse(act)
+                    if !self.refuse(act, ctx.keys())
                         && let Some(row) = self.selected()
                     {
                         self.begin_delete(row, ctx);
@@ -616,8 +630,9 @@ impl HierarchySection {
     ///
     /// Two refusals, in this order: a write in flight (a second one of the same kind would lose a
     /// reply), then a tree that is not there to edit. `r` is deliberately **not** on this path —
-    /// re-reading is how a section that lost a reply recovers.
-    fn refuse(&mut self, act: Act) -> bool {
+    /// re-reading is how a section that lost a reply recovers. `keys` name the key that creates a
+    /// workspace in the no-workspace refusal (MOD-67 M6 D4).
+    fn refuse(&mut self, act: Act, keys: &Keys) -> bool {
         if self.in_flight() {
             return true;
         }
@@ -628,7 +643,8 @@ impl HierarchySection {
             return true;
         }
         if self.snapshot.is_none() && act != Act::HierarchyNewWorkspace {
-            self.notice = Some(NO_WORKSPACE.to_owned());
+            let new = keys.label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace);
+            self.notice = Some(no_workspace(new.as_deref()));
             return true;
         }
         false
@@ -772,7 +788,13 @@ impl HierarchySection {
                 None,
             ),
             Row::Project { .. } => {
-                self.notice = Some("`b` wants the workspace or a repo row".to_owned());
+                let choose = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
+                self.notice = Some(match choose {
+                    Some(choose) => format!("`{choose}` wants the workspace or a repo row"),
+                    None => "pick a path on the workspace or a repo row".to_owned(),
+                });
                 return;
             }
             Row::Repo { project, index } => {
@@ -837,7 +859,13 @@ impl HierarchySection {
                 self.send(request, ctx);
             }
             Row::Workspace | Row::Project { .. } => {
-                self.notice = Some("`p` wants a repo row".to_owned());
+                let primary = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyPrimary);
+                self.notice = Some(match primary {
+                    Some(primary) => format!("`{primary}` wants a repo row"),
+                    None => "only a repo row can be made primary".to_owned(),
+                });
             }
         }
     }
@@ -1267,10 +1295,11 @@ impl HierarchySection {
     }
 
     /// A CAS miss (D7): the tree is replaced, the editor keeps its text and takes the current row's
-    /// token, and the retry is a second `Enter` rather than an automatic write.
-    fn on_stale(&mut self, snapshot: &HierarchySnapshot) {
+    /// token, and the retry is a second `Enter` rather than an automatic write. `keys` name the
+    /// key a `p` retries on (MOD-67 M6 D4).
+    fn on_stale(&mut self, snapshot: &HierarchySnapshot, keys: &Keys) {
         self.busy = None;
-        let reloaded = match &self.mode {
+        let refreshed = match &self.mode {
             Mode::Editing(editor) => Some(reload(snapshot, editor.kind)),
             // MOD-49 blueprint D19: unreachable — path writes are upserts and never answer
             // `HierarchyStale` — and harmless if it ever were: the picker keeps its place.
@@ -1280,9 +1309,12 @@ impl HierarchySection {
         };
         self.snapshot = Some(snapshot.clone());
         self.clamp_cursor();
-        match reloaded {
+        match refreshed {
             // No editor: `p` is the only write that gets here, and its retry is the key again.
-            None => self.notice = Some(RELOADED.to_owned()),
+            None => {
+                let primary = keys.label(views::HIERARCHY_BROWSE, Act::HierarchyPrimary);
+                self.notice = Some(reloaded(primary.as_deref()));
+            }
             Some(Reload::Gone) => {
                 self.mode = Mode::Browse;
                 self.notice = Some(DELETED_ELSEWHERE.to_owned());
@@ -1382,14 +1414,17 @@ impl SettingsSection for HierarchySection {
                 self.mode = Mode::Browse;
                 self.clamp_cursor();
             }
-            StoreReply::HierarchyStale(snapshot) => self.on_stale(snapshot),
+            StoreReply::HierarchyStale(snapshot) => self.on_stale(snapshot, ctx.keys()),
             // MOD-7 milestone 4 (D117): a tree like any other, then what the pass did. A notice a
             // write left (`stored as …`, a follow-up's cause) is kept in front of the report; a
             // refusal shown during the walk is not, since the walk it waited for is over.
             StoreReply::RepoPathsInferred { tree, report } => {
                 let before = self.carried.take();
                 self.on_tree(tree, ctx);
-                let report = inferred_notice(report);
+                let choose = ctx
+                    .keys()
+                    .label(views::HIERARCHY_BROWSE, Act::HierarchyChoosePath);
+                let report = inferred_notice(report, choose.as_deref());
                 self.notice = Some(match before {
                     Some(before) => format!("{before} \u{b7} {report}"),
                     None => report,
@@ -1513,7 +1548,10 @@ impl SettingsSection for HierarchySection {
         if self.unavailable.is_some() {
             message(frame, rows, UNAVAILABLE, ctx.theme);
         } else if self.snapshot.is_none() {
-            message(frame, rows, NO_WORKSPACE, ctx.theme);
+            let new = ctx
+                .keys()
+                .label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace);
+            message(frame, rows, &no_workspace(new.as_deref()), ctx.theme);
         } else {
             frame.render_widget(Paragraph::new(self.lines(ctx.theme)), rows);
         }
@@ -1644,10 +1682,18 @@ fn reload(snapshot: &HierarchySnapshot, kind: EditorKind) -> Reload {
 /// truncated scan, a workspace without a repo — and otherwise `inferred {n} of {m}`, where `m`
 /// counts every repo that had no row before the pass, followed by what was not inferred. A refused
 /// repo is named, not explained: its sentence may name a path, and the notice is one line.
-pub(crate) fn inferred_notice(report: &InferReport) -> String {
+///
+/// `choose` is the label of `settings.hierarchy.choose_path` (MOD-67 M6 D4), the key the notice
+/// sends the user to (`b` under the defaults); unbound, the notice names no key.
+pub(crate) fn inferred_notice(report: &InferReport, choose: Option<&str>) -> String {
     if report.root.is_none() {
-        return "no root on this box for this workspace \u{2014} b on the workspace row sets it"
-            .to_owned();
+        return match choose {
+            Some(choose) => format!(
+                "no root on this box for this workspace \u{2014} {choose} on the workspace row sets it"
+            ),
+            None => "no root on this box for this workspace \u{2014} set one on the workspace row"
+                .to_owned(),
+        };
     }
     if report.truncated {
         return format!(
@@ -1694,7 +1740,12 @@ pub(crate) fn inferred_notice(report: &InferReport) -> String {
     }
     let mut notice = parts.join(" \u{b7} ");
     if !(unmatched.is_empty() && ambiguous.is_empty() && refused.is_empty()) {
-        notice.push_str(" \u{2014} b on a repo sets it by hand");
+        match choose {
+            Some(choose) => {
+                notice.push_str(&format!(" \u{2014} {choose} on a repo sets it by hand"))
+            }
+            None => notice.push_str(" \u{2014} set it by hand on a repo row"),
+        }
     }
     notice
 }
