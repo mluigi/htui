@@ -88,8 +88,9 @@ pub trait DetailTab {
     /// must hand it every key before its own navigation (MOD-4 plan OQ-7). Derived from a mode,
     /// never a flag.
     ///
-    /// A capturing sub-tab returns `Pass` for a `CONTROL` chord, so `ctrl-c` still quits, and
-    /// `Consumed` for everything else: `q`, a digit and `Tab` cannot leave a typed field.
+    /// A capturing sub-tab returns `Pass` for what its modal stack admits (a `CONTROL` or `ALT`
+    /// chord, a function key such as `F1`; MOD-67 M5), so `ctrl-c` still quits and `F1` opens
+    /// help, and `Consumed` for everything else: `q`, a digit and `Tab` cannot leave a typed field.
     fn captures_input(&self) -> bool {
         false
     }

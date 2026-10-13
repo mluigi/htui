@@ -312,6 +312,10 @@ async fn a_rebound_save_saves_the_item_form_a_note_and_a_document() {
     let frame = harness.render();
     assert!(frame.contains(" New note "), "still open:\n{frame}");
     assert!(
+        frame.contains("A note by hand.") && !frame.contains("A note by hand.s"),
+        "`ctrl-s` typed nothing into the note:\n{frame}"
+    );
+    assert!(
         frame.contains("Ctrl+e $EDITOR · F2 save · Esc cancel"),
         "{frame}"
     );
@@ -342,6 +346,10 @@ async fn a_rebound_save_saves_the_item_form_a_note_and_a_document() {
     press(&mut harness, "ctrl-s").await;
     let frame = harness.render();
     assert!(frame.contains(" New document "), "still open:\n{frame}");
+    assert!(
+        frame.contains("The summary.") && !frame.contains("The summary.s"),
+        "`ctrl-s` typed nothing into the body:\n{frame}"
+    );
     assert!(
         frame.contains("Ctrl+e $EDITOR · F2 save · Esc cancel"),
         "{frame}"

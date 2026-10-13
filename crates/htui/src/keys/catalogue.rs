@@ -840,8 +840,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // (connection.rs:807, workspace_switcher.rs:171).
     row(Act::ListFold, List, "fold", &["enter"], "fold"),
     // [pane]
-    // backlog/detail/mod.rs:447 (`Scroll::on_key`), requirements/mod.rs:435, library.rs:708,
-    // templates.rs:528. runs.rs:1546 `J` is next step (a view verb, ANA §6.2:
+    // backlog/detail/mod.rs:465 (`Scroll::apply`), requirements/mod.rs:458, library.rs:812,
+    // templates.rs:616. runs.rs:1713 `J` is next step (a view verb, ANA §6.2:
     // `backlog.runs.next_step`).
     row(
         Act::PaneScrollDown,
@@ -850,13 +850,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["J"],
         "scroll down",
     ),
-    // backlog/detail/mod.rs:448.
+    // backlog/detail/mod.rs:466.
     row(Act::PaneScrollUp, Pane, "scroll_up", &["K"], "scroll up"),
-    // backlog/detail/mod.rs:449, graph.rs:697, divergence.rs:261.
+    // backlog/detail/mod.rs:467, graph.rs:706, divergence.rs:266.
     row(Act::PanePageDown, Pane, "page_down", &["pgdn"], "page down"),
-    // backlog/detail/mod.rs:450.
+    // backlog/detail/mod.rs:468.
     row(Act::PanePageUp, Pane, "page_up", &["pgup"], "page up"),
-    // backlog/mod.rs:758. Settings cycles sections through `settings.next_section` (M3).
+    // backlog/mod.rs:793. Settings cycles sections through `settings.next_section` (M3).
     row(
         Act::PaneNextSubtab,
         Pane,
@@ -864,7 +864,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["l", "]", "right"],
         "next sub-tab",
     ),
-    // backlog/mod.rs:759. Settings: `settings.prev_section` (M3).
+    // backlog/mod.rs:794. Settings: `settings.prev_section` (M3).
     row(
         Act::PanePrevSubtab,
         Pane,

@@ -2139,7 +2139,9 @@ async fn the_live_chat_box_lists_chat_list_and_global() {
 }
 
 /// MOD-67 M5 (D5): the replay's swallow stays fixed and first, on plain keys only: `2` stays on
-/// the replay, and `alt-2` (bound to nothing) neither switches tabs nor closes it.
+/// the replay, and `alt-2` (bound to nothing) neither switches tabs nor closes it. With `alt-2`
+/// bound to `global.select_tab_2` beside `2`, the replay still swallows `2` but passes `alt-2`,
+/// which the shell then obeys: the replay passed it rather than consuming it.
 #[tokio::test]
 async fn replay_swallows_plain_digits_and_passes_alt_digits() {
     let mut harness = Harness::demo()
@@ -2163,6 +2165,31 @@ async fn replay_swallows_plain_digits_and_passes_alt_digits() {
             "`{pressed}` leaves the replay open: {frame}"
         );
     }
+
+    let keys = htui::keys::load_str("version = 1\n[global]\nselect_tab_2 = [\"2\", \"alt-2\"]\n")
+        .expect("the keys load");
+    let mut harness = Harness::demo()
+        .with_keys(keys)
+        .with_tab(Box::new(ChatTab::new()))
+        .with_tab(Box::new(BacklogTab::new()))
+        .with_replay_tab(ChatTab::ID);
+    harness.settle().await;
+    replay(&mut harness, ids::STEP_PLAN).await;
+    assert!(harness.render().contains("read-only"), "the replay is open");
+    harness.key("2");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().tabs.active_id().map(|id| id.0),
+        Some("chat"),
+        "`2` is still swallowed"
+    );
+    harness.key("alt-2");
+    harness.drive().await;
+    assert_eq!(
+        harness.app().tabs.active_id().map(|id| id.0),
+        Some("backlog"),
+        "`alt-2` passed the replay and selected tab 2"
+    );
 }
 
 /// MOD-67 M5 (D7): the CONTROL/ALT guard is gone, and a chord still does not disarm `Esc Esc`
