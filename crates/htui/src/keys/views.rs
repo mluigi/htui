@@ -1362,8 +1362,6 @@ mod tests {
     /// validated (and refuse key files) for a mode no view is ever in.
     #[test]
     fn every_view_stack_is_named_by_a_view() {
-        /// MOD-67 M6: the lanes name these; T-close empties the list (PA-4).
-        const PENDING: &[&str] = &["QUEUE_OVERLAY", "HIERARCHY_PICKER"];
         // Production code only, so a stack named only by a test or a doc comment still counts
         // as unnamed.
         let production: Vec<String> = VIEWS.iter().map(|source| production(source)).collect();
@@ -1383,9 +1381,6 @@ mod tests {
             "views.rs stacks vs DECLARED"
         );
         for name in declared {
-            if PENDING.contains(&name) {
-                continue;
-            }
             assert!(named(name), "no view names views::{name}");
         }
     }
@@ -1395,20 +1390,6 @@ mod tests {
     /// production code (the include-and-strip technique of `every_view_stack_is_named_by_a_view`).
     #[test]
     fn every_act_is_offered_by_a_stack_and_handled_by_a_view() {
-        /// MOD-67 M6: the lanes name these; T-close empties the list (PA-4).
-        const PENDING_ACTS: &[Act] = &[
-            Act::QueueMoveDown,
-            Act::QueueMoveUp,
-            Act::QueuePause,
-            Act::QueueDequeue,
-            Act::QueueOpen,
-            Act::PickerOpen,
-            Act::PickerParent,
-            Act::PickerChoose,
-            Act::PickerChooseDir,
-            Act::PickerGoTo,
-            Act::PickerHidden,
-        ];
         for spec in CATALOGUE {
             assert!(
                 DECLARED
@@ -1436,9 +1417,6 @@ mod tests {
                     .iter()
                     .filter(|spec| spec.context == layer.context() && stack.admits(index, spec.act))
                 {
-                    if PENDING_ACTS.contains(&spec.act) {
-                        continue;
-                    }
                     let act = spec.act;
                     assert!(
                         names(&production, &format!("Act::{act:?}")),
