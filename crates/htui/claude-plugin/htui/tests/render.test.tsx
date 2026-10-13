@@ -1,5 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
-import { BAND, engineBottom, htui, OFFLINE, ok, PANE, start, WAITING, WAITING_NONE } from './fixtures'
+import { BAND, engineBottom, htui, OFFLINE, ok, PANE, start, WAITING, WAITING_NONE, type Answer } from './fixtures'
 
 const SURFACES = ['terminal', 'desktop'] as const
 
@@ -68,6 +68,44 @@ test('a failed poll shows its line in the band', async ($, on) => {
     const line = await ui.find({ type: 'Text', text: /cannot reach Postgres/ })
     expect(line?.text).toBe('htui: cannot reach Postgres: store unreachable: connection refused')
     expect(await ui.find({ type: 'Text', text: /waiting on you/ })).toBeUndefined()
+    await ui.unmount()
+  }
+})
+
+test('a failed poll drops the rows an earlier poll showed', async ($, on) => {
+  const clock = mock.clock(on)
+  const answers: Record<string, Answer> = { waiting: ok(WAITING) }
+  htui(on, answers, [])
+  await start($, on)
+  await clock.settle()
+  answers.waiting = ok(OFFLINE, 3)
+  await clock.advance(30000)
+  for (const surface of SURFACES) {
+    const band = await $.ui.mount({ plugin: 'htui', surface, component: 'AbovePrompt', props: BAND })
+    expect(await band.find({ type: 'Text', text: /waiting on you/ })).toBeUndefined()
+    const line = await band.find({ type: 'Text', text: /cannot reach Postgres/ })
+    expect(line?.text).toBe('htui: cannot reach Postgres: store unreachable: connection refused')
+    await band.unmount()
+    const pane = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props: PANE, requestId: 'htui' })
+    expect(await pane.find({ key: 'row-0' })).toBeUndefined()
+    expect((await pane.find({ type: 'Text', text: /waiting$/ }))?.text).toBe('no workspace · 0 waiting')
+    await pane.unmount()
+  }
+})
+
+test('a pane row is stripped of control characters', async ($, on) => {
+  const clock = mock.clock(on)
+  const doc = JSON.parse(WAITING)
+  doc.workspace = { ...doc.workspace, name: 'Plat\nform' }
+  doc.rows = [{ ...doc.rows[0], text: 'line one\nline two \u001b[31mred' }]
+  htui(on, { waiting: ok(JSON.stringify(doc)) }, [])
+  await start($, on)
+  await clock.settle()
+  for (const surface of SURFACES) {
+    const props = { ...(PANE as object), bodyColumns: 100 } as never
+    const ui = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props, requestId: 'htui' })
+    expect((await ui.find({ key: 'row-0' }))?.text).toBe('gate         MOD-4     prd 0.1          18h  line oneline two [31mred')
+    expect((await ui.find({ type: 'Text', text: /waiting$/ }))?.text).toBe('Platform · 1 waiting')
     await ui.unmount()
   }
 })

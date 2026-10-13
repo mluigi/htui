@@ -20,6 +20,12 @@ const PANE = 'htui'
 const age = (s: number): string =>
   s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m` : s < 86400 ? `${Math.floor(s / 3600)}h` : `${Math.floor(s / 86400)}d`
 
+/**
+ * `s` as a string with its control characters dropped, as htui's own text output drops them
+ * (`state_cmd.rs`'s `clean`): stored text must not drive the terminal, nor break a one-line row.
+ */
+const clean = (s: unknown): string => String(s ?? '').replace(/\p{Cc}/gu, '')
+
 /** A row's reason as the overlay names it: `judge_failed` reads `judge failed`. */
 const label = (reason: string): string => reason.replace(/_/g, ' ')
 
@@ -62,20 +68,23 @@ async function runHtui($: EngineInterface, argv: readonly string[], timeoutMs: n
       line: `htui: answer version ${doc.version} is newer than this plugin: run htui claude emit --force, then /reload-plugins`,
     }
   }
-  if (typeof doc.error?.message === 'string') return { ok: false, line: `htui: ${doc.error.message}` }
+  if (typeof doc.error?.message === 'string') return { ok: false, line: `htui: ${clean(doc.error.message)}` }
   if (r.exitCode !== 0) return { ok: false, line: `htui: exit ${r.exitCode}` }
   return { ok: true, doc }
 }
 
-/** The rows of a `waiting` document, reduced to the fields the mod reads; an entry that is not an object is left out. */
+/**
+ * The rows of a `waiting` document, reduced to the fields the mod reads and stripped of control
+ * characters; an entry that is not an object is left out.
+ */
 const rowsOf = (doc: any): HtuiRow[] =>
   (Array.isArray(doc.rows) ? doc.rows : [])
     .filter((r: unknown) => r !== null && typeof r === 'object')
     .map((r: any) => ({
-      reason: String(r.reason ?? ''),
-      item_key: String(r.item_key ?? ''),
-      step: typeof r.step === 'string' ? r.step : null,
-      text: String(r.text ?? ''),
+      reason: clean(r.reason),
+      item_key: clean(r.item_key),
+      step: typeof r.step === 'string' ? clean(r.step) : null,
+      text: clean(r.text),
       age_seconds: Math.max(0, Math.floor(Number(r.age_seconds) || 0)),
     }))
 
@@ -92,7 +101,7 @@ async function statusText($: EngineInterface): Promise<string> {
   if (ran.ok) {
     const d = ran.doc
     lines.push(
-      `${d.workspace?.name ?? 'no workspace'} · ${d.box?.hostname ?? 'no box'} · ${d.store} · ${d.working} working · ${d.waiting} waiting`,
+      `${d.workspace ? clean(d.workspace.name) : 'no workspace'} · ${d.box ? clean(d.box.hostname) : 'no box'} · ${clean(d.store)} · ${d.working} working · ${d.waiting} waiting`,
     )
     if (d.permissions_known === false) lines.push('permission requests could not be listed; the count may be low')
   } else {
@@ -113,7 +122,7 @@ async function searchText($: EngineInterface, query: string): Promise<string> {
   return hits
     .map(
       h =>
-        `${h.key}  ${h.place}${h.document_kind ? ' ' + h.document_kind : ''}${h.resolution ? ' (' + h.resolution + ')' : ''}  ${h.snippet}`,
+        `${clean(h.key)}  ${clean(h.place)}${h.document_kind ? ' ' + clean(h.document_kind) : ''}${h.resolution ? ' (' + clean(h.resolution) + ')' : ''}  ${clean(h.snippet)}`,
     )
     .join('\n')
 }
@@ -135,7 +144,7 @@ async function poll($: EngineInterface): Promise<void> {
     const ran = await runHtui($, ['htui', 'waiting', '--json'], 10000)
     const at = await $.clock.now()
     const next: HtuiWaiting = ran.ok
-      ? { rows: rowsOf(ran.doc), workspace: ran.doc.workspace?.name ?? null, at, error: null }
+      ? { rows: rowsOf(ran.doc), workspace: ran.doc.workspace ? clean(ran.doc.workspace.name) : null, at, error: null }
       : { rows: [], workspace: null, at, error: ran.line }
     await update($, waiting, () => next)
   } catch {

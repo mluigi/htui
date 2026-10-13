@@ -173,3 +173,36 @@ test('an unreadable or newer answer is a line', async ($, on) => {
   answers.status = ok('{"version":1,"kind":"status","store":"error"}', 1)
   expect(await run($, 'status')).toBe('htui: exit 1')
 })
+
+test('waiting strips control characters from what htui stored', async ($, on) => {
+  const clock = mock.clock(on)
+  const doc = JSON.parse(WAITING)
+  doc.rows = [
+    { ...doc.rows[0], item_key: 'MOD-\u00074', step: 'prd\t0.1', text: 'line one\nline two \u001b[31mred\u001b[0m\r' },
+    doc.rows[1],
+  ]
+  htui(on, { waiting: ok(JSON.stringify(doc)) }, [])
+  expect(await run($, 'waiting')).toBe(
+    'MOD-4  gate  prd0.1  18h  line oneline two [31mred[0m\nMOD-7  unblock  -  2d  blocked, no active run: u reopens it',
+  )
+})
+
+test('status and search strip control characters', async ($, on) => {
+  const clock = mock.clock(on)
+  const status = JSON.parse(STATUS)
+  status.workspace = { ...status.workspace, name: 'Plat\nform' }
+  status.box = { ...status.box, hostname: 'de\u001bsk' }
+  const search = JSON.parse(SEARCH)
+  search.hits = [{ ...search.hits[1], key: 'MOD-\n34', document_kind: 'p\u0007rd', snippet: 'the\r\nconcepts index' }]
+  htui(on, { status: ok(JSON.stringify(status)), search: ok(JSON.stringify(search)) }, [])
+  expect(await run($, 'status')).toBe('Platform · desk · online · 1 working · 2 waiting')
+  expect(await run($, 'search closed items')).toBe('MOD-34  document prd (done)  theconcepts index')
+})
+
+test('an error message is stripped of control characters', async ($, on) => {
+  const clock = mock.clock(on)
+  const doc = JSON.parse(NO_DSN)
+  doc.error.message = 'no Postgres\nDSN \u001b[2Jis stored'
+  htui(on, { waiting: ok(JSON.stringify(doc), 2) }, [])
+  expect(await run($, 'waiting')).toBe('htui: no PostgresDSN [2Jis stored')
+})
