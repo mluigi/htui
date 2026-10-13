@@ -31,7 +31,7 @@ use crate::editor::ExternalEditOutcome;
 use crate::keys::{Act, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
-use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
+use crossterm::event::{KeyEvent, MouseEvent};
 
 pub use body::BodyTab;
 pub use documents::DocumentsTab;
@@ -457,20 +457,8 @@ impl Scroll {
         self.offset = 0;
     }
 
-    /// `J` / `K` scroll one row, `PageDown` / `PageUp` ten, everything else passes through.
-    pub fn on_key(&mut self, key: KeyEvent, len: usize) -> Handled {
-        let step: isize = match key.code {
-            KeyCode::Char('J') => 1,
-            KeyCode::Char('K') => -1,
-            KeyCode::PageDown => PAGE,
-            KeyCode::PageUp => -PAGE,
-            _ => return Handled::Pass,
-        };
-        self.step(step, len)
-    }
-
     /// One pane-scroll act (MOD-67 M4): `pane.scroll_down`/`scroll_up` one row,
-    /// `pane.page_down`/`page_up` ten, clamped as `on_key`; `Pass` for any other act.
+    /// `pane.page_down`/`page_up` ten, clamped to the last row; `Pass` for any other act.
     pub fn apply(&mut self, act: Act, len: usize) -> Handled {
         let step: isize = match act {
             Act::PaneScrollDown => 1,
@@ -493,7 +481,7 @@ impl Scroll {
 
 #[cfg(test)]
 mod tests {
-    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crossterm::event::KeyEvent;
     use htui_core::model::ItemId;
     use ratatui::Frame;
     use ratatui::layout::Rect;
@@ -503,27 +491,14 @@ mod tests {
     use crate::keys::{Act, Stack, views};
     use crate::store_worker::StoreReply;
 
-    fn key(code: KeyCode) -> KeyEvent {
-        KeyEvent::new(code, KeyModifiers::NONE)
-    }
-
+    /// `Scroll::apply`, the pane scroll's one entry (MOD-67 M5 dropped the key-matching
+    /// `on_key`): a row or a page per act, clamped to the last row; any other act passes.
     #[test]
-    fn apply_steps_and_clamps_like_on_key() {
-        let pairs = [
-            (Act::PaneScrollDown, KeyCode::Char('J')),
-            (Act::PaneScrollUp, KeyCode::Char('K')),
-            (Act::PanePageDown, KeyCode::PageDown),
-            (Act::PanePageUp, KeyCode::PageUp),
-        ];
-        for start in [0, 3, 4, 12, 30] {
-            for len in [0, 1, 5, 25] {
-                for (act, code) in pairs {
-                    let (mut by_act, mut by_key) = (Scroll::at(start), Scroll::at(start));
-                    assert_eq!(by_act.apply(act, len), Handled::Consumed, "{act:?}");
-                    assert_eq!(by_key.on_key(key(code), len), Handled::Consumed);
-                    assert_eq!(by_act, by_key, "{act:?} from {start} over {len}");
-                }
-            }
+    fn apply_steps_and_clamps() {
+        for len in [0, 1] {
+            let mut scroll = Scroll::at(3);
+            assert_eq!(scroll.apply(Act::PanePageDown, len), Handled::Consumed);
+            assert_eq!(scroll.offset(), 0, "nothing to scroll over {len} rows");
         }
 
         let mut scroll = Scroll::default();

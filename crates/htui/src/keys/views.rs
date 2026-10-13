@@ -1196,29 +1196,6 @@ mod tests {
             include_str!("../ui/tabs/backlog/detail/runs.rs"),
             include_str!("../ui/tabs/chat/mod.rs"),
         ];
-        /// MOD-67 M5: the lanes name these; T-close empties the list. `BACKLOG_BODY` is named
-        /// by T1c's `detail/mod.rs` (blueprint §4.1).
-        const PENDING: &[&str] = &[
-            "RUNS_BROWSE",
-            "RUNS_CONFIRM",
-            "RUNS_COUNTING",
-            "RUNS_ARTIFACT",
-            "BACKLOG_GRAPH",
-            "BACKLOG_DOCS",
-            "DOCS_COMPOSE",
-            "BACKLOG_NOTES",
-            "NOTES_COMPOSE",
-            "BACKLOG_PROMPT",
-            "BACKLOG_REQS",
-            "REQS_PICK",
-            "REQS_KIND",
-            "REQS_CONFIRM",
-            "BACKLOG_FILTER",
-            "ITEM_FORM",
-            "ITEM_DIVERGENCE",
-            "CHAT_LIVE",
-            "CHAT_REPLAY",
-        ];
         // Production code only: each file up to its test module, its comment lines dropped, so a
         // stack named only by a test or a doc comment still counts as unnamed.
         let production: Vec<String> = VIEWS
@@ -1252,9 +1229,6 @@ mod tests {
             "views.rs stacks vs DECLARED"
         );
         for name in declared {
-            if PENDING.contains(&name) {
-                continue;
-            }
             assert!(named(name), "no view names views::{name}");
         }
     }
