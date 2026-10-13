@@ -44,10 +44,13 @@ const fit = (s: string, columns: number): string => {
   return chars.length <= columns ? s : chars.slice(0, Math.max(0, columns - 1)).join('') + '…'
 }
 
-/** One pane row: reason, item, step and age in columns, then the text, cut to the pane's width. */
+/**
+ * One pane row: reason, item, step and age in columns of 13, 10, 16 and 4, then the text, cut to
+ * the pane's width. A value as wide as its column or wider still ends in one space (V4).
+ */
 const rowLine = (r: HtuiRow, columns: number): string =>
   fit(
-    `${label(r.reason).padEnd(13)}${r.item_key.padEnd(10)}${(r.step ?? '-').padEnd(16)}${age(r.age_seconds).padStart(4)}  ${r.text}`,
+    `${label(r.reason).padEnd(12)} ${r.item_key.padEnd(9)} ${(r.step ?? '-').padEnd(15)} ${age(r.age_seconds).padStart(4)}  ${r.text}`,
     columns,
   )
 

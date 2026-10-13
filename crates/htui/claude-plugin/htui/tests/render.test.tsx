@@ -253,3 +253,24 @@ test('a poll whose rows is not a list shows a line, not a count', async ($, on) 
     await pane.unmount()
   }
 })
+
+test('pane columns never run together', async ($, on) => {
+  const clock = mock.clock(on)
+  const doc = JSON.parse(WAITING)
+  doc.rows = [
+    { ...doc.rows[0], reason: 'permission_request', item_key: 'LONGPREFIX-12345', step: 'a very long step name', age_seconds: 5 },
+    { ...doc.rows[0], reason: 'abcdefghijklm', item_key: 'ABCDEFGHIJ', step: 'sixteen-chars-xx', age_seconds: 950400 },
+  ]
+  htui(on, { waiting: ok(JSON.stringify(doc)) }, [])
+  await start($, on)
+  await clock.settle()
+  const props = { ...(PANE as object), bodyColumns: 200 } as never
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props, requestId: 'htui' })
+    expect((await ui.find({ key: 'row-0' }))?.text).toBe(
+      'permission request LONGPREFIX-12345 a very long step name   5s  approve the PRD',
+    )
+    expect((await ui.find({ key: 'row-1' }))?.text).toBe('abcdefghijklm ABCDEFGHIJ sixteen-chars-xx  11d  approve the PRD')
+    await ui.unmount()
+  }
+})
