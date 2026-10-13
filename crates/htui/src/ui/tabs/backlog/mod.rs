@@ -53,6 +53,7 @@ use crate::ui::tabs::backlog::item_form::{
 };
 use crate::ui::tabs::backlog::list::{ListView, Selection};
 use crate::ui::tabs::registry::{CLOSE_THE_FIELD_FIRST, Tab, TabId};
+use crate::ui::tabs::settings::modal_rest;
 use crossterm::event::{KeyEvent, MouseEvent};
 
 /// Width of the list pane, as a percentage of the body region.
@@ -352,19 +353,17 @@ impl BacklogTab {
 
     /// A key while the filter form is open (MOD-13 D1).
     ///
-    /// Every plain key is consumed, used by the form or not: the global keymap resolves only what
-    /// a tab passes, so a passed `q` would quit, a digit or `Tab` switch tabs, `w` open the
-    /// switcher. A chord ([`filter::CHORD`]: any modifier but `SHIFT`) passes, the rule
-    /// `TextField::on_key` applies (review L4), so `ctrl-c` still quits and `Ctrl+F` still
-    /// searches, and an `Alt` chord is never read as its letter.
+    /// Every plain key the form does not use is consumed; CONTROL, ALT and function keys pass
+    /// (`BACKLOG_FILTER`'s modal layer, MOD-67 M5), so `ctrl-c` quits, `Ctrl+f` searches and `F1`
+    /// opens help.
     fn on_form_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        if key.modifiers.intersects(filter::CHORD) {
-            return Handled::Pass;
-        }
         let Some(form) = self.form.as_mut() else {
             return Handled::Pass;
         };
-        match form.on_key(key) {
+        match form.on_key(key, ctx.keys()) {
+            FormOutcome::Pass => {
+                return modal_rest(views::BACKLOG_FILTER, KeyChord::from_event(key));
+            }
             FormOutcome::Stay => {}
             FormOutcome::Cancel => self.form = None,
             FormOutcome::Refused(sentence) => ctx.emit(Action::Error(sentence)),
@@ -964,7 +963,7 @@ impl Tab for BacklogTab {
         };
         list::render(frame, list_area, &view, ctx.theme);
         if let (Some(form), Some(at)) = (&self.form, form_area) {
-            filter::render(frame, at, form, ctx.theme);
+            filter::render(frame, at, form, ctx.keys(), ctx.theme);
         }
         // MOD-13 milestone 2 D8: the open item form takes the detail pane's place.
         match &self.item_form {
@@ -2520,8 +2519,9 @@ mod tests {
         assert!(runs_reads(&actions).is_empty(), "{actions:?}");
     }
 
-    /// MOD-13 review L4: the open form passes every chord but `SHIFT`, as `TextField` does, so an
-    /// `Alt` chord reaches the shell instead of acting as its letter.
+    /// MOD-13 review L4: a chord never acts as its letter in the open form. MOD-67 M5: what passes
+    /// is `BACKLOG_FILTER`'s modal layer's rule (D5), so an `Alt` chord reaches the shell and a
+    /// `Super`, `Meta` or `Hyper` one is swallowed, as in every M3/M4 modal mode.
     #[tokio::test]
     async fn an_alt_chord_passes_through_the_open_form() {
         let bench = Bench::new().await;
@@ -2530,18 +2530,18 @@ mod tests {
             ..bench.tab()
         };
         press(&mut tab, &bench, KeyCode::Char('f'));
-        for modifier in [
-            KeyModifiers::ALT,
-            KeyModifiers::SUPER,
-            KeyModifiers::META,
-            KeyModifiers::HYPER,
+        for (modifier, handled) in [
+            (KeyModifiers::ALT, Handled::Pass),
+            (KeyModifiers::SUPER, Handled::Consumed),
+            (KeyModifiers::META, Handled::Consumed),
+            (KeyModifiers::HYPER, Handled::Consumed),
         ] {
             assert_eq!(
                 tab.on_key(
                     KeyEvent::new(KeyCode::Char('x'), modifier),
                     &mut bench.ctx()
                 ),
-                Handled::Pass,
+                handled,
                 "{modifier:?}"
             );
         }

@@ -8,6 +8,11 @@
 //! [`FilterForm`] is an inline, capturing panel at the bottom of the list pane (D1), not an
 //! overlay: an overlay factory cannot be seeded with the current filter. It is pure — no `Ctx` —
 //! and answers the tab with a [`FormOutcome`], as `requirements/forms.rs` does.
+//!
+//! MOD-67 M5: its keys resolve through [`views::BACKLOG_FILTER`]. The rows move with
+//! `backlog.filter_form.next_row`/`prev_row` and `form.next_field`/`prev_field`, `x` clears
+//! (`backlog.filter_form.clear`); an option row's value keys (`h`/`l`/arrows, Space) and its
+//! `Enter`/`Esc` are the form's own, plain keys only.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use htui_core::model::{ItemFilter, ProjectId, ProjectRef, Scope, Status, declared_tags_from_text};
@@ -16,6 +21,7 @@ use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::{FieldOutcome, TextField, Theme};
@@ -23,11 +29,22 @@ use crate::ui::{FieldOutcome, TextField, Theme};
 /// Rows the form takes at the bottom of the list pane: two borders, four rows and the hint.
 pub const FORM_HEIGHT: u16 = 7;
 
-/// The hint under every row but Tags.
-pub const HINT_CHOICES: &str = "space toggle · x clear · Enter apply · Esc cancel";
+/// The hint under every row but Tags, through [`views::BACKLOG_FILTER`].
+pub const HINT_CHOICES: HintSpec = &[
+    Hint::Text("space toggle"),
+    Hint::One(Act::FilterClear, "clear"),
+    Hint::Text("Enter apply"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The hint under the Tags row, where the letters are text (blueprint E7).
-pub const HINT_TAGS: &str = "comma list · ↑/↓ row · Enter apply · Esc cancel";
+/// The hint under the Tags row, where the letters are text (blueprint E7): the row moves with
+/// `form.next_field` (`Tab row` under the defaults, MOD-67 M5).
+pub const HINT_TAGS: HintSpec = &[
+    Hint::Text("comma list"),
+    Hint::One(Act::FormNextField, "row"),
+    Hint::Text("Enter apply"),
+    Hint::Text("Esc cancel"),
+];
 
 /// Width of a row's label column, after the two-cell focus marker.
 const LABEL: usize = 8;
@@ -176,6 +193,9 @@ pub enum FormOutcome {
     /// required tag, for the status line (D3, review N2). The form stays open with the text to
     /// fix.
     Refused(String),
+    /// A key the form did not use (MOD-67 M5): the tab answers it with `modal_rest` over
+    /// [`views::BACKLOG_FILTER`], so a chord or a function key reaches the shell.
+    Pass,
 }
 
 /// The open filter form.
@@ -219,46 +239,51 @@ impl FilterForm {
         self.row
     }
 
-    /// Feeds one key.
+    /// Feeds one key, resolved through [`views::BACKLOG_FILTER`] (MOD-67 M5).
     ///
-    /// On the Tags row every plain character is text (blueprint E7), so rows move with
-    /// `Up`/`Down`/`Tab`/`BackTab` there; `j`/`k`/`h`/`l`/`space`/`x` act on the other rows.
-    /// A [`CHORD`] does nothing on any row (MOD-13 review L4): the tab passes chords on before
-    /// they reach here, and this keeps `Alt+x` from clearing a form driven directly.
-    pub fn on_key(&mut self, key: KeyEvent) -> FormOutcome {
-        if key.modifiers.intersects(CHORD) {
+    /// On the Tags row every plain character is text (blueprint E7): the field takes the key
+    /// first, and what it passes moves the row on `form.next_field`/`prev_field` (`Tab`/`Down`,
+    /// `BackTab`/`Up`). On the other rows the form's own plain keys come first (`Enter` applies,
+    /// `Esc` cancels, `h`/`l`/arrows move the option, Space ticks it), then the acts:
+    /// `backlog.filter_form.next_row`/`prev_row` (`j`/`k`) and the field moves, and
+    /// `backlog.filter_form.clear` (`x`). Anything else is [`FormOutcome::Pass`]: a chord is never
+    /// a form key (MOD-13 review L4), so `Alt+x` clears nothing.
+    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> FormOutcome {
+        let tags = self.row == FilterRow::Tags;
+        if tags {
+            match self.tags.on_key(key) {
+                FieldOutcome::Submit => return self.apply(),
+                FieldOutcome::Cancel => return FormOutcome::Cancel,
+                FieldOutcome::Consumed => return FormOutcome::Stay,
+                FieldOutcome::Pass => {}
+            }
+        } else if plain(&key) {
+            match key.code {
+                KeyCode::Enter => return self.apply(),
+                KeyCode::Esc => return FormOutcome::Cancel,
+                KeyCode::Char('h') | KeyCode::Left => return self.move_option(false),
+                KeyCode::Char('l') | KeyCode::Right => return self.move_option(true),
+                KeyCode::Char(' ') => return self.toggle(),
+                _ => {}
+            }
+        }
+        for act in keys.actions(views::BACKLOG_FILTER, KeyChord::from_event(key)) {
+            match act {
+                Act::FormNextField => self.move_row(1),
+                Act::FormPrevField => self.move_row(-1),
+                // On the Tags row the letters are text; a rebound row or clear chord the field
+                // passed still does nothing there, as today's `j`/`k`/`x`.
+                Act::FilterNextRow if !tags => self.move_row(1),
+                Act::FilterPrevRow if !tags => self.move_row(-1),
+                Act::FilterClear if !tags => {
+                    self.draft = BacklogFilter::default();
+                    self.tags.clear();
+                }
+                _ => continue,
+            }
             return FormOutcome::Stay;
         }
-        if self.row == FilterRow::Tags {
-            return match self.tags.on_key(key) {
-                FieldOutcome::Submit => self.apply(),
-                FieldOutcome::Cancel => FormOutcome::Cancel,
-                FieldOutcome::Pass => {
-                    match key.code {
-                        KeyCode::Up | KeyCode::BackTab => self.move_row(-1),
-                        KeyCode::Down | KeyCode::Tab => self.move_row(1),
-                        _ => {}
-                    }
-                    FormOutcome::Stay
-                }
-                FieldOutcome::Consumed => FormOutcome::Stay,
-            };
-        }
-        match key.code {
-            KeyCode::Enter => return self.apply(),
-            KeyCode::Esc => return FormOutcome::Cancel,
-            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => self.move_row(1),
-            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => self.move_row(-1),
-            KeyCode::Char('h') | KeyCode::Left => self.move_option(false),
-            KeyCode::Char('l') | KeyCode::Right => self.move_option(true),
-            KeyCode::Char(' ') => self.toggle(),
-            KeyCode::Char('x') => {
-                self.draft = BacklogFilter::default();
-                self.tags.clear();
-            }
-            _ => {}
-        }
-        FormOutcome::Stay
+        FormOutcome::Pass
     }
 
     /// A bracketed paste: the tag field's on the Tags row, dropped on every other row.
@@ -276,7 +301,7 @@ impl FilterForm {
     }
 
     /// Moves the option cursor of the Status or Project row, wrapping; nothing elsewhere.
-    fn move_option(&mut self, forward: bool) {
+    fn move_option(&mut self, forward: bool) -> FormOutcome {
         let step = |at: usize, len: usize| {
             if len == 0 {
                 at
@@ -291,10 +316,11 @@ impl FilterForm {
             FilterRow::Project => self.project_at = step(self.project_at, self.projects.len()),
             FilterRow::Tags | FilterRow::Ready => {}
         }
+        FormOutcome::Stay
     }
 
     /// Ticks or unticks the option under the cursor, keeping each list in its canonical order.
-    fn toggle(&mut self) {
+    fn toggle(&mut self) -> FormOutcome {
         match self.row {
             FilterRow::Status => {
                 let status = Status::ALL[self.status_at];
@@ -305,7 +331,7 @@ impl FilterForm {
             }
             FilterRow::Project => {
                 let Some(project) = self.projects.get(self.project_at) else {
-                    return;
+                    return FormOutcome::Stay;
                 };
                 toggle(&mut self.draft.projects, project.project_id);
                 let order = &self.projects;
@@ -316,6 +342,7 @@ impl FilterForm {
             FilterRow::Ready => self.draft.ready_here = !self.draft.ready_here,
             FilterRow::Tags => {}
         }
+        FormOutcome::Stay
     }
 
     /// The draft with the typed tags, or the refusal (D3).
@@ -389,6 +416,12 @@ impl FilterForm {
     }
 }
 
+/// Whether `key` carries no modifier but `SHIFT` (how a terminal reports a capital): the option
+/// rows' fixed keys are plain keys only, so `Alt+l` moves no option (MOD-67 M5 D12).
+fn plain(key: &KeyEvent) -> bool {
+    !key.modifiers.intersects(CHORD)
+}
+
 /// Adds `value` when absent, removes it when present.
 fn toggle<T: PartialEq>(values: &mut Vec<T>, value: T) {
     if let Some(at) = values.iter().position(|held| *held == value) {
@@ -412,8 +445,9 @@ fn any(chosen: &[&str]) -> String {
     }
 }
 
-/// Draws the form in `area`, the bottom [`FORM_HEIGHT`] rows of the list pane.
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &FilterForm, theme: &Theme) {
+/// Draws the form in `area`, the bottom [`FORM_HEIGHT`] rows of the list pane, its hint through
+/// [`views::BACKLOG_FILTER`].
+pub fn render(frame: &mut Frame<'_>, area: Rect, form: &FilterForm, keys: &Keys, theme: &Theme) {
     let block = Block::new().borders(Borders::ALL).title(" Filter ");
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -427,7 +461,8 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &FilterForm, theme: &Them
     } else {
         HINT_CHOICES
     };
-    lines.push(Line::styled(cells::clip(hint, width), theme.dim));
+    let hint = keys.hint(views::BACKLOG_FILTER, hint);
+    lines.push(Line::styled(cells::clip(&hint, width), theme.dim));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -448,7 +483,7 @@ mod tests {
 
     fn chars(form: &mut FilterForm, text: &str) -> Vec<FormOutcome> {
         text.chars()
-            .map(|c| form.on_key(key(KeyCode::Char(c))))
+            .map(|c| form.on_key(key(KeyCode::Char(c)), Keys::compiled()))
             .collect()
     }
 
@@ -571,17 +606,20 @@ mod tests {
     fn j_and_k_move_between_rows_and_stop_at_the_ends() {
         let mut form = open();
         assert_eq!(form.row, FilterRow::Status, "the form opens on Status");
-        assert_eq!(form.on_key(key(KeyCode::Char('k'))), FormOutcome::Stay);
+        assert_eq!(
+            form.on_key(key(KeyCode::Char('k')), Keys::compiled()),
+            FormOutcome::Stay
+        );
         assert_eq!(form.row, FilterRow::Status, "no wrap at the top");
-        form.on_key(key(KeyCode::Char('j')));
+        form.on_key(key(KeyCode::Char('j')), Keys::compiled());
         assert_eq!(form.row, FilterRow::Project);
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         assert_eq!(form.row, FilterRow::Tags);
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         assert_eq!(form.row, FilterRow::Ready);
-        form.on_key(key(KeyCode::Char('j')));
+        form.on_key(key(KeyCode::Char('j')), Keys::compiled());
         assert_eq!(form.row, FilterRow::Ready, "no wrap at the bottom");
-        form.on_key(key(KeyCode::Char('k')));
+        form.on_key(key(KeyCode::Char('k')), Keys::compiled());
         assert_eq!(form.row, FilterRow::Tags);
     }
 
@@ -589,44 +627,50 @@ mod tests {
     #[test]
     fn arrows_and_tab_leave_the_tags_row() {
         let mut form = open();
-        form.on_key(key(KeyCode::Tab));
-        form.on_key(key(KeyCode::Tab));
+        form.on_key(key(KeyCode::Tab), Keys::compiled());
+        form.on_key(key(KeyCode::Tab), Keys::compiled());
         assert_eq!(form.row, FilterRow::Tags);
-        assert_eq!(form.on_key(key(KeyCode::Up)), FormOutcome::Stay);
+        assert_eq!(
+            form.on_key(key(KeyCode::Up), Keys::compiled()),
+            FormOutcome::Stay
+        );
         assert_eq!(form.row, FilterRow::Project);
-        form.on_key(key(KeyCode::Down));
-        assert_eq!(form.on_key(key(KeyCode::Down)), FormOutcome::Stay);
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        assert_eq!(
+            form.on_key(key(KeyCode::Down), Keys::compiled()),
+            FormOutcome::Stay
+        );
         assert_eq!(form.row, FilterRow::Ready);
-        form.on_key(key(KeyCode::BackTab));
+        form.on_key(key(KeyCode::BackTab), Keys::compiled());
         assert_eq!(form.row, FilterRow::Tags);
-        form.on_key(key(KeyCode::Tab));
+        form.on_key(key(KeyCode::Tab), Keys::compiled());
         assert_eq!(form.row, FilterRow::Ready);
     }
 
     #[test]
     fn h_and_l_move_within_the_status_options_and_wrap() {
         let mut form = open();
-        form.on_key(key(KeyCode::Char('l')));
+        form.on_key(key(KeyCode::Char('l')), Keys::compiled());
         assert_eq!(Status::ALL[form.status_at], Status::Queued);
-        form.on_key(key(KeyCode::Left));
-        form.on_key(key(KeyCode::Char('h')));
+        form.on_key(key(KeyCode::Left), Keys::compiled());
+        form.on_key(key(KeyCode::Char('h')), Keys::compiled());
         assert_eq!(
             Status::ALL[form.status_at],
             Status::Closed,
             "`h` on the first wraps to the last"
         );
-        form.on_key(key(KeyCode::Right));
+        form.on_key(key(KeyCode::Right), Keys::compiled());
         assert_eq!(Status::ALL[form.status_at], Status::Open, "and back");
 
-        form.on_key(key(KeyCode::Char('j')));
-        form.on_key(key(KeyCode::Char('l')));
-        form.on_key(key(KeyCode::Char('l')));
+        form.on_key(key(KeyCode::Char('j')), Keys::compiled());
+        form.on_key(key(KeyCode::Char('l')), Keys::compiled());
+        form.on_key(key(KeyCode::Char('l')), Keys::compiled());
         assert_eq!(form.project_at, 0, "two projects: `l` twice wraps");
         // `Down`, not `j`: on the Tags row `j` is text (blueprint E7, review L3).
-        form.on_key(key(KeyCode::Down));
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         assert_eq!(form.row(), FilterRow::Ready);
-        form.on_key(key(KeyCode::Char('l')));
+        form.on_key(key(KeyCode::Char('l')), Keys::compiled());
         assert_eq!(
             (form.status_at, form.project_at),
             (0, 0),
@@ -638,20 +682,20 @@ mod tests {
     fn space_toggles_a_status_in_all_order() {
         let mut form = open();
         for _ in 0..5 {
-            form.on_key(key(KeyCode::Char('l')));
+            form.on_key(key(KeyCode::Char('l')), Keys::compiled());
         }
-        form.on_key(key(KeyCode::Char(' ')));
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(form.draft.statuses, [Status::Done]);
         for _ in 0..5 {
-            form.on_key(key(KeyCode::Char('h')));
+            form.on_key(key(KeyCode::Char('h')), Keys::compiled());
         }
-        form.on_key(key(KeyCode::Char(' ')));
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(
             form.draft.statuses,
             [Status::Open, Status::Done],
             "kept in `Status::ALL` order, not toggle order"
         );
-        form.on_key(key(KeyCode::Char(' ')));
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(
             form.draft.statuses,
             [Status::Done],
@@ -662,23 +706,26 @@ mod tests {
     #[test]
     fn space_toggles_a_project() {
         let mut form = open();
-        form.on_key(key(KeyCode::Char('j')));
-        form.on_key(key(KeyCode::Char('l')));
-        form.on_key(key(KeyCode::Char(' ')));
-        form.on_key(key(KeyCode::Char('l')));
-        form.on_key(key(KeyCode::Char(' ')));
+        form.on_key(key(KeyCode::Char('j')), Keys::compiled());
+        form.on_key(key(KeyCode::Char('l')), Keys::compiled());
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
+        form.on_key(key(KeyCode::Char('l')), Keys::compiled());
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(
             form.draft.projects,
             [ids::PROJECT_HTUI, ids::PROJECT_AGY],
             "kept in `ctx.projects` order"
         );
-        form.on_key(key(KeyCode::Char(' ')));
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(form.draft.projects, [ids::PROJECT_AGY]);
 
         let mut none = FilterForm::open(&BacklogFilter::default(), &[]);
-        none.on_key(key(KeyCode::Char('j')));
-        none.on_key(key(KeyCode::Char('l')));
-        assert_eq!(none.on_key(key(KeyCode::Char(' '))), FormOutcome::Stay);
+        none.on_key(key(KeyCode::Char('j')), Keys::compiled());
+        none.on_key(key(KeyCode::Char('l')), Keys::compiled());
+        assert_eq!(
+            none.on_key(key(KeyCode::Char(' ')), Keys::compiled()),
+            FormOutcome::Stay
+        );
         assert!(
             none.draft.projects.is_empty(),
             "no project, nothing to tick"
@@ -689,11 +736,11 @@ mod tests {
     fn space_toggles_ready_here() {
         let mut form = open();
         for _ in 0..3 {
-            form.on_key(key(KeyCode::Down));
+            form.on_key(key(KeyCode::Down), Keys::compiled());
         }
-        form.on_key(key(KeyCode::Char(' ')));
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert!(form.draft.ready_here);
-        form.on_key(key(KeyCode::Char(' ')));
+        form.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert!(!form.draft.ready_here);
     }
 
@@ -701,8 +748,8 @@ mod tests {
     #[test]
     fn the_tags_row_types_every_letter() {
         let mut form = open();
-        form.on_key(key(KeyCode::Down));
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         assert!(
             chars(&mut form, "jk x hl")
                 .iter()
@@ -721,11 +768,11 @@ mod tests {
     #[test]
     fn enter_applies_canonical_tags() {
         let mut form = open();
-        form.on_key(key(KeyCode::Down));
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         chars(&mut form, " rust , gpu,rust");
         assert_eq!(
-            form.on_key(key(KeyCode::Enter)),
+            form.on_key(key(KeyCode::Enter), Keys::compiled()),
             FormOutcome::Apply(BacklogFilter {
                 tags: vec!["gpu".to_owned(), "rust".to_owned()],
                 ..BacklogFilter::default()
@@ -733,9 +780,9 @@ mod tests {
         );
 
         let mut status = open();
-        status.on_key(key(KeyCode::Char(' ')));
+        status.on_key(key(KeyCode::Char(' ')), Keys::compiled());
         assert_eq!(
-            status.on_key(key(KeyCode::Enter)),
+            status.on_key(key(KeyCode::Enter), Keys::compiled()),
             FormOutcome::Apply(BacklogFilter {
                 statuses: vec![Status::Open],
                 ..BacklogFilter::default()
@@ -747,11 +794,14 @@ mod tests {
     #[test]
     fn esc_cancels() {
         let mut form = open();
-        assert_eq!(form.on_key(key(KeyCode::Esc)), FormOutcome::Cancel);
-        form.on_key(key(KeyCode::Down));
-        form.on_key(key(KeyCode::Down));
         assert_eq!(
-            form.on_key(key(KeyCode::Esc)),
+            form.on_key(key(KeyCode::Esc), Keys::compiled()),
+            FormOutcome::Cancel
+        );
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        assert_eq!(
+            form.on_key(key(KeyCode::Esc), Keys::compiled()),
             FormOutcome::Cancel,
             "from the tags row too"
         );
@@ -766,11 +816,14 @@ mod tests {
             ready_here: true,
         };
         let mut form = FilterForm::open(&filter, &projects());
-        assert_eq!(form.on_key(key(KeyCode::Char('x'))), FormOutcome::Stay);
+        assert_eq!(
+            form.on_key(key(KeyCode::Char('x')), Keys::compiled()),
+            FormOutcome::Stay
+        );
         assert_eq!(form.draft, BacklogFilter::default());
         assert_eq!(form.tags.text(), Some(""));
         assert_eq!(
-            form.on_key(key(KeyCode::Enter)),
+            form.on_key(key(KeyCode::Enter), Keys::compiled()),
             FormOutcome::Apply(BacklogFilter::default())
         );
     }
@@ -780,11 +833,11 @@ mod tests {
     #[test]
     fn a_refused_tag_list_stays_open() {
         let mut form = open();
-        form.on_key(key(KeyCode::Down));
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         chars(&mut form, "Rust");
         assert_eq!(
-            form.on_key(key(KeyCode::Enter)),
+            form.on_key(key(KeyCode::Enter), Keys::compiled()),
             FormOutcome::Refused(
                 "tag `Rust` is not 1-64 characters of a-z, 0-9, `_` and `-` starting with a \
                  letter or a digit"
@@ -792,7 +845,10 @@ mod tests {
             )
         );
         assert_eq!(form.tags.text(), Some("Rust"), "the text is kept to fix");
-        assert_eq!(form.on_key(key(KeyCode::Esc)), FormOutcome::Cancel);
+        assert_eq!(
+            form.on_key(key(KeyCode::Esc), Keys::compiled()),
+            FormOutcome::Cancel
+        );
     }
 
     #[test]
@@ -808,14 +864,15 @@ mod tests {
         assert_eq!((form.status_at, form.project_at), (0, 0));
         assert_eq!(form.tags.text(), Some("gpu, rust"));
         assert_eq!(
-            form.on_key(key(KeyCode::Enter)),
+            form.on_key(key(KeyCode::Enter), Keys::compiled()),
             FormOutcome::Apply(filter),
             "applied untouched, it is the same filter"
         );
     }
 
-    /// MOD-13 review L4: a chord is not a form key. `Alt+x` does not clear, `Alt+Enter` does not
-    /// apply, `Alt+space` does not tick; the tab passes them on before they get here.
+    /// MOD-13 review L4, MOD-67 M5 D7: a chord is not a form key. `Alt+x` does not clear,
+    /// `Alt+Enter` does not apply, `Alt+space` does not tick: the form answers `Pass`, and the tab
+    /// leaves them to `BACKLOG_FILTER`'s modal layer.
     #[test]
     fn a_chord_on_a_choice_row_changes_nothing() {
         let filter = BacklogFilter {
@@ -830,17 +887,37 @@ mod tests {
             KeyCode::Esc,
         ] {
             assert_eq!(
-                form.on_key(KeyEvent::new(code, KeyModifiers::ALT)),
-                FormOutcome::Stay,
+                form.on_key(KeyEvent::new(code, KeyModifiers::ALT), Keys::compiled()),
+                FormOutcome::Pass,
                 "Alt+{code:?}"
             );
         }
         assert_eq!(form.draft, filter, "the draft is untouched");
         assert_eq!(
-            form.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SUPER)),
-            FormOutcome::Stay
+            form.on_key(
+                KeyEvent::new(KeyCode::Char('j'), KeyModifiers::SUPER),
+                Keys::compiled()
+            ),
+            FormOutcome::Pass
         );
         assert_eq!(form.row, FilterRow::Status, "and no chord moved the row");
+    }
+
+    /// MOD-67 M5 D5: a function key is no form key on any row, Tags included: the form answers
+    /// `Pass` (the tab's `modal_rest` lets `F1` open help) and the draft is untouched.
+    #[test]
+    fn f1_passes_from_every_row() {
+        let mut form = open();
+        for row in ROWS {
+            assert_eq!(form.row, row);
+            assert_eq!(
+                form.on_key(key(KeyCode::F(1)), Keys::compiled()),
+                FormOutcome::Pass,
+                "{row:?}"
+            );
+            form.on_key(key(KeyCode::Down), Keys::compiled());
+        }
+        assert_eq!(form.draft, BacklogFilter::default());
     }
 
     /// MOD-13 review N3: a project the list cannot name is left out of the summary rather than
@@ -866,8 +943,8 @@ mod tests {
         let mut form = open();
         form.on_paste("rust");
         assert_eq!(form.tags.text(), Some(""), "dropped on the Status row");
-        form.on_key(key(KeyCode::Down));
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         form.on_paste("rust,\ngpu");
         assert_eq!(form.tags.text(), Some("rust,gpu"));
     }
@@ -900,7 +977,9 @@ mod tests {
         let [left, _] = panes(body);
         let list = Block::new().borders(Borders::ALL).inner(left);
         let room = usize::from(list.width) - 2;
-        for hint in [HINT_CHOICES, HINT_TAGS] {
+        for spec in [HINT_CHOICES, HINT_TAGS] {
+            let hint = Keys::compiled().hint(views::BACKLOG_FILTER, spec);
+            let hint = hint.as_str();
             assert!(
                 cell_width(hint) <= room,
                 "{hint:?} is {} columns against {room}",
