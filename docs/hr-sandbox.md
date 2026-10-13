@@ -462,7 +462,7 @@ registry, other projects' Claude transcripts and memory, your prompt history, `g
 and the MCP servers already disabled for this project. Commits carry
 your name and email from `git config user.*`, passed in as environment variables.
 
-Inside a run these are set: `HR_SANDBOX=1`, `HR_ITEM=<ITEM>`, `HR_HEADROOM=0|1`, `HR_STATE=/hr-state`,
+Inside a run these are set: `HR_SANDBOX=1`, `HR_ITEM=<ITEM>`, `HR_STATE=/hr-state`,
 `USERNAME=htui-ci`, `HTUI_TEST_DATABASE_URL`, `HTUI_TEST_QDRANT_URL`, `UV_TOOL_DIR=/tmp/uv-tools`,
 `CARGO_INSTALL_ROOT=/tmp/cargo-install`, the git identity, and a `PATH` with the mise tool
 directories ahead of `~/.local/bin`, no `~/.cargo/bin`, and `/tmp/cargo-install/bin` last — a
@@ -480,7 +480,8 @@ worth keeping belongs in the repo or in Claude's memory of this project, which i
 
 `scripts/hr up ITEM --headroom` makes the run's Claude send its API calls through a headroom proxy.
 The flag is recorded in the run's registry, so `attach` after a stop or a reboot keeps it; there is
-no verb to change it for an existing run (`down --purge` and `up` again). Without the flag nothing
+no verb to change it for an existing run (`down --purge` and `up` again). A registry written by this
+version carries a `headroom=` line that an older `scripts/hr` rejects as an unknown key. Without the flag nothing
 about a run changes.
 
 **One proxy per run, in the run, not your host's proxy.** The container's `localhost` is the
@@ -489,11 +490,12 @@ no published port, no clash with a headroom you run on the host, nothing to star
 first, and no need to bind the host proxy beyond `127.0.0.1` for Docker's bridge. It runs from the
 read-only `~/.local/share/uv/tools` mount, so it is the version you have on the host.
 
-- `up` starts the proxy in the background next to the container's `sleep`; a start that fails does
-  not fail `up`.
-- `attach` checks `http://localhost:8787/readyz` (up to 15 s, each probe capped at 2 s). Ready: it
-  sets `ANTHROPIC_BASE_URL` for that Claude (or shell) only. No proxy process (the container was
-  restarted, or `up` never started one): `attach` starts it first. Still not ready: it prints
+- Nothing starts at `up`: the container is the same as any other run's. `attach` is the only
+  place the proxy is started. It checks `http://localhost:8787/readyz` (up to 30 s, each probe
+  capped at 2 s; a cold first start took 6 to 15 s in testing). Ready: it sets
+  `ANTHROPIC_BASE_URL` for that Claude (or shell) only. No proxy running (the first `attach`, a
+  restarted container, a proxy that died): it starts one first, under a lock, so two `attach`es at
+  once start one. Still not ready: it prints
   `hr: headroom is not answering; this session runs direct` and starts Claude without the variable.
   The check exists because Claude pointed at a dead base URL does not fail, it hangs.
 - The proxy's state, logs and CCR store are in `/tmp/headroom`, set on that one process, so the
@@ -588,7 +590,7 @@ Known residuals:
 ## Troubleshooting
 
 **`hr: headroom is not answering; this session runs direct`** (a `--headroom` run). The proxy did not
-become ready in 15 s. Open a shell with `scripts/hr attach ITEM --shell` and read
+become ready in 30 s. Open a shell with `scripts/hr attach ITEM --shell` and read
 `/tmp/headroom/proxy.out`; `curl -s localhost:8787/readyz` shows its state. `headroom: command not
 found` there means `~/.local/bin/headroom` is missing on the host.
 

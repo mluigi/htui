@@ -172,12 +172,10 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     run --separate-stderr "$HR" up MOD-5
     [[ $status -eq 0 ]]
     [[ "$(reg_get MOD-5 headroom)" == 0 ]]
-    grep -qx 'HR_HEADROOM=0' "$HR_TEST_DOCKER_LOG.env"
 
     run --separate-stderr "$HR" up MOD-4 --headroom --headroom
     [[ $status -eq 0 ]]
     [[ "$(reg_get MOD-4 headroom)" == 1 ]]
-    grep -qx 'HR_HEADROOM=1' "$HR_TEST_DOCKER_LOG.env"
 }
 
 @test "3f. up: --headroom with --no-headroom is refused before any side effect" {
@@ -202,24 +200,16 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     : >"$HR_TEST_DOCKER_LOG"
     run --separate-stderr "$HR" attach MOD-5 </dev/null
     [[ $status -eq 0 ]]
-    grep -qx 'HR_HEADROOM=0' "$HR_TEST_DOCKER_LOG.env"
     run --separate-stderr "$HR" collect MOD-5
+    [[ $status -eq 0 ]]
     grep -qx 'headroom=0' "$(reg_of MOD-5)"
 }
 
-@test "3h. compose: HR_HEADROOM defaults to 0; the proxy starts only behind it, with its state and beacon set inline" {
-    local cfg cmd
+@test "3h. compose is unchanged by TOOL-11: no headroom variable or command, so existing runs keep their config hash" {
+    local cfg
     cfg="$(compose_config)"
-    [[ "$(jq -r '.services.dev.environment.HR_HEADROOM' <<<"$cfg")" == 0 ]]
-    # Off-run containers must see no headroom variable besides the switch: the headroom hooks that
-    # run in every sandbox keep reading the shared ~/.headroom.
-    [[ "$(jq -r '.services.dev.environment | keys[] | select(startswith("HEADROOM_"))' <<<"$cfg")" == '' ]]
-    cmd="$(jq -r '.services.dev.command[2]' <<<"$cfg")"
-    [[ "$cmd" == *'if [ "$$HR_HEADROOM" = 1 ]'* ]]   # $$ = a literal $ for the container's bash
-    [[ "$cmd" == *'HEADROOM_WORKSPACE_DIR=/tmp/headroom HEADROOM_BEACON=off'*'headroom proxy --port 8787'* ]]
-    [[ "$cmd" == *'exec sleep infinity' ]]
-    cfg="$(compose_config HR_HEADROOM=1)"
-    [[ "$(jq -r '.services.dev.environment.HR_HEADROOM' <<<"$cfg")" == 1 ]]
+    [[ "$(jq -r '.services.dev.environment | keys[] | select(test("HEADROOM"; "i"))' <<<"$cfg")" == '' ]]
+    [[ "$(jq -r '.services.dev.command[2]' <<<"$cfg")" != *headroom* ]]
 }
 
 @test "3i. attach: a headroom=0 run keeps the plain exec; a headroom=1 run goes through the guard (claude and --shell)" {
@@ -254,9 +244,9 @@ guard_run() {
     [[ -n "${HEADROOM_GUARD:-}" ]]
     FB="$BATS_TEST_TMPDIR/fb"
     mkdir -p "$FB"
-    printf '#!/bin/sh\n[ -e "%s/up" ]\n' "$FB" >"$FB/curl"
-    printf '#!/bin/sh\n[ -e "%s/running" ]\n' "$FB" >"$FB/pgrep"
-    printf '#!/bin/sh\necho x >>"%s/started"\n[ -e "%s/works" ] && touch "%s/up"\nexit 0\n' "$FB" "$FB" "$FB" >"$FB/headroom"
+    printf '#!/bin/sh\necho "$*" >"%s/curl.args"\n[ -e "%s/up" ]\n' "$FB" "$FB" >"$FB/curl"
+    printf '#!/bin/sh\necho "$*" >"%s/pgrep.args"\n[ -e "%s/running" ]\n' "$FB" "$FB" >"$FB/pgrep"
+    printf '#!/bin/sh\necho "WS=$HEADROOM_WORKSPACE_DIR BEACON=$HEADROOM_BEACON ARGS=$*" >>"%s/started"\n[ -e "%s/works" ] && touch "%s/up"\nexit 0\n' "$FB" "$FB" "$FB" >"$FB/headroom"
     printf '#!/bin/sh\nexec "$@"\n' >"$FB/setsid"
     cp "$FB/setsid" "$FB/nohup"
     printf '#!/bin/sh\necho "BASE=${ANTHROPIC_BASE_URL-unset} ARGS=$*"\n' >"$FB/claude"
@@ -278,6 +268,9 @@ guard_run() {
     [[ $status -eq 0 ]]
     [[ "$output" == 'BASE=http://localhost:8787 ARGS=--dangerously-skip-permissions' ]]
     [[ "$(wc -l <"$FB/started")" -eq 1 ]]
+    [[ "$(cat "$FB/started")" == 'WS=/tmp/headroom BEACON=off ARGS=proxy --port 8787' ]]
+    [[ "$(cat "$FB/curl.args")" == *'http://localhost:8787/readyz'* ]]
+    [[ "$(cat "$FB/pgrep.args")" == *'/headroom proxy --port 8787'* ]]
 }
 
 @test "3l. guard: proxy never answers -> says so, runs direct, finishes (no hang)" {
@@ -287,7 +280,7 @@ guard_run() {
     [[ "$stderr" == *'headroom is not answering; this session runs direct'* ]]
 }
 
-@test "3m. guard: a proxy process that is still starting is waited for, not started twice" {
+@test "3m. guard: a proxy process that is still starting is waited for, not started again" {
     mkdir -p "$BATS_TEST_TMPDIR/fb"; touch "$BATS_TEST_TMPDIR/fb/running"
     HR_HEADROOM_WAIT=1 guard_run claude
     [[ ! -e "$FB/started" ]]
