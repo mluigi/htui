@@ -1,6 +1,6 @@
 # Plan: MOD-96 — settings-file permission rules and the permission mode in htui-driven sessions
 
-**Status: CONFIRMED 2026-10-13 — maintainer took every default: Q1 neutralise, Q2 retire `acceptEdits` from the seed, Q3 (b) migration `0018`, Q4 stay on plan.**
+**Status: DONE 2026-10-13. CONFIRMED 2026-10-13 (all defaults); Q2 reversed after review R1 (see the amendment); write-up `docs/decisions/mod/mod-96.md`.**
 
 **Source**: `HANDOFF.md` MOD-96 (from MOD-91 review M1, `docs/decisions/mod/mod-91.md`).
 **Routing**: plan path (C3 only; accepted by the maintainer 2026-10-13). **Re-routing note:** the probe

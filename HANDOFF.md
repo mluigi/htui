@@ -14,23 +14,23 @@
   target list, pass `-Targets` explicitly to receive the surface).
 - Every item cites the requirement IDs it addresses (`R-NF-4`).
 
-**Current status (2026-10-13):** **MOD-93 is done** (`docs/decisions/mod/mod-93.md`): `htui claude emit [--dir]
+**Current status (2026-10-13):** **MOD-96 is done** (`docs/decisions/mod/mod-96.md`): an isolated
+Claude Code session reads no settings file (`--setting-sources ""` / ACP `settingSources: []`), so their permission
+rules and `defaultMode` no longer settle a call before htui; an isolated `claude-cli` row with no mode gets
+`--permission-mode default`, and ACP rows pin `acp.permission_mode` (seeded `default` on `claude`) with
+`session/set_mode`. `claude-cli` keeps `acceptEdits` (review R1). Owed on the host: the Postgres gate on the merged
+tree. Before it, **MOD-93 is done** (`docs/decisions/mod/mod-93.md`): `htui claude emit [--dir]
 [--force]` writes a local Claude Code marketplace from files built into the binary, holding plugin `htui` at the
 binary's version: a skill that reads htui through MOD-92's `--json` verbs and hands work to htui, and a mod with a
 waiting-on-you band, a `/htui` pane and turnless `/htui status|waiting|search` (skill-only below Claude Code 2.1.287;
 stands down under `HTUI_SESSION`). User guide `docs/htui-claude-plugin.md`. Owed on the host: the Postgres gate, a
-live install against the host store, `tsc` on the mod, Windows. Before it, **MOD-89 is done**
-(`docs/decisions/mod/mod-89.md`): before every agent session of a run htui scans the session's trees for env files
-(`.env`, `.env.*` but templates, `.envrc`); a provider project is refused (`env_files_refused: …`) unless its
-`allow_env_files` switch is on, a provider-less one gets one item note per run (`docs/htui-secrets.md`). Owed on the
-host: the Postgres gate on the merged tree. **MOD-95 is done** (`docs/decisions/mod/mod-95.md`): the `auto_queue`
-overshoot test now pins the batch closing `drained` (test-only). **TOOL-11 is done**
-(`docs/decisions/tool/tool-11.md`: `scripts/hr up --headroom`; owed: a real run), and **MOD-91** and **MOD-92** are
-done (`docs/decisions/mod/mod-91.md`, `docs/decisions/mod/mod-92.md`). Open from ANA-29: **TOOL-8**/**TOOL-9**/
-**TOOL-10**, **CLEAN-12**, **MOD-96**, and **MOD-94** behind a maintainer decision.
-Live coordinates after MOD-70 and MOD-12 M1: migrations run through `0017_follow_up` (`run_command.run_step_id`,
+live install against the host store, `tsc` on the mod, Windows. **MOD-89**, **MOD-95**, **TOOL-11**, **MOD-91**
+and **MOD-92** are done (see `DECISIONS.md`). Open from ANA-29: **TOOL-8**/**TOOL-9**/**TOOL-10**, **CLEAN-12**,
+and **MOD-94** behind a maintainer decision.
+Live coordinates after MOD-96: migrations run through `0018_seed_permission_mode` (MOD-96: data only, pins
+`acp.permission_mode` on the seeded `claude` row), before it `0017_follow_up` (`run_command.run_step_id`,
 `text`; `follow_up_window`; MOD-12's `0016_auto_queue`: `queue_entry`, `queue_batch`, `run.batch_id`), so **the next
-migration is `0018`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
+migration is `0019`** (cache: `0005`). MOD-37's `0014_run_step_opening` and MOD-11's queue migration both landed as
 `0014`; MOD-11's was renumbered at the merge, and MOD-70's `0016` became `0017` at the merge with MOD-12. Pins: store
 conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15,
 `htui-orch` `CASES` re-pin from the merged tree; Postgres tables 45.
@@ -440,26 +440,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   several parents, re-rooting from a node (the tree's `Enter` emits `Action::Reveal`), and how the hop depth
   (`+`/`-`) sits beside the flow's zoom. Not blocked. After MOD-67, which owns the key catalogue.
 
-- [ ] **MOD-96 - Settings-file permission rules and the permission mode still pre-approve calls in htui-driven sessions**
-  (from MOD-91 review M1, `docs/decisions/mod/mod-91.md`). `R-TUI-6`, `R-HIS-1`, `R-AGT-4`. MOD-91
-  stops the user's mods, settings hooks and skills, but its levers
-  (`--settings '{"disableAllHooks":true}'`, `--disable-slash-commands`, the ACP `_meta` block) leave
-  two things in force:
-  - `permissions.allow`/`deny` rules in the user's, the project's and the local `settings.json`;
-  - the row's permission mode (the seeded `claude-cli` row runs `acceptEdits`).
-
-  Both settle a tool call before `mcp__htui__permission_prompt` is asked, so the call never reaches
-  htui's policy or its record. A managed repo that commits `.claude/settings.json` with
-  `{"permissions":{"allow":["Bash"]}}` runs Bash unasked in `local`/`shared_serialized` isolation.
-  MOD-91's probe showed `--setting-sources project,local` is not a usable lever on its own (the
-  skills-directory mod still loads). Open:
-  - whether htui should neutralise settings-file permission rules in the sessions it drives (for
-    example a `--settings` `permissions` override, probed like MOD-91), or treat them as the
-    operator's and the repository's intended policy and only show them;
-  - whether `acceptEdits` stays the seed's default once the relay is the approval path.
-
-  Not blocked.
-
 - [ ] **MOD-94 - Answer a relayed permission request from outside the TUI** (from ANA-29,
   `docs/ANA-29.md` §5.1 C3). `R-TUI-4`, `R-TUI-6`, `R-HIS-1`, `R-ID-6`. MOD-42's executor waits for
   "any store client" to answer a `step_permission` row by compare-and-set
@@ -561,6 +541,6 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
 | ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
-| MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
+| MOD-N   | 19 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |
