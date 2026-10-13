@@ -354,8 +354,11 @@ pub fn merge_launch(stored: &Value, command: &str, args: &[String]) -> Result<Va
     checked_launch(merged)
 }
 
-/// `settings.user_extensions` as the driver reads it: a stored `true` or `false`, and anything
-/// else, an absent key included, `false` (`AgentSettings`' default, MOD-91 D3).
+/// `settings.user_extensions` as the form reads it: a stored `true` or `false`, and anything else,
+/// an absent key included, `false` (`AgentSettings`' default, MOD-91 D3). The driver can differ in
+/// the safe direction only: when any settings key is malformed it falls back to
+/// `AgentSettings::default()`, which is isolated, so the form can show `y` while the driver
+/// isolates.
 fn stored_user_extensions(settings: &Value) -> bool {
     settings
         .get("user_extensions")
@@ -456,7 +459,8 @@ pub fn new_agent(
 
 /// The draft a stored row prefills the edit form with (blueprint F-16): `launch.command` if it is a
 /// string, else empty; the string elements of `launch.args`, in order. Reads nothing else of
-/// `launch`. `user_extensions` is `settings.user_extensions` as the driver reads it (MOD-91 D6).
+/// `launch`. `user_extensions` is `settings.user_extensions` as [`stored_user_extensions`] reads
+/// it (MOD-91 D6), which can show `y` on a row the driver isolates, never the reverse.
 #[must_use]
 pub fn draft_of(agent: &Agent) -> AgentDraft {
     let command = agent
