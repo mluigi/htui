@@ -1,18 +1,35 @@
-//! `htui claude emit` (MOD-93, `R-ID-4`, `R-ID-6`, `R-STO-1`).
+//! `htui claude emit` (MOD-93, `R-ID-4`, `R-ID-6`, `R-STO-1`). Writes htui's Claude Code plugin
+//! as a directory marketplace: `.claude-plugin/marketplace.json` and the plugin `htui/` (the skill,
+//! and the mod when `claude --version` is at least [`CLAUDE_FLOOR`] or does not answer), every
+//! file embedded in this binary from `crates/htui/claude-plugin/`. The plugin's version is the
+//! binary's ([`VERSION`]). Then it prints the two `claude plugin` commands that install it; it runs
+//! neither, and never touches `~/.claude`.
+//!
+//! The target is written only when it is absent or empty, or, with `--force`, when it holds an
+//! earlier emit: nothing but `.claude-plugin` and `htui`, and a marketplace named `htui` (D4).
+//! Anything else is refused, `--force` or not. Nothing outside the target and its two siblings
+//! `<dir>.emit-<pid>` (staging) and `<dir>.old-<pid>` (the earlier emit, moved aside) is written,
+//! but the target's missing parents. Exits are 2 (refused) and 1 (failed), and none reaches Sentry:
+//! the sentences carry home paths.
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
+use crate::cli;
+
 /// The version every emitted plugin carries: this binary's (D5).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The Claude Code version mods need (ANA-29 §2.1); below it the skill alone is written (D6).
+pub const CLAUDE_FLOOR: &str = "2.1.287";
+/// `claude --version` prints `2.1.296 (Claude Code)`.
+pub const CLAUDE_VERSION_PATTERN: &str = r"^(\d+\.\d+\.\d+)";
 
-/// What the source tree's `plugin.json` and `hooks/version.ts` carry in place of a version (D5).
-const SOURCE_VERSION: &str = "0.0.0-source";
-/// `hooks/version.ts`'s placeholder, quotes included; the source holds it exactly once.
+/// `hooks/version.ts`'s placeholder, quotes included; the source holds it exactly once. The source
+/// tree's `plugin.json` carries the same version, which the stamp overwrites without reading it.
 const VERSION_TS_LITERAL: &str = "'0.0.0-source'";
 
 /// The plugin manifest, rewritten with the version (and, skill-only, without the mod's keys).
@@ -61,6 +78,42 @@ pub enum Variant {
     /// The skill alone, for a `claude` below [`CLAUDE_FLOOR`]: no `hooks/`, no `types/`, and
     /// `plugin.json` without `types` and `userConfig`.
     SkillOnly,
+}
+
+/// What `claude --version` said, against [`CLAUDE_FLOOR`] (D6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeCheck {
+    /// At or above the floor: the mod is written.
+    Met(String),
+    /// Below the floor: the skill alone is written.
+    Below(String),
+    /// `claude` is not on `PATH`, printed no version, or timed out: the mod is written.
+    Unchecked,
+}
+
+impl ClaudeCheck {
+    /// The check for a found version: [`Below`](Self::Below) when it is below [`CLAUDE_FLOOR`]
+    /// by semver, [`Met`](Self::Met) otherwise (an unparsable one included), and
+    /// [`Unchecked`](Self::Unchecked) for none.
+    #[must_use]
+    pub fn from_version(found: Option<String>) -> Self {
+        match found {
+            Some(version) if htui_agent::probe::below_min(&version, CLAUDE_FLOOR) => {
+                Self::Below(version)
+            }
+            Some(version) => Self::Met(version),
+            None => Self::Unchecked,
+        }
+    }
+
+    /// The skill alone below the floor; the mod too otherwise.
+    #[must_use]
+    pub const fn variant(&self) -> Variant {
+        match self {
+            Self::Below(_) => Variant::SkillOnly,
+            Self::Met(_) | Self::Unchecked => Variant::WithMod,
+        }
+    }
 }
 
 /// What [`write_to`] is asked to do.
@@ -363,6 +416,97 @@ pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
     })
 }
 
+/// `<local data dir>/htui/claude-plugin` (`~/.local/share/htui/claude-plugin` on Linux), the
+/// sibling of the agents' install root (D3). `None` on a box with no local data directory.
+#[must_use]
+pub fn default_dir() -> Option<PathBuf> {
+    dirs::data_local_dir().map(|dir| dir.join("htui").join("claude-plugin"))
+}
+
+/// Runs `claude --version` through the bounded, killable probe child (cwd: the temp dir), and
+/// checks it against the floor.
+pub async fn probe_claude() -> ClaudeCheck {
+    ClaudeCheck::from_version(
+        htui_agent::probe::capture_version(
+            Path::new("claude"),
+            &htui_agent::VersionProbe {
+                args: vec!["--version".to_owned()],
+                pattern: CLAUDE_VERSION_PATTERN.to_owned(),
+                min: None,
+            },
+            &htui_agent::ProbeEnv::host(std::env::temp_dir()),
+        )
+        .await,
+    )
+}
+
+/// What `htui claude emit` prints on stdout: what was written, whether the mod is in it, the two
+/// install commands, the re-run hint, and a leftover copy when there is one. One line each.
+#[must_use]
+pub fn render(report: &Report, check: &ClaudeCheck) -> String {
+    let dir = report.dir.display();
+    let mut out = format!("Wrote htui's Claude Code plugin {VERSION} to {dir}.\n");
+    out.push_str(&match check {
+        ClaudeCheck::Met(version) => format!("The mod is included (claude {version}).\n"),
+        ClaudeCheck::Below(version) => format!(
+            "The mod is left out: claude {version} is below {CLAUDE_FLOOR}, so only the skill \
+             was written.\n"
+        ),
+        ClaudeCheck::Unchecked => "The mod is included; claude's version could not be checked \
+                                   (no answer from claude --version).\n"
+            .to_owned(),
+    });
+    out.push_str("Install it once:\n");
+    out.push_str(&format!(
+        "  claude plugin marketplace add {}\n",
+        shell_words::quote(&report.dir.to_string_lossy())
+    ));
+    out.push_str("  claude plugin install htui@htui\n");
+    out.push_str(
+        "After upgrading htui: htui claude emit --force, then /reload-plugins in Claude Code.\n",
+    );
+    if let Some(leftover) = &report.leftover {
+        out.push_str(&format!(
+            "The old copy could not be removed: {}.\n",
+            leftover.display()
+        ));
+    }
+    out
+}
+
+/// `htui claude emit`: picks the directory, checks `claude`'s version, writes, and prints the
+/// report.
+///
+/// # Errors
+///
+/// [`EmitExit::Refused`] when there is no `--dir` and no local data directory, or [`write_to`]
+/// refuses; [`EmitExit::Failed`] when it fails or stdout fails (a closed pipe excepted).
+pub async fn run(args: cli::EmitArgs) -> Result<(), EmitExit> {
+    let Some(dir) = args.dir.or_else(default_dir) else {
+        return Err(EmitExit::Refused(
+            "this machine has no local data directory; pass --dir PATH".to_owned(),
+        ));
+    };
+    let check = probe_claude().await;
+    let report = write_to(
+        &dir,
+        &Options {
+            force: args.force,
+            variant: check.variant(),
+        },
+    )?;
+    let mut stdout = std::io::stdout().lock();
+    match stdout
+        .write_all(render(&report, &check).as_bytes())
+        .and_then(|()| stdout.flush())
+    {
+        Err(error) if error.kind() != ErrorKind::BrokenPipe => {
+            Err(EmitExit::Failed(format!("cannot write to stdout: {error}")))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// `plugin.json` with `"version"` set to [`VERSION`], and for [`Variant::SkillOnly`] without
 /// `"types"` and `"userConfig"`. Pretty-printed, with a final newline.
 fn stamp_manifest(body: &str, variant: Variant) -> Result<String, EmitExit> {
@@ -391,9 +535,14 @@ mod tests {
     use serde_json::Value;
 
     use super::{
-        EmitExit, FILES, Options, PLUGIN_JSON, Report, SOURCE_VERSION, VERSION, VERSION_TS,
-        VERSION_TS_LITERAL, Variant, files_for, write_to,
+        CLAUDE_FLOOR, CLAUDE_VERSION_PATTERN, ClaudeCheck, EmitExit, FILES, Options, PLUGIN_JSON,
+        Report, VERSION, VERSION_TS, VERSION_TS_LITERAL, Variant, default_dir, files_for, render,
+        write_to,
     };
+
+    /// What the source tree's `plugin.json` and `hooks/version.ts` carry in place of a version
+    /// (D5).
+    const SOURCE_VERSION: &str = "0.0.0-source";
 
     /// The source tree the table embeds.
     const SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/claude-plugin");
@@ -691,7 +840,9 @@ mod tests {
     /// as it was.
     #[test]
     fn a_foreign_directory_is_refused_even_with_force_and_left_untouched() {
-        let cases: [(&str, &dyn Fn(&Path)); 4] = [
+        /// Turns an earlier emit into a foreign directory.
+        type Plant<'a> = &'a dyn Fn(&Path);
+        let cases: [(&str, Plant); 4] = [
             ("notes.txt", &|dir| {
                 std::fs::write(dir.join("notes.txt"), "mine\n").expect("the extra file");
             }),
@@ -817,5 +968,92 @@ mod tests {
             std::fs::read(&staging).expect("the blocking file reads"),
             b"in the way\n"
         );
+    }
+
+    /// D6: below 2.1.287 the skill alone; at or above it, or unchecked, the mod too. The pattern
+    /// reads `claude --version`'s line.
+    #[test]
+    fn the_floor_decides_the_variant() {
+        let below = ClaudeCheck::from_version(Some("2.1.286".to_owned()));
+        assert_eq!(below, ClaudeCheck::Below("2.1.286".to_owned()));
+        assert_eq!(below.variant(), Variant::SkillOnly);
+        for met in ["2.1.287", "2.1.296"] {
+            let check = ClaudeCheck::from_version(Some(met.to_owned()));
+            assert_eq!(check, ClaudeCheck::Met(met.to_owned()));
+            assert_eq!(check.variant(), Variant::WithMod);
+        }
+        assert_eq!(ClaudeCheck::from_version(None), ClaudeCheck::Unchecked);
+        assert_eq!(ClaudeCheck::Unchecked.variant(), Variant::WithMod);
+        assert_eq!(
+            htui_agent::probe::extract_version("2.1.296 (Claude Code)", CLAUDE_VERSION_PATTERN)
+                .as_deref(),
+            Some("2.1.296")
+        );
+        assert_eq!(CLAUDE_FLOOR, "2.1.287");
+    }
+
+    /// The report: what was written, whether the mod is in it, both commands, the re-run hint,
+    /// and a leftover when there is one.
+    #[test]
+    fn the_report_prints_both_commands_and_the_rerun_hint() {
+        let report = |dir: &str, leftover: Option<&str>| Report {
+            dir: dir.into(),
+            variant: Variant::WithMod,
+            replaced: leftover.is_some(),
+            leftover: leftover.map(Into::into),
+        };
+        let tail = "Install it once:\n  claude plugin marketplace add /p/x\n  claude plugin install \
+                    htui@htui\nAfter upgrading htui: htui claude emit --force, then \
+                    /reload-plugins in Claude Code.\n";
+        assert_eq!(
+            render(
+                &report("/p/x", None),
+                &ClaudeCheck::Met("2.1.296".to_owned())
+            ),
+            format!(
+                "Wrote htui's Claude Code plugin {VERSION} to /p/x.\nThe mod is included (claude \
+                 2.1.296).\n{tail}"
+            )
+        );
+        assert_eq!(
+            render(
+                &report("/p/x", None),
+                &ClaudeCheck::Below("2.1.200".to_owned())
+            ),
+            format!(
+                "Wrote htui's Claude Code plugin {VERSION} to /p/x.\nThe mod is left out: claude \
+                 2.1.200 is below 2.1.287, so only the skill was written.\n{tail}"
+            )
+        );
+        assert_eq!(
+            render(&report("/p/x", None), &ClaudeCheck::Unchecked),
+            format!(
+                "Wrote htui's Claude Code plugin {VERSION} to /p/x.\nThe mod is included; \
+                 claude's version could not be checked (no answer from claude --version).\n{tail}"
+            )
+        );
+        let spaced = render(
+            &report("/my plugins/x", Some("/my plugins/x.old-7")),
+            &ClaudeCheck::Unchecked,
+        );
+        assert!(
+            spaced.contains("\n  claude plugin marketplace add '/my plugins/x'\n"),
+            "{spaced}"
+        );
+        assert!(
+            spaced.ends_with("\nThe old copy could not be removed: /my plugins/x.old-7.\n"),
+            "{spaced}"
+        );
+    }
+
+    /// D3: `<local data dir>/htui/claude-plugin`, the sibling of `htui/agents`.
+    #[test]
+    fn the_default_dir_is_under_the_local_data_dir() {
+        let expected = dirs::data_local_dir().map(|dir| dir.join("htui").join("claude-plugin"));
+        assert_eq!(default_dir(), expected);
+        if let Some(dir) = default_dir() {
+            assert!(dir.ends_with("htui/claude-plugin"), "{}", dir.display());
+            assert!(dir.is_absolute(), "{}", dir.display());
+        }
     }
 }

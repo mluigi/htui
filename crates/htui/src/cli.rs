@@ -136,6 +136,9 @@ pub enum Command {
     /// runs and permission requests, in the overlay's order (project in scope order, then item key,
     /// run, step and reason), with their age. Reads only, as `status`.
     Waiting(StateArgs),
+    /// Write htui's Claude Code plugin (MOD-93). `htui claude emit` writes a directory marketplace
+    /// and prints the two `claude plugin` commands. It runs neither, and never edits `~/.claude`.
+    Claude(ClaudeArgs),
     /// Serve htui's MCP tools to one agent session over stdio. Started by the agent htui launched,
     /// never by hand: it reads HTUI_MCP_ADDR and HTUI_MCP_TOKEN, writes only MCP to stdout, and exits
     /// when the agent closes stdin.
@@ -168,6 +171,36 @@ pub struct WorkerArgs {
     pub dsn_stdin: bool,
 }
 
+/// `htui claude`'s verb (MOD-93). The verb is required: `htui claude` alone is a usage error.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Args)]
+pub struct ClaudeArgs {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: ClaudeCommand,
+}
+
+/// `htui claude`'s verbs.
+#[derive(Debug, Clone, PartialEq, Eq, clap::Subcommand)]
+pub enum ClaudeCommand {
+    /// Write htui's Claude Code plugin, stamped with this htui's version, as a directory
+    /// marketplace in `<local data dir>/htui/claude-plugin` (or `--dir`), then print the two
+    /// commands that install it. Below Claude Code 2.1.287 only the skill is written. `--force`
+    /// replaces an earlier emit, never a directory `emit` did not write.
+    Emit(EmitArgs),
+}
+
+/// `htui claude emit`'s flags (MOD-93 D3, D4). None reads the environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
+pub struct EmitArgs {
+    /// Write here instead of `<local data dir>/htui/claude-plugin`.
+    #[arg(long, value_name = "PATH")]
+    pub dir: Option<PathBuf>,
+    /// Replace a directory an earlier `htui claude emit` wrote. A directory holding anything else
+    /// is refused.
+    #[arg(long)]
+    pub force: bool,
+}
+
 /// `htui status` / `htui waiting`'s flags (MOD-92 D1). None reads the environment.
 #[derive(Debug, Clone, Default, PartialEq, Eq, clap::Args)]
 pub struct StateArgs {
@@ -184,7 +217,9 @@ pub struct StateArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{Args, Command, ProvisionArgs, StateArgs, WorkerArgs};
+    use super::{
+        Args, ClaudeArgs, ClaudeCommand, Command, EmitArgs, ProvisionArgs, StateArgs, WorkerArgs,
+    };
     use clap::{CommandFactory as _, Parser as _};
 
     #[test]
@@ -614,5 +649,83 @@ mod tests {
             }
             assert!(saw_log, "`--log` is propagated to `{name}`");
         }
+    }
+
+    /// `htui claude emit` with these flags.
+    fn emit(dir: Option<&str>, force: bool) -> Option<Command> {
+        Some(Command::Claude(ClaudeArgs {
+            command: ClaudeCommand::Emit(EmitArgs {
+                dir: dir.map(Into::into),
+                force,
+            }),
+        }))
+    }
+
+    /// MOD-93: `htui claude emit` takes `--dir PATH` and `--force`, both optional.
+    #[test]
+    fn claude_emit_parses_its_two_flags() {
+        let args = Args::try_parse_from(["htui", "claude", "emit"]).expect("parse");
+        assert_eq!(args.command, emit(None, false));
+        let args = Args::try_parse_from(["htui", "claude", "emit", "--dir", "x", "--force"])
+            .expect("parse");
+        assert_eq!(args.command, emit(Some("x"), true));
+        let args = Args::try_parse_from(["htui", "claude", "emit", "--force"]).expect("parse");
+        assert_eq!(args.command, emit(None, true));
+    }
+
+    /// MOD-93: `claude` needs its verb, and no TUI flag stands beside it.
+    #[test]
+    fn claude_needs_its_verb_and_refuses_tui_flags() {
+        for bad in [
+            &["htui", "claude"][..],
+            &["htui", "--demo", "claude", "emit"],
+            &["htui", "claude", "emit", "--decisions"],
+        ] {
+            assert!(Args::try_parse_from(bad).is_err(), "{bad:?} must not parse");
+        }
+    }
+
+    /// MOD-93: the global `--log` goes after `claude emit`, as after every subcommand.
+    #[test]
+    fn log_goes_after_claude_emit() {
+        let args = Args::try_parse_from(["htui", "claude", "emit", "--log", "x"]).expect("parse");
+        assert_eq!(args.log.as_deref(), Some(std::path::Path::new("x")));
+        assert_eq!(args.command, emit(None, false));
+    }
+
+    /// `R-STO-1`, MOD-93: no argument of `htui claude emit` reads the environment, except the
+    /// propagated global `--log`.
+    #[test]
+    fn no_claude_emit_argument_reads_the_environment() {
+        let mut command = Args::command();
+        command.build();
+        let emit = command
+            .find_subcommand("claude")
+            .and_then(|claude| claude.find_subcommand("emit"))
+            .expect("`claude emit` is a subcommand");
+        let mut saw_log = false;
+        for arg in emit.get_arguments() {
+            if arg.get_id() == "log" {
+                saw_log = true;
+                assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new("HTUI_LOG")));
+            } else {
+                assert_eq!(
+                    arg.get_env(),
+                    None,
+                    "`htui claude emit --{}` must not read the environment",
+                    arg.get_id()
+                );
+            }
+        }
+        assert!(saw_log, "`--log` is propagated to `claude emit`");
+    }
+
+    /// MOD-93 D14: `htui --version` prints `htui <crate version>`, the line the mod parses.
+    #[test]
+    fn the_version_line_is_htui_and_the_crate_version() {
+        assert_eq!(
+            Args::command().render_version(),
+            format!("htui {}\n", env!("CARGO_PKG_VERSION"))
+        );
     }
 }
