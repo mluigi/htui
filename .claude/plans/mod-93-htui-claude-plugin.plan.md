@@ -211,3 +211,10 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 - [ ] The validation block passes (`claude` steps on this sandbox's 2.1.296)
 - [ ] Patterns mirrored, not reinvented
 - [ ] `rust-reviewer` gate run over the full change set; findings applied or deferred with the maintainer
+
+## Amendments accepted at blueprint (maintainer, 2026-10-13)
+
+`.claude/plans/mod-93-htui-claude-plugin.blueprint.md` A-1 to A-12 supersede the plan where they
+differ: the kit tests live in `crates/htui/claude-plugin/htui/tests/` (A-1); the `/htui`
+`command.run` hook never reads `next` (A-2); no `isPaneOpen` state, the poll reads `$.ui.panes()`
+(A-4); SKILL.md names `docs/htui-cli.md` and the clone URL without a web link (A-7).
