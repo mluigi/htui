@@ -314,7 +314,7 @@ async fn a_save_over_a_moved_head_keeps_the_draft() {
     assert!(
         notice(&frame).contains(
             "saved elsewhere since you opened it \u{2014} v2 is now the latest; your draft is \
-             kept and Ctrl+S saves it as v3"
+             kept and Ctrl+s saves it as v3"
         ),
         "the stale notice: {frame}"
     );
@@ -521,7 +521,7 @@ async fn keys_typed_while_a_save_is_in_flight_are_kept() {
         "the editor stays open: {frame}"
     );
     assert!(
-        notice(&frame).contains("saved v2") && notice(&frame).contains("Ctrl+S saves them as v3"),
+        notice(&frame).contains("saved v2") && notice(&frame).contains("Ctrl+s saves them as v3"),
         "{frame}"
     );
     assert!(frame.contains("saves v3"), "the token moved to v2: {frame}");
@@ -571,7 +571,7 @@ async fn another_session_s_version_is_not_taken_for_the_save() {
     );
     assert!(
         notice(&frame)
-            .contains("v2 is now the latest; your draft is kept and Ctrl+S saves it as v3"),
+            .contains("v2 is now the latest; your draft is kept and Ctrl+s saves it as v3"),
         "the save's own stale reply landed: {frame}"
     );
     assert!(
@@ -1327,7 +1327,7 @@ async fn ctrl_g_proposal_accept_and_save() {
     harness.key("enter");
     let frame = harness.render();
     assert!(
-        notice(&frame).contains("proposal accepted \u{2014} Ctrl+S saves it"),
+        notice(&frame).contains("proposal accepted \u{2014} Ctrl+s saves it"),
         "{frame}"
     );
     assert!(
@@ -1416,4 +1416,23 @@ async fn a_body_holding_a_key_is_not_sent() {
     assert!(hint(&frame).contains("Ctrl+s save"), "{frame}");
     assert!(harness.chat_steps().is_empty(), "no session started");
     assert_eq!(store.active_runs(&vulkan()).await.expect("count"), active);
+}
+
+/// MOD-67 M6 D4: a rebound save key is the one the missing-`{{item}}` warning names.
+#[tokio::test]
+async fn a_rebound_save_key_is_named_by_the_template_warning() {
+    let store = MemStore::demo();
+    let mut harness = open_with_keys(store.clone(), "[form]\nsave = \"f2\"\n").await;
+    harness.key("n");
+    type_text(&mut harness, "triage");
+    harness.key("enter");
+    type_text(&mut harness, "Triage {{item_key}}");
+    harness.key("f2");
+    harness.settle().await;
+    let frame = harness.render();
+    assert!(
+        notice(&frame).contains("never places {{item}} \u{2014} F2 again saves anyway"),
+        "{frame}"
+    );
+    assert_eq!(head(&store, "triage").await, None, "nothing was sent");
 }
