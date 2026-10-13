@@ -1266,13 +1266,15 @@ async fn session_main(
     }
     // Review R1 #2: an isolated row that pins nothing runs in whatever mode the agent chose, which
     // for `claude-agent-acp` is the user's `defaultMode` (`_meta` cannot reach it). Not refused,
-    // since the row asked for nothing, but said: the approval path is then the agent's.
-    if unpinned_under_isolation(&options.settings) {
+    // since the row asked for nothing, but said: the approval path is then the agent's. Review R2
+    // #1: only when the agent reports modes, because a pin on one that reports none (`agy`) would
+    // refuse the start, so the warning would name a fix that does not exist.
+    if unpinned_under_isolation(&options.settings)
+        && let Some(modes) = session.modes()
+    {
         tracing::warn!(
             agent = %options.agent_name,
-            current_mode = session
-                .modes()
-                .map_or("(none reported)", |modes| &*modes.current_mode_id.0),
+            current_mode = &*modes.current_mode_id.0,
             "the session's permission mode was not pinned: `settings.acp.permission_mode` is unset \
              on an isolated row, so the agent's own starting mode stands (MOD-96 D4)"
         );

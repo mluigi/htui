@@ -1573,8 +1573,9 @@ async fn open_restoring_with(
 }
 
 /// Opens `spec` against [`restoring_agent`] reporting `modes` and answering `session/set_mode` per
-/// `set_mode` (MOD-96 D4), under the row settings `settings` and, when `with_child`, with a `sleep 1000` child whose pid the case can assert on.
-/// A `spec` with no `resume` opens with `session/new`.
+/// `set_mode` (MOD-96 D4), under the row settings `settings` and, when `with_child`, with a
+/// `sleep 1000` child whose pid the case can assert on. A `spec` with no `resume` opens with
+/// `session/new`.
 #[cfg(unix)]
 #[expect(
     clippy::disallowed_methods,

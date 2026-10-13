@@ -456,7 +456,8 @@ the settings the adapter would derive from a `CLAUDE_MODEL_CONFIG` set in the ro
 itself, and `settingSources: []` does not reach that read. So an isolated ACP row with no
 `acp.permission_mode` starts in whatever `defaultMode` your settings files name, possibly `auto`,
 and a call that mode settles never reaches htui. htui logs a warning when an isolated ACP session
-starts with no pinned mode. The seeded `claude` row pins `default`. A row you create in
+starts with no pinned mode while the agent reports session modes; an agent that reports none
+(`agy`) cannot be pinned and gets no warning. The seeded `claude` row pins `default`. A row you create in
 **Settings › Agents** carries the pin only when it copies the settings of a row that has it;
 otherwise add `"permission_mode": "default"` under `acp` in its `settings` by hand.
 
