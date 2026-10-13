@@ -2,6 +2,7 @@
 
 > One line per resolved item, newest first. Write-ups live at
 > `docs/decisions/<prefix>/<prefix>-N.md`. Format per `.claude/rules/workflow-docs.md`.
+- **[MOD-96](docs/decisions/mod/mod-96.md)** - Settings-file permission rules and the permission mode in htui-driven sessions (done, 2026-10-13)
 - **[CLEAN-10](docs/decisions/clean/clean-10.md)** - `cargo doc` fails on private intra-doc links (done, 2026-10-13)
 - **[MOD-93](docs/decisions/mod/mod-93.md)** - `htui` Claude Code plugin: one skill, one mod, emitted from the binary (done, 2026-10-13)
 - **[MOD-89](docs/decisions/mod/mod-89.md)** - Warn or refuse when a run's session trees hold env files (done, 2026-10-13)

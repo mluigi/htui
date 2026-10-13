@@ -35,6 +35,11 @@
 //!   ```
 //!
 //!   A box where the row does not resolve **skips** the ACP cases with the reason printed.
+//! - **The MOD-96 D4 ACP case** (`acp_pinned_mode_asks_under_isolation`) goes through the whole
+//!   `AcpDriver::start` instead, so `_meta`, the `session/set_mode` pin and the turn loop are the
+//!   shipped code, and the permission request it rejects is the driver's own `permission_request`
+//!   answered through `AgentSession::answer_permission`. It cannot inject a `--debug-file`, and
+//!   needs none.
 //!
 //! # The scratch configuration
 //!
@@ -69,10 +74,11 @@ use chrono::Utc;
 use htui_agent::acp::AcpDriver;
 use htui_agent::cli::ClaudeStreamAdapter;
 use htui_agent::driver::{
-    AgentDriver, DriverCaps, McpServerSpec, PermissionPolicy, SessionSpec, ToolExposure,
+    AgentDriver, DriverCaps, McpServerSpec, PermissionAnswer, PermissionPolicy, SessionSpec,
+    ToolExposure,
 };
 use htui_agent::error::DriverError;
-use htui_agent::event::{DriverEvent, StopReason};
+use htui_agent::event::{DriverEvent, PermissionOptionKind, StopReason};
 use htui_agent::launch::{AgentSettings, ChildIo, SESSION_VAR};
 use htui_agent::registry::DriverFactory;
 use htui_core::model::{Agent as AgentRow, AgentId, Billing, StepId, Transport};
@@ -471,12 +477,16 @@ const CLI_PROMPT: &str = "Run this exact Bash command: touch ./touched . Then re
 
 /// Starts a session over `row` and reads it to its first `done`.
 async fn cli_turn(row: &AgentRow, scratch: &Scratch) -> CliTurn {
+    cli_turn_with(row, scratch.spec(), CLI_PROMPT).await
+}
+
+/// [`cli_turn`] with the spec and the prompt given.
+async fn cli_turn_with(row: &AgentRow, mut spec: SessionSpec, prompt: &str) -> CliTurn {
     let driver = cli_driver(row);
     let (port, ask) = htui_agent::prompt_bridge::bridge();
-    let mut spec = scratch.spec();
     spec.prompt = Some(port);
     let mut session = driver
-        .start(spec, CLI_PROMPT.to_owned())
+        .start(spec, prompt.to_owned())
         .await
         .unwrap_or_else(|err| panic!("the session starts (an expired token fails here): {err}"));
     let mut turn = CliTurn::default();
@@ -581,6 +591,9 @@ async fn cli_opted_in_is_the_positive_baseline() {
 
 /// T1 row 1 through the shipped code (D1, D4): auth and htui's prompt tool work, no mod loads, the
 /// settings hook does not fire, no skill is listed, and the stub server sees `HTUI_SESSION=1`.
+/// Since MOD-96's `--setting-sources ""` no settings file enables the probe mods, so the debug file
+/// no longer names them at all (it did under MOD-91's levers: both "not loaded"): the init
+/// envelope's `plugins` is what shows neither was even enabled.
 #[tokio::test]
 #[ignore = "spends model tokens against the credential this box holds"]
 async fn cli_isolated_by_default() {
@@ -607,10 +620,18 @@ async fn cli_isolated_by_default() {
         "HTUI_SESSION reaches the session"
     );
     assert!(scratch.touched.exists(), "the allowed Bash call ran");
-    assert_eq!(
-        scratch.mods(),
-        both_mods(false),
-        "the debug file names both mods, and neither loads"
+    assert!(
+        scratch.mods().values().all(|loaded| !loaded),
+        "no probe mod loads"
+    );
+    assert!(turn.init.is_some(), "the init envelope arrived");
+    let plugins = turn.init_list("plugins");
+    assert!(
+        PROBE_MODS
+            .iter()
+            .filter_map(|id| id.split('@').next())
+            .all(|name| !plugins.iter().any(|plugin| plugin == name)),
+        "neither probe mod is enabled: {plugins:?}"
     );
     assert_eq!(
         scratch.hook_marker(),
@@ -657,6 +678,179 @@ async fn cli_an_overriding_settings_is_refused() {
     );
     assert!(!scratch.debug.exists(), "claude never started");
     assert!(!scratch.mcp_log.exists(), "no MCP server started");
+}
+
+/// MOD-96 probes A4 and B4: the command the gated `Bash` call runs. It writes a file, because a
+/// read-only command such as `echo` is never asked about (probes A2, A3 and B3 proved nothing).
+const PY_COMMAND: &str = r#"python3 -c "open('py_out.txt','w').write('x')""#;
+
+/// The file [`PY_COMMAND`] writes, in the checkout.
+const PY_OUT: &str = "py_out.txt";
+
+/// `stub_mcp.py`'s one verdict line, and the deny that replaces it in [`denying_stub`].
+const STUB_ALLOW: &str =
+    r#"verdict = {"behavior": "allow", "updatedInput": args.get("input", {})}"#;
+const STUB_DENY: &str =
+    r#"verdict = {"behavior": "deny", "message": "htui denied this call. Do not retry it."}"#;
+
+/// The stub `htui` server answering every `permission_prompt` with deny: `stub_mcp.py` with its one
+/// verdict line swapped, written into the scratch root (never into the fixtures).
+fn denying_stub(scratch: &Scratch) -> McpServerSpec {
+    let source =
+        std::fs::read_to_string(fixtures().join("stub_mcp.py")).expect("stub_mcp.py reads");
+    assert_eq!(
+        source.matches(STUB_ALLOW).count(),
+        1,
+        "stub_mcp.py's verdict line changed; update STUB_ALLOW"
+    );
+    let path = scratch.mcp_log.with_file_name("stub_mcp_deny.py");
+    std::fs::write(&path, source.replace(STUB_ALLOW, STUB_DENY)).expect("write the denying stub");
+    let mut server = scratch.stub_server();
+    server.args[0] = path.to_string_lossy().into_owned();
+    server
+}
+
+/// The checkout's project settings file allows `Bash` (probes A4/B4's setup). Written after
+/// [`Scratch::new`]'s commit; the CLI reads it whether or not it is committed.
+fn allow_bash_in_project(scratch: &Scratch) {
+    let dir = scratch.checkout.join(".claude");
+    std::fs::create_dir_all(&dir).expect("the checkout's .claude");
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{"permissions":{"allow":["Bash"]}}"#,
+    )
+    .expect("the project settings.json");
+}
+
+/// The prompt that asks for [`PY_COMMAND`] through `Bash`.
+fn py_prompt() -> String {
+    format!(
+        "Use the Bash tool to run exactly this command, and nothing else: {PY_COMMAND} . Then \
+         reply with the single word DONE."
+    )
+}
+
+/// One turn asking for [`PY_COMMAND`], with the denying stub as `htui`.
+async fn py_turn(row: &AgentRow, scratch: &Scratch) -> CliTurn {
+    let mut spec = scratch.spec();
+    spec.mcp = vec![denying_stub(scratch)];
+    cli_turn_with(row, spec, &py_prompt()).await
+}
+
+/// The arguments of every `permission_prompt` call the stub logged.
+fn prompt_calls(scratch: &Scratch) -> Vec<Value> {
+    scratch
+        .mcp_log()
+        .lines()
+        .filter_map(|line| line.strip_prefix("CALL "))
+        .map(|args| serde_json::from_str(args).expect("the stub logs a call's arguments as JSON"))
+        .collect()
+}
+
+fn print_py(label: &str, scratch: &Scratch, turn: &CliTurn) {
+    print_cli(label, scratch, turn);
+    println!("  init permissionMode: {:?}", init_mode(turn));
+    println!(
+        "  {PY_OUT} written: {}",
+        scratch.checkout.join(PY_OUT).exists()
+    );
+    let calls = prompt_calls(scratch);
+    println!(
+        "  permission_prompt calls: {} {:?}",
+        calls.len(),
+        calls
+            .iter()
+            .map(|call| call.get("tool_name").and_then(Value::as_str).unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn init_mode(turn: &CliTurn) -> Option<&str> {
+    turn.init
+        .as_ref()
+        .and_then(|init| init.get("permissionMode"))
+        .and_then(Value::as_str)
+}
+
+/// MOD-96 A4/B4 and D3 through the shipped code: a project `settings.json` that allows `Bash`
+/// settles the call on a row that opts back in (the baseline: written, htui never asked), and is
+/// not read under isolation (`--setting-sources ""`): htui's prompt is asked, denies, and nothing is
+/// written. The isolated row names no permission mode, so D3's `--permission-mode default` is what
+/// the init envelope reports. The stub denies in both halves, so the baseline's file can only come
+/// from the settings file's `allow`.
+#[tokio::test]
+#[ignore = "spends model tokens against the credential this box holds"]
+async fn cli_settings_file_allow_is_asked_under_isolation() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let claude = claude_on_path();
+
+    let opted = Scratch::new(&claude);
+    allow_bash_in_project(&opted);
+    let row = cli_row(&opted, &claude, true, &[]);
+    let opted_turn = py_turn(&row, &opted).await;
+    print_py(
+        "cli opted in, project allow [Bash] (A4, the baseline)",
+        &opted,
+        &opted_turn,
+    );
+
+    let isolated = Scratch::new(&claude);
+    allow_bash_in_project(&isolated);
+    let mut row = cli_row(&isolated, &claude, false, &[]);
+    row.settings["cli"]["permission_mode"] = json!("");
+    let isolated_turn = py_turn(&row, &isolated).await;
+    print_py(
+        "cli isolated, project allow [Bash], no row mode (B4, D3)",
+        &isolated,
+        &isolated_turn,
+    );
+
+    // The baseline must be positive, or the isolated half proves nothing.
+    assert_eq!(
+        opted_turn.stop,
+        Some(StopReason::EndTurn),
+        "baseline: auth and the turn work"
+    );
+    assert!(
+        prompt_calls(&opted).is_empty(),
+        "baseline: the project allow settles the call, so htui is never asked"
+    );
+    assert!(
+        opted.checkout.join(PY_OUT).exists(),
+        "baseline: the allowed Bash call wrote {PY_OUT}; if it did not, this case cannot prove \
+         the isolated half"
+    );
+
+    assert_eq!(
+        isolated_turn.stop,
+        Some(StopReason::EndTurn),
+        "isolated: auth and the turn work"
+    );
+    assert_eq!(
+        init_mode(&isolated_turn),
+        Some("default"),
+        "isolated: D3 passes --permission-mode default for a row that names none"
+    );
+    let calls = prompt_calls(&isolated);
+    let first = calls
+        .first()
+        .expect("isolated: the settings file is not read, so htui's prompt is asked");
+    assert_eq!(
+        first.get("tool_name").and_then(Value::as_str),
+        Some("Bash"),
+        "isolated: the first call asked about is the Bash call: {first}"
+    );
+    assert!(
+        first
+            .pointer("/input/command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains(PY_OUT)),
+        "isolated: the call asked about is the probe command: {first}"
+    );
+    assert!(
+        !isolated.checkout.join(PY_OUT).exists(),
+        "isolated: htui denied, so nothing wrote {PY_OUT}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1058,7 +1252,9 @@ async fn acp_opted_in_is_the_positive_baseline() {
 
 /// T2 (a) through the shipped `_meta` (D5): the turn ends, htui's server connects, neither mod
 /// loads, the hook does not fire, the command list is empty, and the adapter's own `PostToolUse`
-/// hook still reports `current_mode_update: plan`.
+/// hook still reports `current_mode_update: plan`. Since MOD-96 D4's `settingSources: []` no
+/// settings file enables the probe mods, so the debug file no longer names them at all (under
+/// MOD-91's `_meta` it named both, not loaded), as `cli_isolated_by_default` found for D1.
 #[tokio::test]
 #[ignore = "spends model tokens against the credential this box holds"]
 async fn acp_isolated_by_default() {
@@ -1084,10 +1280,14 @@ async fn acp_isolated_by_default() {
         log.contains("env HTUI_SESSION=1"),
         "HTUI_SESSION reaches the session"
     );
-    assert_eq!(
-        scratch.mods(),
-        both_mods(false),
-        "the debug file names both mods, and neither loads"
+    assert!(
+        Scratch::read(&scratch.debug).is_some_and(|debug| !debug.is_empty()),
+        "the debug file was written, so what it does not name is an observation"
+    );
+    assert!(
+        scratch.mods().values().all(|loaded| !loaded),
+        "no probe mod loads: {:?}",
+        scratch.mods()
     );
     assert_eq!(
         scratch.hook_marker(),
@@ -1105,7 +1305,8 @@ async fn acp_isolated_by_default() {
 /// resumed in a second, with the same `_meta`, still loads neither mod. The first process runs
 /// `session/new` and one short turn and ends; the second calls `session/resume` (or
 /// `session/load` when only that is advertised, as the driver chooses) with its own debug file,
-/// and runs one short turn.
+/// and runs one short turn. Under MOD-96 D4's `settingSources: []` the debug file names no probe
+/// mod at all, as in [`acp_isolated_by_default`].
 #[tokio::test]
 #[ignore = "spends model tokens against the credential this box holds"]
 async fn acp_isolated_on_resume() {
@@ -1176,10 +1377,13 @@ async fn acp_isolated_on_resume() {
         Some("end_turn"),
         "the resumed session takes a turn"
     );
-    assert_eq!(
-        resumed_mods,
-        both_mods(false),
-        "the resumed session's debug file names both mods, and neither loads"
+    assert!(
+        Scratch::read(&resumed_debug).is_some_and(|debug| !debug.is_empty()),
+        "the resumed session's debug file was written"
+    );
+    assert!(
+        resumed_mods.values().all(|loaded| !loaded),
+        "no probe mod loads in the resumed session: {resumed_mods:?}"
     );
     assert_eq!(
         scratch.hook_marker(),
@@ -1187,4 +1391,245 @@ async fn acp_isolated_on_resume() {
         "the settings hook fires in neither process"
     );
     assert_eq!(turn.commands, Vec::<String>::new(), "no command is listed");
+}
+
+// ---------------------------------------------------------------------------------------------
+// MOD-96 D4 on the production ACP driver path
+// ---------------------------------------------------------------------------------------------
+
+/// The scratch user `settings.json` gains `permissions.defaultMode: mode`, beside its hook: the
+/// seed `claude-agent-acp` reads for its starting mode, and `_meta` cannot reach (plan T1 c3a).
+fn user_default_mode(scratch: &Scratch, mode: &str) {
+    let path = scratch.cfg.join("settings.json");
+    let text = std::fs::read_to_string(&path).expect("the scratch settings.json reads");
+    let mut settings: Value =
+        serde_json::from_str(&text).expect("the scratch settings.json parses");
+    settings["permissions"] = json!({ "defaultMode": mode });
+    std::fs::write(&path, settings.to_string()).expect("the scratch settings.json writes");
+}
+
+/// The seeded `claude` row ([`acp_row`]) with `settings.acp.permission_mode` set to `mode`, or
+/// removed for `None`, whatever the seed says.
+fn acp_row_pinning(scratch: &Scratch, user_extensions: bool, mode: Option<&str>) -> AgentRow {
+    let mut row = acp_row(scratch, user_extensions);
+    let acp = row
+        .settings
+        .get_mut("acp")
+        .and_then(Value::as_object_mut)
+        .expect("the seed settings carry `acp`");
+    match mode {
+        Some(mode) => acp.insert("permission_mode".to_owned(), json!(mode)),
+        None => acp.remove("permission_mode"),
+    };
+    row
+}
+
+/// What one turn on the production ACP driver showed.
+#[derive(Debug, Default)]
+struct DriverTurn {
+    stop: Option<StopReason>,
+    errors: Vec<String>,
+    /// The `toolCall` of every `session/request_permission` that reached `htui`, from the
+    /// envelope's raw request; each was rejected.
+    asked: Vec<Value>,
+    /// Every mode the session reported after it opened, in order: a `current_mode_update`'s
+    /// `currentModeId`, and the `mode` option's `currentValue` in a `config_option_update` (what
+    /// `claude-agent-acp` 0.75.0 emits when `session/set_mode` succeeds, `session-mode.js:127`),
+    /// each beside the update that carried it.
+    modes: Vec<(String, String)>,
+}
+
+/// Starts `row` through `AcpDriver::start` with [`py_prompt`], rejects every permission request
+/// with its first reject option, and reads to the first `done`. `None` (with the reason printed)
+/// when the seeded row does not resolve on this box.
+async fn driver_py_turn(scratch: &Scratch, row: &AgentRow) -> Option<DriverTurn> {
+    let driver = AcpDriver::from_row(row, DriverCaps::default()).expect("the row builds");
+    let spec = scratch.spec();
+    match driver.launch_for(&spec).await {
+        Ok(_) => {}
+        Err(DriverError::Unresolved(tool)) => {
+            println!(
+                "SKIPPED: the seeded `claude` row does not resolve `{tool}` on this box. Put node \
+                 22+ and claude-agent-acp 0.75.0 where discovery finds them, or set \
+                 HTUI_TOOL_NODE, HTUI_TOOL_NPX and HTUI_TOOL_CLAUDE_AGENT_ACP"
+            );
+            return None;
+        }
+        Err(err) => panic!("the seeded row's launch resolves: {err}"),
+    }
+    let mut session = driver
+        .start(spec, py_prompt())
+        .await
+        .unwrap_or_else(|err| panic!("the session starts (an expired token fails here): {err}"));
+    let mut turn = DriverTurn::default();
+    let read = async {
+        while let Some(envelope) = session.next_event().await.expect("the session streams") {
+            match envelope.event {
+                DriverEvent::PermissionRequest(request) => {
+                    turn.asked.push(
+                        envelope
+                            .raw
+                            .as_ref()
+                            .and_then(|raw| raw.pointer("/params/toolCall"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                    );
+                    let reject = request
+                        .options
+                        .iter()
+                        .find(|option| {
+                            matches!(
+                                option.kind,
+                                PermissionOptionKind::RejectOnce
+                                    | PermissionOptionKind::RejectAlways
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            panic!("the request offers a reject option: {:?}", request.options)
+                        })
+                        .id
+                        .clone();
+                    session
+                        .answer_permission(request.request_id, PermissionAnswer::Selected(reject))
+                        .await
+                        .expect("the rejection reaches the agent");
+                }
+                DriverEvent::Other(other) => {
+                    let mode = match other.update.as_str() {
+                        "current_mode_update" => other.body.get("currentModeId"),
+                        "config_option_update" => other
+                            .body
+                            .get("configOptions")
+                            .and_then(Value::as_array)
+                            .and_then(|options| {
+                                options.iter().find(|option| {
+                                    option.get("id").and_then(Value::as_str) == Some("mode")
+                                })
+                            })
+                            .and_then(|option| option.get("currentValue")),
+                        _ => None,
+                    };
+                    if let Some(mode) = mode.and_then(Value::as_str) {
+                        turn.modes.push((other.update.clone(), mode.to_owned()));
+                    }
+                }
+                DriverEvent::Error(error) => turn.errors.push(format!("{error:?}")),
+                DriverEvent::Done(done) => {
+                    turn.stop = Some(done.stop_reason);
+                    break;
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(TURN_WINDOW, read)
+        .await
+        .expect("the turn ends within the window");
+    let _ = session.cancel(Duration::from_secs(2)).await;
+    drop(session);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    Some(turn)
+}
+
+fn print_driver(label: &str, scratch: &Scratch, turn: &DriverTurn) {
+    println!("== {label}");
+    println!("  stop: {:?}  errors: {:?}", turn.stop, turn.errors);
+    println!("  modes reported: {:?}", turn.modes);
+    println!("  permission requests: {}", turn.asked.len());
+    for call in &turn.asked {
+        println!("    {call}");
+    }
+    println!(
+        "  {PY_OUT} written: {}",
+        scratch.checkout.join(PY_OUT).exists()
+    );
+}
+
+/// MOD-96 D4 live on the production driver (review R1 #4). The world is the bypass D4 closes: a
+/// user `defaultMode: acceptEdits` and a project `allow: ["Bash"]`.
+///
+/// - **Baseline**: a row that opts back in and pins nothing. The project `allow` settles the
+///   `Bash` call, so `htui` is never asked and [`PY_COMMAND`] writes [`PY_OUT`]. It must be
+///   positive, or the isolated half proves nothing.
+/// - **Isolated, pinned `default`**: `_meta`'s `settingSources: []` drops the project `allow`, and
+///   step 2½'s `session/set_mode` moves the session off the user's `acceptEdits` (which `_meta`
+///   cannot reach). The call reaches `htui` as a `permission_request`, is rejected, and nothing is
+///   written. The mode is read from what the adapter reports after the pin: the `mode` option's
+///   `currentValue` in its `config_option_update` (or a `current_mode_update`).
+///
+/// The ask alone proves the `settingSources` lever, not the pin: `acceptEdits` does not settle a
+/// `python3` command either, so an unpinned isolated row is asked too. The reported mode is what
+/// proves the pin; with the row unpinned it is empty and the case fails (checked 2026-10-13).
+#[tokio::test]
+#[ignore = "spends model tokens against the credential this box holds"]
+async fn acp_pinned_mode_asks_under_isolation() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let claude = claude_on_path();
+
+    let opted = Scratch::new(&claude);
+    user_default_mode(&opted, "acceptEdits");
+    allow_bash_in_project(&opted);
+    let row = acp_row_pinning(&opted, true, None);
+    let Some(opted_turn) = driver_py_turn(&opted, &row).await else {
+        return;
+    };
+    print_driver(
+        "acp driver, opted in, no pin, user acceptEdits + project allow [Bash] (the baseline)",
+        &opted,
+        &opted_turn,
+    );
+
+    let isolated = Scratch::new(&claude);
+    user_default_mode(&isolated, "acceptEdits");
+    allow_bash_in_project(&isolated);
+    let row = acp_row_pinning(&isolated, false, Some("default"));
+    let Some(isolated_turn) = driver_py_turn(&isolated, &row).await else {
+        return;
+    };
+    print_driver(
+        "acp driver, isolated, pinned default, user acceptEdits + project allow [Bash] (D4)",
+        &isolated,
+        &isolated_turn,
+    );
+
+    // The baseline must be positive, or the isolated half proves nothing.
+    assert_eq!(
+        opted_turn.stop,
+        Some(StopReason::EndTurn),
+        "baseline: auth and the turn work"
+    );
+    assert!(
+        opted_turn.asked.is_empty(),
+        "baseline: the project allow settles the call, so htui is never asked: {:?}",
+        opted_turn.asked
+    );
+    assert!(
+        opted.checkout.join(PY_OUT).exists(),
+        "baseline: the allowed Bash call wrote {PY_OUT}; if it did not, this case cannot prove \
+         the isolated half"
+    );
+
+    assert_eq!(
+        isolated_turn.stop,
+        Some(StopReason::EndTurn),
+        "isolated: auth and the turn work"
+    );
+    assert_eq!(
+        isolated_turn.modes.last().map(|(_, mode)| mode.as_str()),
+        Some("default"),
+        "isolated: the pin moved the session to `default`, and nothing moved it off: {:?}",
+        isolated_turn.modes
+    );
+    let first = isolated_turn
+        .asked
+        .first()
+        .expect("isolated: the settings files are not read, so htui is asked");
+    assert!(
+        first.to_string().contains(PY_OUT),
+        "isolated: the first call asked about is the probe command: {first}"
+    );
+    assert!(
+        !isolated.checkout.join(PY_OUT).exists(),
+        "isolated: htui rejected, so nothing wrote {PY_OUT}"
+    );
 }

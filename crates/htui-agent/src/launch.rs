@@ -318,6 +318,14 @@ pub struct AcpSettings {
     pub model_config_id: Option<String>,
     /// Which session operations the agent supports.
     pub session: SessionSettings,
+    /// The ACP session mode `htui` pins after `session/new`, `session/resume` and `session/load`
+    /// (MOD-96 D4): `session/set_mode` when the agent reports another current mode, and a refused
+    /// start when it reports no modes or none with this id. `None`, the default, sends nothing.
+    /// The row's own setting, not an isolation lever: it applies whether or not the row opts back in
+    /// (`user_extensions`). `claude-agent-acp` seeds its mode from the settings files' `defaultMode`,
+    /// which `_meta` cannot override (MOD-96 plan, adapter `acp-agent.js:5827, 5952`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
 }
 
 impl Default for AcpSettings {
@@ -327,6 +335,7 @@ impl Default for AcpSettings {
             client_capabilities: ClientCapabilities::default(),
             model_config_id: None,
             session: SessionSettings::default(),
+            permission_mode: None,
         }
     }
 }

@@ -392,6 +392,103 @@ fn user_extensions_is_read_from_the_settings_document() {
     assert!(reparsed.user_extensions, "the round trip keeps the opt-in");
 }
 
+/// MOD-96 D4: `acp.permission_mode` is the session mode an ACP row pins. Absent is `None`, and a
+/// `None` is not written back (so a pre-MOD-96 row re-serialises unchanged); a value is read as
+/// written and kept by a serialise → parse round trip.
+#[test]
+fn acp_permission_mode_is_read_and_round_trips() {
+    let absent: AgentSettings = serde_json::from_str("{}").expect("`{}` is a valid settings row");
+    assert_eq!(absent.acp.permission_mode, None);
+    let written = serde_json::to_value(&absent.acp).expect("acp settings serialise");
+    assert!(
+        written.get("permission_mode").is_none(),
+        "a `None` mode is not written: {written}"
+    );
+
+    let settings: AgentSettings =
+        serde_json::from_str(r#"{ "acp": { "permission_mode": "default" } }"#)
+            .expect("a pinned row parses");
+    assert_eq!(settings.acp.permission_mode.as_deref(), Some("default"));
+
+    let reparsed: AgentSettings =
+        serde_json::from_str(&serde_json::to_string(&settings).expect("settings serialise"))
+            .expect("serialised settings parse");
+    assert_eq!(reparsed, settings);
+    assert_eq!(reparsed.acp.permission_mode.as_deref(), Some("default"));
+}
+
+/// MOD-96 D6 and review R1: the seeded rows, parsed as the driver parses them. `claude-cli`
+/// keeps `acceptEdits` and no agent rule, so an edit gets no answer from htui's policy: the CLI's
+/// mode settles an in-tree edit, after its own safety checks, and anything else still asks.
+/// `claude` pins its ACP session mode to `default`; `agy` pins nothing. Parsing the rows as
+/// [`AgentSettings`] is what proves the wire name `acp.permission_mode`.
+#[test]
+fn the_seeded_rows_keep_accept_edits_and_pin_the_acp_mode() {
+    use htui_agent::event::{PermissionOption, PermissionOptionKind, ToolCallEvent, ToolKind};
+    use htui_agent::permission::evaluate;
+
+    let rows = htui_core::model::agent::seed_rows(
+        chrono::DateTime::from_timestamp(1_788_393_600, 0).expect("a valid timestamp"),
+    );
+    let settings_of = |name: &str| -> AgentSettings {
+        let row = rows
+            .iter()
+            .find(|row| row.name == name)
+            .unwrap_or_else(|| panic!("the seed rows carry `{name}`"));
+        serde_json::from_value(row.settings.clone())
+            .unwrap_or_else(|err| panic!("`{name}`'s settings parse: {err}"))
+    };
+
+    let cli_row = settings_of("claude-cli");
+    let cli = cli_row
+        .cli
+        .as_ref()
+        .expect("claude-cli carries a cli block");
+    assert_eq!(cli.permission_mode, "acceptEdits");
+    assert!(
+        cli_row.permission.rules.is_empty(),
+        "claude-cli carries no agent rule: {:?}",
+        cli_row.permission.rules
+    );
+
+    // The CLI prompt's two options (`cli/mod.rs`): allow once, reject once.
+    let options = [
+        PermissionOption {
+            id: "allow".to_owned(),
+            label: "Allow".to_owned(),
+            kind: PermissionOptionKind::AllowOnce,
+        },
+        PermissionOption {
+            id: "deny".to_owned(),
+            label: "Deny".to_owned(),
+            kind: PermissionOptionKind::RejectOnce,
+        },
+    ];
+    let edit = ToolCallEvent {
+        tool_call_id: "call-1".to_owned(),
+        title: "Edit".to_owned(),
+        tool_kind: ToolKind::Edit,
+        input: serde_json::json!({}),
+        locations: Vec::new(),
+    };
+    assert_eq!(
+        evaluate(&cli_row.permission, Some(&edit), &options),
+        None,
+        "htui's seed policy does not answer an edit: the CLI's `acceptEdits` settles an in-tree one"
+    );
+
+    assert_eq!(
+        settings_of("claude").acp.permission_mode.as_deref(),
+        Some("default"),
+        "claude pins its ACP session mode"
+    );
+    assert_eq!(
+        settings_of("agy").acp.permission_mode,
+        None,
+        "agy pins nothing"
+    );
+}
+
 #[test]
 fn resolve_substitutes_command_args_and_env() {
     let launch: AgentLaunch = serde_json::from_str(CLAUDE_LAUNCH).expect("claude launch parses");

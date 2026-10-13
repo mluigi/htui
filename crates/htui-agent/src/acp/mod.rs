@@ -33,8 +33,8 @@ use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, EnvVariable, InitializeRequest, LoadSessionRequest,
     McpServer, McpServerStdio, Meta, NewSessionRequest, ReadTextFileResponse,
     RequestPermissionOutcome, RequestPermissionResponse, ResumeSessionRequest,
-    SelectedPermissionOutcome, SessionConfigOptionValue, SetSessionConfigOptionRequest,
-    WriteTextFileResponse,
+    SelectedPermissionOutcome, SessionConfigOptionValue, SessionModeId, SessionModeState,
+    SetSessionConfigOptionRequest, SetSessionModeRequest, WriteTextFileResponse,
 };
 use agent_client_protocol::{
     Agent, ByteStreams, Client, ConnectionTo, Dispatch, RestoredSession, SessionMessage,
@@ -1106,6 +1106,12 @@ enum Step {
 /// `CLAUDE_MODEL_CONFIG`, which `htui` itself never sets but a row's launch `env` can). The CLI's
 /// counterpart is [`crate::cli::ISOLATION_ARGS`]; this function is the one place the ACP lever
 /// lives (blueprint B1), pinned by one literal test.
+///
+/// MOD-96 D4: `settingSources: []` is the CLI's `--setting-sources ""`, so no user, project or
+/// local settings file is read. The adapter's own `settingSources: ["user","project","local"]`
+/// precedes the spread (`acp-agent.js:5933-5935`), so ours wins. The adapter's `SettingsManager`
+/// still reads `defaultMode` from those files (`:5827`), which is why the mode is pinned
+/// separately ([`AcpSettings::permission_mode`]).
 #[must_use]
 pub fn isolation_meta() -> Meta {
     Meta::from_iter([(
@@ -1114,6 +1120,7 @@ pub fn isolation_meta() -> Meta {
             "options": {
                 "settings": { "disableAllHooks": true },
                 "extraArgs": { "disable-slash-commands": "" },
+                "settingSources": [],
             },
         }),
     )])
@@ -1247,6 +1254,31 @@ async fn session_main(
     };
     let session_id = session.session_id().clone();
     let session_ref = AgentSessionRef::new(session_id.0.to_string());
+
+    // 2½. MOD-96 D4: the permission mode the row pins, on every route and before the banner, so a
+    //     refused start records nothing. Owed, as a failed restore is (review L-4): `run_session`
+    //     kills and reaps the child before `start` answers.
+    if let Some(wanted) = options.settings.acp.permission_mode.as_deref()
+        && let Err(err) = pin_mode(&cx, &session, wanted, ready, child).await
+    {
+        ready.lock().unwrap_or_else(PoisonError::into_inner).owed = Some(err);
+        return;
+    }
+    // Review R1 #2: an isolated row that pins nothing runs in whatever mode the agent chose, which
+    // for `claude-agent-acp` is the user's `defaultMode` (`_meta` cannot reach it). Not refused,
+    // since the row asked for nothing, but said: the approval path is then the agent's. Review R2
+    // #1: only when the agent reports modes, because a pin on one that reports none (`agy`) would
+    // refuse the start, so the warning would name a fix that does not exist.
+    if unpinned_under_isolation(&options.settings)
+        && let Some(modes) = session.modes()
+    {
+        tracing::warn!(
+            agent = %options.agent_name,
+            current_mode = &*modes.current_mode_id.0,
+            "the session's permission mode was not pinned: `settings.acp.permission_mode` is unset \
+             on an isolated row, so the agent's own starting mode stands (MOD-96 D4)"
+        );
+    }
 
     // 3. The banner is the session's first row (§4.4): resuming a step is a query for it.
     let models = model_values(&session, options.settings.acp.model_config_id.as_deref());
@@ -1920,6 +1952,69 @@ async fn restore_session(
     }
 }
 
+/// MOD-96 D4: what pinning `wanted` takes. `Ok(None)` when it is already current; `Ok(Some(id))`
+/// when the agent offers it and is elsewhere; `Err(why)` when the agent reports no modes, or none
+/// with that id. Fails closed: an unknown starting mode is an unknown approval path.
+fn mode_to_set(
+    modes: Option<&SessionModeState>,
+    wanted: &str,
+) -> std::result::Result<Option<SessionModeId>, String> {
+    let Some(modes) = modes else {
+        return Err(format!(
+            "cannot pin `settings.acp.permission_mode` `{wanted}`: the agent reports no session modes"
+        ));
+    };
+    if &*modes.current_mode_id.0 == wanted {
+        return Ok(None);
+    }
+    if modes
+        .available_modes
+        .iter()
+        .any(|mode| &*mode.id.0 == wanted)
+    {
+        return Ok(Some(SessionModeId::new(wanted)));
+    }
+    let offered: Vec<&str> = modes
+        .available_modes
+        .iter()
+        .map(|mode| &*mode.id.0)
+        .collect();
+    Err(format!(
+        "cannot pin `settings.acp.permission_mode` `{wanted}`: the agent offers no such mode \
+         (it offers {offered:?})"
+    ))
+}
+
+/// Whether a session under `settings` is isolated (`user_extensions` false) yet pins no permission
+/// mode, so the agent's starting mode stands unchosen by `htui` (MOD-96 review R1 #2). A row that
+/// opts back in is left out: the user's `defaultMode` is what it asked for.
+fn unpinned_under_isolation(settings: &AgentSettings) -> bool {
+    !settings.user_extensions && settings.acp.permission_mode.is_none()
+}
+
+/// Pins `wanted` on `session` (MOD-96 D4), after any of the three opening requests. The step is
+/// recorded first, as the opening requests' are, so a refusal answered from the connection names
+/// `session/set_mode`. ANA-4 risk 11: `block_task` only here.
+async fn pin_mode(
+    cx: &ConnectionTo<Agent>,
+    session: &agent_client_protocol::ActiveSession<'static, Agent>,
+    wanted: &str,
+    ready: &Mutex<ReadyCell>,
+    child: &Mutex<ChildGuard>,
+) -> Result<()> {
+    let Some(mode_id) = mode_to_set(session.modes(), wanted).map_err(DriverError::Transport)?
+    else {
+        return Ok(());
+    };
+    at_step(ready, "session/set_mode");
+    let request = SetSessionModeRequest::new(session.session_id().clone(), mode_id);
+    cx.send_request(request)
+        .block_task()
+        .await
+        .map(|_| ())
+        .map_err(|err| handshake_error("session/set_mode", &err, child))
+}
+
 /// Discards every update already queued on `session`, without waiting: the history a
 /// `session/load` replays ahead of its response, or whatever an agent sent ahead of its
 /// `session/resume` answer (SDK `concepts/sessions.rs:86-88`; the handler
@@ -2021,11 +2116,13 @@ fn model_values(
 
 #[cfg(test)]
 mod tests {
-    use agent_client_protocol::schema::v1::AgentCapabilities;
+    use agent_client_protocol::schema::v1::{
+        AgentCapabilities, SessionMode, SessionModeId, SessionModeState,
+    };
     use serde_json::json;
 
-    use super::{Restore, restore_route};
-    use crate::launch::SessionSettings;
+    use super::{Restore, mode_to_set, restore_route, unpinned_under_isolation};
+    use crate::launch::{AcpSettings, AgentSettings, SessionSettings};
 
     fn caps(document: serde_json::Value) -> AgentCapabilities {
         serde_json::from_value(document).expect("the capabilities parse")
@@ -2051,5 +2148,66 @@ mod tests {
             why.contains("sessionCapabilities.resume") && why.contains("loadSession"),
             "{why}"
         );
+    }
+
+    /// MOD-96 D4: a mode already current sends nothing, an offered one is set, and an agent that
+    /// reports no modes, or none with the pinned id, is refused, naming what it does offer.
+    #[test]
+    fn mode_to_set_skips_sends_and_refuses() {
+        let offered = || {
+            vec![
+                SessionMode::new("default", "Default"),
+                SessionMode::new("acceptEdits", "Accept Edits"),
+            ]
+        };
+        let current = SessionModeState::new("default", offered());
+        let elsewhere = SessionModeState::new("acceptEdits", offered());
+        let without = SessionModeState::new(
+            "acceptEdits",
+            vec![
+                SessionMode::new("acceptEdits", "Accept Edits"),
+                SessionMode::new("plan", "Plan"),
+            ],
+        );
+
+        assert_eq!(mode_to_set(Some(&current), "default"), Ok(None));
+        assert_eq!(
+            mode_to_set(Some(&elsewhere), "default"),
+            Ok(Some(SessionModeId::new("default")))
+        );
+
+        let none = mode_to_set(None, "default").expect_err("no modes is refused");
+        assert!(
+            none.contains("`default`") && none.contains("no session modes"),
+            "{none}"
+        );
+
+        let missing =
+            mode_to_set(Some(&without), "default").expect_err("an absent mode is refused");
+        assert!(
+            missing.contains("`default`")
+                && missing.contains("acceptEdits")
+                && missing.contains("plan"),
+            "{missing}"
+        );
+    }
+
+    /// MOD-96 review R1 #2: only an isolated row that pins no mode is warned about. A pinned row
+    /// is `pin_mode`'s, and a row that opts back in takes the user's `defaultMode` on purpose.
+    #[test]
+    fn only_an_isolated_row_without_a_pin_is_warned_about() {
+        let row = |user_extensions: bool, permission_mode: Option<&str>| AgentSettings {
+            acp: AcpSettings {
+                permission_mode: permission_mode.map(ToOwned::to_owned),
+                ..AcpSettings::default()
+            },
+            user_extensions,
+            ..AgentSettings::default()
+        };
+
+        assert!(unpinned_under_isolation(&row(false, None)));
+        assert!(!unpinned_under_isolation(&row(false, Some("default"))));
+        assert!(!unpinned_under_isolation(&row(true, None)));
+        assert!(!unpinned_under_isolation(&row(true, Some("default"))));
     }
 }
