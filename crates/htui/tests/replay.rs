@@ -216,13 +216,12 @@ async fn enter_on_a_pane_that_cannot_replay_says_where_to_press_it() {
         harness.app().status.as_deref(),
         Some("select a step in the Runs pane (J/K) to replay it")
     );
+    // MOD-67 M5 PA-3: the miss is `backlog.replay`, listed in the `?` box.
+    harness.key("?");
+    let help = harness.render();
     assert!(
-        harness
-            .app()
-            .keymap
-            .help_line(&htui::keymap::KeyScope::Tab(BacklogTab::ID))
-            .contains("Enter replay step"),
-        "and the binding is on the Backlog tab's help line"
+        help.contains("Enter replay step"),
+        "and the act is on the Backlog tab's help line:\n{help}"
     );
 }
 

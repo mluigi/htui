@@ -7,7 +7,8 @@
 //!   the version of that kind the next step reads, never a fan-out loser's (MOD-73 review M1), the
 //!   cursor on the body). Its answer opens a [`Compose`] area over
 //!   the pane, which then captures every key; Ctrl+S sends `WriteDocument`, Ctrl+E hands the body
-//!   to `$EDITOR`, `Esc` drops it. Every other key passes while browsing.
+//!   to `$EDITOR`, `Esc` drops it. Every other key passes while browsing. Keys resolve through
+//!   [`views::BACKLOG_DOCS`], the area's through [`views::DOCS_COMPOSE`] (MOD-67 M5 D4).
 //! - **Nothing to save** (the plan's maintainer answer to blueprint §6 Q1): Ctrl+S on a `v` form
 //!   whose title and body are the base's is refused in the form, and nothing is sent.
 //! - **Replies** are this pane's own requests for this pane's item: a `DocumentForm` opens the
@@ -42,7 +43,6 @@
 use std::collections::BTreeSet;
 
 use htui_core::model::hand_written::SUMMARY_KIND;
-use htui_core::model::item_spec::NOTHING_TO_SAVE;
 use htui_core::model::{Document, DocumentHead, ItemId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -52,15 +52,15 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use crate::app::{Action, Ctx, Handled};
 use crate::editor::ExternalEditOutcome;
 use crate::hand_written::{DOCUMENT_FORM_NAME, HandText, WRITE_DOCUMENT_NAME, write_refused};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells;
 use crate::ui::tabs::backlog::detail::compose::{
     self, Compose, ComposeOutcome, could_not_check, may_have_landed, not_written,
 };
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
-use crate::ui::tabs::backlog::item_form::ctrl_s;
 use crate::ui::tabs::settings::wrapped;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
 
 /// Written by a run step.
 const BY_STEP: &str = "step";
@@ -68,8 +68,12 @@ const BY_STEP: &str = "step";
 /// Written by a human.
 const BY_HAND: &str = "hand";
 
-/// The browse hint on the pane's last row (D11).
-const HINT: &str = "J/K move \u{b7} a new \u{b7} v new version";
+/// The browse hint on the pane's last row (D11), through [`views::BACKLOG_DOCS`].
+const HINT: HintSpec = &[
+    Hint::Pair(Act::DocsNextRow, Act::DocsPrevRow, "move"),
+    Hint::One(Act::DocsAdd, "new"),
+    Hint::One(Act::DocsNewVersion, "new version"),
+];
 
 /// Review M1: a `WriteDocument` whose `Failed` may have followed a lost COMMIT, kept while the
 /// check that settles it, the kind's checked version, is in flight (round 2).
@@ -189,12 +193,9 @@ impl DocumentsTab {
     /// A key while the area is open: its outcome, mapped for the Backlog.
     fn on_compose_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Option<Handled> {
         let compose = self.compose.as_mut()?;
-        // The maintainer answer to blueprint §6 Q1: a `v` form saved untouched writes nothing.
-        if ctrl_s(&key) && compose.busy().is_none() && compose.unchanged() {
-            compose.settle(Some(NOTHING_TO_SAVE.to_owned()));
-            return Some(Handled::Consumed);
-        }
-        Some(match compose.on_key(key) {
+        // The maintainer answer to blueprint §6 Q1 (a `v` form saved untouched writes nothing) is
+        // the area's own `form.save` rule now (MOD-67 M5).
+        Some(match compose.on_key(key, ctx.keys()) {
             ComposeOutcome::Stay => Handled::Consumed,
             ComposeOutcome::Pass => Handled::Pass,
             ComposeOutcome::Cancel => {
@@ -446,38 +447,44 @@ impl DetailTab for DocumentsTab {
         if let Some(handled) = self.on_compose_key(key, ctx) {
             return handled;
         }
-        // D9: the sentence stays until the next key.
+        // D9: the sentence stays until the next key (the Backlog's own keys too, MOD-67 M5: the
+        // pane is offered every key first).
         self.notice = None;
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return Handled::Pass;
-        }
         let Some(item) = self.item else {
             return Handled::Pass;
         };
-        match key.code {
-            KeyCode::Char('J') => {
-                self.move_cursor(1);
-                Handled::Consumed
-            }
-            KeyCode::Char('K') => {
-                self.move_cursor(-1);
-                Handled::Consumed
-            }
-            KeyCode::Char('a') => {
-                self.open(item, None, ctx);
-                Handled::Consumed
-            }
-            KeyCode::Char('v') => {
-                if let Some(kind) = self.documents.get(self.cursor).map(|row| row.kind.clone()) {
-                    self.open(item, Some(kind), ctx);
+        for act in ctx
+            .keys()
+            .actions(views::BACKLOG_DOCS, KeyChord::from_event(key))
+        {
+            match act {
+                Act::DocsNextRow => self.move_cursor(1),
+                Act::DocsPrevRow => self.move_cursor(-1),
+                Act::DocsAdd => self.open(item, None, ctx),
+                // Consumed with no row, as `v` always was.
+                Act::DocsNewVersion => {
+                    if let Some(kind) = self.documents.get(self.cursor).map(|row| row.kind.clone())
+                    {
+                        self.open(item, Some(kind), ctx);
+                    }
                 }
-                Handled::Consumed
+                // `PgDn`/`PgUp` only: `J`/`K` move the cursor (`PANE_PAGE`).
+                Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.documents.len());
+                }
+                // The Backlog's and the list's acts, and the global ones: the tab's.
+                _ => continue,
             }
-            _ => self.scroll.on_key(key, self.documents.len()),
+            return Handled::Consumed;
         }
+        Handled::Pass
+    }
+
+    /// `DOCS_COMPOSE` while the area is open, else `BACKLOG_DOCS` (MOD-67 M5 D4).
+    fn key_stack(&self) -> Stack<'static> {
+        self.compose
+            .as_ref()
+            .map_or(views::BACKLOG_DOCS, Compose::stack)
     }
 
     fn on_paste(&mut self, text: &str, _ctx: &mut Ctx<'_>) -> Handled {
@@ -589,7 +596,15 @@ impl DetailTab for DocumentsTab {
         if let Some(compose) = &self.compose {
             let title = self.compose_title(compose);
             let kinds = self.kinds();
-            let body = compose::render(frame, area, compose, &title, Some(&kinds), ctx.theme);
+            let body = compose::render(
+                frame,
+                area,
+                compose,
+                &title,
+                Some(&kinds),
+                ctx.keys(),
+                ctx.theme,
+            );
             ctx.claim_editor_area(body);
             return;
         }
@@ -612,7 +627,13 @@ impl DetailTab for DocumentsTab {
         ])
         .areas(area);
         frame.render_widget(
-            Line::styled(cells::clip(HINT, usize::from(hint.width)), ctx.theme.dim),
+            Line::styled(
+                cells::clip(
+                    &ctx.keys().hint(views::BACKLOG_DOCS, HINT),
+                    usize::from(hint.width),
+                ),
+                ctx.theme.dim,
+            ),
             hint,
         );
         if self.documents.is_empty() {
@@ -653,6 +674,23 @@ mod tests {
     use std::cell::Cell;
 
     const ITEM: ItemId = ids::HTUI_FEAT_1;
+
+    /// The browse hint as the default keys draw it (MOD-67 M5: `super::HINT` is a spec).
+    const HINT: &str = "J/K move \u{b7} a new \u{b7} v new version";
+
+    /// MOD-67 M5: the spec renders today's text under the default keys, and a rebound
+    /// `new_version`.
+    #[test]
+    fn the_hint_renders_through_the_docs_stack() {
+        let stack = views::BACKLOG_DOCS;
+        assert_eq!(crate::keys::Keys::compiled().hint(stack, super::HINT), HINT);
+        let keys = crate::keys::load_str("version = 1\n[backlog.docs]\nnew_version = \"V\"\n")
+            .expect("loads");
+        assert_eq!(
+            keys.hint(stack, super::HINT),
+            "J/K move \u{b7} a new \u{b7} V new version"
+        );
+    }
 
     /// A request as the bench prints it.
     fn sent(request: &StoreRequest) -> String {

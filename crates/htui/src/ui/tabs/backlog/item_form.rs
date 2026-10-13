@@ -5,9 +5,10 @@
 //! [`ItemFormContext`] the worker read through the writer (D3). It is pure — no `Ctx` — and answers
 //! the tab with an [`ItemFormOutcome`], as [`FilterForm`](super::filter::FilterForm) does.
 //!
-//! - **Ctrl+S is checked before a chord passes** (A6): every text widget passes chords, so the
-//!   save would otherwise never reach the form. `Enter` on a one-line field moves on and never
-//!   saves (D8).
+//! - **Ctrl+S saves after the widget** (A6, MOD-67 M5 D8): every text widget passes chords, so
+//!   the save (`form.save`, resolved through [`views::ITEM_FORM`]) reaches the form, and a rebound
+//!   plain save (`f2`) works on every field. `Enter` on a one-line field moves on and never saves
+//!   (D8).
 //! - **The validator gives early feedback** (D4): `item_spec`'s checks run against the form's
 //!   catalogue, and a refusal is the notice line, with nothing sent. The worker runs them again as
 //!   the authority.
@@ -26,7 +27,7 @@
 //!
 //! Redaction (blueprint E10): the form's `Debug` prints lengths, never the body or the paths.
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{KeyCode, KeyEvent};
 use htui_core::model::item_spec::{self, NOTHING_TO_SAVE};
 use htui_core::model::{
     EditReason, ItemId, ItemKindId, ItemSpec, ProjectId, ProjectRef, SpecChanges, SpecError,
@@ -38,29 +39,44 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
+use super::filter::plain;
 use crate::editor::{
     EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
     without_controls,
 };
 use crate::item_writes::{ItemDivergence, ItemFormContext};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::StoreRequest;
 use crate::ui::cells::{self, cell_width};
-use crate::ui::tabs::backlog::filter;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 
 /// Lines `PageUp`/`PageDown` move in the paths and body areas.
 pub const PAGE: u16 = 5;
 
-/// The hint under a text field. It fits the detail pane's inner width at 100x30 (43 columns).
-pub const HINT_TEXT: &str = "Tab field  Ctrl+S save  Esc cancel";
+/// The hint under a text field, through the form's stack (`Tab field · Ctrl+s save · Esc
+/// cancel` under the defaults). It fits the detail pane's inner width at 100x30 (43 columns).
+pub const HINT_TEXT: HintSpec = &[
+    Hint::One(Act::FormNextField, "field"),
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The hint under a picker. It fits the detail pane's inner width at 100x30 (43 columns).
-pub const HINT_PICK: &str = "\u{2190}/\u{2192} choose  Tab field  Esc cancel";
+/// The hint under a picker: its value keys are the picker's own (MOD-67 M5, fixed). It fits the
+/// detail pane's inner width at 100x30 (43 columns).
+pub const HINT_PICK: HintSpec = &[
+    Hint::Text("\u{2190}/\u{2192} choose"),
+    Hint::One(Act::FormNextField, "field"),
+    Hint::Text("Esc cancel"),
+];
 
-/// The hint under the paths and body areas (milestone 4 D7): 39 columns against the detail
-/// pane's 43, so `Tab field` gives way to Ctrl+E (Tab still cycles).
-pub const HINT_AREA: &str = "Ctrl+E $EDITOR  Ctrl+S save  Esc cancel";
+/// The hint under the paths and body areas (milestone 4 D7): 41 columns against the detail
+/// pane's 43 under the defaults, so `Tab field` gives way to Ctrl+E (Tab still cycles).
+pub const HINT_AREA: HintSpec = &[
+    Hint::One(Act::FormExternalEditor, "$EDITOR"),
+    Hint::One(Act::FormSave, "save"),
+    Hint::Text("Esc cancel"),
+];
 
 /// The refusal of a save in a project without item kinds: an item needs one.
 pub const NO_KINDS: &str = "this project has no item kinds; Settings \u{2192} Kinds adds one";
@@ -128,7 +144,8 @@ pub enum Busy {
 pub enum ItemFormOutcome {
     /// The form edited, moved or refused; it stays open and nothing is sent.
     Stay,
-    /// A chord the form does not own (`ctrl-c`, `Ctrl+F`): the tab passes it.
+    /// A key the form did not use that [`views::ITEM_FORM`]'s modal layer lets through
+    /// (`ctrl-c`, `Ctrl+f`, `F1`): the tab passes it.
     Pass,
     /// `Esc`: close the form, send nothing.
     Cancel,
@@ -267,18 +284,6 @@ impl Texts {
             body: spec.body.clone(),
         }
     }
-}
-
-/// Ctrl+S, with or without `SHIFT` (the Requirements tab's rule).
-pub(super) fn ctrl_s(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
-        && matches!(key.code, KeyCode::Char('s' | 'S'))
-}
-
-/// Ctrl+E, with or without `SHIFT` (milestone 4 D1; the Templates editor's rule).
-pub(super) fn ctrl_e(key: &KeyEvent) -> bool {
-    key.modifiers - KeyModifiers::SHIFT == KeyModifiers::CONTROL
-        && matches!(key.code, KeyCode::Char('e' | 'E'))
 }
 
 /// One step through `len` options from `at`, wrapping.
@@ -579,49 +584,49 @@ impl ItemForm {
         ItemFormOutcome::External(ExternalEdit { text, stem })
     }
 
-    /// Feeds one key.
-    ///
-    /// In order: an open divergence view takes every key, Ctrl+S and Ctrl+E included (milestone 3
-    /// D5, review L3); Ctrl+S saves (A6; swallowed while busy); Ctrl+E hands Body or Paths to
-    /// `$EDITOR` (milestone 4 D1, D2; swallowed on any other field and while busy); any other chord
-    /// passes; while busy everything else is swallowed, `Esc` included (D8); `Tab`/`BackTab` cycle
-    /// the focus; then the focused field takes the key.
-    pub fn on_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
+    /// The stack that holds the form's keys (MOD-67 M5 D4): [`views::ITEM_DIVERGENCE`] while the
+    /// view is open, else [`views::ITEM_FORM`] (busy included).
+    #[must_use]
+    pub const fn key_stack(&self) -> Stack<'static> {
         if self.resolving.is_some() {
-            return self.on_view_key(key);
+            views::ITEM_DIVERGENCE
+        } else {
+            views::ITEM_FORM
         }
-        if ctrl_s(&key) {
-            return match self.busy {
-                Some(_) => ItemFormOutcome::Stay,
-                None => self.save(),
-            };
+    }
+
+    /// Feeds one key, resolved through [`views::ITEM_FORM`] (MOD-67 M5).
+    ///
+    /// In order: an open divergence view takes every key (milestone 3 D5); while busy `form.save`
+    /// and `form.external_editor` are swallowed, what the modal layer admits passes and everything
+    /// else is swallowed, `Esc` included (D8); then the focused widget takes the key (a picker its
+    /// plain value keys, `Enter` and `Esc`); then what it left resolves: `form.save` saves (A6),
+    /// `form.external_editor` hands Body or Paths to `$EDITOR` (milestone 4 D1; swallowed on any
+    /// other field), `form.next_field`/`prev_field` move the focus. Anything else is swallowed
+    /// unless the modal layer passes it (`ctrl-c`, `F1`).
+    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> ItemFormOutcome {
+        if self.resolving.is_some() {
+            return self.on_view_key(key, keys);
         }
-        // Milestone 4 D1: before the chord pass, which would hand it to the tab.
-        if ctrl_e(&key) {
-            return match self.busy {
-                Some(_) => ItemFormOutcome::Stay,
-                None => self.hand_off(),
-            };
-        }
-        if key.modifiers.intersects(filter::CHORD) {
-            return ItemFormOutcome::Pass;
-        }
+        let stack = views::ITEM_FORM;
+        let chord = KeyChord::from_event(key);
+        let acts = keys.actions(stack, chord);
         if self.busy.is_some() {
-            return ItemFormOutcome::Stay;
-        }
-        match key.code {
-            KeyCode::Tab => {
-                self.move_focus(true);
-                return ItemFormOutcome::Stay;
-            }
-            KeyCode::BackTab => {
-                self.move_focus(false);
-                return ItemFormOutcome::Stay;
-            }
-            _ => {}
+            let swallowed = acts
+                .iter()
+                .any(|act| matches!(act, Act::FormSave | Act::FormExternalEditor));
+            return if !swallowed && stack.passes(chord) {
+                ItemFormOutcome::Pass
+            } else {
+                ItemFormOutcome::Stay
+            };
         }
         match self.focus {
-            Field::Project | Field::Kind | Field::Graph => self.on_picker_key(key),
+            Field::Project | Field::Kind | Field::Graph => {
+                if let Some(outcome) = self.on_picker_key(&key) {
+                    return outcome;
+                }
+            }
             Field::Title | Field::Priority | Field::Tags => {
                 let text = match self.focus {
                     Field::Title => &mut self.title,
@@ -629,17 +634,15 @@ impl ItemForm {
                     _ => &mut self.tags,
                 };
                 match text.on_key(key) {
-                    // D8: `Enter` moves on; only Ctrl+S saves.
-                    FieldOutcome::Submit => self.move_focus(true),
+                    // D8: `Enter` moves on; only `form.save` saves.
+                    FieldOutcome::Submit => {
+                        self.move_focus(true);
+                        return ItemFormOutcome::Stay;
+                    }
                     FieldOutcome::Cancel => return ItemFormOutcome::Cancel,
-                    FieldOutcome::Pass => match key.code {
-                        KeyCode::Up => self.move_focus(false),
-                        KeyCode::Down => self.move_focus(true),
-                        _ => {}
-                    },
-                    FieldOutcome::Consumed => {}
+                    FieldOutcome::Consumed => return ItemFormOutcome::Stay,
+                    FieldOutcome::Pass => {}
                 }
-                ItemFormOutcome::Stay
             }
             Field::Paths | Field::Body => {
                 let area = if self.focus == Field::Paths {
@@ -648,12 +651,27 @@ impl ItemForm {
                     &mut self.body
                 };
                 match area.on_key(key, PAGE) {
-                    FieldOutcome::Cancel => ItemFormOutcome::Cancel,
-                    FieldOutcome::Consumed | FieldOutcome::Submit | FieldOutcome::Pass => {
-                        ItemFormOutcome::Stay
-                    }
+                    FieldOutcome::Cancel => return ItemFormOutcome::Cancel,
+                    FieldOutcome::Consumed => return ItemFormOutcome::Stay,
+                    FieldOutcome::Submit | FieldOutcome::Pass => {}
                 }
             }
+        }
+        for act in acts {
+            match act {
+                Act::FormSave => return self.save(),
+                // Milestone 4 D1: Body or Paths hand out; any other field swallows it.
+                Act::FormExternalEditor => return self.hand_off(),
+                Act::FormNextField => self.move_focus(true),
+                Act::FormPrevField => self.move_focus(false),
+                _ => continue,
+            }
+            return ItemFormOutcome::Stay;
+        }
+        if stack.passes(chord) {
+            ItemFormOutcome::Pass
+        } else {
+            ItemFormOutcome::Stay
         }
     }
 
@@ -674,17 +692,14 @@ impl ItemForm {
     }
 
     /// A key while the view is open (D5). `Esc` closes it and keeps the text, focus, token and
-    /// reason; `m`/`t` rebase the form on the head with the resolved spec. Ctrl+E is swallowed
-    /// here, not passed as a chord (review L3): no editor opens over the view, and the key never
-    /// reaches a global binding from inside the form (milestone 4 D1).
-    fn on_view_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
+    /// reason; `m`/`t` rebase the form on the head with the resolved spec. `Ctrl+E` is no act in
+    /// [`views::ITEM_DIVERGENCE`], so it passes like any CONTROL chord (MOD-67 M5): no editor
+    /// opens over the view.
+    fn on_view_key(&mut self, key: KeyEvent, keys: &Keys) -> ItemFormOutcome {
         let Some(view) = self.resolving.as_mut() else {
             return ItemFormOutcome::Stay;
         };
-        if ctrl_e(&key) {
-            return ItemFormOutcome::Stay;
-        }
-        match view.on_key(key) {
+        match view.on_key(key, keys) {
             ViewOutcome::Stay => ItemFormOutcome::Stay,
             ViewOutcome::Pass => ItemFormOutcome::Pass,
             ViewOutcome::Back => {
@@ -714,18 +729,24 @@ impl ItemForm {
         self.focus = fields[wrap(at, fields.len(), forward)];
     }
 
-    /// A key on a picker: `Left`/`h` and `Right`/`l` choose, with wrap; `Enter`/`Down` and `Up`
-    /// move between fields; `Esc` cancels.
-    fn on_picker_key(&mut self, key: KeyEvent) -> ItemFormOutcome {
-        match key.code {
-            KeyCode::Left | KeyCode::Char('h') => return self.pick(false),
-            KeyCode::Right | KeyCode::Char('l') => return self.pick(true),
-            KeyCode::Enter | KeyCode::Down => self.move_focus(true),
-            KeyCode::Up => self.move_focus(false),
-            KeyCode::Esc => return ItemFormOutcome::Cancel,
-            _ => {}
+    /// A picker's own keys, plain only (MOD-67 M5, fixed value keys): `Left`/`h` and `Right`/`l`
+    /// choose, with wrap; `Enter` moves on; `Esc` cancels. `None` for any other key, which the
+    /// form then resolves (`Down`/`Up` are `form.next_field`/`prev_field` by default), so an
+    /// `Alt+h` never picks.
+    fn on_picker_key(&mut self, key: &KeyEvent) -> Option<ItemFormOutcome> {
+        if !plain(key) {
+            return None;
         }
-        ItemFormOutcome::Stay
+        Some(match key.code {
+            KeyCode::Left | KeyCode::Char('h') => self.pick(false),
+            KeyCode::Right | KeyCode::Char('l') => self.pick(true),
+            KeyCode::Enter => {
+                self.move_focus(true);
+                ItemFormOutcome::Stay
+            }
+            KeyCode::Esc => ItemFormOutcome::Cancel,
+            _ => return None,
+        })
     }
 
     /// Moves the focused picker one option. The project picker answers [`ItemFormOutcome::Reload`]
@@ -998,7 +1019,13 @@ pub(super) const fn marker(focused: bool) -> &'static str {
 /// Returns the rect the pane claims for an in-pane editor (MOD-57 P2): the field handed to
 /// `$EDITOR`, else the focused one when it is Paths, else the body. The paths rect is
 /// `PATHS_HEIGHT` rows, under `MIN_PANE`, so a Paths edit gets the whole tab body (R0 F1).
-pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme) -> Rect {
+pub fn render(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    form: &ItemForm,
+    keys: &Keys,
+    theme: &Theme,
+) -> Rect {
     let title = match &form.context.item {
         Some(item) => format!(" Edit {} (v{}) ", item.key, item.version),
         None => format!(" New item \u{b7} {} ", form.slug(form.context.project)),
@@ -1092,14 +1119,15 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, form: &ItemForm, theme: &Theme)
         ),
         notice,
     );
-    let text = match form.focus {
+    let spec = match form.focus {
         Field::Project | Field::Kind | Field::Graph => HINT_PICK,
         Field::Title | Field::Priority | Field::Tags => HINT_TEXT,
         Field::Paths | Field::Body => HINT_AREA,
     };
+    let text = keys.hint(views::ITEM_FORM, spec);
     frame.render_widget(
         Paragraph::new(Line::styled(
-            cells::clip(text, usize::from(width)),
+            cells::clip(&text, usize::from(width)),
             theme.dim,
         )),
         hint,
@@ -1137,6 +1165,7 @@ mod tests {
     use crate::testkit::DEFAULT_SIZE;
     use crate::ui::layout::chrome;
     use crate::ui::tabs::backlog::panes;
+    use crossterm::event::KeyModifiers;
     use htui_core::fixtures::ids;
     use htui_core::model::{ItemPatch, NewItemKind, NewStepGraph};
     use htui_core::store::{MemStore, WriteStore as _};
@@ -1150,9 +1179,14 @@ mod tests {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
+    /// `spec` through the form's stack under the default keys.
+    fn rendered(spec: HintSpec) -> String {
+        Keys::compiled().hint(views::ITEM_FORM, spec)
+    }
+
     fn type_text(form: &mut ItemForm, text: &str) {
         for c in text.chars() {
-            form.on_key(key(KeyCode::Char(c)));
+            form.on_key(key(KeyCode::Char(c)), Keys::compiled());
         }
     }
 
@@ -1215,7 +1249,7 @@ mod tests {
             if form.focus == field {
                 return;
             }
-            form.on_key(key(KeyCode::Tab));
+            form.on_key(key(KeyCode::Tab), Keys::compiled());
         }
         assert_eq!(form.focus, field, "Tab reaches every field");
     }
@@ -1247,7 +1281,7 @@ mod tests {
         let mut form = new_form().await;
         let mut seen = vec![form.focus];
         for _ in 0..ORDER.len() {
-            form.on_key(key(KeyCode::Tab));
+            form.on_key(key(KeyCode::Tab), Keys::compiled());
             seen.push(form.focus);
         }
         assert_eq!(
@@ -1264,14 +1298,17 @@ mod tests {
                 Field::Title,
             ]
         );
-        form.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        form.on_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Keys::compiled(),
+        );
         assert_eq!(form.focus, Field::Kind, "BackTab goes back");
 
         let store = MemStore::demo();
         let mut edit = edit_form(&store, ids::HTUI_ANA_1).await;
         let mut seen = vec![edit.focus];
         for _ in 0..ORDER.len() - 1 {
-            edit.on_key(key(KeyCode::Tab));
+            edit.on_key(key(KeyCode::Tab), Keys::compiled());
             seen.push(edit.focus);
         }
         assert!(!seen.contains(&Field::Project), "{seen:?}");
@@ -1284,14 +1321,14 @@ mod tests {
         let mut form = new_form().await;
         type_text(&mut form, "Fresh item");
         assert!(matches!(
-            form.on_key(key(KeyCode::Enter)),
+            form.on_key(key(KeyCode::Enter), Keys::compiled()),
             ItemFormOutcome::Stay
         ));
         assert_eq!(form.focus, Field::Priority);
         assert_eq!(form.busy(), None, "nothing went out");
-        form.on_key(key(KeyCode::Down));
+        form.on_key(key(KeyCode::Down), Keys::compiled());
         assert_eq!(form.focus, Field::Tags, "Down moves on too");
-        form.on_key(key(KeyCode::Up));
+        form.on_key(key(KeyCode::Up), Keys::compiled());
         assert_eq!(form.focus, Field::Priority, "and Up back");
     }
 
@@ -1299,7 +1336,10 @@ mod tests {
     async fn ctrl_s_on_a_blank_title_refuses_in_the_notice() {
         let mut form = new_form().await;
         type_text(&mut form, "   ");
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(
             form.notice(),
             Some(SpecError::BlankTitle.to_string().as_str())
@@ -1311,7 +1351,10 @@ mod tests {
     async fn an_unchanged_edit_says_nothing_to_save() {
         let store = MemStore::demo();
         let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
         assert_eq!(form.busy(), None);
     }
@@ -1322,7 +1365,7 @@ mod tests {
         let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
         let title = format!("{} v2", form.opened.title);
         type_text(&mut form, " v2");
-        let outcome = form.on_key(ctrl('s'));
+        let outcome = form.on_key(ctrl('s'), Keys::compiled());
         assert!(
             matches!(
                 &outcome,
@@ -1356,7 +1399,10 @@ mod tests {
         let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
         assert_eq!(form.tags.text(), Some("docker, rust"));
         form.tags = TextField::with_text("rust,docker");
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
     }
 
@@ -1377,7 +1423,7 @@ mod tests {
             .expect("a legacy row");
         let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
         type_text(&mut form, " fixed");
-        let outcome = form.on_key(ctrl('s'));
+        let outcome = form.on_key(ctrl('s'), Keys::compiled());
         assert!(
             matches!(
                 &outcome,
@@ -1399,7 +1445,10 @@ mod tests {
         type_text(&mut form, "Fresh item");
         focus_on(&mut form, Field::Paths);
         type_text(&mut form, "nope:src");
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         let notice = form.notice().expect("a refusal");
         assert!(notice.contains("`nope`"), "{notice}");
         assert_eq!(form.busy(), None);
@@ -1415,11 +1464,11 @@ mod tests {
         );
         type_text(&mut form, "Fresh item");
         focus_on(&mut form, Field::Kind);
-        form.on_key(key(KeyCode::Right));
+        form.on_key(key(KeyCode::Right), Keys::compiled());
         focus_on(&mut form, Field::Project);
         assert_eq!(form.picker_label(Field::Project), "htui");
 
-        let outcome = form.on_key(key(KeyCode::Char('l')));
+        let outcome = form.on_key(key(KeyCode::Char('l')), Keys::compiled());
         assert!(
             matches!(outcome, ItemFormOutcome::Reload(project) if project == ids::PROJECT_AGY),
             "{outcome:?}"
@@ -1427,7 +1476,7 @@ mod tests {
         assert_eq!(form.busy(), Some(Busy::Reloading(ids::PROJECT_AGY)));
         assert_eq!(form.picker_label(Field::Project), "agy", "drawn while read");
         assert!(matches!(
-            form.on_key(key(KeyCode::Char('h'))),
+            form.on_key(key(KeyCode::Char('h')), Keys::compiled()),
             ItemFormOutcome::Stay
         ));
         assert_eq!(form.busy(), Some(Busy::Reloading(ids::PROJECT_AGY)));
@@ -1442,11 +1491,58 @@ mod tests {
         assert_eq!(form.title.text(), Some("Fresh item"), "the text is kept");
     }
 
+    /// MOD-67 M5 D8: `form.save` resolves after the widget, so a rebound function key saves from
+    /// a text field, a picker and an area alike, and the old `Ctrl+S` is no act (it passes); the
+    /// hint names the new key. `F1` passes from every field (user-visible item 3).
+    #[tokio::test]
+    async fn a_rebound_save_saves_from_every_field_and_ctrl_s_passes() {
+        let keys = crate::keys::load_str("version = 1\n[form]\nsave = \"f2\"\n").expect("loads");
+        let f2 = key(KeyCode::F(2));
+        for field in [Field::Title, Field::Kind, Field::Body] {
+            let mut form = new_form().await;
+            type_text(&mut form, "Fresh item");
+            focus_on(&mut form, field);
+            assert!(
+                matches!(form.on_key(ctrl('s'), &keys), ItemFormOutcome::Pass),
+                "{field:?}"
+            );
+            assert!(
+                matches!(
+                    form.on_key(key(KeyCode::F(1)), &keys),
+                    ItemFormOutcome::Pass
+                ),
+                "{field:?}"
+            );
+            assert_eq!(form.busy(), None, "{field:?}: nothing went out");
+            assert!(
+                matches!(form.on_key(f2, &keys), ItemFormOutcome::Save(_)),
+                "{field:?}"
+            );
+            assert_eq!(form.busy(), Some(Busy::Minting), "{field:?}");
+        }
+        let form = new_form().await;
+        let text = drawn_with(&form, &keys).join("\n");
+        assert!(
+            text.contains("Tab field \u{b7} F2 save \u{b7} Esc cancel"),
+            "{text}"
+        );
+    }
+
+    /// MOD-67 M5 D4: the divergence view's stack while it is open, else the form's.
+    #[tokio::test]
+    async fn the_key_stack_follows_the_divergence_view() {
+        let form = new_form().await;
+        assert_eq!(form.key_stack(), views::ITEM_FORM);
+        let store = MemStore::demo();
+        let form = resolving(&store, retitled("Theirs")).await;
+        assert_eq!(form.key_stack(), views::ITEM_DIVERGENCE);
+    }
+
     #[tokio::test]
     async fn busy_swallows_plain_keys_esc_and_ctrl_s_but_passes_ctrl_c() {
         let mut form = new_form().await;
         type_text(&mut form, "Fresh item");
-        let outcome = form.on_key(ctrl('s'));
+        let outcome = form.on_key(ctrl('s'), Keys::compiled());
         assert!(
             matches!(
                 &outcome,
@@ -1464,12 +1560,21 @@ mod tests {
             KeyCode::Enter,
         ] {
             assert!(
-                matches!(form.on_key(key(code)), ItemFormOutcome::Stay),
+                matches!(
+                    form.on_key(key(code), Keys::compiled()),
+                    ItemFormOutcome::Stay
+                ),
                 "{code:?}"
             );
         }
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
-        assert!(matches!(form.on_key(ctrl('c')), ItemFormOutcome::Pass));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
+        assert!(matches!(
+            form.on_key(ctrl('c'), Keys::compiled()),
+            ItemFormOutcome::Pass
+        ));
         assert_eq!(form.title.text(), Some("Fresh item"));
         assert_eq!(form.focus, Field::Title);
 
@@ -1477,7 +1582,7 @@ mod tests {
         assert_eq!(form.busy(), None);
         assert_eq!(form.notice(), Some("why"));
         assert!(matches!(
-            form.on_key(key(KeyCode::Esc)),
+            form.on_key(key(KeyCode::Esc), Keys::compiled()),
             ItemFormOutcome::Cancel
         ));
     }
@@ -1507,11 +1612,11 @@ mod tests {
         assert_eq!(form.graph_options(), expected);
         assert_eq!(form.picker_label(Field::Graph), "kind default");
         focus_on(&mut form, Field::Graph);
-        form.on_key(key(KeyCode::Right));
+        form.on_key(key(KeyCode::Right), Keys::compiled());
         assert_eq!(form.graph, Some(htui.graphs[0].id));
         assert_eq!(form.picker_label(Field::Graph), htui.graphs[0].name);
-        form.on_key(key(KeyCode::Left));
-        form.on_key(key(KeyCode::Left));
+        form.on_key(key(KeyCode::Left), Keys::compiled());
+        form.on_key(key(KeyCode::Left), Keys::compiled());
         assert_eq!(form.graph, expected.last().copied().flatten(), "wraps");
 
         let clone = store
@@ -1545,7 +1650,9 @@ mod tests {
     fn the_hints_fit_the_detail_pane() {
         let (width, height) = DEFAULT_SIZE;
         let room = panes(chrome(Rect::new(0, 0, width, height)).body)[1].width - 2;
-        for hint in [HINT_TEXT, HINT_PICK, HINT_AREA] {
+        for spec in [HINT_TEXT, HINT_PICK, HINT_AREA] {
+            let hint = rendered(spec);
+            let hint = hint.as_str();
             assert!(
                 cell_width(hint) <= usize::from(room),
                 "{hint:?} is {} columns against {room}",
@@ -1575,7 +1682,10 @@ mod tests {
         type_text(&mut form, "Fresh item");
         focus_on(&mut form, Field::Paths);
         type_text(&mut form, "nope:secret/dir");
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert!(
             form.notice()
                 .is_some_and(|notice| notice.contains("secret/dir"))
@@ -1590,8 +1700,18 @@ mod tests {
         drawn_at(form, DEFAULT_SIZE)
     }
 
+    /// [`drawn`] under `keys`.
+    fn drawn_with(form: &ItemForm, keys: &Keys) -> Vec<String> {
+        drawn_under(form, DEFAULT_SIZE, keys)
+    }
+
     /// The form drawn into the detail pane of a `(width, height)` terminal, one string per row.
-    fn drawn_at(form: &ItemForm, (width, height): (u16, u16)) -> Vec<String> {
+    fn drawn_at(form: &ItemForm, size: (u16, u16)) -> Vec<String> {
+        drawn_under(form, size, Keys::compiled())
+    }
+
+    /// [`drawn_at`] under `keys`.
+    fn drawn_under(form: &ItemForm, (width, height): (u16, u16), keys: &Keys) -> Vec<String> {
         let [_, right] = panes(chrome(Rect::new(0, 0, width, height)).body);
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(
             right.width,
@@ -1600,7 +1720,7 @@ mod tests {
         .expect("a test terminal");
         terminal
             .draw(|frame| {
-                render(frame, frame.area(), form, &Theme::default());
+                render(frame, frame.area(), form, keys, &Theme::default());
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -1629,7 +1749,15 @@ mod tests {
         .expect("a test terminal");
         let mut body = None;
         terminal
-            .draw(|frame| body = Some(render(frame, frame.area(), &form, &Theme::default())))
+            .draw(|frame| {
+                body = Some(render(
+                    frame,
+                    frame.area(),
+                    &form,
+                    Keys::compiled(),
+                    &Theme::default(),
+                ));
+            })
             .expect("the frame draws");
         let body = body.expect("the frame drew");
         let buffer = terminal.backend().buffer();
@@ -1666,7 +1794,15 @@ mod tests {
             .expect("a test terminal");
             let mut rect = None;
             terminal
-                .draw(|frame| rect = Some(render(frame, frame.area(), form, &Theme::default())))
+                .draw(|frame| {
+                    rect = Some(render(
+                        frame,
+                        frame.area(),
+                        form,
+                        Keys::compiled(),
+                        &Theme::default(),
+                    ));
+                })
                 .expect("the frame draws");
             let rect = rect.expect("the frame drew");
             let buffer = terminal.backend().buffer();
@@ -1703,7 +1839,7 @@ mod tests {
             "\u{2039}ANA ",
             "\u{2039}kind default\u{203a}",
             "paths (one per line)",
-            HINT_TEXT,
+            &rendered(HINT_TEXT),
         ] {
             assert!(text.contains(wanted), "{wanted:?} in\n{text}");
         }
@@ -1726,7 +1862,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{}", rows.join("\n"));
-        assert!(flowed.contains(HINT_TEXT), "{}", rows.join("\n"));
+        assert!(flowed.contains(&rendered(HINT_TEXT)), "{}", rows.join("\n"));
     }
 
     /// The notice's rows drawn at `size`, joined back into one sentence.
@@ -1837,7 +1973,7 @@ mod tests {
 
     /// Ctrl+S on `form`, its `Save` served over `store`: the divergence it answered.
     async fn diverged(store: &MemStore, form: &mut ItemForm) -> ItemDivergence {
-        let outcome = form.on_key(ctrl('s'));
+        let outcome = form.on_key(ctrl('s'), Keys::compiled());
         let ItemFormOutcome::Save(request) = outcome else {
             panic!("a save: {outcome:?} ({:?})", form.notice())
         };
@@ -1878,7 +2014,7 @@ mod tests {
 
     /// The `EditItem` a Ctrl+S sent, or a panic naming what it answered.
     fn edit_sent(form: &mut ItemForm) -> (i32, SpecChanges, EditReason) {
-        match form.on_key(ctrl('s')) {
+        match form.on_key(ctrl('s'), Keys::compiled()) {
             ItemFormOutcome::Save(StoreRequest::EditItem {
                 expected_version,
                 changes,
@@ -1912,7 +2048,10 @@ mod tests {
 
         let mut same = ItemForm::open_resolution(divergence.context.clone(), &ItemSpec::of(&head))
             .expect("a context with an item");
-        assert!(matches!(same.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            same.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(same.notice(), Some(NOTHING_TO_SAVE));
 
         let mut new = divergence.context;
@@ -1940,7 +2079,7 @@ mod tests {
         );
         let mine = format!("{} mine", form.opened.title);
         assert!(matches!(
-            form.on_key(key(KeyCode::Char('m'))),
+            form.on_key(key(KeyCode::Char('m')), Keys::compiled()),
             ItemFormOutcome::Stay
         ));
         assert!(form.resolving().is_none());
@@ -1974,7 +2113,7 @@ mod tests {
         .await;
         let mine = format!("{} mine", form.opened.title);
         assert!(matches!(
-            form.on_key(key(KeyCode::Char('m'))),
+            form.on_key(key(KeyCode::Char('m')), Keys::compiled()),
             ItemFormOutcome::Stay
         ));
         assert!(form.resolving().is_none());
@@ -1999,7 +2138,7 @@ mod tests {
         form.priority = TextField::with_text("9");
         let divergence = diverged(&store, &mut form).await;
         form.open_divergence(&divergence);
-        form.on_key(key(KeyCode::Char('t')));
+        form.on_key(key(KeyCode::Char('t')), Keys::compiled());
         assert_eq!(form.title.text(), Some("Theirs"));
         let (version, changes, reason) = edit_sent(&mut form);
         assert_eq!((version, reason), (2, EditReason::DivergenceResolution));
@@ -2017,8 +2156,11 @@ mod tests {
     async fn t_with_every_change_conflicting_has_nothing_to_save() {
         let store = MemStore::demo();
         let mut form = resolving(&store, retitled("Theirs")).await;
-        form.on_key(key(KeyCode::Char('t')));
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        form.on_key(key(KeyCode::Char('t')), Keys::compiled());
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
         assert_eq!(form.busy(), None);
     }
@@ -2031,8 +2173,11 @@ mod tests {
         let mut form = resolving(&store, retitled(&format!("{opened} mine"))).await;
         let view = form.resolving().expect("the view");
         assert!(view.rows().is_empty(), "{view:?}");
-        form.on_key(key(KeyCode::Char('m')));
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        form.on_key(key(KeyCode::Char('m')), Keys::compiled());
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
     }
 
@@ -2042,7 +2187,7 @@ mod tests {
         let store = MemStore::demo();
         let mut form = resolving(&store, retitled("Theirs")).await;
         assert!(matches!(
-            form.on_key(key(KeyCode::Esc)),
+            form.on_key(key(KeyCode::Esc), Keys::compiled()),
             ItemFormOutcome::Stay
         ));
         assert!(form.resolving().is_none());
@@ -2062,7 +2207,7 @@ mod tests {
         assert!(changes.title.is_some());
         form.settle(None);
         assert!(matches!(
-            form.on_key(key(KeyCode::Esc)),
+            form.on_key(key(KeyCode::Esc), Keys::compiled()),
             ItemFormOutcome::Cancel
         ));
     }
@@ -2110,14 +2255,16 @@ mod tests {
         type_text(&mut form, " mine");
         let divergence = diverged(&store, &mut form).await;
         form.open_divergence(&divergence);
-        form.on_key(key(KeyCode::Char('t')));
+        form.on_key(key(KeyCode::Char('t')), Keys::compiled());
         assert!(form.resolving().is_none());
         assert_eq!(form.picker_label(Field::Kind), "NEW Newcomer");
         assert_eq!(form.picker_label(Field::Graph), graph.name);
     }
 
+    /// MOD-67 M5 (user-visible item 7): the view swallows plain keys it does not use; `Ctrl+S` is
+    /// no act there and passes like `ctrl-c` and `F1` (the modal layer), and saves nothing.
     #[tokio::test]
-    async fn the_view_swallows_letters_and_ctrl_s_but_passes_ctrl_c() {
+    async fn the_view_swallows_letters_and_passes_ctrl_s_and_ctrl_c() {
         let store = MemStore::demo();
         let mut form = resolving(&store, retitled("Theirs")).await;
         let title = form.title.text().map(str::to_owned);
@@ -2125,14 +2272,18 @@ mod tests {
             key(KeyCode::Char('x')),
             key(KeyCode::Tab),
             key(KeyCode::Enter),
-            ctrl('s'),
         ] {
             assert!(
-                matches!(form.on_key(event), ItemFormOutcome::Stay),
+                matches!(form.on_key(event, Keys::compiled()), ItemFormOutcome::Stay),
                 "{event:?}"
             );
         }
-        assert!(matches!(form.on_key(ctrl('c')), ItemFormOutcome::Pass));
+        for event in [ctrl('s'), ctrl('c'), key(KeyCode::F(1))] {
+            assert!(
+                matches!(form.on_key(event, Keys::compiled()), ItemFormOutcome::Pass),
+                "{event:?}"
+            );
+        }
         assert!(form.resolving().is_some(), "still open");
         assert_eq!(form.busy(), None, "Ctrl+S sent nothing");
         assert_eq!(form.title.text().map(str::to_owned), title);
@@ -2178,7 +2329,7 @@ mod tests {
     /// Ctrl+E on `form`'s focused field: the `ExternalEdit` it answered, or a panic naming the
     /// outcome.
     fn handed(form: &mut ItemForm) -> ExternalEdit {
-        match form.on_key(ctrl('e')) {
+        match form.on_key(ctrl('e'), Keys::compiled()) {
             ItemFormOutcome::External(edit) => edit,
             other => panic!("an external edit: {other:?} ({:?})", form.notice()),
         }
@@ -2201,10 +2352,13 @@ mod tests {
 
         focus_on(&mut form, Field::Paths);
         form.on_paste("src/**");
-        let outcome = form.on_key(KeyEvent::new(
-            KeyCode::Char('E'),
-            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
-        ));
+        let outcome = form.on_key(
+            KeyEvent::new(
+                KeyCode::Char('E'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            Keys::compiled(),
+        );
         assert!(
             matches!(
                 &outcome,
@@ -2243,7 +2397,7 @@ mod tests {
             Field::Graph,
         ] {
             focus_on(&mut form, field);
-            let outcome = form.on_key(ctrl('e'));
+            let outcome = form.on_key(ctrl('e'), Keys::compiled());
             assert!(
                 matches!(outcome, ItemFormOutcome::Stay),
                 "{field:?}: {outcome:?}"
@@ -2253,7 +2407,7 @@ mod tests {
         }
         let mut form = new_form().await;
         focus_on(&mut form, Field::Project);
-        let outcome = form.on_key(ctrl('e'));
+        let outcome = form.on_key(ctrl('e'), Keys::compiled());
         assert!(matches!(outcome, ItemFormOutcome::Stay), "{outcome:?}");
         assert_eq!(form.external, None);
         assert_eq!(form.focus(), Field::Project);
@@ -2265,16 +2419,22 @@ mod tests {
         let mut form = new_form().await;
         type_text(&mut form, "Fresh item");
         focus_on(&mut form, Field::Body);
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Save(_)));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Save(_)
+        ));
         assert_eq!(form.busy(), Some(Busy::Minting));
-        assert!(matches!(form.on_key(ctrl('e')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            form.on_key(ctrl('e'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(form.external, None);
     }
 
-    /// Review L3: the open three-way view swallows Ctrl+E, so it never reaches a global binding
-    /// (D1's rule) and no editor opens over the view.
+    /// Review L3: no editor opens over the three-way view. MOD-67 M5 (user-visible item 7):
+    /// `Ctrl+E` is no act in `ITEM_DIVERGENCE`, so it passes; nothing global binds it.
     #[tokio::test]
-    async fn ctrl_e_in_the_divergence_view_is_swallowed() {
+    async fn ctrl_e_in_the_divergence_view_opens_no_editor() {
         let store = MemStore::demo();
         let mut form = resolving(&store, retitled("Theirs")).await;
         for event in [
@@ -2284,8 +2444,8 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT,
             ),
         ] {
-            let outcome = form.on_key(event);
-            assert!(matches!(outcome, ItemFormOutcome::Stay), "{outcome:?}");
+            let outcome = form.on_key(event, Keys::compiled());
+            assert!(matches!(outcome, ItemFormOutcome::Pass), "{outcome:?}");
         }
         assert!(form.resolving().is_some(), "still open");
         assert_eq!(form.external, None);
@@ -2365,7 +2525,10 @@ mod tests {
         handed(&mut form);
         form.on_external_edit(ExternalEditOutcome::Edited(form.opened.body.clone()));
         assert_eq!(form.notice(), Some(EDITED));
-        assert!(matches!(form.on_key(ctrl('s')), ItemFormOutcome::Stay));
+        assert!(matches!(
+            form.on_key(ctrl('s'), Keys::compiled()),
+            ItemFormOutcome::Stay
+        ));
         assert_eq!(form.notice(), Some(NOTHING_TO_SAVE));
     }
 
@@ -2473,12 +2636,12 @@ mod tests {
         for field in [Field::Body, Field::Paths] {
             focus_on(&mut form, field);
             let text = drawn(&form).join("\n");
-            assert!(text.contains(HINT_AREA), "{field:?} in\n{text}");
+            assert!(text.contains(&rendered(HINT_AREA)), "{field:?} in\n{text}");
             assert!(!text.contains("Tab field"), "{field:?} in\n{text}");
         }
         focus_on(&mut form, Field::Title);
         let text = drawn(&form).join("\n");
-        assert!(text.contains(HINT_TEXT), "{text}");
+        assert!(text.contains(&rendered(HINT_TEXT)), "{text}");
     }
 
     #[tokio::test]
@@ -2486,7 +2649,7 @@ mod tests {
         let mut form = new_form().await;
         focus_on(&mut form, Field::Body);
         form.on_paste("SECRET-BODY");
-        let outcome = form.on_key(ctrl('e'));
+        let outcome = form.on_key(ctrl('e'), Keys::compiled());
         let printed = format!("{outcome:?}");
         assert!(printed.contains("text_len"), "{printed}");
         assert!(!printed.contains("SECRET-BODY"), "{printed}");

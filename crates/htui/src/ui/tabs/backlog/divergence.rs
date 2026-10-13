@@ -12,6 +12,9 @@
 //!   ancestor → mine.
 //! - **`m`/`t` decide the conflicts only** (D2, D5): the rest of the merge keeps both sides'
 //!   changes. `Esc` returns to the form unchanged.
+//! - **Keys resolve through [`views::ITEM_DIVERGENCE`]** (MOD-67 M5): `backlog.item.theirs`,
+//!   `mine` and `switch_diff`, `list.down`/`up`, `pane.page_down`/`page_up` and `common.back`;
+//!   anything else is swallowed, but a CONTROL, ALT or function key passes (the modal layer).
 //!
 //! Redaction (milestone 2 E10): a [`Row`] holds summaries, never body or path text (`3 lines`,
 //! `2 paths`), and [`Divergence`]'s `Debug` is hand-written to print the rows' fields and states
@@ -19,7 +22,7 @@
 
 use core::cell::Cell;
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 use htui_core::model::item_merge::{self, FieldState, Side, SpecField, SpecMerge};
 use htui_core::model::item_spec;
 use htui_core::model::{Item, ItemKindId, ItemSpec, StepGraphId};
@@ -28,24 +31,26 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use super::item_form::ctrl_s;
 use crate::item_writes::{ItemDivergence, ItemFormContext};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, views};
 use crate::ui::cells;
-use crate::ui::tabs::backlog::filter;
 use crate::ui::tabs::settings::wrapped;
 use crate::ui::{Theme, diff};
 
-/// The hint's pick part while a field conflicts (D4).
-pub const HINT_SIDES: &str = "t theirs wins  m mine wins";
+/// The hint's pick part while a field conflicts (D4), through [`views::ITEM_DIVERGENCE`].
+pub const HINT_SIDES: HintSpec = &[
+    Hint::One(Act::ItemTheirs, "theirs wins"),
+    Hint::One(Act::ItemMine, "mine wins"),
+];
 
 /// The hint's pick part with no conflict (D5): `m` and `t` give the same spec.
 pub const HINT_NO_CONFLICT: &str = "no conflicts \u{2014} m or t continues";
 
 /// Shown when both body and paths differ.
-pub const HINT_TAB: &str = "Tab body/paths";
+pub const HINT_TAB: HintSpec = &[Hint::One(Act::ItemSwitchDiff, "body/paths")];
 
 /// Always last.
-pub const HINT_BACK: &str = "Esc back";
+pub const HINT_BACK: HintSpec = &[Hint::One(Act::Back, "back")];
 
 /// Width of the label column with its trailing gap (`priority` + 2).
 pub const LABEL_WIDTH: usize = 10;
@@ -119,7 +124,8 @@ pub struct Row {
 pub enum ViewOutcome {
     /// Scrolled, switched or swallowed.
     Stay,
-    /// A chord ([`filter::CHORD`]) other than Ctrl+S: the form passes it.
+    /// A key the view did not use that its stack's modal layer lets through (CONTROL, ALT, a
+    /// function key): the form passes it.
     Pass,
     /// `Esc`: back to the form unchanged (D5).
     Back,
@@ -230,39 +236,44 @@ impl Divergence {
         }
     }
 
-    /// One key (D5), in order: Ctrl+S is swallowed, another chord passes, `Esc` goes back, `t`/`m`
-    /// (or `T`/`M`) resolve, `Tab`/`BackTab` switch the diffs, `j`/`k`/`PageDown`/`PageUp` scroll
-    /// them, and anything else is swallowed.
-    pub fn on_key(&mut self, key: KeyEvent) -> ViewOutcome {
-        // Caught before the chord pass (D5): a passed Ctrl+S would reach the app.
-        if ctrl_s(&key) {
+    /// One key (D5), resolved through [`views::ITEM_DIVERGENCE`] (MOD-67 M5): `Esc` goes back,
+    /// `t`/`m` (or `T`/`M`) resolve, `Tab`/`BackTab` switch the diffs (when both texts differ),
+    /// `j`/`k`/arrows/`PageDown`/`PageUp` scroll them. Anything else is swallowed, except what the
+    /// modal layer passes (CONTROL, ALT, function keys), `Ctrl+S` included: nothing binds it here.
+    pub fn on_key(&mut self, key: KeyEvent, keys: &Keys) -> ViewOutcome {
+        let stack = views::ITEM_DIVERGENCE;
+        let chord = KeyChord::from_event(key);
+        for act in keys.actions(stack, chord) {
+            match act {
+                Act::Back => return ViewOutcome::Back,
+                // A capital too (MOD-13 review NIT-3): Shift or Caps Lock is not a different pick.
+                Act::ItemTheirs => return ViewOutcome::Resolve(Side::Theirs),
+                Act::ItemMine => return ViewOutcome::Resolve(Side::Mine),
+                Act::ItemSwitchDiff => {
+                    if self.both_texts() {
+                        self.pane = match self.pane {
+                            Some(DiffPane::Body) => Some(DiffPane::Paths),
+                            Some(DiffPane::Paths) | None => Some(DiffPane::Body),
+                        };
+                        self.diffs = self.pane.map(|pane| {
+                            pane_diffs(&self.merge, pane, self.ancestor_version, self.head_version)
+                        });
+                        self.scroll = 0;
+                    }
+                }
+                Act::ListDown => self.scroll_by(1, true),
+                Act::ListUp => self.scroll_by(1, false),
+                Act::PanePageDown => self.scroll_by(PAGE, true),
+                Act::PanePageUp => self.scroll_by(PAGE, false),
+                _ => continue,
+            }
             return ViewOutcome::Stay;
         }
-        if key.modifiers.intersects(filter::CHORD) {
-            return ViewOutcome::Pass;
+        if stack.passes(chord) {
+            ViewOutcome::Pass
+        } else {
+            ViewOutcome::Stay
         }
-        match key.code {
-            KeyCode::Esc => return ViewOutcome::Back,
-            // A capital too (MOD-13 review NIT-3): Shift or Caps Lock is not a different pick.
-            KeyCode::Char('t' | 'T') => return ViewOutcome::Resolve(Side::Theirs),
-            KeyCode::Char('m' | 'M') => return ViewOutcome::Resolve(Side::Mine),
-            KeyCode::Tab | KeyCode::BackTab if self.both_texts() => {
-                self.pane = match self.pane {
-                    Some(DiffPane::Body) => Some(DiffPane::Paths),
-                    Some(DiffPane::Paths) | None => Some(DiffPane::Body),
-                };
-                self.diffs = self.pane.map(|pane| {
-                    pane_diffs(&self.merge, pane, self.ancestor_version, self.head_version)
-                });
-                self.scroll = 0;
-            }
-            KeyCode::Char('j') | KeyCode::Down => self.scroll_by(1, true),
-            KeyCode::Char('k') | KeyCode::Up => self.scroll_by(1, false),
-            KeyCode::PageDown => self.scroll_by(PAGE, true),
-            KeyCode::PageUp => self.scroll_by(PAGE, false),
-            _ => {}
-        }
-        ViewOutcome::Stay
     }
 
     /// The listed fields.
@@ -302,20 +313,23 @@ impl Divergence {
     }
 
     /// D4/D5: [`HINT_SIDES`] or [`HINT_NO_CONFLICT`], then [`HINT_TAB`] when both body and paths
-    /// differ, then [`HINT_BACK`], joined by two spaces. With a conflict and both texts that is
-    /// exactly D4's `t theirs wins  m mine wins  Tab body/paths  Esc back`.
+    /// differ, then [`HINT_BACK`], each through [`views::ITEM_DIVERGENCE`], empty parts dropped,
+    /// joined by ` · ` (MOD-67 M5 D9). With a conflict and both texts that is
+    /// `t theirs wins · m mine wins · Tab body/paths · Esc back` under the defaults.
     #[must_use]
-    pub fn hint(&self) -> String {
+    pub fn hint(&self, keys: &Keys) -> String {
+        let stack = views::ITEM_DIVERGENCE;
         let mut parts = vec![if self.merge.has_conflict() {
-            HINT_SIDES
+            keys.hint(stack, HINT_SIDES)
         } else {
-            HINT_NO_CONFLICT
+            HINT_NO_CONFLICT.to_owned()
         }];
         if self.both_texts() {
-            parts.push(HINT_TAB);
+            parts.push(keys.hint(stack, HINT_TAB));
         }
-        parts.push(HINT_BACK);
-        parts.join("  ")
+        parts.push(keys.hint(stack, HINT_BACK));
+        parts.retain(|part| !part.is_empty());
+        parts.join(" \u{b7} ")
     }
 
     /// The rebased form's inputs: the view's catalogue (item = head) and `merge.resolve(side)`.
@@ -432,7 +446,7 @@ fn count(n: usize, noun: &str) -> String {
 }
 
 /// D4: the view over the whole tab `area`.
-pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Theme) {
+pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, keys: &Keys, theme: &Theme) {
     let title = header(&view.key, view.ancestor_version, view.head_version);
     let block = Block::new()
         .borders(Borders::ALL)
@@ -531,7 +545,10 @@ pub fn render(frame: &mut Frame<'_>, area: Rect, view: &Divergence, theme: &Them
     }
 
     frame.render_widget(
-        Paragraph::new(Line::styled(cells::clip(&view.hint(), width), theme.dim)),
+        Paragraph::new(Line::styled(
+            cells::clip(&view.hint(keys), width),
+            theme.dim,
+        )),
         hint_at,
     );
 }
@@ -606,7 +623,7 @@ mod tests {
     use crate::store_worker::{StoreReply, StoreRequest};
     use crate::ui::cells::cell_width;
     use crate::ui::layout::chrome;
-    use crossterm::event::KeyModifiers;
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{EditReason, ItemPatch, SpecChanges};
     use htui_core::store::{MemStore, WriteStore as _};
@@ -691,7 +708,7 @@ mod tests {
         terminal
             .draw(|frame| {
                 let area = chrome(frame.area()).body;
-                render(frame, area, view, &Theme::default());
+                render(frame, area, view, Keys::compiled(), &Theme::default());
             })
             .expect("the frame draws");
         let buffer = terminal.backend().buffer();
@@ -846,7 +863,10 @@ mod tests {
         )
         .await;
         assert_eq!(only_body.pane(), Some(DiffPane::Body));
-        assert_eq!(only_body.on_key(key(KeyCode::Tab)), ViewOutcome::Stay);
+        assert_eq!(
+            only_body.on_key(key(KeyCode::Tab), Keys::compiled()),
+            ViewOutcome::Stay
+        );
         assert_eq!(only_body.pane(), Some(DiffPane::Body), "nowhere to go");
 
         let mut both = view(
@@ -858,12 +878,18 @@ mod tests {
         )
         .await;
         assert_eq!(both.pane(), Some(DiffPane::Body));
-        both.on_key(key(KeyCode::Char('j')));
+        both.on_key(key(KeyCode::Char('j')), Keys::compiled());
         assert_eq!(both.scroll(), 1);
-        assert_eq!(both.on_key(key(KeyCode::Tab)), ViewOutcome::Stay);
+        assert_eq!(
+            both.on_key(key(KeyCode::Tab), Keys::compiled()),
+            ViewOutcome::Stay
+        );
         assert_eq!(both.pane(), Some(DiffPane::Paths));
         assert_eq!(both.scroll(), 0, "a switch starts at the top");
-        both.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT));
+        both.on_key(
+            KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT),
+            Keys::compiled(),
+        );
         assert_eq!(both.pane(), Some(DiffPane::Body));
     }
 
@@ -882,12 +908,12 @@ mod tests {
         let body = view.diffs.clone().expect("the body's diffs");
         assert!(body.0.contains("+theirs"), "{:?}", body.0);
         assert_eq!(body.1, "", "my body did not move");
-        view.on_key(key(KeyCode::Char('j')));
+        view.on_key(key(KeyCode::Char('j')), Keys::compiled());
         assert_eq!(view.diffs.as_ref(), Some(&body), "a scroll reuses them");
-        view.on_key(key(KeyCode::Tab));
+        view.on_key(key(KeyCode::Tab), Keys::compiled());
         let paths = view.diffs.clone().expect("the paths' diffs");
         assert!(paths.1.contains("+src/mine/**"), "{:?}", paths.1);
-        view.on_key(key(KeyCode::Tab));
+        view.on_key(key(KeyCode::Tab), Keys::compiled());
         assert_eq!(view.diffs, Some(body), "back on the body");
     }
 
@@ -913,18 +939,21 @@ mod tests {
         .count();
         assert!(lines > 1 && lines - 1 < 5 * PAGE, "{lines}");
         for _ in 0..5 {
-            assert_eq!(view.on_key(key(KeyCode::PageDown)), ViewOutcome::Stay);
+            assert_eq!(
+                view.on_key(key(KeyCode::PageDown), Keys::compiled()),
+                ViewOutcome::Stay
+            );
         }
         assert_eq!(usize::from(view.scroll()), lines - 1);
-        view.on_key(key(KeyCode::Down));
+        view.on_key(key(KeyCode::Down), Keys::compiled());
         assert_eq!(usize::from(view.scroll()), lines - 1, "clamped");
-        view.on_key(key(KeyCode::PageUp));
+        view.on_key(key(KeyCode::PageUp), Keys::compiled());
         assert_eq!(usize::from(view.scroll()), lines - 1 - PAGE);
         for _ in 0..3 {
-            view.on_key(key(KeyCode::PageUp));
+            view.on_key(key(KeyCode::PageUp), Keys::compiled());
         }
         assert_eq!(view.scroll(), 0);
-        view.on_key(key(KeyCode::Char('k')));
+        view.on_key(key(KeyCode::Char('k')), Keys::compiled());
         assert_eq!(view.scroll(), 0, "k at the top stays");
     }
 
@@ -948,12 +977,12 @@ mod tests {
         let top = drawn(&view).join("\n");
         assert!(!top.contains("end-of-39"), "{top}");
         for _ in 0..100 {
-            view.on_key(key(KeyCode::PageDown));
+            view.on_key(key(KeyCode::PageDown), Keys::compiled());
         }
         let end = view.scroll();
         let bottom = drawn(&view).join("\n");
         assert!(bottom.contains("end-of-39"), "{bottom}");
-        view.on_key(key(KeyCode::Char('j')));
+        view.on_key(key(KeyCode::Char('j')), Keys::compiled());
         assert_eq!(view.scroll(), end, "clamped at the last wrapped row");
     }
 
@@ -978,10 +1007,10 @@ mod tests {
         for code in [KeyCode::Char('k'), KeyCode::PageUp] {
             drawn_at(&view, 60, 30);
             for _ in 0..200 {
-                view.on_key(key(KeyCode::PageDown));
+                view.on_key(key(KeyCode::PageDown), Keys::compiled());
             }
             let before = drawn_at(&view, 200, 30);
-            view.on_key(key(code));
+            view.on_key(key(code), Keys::compiled());
             let after = drawn_at(&view, 200, 30);
             assert_ne!(after, before, "{code:?} moved the drawn rows");
         }
@@ -1005,7 +1034,7 @@ mod tests {
         let top = drawn(&view).join("\n");
         assert!(top.contains('\u{7d42}'), "the CJK line's last in\n{top}");
         for _ in 0..100 {
-            view.on_key(key(KeyCode::PageDown));
+            view.on_key(key(KeyCode::PageDown), Keys::compiled());
         }
         let end = drawn(&view).join("\n");
         assert!(end.contains('\u{1f3c1}'), "the emoji line's last in\n{end}");
@@ -1085,8 +1114,8 @@ mod tests {
         )
         .await;
         assert_eq!(
-            conflicted.hint(),
-            "t theirs wins  m mine wins  Tab body/paths  Esc back"
+            conflicted.hint(Keys::compiled()),
+            "t theirs wins \u{b7} m mine wins \u{b7} Tab body/paths \u{b7} Esc back"
         );
         let clean = view(
             |_| ItemPatch {
@@ -1096,21 +1125,30 @@ mod tests {
             |spec| spec.required_tags = vec!["zz-mine".to_owned()],
         )
         .await;
-        assert!(
-            clean.hint().starts_with(HINT_NO_CONFLICT),
-            "{}",
-            clean.hint()
-        );
-        assert!(clean.hint().ends_with(HINT_BACK), "{}", clean.hint());
-        assert!(!clean.hint().contains(HINT_TAB), "{}", clean.hint());
+        let hint = clean.hint(Keys::compiled());
+        assert!(hint.starts_with(HINT_NO_CONFLICT), "{hint}");
+        assert!(hint.ends_with("Esc back"), "{hint}");
+        assert!(!hint.contains("Tab body/paths"), "{hint}");
     }
 
     #[test]
     fn the_longest_hint_fits_the_tab_area() {
         let room = usize::from(chrome(Rect::new(0, 0, 100, 30)).body.width - 2);
+        let keys = Keys::compiled();
+        let rendered = |spec| keys.hint(views::ITEM_DIVERGENCE, spec);
         for hint in [
-            [HINT_SIDES, HINT_TAB, HINT_BACK].join("  "),
-            [HINT_NO_CONFLICT, HINT_TAB, HINT_BACK].join("  "),
+            [
+                rendered(HINT_SIDES),
+                rendered(HINT_TAB),
+                rendered(HINT_BACK),
+            ]
+            .join(" \u{b7} "),
+            [
+                HINT_NO_CONFLICT.to_owned(),
+                rendered(HINT_TAB),
+                rendered(HINT_BACK),
+            ]
+            .join(" \u{b7} "),
         ] {
             assert!(cell_width(&hint) <= room, "{hint:?} against {room}");
         }
@@ -1176,10 +1214,18 @@ mod tests {
                 |_: &Frame<'_>| Rect::default(),
             ] {
                 terminal
-                    .draw(|frame| render(frame, area(frame), &view, &Theme::default()))
+                    .draw(|frame| {
+                        render(
+                            frame,
+                            area(frame),
+                            &view,
+                            Keys::compiled(),
+                            &Theme::default(),
+                        );
+                    })
                     .unwrap_or_else(|err| panic!("{width}x{height}: {err}"));
                 for code in [KeyCode::PageDown, KeyCode::Char('j'), KeyCode::Tab] {
-                    view.on_key(key(code));
+                    view.on_key(key(code), Keys::compiled());
                 }
             }
         }
@@ -1195,26 +1241,43 @@ mod tests {
             |spec| spec.title = "Mine".to_owned(),
         )
         .await;
-        assert_eq!(view.on_key(key(KeyCode::Esc)), ViewOutcome::Back);
         assert_eq!(
-            view.on_key(key(KeyCode::Char('t'))),
+            view.on_key(key(KeyCode::Esc), Keys::compiled()),
+            ViewOutcome::Back
+        );
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('t')), Keys::compiled()),
             ViewOutcome::Resolve(Side::Theirs)
         );
         assert_eq!(
-            view.on_key(key(KeyCode::Char('m'))),
+            view.on_key(key(KeyCode::Char('m')), Keys::compiled()),
             ViewOutcome::Resolve(Side::Mine)
         );
-        assert_eq!(view.on_key(ctrl('s')), ViewOutcome::Stay);
+        // MOD-67 M5 (user-visible item 7): `Ctrl+S` is no act here and passes, as `F1` does.
+        assert_eq!(view.on_key(ctrl('s'), Keys::compiled()), ViewOutcome::Pass);
         assert_eq!(
-            view.on_key(KeyEvent::new(
-                KeyCode::Char('S'),
-                KeyModifiers::CONTROL | KeyModifiers::SHIFT
-            )),
+            view.on_key(
+                KeyEvent::new(
+                    KeyCode::Char('S'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT
+                ),
+                Keys::compiled()
+            ),
+            ViewOutcome::Pass
+        );
+        assert_eq!(
+            view.on_key(key(KeyCode::F(1)), Keys::compiled()),
+            ViewOutcome::Pass
+        );
+        assert_eq!(view.on_key(ctrl('c'), Keys::compiled()), ViewOutcome::Pass);
+        assert_eq!(
+            view.on_key(key(KeyCode::Char('x')), Keys::compiled()),
             ViewOutcome::Stay
         );
-        assert_eq!(view.on_key(ctrl('c')), ViewOutcome::Pass);
-        assert_eq!(view.on_key(key(KeyCode::Char('x'))), ViewOutcome::Stay);
-        assert_eq!(view.on_key(key(KeyCode::Enter)), ViewOutcome::Stay);
+        assert_eq!(
+            view.on_key(key(KeyCode::Enter), Keys::compiled()),
+            ViewOutcome::Stay
+        );
     }
 
     #[tokio::test]
@@ -1229,12 +1292,18 @@ mod tests {
         .await;
         for modifiers in [KeyModifiers::SHIFT, KeyModifiers::NONE] {
             assert_eq!(
-                view.on_key(KeyEvent::new(KeyCode::Char('T'), modifiers)),
+                view.on_key(
+                    KeyEvent::new(KeyCode::Char('T'), modifiers),
+                    Keys::compiled()
+                ),
                 ViewOutcome::Resolve(Side::Theirs),
                 "T with {modifiers:?}"
             );
             assert_eq!(
-                view.on_key(KeyEvent::new(KeyCode::Char('M'), modifiers)),
+                view.on_key(
+                    KeyEvent::new(KeyCode::Char('M'), modifiers),
+                    Keys::compiled()
+                ),
                 ViewOutcome::Resolve(Side::Mine),
                 "M with {modifiers:?}"
             );
