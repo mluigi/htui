@@ -168,6 +168,45 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     for line in "${lines[@]}"; do [[ "$line" == *'read_only: true'* ]]; done
 }
 
+@test "3e. up --headroom / --no-headroom (TOOL-11): registry key, exported HR_HEADROOM, default off" {
+    run --separate-stderr "$HR" up MOD-5
+    [[ $status -eq 0 ]]
+    [[ "$(reg_get MOD-5 headroom)" == 0 ]]
+    grep -qx 'HR_HEADROOM=0' "$HR_TEST_DOCKER_LOG.env"
+
+    run --separate-stderr "$HR" up MOD-4 --headroom --headroom
+    [[ $status -eq 0 ]]
+    [[ "$(reg_get MOD-4 headroom)" == 1 ]]
+    grep -qx 'HR_HEADROOM=1' "$HR_TEST_DOCKER_LOG.env"
+}
+
+@test "3f. up: --headroom with --no-headroom is refused before any side effect" {
+    local flags
+    for flags in '--headroom --no-headroom' '--no-headroom --headroom'; do
+        : >"$HR_TEST_DOCKER_LOG"
+        # shellcheck disable=SC2086
+        run --separate-stderr "$HR" up MOD-5 $flags
+        [[ $status -eq 2 && "$stderr" == *conflict* ]]
+        [[ ! -e "$(reg_of MOD-5)" && ! -e "$HR_ROOT/MOD-5" ]]
+        ! grep -q '^compose' "$HR_TEST_DOCKER_LOG" || false
+    done
+    run --separate-stderr "$HR" --help
+    [[ "$output" == *'--headroom|--no-headroom'* ]]
+}
+
+@test "3g. a registry written before TOOL-11 (no headroom line) still loads as headroom=0 and is upgraded" {
+    mk_run MOD-5
+    sed -i '/^headroom=/d' "$(reg_of MOD-5)"
+    run --separate-stderr "$HR" ls
+    [[ $status -eq 0 && "$output" == *MOD-5* ]]
+    : >"$HR_TEST_DOCKER_LOG"
+    run --separate-stderr "$HR" attach MOD-5 </dev/null
+    [[ $status -eq 0 ]]
+    grep -qx 'HR_HEADROOM=0' "$HR_TEST_DOCKER_LOG.env"
+    run --separate-stderr "$HR" collect MOD-5
+    grep -qx 'headroom=0' "$(reg_of MOD-5)"
+}
+
 @test "4. up warns on uncommitted workflow files; the clone takes the committed ref" {
     printf 'local edit\n' >>"$HR_HOST_REPO/HANDOFF.md"
     mkdir -p "$HR_HOST_REPO/.claude"
@@ -589,6 +628,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
         "run_dir|$HR_SSD_ROOT/MOD-5" "run_dir|" "root_kind|ssd" "root_kind|nvme" "root_kind|"
         "cpus|4;touch x" "cpus|" "cpus|0" "base_sha|abc" "base_sha|$(printf 'g%.0s' {1..40})"
         "base_ref|" "created_at|yesterday" "collected_sha|zzz" "collected_at|now"
+        "headroom|maybe" "headroom|" "headroom|2"
     )
     local c verb
     local -a verbs=("attach MOD-5" "down MOD-5 --purge --force --yes" "down MOD-5" "collect MOD-5" "ls" "gc --yes")
@@ -612,6 +652,7 @@ main_sha() { git -C "$HR_HOST_REPO" rev-parse main; }
     # Structure: missing / duplicate / unknown key, control characters, no header, a symlink.
     cp "$good" "$reg"; sed -i '/^cpus=/d' "$reg";                      check_refused 'missing cpus'
     cp "$good" "$reg"; printf 'cpus=8\n' >>"$reg";                     check_refused 'duplicate cpus'
+    cp "$good" "$reg"; printf 'headroom=1\n' >>"$reg";                 check_refused 'duplicate headroom'
     cp "$good" "$reg"; printf 'mount=/\n' >>"$reg";                    check_refused 'unknown key'
     cp "$good" "$reg"; reg_set MOD-5 base_ref $'main\e]0;x\a';         check_refused 'control characters'
     cp "$good" "$reg"; sed -i 1d "$reg";                               check_refused 'no header'

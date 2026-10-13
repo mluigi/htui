@@ -7,7 +7,7 @@
 # Usage:
 #   scripts/hr                                   # gum menu (terminal only)
 #   scripts/hr build
-#   scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--yes]
+#   scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--headroom|--no-headroom] [--yes]
 #   scripts/hr attach [ITEM] [--shell]
 #   scripts/hr ls [--tsv]
 #   scripts/hr collect ITEM [--merge] [--force] [--yes]
@@ -80,7 +80,8 @@ ROOT_SSD="$(realpath -ms "${HR_SSD_ROOT:-$HOME/htui-hr}")"
 CARGO_VOLUME=htui-hr-cargo
 TAB=$'\t'
 REG_HEADER='# hr run registry v1 - owner: scripts/hr'
-REG_KEYS=(item project branch run_dir root_kind base_ref base_sha cpus created_at collected_sha collected_at)
+REG_KEYS=(item project branch run_dir root_kind base_ref base_sha cpus created_at collected_sha collected_at headroom)
+REG_OPTIONAL=(headroom)   # absent in a registry written before TOOL-11 = 0
 ITEM_RE="^(${ID_ALT})\$"
 
 HOST=''
@@ -103,7 +104,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/hr                       (gum menu; terminal only)
        scripts/hr build
-       scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--yes]
+       scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--headroom|--no-headroom] [--yes]
        scripts/hr attach [ITEM] [--shell]
        scripts/hr ls [--tsv]
        scripts/hr collect ITEM [--merge] [--force] [--yes]
@@ -320,8 +321,11 @@ read_reg() {
     done <"$file"
     [[ "$first" -eq 0 ]] || reg_bad "empty"
     for k in "${REG_KEYS[@]}"; do
-        [[ -n "${RUN[$k]+x}" ]] || reg_bad "missing key $k"
+        [[ -n "${RUN[$k]+x}" ]] && continue
+        case " ${REG_OPTIONAL[*]} " in *" $k "*) continue ;; esac
+        reg_bad "missing key $k"
     done
+    [[ -n "${RUN[headroom]+x}" ]] || RUN[headroom]=0
     local sha_re='^[0-9a-f]{40}([0-9a-f]{24})?$' ts_re='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$'
     [[ "${RUN[item]}" == "$item" && "$item" =~ $ITEM_RE ]] || reg_bad "item '${RUN[item]}' is not $item"
     [[ "${RUN[project]}" == "hr-${item,,}" ]] || reg_bad "project '${RUN[project]}' is not hr-${item,,}"
@@ -336,6 +340,7 @@ read_reg() {
         || reg_bad "run_dir '${RUN[run_dir]}' is not $root/$item (${RUN[root_kind]} root; HR_ROOT / HR_SSD_ROOT changed?)"
     RUN[run_dir]="$root/$item"
     [[ "${RUN[cpus]}" =~ ^[0-9]+(\.[0-9]+)?$ && ! "${RUN[cpus]}" =~ ^0+(\.0+)?$ ]] || reg_bad "cpus '${RUN[cpus]}' is not a positive number"
+    [[ "${RUN[headroom]}" == [01] ]] || reg_bad "headroom '${RUN[headroom]}' is not 0 or 1"
     [[ "${RUN[base_sha]}" =~ $sha_re ]] || reg_bad "base_sha '${RUN[base_sha]}' is not a commit id"
     [[ -n "${RUN[base_ref]}" ]] || reg_bad "empty base_ref"
     [[ "${RUN[created_at]}" =~ $ts_re ]] || reg_bad "created_at '${RUN[created_at]}' is not a UTC timestamp"
@@ -615,6 +620,7 @@ load_run() {
     export HR_CARGO_EMPTY="${RUN[run_dir]}/cargo-empty"
     export HR_CLAUDE_MASK="${RUN[run_dir]}/claude-mask"
     export HR_CPUS="${RUN[cpus]:-4}"
+    export HR_HEADROOM="${RUN[headroom]:-0}"
     SRC="$HR_SRC"
     set_compose "${RUN[project]:-hr-${item,,}}"
 }
@@ -704,10 +710,12 @@ up_abort() { # $1=rc, rest=message — undo a half-made run dir (before the regi
 }
 
 cmd_up() {
-    local item='' ssd=0 ref=main cpus=4 yes=0
+    local item='' ssd=0 ref=main cpus=4 yes=0 headroom=''
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --ssd) ssd=1; shift ;;
+            --headroom) [[ "$headroom" != 0 ]] || usage_die "--headroom and --no-headroom conflict"; headroom=1; shift ;;
+            --no-headroom) [[ "$headroom" != 1 ]] || usage_die "--headroom and --no-headroom conflict"; headroom=0; shift ;;
             --from) [[ $# -ge 2 ]] || usage_die "--from needs a ref"; ref="$2"; shift 2 ;;
             --cpus) [[ $# -ge 2 ]] || usage_die "--cpus needs a number"; cpus="$2"; shift 2 ;;
             --yes | -y) yes=1; shift ;;
@@ -716,6 +724,7 @@ cmd_up() {
             *) [[ -z "$item" ]] || usage_die "up takes one ITEM"; item="$1"; shift ;;
         esac
     done
+    headroom="${headroom:-0}"
     [[ "$cpus" =~ ^[0-9]+(\.[0-9]+)?$ && "$cpus" != 0 ]] || usage_die "--cpus needs a positive number, got '$cpus'"
     [[ -n "$ref" && "$ref" != -* && "$ref" != *[[:cntrl:]]* ]] || usage_die "--from needs a ref, got '$ref'"
     if [[ -n "$item" ]]; then
@@ -836,14 +845,14 @@ cmd_up() {
     # 8. registry before compose, so `down --purge --force` can clean a failed up
     RUN=([item]="$item" [project]="hr-${item,,}" [branch]="hr/$item" [run_dir]="$run_dir"
         [root_kind]="$root_kind" [base_ref]="$ref" [base_sha]="$sha" [cpus]="$cpus"
-        [created_at]="$(now_utc)" [collected_sha]='' [collected_at]='')
+        [created_at]="$(now_utc)" [collected_sha]='' [collected_at]='' [headroom]="$headroom")
     write_reg "$item"
     UP_CREATED=0
     trap - INT TERM
     unlock_runs
 
     # 9. containers
-    export HR_ITEM="$item" HR_SRC="$SRC" HR_CLAUDE_JSON="$run_dir/claude.json" HR_CPUS="$cpus"
+    export HR_ITEM="$item" HR_SRC="$SRC" HR_CLAUDE_JSON="$run_dir/claude.json" HR_CPUS="$cpus" HR_HEADROOM="$headroom"
     export HR_CARGO_EMPTY="$run_dir/cargo-empty" HR_CLAUDE_MASK="$run_dir/claude-mask"
     set_compose "hr-${item,,}"
     spin "Starting $PROJECT" "${COMPOSE[@]}" up -d --wait \
