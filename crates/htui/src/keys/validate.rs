@@ -182,7 +182,7 @@ fn check(
         }
         for &chord in row.chords.iter().filter(|chord| chord.is_printable()) {
             let shown = quote(&chord.spec());
-            let line = row.line.unwrap_or(0);
+            let line = line_of(row);
             check.said.push((line, chord));
             check.errors.push(KeyFileError {
                 line,
@@ -206,6 +206,13 @@ fn resolve_at<'k>(keys: &'k Keys, stack: Stack<'_>, act: Act) -> Option<(usize, 
         .enumerate()
         .filter(|&(index, _)| stack.admits(index, act))
         .find_map(|(index, layer)| keys.row(layer.context(), act).map(|row| (index, row)))
+}
+
+/// The line an error about `row` reports on, and the line of D6's `(line, chord)` key (MOD-67 M6
+/// R1 LOW-5: one rule for every pass): the entry that set its chords, else the file's entry that
+/// repeats its default, else 0 for a row the file leaves alone.
+fn line_of(row: &Row) -> usize {
+    row.line.or(row.entry).unwrap_or(0)
 }
 
 /// A row's identity: its context and act.
@@ -273,7 +280,7 @@ impl Check<'_> {
                     };
                     let row = source(self.keys, row);
                     let slot = (row.context, row.act);
-                    let line = row.line.or(row.entry).unwrap_or(0);
+                    let line = line_of(row);
                     if index < first
                         || seen.contains(&(slot, chord))
                         || self.said.contains(&(line, chord))
@@ -323,7 +330,7 @@ impl Check<'_> {
             .map_or_else(|| "default".to_owned(), |line| format!("line {line}"));
         let shown = quote(&chord.spec());
         let other_name = other.act.spec().map_or("", |spec| spec.name);
-        let line = reported_source.line.or(reported_source.entry).unwrap_or(0);
+        let line = line_of(reported_source);
         self.said.push((line, chord));
         self.errors.push(KeyFileError {
             line,
@@ -364,7 +371,7 @@ fn subject(row: &Row) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, validate};
+    use super::{check, line_of, validate};
     use crate::keys::{
         Act, Context, FIXED, Fixed, KeyChord, Keys, SHADOWING, STATE_GUARDED, load_str,
     };
@@ -391,6 +398,18 @@ mod tests {
     #[test]
     fn the_compiled_defaults_validate() {
         assert_eq!(validate(Keys::compiled()), []);
+    }
+
+    /// MOD-67 M6 R1 LOW-5: every pass reports a row on one line, so D6's `(line, chord)` keys
+    /// agree: the entry that set its chords, else the file's entry that repeats its default (the
+    /// row is the user's, MOD-12 M3 R1 H1), else 0 for a row the file leaves alone.
+    #[test]
+    fn every_pass_reports_a_row_on_one_line() {
+        let keys = load_str("[global]\nqueue = [\"ctrl-q\"]\nquit = [\"z\"]\n").expect("it loads");
+        let line = |act| line_of(keys.row(Context::Global, act).expect("a global row"));
+        assert_eq!(line(Act::Queue), 2, "an entry repeating the default");
+        assert_eq!(line(Act::Quit), 3, "an entry setting the chords");
+        assert_eq!(line(Act::Help), 0, "a row the file leaves alone");
     }
 
     // MOD-57 M2 E9: the editor's keys.
