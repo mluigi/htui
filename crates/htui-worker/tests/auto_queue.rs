@@ -2200,8 +2200,8 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
         spent - CAP
     );
 
-    // L4: the cut run ended and nothing is admissible, so the overshot batch closed `drained`;
-    // which arm closed it (no entry left, or every entry held) is not pinned.
+    // L4: the refused retry left A1 `blocked`, so nothing is ready; with the cut run ended, the
+    // overshot batch closed `drained`. How it stalled is not pinned.
     let closed: Option<String> =
         sqlx::query_scalar("SELECT closed_reason FROM queue_batch WHERE id = $1")
             .bind(batch.as_uuid())

@@ -72,7 +72,7 @@ bash .claude/skills/handoff-run/scripts/validate-workflow-docs.sh
 
 | Risk | Likelihood | Mitigation |
 |---|---|---|
-| Which drain arm closes (`Empty` vs `Stalled`) depends on whether `a1` is still ready after its failed run | Low | assert only the store-visible outcome (`drained`, no open batch), never the arm or its log line |
+| The close is the `order.is_empty()` stall (`runtime.rs:2263`): the refused retry moves A1 `in_progress -> blocked` (`engine.rs` `refuse_no_candidate`), so its entry stays but nothing is ready (corrected at review) | Low | assert only the store-visible outcome (`drained`, no open batch), never the arm or its log line |
 | Losing Pg coverage of "the cap declines admission in an open batch" | Low | under L4 that state only exists with a live batch run or no free slot; the cap-held close is pinned on Mem (M3 (c)) and the engine's cap refusal by `conformance.rs` `a_batch_at_its_cap_starts_no_attempt` |
 | Other `_pg` suites red at the gate for unrelated reasons (load timeouts) | Medium | gate serially (`--test-threads=1`); compare to base `cae64f17` before calling a regression |
 

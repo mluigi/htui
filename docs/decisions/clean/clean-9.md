@@ -21,7 +21,8 @@
   `CapError` for a non-object, non-null blob (`CapError::document`, `3eccc8ae`). Side effect, intended: the worker
   skips such an entry, a chat start is refused, and an enqueue is refused. `56f2d8e3`.
 - **Test hardening (D4).** `a_batch_overshoots_its_cap_by_at_most_one_attempt_pg` asserts the batch is still
-  open before the second sweep (`d0be442f`). The log-level pin needs a tracing capture dev-dependency and is
+  open before the second sweep (`d0be442f`). Superseded by MOD-95 (`eb23a817`): written without
+  MOD-12 M3's `03a60f46`, it contradicted review L4, under which the batch closes `drained`. The log-level pin needs a tracing capture dev-dependency and is
   CLEAN-11.
 
 **Review.** `rust-reviewer`: no HIGH, 2 MED, 6 LOW, all applied except the deferred ones in CLEAN-11.
