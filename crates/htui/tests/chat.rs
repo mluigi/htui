@@ -2057,14 +2057,37 @@ fn status(frame: &str) -> &str {
     frame.lines().last().unwrap_or_default().trim_end()
 }
 
-/// The Chat's last row inside its border: the hint, or the composer's line while it is open.
+/// The shell's hint row (MOD-67 M6 T2): the frame's line above the status line.
 fn hint_row(frame: &str) -> &str {
     let lines: Vec<&str> = frame.lines().collect();
-    lines[lines.len() - 3]
+    lines[lines.len() - 2].trim_end()
+}
+
+/// The Chat's last row inside its border: the composer's line while it is open, blank otherwise.
+fn composer_row(frame: &str) -> &str {
+    let lines: Vec<&str> = frame.lines().collect();
+    lines[lines.len() - 4]
         .trim_end()
         .trim_start_matches('│')
         .trim_end_matches('│')
         .trim_end()
+}
+
+/// MOD-67 M6 T2 (blueprint §1 note 6): the composer's own keys are on screen while it is open,
+/// in the shell's hint row, and its row holds the input.
+#[tokio::test]
+async fn the_composer_hint_shows_while_composing() {
+    let (mut harness, _) = harness(Script::default()).await;
+    let frame = harness.render();
+    assert_eq!(
+        composer_row(&frame),
+        "",
+        "closed, the row is blank: {frame}"
+    );
+    harness.key("i");
+    let frame = harness.render();
+    assert_eq!(hint_row(&frame), "Enter send · Esc leave", "{frame}");
+    assert_eq!(composer_row(&frame), "> _", "{frame}");
 }
 
 /// MOD-67 M5 (D12, PA-4): an open composer is `CAPTURE`. The status line drops `q quit`, `?` is
@@ -2080,7 +2103,7 @@ async fn the_composer_status_line_and_box() {
     harness.key("?");
     assert!(!harness.app().help_visible, "`?` is text in the composer");
     let frame = harness.render();
-    assert_eq!(hint_row(&frame), "> ?_", "{frame}");
+    assert_eq!(composer_row(&frame), "> ?_", "{frame}");
 
     harness.key("f1");
     assert!(harness.app().help_visible, "`F1` opens the box");
@@ -2096,7 +2119,7 @@ async fn the_composer_status_line_and_box() {
     harness.key("f1");
     assert!(!harness.app().help_visible, "`F1` closes it");
     let frame = harness.render();
-    assert_eq!(hint_row(&frame), "> ?_", "the text is intact: {frame}");
+    assert_eq!(composer_row(&frame), "> ?_", "the text is intact: {frame}");
 
     // With every view registered, the offered chords join the capture's status line.
     let mut full = Harness::demo().with_agent_runtime(AgentRuntime::new(DriverFactory::new()));

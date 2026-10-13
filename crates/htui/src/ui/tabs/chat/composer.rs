@@ -109,17 +109,17 @@ impl Composer {
         }
     }
 
-    /// Draws the input line, or the hint that says how to open it.
-    pub fn render(frame: &mut Frame<'_>, area: Rect, composer: &Self, hint: &str, theme: &Theme) {
-        let line = if composer.active {
-            Line::from(vec![
-                Span::styled("> ", theme.accent),
-                Span::styled(composer.text.clone(), theme.base),
-                Span::styled("_", theme.accent),
-            ])
-        } else {
-            Line::styled(hint.to_owned(), theme.dim)
-        };
+    /// Draws the input line while the composer is open; nothing otherwise (the keys that open it
+    /// are the shell's hint row since MOD-67 M6 T2).
+    pub fn render(frame: &mut Frame<'_>, area: Rect, composer: &Self, theme: &Theme) {
+        if !composer.active {
+            return;
+        }
+        let line = Line::from(vec![
+            Span::styled("> ", theme.accent),
+            Span::styled(composer.text.clone(), theme.base),
+            Span::styled("_", theme.accent),
+        ]);
         frame.render_widget(Paragraph::new(line), area);
     }
 }

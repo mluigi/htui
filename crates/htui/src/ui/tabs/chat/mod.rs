@@ -475,12 +475,12 @@ impl ChatTab {
         (!missing.is_empty()).then(|| format!("this agent cannot: {}", missing.join(", ")))
     }
 
-    /// The hint under the transcript, each key labelled through the current mode's stack (MOD-67
-    /// M5 D9), so a rebound key shows its new chord.
+    /// The Chat's keys for the shell's hint row (MOD-67 M6 T2), each labelled through the current
+    /// mode's stack (MOD-67 M5 D9), so a rebound key shows its new chord.
     ///
     /// A refusal takes this line while there is a live conversation to keep on screen, and is
     /// cleared by the next key or the next frame.
-    fn hint(&self, keys: &Keys) -> String {
+    fn hint_text(&self, keys: &Keys) -> String {
         let stack = self.stack();
         // A replay offers three keys and no refusal can apply to it: nothing it can do fails.
         if self.replay.is_some() {
@@ -550,6 +550,12 @@ impl Tab for ChatTab {
     /// set, the agent cycle declined once a session exists, the digits fixed ahead of it).
     fn key_stack(&self) -> Option<Stack<'static>> {
         Some(self.stack())
+    }
+
+    /// The current mode's keys (MOD-67 M6 T2): [`hint_text`](Self::hint_text), in `theme.dim`.
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        let hint = self.hint_text(ctx.keys());
+        (!hint.is_empty()).then(|| Line::styled(hint, ctx.theme.dim))
     }
 
     /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer and the parked
@@ -861,20 +867,11 @@ impl Tab for ChatTab {
         if let Some(row) = parked {
             PermissionStrip::render(frame, strip, row, ctx.theme);
         }
-        match replay {
-            // Not `Composer::render`: the composer belongs to the live view, and a replay must
-            // not show an input line for a step that can take no input.
-            Some(_) => frame.render_widget(
-                Paragraph::new(Line::styled(self.hint(ctx.keys()), ctx.theme.dim)),
-                composer,
-            ),
-            None => Composer::render(
-                frame,
-                composer,
-                &self.composer,
-                &self.hint(ctx.keys()),
-                ctx.theme,
-            ),
+        // Not under a replay: the composer belongs to the live view, and a replay must not show
+        // an input line for a step that can take no input. The keys are the shell's hint row
+        // (MOD-67 M6 T2, `key_hint`).
+        if replay.is_none() {
+            Composer::render(frame, composer, &self.composer, ctx.theme);
         }
     }
 }
@@ -1723,7 +1720,7 @@ mod tests {
             &mut shell.ctx(),
         );
 
-        assert_eq!(tab.hint(Keys::compiled()), sentence);
+        assert_eq!(tab.hint_text(Keys::compiled()), sentence);
         assert!(
             tab.session().is_some_and(|session| session.ended.is_none()),
             "the session is still live"
