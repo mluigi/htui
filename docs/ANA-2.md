@@ -1578,7 +1578,9 @@ unbounded, equal is reached, exactly the minimum is enough). It is applied at th
   from the snapshot, so the recorder cancels the session (`R-AGT-7`). The batch is named in the
   failure note when its term binds.
 
-A batch that reaches its cap stays open and admits nothing; pause and resume open a fresh batch.
+A batch that reaches its cap admits nothing. Once a tick has a free slot and no run of its own is
+live, it closes `drained` (M3, review L4; pinned on Postgres by MOD-95); pause and resume open a
+fresh batch.
 The overshoot is bounded by the sessions already open when the cap is reached: one attempt per
 concurrently open session of the batch, which is the sum of the fan-out of its running phases. Each
 of those sessions is cut at what the batch had left when it started. Agents that report no USD

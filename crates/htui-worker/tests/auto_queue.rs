@@ -2075,9 +2075,10 @@ async fn manual_and_auto_overlap_serialise_on_postgres() {
 /// `research` spends 600; `verdict` (ungated here, so the breach fails the step rather than
 /// parking it) is handed the 400 left, spends 600 and is cut, its failure naming the batch. The
 /// batch's Postgres sum is 1 200: past the cap by the one attempt that was in flight, no more. The
-/// retry meets the walk's batch rule and no second `verdict` attempt is written; the next queue
-/// entry is not admitted. Only batch-term behaviour is asserted: no `per_token_cap_run` is
-/// planted, so the run term is unbounded throughout.
+/// retry meets the walk's batch rule and no second `verdict` attempt is written. With nothing
+/// admissible and no run of its own live, the batch then closes `drained` (MOD-12 M3 D4, review
+/// L4), so an entry queued after it is not admitted until a resume. Only batch-term behaviour is
+/// asserted: no `per_token_cap_run` is planted, so the run term is unbounded throughout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
     const COST: i64 = 600;
@@ -2199,15 +2200,28 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
         spent - CAP
     );
 
-    // The batch must still be open, so the next sweep declining to admit is the cap, not a
-    // closed batch.
+    // L4: the refused retry left A1 `blocked`, so nothing is ready; with the cut run ended, the
+    // overshot batch closed `drained`. How it stalled is not pinned.
     let closed: Option<String> =
         sqlx::query_scalar("SELECT closed_reason FROM queue_batch WHERE id = $1")
             .bind(batch.as_uuid())
             .fetch_one(&db.pool)
             .await
             .expect("the batch row is read");
-    assert_eq!(closed, None, "the batch is still open after the overshoot");
+    assert_eq!(
+        closed.as_deref(),
+        Some("drained"),
+        "the overshot batch closed drained"
+    );
+    assert_eq!(
+        db.store
+            .open_batch_of(ids::BOX)
+            .await
+            .expect("the read answers")
+            .map(|open| open.id),
+        None,
+        "no batch is open after the drain"
+    );
 
     let a2 = mint_ana(&db.store, "a2", 1).await;
     db.store
@@ -2218,7 +2232,7 @@ async fn a_batch_overshoots_its_cap_by_at_most_one_attempt_pg() {
     settle(&mut runtime).await;
     assert!(
         pg_runs(&db.store, a2).await.is_empty(),
-        "the batch is past its cap, so the next entry is not admitted"
+        "no batch is open, so a later entry waits for a resume"
     );
     assert_eq!(
         db.store.batch_spend(batch).await.expect("read"),
