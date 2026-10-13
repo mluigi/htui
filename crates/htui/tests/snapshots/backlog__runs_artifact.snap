@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││read-only · J/K scroll · Esc close         │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+read-only · J/K scroll · Esc close
 Ctrl+c quit · F1 help

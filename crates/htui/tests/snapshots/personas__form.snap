@@ -11,24 +11,3 @@ disallowed-tools  :
 deny-kinds        : edit, delete, move
 command-run (y/n) : y
 permission-default:
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-Tab/Shift+Tab field · Enter save · Esc cancel

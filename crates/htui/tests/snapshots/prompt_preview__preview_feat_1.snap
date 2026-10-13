@@ -59,6 +59,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                                                                            ││- Editing anything. Filters, actions and the item editor are MOD-13.                    │
 │                                                                                                            ││- Driving an agent; the chat tab is MOD-2.                                              │
 │                                                                                                            ││- Any real database. MOD-1 runs against the in-memory store and its demo fixture.       │
-│j/k move · h/l sub-tab · f filter · N new · e edit                                                          ││                                                                                        │
 └────────────────────────────────────────────────────────────────────────────────────────────────────────────┘└────────────────────────────────────────────────────────────────────────────────────────┘
+j/k move · h/l sub-tab · f filter · N new · e edit
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help

@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││follow-up for the running step:            │
 │                                                     ││use the smaller fixture                    │
-│                                                     ││Enter send · Esc cancel                    │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+Enter send · Esc cancel
 Ctrl+c quit · F1 help

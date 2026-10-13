@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││                                           │
 │                                                     ││                                           │
-│                                                     ││Ctrl+e $EDITOR · Ctrl+s save · Esc cancel  │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+Ctrl+e $EDITOR · Ctrl+s save · Esc cancel
 Ctrl+c quit · F1 help

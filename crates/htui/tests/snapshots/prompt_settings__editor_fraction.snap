@@ -31,4 +31,3 @@ project Vulkan Tutorials
 Share of the budget held back for the answer, 0.0 to 0.5.
 range 0..=5000 bp · rungs app
 prompt_reserve_fraction: 0.1
-Enter save · Esc cancel · empty clears

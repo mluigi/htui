@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││                                           │
 │                                                     ││reject with a note:                        │
 │                                                     ││needs work                                 │
-│                                                     ││Enter reject · Esc cancel                  │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+Enter reject · Esc cancel
 Ctrl+c quit · F1 help

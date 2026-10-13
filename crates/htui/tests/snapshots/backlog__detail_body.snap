@@ -29,6 +29,6 @@ Platform · DESKTOP-HTUI · memory · 1 working · 1 waiting
 │                                                     ││  trait objects in registries, so a later  │
 │                                                     ││  module adds a screen by registering it   │
 │                                                     ││  rather than by editing the loop.         │
-│j/k move · h/l sub-tab · f filter · N new · e edit   ││                                           │
 └─────────────────────────────────────────────────────┘└───────────────────────────────────────────┘
+j/k move · h/l sub-tab · f filter · N new · e edit
 q quit · Tab next tab · Shift+Tab previous tab · 1 select tab · ? help
