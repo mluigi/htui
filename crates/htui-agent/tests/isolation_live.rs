@@ -471,12 +471,16 @@ const CLI_PROMPT: &str = "Run this exact Bash command: touch ./touched . Then re
 
 /// Starts a session over `row` and reads it to its first `done`.
 async fn cli_turn(row: &AgentRow, scratch: &Scratch) -> CliTurn {
+    cli_turn_with(row, scratch.spec(), CLI_PROMPT).await
+}
+
+/// [`cli_turn`] with the spec and the prompt given.
+async fn cli_turn_with(row: &AgentRow, mut spec: SessionSpec, prompt: &str) -> CliTurn {
     let driver = cli_driver(row);
     let (port, ask) = htui_agent::prompt_bridge::bridge();
-    let mut spec = scratch.spec();
     spec.prompt = Some(port);
     let mut session = driver
-        .start(spec, CLI_PROMPT.to_owned())
+        .start(spec, prompt.to_owned())
         .await
         .unwrap_or_else(|err| panic!("the session starts (an expired token fails here): {err}"));
     let mut turn = CliTurn::default();
@@ -581,6 +585,9 @@ async fn cli_opted_in_is_the_positive_baseline() {
 
 /// T1 row 1 through the shipped code (D1, D4): auth and htui's prompt tool work, no mod loads, the
 /// settings hook does not fire, no skill is listed, and the stub server sees `HTUI_SESSION=1`.
+/// Since MOD-96's `--setting-sources ""` no settings file enables the probe mods, so the debug file
+/// no longer names them at all (it did under MOD-91's levers: both "not loaded"): the init
+/// envelope's `plugins` is what shows neither was even enabled.
 #[tokio::test]
 #[ignore = "spends model tokens against the credential this box holds"]
 async fn cli_isolated_by_default() {
@@ -607,10 +614,18 @@ async fn cli_isolated_by_default() {
         "HTUI_SESSION reaches the session"
     );
     assert!(scratch.touched.exists(), "the allowed Bash call ran");
-    assert_eq!(
-        scratch.mods(),
-        both_mods(false),
-        "the debug file names both mods, and neither loads"
+    assert!(
+        scratch.mods().values().all(|loaded| !loaded),
+        "no probe mod loads"
+    );
+    assert!(turn.init.is_some(), "the init envelope arrived");
+    let plugins = turn.init_list("plugins");
+    assert!(
+        PROBE_MODS
+            .iter()
+            .filter_map(|id| id.split('@').next())
+            .all(|name| !plugins.iter().any(|plugin| plugin == name)),
+        "neither probe mod is enabled: {plugins:?}"
     );
     assert_eq!(
         scratch.hook_marker(),
@@ -657,6 +672,175 @@ async fn cli_an_overriding_settings_is_refused() {
     );
     assert!(!scratch.debug.exists(), "claude never started");
     assert!(!scratch.mcp_log.exists(), "no MCP server started");
+}
+
+/// MOD-96 probes A4 and B4: the command the gated `Bash` call runs. It writes a file, because a
+/// read-only command such as `echo` is never asked about (probes A2, A3 and B3 proved nothing).
+const PY_COMMAND: &str = r#"python3 -c "open('py_out.txt','w').write('x')""#;
+
+/// The file [`PY_COMMAND`] writes, in the checkout.
+const PY_OUT: &str = "py_out.txt";
+
+/// `stub_mcp.py`'s one verdict line, and the deny that replaces it in [`denying_stub`].
+const STUB_ALLOW: &str =
+    r#"verdict = {"behavior": "allow", "updatedInput": args.get("input", {})}"#;
+const STUB_DENY: &str =
+    r#"verdict = {"behavior": "deny", "message": "htui denied this call. Do not retry it."}"#;
+
+/// The stub `htui` server answering every `permission_prompt` with deny: `stub_mcp.py` with its one
+/// verdict line swapped, written into the scratch root (never into the fixtures).
+fn denying_stub(scratch: &Scratch) -> McpServerSpec {
+    let source =
+        std::fs::read_to_string(fixtures().join("stub_mcp.py")).expect("stub_mcp.py reads");
+    assert_eq!(
+        source.matches(STUB_ALLOW).count(),
+        1,
+        "stub_mcp.py's verdict line changed; update STUB_ALLOW"
+    );
+    let path = scratch.mcp_log.with_file_name("stub_mcp_deny.py");
+    std::fs::write(&path, source.replace(STUB_ALLOW, STUB_DENY)).expect("write the denying stub");
+    let mut server = scratch.stub_server();
+    server.args[0] = path.to_string_lossy().into_owned();
+    server
+}
+
+/// The checkout's project settings file allows `Bash` (probes A4/B4's setup). Written after
+/// [`Scratch::new`]'s commit; the CLI reads it whether or not it is committed.
+fn allow_bash_in_project(scratch: &Scratch) {
+    let dir = scratch.checkout.join(".claude");
+    std::fs::create_dir_all(&dir).expect("the checkout's .claude");
+    std::fs::write(
+        dir.join("settings.json"),
+        r#"{"permissions":{"allow":["Bash"]}}"#,
+    )
+    .expect("the project settings.json");
+}
+
+/// One turn asking for [`PY_COMMAND`], with the denying stub as `htui`.
+async fn py_turn(row: &AgentRow, scratch: &Scratch) -> CliTurn {
+    let mut spec = scratch.spec();
+    spec.mcp = vec![denying_stub(scratch)];
+    let prompt = format!(
+        "Use the Bash tool to run exactly this command, and nothing else: {PY_COMMAND} . Then \
+         reply with the single word DONE."
+    );
+    cli_turn_with(row, spec, &prompt).await
+}
+
+/// The arguments of every `permission_prompt` call the stub logged.
+fn prompt_calls(scratch: &Scratch) -> Vec<Value> {
+    scratch
+        .mcp_log()
+        .lines()
+        .filter_map(|line| line.strip_prefix("CALL "))
+        .map(|args| serde_json::from_str(args).expect("the stub logs a call's arguments as JSON"))
+        .collect()
+}
+
+fn print_py(label: &str, scratch: &Scratch, turn: &CliTurn) {
+    print_cli(label, scratch, turn);
+    println!("  init permissionMode: {:?}", init_mode(turn));
+    println!(
+        "  {PY_OUT} written: {}",
+        scratch.checkout.join(PY_OUT).exists()
+    );
+    let calls = prompt_calls(scratch);
+    println!(
+        "  permission_prompt calls: {} {:?}",
+        calls.len(),
+        calls
+            .iter()
+            .map(|call| call.get("tool_name").and_then(Value::as_str).unwrap_or("?"))
+            .collect::<Vec<_>>()
+    );
+}
+
+fn init_mode(turn: &CliTurn) -> Option<&str> {
+    turn.init
+        .as_ref()
+        .and_then(|init| init.get("permissionMode"))
+        .and_then(Value::as_str)
+}
+
+/// MOD-96 A4/B4 and D3 through the shipped code: a project `settings.json` that allows `Bash`
+/// settles the call on a row that opts back in (the baseline: written, htui never asked), and is
+/// not read under isolation (`--setting-sources ""`): htui's prompt is asked, denies, and nothing is
+/// written. The isolated row names no permission mode, so D3's `--permission-mode default` is what
+/// the init envelope reports. The stub denies in both halves, so the baseline's file can only come
+/// from the settings file's `allow`.
+#[tokio::test]
+#[ignore = "spends model tokens against the credential this box holds"]
+async fn cli_settings_file_allow_is_asked_under_isolation() {
+    let _one = ONE_AT_A_TIME.lock().await;
+    let claude = claude_on_path();
+
+    let opted = Scratch::new(&claude);
+    allow_bash_in_project(&opted);
+    let row = cli_row(&opted, &claude, true, &[]);
+    let opted_turn = py_turn(&row, &opted).await;
+    print_py(
+        "cli opted in, project allow [Bash] (A4, the baseline)",
+        &opted,
+        &opted_turn,
+    );
+
+    let isolated = Scratch::new(&claude);
+    allow_bash_in_project(&isolated);
+    let mut row = cli_row(&isolated, &claude, false, &[]);
+    row.settings["cli"]["permission_mode"] = json!("");
+    let isolated_turn = py_turn(&row, &isolated).await;
+    print_py(
+        "cli isolated, project allow [Bash], no row mode (B4, D3)",
+        &isolated,
+        &isolated_turn,
+    );
+
+    // The baseline must be positive, or the isolated half proves nothing.
+    assert_eq!(
+        opted_turn.stop,
+        Some(StopReason::EndTurn),
+        "baseline: auth and the turn work"
+    );
+    assert!(
+        prompt_calls(&opted).is_empty(),
+        "baseline: the project allow settles the call, so htui is never asked"
+    );
+    assert!(
+        opted.checkout.join(PY_OUT).exists(),
+        "baseline: the allowed Bash call wrote {PY_OUT}; if it did not, this case cannot prove \
+         the isolated half"
+    );
+
+    assert_eq!(
+        isolated_turn.stop,
+        Some(StopReason::EndTurn),
+        "isolated: auth and the turn work"
+    );
+    assert_eq!(
+        init_mode(&isolated_turn),
+        Some("default"),
+        "isolated: D3 passes --permission-mode default for a row that names none"
+    );
+    let calls = prompt_calls(&isolated);
+    let first = calls
+        .first()
+        .expect("isolated: the settings file is not read, so htui's prompt is asked");
+    assert_eq!(
+        first.get("tool_name").and_then(Value::as_str),
+        Some("Bash"),
+        "isolated: the first call asked about is the Bash call: {first}"
+    );
+    assert!(
+        first
+            .pointer("/input/command")
+            .and_then(Value::as_str)
+            .is_some_and(|command| command.contains(PY_OUT)),
+        "isolated: the call asked about is the probe command: {first}"
+    );
+    assert!(
+        !isolated.checkout.join(PY_OUT).exists(),
+        "isolated: htui denied, so nothing wrote {PY_OUT}"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
