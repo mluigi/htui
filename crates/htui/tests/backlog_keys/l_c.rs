@@ -4,13 +4,16 @@
 //! stay in this file.
 
 use htui::agent_worker::AgentRuntime;
-use htui::app::Action;
+use htui::app::{Action, RevealKind};
 use htui::keys::Keys;
 use htui::testkit::Harness;
 use htui::ui::tabs::backlog::BacklogTab;
 use htui_agent::registry::DriverFactory;
 use htui_core::model::WorkspaceSummary;
 use htui_core::store::MemStore;
+
+/// Steps right of Body to the Graph sub-tab: Body, Runs, **Graph**.
+const TO_GRAPH: usize = 2;
 
 /// Steps right of Body to the Prompt sub-tab: Body, Runs, Graph, Docs, Notes, **Prompt**.
 const TO_PROMPT: usize = 5;
@@ -117,5 +120,47 @@ async fn a_chord_does_not_scroll_the_body() {
     assert!(
         !frame.contains(FEAT_1_FIRST_ROW),
         "`J` scrolled one row:\n{frame}"
+    );
+}
+
+/// PA-2: on a Graph node `Enter` is `backlog.graph.reroot`, which shadows the Backlog's replay
+/// miss: it re-roots the list (the detail border reads the new root) and the status line never
+/// says "select a step in the Runs pane". On the new root's own row it is consumed too.
+#[tokio::test]
+async fn enter_re_roots_the_graph_and_never_says_the_miss() {
+    let mut harness = backlog().await;
+    // As `register_all` does: the Graph's `Enter` is an `Action::Reveal` (tests/backlog.rs).
+    harness.app().reveal_tabs = vec![(RevealKind::Item, BacklogTab::ID)];
+    down(&mut harness, TO_FEAT_1).await;
+    sub_tab(&mut harness, TO_GRAPH);
+    let frame = harness.render();
+    assert!(
+        frame.contains("┌ FEAT-1") && frame.contains("depth 2/3 · +/- depth · Enter re-root"),
+        "the Graph on FEAT-1, its footer label-built:\n{frame}"
+    );
+
+    // One `J` from FEAT-1's root row is htui ANA-1 (tests/backlog.rs).
+    harness.key("J");
+    harness.key("enter");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(frame.contains("┌ ANA-1"), "re-rooted on ANA-1:\n{frame}");
+    assert!(
+        frame.contains("depth 2/3"),
+        "the Graph is still active:\n{frame}"
+    );
+    assert_eq!(harness.app().status, None, "no miss on the status line");
+
+    harness.key("enter");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("┌ ANA-1"),
+        "the root row stays put:\n{frame}"
+    );
+    assert_eq!(
+        harness.app().status,
+        None,
+        "the root row's `Enter` says no miss"
     );
 }

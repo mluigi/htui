@@ -18,12 +18,20 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
 use crate::store_worker::StoreReply;
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width, graphemes};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, PAGE, message};
 use crate::ui::tabs::backlog::list;
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::KeyEvent;
+
+/// The footer's key half (MOD-67 M5): `+/- depth · Enter re-root` with the defaults, read
+/// through `BACKLOG_GRAPH` so a rebound key shows its own label.
+const GRAPH_HINT: HintSpec = &[
+    Hint::Pair(Act::GraphDeeper, Act::GraphShallower, "depth"),
+    Hint::One(Act::GraphReroot, "re-root"),
+];
 
 /// An edge that leaves the parent row's item (D4).
 const OUT: &str = "\u{2192}";
@@ -678,30 +686,35 @@ impl DetailTab for GraphTab {
         self.cursor = 0;
     }
 
+    fn key_stack(&self) -> Stack<'static> {
+        views::BACKLOG_GRAPH
+    }
+
     /// `J` / `K` and `PageDown` / `PageUp` move the cursor, `+` / `-` change the view depth,
     /// `Enter` re-roots (D5, D6).
     ///
-    /// Matched on the code alone: a terminal sends `J`, `K` and `+` with `SHIFT`. Unlike the Runs
-    /// pane, `Enter` is consumed even when there is nothing to re-root: here it means "re-root",
-    /// and the Backlog's `replay step` miss would be the wrong answer from this pane.
+    /// Resolved through `BACKLOG_GRAPH` (MOD-67 M5), whole chords, so a chord no act binds goes on
+    /// to the tab. `Enter` is `backlog.graph.reroot`, which shadows the Backlog's replay miss
+    /// (PA-2): unlike the Runs pane, it is consumed even when there is nothing to re-root, since
+    /// here it means "re-root" and the miss would be the wrong answer from this pane.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return Handled::Pass;
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(self.key_stack(), chord) {
+            match act {
+                Act::GraphNextRow => self.move_cursor(1),
+                Act::GraphPrevRow => self.move_cursor(-1),
+                Act::PanePageDown => self.move_cursor(PAGE),
+                Act::PanePageUp => self.move_cursor(-PAGE),
+                Act::GraphDeeper => {
+                    self.set_depth(self.depth.saturating_add(1).min(Self::MAX_HOPS));
+                }
+                Act::GraphShallower => self.set_depth(self.depth.saturating_sub(1).max(1)),
+                Act::GraphReroot => self.re_root(ctx),
+                _ => continue, // list.*, pane.*_subtab, backlog.*, common.edit: the tab's
+            }
+            return Handled::Consumed;
         }
-        match key.code {
-            KeyCode::Char('J') => self.move_cursor(1),
-            KeyCode::Char('K') => self.move_cursor(-1),
-            KeyCode::PageDown => self.move_cursor(PAGE),
-            KeyCode::PageUp => self.move_cursor(-PAGE),
-            KeyCode::Char('+') => self.set_depth(self.depth.saturating_add(1).min(Self::MAX_HOPS)),
-            KeyCode::Char('-') => self.set_depth(self.depth.saturating_sub(1).max(1)),
-            KeyCode::Enter => self.re_root(ctx),
-            _ => return Handled::Pass,
-        }
-        Handled::Consumed
+        Handled::Pass
     }
 
     /// The `Links` reply for the selected item, or its refusal (L8). One for another root is
@@ -761,22 +774,19 @@ impl DetailTab for GraphTab {
             Paragraph::new(lines.split_off(offset.min(lines.len()))),
             tree,
         );
-        frame.render_widget(
-            Paragraph::new(Line::styled(
-                format!(
-                    "depth {}/{} \u{b7} +/- depth \u{b7} Enter re-root",
-                    self.depth,
-                    Self::MAX_HOPS
-                ),
-                ctx.theme.dim,
-            )),
-            footer,
-        );
+        let mut text = format!("depth {}/{}", self.depth, Self::MAX_HOPS);
+        let hint = ctx.keys().hint(views::BACKLOG_GRAPH, GRAPH_HINT);
+        if !hint.is_empty() {
+            text.push_str(" \u{b7} ");
+            text.push_str(&hint);
+        }
+        frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), footer);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crossterm::event::{KeyCode, KeyModifiers};
     use htui_core::fixtures::ids;
     use htui_core::model::{Scope, Status};
     use htui_core::store::{MemStore, ReadStore as _};
