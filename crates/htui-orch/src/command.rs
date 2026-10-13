@@ -532,6 +532,16 @@ pub enum EngineError {
     /// is the run's `secrets_refused: …` sentence; it never carries a value.
     #[error("{}", .0.refusal())]
     Secrets(htui_core::secret::SecretError),
+    /// MOD-89 D3, D6: the session's trees hold env files on a provider project with
+    /// `allow_env_files` off. Its `Display` is the run's `env_files_refused: …` sentence; it names
+    /// the files, never a value.
+    #[error("{}", crate::isolate::env_files::refused(.provider, .files))]
+    EnvFiles {
+        /// `project.secret_provider`.
+        provider: String,
+        /// What the scan found.
+        files: crate::isolate::EnvFiles,
+    },
     /// The driver failed, or the session's stream closed before its `done`.
     #[error(transparent)]
     Driver(#[from] htui_agent::error::DriverError),
