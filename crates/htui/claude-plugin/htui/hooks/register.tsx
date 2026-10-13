@@ -178,16 +178,26 @@ function startTimer($: EngineInterface): void {
   timer = $.clock.every(periodMs, () => void tick($))
 }
 
-/** D14: names a binary whose version is not the plugin's. A failure leaves `skew` null; the poll reports it. */
+/**
+ * D14: names a binary whose version is not the plugin's. Every run writes `skew`,
+ * because `$.state` outlives a reload: after `emit --force` and `/reload-plugins`
+ * the line an earlier check set must go. A failure writes null; the poll reports it.
+ */
 async function checkVersion($: EngineInterface): Promise<void> {
+  let line: string | null = null
   try {
     const r = await $.process.run(['htui', '--version'], { timeoutMs: 10000 })
-    if (r.exitCode !== 0) return
-    const bin = /^htui (\S+)/m.exec(r.stdout)?.[1]
-    if (bin === undefined || bin === VERSION) return
-    await update($, skew, () => `htui ${bin} ≠ plugin ${VERSION}: run htui claude emit --force, then /reload-plugins`)
+    const bin = r.exitCode === 0 ? /^htui (\S+)/m.exec(r.stdout)?.[1] : undefined
+    if (bin !== undefined && bin !== VERSION) {
+      line = `htui ${bin} ≠ plugin ${VERSION}: run htui claude emit --force, then /reload-plugins`
+    }
   } catch {
     // Not on PATH or timed out: the poll reports that.
+  }
+  try {
+    await update($, skew, () => line)
+  } catch {
+    // The module unloaded mid-check (its `$` is gone): nothing is left to show.
   }
 }
 

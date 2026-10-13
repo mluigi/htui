@@ -1,5 +1,5 @@
 import { test, expect, mock } from 'claude-code/testing'
-import { BAND, engineBottom, htui, ok, start, waitingCalls, WAITING, type Call } from './fixtures'
+import { BAND, engineBottom, htui, ok, start, STATUS, waitingCalls, WAITING, WAITING_NONE, type Answer, type Call } from './fixtures'
 
 test('auto polls at start and every poll_seconds', async ($, on) => {
   const clock = mock.clock(on)
@@ -131,3 +131,38 @@ test('a slow poll is not overlapped', { options: { poll_seconds: 5 } }, async ($
   await clock.advance(5000)
   expect(waitingCalls(calls)).toBe(2)
 })
+
+const LATER: [string, Answer][] = [
+  ['a matching binary', ok('htui 0.0.0-source\n')],
+  ['a failed --version', ok('', 1)],
+  ['an unparsed --version', ok('no version here\n')],
+  ['a missing binary', 'deny'],
+]
+
+for (const [name, later] of LATER) {
+  test(`a later session.start with ${name} clears the skew line`, async ($, on) => {
+    const clock = mock.clock(on)
+    engineBottom(on, 'AbovePrompt')
+    const answers: Record<string, Answer> = { status: ok(STATUS), waiting: ok(WAITING_NONE), '--version': ok('htui 9.9.9\n') }
+    htui(on, answers, [])
+    await start($, on)
+    await clock.settle()
+    const status = async () => (await $.command.run({ command: 'htui', args: 'status' } as never)).text
+    const band = async (surface: 'terminal' | 'desktop') => {
+      const ui = await $.ui.mount({ plugin: 'htui', surface, component: 'AbovePrompt', props: BAND })
+      const found = (await ui.find({ key: 'htui-band' })) !== undefined
+      // A-3: a band that stands down leaves the engine's own drawing in place.
+      if (!found) expect(await ui.find({ key: 'engine' })).toBeDefined()
+      await ui.unmount()
+      return found
+    }
+    expect(await status()).toContain('htui 9.9.9 ≠ plugin 0.0.0-source')
+    for (const surface of ['terminal', 'desktop'] as const) expect(await band(surface)).toBe(true)
+    // After `htui claude emit --force`, `/reload-plugins` raises session.start again; `$.state` survives it.
+    answers['--version'] = later
+    await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
+    await clock.settle()
+    expect(await status()).toBe('Platform · desk · online · 1 working · 2 waiting')
+    for (const surface of ['terminal', 'desktop'] as const) expect(await band(surface)).toBe(false)
+  })
+}
