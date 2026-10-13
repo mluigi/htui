@@ -151,7 +151,7 @@ live Infisical and is not recorded yet.
 
 ## Carried
 
-- **MOD-89** - warn or refuse when a run's worktree holds a `.env` file (PRD open question, decided 2026-10-03).
+- **MOD-89** - warn or refuse when a run's worktree holds a `.env` file (PRD open question, decided 2026-10-03). Done 2026-10-13: `docs/decisions/mod/mod-89.md`.
 - **MOD-90** - a separate `htui worker` keeps its 401 latch after the same identity is re-entered in the TUI (A-4's
   generation is per process); documented in `docs/htui-secrets.md`. Done: `docs/decisions/mod/mod-90.md`.
 - **CLEAN-8** - review residuals: L-7 (`read_body` growing an unwiped `Vec<u8>`), the 7 NITs, and a `--demo` guard
