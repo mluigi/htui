@@ -459,7 +459,7 @@ pub fn new_agent(
 
 /// The draft a stored row prefills the edit form with (blueprint F-16): `launch.command` if it is a
 /// string, else empty; the string elements of `launch.args`, in order. Reads nothing else of
-/// `launch`. `user_extensions` is `settings.user_extensions` as [`stored_user_extensions`] reads
+/// `launch`. `user_extensions` is `settings.user_extensions` as `stored_user_extensions` reads
 /// it (MOD-91 D6), which can show `y` on a row the driver isolates, never the reverse.
 #[must_use]
 pub fn draft_of(agent: &Agent) -> AgentDraft {
