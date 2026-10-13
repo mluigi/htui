@@ -28,8 +28,12 @@
 //! item it is for), never by which request it answers (MOD-39 blueprint F-16). One write is in
 //! flight at a time, and offline every write key answers `DATABASE_UNREACHABLE` without a request
 //! (blueprint F-6); the hint row greys the write words then, as the Requirements tab does (PRD
-//! Constraints, plan P10). While the picker or the `y` question is open the pane captures every
-//! key but a `CONTROL` chord, the Runs pane's rule (MOD-4 plan OQ-7).
+//! Constraints, plan P10). While the picker or a question is open the pane captures every key its
+//! mode's stack does not pass: a `CONTROL` or `ALT` chord or a function key goes on to the shell,
+//! so `ctrl-c` quits and `F1` opens help (MOD-67 M5 D7, M3's modal rule).
+//!
+//! Every key is resolved through the mode's stack (`ReqsTab::stack`, MOD-67 M5 D4): the table
+//! above names the default chords.
 //!
 //! The cursor follows a citation, not a position: across a reply it stays on the citation it was
 //! on, or lands on the one a cite just made; an uncited row leaves it on the row that took its
@@ -51,6 +55,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Action, Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::requirements::{
     CITATIONS_NAME, ItemCitations, decision_citation_stays, is_citation_write,
 };
@@ -58,7 +63,8 @@ use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::ui::tabs::settings::modal_rest;
+use crossterm::event::KeyEvent;
 
 /// What `r` says on a citation stamped at the requirement's current version.
 pub const NOT_SUSPECT: &str = "this citation is current; nothing to re-confirm";
@@ -72,15 +78,40 @@ pub const NO_CANDIDATES: &str = "the project has no active requirement left to c
 /// Marks the row the cursor is on; the other rows carry a space of the same width.
 const CURSOR: &str = "\u{25b8}";
 
-/// The browsing footer's words before the write keys; with [`HINT_WRITES`], 42 columns, inside
-/// the 43 a detail pane has at 100x30.
-const HINT_MOVE: &str = "J/K move · ";
+/// The browsing footer's words before the write keys (`J/K move` with the defaults); with
+/// [`WRITES`] and the separator, 42 columns, inside the 43 a detail pane has at 100x30.
+const MOVES: HintSpec = &[Hint::Pair(Act::ReqsNextRow, Act::ReqsPrevRow, "move")];
 
-/// The three write keys, dim while the database is unreachable.
-const HINT_WRITES: &str = "r reconfirm · c cite · u uncite";
+/// The three write keys, dim while the database is unreachable (`r reconfirm · c cite · u
+/// uncite` with the defaults).
+const WRITES: HintSpec = &[
+    Hint::One(Act::ReqsReconfirm, "reconfirm"),
+    Hint::One(Act::ReqsCite, "cite"),
+    Hint::One(Act::ReqsUncite, "uncite"),
+];
 
-/// The picker's footer, under its candidates.
-const PICK_HINT: &str = "j/k move · Enter pick · Esc back";
+/// The picker's footer, under its candidates: `j/k move · Enter pick · Esc back`.
+const PICK_HINT: HintSpec = &[
+    Hint::Pair(Act::ListDown, Act::ListUp, "move"),
+    Hint::One(Act::ReqsPick, "pick"),
+    Hint::One(Act::Back, "back"),
+];
+
+/// The kind question's footer: `a addresses · v reserves · Esc back`.
+const KIND_HINT: HintSpec = &[
+    Hint::One(Act::ReqsAddresses, "addresses"),
+    Hint::One(Act::ReqsReserves, "reserves"),
+    Hint::One(Act::Back, "back"),
+];
+
+/// The uncite question's footer: `y uncite · n keep`.
+const CONFIRM_HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "uncite"),
+    Hint::One(Act::ConfirmNo, "keep"),
+];
+
+/// Between the browsing footer's moves and its write keys.
+const SEP: &str = " \u{b7} ";
 
 /// The Reqs sub-tab (MOD-39 PRD D3, D4; plan P12).
 #[derive(Debug, Default)]
@@ -262,84 +293,105 @@ impl ReqsTab {
         }
     }
 
-    /// A key while the pane captures: a `CONTROL` chord passes, so `ctrl-c` still quits, and
-    /// everything else is the mode's, answered or swallowed.
-    fn modal_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            return Handled::Pass;
+    /// The current mode's stack (MOD-67 M5 D4): the only place a mode maps to its keys.
+    fn stack(&self) -> Stack<'static> {
+        match self.mode {
+            Mode::Browse => views::BACKLOG_REQS,
+            Mode::Pick { .. } => views::REQS_PICK,
+            Mode::Kind { .. } => views::REQS_KIND,
+            Mode::ConfirmUncite { .. } => views::REQS_CONFIRM,
         }
+    }
+
+    /// A key while the pane captures, resolved through the mode's stack (MOD-67 M5 D7): the
+    /// mode's acts answer, and the rest is [`modal_rest`]'s, so a `CONTROL` or `ALT` chord or a
+    /// function key passes (`ctrl-c` quits, `F1` opens help, `alt-y` uncites nothing) and every
+    /// other key is swallowed.
+    fn modal_key(&mut self, key: KeyEvent, ctx: &Ctx<'_>) -> Handled {
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
         let Some(item) = self.item else {
+            if stack.passes(chord) {
+                return Handled::Pass;
+            }
             self.mode = Mode::Browse;
             return Handled::Consumed;
         };
-        self.mode = match self.mode {
-            Mode::Browse => Mode::Browse,
-            Mode::Pick { cursor } => self.pick_key(cursor, key.code),
-            Mode::Kind { requirement } => {
-                let kind = match key.code {
-                    KeyCode::Char('a') => Some(CitationKind::Addresses),
-                    KeyCode::Char('v') => Some(CitationKind::Reserves),
-                    _ => None,
-                };
-                if let Some(kind) = kind {
-                    let cite = StoreRequest::CiteRequirement {
-                        item,
-                        requirement,
-                        kind,
-                    };
-                    if self.send(cite, ctx) {
-                        self.follow = Some((requirement, kind));
-                    }
-                    Mode::Browse
-                } else if key.code == KeyCode::Esc {
-                    let cursor = self
-                        .candidates()
-                        .iter()
-                        .position(|candidate| candidate.id == requirement)
-                        .unwrap_or(0);
-                    Mode::Pick { cursor }
-                } else {
-                    Mode::Kind { requirement }
-                }
-            }
-            Mode::ConfirmUncite { requirement, kind } => match key.code {
-                KeyCode::Char('y') => {
-                    self.send(
-                        StoreRequest::UnciteRequirement {
+        for act in ctx.keys().actions(stack, chord) {
+            let next = match self.mode {
+                Mode::Browse => None,
+                Mode::Pick { cursor } => self.pick_act(cursor, act),
+                Mode::Kind { requirement } => match act {
+                    Act::ReqsAddresses | Act::ReqsReserves => {
+                        let kind = if act == Act::ReqsAddresses {
+                            CitationKind::Addresses
+                        } else {
+                            CitationKind::Reserves
+                        };
+                        let cite = StoreRequest::CiteRequirement {
                             item,
                             requirement,
                             kind,
-                        },
-                        ctx,
-                    );
-                    Mode::Browse
-                }
-                KeyCode::Char('n') | KeyCode::Esc => Mode::Browse,
-                _ => Mode::ConfirmUncite { requirement, kind },
-            },
-        };
-        Handled::Consumed
+                        };
+                        if self.send(cite, ctx) {
+                            self.follow = Some((requirement, kind));
+                        }
+                        Some(Mode::Browse)
+                    }
+                    Act::Back => {
+                        let cursor = self
+                            .candidates()
+                            .iter()
+                            .position(|candidate| candidate.id == requirement)
+                            .unwrap_or(0);
+                        Some(Mode::Pick { cursor })
+                    }
+                    _ => None,
+                },
+                Mode::ConfirmUncite { requirement, kind } => match act {
+                    Act::ConfirmYes => {
+                        self.send(
+                            StoreRequest::UnciteRequirement {
+                                item,
+                                requirement,
+                                kind,
+                            },
+                            ctx,
+                        );
+                        Some(Mode::Browse)
+                    }
+                    Act::ConfirmNo => Some(Mode::Browse),
+                    _ => None,
+                },
+            };
+            if let Some(mode) = next {
+                self.mode = mode;
+                return Handled::Consumed;
+            }
+        }
+        modal_rest(stack, chord)
     }
 
-    /// A key in the picker: move, pick, or back to the list.
-    fn pick_key(&self, cursor: usize, code: KeyCode) -> Mode {
+    /// One act in the picker: the mode it leads to (move, pick, or back to the list), or `None`
+    /// for an act the picker does not take. `J`/`K` (the pane's cursor verbs) and `j`/`k`/arrows
+    /// (the list's) move it alike; `Enter` with no candidate stays.
+    fn pick_act(&self, cursor: usize, act: Act) -> Option<Mode> {
         let last = self.candidates().len().saturating_sub(1);
-        match code {
-            KeyCode::Char('j' | 'J') | KeyCode::Down => Mode::Pick {
+        match act {
+            Act::ReqsNextRow | Act::ListDown => Some(Mode::Pick {
                 cursor: (cursor + 1).min(last),
-            },
-            KeyCode::Char('k' | 'K') | KeyCode::Up => Mode::Pick {
+            }),
+            Act::ReqsPrevRow | Act::ListUp => Some(Mode::Pick {
                 cursor: cursor.saturating_sub(1),
-            },
-            KeyCode::Enter => {
-                self.candidates()
-                    .get(cursor)
-                    .map_or(Mode::Pick { cursor }, |candidate| Mode::Kind {
-                        requirement: candidate.id,
-                    })
-            }
-            KeyCode::Esc => Mode::Browse,
-            _ => Mode::Pick { cursor },
+            }),
+            Act::ReqsPick => Some(self.candidates().get(cursor).map_or(
+                Mode::Pick { cursor },
+                |candidate| Mode::Kind {
+                    requirement: candidate.id,
+                },
+            )),
+            Act::Back => Some(Mode::Browse),
+            _ => None,
         }
     }
 
@@ -379,22 +431,33 @@ impl ReqsTab {
     }
 
     /// The footer of the current mode, every line cut to `width`; the picker shows at most
-    /// `room` candidates, a window that keeps its cursor in view.
-    fn footer(&self, width: usize, room: usize, theme: &Theme) -> Vec<Line<'static>> {
-        let hint = |text: &str| Line::styled(cells::clip(text, width), theme.dim);
+    /// `room` candidates, a window that keeps its cursor in view. The key words are the mode's
+    /// stack's labels in `keys` (MOD-67 M5), identical to the old literals with the defaults.
+    fn footer(&self, width: usize, room: usize, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
+        let stack = self.stack();
+        let hint =
+            |spec: HintSpec| Line::styled(cells::clip(&keys.hint(stack, spec), width), theme.dim);
         let title = |text: String| Line::styled(cells::clip(&text, width), theme.title);
         match self.mode {
             Mode::Browse => {
-                let moves = cells::clip(HINT_MOVE, width);
+                let (moves, writes) = (keys.hint(stack, MOVES), keys.hint(stack, WRITES));
+                // The separator rides on the moves' span, as the old `J/K move · ` did, so the
+                // row clips exactly as it always has.
+                let moves = if moves.is_empty() || writes.is_empty() {
+                    moves
+                } else {
+                    format!("{moves}{SEP}")
+                };
+                let moves = cells::clip(&moves, width);
                 let rest = width.saturating_sub(cell_width(&moves));
-                let writes = if self.writable() {
+                let style = if self.writable() {
                     theme.base
                 } else {
                     theme.dim
                 };
                 vec![Line::from(vec![
                     Span::styled(moves, theme.base),
-                    Span::styled(cells::clip(HINT_WRITES, rest), writes),
+                    Span::styled(cells::clip(&writes, rest), style),
                 ])]
             }
             Mode::Pick { cursor } => {
@@ -422,11 +485,11 @@ impl ReqsTab {
             }
             Mode::Kind { requirement } => vec![
                 title(format!("cite {} as:", self.key_of(requirement))),
-                hint("a addresses · v reserves · Esc back"),
+                hint(KIND_HINT),
             ],
             Mode::ConfirmUncite { requirement, kind } => vec![
                 title(format!("uncite {} ({kind})?", self.key_of(requirement))),
-                hint("y uncite · n keep"),
+                hint(CONFIRM_HINT),
             ],
         }
     }
@@ -461,28 +524,35 @@ impl DetailTab for ReqsTab {
         self.scroll.reset();
     }
 
+    fn key_stack(&self) -> Stack<'static> {
+        self.stack()
+    }
+
+    /// Browsing: whole chords through `BACKLOG_REQS` (MOD-67 M5); a mode's keys go through
+    /// `ReqsTab::modal_key`. With no item every key is the tab's.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         if !matches!(self.mode, Mode::Browse) {
             return self.modal_key(key, ctx);
         }
-        if key
-            .modifiers
-            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-        {
-            return Handled::Pass;
-        }
         let Some(item) = self.item else {
             return Handled::Pass;
         };
-        match key.code {
-            KeyCode::Char('J') => self.move_cursor(1),
-            KeyCode::Char('K') => self.move_cursor(-1),
-            KeyCode::Char('r') => self.reconfirm(item, ctx),
-            KeyCode::Char('c') => self.open_picker(ctx),
-            KeyCode::Char('u') => self.ask_uncite(ctx),
-            _ => return self.scroll.on_key(key, self.rows().len() * 2),
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(self.stack(), chord) {
+            match act {
+                Act::ReqsNextRow => self.move_cursor(1),
+                Act::ReqsPrevRow => self.move_cursor(-1),
+                Act::ReqsReconfirm => self.reconfirm(item, ctx),
+                Act::ReqsCite => self.open_picker(ctx),
+                Act::ReqsUncite => self.ask_uncite(ctx),
+                Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.rows().len() * 2);
+                }
+                _ => continue, // list.*, pane.*_subtab, backlog.*, common.edit: the tab's
+            }
+            return Handled::Consumed;
         }
-        Handled::Consumed
+        Handled::Pass
     }
 
     fn captures_input(&self) -> bool {
@@ -535,7 +605,7 @@ impl DetailTab for ReqsTab {
             return;
         }
         let width = usize::from(area.width);
-        let footer = self.footer(width, usize::from(area.height / 2), ctx.theme);
+        let footer = self.footer(width, usize::from(area.height / 2), ctx.keys(), ctx.theme);
         let [list, prompt] = Layout::vertical([
             Constraint::Min(0),
             Constraint::Length(u16::try_from(footer.len()).unwrap_or(u16::MAX)),
@@ -580,6 +650,8 @@ mod tests {
     use htui_core::model::{ProjectRef, Scope, WorkspaceId};
     use htui_core::store::{MemStore, WriteStore as _};
     use htui_store::Backend;
+
+    use crossterm::event::{KeyCode, KeyModifiers};
 
     use super::*;
     use crate::app::{Emit, TopBarState};
@@ -1004,7 +1076,7 @@ mod tests {
         assert!(rows[0].contains("R-ENT-1 addresses v1"), "{rows:#?}");
     }
 
-    /// The hint row in full: [`HINT_MOVE`] then [`HINT_WRITES`].
+    /// The hint row in full: [`MOVES`], the separator, then [`WRITES`].
     const BROWSE_HINT_TEXT: &str = "J/K move · r reconfirm · c cite · u uncite";
 
     /// PRD Constraints, plan P10: offline the write words of the hint are dim; online they are
@@ -1014,12 +1086,13 @@ mod tests {
         let shell = Shell::new();
         let theme = Theme::default();
         let writes_style = |pane: &ReqsTab| {
-            let footer = pane.footer(usize::from(PANE_WIDTH), 8, &theme);
+            let footer = pane.footer(usize::from(PANE_WIDTH), 8, Keys::compiled(), &theme);
             assert_eq!(text(&footer[0]), BROWSE_HINT_TEXT);
+            let writes = Keys::compiled().hint(views::BACKLOG_REQS, WRITES);
             let writes = footer[0]
                 .spans
                 .iter()
-                .find(|span| span.content == HINT_WRITES)
+                .find(|span| span.content == writes)
                 .expect("the write words are their own span");
             writes.style
         };
@@ -1029,6 +1102,57 @@ mod tests {
         reply.writable = false;
         let offline = pane(&shell, ids::HTUI_ANA_1, reply);
         assert_eq!(writes_style(&offline), theme.dim);
+    }
+
+    /// MOD-67 M5: every mode's footer is built from its stack's labels, and reads as the old
+    /// literal did with the defaults.
+    #[tokio::test]
+    async fn the_mode_footers_read_as_before_with_the_defaults() {
+        let shell = Shell::new();
+        let theme = Theme::default();
+        let mut pane = pane(&shell, ids::HTUI_FEAT_1, citations(ids::HTUI_FEAT_1).await);
+        let last = |pane: &ReqsTab| {
+            pane.footer(usize::from(PANE_WIDTH), 8, Keys::compiled(), &theme)
+                .last()
+                .map(|line| text(line))
+                .unwrap_or_default()
+        };
+        assert_eq!(last(&pane), BROWSE_HINT_TEXT);
+        pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
+        assert_eq!(last(&pane), "j/k move · Enter pick · Esc back");
+        pane.on_key(key(KeyCode::Enter), &mut shell.ctx());
+        assert_eq!(last(&pane), "a addresses · v reserves · Esc back");
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Esc), &mut shell.ctx());
+        pane.on_key(key(KeyCode::Char('u')), &mut shell.ctx());
+        assert_eq!(last(&pane), "y uncite · n keep");
+    }
+
+    /// D7: `ALT` reaches the shell from every mode, as `CONTROL` always did, and a function key
+    /// too; a plain key the mode does not take is still swallowed.
+    #[tokio::test]
+    async fn a_mode_passes_alt_and_function_keys() {
+        let shell = Shell::new();
+        let mut pane = pane(&shell, ids::HTUI_FEAT_1, citations(ids::HTUI_FEAT_1).await);
+        pane.on_key(key(KeyCode::Char('u')), &mut shell.ctx());
+        assert!(pane.captures_input(), "the uncite question");
+        for event in [
+            KeyEvent::new(KeyCode::Char('y'), KeyModifiers::ALT),
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            key(KeyCode::F(1)),
+        ] {
+            assert_eq!(
+                pane.on_key(event, &mut shell.ctx()),
+                Handled::Pass,
+                "{event:?}"
+            );
+        }
+        assert_eq!(
+            pane.on_key(key(KeyCode::Char('q')), &mut shell.ctx()),
+            Handled::Consumed
+        );
+        assert!(pane.captures_input(), "the question is still up");
+        assert_eq!(shell.drained(), (Vec::new(), Vec::new()), "nothing uncited");
     }
 
     /// The picker shows at most `room` candidates, a window that keeps its cursor in view.
@@ -1044,7 +1168,7 @@ mod tests {
         assert_eq!(candidate_keys(&pane), ["R-ENT-1", "R-ENT-2", "R-STO-1"]);
         pane.on_key(key(KeyCode::Char('c')), &mut shell.ctx());
         let window = |pane: &ReqsTab| {
-            pane.footer(usize::from(PANE_WIDTH), 2, &theme)
+            pane.footer(usize::from(PANE_WIDTH), 2, Keys::compiled(), &theme)
                 .iter()
                 .map(|line| text(line).chars().take(10).collect::<String>())
                 .collect::<Vec<_>>()

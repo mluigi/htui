@@ -20,6 +20,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 
 use crate::app::{Ctx, Handled};
+use crate::keys::{Act, KeyChord};
 use crate::store_worker::StoreReply;
 use crate::ui::markdown;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
@@ -74,8 +75,20 @@ impl DetailTab for BodyTab {
         self.scroll.reset();
     }
 
-    fn on_key(&mut self, key: KeyEvent, _ctx: &mut Ctx<'_>) -> Handled {
-        self.scroll.on_key(key, self.len())
+    /// Whole chords through `BACKLOG_BODY` (the trait's default stack, MOD-67 M5 PA-1): the four
+    /// pane-scroll acts scroll, so `alt-J` and `ctrl-PgDn` no longer do; everything else (the
+    /// list, the sub-tabs, the Backlog's verbs, the shell's) is the tab's.
+    fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(self.key_stack(), chord) {
+            match act {
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.len());
+                }
+                _ => {}
+            }
+        }
+        Handled::Pass
     }
 
     fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {

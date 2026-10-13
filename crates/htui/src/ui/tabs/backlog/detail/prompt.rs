@@ -17,11 +17,12 @@ use ratatui::text::{Line, Text};
 use ratatui::widgets::Paragraph;
 
 use crate::app::{Ctx, Handled};
+use crate::keys::{Act, KeyChord, Keys, Stack, views};
 use crate::preview::PromptPreview;
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells;
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, Scroll, message};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::KeyEvent;
 
 /// How wide the label gutter is: every header line is `label` then the value.
 const LABEL: usize = 10;
@@ -121,27 +122,45 @@ impl PromptTab {
     /// would have contributed. What it buys is that one element of [`lines`](Self::lines) is now
     /// exactly one rendered row, which is what the field's doc already claimed and what makes
     /// [`Scroll`]'s clamp against `lines.len()` true rather than a lower bound.
-    fn rebuild(&mut self) {
+    ///
+    /// The `picker` row names the template keys in force (MOD-67 M5 PA-1): `keys` is read here,
+    /// once per reply, not per frame.
+    fn rebuild(&mut self, keys: &Keys) {
         let rows = match self.preview.as_ref() {
-            Some(preview) => render_lines(preview),
+            Some(preview) => render_lines(preview, &picker_keys(keys)),
             None => Vec::new(),
         };
         self.lines = rows.into_iter().flat_map(Row::split).collect();
     }
 }
 
-/// Every line the pane shows, top to bottom (blueprint B.16).
-fn render_lines(preview: &PromptPreview) -> Vec<Row> {
+/// The template keys as the `picker` row names them: the first chord of
+/// `backlog.prompt.next_template` and of `prev_template` through `BACKLOG_PROMPT`, joined `" / "`
+/// (`n / p` with the defaults); an unbound one drops out, and both unbound read `""`.
+fn picker_keys(keys: &Keys) -> String {
+    [Act::PromptNextTemplate, Act::PromptPrevTemplate]
+        .into_iter()
+        .filter_map(|act| keys.label(views::BACKLOG_PROMPT, act))
+        .collect::<Vec<_>>()
+        .join(" / ")
+}
+
+/// Every line the pane shows, top to bottom (blueprint B.16). `picker` is the template keys as
+/// [`picker_keys`] names them; empty, the row reads `N template(s)` alone.
+fn render_lines(preview: &PromptPreview, picker: &str) -> Vec<Row> {
     let mut lines = Vec::new();
     let template = match preview.template.as_ref() {
         Some(row) => format!("{} v{}", row.name, row.version),
         None => "none".to_owned(),
     };
     lines.push(Row::plain(labelled("template", &template)));
-    lines.push(Row::plain(labelled(
-        "picker",
-        &format!("n / p \u{b7} {} template(s)", preview.available.len()),
-    )));
+    let count = format!("{} template(s)", preview.available.len());
+    let picker = if picker.is_empty() {
+        count
+    } else {
+        format!("{picker} \u{b7} {count}")
+    };
+    lines.push(Row::plain(labelled("picker", &picker)));
 
     // Bound once, and used again at the bottom for the text. The second `match` that used to read
     // `preview.outcome` there needed an `unreachable!` arm to say what this binding says by
@@ -324,24 +343,39 @@ impl DetailTab for PromptTab {
         self.scroll.reset();
     }
 
-    fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        let forward = match key.code {
-            KeyCode::Char('n') => true,
-            KeyCode::Char('p') => false,
-            _ => return self.scroll.on_key(key, self.lines.len()),
-        };
-        let (Some(item), Some(name)) = (self.item, self.cycle(forward)) else {
-            return Handled::Pass;
-        };
-        ctx.request(StoreRequest::PromptPreview {
-            item,
-            template_name: Some(name),
-            scope: ctx.scope.clone(),
-        });
-        Handled::Consumed
+    fn key_stack(&self) -> Stack<'static> {
+        views::BACKLOG_PROMPT
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    /// Whole chords through `BACKLOG_PROMPT` (MOD-67 M5 PA-1): `backlog.prompt.next_template`/
+    /// `prev_template` cycle the template, so `ctrl-n` and `alt-p` no longer do, and the four
+    /// pane-scroll acts scroll. With no item or nothing to cycle the act declines and the key goes
+    /// on to the tab.
+    fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
+        let chord = KeyChord::from_event(key);
+        for act in ctx.keys().actions(self.key_stack(), chord) {
+            let forward = match act {
+                Act::PromptNextTemplate => true,
+                Act::PromptPrevTemplate => false,
+                Act::PaneScrollDown | Act::PaneScrollUp | Act::PanePageDown | Act::PanePageUp => {
+                    return self.scroll.apply(act, self.lines.len());
+                }
+                _ => continue,
+            };
+            let (Some(item), Some(name)) = (self.item, self.cycle(forward)) else {
+                continue;
+            };
+            ctx.request(StoreRequest::PromptPreview {
+                item,
+                template_name: Some(name),
+                scope: ctx.scope.clone(),
+            });
+            return Handled::Consumed;
+        }
+        Handled::Pass
+    }
+
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         if let StoreReply::Failed { request, message } = reply
             && *request == crate::store_worker::PROMPT_PREVIEW
         {
@@ -362,7 +396,7 @@ impl DetailTab for PromptTab {
             return;
         }
         self.preview = Some((**preview).clone());
-        self.rebuild();
+        self.rebuild(ctx.keys());
         self.scroll.reset();
     }
 
@@ -529,7 +563,7 @@ mod tests {
             outcome: Ok(assembled),
         };
 
-        let rows = render_lines(&preview);
+        let rows = render_lines(&preview, "n / p");
         let first = labelled(
             "skills",
             "rust-style v2 \u{b7} project \u{b7} always \u{2192} active",
@@ -566,6 +600,37 @@ mod tests {
             .position(|row| row.text.starts_with("section "))
             .expect("the section table is rendered");
         assert!(table < at, "the block sits below the section table");
+    }
+
+    /// MOD-67 M5 PA-1: the `picker` row names the template keys in force: `n / p` with the
+    /// defaults, a rebound key's own label, and nothing but the count when both are unbound.
+    #[test]
+    fn the_picker_row_names_the_template_keys_in_force() {
+        assert_eq!(picker_keys(Keys::compiled()), "n / p");
+        let rebound =
+            crate::keys::load_str("version = 1\n[backlog.prompt]\nnext_template = \"t\"\n")
+                .expect("the keys load");
+        assert_eq!(picker_keys(&rebound), "t / p");
+        let unbound = crate::keys::load_str(
+            "version = 1\n[backlog.prompt]\nnext_template = []\nprev_template = []\n",
+        )
+        .expect("the keys load");
+        assert_eq!(picker_keys(&unbound), "");
+
+        let preview = PromptPreview {
+            item: htui_core::fixtures::ids::HTUI_FEAT_1,
+            available: vec!["implement".to_owned(), "review".to_owned()],
+            template: None,
+            outcome: Err("no template".to_owned()),
+        };
+        assert_eq!(
+            render_lines(&preview, "n / p")[1].text,
+            labelled("picker", "n / p \u{b7} 2 template(s)")
+        );
+        assert_eq!(
+            render_lines(&preview, "")[1].text,
+            labelled("picker", "2 template(s)")
+        );
     }
 
     #[test]
@@ -615,7 +680,7 @@ mod tests {
             outcome: Ok(assembled),
         };
 
-        let rows = render_lines(&preview);
+        let rows = render_lines(&preview, "n / p");
         let row = rows
             .iter()
             .find(|row| row.text.contains("rust-glob"))
