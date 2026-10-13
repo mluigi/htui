@@ -2312,3 +2312,61 @@ async fn a_rebound_thoughts_key_folds_and_t_is_inert() {
     let frame = harness.render();
     assert!(folded(&frame), "and folds again: {frame}");
 }
+
+/// MOD-67 M5 R1 M1 (a): the replay resolves `CHAT_REPLAY` first and swallows a plain `i`, `a`,
+/// `Enter` or digit only when no act of the replay's own took it. `[common] back = ["i"]` leaves
+/// the replay on `i`, and its header names that key.
+#[tokio::test]
+async fn a_back_rebound_onto_i_leaves_the_replay() {
+    let keys = htui::keys::load_str("version = 1\n[common]\nback = [\"i\"]\n")
+        .expect("the key file loads");
+    let mut harness = Harness::demo()
+        .with_keys(keys)
+        .with_tab(Box::new(ChatTab::new()))
+        .with_replay_tab(ChatTab::ID);
+    harness.settle().await;
+    replay(&mut harness, ids::STEP_PLAN).await;
+    let frame = harness.render();
+    assert!(frame.contains("read-only · i leave"), "{frame}");
+
+    harness.key("i");
+    harness.drive().await;
+    let frame = harness.render();
+    assert!(!frame.contains("read-only"), "`i` left the replay: {frame}");
+}
+
+/// MOD-67 M5 R1 M1 (a): `[chat] thoughts = ["i"]` folds and unfolds a replayed thought on `i`,
+/// as the replay's hint says, instead of being swallowed with the live tab's compose key.
+#[tokio::test]
+async fn a_thoughts_key_rebound_onto_i_folds_in_the_replay() {
+    let keys = htui::keys::load_str("version = 1\n[chat]\nthoughts = [\"i\"]\n")
+        .expect("the key file loads");
+    let script = Script::one_turn(vec![
+        ScriptEvent::Emit(DriverEvent::ThoughtChunk(TextChunk {
+            text: "first\nsecond".to_owned(),
+            message_id: Some("t1".to_owned()),
+        })),
+        chunk("hello"),
+        done(),
+    ]);
+    let (mut harness, _) =
+        harness_over(script, Transport::Acp, |harness| harness.with_keys(keys)).await;
+    // `i` is the thoughts key now, so `Enter` (`chat.compose`'s other default) opens the composer.
+    for pressed in ["enter", "h", "i", "enter"] {
+        harness.key(pressed);
+    }
+    harness.drive().await;
+    let step = harness.chat_steps()[0];
+    replay(&mut harness, step).await;
+    let frame = harness.render();
+    assert!(hint_row(&frame).contains("i thoughts"), "{frame}");
+    assert!(
+        frame.contains("thought  first") && !frame.contains("thought  second"),
+        "a thought starts folded: {frame}"
+    );
+
+    harness.key("i");
+    let frame = harness.render();
+    assert!(frame.contains("thought  second"), "`i` unfolds: {frame}");
+    assert!(frame.contains("read-only"), "the replay stays open: {frame}");
+}

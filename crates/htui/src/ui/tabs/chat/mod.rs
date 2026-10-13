@@ -265,26 +265,21 @@ impl ChatTab {
     ///
     /// It takes the keys in force and no [`Ctx`], which is the point: a mode that *cannot* reach
     /// the request sink is one a reviewer can check by looking at this signature, rather than by
-    /// trusting that no arm below grew a `ctx.request` later. The keys the live tab would act on
-    /// (`i`, `Enter`, a digit, `a`) are consumed and do nothing, because a finished step takes no
-    /// prompt and answers no permission request (D41): fixed, first and on plain keys only
-    /// (MOD-67 M5 D5), so `alt-2` still reaches the shell. The rest resolves through
-    /// [`views::CHAT_REPLAY`]: `common.back` (`Esc`) leaves, and the transcript's acts scroll and
-    /// fold exactly as they do live; anything else is the shell's (`q`, `Tab`, `?`).
+    /// trusting that no arm below grew a `ctx.request` later. A key resolves through
+    /// [`views::CHAT_REPLAY`] first: `common.back` (`Esc`) leaves, and the transcript's acts
+    /// scroll and fold exactly as they do live. A key none of them took that the live tab would
+    /// act on (`i`, `Enter`, a digit, `a`) is consumed and does nothing, because a finished step
+    /// takes no prompt and answers no permission request (D41): fixed, on plain keys only (MOD-67
+    /// M5 D5), so `alt-2` still reaches the shell. Anything else is the shell's (`q`, `Tab`, `?`).
+    /// Resolving first lets a key file give the replay's own acts one of those keys
+    /// (`[common] back = ["i"]`, M5 R1 M1); under the defaults none of them has one.
     ///
     /// The digits are *consumed* rather than passed on for the same reason the live tab consumes
     /// them: a `2` typed at a permission row must not fall through to the global tab-select
-    /// binding and move the user off the conversation they are reading.
+    /// binding and move the user off the conversation they are reading. The validator refuses a
+    /// global act on the swallowed keys but the tab select (`keys::FIXED`).
     fn on_key_replay(&mut self, key: KeyEvent, keys: &Keys) -> Handled {
-        if plain(&key)
-            && matches!(
-                key.code,
-                KeyCode::Char('1'..='9' | 'i' | 'a') | KeyCode::Enter
-            )
-        {
-            return Handled::Consumed;
-        }
-        match keys
+        let handled = match keys
             .actions(views::CHAT_REPLAY, KeyChord::from_event(key))
             .first()
             .copied()
@@ -296,14 +291,25 @@ impl ChatTab {
                 // precisely so that *this* key cannot be the second half of an `Esc Esc` that
                 // ends the live chat.
                 self.replay = None;
-                Handled::Consumed
+                return Handled::Consumed;
             }
+            // A global act (the tab select on a digit) is no transcript act: `Pass` here.
             Some(act) => self
                 .replay
                 .as_mut()
                 .map_or(Handled::Pass, |replay| replay.transcript.on_act(act)),
             None => Handled::Pass,
+        };
+        if handled == Handled::Pass
+            && plain(&key)
+            && matches!(
+                key.code,
+                KeyCode::Char('1'..='9' | 'i' | 'a') | KeyCode::Enter
+            )
+        {
+            return Handled::Consumed;
         }
+        handled
     }
 
     /// The replay header: which step is on screen, how much of it there is, and that it is over,
@@ -549,9 +555,10 @@ impl Tab for ChatTab {
         Some(self.stack())
     }
 
-    /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the replay's swallow, the open
-    /// composer and the parked request's digits stay fixed ahead of the resolver (ANA-26 §6.1),
-    /// each on plain keys only, so a chord passes exactly as the old CONTROL/ALT guard made it.
+    /// Each mode resolves through its stack (MOD-67 M5 D4, D5): the open composer and the parked
+    /// request's digits stay fixed ahead of the resolver (ANA-26 §6.1), and the replay's swallow
+    /// takes what the replay's own acts left (M5 R1 M1), each on plain keys only, so a chord
+    /// passes exactly as the old CONTROL/ALT guard made it.
     fn on_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
         // A refusal is transient: it says what the last key could not do, and the next one clears
         // it whatever it was.
