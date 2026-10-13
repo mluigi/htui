@@ -88,7 +88,11 @@ test('a failed poll drops the rows an earlier poll showed', async ($, on) => {
     await band.unmount()
     const pane = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props: PANE, requestId: 'htui' })
     expect(await pane.find({ key: 'row-0' })).toBeUndefined()
-    expect((await pane.find({ type: 'Text', text: /waiting$/ }))?.text).toBe('no workspace · 0 waiting')
+    // V1: the header states no count as fact after a failed poll; the error line beneath says why.
+    expect((await pane.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
+      'htui',
+      'htui: cannot reach Postgres: store unreachable: connection refused',
+    ])
     await pane.unmount()
   }
 })
@@ -197,8 +201,40 @@ test('the pane says when no poll has answered yet', { options: { panel: 'command
   await clock.settle()
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props: PANE, requestId: 'htui' })
-    expect(await ui.find({ type: 'Text', text: 'htui: no answer yet' })).toBeDefined()
-    expect((await ui.find({ type: 'Text', text: /waiting$/ }))?.text).toBe('no workspace · 0 waiting')
+    // V1: before the first answer the header states no count as fact.
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['htui', 'htui: no answer yet'])
+    await ui.unmount()
+  }
+})
+
+const SKEW = 'htui 9.9.9 ≠ plugin 0.0.0-source: run htui claude emit --force, then /reload-plugins'
+
+test('the pane shows the skew line and the error line', async ($, on) => {
+  const clock = mock.clock(on)
+  const answers: Record<string, Answer> = { waiting: ok(OFFLINE, 3), '--version': ok('htui 9.9.9\n') }
+  htui(on, answers, [])
+  await start($, on)
+  await clock.settle()
+  const props = { ...(PANE as object), bodyColumns: 200 } as never
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props, requestId: 'htui' })
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
+      'htui',
+      SKEW,
+      'htui: cannot reach Postgres: store unreachable: connection refused',
+    ])
+    await ui.unmount()
+  }
+  answers.waiting = ok(WAITING)
+  await clock.advance(30000)
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props, requestId: 'htui' })
+    expect((await ui.findAll({ type: 'Text' })).map(t => t.text)).toEqual([
+      'Platform · 2 waiting',
+      SKEW,
+      'gate         MOD-4     prd 0.1          18h  approve the PRD',
+      'unblock      MOD-7     -                 2d  blocked, no active run: u reopens it',
+    ])
     await ui.unmount()
   }
 })

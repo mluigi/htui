@@ -279,11 +279,14 @@ export const register: Register = (on, options) => {
     const s = await read($, skew)
     const columns = e.props.bodyColumns
     const rows = w?.rows ?? []
+    // V1: before the first answer, or after a failed poll, no count is known: the header says only
+    // `htui`, and the line beneath says why.
+    const header = w === null || w.error !== null ? 'htui' : `${w.workspace ?? 'no workspace'} · ${rows.length} waiting`
     const { Box, Text } = $.ui.resolve(e)
     return (
       <Box key="htui-pane" flexDirection="column">
         <Text bold wrap="truncate">
-          {w?.workspace ?? 'no workspace'} · {rows.length} waiting
+          {header}
         </Text>
         {s !== null && <Text wrap="truncate">{s}</Text>}
         {w?.error != null && (
