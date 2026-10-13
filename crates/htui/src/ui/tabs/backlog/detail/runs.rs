@@ -77,12 +77,14 @@ use serde_json::Value;
 
 use self::execution_graph::{ExecutionGraph, by_step, drawable};
 use crate::app::{Action, Ctx, Handled};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::run_worker::{Enabled, FrameKind, ItemActions, ORCH_NAMES, OrchReply, OrchRequest};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
 use crate::ui::tabs::backlog::detail::{DetailId, DetailTab, STAMP, Scroll, message};
 use crate::ui::tabs::chat::permission::PermissionStrip;
+use crate::ui::tabs::settings::modal_rest;
 use crate::ui::text_field::{FieldOutcome, TextField};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -133,6 +135,23 @@ const NO_STEPS_YET: &str = "No steps yet.";
 /// What a relayed request with no summary asks for (MOD-42 blueprint B-14: the transport named no
 /// call, or the scrubber refused it).
 const NO_SUMMARY: &str = "a permission";
+
+/// The cancel question's hint (MOD-67 M5): `y cancel it · n keep it` under the defaults.
+const CONFIRM_CANCEL_HINT: HintSpec = &[
+    Hint::One(Act::ConfirmYes, "cancel it"),
+    Hint::One(Act::ConfirmNo, "keep it"),
+];
+
+/// What the close-out says while it counts.
+const COUNTING_HINT: HintSpec = &[Hint::Text("counting what the close-out writes\u{2026}")];
+
+/// The close-out warning's hint: the resolution's fixed value keys, then its answers
+/// (`←/→ resolution · y continue · n cancel` under the defaults).
+const WARN_HINT: HintSpec = &[
+    Hint::Text("←/→ resolution"),
+    Hint::One(Act::ConfirmYes, "continue"),
+    Hint::One(Act::ConfirmNo, "cancel"),
+];
 
 /// The width of a detail pane at 100x30, which every step line fills exactly (MOD-4 plan D169,
 /// blueprint D197).
@@ -626,27 +645,61 @@ impl RunsTab {
         }
     }
 
-    /// A key while the pane captures (blueprint D201): a `CONTROL` chord passes, so `ctrl-c`
-    /// still quits, and everything else is the mode's, answered or swallowed.
+    /// The current mode's stack (MOD-67 M5 D4): the only place a mode maps to its keys;
+    /// `on_key`, `footer` and the Backlog tab read it.
+    fn stack(&self) -> Stack<'static> {
+        match &self.mode {
+            Mode::Browse => views::RUNS_BROWSE,
+            Mode::RejectNote { .. }
+            | Mode::FollowUp { .. }
+            | Mode::CloseOut(CloseOutStage::Typed { .. } | CloseOutStage::InFlight) => {
+                views::CAPTURE
+            }
+            Mode::ConfirmCancel { .. } | Mode::CloseOut(CloseOutStage::Warn(_)) => {
+                views::RUNS_CONFIRM
+            }
+            Mode::CloseOut(CloseOutStage::Counting) => views::RUNS_COUNTING,
+            Mode::Artifact { .. } => views::RUNS_ARTIFACT,
+        }
+    }
+
+    /// A key while the pane captures (blueprint D201), through the mode's stack (MOD-67 M5 D4):
+    /// the mode's acts and widget keys answer, and every other chord is swallowed unless the
+    /// stack's modal global layer lets it through (`modal_rest`: CONTROL, ALT, function keys), so
+    /// `ctrl-c` still quits, `F1` opens help and `alt-y` answers no question (D7).
     fn modal_key(&mut self, key: KeyEvent, ctx: &mut Ctx<'_>) -> Handled {
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        let stack = self.stack();
+        let chord = KeyChord::from_event(key);
+        // The text fields and the document view: a `CONTROL` chord passes, everything else is
+        // the mode's (their stacks follow in C2).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !matches!(
+                self.mode,
+                Mode::ConfirmCancel { .. }
+                    | Mode::CloseOut(CloseOutStage::Counting | CloseOutStage::Warn(_))
+            )
+        {
             return Handled::Pass;
         }
-        self.mode = match core::mem::take(&mut self.mode) {
-            Mode::Browse => Mode::Browse,
-            Mode::RejectNote { run, step, field } => reject_key(run, step, field, key, ctx),
-            Mode::FollowUp { step, field } => follow_up_key(step, field, key, ctx),
-            Mode::ConfirmCancel { run } => match key.code {
-                KeyCode::Char('y') => {
+        let (mode, handled) = match core::mem::take(&mut self.mode) {
+            Mode::Browse => (Mode::Browse, Handled::Pass),
+            Mode::RejectNote { run, step, field } => {
+                (reject_key(run, step, field, key, ctx), Handled::Consumed)
+            }
+            Mode::FollowUp { step, field } => {
+                (follow_up_key(step, field, key, ctx), Handled::Consumed)
+            }
+            Mode::ConfirmCancel { run } => match ctx.keys().actions(stack, chord).first() {
+                Some(Act::ConfirmYes) => {
                     ctx.request(command(Command::CancelRun { run }));
-                    Mode::Browse
+                    (Mode::Browse, Handled::Consumed)
                 }
-                KeyCode::Char('n') | KeyCode::Esc => Mode::Browse,
-                _ => Mode::ConfirmCancel { run },
+                Some(Act::ConfirmNo) => (Mode::Browse, Handled::Consumed),
+                _ => (Mode::ConfirmCancel { run }, modal_rest(stack, chord)),
             },
             Mode::CloseOut(stage) => match self.item {
-                Some(item) => close_out_key(item, stage, key, ctx),
-                None => Mode::Browse,
+                Some(item) => close_out_key(item, stage, key, stack, ctx),
+                None => (Mode::Browse, Handled::Consumed),
             },
             Mode::Artifact {
                 id,
@@ -660,22 +713,24 @@ impl RunsTab {
                     other => other,
                 };
                 if code == KeyCode::Esc {
-                    Mode::Browse
+                    (Mode::Browse, Handled::Consumed)
                 } else {
                     let len = doc
                         .as_ref()
                         .map_or(0, |doc| artifact_rows(doc, width.get()).len());
                     let _ = scroll.on_key(KeyEvent::new(code, KeyModifiers::NONE), len);
-                    Mode::Artifact {
+                    let mode = Mode::Artifact {
                         id,
                         doc,
                         scroll,
                         width,
-                    }
+                    };
+                    (mode, Handled::Consumed)
                 }
             }
         };
-        Handled::Consumed
+        self.mode = mode;
+        handled
     }
 
     /// A `Document` reply: the artifact view's body, or back to the list when the box does not
@@ -972,54 +1027,84 @@ fn cycle(status: Status, current: Resolution, forward: bool) -> Resolution {
     legal[next]
 }
 
-/// A key in [`Mode::CloseOut`], stage by stage (D167): the mode it leaves the pane in.
+/// A key with no CONTROL, ALT, SUPER, META or HYPER: the only kind a fixed key of MOD-67 D5
+/// (the permission digits, the close-out resolution's value keys) answers.
+fn plain(key: &KeyEvent) -> bool {
+    !key.modifiers.intersects(
+        KeyModifiers::CONTROL
+            | KeyModifiers::ALT
+            | KeyModifiers::SUPER
+            | KeyModifiers::META
+            | KeyModifiers::HYPER,
+    )
+}
+
+/// A key in [`Mode::CloseOut`], stage by stage (D167), through the stage's `stack`: the mode it
+/// leaves the pane in, and whether the key was used.
 ///
-/// Counting and warning leave on `n`/`Esc`; the warning's `←`/`→` (and `h`/`l`) pick the
-/// resolution (MOD-39 plan P13); the typed stage leaves on `Esc` only, because `n` is a letter
-/// there; in flight, every key waits for the answer.
-fn close_out_key(item: ItemId, stage: CloseOutStage, key: KeyEvent, ctx: &Ctx<'_>) -> Mode {
-    let stage = match stage {
-        CloseOutStage::Counting => match key.code {
-            KeyCode::Char('n') | KeyCode::Esc => return Mode::Browse,
-            _ => CloseOutStage::Counting,
+/// Counting and warning leave on `confirm.no` (`n`/`Esc`), the warning goes on with
+/// `confirm.yes` (`y`); the warning's `←`/`→` (and `h`/`l`) pick the resolution (MOD-39 plan
+/// P13), fixed value keys matched on plain keys before the resolver (MOD-67 M5); the typed stage
+/// leaves on `Esc` only, because `n` is a letter there; in flight, every key waits for the
+/// answer. A key no stage used is `modal_rest`'s.
+fn close_out_key(
+    item: ItemId,
+    stage: CloseOutStage,
+    key: KeyEvent,
+    stack: Stack<'_>,
+    ctx: &Ctx<'_>,
+) -> (Mode, Handled) {
+    let chord = KeyChord::from_event(key);
+    let (stage, handled) = match stage {
+        CloseOutStage::Counting => match ctx.keys().actions(stack, chord).first() {
+            Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
+            _ => (CloseOutStage::Counting, modal_rest(stack, chord)),
         },
-        CloseOutStage::Warn(preview) => match key.code {
-            KeyCode::Char('y') => CloseOutStage::Typed {
-                preview,
-                field: TextField::new(),
-            },
-            KeyCode::Char('n') | KeyCode::Esc => return Mode::Browse,
-            KeyCode::Right | KeyCode::Char('l') => {
-                let mut preview = preview;
-                preview.resolution = cycle(preview.status, preview.resolution, true);
-                CloseOutStage::Warn(preview)
+        CloseOutStage::Warn(mut preview) => {
+            let forward = match key.code {
+                KeyCode::Right | KeyCode::Char('l') => Some(true),
+                KeyCode::Left | KeyCode::Char('h') => Some(false),
+                _ => None,
+            };
+            match forward.filter(|_| plain(&key)) {
+                Some(forward) => {
+                    preview.resolution = cycle(preview.status, preview.resolution, forward);
+                    (CloseOutStage::Warn(preview), Handled::Consumed)
+                }
+                None => match ctx.keys().actions(stack, chord).first() {
+                    Some(Act::ConfirmYes) => (
+                        CloseOutStage::Typed {
+                            preview,
+                            field: TextField::new(),
+                        },
+                        Handled::Consumed,
+                    ),
+                    Some(Act::ConfirmNo) => return (Mode::Browse, Handled::Consumed),
+                    _ => (CloseOutStage::Warn(preview), modal_rest(stack, chord)),
+                },
             }
-            KeyCode::Left | KeyCode::Char('h') => {
-                let mut preview = preview;
-                preview.resolution = cycle(preview.status, preview.resolution, false);
-                CloseOutStage::Warn(preview)
-            }
-            _ => CloseOutStage::Warn(preview),
-        },
+        }
         CloseOutStage::Typed { preview, mut field } => match field.on_key(key) {
             FieldOutcome::Submit if field.text() == Some(preview.key.as_str()) => {
                 ctx.request(command(Command::CloseOut {
                     item,
                     resolution: preview.resolution,
                 }));
-                CloseOutStage::InFlight
+                (CloseOutStage::InFlight, Handled::Consumed)
             }
             FieldOutcome::Submit => {
                 field.clear();
                 ctx.emit(Action::Error(NOT_THE_KEY.to_owned()));
-                CloseOutStage::Typed { preview, field }
+                (CloseOutStage::Typed { preview, field }, Handled::Consumed)
             }
-            FieldOutcome::Cancel => return Mode::Browse,
-            FieldOutcome::Consumed | FieldOutcome::Pass => CloseOutStage::Typed { preview, field },
+            FieldOutcome::Cancel => return (Mode::Browse, Handled::Consumed),
+            FieldOutcome::Consumed | FieldOutcome::Pass => {
+                (CloseOutStage::Typed { preview, field }, Handled::Consumed)
+            }
         },
-        CloseOutStage::InFlight => CloseOutStage::InFlight,
+        CloseOutStage::InFlight => (CloseOutStage::InFlight, Handled::Consumed),
     };
-    Mode::CloseOut(stage)
+    (Mode::CloseOut(stage), handled)
 }
 
 /// A verdict's answer: `true` when the action may go, else the guard's sentence is on the status
@@ -1597,6 +1682,10 @@ impl DetailTab for RunsTab {
         !matches!(self.mode, Mode::Browse)
     }
 
+    fn key_stack(&self) -> Stack<'static> {
+        self.stack()
+    }
+
     /// MOD-22 review M-1: a bracketed paste into the rejection note, the follow-up (MOD-70 D14) or
     /// the typed-back key. The `y`/`n` questions are not fields: a paste there is dropped, so its
     /// `y` confirms nothing.
@@ -1783,7 +1872,7 @@ impl DetailTab for RunsTab {
             return;
         }
 
-        let footer = self.footer(area.width, ctx.theme);
+        let footer = self.footer(area.width, ctx.keys(), ctx.theme);
         let height = footer
             .iter()
             .map(|line| line.width().max(1).div_ceil(usize::from(area.width.max(1))))
@@ -1913,9 +2002,12 @@ impl RunsTab {
         (lines, cursor_end)
     }
 
-    /// What a capturing mode asks, drawn under the run list; nothing while browsing.
-    fn footer(&self, width: u16, theme: &Theme) -> Vec<Line<'static>> {
+    /// What a capturing mode asks, drawn under the run list; nothing while browsing. A hint
+    /// built from a spec renders through the mode's stack (MOD-67 M5), so a rebound answer shows
+    /// its own key.
+    fn footer(&self, width: u16, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
         let hint = |text: &str| Line::styled(text.to_owned(), theme.dim);
+        let spec = |spec: HintSpec| Line::styled(keys.hint(self.stack(), spec), theme.dim);
         match &self.mode {
             Mode::Browse | Mode::Artifact { .. } => Vec::new(),
             Mode::RejectNote { field, .. } => vec![
@@ -1930,11 +2022,9 @@ impl RunsTab {
             ],
             Mode::ConfirmCancel { .. } => vec![
                 Line::styled("cancel this run?", theme.title),
-                hint("y cancel it · n keep it"),
+                spec(CONFIRM_CANCEL_HINT),
             ],
-            Mode::CloseOut(CloseOutStage::Counting) => {
-                vec![hint("counting what the close-out writes\u{2026}")]
-            }
+            Mode::CloseOut(CloseOutStage::Counting) => vec![spec(COUNTING_HINT)],
             Mode::CloseOut(CloseOutStage::Warn(preview)) => vec![
                 Line::styled(
                     format!(
@@ -1947,7 +2037,7 @@ impl RunsTab {
                     ),
                     theme.title,
                 ),
-                hint("←/→ resolution · y continue · n cancel"),
+                spec(WARN_HINT),
             ],
             Mode::CloseOut(CloseOutStage::Typed { preview, field }) => {
                 let prompt = format!("type {} to close it: ", preview.key);
@@ -3437,7 +3527,7 @@ mod tests {
 
     /// The footer the pane draws under its list, as text.
     fn footer(pane: &RunsTab) -> Vec<String> {
-        pane.footer(43, &Theme::default())
+        pane.footer(43, Keys::compiled(), &Theme::default())
             .iter()
             .map(|line| text(line).trim_end().to_owned())
             .collect()
