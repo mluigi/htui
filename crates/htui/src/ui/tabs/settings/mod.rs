@@ -217,8 +217,8 @@ pub trait SettingsSection {
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>);
     /// Draws below the section strip.
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>);
-    /// The keys half of this section's hint (its mode's spec through its stack, plus what a write
-    /// in flight adds), for the shell's row (MOD-67 M6 T2). Defaulted to `None`.
+    /// This section's keys (its mode's spec through its stack, plus what a write in flight adds),
+    /// for the shell's hint row (MOD-67 M6 T2). Defaulted to `None`.
     fn key_hint(&self, _keys: &Keys, _theme: &Theme) -> Option<Line<'static>> {
         None
     }

@@ -258,7 +258,7 @@ pub(super) struct LibraryView {
     busy: Option<&'static str>,
     /// What the write in flight carries, for the landing (D98).
     sent: Option<Sent>,
-    /// The last outcome, one line above the hint.
+    /// The last outcome, on the view's last rows.
     notice: Option<Notice>,
     /// What `E`/`Ctrl+E` asked `$EDITOR` for, until `on_external_edit`.
     external: Option<Pending>,

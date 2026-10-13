@@ -53,24 +53,24 @@ use crate::ui::{FieldOutcome, TextArea, TextField, Theme};
 /// Lines `PageUp`/`PageDown` move in the paths and body areas.
 pub const PAGE: u16 = 5;
 
-/// The hint under a text field, through the form's stack (`Tab field · Ctrl+s save · Esc
-/// cancel` under the defaults). It fits the detail pane's inner width at 100x30 (43 columns).
+/// The shell's hint row on a text field, through the form's stack (`Tab field · Ctrl+s save · Esc
+/// cancel` under the defaults).
 pub const HINT_TEXT: HintSpec = &[
     Hint::One(Act::FormNextField, "field"),
     Hint::One(Act::FormSave, "save"),
     Hint::Text("Esc cancel"),
 ];
 
-/// The hint under a picker: its value keys are the picker's own (MOD-67 M5, fixed). It fits the
-/// detail pane's inner width at 100x30 (43 columns).
+/// The shell's hint row on a picker: its value keys are the picker's own (MOD-67 M5, fixed).
 pub const HINT_PICK: HintSpec = &[
     Hint::Text("\u{2190}/\u{2192} choose"),
     Hint::One(Act::FormNextField, "field"),
     Hint::Text("Esc cancel"),
 ];
 
-/// The hint under the paths and body areas (milestone 4 D7): 41 columns against the detail
-/// pane's 43 under the defaults, so `Tab field` gives way to Ctrl+E (Tab still cycles).
+/// The shell's hint row on the paths and body areas (milestone 4 D7): Ctrl+E in place of `Tab
+/// field`, which still cycles. Milestone 4 cut it to fit the detail pane; the row it now takes is
+/// the terminal's width (MOD-67 M6 T2), but the compose hints share it and their snapshots pin it.
 pub const HINT_AREA: HintSpec = &[
     Hint::One(Act::FormExternalEditor, "$EDITOR"),
     Hint::One(Act::FormSave, "save"),
@@ -186,7 +186,7 @@ pub struct ItemForm {
     focus: Field,
     /// A read or write in flight.
     busy: Option<Busy>,
-    /// The last refusal or reply, above the hint.
+    /// The last refusal or reply, on the form's last rows.
     notice: Option<String>,
     /// The revision reason a save sends: `Edited`, or `DivergenceResolution` once rebased
     /// (milestone 3 D6).

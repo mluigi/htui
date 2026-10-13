@@ -236,7 +236,7 @@ const HINT_CHOOSING: HintSpec = &[
     Hint::All(Act::ConfirmNo, "cancel"),
 ];
 
-/// The hint line while a login is spawning or running (MOD-22 D270: 41 of the 98 columns).
+/// The hint line while a login is spawning or running (MOD-22 D270).
 const HINT_AUTH_RUNNING: HintSpec = &[
     Hint::One(Act::AgentsOpenLink, "open link"),
     Hint::One(Act::AgentsPasteRedirect, "paste redirect"),
@@ -2927,7 +2927,7 @@ fn phase_cell(phase: InstallPhase, done: u64, total: Option<u64>) -> String {
     }
 }
 
-/// The one line a finished install leaves on the hint row.
+/// The one line a finished install leaves under the pane.
 ///
 /// Never "installed" on its own for a failure: `R-AGT-6` says the probe decides, and D16's two
 /// failure shapes differ in the one thing the user has to act on — whether the box was left with a

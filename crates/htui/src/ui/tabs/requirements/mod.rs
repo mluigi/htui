@@ -107,10 +107,10 @@ const HINT_WRITES: HintSpec = &[
 /// The hint row's words after the write keys.
 const HINT_RELOAD: HintSpec = &[Hint::One(Act::Reload, "reload")];
 
-/// The hint row on the filter, after the field: the field's own keys.
+/// The hint row while the filter is open: the field's own keys.
 const FILTER_HINT: HintSpec = &[Hint::Text("Enter apply"), Hint::Text("Esc clear")];
 
-/// The filter field's width on the hint row.
+/// The filter field's width on the filter row.
 const FILTER_WIDTH: u16 = 30;
 
 /// The hint row on the area and requirement forms (MOD-67 M4 D9).
@@ -205,7 +205,7 @@ pub struct RequirementsTab {
     /// The tab write in flight, by `StoreRequest::name`: one at a time, and the only write a
     /// `RequirementWritten` lands (MOD-59 D4).
     busy: Option<&'static str>,
-    /// The last outcome, one line above the hint.
+    /// The last outcome, on the notice rows above the filter row.
     notice: Option<Notice>,
     /// A reveal waiting for the next `Requirements` reply (MOD-64 D235).
     pending_reveal: Option<(RequirementId, String)>,
@@ -230,7 +230,7 @@ enum Mode {
     Withdraw(WithdrawForm),
 }
 
-/// One line of report above the hint.
+/// The report on the notice rows, above the filter row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Notice {
     /// Dim.

@@ -4888,11 +4888,11 @@ async fn a_bare_row_reads_not_probed() {
     );
 }
 
-/// D245: the keys and the note are two lines, the note last (which is what
-/// [`the_idle_hint_says_r_cannot_refresh_quota`] reads); the keys are the shell's hint row since
-/// MOD-67 M6 T2.
+/// D245, MOD-67 M6 T2: the idle keys are the shell's hint row, not the section's, and the quota
+/// note is the section's last line (which is what [`the_idle_hint_says_r_cannot_refresh_quota`]
+/// reads).
 #[tokio::test]
-async fn the_idle_keys_and_the_quota_note_are_two_lines() {
+async fn the_idle_keys_are_the_shell_row_and_the_note_is_last() {
     let bench = SectionBench::new().await;
     let section = section_over(&bench, vec![registry_row("declared", true)]);
     let rendered = render_section(&section, &bench.ctx());

@@ -399,7 +399,7 @@ pub struct KindsSection {
     /// staleness index keeps only the newest request of a kind, so two writes of one kind racing
     /// would lose the reply about the one that landed.
     busy: Option<&'static str>,
-    /// The last outcome, one line on the hint row.
+    /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
 }
 
@@ -1305,8 +1305,8 @@ impl KindsSection {
         )
     }
 
-    /// The keys half of the hint line, plus what a write in flight adds to it. Rendered through
-    /// the mode's own stack, so a rebound key shows its new chord.
+    /// The mode's keys for the shell's hint row, plus what a write in flight adds to them.
+    /// Rendered through the mode's own stack, so a rebound key shows its new chord.
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
             Mode::Editing(_) => HINT_EDITING,

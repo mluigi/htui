@@ -1116,7 +1116,7 @@ impl SecretsSection {
                 SCOPE_GUIDE,
             ),
         };
-        // Under the form rather than on the hint line: a refusal is about what was just typed.
+        // Under the form rather than on the notice row: a refusal is about what was just typed.
         let (text, style) = match &self.notice {
             Some(notice) if notice.is_error() => (notice.text(), theme.error),
             Some(notice) => (notice.text(), theme.dim),
@@ -1149,8 +1149,8 @@ impl SecretsSection {
         )
     }
 
-    /// The keys half of the hint line, rendered through the mode's stack with the keys in force,
-    /// plus a write in flight in Browse.
+    /// The mode's keys for the shell's hint row, rendered through the mode's stack with the keys
+    /// in force, plus a write in flight in Browse.
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match self.mode {
             Mode::EditingUrl(_) => HINT_URL,

@@ -182,7 +182,7 @@ pub(super) struct TemplatesView {
     /// The write in flight, by `StoreRequest::name`. One at a time (`settings/prompt.rs`'s rule):
     /// the staleness index keeps only the newest request of a kind.
     busy: Option<&'static str>,
-    /// The last outcome, one line above the hint.
+    /// The last outcome, on the view's last rows.
     notice: Option<Notice>,
     /// What `E`/`Ctrl+E` asked `$EDITOR` for, until `on_external_edit`.
     external: Option<Pending>,

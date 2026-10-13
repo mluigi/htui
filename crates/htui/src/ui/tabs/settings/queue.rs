@@ -235,7 +235,7 @@ pub struct QueueSection {
     /// The write in flight, by [`StoreRequest::name`]; a second is refused until the reply, and
     /// only a write's reply closes the editor (`PromptSection`'s H-3, H-4).
     busy: Option<&'static str>,
-    /// The last outcome, one line on the hint row.
+    /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
 }
 
@@ -570,8 +570,8 @@ impl QueueSection {
         }
     }
 
-    /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus a write in
-    /// flight.
+    /// The mode's keys for the shell's hint row, through the mode's stack (MOD-67 D9), plus a
+    /// write in flight.
     fn hint_text(&self, bound: &Keys) -> String {
         let spec = match self.mode {
             Mode::Editing(_) => HINT_EDITING,

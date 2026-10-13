@@ -284,7 +284,7 @@ pub struct PromptSection {
     /// staleness index keeps only the newest request of a kind, so two writes of one kind racing
     /// would lose the reply about the one that landed (H-4).
     busy: Option<&'static str>,
-    /// The last outcome, one line on the hint row.
+    /// The last outcome, on the notice row under the pane.
     notice: Option<Notice>,
 }
 
@@ -757,8 +757,8 @@ impl PromptSection {
         }
     }
 
-    /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus what a write in
-    /// flight adds to it.
+    /// The mode's keys for the shell's hint row, through the mode's stack (MOD-67 D9), plus what a
+    /// write in flight adds to them.
     fn hint_text(&self, bound: &Keys) -> String {
         let spec = match self.mode {
             Mode::Editing(_) => HINT_EDITING,

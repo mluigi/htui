@@ -328,7 +328,7 @@ pub struct ConnectionSection {
     selected: usize,
     /// Browsing, typing, or being asked a question.
     mode: Mode,
-    /// The last outcome, one line on the hint row or under the field.
+    /// The last outcome, on the notice row under the pane in Browse, under the field otherwise.
     notice: Option<Notice>,
     /// The write in flight, by [`StoreRequest::name`]. A second one is refused until the reply:
     /// the staleness index keeps only the newest request of a kind, so two writes of one kind
@@ -630,7 +630,7 @@ impl ConnectionSection {
                         .spans,
                 );
                 let mut lines = vec![Line::from(spans)];
-                // Under the field rather than on the hint line: a refusal is about what was just
+                // Under the field rather than on the notice row: a refusal is about what was just
                 // typed, and it belongs where the typing is.
                 let guide = match self.dsn_state() {
                     Some(DsnState::Stored) => REPLACES,
@@ -684,8 +684,8 @@ impl ConnectionSection {
         )
     }
 
-    /// The keys half of the hint line, through the mode's stack (MOD-67 D9), plus what a write in
-    /// flight adds to it.
+    /// The mode's keys for the shell's hint row, through the mode's stack (MOD-67 D9), plus what a
+    /// write in flight adds to them.
     fn hint_text(&self, bound: &Keys) -> String {
         let spec = match self.mode {
             Mode::Editing(_) => HINT_EDITING,

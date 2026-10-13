@@ -310,7 +310,7 @@ pub struct HierarchySection {
     /// the agent section's `probing` refuses a second probe: the staleness index keeps only the
     /// newest request of a kind, so two writes of one kind racing would lose a reply.
     busy: Option<&'static str>,
-    /// The last outcome, one line on the hint row.
+    /// The last outcome, on the notice row under the pane.
     notice: Option<String>,
     /// What an inference in flight puts in front of its report: the `stored as …` notice of the
     /// write it follows, or `None` for `i`. Held apart from `notice`, which a key refused during
@@ -480,8 +480,8 @@ impl HierarchySection {
         )
     }
 
-    /// The keys half of the hint line, plus what a write in flight adds to it. Rendered through
-    /// the mode's own stack, so a rebound key shows its new chord.
+    /// The mode's keys for the shell's hint row, plus what a write in flight adds to them.
+    /// Rendered through the mode's own stack, so a rebound key shows its new chord.
     fn hint_text(&self, keys: &Keys) -> String {
         let spec = match &self.mode {
             Mode::Browse => {
