@@ -107,15 +107,23 @@ test('off never polls and never opens a pane', { options: { panel: 'off' } }, as
 test('an htui-driven session stands down', async ($, on) => {
   const clock = mock.clock(on)
   const calls: Call[] = []
-  htui(on, { waiting: ok(WAITING) }, calls)
+  htui(on, { waiting: ok(WAITING), status: ok(STATUS) }, calls)
   engineBottom(on, 'AbovePrompt')
   let registers = 0
   on('command.register', async () => {
     registers += 1
     return { value: undefined }
   })
+  let opens = 0
+  on('ui.open', async () => {
+    opens += 1
+    return { value: { isPlaced: true } }
+  })
   mock.env(on, { HTUI_SESSION: '1' })
   on('session.start', async ($, e) => e)
+  // Rows and a skew line stand in $.state (it outlives a reload): only `active` keeps the band away.
+  on('state.get', { plugin: 'htui', key: 'waiting' }, async () => ({ value: { value: SEEDED, version: 1 } }))
+  on('state.get', { plugin: 'htui', key: 'skew' }, async () => ({ value: { value: 'htui 9.9.9 ≠ plugin 0.0.0-source', version: 1 } }))
   await $.session.start({ source: 'startup', cwd: '/tmp' } as never)
   await clock.advance(60000)
   expect(registers).toBe(0)
@@ -126,7 +134,22 @@ test('an htui-driven session stands down', async ($, on) => {
     expect(await ui.find({ key: 'htui-band' })).toBeUndefined()
     await ui.unmount()
   }
+  // F7b: /htui answers that it stands down, and runs nothing.
+  for (const args of ['', 'status', 'waiting', 'search closed items']) {
+    expect((await $.command.run({ command: 'htui', args } as never)).text).toBe('htui: stands down in sessions htui drives')
+  }
+  await clock.advance(60000)
+  expect(calls).toHaveLength(0)
+  expect(opens).toBe(0)
 })
+
+/** A `waiting` value with one row, as a poll writes it. */
+const SEEDED = {
+  rows: [{ reason: 'gate', item_key: 'MOD-4', step: 'prd 0.1', text: 'approve the PRD', age_seconds: 64800 }],
+  workspace: 'Platform',
+  at: 0,
+  error: null,
+}
 
 test('a slow poll is not overlapped', { options: { poll_seconds: 5 } }, async ($, on) => {
   const clock = mock.clock(on)

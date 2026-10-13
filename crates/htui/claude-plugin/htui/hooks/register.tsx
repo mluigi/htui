@@ -227,6 +227,9 @@ export const register: Register = (on, options) => {
   })
 
   on('command.run', { command: 'htui' }, async ($, e) => {
+    // D15: a session htui drives never registers /htui; should the command reach the hook anyway,
+    // it runs nothing. Still no `next` (A-2): the hook answers its own command.
+    if (!(await read($, active))) return { text: 'htui: stands down in sessions htui drives' }
     const args = e.args.trim()
     const space = args.search(/\s/)
     const verb = space === -1 ? args : args.slice(0, space)
