@@ -214,6 +214,44 @@ test('an unreadable or newer answer is a line', async ($, on) => {
   expect(await run($, 'status')).toBe('htui: exit 1')
 })
 
+test('status with a count that is not a number is unreadable', async ($, on) => {
+  const clock = mock.clock(on)
+  const answers: Record<string, Answer> = { '--version': ok('htui 9.9.9\n') }
+  htui(on, answers, [])
+  await begin($, on, clock)
+  const bad: [string, unknown][] = [
+    ['working', '1'],
+    ['working', undefined],
+    ['waiting', null],
+    ['waiting', 1.5],
+    ['waiting', -1],
+  ]
+  for (const [field, value] of bad) {
+    answers.status = ok(JSON.stringify({ ...JSON.parse(STATUS), [field]: value }))
+    expect(await run($, 'status')).toBe(`htui: unreadable answer (exit 0)\n${SKEW}`)
+  }
+})
+
+test('waiting whose rows is not a list is unreadable', async ($, on) => {
+  const clock = mock.clock(on)
+  const answers: Record<string, Answer> = {}
+  htui(on, answers, [])
+  await begin($, on, clock)
+  for (const rows of [undefined, 'none', { 0: {} }]) {
+    answers.waiting = ok(JSON.stringify({ ...JSON.parse(WAITING), rows }))
+    expect(await run($, 'waiting')).toBe('htui: unreadable answer (exit 0)')
+  }
+})
+
+test('waiting leaves out a row that is not an object', async ($, on) => {
+  const clock = mock.clock(on)
+  const doc = JSON.parse(WAITING)
+  doc.rows = [null, 7, 'MOD-9', [doc.rows[1]], doc.rows[0]]
+  htui(on, { waiting: ok(JSON.stringify(doc)) }, [])
+  await begin($, on, clock)
+  expect(await run($, 'waiting')).toBe('MOD-4  gate  prd 0.1  18h  approve the PRD')
+})
+
 test('waiting strips control characters from what htui stored', async ($, on) => {
   const clock = mock.clock(on)
   const doc = JSON.parse(WAITING)

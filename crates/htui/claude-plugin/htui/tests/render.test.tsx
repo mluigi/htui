@@ -238,3 +238,18 @@ test('the pane shows the skew line and the error line', async ($, on) => {
     await ui.unmount()
   }
 })
+
+test('a poll whose rows is not a list shows a line, not a count', async ($, on) => {
+  const clock = mock.clock(on)
+  htui(on, { waiting: ok(JSON.stringify({ ...JSON.parse(WAITING), rows: 'none' })) }, [])
+  await start($, on)
+  await clock.settle()
+  for (const surface of SURFACES) {
+    const band = await $.ui.mount({ plugin: 'htui', surface, component: 'AbovePrompt', props: BAND })
+    expect((await band.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['htui: unreadable answer (exit 0)'])
+    await band.unmount()
+    const pane = await $.ui.mount({ plugin: 'htui', surface, component: 'Pane', props: PANE, requestId: 'htui' })
+    expect((await pane.findAll({ type: 'Text' })).map(t => t.text)).toEqual(['htui', 'htui: unreadable answer (exit 0)'])
+    await pane.unmount()
+  }
+})

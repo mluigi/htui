@@ -10,8 +10,17 @@ const waiting = atom({ plugin: 'htui', key: 'waiting' } as const, null as HtuiWa
 const skew = atom({ plugin: 'htui', key: 'skew' } as const, null as string | null)
 const active = atom({ plugin: 'htui', key: 'active' } as const, false as boolean)
 
-/** What one run of `htui` came to: its document, or the line that says why there is none. */
-type Ran = { ok: true; doc: any } | { ok: false; line: string }
+/** What one run of `htui` came to: its document and exit code, or the line that says why there is none. */
+type Ran = { ok: true; doc: any; exitCode: number } | { ok: false; line: string }
+
+/** The line for an answer the mod cannot read. */
+const unreadable = (exitCode: number): string => `htui: unreadable answer (exit ${exitCode})`
+
+/** A count as htui prints one: a whole number, not negative (V3). */
+const isCount = (v: unknown): v is number => Number.isSafeInteger(v) && (v as number) >= 0
+
+/** A JSON object: not null, not a list. */
+const isObject = (v: unknown): v is Record<string, unknown> => v !== null && typeof v === 'object' && !Array.isArray(v)
 
 /** The pane's id, and the requestId its `ui.render` carries. */
 const PANE = 'htui'
@@ -59,9 +68,7 @@ async function runHtui($: EngineInterface, argv: readonly string[], timeoutMs: n
   } catch {
     doc = undefined
   }
-  if (doc === null || typeof doc !== 'object' || Array.isArray(doc)) {
-    return { ok: false, line: `htui: unreadable answer (exit ${r.exitCode})` }
-  }
+  if (!isObject(doc)) return { ok: false, line: unreadable(r.exitCode) }
   if (typeof doc.version === 'number' && doc.version > 1) {
     return {
       ok: false,
@@ -70,16 +77,16 @@ async function runHtui($: EngineInterface, argv: readonly string[], timeoutMs: n
   }
   if (typeof doc.error?.message === 'string') return { ok: false, line: `htui: ${clean(doc.error.message)}` }
   if (r.exitCode !== 0) return { ok: false, line: `htui: exit ${r.exitCode}` }
-  return { ok: true, doc }
+  return { ok: true, doc, exitCode: r.exitCode }
 }
 
 /**
  * The rows of a `waiting` document, reduced to the fields the mod reads and stripped of control
- * characters; an entry that is not an object is left out.
+ * characters; an entry that is not an object (a list included) is left out.
  */
-const rowsOf = (doc: any): HtuiRow[] =>
-  (Array.isArray(doc.rows) ? doc.rows : [])
-    .filter((r: unknown) => r !== null && typeof r === 'object')
+const rowsOf = (rows: readonly unknown[]): HtuiRow[] =>
+  rows
+    .filter(isObject)
     .map((r: any) => ({
       reason: clean(r.reason),
       item_key: clean(r.item_key),
@@ -87,6 +94,16 @@ const rowsOf = (doc: any): HtuiRow[] =>
       text: clean(r.text),
       age_seconds: Math.max(0, Math.floor(Number(r.age_seconds) || 0)),
     }))
+
+/**
+ * A `waiting` run's rows and workspace name; a document whose `rows` is not a list is unreadable,
+ * so that no count is shown that htui did not give (V3).
+ */
+function waitingOf(ran: Ran): { ok: true; rows: HtuiRow[]; workspace: string | null } | { ok: false; line: string } {
+  if (!ran.ok) return ran
+  if (!Array.isArray(ran.doc.rows)) return { ok: false, line: unreadable(ran.exitCode) }
+  return { ok: true, rows: rowsOf(ran.doc.rows), workspace: ran.doc.workspace ? clean(ran.doc.workspace.name) : null }
+}
 
 /** `/htui waiting`'s text, one line per row. */
 const waitingText = (rows: readonly HtuiRow[]): string =>
@@ -98,7 +115,9 @@ const waitingText = (rows: readonly HtuiRow[]): string =>
 async function statusText($: EngineInterface): Promise<string> {
   const ran = await runHtui($, ['htui', 'status', '--json'], 10000)
   const lines: string[] = []
-  if (ran.ok) {
+  if (ran.ok && !(isCount(ran.doc.working) && isCount(ran.doc.waiting))) {
+    lines.push(unreadable(ran.exitCode))
+  } else if (ran.ok) {
     const d = ran.doc
     lines.push(
       `${d.workspace ? clean(d.workspace.name) : 'no workspace'} · ${d.box ? clean(d.box.hostname) : 'no box'} · ${clean(d.store)} · ${d.working} working · ${d.waiting} waiting`,
@@ -117,7 +136,7 @@ async function searchText($: EngineInterface, query: string): Promise<string> {
   const ran = await runHtui($, ['htui', `--search-items=${query}`, '--json'], 60000)
   if (!ran.ok) return ran.line
   if (ran.doc.index === 'empty') return 'No concepts index yet: run htui --index-items.'
-  const hits: any[] = Array.isArray(ran.doc.hits) ? ran.doc.hits.filter((h: unknown) => h !== null && typeof h === 'object') : []
+  const hits: any[] = Array.isArray(ran.doc.hits) ? ran.doc.hits.filter(isObject) : []
   if (hits.length === 0) return 'No hits.'
   return hits
     .map(
@@ -144,11 +163,11 @@ async function poll($: EngineInterface): Promise<void> {
   if (polling) return
   polling = true
   try {
-    const ran = await runHtui($, ['htui', 'waiting', '--json'], 10000)
+    const got = waitingOf(await runHtui($, ['htui', 'waiting', '--json'], 10000))
     const at = await $.clock.now()
-    const next: HtuiWaiting = ran.ok
-      ? { rows: rowsOf(ran.doc), workspace: ran.doc.workspace ? clean(ran.doc.workspace.name) : null, at, error: null }
-      : { rows: [], workspace: null, at, error: ran.line }
+    const next: HtuiWaiting = got.ok
+      ? { rows: got.rows, workspace: got.workspace, at, error: null }
+      : { rows: [], workspace: null, at, error: got.line }
     await update($, waiting, () => next)
   } catch {
     // The module unloaded mid-poll (its `$` is gone): nothing is left to show.
@@ -257,8 +276,8 @@ export const register: Register = (on, options) => {
       return o.isPlaced ? {} : { text: `htui: the pane waits: ${o.reason}` }
     }
     if (verb === '' || verb === 'waiting') {
-      const ran = await runHtui($, ['htui', 'waiting', '--json'], 10000)
-      return { text: ran.ok ? waitingText(rowsOf(ran.doc)) : ran.line }
+      const got = waitingOf(await runHtui($, ['htui', 'waiting', '--json'], 10000))
+      return { text: got.ok ? waitingText(got.rows) : got.line }
     }
     if (verb === 'status') return { text: await statusText($) }
     if (verb === 'search') {
