@@ -107,7 +107,7 @@ a space). When the old copy could not be removed after a `--force`, one more lin
 |---|---|
 | 0 | Written. |
 | 2 | Refused: the target holds the htui plugin and `--force` is missing, holds files `emit` did not write, or is a file; or there is no local data directory and no `--dir`. A usage error also exits 2. |
-| 1 | Failed: a directory or file could not be created, written, moved or replaced, or the report could not be printed. |
+| 1 | Failed: a directory could not be read, created, moved or replaced, a file could not be written, or the report could not be printed. If moving the new copy into place fails, the old copy is put back. |
 
 A refusal prints its sentence on standard error, as `htui: <sentence>`, and writes nothing:
 
