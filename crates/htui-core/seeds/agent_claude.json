@@ -34,6 +34,7 @@
              "client_capabilities": { "fs_read": true, "fs_write": true, "terminal": false,
                                       "elicitation": false },
              "model_config_id": null,
+             "permission_mode": "default",
              "session": { "load": true, "resume": true } },
     "permission": { "default": "ask", "rules": [], "remembered": [] },
     "quota": { "source": "acp_meta_rate_limit" },
