@@ -824,24 +824,24 @@ pub static CATALOGUE: &[ActionSpec] = &[
     // returns `Pass` on `Esc` and this layer closes it (`concepts_search.rs:334-335`).
     capture_row(Act::OverlayClose, Overlay, "close", &["esc"], "close"),
     // [list]
-    // backlog/mod.rs:754, requirements/mod.rs:430, connection.rs:811, kinds.rs:1492,
+    // backlog/mod.rs:789, requirements/mod.rs:443, connection.rs:811, kinds.rs:1492,
     // qdrant.rs:404, workspace_switcher.rs:163, waiting_list.rs:274. agents.rs:2420 and
     // hierarchy.rs:1212 take `j` only (ANA §6.6 adds `down`, M3).
     row(Act::ListDown, List, "down", &["j", "down"], "down"),
-    // backlog/mod.rs:755, requirements/mod.rs:431, connection.rs:815, kinds.rs:1496,
+    // backlog/mod.rs:790, requirements/mod.rs:444, connection.rs:815, kinds.rs:1496,
     // boxes.rs:699, library.rs:689.
     row(Act::ListUp, List, "up", &["k", "up"], "up"),
-    // backlog/mod.rs:756, requirements/mod.rs:432. kinds.rs:1476 binds `g` to open graph (M3).
+    // backlog/mod.rs:791, requirements/mod.rs:445. kinds.rs:1476 binds `g` to open graph (M3).
     row(Act::ListTop, List, "top", &["g", "home"], "top"),
-    // backlog/mod.rs:757, requirements/mod.rs:433.
+    // backlog/mod.rs:792, requirements/mod.rs:446.
     row(Act::ListBottom, List, "bottom", &["G", "end"], "bottom"),
-    // backlog/mod.rs:791-797 (fold, else the detail pane; the Backlog tries it before the pane,
-    // MOD-67 M5 PA-2), requirements/mod.rs:434. Elsewhere `Enter` is a view verb
+    // backlog/mod.rs:779 (fold, else the detail pane at :784; the Backlog tries it before the
+    // pane, MOD-67 M5 PA-2), requirements/mod.rs:448. Elsewhere `Enter` is a view verb
     // (connection.rs:807, workspace_switcher.rs:171).
     row(Act::ListFold, List, "fold", &["enter"], "fold"),
     // [pane]
-    // backlog/detail/mod.rs:465 (`Scroll::apply`), requirements/mod.rs:458, library.rs:812,
-    // templates.rs:616. runs.rs:1713 `J` is next step (a view verb, ANA §6.2:
+    // backlog/detail/mod.rs:466 (`Scroll::apply`), requirements/mod.rs:453, library.rs:812,
+    // templates.rs:616. runs.rs:1701 `J` is next step (a view verb, ANA §6.2:
     // `backlog.runs.next_step`).
     row(
         Act::PaneScrollDown,
@@ -850,11 +850,11 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["J"],
         "scroll down",
     ),
-    // backlog/detail/mod.rs:466.
+    // backlog/detail/mod.rs:467.
     row(Act::PaneScrollUp, Pane, "scroll_up", &["K"], "scroll up"),
-    // backlog/detail/mod.rs:467, graph.rs:706, divergence.rs:266.
+    // backlog/detail/mod.rs:468, graph.rs:706, divergence.rs:266.
     row(Act::PanePageDown, Pane, "page_down", &["pgdn"], "page down"),
-    // backlog/detail/mod.rs:468.
+    // backlog/detail/mod.rs:469.
     row(Act::PanePageUp, Pane, "page_up", &["pgup"], "page up"),
     // backlog/mod.rs:793. Settings cycles sections through `settings.next_section` (M3).
     row(
@@ -874,15 +874,15 @@ pub static CATALOGUE: &[ActionSpec] = &[
     ),
     // [confirm]
     // connection.rs:483, qdrant.rs:214, kinds.rs:715, hierarchy.rs:769, personas.rs:785,
-    // boxes.rs:545, runs.rs:640, detail/requirements.rs:306. migration_prompt.rs:92 also
+    // boxes.rs:545, runs.rs:721, :1144, detail/requirements.rs:352. migration_prompt.rs:92 also
     // takes `Y`: a `VIEW_DEFAULTS` row.
     row(Act::ConfirmYes, Confirm, "yes", &["y"], "yes"),
     // connection.rs:487, qdrant.rs:218, kinds.rs:726, agents.rs:1161, boxes.rs:546,
-    // personas.rs:791, runs.rs:644, detail/requirements.rs:317, hierarchy.rs:761.
+    // personas.rs:791, runs.rs:725, :1151, detail/requirements.rs:363, hierarchy.rs:761.
     // migration_prompt.rs:97 also takes `N`: a `VIEW_DEFAULTS` row.
     row(Act::ConfirmNo, Confirm, "no", &["n", "esc"], "no"),
     // [form]: all in capture; every chord is named or ctrl.
-    // item_form.rs:613, requirements/forms.rs:306, compose.rs:340. The Settings forms also
+    // item_form.rs:664, requirements/mod.rs:555, compose.rs:376. The Settings forms also
     // take `Down` (agents.rs:2166): `VIEW_DEFAULTS` rows (M3); so do the Library rename form,
     // the attachment form and the Requirements forms (M4 `VIEW_DEFAULTS` rows), and the item
     // form, the Docs compose area and the filter form (M5 `VIEW_DEFAULTS` rows).
@@ -893,7 +893,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["tab"],
         "next field",
     ),
-    // item_form.rs:617, requirements/forms.rs:310, compose.rs:344. The Settings forms also
+    // item_form.rs:665, requirements/mod.rs:556, compose.rs:377. The Settings forms also
     // take `Up`: `VIEW_DEFAULTS` rows (M3); so do the M4 and M5 forms above.
     capture_row(
         Act::FormPrevField,
@@ -902,14 +902,15 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["backtab"],
         "previous field",
     ),
-    // text_area.rs:194, item_form.rs:275, requirements/mod.rs:233, attach.rs:477,
+    // text_area.rs:194, item_form.rs:661, requirements/mod.rs:554, attach.rs:477,
     // library.rs:990. Every site also accepts `ctrl-S` (blueprint F-7, M4). The Library and
     // Templates editors resolve it after their widget passes the chord; Requirements sends a
     // modified chord (`ctrl-s` by default) straight to the resolver and a plain one (a rebound
     // `f2`) to its widget first (MOD-67 M4 PA-3). The Backlog's item form and Notes/Docs compose
-    // areas resolve it after their widgets (MOD-67 M5 D8).
+    // areas resolve it after their widgets (MOD-67 M5 D8; compose.rs:372).
     capture_row(Act::FormSave, Form, "save", &["ctrl-s"], "save"),
-    // item_form.rs:281 (label at :63), library.rs:1021, templates.rs:689. Same `E` alias.
+    // item_form.rs:663 (label at :75), compose.rs:374, library.rs:1021, templates.rs:689. Same
+    // `E` alias.
     capture_row(
         Act::FormExternalEditor,
         Form,
@@ -919,20 +920,20 @@ pub static CATALOGUE: &[ActionSpec] = &[
     ),
     // [common]
     // connection.rs:779, qdrant.rs:382, kinds.rs:1468, hierarchy.rs:1241, prompt.rs:849,
-    // agents.rs:2401, backlog/mod.rs:779. boxes.rs:707 `e` edits quirks (a view verb).
+    // agents.rs:2401, backlog/mod.rs:811. boxes.rs:707 `e` edits quirks (a view verb).
     row(Act::Edit, Common, "edit", &["e"], "edit"),
     // kinds.rs:1452, hierarchy.rs:1233, agents.rs:2395, library.rs:694, templates.rs:527.
     // The Backlog's `N` is `backlog.new_item`.
     row(Act::New, Common, "new", &["n"], "new"),
     // hierarchy.rs:1279, kinds.rs:1484.
     row(Act::Delete, Common, "delete", &["d"], "delete"),
-    // connection.rs:785, qdrant.rs:388. detail/requirements.rs:481 `c` is the cite picker.
+    // connection.rs:785, qdrant.rs:388. detail/requirements.rs:546 `c` is the cite picker.
     row(Act::Clear, Common, "clear", &["c"], "clear"),
     // connection.rs:822, qdrant.rs:414, kinds.rs:1505, hierarchy.rs:1289, prompt.rs:869,
-    // boxes.rs:733, requirements/mod.rs:449, library.rs:690, templates.rs:523, attach.rs:398.
+    // boxes.rs:733, requirements/mod.rs:471, library.rs:690, templates.rs:523, attach.rs:398.
     // agents.rs:2495 `r` probes (a view verb).
     row(Act::Reload, Common, "reload", &["r"], "reload"),
-    // divergence.rs:245, library.rs:895, chat/mod.rs:233. personas.rs:841 also takes `Enter`:
+    // divergence.rs:248, library.rs:895, chat/mod.rs:280. personas.rs:841 also takes `Enter`:
     // a `VIEW_DEFAULTS` row.
     row(Act::Back, Common, "back", &["esc"], "back"),
     // connection.rs:828, boxes.rs:739, hierarchy.rs:1295, kinds.rs:1511, prompt.rs:875.
@@ -1338,7 +1339,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "cancel the turn",
     ),
     // [requirements]
-    // requirements/mod.rs:448 (`'a'`).
+    // requirements/mod.rs:467 (`'a'`).
     row(
         Act::RequirementsNewArea,
         Requirements,
@@ -1346,7 +1347,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["a"],
         "new area",
     ),
-    // requirements/mod.rs:448 (`'e'`).
+    // requirements/mod.rs:469 (`'e'`).
     row(
         Act::RequirementsAmend,
         Requirements,
@@ -1354,7 +1355,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["e"],
         "amend",
     ),
-    // requirements/mod.rs:448 (`'W'`).
+    // requirements/mod.rs:470 (`'W'`).
     row(
         Act::RequirementsWithdraw,
         Requirements,
@@ -1362,7 +1363,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["W"],
         "withdraw",
     ),
-    // requirements/mod.rs:438.
+    // requirements/mod.rs:456.
     row(
         Act::RequirementsFilter,
         Requirements,
@@ -1372,8 +1373,8 @@ pub static CATALOGUE: &[ActionSpec] = &[
     ),
     // [backlog]: the Backlog tab's own verbs (MOD-67 M5 D1), one row each, so each sub-tab's
     // table may override them; every Backlog browse stack carries this layer.
-    // backlog/mod.rs:791-797 (the pane's `Enter`), app/mod.rs:143-148 (the miss row, MOD-67 M5 D6):
-    // offered on every sub-tab, so the miss fires from each.
+    // backlog/mod.rs:784 (the pane's `Enter`: runs.rs:1711 replays) and backlog/mod.rs:820 (the
+    // miss, MOD-67 M5 D6): offered on every sub-tab, so the miss fires from each.
     row(
         Act::BacklogReplay,
         Backlog,
@@ -1381,7 +1382,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["enter"],
         "replay step",
     ),
-    // backlog/mod.rs:762, app/mod.rs:152.
+    // backlog/mod.rs:797.
     row(
         Act::BacklogOpenGraph,
         Backlog,
@@ -1389,9 +1390,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["m"],
         "open graph",
     ),
-    // backlog/mod.rs:767.
+    // backlog/mod.rs:800.
     row(Act::BacklogOpenFilter, Backlog, "filter", &["f"], "filter"),
-    // backlog/mod.rs:770.
+    // backlog/mod.rs:803.
     row(
         Act::BacklogClearFilter,
         Backlog,
@@ -1399,9 +1400,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["F"],
         "clear filter",
     ),
-    // backlog/mod.rs:778: `N`, not `common.new`'s `n` (MOD-67 M5 D2).
+    // backlog/mod.rs:810: `N`, not `common.new`'s `n` (MOD-67 M5 D2).
     row(Act::BacklogNewItem, Backlog, "new_item", &["N"], "new item"),
-    // backlog/mod.rs:783.
+    // backlog/mod.rs:814.
     row(
         Act::BacklogQueue,
         Backlog,
@@ -1409,7 +1410,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["Q"],
         "queue / dequeue",
     ),
-    // backlog/mod.rs:784.
+    // backlog/mod.rs:815.
     row(
         Act::BacklogPauseQueue,
         Backlog,
@@ -1418,7 +1419,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "pause / resume queue",
     ),
     // [backlog.runs]
-    // runs.rs:1546 (ANA-26 §6.2: `J` is the step cursor here, not `pane.scroll_down`).
+    // runs.rs:1701 (ANA-26 §6.2: `J` is the step cursor here, not `pane.scroll_down`).
     row(
         Act::RunsNextStep,
         BacklogRuns,
@@ -1426,7 +1427,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["J"],
         "next step",
     ),
-    // runs.rs:1550.
+    // runs.rs:1705.
     row(
         Act::RunsPrevStep,
         BacklogRuns,
@@ -1434,13 +1435,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["K"],
         "previous step",
     ),
-    // runs.rs:1580 -> :770.
+    // runs.rs:1725 -> :888 (`RunsTab::on_key` hands every verb to `action`).
     row(Act::RunsApprove, BacklogRuns, "approve", &["a"], "approve"),
-    // runs.rs:777.
+    // runs.rs:895.
     row(Act::RunsReject, BacklogRuns, "reject", &["x"], "reject"),
-    // runs.rs:784.
+    // runs.rs:902.
     row(Act::RunsRetry, BacklogRuns, "retry", &["r"], "retry step"),
-    // runs.rs:787.
+    // runs.rs:905.
     row(
         Act::RunsPromote,
         BacklogRuns,
@@ -1448,7 +1449,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["p"],
         "promote to chat",
     ),
-    // runs.rs:790.
+    // runs.rs:908.
     row(
         Act::RunsSelect,
         BacklogRuns,
@@ -1456,7 +1457,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["s"],
         "select winner",
     ),
-    // runs.rs:798.
+    // runs.rs:916.
     row(
         Act::RunsAccept,
         BacklogRuns,
@@ -1464,9 +1465,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["A"],
         "accept output",
     ),
-    // runs.rs:806.
+    // runs.rs:924.
     row(Act::RunsOpen, BacklogRuns, "open", &["o"], "open output"),
-    // runs.rs:736 (`'c'`).
+    // runs.rs:848, :864.
     row(
         Act::RunsCancelRun,
         BacklogRuns,
@@ -1474,7 +1475,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["c"],
         "cancel run",
     ),
-    // runs.rs:736 (`'T'`).
+    // runs.rs:848, :867.
     row(
         Act::RunsCleanup,
         BacklogRuns,
@@ -1482,9 +1483,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["T"],
         "retry cleanup",
     ),
-    // runs.rs:716.
+    // runs.rs:828.
     row(Act::RunsUnblock, BacklogRuns, "unblock", &["u"], "unblock"),
-    // runs.rs:721.
+    // runs.rs:833.
     row(
         Act::RunsStartRun,
         BacklogRuns,
@@ -1492,7 +1493,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["R"],
         "start run",
     ),
-    // runs.rs:730.
+    // runs.rs:842.
     row(
         Act::RunsCloseOut,
         BacklogRuns,
@@ -1500,7 +1501,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["C"],
         "close out",
     ),
-    // runs.rs:708.
+    // runs.rs:819.
     row(
         Act::RunsFollowUp,
         BacklogRuns,
@@ -1508,7 +1509,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["i"],
         "follow up",
     ),
-    // runs.rs:1560.
+    // runs.rs:1715.
     row(
         Act::RunsToggleView,
         BacklogRuns,
@@ -1516,9 +1517,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["v"],
         "list / flow",
     ),
-    // runs.rs:1575.
+    // runs.rs:1716.
     row(Act::RunsZoomIn, BacklogRuns, "zoom_in", &["+"], "zoom in"),
-    // runs.rs:1576.
+    // runs.rs:1717.
     row(
         Act::RunsZoomOut,
         BacklogRuns,
@@ -1526,7 +1527,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["-"],
         "zoom out",
     ),
-    // runs.rs:1577.
+    // runs.rs:1718.
     row(
         Act::RunsZoomFit,
         BacklogRuns,
@@ -1535,7 +1536,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "fit the run",
     ),
     // [backlog.graph]
-    // graph.rs:695.
+    // graph.rs:704.
     row(
         Act::GraphNextRow,
         BacklogGraph,
@@ -1543,7 +1544,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["J"],
         "next row",
     ),
-    // graph.rs:696.
+    // graph.rs:705.
     row(
         Act::GraphPrevRow,
         BacklogGraph,
@@ -1551,9 +1552,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["K"],
         "previous row",
     ),
-    // graph.rs:699.
+    // graph.rs:708.
     row(Act::GraphDeeper, BacklogGraph, "deeper", &["+"], "deeper"),
-    // graph.rs:700.
+    // graph.rs:711.
     row(
         Act::GraphShallower,
         BacklogGraph,
@@ -1561,7 +1562,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["-"],
         "shallower",
     ),
-    // graph.rs:701 (MOD-67 M5 PA-2): always consumes `Enter`, so it shadows
+    // graph.rs:712 (MOD-67 M5 PA-2): always consumes `Enter`, so it shadows
     // `backlog.replay` (`SHADOWING`).
     row(
         Act::GraphReroot,
@@ -1579,7 +1580,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["J"],
         "next row",
     ),
-    // documents.rs:465.
+    // documents.rs:462.
     row(
         Act::DocsPrevRow,
         BacklogDocs,
@@ -1587,9 +1588,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["K"],
         "previous row",
     ),
-    // documents.rs:469.
+    // documents.rs:463.
     row(Act::DocsAdd, BacklogDocs, "add", &["a"], "new document"),
-    // documents.rs:473.
+    // documents.rs:465.
     row(
         Act::DocsNewVersion,
         BacklogDocs,
@@ -1598,10 +1599,10 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "new version",
     ),
     // [backlog.notes]
-    // notes.rs:303.
+    // notes.rs:306.
     row(Act::NotesAdd, BacklogNotes, "add", &["a"], "add note"),
     // [backlog.prompt]
-    // prompt.rs:329 (MOD-67 M5 PA-1).
+    // prompt.rs:358 (MOD-67 M5 PA-1).
     row(
         Act::PromptNextTemplate,
         BacklogPrompt,
@@ -1609,7 +1610,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["n"],
         "next template",
     ),
-    // prompt.rs:330.
+    // prompt.rs:359.
     row(
         Act::PromptPrevTemplate,
         BacklogPrompt,
@@ -1618,7 +1619,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "previous template",
     ),
     // [backlog.reqs]
-    // detail/requirements.rs:478, :328 (the picker's `J`).
+    // detail/requirements.rs:543, :381 (the picker's `J`).
     row(
         Act::ReqsNextRow,
         BacklogReqs,
@@ -1626,7 +1627,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["J"],
         "next row",
     ),
-    // detail/requirements.rs:479, :331.
+    // detail/requirements.rs:544, :384.
     row(
         Act::ReqsPrevRow,
         BacklogReqs,
@@ -1634,7 +1635,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["K"],
         "previous row",
     ),
-    // detail/requirements.rs:480.
+    // detail/requirements.rs:545.
     row(
         Act::ReqsReconfirm,
         BacklogReqs,
@@ -1642,13 +1643,13 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["r"],
         "reconfirm",
     ),
-    // detail/requirements.rs:481.
+    // detail/requirements.rs:546.
     row(Act::ReqsCite, BacklogReqs, "cite", &["c"], "cite"),
-    // detail/requirements.rs:482.
+    // detail/requirements.rs:547.
     row(Act::ReqsUncite, BacklogReqs, "uncite", &["u"], "uncite"),
-    // detail/requirements.rs:334.
+    // detail/requirements.rs:387.
     row(Act::ReqsPick, BacklogReqs, "pick", &["enter"], "pick"),
-    // detail/requirements.rs:280.
+    // detail/requirements.rs:325.
     row(
         Act::ReqsAddresses,
         BacklogReqs,
@@ -1656,7 +1657,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["a"],
         "addresses",
     ),
-    // detail/requirements.rs:281.
+    // detail/requirements.rs:325 (`v`).
     row(
         Act::ReqsReserves,
         BacklogReqs,
@@ -1665,7 +1666,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "reserves",
     ),
     // [backlog.filter_form]
-    // filter.rs:250 (`'j'`; `Down` and `Tab` are `form.next_field`, `VIEW_DEFAULTS`).
+    // filter.rs:266 (`'j'`; `Down` and `Tab` are `form.next_field`, `VIEW_DEFAULTS`).
     row(
         Act::FilterNextRow,
         BacklogFilter,
@@ -1673,7 +1674,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["j"],
         "next row",
     ),
-    // filter.rs:251.
+    // filter.rs:267.
     row(
         Act::FilterPrevRow,
         BacklogFilter,
@@ -1681,10 +1682,10 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["k"],
         "previous row",
     ),
-    // filter.rs:255: clears the whole draft (a form verb, not an option's value).
+    // filter.rs:268: clears the whole draft (a form verb, not an option's value).
     row(Act::FilterClear, BacklogFilter, "clear", &["x"], "clear"),
     // [backlog.item]
-    // divergence.rs:247.
+    // divergence.rs:250.
     row(
         Act::ItemTheirs,
         BacklogItem,
@@ -1692,9 +1693,9 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["t", "T"],
         "theirs wins",
     ),
-    // divergence.rs:248.
+    // divergence.rs:251.
     row(Act::ItemMine, BacklogItem, "mine", &["m", "M"], "mine wins"),
-    // divergence.rs:249.
+    // divergence.rs:252.
     row(
         Act::ItemSwitchDiff,
         BacklogItem,
@@ -1703,7 +1704,7 @@ pub static CATALOGUE: &[ActionSpec] = &[
         "body/paths",
     ),
     // [chat]
-    // chat/mod.rs:498.
+    // chat/mod.rs:598.
     row(
         Act::ChatCompose,
         Chat,
@@ -1711,15 +1712,15 @@ pub static CATALOGUE: &[ActionSpec] = &[
         &["i", "enter"],
         "compose",
     ),
-    // chat/mod.rs:502.
+    // chat/mod.rs:604.
     row(Act::ChatNextAgent, Chat, "next_agent", &["a"], "next agent"),
-    // chat/mod.rs:506.
+    // chat/mod.rs:608.
     row(Act::ChatEnd, Chat, "end", &["esc"], "end chat (twice)"),
-    // transcript.rs:491.
+    // transcript.rs:492.
     row(Act::ChatThoughts, Chat, "thoughts", &["t"], "thoughts"),
-    // transcript.rs:483: no Chat stack offers `list.top`, so the name is the view's.
+    // transcript.rs:484: no Chat stack offers `list.top`, so the name is the view's.
     row(Act::ChatTop, Chat, "top", &["g"], "top"),
-    // transcript.rs:487.
+    // transcript.rs:488.
     row(Act::ChatBottom, Chat, "bottom", &["G"], "bottom"),
 ];
 
@@ -1759,17 +1760,18 @@ pub static VIEW_DEFAULTS: &[(Context, Act, &[&str])] = &[
     // requirements/forms.rs:96: the area form; every Requirements form takes the rows (§1).
     (Requirements, Act::FormNextField, &["down"]),
     (Requirements, Act::FormPrevField, &["up"]),
-    // runs.rs:658, :659: the document view maps `j`/`k` to `J`/`K` (only `RUNS_ARTIFACT` offers
-    // the scroll acts, so `J`/`K` stay the step cursor in browse; MOD-67 M5 §3.3).
+    // runs.rs:746, :747: the document view scrolls on `j`/`k` as on `J`/`K` (only
+    // `RUNS_ARTIFACT` offers the scroll acts, so `J`/`K` stay the step cursor in browse; MOD-67
+    // M5 §3.3).
     (BacklogRuns, Act::PaneScrollDown, &["j"]),
     (BacklogRuns, Act::PaneScrollUp, &["k"]),
-    // compose.rs:358, :357: the kind and title rows pass `Down`/`Up`.
+    // compose.rs:376, :377: the kind and title rows pass `Down`/`Up`.
     (BacklogDocs, Act::FormNextField, &["down"]),
     (BacklogDocs, Act::FormPrevField, &["up"]),
-    // filter.rs:239, :250 and :238, :251.
+    // filter.rs:262, :263.
     (BacklogFilter, Act::FormNextField, &["down"]),
     (BacklogFilter, Act::FormPrevField, &["up"]),
-    // item_form.rs:637, :723 and :636, :724.
+    // item_form.rs:664, :665 (a picker passes `Down`/`Up`, :735).
     (BacklogItem, Act::FormNextField, &["down"]),
     (BacklogItem, Act::FormPrevField, &["up"]),
 ];
@@ -1782,7 +1784,7 @@ pub static SHADOWING: &[(Act, Act)] = &[
     // migration_prompt.rs:97 + VIEW_DEFAULTS: `[migration] no` derives ["n", "esc", "N"], and
     // `Esc` is also overlay.close below it. Both close the prompt, nothing applied.
     (Act::ConfirmNo, Act::OverlayClose),
-    // graph.rs:680-686: the Graph pane answers `Enter` itself (re-root), always; the Backlog's
+    // graph.rs:712: the Graph pane answers `Enter` itself (re-root), always; the Backlog's
     // replay miss never fires there (MOD-67 M5 PA-2).
     (Act::GraphReroot, Act::BacklogReplay),
 ];
@@ -1795,7 +1797,7 @@ pub static STATE_GUARDED: &[(Act, Act)] = &[
     // boxes.rs:712-721: the executor question opens only over a listed box with a readable
     // list; otherwise `w` declines and falls through to the switcher (box_settings.rs:1356).
     (Act::BoxesExecutor, Act::Workspaces),
-    // backlog/mod.rs:791-797, ANA-26 §7.4: a project header folds; on an item row the fold
+    // backlog/mod.rs:779-786, ANA-26 §7.4: a project header folds; on an item row the fold
     // declines and the pane (Runs replays) or the miss answers. The tab tries the fold first
     // (MOD-67 M5 PA-2).
     (Act::ListFold, Act::BacklogReplay),
