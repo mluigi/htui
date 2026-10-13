@@ -15,18 +15,32 @@ test('auto polls at start and every poll_seconds', async ($, on) => {
   expect(waitingCalls(calls)).toBe(2)
 })
 
-test('poll_seconds below 5 is read as 5', { options: { poll_seconds: 1 } }, async ($, on) => {
-  const clock = mock.clock(on)
-  const calls: Call[] = []
-  htui(on, { waiting: ok(WAITING) }, calls)
-  await start($, on)
-  await clock.settle()
-  expect(waitingCalls(calls)).toBe(1)
-  await clock.advance(5000)
-  expect(waitingCalls(calls)).toBe(2)
-  await clock.advance(1000)
-  expect(waitingCalls(calls)).toBe(2)
-})
+// F7a: poll_seconds is clamped to [5, 3600]; 0 reads as the default 30. A non-number never
+// reaches the mod: the engine refuses options that do not fit plugin.json's userConfig.
+const PERIODS: [string, number, number][] = [
+  ['below 5 is read as 5', 1, 5],
+  ['4 is read as 5', 4, 5],
+  ['a negative is read as 5', -10, 5],
+  ['0 is read as 30', 0, 30],
+  ['above 3600 is read as 3600', 7200, 3600],
+  ['3600 is kept', 3600, 3600],
+  ['7 is kept', 7, 7],
+]
+
+for (const [name, poll_seconds, seconds] of PERIODS) {
+  test(`poll_seconds ${name}`, { options: { poll_seconds } }, async ($, on) => {
+    const clock = mock.clock(on)
+    const calls: Call[] = []
+    htui(on, { waiting: ok(WAITING) }, calls)
+    await start($, on)
+    await clock.settle()
+    expect(waitingCalls(calls)).toBe(1)
+    await clock.advance(seconds * 1000 - 1)
+    expect(waitingCalls(calls)).toBe(1)
+    await clock.advance(1)
+    expect(waitingCalls(calls)).toBe(2)
+  })
+}
 
 test('command polls nothing until /htui and stops when the pane closes', { options: { panel: 'command' } }, async ($, on) => {
   const clock = mock.clock(on)

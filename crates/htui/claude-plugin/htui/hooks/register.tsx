@@ -129,8 +129,11 @@ async function searchText($: EngineInterface, query: string): Promise<string> {
 
 /** `auto`, `command` or `off` (D12), as `register` read it from the options. */
 let panel: 'auto' | 'command' | 'off' = 'auto'
-/** The poll period: `poll_seconds`, at least 5 (A-12). */
+/** The poll period: `poll_seconds` clamped to [5, 3600]; 0 or a non-number reads as 30 (A-12). */
 let periodMs = 30000
+/** `poll_seconds` as a period in seconds: 0 or a non-number is 30; else clamped to [5, 3600]. */
+const pollSeconds = (v: unknown): number =>
+  typeof v !== 'number' || Number.isNaN(v) || v === 0 ? 30 : Math.min(3600, Math.max(5, v))
 /** The poll timer while one runs; a module reload drops it. */
 let timer: Timer | null = null
 /** Set while a poll runs, so a slow poll is never overlapped by the next tick. */
@@ -203,7 +206,7 @@ async function checkVersion($: EngineInterface): Promise<void> {
 
 export const register: Register = (on, options) => {
   panel = options.panel === 'command' || options.panel === 'off' ? options.panel : 'auto'
-  periodMs = Math.max(5, Number(options.poll_seconds) || 30) * 1000
+  periodMs = pollSeconds(options.poll_seconds) * 1000
   timer = null
   polling = false
 
