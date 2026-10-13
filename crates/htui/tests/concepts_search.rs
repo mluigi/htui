@@ -494,3 +494,28 @@ async fn a_rebound_reindex_acts_and_the_old_chord_is_inert() {
     assert!(frame.contains(&report), "`F5` re-indexed: {frame}");
     assert_eq!(harness.app().status, None);
 }
+
+/// MOD-67 M6 D4: a search that found nothing names the re-index key in force.
+#[tokio::test]
+async fn a_rebound_reindex_key_is_named_with_no_matches() {
+    let keys = htui::keys::load_str("version = 1\n[concepts]\nreindex = \"ctrl-o\"\n")
+        .expect("the keys load");
+    let mut harness = in_platform(
+        Harness::demo()
+            .with_agent_runtime(AgentRuntime::new(DriverFactory::new()))
+            .with_concepts_runtime(ConceptsRuntime::new(Arc::new(MemIndex::new())))
+            .with_keys(keys),
+    )
+    .await;
+    harness.key("ctrl-f");
+    for pressed in ["q", "u", "x"] {
+        harness.key(pressed);
+    }
+    harness.key("enter");
+    harness.drive_to_end().await;
+    let frame = harness.render();
+    assert!(
+        frame.contains("no matches \u{2014} Ctrl+o indexes this scope if the index is empty"),
+        "{frame}"
+    );
+}

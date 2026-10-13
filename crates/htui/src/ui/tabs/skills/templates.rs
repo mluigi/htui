@@ -26,10 +26,10 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
-use super::agent_help::{ACCEPTED, AgentHelp, HelpOutcome, Report};
+use super::agent_help::{AgentHelp, HelpOutcome, Report, accepted};
 use crate::app::{Action, Ctx, Handled};
-use crate::editor::{EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::editor::{ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::templates::{READ_NAME, REQUEST_NAMES, TemplateBody, TemplatesSnapshot};
 use crate::ui::cells::{self, cell_width};
@@ -65,9 +65,16 @@ const UNAVAILABLE: &str = "templates unavailable";
 /// A version key on a project header row.
 const SELECT_A_TEMPLATE: &str = "select a template";
 
-/// `Ctrl+S` on a phase body that never places `{{item}}` (ANA-5 §4.1: warn, never refuse).
-const OMITS_ITEM: &str =
-    "this phase template never places {{item}} \u{2014} Ctrl+S again saves anyway";
+/// `Ctrl+S` on a phase body that never places `{{item}}` (ANA-5 §4.1: warn, never refuse). `save`
+/// is `FormSave`'s label through `TEMPLATES_EDITOR` (MOD-67 M6 D4); with none bound the sentence
+/// says a save.
+fn omits_item(save: Option<&str>) -> String {
+    let warning = "this phase template never places {{item}}";
+    match save {
+        Some(save) => format!("{warning} \u{2014} {save} again saves anyway"),
+        None => format!("{warning} \u{2014} saving again saves anyway"),
+    }
+}
 
 /// `Esc` over a modified draft, the first time (OQ-6).
 const UNSAVED: &str = "unsaved changes \u{2014} Esc again discards";
@@ -121,19 +128,31 @@ const REVIEW_WIRE: &str = "wire: first 3 lines `---` / `verdict: approve|request
 const JUDGE_WIRE: &str = "wire: end with one ```json block {winner, reasons}";
 
 /// `TemplatesStale` over an open editor (plan D11). The view's own sentence, not the Settings
-/// tab's `CHANGED_ELSEWHERE`: that one names `Enter`, which is not this editor's key.
-fn template_changed_elsewhere(head: i32) -> String {
-    format!(
-        "saved elsewhere since you opened it \u{2014} v{head} is now the latest; your draft is \
-         kept and Ctrl+S saves it as v{}",
-        head + 1
-    )
+/// tab's `CHANGED_ELSEWHERE`: that one names `Enter`, which is not this editor's key. `save` is
+/// `FormSave`'s label through `TEMPLATES_EDITOR` (MOD-67 M6 D4); with none bound the sentence
+/// says what saving writes.
+fn template_changed_elsewhere(head: i32, save: Option<&str>) -> String {
+    let next = head + 1;
+    match save {
+        Some(save) => format!(
+            "saved elsewhere since you opened it \u{2014} v{head} is now the latest; your draft is \
+             kept and {save} saves it as v{next}"
+        ),
+        None => format!(
+            "saved elsewhere since you opened it \u{2014} v{head} is now the latest; your draft is \
+             kept and saving writes it as v{next}"
+        ),
+    }
 }
 
 /// MOD-59 D5: a save that applied although its re-read failed. It landed; the view still draws
-/// what it held, and `r` reads again.
-fn landed_unread(landed: &str, why: &str) -> String {
-    format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
+/// what it held, and `reload` (`Reload`'s label through `TEMPLATES_BROWSE`, MOD-67 M6 D4) reads
+/// again; with none bound the clause goes.
+fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
+    match reload {
+        Some(reload) => format!("{landed} \u{2014} the re-read failed, {reload} reloads: {why}"),
+        None => format!("{landed} \u{2014} the re-read failed: {why}"),
+    }
 }
 
 /// The Templates view. Holds no store handle and no `UserId` (`R-NF-3`).
@@ -416,7 +435,7 @@ impl TemplatesView {
         {
             let outcome = help.on_reply(reply, ctx);
             if outcome != HelpOutcome::Consumed {
-                self.apply_help(outcome);
+                self.apply_help(outcome, ctx.keys());
             }
         }
         match reply {
@@ -441,7 +460,7 @@ impl TemplatesView {
                     }
                     self.snapshot = Some((**snapshot).clone());
                     self.unavailable = None;
-                    self.land_save(*project, name, *version, None);
+                    self.land_save(*project, name, *version, None, ctx.keys());
                     self.clamp_cursor();
                 }
                 // No snapshot to check the scope by: only the save in flight owns this reply, and
@@ -450,7 +469,7 @@ impl TemplatesView {
                     if self.snapshot.is_none() {
                         self.unavailable = Some(why.clone());
                     }
-                    self.land_save(*project, name, *version, Some(why));
+                    self.land_save(*project, name, *version, Some(why), ctx.keys());
                 }
                 Err(_) => {}
             },
@@ -468,8 +487,11 @@ impl TemplatesView {
                             // The draft stays; the token moves to the head the user has now been
                             // told about, so the next `Ctrl+S` is a deliberate overwrite-by-append.
                             editor.token = Some(head.version);
-                            self.notice =
-                                Some(Notice::Error(template_changed_elsewhere(head.version)));
+                            let save = ctx.keys().label(views::TEMPLATES_EDITOR, Act::FormSave);
+                            self.notice = Some(Notice::Error(template_changed_elsewhere(
+                                head.version,
+                                save.as_deref(),
+                            )));
                         }
                     }
                 }
@@ -492,7 +514,7 @@ impl TemplatesView {
 
     /// The `$EDITOR` handoff came back (plan D11, OQ-3). No handoff pending (the scope changed
     /// meanwhile): ignored.
-    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {
+    pub(super) fn on_external_edit(&mut self, outcome: ExternalEditOutcome, ctx: &mut Ctx<'_>) {
         let Some(Pending { mut editor, resume }) = self.external.take() else {
             return;
         };
@@ -510,7 +532,11 @@ impl TemplatesView {
                         editor.area.set_cursor(error_at(&err).unwrap_or(text.len()));
                         Notice::Error(err.to_string())
                     }
-                    Ok(_) => Notice::Info(EDITED.to_owned()),
+                    Ok(_) => Notice::Info(edited(
+                        ctx.keys()
+                            .label(views::TEMPLATES_EDITOR, Act::FormSave)
+                            .as_deref(),
+                    )),
                 });
                 self.mode = Mode::Editing(editor);
             }
@@ -758,15 +784,16 @@ impl TemplatesView {
             }
             FieldOutcome::Submit => {
                 let (project, name) = (*project, field.text().unwrap_or_default().to_owned());
-                self.create(project, name);
+                self.create(project, name, ctx.keys());
                 Handled::Consumed
             }
         }
     }
 
     /// `Enter` on a new name (plan D13): an invalid or taken name is refused; otherwise the editor
-    /// opens on the compiled default of that name, or empty, with no token.
-    fn create(&mut self, project: ProjectId, name: String) {
+    /// opens on the compiled default of that name, or empty, with no token. A taken name sends the
+    /// user to the browse edit key `keys` binds (MOD-67 M6 D4).
+    fn create(&mut self, project: ProjectId, name: String, keys: &Keys) {
         if !PromptTemplate::name_is_valid(&name) {
             self.notice = Some(Notice::Error(invalid_template_name(&name)));
             return;
@@ -776,9 +803,12 @@ impl TemplatesView {
             .as_ref()
             .is_some_and(|snapshot| snapshot.head(project, &name).is_some())
         {
-            self.notice = Some(Notice::Error(format!(
-                "`{name}` exists \u{2014} select it and press e"
-            )));
+            self.notice = Some(Notice::Error(
+                match keys.label(views::TEMPLATES_BROWSE, Act::Edit) {
+                    Some(edit) => format!("`{name}` exists \u{2014} select it and press {edit}"),
+                    None => format!("`{name}` exists"),
+                },
+            ));
             return;
         }
         let body = body_of(&name).unwrap_or("");
@@ -804,7 +834,7 @@ impl TemplatesView {
             && let Some(help) = editor.help.as_mut()
         {
             let outcome = help.on_key(key, ctx);
-            return self.apply_help(outcome);
+            return self.apply_help(outcome, ctx.keys());
         }
         let busy = self.busy;
         let page = self.page.get();
@@ -873,7 +903,11 @@ impl TemplatesView {
                 if role == TemplateRole::Phase && parsed.omits_item() && !editor.confirm_item =>
             {
                 editor.confirm_item = true;
-                self.notice = Some(Notice::Info(OMITS_ITEM.to_owned()));
+                self.notice = Some(Notice::Info(omits_item(
+                    ctx.keys()
+                        .label(views::TEMPLATES_EDITOR, Act::FormSave)
+                        .as_deref(),
+                )));
             }
             Ok(_) => {
                 let body = editor.area.text().to_owned();
@@ -948,7 +982,7 @@ impl TemplatesView {
     /// What the open help's key or reply did. An accepted proposal replaces the draft through the
     /// `$EDITOR` return's gate (`on_external_edit`'s `Edited` arm): `parse` runs, the cursor goes
     /// to its error, and nothing is sent. `original` is left alone, so `Esc` still asks first.
-    fn apply_help(&mut self, outcome: HelpOutcome) -> Handled {
+    fn apply_help(&mut self, outcome: HelpOutcome, keys: &Keys) -> Handled {
         let Mode::Editing(editor) = &mut self.mode else {
             return Handled::Pass;
         };
@@ -972,7 +1006,10 @@ impl TemplatesView {
                         editor.area.set_cursor(error_at(&err).unwrap_or(text.len()));
                         Notice::Error(err.to_string())
                     }
-                    Ok(_) => Notice::Info(ACCEPTED.to_owned()),
+                    Ok(_) => Notice::Info(accepted(
+                        keys.label(views::TEMPLATES_EDITOR, Act::FormSave)
+                            .as_deref(),
+                    )),
                 });
             }
         }
@@ -1057,7 +1094,14 @@ impl TemplatesView {
     ///
     /// Keys typed while the save was in flight still edit the draft. When they did, the editor
     /// stays open on them with the token at the saved version, so the next `Ctrl+S` appends them.
-    fn land_save(&mut self, project: ProjectId, name: &str, version: i32, unread: Option<&str>) {
+    fn land_save(
+        &mut self,
+        project: ProjectId,
+        name: &str,
+        version: i32,
+        unread: Option<&str>,
+        keys: &Keys,
+    ) {
         if self.busy != Some(SAVE_NAME) {
             return;
         }
@@ -1085,17 +1129,24 @@ impl TemplatesView {
                     editor.original = sent;
                     editor.confirm_item = false;
                     editor.esc_armed = false;
-                    format!(
-                        "saved v{version} \u{2014} later edits kept, Ctrl+S saves them as v{}",
-                        version + 1
-                    )
+                    match keys.label(views::TEMPLATES_EDITOR, Act::FormSave) {
+                        Some(save) => format!(
+                            "saved v{version} \u{2014} later edits kept, {save} saves them as v{}",
+                            version + 1
+                        ),
+                        None => format!("saved v{version} \u{2014} later edits kept"),
+                    }
                 }
             }
             Mode::Browse | Mode::Naming { .. } => format!("saved v{version}"),
         };
         self.notice = Some(match unread {
             None => Notice::Info(landed),
-            Some(why) => Notice::Error(landed_unread(&landed, why)),
+            Some(why) => Notice::Error(landed_unread(
+                &landed,
+                why,
+                keys.label(views::TEMPLATES_BROWSE, Act::Reload).as_deref(),
+            )),
         });
     }
 
@@ -1354,6 +1405,28 @@ mod tests {
     use htui_store::Backend;
 
     use super::*;
+
+    /// MOD-67 M6 D4: the Templates notices name the key in force, and drop it unbound.
+    #[test]
+    fn the_templates_notices_name_their_key_or_none() {
+        assert_eq!(
+            omits_item(Some("F2")),
+            "this phase template never places {{item}} \u{2014} F2 again saves anyway"
+        );
+        assert_eq!(
+            omits_item(None),
+            "this phase template never places {{item}} \u{2014} saving again saves anyway"
+        );
+        assert!(template_changed_elsewhere(2, None).ends_with("saving writes it as v3"));
+        assert_eq!(
+            landed_unread("saved v2", "gone", Some("F5")),
+            "saved v2 \u{2014} the re-read failed, F5 reloads: gone"
+        );
+        assert_eq!(
+            landed_unread("saved v2", "gone", None),
+            "saved v2 \u{2014} the re-read failed: gone"
+        );
+    }
     use crate::app::{Action, Emit, TopBarState};
     use crate::keys::Keys;
     use crate::store_worker::{Origin, StoreRequest};
@@ -2152,7 +2225,7 @@ mod tests {
         view.on_reply(&agent_fixtures::chunk("```\nDo {{item}}.\n```\n"), &mut ctx);
         view.on_reply(&agent_fixtures::ended(StopReason::EndTurn), &mut ctx);
         view.on_key(key('y'), &mut ctx);
-        assert_eq!(view.notice, Some(Notice::Info(ACCEPTED.to_owned())));
+        assert_eq!(view.notice, Some(Notice::Info(accepted(Some("Ctrl+s")))));
         view.on_key(ctrl('s'), &mut ctx);
         let save = bench.one();
         assert!(

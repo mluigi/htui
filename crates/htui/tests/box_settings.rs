@@ -999,7 +999,7 @@ async fn a_stale_reply_over_the_quirks_editor_names_ctrl_s() {
         frame.contains("changed elsewhere since you opened it"),
         "{frame}"
     );
-    assert!(frame.contains("ctrl-s retries"), "{frame}");
+    assert!(frame.contains("Ctrl+s retries"), "{frame}");
     assert!(!frame.contains("Enter retries"), "{frame}");
 
     bench.key(&mut section, "ctrl-s");
@@ -1832,7 +1832,7 @@ async fn boxes_stale_over_the_spec_editor_keeps_the_text_and_takes_the_new_token
         frame.contains("changed elsewhere since you opened it"),
         "{frame}"
     );
-    assert!(frame.contains("ctrl-s retries"), "{frame}");
+    assert!(frame.contains("Ctrl+s retries"), "{frame}");
 
     bench.key(&mut section, "ctrl-s");
     assert_eq!(
@@ -2246,4 +2246,30 @@ async fn the_empty_list_renders() {
     insta::with_settings!({ filters => vec![DIGEST_FILTER] }, {
         insta::assert_snapshot!("no_boxes", frame);
     });
+}
+
+/// MOD-67 M6 D4: a stale quirks save names the save key in force as its retry.
+#[tokio::test]
+async fn a_rebound_save_key_is_named_after_a_stale_quirks_save() {
+    let keys =
+        htui::keys::load_str("version = 1\n[form]\nsave = \"f2\"\n").expect("the key file loads");
+    let bench = SectionBench::new().await.with_keys(keys);
+    let mut section = BoxesSection::new();
+    feed(&bench, &mut section, &snap_of(MemStore::demo()).await);
+
+    bench.key(&mut section, "e");
+    type_at(&bench, &mut section, "no admin rights");
+    bench.key(&mut section, "f2");
+    only_edit(&requests(&bench));
+    bench.reply(
+        &mut section,
+        &StoreReply::BoxesStale(Box::new(demo_at_version(5).await)),
+    );
+
+    let frame = bench.render_section(&section, 100);
+    let words = frame.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        words.contains("reloaded; F2 retries against the current row"),
+        "{frame}"
+    );
 }

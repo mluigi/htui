@@ -82,8 +82,14 @@ const HINT_EDITING: HintSpec = &[
     Hint::Text("empty clears"),
 ];
 
-/// What `e` says on a group header (B-1).
-const NOT_A_VALUE_ROW: &str = "`e` edits a value row";
+/// What `e` says on a group header (B-1). `edit` is `Edit`'s label through `PROMPT_BROWSE`
+/// (MOD-67 M6 D4); with none bound the sentence names no key.
+fn not_a_value_row(edit: Option<&str>) -> String {
+    match edit {
+        Some(edit) => format!("`{edit}` edits a value row"),
+        None => "only a value row is edited".to_owned(),
+    }
+}
 
 /// What an empty field over a rung that holds nothing says: there is nothing to clear, so there is
 /// no request to send (D10).
@@ -462,9 +468,11 @@ impl PromptSection {
     ///
     /// Empty when the rung holds nothing, which is the same field an `Enter` reads as "clear"
     /// — and on an unset rung that is not a write at all (D10).
-    fn open_edit(&mut self, row: Row) {
+    fn open_edit(&mut self, row: Row, keys: &Keys) {
         let Some(opening) = self.target_of(row) else {
-            self.say(NOT_A_VALUE_ROW);
+            self.say(&not_a_value_row(
+                keys.label(views::PROMPT_BROWSE, Act::Edit).as_deref(),
+            ));
             return;
         };
         let editor = Editor {
@@ -872,7 +880,7 @@ impl SettingsSection for PromptSection {
                     if !self.blocked()
                         && let Some(row) = self.selected()
                     {
-                        self.open_edit(row);
+                        self.open_edit(row, ctx.keys());
                     }
                 }
                 Act::ListDown => self.move_cursor(true),
@@ -1171,6 +1179,13 @@ fn clamp_line(peer: SettingKey, used: i64) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// MOD-67 M6 D4: the header refusal names the edit key, and none unbound.
+    #[test]
+    fn not_a_value_row_names_the_edit_key_or_none() {
+        assert_eq!(not_a_value_row(Some("e")), "`e` edits a value row");
+        assert_eq!(not_a_value_row(None), "only a value row is edited");
+    }
 
     /// The blob a project holds when it stores `key` — built from the registry, because no key is
     /// spelled in this file (acceptance line 4).

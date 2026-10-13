@@ -63,8 +63,15 @@ pub const NOT_READ: &str = "queue settings not read yet";
 /// What the rows pane says when the read itself was refused, before the refusal's sentence.
 pub const UNAVAILABLE: &str = "queue settings unavailable";
 
-/// What `e` says on a group header.
-pub const NOT_A_VALUE_ROW: &str = "`e` edits a value row";
+/// What `e` says on a group header. `edit` is `Edit`'s first label through `QUEUE_BROWSE`
+/// (MOD-67 M6 D4); with none bound the sentence names no key.
+#[must_use]
+pub fn not_a_value_row(edit: Option<&str>) -> String {
+    match edit {
+        Some(edit) => format!("`{edit}` edits a value row"),
+        None => "only a value row is edited".to_owned(),
+    }
+}
 
 /// What an empty field over a key that holds nothing says: there is nothing to clear.
 pub const NOTHING_SET: &str = "nothing is set here";
@@ -337,9 +344,11 @@ impl QueueSection {
     }
 
     /// `e`: the row under the cursor, prefilled with its value as typed.
-    fn open_edit(&mut self, row: Row) {
+    fn open_edit(&mut self, row: Row, keys: &Keys) {
         let Some((target, stored, expected)) = self.opening(row) else {
-            self.say(NOT_A_VALUE_ROW);
+            self.say(&not_a_value_row(
+                keys.label(views::QUEUE_BROWSE, Act::Edit).as_deref(),
+            ));
             return;
         };
         let text = stored.map_or_else(String::new, |value| typed(target.key(), value));
@@ -645,7 +654,7 @@ impl SettingsSection for QueueSection {
                     if !self.blocked()
                         && let Some(row) = self.selected()
                     {
-                        self.open_edit(row);
+                        self.open_edit(row, ctx.keys());
                     }
                 }
                 Act::ListDown => self.move_cursor(true),
@@ -850,6 +859,13 @@ fn reload(snapshot: &QueueSettingsSnapshot, target: Target) -> Reload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// MOD-67 M6 D4: the header refusal names the edit key, and none unbound.
+    #[test]
+    fn not_a_value_row_names_the_edit_key_or_none() {
+        assert_eq!(not_a_value_row(Some("e")), "`e` edits a value row");
+        assert_eq!(not_a_value_row(None), "only a value row is edited");
+    }
 
     /// The editor's `Debug` names the target and the token, never the buffer.
     #[test]

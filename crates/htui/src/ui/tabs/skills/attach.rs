@@ -467,7 +467,8 @@ impl AttachPane {
         };
         let target = target(*row, snapshot, ctx);
         let name = skill_name(snapshot, self.skill);
-        let question = format!("detach `{name}` from {target}? y detaches, any other key keeps it");
+        let yes = ctx.keys().label(views::ATTACH_CONFIRM, Act::ConfirmYes);
+        let question = detach_question(&name, &target, yes.as_deref());
         self.mode = AttachMode::ConfirmDetach {
             key,
             token: stored.updated_at,
@@ -1184,10 +1185,38 @@ fn render_picker(
     );
 }
 
+/// The detach question over `name` and `target`, its answer `yes` (`ConfirmYes`'s label through
+/// `ATTACH_CONFIRM`, MOD-67 M6 D4); with none bound the question stands alone.
+fn detach_question(name: &str, target: &str, yes: Option<&str>) -> String {
+    match yes {
+        Some(yes) => {
+            format!("detach `{name}` from {target}? {yes} detaches, any other key keeps it")
+        }
+        None => format!("detach `{name}` from {target}?"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ui::cells::cell_width;
+
+    /// MOD-67 M6 D4: the detach question names the answer in force through `ATTACH_CONFIRM`, and
+    /// asks alone when none is bound.
+    #[test]
+    fn a_rebound_detach_answer_is_named() {
+        let keys =
+            crate::keys::load_str("version = 1\n[skills.attach]\nyes = \"Y\"\n").expect("loads");
+        let yes = keys.label(views::ATTACH_CONFIRM, Act::ConfirmYes);
+        assert_eq!(
+            detach_question("tests", "global", yes.as_deref()),
+            "detach `tests` from global? Y detaches, any other key keeps it"
+        );
+        assert_eq!(
+            detach_question("tests", "global", None),
+            "detach `tests` from global?"
+        );
+    }
 
     /// A ZWJ family: one cluster of five code points, 2 cells.
     const FAMILY: &str = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";

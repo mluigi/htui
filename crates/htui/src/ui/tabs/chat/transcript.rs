@@ -498,23 +498,25 @@ impl Transcript {
     }
 
     /// The last `resume_failed` row's lines, or none: what a chat whose handoff start failed too
-    /// shows above its refusal (MOD-37 review L-6).
+    /// shows above its refusal (MOD-37 review L-6). `unfold` as [`Transcript::lines`] takes it.
     #[must_use]
-    pub fn resume_failed_lines(&self, theme: &Theme) -> Vec<Line<'static>> {
+    pub fn resume_failed_lines(&self, theme: &Theme, unfold: Option<&str>) -> Vec<Line<'static>> {
         self.rows
             .iter()
             .rev()
             .find(|row| matches!(row, TranscriptRow::ResumeFailed { .. }))
-            .map(|row| self.render_row(row, theme))
+            .map(|row| self.render_row(row, theme, unfold))
             .unwrap_or_default()
     }
 
-    /// The transcript as lines, tail-first when nothing has been scrolled.
+    /// The transcript as lines, tail-first when nothing has been scrolled. `unfold` is the
+    /// thoughts key a folded thought names, `ChatThoughts`'s label through the stack the
+    /// transcript is read in (MOD-67 M6 D4); with none bound a folded thought names no key.
     #[must_use]
-    pub fn lines(&self, height: usize, theme: &Theme) -> Vec<Line<'static>> {
+    pub fn lines(&self, height: usize, theme: &Theme, unfold: Option<&str>) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         for row in &self.rows {
-            lines.extend(self.render_row(row, theme));
+            lines.extend(self.render_row(row, theme, unfold));
         }
         self.rendered.set(lines.len());
         self.height.set(height);
@@ -525,8 +527,13 @@ impl Transcript {
         lines.into_iter().skip(first).take(height).collect()
     }
 
-    /// One row's lines.
-    fn render_row(&self, row: &TranscriptRow, theme: &Theme) -> Vec<Line<'static>> {
+    /// One row's lines; a folded thought names `unfold` ([`Transcript::lines`]).
+    fn render_row(
+        &self,
+        row: &TranscriptRow,
+        theme: &Theme,
+        unfold: Option<&str>,
+    ) -> Vec<Line<'static>> {
         match row {
             TranscriptRow::Prompt { text } | TranscriptRow::FollowUp { text } => {
                 vec![Line::from(vec![
@@ -541,10 +548,11 @@ impl Transcript {
             TranscriptRow::Thought { text, .. } => {
                 if self.fold_thoughts {
                     let summary = text.lines().next().unwrap_or_default();
-                    vec![Line::styled(
-                        format!("thought  {summary} (t to unfold)"),
-                        theme.dim,
-                    )]
+                    let folded = match unfold {
+                        Some(unfold) => format!("thought  {summary} ({unfold} to unfold)"),
+                        None => format!("thought  {summary}"),
+                    };
+                    vec![Line::styled(folded, theme.dim)]
                 } else {
                     text.lines()
                         .map(|line| Line::styled(format!("thought  {line}"), theme.dim))
@@ -826,7 +834,7 @@ mod tests {
         assert_eq!(rows.len(), 1, "the refusal is a row of its own: {rows:?}");
         let theme = Theme::default();
         let text = transcript
-            .render_row(&rows[0], &theme)
+            .render_row(&rows[0], &theme, Some("t"))
             .first()
             .map(ToString::to_string)
             .unwrap_or_default();
@@ -884,7 +892,7 @@ mod tests {
         assert_eq!(live.rows(), &expected, "one row, live");
 
         let theme = Theme::default();
-        let lines = live.render_row(&live.rows()[0], &theme);
+        let lines = live.render_row(&live.rows()[0], &theme, Some("t"));
         let shown: Vec<String> = lines.iter().map(ToString::to_string).collect();
         assert_eq!(
             shown,
@@ -957,10 +965,14 @@ mod tests {
             message_id: None,
         })));
         let theme = Theme::default();
-        assert_eq!(transcript.lines(20, &theme).len(), 1, "folded");
+        assert_eq!(transcript.lines(20, &theme, Some("t")).len(), 1, "folded");
+        // MOD-67 M6 D4: the folded row names the thoughts key in force, and none unbound.
+        let named = |unfold| transcript.lines(20, &theme, unfold)[0].to_string();
+        assert_eq!(named(Some("T")), "thought  first (T to unfold)");
+        assert_eq!(named(None), "thought  first");
 
         transcript.on_act(Act::ChatThoughts);
-        assert_eq!(transcript.lines(20, &theme).len(), 3, "unfolded");
+        assert_eq!(transcript.lines(20, &theme, Some("t")).len(), 3, "unfolded");
     }
 
     /// The fixture's `plan` step is eight persisted rows and seven rendered ones: the
@@ -1034,7 +1046,7 @@ mod tests {
             })));
         }
         let theme = Theme::default();
-        let tail = transcript.lines(3, &theme);
+        let tail = transcript.lines(3, &theme, Some("t"));
         assert_eq!(tail.len(), 3);
         assert!(
             tail[2].to_string().contains("cancelled"),
@@ -1043,7 +1055,7 @@ mod tests {
         );
 
         transcript.on_act(Act::ChatTop);
-        let top = transcript.lines(3, &theme);
+        let top = transcript.lines(3, &theme, Some("t"));
         assert!(
             top[0].to_string().contains("end_turn"),
             "`g` goes to the first line: {:?}",

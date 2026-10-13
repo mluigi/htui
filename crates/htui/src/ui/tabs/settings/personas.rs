@@ -144,8 +144,20 @@ pub const COMMAND_RUN_IS_Y_OR_N: &str = "`command-run (y/n)` is y or n";
 /// The `permission-default` field holds something else.
 pub const DEFAULT_IS_ASK_OR_DENY: &str = "`permission-default` is blank, ask or deny";
 
-/// A body or rules save whose token was spent: the editor stays, and `Ctrl+S` retries.
-pub const CHANGED_ELSEWHERE_SAVE: &str = "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+S retries against the current row";
+/// A body or rules save whose token was spent: the editor stays, and `save`, `FormSave`'s label
+/// through `PERSONAS_EDITOR`, retries (MOD-67 M6 D4); with none bound the sentence says a save.
+#[must_use]
+pub fn changed_elsewhere_save(save: Option<&str>) -> String {
+    match save {
+        Some(save) => format!(
+            "changed elsewhere since you opened it \u{2014} reloaded; {save} retries against the \
+             current row"
+        ),
+        None => "changed elsewhere since you opened it \u{2014} reloaded; save again to retry \
+                 against the current row"
+            .to_owned(),
+    }
+}
 
 /// What a spent token says when fields the user changed were changed elsewhere too, before their
 /// labels (copied from `agents.rs`, which stays untouched). Opens like `CHANGED_ELSEWHERE`, so
@@ -993,7 +1005,7 @@ impl PersonasSection {
     }
 
     /// What one persona write did (D21), once the rows are the re-read's.
-    fn on_written(&mut self, outcome: &PersonaWrite) {
+    fn on_written(&mut self, outcome: &PersonaWrite, keys: &Keys) {
         match outcome {
             PersonaWrite::Created { id, name } => {
                 if matches!(
@@ -1072,7 +1084,7 @@ impl PersonasSection {
                 }
                 self.notice = Some(Notice::Info(notice));
             }
-            PersonaWrite::Stale { id } => self.on_stale(*id),
+            PersonaWrite::Stale { id } => self.on_stale(*id, keys),
             PersonaWrite::Gone { id } => {
                 if self.editing(*id)
                     || matches!(&self.mode, Mode::Deleting { id: asked, .. } if asked == id)
@@ -1086,8 +1098,10 @@ impl PersonasSection {
         }
     }
 
-    /// A spent token: rebase an open editor of `id` onto the re-read's row.
-    fn on_stale(&mut self, id: PersonaId) {
+    /// A spent token: rebase an open editor of `id` onto the re-read's row. The body and rules
+    /// editors' sentence names their save key as `keys` binds it (MOD-67 M6 D4).
+    fn on_stale(&mut self, id: PersonaId, keys: &Keys) {
+        let save = keys.label(views::PERSONAS_EDITOR, Act::FormSave);
         if !self.editing(id) {
             self.notice = Some(Notice::Error(CHANGED_ELSEWHERE_CLOSED.to_owned()));
             return;
@@ -1117,7 +1131,7 @@ impl PersonasSection {
                 }
                 editor.sent = None;
                 editor.esc_armed = false;
-                CHANGED_ELSEWHERE_SAVE.to_owned()
+                changed_elsewhere_save(save.as_deref())
             }
             Mode::Rules(editor) => {
                 let rules = format_rules(&row.permission.rules);
@@ -1129,7 +1143,7 @@ impl PersonasSection {
                 editor.default = row.permission.default;
                 editor.sent = None;
                 editor.esc_armed = false;
-                CHANGED_ELSEWHERE_SAVE.to_owned()
+                changed_elsewhere_save(save.as_deref())
             }
             Mode::Browse
             | Mode::Deleting { .. }
@@ -1886,7 +1900,7 @@ impl SettingsSection for PersonasSection {
         handled
     }
 
-    fn on_reply(&mut self, reply: &StoreReply, _ctx: &mut Ctx<'_>) {
+    fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
         match reply {
             StoreReply::Personas(rows) => {
                 self.personas.clone_from(rows);
@@ -1900,7 +1914,7 @@ impl SettingsSection for PersonasSection {
                 self.unavailable = None;
                 self.busy = None;
                 self.clamp();
-                self.on_written(outcome);
+                self.on_written(outcome, ctx.keys());
             }
             StoreReply::PersonaImports(imports) => {
                 if let Ok(rows) = &imports.personas {
@@ -1963,6 +1977,26 @@ impl SettingsSection for PersonasSection {
         frame.render_widget(
             Paragraph::new(Line::styled(self.hint(ctx.keys()), hint)),
             hint_area,
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// MOD-67 M6 D4: the stale body/rules notice names the save key, and says a save unbound.
+    #[test]
+    fn changed_elsewhere_save_names_the_save_key_or_none() {
+        assert_eq!(
+            changed_elsewhere_save(Some("Ctrl+s")),
+            "changed elsewhere since you opened it \u{2014} reloaded; Ctrl+s retries against the \
+             current row"
+        );
+        assert_eq!(
+            changed_elsewhere_save(None),
+            "changed elsewhere since you opened it \u{2014} reloaded; save again to retry against \
+             the current row"
         );
     }
 }

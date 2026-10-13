@@ -9,7 +9,7 @@ use crate::qdrant_settings_info::{QdrantSnapshot, QdrantState};
 use crate::secrets_settings::{DEMO_SESSION, Redacted};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::cells::cell_width;
-use crate::ui::tabs::settings::{SectionId, SettingsSection, modal_rest, wrapped};
+use crate::ui::tabs::settings::{SectionId, SettingsSection, answers, asked, modal_rest, wrapped};
 use crate::ui::{FieldOutcome, TextField};
 use crossterm::event::KeyEvent;
 
@@ -25,7 +25,8 @@ const DEMO_ROW: &str = "n/a in a demo session";
 const UNREADABLE: &str = "the keyring could not be read";
 const UNREADABLE_GUIDE: &str =
     "the keyring could not be read; Enter tries to store a Qdrant URL in it";
-const CONFIRM_CLEAR: &str = "Remove the Qdrant settings from the keyring? y / n";
+/// The clear question; the answers are appended as the keys bind them (MOD-67 M6 PA-6).
+const CONFIRM_CLEAR: &str = "Remove the Qdrant settings from the keyring?";
 
 // The hint rows (MOD-67 M3 D9): rendered through the mode's stack, so a rebound key shows its
 // new chord. `Enter`/`Esc` in the editors are the text field's own keys (D13), written as text.
@@ -604,7 +605,8 @@ impl SettingsSection for QdrantSection {
                 );
             }
             Mode::ConfirmClear => {
-                lines.extend(question(CONFIRM_CLEAR, room, ctx.theme));
+                let answers = answers(ctx.keys(), views::QDRANT_CONFIRM);
+                lines.extend(question(&asked(CONFIRM_CLEAR, &answers), room, ctx.theme));
             }
         }
 

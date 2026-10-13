@@ -14,7 +14,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::app::{Action, Ctx, Handled, OverlayAction};
-use crate::keys::{Act, Hint, HintSpec, KeyChord, Stack, views};
+use crate::keys::{Act, Hint, HintSpec, KeyChord, Keys, Stack, views};
 use crate::store_worker::{StoreReply, StoreRequest};
 use crate::ui::Theme;
 use crate::ui::cells::{self, cell_width};
@@ -93,10 +93,10 @@ impl WorkspaceSwitcher {
 
     /// The box's contents: one line per workspace, a blank line, then `hint` (the rendered
     /// [`HINT`]).
-    fn lines(&self, hint: &str, theme: &Theme) -> Vec<Line<'static>> {
+    fn lines(&self, hint: &str, keys: &Keys, theme: &Theme) -> Vec<Line<'static>> {
         let mut lines = if self.workspaces.is_empty() {
             vec![Line::styled(
-                format!("{NO_CURSOR}{}", self.empty_text()),
+                format!("{NO_CURSOR}{}", self.empty_text(keys)),
                 theme.dim,
             )]
         } else {
@@ -117,12 +117,18 @@ impl WorkspaceSwitcher {
         lines
     }
 
-    /// What an empty list says. Never a blank box (plan D11's rule, applied to an overlay).
-    fn empty_text(&self) -> &'static str {
-        if self.loaded {
-            "no workspaces — `N` in Settings > Hierarchy creates one"
-        } else {
-            "reading the store"
+    /// What an empty list says. Never a blank box (plan D11's rule, applied to an overlay). The
+    /// key that creates a workspace is the one `keys` binds where it acts, Settings > Hierarchy
+    /// (`HIERARCHY_BROWSE`, MOD-67 M6 D4); with none bound the sentence names only the place.
+    fn empty_text(&self, keys: &Keys) -> String {
+        if !self.loaded {
+            return "reading the store".to_owned();
+        }
+        match keys.label(views::HIERARCHY_BROWSE, Act::HierarchyNewWorkspace) {
+            Some(new) => {
+                format!("no workspaces \u{2014} `{new}` in Settings > Hierarchy creates one")
+            }
+            None => "no workspaces \u{2014} create one in Settings > Hierarchy".to_owned(),
         }
     }
 
@@ -205,7 +211,11 @@ impl Overlay for WorkspaceSwitcher {
     }
 
     fn render(&self, frame: &mut Frame<'_>, area: Rect, ctx: &Ctx<'_>) {
-        let lines = self.lines(&ctx.keys().hint(views::SWITCHER, HINT), ctx.theme);
+        let lines = self.lines(
+            &ctx.keys().hint(views::SWITCHER, HINT),
+            ctx.keys(),
+            ctx.theme,
+        );
         let widest = widest(&lines);
         let width = u16::try_from(widest)
             .unwrap_or(u16::MAX)
@@ -257,7 +267,6 @@ mod tests {
     use htui_core::model::WorkspaceId;
 
     use super::*;
-    use crate::keys::Keys;
 
     /// The hint rendered with the compiled keys.
     fn hint() -> String {
@@ -273,6 +282,35 @@ mod tests {
         }
     }
 
+    /// MOD-67 M6 D4: the empty list names the key that creates a workspace where it acts
+    /// (`HIERARCHY_BROWSE`), and only the place when it is unbound.
+    #[test]
+    fn the_empty_switcher_names_the_hierarchy_key() {
+        let switcher = WorkspaceSwitcher {
+            workspaces: Vec::new(),
+            selected: 0,
+            loaded: true,
+        };
+        assert_eq!(
+            switcher.empty_text(Keys::compiled()),
+            "no workspaces \u{2014} `N` in Settings > Hierarchy creates one"
+        );
+        let keys =
+            crate::keys::load_str("version = 1\n[settings.hierarchy]\nnew_workspace = \"W\"\n")
+                .expect("loads");
+        assert_eq!(
+            switcher.empty_text(&keys),
+            "no workspaces \u{2014} `W` in Settings > Hierarchy creates one"
+        );
+        let unbound =
+            crate::keys::load_str("version = 1\n[settings.hierarchy]\nnew_workspace = []\n")
+                .expect("loads");
+        assert_eq!(
+            switcher.empty_text(&unbound),
+            "no workspaces \u{2014} create one in Settings > Hierarchy"
+        );
+    }
+
     /// MOD-60: the name column is measured and padded in cells, so a CJK name's project count
     /// lines up with an ASCII one's.
     #[test]
@@ -282,7 +320,7 @@ mod tests {
             selected: 0,
             loaded: true,
         };
-        let lines = switcher.lines(&hint(), &Theme::default());
+        let lines = switcher.lines(&hint(), Keys::compiled(), &Theme::default());
         let first: Vec<usize> = lines[..2]
             .iter()
             .map(|line| cell_width(&line.spans[0].content))
@@ -304,7 +342,7 @@ mod tests {
             selected: 0,
             loaded: true,
         };
-        let lines = switcher.lines(&hint(), &Theme::default());
+        let lines = switcher.lines(&hint(), Keys::compiled(), &Theme::default());
         let mut buffer = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 80, 3));
         let ends: Vec<u16> = (0u16..3)
             .map(|y| buffer.set_line(0, y, &lines[usize::from(y)], 80).0)
@@ -322,7 +360,7 @@ mod tests {
             selected: 0,
             loaded: true,
         };
-        let lines = switcher.lines(&hint(), &Theme::default());
+        let lines = switcher.lines(&hint(), Keys::compiled(), &Theme::default());
         let row: String = lines[0]
             .spans
             .iter()

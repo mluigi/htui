@@ -132,30 +132,42 @@ fn in_flight(busy: &str) -> String {
 }
 
 /// MOD-59 D5: a write that applied although its re-read failed. It landed; the tab still draws
-/// what it held, and `r` reads again.
-fn landed_unread(landed: &str, why: &str) -> String {
-    format!("{landed} \u{2014} the re-read failed, r reloads: {why}")
+/// what it held, and `reload` (`Reload`'s label through `REQUIREMENTS_BROWSE`, MOD-67 M6 D4) reads
+/// again; with none bound the clause goes.
+fn landed_unread(landed: &str, why: &str, reload: Option<&str>) -> String {
+    match reload {
+        Some(reload) => format!("{landed} \u{2014} the re-read failed, {reload} reloads: {why}"),
+        None => format!("{landed} \u{2014} the re-read failed: {why}"),
+    }
 }
 
 /// MOD-59 review M1: a mint's `Failed`. A mint whose COMMIT landed but whose answer was lost comes
 /// back as the same `Failed`, and its retry would mint a second requirement, so the notice does not
 /// call it a refusal. The form keeps its text, and the tab re-reads the tree, which is drawn beside
-/// the form: the check needs no `Esc`, which would drop the draft (re-review L1).
-fn mint_failed(why: &str) -> String {
-    format!(
-        "{why} \u{2014} it may have been written; the tree is being re-read, look for it there \
-         before Ctrl+S"
-    )
+/// the form: the check needs no `Esc`, which would drop the draft (re-review L1). `save` is
+/// `FormSave`'s label through `REQUIREMENTS_FORM` (MOD-67 M6 D4); with none bound the sentence
+/// says to look first.
+fn mint_failed(why: &str, save: Option<&str>) -> String {
+    let hedge = format!(
+        "{why} \u{2014} it may have been written; the tree is being re-read, look for it there"
+    );
+    match save {
+        Some(save) => format!("{hedge} before {save}"),
+        None => format!("{hedge} first"),
+    }
 }
 
 /// A `RequirementsStale` over an open form: the text is kept and the token moved to the head.
 /// The tab's own sentence rather than Settings' `CHANGED_ELSEWHERE`, whose retry is `Enter`
-/// (blueprint F-1).
-fn requirement_changed_elsewhere(head: i32) -> String {
-    format!(
-        "changed elsewhere since you opened it \u{2014} now v{head}; your text is kept and Ctrl+S \
-         saves over it"
-    )
+/// (blueprint F-1). `save` is `FormSave`'s label through the open form's stack (MOD-67 M6 D4);
+/// with none bound the clause goes.
+fn requirement_changed_elsewhere(head: i32, save: Option<&str>) -> String {
+    let kept =
+        format!("changed elsewhere since you opened it \u{2014} now v{head}; your text is kept");
+    match save {
+        Some(save) => format!("{kept} and {save} saves over it"),
+        None => kept,
+    }
 }
 
 /// The Requirements tab's sentence for a reveal of a requirement this workspace does not hold
@@ -730,7 +742,13 @@ impl RequirementsTab {
         self.mode = Mode::Browse;
         self.notice = Some(match unread {
             None => Notice::Info(landed),
-            Some(why) => Notice::Error(landed_unread(&landed, why)),
+            Some(why) => Notice::Error(landed_unread(
+                &landed,
+                why,
+                ctx.keys()
+                    .label(views::REQUIREMENTS_BROWSE, Act::Reload)
+                    .as_deref(),
+            )),
         });
         let held = self.snapshot.as_ref().is_some_and(|snapshot| match row {
             Row::Area(id) => snapshot.area(id).is_some(),
@@ -844,8 +862,9 @@ impl RequirementsTab {
 
     /// A `RequirementsStale` over the write in flight: the form stays with its text, its token
     /// moves to the head, and the notice says so. A head withdrawn elsewhere takes no retry, and
-    /// the notice says that instead.
-    fn stale(&mut self) {
+    /// the notice says that instead. The retry is the save key `keys` binds in the open form's
+    /// stack (MOD-67 M6 D4).
+    fn stale(&mut self, keys: &Keys) {
         if self.busy.take().is_none() {
             return;
         }
@@ -874,18 +893,28 @@ impl RequirementsTab {
             self.notice = Some(Notice::Error(requirement_withdrawn(&key)));
             return;
         }
-        match &mut self.mode {
+        let stack = match &mut self.mode {
             Mode::Requirement(RequirementForm {
                 target:
                     FormTarget::Amend {
                         expected_version, ..
                     },
                 ..
-            }) => *expected_version = head,
-            Mode::Withdraw(form) => form.set_expected_version(head),
-            _ => {}
-        }
-        self.notice = Some(Notice::Error(requirement_changed_elsewhere(head)));
+            }) => {
+                *expected_version = head;
+                views::REQUIREMENTS_FORM
+            }
+            Mode::Withdraw(form) => {
+                form.set_expected_version(head);
+                views::REQUIREMENTS_WITHDRAW
+            }
+            _ => views::REQUIREMENTS_FORM,
+        };
+        let save = keys.label(stack, Act::FormSave);
+        self.notice = Some(Notice::Error(requirement_changed_elsewhere(
+            head,
+            save.as_deref(),
+        )));
     }
 
     // --- render --------------------------------------------------------------------------------
@@ -1178,7 +1207,7 @@ impl Tab for RequirementsTab {
                 }
                 self.snapshot = Some((**snapshot).clone());
                 self.recovered();
-                self.stale();
+                self.stale(ctx.keys());
                 let before = self.selected;
                 self.reselect(ctx);
                 // The head moved elsewhere, so a detail still on screen for the same row is the
@@ -1221,7 +1250,8 @@ impl Tab for RequirementsTab {
                 // mint the worker refused before its insert is a refusal like the others (L2).
                 self.busy = None;
                 if *request == MINT_NAME && !self.mint_refused(message, ctx) {
-                    self.notice = Some(Notice::Error(mint_failed(message)));
+                    let save = ctx.keys().label(views::REQUIREMENTS_FORM, Act::FormSave);
+                    self.notice = Some(Notice::Error(mint_failed(message, save.as_deref())));
                     ctx.request(StoreRequest::Requirements(ctx.scope.clone()));
                 } else {
                     self.notice = Some(Notice::Error(message.clone()));
@@ -2070,7 +2100,7 @@ mod tests {
         assert!(
             matches!(&hedge, Some(Notice::Error(text))
                 if text.starts_with("store unreachable: reset \u{2014} it may have been written")
-                    && text.contains("Ctrl+S")
+                    && text.contains("Ctrl+s")
                     && !text.contains("Esc")),
             "{hedge:?}"
         );
@@ -2162,6 +2192,33 @@ mod tests {
         assert_eq!(
             tab.notice,
             Some(Notice::Error(requirement_withdrawn("R-ENT-1")))
+        );
+    }
+
+    /// MOD-67 M6 D4: the Requirements hedges name the save key in force through
+    /// `REQUIREMENTS_FORM`, and the reload key through `REQUIREMENTS_BROWSE`; unbound, neither.
+    #[test]
+    fn a_rebound_save_key_is_named_by_a_requirements_hedge() {
+        use super::{landed_unread, mint_failed, requirement_changed_elsewhere};
+        use crate::keys::{Act, load_str};
+        let keys = load_str("version = 1\n[form]\nsave = \"f2\"\n").expect("loads");
+        let save = keys.label(views::REQUIREMENTS_FORM, Act::FormSave);
+        assert_eq!(save.as_deref(), Some("F2"));
+        assert!(
+            mint_failed("boom", save.as_deref()).ends_with("look for it there before F2"),
+            "{}",
+            mint_failed("boom", save.as_deref())
+        );
+        assert!(requirement_changed_elsewhere(4, save.as_deref()).ends_with("F2 saves over it"));
+        assert!(mint_failed("boom", None).ends_with("look for it there first"));
+        assert!(requirement_changed_elsewhere(4, None).ends_with("your text is kept"));
+        assert_eq!(
+            landed_unread("saved", "gone", Some("r")),
+            "saved \u{2014} the re-read failed, r reloads: gone"
+        );
+        assert_eq!(
+            landed_unread("saved", "gone", None),
+            "saved \u{2014} the re-read failed: gone"
         );
     }
 }

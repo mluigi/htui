@@ -495,8 +495,12 @@ impl ChatTab {
             return keys.hint(stack, COMPOSE_HINT);
         }
         if self.cancel_armed {
-            // Key prose, M6's (MOD-67 D11).
-            return "Esc again ends this chat".to_owned();
+            // MOD-67 M6 D4: the end key in force, as the live hint doubles it. Only `ChatEnd`
+            // arms, so it is bound whenever this shows; unbound, the line is empty.
+            return keys
+                .label(stack, Act::ChatEnd)
+                .map(|end| format!("{end} again ends this chat"))
+                .unwrap_or_default();
         }
         if self.transcript.parked().is_some() {
             return keys.hint(stack, PARKED_HINT);
@@ -816,7 +820,11 @@ impl Tab for ChatTab {
                     frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body)
                 }
                 None => {
-                    let lines = replay.transcript.lines(body.height as usize, ctx.theme);
+                    let unfold = ctx.keys().label(views::CHAT_REPLAY, Act::ChatThoughts);
+                    let lines =
+                        replay
+                            .transcript
+                            .lines(body.height as usize, ctx.theme, unfold.as_deref());
                     frame.render_widget(Paragraph::new(lines), body);
                 }
             }
@@ -829,7 +837,10 @@ impl Tab for ChatTab {
         {
             // MOD-37 review L-6: a resume whose handoff failed too has a `resume_failed` line, and
             // it goes above the refusal: it is why the header says `handoff`.
-            let mut lines = self.transcript.resume_failed_lines(ctx.theme);
+            let unfold = ctx.keys().label(views::CHAT_LIVE, Act::ChatThoughts);
+            let mut lines = self
+                .transcript
+                .resume_failed_lines(ctx.theme, unfold.as_deref());
             lines.push(Line::styled(refusal.clone(), ctx.theme.error));
             frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), body);
         } else if self.session.is_none() && !self.pending_start {
@@ -840,7 +851,10 @@ impl Tab for ChatTab {
             };
             frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), body);
         } else {
-            let lines = self.transcript.lines(body.height as usize, ctx.theme);
+            let unfold = ctx.keys().label(views::CHAT_LIVE, Act::ChatThoughts);
+            let lines = self
+                .transcript
+                .lines(body.height as usize, ctx.theme, unfold.as_deref());
             frame.render_widget(Paragraph::new(lines), body);
         }
 

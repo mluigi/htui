@@ -40,7 +40,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use super::divergence::{Divergence, ViewOutcome, rebased_on, still_behind};
 use crate::editor::{
-    EDITED, ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, strip_added_newline,
+    ExternalEdit, ExternalEditOutcome, NO_CHANGES, WAIT_FLAG, edited, strip_added_newline,
     without_controls,
 };
 use crate::item_writes::{ItemDivergence, ItemFormContext};
@@ -345,10 +345,15 @@ impl ItemForm {
     /// D5: the form rebased on the head after `m`/`t`. `opened` holds the head's texts, so A4's
     /// "unchanged keeps the stored value" now means "unchanged from the head"; the widgets hold
     /// `resolved`'s texts; kind and graph are `resolved`'s; the token is `head.version`; the reason
-    /// `DivergenceResolution`; focus Title; the notice `rebased_on(head.version)`. `None` when
-    /// `context.item` is `None` (`open_edit`'s rule).
+    /// `DivergenceResolution`; focus Title; the notice `rebased_on(head.version, save)`, `save` the
+    /// form's save key as `keys` binds it (MOD-67 M6 D4). `None` when `context.item` is `None`
+    /// (`open_edit`'s rule).
     #[must_use]
-    pub fn open_resolution(context: ItemFormContext, resolved: &ItemSpec) -> Option<Self> {
+    pub fn open_resolution(
+        context: ItemFormContext,
+        resolved: &ItemSpec,
+        keys: &Keys,
+    ) -> Option<Self> {
         let head = context.item.as_ref()?;
         let (opened, version) = (Texts::of(&ItemSpec::of(head)), head.version);
         let mut form = Self::build(
@@ -360,7 +365,10 @@ impl ItemForm {
             &Texts::of(resolved),
         );
         form.reason = EditReason::DivergenceResolution;
-        form.notice = Some(rebased_on(version));
+        form.notice = Some(rebased_on(
+            version,
+            keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+        ));
         Some(form)
     }
 
@@ -504,11 +512,11 @@ impl ItemForm {
 
     /// D4: the `$EDITOR` handoff came back. No field out (`external` is `None`): ignored.
     /// `Edited` replaces only the handed-out field's text (control characters dropped, then D5),
-    /// puts the cursor at its end, focuses it and says `EDITED`;
+    /// puts the cursor at its end, focuses it and says `edited`, naming `keys`' save key (MOD-67 M6);
     /// the token, reason, `opened` and every other field are untouched, so A4's "unchanged" still
     /// compares against what the form opened with. `Unchanged` says `NO_CHANGES` (+ `WAIT_FLAG`
     /// when quick); `Failed` says its sentence; neither touches the text.
-    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome) {
+    pub fn on_external_edit(&mut self, outcome: ExternalEditOutcome, keys: &Keys) {
         let Some(field) = self.external.take() else {
             return;
         };
@@ -532,7 +540,9 @@ impl ItemForm {
                     // Review L4: at the end, so a long body's edited tail is what the area shows.
                     area.set_cursor(usize::MAX);
                     self.focus = field;
-                    self.notice = Some(EDITED.to_owned());
+                    self.notice = Some(edited(
+                        keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                    ));
                 }
             }
             ExternalEditOutcome::Unchanged { quick } => {
@@ -702,14 +712,17 @@ impl ItemForm {
             ViewOutcome::Stay => ItemFormOutcome::Stay,
             ViewOutcome::Pass => ItemFormOutcome::Pass,
             ViewOutcome::Back => {
-                self.notice = Some(still_behind(view.head_version()));
+                self.notice = Some(still_behind(
+                    view.head_version(),
+                    keys.label(views::ITEM_FORM, Act::FormSave).as_deref(),
+                ));
                 self.resolving = None;
                 ItemFormOutcome::Stay
             }
             ViewOutcome::Resolve(side) => {
                 if let Some(view) = self.resolving.take() {
                     let (context, resolved) = view.resolve(side);
-                    if let Some(form) = Self::open_resolution(context, &resolved) {
+                    if let Some(form) = Self::open_resolution(context, &resolved, keys) {
                         *self = form;
                     }
                 }
@@ -1137,13 +1150,16 @@ pub fn render(
     }
 }
 
-/// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost.
+/// D11: a mint's `Failed` that may have followed a COMMIT whose answer was lost. `save` is
+/// `FormSave`'s label through `ITEM_FORM`, the form that stays open (MOD-67 M6 D4); with none
+/// bound the sentence says to look first.
 #[must_use]
-pub fn mint_may_have_landed(why: &str) -> String {
-    format!(
-        "{why} \u{2014} it may have been written; the list is being re-read, look for it before \
-         Ctrl+S"
-    )
+pub fn mint_may_have_landed(why: &str, save: Option<&str>) -> String {
+    let hedge = format!("{why} \u{2014} it may have been written; the list is being re-read");
+    match save {
+        Some(save) => format!("{hedge}, look for it before {save}"),
+        None => format!("{hedge}, look for it first"),
+    }
 }
 
 /// Review L4: the same hedge for a mint whose form a scope change closed. Nothing is re-read and
@@ -1852,7 +1868,7 @@ mod tests {
         type_text(&mut form, "Fresh item");
         let why = "store unreachable: error communicating with database: Connection reset by \
                    peer (os error 104)";
-        let hedge = mint_may_have_landed(why);
+        let hedge = mint_may_have_landed(why, Some("Ctrl+s"));
         form.settle(Some(hedge.clone()));
         let rows = drawn(&form);
         let flowed = rows
@@ -1862,6 +1878,16 @@ mod tests {
             .join(" ");
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{}", rows.join("\n"));
         assert!(flowed.contains(&rendered(HINT_TEXT)), "{}", rows.join("\n"));
+    }
+
+    /// MOD-67 M6 D4: the mint hedge names the save key in force, and says to look first unbound.
+    #[test]
+    fn the_mint_hedge_names_the_save_key_or_none() {
+        assert!(mint_may_have_landed("boom", Some("F2")).ends_with("look for it before F2"));
+        assert_eq!(
+            mint_may_have_landed("boom", None),
+            "boom \u{2014} it may have been written; the list is being re-read, look for it first"
+        );
     }
 
     /// The notice's rows drawn at `size`, joined back into one sentence.
@@ -1883,7 +1909,7 @@ mod tests {
         type_text(&mut form, "Fresh item");
         let why = "store unreachable: error communicating with database: Connection reset by \
                    peer (os error 104)";
-        let hedge = mint_may_have_landed(why);
+        let hedge = mint_may_have_landed(why, Some("Ctrl+s"));
         form.settle(Some(hedge.clone()));
         let (flowed, rows) = flowed_at(&form, (80, 24));
         assert!(flowed.contains(&hedge), "{hedge:?} in\n{rows}");
@@ -1898,8 +1924,8 @@ mod tests {
             "store unreachable: {}",
             "connection reset by peer ".repeat(12)
         );
-        form.settle(Some(mint_may_have_landed(why.trim_end())));
-        let tail = mint_may_have_landed("");
+        form.settle(Some(mint_may_have_landed(why.trim_end(), Some("Ctrl+s"))));
+        let tail = mint_may_have_landed("", Some("Ctrl+s"));
         let (flowed, rows) = flowed_at(&form, (80, 24));
         assert!(flowed.contains(tail.trim_start()), "{tail:?} in\n{rows}");
     }
@@ -2035,18 +2061,26 @@ mod tests {
             title: "Resolved".to_owned(),
             ..ItemSpec::of(&head)
         };
-        let rebased = ItemForm::open_resolution(divergence.context.clone(), &resolved)
-            .expect("a context with an item");
+        let rebased =
+            ItemForm::open_resolution(divergence.context.clone(), &resolved, Keys::compiled())
+                .expect("a context with an item");
         assert_eq!(rebased.token(), Some(head.version));
         assert_eq!(rebased.reason(), EditReason::DivergenceResolution);
-        assert_eq!(rebased.notice(), Some(rebased_on(head.version).as_str()));
+        assert_eq!(
+            rebased.notice(),
+            Some(rebased_on(head.version, Some("Ctrl+s")).as_str())
+        );
         assert_eq!(rebased.opened.title, head.title, "unchanged means the head");
         assert_eq!(rebased.title.text(), Some("Resolved"));
         assert_eq!(rebased.focus(), Field::Title);
         assert!(rebased.resolving().is_none());
 
-        let mut same = ItemForm::open_resolution(divergence.context.clone(), &ItemSpec::of(&head))
-            .expect("a context with an item");
+        let mut same = ItemForm::open_resolution(
+            divergence.context.clone(),
+            &ItemSpec::of(&head),
+            Keys::compiled(),
+        )
+        .expect("a context with an item");
         assert!(matches!(
             same.on_key(ctrl('s'), Keys::compiled()),
             ItemFormOutcome::Stay
@@ -2055,7 +2089,7 @@ mod tests {
 
         let mut new = divergence.context;
         new.item = None;
-        assert!(ItemForm::open_resolution(new, &resolved).is_none());
+        assert!(ItemForm::open_resolution(new, &resolved, Keys::compiled()).is_none());
     }
 
     /// D2, D5: my title wins its conflict, their priority is kept, and the save is a resolution
@@ -2199,7 +2233,10 @@ mod tests {
             "{:?}",
             form.title.text()
         );
-        assert_eq!(form.notice(), Some(still_behind(2).as_str()));
+        assert_eq!(
+            form.notice(),
+            Some(still_behind(2, Some("Ctrl+s")).as_str())
+        );
 
         let (version, changes, reason) = edit_sent(&mut form);
         assert_eq!((version, reason), (1, EditReason::Edited));
@@ -2464,7 +2501,10 @@ mod tests {
             form.title.text().map(str::to_owned),
             form.paths.text().to_owned(),
         );
-        form.on_external_edit(ExternalEditOutcome::Edited("New body.\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("New body.\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(
             form.body.text(),
             "New body.",
@@ -2476,7 +2516,7 @@ mod tests {
             "review L4: the cursor ends the text"
         );
         assert_eq!(form.focus(), Field::Body);
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
         assert_eq!(form.title.text().map(str::to_owned), title);
         assert_eq!(form.paths.text(), paths);
         assert_eq!(form.token(), Some(1));
@@ -2502,7 +2542,10 @@ mod tests {
         let body = form.body.text().to_owned();
         focus_on(&mut form, Field::Paths);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("src/**\nlib/**\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.paths.text(), "src/**\nlib/**");
         assert_eq!(
             form.paths.cursor_line_col(),
@@ -2511,7 +2554,7 @@ mod tests {
         );
         assert_eq!(form.body.text(), body);
         assert_eq!(form.focus(), Field::Paths);
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// A4: "unchanged" compares against what the form opened with, not what was handed out.
@@ -2522,8 +2565,11 @@ mod tests {
         focus_on(&mut form, Field::Body);
         type_text(&mut form, "x");
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited(form.opened.body.clone()));
-        assert_eq!(form.notice(), Some(EDITED));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited(form.opened.body.clone()),
+            Keys::compiled(),
+        );
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
         assert!(matches!(
             form.on_key(ctrl('s'), Keys::compiled()),
             ItemFormOutcome::Stay
@@ -2552,7 +2598,7 @@ mod tests {
             ),
         ] {
             handed(&mut form);
-            form.on_external_edit(outcome);
+            form.on_external_edit(outcome, Keys::compiled());
             assert_eq!(form.notice(), Some(notice.as_str()));
             assert_eq!(form.body.text(), body);
             assert_eq!(form.external, None);
@@ -2567,19 +2613,28 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abc\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abc\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some(NO_CHANGES));
         assert_eq!(form.body.text(), "abc");
 
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abd\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abd\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "abd");
 
         form.body = TextArea::with_text("abc\n");
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("abc\n\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("abc\n\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "abc\n\n");
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// Review L2: a control character from the editor is dropped, as a paste drops one; a `\t`
@@ -2591,11 +2646,12 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited(
-            "a\u{1b}[31mb\u{7}c\u{0}\n\tindented\u{7f}\n".to_owned(),
-        ));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("a\u{1b}[31mb\u{7}c\u{0}\n\tindented\u{7f}\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), "a[31mbc\n\tindented");
-        assert_eq!(form.notice(), Some(EDITED));
+        assert_eq!(form.notice(), Some(edited(Some("Ctrl+s")).as_str()));
     }
 
     /// Review L2: the filter runs before D5's compare, so a return that differs only by control
@@ -2607,7 +2663,10 @@ mod tests {
         form.body = TextArea::with_text("abc");
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Edited("a\u{1b}bc\u{0}\n".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("a\u{1b}bc\u{0}\n".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some(NO_CHANGES));
         assert_eq!(form.body.text(), "abc");
     }
@@ -2617,14 +2676,23 @@ mod tests {
         let store = MemStore::demo();
         let mut form = edit_form(&store, ids::HTUI_ANA_1).await;
         let body = form.body.text().to_owned();
-        form.on_external_edit(ExternalEditOutcome::Edited("x".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Edited("x".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.body.text(), body);
         assert_eq!(form.notice(), None);
 
         focus_on(&mut form, Field::Body);
         handed(&mut form);
-        form.on_external_edit(ExternalEditOutcome::Failed("one".to_owned()));
-        form.on_external_edit(ExternalEditOutcome::Failed("two".to_owned()));
+        form.on_external_edit(
+            ExternalEditOutcome::Failed("one".to_owned()),
+            Keys::compiled(),
+        );
+        form.on_external_edit(
+            ExternalEditOutcome::Failed("two".to_owned()),
+            Keys::compiled(),
+        );
         assert_eq!(form.notice(), Some("one"), "the second had no field out");
     }
 
