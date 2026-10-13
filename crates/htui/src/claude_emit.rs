@@ -6,8 +6,10 @@
 //! neither, and never touches `~/.claude`.
 //!
 //! The target is written only when it is absent or empty, or, with `--force`, when it holds an
-//! earlier emit: nothing but `.claude-plugin` and `htui`, and a marketplace named `htui` (D4).
-//! Anything else is refused, `--force` or not. Nothing outside the target and its two siblings
+//! earlier emit: every file one `emit` writes (or the engine's `htui/.claude-plugin/types/`, A-10),
+//! no link, a marketplace named `htui`, and a stamped version, not the source tree's (D4).
+//! Anything else is refused, `--force` or not, and so is a path with a `..` or one that is not
+//! UTF-8. Nothing outside the target and its two siblings
 //! `<dir>.emit-<pid>` (staging) and `<dir>.old-<pid>` (the earlier emit, moved aside) is written,
 //! but the target's missing parents. Exits are 2 (refused) and 1 (failed), and none reaches Sentry:
 //! the sentences carry home paths.
@@ -15,7 +17,7 @@
 use std::ffi::OsStr;
 use std::fs;
 use std::io::{ErrorKind, Write as _};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -28,6 +30,9 @@ pub const CLAUDE_FLOOR: &str = "2.1.287";
 /// `claude --version` prints `2.1.296 (Claude Code)`.
 pub const CLAUDE_VERSION_PATTERN: &str = r"^(\d+\.\d+\.\d+)";
 
+/// What the source tree's `plugin.json` and `hooks/version.ts` carry in place of a version (D5).
+/// A target whose `plugin.json` says it is the source tree, not an emit, and is never replaced.
+const SOURCE_VERSION: &str = "0.0.0-source";
 /// `hooks/version.ts`'s placeholder, quotes included; the source holds it exactly once. The source
 /// tree's `plugin.json` carries the same version, which the stamp overwrites without reading it.
 const VERSION_TS_LITERAL: &str = "'0.0.0-source'";
@@ -213,7 +218,8 @@ enum Target {
     Absent,
     /// A directory with no entries.
     Empty,
-    /// An earlier emit: only `.claude-plugin` and `htui`, and a marketplace named `htui`.
+    /// An earlier emit: every file one of [`FILES`]' paths (the engine's types folder aside), a
+    /// marketplace named `htui`, and not the source tree's placeholder version.
     Ours,
     /// Anything else that is a directory (or a link); why, for the refusal.
     Foreign(String),
@@ -221,8 +227,62 @@ enum Target {
     NotADirectory,
 }
 
-/// The entries an earlier emit leaves in its directory.
-const OUR_ENTRIES: [&str; 2] = [".claude-plugin", "htui"];
+/// The folder the engine writes the mod's types into when it hot-reloads a plugin folder (A-10):
+/// the one thing an earlier emit may hold that `emit` did not write.
+const ENGINE_TYPES: &str = "htui/.claude-plugin/types";
+
+/// Whether `rel` is a directory an emit makes: a parent of one of [`FILES`]' paths.
+fn emitted_dir(rel: &str) -> bool {
+    FILES.iter().any(|file| {
+        file.path
+            .strip_prefix(rel)
+            .is_some_and(|rest| rest.starts_with('/'))
+    })
+}
+
+/// The first entry under `dir` (at relative `/`-path `rel`) that no emit writes, in name order, as
+/// the refusal names it: a [`FILES`] path is a regular file, every directory is a parent of one,
+/// and nothing is a link. [`ENGINE_TYPES`] is not looked into.
+fn first_foreign(
+    dir: &Path,
+    rel: &str,
+    unreadable: &dyn Fn(std::io::Error) -> EmitExit,
+) -> Result<Option<String>, EmitExit> {
+    let mut entries = Vec::new();
+    for entry in fs::read_dir(dir).map_err(unreadable)? {
+        let entry = entry.map_err(unreadable)?;
+        entries.push((entry.file_name(), entry.file_type().map_err(unreadable)?));
+    }
+    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, kind) in entries {
+        let name_text = name.to_string_lossy();
+        let path = if rel.is_empty() {
+            name_text.into_owned()
+        } else {
+            format!("{rel}/{name_text}")
+        };
+        if kind.is_symlink() {
+            return Ok(Some(format!("{path}, a symbolic link")));
+        }
+        if name.to_str().is_none() {
+            return Ok(Some(path));
+        }
+        if kind.is_dir() {
+            if path == ENGINE_TYPES {
+                continue;
+            }
+            if !emitted_dir(&path) {
+                return Ok(Some(path));
+            }
+            if let Some(found) = first_foreign(&dir.join(&name), &path, unreadable)? {
+                return Ok(Some(found));
+            }
+        } else if !(kind.is_file() && FILES.iter().any(|file| file.path == path)) {
+            return Ok(Some(path));
+        }
+    }
+    Ok(None)
+}
 
 /// What `dir` holds.
 fn classify(dir: &Path) -> Result<Target, EmitExit> {
@@ -239,24 +299,18 @@ fn classify(dir: &Path) -> Result<Target, EmitExit> {
     if !metadata.is_dir() {
         return Ok(Target::NotADirectory);
     }
-    let mut entries = Vec::new();
-    for entry in fs::read_dir(dir).map_err(unreadable)? {
-        let entry = entry.map_err(unreadable)?;
-        entries.push((entry.file_name(), entry.file_type().map_err(unreadable)?));
-    }
-    if entries.is_empty() {
+    if fs::read_dir(dir).map_err(unreadable)?.next().is_none() {
         return Ok(Target::Empty);
     }
-    entries.sort_by(|(left, _), (right, _)| left.cmp(right));
-    if let Some((name, _)) = entries
-        .iter()
-        .find(|(name, _)| !OUR_ENTRIES.iter().any(|ours| name == OsStr::new(ours)))
-    {
-        return Ok(Target::Foreign(name.to_string_lossy().into_owned()));
+    if let Some(found) = first_foreign(dir, "", &unreadable)? {
+        return Ok(Target::Foreign(found));
     }
-    if entries.iter().any(|(_, kind)| kind.is_symlink()) {
-        return Ok(Target::Foreign("a symbolic link".to_owned()));
-    }
+    let json = |path: &str| -> Option<Value> {
+        let file = path
+            .split('/')
+            .fold(dir.to_path_buf(), |dir, part| dir.join(part));
+        serde_json::from_str(&fs::read_to_string(file).ok()?).ok()
+    };
     let Ok(text) = fs::read_to_string(dir.join(".claude-plugin").join("marketplace.json")) else {
         return Ok(Target::Foreign("no marketplace.json".to_owned()));
     };
@@ -264,11 +318,49 @@ fn classify(dir: &Path) -> Result<Target, EmitExit> {
         .ok()
         .and_then(|marketplace| marketplace.get("name")?.as_str().map(|name| name == "htui"))
         .unwrap_or(false);
-    if named_htui {
-        Ok(Target::Ours)
-    } else {
-        Ok(Target::Foreign("marketplace.json is not htui's".to_owned()))
+    if !named_htui {
+        return Ok(Target::Foreign("marketplace.json is not htui's".to_owned()));
     }
+    // The source tree holds the same paths; its placeholder version tells it from an emit.
+    let source = json(PLUGIN_JSON).is_some_and(|manifest| {
+        manifest.get("version").and_then(Value::as_str) == Some(SOURCE_VERSION)
+    });
+    if source {
+        return Ok(Target::Foreign(format!(
+            "the plugin source tree, version {SOURCE_VERSION}"
+        )));
+    }
+    Ok(Target::Ours)
+}
+
+/// `dir` made absolute, with its `.` components and a trailing separator dropped, so that a
+/// symbolic link is the link and the printed path is plain.
+///
+/// # Errors
+///
+/// [`EmitExit::Refused`] for a path with a `..` (resolving it could create a directory outside
+/// the target) or one that is not UTF-8 (Claude Code takes the path as text);
+/// [`EmitExit::Failed`] when the current directory cannot be read.
+fn target_path(dir: &Path) -> Result<PathBuf, EmitExit> {
+    if dir.components().any(|part| part == Component::ParentDir) {
+        return Err(EmitExit::Refused(format!(
+            "{} contains ..; give the path without ..",
+            dir.display()
+        )));
+    }
+    let absolute = std::path::absolute(dir)
+        .map_err(|error| EmitExit::Failed(format!("cannot resolve {}: {error}", dir.display())))?;
+    let plain: PathBuf = absolute
+        .components()
+        .filter(|part| *part != Component::CurDir)
+        .collect();
+    if plain.to_str().is_none() {
+        return Err(EmitExit::Refused(format!(
+            "{} is not valid UTF-8; Claude Code cannot add it",
+            plain.display()
+        )));
+    }
+    Ok(plain)
 }
 
 /// How the staged tree goes into place.
@@ -319,8 +411,7 @@ fn fill(root: &Path, files: &[(&str, String)]) -> Result<(), EmitExit> {
 /// [`EmitExit::Failed`] when a directory cannot be read, made or renamed, or a file cannot be
 /// written; the staging directory is removed, and a moved-aside emit is put back.
 pub fn write_to(dir: &Path, options: &Options) -> Result<Report, EmitExit> {
-    let dir = std::path::absolute(dir)
-        .map_err(|error| EmitExit::Failed(format!("cannot resolve {}: {error}", dir.display())))?;
+    let dir = target_path(dir)?;
     let (Some(name), Some(parent)) = (dir.file_name(), dir.parent()) else {
         return Err(EmitExit::Refused(format!(
             "{} names no directory to write",
@@ -462,9 +553,19 @@ pub fn render(report: &Report, check: &ClaudeCheck) -> String {
         shell_words::quote(&report.dir.to_string_lossy())
     ));
     out.push_str("  claude plugin install htui@htui\n");
-    out.push_str(
-        "After upgrading htui: htui claude emit --force, then /reload-plugins in Claude Code.\n",
-    );
+    // The bare verb writes the default dir; any other needs its `--dir` again.
+    let rerun = if default_dir().as_deref() == Some(report.dir.as_path()) {
+        String::new()
+    } else {
+        format!(
+            " --dir {}",
+            shell_words::quote(&report.dir.to_string_lossy())
+        )
+    };
+    out.push_str(&format!(
+        "After upgrading htui: htui claude emit --force{rerun}, then /reload-plugins in Claude \
+         Code.\n"
+    ));
     if let Some(leftover) = &report.leftover {
         out.push_str(&format!(
             "The old copy could not be removed: {}.\n",
@@ -536,13 +637,9 @@ mod tests {
 
     use super::{
         CLAUDE_FLOOR, CLAUDE_VERSION_PATTERN, ClaudeCheck, EmitExit, FILES, Options, PLUGIN_JSON,
-        Report, VERSION, VERSION_TS, VERSION_TS_LITERAL, Variant, default_dir, files_for, render,
-        write_to,
+        Report, SOURCE_VERSION, VERSION, VERSION_TS, VERSION_TS_LITERAL, Variant, default_dir,
+        files_for, render, write_to,
     };
-
-    /// What the source tree's `plugin.json` and `hooks/version.ts` carry in place of a version
-    /// (D5).
-    const SOURCE_VERSION: &str = "0.0.0-source";
 
     /// The source tree the table embeds.
     const SOURCE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/claude-plugin");
@@ -815,13 +912,16 @@ mod tests {
         assert_eq!(names_in(root.path()), ["plugin"]);
     }
 
-    /// D4: `--force` swaps an earlier emit for a fresh one; nothing of the old tree survives.
+    /// D4: `--force` swaps an earlier emit for a fresh one; nothing of the old tree survives: not
+    /// the mod a skill-only emit leaves out, and not the types the engine wrote beside it (A-10).
     #[test]
     fn force_replaces_an_earlier_emit_and_leaves_no_stale_file() {
         let root = tempfile::tempdir().expect("a temp dir");
         let dir = root.path().join("plugin");
         emit(&dir, false, Variant::WithMod).expect("the first emit");
-        std::fs::write(dir.join("htui/hooks/stale.ts"), "export {}\n").expect("the stale file");
+        let types = dir.join("htui/.claude-plugin/types/claude-code");
+        std::fs::create_dir_all(&types).expect("the engine's types folder");
+        std::fs::write(types.join("index.d.ts"), "export {}\n").expect("the engine's types");
         let report = emit(&dir, true, Variant::SkillOnly).expect("the forced emit");
         assert_eq!(
             report,
@@ -833,6 +933,10 @@ mod tests {
             }
         );
         assert!(!dir.join("htui/hooks").exists(), "hooks/ is gone");
+        assert!(
+            !dir.join("htui/.claude-plugin/types").exists(),
+            "types/ is gone"
+        );
         assert_eq!(files_of(&dir), written_files(Variant::SkillOnly));
     }
 
@@ -1003,7 +1107,7 @@ mod tests {
             leftover: leftover.map(Into::into),
         };
         let tail = "Install it once:\n  claude plugin marketplace add /p/x\n  claude plugin install \
-                    htui@htui\nAfter upgrading htui: htui claude emit --force, then \
+                    htui@htui\nAfter upgrading htui: htui claude emit --force --dir /p/x, then \
                     /reload-plugins in Claude Code.\n";
         assert_eq!(
             render(
@@ -1044,6 +1148,37 @@ mod tests {
             spaced.ends_with("\nThe old copy could not be removed: /my plugins/x.old-7.\n"),
             "{spaced}"
         );
+        assert!(
+            spaced.contains(
+                "\nAfter upgrading htui: htui claude emit --force --dir '/my plugins/x', then \
+                 /reload-plugins in Claude Code.\n"
+            ),
+            "{spaced}"
+        );
+    }
+
+    /// The rerun hint names no `--dir` for the default directory: the bare verb writes there.
+    #[test]
+    fn the_rerun_hint_names_the_dir_only_off_the_default() {
+        let Some(dir) = default_dir() else {
+            return;
+        };
+        let rendered = render(
+            &Report {
+                dir,
+                variant: Variant::WithMod,
+                replaced: false,
+                leftover: None,
+            },
+            &ClaudeCheck::Unchecked,
+        );
+        assert!(
+            rendered.contains(
+                "\nAfter upgrading htui: htui claude emit --force, then /reload-plugins in Claude \
+                 Code.\n"
+            ),
+            "{rendered}"
+        );
     }
 
     /// D3: `<local data dir>/htui/claude-plugin`, the sibling of `htui/agents`.
@@ -1055,5 +1190,178 @@ mod tests {
             assert!(dir.ends_with("htui/claude-plugin"), "{}", dir.display());
             assert!(dir.is_absolute(), "{}", dir.display());
         }
+    }
+
+    /// The foreign refusal for `dir`, naming `why`.
+    fn foreign(dir: &Path, why: &str) -> String {
+        format!(
+            "{} holds files htui claude emit did not write ({why}); it is left as it is. Choose \
+             another --dir.",
+            dir.display()
+        )
+    }
+
+    /// Copies the tree at `from` to `to` (absent), files and directories.
+    fn copy_tree(from: &Path, to: &Path) {
+        std::fs::create_dir_all(to).expect("the copy's directory");
+        for entry in std::fs::read_dir(from).expect("the directory reads") {
+            let entry = entry.expect("the entry reads");
+            let target = to.join(entry.file_name());
+            if entry.file_type().expect("the file type reads").is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                std::fs::copy(entry.path(), &target).expect("the file copies");
+            }
+        }
+    }
+
+    /// F1: `--force` deletes nothing `emit` did not write. A copy of the source tree (its kit
+    /// tests, or without them its placeholder version) and an emit holding one more file or
+    /// folder are refused, and left byte for byte as they were.
+    #[test]
+    fn force_refuses_a_tree_holding_anything_emit_did_not_write() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        copy_tree(Path::new(SOURCE), &dir);
+        let before = tree(&dir);
+        assert_eq!(
+            refusal(emit(&dir, true, Variant::WithMod)),
+            foreign(&dir, "htui/tests")
+        );
+        assert_eq!(tree(&dir), before);
+
+        std::fs::remove_dir_all(dir.join("htui/tests")).expect("the kit tests removed");
+        let before = tree(&dir);
+        assert_eq!(
+            refusal(emit(&dir, true, Variant::WithMod)),
+            foreign(&dir, "the plugin source tree, version 0.0.0-source")
+        );
+        assert_eq!(tree(&dir), before);
+        assert_eq!(names_in(root.path()), ["plugin"]);
+
+        type Plant<'a> = &'a dyn Fn(&Path);
+        let cases: [(&str, Plant); 3] = [
+            ("htui/hooks/extra.ts", &|dir| {
+                std::fs::write(dir.join("htui/hooks/extra.ts"), "export {}\n")
+                    .expect("the extra hooks file");
+            }),
+            ("htui/tests", &|dir| {
+                std::fs::create_dir(dir.join("htui/tests")).expect("the extra folder");
+            }),
+            ("htui/skills/htui/notes.md", &|dir| {
+                std::fs::write(dir.join("htui/skills/htui/notes.md"), "mine\n")
+                    .expect("the extra skill file");
+            }),
+        ];
+        for (why, plant) in cases {
+            let root = tempfile::tempdir().expect("a temp dir");
+            let dir = root.path().join("plugin");
+            emit(&dir, false, Variant::WithMod).expect("the first emit");
+            plant(&dir);
+            let before = tree(&dir);
+            assert_eq!(
+                refusal(emit(&dir, true, Variant::SkillOnly)),
+                foreign(&dir, why)
+            );
+            assert_eq!(tree(&dir), before, "{why}");
+            assert_eq!(names_in(root.path()), ["plugin"], "{why}");
+        }
+    }
+
+    /// F1: a link inside an earlier emit is foreign too, and named.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_inside_an_earlier_emit_is_refused() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let dir = root.path().join("plugin");
+        emit(&dir, false, Variant::WithMod).expect("the first emit");
+        let outside = root.path().join("outside.ts");
+        std::fs::write(&outside, "export {}\n").expect("the file outside");
+        std::os::unix::fs::symlink(&outside, dir.join("htui/hooks/up")).expect("the link");
+        let before = tree(&dir);
+        assert_eq!(
+            refusal(emit(&dir, true, Variant::WithMod)),
+            foreign(&dir, "htui/hooks/up, a symbolic link")
+        );
+        assert_eq!(tree(&dir), before);
+        assert_eq!(
+            std::fs::read(&outside).expect("the file outside reads"),
+            b"export {}\n"
+        );
+    }
+
+    /// F2: a trailing separator never makes the link's target the target: `link/` is the link.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_target_with_a_trailing_slash_is_refused() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let real = root.path().join("real");
+        emit(&real, false, Variant::WithMod).expect("the first emit");
+        let link = root.path().join("plugin");
+        std::os::unix::fs::symlink(&real, &link).expect("the link");
+        let before = tree(&real);
+        for force in [false, true] {
+            assert_eq!(
+                refusal(emit(&link.join(""), force, Variant::SkillOnly)),
+                foreign(&link, "a symbolic link"),
+                "force: {force}"
+            );
+        }
+        assert_eq!(tree(&real), before);
+        assert_eq!(names_in(root.path()), ["plugin", "real"]);
+    }
+
+    /// F2: `.` components and a trailing separator are dropped from the directory written and
+    /// printed.
+    #[test]
+    fn dot_components_and_a_trailing_slash_are_dropped() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let given = root.path().join(".").join("plugin").join(".").join("");
+        let report = emit(&given, false, Variant::SkillOnly).expect("the emit succeeds");
+        let dir = std::path::absolute(root.path().join("plugin")).expect("an absolute path");
+        assert_eq!(report.dir.as_os_str(), dir.as_os_str());
+        assert_eq!(names_in(root.path()), ["plugin"]);
+    }
+
+    /// F2: a `..` is refused, not resolved, and nothing is created on either side of it.
+    #[test]
+    fn a_dot_dot_component_is_refused_and_creates_nothing() {
+        let root = tempfile::tempdir().expect("a temp dir");
+        let given = root.path().join("a").join("..").join("b");
+        let dir = std::path::absolute(&given).expect("an absolute path");
+        for force in [false, true] {
+            assert_eq!(
+                refusal(emit(&given, force, Variant::WithMod)),
+                format!("{} contains ..; give the path without ..", dir.display())
+            );
+        }
+        assert!(names_in(root.path()).is_empty());
+    }
+
+    /// F3: Claude Code takes the marketplace path as text, so a path that is not UTF-8 is refused
+    /// before anything is created.
+    #[cfg(unix)]
+    #[test]
+    fn a_target_that_is_not_utf8_is_refused() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let root = tempfile::tempdir().expect("a temp dir");
+        let given = root
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"plug\xffins"))
+            .join("plugin");
+        assert_eq!(
+            refusal(emit(&given, false, Variant::WithMod)),
+            format!(
+                "{} is not valid UTF-8; Claude Code cannot add it",
+                given.display()
+            )
+        );
+        assert_eq!(
+            std::fs::read_dir(root.path())
+                .expect("the directory reads")
+                .count(),
+            0
+        );
     }
 }
