@@ -18,11 +18,9 @@
     }
   },
   "settings": {
-    "cli": { "stream": "claude_stream_json", "permission_mode": "default",
+    "cli": { "stream": "claude_stream_json", "permission_mode": "acceptEdits",
              "extra_args": [] },
-    "permission": { "default": "ask",
-                    "rules": [{"match": {"tool_kind": "edit"}, "answer": "allow_once", "reason": "edits are allowed and recorded by htui (MOD-96); a persona rule can refuse them"}],
-                    "remembered": [] },
+    "permission": { "default": "ask", "rules": [], "remembered": [] },
     "quota": { "source": "cli_rate_limit_event" },
     "usage": { "scope": "model_usage" }
   }
