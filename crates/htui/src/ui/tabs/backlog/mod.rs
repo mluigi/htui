@@ -872,7 +872,7 @@ impl Tab for BacklogTab {
     /// The keys of what holds the Backlog's keyboard (MOD-67 M6 T2): the divergence view's, the
     /// item form's or the filter form's while one is open; a capturing pane's alone; browsing,
     /// the focused pane's [`DetailTab::key_hint`](detail::DetailTab::key_hint), then ` · ` and
-    /// [`LIST_HINT`] when the joined row fits `width`, the pane's alone when not, [`LIST_HINT`]
+    /// `LIST_HINT` when the joined row fits `width`, the pane's alone when not, `LIST_HINT`
     /// alone when the pane has none (Body, Prompt).
     fn key_hint(&self, width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let (keys, theme) = (ctx.keys(), ctx.theme);

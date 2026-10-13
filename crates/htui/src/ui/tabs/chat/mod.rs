@@ -552,7 +552,7 @@ impl Tab for ChatTab {
         Some(self.stack())
     }
 
-    /// The current mode's keys (MOD-67 M6 T2): [`hint_text`](Self::hint_text), in `theme.dim`.
+    /// The current mode's keys (MOD-67 M6 T2): `hint_text`, in `theme.dim`.
     fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
         let hint = self.hint_text(ctx.keys());
         (!hint.is_empty()).then(|| Line::styled(hint, ctx.theme.dim))

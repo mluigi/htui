@@ -12,7 +12,7 @@
 //! M4 adds the Skills and Requirements stacks. Layer order: view, a parent view's `only` layer
 //! (the attachments pane over the Library), `settings`/`skills`, `confirm`, `form`, `common`,
 //! `list`, `pane`, `overlay`, then the global layers; a capturing Skills mode whose widget passes
-//! `Tab` puts [`TABS`] before [`MODAL`] (PA-2).
+//! `Tab` puts `TABS` before `MODAL` (PA-2).
 //!
 //! M5 adds the Backlog and Chat stacks. A Backlog browse stack is the pane's view layer, then the
 //! tail every sub-tab shares: `pane` (narrowed per pane), `backlog`, `common ∩ {edit}`, `list`,
@@ -137,12 +137,11 @@ const FORM: Layer = Layer::all(Context::Form);
 /// (L-A Q11). `SettingsTab` resolves `settings.next_section`/`prev_section` through it.
 pub const SETTINGS_TAB: Stack<'static> = Stack::new(&[SETTINGS, GLOBAL]);
 
-/// A mode that is a text field or an opaque widget and nothing else (PA-7): the agents paste
-/// field, the Qdrant URL and key editors, the connection, prompt and queue editors, the boxes
-/// tags editor, hierarchy's typed delete, its in-flight delete and its path picker's go-to field,
-/// the personas
-/// import path and the secrets URL; the Requirements filter (MOD-67 M4); the Runs note,
-/// follow-up and typed key, a close-out in flight and the chat composer (MOD-67 M5).
+/// A mode that is a text field or an opaque widget and nothing else (PA-7): the agents paste field,
+/// the Qdrant URL and key editors, the connection, prompt and queue editors, the boxes tags editor,
+/// hierarchy's typed delete, its in-flight delete and its path picker's go-to field, the personas
+/// import path and the secrets URL; the Requirements filter (MOD-67 M4); the Runs note, follow-up
+/// and typed key, a close-out in flight and the chat composer (MOD-67 M5).
 pub const CAPTURE: Stack<'static> = Stack::new(&[MODAL]);
 
 /// Settings > Agents, browsing the agent list.

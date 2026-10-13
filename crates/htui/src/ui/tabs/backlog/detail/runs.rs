@@ -1921,7 +1921,7 @@ impl DetailTab for RunsTab {
         }
     }
 
-    /// The mode's keys (MOD-67 M6 T2): [`hint_spec`](Self::hint_spec) through the mode's stack;
+    /// The mode's keys (MOD-67 M6 T2): `hint_spec` through the mode's stack;
     /// nothing with no item selected.
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         self.item?;

@@ -416,7 +416,7 @@ impl DetailTab for NotesTab {
         }
     }
 
-    /// The compose area's keys while it is open, else [`HINT`] (MOD-67 M6 T2); nothing with no
+    /// The compose area's keys while it is open, else `HINT` (MOD-67 M6 T2); nothing with no
     /// item selected.
     fn key_hint(&self, keys: &Keys, theme: &Theme) -> Option<Line<'static>> {
         let hint = match &self.compose {

@@ -779,7 +779,7 @@ impl DetailTab for GraphTab {
         frame.render_widget(Paragraph::new(Line::styled(text, ctx.theme.dim)), footer);
     }
 
-    /// [`GRAPH_HINT`] while the tree is drawn (MOD-67 M6 T2): the footer under it keeps only
+    /// `GRAPH_HINT` while the tree is drawn (MOD-67 M6 T2): the footer under it keeps only
     /// `depth d/3`. Nothing while there is no tree to move in.
     fn key_hint(&self, keys: &crate::keys::Keys, theme: &Theme) -> Option<Line<'static>> {
         if self.item.is_none() || self.graph.is_none() || self.visible().len() <= 1 {
