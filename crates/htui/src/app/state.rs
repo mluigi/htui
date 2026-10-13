@@ -17,6 +17,7 @@ use crate::app::pane::OpenEditor;
 use crate::editor::{EDITOR_BUSY, ExternalEdit, ExternalEditOutcome};
 use crate::keys::{Act, CTRL_C, Context, HelpLine, KeyChord, Keys, Stack};
 use crate::store_worker::{Origin, RequestEnvelope, Seq, StoreRequest};
+use crate::ui::cells::clip_line;
 use crate::ui::overlay::{Overlay, OverlayRegistry, OverlayStack};
 use crate::ui::tabs::{Tab, TabId, TabRegistry};
 use crate::ui::{Theme, layout, top_bar};
@@ -859,7 +860,13 @@ impl App {
     }
 
     /// Draws one frame: top bar, tab strip, the active tab, the in-pane editor over it (MOD-57
-    /// P1), the status line, then the overlays bottom-up and the help box on top.
+    /// P1), the hint row (MOD-67 M6), the status line, then the overlays bottom-up and the help
+    /// box on top.
+    ///
+    /// The hint row holds the active tab's [`Tab::key_hint`]; it is blank under any overlay (the
+    /// overlay's box has its own hint, plan Q1 (a)) and while the in-pane editor's tab is on
+    /// screen (focused, the editor has the keys; unfocused, the tab refuses its own,
+    /// [`Stack::EDITOR_OPEN`]). The `?` box leaves it alone: the box is centred over the body.
     ///
     /// Rendering is read-only by contract: a view that emits here is not applied until the next
     /// key or reply drains the queue.
@@ -889,6 +896,19 @@ impl App {
         }
 
         self.draw_editor(frame, chrome.body);
+
+        let hint = match self.tabs.active() {
+            Some(tab) if self.overlays.is_empty() && !self.editor_visible() => {
+                tab.key_hint(chrome.hint.width, &self.ctx(Origin::Tab(tab.id())))
+            }
+            _ => None,
+        };
+        if let Some(line) = hint {
+            frame.render_widget(
+                Paragraph::new(clip_line(line, chrome.hint.width)),
+                chrome.hint,
+            );
+        }
 
         let (status, style) = match &self.status {
             Some(message) => (message.clone(), self.theme.error),

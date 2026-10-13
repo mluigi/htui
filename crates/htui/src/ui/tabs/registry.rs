@@ -78,6 +78,13 @@ pub trait Tab {
     fn key_stack(&self) -> Option<Stack<'static>> {
         None
     }
+    /// The keys of this tab's focused mode for the shell's hint row (MOD-67 M6 D10, design review
+    /// finding 3): the mode's hint spec rendered through its own stack, so a rebound key shows its
+    /// new chord. `width` is the row's; a tab that composes two hints keeps the second only when
+    /// both fit. `None`: no row (the test doubles; a tab with nothing to say). Defaulted.
+    fn key_hint(&self, _width: u16, _ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        None
+    }
     /// The `$EDITOR` handoff this tab asked for came back (MOD-9 D10). Defaulted, the trait's
     /// second default after `focus_section`, so no other tab changes.
     fn on_external_edit(&mut self, _outcome: ExternalEditOutcome, _ctx: &mut Ctx<'_>) {}

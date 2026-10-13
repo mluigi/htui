@@ -38,6 +38,7 @@ pub mod list;
 use htui_core::model::{ItemId, ItemKindId, ItemSummary, ProjectId, RunId, Scope, Status, StepId};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::text::Line;
 
 use crate::app::{Action, Ctx, Handled, RevealTarget};
 use crate::editor::ExternalEditOutcome;
@@ -848,6 +849,11 @@ impl Tab for BacklogTab {
             return Some(form.key_stack());
         }
         Some(self.detail.key_stack())
+    }
+
+    fn key_hint(&self, _width: u16, ctx: &Ctx<'_>) -> Option<Line<'static>> {
+        self.list_hint(ctx.keys())
+            .map(|hint| Line::styled(hint, ctx.theme.dim))
     }
 
     fn on_reply(&mut self, reply: &StoreReply, ctx: &mut Ctx<'_>) {
