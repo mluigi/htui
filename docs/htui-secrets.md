@@ -464,9 +464,12 @@ only, never contents.
 
 **Where htui looks.** The session's working directory and every extra directory it may read,
 recursively, skipping `.git` and the build directories `copy` mode skips (`target/`, `build/`,
-`cmake-build-*/`, `node_modules/`, `.venv/`, `out/`, `dist/`), up to 100 000 entries. A longer
-walk stops there, ends its list with `(scan cut at 100000 entries)` and logs a warning. An entry
-htui cannot read is skipped with a warning: the check never stops a run over an I/O error.
+`cmake-build-*/`, `node_modules/`, `.venv/`, `out/`, `dist/`), up to 100 000 entries across all
+of them. The top level of every directory is read before anything below it, and in each directory
+its files come before its subdirectories, so a large subtree cannot use up the budget before a
+top-level `.env` is seen. A longer walk stops there, ends its list with
+`(scan cut at 100000 entries)` and logs a warning. An entry htui cannot read is skipped with a
+warning: the check never stops a run over an I/O error.
 
 **Which mode exposes what.**
 
@@ -482,7 +485,7 @@ directory (`docs/.env`); under `worktree` and `copy` every path starts with the 
 (`core/.env`). At most five are named, then `and N more`.
 
 **Refuse or warn.** A project with `secret_provider` set is refused before its agent starts. The
-step's tree and prompt are already prepared by then; nothing of the session is. The run's failure
+step's tree and its prompt record already exist by then; the agent never starts. The run's failure
 reads:
 
 ```
@@ -491,8 +494,11 @@ env_files_refused: `.env`, `web/.env.local` in the session's trees; the project 
 
 A group of fan-out candidates that are all refused fails the run with the same sentence, each
 candidate noted as for `secrets_refused` ([When htui refuses](#when-htui-refuses)); a group where
-only some are refused goes on with the others. A project without a provider is never refused: its
-item gets a note, once per run, and the run goes on:
+only some are refused goes on with the others. A resumed group counts the candidates that finished
+before the restart too: if one of them is done, the group goes on with it. A run cancelled while
+the trees are being checked ends cancelled, not refused. A project without a provider is never
+refused: its item gets a note, once per run, and the run goes on (if the note cannot be written,
+htui logs a warning and the run still goes on):
 
 ```
 env files in the session's trees: `.env`; the agent can read them
