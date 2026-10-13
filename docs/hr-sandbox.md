@@ -27,6 +27,7 @@ Linux only. The design, and why it is built this way, is in
 - [Listing, stopping and cleaning up](#listing-stopping-and-cleaning-up)
 - [Where the data lives](#where-the-data-lives)
 - [What is inside a sandbox, and what is not](#what-is-inside-a-sandbox-and-what-is-not)
+- [Headroom in a run](#headroom-in-a-run)
 - [Threat model](#threat-model)
 - [Troubleshooting](#troubleshooting)
 - [Tests](#tests)
@@ -95,7 +96,7 @@ to match `rust-toolchain.toml` and `Cargo.lock`, so bump it together with them. 
 ## Starting a run
 
 ```
-scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--yes]
+scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--headroom|--no-headroom] [--yes]
 ```
 
 - Without `ITEM` you pick from the open items in `HANDOFF.md` on `REF`; items that already have a
@@ -108,6 +109,9 @@ scripts/hr up [ITEM] [--ssd] [--from REF] [--cpus N] [--yes]
   continues. Commit first if the run needs them.
 - `--ssd` puts the run on the SSD (`~/htui-hr`) instead of `/media`.
 - `--cpus N` limits the run's `dev` container (default 4).
+- `--headroom` routes the run's Claude through [headroom](https://github.com/headroomlabs-ai/headroom),
+  the context-compressing proxy you installed on the host. Off by default; `--no-headroom` says so
+  explicitly, and giving both is refused (`2`). See [Headroom in a run](#headroom-in-a-run).
 
 What `up` copies in besides the clone: your untracked `.claude/settings.local.json` (it carries the
 Gortex and headroom hooks), a private copy of `~/.claude.json`, and your global git ignore rules
@@ -443,7 +447,7 @@ runs rather than letting them pile up.
 | `~/.claude/history.jsonl`, `bash-commands.log`, `cost-tracker.log`, `security/log.txt` | an empty file each, from `claude-mask/` in the run directory | per run |
 | `~/.claude.json` | a private copy | changes inside do not flow back |
 | `~/.gortex` config, instructions, models | same path | read-only |
-| `~/.headroom`, `~/.serena`, `~/.cache/uv` | same path | read-write, shared |
+| `~/.headroom`, `~/.serena`, `~/.cache/uv` | same path | read-write, shared. A run made with `--headroom` keeps its proxy's state and logs in `/tmp/headroom` instead, so a proxy never writes here |
 | this repo's `.remember/` | `.remember/` in the clone | read-write, shared |
 | state directory (ID leases) | `/hr-state` | read-write, shared |
 | `htui-hr-cargo` volume | `~/.cargo` | read-write, shared by all runs; `config`, `config.toml`, `credentials` and `credentials.toml` are one empty read-only file (`cargo-empty` in the run directory); `bin` is an empty read-only `tmpfs`; `registry/src` is a per-run volume |
@@ -458,7 +462,7 @@ registry, other projects' Claude transcripts and memory, your prompt history, `g
 and the MCP servers already disabled for this project. Commits carry
 your name and email from `git config user.*`, passed in as environment variables.
 
-Inside a run these are set: `HR_SANDBOX=1`, `HR_ITEM=<ITEM>`, `HR_STATE=/hr-state`,
+Inside a run these are set: `HR_SANDBOX=1`, `HR_ITEM=<ITEM>`, `HR_HEADROOM=0|1`, `HR_STATE=/hr-state`,
 `USERNAME=htui-ci`, `HTUI_TEST_DATABASE_URL`, `HTUI_TEST_QDRANT_URL`, `UV_TOOL_DIR=/tmp/uv-tools`,
 `CARGO_INSTALL_ROOT=/tmp/cargo-install`, the git identity, and a `PATH` with the mise tool
 directories ahead of `~/.local/bin`, no `~/.cargo/bin`, and `/tmp/cargo-install/bin` last — a
@@ -471,6 +475,45 @@ keyring.
 Every run starts its own Gortex daemon with its own index (the first index takes about 20 seconds).
 Gortex memories written in a run stay in that run and are deleted when it is purged — anything
 worth keeping belongs in the repo or in Claude's memory of this project, which is shared.
+
+## Headroom in a run
+
+`scripts/hr up ITEM --headroom` makes the run's Claude send its API calls through a headroom proxy.
+The flag is recorded in the run's registry, so `attach` after a stop or a reboot keeps it; there is
+no verb to change it for an existing run (`down --purge` and `up` again). Without the flag nothing
+about a run changes.
+
+**One proxy per run, in the run, not your host's proxy.** The container's `localhost` is the
+run's own network namespace, so the proxy listens on `localhost:8787` there and nowhere else:
+no published port, no clash with a headroom you run on the host, nothing to start on the host
+first, and no need to bind the host proxy beyond `127.0.0.1` for Docker's bridge. It runs from the
+read-only `~/.local/share/uv/tools` mount, so it is the version you have on the host.
+
+- `up` starts the proxy in the background next to the container's `sleep`; a start that fails does
+  not fail `up`.
+- `attach` checks `http://localhost:8787/readyz` (up to 15 s, each probe capped at 2 s). Ready: it
+  sets `ANTHROPIC_BASE_URL` for that Claude (or shell) only. No proxy process (the container was
+  restarted, or `up` never started one): `attach` starts it first. Still not ready: it prints
+  `hr: headroom is not answering; this session runs direct` and starts Claude without the variable.
+  The check exists because Claude pointed at a dead base URL does not fail, it hangs.
+- The proxy's state, logs and CCR store are in `/tmp/headroom`, set on that one process, so the
+  shared `~/.headroom` is never written and a run's SQLite store never meets your host's or another
+  run's. The cost: a run's savings are not added to your host's totals, and the data is gone when
+  the container is. The headroom hooks and CLI in an ordinary run keep using `~/.headroom`.
+- The upload beacon (anonymous session summaries to Headroom Labs, on by default in headroom) is
+  off in a run: `HEADROOM_BEACON=off` on the proxy.
+
+**What headroom sees.** Every request of the run passes through it: all prompts, file contents, tool
+results and the `Authorization` it forwards upstream (the run's login). It rewrites those requests
+to shorten them, so what Claude sends and what Anthropic receives differ by design. At its default
+log level the proxy wrote neither a bearer token, an API key nor prompt text to its log (checked
+with a canary request); do not set `HEADROOM_LOG_MESSAGES` in a run. This adds no reach a hostile
+run did not have, since it already holds the login, but it does put a third-party program on the
+path of every prompt.
+
+**When the proxy is down.** At `attach`: described above, the session runs direct. Mid-session: the
+proxy dying (killed, out of memory) makes that session's requests fail until you leave and
+`attach` again; the check runs on every `attach`, and a session started direct stays direct.
 
 ## Threat model
 
@@ -485,7 +528,7 @@ read-write:
 | `~/.claude` — by design, so runs have your login, settings, plugins, skills, agents and commands | add hooks or settings that execute in your next host Claude session; read or use the login (`.credentials.json`) |
 | `~/.claude/projects/-home-mluigi-projects-htui` | read this project's host session transcripts; change its auto-memory, which your next host session loads |
 | `~/.cache/uv` | plant packages that `uvx` runs on the host |
-| `~/.headroom`, `~/.serena` | change the state and configuration your host headroom and serena read |
+| `~/.headroom`, `~/.serena` | change the state and configuration your host headroom and serena read. A `--headroom` run's own proxy does not write to `~/.headroom` (its state is in the container), but the host's hooks and CLI still read it |
 | this repo's `.remember/` | replace a file such as `now.md` with a symlink to a file in your checkout; the host remember plugin then writes into the checkout |
 | the state directory (`/hr-state`) | delete the lease file or hold its lock; bounded by the fail-closed rules in [New item IDs across runs](#new-item-ids-across-runs) |
 | the `htui-hr-cargo` volume | change the cached `.crate` files and index other runs extract from. `registry/src` is per run, `bin/` is an empty read-only mount, the config and credentials files are read-only and empty, and `up` refuses a mount point replaced by the wrong kind of entry |
@@ -543,6 +586,11 @@ Known residuals:
   own run look collected, so a purge then drops that run's uncollected work.
 
 ## Troubleshooting
+
+**`hr: headroom is not answering; this session runs direct`** (a `--headroom` run). The proxy did not
+become ready in 15 s. Open a shell with `scripts/hr attach ITEM --shell` and read
+`/tmp/headroom/proxy.out`; `curl -s localhost:8787/readyz` shows its state. `headroom: command not
+found` there means `~/.local/bin/headroom` is missing on the host.
 
 **`up` says `run scripts/hr build` or `rebuild`.** The image is missing, or was built for a
 different uid, gid or home directory. Run `scripts/hr build`.
