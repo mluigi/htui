@@ -66,6 +66,15 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
   single-agent step, a phase's `command_queue = always`, is settable only in Postgres (Settings ›
   Kinds shows it read-only). Options to weigh: a non-routing item label, exempting `heavy_build`
   from the box-tag match, or a phase/queue setting in the TUI.
+- [ ] **ANA-30 - Utility models: auxiliary cheap-model calls (session titles etc.)**. Survey every
+  place htui could use a small, cheap model for background work: session and item titles,
+  summaries, history digests, commit messages, judge or triage calls, and similar. Motivation: a
+  $100 Claude API credit is available and needs uses. Per use, record the call site, the model tier
+  (`docs/ANA-21.md`), the API route (direct Claude API vs the `claude` CLI that htui wraps), an
+  estimated token cost, and the trigger. Then budget the uses against the credit and decide
+  whether a `utility_model` setting is worth building. A MOD is spawned only if the verdict says
+  yes. Not blocked.
+
 ### Next features
 - [ ] **MOD-36 - Weighted agent assignment across fan-out candidates** (from MOD-4 milestone 4,
   OQ-7; ANA-21 is done, `docs/decisions/ana/ana-21.md`). `R-AGT-8`,
@@ -560,7 +569,7 @@ conformance `CASES` 159 (MOD-10 M4 adds the secret-column case), `READ_CASES` 15
 
 | Area    | Open                                                                                     |
 |---------|-------------------------------------------------------------------------------------------|
-| ANA-N   | 2 (ANA-25 learned weights, ANA-28 heavy_build routing) |
+| ANA-N   | 3 (ANA-25 learned weights, ANA-28 heavy_build routing, ANA-30 utility models) |
 | MOD-N   | 20 (MOD-16 Windows verification, MOD-27 swarm, MOD-36 weighted agent assignment, MOD-75 agent question tool, MOD-43 remote dispatch, MOD-44 container env, MOD-46 NOTIFY streaming, MOD-47 control plane, MOD-48 config manager, MOD-67 configurable hotkeys, MOD-81 terminal widths, MOD-82 shared pane chrome, MOD-83 display labels and errors, MOD-85 remaining accent uses, MOD-88 item-graph flow mode, MOD-94 permission answers outside the TUI, MOD-96 settings-file permission rules in driven sessions, deferred MOD-3 diff, MOD-5 tracker, MOD-8 import) |
 | CLEAN-N | 3 (CLEAN-10 `cargo doc` private links, CLEAN-11 CLEAN-9 deferred review residuals, CLEAN-12 `.claude/` hygiene) |
 | TOOL-N  | 3 (TOOL-8 `htui-dev` mod, TOOL-9 gate script and git hooks, TOOL-10 sandbox mod hardening) |
