@@ -317,7 +317,8 @@ pub static DECLARED: &[(&str, Stack<'static>)] = &[
 pub struct Fixed {
     /// The stack, one of [`DECLARED`]'s; its phrase names it in the error.
     pub stack: Stack<'static>,
-    /// The keys, spelled as in a key file, matched on plain keys only (SHIFT aside).
+    /// The keys, spelled as in a key file, matched on plain keys only (SHIFT aside), so the
+    /// validator also refuses a named key's SHIFT form (`shift-left`); a character has none.
     pub chords: &'static [&'static str],
     /// The keys shadow only the stack's global layer: the Chat replay resolves its own acts
     /// first and swallows what they left (M5 R1 M1 (a)).

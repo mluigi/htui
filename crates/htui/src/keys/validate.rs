@@ -12,6 +12,7 @@ use super::{
     Act, Context, DECLARED, FIXED, Fixed, KeyChord, KeyFileError, Keys, Lost, Row, SHADOWING,
     STATE_GUARDED, Stack, quote,
 };
+use crossterm::event::KeyModifiers;
 
 /// The user's binding wins (MOD-12 M3 R1 H1, maintainer 2026-10-08): an entry of the file that
 /// shares a chord with an action in **its own context** that the file leaves at its default
@@ -187,7 +188,8 @@ struct Check<'k> {
 
 impl Check<'_> {
     /// The fixed-key pass (MOD-67 M5 R1 M1): every act a [`Fixed`] entry's stack resolves on one
-    /// of its keys, in the layers the keys shadow, unless the entry shadows that act by design.
+    /// of its keys or on a named key's SHIFT form, in the layers the keys shadow, unless the
+    /// entry shadows that act by design.
     /// A row and chord are reported once, naming the first stack, on the row's [`source`].
     fn fixed(&mut self, table: &[Fixed]) {
         let mut seen: Vec<(Slot, KeyChord)> = Vec::new();
@@ -201,9 +203,16 @@ impl Check<'_> {
             } else {
                 0
             };
-            for written in entry.chords {
+            let chords = entry.chords.iter().flat_map(|written| {
                 let chord = KeyChord::parse_strict(written)
                     .unwrap_or_else(|err| panic!("fixed key {written:?}: {err}"));
+                // A view matches its fixed keys with `keys::is_plain`, which lets SHIFT through,
+                // and a named key keeps SHIFT in its chord (a character drops it), so the
+                // shifted named key is fixed too (M5 R1 fix): `shift-left` moves the option.
+                let shifted = KeyChord::new(chord.code, chord.mods | KeyModifiers::SHIFT);
+                std::iter::once(chord).chain((shifted != chord).then_some(shifted))
+            });
+            for chord in chords {
                 for act in self.keys.actions(entry.stack, chord) {
                     if entry.shadowed.contains(&act) {
                         continue;
@@ -696,6 +705,45 @@ mod tests {
                 2,
                 r#"[backlog.runs] yes = "right": "right" is fixed in a Runs question"#
             )
+        );
+    }
+
+    /// MOD-67 M5 R1 fix: a view matches its fixed keys with `keys::is_plain`, which lets SHIFT
+    /// through, and a named key keeps its SHIFT in a chord, so `shift-left` is as fixed as `left`.
+    #[test]
+    fn a_shifted_named_fixed_key_is_refused_too() {
+        assert_eq!(
+            errors("[backlog.filter_form]\nclear = [\"shift-left\"]\n"),
+            one(
+                2,
+                r#"[backlog.filter_form] clear = "shift-left": "shift-left" is fixed in the Backlog filter form"#
+            )
+        );
+        assert_eq!(
+            errors("[backlog.filter_form]\nnext_row = [\"shift-right\"]\n"),
+            one(
+                2,
+                r#"[backlog.filter_form] next_row = "shift-right": "shift-right" is fixed in the Backlog filter form"#
+            )
+        );
+        assert_eq!(
+            errors("[form]\nsave = [\"ctrl-s\", \"shift-left\"]\n"),
+            one(
+                2,
+                r#"[form] save = "shift-left": "shift-left" is fixed in the item form"#
+            )
+        );
+        assert_eq!(
+            errors("[backlog.runs]\nyes = [\"y\", \"shift-right\"]\n"),
+            one(
+                2,
+                r#"[backlog.runs] yes = "shift-right": "shift-right" is fixed in a Runs question"#
+            )
+        );
+        // An unfixed shifted key is still free: `shift-up` is no option key.
+        assert_eq!(
+            errors("[backlog.filter_form]\nclear = [\"x\", \"shift-up\"]\n"),
+            []
         );
     }
 
