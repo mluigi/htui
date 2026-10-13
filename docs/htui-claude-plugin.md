@@ -70,7 +70,10 @@ replaces it.
 A directory counts as one `emit` wrote when it holds nothing but `.claude-plugin` and `htui`, and
 its `.claude-plugin/marketplace.json` names the marketplace `htui`. A directory with one more
 file, another marketplace, no `marketplace.json`, or a `marketplace.json` that is not JSON is left
-exactly as it is. So `--force` never deletes your own files under a `--dir` you chose.
+exactly as it is. So `--force` never touches a directory that holds anything beside
+`.claude-plugin` and `htui`. The check looks only at those two top-level names: inside them,
+`--force` replaces everything, so keep nothing of your own there, and never point `--dir` at
+htui's source tree (`crates/htui/claude-plugin` passes the check).
 
 `emit` writes the new copy into a sibling directory, `<name>.emit-<pid>`, then moves it into
 place. With `--force`, the old copy is first moved aside to `<name>.old-<pid>`, the new copy takes
